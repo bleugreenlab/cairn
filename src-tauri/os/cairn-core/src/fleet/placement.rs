@@ -458,6 +458,11 @@ mod tests {
             CellUnavailableReason::ObjectInfrastructure(
                 ObjectInfrastructureStage::FetchInterrupted,
             ),
+            // A source that refused deterministically refuses the same work
+            // again; waiting on it waits forever.
+            CellUnavailableReason::ObjectInfrastructure(
+                ObjectInfrastructureStage::MaterializationRefused,
+            ),
             CellUnavailableReason::HomeCannotHold {
                 home: "bgsrv-ub".into(),
                 ceiling: cairn_common::executor_protocol::MemoryCeiling {

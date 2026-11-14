@@ -105,10 +105,78 @@ impl Default for PackLimits {
     }
 }
 
+impl PackLimits {
+    /// Limits narrower than the defaults, so a test can cross every bound
+    /// with a repository small enough to build in milliseconds.
+    pub fn new(max_pack_bytes: u64, max_object_count: u64, max_inflated_bytes: u64) -> Self {
+        Self {
+            max_pack_bytes,
+            max_object_count,
+            max_inflated_bytes,
+        }
+    }
+
+    pub fn max_pack_bytes(&self) -> u64 {
+        self.max_pack_bytes
+    }
+}
+
+/// Which transfer bound a pack crossed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LimitDimension {
+    PackBytes,
+    ObjectCount,
+    InflatedBytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LimitViolation {
+    pub dimension: LimitDimension,
+    pub actual: u64,
+    pub limit: u64,
+}
+
+impl std::fmt::Display for LimitViolation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bound = match self.dimension {
+            LimitDimension::PackBytes => "byte",
+            LimitDimension::ObjectCount => "object",
+            LimitDimension::InflatedBytes => "inflated byte",
+        };
+        write!(
+            formatter,
+            "pack exceeds {bound} limit: {} > {}",
+            self.actual, self.limit
+        )
+    }
+}
+
+/// Why a received pack was refused: a transfer bound, or anything else.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PackValidationError {
+    Limit(LimitViolation),
+    Invalid(String),
+}
+
+impl std::fmt::Display for PackValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Limit(violation) => violation.fmt(formatter),
+            Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for PackValidationError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectSize {
     pub oid: String,
-    kind: String,
+    pub kind: String,
     /// Canonical, decompressed and undeltified Git object bytes.
     canonical_bytes: u64,
 }
@@ -260,15 +328,83 @@ pub fn validate_pack(
     scratch: &Path,
 ) -> Result<ValidatedPack, String> {
     if pack.len() as u64 > limits.max_pack_bytes {
-        return Err(format!(
-            "pack exceeds byte limit: {} > {}",
-            pack.len(),
-            limits.max_pack_bytes
-        ));
+        return Err(LimitViolation {
+            dimension: LimitDimension::PackBytes,
+            actual: pack.len() as u64,
+            limit: limits.max_pack_bytes,
+        }
+        .to_string());
     }
+    let staging = scratch_tempdir(scratch, ".receive-")
+        .map_err(|e| format!("creating pack validation scratch under {e}"))?;
+    let received = staging.path().join("received.pack");
+    fs::write(&received, pack).map_err(|e| format!("writing quarantined pack: {e}"))?;
+    let validated =
+        validate_pack_file(&received, limits, scratch).map_err(|error| error.to_string())?;
+    let index =
+        fs::read(&validated.index_path).map_err(|e| format!("reading derived pack index: {e}"))?;
+    Ok(ValidatedPack {
+        pack: pack.to_vec(),
+        index,
+        manifest: validated.manifest,
+    })
+}
+
+/// A validated pack still on disk, beside the index validation derived for
+/// it, in a scratch directory removed when this is dropped. Receivers and
+/// producers that move many packs hold one of these at a time, so no more than
+/// one pack's bytes is ever resident in memory or scratch at once.
+#[derive(Debug)]
+pub struct ValidatedPackFile {
+    _dir: tempfile::TempDir,
+    pub pack_path: PathBuf,
+    index_path: PathBuf,
+    pub manifest: PackManifest,
+}
+
+/// [`validate_pack`] for a pack already in a file. The file is moved into the
+/// validation scratch under `scratch`, so the caller's copy is gone either way;
+/// on refusal the scratch is removed with it.
+pub fn validate_pack_file(
+    pack: &Path,
+    limits: PackLimits,
+    scratch: &Path,
+) -> Result<ValidatedPackFile, PackValidationError> {
     let scratch_dir = scratch_tempdir(scratch, ".validate-")
         .map_err(|e| format!("creating pack validation scratch under {e}"))?;
-    let scratch = scratch_dir.path();
+    let pack_path = scratch_dir.path().join("incoming.pack");
+    if fs::rename(pack, &pack_path).is_err() {
+        fs::copy(pack, &pack_path).map_err(|e| format!("writing quarantined pack: {e}"))?;
+        let _ = fs::remove_file(pack);
+    }
+    let pack_bytes = fs::metadata(&pack_path)
+        .map_err(|e| format!("reading quarantined pack: {e}"))?
+        .len();
+    if pack_bytes > limits.max_pack_bytes {
+        return Err(PackValidationError::Limit(LimitViolation {
+            dimension: LimitDimension::PackBytes,
+            actual: pack_bytes,
+            limit: limits.max_pack_bytes,
+        }));
+    }
+    let index_path = scratch_dir.path().join("incoming.idx");
+    let manifest = index_quarantined_pack(scratch_dir.path(), &pack_path, &index_path, limits)?;
+    Ok(ValidatedPackFile {
+        _dir: scratch_dir,
+        pack_path,
+        index_path,
+        manifest,
+    })
+}
+
+/// Index `pack_path` against an empty object database in `scratch`, writing
+/// `index_path`, and hold the result to `limits`.
+fn index_quarantined_pack(
+    scratch: &Path,
+    pack_path: &Path,
+    index_path: &Path,
+    limits: PackLimits,
+) -> Result<PackManifest, PackValidationError> {
     let git_dir = scratch.join("repository.git");
     // host-default-branch: a throwaway quarantine that validates a pack's
     // objects; no ref in it is ever read.
@@ -281,20 +417,21 @@ pub fn validate_pack(
         return Err(format!(
             "initializing quarantine repository: {}",
             String::from_utf8_lossy(&init.stderr).trim()
-        ));
+        )
+        .into());
     }
     let objects = git_dir.join("objects");
-    let pack_path = scratch.join("incoming.pack");
-    let index_path = scratch.join("incoming.idx");
-    fs::write(&pack_path, pack).map_err(|e| format!("writing quarantined pack: {e}"))?;
+    let pack_bytes = fs::metadata(pack_path)
+        .map_err(|e| format!("reading quarantined pack: {e}"))?
+        .len();
 
-    let input = File::open(&pack_path).map_err(|e| format!("opening quarantined pack: {e}"))?;
+    let input = File::open(pack_path).map_err(|e| format!("opening quarantined pack: {e}"))?;
     let output = Command::new("git")
         // Indexing against an empty object directory rejects unresolved delta
         // bases. Do not use `--strict`: a legitimate delta-range pack may carry
         // a commit whose parent is intentionally supplied by an alternate ODB.
         .args(["index-pack", "--index-version=2", "-o"])
-        .arg(&index_path)
+        .arg(index_path)
         .arg("--stdin")
         .env("GIT_DIR", &git_dir)
         .env("GIT_OBJECT_DIRECTORY", &objects)
@@ -305,26 +442,28 @@ pub fn validate_pack(
         return Err(format!(
             "invalid or thin pack: {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        )
+        .into());
     }
-    let index = fs::read(&index_path).map_err(|e| format!("reading derived pack index: {e}"))?;
-    let objects_manifest = verify_pack_manifest(&index_path)?;
+    let objects_manifest = verify_pack_manifest(index_path)?;
     let object_count = objects_manifest.len() as u64;
     let canonical_bytes = objects_manifest.iter().try_fold(0u64, |sum, object| {
         sum.checked_add(object.canonical_bytes)
             .ok_or_else(|| "canonical object size overflow".to_string())
     })?;
     if object_count > limits.max_object_count {
-        return Err(format!(
-            "pack exceeds object limit: {object_count} > {}",
-            limits.max_object_count
-        ));
+        return Err(PackValidationError::Limit(LimitViolation {
+            dimension: LimitDimension::ObjectCount,
+            actual: object_count,
+            limit: limits.max_object_count,
+        }));
     }
     if canonical_bytes > limits.max_inflated_bytes {
-        return Err(format!(
-            "pack exceeds inflated byte limit: {canonical_bytes} > {}",
-            limits.max_inflated_bytes
-        ));
+        return Err(PackValidationError::Limit(LimitViolation {
+            dimension: LimitDimension::InflatedBytes,
+            actual: canonical_bytes,
+            limit: limits.max_inflated_bytes,
+        }));
     }
     // With `--stdin` Git reports `pack\t<checksum>` rather than the bare
     // checksum produced by file-based indexing.
@@ -335,17 +474,13 @@ pub fn validate_pack(
         .ok_or_else(|| "git index-pack did not report a pack checksum".to_string())?
         .to_owned();
     validate_oid(&checksum)?;
-    Ok(ValidatedPack {
-        pack: pack.to_vec(),
-        index,
-        manifest: PackManifest {
-            pack_checksum: checksum,
-            pack_bytes: pack.len() as u64,
-            index_bytes: fs::metadata(&index_path).map_err(|e| e.to_string())?.len(),
-            object_count,
-            canonical_bytes,
-            objects: objects_manifest,
-        },
+    Ok(PackManifest {
+        pack_checksum: checksum,
+        pack_bytes,
+        index_bytes: fs::metadata(index_path).map_err(|e| e.to_string())?.len(),
+        object_count,
+        canonical_bytes,
+        objects: objects_manifest,
     })
 }
 
@@ -356,16 +491,85 @@ pub fn install_pack(
     objects_dir: &Path,
     validated: &ValidatedPack,
 ) -> Result<InstalledPack, String> {
+    install_with(objects_dir, &validated.manifest, |pack, index| {
+        write_synced(pack, &validated.pack)?;
+        write_synced(index, &validated.index)
+    })
+}
+
+/// [`install_pack`] for a pack validated on disk. The files are copied, so
+/// the validated pack can be installed again elsewhere.
+pub fn install_pack_file(
+    objects_dir: &Path,
+    validated: &ValidatedPackFile,
+) -> Result<InstalledPack, String> {
+    install_with(objects_dir, &validated.manifest, |pack, index| {
+        copy_synced(&validated.pack_path, pack)?;
+        copy_synced(&validated.index_path, index)
+    })
+}
+
+/// What publishing a staged pack needs: its files and identity, and no object
+/// list. A receiver of many packs keeps one of these per pack until the
+/// closure is proven, so what it holds grows with the pack count, never with
+/// the objects the packs carry; an [`InstalledPack`]'s manifest is let go as
+/// soon as the pack is staged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedPack {
+    pub pack_path: PathBuf,
+    index_path: PathBuf,
+    pub pack_checksum: String,
+    pub pack_bytes: u64,
+    pub index_bytes: u64,
+}
+
+impl From<InstalledPack> for StagedPack {
+    fn from(installed: InstalledPack) -> Self {
+        Self {
+            pack_path: installed.pack_path,
+            index_path: installed.index_path,
+            pack_checksum: installed.manifest.pack_checksum,
+            pack_bytes: installed.manifest.pack_bytes,
+            index_bytes: installed.manifest.index_bytes,
+        }
+    }
+}
+
+/// Move a staged pack into `objects_dir`, which must be on the same volume:
+/// how a staged closure is published once proven. Idempotent like
+/// [`install_pack`]; the staged files are left in place when the destination
+/// already holds the pack.
+pub fn publish_staged_pack(objects_dir: &Path, staged: &StagedPack) -> Result<StagedPack, String> {
+    let manifest = PackManifest {
+        pack_checksum: staged.pack_checksum.clone(),
+        pack_bytes: staged.pack_bytes,
+        index_bytes: staged.index_bytes,
+        object_count: 0,
+        canonical_bytes: 0,
+        objects: Vec::new(),
+    };
+    install_with(objects_dir, &manifest, |pack, index| {
+        fs::rename(&staged.pack_path, pack).map_err(|e| format!("moving staged pack: {e}"))?;
+        fs::rename(&staged.index_path, index).map_err(|e| format!("moving staged index: {e}"))
+    })
+    .map(StagedPack::from)
+}
+
+fn install_with(
+    objects_dir: &Path,
+    manifest: &PackManifest,
+    stage: impl FnOnce(&Path, &Path) -> Result<(), String>,
+) -> Result<InstalledPack, String> {
     let pack_dir = objects_dir.join("pack");
     fs::create_dir_all(&pack_dir).map_err(|e| format!("creating pack directory: {e}"))?;
-    let stem = format!("pack-{}", validated.manifest.pack_checksum);
+    let stem = format!("pack-{}", manifest.pack_checksum);
     let pack_path = pack_dir.join(format!("{stem}.pack"));
     let index_path = pack_dir.join(format!("{stem}.idx"));
     if pack_path.is_file() && index_path.is_file() {
         return Ok(InstalledPack {
             pack_path,
             index_path,
-            manifest: validated.manifest.clone(),
+            manifest: manifest.clone(),
             already_present: true,
         });
     }
@@ -379,8 +583,7 @@ pub fn install_pack(
         .map_err(|e| format!("creating same-filesystem pack quarantine: {e}"))?;
     let staged_pack = quarantine.path().join(format!("{stem}.pack"));
     let staged_index = quarantine.path().join(format!("{stem}.idx"));
-    write_synced(&staged_pack, &validated.pack)?;
-    write_synced(&staged_index, &validated.index)?;
+    stage(&staged_pack, &staged_index)?;
     fs::rename(&staged_pack, &pack_path).map_err(|e| format!("publishing pack: {e}"))?;
     if let Err(error) = fs::rename(&staged_index, &index_path) {
         let _ = fs::remove_file(&pack_path);
@@ -396,9 +599,324 @@ pub fn install_pack(
     Ok(InstalledPack {
         pack_path,
         index_path,
-        manifest: validated.manifest.clone(),
+        manifest: manifest.clone(),
         already_present: false,
     })
+}
+
+/// What [`build_bounded_packs`] sent.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BoundedPackSummary {
+    pub packs: u64,
+    pub objects: u64,
+    pub pack_bytes: u64,
+}
+
+/// One object the closure reaches, as a limit refusal names it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClosureObject {
+    pub oid: String,
+    pub kind: String,
+    /// The path the reachable listing reached it by; `None` for an object
+    /// listed without one (a commit, a root tree).
+    pub path: Option<String>,
+    pub canonical_bytes: u64,
+    /// The bytes of the pack that held only this object, when one was built.
+    pub packed_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BoundedPackError {
+    /// One object cannot fit a pack within the limits, alone. Deterministic.
+    Oversized {
+        object: ClosureObject,
+        violation: LimitViolation,
+    },
+    /// The source repository lacks an object the closure reaches.
+    SourceMissing(String),
+    /// Listing, building or validating failed for another reason.
+    Failed(String),
+    /// The consumer refused a pack (it went away, or its write failed).
+    Stopped(String),
+}
+
+impl std::fmt::Display for BoundedPackError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Oversized { object, violation } => write!(
+                formatter,
+                "{} {} ({} canonical bytes) cannot fit one legal pack: {violation}",
+                object.kind, object.oid, object.canonical_bytes
+            ),
+            Self::SourceMissing(message) | Self::Failed(message) | Self::Stopped(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+/// One reachable object on its way into a pack.
+#[derive(Clone, Debug)]
+struct ListedObject {
+    oid: String,
+    kind: String,
+    canonical_bytes: u64,
+    disk_bytes: u64,
+    path: Option<String>,
+}
+
+/// Build the closure [`build_reachable_pack`] would, as a sequence of packs
+/// each within `limits`, and hand each to `emit` as it is validated.
+///
+/// A closure is bounded only by disk and time; each pack is bounded by
+/// `limits`. The reachable listing and its object sizes are spooled under
+/// `scratch` rather than held, and objects are batched in listing order by
+/// count, canonical bytes and their on-disk size. Every candidate pack is
+/// non-thin and is indexed against an empty object database before `emit`
+/// sees it, which is what proves it carries no delta against an object in
+/// another pack. A candidate that exceeds a limit is split in half and
+/// rebuilt; one object that exceeds a limit alone is a deterministic refusal
+/// naming it. One pack exists at a time: `emit` owns it, and it is gone
+/// before the next is built.
+pub fn build_bounded_packs(
+    repository: &Path,
+    wants: &[String],
+    haves: &[String],
+    limits: PackLimits,
+    scratch: &Path,
+    emit: &mut dyn FnMut(ValidatedPackFile) -> Result<(), String>,
+) -> Result<BoundedPackSummary, BoundedPackError> {
+    if wants.is_empty() {
+        return Err(BoundedPackError::Failed(
+            "at least one wanted commit is required".into(),
+        ));
+    }
+    validate_oids(wants.iter().chain(haves)).map_err(BoundedPackError::Failed)?;
+    let spool = scratch_tempdir(scratch, ".fetch-spool-")
+        .map_err(|e| BoundedPackError::Failed(format!("creating object fetch spool under {e}")))?;
+    let listed = spool.path().join("reachable");
+    let mut args = vec!["rev-list", "--objects"];
+    args.extend(wants.iter().map(String::as_str));
+    if !haves.is_empty() {
+        args.push("--not");
+        args.extend(haves.iter().map(String::as_str));
+    }
+    git_to_file(repository, &args, None, &listed).map_err(BoundedPackError::Failed)?;
+    let sized = spool.path().join("sized");
+    git_to_file(
+        repository,
+        &[
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize) %(objectsize:disk) %(rest)",
+        ],
+        Some(&listed),
+        &sized,
+    )
+    .map_err(BoundedPackError::Failed)?;
+
+    // The on-disk size is the source's representation, which a pack can
+    // grow past when it undeltifies, so batches aim at half the byte limit
+    // and validation remains the judge.
+    let disk_budget = (limits.max_pack_bytes / 2).max(1);
+    let reader = std::io::BufReader::new(
+        File::open(&sized).map_err(|e| BoundedPackError::Failed(format!("reading spool: {e}")))?,
+    );
+    let mut summary = BoundedPackSummary::default();
+    let mut batch: Vec<ListedObject> = Vec::new();
+    let (mut batch_canonical, mut batch_disk) = (0u64, 0u64);
+    for line in std::io::BufRead::lines(reader) {
+        let line = line.map_err(|e| BoundedPackError::Failed(format!("reading spool: {e}")))?;
+        let object = parse_listed_object(&line)?;
+        let over = batch.len() as u64 + 1 > limits.max_object_count
+            || batch_canonical.saturating_add(object.canonical_bytes) > limits.max_inflated_bytes
+            || batch_disk.saturating_add(object.disk_bytes) > disk_budget;
+        if over && !batch.is_empty() {
+            pack_batch(
+                repository,
+                std::mem::take(&mut batch),
+                limits,
+                spool.path(),
+                emit,
+                &mut summary,
+            )?;
+            batch_canonical = 0;
+            batch_disk = 0;
+        }
+        batch_canonical = batch_canonical.saturating_add(object.canonical_bytes);
+        batch_disk = batch_disk.saturating_add(object.disk_bytes);
+        batch.push(object);
+    }
+    if !batch.is_empty() {
+        pack_batch(repository, batch, limits, spool.path(), emit, &mut summary)?;
+    }
+    Ok(summary)
+}
+
+fn parse_listed_object(line: &str) -> Result<ListedObject, BoundedPackError> {
+    let mut fields = line.splitn(5, ' ');
+    let oid = fields.next().unwrap_or_default();
+    let kind = fields.next().unwrap_or_default();
+    if kind == "missing" {
+        return Err(BoundedPackError::SourceMissing(format!(
+            "the source repository is missing object {oid}, which the closure reaches"
+        )));
+    }
+    let malformed = || BoundedPackError::Failed(format!("malformed object listing line {line:?}"));
+    validate_oid(oid).map_err(|_| malformed())?;
+    let canonical_bytes = fields
+        .next()
+        .and_then(|size| size.parse().ok())
+        .ok_or_else(malformed)?;
+    let disk_bytes = fields
+        .next()
+        .and_then(|size| size.parse().ok())
+        .ok_or_else(malformed)?;
+    let path = fields
+        .next()
+        .map(str::trim_end)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
+    Ok(ListedObject {
+        oid: oid.to_owned(),
+        kind: kind.to_owned(),
+        canonical_bytes,
+        disk_bytes,
+        path,
+    })
+}
+
+/// Build, validate and emit `batch` as one or more legal packs.
+fn pack_batch(
+    repository: &Path,
+    batch: Vec<ListedObject>,
+    limits: PackLimits,
+    scratch: &Path,
+    emit: &mut dyn FnMut(ValidatedPackFile) -> Result<(), String>,
+    summary: &mut BoundedPackSummary,
+) -> Result<(), BoundedPackError> {
+    let mut pending = vec![batch];
+    while let Some(batch) = pending.pop() {
+        let built = build_candidate_pack(repository, &batch, scratch)?;
+        let packed_bytes = fs::metadata(&built.1).map(|meta| meta.len()).ok();
+        match validate_pack_file(&built.1, limits, scratch) {
+            Ok(validated) => {
+                drop(built);
+                summary.packs += 1;
+                summary.objects += validated.manifest.object_count;
+                summary.pack_bytes += validated.manifest.pack_bytes;
+                emit(validated).map_err(BoundedPackError::Stopped)?;
+            }
+            Err(PackValidationError::Limit(violation)) if batch.len() == 1 => {
+                let object = batch.into_iter().next().unwrap();
+                return Err(BoundedPackError::Oversized {
+                    object: ClosureObject {
+                        oid: object.oid,
+                        kind: object.kind,
+                        path: object.path,
+                        canonical_bytes: object.canonical_bytes,
+                        packed_bytes,
+                    },
+                    violation,
+                });
+            }
+            Err(PackValidationError::Limit(_)) => {
+                let mut left = batch;
+                let right = left.split_off(left.len() / 2);
+                // Popped from the end, so the first half goes out first.
+                pending.push(right);
+                pending.push(left);
+            }
+            Err(PackValidationError::Invalid(message)) => {
+                return Err(BoundedPackError::Failed(format!(
+                    "built pack failed validation: {message}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `git pack-objects` of exactly `batch`, in a scratch directory the returned
+/// guard removes. Without `--thin` Git never writes a delta whose base is
+/// outside the pack; a reused delta whose base belongs to another batch is
+/// written whole. Validation against an empty object database proves it.
+fn build_candidate_pack(
+    repository: &Path,
+    batch: &[ListedObject],
+    scratch: &Path,
+) -> Result<(tempfile::TempDir, PathBuf), BoundedPackError> {
+    let dir = scratch_tempdir(scratch, ".candidate-")
+        .map_err(|e| BoundedPackError::Failed(format!("creating pack scratch under {e}")))?;
+    let base = dir.path().join("candidate");
+    let mut input = String::with_capacity(batch.len() * (SHA1_HEX_LEN + 2));
+    for object in batch {
+        input.push_str(&object.oid);
+        if let Some(path) = &object.path {
+            input.push(' ');
+            input.push_str(path);
+        }
+        input.push('\n');
+    }
+    let base_arg = base.to_string_lossy().into_owned();
+    let checksum = git(
+        repository,
+        &["pack-objects", "--quiet", "--window=0", &base_arg],
+        Some(input.as_bytes()),
+        &[],
+    )
+    .map_err(|e| BoundedPackError::Failed(format!("building a pack: {e}")))?;
+    let checksum = checksum.trim();
+    validate_oid(checksum).map_err(BoundedPackError::Failed)?;
+    let pack = dir.path().join(format!("candidate-{checksum}.pack"));
+    Ok((dir, pack))
+}
+
+/// Prove `commit`'s closure is complete through a primary and alternate
+/// object databases, stopping at `shallow`, without enumerating object sizes:
+/// the verdict alone, for a receiver that needs no manifest. Returns how many
+/// objects the closure reaches.
+pub fn prove_commit_closure(
+    primary_objects_dir: &Path,
+    alternate_objects_dirs: &[PathBuf],
+    shallow: &[String],
+    commit: &str,
+    scratch: &Path,
+) -> Result<u64, String> {
+    validate_oid(commit)?;
+    validate_oids(shallow)?;
+    let plumbing_repo = plumbing_repository(scratch)?;
+    if !shallow.is_empty() {
+        write_shallow_list(&plumbing_repo.path().join("shallow"), shallow)?;
+    }
+    let env = odb_env(
+        plumbing_repo.path(),
+        primary_objects_dir,
+        alternate_objects_dirs,
+    );
+    let kind = git(Path::new("."), &["cat-file", "-t", commit], None, &env)?;
+    if kind.trim() != "commit" {
+        return Err(format!("object {commit} is not a commit"));
+    }
+    let listed = plumbing_repo.path().join("closure");
+    let mut command = Command::new("git");
+    command
+        .args(["rev-list", "--objects", "--missing=print", commit])
+        .envs(env.iter().cloned());
+    run_to_file(command, None, &listed, "git rev-list --objects")?;
+    let reader = std::io::BufReader::new(
+        File::open(&listed).map_err(|e| format!("reading closure listing: {e}"))?,
+    );
+    let mut count = 0u64;
+    for line in std::io::BufRead::lines(reader) {
+        let line = line.map_err(|e| format!("reading closure listing: {e}"))?;
+        let oid = line.split_whitespace().next().unwrap_or_default();
+        if let Some(missing) = oid.strip_prefix('?') {
+            return Err(format!("commit closure is missing object {missing}"));
+        }
+        validate_oid(oid)?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// Verify and enumerate the complete commit/tree/blob closure through a primary
@@ -714,6 +1232,54 @@ fn verify_pack_manifest(index_path: &Path) -> Result<Vec<ObjectSize>, String> {
         });
     }
     Ok(objects)
+}
+
+fn copy_synced(from: &Path, to: &Path) -> Result<(), String> {
+    fs::copy(from, to).map_err(|e| format!("copying {}: {e}", from.display()))?;
+    File::open(to)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| format!("syncing {}: {e}", to.display()))
+}
+
+/// Run git in `cwd` with its standard output written to `stdout` and its
+/// standard input, if any, read from a file: for listings too large to hold.
+fn git_to_file(
+    cwd: &Path,
+    args: &[&str],
+    stdin: Option<&Path>,
+    stdout: &Path,
+) -> Result<(), String> {
+    let mut command = Command::new("git");
+    command.current_dir(cwd).args(args);
+    run_to_file(command, stdin, stdout, &format!("git {}", args.join(" ")))
+}
+
+fn run_to_file(
+    mut command: Command,
+    stdin: Option<&Path>,
+    stdout: &Path,
+    name: &str,
+) -> Result<(), String> {
+    let output = File::create(stdout).map_err(|e| format!("creating {name} output: {e}"))?;
+    let input = match stdin {
+        Some(path) => {
+            Stdio::from(File::open(path).map_err(|e| format!("opening {name} input: {e}"))?)
+        }
+        None => Stdio::null(),
+    };
+    let result = command
+        .stdin(input)
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawning {name}: {e}"))?;
+    if !result.status.success() {
+        return Err(format!(
+            "{name} failed: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -1196,5 +1762,240 @@ mod tests {
         let oversized = vec!["a".repeat(40); MAX_SHALLOW_BOUNDARY_COMMITS + 1];
         assert!(encode_shallow_boundary(&oversized).is_err());
         assert!(parse_shallow_boundary(&oversized.join(" ")).is_err());
+    }
+
+    /// `len` bytes no compressor shrinks, different for every `seed`.
+    fn incompressible(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    /// A history of `commits` commits, each adding one incompressible file.
+    fn history(commits: usize, file_bytes: usize) -> (tempfile::TempDir, Vec<String>) {
+        let source = tempfile::tempdir().unwrap();
+        init_repo(source.path());
+        let tips = (0..commits)
+            .map(|index| {
+                write_file(
+                    source.path(),
+                    &format!("dir/file-{index}.bin"),
+                    &incompressible(index as u64 + 1, file_bytes),
+                );
+                commit_all(source.path(), &format!("commit {index}"))
+            })
+            .collect();
+        (source, tips)
+    }
+
+    /// Every emitted pack, installed alone into a fresh empty object database
+    /// (so each is proven independent of the others) and also into one
+    /// shared database the closure is proven against.
+    fn collect_bounded(
+        source: &Path,
+        want: &str,
+        haves: &[String],
+        limits: PackLimits,
+        scratch: &Path,
+    ) -> (
+        Result<BoundedPackSummary, BoundedPackError>,
+        Vec<PackManifest>,
+        tempfile::TempDir,
+    ) {
+        let assembled = tempfile::tempdir().unwrap();
+        let mut manifests = Vec::new();
+        let result = build_bounded_packs(
+            source,
+            &[want.to_owned()],
+            haves,
+            limits,
+            scratch,
+            &mut |pack| {
+                let alone = tempfile::tempdir().unwrap();
+                install_pack_file(&alone.path().join("objects"), &pack)?;
+                install_pack_file(&assembled.path().join("objects"), &pack)?;
+                manifests.push(pack.manifest.clone());
+                Ok(())
+            },
+        );
+        (result, manifests, assembled)
+    }
+
+    #[test]
+    fn a_closure_over_every_limit_arrives_as_legal_independent_packs() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (source, tips) = history(12, 4096);
+        let tip = tips.last().unwrap();
+        let full = build_reachable_pack(source.path(), std::slice::from_ref(tip), &[])
+            .unwrap()
+            .unwrap()
+            .0;
+        for limits in [
+            // The aggregate pack is several times each of these bounds.
+            PackLimits::new(full.len() as u64 / 4, 1_000_000, u64::MAX),
+            PackLimits::new(u64::MAX, 5, u64::MAX),
+            PackLimits::new(u64::MAX, 1_000_000, 3 * 4096),
+        ] {
+            assert!(validate_pack(&full, limits, scratch.path()).is_err());
+            let (summary, manifests, assembled) =
+                collect_bounded(source.path(), tip, &[], limits, scratch.path());
+            let summary = summary.unwrap();
+            assert!(summary.packs > 1, "{limits:?} gave {summary:?}");
+            assert_eq!(summary.packs as usize, manifests.len());
+            for manifest in &manifests {
+                assert!(manifest.pack_bytes <= limits.max_pack_bytes);
+                assert!(manifest.object_count <= limits.max_object_count);
+                assert!(manifest.canonical_bytes <= limits.max_inflated_bytes);
+            }
+            // The assembled packs are the source's whole reachable set, and
+            // its history: every commit back to the root.
+            let objects = assembled.path().join("objects");
+            let reached = prove_commit_closure(&objects, &[], &[], tip, scratch.path()).unwrap();
+            let source_listing = git(source.path(), &["rev-list", "--objects", tip]);
+            assert_eq!(reached as usize, source_listing.lines().count());
+            assert_eq!(summary.objects, reached);
+            for commit in &tips {
+                assert!(prove_commit_closure(&objects, &[], &[], commit, scratch.path()).is_ok());
+            }
+        }
+        assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn one_object_no_pack_can_hold_is_refused_by_name_and_a_compressible_one_is_not() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        init_repo(source.path());
+        write_file(source.path(), "small.txt", b"small");
+        write_file(
+            source.path(),
+            "assets/huge.bin",
+            &incompressible(7, 64 * 1024),
+        );
+        write_file(source.path(), "assets/zeros.bin", &vec![0u8; 256 * 1024]);
+        let tip = commit_all(source.path(), "assets");
+        let huge = git(source.path(), &["rev-parse", "HEAD:assets/huge.bin"])
+            .trim()
+            .to_owned();
+
+        // 256 KiB of zeros compresses far below 32 KiB, so it packs; the
+        // incompressible 64 KiB cannot, and is named with where it lives.
+        let limits = PackLimits::new(32 * 1024, 1_000_000, u64::MAX);
+        let (result, _, _) = collect_bounded(source.path(), &tip, &[], limits, scratch.path());
+        let BoundedPackError::Oversized { object, violation } = result.unwrap_err() else {
+            panic!("an object no pack can hold is the deterministic refusal");
+        };
+        assert_eq!(object.oid, huge);
+        assert_eq!(object.kind, "blob");
+        assert_eq!(object.path.as_deref(), Some("assets/huge.bin"));
+        assert_eq!(object.canonical_bytes, 64 * 1024);
+        assert_eq!(violation.dimension, LimitDimension::PackBytes);
+        assert_eq!(violation.limit, 32 * 1024);
+        assert_eq!(object.packed_bytes, Some(violation.actual));
+        assert!(violation.actual > violation.limit);
+
+        let limits = PackLimits::new(u64::MAX, 1_000_000, 128 * 1024);
+        let (result, _, _) = collect_bounded(source.path(), &tip, &[], limits, scratch.path());
+        let BoundedPackError::Oversized { object, violation } = result.unwrap_err() else {
+            panic!("an object over the inflated bound is refused");
+        };
+        assert_eq!(object.path.as_deref(), Some("assets/zeros.bin"));
+        assert_eq!(violation.dimension, LimitDimension::InflatedBytes);
+        assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn haves_narrow_the_packs_and_a_covered_want_sends_none() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (source, tips) = history(4, 1024);
+        let (cold, cold_manifests, _) = collect_bounded(
+            source.path(),
+            &tips[3],
+            &[],
+            PackLimits::default(),
+            scratch.path(),
+        );
+        let (warm, _, _) = collect_bounded(
+            source.path(),
+            &tips[3],
+            std::slice::from_ref(&tips[2]),
+            PackLimits::default(),
+            scratch.path(),
+        );
+        assert_eq!(cold_manifests.len(), 1);
+        assert!(warm.unwrap().objects < cold.unwrap().objects);
+        let (covered, manifests, _) = collect_bounded(
+            source.path(),
+            &tips[3],
+            std::slice::from_ref(&tips[3]),
+            PackLimits::default(),
+            scratch.path(),
+        );
+        assert_eq!(covered.unwrap(), BoundedPackSummary::default());
+        assert!(manifests.is_empty());
+    }
+
+    #[test]
+    fn bounded_packs_of_a_shallow_source_stop_at_its_boundary() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (_temp, clone, tip, parent) = shallow_clone();
+        let (summary, manifests, assembled) =
+            collect_bounded(&clone, &tip, &[], PackLimits::default(), scratch.path());
+        summary.unwrap();
+        assert!(manifests
+            .iter()
+            .flat_map(|manifest| &manifest.objects)
+            .all(|object| object.oid != parent));
+        let objects = assembled.path().join("objects");
+        let shallow = shallow_boundary(&clone, &tip).unwrap();
+        assert!(prove_commit_closure(&objects, &[], &shallow, &tip, scratch.path()).is_ok());
+        assert_eq!(
+            prove_commit_closure(&objects, &[], &[], &tip, scratch.path()).unwrap_err(),
+            format!("commit closure is missing object {parent}")
+        );
+    }
+
+    #[test]
+    fn a_staged_pack_publishes_by_move_and_idempotently() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (source, tips) = history(2, 512);
+        let mut staged = Vec::new();
+        let staging = tempfile::tempdir().unwrap();
+        build_bounded_packs(
+            source.path(),
+            &[tips[1].clone()],
+            &[],
+            PackLimits::default(),
+            scratch.path(),
+            &mut |pack| {
+                staged.push(StagedPack::from(install_pack_file(
+                    &staging.path().join("objects"),
+                    &pack,
+                )?));
+                Ok(())
+            },
+        )
+        .unwrap();
+        let primary = tempfile::tempdir().unwrap();
+        let objects = primary.path().join("objects");
+        for pack in &staged {
+            let published = publish_staged_pack(&objects, pack).unwrap();
+            assert!(
+                !pack.pack_path.exists(),
+                "publication moves the staged file"
+            );
+            assert!(published.pack_path.is_file());
+            assert_eq!(
+                publish_staged_pack(&objects, &published).unwrap(),
+                published
+            );
+        }
+        prove_commit_closure(&objects, &[], &[], &tips[1], scratch.path()).unwrap();
     }
 }

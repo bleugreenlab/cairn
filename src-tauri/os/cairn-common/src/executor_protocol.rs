@@ -99,11 +99,11 @@ pub fn executor_machine_service_artifact_path(target: &str, pack: &str, service:
     format!("/api/executor/artifact/{target}/machine-service/{pack}/{service}")
 }
 
-/// The response header on a runner object fetch that names the source
-/// repository's shallow boundary reached by the wanted commit's history, as
-/// space-separated commit IDs. The pack stops at those commits by design, so the
-/// executor proves the closure against them and records them in its managed
-/// repository's `shallow` file. Absent for a complete source.
+/// The response header that carried a runner object fetch's shallow boundary
+/// from Version 155 until cairn/7167, which moved the boundary into the fetch
+/// stream's Shallow record ([`object_fetch_stream::StreamShallow`]). Nothing
+/// sends it now; it stays named because the ledger paragraph for Version 155
+/// links it.
 pub const OBJECT_SHALLOW_BOUNDARY_HEADER: &str = "x-cairn-shallow-boundary";
 
 /// The workspace crate the `cairn` CLI is published as, in a manifest's
@@ -4781,6 +4781,882 @@ pub struct CatalogFetchResponse {
     pub packs: Vec<CatalogPackDescriptor>,
 }
 
+/// Why a managed object source could not serve a materialization, as the
+/// source itself knew it.
+///
+/// Sent as the JSON body of a refused `/fetch`, `/catalog` or `/cloud-grant`
+/// request and as the terminal Error record of a fetch stream. The executor
+/// keeps one per source it tried and reports them runner first, so the reason
+/// a lane carries is the one that was decided where it was decided, never a
+/// status code read back on the far side. `detail` is safe for a lane
+/// diagnostic: it never carries a credential, a grant URL or an account error.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectFetchFailure {
+    pub code: ObjectFetchFailureCode,
+    pub class: ObjectFetchFailureClass,
+    pub detail: String,
+    /// The bound that was exceeded, for a limit refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<PackLimitViolation>,
+    /// The one object that cannot fit any legal pack, for a limit refusal.
+    /// Boxed so the failure stays small enough to travel in a `Result`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<Box<OversizedObject>>,
+}
+
+/// The longest `detail` an [`ObjectFetchFailure`] carries.
+pub const MAX_OBJECT_FETCH_FAILURE_DETAIL_BYTES: usize = 1024;
+
+impl ObjectFetchFailure {
+    /// A failure of `code`, classified as the code classifies it, with
+    /// `detail` cut to [`MAX_OBJECT_FETCH_FAILURE_DETAIL_BYTES`].
+    pub fn new(code: ObjectFetchFailureCode, detail: impl Into<String>) -> Self {
+        let mut detail = detail.into();
+        if detail.len() > MAX_OBJECT_FETCH_FAILURE_DETAIL_BYTES {
+            let mut end = MAX_OBJECT_FETCH_FAILURE_DETAIL_BYTES;
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.truncate(end);
+        }
+        Self {
+            code,
+            class: code.class(),
+            detail,
+            limit: None,
+            object: None,
+        }
+    }
+
+    /// One object that no legal pack can hold: the deterministic refusal.
+    pub fn oversized_object(object: OversizedObject, limit: PackLimitViolation) -> Self {
+        let place = match &object.path {
+            Some(path) => format!("at path {path}"),
+            None => format!("with no path (a {})", object.kind),
+        };
+        let packed = match object.packed_bytes {
+            Some(bytes) => format!(", {bytes} bytes packed"),
+            None => String::new(),
+        };
+        let detail = format!(
+            "{} {} {place} ({} canonical bytes{packed}) cannot fit one legal pack: {} {} > {}",
+            object.kind,
+            object.oid,
+            object.canonical_bytes,
+            limit.dimension.describe(),
+            limit.actual,
+            limit.limit,
+        );
+        Self {
+            limit: Some(limit),
+            object: Some(Box::new(object)),
+            ..Self::new(ObjectFetchFailureCode::ObjectExceedsPackLimit, detail)
+        }
+    }
+
+    /// Whether a second source might serve what this one could not.
+    pub fn alternate_may_help(&self) -> bool {
+        !matches!(self.class, ObjectFetchFailureClass::Integrity)
+    }
+}
+
+impl std::fmt::Display for ObjectFetchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.class {
+            ObjectFetchFailureClass::NotApplicable => {
+                write!(formatter, "not applicable: {}", self.detail)
+            }
+            _ => formatter.write_str(&self.detail),
+        }
+    }
+}
+
+/// What an [`ObjectFetchFailure`] licenses the executor and the runner to do.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ObjectFetchFailureClass {
+    /// This source answers the same way for the same commit and executor until
+    /// something it depends on changes, so repeating the request repeats the
+    /// refusal: never retried as transient.
+    Deterministic,
+    /// This source cannot serve this project at all, by configuration (cloud
+    /// objects for a project with no team). Nothing was attempted.
+    NotApplicable,
+    /// This source does not hold what was asked; another source may.
+    Unavailable,
+    /// Load, a connection or a service failed; time may relieve it.
+    Transient,
+    /// The execution authorization the request carried is no longer live.
+    StaleAuthorization,
+    /// What the source sent cannot be trusted. Fails closed.
+    Integrity,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ObjectFetchFailureCode {
+    /// One reachable object cannot fit a pack within the transfer limits.
+    ObjectExceedsPackLimit,
+    /// The source's shallow boundary is wider than a transfer may declare.
+    ShallowBoundaryTooWide,
+    /// The source cannot resolve the wanted commit.
+    CommitUnresolvable,
+    /// The source's own repository is missing an object the closure reaches.
+    SourceObjectsMissing,
+    /// The source repository could not be found for the coordinate.
+    RepositoryUnavailable,
+    /// Building or validating a pack failed for a reason other than a limit.
+    PackConstruction,
+    /// The cloud catalog holds no chain that reaches the wanted commit.
+    CatalogMiss,
+    /// The project has no team, so cloud objects cannot serve it.
+    CloudNotApplicable,
+    /// The request's execution authorization is stale or no longer active.
+    StaleAuthorization,
+    /// A service the source depends on is unavailable.
+    ServiceUnavailable,
+    /// The executor could not reach the source, or the transfer broke off.
+    Connection,
+    /// The source answered outside the protocol.
+    Protocol,
+    /// What the source sent failed verification.
+    Integrity,
+}
+
+impl ObjectFetchFailureCode {
+    pub fn class(self) -> ObjectFetchFailureClass {
+        use ObjectFetchFailureClass as Class;
+        match self {
+            Self::ObjectExceedsPackLimit | Self::ShallowBoundaryTooWide => Class::Deterministic,
+            Self::CloudNotApplicable => Class::NotApplicable,
+            Self::CommitUnresolvable
+            | Self::SourceObjectsMissing
+            | Self::RepositoryUnavailable
+            | Self::CatalogMiss => Class::Unavailable,
+            Self::PackConstruction | Self::ServiceUnavailable | Self::Connection => {
+                Class::Transient
+            }
+            Self::StaleAuthorization => Class::StaleAuthorization,
+            Self::Protocol | Self::Integrity => Class::Integrity,
+        }
+    }
+}
+
+/// A transfer bound one pack exceeded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PackLimitViolation {
+    pub dimension: PackLimitDimension,
+    pub actual: u64,
+    pub limit: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PackLimitDimension {
+    /// The pack file's own bytes.
+    PackBytes,
+    /// Objects in the pack.
+    ObjectCount,
+    /// The pack's objects' canonical, decompressed bytes.
+    InflatedBytes,
+}
+
+impl PackLimitDimension {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::PackBytes => "pack bytes",
+            Self::ObjectCount => "object count",
+            Self::InflatedBytes => "inflated bytes",
+        }
+    }
+}
+
+/// The one object a limit refusal names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OversizedObject {
+    pub oid: String,
+    pub kind: String,
+    /// A path the closure reaches the object by; `None` for an object that has
+    /// none (a commit, a root tree).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub canonical_bytes: u64,
+    /// The pack that held only this object, when one was built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packed_bytes: Option<u64>,
+}
+
+/// The runner object fetch's response body: a versioned sequence of
+/// independently validated, non-thin packs.
+///
+/// A closure is not one pack. Each pack is bounded by the transfer limits and
+/// carries no delta against an object outside itself, so a receiver validates
+/// each against an empty object database, installs it into a private staging
+/// database and lets its bytes go before the next arrives. Nothing is proven
+/// until the End record arrives and the receiver proves the whole closure; a
+/// prefix is never usable.
+///
+/// The body is `MAGIC` and then records. A record is a one-byte tag, a
+/// big-endian `u32` metadata length of at most
+/// [`MAX_RECORD_METADATA_BYTES`](object_fetch_stream::MAX_RECORD_METADATA_BYTES),
+/// and that many bytes of JSON metadata; a Pack record is followed by exactly
+/// its declared byte count of pack data. The order is one Begin, one Shallow,
+/// any number of Packs in sequence, and one End, or a terminal Error in place
+/// of the End when production fails after the response began. End carries a
+/// SHA-256 of every Begin, Shallow and Pack record header as sent, binding the
+/// descriptors and the boundary. Each pack and each record is bounded; the
+/// stream as a whole, and its pack count, are not.
+pub mod object_fetch_stream {
+    use super::{ObjectFetchFailure, ObjectTransferCoordinate};
+    use serde::{de::DeserializeOwned, Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+
+    pub const CONTENT_TYPE: &str = "application/x-cairn-object-fetch-stream";
+    pub const MAGIC: &[u8; 8] = b"CAIRNOF1";
+    pub const VERSION: u32 = 1;
+    pub const MAX_RECORD_METADATA_BYTES: u32 = 64 * 1024;
+    /// The most shallow commits one stream may declare.
+    pub const MAX_SHALLOW_COMMITS: usize = 512;
+    const HEADER_BYTES: usize = 5;
+    const TAG_BEGIN: u8 = b'B';
+    const TAG_SHALLOW: u8 = b'S';
+    const TAG_PACK: u8 = b'P';
+    const TAG_END: u8 = b'E';
+    const TAG_ERROR: u8 = b'X';
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct StreamBegin {
+        pub version: u32,
+        pub coordinate: ObjectTransferCoordinate,
+        pub want_commit: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct StreamShallow {
+        /// The source's shallow commits the wanted history reaches. The packs
+        /// stop there by design, so the receiver proves the closure against
+        /// them and records them. Only the source may assert this.
+        pub commits: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct StreamPack {
+        pub sequence: u64,
+        pub byte_count: u64,
+        pub sha256: String,
+        pub pack_checksum: String,
+        pub object_count: u64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct StreamEnd {
+        pub pack_count: u64,
+        pub pack_bytes: u64,
+        pub digest: String,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StreamError {
+        failure: ObjectFetchFailure,
+    }
+
+    fn record(tag: u8, metadata: &impl Serialize) -> Vec<u8> {
+        let json = serde_json::to_vec(metadata).expect("stream metadata serializes");
+        let mut bytes = Vec::with_capacity(HEADER_BYTES + json.len());
+        bytes.push(tag);
+        bytes.extend_from_slice(&(json.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&json);
+        bytes
+    }
+
+    fn valid_hex(value: &str, len: usize) -> bool {
+        value.len() == len
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    /// Writes one stream's records, keeping the sequence and the digest.
+    #[derive(Default)]
+    pub struct StreamEncoder {
+        digest: Sha256,
+        packs: u64,
+        pack_bytes: u64,
+    }
+
+    /// One pack the producer is about to send.
+    pub struct PackDescriptor {
+        pub byte_count: u64,
+        pub sha256: String,
+        pub pack_checksum: String,
+        pub object_count: u64,
+    }
+
+    impl StreamEncoder {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        fn digested(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+            self.digest.update(&bytes);
+            bytes
+        }
+
+        /// The stream's opening bytes: the magic, Begin and Shallow.
+        pub fn open(
+            &mut self,
+            coordinate: &ObjectTransferCoordinate,
+            want_commit: &str,
+            shallow: &[String],
+        ) -> Result<Vec<u8>, String> {
+            if shallow.len() > MAX_SHALLOW_COMMITS {
+                return Err(format!(
+                    "shallow boundary of {} commits exceeds the transfer limit of {MAX_SHALLOW_COMMITS}",
+                    shallow.len()
+                ));
+            }
+            let mut bytes = MAGIC.to_vec();
+            bytes.extend(self.digested(record(
+                TAG_BEGIN,
+                &StreamBegin {
+                    version: VERSION,
+                    coordinate: coordinate.clone(),
+                    want_commit: want_commit.to_owned(),
+                },
+            )));
+            bytes.extend(self.digested(record(
+                TAG_SHALLOW,
+                &StreamShallow {
+                    commits: shallow.to_vec(),
+                },
+            )));
+            Ok(bytes)
+        }
+
+        /// A Pack record's header; exactly `byte_count` bytes of pack follow.
+        pub fn pack(&mut self, pack: PackDescriptor) -> Vec<u8> {
+            let header = record(
+                TAG_PACK,
+                &StreamPack {
+                    sequence: self.packs,
+                    byte_count: pack.byte_count,
+                    sha256: pack.sha256,
+                    pack_checksum: pack.pack_checksum,
+                    object_count: pack.object_count,
+                },
+            );
+            self.packs += 1;
+            self.pack_bytes += pack.byte_count;
+            self.digested(header)
+        }
+
+        pub fn end(self) -> Vec<u8> {
+            record(
+                TAG_END,
+                &StreamEnd {
+                    pack_count: self.packs,
+                    pack_bytes: self.pack_bytes,
+                    digest: format!("{:x}", self.digest.finalize()),
+                },
+            )
+        }
+
+        /// The terminal record for a failure after the response began.
+        pub fn error(failure: &ObjectFetchFailure) -> Vec<u8> {
+            record(
+                TAG_ERROR,
+                &StreamError {
+                    failure: failure.clone(),
+                },
+            )
+        }
+    }
+
+    /// One thing a decoder read.
+    pub enum StreamEvent<'a> {
+        Begin(StreamBegin),
+        Shallow(Vec<String>),
+        PackStart(StreamPack),
+        /// Part of the current pack's data, in order. The decoder has already
+        /// checked it fits the declared byte count.
+        PackBytes(&'a [u8]),
+        /// The current pack's data is complete and matches its SHA-256.
+        PackEnd(StreamPack),
+        End(StreamEnd),
+        Error(ObjectFetchFailure),
+    }
+
+    #[derive(Debug)]
+    pub enum DecodeError<E> {
+        /// The stream broke the protocol: fails closed.
+        Violation(String),
+        /// The consumer refused an event.
+        Sink(E),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        Magic,
+        Begin,
+        Shallow,
+        PackOrEnd,
+        InPack,
+        Finished,
+    }
+
+    struct CurrentPack {
+        descriptor: StreamPack,
+        remaining: u64,
+        digest: Sha256,
+    }
+
+    /// A push decoder: bytes in, in whatever chunks the transport delivers,
+    /// events out. It never holds more than one record's metadata, and pack
+    /// data passes through to the consumer without being buffered.
+    pub struct StreamDecoder {
+        max_pack_bytes: u64,
+        phase: Phase,
+        buffer: Vec<u8>,
+        digest: Sha256,
+        packs: u64,
+        pack_bytes: u64,
+        current: Option<CurrentPack>,
+        terminal_error: bool,
+    }
+
+    impl StreamDecoder {
+        pub fn new(max_pack_bytes: u64) -> Self {
+            Self {
+                max_pack_bytes,
+                phase: Phase::Magic,
+                buffer: Vec::new(),
+                digest: Sha256::new(),
+                packs: 0,
+                pack_bytes: 0,
+                current: None,
+                terminal_error: false,
+            }
+        }
+
+        pub fn push<E>(
+            &mut self,
+            mut input: &[u8],
+            on: &mut impl FnMut(StreamEvent<'_>) -> Result<(), E>,
+        ) -> Result<(), DecodeError<E>> {
+            while !input.is_empty() {
+                match self.phase {
+                    Phase::Finished => {
+                        return Err(DecodeError::Violation(
+                            "object fetch stream carries data after its terminal record".into(),
+                        ));
+                    }
+                    Phase::Magic => {
+                        let wanted = MAGIC.len() - self.buffer.len();
+                        let take = wanted.min(input.len());
+                        self.buffer.extend_from_slice(&input[..take]);
+                        input = &input[take..];
+                        if self.buffer.len() == MAGIC.len() {
+                            if self.buffer.as_slice() != MAGIC {
+                                return Err(DecodeError::Violation(
+                                    "object fetch response is not a Cairn object fetch stream"
+                                        .into(),
+                                ));
+                            }
+                            self.buffer.clear();
+                            self.phase = Phase::Begin;
+                        }
+                    }
+                    Phase::InPack => {
+                        let current = self.current.as_mut().expect("a pack is in progress");
+                        let take = (current.remaining.min(input.len() as u64)) as usize;
+                        current.digest.update(&input[..take]);
+                        current.remaining -= take as u64;
+                        on(StreamEvent::PackBytes(&input[..take])).map_err(DecodeError::Sink)?;
+                        input = &input[take..];
+                        if current.remaining == 0 {
+                            let current = self.current.take().unwrap();
+                            let actual = format!("{:x}", current.digest.finalize());
+                            if actual != current.descriptor.sha256 {
+                                return Err(DecodeError::Violation(format!(
+                                    "object fetch pack {} content hash mismatch: declared {}, received {actual}",
+                                    current.descriptor.sequence, current.descriptor.sha256
+                                )));
+                            }
+                            self.phase = Phase::PackOrEnd;
+                            on(StreamEvent::PackEnd(current.descriptor))
+                                .map_err(DecodeError::Sink)?;
+                        }
+                    }
+                    Phase::Begin | Phase::Shallow | Phase::PackOrEnd => {
+                        if self.buffer.len() < HEADER_BYTES {
+                            let take = (HEADER_BYTES - self.buffer.len()).min(input.len());
+                            self.buffer.extend_from_slice(&input[..take]);
+                            input = &input[take..];
+                            if self.buffer.len() < HEADER_BYTES {
+                                continue;
+                            }
+                            let length = u32::from_be_bytes(self.buffer[1..5].try_into().unwrap());
+                            if length > MAX_RECORD_METADATA_BYTES {
+                                return Err(DecodeError::Violation(format!(
+                                    "object fetch record declares {length} metadata bytes, over the limit of {MAX_RECORD_METADATA_BYTES}"
+                                )));
+                            }
+                            self.buffer.reserve(length as usize);
+                        }
+                        let length =
+                            u32::from_be_bytes(self.buffer[1..5].try_into().unwrap()) as usize;
+                        let wanted = HEADER_BYTES + length - self.buffer.len();
+                        let take = wanted.min(input.len());
+                        self.buffer.extend_from_slice(&input[..take]);
+                        input = &input[take..];
+                        if self.buffer.len() == HEADER_BYTES + length {
+                            let record = std::mem::take(&mut self.buffer);
+                            self.record(&record, on)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn record<E>(
+            &mut self,
+            record: &[u8],
+            on: &mut impl FnMut(StreamEvent<'_>) -> Result<(), E>,
+        ) -> Result<(), DecodeError<E>> {
+            fn parse<T: DeserializeOwned, E>(json: &[u8], name: &str) -> Result<T, DecodeError<E>> {
+                serde_json::from_slice(json).map_err(|error| {
+                    DecodeError::Violation(format!("malformed object fetch {name} record: {error}"))
+                })
+            }
+            let violation = |message: String| Err(DecodeError::Violation(message));
+            let json = &record[HEADER_BYTES..];
+            match (self.phase, record[0]) {
+                (Phase::Begin, TAG_BEGIN) => {
+                    let begin: StreamBegin = parse(json, "Begin")?;
+                    if begin.version != VERSION {
+                        return violation(format!(
+                            "unsupported object fetch stream version {} (this executor reads {VERSION})",
+                            begin.version
+                        ));
+                    }
+                    self.digest.update(record);
+                    self.phase = Phase::Shallow;
+                    on(StreamEvent::Begin(begin)).map_err(DecodeError::Sink)
+                }
+                (Phase::Shallow, TAG_SHALLOW) => {
+                    let shallow: StreamShallow = parse(json, "Shallow")?;
+                    if shallow.commits.len() > MAX_SHALLOW_COMMITS
+                        || shallow.commits.iter().any(|commit| !valid_hex(commit, 40))
+                    {
+                        return violation(
+                            "object fetch Shallow record is malformed or too wide".into(),
+                        );
+                    }
+                    self.digest.update(record);
+                    self.phase = Phase::PackOrEnd;
+                    on(StreamEvent::Shallow(shallow.commits)).map_err(DecodeError::Sink)
+                }
+                (Phase::PackOrEnd, TAG_PACK) => {
+                    let pack: StreamPack = parse(json, "Pack")?;
+                    if pack.sequence != self.packs {
+                        return violation(format!(
+                            "object fetch pack {} arrived where pack {} was due",
+                            pack.sequence, self.packs
+                        ));
+                    }
+                    if pack.byte_count == 0 || pack.byte_count > self.max_pack_bytes {
+                        return violation(format!(
+                            "object fetch pack {} declares {} bytes, outside 1..={}",
+                            pack.sequence, pack.byte_count, self.max_pack_bytes
+                        ));
+                    }
+                    if !valid_hex(&pack.sha256, 64) || !valid_hex(&pack.pack_checksum, 40) {
+                        return violation(format!(
+                            "object fetch pack {} has a malformed identity",
+                            pack.sequence
+                        ));
+                    }
+                    self.digest.update(record);
+                    self.packs += 1;
+                    self.pack_bytes += pack.byte_count;
+                    self.current = Some(CurrentPack {
+                        descriptor: pack.clone(),
+                        remaining: pack.byte_count,
+                        digest: Sha256::new(),
+                    });
+                    self.phase = Phase::InPack;
+                    on(StreamEvent::PackStart(pack)).map_err(DecodeError::Sink)
+                }
+                (Phase::PackOrEnd, TAG_END) => {
+                    let end: StreamEnd = parse(json, "End")?;
+                    let digest = format!("{:x}", std::mem::take(&mut self.digest).finalize());
+                    if end.pack_count != self.packs
+                        || end.pack_bytes != self.pack_bytes
+                        || end.digest != digest
+                    {
+                        return violation(format!(
+                            "object fetch End record disagrees with the stream: declared {} packs of {} bytes, received {} of {}",
+                            end.pack_count, end.pack_bytes, self.packs, self.pack_bytes
+                        ));
+                    }
+                    self.phase = Phase::Finished;
+                    on(StreamEvent::End(end)).map_err(DecodeError::Sink)
+                }
+                (Phase::Shallow | Phase::PackOrEnd, TAG_ERROR) => {
+                    let error: StreamError = parse(json, "Error")?;
+                    self.phase = Phase::Finished;
+                    self.terminal_error = true;
+                    on(StreamEvent::Error(error.failure)).map_err(DecodeError::Sink)
+                }
+                (phase, tag) => violation(format!(
+                    "unexpected object fetch record {:?} while expecting {phase:?}",
+                    tag as char
+                )),
+            }
+        }
+
+        /// Call once the transport reports the body complete. A stream that
+        /// stopped before its terminal record is truncated.
+        pub fn finish(&self) -> Result<(), String> {
+            match self.phase {
+                Phase::Finished => Ok(()),
+                Phase::InPack => Err(format!(
+                    "object fetch stream ended inside pack {}",
+                    self.packs.saturating_sub(1)
+                )),
+                _ => Err("object fetch stream ended before its End record".into()),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::{GitObjectFormat, ObjectFetchFailureCode, RepositoryIdentity};
+        use super::*;
+
+        fn coordinate() -> ObjectTransferCoordinate {
+            ObjectTransferCoordinate {
+                repository: RepositoryIdentity {
+                    project_id: "project".into(),
+                    repository_id: "repository".into(),
+                    object_format: GitObjectFormat::Sha1,
+                },
+                request_id: "request".into(),
+                attempt_id: "attempt".into(),
+                executor_id: "executor".into(),
+                connection_generation: 3,
+            }
+        }
+
+        fn descriptor(data: &[u8]) -> PackDescriptor {
+            PackDescriptor {
+                byte_count: data.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(data)),
+                pack_checksum: "c".repeat(40),
+                object_count: 1,
+            }
+        }
+
+        /// A stream of `packs`, with a `"a" * 40` boundary.
+        fn stream(packs: &[&[u8]]) -> Vec<u8> {
+            let mut encoder = StreamEncoder::new();
+            let mut bytes = encoder
+                .open(&coordinate(), &"f".repeat(40), &["a".repeat(40)])
+                .unwrap();
+            for data in packs {
+                bytes.extend(encoder.pack(descriptor(data)));
+                bytes.extend_from_slice(data);
+            }
+            bytes.extend(encoder.end());
+            bytes
+        }
+
+        #[derive(Debug, Default, PartialEq)]
+        struct Seen {
+            begin: Option<StreamBegin>,
+            shallow: Vec<String>,
+            packs: Vec<Vec<u8>>,
+            ended: bool,
+            error: Option<ObjectFetchFailure>,
+        }
+
+        fn decode(bytes: &[u8], chunk: usize) -> (Seen, Result<(), String>) {
+            let mut decoder = StreamDecoder::new(1024);
+            let mut seen = Seen::default();
+            let mut on = |event: StreamEvent<'_>| -> Result<(), String> {
+                match event {
+                    StreamEvent::Begin(begin) => seen.begin = Some(begin),
+                    StreamEvent::Shallow(commits) => seen.shallow = commits,
+                    StreamEvent::PackStart(_) => seen.packs.push(Vec::new()),
+                    StreamEvent::PackBytes(data) => {
+                        seen.packs.last_mut().unwrap().extend_from_slice(data)
+                    }
+                    StreamEvent::PackEnd(_) => {}
+                    StreamEvent::End(_) => seen.ended = true,
+                    StreamEvent::Error(failure) => seen.error = Some(failure),
+                }
+                Ok(())
+            };
+            for piece in bytes.chunks(chunk.max(1)) {
+                if let Err(error) = decoder.push(piece, &mut on) {
+                    let DecodeError::Violation(message) = error else {
+                        unreachable!("the test sink never refuses")
+                    };
+                    return (seen, Err(message));
+                }
+            }
+            let finished = decoder.finish();
+            (seen, finished)
+        }
+
+        #[test]
+        fn a_stream_round_trips_in_any_chunking_including_zero_packs() {
+            let bytes = stream(&[b"first pack", b"second"]);
+            for chunk in [1, 3, 7, bytes.len()] {
+                let (seen, finished) = decode(&bytes, chunk);
+                finished.unwrap();
+                assert_eq!(seen.begin.as_ref().unwrap().coordinate, coordinate());
+                assert_eq!(seen.shallow, vec!["a".repeat(40)]);
+                assert_eq!(seen.packs, vec![b"first pack".to_vec(), b"second".to_vec()]);
+                assert!(seen.ended);
+            }
+            let (seen, finished) = decode(&stream(&[]), 2);
+            finished.unwrap();
+            assert!(seen.packs.is_empty() && seen.ended);
+        }
+
+        #[test]
+        fn truncation_trailing_data_and_a_missing_end_are_refused() {
+            let bytes = stream(&[b"payload"]);
+            let end_len = StreamEncoder::new().end().len();
+            let (_, finished) = decode(&bytes[..bytes.len() - end_len], 4);
+            assert!(finished.unwrap_err().contains("before its End"));
+            let (_, finished) = decode(&bytes[..bytes.len() - end_len - 2], 4);
+            assert!(finished.unwrap_err().contains("inside pack 0"));
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(decode(&trailing, 5)
+                .1
+                .unwrap_err()
+                .contains("after its terminal"));
+            assert!(decode(b"PACK\0\0\0\x02", 8)
+                .1
+                .unwrap_err()
+                .contains("not a Cairn object fetch stream"));
+        }
+
+        #[test]
+        fn corrupted_reordered_and_oversized_records_fail_closed() {
+            // A flipped byte inside pack data breaks its declared hash.
+            let mut corrupt = stream(&[b"payload!"]);
+            let at = corrupt.windows(8).position(|w| w == b"payload!").unwrap();
+            corrupt[at] ^= 1;
+            assert!(decode(&corrupt, 3)
+                .1
+                .unwrap_err()
+                .contains("content hash mismatch"));
+
+            // A Pack out of sequence.
+            let mut encoder = StreamEncoder::new();
+            let mut reordered = encoder.open(&coordinate(), &"f".repeat(40), &[]).unwrap();
+            encoder.pack(descriptor(b"skipped"));
+            reordered.extend(encoder.pack(descriptor(b"x")));
+            reordered.extend_from_slice(b"x");
+            assert!(decode(&reordered, 64)
+                .1
+                .unwrap_err()
+                .contains("pack 1 arrived"));
+
+            // A declared pack past the receiver's bound, refused before a byte
+            // of it is read.
+            let mut encoder = StreamEncoder::new();
+            let mut oversized = encoder.open(&coordinate(), &"f".repeat(40), &[]).unwrap();
+            oversized.extend(encoder.pack(PackDescriptor {
+                byte_count: 4096,
+                ..descriptor(b"x")
+            }));
+            assert!(decode(&oversized, 64)
+                .1
+                .unwrap_err()
+                .contains("outside 1..=1024"));
+
+            // A metadata length past the record bound.
+            let mut malicious = MAGIC.to_vec();
+            malicious.push(TAG_BEGIN);
+            malicious.extend_from_slice(&u32::MAX.to_be_bytes());
+            assert!(decode(&malicious, 64)
+                .1
+                .unwrap_err()
+                .contains("metadata bytes"));
+
+            // A Begin where the Shallow is due.
+            let open = StreamEncoder::new()
+                .open(&coordinate(), &"f".repeat(40), &[])
+                .unwrap();
+            let begin_len = open.len()
+                - MAGIC.len()
+                - record(TAG_SHALLOW, &StreamShallow { commits: vec![] }).len();
+            let mut twice = open[..MAGIC.len() + begin_len].to_vec();
+            twice.extend_from_slice(&open[MAGIC.len()..MAGIC.len() + begin_len]);
+            assert!(decode(&twice, 64)
+                .1
+                .unwrap_err()
+                .contains("unexpected object fetch record"));
+
+            // A Shallow record altered in flight disagrees with End's digest.
+            let mut tampered = stream(&[b"p"]);
+            let at = tampered
+                .windows(40)
+                .position(|w| w == "a".repeat(40).as_bytes())
+                .unwrap();
+            tampered[at] = b'b';
+            assert!(decode(&tampered, 64)
+                .1
+                .unwrap_err()
+                .contains("End record disagrees"));
+
+            // A Begin from a newer stream version.
+            let mut future = MAGIC.to_vec();
+            future.extend(record(
+                TAG_BEGIN,
+                &StreamBegin {
+                    version: VERSION + 1,
+                    coordinate: coordinate(),
+                    want_commit: "f".repeat(40),
+                },
+            ));
+            assert!(decode(&future, 64).1.unwrap_err().contains("unsupported"));
+        }
+
+        #[test]
+        fn a_producer_error_after_a_prefix_is_terminal_and_typed() {
+            let mut encoder = StreamEncoder::new();
+            let mut bytes = encoder.open(&coordinate(), &"f".repeat(40), &[]).unwrap();
+            bytes.extend(encoder.pack(descriptor(b"first")));
+            bytes.extend_from_slice(b"first");
+            let failure = ObjectFetchFailure::new(
+                ObjectFetchFailureCode::SourceObjectsMissing,
+                "the source repository is missing object x",
+            );
+            bytes.extend(StreamEncoder::error(&failure));
+            let (seen, finished) = decode(&bytes, 5);
+            finished.unwrap();
+            assert_eq!(seen.error, Some(failure));
+            assert!(!seen.ended);
+            assert_eq!(seen.packs.len(), 1);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MutationDeltaUploadRequest {
@@ -8416,7 +9292,24 @@ pub struct LearnedResourceEstimate {
 /// What a runner gets wrong talking to an older executor: nothing; it receives
 /// the same result and acknowledgement vocabulary and can settle that result
 /// even when the consumer has gone away.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
+///
+/// Version 172 (cairn/7167) replaces the runner object fetch's single raw
+/// pack with a versioned stream of independently validated, non-thin packs
+/// ([`object_fetch_stream`]), so a cold executor can be seeded with a closure
+/// larger than one pack's transfer limits, which no single pack can carry.
+/// The shallow boundary moves from the `x-cairn-shallow-boundary` header into
+/// the stream's Shallow record. A refused `/fetch`, `/catalog` or
+/// `/cloud-grant` answers with an [`ObjectFetchFailure`] body, the catalog
+/// answers a project with no team as not applicable (409) without minting a
+/// grant, and [`ObjectInfrastructureStage::MaterializationRefused`] names a
+/// deterministic refusal (one object no legal pack can hold). What a runner
+/// gets wrong talking to an older executor: that executor reads the stream as
+/// one pack and refuses it as corrupt, so nothing could be materialized. An
+/// older runner talking to a newer executor sends one raw pack, which the
+/// newer executor refuses as a stream without its magic, and could not decode
+/// a `materializationRefused` outcome. Both pairings are refused at the
+/// handshake until the executor self-updates, which is the point of the bump.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 172;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -12711,6 +13604,10 @@ pub enum ObjectInfrastructureStage {
     UploadFailure,
     ExpiredReceipt,
     StaleReceipt,
+    /// A source refused the materialization deterministically for this
+    /// executor and commit (one object no legal pack can hold): presenting the
+    /// same work again meets the same refusal.
+    MaterializationRefused,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

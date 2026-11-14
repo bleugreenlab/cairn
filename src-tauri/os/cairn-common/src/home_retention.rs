@@ -357,6 +357,15 @@ pub const HOME_RETENTION: &[HomeEntry] = &[
         Singleton("jj/config.toml, rewritten in place"),
     ),
     dir(
+        "object-fetch-scratch",
+        "cairn-core runner object fetch spool (open_runner_fetch)",
+        "execution",
+        Window {
+            max_age_secs: DAY_SECS,
+            enforcer: "each fetch removes its spool; reclaim_stale_fetch_scratch at the next fetch",
+        },
+    ),
+    dir(
         "object-upload-staging",
         "cairn-transport object uploads, ObjectPlane::stage_delta",
         "performance",

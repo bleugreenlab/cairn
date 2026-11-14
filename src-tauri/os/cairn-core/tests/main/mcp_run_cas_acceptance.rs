@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -18,13 +18,15 @@ use base64::Engine;
 use cairn_common::executor_protocol::{
     CatalogFetchResponse, CatalogPackDescriptor, CellCommandClass, CellOutcome, CellPriority,
     CellRequest, CloudObjectGrant, CloudObjectGrantRequest, CloudObjectOperation,
-    DeltaUploadReceipt, MutationDeltaUploadRequest, MutationPolicy, ObjectTransferCoordinate,
-    RepositoryLocator, CLOUD_OBJECT_GRANT_VERSION,
+    DeltaUploadReceipt, MutationDeltaUploadRequest, MutationPolicy, ObjectFetchFailure,
+    ObjectFetchFailureCode, ObjectTransferCoordinate, RepositoryLocator,
+    CLOUD_OBJECT_GRANT_VERSION,
 };
 use cairn_core::internal::orchestrator::object_plane::{
-    build_local_reachable_pack, content_sha256,
+    content_sha256, object_fetch_refusal, open_runner_fetch, RunnerFetchRequest,
 };
 use cairn_core::internal::orchestrator::Orchestrator;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -36,7 +38,6 @@ struct ObjectServerState {
     staging: PathBuf,
     fetches: Arc<AtomicUsize>,
     uploads: Arc<AtomicUsize>,
-    interrupt_fetch: Arc<AtomicBool>,
     fail_upload: Arc<AtomicBool>,
     cloud_only: Arc<AtomicBool>,
     corrupt_catalog_suffix: Arc<AtomicBool>,
@@ -126,23 +127,24 @@ async fn catalog(
     // Production pack construction. Only the storage around it is simulated: a
     // second implementation of what a runner actually serves would let this
     // fixture stay green while the real route drifted.
-    let Some(built) = build_local_reachable_pack(
+    let haves = cairn_codec::transfer::known_commits(&state.repository, &request.have_commits)
+        .unwrap_or_default();
+    let Some((pack, _)) = cairn_codec::transfer::build_reachable_pack(
         &state.repository,
-        &request.want_commit,
-        &request.have_commits,
+        std::slice::from_ref(&request.want_commit),
+        &haves,
     )
     .ok()
-    .and_then(|fetched| fetched.pack) else {
+    .flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let index = cairn_codec::transfer::validate_pack(
-        &built.pack,
+    let validated = cairn_codec::transfer::validate_pack(
+        &pack,
         cairn_codec::transfer::PackLimits::default(),
         &std::env::temp_dir(),
     )
-    .unwrap()
-    .index;
-    let framed = cairn_codec::transfer::frame_pack(&built.pack, &index);
+    .unwrap();
+    let framed = cairn_codec::transfer::frame_pack(&pack, &validated.index);
     let hash = content_sha256(&framed);
     state
         .cloud
@@ -154,7 +156,7 @@ async fn catalog(
         catalog_id: format!("acceptance:{hash}"),
         content_hash: hash.clone(),
         byte_count: framed.len() as u64,
-        pack_checksum: built.pack_checksum,
+        pack_checksum: validated.manifest.pack_checksum,
         base_commit: None,
         tip_commit: request.want_commit.clone(),
         grant: grant(hash, CloudObjectOperation::Get, url),
@@ -370,7 +372,6 @@ async fn fixture_from(make_repository: fn(&Path) -> String) -> Fixture {
         staging: temp.path().join("object-staging"),
         fetches: Arc::new(AtomicUsize::new(0)),
         uploads: Arc::new(AtomicUsize::new(0)),
-        interrupt_fetch: Arc::new(AtomicBool::new(false)),
         fail_upload: Arc::new(AtomicBool::new(false)),
         cloud_only: Arc::new(AtomicBool::new(false)),
         corrupt_catalog_suffix: Arc::new(AtomicBool::new(false)),
@@ -478,7 +479,12 @@ async fn fetch(
 ) -> Response {
     state.fetches.fetch_add(1, Ordering::SeqCst);
     if state.cloud_only.load(Ordering::SeqCst) {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        // Typed, as the real route answers: an untyped refusal is outside the
+        // protocol and fails closed without trying the cloud.
+        return object_fetch_refusal(&ObjectFetchFailure::new(
+            ObjectFetchFailureCode::RepositoryUnavailable,
+            "the acceptance runner serves this repository from the cloud only",
+        ));
     }
     if !authenticated(&state, &headers)
         || !state
@@ -488,37 +494,29 @@ async fn fetch(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    // Production pack construction, and production's own answer for a commit
-    // this runner cannot resolve: a want it has no objects for is unprocessable,
-    // not a silently empty success.
-    let built = match build_local_reachable_pack(
-        &state.repository,
-        &request.want_commit,
-        &request.have_commits,
-    ) {
-        Ok(built) => built,
-        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    // Production's fetch stream, and production's own typed answer for a
+    // commit this runner cannot resolve: never a silently empty success.
+    let stream = match open_runner_fetch(RunnerFetchRequest {
+        repository: state.repository.clone(),
+        scratch: state.staging.join("fetch-scratch"),
+        coordinate: request.coordinate,
+        want_commit: request.want_commit,
+        have_commits: request.have_commits,
+        limits: Default::default(),
+    })
+    .await
+    {
+        Ok(stream) => stream,
+        Err(failure) => return object_fetch_refusal(&failure),
     };
-    // Production response headers, for the same reason.
-    let headers = built.response_headers().unwrap();
-    let mut response = match built.pack {
-        None => StatusCode::NO_CONTENT.into_response(),
-        Some(_) if state.interrupt_fetch.swap(false, Ordering::SeqCst) => {
-            return (StatusCode::OK, Bytes::from_static(b"PACK interrupted")).into_response();
+    let (parts, body) = stream.into_response().into_parts();
+    let served = state.runner_object_bytes.clone();
+    let body = body.into_data_stream().inspect(move |chunk| {
+        if let Ok(chunk) = chunk {
+            served.fetch_add(chunk.len(), Ordering::SeqCst);
         }
-        Some(pack) => {
-            state
-                .runner_object_bytes
-                .fetch_add(pack.pack.len(), Ordering::SeqCst);
-            Response::new(Body::from(pack.pack))
-        }
-    };
-    for (name, value) in headers {
-        response
-            .headers_mut()
-            .insert(name, HeaderValue::from_str(&value).unwrap());
-    }
-    response
+    });
+    Response::from_parts(parts, Body::from_stream(body))
 }
 
 async fn upload(

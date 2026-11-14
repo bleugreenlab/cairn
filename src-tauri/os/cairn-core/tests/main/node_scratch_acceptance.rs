@@ -20,9 +20,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -31,7 +30,9 @@ use cairn_core::internal::db::DbState;
 use cairn_core::internal::mcp::handlers::run::handle_run;
 use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
-use cairn_core::internal::orchestrator::object_plane::build_local_reachable_pack;
+use cairn_core::internal::orchestrator::object_plane::{
+    object_fetch_refusal, open_runner_fetch, RunnerFetchRequest,
+};
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
 use cairn_core::internal::services::{RealProcessSpawner, RealPtyFactory};
@@ -212,25 +213,19 @@ async fn fetch(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let built = match build_local_reachable_pack(
-        &server.repository,
-        &request.want_commit,
-        &request.have_commits,
-    ) {
-        Ok(built) => built,
-        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
-    };
-    let headers = built.response_headers().unwrap();
-    let mut response = match built.pack {
-        None => StatusCode::NO_CONTENT.into_response(),
-        Some(pack) => Response::new(Body::from(pack.pack)),
-    };
-    for (name, value) in headers {
-        response
-            .headers_mut()
-            .insert(name, HeaderValue::from_str(&value).unwrap());
+    match open_runner_fetch(RunnerFetchRequest {
+        repository: server.repository.clone(),
+        scratch: server.repository.with_extension("fetch-scratch"),
+        coordinate: request.coordinate,
+        want_commit: request.want_commit,
+        have_commits: request.have_commits,
+        limits: Default::default(),
+    })
+    .await
+    {
+        Ok(stream) => stream.into_response(),
+        Err(failure) => object_fetch_refusal(&failure),
     }
-    response
 }
 
 // ── A node on two machines ─────────────────────────────────────────────────

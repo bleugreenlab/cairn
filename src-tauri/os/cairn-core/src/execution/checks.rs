@@ -21123,6 +21123,7 @@ cairn-common = { path = "../cairn-common" }
             ObjectInfrastructure(ObjectInfrastructureStage::UploadFailure),
             ObjectInfrastructure(ObjectInfrastructureStage::ExpiredReceipt),
             ObjectInfrastructure(ObjectInfrastructureStage::StaleReceipt),
+            ObjectInfrastructure(ObjectInfrastructureStage::MaterializationRefused),
         ];
         let mut failures = unavailable
             .into_iter()

@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::body::Bytes;
 use cairn_common::executor_protocol::{
-    CellRequest, CloudObjectGrantRequest, CloudObjectOperation, DeltaUploadReceipt,
+    object_fetch_stream, CellRequest, CloudObjectGrantRequest, CloudObjectOperation,
+    DeltaUploadReceipt, ObjectFetchFailure, ObjectFetchFailureClass, ObjectFetchFailureCode,
     ObjectTransferCoordinate,
 };
 use sha2::{Digest, Sha256};
@@ -160,65 +162,325 @@ pub async fn resolve_catalog_chain(
     Ok(chain)
 }
 
-/// What a runner answers an executor's object fetch with.
-pub struct RunnerFetch {
-    /// The objects the executor lacks; `None` when its haves already cover the
-    /// wanted commit.
-    pub pack: Option<ValidatedObjectPack>,
-    /// The source repository's shallow commits that the wanted commit's
-    /// history reaches. The pack deliberately stops there, so the executor
-    /// must prove the closure against, and record, the same boundary.
-    pub shallow_boundary: Vec<String>,
+/// What an executor's object fetch asks this runner for.
+pub struct RunnerFetchRequest {
+    /// The project's store repository, read without the project-store lock.
+    pub repository: PathBuf,
+    /// Where the reachable listing and the pack being sent are spooled. Only
+    /// one pack is ever there at once.
+    pub scratch: PathBuf,
+    pub coordinate: ObjectTransferCoordinate,
+    pub want_commit: String,
+    pub have_commits: Vec<String>,
+    pub limits: cairn_codec::transfer::PackLimits,
 }
 
-impl RunnerFetch {
-    /// The response headers carrying this answer's pack identity and shallow
-    /// boundary. Fails only for a boundary too wide to transfer.
-    pub fn response_headers(&self) -> Result<Vec<(&'static str, String)>, String> {
-        let mut headers = Vec::new();
-        if let Some(pack) = &self.pack {
-            headers.push(("x-cairn-content-sha256", content_sha256(&pack.pack)));
-            headers.push(("x-cairn-pack-checksum", pack.pack_checksum.clone()));
-        }
-        if !self.shallow_boundary.is_empty() {
-            headers.push((
-                cairn_common::executor_protocol::OBJECT_SHALLOW_BOUNDARY_HEADER,
-                cairn_codec::transfer::encode_shallow_boundary(&self.shallow_boundary)?,
-            ));
-        }
-        Ok(headers)
+/// How many chunks of pack data wait between the builder and the network.
+/// The builder blocks once they are full, so a slow executor slows the build
+/// rather than filling memory.
+const FETCH_STREAM_CHANNEL_CHUNKS: usize = 4;
+const FETCH_STREAM_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// A runner object fetch that has begun: the closure, as a fetch stream
+/// (see [`cairn_common::executor_protocol::object_fetch_stream`]) produced on
+/// a blocking thread one pack at a time. Dropping it (the executor went away)
+/// stops the producer at its next chunk and removes its scratch.
+pub struct RunnerFetchStream {
+    chunks: tokio::sync::mpsc::Receiver<Bytes>,
+}
+
+impl RunnerFetchStream {
+    pub fn into_response(self) -> axum::response::Response {
+        let body = futures_util::stream::unfold(self.chunks, |mut chunks| async move {
+            chunks
+                .recv()
+                .await
+                .map(|chunk| (Ok::<_, std::io::Error>(chunk), chunks))
+        });
+        let mut response = axum::response::Response::new(axum::body::Body::from_stream(body));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static(object_fetch_stream::CONTENT_TYPE),
+        );
+        response
     }
 }
 
-/// Read-only runner-local pack construction. Call without the project-store lock.
+/// The HTTP answer to a refused object request: the status its class names,
+/// with the typed failure as the body, which is what the executor reads.
+pub fn object_fetch_refusal(failure: &ObjectFetchFailure) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let status = match failure.class {
+        ObjectFetchFailureClass::Deterministic | ObjectFetchFailureClass::Integrity => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        ObjectFetchFailureClass::NotApplicable => StatusCode::CONFLICT,
+        ObjectFetchFailureClass::Unavailable => StatusCode::NOT_FOUND,
+        ObjectFetchFailureClass::Transient => StatusCode::SERVICE_UNAVAILABLE,
+        ObjectFetchFailureClass::StaleAuthorization => StatusCode::FORBIDDEN,
+    };
+    (status, axum::Json(failure.clone())).into_response()
+}
+
+/// Begin answering an object fetch.
+///
+/// Resolves once the first pack is validated (or the closure is known to
+/// need none), so a refusal decided before any byte is sent (an unknown
+/// commit, an object no pack can hold among the first) is an ordinary typed
+/// error response. A failure after that ends the stream with its Error
+/// record. Call without the project-store lock.
 ///
 /// A have this store does not hold narrows nothing and is dropped, rather
 /// than failing the fetch: an executor offers its checkouts' heads, and one
 /// may stand on a commit it sealed that has not reached this runner.
-pub fn build_local_reachable_pack(
-    repository: &Path,
-    want_commit: &str,
-    have_commits: &[String],
-) -> Result<RunnerFetch, String> {
-    let wants = [want_commit.to_owned()];
-    let shallow_boundary = cairn_codec::transfer::shallow_boundary(repository, want_commit)?;
-    let haves = cairn_codec::transfer::known_commits(repository, have_commits)?;
-    let Some((pack, builder_index)) =
-        cairn_codec::transfer::build_reachable_pack(repository, &wants, &haves)?
-    else {
-        return Ok(RunnerFetch {
-            pack: None,
-            shallow_boundary,
-        });
-    };
-    let validated = validate_pack_bytes(pack)?;
-    if validated.index != builder_index {
-        return Err("reachable pack builder index disagrees with independent validation".into());
+pub async fn open_runner_fetch(
+    request: RunnerFetchRequest,
+) -> Result<RunnerFetchStream, ObjectFetchFailure> {
+    let (started, answer) = tokio::sync::oneshot::channel();
+    let (sender, chunks) = tokio::sync::mpsc::channel(FETCH_STREAM_CHANNEL_CHUNKS);
+    tokio::task::spawn_blocking(move || produce_runner_fetch(request, started, sender));
+    match answer.await {
+        Ok(Ok(())) => Ok(RunnerFetchStream { chunks }),
+        Ok(Err(failure)) => Err(failure),
+        Err(_) => Err(ObjectFetchFailure::new(
+            ObjectFetchFailureCode::PackConstruction,
+            "the runner's object fetch producer stopped without answering",
+        )),
     }
-    Ok(RunnerFetch {
-        pack: Some(validated),
-        shallow_boundary,
-    })
+}
+
+type FetchStarted = tokio::sync::oneshot::Sender<Result<(), ObjectFetchFailure>>;
+
+fn produce_runner_fetch(
+    request: RunnerFetchRequest,
+    started: FetchStarted,
+    sender: tokio::sync::mpsc::Sender<Bytes>,
+) {
+    use cairn_codec::transfer::{build_bounded_packs, known_commits, shallow_boundary};
+    let repository = &request.repository;
+    let want = &request.want_commit;
+    let prepared = (|| {
+        let unresolvable = || {
+            ObjectFetchFailure::new(
+                ObjectFetchFailureCode::CommitUnresolvable,
+                format!("the runner cannot resolve commit {want}"),
+            )
+        };
+        if known_commits(repository, std::slice::from_ref(want))
+            .map_err(|_| unresolvable())?
+            .is_empty()
+        {
+            return Err(unresolvable());
+        }
+        let shallow = shallow_boundary(repository, want).map_err(|error| {
+            ObjectFetchFailure::new(ObjectFetchFailureCode::PackConstruction, error)
+        })?;
+        if shallow.len() > object_fetch_stream::MAX_SHALLOW_COMMITS {
+            return Err(ObjectFetchFailure::new(
+                ObjectFetchFailureCode::ShallowBoundaryTooWide,
+                format!(
+                    "the source's shallow boundary for {want} is {} commits, over the transfer limit of {}",
+                    shallow.len(),
+                    object_fetch_stream::MAX_SHALLOW_COMMITS
+                ),
+            ));
+        }
+        let haves = known_commits(repository, &request.have_commits).map_err(|error| {
+            ObjectFetchFailure::new(ObjectFetchFailureCode::PackConstruction, error)
+        })?;
+        std::fs::create_dir_all(&request.scratch).map_err(|error| {
+            ObjectFetchFailure::new(
+                ObjectFetchFailureCode::PackConstruction,
+                format!("creating object fetch scratch: {error}"),
+            )
+        })?;
+        reclaim_stale_fetch_scratch(&request.scratch);
+        Ok((shallow, haves))
+    })();
+    let (shallow, haves) = match prepared {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            let _ = started.send(Err(failure));
+            return;
+        }
+    };
+
+    let mut encoder = object_fetch_stream::StreamEncoder::new();
+    let opening = encoder
+        .open(&request.coordinate, want, &shallow)
+        .expect("the boundary was bounded above");
+    let mut pending_start = Some((started, opening));
+    let send = |bytes: Vec<u8>| {
+        sender
+            .blocking_send(Bytes::from(bytes))
+            .map_err(|_| "the executor stopped reading the object fetch".to_string())
+    };
+    // Nothing is sent until there is something to send, so a refusal
+    // decided before the first pack is an ordinary error response.
+    let begin = |pending: &mut Option<(FetchStarted, Vec<u8>)>| -> Result<(), String> {
+        if let Some((started, opening)) = pending.take() {
+            let _ = started.send(Ok(()));
+            send(opening)?;
+        }
+        Ok(())
+    };
+    let built = build_bounded_packs(
+        repository,
+        std::slice::from_ref(want),
+        &haves,
+        request.limits,
+        &request.scratch,
+        &mut |pack| {
+            begin(&mut pending_start)?;
+            let sha256 = sha256_file(&pack.pack_path)?;
+            send(encoder.pack(object_fetch_stream::PackDescriptor {
+                byte_count: pack.manifest.pack_bytes,
+                sha256,
+                pack_checksum: pack.manifest.pack_checksum.clone(),
+                object_count: pack.manifest.object_count,
+            }))?;
+            let mut file = std::fs::File::open(&pack.pack_path)
+                .map_err(|error| format!("reading built pack: {error}"))?;
+            let mut sent = 0u64;
+            loop {
+                let mut chunk = vec![0u8; FETCH_STREAM_CHUNK_BYTES];
+                let read = std::io::Read::read(&mut file, &mut chunk)
+                    .map_err(|error| format!("reading built pack: {error}"))?;
+                if read == 0 {
+                    break;
+                }
+                chunk.truncate(read);
+                sent += read as u64;
+                send(chunk)?;
+            }
+            if sent != pack.manifest.pack_bytes {
+                return Err(format!(
+                    "built pack changed while it was sent: {sent} of {} bytes",
+                    pack.manifest.pack_bytes
+                ));
+            }
+            Ok(())
+        },
+    );
+    let failure = match built {
+        Ok(summary) => {
+            if begin(&mut pending_start)
+                .and_then(|()| send(encoder.end()))
+                .is_ok()
+            {
+                log::info!(
+                    "served object fetch for {want} to executor {} request {}: {} packs, {} objects, {} bytes",
+                    request.coordinate.executor_id,
+                    request.coordinate.request_id,
+                    summary.packs,
+                    summary.objects,
+                    summary.pack_bytes,
+                );
+            }
+            return;
+        }
+        Err(cairn_codec::transfer::BoundedPackError::Stopped(reason)) => {
+            log::info!(
+                "object fetch for {want} to executor {} request {} stopped: {reason}",
+                request.coordinate.executor_id,
+                request.coordinate.request_id,
+            );
+            return;
+        }
+        Err(error) => bounded_pack_failure(error),
+    };
+    log::warn!(
+        "managed object fetch for {want} to executor {} request {} attempt {} refused: {failure}",
+        request.coordinate.executor_id,
+        request.coordinate.request_id,
+        request.coordinate.attempt_id,
+    );
+    match pending_start.take() {
+        Some((started, _)) => {
+            let _ = started.send(Err(failure));
+        }
+        None => {
+            let _ = send(object_fetch_stream::StreamEncoder::error(&failure));
+        }
+    }
+}
+
+/// How old an entry in the fetch scratch must be before a later fetch
+/// removes it. Every fetch removes its own spool on every return, so an older
+/// one was left by a runner that died mid-fetch; a live fetch is never this
+/// old, because the executor's whole-request deadline is ten minutes.
+const STALE_FETCH_SCRATCH: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn reclaim_stale_fetch_scratch(scratch: &Path) {
+    let Ok(entries) = std::fs::read_dir(scratch) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > STALE_FETCH_SCRATCH);
+        if stale {
+            let path = entry.path();
+            let removed = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            if let Err(error) = removed {
+                log::warn!(
+                    "could not remove stale object fetch scratch {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// The typed failure a bounded pack build ended in.
+fn bounded_pack_failure(error: cairn_codec::transfer::BoundedPackError) -> ObjectFetchFailure {
+    use cairn_codec::transfer::{BoundedPackError, LimitDimension};
+    use cairn_common::executor_protocol::{
+        OversizedObject, PackLimitDimension, PackLimitViolation,
+    };
+    match error {
+        BoundedPackError::Oversized { object, violation } => ObjectFetchFailure::oversized_object(
+            OversizedObject {
+                oid: object.oid,
+                kind: object.kind,
+                path: object.path,
+                canonical_bytes: object.canonical_bytes,
+                packed_bytes: object.packed_bytes,
+            },
+            PackLimitViolation {
+                dimension: match violation.dimension {
+                    LimitDimension::PackBytes => PackLimitDimension::PackBytes,
+                    LimitDimension::ObjectCount => PackLimitDimension::ObjectCount,
+                    LimitDimension::InflatedBytes => PackLimitDimension::InflatedBytes,
+                },
+                actual: violation.actual,
+                limit: violation.limit,
+            },
+        ),
+        BoundedPackError::SourceMissing(message) => {
+            ObjectFetchFailure::new(ObjectFetchFailureCode::SourceObjectsMissing, message)
+        }
+        BoundedPackError::Failed(message) | BoundedPackError::Stopped(message) => {
+            ObjectFetchFailure::new(ObjectFetchFailureCode::PackConstruction, message)
+        }
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("reading built pack: {error}"))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|error| format!("hashing built pack: {error}"))?;
+    Ok(hex_hash(hasher.finalize().into()))
 }
 
 #[derive(Clone, Debug)]
@@ -917,8 +1179,123 @@ mod tests {
     /// reached the runner yet. Offered as a have, that commit used to fail the
     /// whole fetch with a 422; it now narrows nothing, and a have the runner
     /// does hold still narrows the pack to what the executor lacks.
-    #[test]
-    fn an_unknown_have_does_not_fail_the_fetch_and_a_known_one_narrows_it() {
+    /// What a fetch served: the packs' object counts, in order.
+    async fn served(
+        repository: &Path,
+        tip: &str,
+        haves: &[String],
+        limits: cairn_codec::transfer::PackLimits,
+    ) -> Result<Vec<u64>, ObjectFetchFailure> {
+        let scratch = tempfile::tempdir().unwrap();
+        let stream = open_runner_fetch(RunnerFetchRequest {
+            repository: repository.to_path_buf(),
+            scratch: scratch.path().join("fetch"),
+            coordinate: coordinate(1),
+            want_commit: tip.to_owned(),
+            have_commits: haves.to_vec(),
+            limits,
+        })
+        .await?;
+        let body = axum::body::to_bytes(stream.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut decoder = object_fetch_stream::StreamDecoder::new(u64::MAX);
+        let mut packs = Vec::new();
+        let mut ended = false;
+        let mut failed = None;
+        decoder
+            .push(&body, &mut |event| {
+                match event {
+                    object_fetch_stream::StreamEvent::PackStart(pack) => {
+                        packs.push(pack.object_count)
+                    }
+                    object_fetch_stream::StreamEvent::End(_) => ended = true,
+                    object_fetch_stream::StreamEvent::Error(failure) => failed = Some(failure),
+                    _ => {}
+                }
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        decoder.finish().unwrap();
+        assert_eq!(
+            std::fs::read_dir(scratch.path().join("fetch"))
+                .unwrap()
+                .count(),
+            0,
+            "a served fetch leaves no scratch behind"
+        );
+        // A refusal after the first pack arrives as the stream's Error record,
+        // which the executor takes as the fetch's failure.
+        if let Some(failure) = failed {
+            return Err(failure);
+        }
+        assert!(ended, "the stream ended with neither End nor Error");
+        assert_eq!(
+            std::fs::read_dir(scratch.path().join("fetch"))
+                .unwrap()
+                .count(),
+            0,
+            "a served fetch leaves no scratch behind"
+        );
+        Ok(packs)
+    }
+
+    fn git_in(repository: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+            .args(args)
+            .current_dir(repository)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_closure_past_one_pack_is_served_as_several_and_an_unpackable_object_is_named() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path();
+        git_in(repository, &["init", "-b", "main", "-q"]);
+        for index in 0..6u8 {
+            // Incompressible enough that six of them cannot share 8 KiB.
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(index + 1);
+            let bytes: Vec<u8> = (0..4096)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect();
+            std::fs::write(repository.join(format!("blob-{index}")), bytes).unwrap();
+            git_in(repository, &["add", "."]);
+            git_in(repository, &["commit", "-qm", &format!("blob {index}")]);
+        }
+        let tip = git_in(repository, &["rev-parse", "HEAD"]);
+        let small = cairn_codec::transfer::PackLimits::new(8 * 1024, 1_000_000, u64::MAX);
+        let packs = served(repository, &tip, &[], small).await.unwrap();
+        assert!(packs.len() > 1, "{packs:?}");
+
+        let tiny = cairn_codec::transfer::PackLimits::new(1024, 1_000_000, u64::MAX);
+        let refused = served(repository, &tip, &[], tiny).await.unwrap_err();
+        assert_eq!(refused.code, ObjectFetchFailureCode::ObjectExceedsPackLimit);
+        assert_eq!(refused.class, ObjectFetchFailureClass::Deterministic);
+        let object = refused.object.as_ref().unwrap();
+        assert!(object.path.as_deref().unwrap().starts_with("blob-"));
+        assert!(refused.detail.contains(&object.oid), "{}", refused.detail);
+
+        let unknown = served(repository, &"2".repeat(40), &[], small)
+            .await
+            .unwrap_err();
+        assert_eq!(unknown.code, ObjectFetchFailureCode::CommitUnresolvable);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_have_does_not_fail_the_fetch_and_a_known_one_narrows_it() {
         const UNKNOWN: &str = "1111111111111111111111111111111111111111";
         let temp = tempfile::tempdir().unwrap();
         let repository = temp.path();
@@ -946,16 +1323,19 @@ mod tests {
         git(&["commit", "-qm", "next"]);
         let tip = git(&["rev-parse", "HEAD"]);
 
-        let count = |haves: &[String]| {
-            build_local_reachable_pack(repository, &tip, haves)
-                .unwrap()
-                .pack
-                .unwrap()
-                .object_count
+        let count = |haves: Vec<String>| {
+            let tip = tip.clone();
+            async move {
+                served(repository, &tip, &haves, Default::default())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .sum::<u64>()
+            }
         };
-        let full = count(&[]);
-        assert_eq!(count(&[UNKNOWN.to_string()]), full);
-        let narrowed = count(&[UNKNOWN.to_string(), parent]);
+        let full = count(vec![]).await;
+        assert_eq!(count(vec![UNKNOWN.to_string()]).await, full);
+        let narrowed = count(vec![UNKNOWN.to_string(), parent]).await;
         assert!(
             narrowed < full,
             "{narrowed} objects is not fewer than {full}"
