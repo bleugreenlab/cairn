@@ -331,7 +331,7 @@ pub(crate) async fn project_key(orch: &Orchestrator, row: &FactRow) -> Option<St
         })
 }
 
-async fn project_path(orch: &Orchestrator, project_id: Option<&str>) -> Option<PathBuf> {
+pub(super) async fn project_path(orch: &Orchestrator, project_id: Option<&str>) -> Option<PathBuf> {
     let project_id = project_id?.to_owned();
     orch.db
         .local

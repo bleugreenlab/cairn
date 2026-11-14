@@ -671,10 +671,10 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("runtime_admission_cursors", MARKER),
     keep("runtime_admission_host_guard", MARKER),
     keep("channel_cursor", MARKER),
-    keep("ambient_routing_feedback_cursor", MARKER),
+    keep("route_decision_feedback_cursor", MARKER),
     keep(
-        "ambient_routing_feedback",
-        "the ambient route's label set: one row per ambient Discord message outcome, swept on project delete",
+        "route_decision_feedback",
+        "the decision-route label set: one row per event, route, node and recipient, swept on project delete",
     ),
     keep("ci_logs_cache", "refetchable CI logs; empty on 10-30"),
     keep("vibe_axes", SMALL),

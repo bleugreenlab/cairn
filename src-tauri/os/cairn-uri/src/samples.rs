@@ -467,7 +467,7 @@ resource_samples! {
         provider: "discord".to_string(),
         path: vec!["cairn".to_string(), "channels".to_string()],
     } => Parser,
-    ChannelsAmbientFeedback {} => Parser,
+    ProjectEventFeedback { project: "cairn".to_string() } => Parser,
     Operator {} => Parser,
     OperatorMessage { id: "0193a5e2-7c1d-7b1e-9f3a-5d2c8e4b6a10".to_string() } => Parser,
     Executors {} => Parser,

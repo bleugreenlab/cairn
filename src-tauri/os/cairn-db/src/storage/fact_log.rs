@@ -361,6 +361,20 @@ pub async fn list_facts_after(
     .await
 }
 
+/// All sources after `after_id`, oldest first, for cross-source consumers.
+pub async fn list_all_facts_after(
+    db: &LocalDb,
+    after_id: i64,
+    limit: i64,
+) -> DbResult<Vec<FactRow>> {
+    db.query_all(
+        format!("SELECT {COLUMNS} FROM fact_log WHERE id>?1 ORDER BY id LIMIT ?2"),
+        (after_id, limit),
+        from_row,
+    )
+    .await
+}
+
 pub async fn get_fact(db: &LocalDb, id: i64) -> DbResult<Option<FactRow>> {
     db.query_opt(
         format!("SELECT {COLUMNS} FROM fact_log WHERE id=?1"),

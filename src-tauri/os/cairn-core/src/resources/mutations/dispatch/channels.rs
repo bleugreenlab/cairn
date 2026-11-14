@@ -51,35 +51,8 @@ pub(super) async fn dispatch(
                 .map(Some)
                 .map_err(|error| build_failure(index, item, error))
         }
-        (CairnResource::ChannelsAmbientFeedback, ChangeMode::Append) => {
-            label(orch, request, index, item, dry_run).await.map(Some)
-        }
         _ => Ok(None),
     }
-}
-
-/// A thread or the operator labelling an ambient routing. Refusals come in a
-/// fixed order, each a sentence naming its reason: the payload's shape, then
-/// the labeller (a chartered thread, never a task or node; or the verified
-/// desktop operator through the channels door), then the event, then the
-/// re-route target.
-async fn label(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    index: usize,
-    item: &ChangeItem,
-    dry_run: bool,
-) -> ResourceMutationResult<String> {
-    use crate::channels::ambient_feedback::{apply_label, labeller, LabelPayload};
-    let payload = append_payload(index, item)?;
-    let payload =
-        LabelPayload::parse(payload).map_err(|error| build_failure(index, item, error))?;
-    let labeller = labeller(orch, request)
-        .await
-        .map_err(|error| build_failure(index, item, error))?;
-    apply_label(orch, request, &labeller, &payload, dry_run)
-        .await
-        .map_err(|error| build_failure(index, item, error))
 }
 
 /// The message a send's `replyTo` names, resolved within the conversation the

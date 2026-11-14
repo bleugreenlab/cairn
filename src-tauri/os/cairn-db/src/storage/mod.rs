@@ -21,7 +21,6 @@ mod test_template;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod checkpoint_probe;
 
-pub mod ambient_feedback;
 pub mod authority;
 pub mod content_store;
 pub mod events;
@@ -35,6 +34,7 @@ pub mod quarantine;
 pub mod rebuilds;
 pub mod render;
 pub mod requests;
+pub mod route_feedback;
 pub mod served_api;
 pub mod usage_readings;
 
@@ -51,12 +51,12 @@ pub use fact_log::{
     coalesce_wake as coalesce_fact_wake, coalesce_wake_conn as coalesce_fact_wake_conn,
     count_facts, finish as finish_fact, finish_wake as finish_fact_wake, get_fact,
     get_wakes as get_fact_wakes, hold_wake_until_conn as hold_fact_wake_until_conn, insert_fact,
-    latest_for_source, latest_per_source, list_facts, list_facts_after, prune as prune_facts,
-    prune_receipts as prune_delivery_receipts, prune_wakes as prune_fact_wakes,
-    raise_wake_level_conn as raise_fact_wake_level_conn, recover_on_start as recover_fact_log,
-    requeue_wake as requeue_fact_wake, route_state, set_index_outcome, FactFilter, FactRow,
-    FactScope, FactWake, LogDedupe, NewFact, PruneSelector, Recovery, WakeMatch, WakeWindow,
-    PASSIVE_CAMP_FACT_REF_PREFIX,
+    latest_for_source, latest_per_source, list_all_facts_after, list_facts, list_facts_after,
+    prune as prune_facts, prune_receipts as prune_delivery_receipts,
+    prune_wakes as prune_fact_wakes, raise_wake_level_conn as raise_fact_wake_level_conn,
+    recover_on_start as recover_fact_log, requeue_wake as requeue_fact_wake, route_state,
+    set_index_outcome, FactFilter, FactRow, FactScope, FactWake, LogDedupe, NewFact, PruneSelector,
+    Recovery, WakeMatch, WakeWindow, PASSIVE_CAMP_FACT_REF_PREFIX,
 };
 pub use failed_dependencies::{failed_dependency_candidates, failed_dependency_candidates_conn};
 pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEED_PAGE_MAX};

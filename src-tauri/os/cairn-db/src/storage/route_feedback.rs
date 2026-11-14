@@ -1,6 +1,5 @@
-//! The ambient routing label set (`ambient_routing_feedback`): one row per
-//! outcome of the ambient Discord route, keyed by the fact log row the message
-//! minted. Rows are written by the channels sweep from the route's firings, by
+//! Decision-route labels keyed by project, fact, route, decision node and recipient.
+//! Rows are written by the route sweep from the route's firings, by
 //! a thread's feedback write, and stamped once by the 48-hour engagement pass.
 //! Every timestamp is epoch seconds.
 
@@ -24,9 +23,14 @@ pub const OUTCOME_UNRECORDED: &str = "unrecorded";
 
 /// One outcome row as the sweep (or a feedback write) first records it.
 #[derive(Debug, Clone, PartialEq)]
-pub struct NewAmbientFeedback {
+pub struct NewRouteFeedback {
     pub project_key: String,
     pub event_id: i64,
+    pub route_id: String,
+    pub decision_node: String,
+    pub question: String,
+    pub question_text: Option<String>,
+    pub source: String,
     /// The delivered thread's URI; `None` for the event's refused-side row.
     pub recipient_thread: Option<String>,
     pub outcome: String,
@@ -41,10 +45,15 @@ pub struct NewAmbientFeedback {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AmbientFeedbackRow {
+pub struct RouteFeedbackRow {
     pub id: i64,
     pub project_key: String,
     pub event_id: i64,
+    pub route_id: String,
+    pub decision_node: String,
+    pub question: String,
+    pub question_text: Option<String>,
+    pub source: String,
     pub recipient_thread: Option<String>,
     pub outcome: String,
     pub pick: Option<String>,
@@ -66,10 +75,10 @@ pub struct AmbientFeedbackRow {
     pub swept_at: i64,
 }
 
-const COLUMNS: &str = "id,project_key,event_id,recipient_thread,outcome,pick,probability,measured_by,revision,picks_json,addresses_from,verdict,reroute_to,note,labelled_by,first_labelled_at,labelled_at,engaged,engaged_by,engagement_checked_at,event_at,swept_at";
+const COLUMNS: &str = "id,project_key,event_id,recipient_thread,outcome,pick,probability,measured_by,revision,picks_json,addresses_from,verdict,reroute_to,note,labelled_by,first_labelled_at,labelled_at,engaged,engaged_by,engagement_checked_at,event_at,swept_at,route_id,decision_node,question,source,question_text";
 
-fn from_row(row: &crate::turso::Row) -> DbResult<AmbientFeedbackRow> {
-    Ok(AmbientFeedbackRow {
+fn from_row(row: &crate::turso::Row) -> DbResult<RouteFeedbackRow> {
+    Ok(RouteFeedbackRow {
         id: row.i64(0)?,
         project_key: row.text(1)?,
         event_id: row.i64(2)?,
@@ -92,6 +101,11 @@ fn from_row(row: &crate::turso::Row) -> DbResult<AmbientFeedbackRow> {
         engagement_checked_at: row.opt_i64(19)?,
         event_at: row.i64(20)?,
         swept_at: row.i64(21)?,
+        route_id: row.text(22)?,
+        decision_node: row.text(23)?,
+        question: row.text(24)?,
+        source: row.text(25)?,
+        question_text: row.opt_text(26)?,
     })
 }
 
@@ -105,12 +119,12 @@ pub struct SweptCounts {
 
 async fn existing_source(
     conn: &crate::storage::TrackedConnection,
-    row: &NewAmbientFeedback,
+    row: &NewRouteFeedback,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
         .query(
-            "SELECT addresses_from FROM ambient_routing_feedback WHERE project_key=?1 AND event_id=?2 AND recipient_thread IS ?3",
-            params![row.project_key.clone(), row.event_id, row.recipient_thread.clone()],
+            "SELECT addresses_from FROM route_decision_feedback WHERE project_key=?1 AND event_id=?2 AND recipient_thread IS ?3 AND route_id=?4 AND decision_node=?5 AND question=?6",
+            params![row.project_key.clone(), row.event_id, row.recipient_thread.clone(), row.route_id.clone(), row.decision_node.clone(), row.question.clone()],
         )
         .await?;
     match rows.next().await? {
@@ -121,10 +135,10 @@ async fn existing_source(
 
 async fn insert_conn(
     conn: &crate::storage::TrackedConnection,
-    row: &NewAmbientFeedback,
+    row: &NewRouteFeedback,
 ) -> DbResult<()> {
     conn.execute(
-        "INSERT INTO ambient_routing_feedback (project_key,event_id,recipient_thread,outcome,pick,probability,measured_by,revision,picks_json,addresses_from,event_at,swept_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        "INSERT INTO route_decision_feedback (project_key,event_id,recipient_thread,outcome,pick,probability,measured_by,revision,picks_json,addresses_from,event_at,swept_at,route_id,decision_node,question,source,question_text) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
         params![
             row.project_key.clone(),
             row.event_id,
@@ -137,7 +151,12 @@ async fn insert_conn(
             row.picks_json.clone(),
             row.addresses_from.clone(),
             row.event_at,
-            row.swept_at
+            row.swept_at,
+            row.route_id.clone(),
+            row.decision_node.clone(),
+            row.question.clone(),
+            row.source.clone(),
+            row.question_text.clone()
         ],
     )
     .await?;
@@ -151,7 +170,7 @@ async fn insert_conn(
 /// inserting: the sweep re-reaches nothing, but a write may have raced it.
 pub async fn record_swept(
     db: &LocalDb,
-    rows: Vec<NewAmbientFeedback>,
+    rows: Vec<NewRouteFeedback>,
     cursor: i64,
 ) -> DbResult<SweptCounts> {
     db.write(move |conn| {
@@ -166,7 +185,7 @@ pub async fn record_swept(
                     }
                     Some(addresses_from::LABEL) => {
                         conn.execute(
-                            "UPDATE ambient_routing_feedback SET outcome=?4,pick=?5,probability=?6,measured_by=?7,revision=?8,picks_json=?9,addresses_from=?10,swept_at=?11 WHERE project_key=?1 AND event_id=?2 AND recipient_thread IS ?3 AND addresses_from='label'",
+                            "UPDATE route_decision_feedback SET outcome=?4,pick=?5,probability=?6,measured_by=?7,revision=?8,picks_json=?9,addresses_from=?10,swept_at=?11,question_text=?14 WHERE project_key=?1 AND event_id=?2 AND recipient_thread IS ?3 AND route_id=?12 AND decision_node=?13 AND question=?15 AND addresses_from='label'",
                             params![
                                 row.project_key.clone(),
                                 row.event_id,
@@ -178,7 +197,11 @@ pub async fn record_swept(
                                 row.revision.clone(),
                                 row.picks_json.clone(),
                                 row.addresses_from.clone(),
-                                row.swept_at
+                                row.swept_at,
+                                row.route_id.clone(),
+                                row.decision_node.clone(),
+                                row.question_text.clone(),
+                                row.question.clone()
                             ],
                         )
                         .await?;
@@ -188,7 +211,7 @@ pub async fn record_swept(
                 }
             }
             conn.execute(
-                "INSERT INTO ambient_routing_feedback_cursor (id, fact_log_id) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET fact_log_id=excluded.fact_log_id WHERE excluded.fact_log_id > ambient_routing_feedback_cursor.fact_log_id",
+                "INSERT INTO route_decision_feedback_cursor (id, fact_log_id) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET fact_log_id=excluded.fact_log_id WHERE excluded.fact_log_id > route_decision_feedback_cursor.fact_log_id",
                 (cursor,),
             )
             .await?;
@@ -202,7 +225,7 @@ pub async fn record_swept(
 pub async fn sweep_cursor(db: &LocalDb) -> DbResult<i64> {
     Ok(db
         .query_opt_i64(
-            "SELECT fact_log_id FROM ambient_routing_feedback_cursor WHERE id=1",
+            "SELECT fact_log_id FROM route_decision_feedback_cursor WHERE id=1",
             (),
         )
         .await?
@@ -214,22 +237,28 @@ pub async fn find(
     db: &LocalDb,
     project_key: &str,
     event_id: i64,
+    route_id: &str,
+    decision_node: &str,
+    question: &str,
     recipient: Option<&str>,
-) -> DbResult<Option<AmbientFeedbackRow>> {
+) -> DbResult<Option<RouteFeedbackRow>> {
     db.query_opt(
-        format!("SELECT {COLUMNS} FROM ambient_routing_feedback WHERE project_key=?1 AND event_id=?2 AND recipient_thread IS ?3"),
-        params![project_key.to_string(), event_id, recipient.map(str::to_owned)],
+        format!("SELECT {COLUMNS} FROM route_decision_feedback WHERE project_key=?1 AND event_id=?2 AND recipient_thread IS ?3 AND route_id=?4 AND decision_node=?5 AND question=?6"),
+        params![project_key.to_string(), event_id, recipient.map(str::to_owned), route_id.to_string(), decision_node.to_string(), question.to_string()],
         from_row,
     )
     .await
 }
 
 /// Insert `row` unless its key already holds one, and return what is stored.
-pub async fn ensure(db: &LocalDb, row: NewAmbientFeedback) -> DbResult<AmbientFeedbackRow> {
+pub async fn ensure(db: &LocalDb, row: NewRouteFeedback) -> DbResult<RouteFeedbackRow> {
     let key = (
         row.project_key.clone(),
         row.event_id,
         row.recipient_thread.clone(),
+        row.route_id.clone(),
+        row.decision_node.clone(),
+        row.question.clone(),
     );
     db.write(move |conn| {
         let row = row.clone();
@@ -241,14 +270,14 @@ pub async fn ensure(db: &LocalDb, row: NewAmbientFeedback) -> DbResult<AmbientFe
         })
     })
     .await?;
-    find(db, &key.0, key.1, key.2.as_deref())
+    find(db, &key.0, key.1, &key.3, &key.4, &key.5, key.2.as_deref())
         .await?
-        .ok_or_else(|| super::DbError::internal("ensured ambient feedback row disappeared"))
+        .ok_or_else(|| super::DbError::internal("ensured route feedback row disappeared"))
 }
 
 /// A label as one feedback write sets it.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AmbientLabel {
+pub struct RouteLabel {
     pub verdict: String,
     pub reroute_to: Option<String>,
     pub note: Option<String>,
@@ -260,26 +289,47 @@ pub struct AmbientLabel {
 pub async fn set_label(
     db: &LocalDb,
     id: i64,
-    label: AmbientLabel,
-) -> DbResult<Option<AmbientFeedbackRow>> {
-    db.execute(
-        "UPDATE ambient_routing_feedback SET verdict=?2, reroute_to=?3, note=?4, labelled_by=?5, labelled_at=?6, first_labelled_at=COALESCE(first_labelled_at, ?6) WHERE id=?1",
-        params![
-            id,
-            label.verdict,
-            label.reroute_to,
-            label.note,
-            label.labelled_by,
-            label.labelled_at
-        ],
-    )
-    .await?;
-    get(db, id).await
+    label: RouteLabel,
+) -> DbResult<Option<RouteFeedbackRow>> {
+    if get(db, id).await?.is_none() {
+        return Ok(None);
+    }
+    Ok(set_labels(db, vec![id], label).await?.pop())
 }
 
-pub async fn get(db: &LocalDb, id: i64) -> DbResult<Option<AmbientFeedbackRow>> {
+/// Replace all selected labels atomically, preserving each first-label time.
+/// Missing rows reject the whole batch rather than silently partially labelling.
+pub async fn set_labels(
+    db: &LocalDb,
+    ids: Vec<i64>,
+    label: RouteLabel,
+) -> DbResult<Vec<RouteFeedbackRow>> {
+    db.write(move |conn| {
+        let ids = ids.clone();
+        let label = label.clone();
+        Box::pin(async move {
+            let mut labelled = Vec::with_capacity(ids.len());
+            for id in ids {
+                conn.execute(
+                    "UPDATE route_decision_feedback SET verdict=?2, reroute_to=?3, note=?4, labelled_by=?5, labelled_at=?6, first_labelled_at=COALESCE(first_labelled_at, ?6) WHERE id=?1",
+                    params![id, label.verdict.clone(), label.reroute_to.clone(), label.note.clone(), label.labelled_by.clone(), label.labelled_at],
+                ).await?;
+                let mut rows = conn.query(
+                    &format!("SELECT {COLUMNS} FROM route_decision_feedback WHERE id=?1"),
+                    (id,),
+                ).await?;
+                let row = rows.next().await?
+                    .ok_or_else(|| super::DbError::internal(format!("feedback row {id} disappeared while labelling")))?;
+                labelled.push(from_row(&row)?);
+            }
+            Ok(labelled)
+        })
+    }).await
+}
+
+pub async fn get(db: &LocalDb, id: i64) -> DbResult<Option<RouteFeedbackRow>> {
     db.query_opt(
-        format!("SELECT {COLUMNS} FROM ambient_routing_feedback WHERE id=?1"),
+        format!("SELECT {COLUMNS} FROM route_decision_feedback WHERE id=?1"),
         (id,),
         from_row,
     )
@@ -296,7 +346,11 @@ pub enum Engagement {
 
 /// A read over the label set. Every field narrows; `None` does not.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct AmbientFeedbackFilter {
+pub struct RouteFeedbackFilter {
+    pub project_key: Option<String>,
+    pub event_id: Option<i64>,
+    pub route: Option<String>,
+    pub source: Option<String>,
     /// Rows whose event is at or after this epoch second.
     pub since: Option<i64>,
     pub verdict: Option<String>,
@@ -306,7 +360,7 @@ pub struct AmbientFeedbackFilter {
     pub engaged: Option<Engagement>,
 }
 
-fn filter_sql(filter: &AmbientFeedbackFilter) -> (String, Vec<crate::turso::Value>) {
+fn filter_sql(filter: &RouteFeedbackFilter) -> (String, Vec<crate::turso::Value>) {
     use crate::turso::Value;
     let mut clauses = Vec::new();
     let mut binds = Vec::new();
@@ -314,6 +368,18 @@ fn filter_sql(filter: &AmbientFeedbackFilter) -> (String, Vec<crate::turso::Valu
         binds.push(value);
         clauses.push(clause.replace('?', &format!("?{}", binds.len())));
     };
+    if let Some(project) = &filter.project_key {
+        bind("project_key = ?", Value::Text(project.clone()), &mut binds);
+    }
+    if let Some(event) = filter.event_id {
+        bind("event_id = ?", Value::Integer(event), &mut binds);
+    }
+    if let Some(route) = &filter.route {
+        bind("route_id = ?", Value::Text(route.clone()), &mut binds);
+    }
+    if let Some(source) = &filter.source {
+        bind("source = ?", Value::Text(source.clone()), &mut binds);
+    }
     if let Some(since) = filter.since {
         bind("event_at >= ?", Value::Integer(since), &mut binds);
     }
@@ -345,14 +411,14 @@ fn filter_sql(filter: &AmbientFeedbackFilter) -> (String, Vec<crate::turso::Valu
 /// The filtered rows, newest event first.
 pub async fn list(
     db: &LocalDb,
-    filter: &AmbientFeedbackFilter,
+    filter: &RouteFeedbackFilter,
     limit: i64,
-) -> DbResult<Vec<AmbientFeedbackRow>> {
+) -> DbResult<Vec<RouteFeedbackRow>> {
     let (clause, mut binds) = filter_sql(filter);
     binds.push(crate::turso::Value::Integer(limit));
     let n = binds.len();
     db.query_all(
-        format!("SELECT {COLUMNS} FROM ambient_routing_feedback{clause} ORDER BY event_id DESC, recipient_thread LIMIT ?{n}"),
+        format!("SELECT {COLUMNS} FROM route_decision_feedback{clause} ORDER BY event_id DESC, recipient_thread LIMIT ?{n}"),
         binds,
         from_row,
     )
@@ -361,10 +427,10 @@ pub async fn list(
 
 /// `(rows, rows with outcome unrecorded)` under `filter`: how many events the
 /// sweep reached only after route_firings had evicted their firings.
-pub async fn counts(db: &LocalDb, filter: &AmbientFeedbackFilter) -> DbResult<(i64, i64)> {
+pub async fn counts(db: &LocalDb, filter: &RouteFeedbackFilter) -> DbResult<(i64, i64)> {
     let (clause, binds) = filter_sql(filter);
     let sql = format!(
-        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN outcome='{OUTCOME_UNRECORDED}' THEN 1 ELSE 0 END), 0) FROM ambient_routing_feedback{clause}"
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN outcome='{OUTCOME_UNRECORDED}' THEN 1 ELSE 0 END), 0) FROM route_decision_feedback{clause}"
     );
     Ok(db
         .query_opt(sql, binds, |row| Ok((row.i64(0)?, row.i64(1)?)))
@@ -378,9 +444,9 @@ pub async fn pending_engagement(
     db: &LocalDb,
     due_by: i64,
     limit: i64,
-) -> DbResult<Vec<AmbientFeedbackRow>> {
+) -> DbResult<Vec<RouteFeedbackRow>> {
     db.query_all(
-        format!("SELECT {COLUMNS} FROM ambient_routing_feedback WHERE engagement_checked_at IS NULL AND event_at <= ?1 ORDER BY event_at, id LIMIT ?2"),
+        format!("SELECT {COLUMNS} FROM route_decision_feedback WHERE engagement_checked_at IS NULL AND event_at <= ?1 ORDER BY event_at, id LIMIT ?2"),
         (due_by, limit),
         from_row,
     )
@@ -396,7 +462,7 @@ pub async fn stamp_engagement(
     checked_at: i64,
 ) -> DbResult<()> {
     db.execute(
-        "UPDATE ambient_routing_feedback SET engaged=?2, engaged_by=?3, engagement_checked_at=?4 WHERE id=?1 AND engagement_checked_at IS NULL",
+        "UPDATE route_decision_feedback SET engaged=?2, engaged_by=?3, engagement_checked_at=?4 WHERE id=?1 AND engagement_checked_at IS NULL",
         params![id, i64::from(engaged), engaged_by, checked_at],
     )
     .await?;
@@ -407,10 +473,15 @@ pub async fn stamp_engagement(
 mod tests {
     use super::*;
 
-    fn swept(event_id: i64, recipient: Option<&str>, source: &str) -> NewAmbientFeedback {
-        NewAmbientFeedback {
+    fn swept(event_id: i64, recipient: Option<&str>, source: &str) -> NewRouteFeedback {
+        NewRouteFeedback {
             project_key: "cairn".into(),
             event_id,
+            route_id: "ambient-channel".into(),
+            decision_node: "pick".into(),
+            question: "thread".into(),
+            question_text: Some("Which thread owns this?".into()),
+            source: "channel_message".into(),
             recipient_thread: recipient.map(str::to_owned),
             outcome: "admitted".into(),
             pick: Some("devops".into()),
@@ -426,7 +497,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_repeated_sweep_inserts_nothing_and_the_cursor_only_advances() {
-        let db = crate::storage::migrated_test_db("ambient-feedback-idempotent.db").await;
+        let db = crate::storage::migrated_test_db("route-feedback-idempotent.db").await;
         let devops = Some("cairn://p/cairn/devops");
         let batch = vec![
             swept(1, devops, addresses_from::FIRINGS),
@@ -438,21 +509,19 @@ mod tests {
         let again = record_swept(&db, batch, 3).await.unwrap();
         assert_eq!(again, SweptCounts::default());
         assert_eq!(sweep_cursor(&db).await.unwrap(), 5, "never moves back");
-        let (total, unrecorded) = counts(&db, &AmbientFeedbackFilter::default())
-            .await
-            .unwrap();
+        let (total, unrecorded) = counts(&db, &RouteFeedbackFilter::default()).await.unwrap();
         assert_eq!((total, unrecorded), (3, 0));
     }
 
     #[tokio::test]
     async fn the_refused_side_holds_one_row_per_event() {
-        let db = crate::storage::migrated_test_db("ambient-feedback-refused.db").await;
+        let db = crate::storage::migrated_test_db("route-feedback-refused.db").await;
         record_swept(&db, vec![swept(7, None, addresses_from::NONE)], 7)
             .await
             .unwrap();
         let duplicate = db
             .execute(
-                "INSERT INTO ambient_routing_feedback (project_key,event_id,outcome,addresses_from,event_at,swept_at) VALUES ('cairn',7,'refused','none',1,1)",
+                "INSERT INTO route_decision_feedback (project_key,event_id,route_id,decision_node,question,source,outcome,addresses_from,event_at,swept_at) VALUES ('cairn',7,'ambient-channel','pick','thread','channel_message','refused','none',1,1)",
                 (),
             )
             .await;
@@ -460,16 +529,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_node_and_project_partition_both_delivered_and_refused_rows() {
+        let db = crate::storage::migrated_test_db("route-feedback-keys.db").await;
+        let mut batch = Vec::new();
+        for recipient in [None, Some("cairn://p/cairn/devops")] {
+            let base = swept(9, recipient, addresses_from::FIRINGS);
+            batch.push(base.clone());
+            let mut other_route = base.clone();
+            other_route.route_id = "post-routing".into();
+            other_route.source = "post_created".into();
+            batch.push(other_route);
+            let mut other_node = base.clone();
+            other_node.decision_node = "second-pick".into();
+            batch.push(other_node);
+            let mut other_question = base.clone();
+            other_question.question = "second-thread".into();
+            batch.push(other_question);
+            let mut other_project = base;
+            other_project.project_key = "other".into();
+            batch.push(other_project);
+        }
+        assert_eq!(
+            record_swept(&db, batch.clone(), 9).await.unwrap().inserted,
+            10
+        );
+        assert_eq!(
+            record_swept(&db, batch, 9).await.unwrap(),
+            SweptCounts::default()
+        );
+        let filter = RouteFeedbackFilter {
+            project_key: Some("cairn".into()),
+            event_id: Some(9),
+            route: Some("post-routing".into()),
+            source: Some("post_created".into()),
+            ..Default::default()
+        };
+        assert_eq!(list(&db, &filter, 20).await.unwrap().len(), 2);
+        assert_eq!(counts(&db, &filter).await.unwrap(), (2, 0));
+    }
+
+    #[tokio::test]
     async fn a_label_row_takes_the_sweeps_features_and_keeps_its_label() {
-        let db = crate::storage::migrated_test_db("ambient-feedback-fill.db").await;
+        let db = crate::storage::migrated_test_db("route-feedback-fill.db").await;
         let mut early = swept(3, None, addresses_from::LABEL);
         early.outcome = OUTCOME_UNRECORDED.into();
         early.pick = None;
+        early.question_text = None;
         let row = ensure(&db, early).await.unwrap();
         set_label(
             &db,
             row.id,
-            AmbientLabel {
+            RouteLabel {
                 verdict: "reroute".into(),
                 reroute_to: Some("cairn://p/cairn/docs".into()),
                 note: None,
@@ -483,7 +593,14 @@ mod tests {
         later.outcome = "below_threshold".into();
         let counts = record_swept(&db, vec![later], 3).await.unwrap();
         assert_eq!(counts.filled, 1);
-        let row = find(&db, "cairn", 3, None).await.unwrap().unwrap();
+        let row = find(&db, "cairn", 3, "ambient-channel", "pick", "thread", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.question_text.as_deref(),
+            Some("Which thread owns this?")
+        );
         assert_eq!(
             (
                 row.outcome.as_str(),
@@ -504,11 +621,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_label_keeps_the_first_labelled_time() {
-        let db = crate::storage::migrated_test_db("ambient-feedback-relabel.db").await;
+        let db = crate::storage::migrated_test_db("route-feedback-relabel.db").await;
         let row = ensure(&db, swept(4, Some("cairn://p/cairn/devops"), "firings"))
             .await
             .unwrap();
-        let label = |verdict: &str, at: i64| AmbientLabel {
+        let label = |verdict: &str, at: i64| RouteLabel {
             verdict: verdict.into(),
             reroute_to: None,
             note: None,
@@ -531,8 +648,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_labels_rollback_on_missing_rows_and_keep_each_first_time() {
+        let db = crate::storage::migrated_test_db("route-feedback-batch-label.db").await;
+        let a = ensure(&db, swept(1, None, "firings")).await.unwrap();
+        let b = ensure(&db, swept(2, None, "firings")).await.unwrap();
+        let label = |at| RouteLabel {
+            verdict: "not_mine".into(),
+            reroute_to: None,
+            note: None,
+            labelled_by: "operator".into(),
+            labelled_at: at,
+        };
+        set_labels(&db, vec![a.id], label(10)).await.unwrap();
+        assert!(set_labels(&db, vec![a.id, b.id, -1], label(20))
+            .await
+            .is_err());
+        assert_eq!(get(&db, a.id).await.unwrap().unwrap().labelled_at, Some(10));
+        assert_eq!(get(&db, b.id).await.unwrap().unwrap().labelled_at, None);
+        let rows = set_labels(&db, vec![a.id, b.id], label(30)).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].first_labelled_at, Some(10));
+        assert_eq!(rows[1].first_labelled_at, Some(30));
+        assert!(rows.iter().all(|row| row.labelled_at == Some(30)));
+    }
+
+    #[tokio::test]
     async fn engagement_is_due_after_the_horizon_and_stamped_once() {
-        let db = crate::storage::migrated_test_db("ambient-feedback-engagement.db").await;
+        let db = crate::storage::migrated_test_db("route-feedback-engagement.db").await;
         record_swept(
             &db,
             vec![swept(5, Some("cairn://p/cairn/devops"), "firings")],
@@ -557,13 +699,13 @@ mod tests {
             (row.engaged, row.engagement_checked_at),
             (Some(true), Some(300))
         );
-        let filter = AmbientFeedbackFilter {
+        let filter = RouteFeedbackFilter {
             engaged: Some(Engagement::Engaged),
             thread: Some("cairn://p/cairn/devops".into()),
             ..Default::default()
         };
         assert_eq!(list(&db, &filter, 10).await.unwrap().len(), 1);
-        let filter = AmbientFeedbackFilter {
+        let filter = RouteFeedbackFilter {
             engaged: Some(Engagement::Unchecked),
             ..Default::default()
         };

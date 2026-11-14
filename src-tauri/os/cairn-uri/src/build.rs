@@ -1074,6 +1074,9 @@ pub fn build_project_route_uri(project: &str, id: &str) -> String {
 pub fn build_project_events_uri(project: &str) -> String {
     format!("{}/events", build_project_uri(project))
 }
+pub fn build_project_event_feedback_uri(project: &str) -> String {
+    format!("{}/feedback", build_project_events_uri(project))
+}
 pub fn build_project_event_uri(project: &str, id: i64) -> String {
     format!("{}/{id}", build_project_events_uri(project))
 }
@@ -1653,7 +1656,7 @@ impl CairnResource {
                 }
                 uri
             }
-            Self::ChannelsAmbientFeedback => "cairn://channels/ambient/feedback".to_string(),
+            Self::ProjectEventFeedback { project } => build_project_event_feedback_uri(project),
             Self::Operator => "cairn://operator".to_string(),
             Self::OperatorMessage { id } => format!("cairn://operator/messages/{id}"),
             Self::Executors => "cairn://executors".to_string(),

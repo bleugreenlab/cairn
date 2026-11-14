@@ -224,6 +224,17 @@ pub struct FieldSpec {
     pub stored: bool,
 }
 
+/// A source-owned passive engagement check over an event's observation window.
+pub type EngagementSignal = for<'a> fn(
+    &'a crate::storage::LocalDb,
+    &'a crate::storage::FactRow,
+    &'a str,
+    i64,
+    i64,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>,
+>;
+
 #[derive(Debug, Clone)]
 pub struct SourceSpec {
     pub fields: HashMap<&'static str, FieldSpec>,
@@ -246,6 +257,9 @@ pub struct SourceSpec {
     /// excludes that job too, so a home that rotated sessions between mint and
     /// indexing is still never woken by its own words.
     pub actor_home: Option<&'static str>,
+    /// Extra passive engagement checks owned by this source. Event citations
+    /// are common to every source and are checked separately by the route sweep.
+    pub engagement_signals: &'static [EngagementSignal],
     /// Whether list fields are stored whole rather than cut at the log's list
     /// bound. Set for sources whose lists are reference sets the lane resolves
     /// or matches (`mentions`): a cut list would silently drop recipients and
@@ -417,6 +431,7 @@ impl Default for FactRegistry {
             max_stored_chars: None,
             addressees: &[],
             actor_home: None,
+            engagement_signals: &[],
             whole_lists: false,
             muted: MutedDelivery::Drop,
             untrusted: None,
@@ -441,6 +456,7 @@ impl Default for FactRegistry {
             max_stored_chars: Some(GITHUB_COMMENT_MAX_CHARS),
             addressees: &[],
             actor_home: None,
+            engagement_signals: &[],
             whole_lists: false,
             muted: MutedDelivery::Drop,
             untrusted: Some(&["repository", "kind", "number", "author"]),
@@ -461,6 +477,7 @@ impl Default for FactRegistry {
             max_stored_chars: None,
             addressees: &[],
             actor_home: None,
+            engagement_signals: &[],
             whole_lists: false,
             muted: MutedDelivery::Drop,
             untrusted: None,
@@ -486,6 +503,7 @@ impl Default for FactRegistry {
             max_stored_chars: None,
             addressees: &["camp", "mentions"],
             actor_home: Some("author"),
+            engagement_signals: &[],
             whole_lists: true,
             muted: MutedDelivery::RideAlong,
             untrusted: None,
@@ -507,6 +525,7 @@ impl Default for FactRegistry {
             max_stored_chars: None,
             addressees: &["postAuthor", "camp", "mentions"],
             actor_home: Some("author"),
+            engagement_signals: &[],
             whole_lists: true,
             muted: MutedDelivery::RideAlong,
             untrusted: None,
@@ -531,6 +550,7 @@ impl Default for FactRegistry {
             max_stored_chars: None,
             addressees: &[],
             actor_home: None,
+            engagement_signals: &[],
             whole_lists: false,
             muted: MutedDelivery::Drop,
             untrusted: Some(&["endpoint", "type"]),
@@ -552,6 +572,7 @@ impl Default for FactRegistry {
             max_stored_chars: None,
             addressees: &[],
             actor_home: None,
+            engagement_signals: &[crate::channels::agent_message::sent_to_originating_conversation],
             whole_lists: false,
             muted: MutedDelivery::Drop,
             untrusted: Some(&["conversationLabel", "senderLabel"]),
@@ -581,6 +602,7 @@ impl Default for FactRegistry {
             max_stored_chars: None,
             addressees: &[],
             actor_home: None,
+            engagement_signals: &[],
             whole_lists: false,
             muted: MutedDelivery::Drop,
             untrusted: None,
@@ -603,6 +625,7 @@ impl Default for FactRegistry {
             max_stored_chars: None,
             addressees: &["camp"],
             actor_home: None,
+            engagement_signals: &[],
             whole_lists: false,
             muted: MutedDelivery::RideAlong,
             untrusted: None,
@@ -1287,6 +1310,30 @@ mod tests {
             FieldKind::List,
             "an addressee field is still matchable with the list predicate shape"
         );
+    }
+
+    #[test]
+    fn only_channels_declares_an_extra_engagement_signal() {
+        let registry = FactRegistry::default();
+        for name in registry.source_names() {
+            let spec = registry.source(name).unwrap();
+            assert_eq!(
+                spec.engagement_signals.len(),
+                usize::from(name == "channel_message"),
+                "{name}"
+            );
+            if !spec.engagement_signals.is_empty() {
+                assert!(spec
+                    .fields
+                    .get("conversation")
+                    .is_some_and(|field| field.stored));
+                assert!(std::ptr::fn_addr_eq(
+                    spec.engagement_signals[0],
+                    crate::channels::agent_message::sent_to_originating_conversation
+                        as EngagementSignal,
+                ));
+            }
+        }
     }
 
     /// An actor home must be a stored field, or the lane could never resolve it.

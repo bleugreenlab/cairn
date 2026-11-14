@@ -63,8 +63,7 @@ pub fn removed_executor_verb_refusal(uri: &str) -> Option<String> {
 
 /// The channel providers `cairn://channels/{provider}` names: the in-app
 /// channel `app` and the external transports. Any other word under
-/// `cairn://channels` is not a provider, so `cairn://channels/ambient/feedback`
-/// keeps its own meaning.
+/// `cairn://channels` is not a provider.
 pub fn is_channel_provider(segment: &str) -> bool {
     matches!(segment, "app" | "discord" | "imessage" | "telegram")
 }
@@ -123,7 +122,6 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["dev", "launch-ticket"] => Some(CairnResource::DevLaunchTicket),
         ["logs"] => Some(CairnResource::Logs),
         ["channels"] => Some(CairnResource::Channels),
-        ["channels", "ambient", "feedback"] => Some(CairnResource::ChannelsAmbientFeedback),
         ["operator"] => Some(CairnResource::Operator),
         ["operator", "messages", id] if !id.is_empty() => Some(CairnResource::OperatorMessage {
             id: (*id).to_string(),
@@ -468,6 +466,11 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         [PROJECT_SCOPE, project, "events"] => Some(CairnResource::ProjectEvents {
             project: canonical_project(project),
         }),
+        [PROJECT_SCOPE, project, "events", "feedback"] => {
+            Some(CairnResource::ProjectEventFeedback {
+                project: canonical_project(project),
+            })
+        }
         // `endpoints` is reserved beside the numeric row ids.
         [PROJECT_SCOPE, project, "events", "endpoints"] => {
             Some(CairnResource::ProjectEventEndpoints {

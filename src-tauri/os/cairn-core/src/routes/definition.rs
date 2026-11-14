@@ -1287,7 +1287,7 @@ mod tests {
         assert!(
             matches!(target, Bindable::Bound(ArgumentBinding::Field { field }) if field == "answers.thread.addresses")
         );
-        assert_eq!(body.as_deref(), Some("Decision: {{answers.thread.citations}}.\nVia {{conversationLabel}}, from {{senderLabel}}. Event {{event}}.\nIf this isn't yours, answer the event: write cairn://channels/ambient/feedback {event, verdict: not_mine | reroute, to?}.\n\n{{text}}\n"));
+        assert_eq!(body.as_deref(), Some("Decision: {{answers.thread.citations}}.\nVia {{conversationLabel}}, from {{senderLabel}}. Event {{event}}.\nIf this isn't yours, answer the event: write cairn:@/events/feedback {event: \"{{event}}\", verdict: not_mine | reroute, to?}.\n\n{{text}}\n"));
         let acknowledgements = [
             ("ack_routed", "admitted", "Routed to {{answers.thread.citations}}."),
             ("ack_below_threshold", "below_threshold", "No thread claimed this (closest: {{answers.thread.citation}}). Start with @thread or #channel to route it."),

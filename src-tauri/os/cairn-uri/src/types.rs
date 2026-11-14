@@ -1088,9 +1088,10 @@ pub enum CairnResource {
         provider: String,
         path: Vec<String>,
     },
-    /// The ambient Discord route's label set: one row per routing outcome,
-    /// read by judgment and labelled by the receiving threads.
-    ChannelsAmbientFeedback,
+    /// Decision-route feedback for events in one project.
+    ProjectEventFeedback {
+        project: String,
+    },
     /// The operator as a recipient: his channels with their purpose lines, his
     /// presence and last-seen, and the reader's own messages to him.
     Operator,
@@ -1367,7 +1368,7 @@ impl CairnResource {
             Self::Channels => ResourceKind::Channels,
             Self::ChannelsProvider { .. } => ResourceKind::ChannelsProvider,
             Self::ChannelsConversation { .. } => ResourceKind::ChannelsConversation,
-            Self::ChannelsAmbientFeedback => ResourceKind::ChannelsAmbientFeedback,
+            Self::ProjectEventFeedback { .. } => ResourceKind::ProjectEventFeedback,
             Self::Operator => ResourceKind::Operator,
             Self::OperatorMessage { .. } => ResourceKind::OperatorMessage,
             Self::Executors => ResourceKind::Executors,

@@ -232,7 +232,7 @@ impl CairnResource {
             | Self::Channels
             | Self::ChannelsProvider { .. }
             | Self::ChannelsConversation { .. }
-            | Self::ChannelsAmbientFeedback
+            | Self::ProjectEventFeedback { .. }
             | Self::Operator
             | Self::OperatorMessage { .. }
             | Self::Grants

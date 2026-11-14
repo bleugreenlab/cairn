@@ -2159,8 +2159,8 @@ async fn render_resource_body(
             )
             .await
         }
-        CairnResource::ChannelsAmbientFeedback => {
-            crate::resources::channels::render_ambient_feedback(orch, &params).await
+        CairnResource::ProjectEventFeedback { project } => {
+            crate::resources::events::render_feedback(orch, &project, &params).await
         }
         CairnResource::Operator => {
             crate::resources::operator::render_operator(orch, request, &params).await

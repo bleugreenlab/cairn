@@ -69,9 +69,9 @@ pub(super) const CHANNEL_KEY_ADDRESSED: &[KeyAddressedSpec] = &[
         table: "channel_state_card",
         sweep_where_sql: "project_key = ?1",
     },
-    // The ambient route's label set, keyed by the project its events belong to.
+    // Decision-route labels belong to the project their events name.
     KeyAddressedSpec {
-        table: "ambient_routing_feedback",
+        table: "route_decision_feedback",
         sweep_where_sql: "project_key = ?1",
     },
     KeyAddressedSpec {
@@ -1621,9 +1621,9 @@ pub(super) mod tests {
             INSERT INTO channel_inbound(id, channel, sender, text, received_at, conversation, target_uri, binding_kind)
               VALUES ('inbound-ambient-{project_key}', 'discord', 'operator', 'who owns this?', 1, 'discord:1/104', 'cairn://p/{project_key}', 'ambient'),
                      ('inbound-thread-{project_key}', 'discord', 'operator', 'hello', 1, 'discord:1/102', 'cairn://p/{project_key}/general', 'structural');
-            INSERT INTO ambient_routing_feedback(project_key, event_id, recipient_thread, outcome, addresses_from, event_at, swept_at)
-              VALUES ('{project_key}', 1, 'cairn://p/{project_key}/general', 'admitted', 'firings', 1, 1),
-                     ('{project_key}', 2, NULL, 'refused', 'firings', 1, 1);
+            INSERT INTO route_decision_feedback(project_key, event_id, route_id, decision_node, question, source, recipient_thread, outcome, addresses_from, event_at, swept_at)
+              VALUES ('{project_key}', 1, 'ambient-channel', 'pick', 'thread', 'channel_message', 'cairn://p/{project_key}/general', 'admitted', 'firings', 1, 1),
+                     ('{project_key}', 2, 'ambient-channel', 'pick', 'thread', 'channel_message', NULL, 'refused', 'firings', 1, 1);
             "#
         ))
         .await
@@ -1854,7 +1854,7 @@ pub(super) mod tests {
             "channel_outbound",
             "channel_ask_action",
             "channel_ask_resolution",
-            "ambient_routing_feedback",
+            "route_decision_feedback",
         ] {
             assert_eq!(count_rows(&db, table).await, 0, "{table} retained rows");
         }
@@ -2105,11 +2105,11 @@ pub(super) mod tests {
         assert_eq!(
             key_addressed,
             [
-                "ambient_routing_feedback",
                 "channel_state_card",
                 "discord_surface",
                 "project_library_trust",
-                "project_routes"
+                "project_routes",
+                "route_decision_feedback"
             ]
         );
         // `project_routes` is intentionally swept by the routing path because

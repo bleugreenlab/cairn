@@ -19,7 +19,41 @@ use cairn_uri::{parse_uri, CairnResource};
 use uuid::Uuid;
 
 use super::{ledger, render_text_floor, ConversationAddress, OutboundAsk};
-use crate::storage::LocalDb;
+use crate::storage::{FactRow, LocalDb, RowExt};
+
+/// Whether the recipient sent agent text to the event's originating conversation
+/// during the observation window. Route-authored sends do not name a thread.
+pub fn sent_to_originating_conversation<'a>(
+    local: &'a LocalDb,
+    fact: &'a FactRow,
+    thread_uri: &'a str,
+    from: i64,
+    to: i64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let fields: serde_json::Value =
+            serde_json::from_str(&fact.fields_json).map_err(|error| error.to_string())?;
+        let Some(conversation) = fields
+            .get("conversation")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(false);
+        };
+        let refs = local
+            .query_all(
+                "SELECT binding_ref FROM channel_outbound WHERE conversation = ?1 AND kind = ?2 AND created_at BETWEEN ?3 AND ?4",
+                (conversation.to_string(), KIND.to_string(), from * 1000, to * 1000),
+                |row| row.text(0),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let thread_uri = cairn_uri::canonicalize_uri_identity(thread_uri);
+        Ok(refs.iter().any(|binding_ref| {
+            sender_home(binding_ref)
+                .is_some_and(|home| cairn_uri::canonicalize_uri_identity(home) == thread_uri)
+        }))
+    })
+}
 
 /// The `channel_outbound.kind` of an agent message.
 pub const KIND: &str = "message";

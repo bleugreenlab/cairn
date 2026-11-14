@@ -414,7 +414,7 @@ fn citation(name: &str, probability: &str, method: &str) -> String {
 
 fn delivered(citations: &str, event: &str, text: &str) -> String {
     format!(
-        "Decision: {citations}.\nVia {AMBIENT_LABEL}, from operator. Event {event}.\nIf this isn't yours, answer the event: write cairn://channels/ambient/feedback {{event, verdict: not_mine | reroute, to?}}.\n\n{text}\n"
+        "Decision: {citations}.\nVia {AMBIENT_LABEL}, from operator. Event {event}.\nIf this isn't yours, answer the event: write cairn:@/events/feedback {{event: \"{event}\", verdict: not_mine | reroute, to?}}.\n\n{text}\n"
     )
 }
 
@@ -743,15 +743,18 @@ async fn two_admitted_threads_each_hear_it_and_one_acknowledgement_cites_both_in
     // The label set's sweep reads this journal: one row per delivered thread,
     // each snapshotting the decision.
     let now = orch.services.clock.now();
-    let report = crate::channels::ambient_feedback::sweep_once(&orch, now)
+    let report = crate::routes::feedback::sweep_once(&orch, now)
         .await
         .unwrap();
     assert_eq!((report.inserted, report.unrecorded), (2, 0));
     for name in ["devops", "docs"] {
-        let row = crate::storage::ambient_feedback::find(
+        let row = crate::storage::route_feedback::find(
             &orch.db.local,
             PROJECT,
             routed.row.id,
+            "ambient-channel",
+            "pick",
+            "thread",
             Some(&build_thread_uri(PROJECT, name)),
         )
         .await

@@ -114,6 +114,7 @@ impl CairnResource {
             | ProjectRoute { project, .. }
             | ProjectRouteHistory { project, .. }
             | ProjectRouteHistoryEntry { project, .. }
+            | ProjectEventFeedback { project, .. }
             | ProjectEvents { project, .. }
             | ProjectEvent { project, .. }
             | ProjectEventEndpoints { project, .. }
@@ -254,6 +255,7 @@ impl CairnResource {
             | Self::ProjectRoute { project, .. }
             | Self::ProjectRouteHistory { project, .. }
             | Self::ProjectRouteHistoryEntry { project, .. }
+            | Self::ProjectEventFeedback { project }
             | Self::ProjectEvents { project }
             | Self::ProjectEvent { project, .. }
             | Self::ProjectEventEndpoints { project }
@@ -307,7 +309,6 @@ impl CairnResource {
             | Self::Channels
             | Self::ChannelsProvider { .. }
             | Self::ChannelsConversation { .. }
-            | Self::ChannelsAmbientFeedback
             | Self::Operator
             | Self::OperatorMessage { .. }
             | Self::Executors
@@ -481,6 +482,7 @@ impl CairnResource {
             | Self::ProjectRoute { .. }
             | Self::ProjectRouteHistory { .. }
             | Self::ProjectRouteHistoryEntry { .. }
+            | Self::ProjectEventFeedback { .. }
             | Self::ProjectEvents { .. }
             | Self::ProjectEvent { .. }
             | Self::ProjectEventEndpoints { .. }
@@ -527,7 +529,6 @@ impl CairnResource {
             | Self::Channels
             | Self::ChannelsProvider { .. }
             | Self::ChannelsConversation { .. }
-            | Self::ChannelsAmbientFeedback
             | Self::Operator
             | Self::OperatorMessage { .. }
             | Self::Executors

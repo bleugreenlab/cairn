@@ -1,41 +1,17 @@
-//! The ambient routing label set's sweep (cairn/6290).
-//!
-//! The ambient Discord route classifies each unaddressed ambient message and
-//! delivers it to the admitted threads. Calibrating its floors needs an outcome
-//! for every routing, not only for the ones a thread chose to label, so this
-//! sweep walks the fact log's ambient `channel_message` rows in id order and
-//! records one `ambient_routing_feedback` row per delivered address, or one
-//! recipient-less row for an outcome that delivered nowhere.
-//!
-//! The decision summary survives only in the route's firing journal, a
-//! 200-row ring buffer per route, so the sweep runs every five minutes. A fact
-//! whose firings were already evicted still gets one row, with outcome
-//! `unrecorded` and no features, so losses are counted rather than silent; the
-//! durable decision record that would replace them is cairn/6317.
-//!
-//! The same pass settles engagement 48 hours after each event, from exactly two
-//! signals: the recipient thread authored a record citing the event (a thread
-//! message, an issue, a post or post comment), or it sent agent text to the
-//! originating conversation. Issue comments carry no author column, so they
-//! cannot be attributed to a thread and are not searched. A refused-side row is
-//! engaged when any thread cited the event, and names the earliest one.
+//! Decision-route feedback and passive engagement, keyed by event.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use cairn_uri::{build_thread_uri, parse_uri, CairnResource};
 use serde_json::Value;
 
 use crate::orchestrator::Orchestrator;
-use crate::storage::ambient_feedback::{
-    self as feedback, addresses_from, AmbientFeedbackRow, NewAmbientFeedback, OUTCOME_UNRECORDED,
+use crate::storage::route_feedback::{
+    self as feedback, addresses_from, NewRouteFeedback, RouteFeedbackRow,
 };
 use crate::storage::{route_state, FactRow, LocalDb, RouteFiringRecord, RowExt};
 
-/// The shipped ambient route's id: its file stem.
-pub const AMBIENT_ROUTE: &str = "ambient-channel";
-/// The decision question whose answer names the owning thread.
-pub const THREAD_QUESTION: &str = "thread";
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// How long after an event its passive engagement is judged.
 pub const ENGAGEMENT_HORIZON_SECONDS: i64 = 48 * 60 * 60;
@@ -43,7 +19,6 @@ pub const ENGAGEMENT_HORIZON_SECONDS: i64 = 48 * 60 * 60;
 /// non-admitted outcome is journaled only once its acknowledgement has sent.
 const SETTLE_SECONDS: i64 = 10 * 60;
 const BATCH: i64 = 200;
-const SOURCE: &str = "channel_message";
 
 /// What one pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,16 +42,16 @@ pub fn spawn(orch: Orchestrator) {
             let now = orch.services.clock.now();
             match sweep_once(&orch, now).await {
                 Ok(report) if report != SweepReport::default() => {
-                    log::info!("ambient feedback sweep: {report:?}")
+                    log::info!("route feedback sweep: {report:?}")
                 }
                 Ok(_) => {}
-                Err(error) => log::warn!("ambient feedback sweep failed: {error}"),
+                Err(error) => log::warn!("route feedback sweep failed: {error}"),
             }
         }
     });
 }
 
-/// One pass: record every settled ambient outcome past the cursor, then stamp
+/// One pass: record every settled decision outcome past the cursor, then stamp
 /// every row whose engagement horizon has passed. `now` is epoch seconds.
 pub async fn sweep_once(orch: &Orchestrator, now: i64) -> Result<SweepReport, String> {
     let mut report = sweep_outcomes(orch, now).await?;
@@ -84,44 +59,13 @@ pub async fn sweep_once(orch: &Orchestrator, now: i64) -> Result<SweepReport, St
     Ok(report)
 }
 
-fn fields(fact: &FactRow) -> BTreeMap<String, Value> {
-    serde_json::from_str(&fact.fields_json).unwrap_or_default()
-}
-
-/// Whether `fact` is an unaddressed message in an ambient Discord binding:
-/// exactly what the ambient route's trigger matches.
-pub(crate) fn is_ambient_discord(fact: &FactRow) -> bool {
-    let fields = fields(fact);
-    fact.source == SOURCE
-        && fields.get("bindingKind").and_then(Value::as_str) == Some("ambient")
-        && fields.get("addressed").and_then(Value::as_bool) == Some(false)
-        && fields.get("provider").and_then(Value::as_str) == Some("discord")
-}
-
-/// The conversation an ambient fact arrived in.
-pub(crate) fn conversation_of(fact: &FactRow) -> Option<String> {
-    fields(fact)
-        .get("conversation")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-/// The ambient route's own firings for one fact.
-pub(crate) async fn ambient_firings(
-    db: &LocalDb,
-    fact_id: i64,
-) -> Result<Vec<RouteFiringRecord>, String> {
-    Ok(crate::storage::list_firings_for_fact(db, fact_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|firing| firing.route_id == AMBIENT_ROUTE)
-        .collect())
-}
-
 /// The thread decision as the route's firing journal recorded it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ThreadDecision {
+    pub route_id: String,
+    pub decision_node: String,
+    pub question: String,
+    pub question_text: Option<String>,
     pub outcome: String,
     pub pick: Option<String>,
     pub picks: Vec<String>,
@@ -155,8 +99,8 @@ fn citation_revision(citation: &str) -> Option<String> {
 /// Read the thread decision from one journaled decision entry: the outcome
 /// and answers as summarized, the pick's own probability, and the pick's
 /// charter revision from the options the question was asked over.
-fn decision_from_entry(entry: &Value) -> Option<ThreadDecision> {
-    let answer = entry.get("answers")?.get(THREAD_QUESTION)?;
+fn decision_from_entry(entry: &Value, route: &str, question: &str) -> Option<ThreadDecision> {
+    let answer = entry.get("answers")?.get(question)?;
     let outcome = answer.get("outcome")?.as_str()?.to_string();
     let pick = answer
         .get("pick")
@@ -181,7 +125,7 @@ fn decision_from_entry(entry: &Value) -> Option<ThreadDecision> {
             .get("questions")?
             .as_array()?
             .iter()
-            .find(|question| question.get("name").and_then(Value::as_str) == Some(THREAD_QUESTION))?
+            .find(|candidate| candidate.get("name").and_then(Value::as_str) == Some(question))?
             .get("options")?
             .as_array()?
             .iter()
@@ -199,6 +143,21 @@ fn decision_from_entry(entry: &Value) -> Option<ThreadDecision> {
             .and_then(|citation| citation_revision(&citation))
     });
     Some(ThreadDecision {
+        route_id: route.to_string(),
+        decision_node: entry.get("decision")?.as_str()?.to_string(),
+        question: question.to_string(),
+        question_text: entry
+            .get("asked")
+            .and_then(|a| a.get("questions"))
+            .and_then(Value::as_array)
+            .and_then(|questions| {
+                questions
+                    .iter()
+                    .find(|q| q.get("name").and_then(Value::as_str) == Some(question))
+            })
+            .and_then(|q| q.get("instructions"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         outcome,
         pick,
         picks: strings(answer.get("picks").unwrap_or(&Value::Null)),
@@ -213,13 +172,55 @@ fn decision_from_entry(entry: &Value) -> Option<ThreadDecision> {
     })
 }
 
+fn routing_question(question: &Value) -> bool {
+    if question.get("source").and_then(Value::as_str) == Some("chartered_threads") {
+        return true;
+    }
+    // Resolved charter options replace the source declaration in the journal.
+    question.get("options").and_then(Value::as_array).is_some_and(|options| {
+        options.iter().any(|option| option.get("address").and_then(Value::as_str)
+            .is_some_and(|uri| matches!(parse_uri(uri), Some(CairnResource::Thread { path, .. }) if path.is_empty())))
+    })
+}
+
 /// The thread decision any of `firings` journaled; every firing of one fact
 /// carries the same one.
-pub(crate) fn thread_decision(firings: &[RouteFiringRecord]) -> Option<ThreadDecision> {
-    firings.iter().find_map(|firing| {
-        let history: Vec<Value> = serde_json::from_str(firing.transforms_json.as_deref()?).ok()?;
-        history.iter().find_map(decision_from_entry)
-    })
+fn decisions(firings: &[RouteFiringRecord]) -> Vec<ThreadDecision> {
+    let mut found = Vec::new();
+    for firing in firings {
+        let history: Vec<Value> =
+            serde_json::from_str(firing.transforms_json.as_deref().unwrap_or("[]"))
+                .unwrap_or_default();
+        for entry in history {
+            let Some(answers) = entry.get("answers").and_then(Value::as_object) else {
+                continue;
+            };
+            let questions = entry
+                .get("asked")
+                .and_then(|a| a.get("questions"))
+                .and_then(Value::as_array);
+            for question in answers.keys().filter(|name| {
+                questions.is_some_and(|questions| {
+                    questions.iter().any(|question| {
+                        question.get("name").and_then(Value::as_str) == Some(name.as_str())
+                            && routing_question(question)
+                    })
+                })
+            }) {
+                let Some(decision) = decision_from_entry(&entry, &firing.route_id, question) else {
+                    continue;
+                };
+                if !found.iter().any(|d: &ThreadDecision| {
+                    d.route_id == decision.route_id
+                        && d.decision_node == decision.decision_node
+                        && d.question == decision.question
+                }) {
+                    found.push(decision);
+                }
+            }
+        }
+    }
+    found
 }
 
 /// The threads the route delivered `firings` to, in journal order.
@@ -230,6 +231,10 @@ pub(crate) fn delivered_threads(firings: &[RouteFiringRecord]) -> Vec<String> {
             continue;
         }
         if let Some(sink) = firing.sink_ref.as_deref() {
+            if !matches!(parse_uri(sink), Some(CairnResource::Thread { path, .. }) if path.is_empty())
+            {
+                continue;
+            }
             let thread = cairn_uri::canonicalize_uri_identity(sink);
             if !threads.contains(&thread) {
                 threads.push(thread);
@@ -244,71 +249,230 @@ pub(crate) fn event_at(fact: &FactRow) -> i64 {
     fact.minted_at / 1000
 }
 
-/// The rows one ambient fact's outcome produces: one per delivered thread when
+/// The rows one dispatched fact's outcome produces: one per delivered thread when
 /// admitted, otherwise one recipient-less row; a fact whose firings are gone
-/// yields one `unrecorded` row with no features.
+/// is counted as unrecorded without inventing a route identity.
 pub(crate) fn outcome_rows(
     project_key: &str,
     fact: &FactRow,
     firings: &[RouteFiringRecord],
     now: i64,
-) -> Vec<NewAmbientFeedback> {
-    let row = |recipient: Option<String>, decision: Option<&ThreadDecision>, source: &str| {
-        NewAmbientFeedback {
-            project_key: project_key.to_string(),
-            event_id: fact.id,
-            recipient_thread: recipient,
-            outcome: decision.map_or_else(|| OUTCOME_UNRECORDED.to_string(), |d| d.outcome.clone()),
-            pick: decision.and_then(|d| d.pick.clone()),
-            probability: decision.and_then(|d| d.probability),
-            measured_by: decision.and_then(|d| d.measured_by.clone()),
-            revision: decision.and_then(|d| d.revision.clone()),
-            picks_json: decision.map(|d| serde_json::to_string(&d.picks).unwrap_or_default()),
-            addresses_from: source.to_string(),
-            event_at: event_at(fact),
-            swept_at: now,
+) -> Vec<NewRouteFeedback> {
+    let row = |recipient, decision: &ThreadDecision| NewRouteFeedback {
+        project_key: project_key.to_string(),
+        event_id: fact.id,
+        route_id: decision.route_id.clone(),
+        decision_node: decision.decision_node.clone(),
+        question: decision.question.clone(),
+        question_text: decision.question_text.clone(),
+        source: fact.source.clone(),
+        recipient_thread: recipient,
+        outcome: decision.outcome.clone(),
+        pick: decision.pick.clone(),
+        probability: decision.probability,
+        measured_by: decision.measured_by.clone(),
+        revision: decision.revision.clone(),
+        picks_json: Some(serde_json::to_string(&decision.picks).unwrap_or_default()),
+        addresses_from: addresses_from::FIRINGS.to_string(),
+        event_at: event_at(fact),
+        swept_at: now,
+    };
+    let recorded = decisions(firings);
+    let mut rows = Vec::new();
+    for decision in &recorded {
+        let recipients = delivered_threads(firings)
+            .into_iter()
+            .filter(|recipient| {
+                decision
+                    .addresses
+                    .iter()
+                    .any(|address| cairn_uri::canonicalize_uri_identity(address) == *recipient)
+                    && firings.iter().any(|f| {
+                        f.route_id == decision.route_id
+                            && decisions(std::slice::from_ref(f)).iter().any(|d| {
+                                d.decision_node == decision.decision_node
+                                    && d.question == decision.question
+                            })
+                            && f.status == "fired"
+                            && f.sink_kind == "message"
+                            && f.sink_ref.as_deref().is_some_and(|sink| {
+                                cairn_uri::canonicalize_uri_identity(sink) == *recipient
+                            })
+                    })
+            })
+            .collect::<Vec<_>>();
+        if recipients.is_empty() || decision.outcome != "admitted" {
+            rows.push(row(None, decision));
+        } else {
+            rows.extend(
+                recipients
+                    .into_iter()
+                    .map(|recipient| row(Some(recipient), decision)),
+            );
         }
+    }
+    rows
+}
+
+fn rows_for(
+    project: &str,
+    fact: &FactRow,
+    firings: &[RouteFiringRecord],
+    routes: &super::index::RouteSet,
+    now: i64,
+) -> Vec<NewRouteFeedback> {
+    let mut rows = outcome_rows(project, fact, firings, now);
+    if rows.iter().any(|r| r.question_text.is_none()) {
+        for row in &mut rows {
+            if row.question_text.is_some() {
+                continue;
+            }
+            // Old journal entries may lack instructions. The current definition
+            // is an explicitly approximate snapshot, not historical evidence.
+            if let Some(route) = routes
+                .routes_for(&fact.source)
+                .find(|r| r.id == row.route_id)
+            {
+                if let Some(node) = route
+                    .definition
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == row.decision_node)
+                {
+                    if let super::RouteNodeConfig::Decision { decision, .. } = &node.config {
+                        row.question_text = serde_json::to_value(decision).ok().and_then(|value| {
+                            value
+                                .get("questions")
+                                .and_then(Value::as_array)
+                                .and_then(|qs| {
+                                    qs.iter().find(|q| {
+                                        q.get("name").and_then(Value::as_str)
+                                            == Some(row.question.as_str())
+                                    })
+                                })
+                                .and_then(|q| q.get("instructions"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        });
+                    }
+                }
+            }
+        }
+    }
+    rows
+}
+
+fn has_thread_sink(definition: &super::RouteDefinition) -> bool {
+    definition.nodes.iter().any(|node| matches!(&node.config,
+        super::RouteNodeConfig::Sink { sink: super::RouteSink::Message { target, .. } }
+        if match target {
+            super::Bindable::Fixed(uri) => matches!(parse_uri(uri), Some(CairnResource::Thread { path, .. }) if path.is_empty()),
+            super::Bindable::Bound(_) => true,
+        }))
+}
+
+async fn current_routes(
+    orch: &Orchestrator,
+    fact: &FactRow,
+    now: i64,
+) -> Result<std::sync::Arc<super::index::RouteSet>, String> {
+    let path = super::worker::project_path(orch, fact.project_id.as_deref()).await;
+    orch.fact_log
+        .index
+        .routes(&orch.config_dir, path.as_deref(), now)
+}
+
+fn feedback_firings(
+    mut firings: Vec<RouteFiringRecord>,
+    fact: &FactRow,
+    routes: &super::index::RouteSet,
+) -> Vec<RouteFiringRecord> {
+    let eligible: Vec<_> = firings
+        .iter()
+        .filter(|firing| {
+            if !delivered_threads(std::slice::from_ref(firing)).is_empty() {
+                return true;
+            }
+            match routes
+                .routes_for(&fact.source)
+                .find(|route| route.id == firing.route_id)
+            {
+                Some(route) => has_thread_sink(&route.definition),
+                None => false,
+            }
+        })
+        .map(|f| f.route_id.clone())
+        .collect();
+    firings.retain(|f| eligible.contains(&f.route_id));
+    firings
+}
+
+/// With the bounded journal gone, current route matching is only an estimate;
+/// it never supplies a fabricated historical route/node identity.
+async fn missing_decision_history(
+    orch: &Orchestrator,
+    fact: &FactRow,
+    routes: &super::index::RouteSet,
+    registry: &super::FactRegistry,
+) -> Result<bool, String> {
+    let clauses: Vec<_> = routes
+        .routes_for(&fact.source)
+        .filter(|route| {
+            has_thread_sink(&route.definition)
+                && route
+                    .definition
+                    .nodes
+                    .iter()
+                    .any(|n| n.config.is_decision())
+        })
+        .flat_map(|route| route.definition.triggers())
+        .collect();
+    if clauses.is_empty() {
+        return Ok(false);
+    }
+    let needs_content = registry
+        .source(&fact.source)
+        .is_some_and(|spec| super::log::clauses_need_hydration(spec, clauses.iter().copied()));
+    let stored = super::log::stored_fact(fact)?;
+    let fields = if needs_content {
+        match super::log::hydrate(orch, fact).await {
+            Ok(hydrated) => hydrated.fact.fields,
+            Err(error) => {
+                log::info!("route feedback: cannot estimate missing history for fact {} source {}: {error}", fact.id, fact.source);
+                return Ok(false);
+            }
+        }
+    } else {
+        stored.fields
     };
-    let Some(decision) = thread_decision(firings) else {
-        return vec![row(None, None, addresses_from::NONE)];
+    let candidate = super::Fact {
+        source: &fact.source,
+        fields: &fields,
+        presence: if fact.presence == "active" {
+            super::Presence::Active
+        } else {
+            super::Presence::Away
+        },
     };
-    if decision.outcome != "admitted" {
-        return vec![row(None, Some(&decision), addresses_from::FIRINGS)];
-    }
-    let mut recipients = delivered_threads(firings);
-    if recipients.is_empty() {
-        recipients = decision
-            .addresses
-            .iter()
-            .map(|address| cairn_uri::canonicalize_uri_identity(address))
-            .collect();
-    }
-    if recipients.is_empty() {
-        return vec![row(None, Some(&decision), addresses_from::FIRINGS)];
-    }
-    recipients
+    Ok(clauses
         .into_iter()
-        .map(|recipient| row(Some(recipient), Some(&decision), addresses_from::FIRINGS))
-        .collect()
+        .any(|clause| super::matches(std::slice::from_ref(clause), &candidate)))
 }
 
 async fn sweep_outcomes(orch: &Orchestrator, now: i64) -> Result<SweepReport, String> {
+    let registry = super::FactRegistry::default();
     let local = &orch.db.local;
     let mut report = SweepReport::default();
     let mut cursor = feedback::sweep_cursor(local)
         .await
         .map_err(|error| error.to_string())?;
     loop {
-        let facts = crate::storage::list_facts_after(local, SOURCE, cursor, BATCH)
+        let facts = crate::storage::list_all_facts_after(local, cursor, BATCH)
             .await
             .map_err(|error| error.to_string())?;
         let mut rows = Vec::new();
         let mut advanced = cursor;
         for fact in &facts {
-            if !is_ambient_discord(fact) {
-                advanced = fact.id;
-                continue;
-            }
             match fact.route_state.as_str() {
                 route_state::PENDING | route_state::QUEUED | route_state::RUNNING => {
                     report.held_at = Some(fact.id);
@@ -321,8 +485,15 @@ async fn sweep_outcomes(orch: &Orchestrator, now: i64) -> Result<SweepReport, St
                 }
                 _ => {}
             }
-            let firings = ambient_firings(local, fact.id).await?;
-            if firings.is_empty() && now - event_at(fact) < SETTLE_SECONDS {
+            let raw = crate::storage::list_firings_for_fact(local, fact.id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let raw_missing = raw.is_empty();
+            let routes = current_routes(orch, fact, now).await?;
+            let firings = feedback_firings(raw, fact, &routes);
+            let missing =
+                raw_missing && missing_decision_history(orch, fact, &routes, &registry).await?;
+            if missing && now - event_at(fact) < SETTLE_SECONDS {
                 report.held_at = Some(fact.id);
                 break;
             }
@@ -330,15 +501,9 @@ async fn sweep_outcomes(orch: &Orchestrator, now: i64) -> Result<SweepReport, St
                 advanced = fact.id;
                 continue;
             };
-            let produced = outcome_rows(&project_key, fact, &firings, now);
-            if produced
-                .iter()
-                .any(|row| row.addresses_from == addresses_from::NONE)
-            {
-                log::info!(
-                    "ambient feedback: fact {} reached after its firings were evicted; recorded as unrecorded",
-                    fact.id
-                );
+            let produced = rows_for(&project_key, fact, &firings, &routes, now);
+            if missing {
+                log::info!("route feedback: fact {} source {} has no surviving decision journal; counted unrecorded without fabricating route identity", fact.id, fact.source);
                 report.unrecorded += 1;
             }
             rows.extend(produced);
@@ -553,7 +718,7 @@ async fn citing_threads(
     db: &LocalDb,
     project_id: &str,
     project_key: &str,
-    row: &AmbientFeedbackRow,
+    row: &RouteFeedbackRow,
 ) -> Result<Vec<String>, String> {
     let window = (row.event_at, row.event_at + ENGAGEMENT_HORIZON_SECONDS);
     let mut threads = Vec::new();
@@ -574,51 +739,12 @@ async fn citing_threads(
     Ok(threads)
 }
 
-/// Whether `thread_uri` sent agent text to the event's conversation within the
-/// horizon. Only `message`-kind rows qualify: a `route`-kind row is authored
-/// by a route rather than a thread, so the issue's "agent text or route" sends
-/// reduce to agent text.
-async fn sent_to_conversation(
-    local: &LocalDb,
-    row: &AmbientFeedbackRow,
-    thread_uri: &str,
-) -> Result<bool, String> {
-    let Some(fact) = crate::storage::get_fact(local, row.event_id)
-        .await
-        .map_err(|error| error.to_string())?
-    else {
-        return Ok(false);
-    };
-    let Some(conversation) = conversation_of(&fact) else {
-        return Ok(false);
-    };
-    let from_ms = row.event_at * 1000;
-    let to_ms = (row.event_at + ENGAGEMENT_HORIZON_SECONDS) * 1000;
-    let refs = local
-        .query_all(
-            "SELECT binding_ref FROM channel_outbound WHERE conversation = ?1 AND kind = ?2 AND created_at BETWEEN ?3 AND ?4",
-            (
-                conversation,
-                crate::channels::agent_message::KIND.to_string(),
-                from_ms,
-                to_ms,
-            ),
-            |row| row.text(0),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    let thread_uri = cairn_uri::canonicalize_uri_identity(thread_uri);
-    Ok(refs.iter().any(|binding_ref| {
-        crate::channels::agent_message::sender_home(binding_ref)
-            .is_some_and(|home| cairn_uri::canonicalize_uri_identity(home) == thread_uri)
-    }))
-}
-
 async fn check_engagement(orch: &Orchestrator, now: i64) -> Result<u64, String> {
     let local = &orch.db.local;
     let due = feedback::pending_engagement(local, now - ENGAGEMENT_HORIZON_SECONDS, BATCH)
         .await
         .map_err(|error| error.to_string())?;
+    let registry = super::FactRegistry::default();
     let mut projects: HashMap<String, Option<String>> = HashMap::new();
     let mut checked = 0;
     for row in due {
@@ -642,7 +768,26 @@ async fn check_engagement(orch: &Orchestrator, now: i64) -> Result<u64, String> 
                         let recipient_id =
                             thread_id_for_uri(&db, &project_id, &row.project_key, recipient).await;
                         let cited = recipient_id.as_ref().is_some_and(|id| citing.contains(id));
-                        let engaged = cited || sent_to_conversation(local, &row, recipient).await?;
+                        let mut engaged = cited;
+                        if !engaged {
+                            if let Some(fact) = crate::storage::get_fact(local, row.event_id)
+                                .await
+                                .map_err(|e| e.to_string())?
+                            {
+                                if let Some(spec) = registry.source(&fact.source) {
+                                    for signal in spec.engagement_signals {
+                                        engaged |= signal(
+                                            local,
+                                            &fact,
+                                            recipient,
+                                            row.event_at,
+                                            row.event_at + ENGAGEMENT_HORIZON_SECONDS,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
+                        }
                         (engaged, None)
                     }
                     None => match citing.first() {
@@ -699,7 +844,7 @@ impl Labeller {
 
 /// A feedback write that speaks for no run and carries no operator credential:
 /// nothing proves who sent it, so it labels nothing.
-const RUN_LESS_LABEL_REFUSAL: &str = "Refused: this request speaks for no run and carries no operator credential, so it cannot label an ambient routing. A chartered thread labels its own routings; the operator labels them from the desktop.";
+const RUN_LESS_LABEL_REFUSAL: &str = "Refused: this request speaks for no run and carries no operator credential, so it cannot label a decision routing. A chartered thread labels its own routings; the operator labels them from the desktop.";
 
 /// The labeller of a feedback write. The verified desktop operator (the
 /// channels door's stamp) labels as the operator; otherwise the write must
@@ -723,7 +868,7 @@ pub(crate) async fn labeller(
     let agent = crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
         .await
         .map_err(|error| {
-            format!("Only a chartered thread or the operator can label an ambient routing, and this write's run could not be resolved: {error}")
+            format!("Only a chartered thread or the operator can label a decision routing, and this write's run could not be resolved: {error}")
         })?;
     match parse_uri(&agent.home) {
         Some(CairnResource::Thread { project, path, .. }) if path.is_empty() => {
@@ -733,7 +878,7 @@ pub(crate) async fn labeller(
             })
         }
         _ => Err(format!(
-            "Only a chartered thread can label an ambient routing; this write came from {}, which is a task or node, not a thread.",
+            "Only a chartered thread can label a decision routing; this write came from {}, which is a task or node, not a thread.",
             agent.home
         )),
     }
@@ -807,7 +952,10 @@ fn event_id(event: &Value) -> Result<(i64, Option<String>), String> {
             }
             match parse_uri(text) {
                 Some(CairnResource::ProjectEvent { project, id }) => Ok((id, Some(project))),
-                Some(CairnResource::WorkspaceEvent { id }) => Ok((id, None)),
+                Some(CairnResource::WorkspaceEvent { .. }) => Err(
+                    "Project-less event URIs cannot be labelled: feedback requires a project."
+                        .into(),
+                ),
                 _ => Err(refused()),
             }
         }
@@ -815,9 +963,10 @@ fn event_id(event: &Value) -> Result<(i64, Option<String>), String> {
     }
 }
 
-/// The ambient fact a label names, and its project.
+/// The dispatched fact a label names, and its project.
 async fn labelled_fact(
     orch: &Orchestrator,
+    project: &str,
     labeller: &Labeller,
     event: &Value,
 ) -> Result<(FactRow, String), String> {
@@ -830,17 +979,16 @@ async fn labelled_fact(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("{uri_named} is not in this runner's event log."))?;
-    if !is_ambient_discord(&fact) {
-        return Err(format!(
-            "{uri_named} is a {} event, not an unaddressed message in an ambient Discord conversation; only ambient routings can be labelled.",
-            fact.source
-        ));
-    }
     let project_key = crate::routes::project_key(orch, &fact)
         .await
         .ok_or_else(|| {
             format!("{uri_named} belongs to no project, so it has no routing to label.")
         })?;
+    if !project.eq_ignore_ascii_case(&project_key) {
+        return Err(format!(
+            "Event {id} belongs to project {project_key}, not writer project {project}."
+        ));
+    }
     if let Some(named) = named_project.filter(|named| !named.eq_ignore_ascii_case(&project_key)) {
         return Err(format!(
             "{uri_named} names project {named}, but event {id} belongs to project {project_key}."
@@ -855,6 +1003,15 @@ async fn labelled_fact(
                 "Event {id} belongs to project {project_key}; a thread of project {own} cannot label it."
             ));
         }
+    }
+    if !matches!(
+        fact.route_state.as_str(),
+        route_state::DONE | route_state::FAILED | route_state::INTERRUPTED
+    ) {
+        return Err(format!(
+            "{uri_named} was not dispatched by a decision route (state {}).",
+            fact.route_state
+        ));
     }
     Ok((fact, project_key))
 }
@@ -906,8 +1063,13 @@ async fn reroute_target(
 
 /// The citation form a re-route header repeats: the firing's own citations,
 /// or, once those are evicted, the row's snapshot in the same shape.
-fn original_citations(firings: &[RouteFiringRecord], row: &AmbientFeedbackRow) -> String {
-    if let Some(decision) = thread_decision(firings).filter(|d| !d.citations.is_empty()) {
+fn original_citations(firings: &[RouteFiringRecord], row: &RouteFeedbackRow) -> String {
+    if let Some(decision) = decisions(firings).into_iter().find(|d| {
+        d.route_id == row.route_id
+            && d.decision_node == row.decision_node
+            && d.question == row.question
+            && !d.citations.is_empty()
+    }) {
         return decision.citations.join(", ");
     }
     format!(
@@ -928,14 +1090,15 @@ fn original_citations(firings: &[RouteFiringRecord], row: &AmbientFeedbackRow) -
 pub(crate) async fn apply_label(
     orch: &Orchestrator,
     request: &crate::mcp::types::McpCallbackRequest,
+    project: &str,
     labeller: &Labeller,
     payload: &LabelPayload,
     dry_run: bool,
 ) -> Result<String, String> {
     let local = &orch.db.local;
     let now = orch.services.clock.now();
-    let (fact, project_key) = labelled_fact(orch, labeller, &payload.event).await?;
-    let event = crate::routes::fact_row_uri(Some(&project_key), fact.id);
+    let (fact, project_key) = labelled_fact(orch, project, labeller, &payload.event).await?;
+    let event = super::fact_row_uri(Some(&project_key), fact.id);
     let db = orch.db.for_project(&project_key).await;
     let project_id = project_id(&db, &project_key)
         .await?
@@ -944,144 +1107,139 @@ pub(crate) async fn apply_label(
         Some(to) => Some(reroute_target(&db, &project_id, &project_key, to, labeller).await?),
         None => None,
     };
-    let firings = ambient_firings(local, fact.id).await?;
-
-    // The labeller's own delivered row: swept already, or created now from a
-    // surviving firing that names it.
-    let mut own = None;
-    if let Some(uri) = labeller.thread_uri() {
-        own = feedback::find(local, &project_key, fact.id, Some(uri))
-            .await
-            .map_err(|error| error.to_string())?;
-        if own.is_none() && !dry_run && delivered_threads(&firings).iter().any(|t| t == uri) {
-            if let Some(row) = outcome_rows(&project_key, &fact, &firings, now)
-                .into_iter()
-                .find(|row| row.recipient_thread.as_deref() == Some(uri))
-            {
-                own = Some(
-                    feedback::ensure(local, row)
-                        .await
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-        }
-    }
-    let own_delivery = own.is_some()
-        || labeller
-            .thread_uri()
-            .is_some_and(|uri| delivered_threads(&firings).iter().any(|t| t == uri));
-    if !own_delivery && payload.verdict == "not_mine" {
+    let raw = crate::storage::list_firings_for_fact(local, fact.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let routes = current_routes(orch, &fact, now).await?;
+    let firings = feedback_firings(raw, &fact, &routes);
+    let existing = feedback::list(
+        local,
+        &feedback::RouteFeedbackFilter {
+            project_key: Some(project_key.clone()),
+            event_id: Some(fact.id),
+            ..Default::default()
+        },
+        i64::MAX,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let produced = rows_for(&project_key, &fact, &firings, &routes, now);
+    if decisions(&firings).is_empty() && existing.is_empty() {
         return Err(format!(
-            "Nothing to disown: {event} was not delivered to {}, so not_mine has no delivery to label. To record where it ended up, write verdict reroute with to naming the thread that handled it.",
-            labeller.thread_uri().unwrap_or("the operator")
+            "{event} has no dispatched decision routing to label."
         ));
     }
-    let side = if own_delivery {
-        labeller.thread_uri().unwrap_or_default().to_string()
+    let own_delivery = labeller.thread_uri().is_some_and(|uri| {
+        existing
+            .iter()
+            .any(|r| r.recipient_thread.as_deref() == Some(uri))
+            || produced
+                .iter()
+                .any(|r| r.recipient_thread.as_deref() == Some(uri))
+    });
+    if !own_delivery && payload.verdict == "not_mine" {
+        return Err(format!("Nothing to disown: {event} was not delivered to {}, so not_mine has no delivery to label. To record where it ended up, write verdict reroute with to naming the thread that handled it.", labeller.thread_uri().unwrap_or("the operator")));
+    }
+    let recipient = if own_delivery {
+        labeller.thread_uri()
     } else {
-        "the refused side".to_string()
+        None
     };
-    let to_text = target
-        .as_ref()
-        .map(|(_, uri)| format!(" → {uri}"))
-        .unwrap_or_default();
+    let side = recipient.unwrap_or("the refused side");
+    let mut selected: Vec<_> = existing
+        .iter()
+        .filter(|r| r.recipient_thread.as_deref() == recipient)
+        .cloned()
+        .collect();
     let delivers = own_delivery
         && target.as_ref().is_some_and(|(_, uri)| {
-            own.as_ref().and_then(|row| row.reroute_to.as_deref()) != Some(uri.as_str())
+            !selected
+                .iter()
+                .any(|r| r.reroute_to.as_deref() == Some(uri))
         });
     if dry_run {
-        let delivery = match (&target, delivers) {
-            (Some((_, uri)), true) => format!("; would deliver the original message to {uri}"),
-            _ => String::new(),
-        };
         return Ok(format!(
-            "Would label {event} for {side}: {}{to_text}{delivery}.",
-            payload.verdict
+            "Would label {event} for {side}: {}{}.",
+            payload.verdict,
+            if delivers {
+                "; would deliver the original message"
+            } else {
+                ""
+            }
         ));
     }
-
-    let row = match own {
-        Some(row) => row,
-        None => match feedback::find(local, &project_key, fact.id, None)
+    for mut row in produced {
+        if !own_delivery {
+            row.recipient_thread = None;
+        }
+        if row.recipient_thread.as_deref() != recipient {
+            continue;
+        }
+        let stored = feedback::ensure(local, row)
             .await
-            .map_err(|error| error.to_string())?
-        {
-            Some(row) => row,
-            None => {
-                let decision = thread_decision(&firings);
-                let swept = feedback::sweep_cursor(local)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    >= fact.id;
-                let source = match (&decision, swept) {
-                    (Some(_), _) => addresses_from::FIRINGS,
-                    (None, true) => addresses_from::NONE,
-                    (None, false) => addresses_from::LABEL,
-                };
-                feedback::ensure(
-                    local,
-                    NewAmbientFeedback {
-                        project_key: project_key.clone(),
-                        event_id: fact.id,
-                        recipient_thread: None,
-                        outcome: decision
-                            .as_ref()
-                            .map_or_else(|| OUTCOME_UNRECORDED.to_string(), |d| d.outcome.clone()),
-                        pick: decision.as_ref().and_then(|d| d.pick.clone()),
-                        probability: decision.as_ref().and_then(|d| d.probability),
-                        measured_by: decision.as_ref().and_then(|d| d.measured_by.clone()),
-                        revision: decision.as_ref().and_then(|d| d.revision.clone()),
-                        picks_json: decision
-                            .as_ref()
-                            .map(|d| serde_json::to_string(&d.picks).unwrap_or_default()),
-                        addresses_from: source.to_string(),
-                        event_at: event_at(&fact),
-                        swept_at: now,
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            }
-        },
-    };
-
-    let mut delivered = String::new();
-    if delivers {
-        if let (Some((target_id, target_uri)), Some(from)) = (&target, labeller.thread_uri()) {
-            let text = match fact.record_id.as_deref() {
-                Some(record) => crate::channels::ledger::get_inbound(local, record)
-                    .await?
-                    .map(|inbound| inbound.text),
-                None => None,
-            };
-            match text {
-                Some(text) => {
-                    let body = format!(
-                        "Re-routed from {from} (event {event}): originally Decision: {}\n\n{text}",
-                        original_citations(&firings, &row)
-                    );
-                    crate::mcp::handlers::messages::append_thread_message(
-                        orch,
-                        request,
-                        &project_key,
-                        target_id,
-                        &body,
-                    )
-                    .await?;
-                    delivered = format!(" Delivered the original message to {target_uri}.");
-                }
-                None => {
-                    delivered = format!(
-                        " The original message is no longer in the inbound ledger, so nothing was delivered to {target_uri}."
-                    )
-                }
+            .map_err(|e| e.to_string())?;
+        if !selected.iter().any(|r| r.id == stored.id) {
+            selected.push(stored);
+        }
+    }
+    if !own_delivery {
+        for retained in &existing {
+            let row = feedback::ensure(
+                local,
+                NewRouteFeedback {
+                    project_key: retained.project_key.clone(),
+                    event_id: retained.event_id,
+                    route_id: retained.route_id.clone(),
+                    decision_node: retained.decision_node.clone(),
+                    question: retained.question.clone(),
+                    question_text: retained.question_text.clone(),
+                    source: retained.source.clone(),
+                    recipient_thread: None,
+                    outcome: retained.outcome.clone(),
+                    pick: retained.pick.clone(),
+                    probability: retained.probability,
+                    measured_by: retained.measured_by.clone(),
+                    revision: retained.revision.clone(),
+                    picks_json: retained.picks_json.clone(),
+                    addresses_from: retained.addresses_from.clone(),
+                    event_at: retained.event_at,
+                    swept_at: now,
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            if !selected.iter().any(|r| r.id == row.id) {
+                selected.push(row);
             }
         }
     }
-    feedback::set_label(
+    if selected.is_empty() {
+        return Err(format!(
+            "{event} has no surviving decision snapshot to label."
+        ));
+    }
+    let mut delivered = String::new();
+    if delivers {
+        if let (Some((target_id, target_uri)), Some(from), Some(row)) =
+            (&target, labeller.thread_uri(), selected.first())
+        {
+            match super::log::hydrate(orch, &fact).await {
+                Ok(hydrated) => {
+                    let text = hydrated.fact.fields.get("text").or_else(|| hydrated.fact.fields.get("body"))
+                        .and_then(Value::as_str).map(str::to_owned)
+                        .or(hydrated.fact.summary).unwrap_or_else(|| fact.record_ref.clone());
+                    let body = format!("Re-routed from {from} (event {event}): originally Decision: {}\n\n{text}", original_citations(&firings, row));
+                    crate::mcp::handlers::messages::append_thread_message(orch, request, &project_key, target_id, &body).await?;
+                    delivered = format!(" Delivered the original message to {target_uri}.");
+                }
+                Err(error) => delivered = format!(" The original record could not be hydrated ({error}), so nothing was delivered to {target_uri}."),
+            }
+        }
+    }
+    feedback::set_labels(
         local,
-        row.id,
-        feedback::AmbientLabel {
+        selected.iter().map(|row| row.id).collect(),
+        feedback::RouteLabel {
             verdict: payload.verdict.clone(),
             reroute_to: target.as_ref().map(|(_, uri)| uri.clone()),
             note: payload.note.clone(),
@@ -1090,13 +1248,13 @@ pub(crate) async fn apply_label(
         },
     )
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(|e| e.to_string())?;
     Ok(format!(
-        "Labelled {event} for {side}: {}{to_text}.{delivered}",
+        "Labelled {event} for {side}: {}.{delivered}",
         payload.verdict
     ))
 }
 
 #[cfg(test)]
-#[path = "ambient_feedback_tests.rs"]
+#[path = "feedback_tests.rs"]
 mod tests;

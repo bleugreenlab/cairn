@@ -45,7 +45,7 @@ const ROW_KEYS: &[ProjectionSpec] = &[ProjectionSpec {
 
 const LIST_DESCRIPTION: &str = "Every minted route fact, newest first: what it pointed at, which threads it woke, and what its routes did";
 const ROW_DESCRIPTION: &str =
-    "One fact log row: its stored fields, the record it points at, its wakes, and its route firings";
+    "One fact log row: its stored fields, the record it points at, its wakes, its route firings, and its decision-route feedback";
 
 const fn list(kind: ResourceKind, uri: &'static str, name: &'static str) -> ResourceContract {
     ResourceContract {
@@ -186,3 +186,41 @@ pub(crate) const WORKSPACE_EVENT_CONTRACT: ResourceContract = row(
     "cairn://routes/events/{id}",
     "Workspace event",
 );
+
+const FEEDBACK_EVENT: KeySpec = KeySpec::new(
+    "event",
+    KeyType::Any,
+    "the event URI the delivered message cites (cairn://p/{project}/events/{id}), or its id",
+);
+const FEEDBACK_VERDICT: KeySpec = KeySpec::new("verdict", KeyType::Str, "not_mine | reroute");
+const FEEDBACK_TO: KeySpec = KeySpec::new(
+    "to",
+    KeyType::Str,
+    "the chartered thread URI that owns it; required for reroute, refused for not_mine",
+);
+const FEEDBACK_NOTE: KeySpec = KeySpec::new("note", KeyType::Str, "");
+pub(crate) const PROJECT_EVENT_FEEDBACK_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectEventFeedback,
+    uri_template: "cairn://p/{project}/events/feedback",
+    name: "Decision-route feedback",
+    description: "The project's decision-route label set: one row per routing outcome, swept from the event log every five minutes. Each address-bearing decision question has one row per thread it was delivered to. A recipient-NULL row means no recipient, not necessarily refusal: it also records an admitted question whose selected deliveries were all non-fired, or a non-recipient's label on an admitted event. Read outcome to distinguish refusal from undelivered admission. Historical rows without a decision snapshot read `unrecorded`. When firing history has been evicted, the sweep estimates unrecorded events matching current eligible decision routes without inventing a route or decision-node row. Each row snapshots the pick, probability, method, charter revision and admitted picks, beside the label and the passive engagement the sweep records 48 hours after the event (engaged when the recipient cited the event or met an engagement signal declared by its source; on a refused-side row, engaged_by names the first thread that cited it). Append {event, verdict} to label a delivery: the labeller is the writing thread, never the payload, and only a chartered thread or the operator may write. `not_mine` disowns a delivery on the writer's own row. `reroute` with `to` names the thread that owns it: on the recipient's own row it also delivers the original message once to that thread's messages; from anyone else it records where the event ended up on the refused-side row and delivers nothing. Only project-owned events dispatched by a decision route accept labels; project-less events are refused. Rerouting sends nothing off-box.",
+    read_projections: &[
+        ProjectionSpec { key: "route", values: "route id" },
+        ProjectionSpec { key: "source", values: "fact source" },
+        ProjectionSpec { key: "since", values: "epoch seconds; events at or after" },
+        ProjectionSpec { key: "limit", values: "N rows (default 50, max 500)" },
+        ProjectionSpec { key: "verdict", values: "not_mine | reroute" },
+        ProjectionSpec { key: "outcome", values: "admitted | below_threshold | refused | unanswerable | failed | unrecorded" },
+        ProjectionSpec { key: "thread", values: "thread URI; rows delivered or re-routed to it" },
+        ProjectionSpec { key: "engaged", values: "true | false | unchecked" },
+    ],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Append,
+        required: &[FEEDBACK_EVENT, FEEDBACK_VERDICT],
+        optional: &[FEEDBACK_TO, FEEDBACK_NOTE],
+        label: "label a decision routing",
+        example: "write({changes:[{target:\"cairn://p/PROJECT/events/feedback\",mode:\"append\",payload:{event:\"cairn://p/PROJECT/events/ID\",verdict:\"reroute\",to:\"cairn://p/PROJECT/THREAD\"}}]})",
+    }],
+};

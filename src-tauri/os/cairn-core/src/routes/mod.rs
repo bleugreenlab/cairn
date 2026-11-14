@@ -3,6 +3,7 @@
 pub mod decision;
 mod definition;
 mod dispatcher;
+pub mod feedback;
 mod graph;
 mod index;
 mod lifecycle;
@@ -29,9 +30,10 @@ pub use log::{mint, spawn_mint, spawn_mint_deferred, Mint, MintOwned};
 pub(crate) use mentions::structural_mentions;
 pub(crate) use predicate::value_matches;
 pub use predicate::{
-    clause_value_problem, explain_clause, matches, AddressKind, Fact, FactFieldShape, FactRegistry,
-    FactSourceShape, FactSurface, FieldKind, FieldSpec, FieldVocabulary, LogDedupe, Presence,
-    SourceSpec, TriggerClause, ANSWERS_PREFIX, COMPARISON_OPERATORS, EVENT_FIELD,
+    clause_value_problem, explain_clause, matches, AddressKind, EngagementSignal, Fact,
+    FactFieldShape, FactRegistry, FactSourceShape, FactSurface, FieldKind, FieldSpec,
+    FieldVocabulary, LogDedupe, Presence, SourceSpec, TriggerClause, ANSWERS_PREFIX,
+    COMPARISON_OPERATORS, EVENT_FIELD,
 };
 pub use references::validate_references;
 pub(crate) use worker::{

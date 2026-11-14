@@ -3043,14 +3043,14 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "fact_log_wakes",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
-    // The ambient route's label set is swept from this runner's fact log and
+    // The decision routes' label set is swept from this runner's fact log and
     // firing journal, and sits beside them for the same reason.
     (
-        "ambient_routing_feedback",
+        "route_decision_feedback",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
-        "ambient_routing_feedback_cursor",
+        "route_decision_feedback_cursor",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
@@ -7234,6 +7234,88 @@ mod camps_conversations_migration_tests {
                 "{index} exists"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn decision_feedback_preserves_seeded_ambient_labels_and_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("decision-feedback.turso.db"))
+            .await
+            .unwrap();
+        let name = "route_decision_feedback";
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != name)
+            .copied()
+            .collect::<Vec<_>>();
+        let target = TURSO_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name() == name)
+            .copied()
+            .expect("feedback migration");
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "INSERT INTO ambient_routing_feedback
+             (id,project_key,event_id,recipient_thread,outcome,pick,probability,measured_by,revision,picks_json,addresses_from,verdict,reroute_to,note,labelled_by,first_labelled_at,labelled_at,engaged,engaged_by,engagement_checked_at,event_at,swept_at)
+             VALUES (41,'cairn',7,'cairn://p/cairn/devops','admitted','devops',0.9,'native','rev','[]','firings','reroute','cairn://p/cairn/docs','note','operator',10,20,1,'cairn://p/cairn/docs',30,1,2),
+                    (42,'cairn',8,NULL,'below_threshold',NULL,NULL,NULL,NULL,NULL,'none',NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,31,3,4);
+             INSERT INTO ambient_routing_feedback_cursor VALUES (1,99);"
+        ).await.unwrap();
+        MigrationRunner::new(vec![target]).run(&db).await.unwrap();
+        let row = super::super::route_feedback::get(&db, 41)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                row.route_id.as_str(),
+                row.decision_node.as_str(),
+                row.question.as_str(),
+                row.source.as_str()
+            ),
+            ("ambient-channel", "pick", "thread", "channel_message")
+        );
+        assert_eq!(
+            (
+                row.event_id,
+                row.probability,
+                row.first_labelled_at,
+                row.labelled_at,
+                row.engaged,
+                row.engagement_checked_at
+            ),
+            (7, Some(0.9), Some(10), Some(20), Some(true), Some(30))
+        );
+        assert_eq!(
+            (
+                row.verdict.as_deref(),
+                row.note.as_deref(),
+                row.revision.as_deref(),
+                row.reroute_to.as_deref(),
+                row.labelled_by.as_deref()
+            ),
+            (
+                Some("reroute"),
+                Some("note"),
+                Some("rev"),
+                Some("cairn://p/cairn/docs"),
+                Some("operator")
+            )
+        );
+        let refused = super::super::route_feedback::get(&db, 42)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refused.question_text, None);
+        assert_eq!(refused.recipient_thread, None);
+        assert_eq!(refused.outcome, "below_threshold");
+        assert_eq!(
+            super::super::route_feedback::sweep_cursor(&db)
+                .await
+                .unwrap(),
+            99
+        );
+        assert_eq!(count(&db,"SELECT COUNT(*) FROM sqlite_master WHERE name IN ('ambient_routing_feedback','ambient_routing_feedback_cursor')").await,0);
     }
 
     #[tokio::test]

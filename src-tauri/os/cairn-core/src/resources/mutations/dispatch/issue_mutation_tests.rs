@@ -2866,7 +2866,7 @@ fn sample_resource(kind: cairn_uri::ResourceKind, mode: ChangeMode) -> CairnReso
         K::ProjectCampPosts => "cairn://p/cairn/camps/rebuild/posts",
         K::Channels => "cairn://channels",
         K::ChannelsConversation => "cairn://channels/discord/cairn/general",
-        K::ChannelsAmbientFeedback => "cairn://channels/ambient/feedback",
+        K::ProjectEventFeedback => "cairn://p/cairn/events/feedback",
         K::Operator => "cairn://operator",
         K::OperatorMessage => "cairn://operator/messages/m-1",
         K::ProjectThreads => "cairn://p/cairn/threads",

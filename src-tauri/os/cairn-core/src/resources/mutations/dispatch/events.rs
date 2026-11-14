@@ -9,13 +9,24 @@ use cairn_uri::CairnResource;
 /// (delete on a member) ingress endpoints.
 pub(super) async fn dispatch(
     o: &Orchestrator,
-    _r: &McpCallbackRequest,
+    r: &McpCallbackRequest,
     i: usize,
     x: &ChangeItem,
     dry: bool,
     u: &CairnResource,
 ) -> ResourceMutationResult<Option<String>> {
     let outcome = match (u, x.mode) {
+        (CairnResource::ProjectEventFeedback { project }, ChangeMode::Append) => {
+            use crate::routes::feedback::{apply_label, labeller, LabelPayload};
+            let payload = super::append_payload(i, x)?;
+            let payload =
+                LabelPayload::parse(payload).map_err(|error| build_failure(i, x, error))?;
+            let who = labeller(o, r)
+                .await
+                .map_err(|error| build_failure(i, x, error))?;
+            apply_label(o, r, project, &who, &payload, dry).await
+        }
+
         (CairnResource::ProjectEventEndpoints { project }, ChangeMode::Append) => {
             if dry {
                 return Ok(Some("Would mint an ingress endpoint".into()));

@@ -687,6 +687,21 @@ pub(crate) async fn member(
         "\n## Routes\n\n{}\n",
         routes_segment(&keys, &row, &firings)
     ));
+    let filter = crate::storage::route_feedback::RouteFeedbackFilter {
+        project_key: row.project_id.as_ref().and_then(|id| keys.get(id)).cloned(),
+        event_id: Some(row.id),
+        ..Default::default()
+    };
+    match crate::storage::route_feedback::list(&orch.db.local, &filter, i64::MAX).await {
+        Ok(rows) if !rows.is_empty() => {
+            out.push_str("\n### Feedback\n");
+            for feedback in &rows {
+                out.push_str(&format!("\n{}\n", render_feedback_row(feedback)));
+            }
+        }
+        Err(error) => out.push_str(&format!("\nReading event feedback failed: {error}\n")),
+        _ => {}
+    }
     out
 }
 
@@ -728,6 +743,198 @@ async fn explain_segment(orch: &Orchestrator, row: &FactRow, home: &str) -> Stri
                 }
             }
         }
+    }
+    out
+}
+
+const FEEDBACK_URI: &str = "cairn://p/{project}/events/feedback";
+const FEEDBACK_DEFAULT_LIMIT: i64 = 50;
+const FEEDBACK_MAX_LIMIT: i64 = 500;
+const FEEDBACK_OUTCOMES: [&str; 6] = [
+    "admitted",
+    "below_threshold",
+    "refused",
+    "unanswerable",
+    "failed",
+    crate::storage::route_feedback::OUTCOME_UNRECORDED,
+];
+
+/// The read's filter and row limit, or the sentence refusing a query value.
+pub(crate) fn feedback_query(
+    project: &str,
+    params: &[QueryParam],
+) -> Result<(crate::storage::route_feedback::RouteFeedbackFilter, i64), String> {
+    use crate::storage::route_feedback::{Engagement, RouteFeedbackFilter};
+    let mut filter = RouteFeedbackFilter {
+        project_key: Some(project.to_string()),
+        ..Default::default()
+    };
+    let mut limit = FEEDBACK_DEFAULT_LIMIT;
+    for param in params {
+        let value = param.value.trim();
+        match param.key.as_str() {
+            "route" => filter.route = Some(value.to_string()),
+            "source" => filter.source = Some(value.to_string()),
+            "since" => {
+                filter.since = Some(value.parse().map_err(|_| {
+                    format!("since must be epoch seconds for {FEEDBACK_URI}; got '{value}'")
+                })?)
+            }
+            "limit" => {
+                let parsed: i64 = value.parse().map_err(|_| {
+                    format!("limit must be a positive number for {FEEDBACK_URI}; got '{value}'")
+                })?;
+                limit = parsed.clamp(1, FEEDBACK_MAX_LIMIT);
+            }
+            "verdict" if matches!(value, "not_mine" | "reroute") => {
+                filter.verdict = Some(value.to_string())
+            }
+            "verdict" => {
+                return Err(format!(
+                    "Unknown verdict '{value}' for {FEEDBACK_URI}; expected not_mine or reroute"
+                ))
+            }
+            "outcome" if FEEDBACK_OUTCOMES.contains(&value) => {
+                filter.outcome = Some(value.to_string())
+            }
+            "outcome" => {
+                return Err(format!(
+                    "Unknown outcome '{value}' for {FEEDBACK_URI}; expected one of {}",
+                    FEEDBACK_OUTCOMES.join(", ")
+                ))
+            }
+            "thread" => match cairn_uri::parse_uri(value) {
+                Some(cairn_uri::CairnResource::Thread { path, .. }) if path.is_empty() => {
+                    filter.thread = Some(cairn_uri::canonicalize_uri_identity(value))
+                }
+                _ => {
+                    return Err(format!(
+                        "thread must be a thread URI such as cairn://p/PROJECT/THREAD for {FEEDBACK_URI}; got '{value}'"
+                    ))
+                }
+            },
+            "engaged" => {
+                filter.engaged = Some(match value {
+                    "true" => Engagement::Engaged,
+                    "false" => Engagement::NotEngaged,
+                    "unchecked" => Engagement::Unchecked,
+                    _ => {
+                        return Err(format!(
+                            "Unknown engaged '{value}' for {FEEDBACK_URI}; expected true, false, or unchecked"
+                        ))
+                    }
+                })
+            }
+            other => {
+                return Err(format!(
+                    "Unsupported query parameter '{other}' for {FEEDBACK_URI}"
+                ))
+            }
+        }
+    }
+    Ok((filter, limit))
+}
+
+fn utc(seconds: i64) -> String {
+    chrono::DateTime::from_timestamp(seconds, 0)
+        .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| seconds.to_string())
+}
+
+/// One label-set row as the read renders it.
+pub(crate) fn render_feedback_row(
+    row: &crate::storage::route_feedback::RouteFeedbackRow,
+) -> String {
+    let event = crate::routes::fact_row_uri(Some(&row.project_key), row.event_id);
+    let recipient = row.recipient_thread.as_deref().unwrap_or("(refused side)");
+    let mut lines = vec![format!(
+        "- {event} · {} → {recipient} · event at {}",
+        row.outcome,
+        utc(row.event_at)
+    )];
+    lines.push(format!(
+        "  route {} · decision {} · question {} · source {}",
+        row.route_id, row.decision_node, row.question, row.source
+    ));
+    if let Some(question_text) = &row.question_text {
+        lines.push(format!("  question text: {question_text}"));
+    }
+    let probability = row
+        .probability
+        .map(|p| format!("{p:.2}"))
+        .unwrap_or_else(|| "-".into());
+    lines.push(format!(
+        "  pick {} ({probability}, {}, rev {}) · picks {} · addresses from {}",
+        row.pick.as_deref().unwrap_or("-"),
+        row.measured_by.as_deref().unwrap_or("-"),
+        row.revision.as_deref().unwrap_or("-"),
+        row.picks_json.as_deref().unwrap_or("-"),
+        row.addresses_from
+    ));
+    lines.push(match row.verdict.as_deref() {
+        Some(verdict) => {
+            let to = row
+                .reroute_to
+                .as_deref()
+                .map(|to| format!(" → {to}"))
+                .unwrap_or_default();
+            let note = row
+                .note
+                .as_deref()
+                .map(|note| format!(" · note: {note}"))
+                .unwrap_or_default();
+            format!(
+                "  verdict {verdict}{to} by {} at {}{note}",
+                row.labelled_by.as_deref().unwrap_or("-"),
+                row.labelled_at.map(utc).unwrap_or_else(|| "-".into())
+            )
+        }
+        None => "  verdict none".to_string(),
+    });
+    lines.push(match (row.engagement_checked_at, row.engaged) {
+        (Some(checked), Some(engaged)) => {
+            let by = row
+                .engaged_by
+                .as_deref()
+                .map(|by| format!(" by {by}"))
+                .unwrap_or_default();
+            format!(
+                "  engaged {}{by} · checked {}",
+                if engaged { "yes" } else { "no" },
+                utc(checked)
+            )
+        }
+        _ => "  engagement unchecked (judged 48 hours after the event)".to_string(),
+    });
+    lines.join("\n")
+}
+
+/// `cairn://p/{project}/events/feedback`: the label set, newest event first,
+/// under a header counting the rows and the `unrecorded` ones among them.
+pub async fn render_feedback(orch: &Orchestrator, project: &str, params: &[QueryParam]) -> String {
+    let (filter, limit) = match feedback_query(project, params) {
+        Ok(query) => query,
+        Err(error) => return error,
+    };
+    let db = &orch.db.local;
+    let (counts, rows) = match (
+        crate::storage::route_feedback::counts(db, &filter).await,
+        crate::storage::route_feedback::list(db, &filter, limit).await,
+    ) {
+        (Ok(counts), Ok(rows)) => (counts, rows),
+        (Err(error), _) | (_, Err(error)) => {
+            return format!("Reading the decision-route label set failed: {error}")
+        }
+    };
+    let (total, unrecorded) = counts;
+    let mut out = format!(
+        "# Decision-route feedback\n\n{total} rows; {unrecorded} historical unrecorded rows. Events whose firing identity was evicted are counted by the sweep, not fabricated as feedback rows (the durable decision record is cairn/6317). Showing {}.\n",
+        rows.len()
+    );
+    for row in &rows {
+        out.push('\n');
+        out.push_str(&render_feedback_row(row));
+        out.push('\n');
     }
     out
 }

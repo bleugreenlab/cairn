@@ -1266,7 +1266,6 @@ fn feed_state(liveness: Option<ChannelLiveness>, now: i64) -> &'static str {
 }
 
 pub mod agent_message;
-pub mod ambient_feedback;
 pub mod bindings;
 pub mod default_project;
 pub mod discord_surfaces;
@@ -1291,7 +1290,7 @@ pub use cairn_channels::{
 /// Starts the configured external channel service on runner hosts.
 pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
     crate::routes::spawn_attention_minter(orch.clone());
-    ambient_feedback::spawn(orch.clone());
+    crate::routes::feedback::spawn(orch.clone());
     tokio::spawn(supervise_telegram(orch.clone()));
     tokio::spawn(supervise_discord(orch.clone()));
     tokio::spawn(async move {

@@ -117,22 +117,31 @@ fn parses_and_roundtrips_the_operator() {
 }
 
 #[test]
-fn parses_and_roundtrips_ambient_feedback() {
-    let resource = CairnResource::ChannelsAmbientFeedback;
+fn parses_and_roundtrips_project_event_feedback() {
+    let resource = CairnResource::ProjectEventFeedback {
+        project: "cairn".into(),
+    };
+    let uri = build_project_event_feedback_uri("cairn");
     assert_eq!(
-        parse_uri("cairn://channels/ambient/feedback?verdict=reroute&engaged=false"),
+        parse_uri(&format!(
+            "{uri}?route=ambient-channel&source=channel_message"
+        )),
         Some(resource.clone())
     );
-    assert_eq!(resource.to_uri(), "cairn://channels/ambient/feedback");
-    assert_eq!(resource.kind(), ResourceKind::ChannelsAmbientFeedback);
-    assert_eq!(resource.project(), None);
+    assert_eq!(resource.to_uri(), uri);
+    assert_eq!(resource.kind(), ResourceKind::ProjectEventFeedback);
+    assert_eq!(resource.project(), Some("cairn"));
     assert_eq!(resource.issue_number(), None);
+    assert!(resource
+        .label(&LabelContext::default())
+        .contains("event feedback"));
     assert_eq!(parse_uri("cairn://channels/ambient"), None);
+    assert_eq!(
+        parse_uri(&["cairn://channels/ambient", "/feedback"].concat()),
+        None
+    );
 }
 
-/// The reserved thread coordinate renders at the thread's own address, and it
-/// reaches every node and task sub-resource because they all compose from
-/// `build_node_uri`.
 #[test]
 fn the_thread_coordinate_renders_as_a_thread_address() {
     assert_eq!(

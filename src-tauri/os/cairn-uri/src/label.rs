@@ -237,7 +237,7 @@ impl CairnResource {
                     _ => with_path(format!("{} channel", channel_provider_name(provider)), path),
                 }
             }
-            Self::ChannelsAmbientFeedback => "Channel ambient feedback".to_string(),
+            Self::ProjectEventFeedback { project } => in_project(project, "event feedback"),
             Self::Operator => "Operator".to_string(),
             Self::OperatorMessage { id } => {
                 format!(
