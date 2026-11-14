@@ -37,6 +37,15 @@ pub trait Hub: Send + Sync {
     fn get(&self, url: String) -> Fetched<'_> {
         self.fetch(url, Vec::new())
     }
+    fn get_bounded(&self, url: String, max_bytes: usize) -> Fetched<'_> {
+        Box::pin(async move {
+            let body = self.get(url).await?;
+            if body.as_ref().is_some_and(|body| body.len() > max_bytes) {
+                return Err("Hugging Face search response is too large".into());
+            }
+            Ok(body)
+        })
+    }
     fn base(&self) -> &str {
         HUGGING_FACE
     }
@@ -60,6 +69,36 @@ impl Web {
 }
 
 impl Hub for Web {
+    fn get_bounded(&self, url: String, max_bytes: usize) -> Fetched<'_> {
+        Box::pin(async move {
+            let mut response = self
+                .client
+                .get(&url)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(|error| format!("{url}: {error}"))?
+                .error_for_status()
+                .map_err(|error| format!("{url}: {error}"))?;
+            if response
+                .content_length()
+                .is_some_and(|len| len > max_bytes as u64)
+            {
+                return Err("Hugging Face search response is too large".into());
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+                if chunk.len() > max_bytes.saturating_sub(body.len()) {
+                    return Err("Hugging Face search response is too large".into());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            String::from_utf8(body)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        })
+    }
+
     fn fetch(&self, url: String, headers: Vec<(&'static str, String)>) -> Fetched<'_> {
         Box::pin(async move {
             let mut request = self.client.get(&url);
@@ -89,6 +128,67 @@ impl Hub for Web {
             }
         })
     }
+}
+
+const SEARCH_LIMIT: usize = 20;
+const SEARCH_BYTES: usize = 256 * 1024;
+
+/// Repository identity only; searching never resolves or registers a model.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SearchModel {
+    pub repo: String,
+}
+
+pub async fn search(hub: &dyn Hub, query: &str) -> Result<Vec<SearchModel>, String> {
+    if query.len() > 200 || query.chars().any(char::is_control) {
+        return Err(
+            "model search query must be at most 200 bytes without control characters".into(),
+        );
+    }
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut url = reqwest::Url::parse(&format!("{}/api/models", hub.base().trim_end_matches('/')))
+        .map_err(|error| error.to_string())?;
+    // Hub treats full/config as presence switches, even with a "false" value.
+    url.query_pairs_mut()
+        .append_pair("search", query)
+        .append_pair("limit", "20");
+    let body = tokio::time::timeout(
+        Duration::from_secs(10),
+        hub.get_bounded(url.to_string(), SEARCH_BYTES),
+    )
+    .await
+    .map_err(|_| "Hugging Face search timed out".to_string())??
+    .ok_or("Hugging Face model search is unavailable")?;
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        id: String,
+    }
+    let entries: Vec<Entry> = serde_json::from_str(&body)
+        .map_err(|error| format!("invalid Hugging Face model search response: {error}"))?;
+    let mut seen = std::collections::BTreeSet::new();
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            !entry.id.is_empty()
+                && entry.id.len() <= 200
+                && entry
+                    .id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+                && seen.insert(entry.id.to_ascii_lowercase())
+        })
+        .take(SEARCH_LIMIT)
+        .map(|entry| SearchModel { repo: entry.id })
+        .collect())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RegisteredModel {
+    pub message: String,
+    pub model: String,
 }
 
 /// Read `repo` at `revision` (a sha or a ref; `main` when `None`).
@@ -182,6 +282,15 @@ pub async fn register(
     repo: &str,
     revision: Option<&str>,
 ) -> Result<String, String> {
+    Ok(register_detailed(db, hub, repo, revision).await?.message)
+}
+
+pub async fn register_detailed(
+    db: &LocalDb,
+    hub: &dyn Hub,
+    repo: &str,
+    revision: Option<&str>,
+) -> Result<RegisteredModel, String> {
     let resolved = resolve(hub, repo, revision).await?;
     let model = model_of(&resolved.model, now_ms());
     let mut records = Inventory::default();
@@ -209,7 +318,10 @@ pub async fn register(
         model.revision.as_deref().unwrap_or("unknown"),
         describe(&model)
     ));
-    Ok(said)
+    Ok(RegisteredModel {
+        message: said,
+        model: model.name,
+    })
 }
 
 /// One line of what a model's facts say, unknown facts named as such.
@@ -463,13 +575,87 @@ pub(crate) mod tests {
         }
     }
 
+    struct SearchHub {
+        body: String,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Hub for SearchHub {
+        fn fetch(&self, url: String, headers: Vec<(&'static str, String)>) -> Fetched<'_> {
+            assert!(headers.is_empty(), "search is anonymous");
+            self.calls.lock().unwrap().push(url);
+            Box::pin(async { Ok(Some(self.body.clone())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn search_is_one_encoded_bounded_listing_without_repository_reads() {
+        let body = serde_json::to_string(
+            &(0..30)
+                .map(|i| {
+                    serde_json::json!({
+                        "id": format!("org/model-{i}"), "modelId": format!("org/model-{i}"),
+                        "config": {"ignored": true}, "siblings": [{"rfilename": "ignored"}]
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let hub = SearchHub {
+            body,
+            calls: Default::default(),
+        };
+        let results = search(&hub, " Qwen/hello &limit=999 ").await.unwrap();
+        assert_eq!(results.len(), 20);
+        assert_eq!(results[0].repo, "org/model-0");
+        let calls = hub.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let url = reqwest::Url::parse(&calls[0]).unwrap();
+        assert_eq!(url.path(), "/api/models");
+        let params: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params["search"], "Qwen/hello &limit=999");
+        assert_eq!(params["limit"], "20");
+        assert!(!params.contains_key("full"));
+        assert!(!params.contains_key("config"));
+    }
+
+    #[tokio::test]
+    async fn search_validates_before_fetch_and_bounds_and_validates_the_response() {
+        let mut hub = SearchHub {
+            body: "[]".into(),
+            calls: Default::default(),
+        };
+        assert!(search(&hub, "bad\nquery").await.is_err());
+        assert!(search(&hub, &"x".repeat(201)).await.is_err());
+        assert!(search(&hub, "  ").await.unwrap().is_empty());
+        assert!(hub.calls.lock().unwrap().is_empty());
+        hub.body = "x".repeat(SEARCH_BYTES + 1);
+        assert!(search(&hub, "x").await.unwrap_err().contains("too large"));
+        hub.body = "{}".into();
+        assert!(search(&hub, "x").await.unwrap_err().contains("invalid"));
+        hub.body =
+            r#"[{"id":"org/a"},{"id":"ORG/a"},{"id":"bad?url"},{"id":"org/b","modelId":"org/b"}]"#
+                .into();
+        assert_eq!(
+            search(&hub, "x")
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.repo.as_str())
+                .collect::<Vec<_>>(),
+            ["org/a", "org/b"]
+        );
+    }
+
     #[tokio::test]
     async fn registering_a_derivative_registers_its_base_and_says_so() {
         let db = crate::storage::migrated_test_db("inference-models-derivative").await;
         let hub = FakeHub::fixtures();
-        let said = register(&db, &hub, "nvidia/Qwen3.6-35B-A3B-NVFP4", None)
+        let registered = register_detailed(&db, &hub, "nvidia/Qwen3.6-35B-A3B-NVFP4", None)
             .await
             .unwrap();
+        assert_eq!(registered.model, "Qwen/Qwen3.6-35B-A3B");
+        let said = registered.message;
         assert!(
             said.starts_with(
                 "nvidia/Qwen3.6-35B-A3B-NVFP4 is a nvfp4 quantization of Qwen/Qwen3.6-35B-A3B"

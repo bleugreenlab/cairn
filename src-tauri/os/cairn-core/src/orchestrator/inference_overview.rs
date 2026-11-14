@@ -203,6 +203,14 @@ pub struct ModelProfile {
     pub regenerable: bool,
     /// Its measured fit per pool; empty when nothing is measured yet.
     pub fit: Vec<ProfileFit>,
+    pub loadable: Vec<ProfileLoadable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProfileLoadable {
+    pub pool: String,
+    pub blocked: Option<String>,
+    pub verifies: bool,
 }
 
 /// How a generated profile was made: the run that wrote it, the template it
@@ -701,6 +709,7 @@ impl Sources<'_> {
         .iter()
         .filter(|id| !self.unpromoted.contains(id.as_str()))
         .filter_map(|id| self.inventory.profiles.get(id))
+        .filter(|profile| group.profiles.iter().any(|p| p.id == profile.id))
         .map(|profile| {
             let (_, per_machine) = Self::declared_size(profile);
             (profile, self.fits(pool, profile, per_machine))
@@ -732,6 +741,56 @@ impl Sources<'_> {
         )
     }
 
+    fn profile_offer(
+        &self,
+        pool: &PoolView,
+        model: &str,
+        profile: &InferenceProfile,
+    ) -> ProfileLoadable {
+        let group = ModelGroup {
+            name: model.to_string(),
+            record: None,
+            profiles: vec![profile],
+        };
+        let offer = self.offer(pool, &self.deployments_of(pool), &group);
+        ProfileLoadable {
+            pool: pool.key.to_string(),
+            blocked: if self.unpromoted.contains(profile.id.as_str()) {
+                Some("generated draft is not promoted: it needs a passing verification".into())
+            } else {
+                offer.blocked
+            },
+            verifies: offer.verifies,
+        }
+    }
+
+    fn exact_load(
+        &self,
+        pool: &PoolKey,
+        model: &str,
+        profile: &str,
+    ) -> Result<Option<Vec<InferenceProfileId>>, String> {
+        let pool = self
+            .models
+            .pools
+            .iter()
+            .find(|p| &p.key == pool)
+            .ok_or("unknown inference pool")?;
+        let profile = self
+            .inventory
+            .profiles
+            .get(&InferenceProfileId::from(profile))
+            .ok_or("unknown inference profile")?;
+        if !same_model(&profile.model.name, model) {
+            return Err("profile does not serve the selected model".into());
+        }
+        let offer = self.profile_offer(pool, model, profile);
+        if let Some(why) = offer.blocked {
+            return Err(why);
+        }
+        Ok(offer.verifies.then(|| vec![profile.id.clone()]))
+    }
+
     fn offer(
         &self,
         pool: &PoolView,
@@ -741,7 +800,7 @@ impl Sources<'_> {
         let mut here: Vec<(&InferenceProfile, Option<u64>, Option<String>)> = deployments
             .iter()
             .filter_map(|id| Some((id, self.model_of(id)?)))
-            .filter(|(_, profile)| same_model(&profile.model.name, &group.name))
+            .filter(|(_, profile)| group.profiles.iter().any(|p| p.id == profile.id))
             .filter(|(_, profile)| !self.unpromoted.contains(profile.id.as_str()))
             // A deployment of a profile edited since it was verified runs
             // content nothing has vouched for: a load verifies it first.
@@ -1047,6 +1106,12 @@ impl Sources<'_> {
                             edited: self.edited.contains(profile.id.as_str()),
                             regenerable: self.regenerable.contains(profile.id.as_str()),
                             fit: self.profile_fit(profile),
+                            loadable: self
+                                .models
+                                .pools
+                                .iter()
+                                .map(|pool| self.profile_offer(pool, &group.name, profile))
+                                .collect(),
                         })
                         .collect(),
                     blocked: self.model_blocked(group),
@@ -1198,9 +1263,18 @@ pub async fn running_detail(
 /// container profiles fit it is verified there first, in the background, and
 /// the first profile that passes stays loaded for the operator as if the
 /// request had loaded it.
-pub async fn load(orch: &Orchestrator, pool: &str, model: &str) -> Result<String, String> {
+pub async fn load(
+    orch: &Orchestrator,
+    pool: &str,
+    model: &str,
+    profile: Option<&str>,
+) -> Result<String, String> {
     let key = PoolKey::from(pool);
-    let verifies = with_sources(orch, |sources| sources.load_verifies(&key, model)).await?;
+    let verifies = with_sources(orch, |sources| match profile {
+        Some(profile) => sources.exact_load(&key, model, profile),
+        None => Ok(sources.load_verifies(&key, model)),
+    })
+    .await??;
     if let Some(profiles) = verifies {
         let detected = super::inference_generate::detected_pool(orch, pool)?;
         let first = profiles
@@ -1227,7 +1301,7 @@ pub async fn load(orch: &Orchestrator, pool: &str, model: &str) -> Result<String
             }
         ));
     }
-    let handle = models::request(orch, model, None, OPERATOR, Some(&PoolKey::from(pool))).await?;
+    let handle = models::request_profile(orch, model, profile, OPERATOR, &key).await?;
     let status = handle.status(orch).await?;
     Ok(format!("Request #{}: {}", handle.id, status.describe()))
 }
@@ -1320,9 +1394,18 @@ pub async fn try_prompt(
 
 /// Register a model by its Hugging Face repository id, reading its facts, as
 /// `append cairn://inference/models {repo}` does.
-pub async fn register_model(orch: &Orchestrator, repo: &str) -> Result<String, String> {
+pub async fn register_model(
+    orch: &Orchestrator,
+    repo: &str,
+) -> Result<super::inference_models::RegisteredModel, String> {
     let hub = super::inference_models::Web::new()?;
-    super::inference_models::register(&orch.db.local, &hub, repo.trim(), None).await
+    super::inference_models::register_detailed(&orch.db.local, &hub, repo.trim(), None).await
+}
+
+pub async fn search_models(
+    query: &str,
+) -> Result<Vec<super::inference_models::SearchModel>, String> {
+    super::inference_models::search(&super::inference_models::Web::new()?, query).await
 }
 
 /// A started generation as the page needs it: its record's id and the
@@ -2293,6 +2376,60 @@ profiles:
             (Some("no deployment here"), false)
         );
         assert_eq!(sources.load_verifies(&PoolKey::from("fedora"), QWEN), None);
+    }
+
+    #[test]
+    fn exact_profile_load_and_overview_share_pool_eligibility_without_fallback() {
+        const GGUF: &str = "qwen3-embed-4b-gguf";
+        let mut world = sparks_with_embed_container(10 * GIB);
+        let sources = world.sources();
+        assert_eq!(
+            sources.exact_load(&SPARKS.into(), EMBED, GGUF).unwrap(),
+            Some(vec![GGUF.into()])
+        );
+        // The model has another deployed profile on Fedora, but not this one.
+        assert!(sources
+            .exact_load(&SPARKS.into(), EMBED, "qwen3-embed-4b")
+            .is_err());
+        assert!(sources.exact_load(&SPARKS.into(), QWEN, GGUF).is_err());
+        assert!(sources.exact_load(&"missing".into(), EMBED, GGUF).is_err());
+        assert!(sources
+            .exact_load(&SPARKS.into(), EMBED, "missing")
+            .is_err());
+        let overview = world.overview();
+        let profile = overview
+            .models
+            .iter()
+            .find(|m| m.name == EMBED)
+            .unwrap()
+            .profiles
+            .iter()
+            .find(|p| p.id == GGUF)
+            .unwrap();
+        assert_eq!(
+            profile.loadable.iter().find(|l| l.pool == SPARKS).unwrap(),
+            &ProfileLoadable {
+                pool: SPARKS.into(),
+                blocked: None,
+                verifies: true
+            }
+        );
+        world.unpromoted.insert(GGUF.into());
+        assert!(world
+            .sources()
+            .exact_load(&SPARKS.into(), EMBED, GGUF)
+            .unwrap_err()
+            .contains("draft"));
+        assert_eq!(world.sources().load_verifies(&SPARKS.into(), EMBED), None);
+        world.unpromoted.clear();
+        world.inventory.insert_profile(embed_container(200 * GIB));
+        assert_eq!(
+            world
+                .sources()
+                .exact_load(&SPARKS.into(), EMBED, GGUF)
+                .unwrap_err(),
+            "won't fit"
+        );
     }
 
     #[test]

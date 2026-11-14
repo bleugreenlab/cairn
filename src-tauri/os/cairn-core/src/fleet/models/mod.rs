@@ -622,6 +622,26 @@ pub async fn request(
     .await
 }
 
+/// An explicit profile narrows this request only; it never changes model-wide preference.
+pub async fn request_profile(
+    orch: &Orchestrator,
+    model: &str,
+    profile: Option<&str>,
+    requester: &str,
+    pool: &PoolKey,
+) -> Result<RequestHandle, String> {
+    request_selection_with(
+        &orch.db.local,
+        orch.fleet.as_ref(),
+        (model, profile),
+        None,
+        requester,
+        Some(pool),
+        now_ms(),
+    )
+    .await
+}
+
 pub(crate) async fn request_with(
     db: &LocalDb,
     host: &dyn Host,
@@ -631,9 +651,27 @@ pub(crate) async fn request_with(
     pool: Option<&PoolKey>,
     now: Ms,
 ) -> Result<RequestHandle, String> {
+    request_selection_with(db, host, (model, None), verb, requester, pool, now).await
+}
+
+async fn request_selection_with(
+    db: &LocalDb,
+    host: &dyn Host,
+    selection: (&str, Option<&str>),
+    verb: Option<VerbKind>,
+    requester: &str,
+    pool: Option<&PoolKey>,
+    now: Ms,
+) -> Result<RequestHandle, String> {
+    let (model, profile) = selection;
     let mut book = passed_book(db, host, now).await?;
     let inventory = load_inventory(db).await?;
-    let (_, catalog) = catalog_now(db, &inventory, host).await?;
+    let (_, mut catalog) = catalog_now(db, &inventory, host).await?;
+    catalog.retain(|id, _| {
+        inventory.deployments.get(id).is_some_and(|deployment| {
+            profile.is_none_or(|profile| deployment.profile.as_str() == profile)
+        })
+    });
     let deployment = choose_deployment(&catalog, &book.state.residents, model, verb, pool)?;
     let chosen = &catalog[&deployment];
     let pool = book

@@ -1084,12 +1084,18 @@ impl Act for Live {
         requester: String,
     ) -> Pending<'_, Result<String, String>> {
         Box::pin(async move {
-            let handle = models::request(
+            let inventory = load_inventory(&self.orch.db.local).await?;
+            let profile = &inventory
+                .deployments
+                .get(&DeploymentId::from(deployment.as_str()))
+                .ok_or("the verified deployment is gone")?
+                .profile;
+            let handle = models::request_profile(
                 &self.orch,
                 &model,
-                None,
+                Some(profile.as_str()),
                 &requester,
-                Some(&PoolKey::from(pool.as_str())),
+                &PoolKey::from(pool.as_str()),
             )
             .await?;
             if handle.deployment.as_str() != deployment {

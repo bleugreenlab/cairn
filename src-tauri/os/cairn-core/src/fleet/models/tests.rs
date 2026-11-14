@@ -1429,6 +1429,136 @@ mod host {
         );
     }
 
+    /// A profile a generation names as its draft is governed by the promotion
+    /// gate: until a pass of exactly what it is now promotes it, placement's
+    /// catalog refuses it, so no warm model, model pin or deployment pin
+    /// outside the operator-approved verification claim acquires it.
+    #[tokio::test]
+    async fn an_unpromoted_generated_profile_is_not_acquired_until_a_pass_promotes_it() {
+        use crate::orchestrator::inference::load_inventory;
+        use crate::orchestrator::inference_verify::digest;
+        let db = sparks_db("models-unpromoted-generated").await;
+        db.execute("INSERT INTO inference_generations
+            (id,project_id,job_id,node_uri,model,pool,state,draft_profile,draft_written_at,started_at)
+            VALUES ('g','p','j','cairn://p/p/1/1/g',?1,?2,'failed',?1,1,1)",
+            (DSV4F, SPARKS)).await.unwrap();
+        let host = sparks();
+        host.heads.attach(SP1, 110, 0);
+        host.heads.attach(SP2, 110, 0);
+        // A preference written before the generation is re-evaluated on every pass.
+        store::save_preference(
+            &db,
+            &SPARKS.into(),
+            &super::Preference {
+                warm_model: Some(DSV4F.into()),
+                idle_override_secs: Some(0),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+        pass(&db, &host, 1_000).await.unwrap();
+        pass(&db, &host, 2_000).await.unwrap();
+        assert!(
+            host.heads.starts().is_empty(),
+            "warming must not acquire it"
+        );
+        let model_pin = PinTarget::Model {
+            name: DSV4F.into(),
+            pool: None,
+        };
+        assert!(pin_with(&db, &host, model_pin.clone(), "operator", 2_001)
+            .await
+            .is_err());
+        assert!(
+            pin_with(
+                &db,
+                &host,
+                PinTarget::Deployment(DSV4F.into()),
+                "verify:v",
+                2_002
+            )
+            .await
+            .is_err(),
+            "only the claim the operator approved may start an unpromoted draft"
+        );
+        assert!(host.models.book.lock().await.state.residents.is_empty());
+
+        let inventory = load_inventory(&db).await.unwrap();
+        let current = digest(&inventory.profiles[&DSV4F.into()]);
+        db.execute("INSERT INTO inference_verifications
+            (id,profile_id,profile_digest,pool_id,deployment_id,machines_json,requested_by,started_at,outcome,stage)
+            VALUES ('v',?1,?2,?3,?1,'[]','operator',3,'passed','done')",
+            (DSV4F, current.as_str(), SPARKS)).await.unwrap();
+        pin_with(&db, &host, model_pin, "operator", 3_000)
+            .await
+            .unwrap();
+        assert!(
+            !host.models.book.lock().await.state.residents.is_empty(),
+            "a pass of what it is now promotes it"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_profile_request_records_only_the_selected_deployment() {
+        use crate::orchestrator::inference::{
+            load_inventory, write_inventory, Authoring, Removals,
+        };
+        let db = sparks_db("models-exact-profile").await;
+        let mut inventory = load_inventory(&db).await.unwrap();
+        let mut selected = inventory.profiles[&DSV4F.into()].clone();
+        selected.id = "selected".into();
+        inventory.insert_profile(selected);
+        let mut deployed = inventory.deployments[&DSV4F.into()].clone();
+        deployed.id = "z-selected".into();
+        deployed.profile = "selected".into();
+        deployed.api_port = 9998;
+        inventory.insert_deployment(deployed);
+        write_inventory(
+            &db,
+            &Authoring::Patch {
+                upsert: Some(inventory.to_yaml()),
+                remove: Removals::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let host = sparks();
+        host.heads.attach(SP1, 110, 0);
+        host.heads.attach(SP2, 110, 0);
+        let handle = super::super::request_selection_with(
+            &db,
+            &host,
+            (DSV4F, Some("selected")),
+            None,
+            "operator",
+            Some(&SPARKS.into()),
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(handle.deployment.as_str(), "z-selected");
+        let requests = store::load_requests(&db).await.unwrap();
+        assert!(requests
+            .iter()
+            .all(|request| request.deployment.as_str() == "z-selected"));
+        assert!(super::super::request_selection_with(
+            &db,
+            &host,
+            (DSV4F, Some("missing")),
+            None,
+            "operator",
+            Some(&SPARKS.into()),
+            1_001
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            store::load_requests(&db).await.unwrap().len(),
+            requests.len()
+        );
+    }
+
     /// A request acquires the gang in one decision: both Sparks carry the
     /// reservation from the same pass. The start waits while the work on sp1
     /// may finish, then only the check in the way is preempted (never the
