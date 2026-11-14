@@ -284,6 +284,9 @@ pub enum OpenRouterSort {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    /// Opaque hash of the workspace settings document read with this snapshot.
+    #[serde(default)]
+    pub revision: String,
     /// Pools, the capability ladder, and the default allotment. `None` until
     /// the one-time conversion from the tier grid has written it.
     #[serde(default)]
@@ -403,6 +406,8 @@ pub struct Settings {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettings {
+    /// Refuse the entire update if the workspace document no longer matches.
+    pub expected_revision: Option<String>,
     /// Replace the pools, ladder and default allotment. Refused when it does
     /// not validate (an unknown pool in `defaultModels`, a level off 0..1).
     pub models: Option<crate::allotment::ModelsConfig>,

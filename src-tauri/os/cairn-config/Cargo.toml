@@ -21,6 +21,7 @@ sha2 = "0.10"
 hex = "0.4"
 uuid = "1"
 log = "0.4"
+parking_lot = "0.12"
 dirs = "5"
 tempfile = "3"
 

@@ -3783,8 +3783,16 @@ impl Orchestrator {
     /// a subprocess round-trip when the daemon is live, so call this on demand,
     /// never on a hot path.
     pub fn build_service_statuses(&self) -> Vec<BuildServiceStatus> {
+        self.build_service_statuses_from_config(settings::load_build_services(&self.config_dir))
+    }
+
+    /// Probe a captured declaration without holding the settings persistence lock.
+    pub(crate) fn build_service_statuses_from_config(
+        &self,
+        configs: HashMap<String, BuildServiceConfig>,
+    ) -> Vec<BuildServiceStatus> {
         let templates = self.build_service_templates();
-        let mut out: Vec<BuildServiceStatus> = settings::load_build_services(&self.config_dir)
+        let mut out: Vec<BuildServiceStatus> = configs
             .into_iter()
             .map(|(name, cfg)| {
                 let mut env_keys: Vec<String> = cfg.env.keys().cloned().collect();

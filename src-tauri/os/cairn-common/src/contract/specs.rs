@@ -1044,6 +1044,11 @@ pub(crate) const SETTINGS_EMBEDDING_MODEL: KeySpec = KeySpec::new(
     KeyType::Str,
     "provider/model the workspace embeds with; changing it re-embeds history; null is cairn/cohere-embed-v4",
 );
+pub(crate) const SETTINGS_EXPECTED_REVISION: KeySpec = KeySpec::new(
+    "expectedRevision",
+    KeyType::Str,
+    "revision from read cairn://settings; stale values refuse before any section is written; covers settings.yaml, not credentials or keybinds; omit for unconditional writes",
+);
 pub(crate) const SETTINGS_MERGE_TYPE: KeySpec =
     KeySpec::new("mergeType", KeyType::Str, "squash|merge|rebase");
 pub(crate) const SETTINGS_MEMORY_REVIEW_ENABLED: KeySpec = KeySpec::new(

@@ -3,6 +3,7 @@
 //! Settings are stored in `~/.cairn/settings.yaml` and are the source of truth.
 //! The database is no longer used for workspace settings.
 
+use parking_lot::ReentrantMutex;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
@@ -908,6 +909,7 @@ impl SettingsFile {
         };
 
         Settings {
+            revision: String::new(),
             models: self.models.clone(),
             // A built-in provider is never one a workspace installed, even
             // where an older file still names it.
@@ -1084,7 +1086,7 @@ pub fn settings_file_stamp(config_dir: &std::path::Path) -> Option<(std::time::S
 }
 
 const WORKSPACE_HEADER: &str = "# Cairn Workspace Settings";
-static WORKSPACE_SETTINGS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static WORKSPACE_SETTINGS_LOCK: OnceLock<ReentrantMutex<()>> = OnceLock::new();
 
 /// Mutate the workspace settings mapping as one serialized, atomic transaction.
 ///
@@ -1121,10 +1123,8 @@ fn mutate_workspace_settings_with_sync<T>(
     mutate: impl FnOnce(&mut serde_yaml::Mapping) -> Result<T, String>,
     sync_directory: fn(&std::path::Path) -> Result<(), String>,
 ) -> Result<CommitOutcome<T>, String> {
-    let lock = WORKSPACE_SETTINGS_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lock = WORKSPACE_SETTINGS_LOCK.get_or_init(|| ReentrantMutex::new(()));
+    let _guard = lock.lock();
     let path = get_settings_path(config_dir);
 
     let content = match std::fs::read_to_string(&path) {
@@ -1231,13 +1231,87 @@ pub fn load_mcp_public_url(config_dir: &std::path::Path) -> Option<String> {
 
 /// Load settings from file. Returns defaults if file doesn't exist or is invalid.
 pub fn load_settings(config_dir: &std::path::Path) -> Settings {
-    match load_settings_file(config_dir) {
-        Ok(file) => file.to_settings(),
+    match load_settings_snapshot(config_dir) {
+        Ok(settings) => settings,
         Err(e) => {
             log::info!("Using default settings: {}", e);
             SettingsFile::default().to_settings()
         }
     }
+}
+
+/// Hash the complete document, including keys outside the general settings DTO.
+/// Formatting and comments are not settings changes.
+pub fn settings_revision(root: &serde_yaml::Mapping) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let yaml = serde_yaml::to_string(root)
+        .map_err(|error| format!("Failed to serialize settings revision: {error}"))?;
+    Ok(hex::encode(Sha256::digest(yaml.as_bytes())))
+}
+
+/// Read the values and revision from the same file snapshot.
+pub fn load_settings_snapshot(config_dir: &std::path::Path) -> Result<Settings, String> {
+    let content = match std::fs::read_to_string(get_settings_path(config_dir)) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("Failed to read settings file: {error}")),
+    };
+    let root = match serde_yaml::from_str::<serde_yaml::Value>(&content)
+        .map_err(|error| format!("Failed to parse settings file: {error}"))?
+    {
+        serde_yaml::Value::Mapping(root) => root,
+        serde_yaml::Value::Null => serde_yaml::Mapping::new(),
+        _ => return Err("settings file root is not a mapping".to_string()),
+    };
+    // The text deserializer accepts YAML scalar-to-string coercions used by
+    // command arguments; deserializing the parsed Value would reject them.
+    let file: SettingsFile = if root.is_empty() {
+        SettingsFile::default()
+    } else {
+        serde_yaml::from_str(&content)
+            .map_err(|error| format!("Failed to parse settings file: {error}"))?
+    };
+    let mut settings = file.to_settings();
+    settings.revision = settings_revision(&root)?;
+    Ok(settings)
+}
+
+/// Apply a synchronous multi-store patch only if its settings snapshot is current.
+/// Nested YAML mutations take the same reentrant lock, so no settings writer can
+/// intervene between this comparison and any section replacement. This is not a
+/// rollback transaction for the independent credential and keybind stores.
+pub fn with_settings_revision<T>(
+    config_dir: &std::path::Path,
+    expected: Option<&str>,
+    apply: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let lock = WORKSPACE_SETTINGS_LOCK.get_or_init(|| ReentrantMutex::new(()));
+    let _guard = lock.lock();
+    if let Some(expected) = expected {
+        let current = load_settings_snapshot(config_dir)?.revision;
+        if expected != current {
+            return Err(format!(
+                "settings revision conflict: current revision is {current}"
+            ));
+        }
+    }
+    apply()
+}
+
+/// Compare only while holding the workspace mutation lock.
+pub fn check_settings_revision(
+    root: &serde_yaml::Mapping,
+    expected: Option<&str>,
+) -> Result<(), String> {
+    if let Some(expected) = expected {
+        let current = settings_revision(root)?;
+        if expected != current {
+            return Err(format!(
+                "settings revision conflict: current revision is {current}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the OS-sandbox read denylist for executor cells: the configured
@@ -1608,6 +1682,7 @@ pub fn update_settings(
     provider_names: &ProviderNames,
 ) -> Result<Settings, String> {
     mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        check_settings_revision(root, input.expected_revision.as_deref())?;
         let file: SettingsFile =
             serde_yaml::from_value(serde_yaml::Value::Mapping(root.clone()))
                 .map_err(|error| format!("Failed to parse settings file: {error}"))?;
@@ -1626,6 +1701,7 @@ pub fn update_settings(
             models.validate()?;
         }
         merge_settings_keys(config_dir, root, &current)?;
+        current.revision = settings_revision(root)?;
         Ok(current)
     })
 }
@@ -2149,6 +2225,92 @@ mod tests {
     /// Build a default Settings for test use (avoids repeating all fields).
     fn test_settings() -> Settings {
         SettingsFile::default().to_settings()
+    }
+
+    #[test]
+    fn settings_compare_and_set_refuses_second_writer_without_writing() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let first = load_settings(dir);
+        let second = load_settings(dir);
+        assert!(!first.revision.is_empty());
+        assert_eq!(first.revision, second.revision);
+        let saved = update_settings(
+            dir,
+            UpdateSettings {
+                expected_revision: Some(first.revision),
+                orphan_cleanup_days: Some(12),
+                ..Default::default()
+            },
+            &ProviderNames::default(),
+        )
+        .unwrap();
+        assert_ne!(saved.revision, second.revision);
+        assert_eq!(saved.revision, load_settings(dir).revision);
+        let bytes = std::fs::read(get_settings_path(dir)).unwrap();
+        let error = update_settings(
+            dir,
+            UpdateSettings {
+                expected_revision: Some(second.revision),
+                orphan_cleanup_days: Some(24),
+                ..Default::default()
+            },
+            &ProviderNames::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "settings revision conflict: current revision is {}",
+                saved.revision
+            )
+        );
+        assert_eq!(std::fs::read(get_settings_path(dir)).unwrap(), bytes);
+        assert_eq!(load_settings(dir).orphan_cleanup_days, 12);
+        let unguarded = update_settings(
+            dir,
+            UpdateSettings {
+                orphan_cleanup_days: Some(24),
+                ..Default::default()
+            },
+            &ProviderNames::default(),
+        )
+        .unwrap();
+        assert_eq!(unguarded.orphan_cleanup_days, 24);
+    }
+
+    #[test]
+    fn settings_revision_preserves_yaml_string_coercions() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            get_settings_path(temp.path()),
+            "orphanCleanupDays: 12\nmcpServers:\n  test:\n    transport: stdio\n    command: echo\n    args: [123]\n",
+        ).unwrap();
+        let snapshot = load_settings_snapshot(temp.path()).unwrap();
+        assert_eq!(snapshot.orphan_cleanup_days, 12);
+        assert_eq!(snapshot.revision, load_settings(temp.path()).revision);
+        assert!(!snapshot.revision.is_empty());
+    }
+
+    #[test]
+    fn settings_revision_covers_other_sections_and_survives_restart() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let before = load_settings(dir).revision;
+        mutate_workspace_settings(dir, "test section", |root| {
+            root.insert(
+                "unknownSection".into(),
+                serde_yaml::from_str("{value: 1}").unwrap(),
+            );
+            Ok(())
+        })
+        .unwrap();
+        let after = load_settings(dir).revision;
+        assert_ne!(before, after);
+        assert_eq!(after, load_settings(dir).revision);
+        with_settings_revision(dir, Some(&after), || Ok(())).unwrap();
+        assert_eq!(after, load_settings(dir).revision);
+        assert!(with_settings_revision(dir, Some(&before), || Ok(())).is_err());
     }
 
     #[test]

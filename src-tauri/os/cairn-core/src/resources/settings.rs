@@ -57,8 +57,26 @@ fn model_defaults(settings: &crate::models::Settings) -> String {
 pub(super) async fn read_settings(orch: &Orchestrator) -> String {
     let mut out = String::from("# Workspace settings\n\n");
 
+    // Capture YAML-backed sections together; runtime probes and awaits must
+    // happen after releasing the workspace settings lock.
+    let snapshot = crate::config::settings::with_settings_revision(&orch.config_dir, None, || {
+        Ok((
+            crate::config::settings::load_settings_snapshot(&orch.config_dir)?,
+            crate::config::settings::load_inference(&orch.config_dir),
+            crate::config::settings::load_served_api(&orch.config_dir),
+            crate::config::settings::load_build_services(&orch.config_dir),
+        ))
+    });
+    let (settings, inference, served, build_services) = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => return format!("{out}Settings unavailable: {error}\n"),
+    };
+
     // --- App preferences ---
-    let settings = orch.get_settings();
+    out.push_str(&format!(
+        "Revision: `{}` (settings.yaml)\n\n",
+        settings.revision
+    ));
     out.push_str("## App preferences\n\n");
     out.push_str(&format!(
         "- maxThinkingTokens: {}\n",
@@ -260,7 +278,7 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
 
     // --- Build services ---
     out.push_str("## Build services\n\n");
-    let services = orch.build_service_statuses();
+    let services = orch.build_service_statuses_from_config(build_services);
     if services.is_empty() {
         out.push_str("None configured.\n\n");
     } else {
@@ -287,7 +305,6 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
 
     // --- Inference profile declarations ---
     out.push_str("## Inference\n\n");
-    let inference = crate::config::settings::load_inference(&orch.config_dir);
     if inference.profiles.is_empty() {
         out.push_str("- profile declarations: none\n");
     }
@@ -311,7 +328,6 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
 
     // --- Served API ---
     out.push_str("## Served API\n\n");
-    let served = crate::config::settings::load_served_api(&orch.config_dir);
     match &served.bind {
         None => out.push_str("- listener: off (no `servedApi.bind`)\n"),
         Some(bind) => out.push_str(&format!(
@@ -367,6 +383,7 @@ mod tests {
     async fn every_model_default_renders_set_or_as_what_unset_means() {
         let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
         let unset = super::read_settings(&orch).await;
+        assert!(unset.contains(&format!("Revision: `{}`", orch.get_settings().revision)));
         assert!(
             unset.contains("- decisionModel: unset (the catalog's best decision offer)"),
             "{unset}"

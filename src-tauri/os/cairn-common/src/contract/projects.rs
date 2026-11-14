@@ -256,6 +256,7 @@ pub(crate) const SETTINGS_CONTRACT: ResourceContract =
             mode: ChangeMode::Patch,
             required: &[],
             optional: &[
+                SETTINGS_EXPECTED_REVISION,
                 SETTINGS_MERGE_TYPE,
                 SETTINGS_MEMORY_REVIEW_ENABLED,
                 SETTINGS_MODELS,
