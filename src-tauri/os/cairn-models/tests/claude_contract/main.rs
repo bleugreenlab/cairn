@@ -180,3 +180,30 @@ fn account_identity_probe_absent() {
         cases::Identity::Absent,
     ));
 }
+
+#[test]
+fn interrupt_context_before_response() {
+    pass(cases::interrupt_context_probe(&env(), false, false));
+}
+#[test]
+fn interrupt_context_after_consumption() {
+    pass(cases::interrupt_context_probe(&env(), true, false));
+}
+#[test]
+fn interrupt_context_before_response_cold_resume() {
+    pass(cases::interrupt_context_probe(&env(), false, true));
+}
+#[test]
+fn interrupt_context_after_consumption_cold_resume() {
+    pass(cases::interrupt_context_probe(&env(), true, true));
+}
+
+#[test]
+fn interrupt_context_durable_markers() {
+    pass(cases::interrupt_context_durable_markers());
+}
+
+#[test]
+fn interrupt_context_mixed_siblings() {
+    pass(cases::interrupt_context_mixed_siblings());
+}

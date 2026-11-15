@@ -1771,3 +1771,217 @@ pub fn account_email_never_reaches_the_model(env: &ContractEnv, prepare: bool) -
         format!("the CLI wrote the email back into its home: {profile}")
     })
 }
+
+/// Diagnostic rather than a claimed host-handoff fix: the real CLI owns all
+/// cancellation text. MCP release and the CLI's tool-result frame establish
+/// the two orderings; no grace timer is used as evidence of consumption.
+pub fn interrupt_context_probe(env: &ContractEnv, consumed: bool, cold: bool) -> CaseResult {
+    interrupt_context_case(env, consumed, cold, MCP_TOOL_TEXT, false)
+}
+
+// These are the host's marker bytes, not a simulated CLI interpretation.
+const WAIT_MARKER: &str = "Wait suspended; the same run call will resume when its condition fires.";
+const BATCH_MARKER: &str = "Run handed off to durable suspend; still running. The same call resumes with this batch's completed result.";
+// Measured from the real pinned CLI in the subsequent Messages request.
+const CLI_INTERRUPTED_TOOL_CONTEXT: &str = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed. Correction to the text above: this call was stopped while running, not refused before it ran. It may have run in part or in full, and its changes may have been written. No permission prompt was involved. Work it started elsewhere (a remote command, a background process) may still be running, so check before starting the same work again. The instruction to stop and wait still stands.";
+
+pub fn interrupt_context_durable_markers() -> CaseResult {
+    let c = Check("interrupt_context_probe");
+    for (source, name, expected) in [
+        (
+            include_str!("../../../cairn-core/src/mcp/handlers/owned_wait.rs"),
+            "WAIT_SUSPENDED_MARKER",
+            WAIT_MARKER,
+        ),
+        (
+            include_str!("../../../cairn-core/src/mcp/handlers/run/mod.rs"),
+            "RUN_BATCH_SUSPENDED_MARKER",
+            BATCH_MARKER,
+        ),
+    ] {
+        let declaration = format!("const {name}: &str =");
+        let actual = source
+            .split_once(&declaration)
+            .and_then(|(_, rest)| rest.split('"').nth(1));
+        c.that(actual == Some(expected), || {
+            format!("fixture {name} drifted from host marker: {actual:?}")
+        })?;
+    }
+    for marker in [WAIT_MARKER, BATCH_MARKER] {
+        for consumed in [false, true] {
+            for cold in [false, true] {
+                let env = Check("interrupt_context_probe")
+                    .setup(ContractEnv::new(), "creating isolated case")?;
+                interrupt_context_case(&env, consumed, cold, marker, true)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn interrupt_context_case(
+    env: &ContractEnv,
+    consumed: bool,
+    cold: bool,
+    marker: &'static str,
+    durable: bool,
+) -> CaseResult {
+    let c = Check("interrupt_context_probe");
+    let gate = env.mcp.hold_next_response(marker);
+    env.fake.queue([
+        Mode::Tool {
+            name: "mcp__cairn__run",
+            args: if marker == BATCH_MARKER {
+                r#"{"commands":[{"command":"contract-long-running-command"}]}"#
+            } else {
+                r#"{"commands":[{"waitFor":{"duration":"3m"}}]}"#
+            },
+        },
+        Mode::Slow,
+    ]);
+    let mut session = launch(c, env, Launch::new())?;
+    c.ok(session.turn("Run the host wait."), "starting the wait")?;
+    c.ok(
+        gate.wait(),
+        "waiting for the MCP call to reach the response barrier",
+    )?;
+    if consumed {
+        gate.release();
+        c.some(
+            session.until(Duration::from_secs(60), |frame| {
+                frame.kind() == "user" && frame.raw.to_string().contains(marker)
+            }),
+            "CLI tool-result emission proving the MCP response was consumed",
+        )?;
+    }
+    c.ok(
+        session.control.interrupt(if durable {
+            cairn_models::interface::session::InterruptCause::DurablePark
+        } else {
+            cairn_models::interface::session::InterruptCause::OperatorStop
+        }),
+        "interrupting the real CLI",
+    )?;
+    acknowledgement(c, &mut session, "interrupt")?;
+    let terminal = session.result(c)?;
+    gate.release();
+    eprintln!(
+        "interrupt-context consumed={consumed} cold={cold} durable={durable} marker={marker:?} terminal={}",
+        terminal.raw["terminal_reason"]
+    );
+    if cold {
+        let id = session.session_id.clone();
+        session.close();
+        session = launch(c, env, Launch::new().resume(&id))?;
+    }
+    // In the interrupt-first arm, Mode::Slow was never consumed by a
+    // tool-result continuation. Clear it before requesting the next turn.
+    env.fake.replace_queue([Mode::Text]);
+    session.ok_turn(c, "Continue after the host interruption.")?;
+    let requests = env.fake.inference();
+    let next = c.some(requests.last(), "the subsequent Messages request")?;
+    let blocks: Vec<Value> = next
+        .tool_results()
+        .into_iter()
+        .filter(|block| block["tool_use_id"] == TOOL_USE_ID)
+        .collect();
+    eprintln!(
+        "interrupt-context consumed={consumed} cold={cold} tool_results={}",
+        json!(blocks)
+    );
+    c.that(blocks.len() == 1, || {
+        format!("expected exactly one result: {blocks:?}")
+    })?;
+    let expected = if consumed {
+        json!({"type":"tool_result", "tool_use_id":TOOL_USE_ID,
+            "content":[{"type":"text", "text":marker}]})
+    } else {
+        json!({"type":"tool_result", "tool_use_id":TOOL_USE_ID,
+            "content":CLI_INTERRUPTED_TOOL_CONTEXT, "is_error":true})
+    };
+    c.that(blocks[0] == expected, || {
+        format!(
+            "unexpected exact model context: {} (expected {expected})",
+            blocks[0]
+        )
+    })?;
+    c.that(
+        terminal.raw["terminal_reason"]
+            == if consumed {
+                "aborted_streaming"
+            } else {
+                "aborted_tools"
+            },
+        || format!("unexpected terminal: {}", terminal.raw),
+    )?;
+    c.that(env.fake.egress().is_empty(), || {
+        format!("unexpected egress: {:?}", env.fake.egress())
+    })
+}
+
+/// One sibling has actually returned while the other's response remains held.
+/// The CLI, not the fake, decides which results survive interruption.
+pub fn interrupt_context_mixed_siblings() -> CaseResult {
+    let c = Check("interrupt_context_mixed_siblings");
+    for cold in [false, true] {
+        let env = c.setup(ContractEnv::new(), "creating sibling case")?;
+        let gate = env.mcp.hold_next_response(WAIT_MARKER);
+        env.fake.queue([Mode::SiblingTools]);
+        let mut session = launch(c, &env, Launch::new())?;
+        c.ok(
+            session.turn("Read and wait concurrently."),
+            "starting siblings",
+        )?;
+        c.ok(gate.wait(), "pending run sibling reaching barrier")?;
+        c.some(
+            session.until(Duration::from_secs(60), |frame| {
+                frame.kind() == "user" && frame.raw.to_string().contains(MCP_TOOL_TEXT)
+            }),
+            "read sibling consumed before interruption",
+        )?;
+        c.ok(
+            session
+                .control
+                .interrupt(cairn_models::interface::session::InterruptCause::DurablePark),
+            "parking with a pending sibling",
+        )?;
+        acknowledgement(c, &mut session, "interrupt")?;
+        session.result(c)?;
+        gate.release();
+        if cold {
+            let id = session.session_id.clone();
+            session.close();
+            session = launch(c, &env, Launch::new().resume(&id))?;
+        }
+        session.ok_turn(c, "Continue after parking.")?;
+        let requests = env.fake.inference();
+        let next = c.some(requests.last(), "subsequent sibling context")?;
+        let blocks = next.tool_results();
+        eprintln!(
+            "interrupt-context mixed-siblings cold={cold} tool_results={}",
+            json!(blocks)
+        );
+        let read = blocks
+            .iter()
+            .find(|block| block["tool_use_id"] == "toolu_sibling_read");
+        let run = blocks
+            .iter()
+            .find(|block| block["tool_use_id"] == TOOL_USE_ID);
+        c.that(
+            read == Some(
+                &json!({"type":"tool_result", "tool_use_id":"toolu_sibling_read",
+            "content":[{"type":"text", "text":MCP_TOOL_TEXT}]}),
+            ),
+            || format!("read context: {read:?}"),
+        )?;
+        c.that(
+            run == Some(&json!({"type":"tool_result", "tool_use_id":TOOL_USE_ID,
+            "content":CLI_INTERRUPTED_TOOL_CONTEXT, "is_error":true})),
+            || format!("run context: {run:?}"),
+        )?;
+        c.that(blocks.len() == 2 && env.fake.egress().is_empty(), || {
+            format!("blocks={blocks:?}, egress={:?}", env.fake.egress())
+        })?;
+    }
+    Ok(())
+}

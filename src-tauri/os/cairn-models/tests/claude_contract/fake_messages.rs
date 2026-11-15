@@ -54,6 +54,8 @@ pub enum Mode {
     /// One `StructuredOutput` call carrying [`STRUCTURED_INPUT`], while the
     /// request offers that tool and carries no tool result yet.
     StructuredOutput,
+    /// A read sibling followed by a run sibling in one assistant message.
+    SiblingTools,
     /// Refuse with this HTTP status. With `rate_limit_headers`, the
     /// `anthropic-ratelimit-unified-*` set rides along, its status
     /// `unified_status`.
@@ -142,6 +144,10 @@ impl FakeMessages {
     /// [`Mode::Text`].
     pub fn queue(&self, modes: impl IntoIterator<Item = Mode>) {
         self.state.lock().unwrap().queue.extend(modes);
+    }
+
+    pub fn replace_queue(&self, modes: impl IntoIterator<Item = Mode>) {
+        self.state.lock().unwrap().queue = modes.into_iter().collect();
     }
 
     /// Answer any request carrying this bearer token with a 401.
@@ -467,6 +473,33 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                 std::thread::sleep(Duration::from_millis(250));
             }
         }
+        Mode::SiblingTools => {
+            for (index, id, name, args) in [
+                (
+                    0,
+                    "toolu_sibling_read",
+                    "mcp__cairn__read",
+                    r#"{"paths":["file:README.md"]}"#,
+                ),
+                (
+                    1,
+                    TOOL_USE_ID,
+                    "mcp__cairn__run",
+                    r#"{"commands":[{"waitFor":{"duration":"3m"}}]}"#,
+                ),
+            ] {
+                stream.write_all(&block_start(
+                    index,
+                    json!({"type":"tool_use", "id":id, "name":name, "input":{}}),
+                ))?;
+                stream.write_all(&delta(
+                    index,
+                    json!({"type":"input_json_delta", "partial_json":args}),
+                ))?;
+                stream.write_all(&block_stop(index))?;
+            }
+            stream.write_all(&finish("tool_use"))?;
+        }
         Mode::Tool { name, args } => stream.write_all(&tool_call(name, args))?,
         Mode::StructuredOutput => {
             stream.write_all(&tool_call("StructuredOutput", STRUCTURED_INPUT))?
@@ -504,6 +537,39 @@ pub struct McpStub {
     calls: Arc<Mutex<Vec<(String, String)>>>,
     /// Every JSON-RPC message posted, whole, in order.
     bodies: Arc<Mutex<Vec<Value>>>,
+    barrier: Arc<Mutex<Option<McpBarrier>>>,
+}
+
+/// A single tools/call cannot answer until the test releases it. Timeouts
+/// bound failures; they never establish the response/interrupt ordering.
+#[derive(Clone)]
+struct McpBarrier {
+    entered: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+    text: &'static str,
+}
+
+pub struct McpResponseGate {
+    entered: crossbeam_channel::Receiver<()>,
+    release: crossbeam_channel::Sender<()>,
+}
+
+impl McpResponseGate {
+    pub fn wait(&self) -> Result<(), String> {
+        self.entered
+            .recv_timeout(Duration::from_secs(60))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn release(&self) {
+        let _ = self.release.try_send(());
+    }
+}
+
+impl Drop for McpResponseGate {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// What every `tools/call` answers.
@@ -515,16 +581,36 @@ impl McpStub {
         let url = format!("http://{}/mcp", listener.local_addr()?);
         let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let barrier = Arc::new(Mutex::new(None::<McpBarrier>));
+        let shared_barrier = barrier.clone();
         let (record, keep) = (calls.clone(), bodies.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let (record, keep) = (record.clone(), keep.clone());
+                let barrier = shared_barrier.clone();
                 std::thread::spawn(move || {
-                    let _ = serve_mcp(stream, &record, &keep);
+                    let _ = serve_mcp(stream, &record, &keep, &barrier);
                 });
             }
         });
-        Ok(Self { url, calls, bodies })
+        Ok(Self {
+            url,
+            calls,
+            bodies,
+            barrier,
+        })
+    }
+
+    pub fn hold_next_response(&self, text: &'static str) -> McpResponseGate {
+        let (entered_tx, entered) = crossbeam_channel::bounded(1);
+        let (release, release_rx) = crossbeam_channel::bounded(1);
+        let old = self.barrier.lock().unwrap().replace(McpBarrier {
+            entered: entered_tx,
+            release: release_rx,
+            text,
+        });
+        assert!(old.is_none(), "a response gate is already armed");
+        McpResponseGate { entered, release }
     }
 
     pub fn calls(&self) -> Vec<(String, String)> {
@@ -540,6 +626,7 @@ fn serve_mcp(
     stream: TcpStream,
     record: &Mutex<Vec<(String, String)>>,
     keep: &Mutex<Vec<Value>>,
+    barrier: &Mutex<Option<McpBarrier>>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -573,7 +660,20 @@ fn serve_mcp(
         let rpc = request["method"].as_str().unwrap_or("").to_string();
         record.lock().unwrap().push((rpc.clone(), token));
         keep.lock().unwrap().push(request.clone());
-        mcp_reply(&rpc, &request)
+        let mut reply = mcp_reply(&rpc, &request);
+        if rpc == "tools/call" && request["params"]["name"] == "run" {
+            let gate = barrier.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let _ = gate.entered.send(());
+                gate.release
+                    .recv_timeout(Duration::from_secs(90))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))?;
+                reply.1 = json!({"jsonrpc":"2.0", "id":request["id"],
+                    "result":{"content":[{"type":"text", "text":gate.text}]}})
+                .to_string();
+            }
+        }
+        reply
     } else {
         // No server-initiated stream: a GET for one is refused, which the
         // client takes as "none offered".

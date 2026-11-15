@@ -8974,6 +8974,81 @@ mod tests {
         assert!(results[0].1.contains(ABANDONED_OUTCOME));
     }
 
+    /// Cut the abandonment at each durable delivery boundary, then run the same
+    /// recovery entrypoint startup uses. These cuts concern stored events only;
+    /// they do not acknowledge consumption by a provider's native conversation.
+    #[tokio::test]
+    async fn abandonment_delivery_boundary_replay_is_exclusive_and_idempotent() {
+        for batch in [false, true] {
+            for cause in AbandonCause::ALL {
+                // Decision committed; claim committed; event appended; row closed.
+                for boundary in 0..4 {
+                    let (orch, base, _) = durable_env().await;
+                    let record = if batch {
+                        run_batch_record(&base, false)
+                    } else {
+                        base
+                    };
+                    insert(&orch.db.local, &record).await.unwrap();
+                    register_warm(&orch);
+                    resolver_in_flight(&orch).await;
+                    let seeded_turns = wait_resolved_turns(&orch).await;
+                    let call = SuspendedCall::of(&record);
+                    assert!(mark_abandoned(&orch.db.local, &record.id, cause)
+                        .await
+                        .unwrap());
+                    let stored = wait_row(&orch, &record.id).await.1;
+                    assert!(
+                        !claim_continuation(&orch.db.local, &record.id, "successor-turn")
+                            .await
+                            .unwrap()
+                    );
+                    match boundary {
+                        1 => assert!(claim_result_delivery(&orch.db.local, &record.id)
+                            .await
+                            .unwrap()),
+                        2 | 3 => {
+                            deliver_abandonment(&orch, &orch.db.local, &call, cause).await;
+                            if boundary == 3 {
+                                cancel_abandoned(&orch.db.local, &record.id, cause)
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                        _ => {}
+                    }
+                    let before = tool_results(&orch).await;
+                    // No resolver survives a restart: reclaim an orphaned claim,
+                    // but retain an event which already committed behind it.
+                    redrive_resolving(&orch, &orch.db.local, &record, stored.clone(), None).await;
+                    let after = tool_results(&orch).await;
+                    assert_eq!(
+                        after.len(),
+                        1,
+                        "batch={batch}, cause={cause:?}, cut={boundary}"
+                    );
+                    if !before.is_empty() {
+                        assert_eq!(after, before, "recovery must not replace a delivered event");
+                    }
+                    assert_eq!(wait_row(&orch, &record.id).await.0, "cancelled");
+                    assert_eq!(wait_row(&orch, &record.id).await.1, stored);
+                    assert_eq!(wait_resolved_turns(&orch).await, seeded_turns);
+                    assert!(
+                        !claim_continuation(&orch.db.local, &record.id, "successor-turn")
+                            .await
+                            .unwrap()
+                    );
+                    redrive_resolving(&orch, &orch.db.local, &record, stored, None).await;
+                    assert_eq!(
+                        tool_results(&orch).await,
+                        after,
+                        "duplicate replay is inert"
+                    );
+                }
+            }
+        }
+    }
+
     /// The converse: a claim with its result already in the transcript is a
     /// completed delivery, and reclaiming must leave it alone.
     #[tokio::test]
