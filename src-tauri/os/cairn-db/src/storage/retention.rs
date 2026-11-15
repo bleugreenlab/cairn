@@ -624,10 +624,10 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "expensive per-resource vectors, one per resource",
     )
     .budget(192),
-    keep(
-        "command_resource_profiles",
-        "bounded by command-key cardinality; samples capped in the row",
-    ),
+    // Configured-check and submitter identities are bounded by command-key
+    // cardinality; ad-hoc compile identities, minted from free-form agent
+    // command lines, are aged out by the rule.
+    evict("command_resource_profiles", Eviction::AdHocCommandProfiles),
     keep(
         "suite_memory_evidence",
         "bounded by suite and machine-context cardinality; one high-water row each",
@@ -640,10 +640,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "resident_kills_learned",
         "pruned to two days of out-of-memory kills as rows are added",
     ),
-    keep(
-        "command_duration_profiles",
-        "bounded by command-key cardinality; samples capped in the row",
-    ),
+    evict("command_duration_profiles", Eviction::AdHocCommandProfiles),
     keep(
         "command_contention_profiles",
         "bounded by command-key cardinality; samples capped in the row",
@@ -816,6 +813,16 @@ const SETTLED_WAIT_AGE_S: i64 = 7 * DAY_S;
 /// reserve_watchdog_successor counts recent successor_reserved rows to enforce
 /// the live recovery budget. Older evidence is forensic, not recovery state.
 const WATCHDOG_ROUTINE_AGE_S: i64 = 7 * DAY_S;
+/// An ad-hoc compile identity not run for this long is forgotten: its next
+/// run stands on its class prior again and measures itself once.
+const AD_HOC_PROFILE_AGE_S: i64 = 30 * DAY_S;
+/// What starts the key of a command identity minted from an agent's own
+/// command line, rather than given by a configured check or submitter. Only
+/// such keys are aged out ([`Eviction::AdHocCommandProfiles`]).
+pub const AD_HOC_COMMAND_KEY_PREFIX: &str = "ad-hoc:";
+/// The least key past every ad-hoc key: the prefix with its last byte, `:`,
+/// advanced to `;`, so the walks are a primary-key range.
+const AD_HOC_COMMAND_KEY_END: &str = "ad-hoc;";
 const WATCHDOG_RECOVERY_AGE_S: i64 = 30 * DAY_S;
 /// A settled regeneration a newer row of the same branch and rule shadows is
 /// read by nothing but a merge still waiting on it by id, and that wait is
@@ -896,6 +903,15 @@ pub(crate) const WATCHDOG_WALK: &str = "SELECT rowid FROM codex_watchdog_lifecyc
      WHERE created_at < ?1 AND (created_at < ?2 \
      OR kind IN ('phase_transition', 'armed', 'disarmed')) \
      ORDER BY created_at LIMIT ?3";
+
+/// Ad-hoc identities' profiles last updated before the cutoff, as a seek on
+/// the primary key's `(identity_version, command_identity)` prefix.
+pub(crate) const AD_HOC_RESOURCE_WALK: &str = "SELECT rowid FROM command_resource_profiles \
+     WHERE identity_version = ?1 AND command_identity >= ?2 AND command_identity < ?3 \
+     AND updated_at_unix_ms < ?4 LIMIT ?5";
+pub(crate) const AD_HOC_DURATION_WALK: &str = "SELECT rowid FROM command_duration_profiles \
+     WHERE identity_version = ?1 AND command_identity >= ?2 AND command_identity < ?3 \
+     AND updated_at_unix_ms < ?4 LIMIT ?5";
 
 /// Regenerations in rowid order. The table is small (this rule keeps it to
 /// about one row per rule per live branch), so a pass walks it whole.
@@ -981,12 +997,19 @@ pub enum Eviction {
     /// `execution_queue_closed_incarnations` once none of its rows remain. A
     /// live entry is never deleted, whatever its age.
     SettledQueueEntries,
+    /// `command_resource_profiles` and `command_duration_profiles` rows of
+    /// ad-hoc compile identities ([`AD_HOC_COMMAND_KEY_PREFIX`]) last updated
+    /// more than thirty days ago. Every distinct agent command line that
+    /// compiles Rust mints one, so their count follows what agents type, not
+    /// what the project configures; configured-check and submitter identities
+    /// are never deleted.
+    AdHocCommandProfiles,
 }
 
 impl Eviction {
     /// The initial order before budget-driven rotation. Watchdog evidence gets
     /// the first runtime turn rather than waiting behind payload-heavy journals.
-    pub const ALL: [Eviction; 9] = [
+    pub const ALL: [Eviction; 10] = [
         Eviction::WatchdogLifecycle,
         Eviction::DoneOutbox,
         Eviction::TerminalStreams,
@@ -996,6 +1019,7 @@ impl Eviction {
         Eviction::AppliedSearchOutbox,
         Eviction::SettledRegenerations,
         Eviction::SettledQueueEntries,
+        Eviction::AdHocCommandProfiles,
     ];
 
     pub fn name(self) -> &'static str {
@@ -1009,6 +1033,7 @@ impl Eviction {
             Eviction::WatchdogLifecycle => "watchdog_lifecycle",
             Eviction::SettledRegenerations => "settled_regenerations",
             Eviction::SettledQueueEntries => "settled_queue_entries",
+            Eviction::AdHocCommandProfiles => "ad_hoc_command_profiles",
         }
     }
 
@@ -1025,6 +1050,9 @@ impl Eviction {
             Eviction::SettledRegenerations => &["branch_regenerations"],
             Eviction::SettledQueueEntries => {
                 &["execution_queue", "execution_queue_closed_incarnations"]
+            }
+            Eviction::AdHocCommandProfiles => {
+                &["command_resource_profiles", "command_duration_profiles"]
             }
         }
     }
@@ -1046,6 +1074,7 @@ impl Eviction {
             Eviction::WatchdogLifecycle => select_watchdog_lifecycle(db, now).await?,
             Eviction::SettledRegenerations => select_settled_regenerations(db, now, cursor).await?,
             Eviction::SettledQueueEntries => select_settled_queue_entries(db, now, cursor).await?,
+            Eviction::AdHocCommandProfiles => select_ad_hoc_profiles(db, now).await?,
         };
         let select = started.elapsed();
         let rows = selection.rows();
@@ -1309,6 +1338,46 @@ async fn select_watchdog_lifecycle(db: &LocalDb, now: i64) -> DbResult<Selection
     Ok(Selection {
         done: rowids.len() < PAGE_ROWS,
         deletes: vec![("codex_watchdog_lifecycle", rowids)],
+        ..Selection::default()
+    })
+}
+
+/// Aged ad-hoc profiles, at most [`PAGE_ROWS`] rows across both tables.
+/// `updated_at_unix_ms` is milliseconds; the pass clock is seconds.
+async fn select_ad_hoc_profiles(db: &LocalDb, now: i64) -> DbResult<Selection> {
+    let cutoff_ms = (now - AD_HOC_PROFILE_AGE_S).saturating_mul(1_000);
+    let version = i64::from(cairn_common::executor_protocol::COMMAND_RESOURCE_IDENTITY_VERSION);
+    let walk = |sql: &'static str, limit: usize| {
+        db.query_all(
+            sql,
+            (
+                version,
+                AD_HOC_COMMAND_KEY_PREFIX,
+                AD_HOC_COMMAND_KEY_END,
+                cutoff_ms,
+                limit as i64,
+            ),
+            |row| row.i64(0),
+        )
+    };
+    let resource = walk(AD_HOC_RESOURCE_WALK, PAGE_ROWS).await?;
+    let duration = match PAGE_ROWS - resource.len() {
+        0 => Vec::new(),
+        room => walk(AD_HOC_DURATION_WALK, room).await?,
+    };
+    let done = resource.len() + duration.len() < PAGE_ROWS;
+    let mut deletes = Vec::new();
+    for (table, rowids) in [
+        ("command_resource_profiles", resource),
+        ("command_duration_profiles", duration),
+    ] {
+        if !rowids.is_empty() {
+            deletes.push((table, rowids));
+        }
+    }
+    Ok(Selection {
+        deletes,
+        done,
         ..Selection::default()
     })
 }

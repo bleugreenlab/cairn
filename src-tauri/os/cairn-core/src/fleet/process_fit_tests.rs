@@ -518,7 +518,7 @@ async fn the_class_prior_defers_the_small_machine() {
     };
     let text = PlacementRejectionReason::ProcessDeferred(misfit).describe();
     assert!(
-        text.contains("(rustc, suite rust-tests, 9.2 GiB measured on bgsrv-ub2 x 1.25 headroom; a prior for this project's Rust compiles"),
+        text.contains("(rustc, unmeasured; standing in: suite rust-tests's peak 9.2 GiB from bgsrv-ub2 x 1.25 headroom)"),
         "{text}"
     );
     assert!(text.starts_with("deferred: "), "{text}");
@@ -540,6 +540,82 @@ async fn the_class_prior_defers_the_small_machine() {
             Some(ProcessFit::Waived(_))
         ),
         "a platform with no memory killer prices a prior as it prices a measurement"
+    );
+}
+
+/// cairn/7027's specimen: bgsrv-win, 27.8 GiB with 23.3 GiB standing, can
+/// give one process 4.5 GiB. An agent's ad-hoc `cargo test -p cairn-codec`,
+/// measured nowhere, stands on `class:cargoTest`'s 29.7 GiB rustc from bbs on
+/// Linux: a number of other work, so bgsrv-win is deferred rather than
+/// refused, and the sentence says the number is borrowed. A configured
+/// suite's own 29.7 GiB, with the same numbers, still refuses.
+#[tokio::test]
+async fn a_class_suites_peak_defers_an_unmeasured_command() {
+    let db = Arc::new(crate::storage::migrated_test_db("process-fit-class-suite.db").await);
+    let class = CellCommandClass::CargoTest;
+    let bbs = linux("bbs-device:bbs", "x86_64");
+    let windows = resource_profiles::ProfileContext {
+        os: "windows".into(),
+        ..linux("bgsrv-win-device:bgsrv-win", "x86_64")
+    };
+    let peak = 29_700 * GIB / 1000;
+    let total = 27_800 * GIB / 1000;
+    let standing = 23_300 * GIB / 1000;
+    let codec = resource_profiles::ad_hoc_identity(
+        "cairn",
+        "cargo test --manifest-path src-tauri/Cargo.toml -p cairn-codec --lib -- one",
+        class,
+    )
+    .unwrap();
+    let configured = CommandResourceIdentity {
+        version: 1,
+        key: "rust-tests:cold".into(),
+        suite: Some("rust-tests".into()),
+    };
+    let mut evidence = Vec::new();
+    for identity in [&codec, &configured] {
+        let suite = resource_profiles::suite_key("cairn", Some(identity), class);
+        resource_profiles::observe_suite(
+            db.clone(),
+            suite.as_deref(),
+            class,
+            &bbs,
+            &rustc_completion(peak, 1),
+            resource_profiles::CompletionKind::Failed,
+            resource_profiles::MachineAdmission::default(),
+        )
+        .await;
+        evidence.push(
+            resource_profiles::resolve_process_demand(
+                db.clone(),
+                Some(identity),
+                suite.as_deref(),
+                class,
+                &windows,
+            )
+            .await,
+        );
+    }
+    let here = "bgsrv-win-device:bgsrv-win";
+    let Some(ProcessFit::Deferred(misfit)) =
+        judge_process_evidence(&evidence[0], total, Some(standing), None, None, here, true)
+    else {
+        panic!("a class suite's peak defers: {:?}", evidence[0]);
+    };
+    let text = PlacementRejectionReason::ProcessDeferred(misfit).describe();
+    assert!(
+        text.contains("(rustc, unmeasured; standing in: suite class:cargoTest's peak 29.7 GiB from bbs (linux x86_64) x 1.25 headroom)"),
+        "{text}"
+    );
+    assert!(
+        matches!(
+            judge_process_evidence(&evidence[1], total, Some(standing), None, None, here, true),
+            Some(ProcessFit::Refused(
+                PlacementRejectionReason::ProcessTooLarge(_)
+            ))
+        ),
+        "a configured suite's peak is a measurement of the suite: {:?}",
+        evidence[1]
     );
 }
 

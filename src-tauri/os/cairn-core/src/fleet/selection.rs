@@ -1663,8 +1663,8 @@ impl Fleet {
             price_host_stall(&mut prediction, &entry.health.host, now);
             if let Some(db) = &oracle.db {
                 let identities: Vec<&CommandResourceIdentity> = match plan {
-                    Some(plan) if !plan.batch_identities.is_empty() => {
-                        plan.batch_identities.iter().collect()
+                    Some(plan) if plan.known_batch_identities().next().is_some() => {
+                        plan.known_batch_identities().collect()
                     }
                     _ => request.command_resource_identity.iter().collect(),
                 };
@@ -3408,10 +3408,11 @@ pub(super) fn process_fit(
 /// measured (a named peak, or a kill's victim), and the kernel here would kill
 /// it. A named demand on a platform that cannot kill, or an unnamed peak that
 /// would have misfit anywhere, is waived with the refusal kept for the record.
-/// A measurement borrowed from another platform refuses like one taken here.
-/// A class prior defers instead: it is the project's largest rustc, not this
-/// work's, so a machine too small for it is offered the work last rather than
-/// never.
+/// A measurement of this work borrowed from another platform refuses like one
+/// taken here. A class prior defers instead: it is a number measured of other
+/// work (its command class's peak, or the project's largest rustc), so a
+/// machine too small for it is offered the work last rather than never, and
+/// the first run there measures the work itself.
 pub(super) fn judge_process_evidence(
     evidence: &resource_profiles::ProcessEvidence,
     total_bytes: u64,
@@ -6147,8 +6148,11 @@ pub(super) fn clamp_declared_concurrency(
 pub(super) struct ReservationPlan {
     pub(super) db: Arc<cairn_db::storage::LocalDb>,
     pub(super) command_class: cairn_common::executor_protocol::CellCommandClass,
-    /// One identity per batch item, empty for a single-command request.
-    pub(super) batch_identities: Vec<CommandResourceIdentity>,
+    /// Each batch item's identity, index-aligned with the items (`None` for
+    /// an item that has none), empty for a single-command request. Learning
+    /// zips it against the items' outcomes by position, so it must never drop
+    /// an item.
+    pub(super) batch_identities: Vec<Option<CommandResourceIdentity>>,
     pub(super) request_identity: Option<CommandResourceIdentity>,
     /// Present when the caller declared its own concurrency demand, which covers
     /// concurrency and nothing else.
@@ -6187,18 +6191,41 @@ impl ReservationPlan {
         let declared_concurrency = (request.resource_reservation.source
             == ResourceReservationSource::Declared)
             .then_some(request.resource_reservation.concurrency_units);
+        // The one place a batch item's identity is decided: the submitter's,
+        // else one minted for an ad-hoc Rust compile, so an agent's `cargo
+        // test -p small` is learned as itself rather than as its class.
+        let batch_suites: Vec<_> = batch
+            .map(|batch| {
+                batch
+                    .items
+                    .iter()
+                    .map(|item| {
+                        let command = std::iter::once(item.program.as_str())
+                            .chain(item.args.iter().map(String::as_str))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let class =
+                            cairn_common::executor_protocol::CellCommandClass::classify(&command);
+                        let identity = item.command_resource_identity.clone().or_else(|| {
+                            resource_profiles::ad_hoc_identity(&request.project_id, &command, class)
+                        });
+                        let suite = resource_profiles::suite_key(
+                            &request.project_id,
+                            identity.as_ref(),
+                            class,
+                        );
+                        (identity, suite, class)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             db,
             command_class: request.command_class,
-            batch_identities: batch
-                .map(|batch| {
-                    batch
-                        .items
-                        .iter()
-                        .filter_map(|item| item.command_resource_identity.clone())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            batch_identities: batch_suites
+                .iter()
+                .map(|(identity, _, _)| identity.clone())
+                .collect(),
             request_identity: request.command_resource_identity.clone(),
             declared_concurrency,
             resolves: (declared_concurrency.is_some()
@@ -6214,33 +6241,13 @@ impl ReservationPlan {
                 request.command_resource_identity.as_ref(),
                 request.command_class,
             ),
-            batch_suites: batch
-                .map(|batch| {
-                    batch
-                        .items
-                        .iter()
-                        .map(|item| {
-                            let command = std::iter::once(item.program.as_str())
-                                .chain(item.args.iter().map(String::as_str))
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            let class = cairn_common::executor_protocol::CellCommandClass::classify(
-                                &command,
-                            );
-                            (
-                                item.command_resource_identity.clone(),
-                                resource_profiles::suite_key(
-                                    &request.project_id,
-                                    item.command_resource_identity.as_ref(),
-                                    class,
-                                ),
-                                class,
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            batch_suites,
         }
+    }
+
+    /// The batch items' identities, skipping items that have none.
+    pub(super) fn known_batch_identities(&self) -> impl Iterator<Item = &CommandResourceIdentity> {
+        self.batch_identities.iter().flatten()
     }
 
     /// The largest single process this work is known to hold on `context`'s
@@ -6356,7 +6363,7 @@ impl ReservationPlan {
         let prior = resource_profiles::cold_start_prior(self.command_class, capabilities);
         let class_prior = prior.clone();
         let mut resolved = if self.batch_suites.is_empty()
-            || (self.parallel_width > 1 && self.batch_identities.is_empty())
+            || (self.parallel_width > 1 && self.known_batch_identities().next().is_none())
         {
             resource_profiles::resolve_reservation(
                 self.db.clone(),
@@ -6405,11 +6412,6 @@ impl ReservationPlan {
         }
         if self.batch_suites.is_empty() || self.parallel_width > 1 {
             resolved.process_evidence = self.process_evidence(&context).await;
-            if self.batch_suites.is_empty() && self.request_identity.is_none() {
-                resolved.process_evidence.build_job_memory = None;
-                resolved.process_evidence.build_jobs_elsewhere = None;
-                resolved.process_evidence.test_phase = None;
-            }
             resolved.charge_measured_peak();
             let cpu_width = capabilities
                 .concurrency_capacity
@@ -6431,7 +6433,7 @@ impl ReservationPlan {
         context: &resource_profiles::ProfileContext,
         duration_context: resource_profiles::DurationContext,
     ) -> cairn_common::executor_protocol::DurationEstimate {
-        if self.batch_identities.is_empty() {
+        if self.known_batch_identities().next().is_none() {
             return resource_profiles::resolve_duration(
                 self.db.clone(),
                 self.request_identity.as_ref(),
@@ -6457,7 +6459,7 @@ impl ReservationPlan {
         duration_context: resource_profiles::DurationContext,
     ) -> cairn_common::executor_protocol::DurationEstimate {
         let mut total: Option<cairn_common::executor_protocol::DurationEstimate> = None;
-        for identity in &self.batch_identities {
+        for identity in self.known_batch_identities() {
             let item = resource_profiles::resolve_duration(
                 self.db.clone(),
                 Some(identity),
@@ -6558,11 +6560,6 @@ impl ReservationPlan {
                     context,
                 )
                 .await;
-                if identity.is_none() {
-                    item.process_evidence.build_job_memory = None;
-                    item.process_evidence.build_jobs_elsewhere = None;
-                    item.process_evidence.test_phase = None;
-                }
                 item.charge_measured_peak();
                 item.price_at_width(cpu_width, &member_prior, memory_budget_bytes);
                 process_evidence = Some(match process_evidence {

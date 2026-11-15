@@ -235,6 +235,9 @@ async fn every_selection_and_delete_seeks() {
         !plan.iter().any(|line| line.contains("SORTER")),
         "{plan:#?}"
     );
+    for walk in [AD_HOC_RESOURCE_WALK, AD_HOC_DURATION_WALK] {
+        assert_seeks(&db, walk, 5, "USING INDEX").await;
+    }
     for table in [
         "codex_watchdog_lifecycle",
         "effect_outbox",
@@ -247,6 +250,8 @@ async fn every_selection_and_delete_seeks() {
         "branch_regenerations",
         "execution_queue",
         "execution_queue_closed_incarnations",
+        "command_resource_profiles",
+        "command_duration_profiles",
     ] {
         let delete = format!("DELETE FROM {table} WHERE rowid IN ({})", placeholders(3));
         assert_seeks(&db, &delete, 3, ROWID).await;
@@ -1455,6 +1460,49 @@ fn quantiles_take_the_nearest_rank() {
     assert_eq!(quantile(&[], 0.5), 0);
     assert_eq!(quantile(&[5, 1, 3], 0.5), 3);
     assert_eq!(quantile(&[5, 1, 3], 0.99), 5);
+}
+
+/// Ad-hoc command identities, minted from whatever an agent types, are
+/// forgotten thirty days after their last run, in both profile tables; a
+/// configured check's identity is never touched however old.
+#[tokio::test]
+async fn only_aged_ad_hoc_command_profiles_are_evicted() {
+    let (_temp, db) = private_db().await;
+    let old_ms = (NOW - 31 * DAY_S) * 1_000;
+    let fresh_ms = (NOW - 29 * DAY_S) * 1_000;
+    let rows = [
+        ("ad-hoc:old", old_ms),
+        ("ad-hoc:fresh", fresh_ms),
+        ("configured-check-key", old_ms),
+    ];
+    for (key, updated) in rows {
+        db.execute(
+            "INSERT INTO command_resource_profiles (identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint, sample_count, updated_at_unix_ms, confidence_millis)
+             VALUES (1, ?1, 'device:executor', 'linux', 'x86_64', 'rust', 1, ?2, 200)",
+            (key.to_string(), updated),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO command_duration_profiles (identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint, warmth, sample_count, updated_at_unix_ms)
+             VALUES (1, ?1, 'device:executor', 'linux', 'x86_64', 'rust', 'cold', 1, ?2)",
+            (key.to_string(), updated),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(AD_HOC_COMMAND_KEY_PREFIX.ends_with(':'));
+    let report = run(&db, UNBOUNDED, &[Eviction::AdHocCommandProfiles]).await;
+    assert_eq!(report.rules[0].rows, 2, "{report}");
+    for sql in [
+        "SELECT command_identity FROM command_resource_profiles ORDER BY command_identity",
+        "SELECT command_identity FROM command_duration_profiles ORDER BY command_identity",
+    ] {
+        assert_eq!(
+            ids(&db, sql).await,
+            ["ad-hoc:fresh", "configured-check-key"]
+        );
+    }
 }
 
 fn watchdog_eviction() -> Eviction {

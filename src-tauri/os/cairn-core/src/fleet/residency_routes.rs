@@ -1729,8 +1729,21 @@ impl Fleet {
                 .await;
         let connections = self.lock_connections();
         let entry = connections.get(&selected.executor_id)?;
-        let ProcessFit::Refused(reason) = process_fit(&evidence, entry)? else {
-            return None;
+        // A resident has no command identity, and the kills it posts carry its
+        // class but not its command, so its class suite is the only record its
+        // command has: what that suite measured, here or on another platform,
+        // refuses as a measurement of it would. A batch's class suite only
+        // defers (its own identity measures it on the first run), but a
+        // terminal is pinned to its environment's machine, where deferring
+        // would start it anyway. The project's largest rustc, another suite's
+        // number, still only defers.
+        let own_suite = suite.split_once('/').map(|(_, name)| name);
+        let reason = match process_fit(&evidence, entry)? {
+            ProcessFit::Refused(reason) => reason,
+            ProcessFit::Deferred(misfit) if misfit.suite.as_deref() == own_suite => {
+                PlacementRejectionReason::ProcessTooLarge(misfit)
+            }
+            _ => return None,
         };
         Some(format!(
             "{} cannot run this terminal's command: {}. Nothing was started; run the command as a batch, which placement sends to a machine that can hold it, or start the terminal on such a machine.",

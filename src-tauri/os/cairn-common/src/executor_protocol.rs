@@ -9409,6 +9409,16 @@ pub struct LearnedResourceEstimate {
 /// (`moved_vocabulary_frames_are_byte_identical`), so an older peer on either
 /// side reads exactly what it read before. What a runner gets wrong talking to
 /// an older executor: nothing.
+///
+/// cairn/7027 does not move the number. No frame, variant or field changes.
+/// The runner now mints a [`CommandResourceIdentity`] for an agent's ad-hoc
+/// Rust compile inside its own reservation plan, and never sends it: the
+/// batch items it serializes still carry none. A class suite's stand-in peak
+/// is now labelled [`ProcessDemandBasis::ClassPrior`], an existing variant,
+/// and its sentence in `describe_process_evidence` names the number as
+/// borrowed. Only the runner builds or renders process demands, into its own
+/// placement records, so a runner talking to an older executor gets nothing
+/// wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -22823,11 +22833,13 @@ pub enum ProcessDemandBasis {
     /// `platform` is that platform as a reader names it: its architecture,
     /// or its operating system and architecture when the system differs too.
     OtherPlatform { platform: String },
-    /// Nothing of this work was measured on any platform. The demand is the
-    /// project's largest measured rustc across its suites, a prior for any
-    /// Rust compile of the project. `platform` is set when that rustc was
-    /// measured on another platform. Unlike a measurement of the work, a
-    /// prior defers a machine too small for it rather than refusing it.
+    /// Nothing of this work was measured on any platform, so the demand is a
+    /// number measured of other work: its command class's suite peak (an
+    /// agent's ad-hoc `cargo test` standing on `class:cargoTest`), else the
+    /// project's largest measured rustc across its suites. `platform` is set
+    /// when that number was measured on another platform. Unlike a
+    /// measurement of the work, a prior defers a machine too small for it
+    /// rather than refusing it.
     ClassPrior {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         platform: Option<String>,
@@ -22860,7 +22872,7 @@ fn describe_process_evidence(
     if let Some(name) = process_name {
         evidence.push(name.to_string());
     }
-    if let Some(suite) = suite {
+    if let Some(suite) = suite.filter(|_| !basis.is_class_prior()) {
         evidence.push(format!("suite {suite}"));
     }
     let (measured, headroom) = match measured_bytes.filter(|bytes| *bytes > 0) {
@@ -22885,16 +22897,34 @@ fn describe_process_evidence(
         (None, Some(platform)) => format!(" on {platform}"),
         (None, None) => String::new(),
     };
-    let prior = if basis.is_class_prior() {
-        "; a prior for this project's Rust compiles, since nothing of this work was measured on any platform"
-    } else {
-        ""
-    };
+    if basis.is_class_prior() {
+        // A borrowed number says so first, and whose it is: nothing of this
+        // work was measured, so it must not read as this work's measurement.
+        let source = match suite {
+            Some(suite) => format!("suite {suite}'s peak"),
+            None => "a peak".to_string(),
+        };
+        let from = match (measured_here, measured_on, platform) {
+            (true, _, _) => " from here".to_string(),
+            (false, Some(machine), Some(platform)) => format!(" from {machine} ({platform})"),
+            (false, Some(machine), None) => format!(" from {machine}"),
+            (false, None, Some(platform)) => format!(" from {platform}"),
+            (false, None, None) => String::new(),
+        };
+        let amount = measured_bytes
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| format!(" {}", describe_gib(bytes)))
+            .unwrap_or_default();
+        evidence.push(format!(
+            "unmeasured; standing in: {source}{amount}{from}{headroom}"
+        ));
+        return evidence.join(", ");
+    }
     match (measured_here, measured.is_empty() && place.is_empty()) {
-        (true, _) => evidence.push(format!("{measured}measured here{headroom}{prior}")),
-        (false, true) => evidence.push(format!("estimated here{prior}")),
+        (true, _) => evidence.push(format!("{measured}measured here{headroom}")),
+        (false, true) => evidence.push("estimated here".to_string()),
         (false, false) => evidence.push(format!(
-            "{measured}measured{place}{headroom}{prior}; estimated here"
+            "{measured}measured{place}{headroom}; estimated here"
         )),
     }
     evidence.join(", ")

@@ -3002,6 +3002,146 @@ async fn a_parallel_batch_is_charged_for_every_item_it_runs_at_once() {
     );
 }
 
+/// A minted identity is no licence to its class suite's build-job figures,
+/// which some other command of the class measured. A 30 GiB largest job
+/// learned under `class:cargoTest` here must not make `cargo test -p
+/// cairn-codec` too large for a 20 GiB executor bound (the test placement's
+/// `executor_bound_rejection` applies); the same figures learned under a
+/// configured suite still do.
+#[tokio::test]
+async fn a_class_suites_build_jobs_never_price_an_ad_hoc_compile() {
+    const GIB: u64 = 1 << 30;
+    let db = Arc::new(crate::storage::migrated_test_db("class-suite-build-jobs.db").await);
+    let mut capabilities = capabilities_with_cores(16);
+    capabilities.memory_budget_bytes = Some(120 * GIB);
+    let context = ReservationPlan::context_for("device", "executor", &capabilities);
+    let request = provenance_request();
+    let census = CellExecutionMeta {
+        stop: None,
+        peak_process: Some(cairn_common::executor_protocol::PeakProcess {
+            bytes: 30 * GIB,
+            name: Some("rustc".into()),
+        }),
+        build_job_processes: Some(cairn_common::executor_protocol::BuildJobProcesses {
+            processes: 40,
+            largest_bytes: 30 * GIB,
+            typical_bytes: GIB,
+        }),
+        ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
+    };
+    for suite in ["class:cargoTest", "rust-tests"] {
+        resource_profiles::observe_suite(
+            db.clone(),
+            Some(&format!("{}/{suite}", request.project_id)),
+            CellCommandClass::CargoTest,
+            &context,
+            &census,
+            resource_profiles::CompletionKind::Succeeded,
+            resource_profiles::MachineAdmission::default(),
+        )
+        .await;
+    }
+    let resolve = |item: ProcessBatchItem| {
+        let (db, request, capabilities) = (db.clone(), request.clone(), capabilities.clone());
+        async move {
+            let batch = ProcessBatch {
+                files: Vec::new(),
+                runtime_packages: Vec::new(),
+                sequential: true,
+                stop_on_error: false,
+                sandbox_mode: ProcessSandboxMode::Unconfined,
+                timeout_bases: Vec::new(),
+                items: vec![item],
+                runner_context_id: None,
+                execution_residency: None,
+                containment: None,
+                node_scratch: None,
+            };
+            ReservationPlan::new(db, &request, Some(&batch))
+                .resolve_for(
+                    &request,
+                    "device",
+                    "executor",
+                    &capabilities,
+                    resource_profiles::DurationContext {
+                        class: CellCommandClass::CargoTest,
+                        warmth: ExecutionWarmth::Cold,
+                        now_unix_ms: NOW,
+                    },
+                )
+                .await
+        }
+    };
+    let ad_hoc = ProcessBatchItem {
+        args: vec!["cargo test -p cairn-codec --lib".into()],
+        ..cache_batch_item(Vec::new())
+    };
+    let configured = ProcessBatchItem {
+        command_resource_identity: Some(CommandResourceIdentity {
+            version: 1,
+            key: "rust-tests:cold".into(),
+            suite: Some("rust-tests".into()),
+        }),
+        ..ad_hoc.clone()
+    };
+    let bound = 20 * GIB;
+
+    let small = resolve(ad_hoc).await;
+    assert_eq!(small.reservation.build_job_memory, None);
+    assert_eq!(small.rationale.build_jobs_price, None);
+    assert!(
+        small.reservation.solve_memory_grant(1, bound, 0).is_ok(),
+        "another command's 30 GiB job never refuses this one at the bound: {:?}",
+        small.reservation
+    );
+    // Measured once on another machine, the command is charged its own
+    // largest process here, never the 2 GiB prior again.
+    let identity = resource_profiles::ad_hoc_identity(
+        &request.project_id,
+        "cargo test -p cairn-codec --lib",
+        CellCommandClass::CargoTest,
+    )
+    .unwrap();
+    resource_profiles::observe_completed(
+        db.clone(),
+        Some(&identity),
+        &resource_profiles::ProfileContext {
+            executor_class: "elsewhere-device:elsewhere".into(),
+            ..context.clone()
+        },
+        &CellExecutionMeta {
+            stop: None,
+            peak_process: Some(cairn_common::executor_protocol::PeakProcess {
+                bytes: 3 * GIB,
+                name: Some("rustc".into()),
+            }),
+            ..resource_profiles::oom_killed_for_test(3 * GIB, None, 0, 2)
+        },
+        resource_profiles::CompletionKind::Succeeded,
+    )
+    .await;
+    let measured = resolve(ProcessBatchItem {
+        args: vec!["cargo test -p cairn-codec --lib -- one::test".into()],
+        ..cache_batch_item(Vec::new())
+    })
+    .await;
+    assert!(
+        measured.reservation.memory_charge_bytes() >= 3 * GIB / 4 * 5,
+        "a command measured on another machine is charged its own process: {:?}",
+        measured.reservation
+    );
+    let suite = resolve(configured).await;
+    assert!(
+        suite.reservation.build_job_memory.is_some(),
+        "a configured suite's jobs are its own"
+    );
+    assert!(
+        suite.reservation.solve_memory_grant(1, bound, 0).is_err(),
+        "a configured suite's measured 30 GiB job is still refused at a 20 GiB bound: {:?}",
+        suite.reservation
+    );
+}
+
 /// A reservation has two independent halves, and the record must carry both.
 ///
 /// Concurrency comes from the caller and memory/disk come from the learned
@@ -8593,7 +8733,7 @@ async fn a_cold_compile_is_offered_the_small_machine_last_on_the_class_prior() {
     assert!(
         demand
             .describe()
-            .starts_with("one process of ~11.5 GiB (rustc, suite rust-tests, 9.2 GiB measured on bgsrv-ub x 1.25 headroom; a prior for this project's Rust compiles"),
+            .starts_with("one process of ~11.5 GiB (rustc, unmeasured; standing in: suite rust-tests's peak 9.2 GiB from bgsrv-ub x 1.25 headroom)"),
         "{}",
         demand.describe()
     );
@@ -8633,6 +8773,93 @@ async fn a_cold_compile_is_offered_the_small_machine_last_on_the_class_prior() {
         "{demand:?}"
     );
     assert!(demand.describe().starts_with("placed unmeasured"));
+
+    // cairn/7027: an agent's ad-hoc `cargo test -p cairn-codec`, measured
+    // nowhere, stands on its class suite's 9.2 GiB. Deferral is for pinned or
+    // last-resort placement only: unpinned, it still goes to the machine that
+    // can hold the borrowed number, and the small one is deferred, not refused.
+    let (pool, db, mut request) = fleet("process-prior-ad-hoc.db", false, false).await;
+    let small = {
+        let connections = pool.lock_connections();
+        let entry = connections.get("bgsrv-ub").expect("the small machine");
+        ReservationPlan::context_for(
+            &entry.identity.device_id,
+            &entry.identity.executor_id,
+            &entry.advertisement.capabilities,
+        )
+    };
+    resource_profiles::observe_suite(
+        db.clone(),
+        Some(&format!("{}/class:cargoTest", request.project_id)),
+        CellCommandClass::CargoTest,
+        &small,
+        &CellExecutionMeta {
+            stop: None,
+            peak_process: Some(cairn_common::executor_protocol::PeakProcess {
+                bytes: 9_910_000_000,
+                name: Some("rustc".into()),
+            }),
+            ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
+        },
+        resource_profiles::CompletionKind::Failed,
+        resource_profiles::MachineAdmission::default(),
+    )
+    .await;
+    request.command_resource_identity = None;
+    request.command_class = CellCommandClass::CargoTest;
+    let batch = ProcessBatch {
+        files: Vec::new(),
+        runtime_packages: Vec::new(),
+        sequential: true,
+        stop_on_error: false,
+        sandbox_mode: ProcessSandboxMode::Unconfined,
+        timeout_bases: Vec::new(),
+        items: vec![ProcessBatchItem {
+            args: vec!["cargo test -p cairn-codec --lib".into()],
+            ..cache_batch_item(Vec::new())
+        }],
+        runner_context_id: None,
+        execution_residency: None,
+        containment: None,
+        node_scratch: None,
+    };
+    let plan = ReservationPlan::new(db, &request, Some(&batch));
+    let placement = pool
+        .select_executor_once_with(
+            &request,
+            Some(&plan),
+            &ActivePlacementPolicy::default_profile(),
+            &HashMap::new(),
+            &AdmissionView::default(),
+            |_, _| SyncCost::Known(0),
+        )
+        .await
+        .unwrap()
+        .placed()
+        .expect("the large machine takes it");
+    assert_eq!(
+        placement.selected.executor_id, "bbs",
+        "unpinned, an unmeasured ad-hoc compile prefers the machine its borrowed number fits"
+    );
+    let small = placement
+        .decision
+        .rejected
+        .iter()
+        .find(|rejection| rejection.executor_id == "bgsrv-ub")
+        .expect("bgsrv-ub is on the record");
+    assert!(
+        matches!(small.reason, PlacementRejectionReason::ProcessDeferred(_)),
+        "{}",
+        small.reason.describe()
+    );
+    assert!(
+        small
+            .reason
+            .describe()
+            .contains("unmeasured; standing in: suite class:cargoTest's peak 9.2 GiB"),
+        "{}",
+        small.reason.describe()
+    );
 }
 
 /// cairn/6310 end to end: bgsrv-mac, the only macOS machine, whose
@@ -22966,6 +23193,10 @@ async fn a_review_waves_board_follows_its_members_one_at_a_time() {
 /// the fit line count two crowded kills because their starting load is
 /// unknown, and the vitest item's process is learned under vitest, not
 /// cargo. Those kills teach the victim's size without ending the fit.
+///
+/// The runner mints an identity for each cargo item and none for vitest,
+/// which runs first, so each cargo identity must learn its own item's kill
+/// rather than the outcome one position before it.
 #[tokio::test]
 async fn an_identity_free_batch_teaches_each_items_suite_and_counts_its_kills() {
     use cairn_common::executor_protocol::ProcessBatchItemOutcome;
@@ -22975,9 +23206,9 @@ async fn an_identity_free_batch_teaches_each_items_suite_and_counts_its_kills() 
     let (sender, mut executor) = mpsc::unbounded_channel();
     let generation = orch.fleet.attach_executor(sender);
     let commands = [
+        "bun run test:frontend",
         "cargo test -p cairn-core",
         "cargo test -p cairn-db",
-        "bun run test:frontend",
     ];
     let items = commands
         .iter()
@@ -23049,9 +23280,9 @@ async fn an_identity_free_batch_teaches_each_items_suite_and_counts_its_kills() 
             })
         };
         let outcomes = vec![
+            item("vitest", GIB, None),
             item("cargo-core", 2 * GIB, killed(7)),
             item("cargo-db", 2 * GIB, killed(8)),
-            item("vitest", GIB, None),
         ];
         let mut outcome = completed_for(&request, COLOCATED_EXECUTOR_ID, generation);
         if let CellOutcome::Completed { output, .. } = &mut outcome {
@@ -23072,6 +23303,7 @@ async fn an_identity_free_batch_teaches_each_items_suite_and_counts_its_kills() 
         owner_id: request.project_id.clone(),
     };
     request.command_resource_identity = None;
+    let project_id = request.project_id.clone();
     let batch = ProcessBatch {
         files: Vec::new(),
         runtime_packages: Vec::new(),
@@ -23135,14 +23367,39 @@ async fn an_identity_free_batch_teaches_each_items_suite_and_counts_its_kills() 
             connections.get(COLOCATED_EXECUTOR_ID).unwrap(),
         ))
     };
-    let evidence = resource_profiles::resolve_process_demand(
-        db,
-        None,
-        Some(&rows[0].0),
-        cairn_common::executor_protocol::CellCommandClass::CargoTest,
-        &context,
-    )
-    .await;
+    let cargo_test = cairn_common::executor_protocol::CellCommandClass::CargoTest;
+    for package in ["cairn-core", "cairn-db"] {
+        // A later run of the same command under another filter is the same
+        // identity, and resolves to what this one measured of itself.
+        let identity = resource_profiles::ad_hoc_identity(
+            &project_id,
+            &format!("cargo test -p {package} -- some::filter"),
+            cargo_test,
+        )
+        .unwrap();
+        let own = resource_profiles::resolve_process_demand(
+            db.clone(),
+            Some(&identity),
+            Some(&rows[0].0),
+            cargo_test,
+            &context,
+        )
+        .await
+        .demand
+        .unwrap_or_else(|| panic!("{package} learned its own kill"));
+        assert_eq!(
+            (own.peak_bytes, own.suite.as_deref(), own.basis.clone()),
+            (
+                3 * GIB,
+                None,
+                cairn_common::executor_protocol::ProcessDemandBasis::ThisPlatform
+            ),
+            "{package} speaks for itself, not for the item before it"
+        );
+    }
+    let evidence =
+        resource_profiles::resolve_process_demand(db, None, Some(&rows[0].0), cargo_test, &context)
+            .await;
     assert_eq!(
         judge_process_evidence(
             &evidence,

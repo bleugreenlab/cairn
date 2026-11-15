@@ -362,8 +362,9 @@ impl ResolvedResourceProfile {
     /// [`resolve_reservation`]) and the largest single process measured of this
     /// work on any platform, with headroom.
     ///
-    /// Measured, never declared (tenet 946). A class prior is the project's
-    /// largest rustc, not a measurement of this work, so it does not count; nor
+    /// Measured, never declared (tenet 946). A class prior (a command class's
+    /// peak, or the project's largest rustc) is not a measurement of this
+    /// work, so it does not count; nor
     /// does a borrowed tree peak, which scales with the width of the machine
     /// that measured it rather than with this one.
     ///
@@ -824,6 +825,57 @@ pub(super) fn suite_key(
     }
 }
 
+/// The identity an agent's ad-hoc Rust compile is learned under, so the
+/// command speaks for itself after one run instead of borrowing its command
+/// class's largest peak forever. `None` for any command that does not compile
+/// the project's Rust: the per-process fit judges only those, and minting
+/// identities for every shell command would grow the profile table for
+/// nothing.
+///
+/// In a plain `cargo` invocation everything from the first bare `--` on is
+/// the test binary's arguments (filters, `--exact`, `--nocapture`), which do
+/// not change what is compiled, so such runs differing only there share one
+/// identity. Anything else keeps its whole command line: a shell line can
+/// carry a second command after `--` (`cargo test -p a -- x && cargo test -p
+/// core`), and folding it into `cargo test -p a` would price an unmeasured
+/// large compile as an already-measured small one, or let the large run
+/// contaminate the small one's rise-only peak. Whitespace is normalized. The
+/// suite is left unset, so the identity's suite is its command class.
+pub(super) fn ad_hoc_identity(
+    project_id: &str,
+    command: &str,
+    class: CellCommandClass,
+) -> Option<CommandResourceIdentity> {
+    use sha2::{Digest, Sha256};
+    if !class.compiles_rust() {
+        return None;
+    }
+    const SHELL_SYNTAX: &[char] = &[';', '|', '&', '<', '>', '`', '$', '(', ')', '\n', '\r'];
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let plain_cargo = tokens.first() == Some(&"cargo") && !command.contains(SHELL_SYNTAX);
+    let compiled = match tokens.iter().position(|token| *token == "--") {
+        Some(at) if plain_cargo => &tokens[..at],
+        _ => &tokens[..],
+    };
+    let normalized = compiled.join(" ");
+    let mut hasher = Sha256::new();
+    for field in ["ad-hoc-command-v1", project_id, normalized.as_str()] {
+        hasher.update(field.len().to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    Some(CommandResourceIdentity {
+        version: cairn_common::executor_protocol::COMMAND_RESOURCE_IDENTITY_VERSION,
+        // The prefix is what retention ages these out by: unlike a configured
+        // check's, their number follows whatever agents type.
+        key: format!(
+            "{}{:x}",
+            cairn_db::storage::retention::AD_HOC_COMMAND_KEY_PREFIX,
+            hasher.finalize()
+        ),
+        suite: None,
+    })
+}
+
 /// What marks a suite keyed by command class rather than by a check's name.
 const CLASS_SUITE_PREFIX: &str = "class:";
 
@@ -843,8 +895,11 @@ fn suite_display(suite_key: &str) -> String {
 /// configured check's suite always joins it: a tiered lane is one suite whose
 /// identity moves with its configuration, and any of its runs may compile the
 /// whole closure. A command-class suite only stands in for an identity that
-/// has measured nothing, since a class spans unrelated commands, and an
-/// identity measured once on any machine then speaks for itself.
+/// has measured nothing on any platform, since a class spans unrelated
+/// commands, and an identity measured once on any machine then speaks for
+/// itself. A class suite's number is not a measurement of this work, so it
+/// stands in as a class prior: placement defers a machine too small for it
+/// rather than refusing it, and the first run there measures the identity.
 ///
 /// A peak with no process named is never a single-process demand: the macOS
 /// sampler cannot attribute its peak to one process, so the number it records
@@ -890,8 +945,8 @@ pub(super) async fn resolve_process_demand(
     };
     let class_suite =
         suite_key.is_some_and(|key| suite_display(key).starts_with(CLASS_SUITE_PREFIX));
-    let suite_applies = !class_suite || own.is_empty();
     let measured_nowhere = own.is_empty() && own_elsewhere.is_none();
+    let suite_applies = !class_suite || measured_nowhere;
     let kills_here = suite.as_ref().and_then(|suite| suite.kills_here.clone());
     let suite_peak = suite
         .as_ref()
@@ -903,7 +958,10 @@ pub(super) async fn resolve_process_demand(
             suite: suite_key.map(suite_display),
             measured_on: Some(measured_on),
             kills_here: None,
-            basis: ProcessDemandBasis::ThisPlatform,
+            basis: match class_suite {
+                true => ProcessDemandBasis::ClassPrior { platform: None },
+                false => ProcessDemandBasis::ThisPlatform,
+            },
         });
     // The suite's row keeps one peak, a measurement or a victim, with its
     // name; unnamed, it cannot be told from a tree's total, so it is one.
@@ -916,7 +974,7 @@ pub(super) async fn resolve_process_demand(
     if demand.is_none() {
         let suite_elsewhere = suite
             .as_ref()
-            .filter(|_| !class_suite || measured_nowhere)
+            .filter(|_| suite_applies)
             .and_then(|suite| suite.elsewhere.clone())
             .map(|(bytes, name, measured_on, platform)| ProcessDemand {
                 peak_bytes: bytes,
@@ -924,7 +982,12 @@ pub(super) async fn resolve_process_demand(
                 suite: suite_key.map(suite_display),
                 measured_on: Some(measured_on),
                 kills_here: None,
-                basis: ProcessDemandBasis::OtherPlatform { platform },
+                basis: match class_suite {
+                    true => ProcessDemandBasis::ClassPrior {
+                        platform: Some(platform),
+                    },
+                    false => ProcessDemandBasis::OtherPlatform { platform },
+                },
             });
         demand = ProcessDemand::max(own_elsewhere, suite_elsewhere);
     }
@@ -952,14 +1015,21 @@ pub(super) async fn resolve_process_demand(
         }
         (None, None) => {}
     }
+    // A class suite's test phase and build jobs were measured of whichever
+    // commands of the class happened to run, so they never size the jobs an
+    // executor grants this work nor price it: a 30 GiB job of one `cargo
+    // test` would otherwise refuse a small `cargo test -p` at the executor's
+    // memory bound however small its own measurement. A configured suite's
+    // figures are the suite's own, and always apply.
+    let jobs = suite.filter(|_| !class_suite);
     ProcessEvidence {
         unreadable_memory,
         demand,
         unattributed,
         unmeasured_compile,
-        test_phase: suite.as_ref().and_then(|suite| suite.test_phase),
-        build_job_memory: suite.as_ref().and_then(|suite| suite.build_job_memory),
-        build_jobs_elsewhere: suite
+        test_phase: jobs.as_ref().and_then(|suite| suite.test_phase),
+        build_job_memory: jobs.as_ref().and_then(|suite| suite.build_job_memory),
+        build_jobs_elsewhere: jobs
             .filter(|suite| suite.build_job_memory.is_none())
             .and_then(|suite| suite.build_jobs_elsewhere),
     }
@@ -3992,19 +4062,42 @@ mod process_peak_tests {
             MachineAdmission::default(),
         )
         .await;
+        let stand_in = resolve_process_demand(
+            db.clone(),
+            None,
+            class.as_deref(),
+            CellCommandClass::CargoTest,
+            &fedora,
+        )
+        .await
+        .demand
+        .expect("an unmeasured command's class speaks for it");
+        assert_eq!(stand_in.peak_bytes, 10 * GIB);
+        assert_eq!(stand_in.suite.as_deref(), Some("class:cargoTest"));
         assert_eq!(
-            resolve_process_demand(
-                db.clone(),
-                None,
-                class.as_deref(),
-                CellCommandClass::CargoTest,
-                &fedora
-            )
-            .await
-            .demand
-            .map(|demand| demand.peak_bytes),
-            Some(10 * GIB),
-            "an agent's batch has no identity, and its class speaks for it"
+            stand_in.basis,
+            ProcessDemandBasis::ClassPrior { platform: None },
+            "a class's peak is not a measurement of this command"
+        );
+        let windows = ProfileContext {
+            os: "windows".into(),
+            ..context("bgsrv-win-device:bgsrv-win")
+        };
+        let borrowed = resolve_process_demand(
+            db.clone(),
+            None,
+            class.as_deref(),
+            CellCommandClass::CargoTest,
+            &windows,
+        )
+        .await
+        .demand
+        .expect("another platform's class peak stands in");
+        assert_eq!(
+            borrowed.basis,
+            ProcessDemandBasis::ClassPrior {
+                platform: Some("linux x86_64".into())
+            }
         );
         let small = CommandResourceIdentity {
             suite: None,
@@ -4030,6 +4123,190 @@ mod process_peak_tests {
             .demand
             .map(|demand| demand.peak_bytes),
             Some(GIB)
+        );
+    }
+
+    /// An ad-hoc Rust compile is keyed by what it compiles: its test binary's
+    /// arguments and its spacing do not move it, its packages and its project
+    /// do, and a command that compiles no Rust is not minted one.
+    #[test]
+    fn an_ad_hoc_compile_is_its_command_without_its_test_arguments() {
+        let key = |project: &str, command: &str| {
+            ad_hoc_identity(project, command, CellCommandClass::CargoTest).map(|id| id.key)
+        };
+        let codec = key("cairn", "cargo test -p cairn-codec --lib -- a::b");
+        assert!(codec.is_some());
+        assert_eq!(
+            codec,
+            key("cairn", "cargo  test -p cairn-codec --lib -- c::d --exact")
+        );
+        assert_eq!(codec, key("cairn", "cargo test -p cairn-codec --lib"));
+        assert_ne!(
+            codec,
+            key("cairn", "cargo test -p cairn-core --lib -- a::b")
+        );
+        assert_ne!(
+            codec,
+            key("other", "cargo test -p cairn-codec --lib -- a::b")
+        );
+        for compound in [
+            "cargo test -p cairn-codec --lib -- a::b && cargo test -p cairn-core --lib",
+            "cargo test -p cairn-codec --lib -- a::b; cargo test -p cairn-core --lib",
+            "cargo test -p cairn-codec --lib -- a::b\ncargo test -p cairn-core --lib",
+            "cargo test -p cairn-codec --lib -- a::b | tee out",
+        ] {
+            assert_ne!(
+                codec,
+                key("cairn", compound),
+                "a shell line keeps its suffix: {compound}"
+            );
+        }
+        assert_ne!(
+            key("cairn", "bun run test:rust -p cairn-codec -- a::b"),
+            key("cairn", "bun run test:rust -p cairn-codec -- c::d"),
+            "only a plain cargo invocation's `--` is known to start test arguments"
+        );
+        let minted = ad_hoc_identity("cairn", "cargo check -p x", CellCommandClass::CargoCheck)
+            .expect("a compile is minted one");
+        assert_eq!(minted.suite, None, "its suite stays its command class");
+        assert_eq!(
+            ad_hoc_identity("cairn", "bunx vitest run", CellCommandClass::Vitest),
+            None
+        );
+        assert_eq!(
+            ad_hoc_identity("cairn", "echo hi", CellCommandClass::Other),
+            None
+        );
+    }
+
+    /// A compound shell line is not the plain cargo command it starts with,
+    /// whichever is measured first: the small one's number never prices the
+    /// unmeasured compound line, and the compound line's large one never
+    /// raises the small one.
+    #[tokio::test]
+    async fn a_compound_shell_line_is_not_the_cargo_command_it_starts_with() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-peak-compound.db").await);
+        let fedora = context("fedora:fedora");
+        let class = suite_key("cairn", None, CellCommandClass::CargoTest);
+        observe_suite(
+            db.clone(),
+            class.as_deref(),
+            CellCommandClass::CargoTest,
+            &fedora,
+            &completed(30 * GIB, 1),
+            CompletionKind::Failed,
+            MachineAdmission::default(),
+        )
+        .await;
+        let mint =
+            |command| ad_hoc_identity("cairn", command, CellCommandClass::CargoTest).unwrap();
+        let resolve = |identity: CommandResourceIdentity| {
+            let (db, class, fedora) = (db.clone(), class.clone(), fedora.clone());
+            async move {
+                resolve_process_demand(
+                    db,
+                    Some(&identity),
+                    class.as_deref(),
+                    CellCommandClass::CargoTest,
+                    &fedora,
+                )
+                .await
+                .demand
+                .unwrap()
+            }
+        };
+        let observe = |identity: CommandResourceIdentity, peak| {
+            let (db, fedora) = (db.clone(), fedora.clone());
+            async move {
+                observe_completed(
+                    db,
+                    Some(&identity),
+                    &fedora,
+                    &completed(peak, 2),
+                    CompletionKind::Succeeded,
+                )
+                .await;
+            }
+        };
+
+        // The small command measured first.
+        let small = mint("cargo test -p cairn-codec --lib -- a");
+        let compound =
+            mint("cargo test -p cairn-codec --lib -- a && cargo test -p cairn-core --lib");
+        observe(small.clone(), 2 * GIB / 5).await;
+        let unmeasured = resolve(compound).await;
+        assert_eq!(
+            (unmeasured.peak_bytes, unmeasured.basis),
+            (30 * GIB, ProcessDemandBasis::ClassPrior { platform: None }),
+            "the compound line stands on its class, not on the small command"
+        );
+
+        // The compound line measured first.
+        let compound = mint("cargo test -p cairn-db --lib -- b; cargo test -p cairn-core --lib");
+        let small = mint("cargo test -p cairn-db --lib -- b");
+        observe(compound, 28 * GIB).await;
+        observe(small.clone(), GIB / 2).await;
+        assert_eq!(
+            resolve(small).await.peak_bytes,
+            GIB / 2,
+            "the small command keeps its own number"
+        );
+    }
+
+    /// A command measured once on Linux speaks for itself on Windows, where
+    /// its class has a far larger peak: the class only stands in for a
+    /// command measured nowhere.
+    #[tokio::test]
+    async fn a_command_measured_on_linux_speaks_for_itself_on_windows() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-peak-ad-hoc.db").await);
+        let fedora = context("fedora:fedora");
+        let windows = ProfileContext {
+            os: "windows".into(),
+            ..context("bgsrv-win-device:bgsrv-win")
+        };
+        let class = suite_key("cairn", None, CellCommandClass::CargoTest);
+        observe_suite(
+            db.clone(),
+            class.as_deref(),
+            CellCommandClass::CargoTest,
+            &windows,
+            &completed(30 * GIB, 1),
+            CompletionKind::Succeeded,
+            MachineAdmission::default(),
+        )
+        .await;
+        let small = ad_hoc_identity(
+            "cairn",
+            "cargo test -p cairn-codec --lib",
+            CellCommandClass::CargoTest,
+        )
+        .unwrap();
+        let suite = suite_key("cairn", Some(&small), CellCommandClass::CargoTest);
+        assert_eq!(suite, class, "an ad-hoc identity's suite is its class");
+        observe_completed(
+            db.clone(),
+            Some(&small),
+            &fedora,
+            &completed(2 * GIB / 5, 2),
+            CompletionKind::Succeeded,
+        )
+        .await;
+        let demand = resolve_process_demand(
+            db,
+            Some(&small),
+            suite.as_deref(),
+            CellCommandClass::CargoTest,
+            &windows,
+        )
+        .await
+        .demand
+        .expect("measured on Linux");
+        assert_eq!(demand.peak_bytes, 2 * GIB / 5);
+        assert_eq!(
+            demand.basis,
+            ProcessDemandBasis::OtherPlatform {
+                platform: "linux x86_64".into()
+            }
         );
     }
 

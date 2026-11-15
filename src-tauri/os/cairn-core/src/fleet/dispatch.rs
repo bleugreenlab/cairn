@@ -3921,17 +3921,20 @@ impl Fleet {
                 // against a profile its own run has already moved.
                 let mut expected_ms = Vec::with_capacity(items.len());
                 for (identity, item) in batch_profile_identities.iter().zip(&items) {
-                    expected_ms.push(
-                        resource_profiles::learned_expectation(
-                            db.clone(),
-                            identity,
-                            &profile_context,
-                            &metadata.for_batch_item(item),
-                        )
-                        .await,
-                    );
+                    expected_ms.push(match identity {
+                        Some(identity) => {
+                            resource_profiles::learned_expectation(
+                                db.clone(),
+                                identity,
+                                &profile_context,
+                                &metadata.for_batch_item(item),
+                            )
+                            .await
+                        }
+                        None => None,
+                    });
                 }
-                if !batch_profile_identities.is_empty() {
+                if batch_profile_identities.iter().any(Option::is_some) {
                     pace = Some(BatchPace {
                         lowered: selected.colocated,
                         expected_ms,
@@ -3966,7 +3969,12 @@ impl Fleet {
                     )
                     .await;
                 }
+                // Index-aligned with the items, so each item teaches only its
+                // own identity; an item with none teaches only its suite.
                 for (identity, item) in batch_profile_identities.iter().zip(items) {
+                    let Some(identity) = identity else {
+                        continue;
+                    };
                     let item_meta = metadata.for_batch_item(&item);
                     // An item the batch never ran to an end (handed off as
                     // suspended) says nothing about how the machine ends work.
@@ -4752,6 +4760,9 @@ pub(super) fn serialize_process_batch(
             // An agent's batch is stopped by cancellation alone: its owner is
             // present to end it, and a quiet interactive command is normal.
             silence_bound_ms: 0,
+            // Minted, where the command earns one, by the reservation plan
+            // that both places and learns from the batch
+            // (`resource_profiles::ad_hoc_identity`), not sent from here.
             command_resource_identity: None,
             verdict_environment_names: Vec::new(),
         });
