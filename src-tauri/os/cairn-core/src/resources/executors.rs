@@ -1983,6 +1983,11 @@ pub(crate) fn render_executor_with_kills(
             }
         ));
     }
+    if let Some(narrowings) = health.admission.floor_narrowings_last_day {
+        out.push_str(&format!(
+            "- Spawn narrowings under the floor width, last day: {narrowings}\n"
+        ));
+    }
     if health.queues.is_empty() {
         out.push_str("- Queues: empty\n");
     } else {
@@ -14114,6 +14119,7 @@ mod running_now_tests {
     use super::render_running_now;
     use cairn_common::executor_protocol::{
         BuildJobs, CellCommandClass, ExecutingCellRequest, FleetSnapshot, MemoryJobBound,
+        SpawnMemory,
     };
 
     const GIB: u64 = 1 << 30;
@@ -14148,7 +14154,18 @@ mod running_now_tests {
     /// operator reads it, with the reading that held it.
     #[test]
     fn a_running_row_names_its_build_jobs_and_the_memory_that_held_them() {
-        let held = BuildJobs::new(8, Some(MemoryJobBound::new(12 * GIB, 0, 5 * GIB / 2, 1)));
+        let held = BuildJobs::new(
+            8,
+            Some(MemoryJobBound::assumed(
+                SpawnMemory {
+                    available_bytes: 12 * GIB,
+                    owed_bytes: 0,
+                    owing: 0,
+                    measured_at_unix_ms: 0,
+                },
+                5 * GIB / 2,
+            )),
+        );
         let rendered = render_running_now(&running(Some(held)), None, 60_000);
         assert!(
             rendered.contains(

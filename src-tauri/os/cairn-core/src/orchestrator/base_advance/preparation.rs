@@ -77,6 +77,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cairn_db::turso::params;
+use cairn_platform::stack::off_frame;
 
 use super::{
     advance_sibling_durable_base, append_conflict_diagnostic, branch_owners, load_on_branch_jobs,
@@ -2532,8 +2533,8 @@ impl Context<'_> {
                     warnings: Vec::new(),
                 })));
             }
-            return self
-                .continue_attempt(
+            return off_frame(|| {
+                self.continue_attempt(
                     attempt,
                     returned,
                     relationship,
@@ -2542,17 +2543,20 @@ impl Context<'_> {
                     settlement,
                     merge_mode,
                 )
-                .await;
+            })
+            .await;
         }
-        self.continue_attempt(
-            attempt,
-            guard,
-            relationship,
-            snapshot,
-            recovered_export,
-            settlement,
-            merge_mode,
-        )
+        off_frame(|| {
+            self.continue_attempt(
+                attempt,
+                guard,
+                relationship,
+                snapshot,
+                recovered_export,
+                settlement,
+                merge_mode,
+            )
+        })
         .await
     }
 
@@ -3130,7 +3134,9 @@ impl Context<'_> {
         }
         drop(guard);
 
-        self.after_install(&jobs, &relationship, &installed, &mut warnings)
+        let (siblings, installed_relationship, advanced) = (&jobs, &relationship, &installed);
+        let warned = &mut warnings;
+        off_frame(move || self.after_install(siblings, installed_relationship, advanced, warned))
             .await;
         if let Some(hold) = self
             .dispatch_regenerations(&regenerations, &mut warnings)

@@ -12599,6 +12599,15 @@ fn executor_unit_bound_is_hard_but_planning_ceiling_is_not() {
             largest_bytes: 8 << 30,
             typical_bytes: 4 << 30,
             samples: 1,
+            // Measured here out to 16 jobs, so each narrower width is priced
+            // by the job model rather than charged the whole as unlearned.
+            width: Some(cairn_common::executor_protocol::JobWidthEvidence {
+                widest_jobs: 16,
+                widest_tree_bytes: 0,
+                marginal_bytes: 0,
+                marginal_jobs: 0,
+                marginal_tree_bytes: 0,
+            }),
         });
     assert!(modeled.reservation.memory_charge_at(Some(16)) > BOUND);
     let modeled = HashMap::from([("bbs".into(), modeled)]);

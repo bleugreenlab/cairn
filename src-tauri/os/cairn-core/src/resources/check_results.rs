@@ -2176,11 +2176,14 @@ mod tests {
         const GIB: u64 = 1 << 30;
         observation.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(
             8,
-            Some(cairn_common::executor_protocol::MemoryJobBound::new(
-                12 * GIB,
-                0,
+            Some(cairn_common::executor_protocol::MemoryJobBound::assumed(
+                cairn_common::executor_protocol::SpawnMemory {
+                    available_bytes: 12 * GIB,
+                    owed_bytes: 0,
+                    owing: 0,
+                    measured_at_unix_ms: 0,
+                },
                 5 * GIB / 2,
-                1,
             )),
         ));
         let body = render(&observation);

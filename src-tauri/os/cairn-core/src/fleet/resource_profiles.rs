@@ -4,10 +4,11 @@ use cairn_common::executor_protocol::{
     BuildJobMemoryEvidence, BuildJobProcesses, BuildJobsPrice, CellCommandClass, CellExecutionMeta,
     CommandResourceIdentity, CommandStop, ContentionEstimate, ContentionEvidence,
     ContentionFallback, CrowdedKills, DurationEstimate, DurationEvidence, DurationFallback,
-    ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality, MemoryCeiling,
-    MemoryKill, MemoryKillCause, MemoryKillEvent, ProcessDemandBasis, ReservationFallback,
-    ReservationRationale, TestPhaseEvidence, TestPhaseMeasurement, DURATION_PROFILE_STALE_AFTER_MS,
-    DURATION_SAMPLE_WINDOW, MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
+    ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, JobWidthEvidence,
+    MeasurementQuality, MemoryCeiling, MemoryKill, MemoryKillCause, MemoryKillEvent,
+    ProcessDemandBasis, ReservationFallback, ReservationRationale, TestPhaseEvidence,
+    TestPhaseMeasurement, DURATION_PROFILE_STALE_AFTER_MS, DURATION_SAMPLE_WINDOW,
+    MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
     MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_db::turso::params;
@@ -485,6 +486,7 @@ impl PricingJobs {
                 .typical_bytes
                 .max(right.evidence.typical_bytes),
             samples: left.evidence.samples.min(right.evidence.samples),
+            width: None,
         };
         let same_platform = left.same_platform && right.same_platform;
         let larger = match right.evidence.largest_bytes > left.evidence.largest_bytes {
@@ -760,6 +762,7 @@ impl ProcessEvidence {
                 largest_bytes: left.largest_bytes.max(right.largest_bytes),
                 typical_bytes: left.typical_bytes.max(right.typical_bytes),
                 samples: left.samples.min(right.samples),
+                width: None,
             }),
             _ => None,
         };
@@ -1116,7 +1119,9 @@ async fn load_suite_evidence(
                             oom_crowded_most_co_resident, oom_crowded_memory_brake,
                             oom_crowded_killed_at_unix_ms, upper_test_phase_peak_bytes,
                             upper_test_phase_bytes_per_test, upper_job_largest_bytes,
-                            upper_job_typical_bytes, job_census_samples
+                            upper_job_typical_bytes, job_census_samples,
+                            widest_census_jobs, widest_tree_peak_bytes,
+                            upper_job_marginal_bytes, marginal_jobs, marginal_tree_peak_bytes
                      FROM suite_memory_evidence
                      WHERE suite_key=?1",
                     params![suite_key],
@@ -1139,15 +1144,39 @@ async fn load_suite_evidence(
                 let samples = row.get::<i64>(16)?;
                 let jobs = match (row.get::<Option<i64>>(14)?, row.get::<Option<i64>>(15)?) {
                     (Some(largest), Some(typical)) if largest > 0 && typical > 0 && samples > 0 => {
+                        let unsigned =
+                            |value: Option<i64>| value.map_or(0, |value| value.max(0) as u64);
+                        let width = match (row.get::<Option<i64>>(17)?, row.get::<Option<i64>>(18)?)
+                        {
+                            (Some(widest), Some(tree)) if widest > 0 => Some(JobWidthEvidence {
+                                widest_jobs: u32::try_from(widest).unwrap_or(u32::MAX),
+                                widest_tree_bytes: tree.max(0) as u64,
+                                marginal_bytes: unsigned(row.get::<Option<i64>>(19)?),
+                                marginal_jobs: u32::try_from(unsigned(row.get::<Option<i64>>(20)?))
+                                    .unwrap_or(u32::MAX),
+                                marginal_tree_bytes: unsigned(row.get::<Option<i64>>(21)?),
+                            }),
+                            _ => None,
+                        };
                         Some(BuildJobMemoryEvidence {
                             largest_bytes: largest as u64,
                             typical_bytes: typical as u64,
                             samples: u32::try_from(samples).unwrap_or(u32::MAX),
+                            width,
                         })
                     }
                     _ => None,
                 };
-                if let Some(jobs) = jobs.filter(|_| executor_class != context.executor_class) {
+                // Another machine's widths say nothing about what this one
+                // has measured: borrowed figures price, they never unlock a
+                // width here.
+                if let Some(jobs) = jobs
+                    .filter(|_| executor_class != context.executor_class)
+                    .map(|jobs| BuildJobMemoryEvidence {
+                        width: None,
+                        ..jobs
+                    })
+                {
                     let same_platform = os == context.os && arch == context.arch;
                     let better = evidence.build_jobs_elsewhere.as_ref().is_none_or(|held| {
                         (same_platform, jobs.largest_bytes)
@@ -1390,8 +1419,45 @@ pub(super) async fn observe_suite(
         metadata
             .build_job_processes
             .filter(BuildJobProcesses::speaks_for_a_typical_job),
+        width_sample(metadata),
     )
     .await;
+}
+
+/// One run's tree at the width it was granted: the build jobs its cargo was
+/// told, its tree peak, and what each job beyond the largest added to it.
+/// `None` where the executor stated no build jobs or measured no tree.
+///
+/// The jobs are what the executor set where the command left them unset; a
+/// run whose command set its own ([`BuildJobs::command_sets_jobs`]) is not
+/// sampled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WidthSample {
+    pub jobs: u32,
+    pub tree_bytes: u64,
+    pub marginal_bytes: Option<u64>,
+}
+
+pub(super) fn width_sample(metadata: &CellExecutionMeta) -> Option<WidthSample> {
+    let build_jobs = metadata.allocation.as_ref()?.build_jobs?;
+    // A command that set its own build jobs ran at a width nothing can
+    // prove, so it teaches none: a pinned one-job run under a 20-job grant
+    // would otherwise read as measured at 20 with a one-job tree.
+    if build_jobs.command_sets_jobs.is_some() {
+        return None;
+    }
+    let jobs = build_jobs.jobs.max(1);
+    let tree_bytes = metadata.peak_rss_bytes?;
+    let largest = metadata
+        .build_job_processes
+        .map(|census| census.largest_bytes)
+        .or_else(|| metadata.peak_process.as_ref().map(|peak| peak.bytes))?;
+    Some(WidthSample {
+        jobs,
+        tree_bytes,
+        marginal_bytes: (jobs >= 2)
+            .then(|| tree_bytes.saturating_sub(largest) / u64::from(jobs - 1)),
+    })
 }
 
 /// What one observation says about a suite's kills here.
@@ -1485,6 +1551,7 @@ pub(super) async fn observe_suite_kill(
         Some(kill.pid),
         None,
         None,
+        None,
     )
     .await;
 }
@@ -1516,8 +1583,13 @@ async fn record_suite_evidence(
     resident_kill: Option<u32>,
     test_phase: Option<TestPhaseMeasurement>,
     build_jobs: Option<BuildJobProcesses>,
+    width: Option<WidthSample>,
 ) -> Result<(), String> {
-    if peak.is_none() && kills == KillsSeen::Neither && test_phase.is_none() && build_jobs.is_none()
+    if peak.is_none()
+        && kills == KillsSeen::Neither
+        && test_phase.is_none()
+        && build_jobs.is_none()
+        && width.is_none()
     {
         return Ok(());
     }
@@ -1607,8 +1679,8 @@ async fn record_suite_evidence(
                 None => (None, None),
             };
             conn.execute(
-                r#"INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, upper_process_peak_bytes, process_peak_name, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms, oom_kill_memory_brake, oom_crowded_kill_count, oom_crowded_most_co_resident, oom_crowded_memory_brake, oom_crowded_killed_at_unix_ms, upper_test_phase_peak_bytes, upper_test_phase_bytes_per_test, upper_job_largest_bytes, upper_job_typical_bytes, job_census_samples, oom_event_json, oom_policy_observed_at_unix_ms)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                r#"INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, upper_process_peak_bytes, process_peak_name, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms, oom_kill_memory_brake, oom_crowded_kill_count, oom_crowded_most_co_resident, oom_crowded_memory_brake, oom_crowded_killed_at_unix_ms, upper_test_phase_peak_bytes, upper_test_phase_bytes_per_test, upper_job_largest_bytes, upper_job_typical_bytes, job_census_samples, oom_event_json, oom_policy_observed_at_unix_ms, widest_census_jobs, widest_tree_peak_bytes, upper_job_marginal_bytes, marginal_jobs, marginal_tree_peak_bytes)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, CASE WHEN ?24 IS NULL THEN NULL ELSE ?22 END, CASE WHEN ?24 IS NULL THEN NULL ELSE ?23 END)
                    ON CONFLICT(suite_key, executor_class, os, arch) DO UPDATE SET
                      upper_process_peak_bytes=CASE WHEN ?5 IS NULL THEN suite_memory_evidence.upper_process_peak_bytes WHEN suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes THEN ?5 ELSE suite_memory_evidence.upper_process_peak_bytes END,
                      process_peak_name=CASE WHEN ?5 IS NOT NULL AND (suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes) THEN COALESCE(?6, suite_memory_evidence.process_peak_name) ELSE suite_memory_evidence.process_peak_name END,
@@ -1626,7 +1698,15 @@ async fn record_suite_evidence(
                      upper_job_typical_bytes=CASE WHEN ?18 IS NULL THEN suite_memory_evidence.upper_job_typical_bytes WHEN suite_memory_evidence.upper_job_typical_bytes IS NULL OR ?18 > suite_memory_evidence.upper_job_typical_bytes THEN ?18 ELSE suite_memory_evidence.upper_job_typical_bytes END,
                      oom_event_json=?20,
                      oom_policy_observed_at_unix_ms=?21,
-                     job_census_samples=suite_memory_evidence.job_census_samples + ?19"#,
+                     job_census_samples=suite_memory_evidence.job_census_samples + ?19,
+                     widest_census_jobs=CASE WHEN ?22 IS NULL THEN suite_memory_evidence.widest_census_jobs WHEN suite_memory_evidence.widest_census_jobs IS NULL OR ?22 > suite_memory_evidence.widest_census_jobs THEN ?22 ELSE suite_memory_evidence.widest_census_jobs END,
+                     widest_tree_peak_bytes=CASE WHEN ?22 IS NULL THEN suite_memory_evidence.widest_tree_peak_bytes WHEN suite_memory_evidence.widest_census_jobs IS NULL OR ?22 > suite_memory_evidence.widest_census_jobs THEN ?23 WHEN ?22 = suite_memory_evidence.widest_census_jobs AND ?23 > COALESCE(suite_memory_evidence.widest_tree_peak_bytes, 0) THEN ?23 ELSE suite_memory_evidence.widest_tree_peak_bytes END,
+                     upper_job_marginal_bytes=CASE WHEN ?24 IS NULL THEN suite_memory_evidence.upper_job_marginal_bytes WHEN suite_memory_evidence.upper_job_marginal_bytes IS NULL OR ?24 > suite_memory_evidence.upper_job_marginal_bytes THEN ?24 ELSE suite_memory_evidence.upper_job_marginal_bytes END,
+                     marginal_jobs=CASE WHEN ?24 IS NOT NULL AND (suite_memory_evidence.upper_job_marginal_bytes IS NULL OR ?24 > suite_memory_evidence.upper_job_marginal_bytes) THEN ?22 ELSE suite_memory_evidence.marginal_jobs END,
+                     marginal_tree_peak_bytes=CASE WHEN ?24 IS NOT NULL AND (suite_memory_evidence.upper_job_marginal_bytes IS NULL OR ?24 > suite_memory_evidence.upper_job_marginal_bytes) THEN ?23 ELSE suite_memory_evidence.marginal_tree_peak_bytes END"#,
+                // Passed as a Vec: in a debug build an `execute` over an array
+                // of more than twenty parameters costs its caller a 32 KiB
+                // poll frame, which a check's placement path cannot spare.
                 params![
                     suite_key.clone(),
                     context.executor_class.clone(),
@@ -1648,8 +1728,13 @@ async fn record_suite_evidence(
                     build_jobs.map(|jobs| jobs.typical_bytes as i64),
                     i64::from(build_jobs.is_some()),
                     event_json,
-                    policy_at as i64
-                ],
+                    policy_at as i64,
+                    width.map(|width| i64::from(width.jobs)),
+                    width.map(|width| width.tree_bytes as i64),
+                    width.and_then(|width| width.marginal_bytes.map(|bytes| bytes as i64))
+                ]
+                .into_iter()
+                .collect::<cairn_db::turso::Result<Vec<_>>>()?,
             )
             .await?;
             Ok(())
@@ -3187,11 +3272,172 @@ mod process_peak_tests {
         }
     }
 
+    /// cairn/7244: a run's tree at the width it was granted is learned per
+    /// machine, rise-only, with the run each figure came from. A one-job run
+    /// measures width one; a 20-job run whose tree peaked at 54.7 GiB beside a
+    /// 27.5 GiB largest job teaches 20 and what each further job added; a
+    /// later ten-job run moves neither down.
+    #[tokio::test]
+    async fn a_suites_tree_is_learned_at_the_width_it_ran() {
+        use cairn_common::executor_protocol::{BuildJobs, ExecutionAllocation, NoCapReason};
+        let db = Arc::new(crate::storage::migrated_test_db("width-evidence.db").await);
+        let suite = suite_key(
+            "cairn",
+            Some(&identity("rust-tests-w")),
+            CellCommandClass::CargoTest,
+        );
+        let spark = context("bginf-sp1:bginf-sp1");
+        let largest = 55 * GIB / 2;
+        let run = |jobs: u32, tree: u64| CellExecutionMeta {
+            build_job_processes: Some(BuildJobProcesses {
+                processes: 40,
+                largest_bytes: largest,
+                typical_bytes: 680 << 20,
+            }),
+            peak_rss_bytes: Some(tree),
+            allocation: Some(
+                ExecutionAllocation::uncapped(jobs, NoCapReason::CapNotImplemented, None, 1)
+                    .with_build_jobs(BuildJobs::new(jobs, None)),
+            ),
+            ..completed(largest, 1)
+        };
+        let learned = |db: Arc<LocalDb>| {
+            let suite = suite.clone();
+            let spark = spark.clone();
+            async move {
+                resolve_process_demand(
+                    db,
+                    None,
+                    suite.as_deref(),
+                    CellCommandClass::CargoTest,
+                    &spark,
+                )
+                .await
+                .build_job_memory
+                .unwrap()
+            }
+        };
+        for (jobs, tree) in [(1, 30 * GIB), (20, 547 * GIB / 10), (10, 40 * GIB)] {
+            observe_suite(
+                db.clone(),
+                suite.as_deref(),
+                CellCommandClass::CargoTest,
+                &spark,
+                &run(jobs, tree),
+                CompletionKind::Succeeded,
+                MachineAdmission::default(),
+            )
+            .await;
+            if jobs == 1 {
+                let width = learned(db.clone()).await.width.unwrap();
+                assert_eq!((width.widest_jobs, width.marginal_bytes), (1, 0));
+            }
+        }
+        let evidence = learned(db.clone()).await;
+        let width = evidence.width.unwrap();
+        let marginal = (547 * GIB / 10 - largest) / 19;
+        assert_eq!(
+            width,
+            JobWidthEvidence {
+                widest_jobs: 20,
+                widest_tree_bytes: 547 * GIB / 10,
+                marginal_bytes: marginal,
+                marginal_jobs: 20,
+                marginal_tree_bytes: 547 * GIB / 10,
+            },
+            "the ten-job run's (40 - 27.5) / 9 = 1.39 GiB is under 1.43 and moves nothing"
+        );
+        assert_eq!(evidence.measured_width(), 20);
+        assert_eq!(evidence.further_job_bytes(), marginal);
+        // Another machine borrows the jobs, never the width.
+        let other = context("fedora:fedora");
+        let borrowed = resolve_process_demand(
+            db,
+            None,
+            suite.as_deref(),
+            CellCommandClass::CargoTest,
+            &other,
+        )
+        .await;
+        assert_eq!(
+            borrowed
+                .build_jobs_elsewhere
+                .map(|pricing| pricing.evidence.width),
+            Some(None)
+        );
+    }
+
+    /// A run whose command pinned its own build jobs (one, under a 20-job
+    /// grant) ran at a width nothing can prove, so it teaches none: the next
+    /// default-width admission of the suite is still unlearned past one job
+    /// and runs alone.
+    #[tokio::test]
+    async fn a_run_that_set_its_own_jobs_teaches_no_width() {
+        use cairn_common::executor_protocol::{
+            BuildJobs, ExecutionAllocation, JobsSetBy, NoCapReason,
+        };
+        let db = Arc::new(crate::storage::migrated_test_db("pinned-jobs.db").await);
+        let suite = suite_key(
+            "cairn",
+            Some(&identity("rust-tests-p")),
+            CellCommandClass::CargoTest,
+        );
+        let spark = context("bginf-sp1:bginf-sp1");
+        let pinned = CellExecutionMeta {
+            build_job_processes: Some(BuildJobProcesses {
+                processes: 40,
+                largest_bytes: 27 * GIB,
+                typical_bytes: 680 << 20,
+            }),
+            peak_rss_bytes: Some(28 * GIB),
+            allocation: Some(
+                ExecutionAllocation::uncapped(20, NoCapReason::CapNotImplemented, None, 1)
+                    .with_build_jobs(BuildJobs {
+                        command_sets_jobs: Some(JobsSetBy::Environment),
+                        ..BuildJobs::new(20, None)
+                    }),
+            ),
+            ..completed(27 * GIB, 1)
+        };
+        assert_eq!(width_sample(&pinned), None);
+        observe_suite(
+            db.clone(),
+            suite.as_deref(),
+            CellCommandClass::CargoTest,
+            &spark,
+            &pinned,
+            CompletionKind::Succeeded,
+            MachineAdmission::default(),
+        )
+        .await;
+        let evidence = resolve_process_demand(
+            db,
+            None,
+            suite.as_deref(),
+            CellCommandClass::CargoTest,
+            &spark,
+        )
+        .await
+        .build_job_memory
+        .expect("the census is still learned");
+        assert_eq!(evidence.width, None);
+        assert_eq!(evidence.measured_width(), 1);
+        let lane = ResourceReservation {
+            build_job_memory: Some(evidence),
+            ..ResourceReservation::default()
+        };
+        assert!(lane.runs_unlearned_width(Some(20)));
+    }
+
     /// cairn/6263's specimen: a whole-suite rust-tests lane measured on 32-core
-    /// fedora, borrowed by a 20-core Spark that never ran it. The borrowed
-    /// tree priced it at the Spark's whole 77.6 GiB cap; its build jobs as
-    /// fedora measured them (a 12 GiB largest, 1 GiB typical) price it at the
-    /// Spark's own width, 12 + 19 x 1 = 31 GiB, and the record says so.
+    /// fedora, borrowed by a 20-core Spark that never ran it. Fedora's build
+    /// jobs (a 12 GiB largest, 1 GiB typical) would price it at the Spark's
+    /// width, 12 + 19 x 1 = 31 GiB. Since cairn/7244 that price stands only
+    /// for widths the Spark itself measured: the job model under-priced wide
+    /// trees by up to 24 GiB (54.7 GiB measured at 20 jobs on bginf-sp2), and
+    /// another machine's widths say nothing of this one's. So the Spark, which
+    /// measured none, is charged the borrowed tree whole at its width until a
+    /// run there measures one; the record still names the jobs it priced.
     #[tokio::test]
     async fn a_borrowed_lane_is_priced_at_the_width_the_borrowing_machine_grants() {
         let db = Arc::new(crate::storage::migrated_test_db("price-at-width.db").await);
@@ -3268,7 +3514,7 @@ mod process_peak_tests {
         let borrowed_tree = memory_reservation_cap(budget);
         let mut priced = resolved(ResourceReservationSource::Unmeasured, borrowed_tree);
         priced.price_at_width(20, &class_prior, Some(budget));
-        assert_eq!(priced.reservation.memory_bytes, 31 * GIB);
+        assert_eq!(priced.reservation.memory_bytes, borrowed_tree);
         assert_eq!(
             priced.rationale.build_jobs_price,
             Some(BuildJobsPrice {
@@ -3300,6 +3546,15 @@ mod process_peak_tests {
                 largest_bytes: 14_700 * (GIB / 1000),
                 typical_bytes: 5 * GIB / 2,
                 samples: 1,
+                // Measured here at 32 jobs; unmeasured, every width past
+                // one would be charged the whole tree, over the ceiling.
+                width: Some(JobWidthEvidence {
+                    widest_jobs: 32,
+                    widest_tree_bytes: 60 * GIB,
+                    marginal_bytes: 0,
+                    marginal_jobs: 32,
+                    marginal_tree_bytes: 60 * GIB,
+                }),
             });
             local.memory_fit = MemoryFit::of(Some(tree), Some(historical_budget));
             local.charge_measured_peak();
@@ -3315,7 +3570,8 @@ mod process_peak_tests {
             assert!(price.largest_bytes + 22 * price.typical_bytes > ceiling);
             assert_eq!(local.reservation.source, ResourceReservationSource::Learned);
         }
-        // A kill here floors the price.
+        // A kill here floors the price. With no width measured here the
+        // borrowed whole is already above the floor, so it stands.
         let mut killed = resolved(ResourceReservationSource::Unmeasured, 40 * GIB);
         killed.rationale.memory_kill = Some(MemoryKill {
             victim_resident_bytes: 35 * GIB,
@@ -3325,6 +3581,7 @@ mod process_peak_tests {
         });
         killed.price_at_width(20, &class_prior, Some(budget));
         assert_eq!(killed.reservation.memory_bytes, 40 * GIB);
+        assert!(killed.reservation.memory_bytes >= 35 * GIB);
         // Retiring the inferred host floor does not justify borrowed narrowing
         // when local width evidence is missing.
         killed.rationale.upper_peak_rss_bytes = Some(45_471_857_856);
@@ -3436,6 +3693,7 @@ mod process_peak_tests {
             largest_bytes: 8 * GIB,
             typical_bytes: 3 * GIB / 2,
             samples: 2,
+            width: None,
         };
         assert_eq!(learned("fedora:fedora").await, Some(evidence));
         assert_eq!(
@@ -4790,11 +5048,14 @@ mod tests {
                 )
                 .with_build_jobs(cairn_common::executor_protocol::BuildJobs::new(
                     10,
-                    Some(cairn_common::executor_protocol::MemoryJobBound::new(
-                        memory_available,
-                        finished,
+                    Some(cairn_common::executor_protocol::MemoryJobBound::assumed(
+                        cairn_common::executor_protocol::SpawnMemory {
+                            available_bytes: memory_available,
+                            owed_bytes: 0,
+                            owing: 0,
+                            measured_at_unix_ms: finished,
+                        },
                         5 * GIB / 2,
-                        1,
                     )),
                 )),
             );

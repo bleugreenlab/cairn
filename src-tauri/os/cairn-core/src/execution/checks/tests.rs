@@ -6584,6 +6584,8 @@ fn every_no_start_reason_keeps_its_own_condition_class() {
                     owed_bytes: 0,
                     owing: Vec::new(),
                     total_bytes: None,
+                    width_floor: None,
+                    alone_beside: None,
                 }]),
             ),
             SubstrateFailureShape::Capacity,
@@ -6744,6 +6746,8 @@ fn a_deadlines_retry_eligibility_matches_the_fleets_own_capacity_verdict() {
                 owed_bytes: 0,
                 owing: Vec::new(),
                 total_bytes: None,
+                width_floor: None,
+                alone_beside: None,
             }]),
         ),
         deadline(

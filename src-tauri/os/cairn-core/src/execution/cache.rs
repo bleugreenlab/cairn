@@ -4189,11 +4189,14 @@ pub(crate) mod tests {
         const GIB: u64 = 1 << 30;
         write.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(
             8,
-            Some(cairn_common::executor_protocol::MemoryJobBound::new(
-                12 * GIB,
-                90,
+            Some(cairn_common::executor_protocol::MemoryJobBound::assumed(
+                cairn_common::executor_protocol::SpawnMemory {
+                    available_bytes: 12 * GIB,
+                    owed_bytes: 0,
+                    owing: 0,
+                    measured_at_unix_ms: 90,
+                },
                 5 * GIB / 2,
-                1,
             )),
         ));
         record_fresh_check_observation(db.clone(), write.clone()).unwrap();

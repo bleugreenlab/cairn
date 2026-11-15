@@ -1619,15 +1619,16 @@ impl Fleet {
             };
             let run = match plan {
                 Some(plan) => {
-                    let mut resolved = plan
-                        .resolve_for(
+                    let mut resolved = off_frame(|| {
+                        plan.resolve_for(
                             request,
                             &entry.identity.device_id,
                             &entry.identity.executor_id,
                             &entry.advertisement.capabilities,
                             duration_context,
                         )
-                        .await;
+                    })
+                    .await;
                     self.record_memory_lookup_failures(&mut resolved, &entry.identity.executor_id);
                     let run = resolved.duration.clone();
                     reservations.insert(entry.identity.executor_id.clone(), resolved);
@@ -1707,15 +1708,16 @@ impl Fleet {
                     warmth: candidate_warmth(entry, request, now).for_lookup(),
                     now_unix_ms: now,
                 };
-                let mut resolved = plan
-                    .resolve_for(
+                let mut resolved = off_frame(|| {
+                    plan.resolve_for(
                         request,
                         &entry.identity.device_id,
                         &entry.identity.executor_id,
                         &entry.advertisement.capabilities,
                         duration_context,
                     )
-                    .await;
+                })
+                .await;
                 self.record_memory_lookup_failures(&mut resolved, &row.executor_id);
                 away_reservations.insert(row.executor_id.clone(), resolved);
             }

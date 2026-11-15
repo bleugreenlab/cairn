@@ -1,6 +1,9 @@
 use super::*;
-use cairn_common::executor_protocol::BuildJobMemoryEvidence;
+use cairn_common::executor_protocol::{BuildJobMemoryEvidence, JobWidthEvidence};
 
+/// Work measured here out to 20 jobs, with no tree figure above its job
+/// model, so each width to 20 is priced by the model alone; an unmeasured
+/// width would be charged the whole figure and no two curves could cross.
 fn member(largest: u64, typical: u64, whole: u64) -> ResourceReservation {
     ResourceReservation {
         memory_bytes: whole,
@@ -9,6 +12,13 @@ fn member(largest: u64, typical: u64, whole: u64) -> ResourceReservation {
             largest_bytes: largest,
             typical_bytes: typical,
             samples: 1,
+            width: Some(JobWidthEvidence {
+                widest_jobs: 20,
+                widest_tree_bytes: 0,
+                marginal_bytes: 0,
+                marginal_jobs: 0,
+                marginal_tree_bytes: 0,
+            }),
         }),
         ..ResourceReservation::default()
     }
