@@ -100,7 +100,7 @@ pub(crate) const THREAD_QUEUE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ThreadQueue,
     uri_template: "cairn://p/{project}/{thread}/queue",
     name: "Thread queue",
-    description: "This thread's children's executions that the execution queue's caps hold, in the order they start: each with its issue, its place on each cap holding it (fleet, thread), and how long it has been held. Patch `order` to put children first: the listed children take the earliest places this thread's cap-held set already occupies, in both the fleet order and the thread order, and unlisted ones follow in their current order. No other thread's place moves and no cap is skipped; only the operator's Start now skips the queue. Ordered by the thread itself (its sessions and their tasks) or the operator. To file straight to the head, pass place:\"head\" with the execution.",
+    description: "This thread's children by derived standing: Running under the workspace focus bound, Queued (re-entries before fresh starts), Held by the open-PR bound, Parked with what they await, and Stopped. Only agent work in flight counts toward focus; open plans, PRs and other waits remain visible. Patch `order` with child issue numbers to put listed work first within each queue band; unlisted work follows in its existing order. Fresh work never moves ahead of a re-entry. Fresh executions rotate within the fleet and thread places the thread already occupies, so no other thread's place moves and no cap is skipped. Only the thread itself (its sessions and tasks) or the operator may order it. Only the operator's Start now skips the caps. To file at the head of the fresh band, pass place:\"head\" with the execution.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -109,7 +109,7 @@ pub(crate) const THREAD_QUEUE_CONTRACT: ResourceContract = ResourceContract {
         required: &[KeySpec::new(
             "order",
             KeyType::Array,
-            "this thread's children by issue number, first to start first; each takes its cap-held executions with it",
+            "this thread's children by issue number, first within their own band; re-entries always precede fresh work",
         )],
         optional: &[],
         label: "order this thread's held children",
@@ -257,7 +257,7 @@ pub(crate) const THREAD_CONTRACT: ResourceContract = ResourceContract {
     // resolves to a node-family kind whose template spells an issue coordinate a
     // thread does not have. Reading any of these addresses returns that family's
     // own affordance block, so this line only has to say the addresses exist.
-    description: "A first-class thread overview, including child branches' literal head/base and bounded ahead/behind counts (≥ means capped; unresolved ancestry is unknown). Reading never prepares branches or acquires a checkout. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /queue (its children's cap-held executions in start order; patch {order:[N,...]} to reorder), /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /pages, /services. The session has no branch. Branch-shaped resources (diff, changed, checks, rebase) do not apply to the thread session itself.",
+    description: "A first-class thread overview, including child branches' literal head/base and bounded ahead/behind counts (≥ means capped; unresolved ancestry is unknown). Reading never prepares branches or acquires a checkout. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /queue (running, queued, PR-held, parked and stopped children; patch {order:[N,...]} to reorder within re-entry and fresh bands), /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /pages, /services. The session has no branch. Branch-shaped resources (diff, changed, checks, rebase) do not apply to the thread session itself.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,

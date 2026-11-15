@@ -5,6 +5,19 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Why work is entering an agent. Addressed work never waits for focus.
+/// There is deliberately no default: every ingress must name its cause.
+///
+/// ```compile_fail
+/// let _: cairn_domain::WakeCause = Default::default();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeCause {
+    Addressed,
+    System,
+}
+
 /// A turn — a semantic unit of agent work within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

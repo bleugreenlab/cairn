@@ -35,6 +35,7 @@ async fn insert_pending_direct(orch: &Orchestrator, recipient: &str, content: &s
     let msg = msg_db::insert_direct_message(
         &orch.db.local,
         cairn_attention::direct::NewDirect {
+            cause: cairn_core::models::WakeCause::Addressed,
             id: uuid::Uuid::new_v4().to_string(),
             sender_run_id: Some("sender-run".to_string()),
             sender_name: "planner".to_string(),

@@ -374,6 +374,15 @@ fn resume_restart_interrupted_job(
     job_id: &str,
     turn_id: &str,
 ) -> Result<bool, String> {
+    let admission = crate::storage::run_db_blocking(|| async {
+        orch.admission_lock
+            .acquire(
+                crate::execution::gates::capacity::AdmissionSite::HoldRelease,
+                job_id.to_string(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+    })?;
     let launch_lock = orch.job_launch_lock(job_id);
     let guard = launch_lock
         .lock()
@@ -391,8 +400,9 @@ fn resume_restart_interrupted_job(
     if crate::threads::is_dormant_thread_session_sync(&orch.db.local, job_id) {
         return Err(crate::threads::dormant_thread_refusal());
     }
-    let launch =
-        crate::execution::jobs::continue_job_launch_locked_for_recovery(orch, job_id, None, guard)?;
+    let launch = crate::execution::jobs::continue_job_launch_locked_for_recovery(
+        admission, orch, job_id, None, guard,
+    )?;
     let (run, successor, state) = match launch {
         crate::execution::jobs::RecoveryContinuation::Started { run, turn_id } => {
             (run, turn_id, "started")

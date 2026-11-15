@@ -428,27 +428,34 @@ async fn assert_held(db: &LocalDb) {
 }
 
 #[tokio::test]
-async fn terminal_result_stores_boundary_and_holds_the_current_turn() {
+async fn resolution_claims_and_launches_exactly_one_successor() {
     let (_temp, db, orch, recorder) = fixture().await;
     let hold = hold(&orch, &db, LIMIT).await;
     assert_eq!(hold.retry_not_before, Some(RESET_AT));
     assert_eq!(hold.boundary_source, "result_text");
     assert_held(&db).await;
     assert_eq!(hold.due_at(RESET_AT - 1), None);
-    assert!(
-        !resolve_provider_limit_hold(&orch, &hold, hold.next_due_at().unwrap() - 1)
-            .await
-            .unwrap()
-    );
+    let due = hold.next_due_at().unwrap();
+    assert!(!resolve_provider_limit_hold(&orch, &hold, due - 1)
+        .await
+        .unwrap());
     assert_eq!(turns(&db).await, 1);
     assert_eq!(recorder.spawn_count(), 0);
-}
-
-#[tokio::test]
-async fn resolution_claims_and_launches_exactly_one_successor() {
-    let (_temp, db, orch, recorder) = fixture().await;
-    let hold = hold(&orch, &db, LIMIT).await;
-    let due = hold.next_due_at().unwrap();
+    assert_eq!(
+        supersede_orphaned_provider_limit_holds(&db, RESET_AT)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        text(
+            &db,
+            "SELECT state FROM provider_limit_holds WHERE id=?1",
+            &hold.id
+        )
+        .await,
+        "active"
+    );
     assert!(resolve_provider_limit_hold(&orch, &hold, due)
         .await
         .unwrap());
@@ -580,7 +587,15 @@ async fn a_tool_in_flight_holds_without_a_timer() {
 
     // One explicit continue is authoritative over the gated hold, which then has
     // no head left to own.
-    continue_job_impl(&orch, "a", None, None, None).unwrap();
+    continue_job_impl(
+        cairn_core::models::WakeCause::Addressed,
+        &orch,
+        "a",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(turns(&db).await, 2);
     assert!(!resolve_provider_limit_hold(&orch, &hold, i64::MAX)
         .await
@@ -828,28 +843,6 @@ async fn a_credits_message_before_a_generic_error_holds() {
     assert!(note.contains(exhausted.as_str()), "{note}");
 }
 
-// The sweep retires only holds that lost their head: a live hold is untouched.
-#[tokio::test]
-async fn a_hold_that_still_owns_its_head_is_not_retired() {
-    let (_temp, db, orch, _recorder) = fixture().await;
-    let hold = hold(&orch, &db, "Usage limit reached").await;
-    assert_eq!(
-        supersede_orphaned_provider_limit_holds(&db, RESET_AT)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        text(
-            &db,
-            "SELECT state FROM provider_limit_holds WHERE id=?1",
-            &hold.id
-        )
-        .await,
-        "active"
-    );
-}
-
 #[tokio::test]
 async fn an_answered_tool_call_fails_over_and_resumes_on_its_own() {
     let (_temp, db, orch, _recorder) = fixture().await;
@@ -962,7 +955,15 @@ async fn operator_stop_cancels_hold_but_explicit_resume_still_runs() {
     );
     assert_eq!(turns(&db).await, 1);
     assert_eq!(recorder.spawn_count(), 0);
-    continue_job_impl(&orch, "a", None, None, None).unwrap();
+    continue_job_impl(
+        cairn_core::models::WakeCause::Addressed,
+        &orch,
+        "a",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(turns(&db).await, 2);
     await_admission(&orch, "a", "active").await;
     assert_eq!(recorder.spawn_count(), 1);
@@ -1063,4 +1064,952 @@ async fn cold_process_spawn_refusal_restores_the_held_head() {
         "pending"
     );
     assert_eq!(holds[0].resolved_at, None);
+}
+
+/// One parked child beside one running child at focus=1. No notifier or
+/// background gate loop is installed: every recovery below gets no hint.
+async fn focus_fixture() -> (TempDir, Arc<LocalDb>, Orchestrator, RecordedProcesses) {
+    let (temp, db, orch, recorder) = fixture().await;
+    orch.update_settings(cairn_core::models::UpdateSettings {
+        max_open_children_per_thread: Some(1),
+        max_concurrent_executions: Some(10),
+        ..Default::default()
+    })
+    .unwrap();
+    db.execute_script("INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES('focus','project','focus',1,1);
+        UPDATE issues SET parent_thread_id='focus' WHERE id='issue';
+        UPDATE jobs SET status='blocked' WHERE id='b';
+        UPDATE turns SET state='complete',ended_at=2 WHERE id='turn';
+        UPDATE runs SET status='exited' WHERE id='run';
+        INSERT INTO issues(id,project_id,number,title,status,parent_thread_id,created_at,updated_at) VALUES('busy','project',2,'Busy','active','focus',1,1);
+        INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('busy-exec','hold','busy','project','running',1,1);
+        INSERT INTO jobs(id,execution_id,project_id,issue_id,status,node_name,created_at,updated_at) VALUES('busy-job','busy-exec','project','busy','running','Busy',1,1);
+        INSERT INTO sessions(id,job_id,backend,status,created_at,updated_at) VALUES('busy-session','busy-job','claude','open',1,1);
+        INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('busy-turn','busy-session','busy-job',1,'running','initial',1,1);
+        UPDATE jobs SET current_turn_id='busy-turn',current_session_id='busy-session' WHERE id='busy-job';").await.unwrap();
+    (temp, db, orch, recorder)
+}
+
+#[tokio::test]
+async fn focus_resume_survives_boot_and_periodic_pass_without_a_hint_and_delivers_once() {
+    use cairn_core::internal::execution::jobs::WakeCause;
+    let (temp, db, orch, _recorder) = focus_fixture().await;
+    let error = continue_job_impl(
+        WakeCause::System,
+        &orch,
+        "a",
+        Some("focus-system-marker"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(error.contains("focus"), "{error}");
+    let held = only_hold(&db).await;
+    assert_eq!(
+        held.kind,
+        cairn_core::internal::orchestrator::wakes::HoldKind::Resume
+    );
+    assert_eq!(held.boundary_source, "thread_focus");
+    assert_eq!(held.next_due_at(), None);
+    assert_eq!(
+        common::scalar_i64_by_id(&db, "SELECT COUNT(*) FROM turns WHERE job_id=?1", "a").await,
+        1
+    );
+    drop(orch);
+    let (orch, recorder) = orchestrator(&temp, db.clone());
+    // Boot pass: still full. It must neither launch nor lose the durable input.
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    assert_eq!(only_hold(&db).await.id, held.id);
+    // Silent SQL changes model a missed hint. Job remains running while its
+    // head publishes the artifact and ends, so only activity frees the slot.
+    db.execute(
+        "UPDATE turns SET state='complete',ended_at=3 WHERE id='busy-turn'",
+        (),
+    )
+    .await
+    .unwrap();
+    let (pass, timer) = tokio::join!(
+        cairn_core::internal::execution::gates::sweep::sweep(&orch),
+        resolve_provider_limit_hold(&orch, &held, i64::MAX)
+    );
+    pass.unwrap();
+    assert!(!timer.unwrap(), "thread holds have no timer");
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    assert_eq!(
+        common::scalar_i64_by_id(&db, "SELECT COUNT(*) FROM turns WHERE job_id=?1", "a").await,
+        2
+    );
+    assert_eq!(common::scalar_i64_by_id(&db,"SELECT COUNT(*) FROM events e JOIN turns t ON t.id=e.turn_id WHERE t.job_id=?1 AND e.data LIKE '%focus-system-marker%'","a").await,1);
+    await_admission(&orch, "a", "active").await;
+    assert_eq!(recorder.spawn_count(), 1);
+}
+
+#[tokio::test]
+async fn addressed_continue_and_start_now_bypass_full_focus_without_duplicate_delivery() {
+    use cairn_core::internal::execution::jobs::WakeCause;
+    for mode in ["continue", "start_now", "operator", "agent"] {
+        let (_temp, db, orch, recorder) = focus_fixture().await;
+        if mode == "start_now" {
+            continue_job_impl(
+                WakeCause::System,
+                &orch,
+                "a",
+                Some("focus-once-marker"),
+                None,
+                None,
+            )
+            .unwrap_err();
+            let held = only_hold(&db).await;
+            assert!(
+                cairn_core::internal::orchestrator::wakes::start_now_thread_hold(
+                    &orch,
+                    &held.id,
+                    json!({"operator":true})
+                )
+                .await
+                .unwrap()
+            );
+            assert!(
+                !cairn_core::internal::orchestrator::wakes::start_now_thread_hold(
+                    &orch,
+                    &held.id,
+                    json!({"operator":true})
+                )
+                .await
+                .unwrap()
+            );
+        } else if matches!(mode, "operator" | "agent") {
+            use cairn_core::internal::mcp::types::McpCallbackRequest;
+            db.execute_script("INSERT INTO runs(id,job_id,project_id,issue_id,session_id,status,start_mode,created_at,updated_at) VALUES('busy-run','busy-job','project','busy','busy-session','live','resume',1,1);
+                UPDATE turns SET run_id='busy-run' WHERE id='busy-turn';").await.unwrap();
+            let request = McpCallbackRequest {
+                answer_bound_ms: None,
+                thread_id: None,
+                cwd: "/tmp".into(),
+                run_id: (mode == "agent").then(|| "busy-run".into()),
+                tool: "write".into(),
+                payload: json!({}),
+                tool_use_id: None,
+                origin: None,
+            };
+            let sent = cairn_core::internal::mcp::handlers::messages::append_direct_message(
+                &orch,
+                &request,
+                "hold",
+                1,
+                1,
+                "a",
+                None,
+                "focus-once-marker",
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(sent.starts_with("Sent direct message"), "{mode}: {sent}");
+        } else {
+            continue_job_impl(
+                WakeCause::Addressed,
+                &orch,
+                "a",
+                Some("focus-once-marker"),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        await_admission(&orch, "a", "active").await;
+        assert_eq!(recorder.spawn_count(), 1);
+        assert_eq!(
+            common::scalar_i64_by_id(&db, "SELECT COUNT(*) FROM turns WHERE job_id=?1", "a").await,
+            2
+        );
+        db.execute_script("INSERT INTO issues(id,project_id,number,title,status,parent_thread_id,created_at,updated_at) VALUES('ingress-fresh','project',9002,'Fresh','active','focus',1,1);
+            INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('ingress-fresh','hold','ingress-fresh','project','running',1,1);
+            INSERT INTO jobs(id,execution_id,issue_id,project_id,status,node_name,created_at,updated_at) VALUES('ingress-fresh','ingress-fresh','ingress-fresh','project','pending','Fresh',1,1);
+            UPDATE turns SET state='complete',ended_at=2 WHERE id='busy-turn';
+            UPDATE jobs SET status='completed' WHERE id='busy-job';").await.unwrap();
+        assert_ingress_counts_and_holds_fresh(&orch, &db, "a").await;
+    }
+}
+
+#[tokio::test]
+async fn ending_a_focus_held_child_retires_the_hold_without_claiming_its_input() {
+    use cairn_core::internal::orchestrator::attention_push::{push, Boundary, Wake};
+    use cairn_core::messages::delivery::nudge_job_for_urgency;
+    use cairn_core::messages::queued::Delivery;
+    // Merge, close, and the operator's withdrawal (Stop) each end the held
+    // child. The held wake is a real queued check-settled push, so the
+    // assertion is on queue ownership: its delivery stamp stays NULL.
+    for exit in ["merged_at", "closed_at", "stop"] {
+        let (_temp, db, orch, recorder) = focus_fixture().await;
+        let checks = "cairn://p/hold/1/1/a/checks";
+        let (push_id, _) = push(
+            &db,
+            "a",
+            checks,
+            Wake::Wake,
+            Boundary::Event,
+            &format!("turn-checks:{checks}"),
+        )
+        .await
+        .unwrap();
+        let _ = nudge_job_for_urgency(&orch, "a", Delivery::Queue);
+        let held = only_hold(&db).await;
+        assert_eq!(held.boundary_source, "thread_focus", "{exit}");
+        assert_eq!(push_delivery(&db, &push_id).await, None, "{exit}");
+
+        if exit == "stop" {
+            stop_job(&orch, "a").unwrap();
+        } else {
+            db.execute(format!("UPDATE issues SET {exit}=3 WHERE id='issue'"), ())
+                .await
+                .unwrap();
+        }
+        // A freed slot must not revive the ended child's wake.
+        db.execute(
+            "UPDATE turns SET state='complete',ended_at=3 WHERE id='busy-turn'",
+            (),
+        )
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            cairn_core::internal::execution::gates::sweep::sweep(&orch)
+                .await
+                .unwrap();
+        }
+        assert!(
+            load_active_provider_limit_holds(&db)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{exit}"
+        );
+        assert_eq!(recorder.spawn_count(), 0, "{exit}");
+        assert_eq!(
+            common::scalar_i64_by_id(&db, "SELECT COUNT(*) FROM turns WHERE job_id=?1", "a").await,
+            1,
+            "{exit}: no successor"
+        );
+        assert_eq!(
+            push_delivery(&db, &push_id).await,
+            None,
+            "{exit}: the wake is neither delivered nor stamped"
+        );
+    }
+}
+
+/// A second parked child `second` (job `c`) in the focus thread, shaped like
+/// `issue`'s job `a`: running, its head turn complete, its run exited.
+async fn second_parked_child(db: &LocalDb) {
+    db.execute_script("INSERT INTO issues(id,project_id,number,title,status,parent_thread_id,created_at,updated_at) VALUES('second','project',3,'Second','active','focus',1,1);
+        INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,snapshot) SELECT 'second-exec','hold','second','project','running',1,1,snapshot FROM executions WHERE id='exec';
+        INSERT INTO jobs(id,execution_id,recipe_node_id,project_id,issue_id,status,uri_segment,node_name,created_at,updated_at) VALUES('c','second-exec','a','project','second','running','a','A',1,1);
+        INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at) VALUES('session-c','c','claude','claude-session-c','open',1,2000000000,2000000000);
+        INSERT INTO runs(id,project_id,issue_id,job_id,session_id,status,created_at,updated_at,start_mode) VALUES('run-c','project','second','c','session-c','exited',1,1,'resume');
+        INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at) VALUES('turn-c','session-c','run-c','c',1,'complete','initial',1,2,2);
+        UPDATE jobs SET current_session_id='session-c',current_turn_id='turn-c' WHERE id='c';").await.unwrap();
+}
+
+async fn marker_deliveries(db: &LocalDb, job: &str, marker: &str) -> i64 {
+    db.query_opt_i64(
+        "SELECT COUNT(*) FROM events e JOIN turns t ON t.id=e.turn_id WHERE t.job_id=?1 AND e.data LIKE ?2",
+        (job.to_owned(), format!("%{marker}%")),
+    )
+    .await
+    .unwrap()
+    .unwrap_or(0)
+}
+
+/// Plan verification 4 (Acceptance C): two system re-entries at a full focus
+/// cap release in the order they arose, one per freed slot, each delivering
+/// its wake exactly once. `c` re-enters first though its hold id sorts after
+/// `a`'s, so only arrival order can put it ahead. No hint is installed.
+#[tokio::test]
+async fn two_focus_reentries_release_in_the_order_they_arose() {
+    use cairn_core::internal::execution::jobs::WakeCause;
+    let (_temp, db, orch, recorder) = focus_fixture().await;
+    second_parked_child(&db).await;
+    for (job, marker) in [
+        ("c", "first-reentry-marker"),
+        ("a", "second-reentry-marker"),
+    ] {
+        let error =
+            continue_job_impl(WakeCause::System, &orch, job, Some(marker), None, None).unwrap_err();
+        assert!(error.contains("focus"), "{job}: {error}");
+    }
+    let holds = load_active_provider_limit_holds(&db).await.unwrap();
+    assert_eq!(holds.len(), 2, "{holds:?}");
+    let first = holds.iter().find(|h| h.job_id == "c").unwrap().clone();
+    let second = holds.iter().find(|h| h.job_id == "a").unwrap().clone();
+    assert!(first.queue_order() < second.queue_order());
+    for hold in [&first, &second] {
+        assert_eq!(hold.boundary_source, "thread_focus");
+        assert_eq!(hold.next_due_at(), None);
+    }
+
+    // One slot frees silently. One pass releases only the earlier re-entry;
+    // its resumed turn makes `second` active, which fills the cap again.
+    db.execute(
+        "UPDATE turns SET state='complete',ended_at=3 WHERE id='busy-turn'",
+        (),
+    )
+    .await
+    .unwrap();
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    let state = |id: String| {
+        let db = db.clone();
+        async move {
+            text(
+                &db,
+                "SELECT state FROM provider_limit_holds WHERE id=?1",
+                &id,
+            )
+            .await
+        }
+    };
+    assert_eq!(state(first.id.clone()).await, "resolved");
+    assert_eq!(state(second.id.clone()).await, "active");
+    assert_eq!(
+        common::scalar_i64_by_id(&db, "SELECT COUNT(*) FROM turns WHERE job_id=?1", "a").await,
+        1,
+        "the later re-entry still waits"
+    );
+    await_admission(&orch, "c", "active").await;
+    assert_eq!(recorder.spawn_count(), 1);
+
+    // The resumed turn ends; the next pass releases the later re-entry.
+    db.execute(
+        "UPDATE turns SET state='complete',ended_at=4 WHERE job_id='c' AND state IN ('pending','running')",
+        (),
+    )
+    .await
+    .unwrap();
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    assert_eq!(state(second.id.clone()).await, "resolved");
+    await_admission(&orch, "a", "active").await;
+    assert_eq!(recorder.spawn_count(), 2);
+    assert_eq!(marker_deliveries(&db, "c", "first-reentry-marker").await, 1);
+    assert_eq!(
+        marker_deliveries(&db, "a", "second-reentry-marker").await,
+        1
+    );
+}
+
+/// Waits until the admission worker's failed start has restored hold `id` for
+/// its `attempts`-th time.
+async fn await_restored(db: &LocalDb, id: &str, attempts: i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let restored = db
+                .query_opt_i64(
+                    "SELECT launch_attempts FROM provider_limit_holds WHERE id=?1 AND state='active'",
+                    (id.to_owned(),),
+                )
+                .await
+                .unwrap();
+            if restored == Some(attempts) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("hold {id} was not restored for attempt {attempts}"));
+}
+
+/// A held re-entry whose launch really fails three times is gated
+/// `launch_failed`: only the operator releases it, so it leaves the band. A
+/// later re-entry and then a fresh filing on the same thread both still
+/// release when a slot frees, rather than queueing behind it forever.
+#[tokio::test]
+async fn a_launch_failed_reentry_leaves_the_band_and_blocks_no_later_work() {
+    use cairn_core::internal::execution::jobs::WakeCause;
+    use cairn_core::internal::orchestrator::wakes::RESUME_GATE_LAUNCH_FAILED;
+    let (temp, db, orch, _recorder) = focus_fixture().await;
+    continue_job_impl(
+        WakeCause::System,
+        &orch,
+        "a",
+        Some("gated-marker"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    let gated = only_hold(&db).await;
+    assert_eq!(gated.launch_attempts, 0);
+    drop(orch);
+    let (orch, failing) = orchestrator_with_spawn_failure(
+        &temp,
+        db.clone(),
+        Some(ClaudeAuth::ApiKey("test-key".into())),
+        true,
+    );
+    db.execute(
+        "UPDATE turns SET state='complete',ended_at=3 WHERE id='busy-turn'",
+        (),
+    )
+    .await
+    .unwrap();
+    for attempt in 1..=3 {
+        cairn_core::internal::execution::gates::sweep::sweep(&orch)
+            .await
+            .unwrap();
+        promote_private_lanes_for_test(&orch);
+        await_restored(&db, &gated.id, attempt).await;
+        assert_eq!(failing.spawn_count(), attempt as usize);
+    }
+    let restored = only_hold(&db).await;
+    assert_eq!(
+        restored.resume_gate.as_deref(),
+        Some(RESUME_GATE_LAUNCH_FAILED)
+    );
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    assert_eq!(failing.spawn_count(), 3, "a gated hold is not retried");
+    drop(orch);
+
+    // Healthy launches from here. The cap fills again and a second child
+    // re-enters behind it.
+    let (orch, recorder) = orchestrator(&temp, db.clone());
+    second_parked_child(&db).await;
+    db.execute(
+        "UPDATE turns SET state='running',ended_at=NULL WHERE id='busy-turn'",
+        (),
+    )
+    .await
+    .unwrap();
+    let error = continue_job_impl(
+        WakeCause::System,
+        &orch,
+        "c",
+        Some("later-reentry-marker"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(error.contains("focus"), "{error}");
+    let later = load_active_provider_limit_holds(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|h| h.job_id == "c")
+        .unwrap();
+    assert!(gated.queue_order() < later.queue_order());
+
+    // The slot frees: the later re-entry releases despite the older gated hold.
+    db.execute(
+        "UPDATE turns SET state='complete',ended_at=4 WHERE id='busy-turn'",
+        (),
+    )
+    .await
+    .unwrap();
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    await_admission(&orch, "c", "active").await;
+    assert_eq!(recorder.spawn_count(), 1);
+    assert_eq!(marker_deliveries(&db, "c", "later-reentry-marker").await, 1);
+
+    // Its turn ends: a fresh filing on the thread starts at once.
+    db.execute_script("UPDATE turns SET state='complete',ended_at=5 WHERE job_id='c' AND state IN ('pending','running');
+        INSERT INTO issues(id,project_id,number,title,status,parent_thread_id,created_at,updated_at) VALUES('fresh','project',4,'Fresh','active','focus',1,1);
+        INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('fresh-exec','hold','fresh','project','running',1,1);
+        INSERT INTO jobs(id,execution_id,issue_id,project_id,status,node_name,created_at,updated_at) VALUES('fresh','fresh-exec','fresh','project','pending','Fresh',1,1);").await.unwrap();
+    assert!(
+        cairn_core::internal::orchestrator::wakes::admit_thread_launch(
+            &orch,
+            "fresh",
+            WakeCause::System,
+            false
+        )
+        .await
+        .unwrap()
+        .is_some(),
+        "a fresh start is not held behind a gated hold"
+    );
+    let still = load_active_provider_limit_holds(&db).await.unwrap();
+    assert_eq!(still.len(), 1, "{still:?}");
+    assert_eq!(
+        still[0].id, gated.id,
+        "the gated hold waits for the operator"
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &db,
+            "SELECT COUNT(*) FROM turns WHERE job_id=?1 AND state IN ('pending','running')",
+            "a"
+        )
+        .await,
+        0,
+        "the gated child has no live successor"
+    );
+}
+
+/// Plan verification 5 (harness condition 2): an Addressed Continue on a child
+/// that ALREADY holds a focus-held System wake runs at once at a full cap,
+/// retires the hold, and delivers both inputs exactly once. A later pass finds
+/// nothing to redeliver.
+#[tokio::test]
+async fn an_addressed_continue_supersedes_a_held_system_wake_and_delivers_it_once() {
+    use cairn_core::internal::execution::jobs::WakeCause;
+    let (_temp, db, orch, recorder) = focus_fixture().await;
+    continue_job_impl(
+        WakeCause::System,
+        &orch,
+        "a",
+        Some("held-system-marker"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    let held = only_hold(&db).await;
+    assert_eq!(held.boundary_source, "thread_focus");
+
+    continue_job_impl(
+        WakeCause::Addressed,
+        &orch,
+        "a",
+        Some("addressed-marker"),
+        None,
+        None,
+    )
+    .unwrap();
+    await_admission(&orch, "a", "active").await;
+    assert_eq!(recorder.spawn_count(), 1);
+    assert_eq!(turns(&db).await, 2);
+    assert!(
+        load_active_provider_limit_holds(&db)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the addressed turn retires the held continuation"
+    );
+    assert_eq!(marker_deliveries(&db, "a", "addressed-marker").await, 1);
+    assert_eq!(
+        marker_deliveries(&db, "a", "held-system-marker").await,
+        1,
+        "the held wake is neither dropped nor duplicated"
+    );
+
+    // The busy sibling ends and a pass runs: nothing is redelivered.
+    db.execute(
+        "UPDATE turns SET state='complete',ended_at=3 WHERE id='busy-turn'",
+        (),
+    )
+    .await
+    .unwrap();
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    assert_eq!(turns(&db).await, 2);
+    assert_eq!(recorder.spawn_count(), 1);
+    assert_eq!(marker_deliveries(&db, "a", "held-system-marker").await, 1);
+}
+
+async fn push_delivery(db: &LocalDb, push: &str) -> Option<String> {
+    common::scalar_text_by_id(
+        db,
+        "SELECT delivered_event_id FROM attention_pushes WHERE id=?1",
+        push,
+    )
+    .await
+}
+
+/// Plan verification 5 with a real check-settled wake rather than a message
+/// marker: the push is stored in the shape the checks router stores
+/// (`turn-checks:<checks uri>`, wake, event boundary) and delivered by the
+/// production nudge, whose cause comes from the push key. At a full cap the
+/// wake is focus-held with the push undelivered; the no-hint pass releases
+/// it, the push is stamped by one briefing event in the resumed turn, and a
+/// second pass neither re-stamps nor relaunches.
+#[tokio::test]
+async fn a_check_settled_push_is_held_then_delivered_exactly_once() {
+    use cairn_core::internal::orchestrator::attention_push::{push, Boundary, Wake};
+    use cairn_core::messages::delivery::nudge_job_for_urgency;
+    use cairn_core::messages::queued::Delivery;
+    let (_temp, db, orch, recorder) = focus_fixture().await;
+    let checks = "cairn://p/hold/1/1/a/checks";
+    let (push_id, wake) = push(
+        &db,
+        "a",
+        checks,
+        Wake::Wake,
+        Boundary::Event,
+        &format!("turn-checks:{checks}"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(wake, Wake::Wake);
+
+    // The nudge's resume is refused by focus, so the outcome is not asserted.
+    let _ = nudge_job_for_urgency(&orch, "a", Delivery::Queue);
+    let held = only_hold(&db).await;
+    assert_eq!(held.boundary_source, "thread_focus");
+    assert_eq!(
+        held.kind,
+        cairn_core::internal::orchestrator::wakes::HoldKind::Resume
+    );
+    assert_eq!(turns(&db).await, 1);
+    assert_eq!(
+        push_delivery(&db, &push_id).await,
+        None,
+        "held, not delivered"
+    );
+    assert_eq!(recorder.spawn_count(), 0);
+
+    db.execute(
+        "UPDATE turns SET state='complete',ended_at=3 WHERE id='busy-turn'",
+        (),
+    )
+    .await
+    .unwrap();
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    await_admission(&orch, "a", "active").await;
+    assert_eq!(turns(&db).await, 2);
+    let event = push_delivery(&db, &push_id)
+        .await
+        .expect("the released turn delivers the push");
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &db,
+            "SELECT COUNT(*) FROM events e JOIN turns t ON t.id=e.turn_id
+             WHERE e.id=?1 AND t.job_id='a' AND t.predecessor_id IS NOT NULL",
+            &event,
+        )
+        .await,
+        1,
+        "stamped by an event in the resumed turn"
+    );
+    assert_eq!(recorder.spawn_count(), 1);
+
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    assert_eq!(
+        push_delivery(&db, &push_id).await.as_deref(),
+        Some(event.as_str())
+    );
+    assert_eq!(turns(&db).await, 2);
+    assert_eq!(recorder.spawn_count(), 1);
+}
+
+/// A synced focus hold whose execution another runner owns is never claimed
+/// here, even with a free slot: the pass leaves it active and launches
+/// nothing. Once this runner owns the execution, the next pass releases it
+/// once and delivers its input once.
+#[tokio::test]
+async fn a_foreign_owned_focus_hold_is_not_claimed_until_this_runner_owns_it() {
+    use cairn_core::internal::execution::jobs::WakeCause;
+    let (_temp, db, orch, recorder) = focus_fixture().await;
+    continue_job_impl(
+        WakeCause::System,
+        &orch,
+        "a",
+        Some("foreign-owner-marker"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    let held = only_hold(&db).await;
+    db.execute_script(
+        "UPDATE executions SET runner_device_id='a-peer-device' WHERE id='exec';
+         UPDATE turns SET state='complete',ended_at=3 WHERE id='busy-turn';",
+    )
+    .await
+    .unwrap();
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    assert!(!release_on_supply_change(&orch, &held, i64::MAX)
+        .await
+        .unwrap());
+    assert_eq!(
+        text(
+            &db,
+            "SELECT state FROM provider_limit_holds WHERE id=?1",
+            &held.id
+        )
+        .await,
+        "active"
+    );
+    assert_eq!(turns(&db).await, 1);
+    assert_eq!(recorder.spawn_count(), 0);
+
+    db.execute(
+        "UPDATE executions SET runner_device_id=NULL WHERE id='exec'",
+        (),
+    )
+    .await
+    .unwrap();
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    await_admission(&orch, "a", "active").await;
+    assert_eq!(turns(&db).await, 2);
+    assert_eq!(recorder.spawn_count(), 1);
+    assert_eq!(marker_deliveries(&db, "a", "foreign-owner-marker").await, 1);
+}
+
+/// Crash recovery for a focus-held continuation whose claim committed but
+/// whose launch never happened: (a) the hold is `resolved` and nothing else
+/// moved; (b) a pending direct successor of the held head was also written,
+/// with no run and no prepared launch, and became the job's head. A new
+/// runner's no-hint pass restores the claim with its FIFO place, it waits
+/// while the cap is full, then releases once and delivers the original input
+/// once.
+#[tokio::test]
+async fn a_crash_between_focus_claim_and_launch_is_recovered_with_its_place() {
+    use cairn_core::internal::execution::jobs::WakeCause;
+    for orphan_successor in [false, true] {
+        let (temp, db, orch, _recorder) = focus_fixture().await;
+        continue_job_impl(
+            WakeCause::System,
+            &orch,
+            "a",
+            Some("crash-recovery-marker"),
+            None,
+            None,
+        )
+        .unwrap_err();
+        let held = only_hold(&db).await;
+        drop(orch);
+        db.execute(
+            "UPDATE provider_limit_holds SET state='resolved',resolved_at=3,updated_at=3 WHERE id=?1",
+            params![held.id.as_str()],
+        )
+        .await
+        .unwrap();
+        if orphan_successor {
+            db.execute_script(
+                "INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,predecessor_id,created_at,updated_at)
+                   VALUES('crash-successor','session',NULL,'a',2,'pending','wait_resolved','turn',3,3);
+                 UPDATE jobs SET current_turn_id='crash-successor' WHERE id='a';",
+            )
+            .await
+            .unwrap();
+        }
+
+        let (orch, recorder) = orchestrator(&temp, db.clone());
+        cairn_core::internal::execution::gates::sweep::sweep(&orch)
+            .await
+            .unwrap();
+        let restored = only_hold(&db).await;
+        assert_eq!(restored.id, held.id, "orphan={orphan_successor}");
+        assert_eq!(restored.boundary_source, "thread_focus");
+        assert_eq!(
+            restored.queue_order(),
+            held.queue_order(),
+            "its re-entry place is kept"
+        );
+        assert_eq!(recorder.spawn_count(), 0, "the cap is still full");
+        assert_eq!(
+            marker_deliveries(&db, "a", "crash-recovery-marker").await,
+            0
+        );
+
+        db.execute(
+            "UPDATE turns SET state='complete',ended_at=4 WHERE id='busy-turn'",
+            (),
+        )
+        .await
+        .unwrap();
+        cairn_core::internal::execution::gates::sweep::sweep(&orch)
+            .await
+            .unwrap();
+        await_admission(&orch, "a", "active").await;
+        assert_eq!(recorder.spawn_count(), 1, "orphan={orphan_successor}");
+        assert_eq!(
+            marker_deliveries(&db, "a", "crash-recovery-marker").await,
+            1,
+            "orphan={orphan_successor}"
+        );
+        assert_eq!(
+            common::scalar_i64_by_id(
+                &db,
+                "SELECT COUNT(*) FROM turns WHERE job_id=?1 AND state IN ('pending','running')",
+                "a"
+            )
+            .await,
+            1,
+            "one live successor"
+        );
+        cairn_core::internal::execution::gates::sweep::sweep(&orch)
+            .await
+            .unwrap();
+        assert_eq!(recorder.spawn_count(), 1);
+    }
+}
+
+/// Saturate a parked ingress recipient's thread without another migrated store.
+pub(super) async fn saturate_ingress_focus(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    issue: &str,
+    execution: &str,
+) {
+    orch.update_settings(cairn_core::models::UpdateSettings {
+        max_open_children_per_thread: Some(1),
+        max_concurrent_executions: Some(10),
+        ..Default::default()
+    })
+    .unwrap();
+    db.execute("INSERT INTO threads(id,project_id,name,created_at,updated_at) SELECT 'ingress-focus',project_id,'ingress-focus',1,1 FROM issues WHERE id=?1", (issue.to_owned(),)).await.unwrap();
+    db.execute(
+        "UPDATE issues SET parent_thread_id='ingress-focus' WHERE id=?1",
+        (issue.to_owned(),),
+    )
+    .await
+    .unwrap();
+    for (id, number) in [("ingress-busy", 9001), ("ingress-fresh", 9002)] {
+        db.execute("INSERT INTO issues(id,project_id,number,title,status,parent_thread_id,created_at,updated_at) SELECT ?1,project_id,?2,?1,'active','ingress-focus',1,1 FROM issues WHERE id=?3", (id.to_owned(), number, issue.to_owned())).await.unwrap();
+        db.execute("INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,snapshot) SELECT ?1,recipe_id,?1,project_id,'running',1,1,snapshot FROM executions WHERE id=?2", (id.to_owned(),execution.to_owned())).await.unwrap();
+        db.execute("INSERT INTO jobs(id,execution_id,issue_id,project_id,status,node_name,created_at,updated_at) SELECT ?1,?1,?1,project_id,'pending',?1,1,1 FROM issues WHERE id=?1", (id.to_owned(),)).await.unwrap();
+    }
+    db.execute_script("INSERT INTO sessions(id,job_id,backend,status,created_at,updated_at) VALUES('ingress-busy','ingress-busy','claude','open',1,1);
+      INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('ingress-busy','ingress-busy','ingress-busy',1,'running','initial',1,1);
+      UPDATE jobs SET status='running',current_session_id='ingress-busy',current_turn_id='ingress-busy' WHERE id='ingress-busy';").await.unwrap();
+}
+
+/// Remove the original occupant: only the addressed recipient can now fill focus.
+pub(super) async fn assert_ingress_counts_and_holds_fresh(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    recipient: &str,
+) {
+    assert!(load_active_provider_limit_holds(db)
+        .await
+        .unwrap()
+        .iter()
+        .all(|h| h.job_id != recipient));
+    db.execute_script(
+        "UPDATE turns SET state='complete',ended_at=2 WHERE id='ingress-busy';
+      UPDATE jobs SET status='completed' WHERE id='ingress-busy';",
+    )
+    .await
+    .unwrap();
+    assert!(
+        cairn_core::internal::orchestrator::wakes::admit_thread_launch(
+            orch,
+            "ingress-fresh",
+            cairn_core::models::WakeCause::System,
+            false
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let holds = load_active_provider_limit_holds(db).await.unwrap();
+    assert!(holds
+        .iter()
+        .any(|h| h.job_id == "ingress-fresh" && h.boundary_source == "thread_focus"));
+}
+
+/// An operator answer, authenticated as a desktop operator.
+fn operator_allow() -> cairn_core::internal::mcp::handlers::permission::PermissionAnswer {
+    use cairn_common::identity::{
+        Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, CredentialRef,
+        PrincipalRef, VerificationMethod, VerificationRecord, VerificationStatus,
+        VerificationStrength,
+    };
+    use cairn_core::internal::mcp::handlers::permission::{
+        OperatorApproval, PermissionAnswer, PermissionDecision,
+    };
+    let actor = PrincipalRef::Machine {
+        device_id: "test-device".to_string(),
+    };
+    let verification = VerificationRecord::new(
+        VerificationMethod::DesktopCredential,
+        VerificationStatus::Verified,
+        None,
+        None,
+        None,
+        Some(CredentialRef::new("desktop_operator_credential").unwrap()),
+        VerificationStrength::new("local_shared_secret").unwrap(),
+        1,
+    )
+    .unwrap();
+    let evidence = AppearanceEvidence::new(
+        AppearanceTransport::AuthenticatedDesktop,
+        Address::Desktop {
+            device_id: "test-device".to_string(),
+        },
+        verification,
+        1,
+        None,
+    )
+    .unwrap();
+    let appearance = AppearanceSnapshot::new(actor.clone(), evidence, vec![], None).unwrap();
+    PermissionAnswer::from_operator(
+        PermissionDecision::Allow,
+        OperatorApproval::authenticated(actor, appearance).unwrap(),
+    )
+}
+
+/// Plan verification 6, the permission path: at a full focus cap, answering a
+/// child's parked permission resumes it at once (an Addressed turn, never
+/// held). It then counts, so once the busy sibling ends a second child's
+/// fresh launch is still held behind it.
+#[tokio::test]
+async fn a_permission_answer_resumes_at_a_full_cap_and_then_counts() {
+    use cairn_core::internal::execution::jobs::WakeCause;
+    use cairn_core::internal::mcp::handlers::permission::resolve_permission_request;
+    let (_temp, db, orch, recorder) = focus_fixture().await;
+    second_parked_child(&db).await;
+    db.execute_script(
+        "UPDATE turns SET state='yielded',yield_reason='permission',ended_at=NULL WHERE id='turn';
+         INSERT INTO permission_requests(id,run_id,job_id,tool_use_id,tool_name,tool_input,status,created_at,turn_id,uri_segment)
+           VALUES('perm-a','run','a','toolu-perm','Bash','{}','pending',1,'turn','perm-1');",
+    )
+    .await
+    .unwrap();
+
+    resolve_permission_request(&orch, "perm-a", operator_allow())
+        .await
+        .expect("the answer applies");
+    assert!(
+        load_active_provider_limit_holds(&db)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an answer is never focus-held"
+    );
+    await_admission(&orch, "a", "active").await;
+    assert_eq!(turns(&db).await, 2);
+    assert_eq!(recorder.spawn_count(), 1);
+
+    // The busy sibling ends; the answered child still holds the one slot.
+    db.execute(
+        "UPDATE turns SET state='complete',ended_at=3 WHERE id='busy-turn'",
+        (),
+    )
+    .await
+    .unwrap();
+    let admitted = cairn_core::internal::orchestrator::wakes::admit_thread_launch(
+        &orch,
+        "c",
+        WakeCause::System,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(admitted.is_none(), "the next fresh launch is held");
+    let held = only_hold(&db).await;
+    assert_eq!(held.job_id, "c");
+    assert_eq!(
+        held.kind,
+        cairn_core::internal::orchestrator::wakes::HoldKind::Launch
+    );
+    assert_eq!(held.boundary_source, "thread_focus");
+    assert_eq!(recorder.spawn_count(), 1);
 }

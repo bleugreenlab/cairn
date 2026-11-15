@@ -95,9 +95,9 @@ pub(crate) fn install_sweep_notifier(orch: Orchestrator) {
     if let Ok(mut sender) = notifier().lock() {
         *sender = Some(tx);
     }
-    // Job-status and turn writers in `cairn-workflow` hint through the same
-    // channel when they may have freed a fleet slot.
-    cairn_workflow::gates::hint::install(notify_gate_evidence_changed);
+    // Workflow, session recovery and merge-status writers share one
+    // post-commit hint channel when admission evidence changes.
+    cairn_db::admission_hint::install(notify_gate_evidence_changed);
     tokio::spawn(super::pulse::run_gate_sweep_loop(
         orch,
         rx,
@@ -209,6 +209,7 @@ pub(crate) async fn sweep_with(
     vocabulary: &GateVocabulary,
     now: i64,
 ) -> Result<SweepReport, String> {
+    crate::orchestrator::wakes::resolve_thread_holds(orch, now).await?;
     let mut report = SweepReport::default();
     // The queue's order, across every database: a fleet slot that frees goes
     // to whatever is first in line, wherever it lives. An earlier execution
@@ -902,6 +903,7 @@ pub(crate) async fn announce_release(
         let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
             execution_id: execution_id.to_string(),
             outbox_entry_id: None,
+            focus_admitted: true,
         });
     }
     if let Some(issue_id) = issue_id {

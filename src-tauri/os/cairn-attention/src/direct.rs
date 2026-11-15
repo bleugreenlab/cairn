@@ -20,6 +20,7 @@ pub struct NewRecipient {
 /// `message_recipients` row per addressee, in position order.
 #[derive(Debug, Clone)]
 pub struct NewDirect {
+    pub cause: cairn_domain::WakeCause,
     pub id: String,
     pub sender_run_id: Option<String>,
     pub sender_name: String,
@@ -42,8 +43,10 @@ impl NewDirect {
         recipient_run_id: Option<&str>,
         wake: Wake,
         now: i64,
+        cause: cairn_domain::WakeCause,
     ) -> Self {
         NewDirect {
+            cause,
             id: id.to_string(),
             sender_run_id: None,
             sender_name: sender_name.to_string(),
@@ -89,8 +92,8 @@ pub async fn insert_direct_message_conn(
             &format!(
                 "{verb} INTO messages (
                     id, channel_type, channel_id, sender_run_id, sender_name,
-                    content, created_at, urgency
-                 ) VALUES (?1, 'direct', NULL, ?2, ?3, ?4, ?5, ?6)"
+                    content, created_at, urgency, wake_cause
+                 ) VALUES (?1, 'direct', NULL, ?2, ?3, ?4, ?5, ?6, ?7)"
             ),
             params![
                 direct.id.as_str(),
@@ -98,7 +101,11 @@ pub async fn insert_direct_message_conn(
                 direct.sender_name.as_str(),
                 direct.content.as_str(),
                 direct.created_at,
-                direct.urgency.map(DeliveryUrgency::as_str)
+                direct.urgency.map(DeliveryUrgency::as_str),
+                match direct.cause {
+                    cairn_domain::WakeCause::Addressed => "addressed",
+                    cairn_domain::WakeCause::System => "system",
+                }
             ],
         )
         .await?
@@ -134,7 +141,7 @@ async fn verify_existing_direct(
 ) -> Result<(), DbError> {
     let mut rows = conn
         .query(
-            "SELECT channel_type, sender_run_id, sender_name, content, urgency
+            "SELECT channel_type, sender_run_id, sender_name, content, urgency, wake_cause
                FROM messages WHERE id = ?1",
             params![direct.id.as_str()],
         )
@@ -146,6 +153,11 @@ async fn verify_existing_direct(
                 && row.text(2)? == direct.sender_name
                 && row.text(3)? == direct.content
                 && row.opt_text(4)?.as_deref() == direct.urgency.map(DeliveryUrgency::as_str)
+                && row.text(5)?
+                    == match direct.cause {
+                        cairn_domain::WakeCause::Addressed => "addressed",
+                        cairn_domain::WakeCause::System => "system",
+                    }
         }
         None => false,
     };
@@ -306,6 +318,7 @@ pub async fn settle_direct_conn(
     urgency: DeliveryUrgency,
     message_id: &str,
     operator_message_id: Option<&str>,
+    cause: cairn_domain::WakeCause,
 ) -> Result<(String, crate::push::Wake), DbError> {
     use crate::push::Boundary;
 
@@ -322,6 +335,7 @@ pub async fn settle_direct_conn(
             Some(recipient_run_id),
             wake,
             now,
+            cause,
         ),
         OnExisting::Ignore,
     )
@@ -388,6 +402,7 @@ pub async fn insert_system_direct_push_with_message_id_conn(
             Some(recipient_run_id),
             wake,
             now,
+            cairn_domain::WakeCause::System,
         ),
         OnExisting::Fail,
     )

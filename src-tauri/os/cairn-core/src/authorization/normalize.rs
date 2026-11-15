@@ -637,6 +637,7 @@ mod tests {
                 thread: "judgment".to_string(),
                 open: vec![1, 2, 3, 4, 5],
                 limit: 4,
+                reentries: 0,
                 place: Some(1),
                 placed_by: None,
                 pin: None,

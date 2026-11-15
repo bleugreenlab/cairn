@@ -300,6 +300,7 @@ async fn start_and_advance(
         let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
             execution_id: execution.id.clone(),
             outbox_entry_id: None,
+            focus_admitted: true,
         });
     }
     Ok(launched)
@@ -519,6 +520,7 @@ async fn launch_recipe_execution(
             filed_at: orch.services.clock.now(),
             place,
             turn,
+            operator_started: starter == Starter::Operator,
         },
     )
     .await?;
@@ -547,7 +549,8 @@ async fn launch_recipe_execution(
         // An ungated launch is never held, so there is nothing to release it
         // from; a gated one has not been released yet.
         released_at: None,
-        release_override_json: None,
+        release_override_json: (starter == Starter::Operator)
+            .then(|| r#"{"operator":true}"#.to_string()),
         gate_census: None,
     };
     Ok(Launched {
@@ -1401,6 +1404,7 @@ pub(crate) async fn file_held_with_observed_satisfaction(
             filed_at: orch.services.clock.now(),
             place: QueuePlace::Tail,
             turn: None,
+            operator_started: false,
         },
     )
     .await?;
@@ -1433,6 +1437,7 @@ struct LaunchGates {
     filed_at: i64,
     place: QueuePlace,
     turn: Option<i64>,
+    operator_started: bool,
 }
 
 /// What starting an issue's execution actually did to its lineage.
@@ -1480,6 +1485,7 @@ async fn insert_issue_execution_atomic(
         filed_at,
         place,
         turn,
+        operator_started,
     } = gates;
     if !gates.is_empty() && intent == LaunchIntent::AutomaticTrigger {
         return Err(
@@ -1559,6 +1565,13 @@ async fn insert_issue_execution_atomic(
             execution.seq = Some(seq);
             execution.lifecycle = lifecycle;
             insert_execution_conn(conn, &execution).await?;
+            if operator_started {
+                conn.execute(
+                    "UPDATE executions SET release_override_json = ?2 WHERE id = ?1",
+                    params![execution.id.as_str(), r#"{"operator":true}"#],
+                )
+                .await?;
+            }
             if let (Some(turn), false) = (turn, held) {
                 crate::execution::gates::rotation::record_turn_conn(
                     conn,

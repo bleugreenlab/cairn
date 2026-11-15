@@ -172,8 +172,15 @@ impl WorkflowHost for CoreWorkflowHost {
         }
     }
     fn continue_job(&self, job_id: &str, message: &str) -> Result<(), String> {
-        crate::execution::jobs::continue_job_impl(&self.0, job_id, Some(message), None, None)
-            .map(|_| ())
+        crate::execution::jobs::continue_job_impl(
+            crate::execution::jobs::WakeCause::System,
+            &self.0,
+            job_id,
+            Some(message),
+            None,
+            None,
+        )
+        .map(|_| ())
     }
     fn resume_parent(&self, job_id: &str, mode: ParentResume) -> Result<(), String> {
         match mode {
@@ -206,7 +213,15 @@ impl WorkflowHost for CoreWorkflowHost {
     }
     async fn execute(&self, workload: Workload) -> Result<Option<EffectResult>, String> {
         let effect = match workload {
-            Workload::AgentJobs(jobs) => WorkflowEffect::StartAgentJobs(jobs),
+            Workload::AgentJobs {
+                jobs,
+                cause,
+                focus_admitted,
+            } => WorkflowEffect::StartAgentJobs {
+                jobs,
+                cause,
+                focus_admitted,
+            },
             Workload::Action {
                 action_run_id,
                 execution_id,

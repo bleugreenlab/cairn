@@ -67,6 +67,7 @@ pub trait AttentionHost: RecipientHost {
 /// One direct delivery to one job.
 #[derive(Clone, Debug)]
 pub struct DeliveryRequest<'a> {
+    pub cause: cairn_domain::WakeCause,
     pub job_id: &'a str,
     pub sender: Option<&'a str>,
     pub message: &'a str,
@@ -80,8 +81,14 @@ pub struct DeliveryRequest<'a> {
 }
 
 impl<'a> DeliveryRequest<'a> {
-    pub fn new(job_id: &'a str, message: &'a str, urgency: DeliveryUrgency) -> Self {
+    pub fn new(
+        job_id: &'a str,
+        message: &'a str,
+        urgency: DeliveryUrgency,
+        cause: cairn_domain::WakeCause,
+    ) -> Self {
         Self {
+            cause,
             job_id,
             sender: None,
             message,

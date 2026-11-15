@@ -1430,6 +1430,7 @@ pub(super) mod unstarted_child_tests {
     #[derive(Default)]
     pub(in crate::execution::delegation::runtime) struct HoldingExecutor {
         started: Mutex<Vec<String>>,
+        focus_admissions: Mutex<Vec<bool>>,
     }
 
     #[async_trait::async_trait]
@@ -1439,7 +1440,13 @@ pub(super) mod unstarted_child_tests {
             _orch: &Orchestrator,
             effect: WorkflowEffect,
         ) -> Result<Option<EffectResult>, String> {
-            if let WorkflowEffect::StartAgentJobs(jobs) = effect {
+            if let WorkflowEffect::StartAgentJobs {
+                jobs,
+                focus_admitted,
+                ..
+            } = effect
+            {
+                self.focus_admissions.lock().unwrap().push(focus_admitted);
                 self.started
                     .lock()
                     .unwrap()
@@ -2275,6 +2282,7 @@ pub(super) mod unstarted_child_tests {
         vec![WorkflowEffect::AdvanceDag {
             execution_id: "e".to_string(),
             outbox_entry_id: None,
+            focus_admitted: false,
         }]
     }
 
@@ -2287,9 +2295,18 @@ pub(super) mod unstarted_child_tests {
         persist_pending_packet(&orch).await;
         break_advancement_after_its_claim(&orch).await;
 
-        let error = crate::effects::run::execute_effects(&orch, cascading_advance())
+        let mut effects = cascading_advance();
+        if let WorkflowEffect::AdvanceDag { focus_admitted, .. } = &mut effects[0] {
+            *focus_admitted = true;
+        }
+        let error = crate::effects::run::execute_effects(&orch, effects)
             .await
             .expect_err("the broken action node fails the cascading reduction");
+        assert_eq!(
+            *executor.focus_admissions.lock().unwrap(),
+            [true],
+            "same-pass error handover retains fresh admission"
+        );
         assert!(error.contains("Action node has no valid config"), "{error}");
 
         let child = text(

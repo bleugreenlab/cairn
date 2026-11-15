@@ -185,6 +185,7 @@ async fn continue_sessionless_checkpoint_errors_and_stays_blocked() {
     insert_job(&ctx.db, "job-4", "blocked").await;
 
     let result = cairn_core::internal::execution::jobs::continue_job_impl(
+        cairn_core::models::WakeCause::Addressed,
         &ctx.orch,
         "job-4",
         Some("please revise"),

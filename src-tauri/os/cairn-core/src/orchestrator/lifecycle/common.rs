@@ -139,6 +139,7 @@ pub(super) fn apply_turn_outcome(
                         ),
                     )
                     .await?;
+                    conn.on_commit(cairn_db::admission_hint::evidence_changed);
                     Ok(())
                 })
             })
@@ -230,6 +231,7 @@ pub(super) fn interrupt_turn(
                         (end_reason.as_deref(), now, turn_id.as_str()),
                     )
                     .await?;
+                    conn.on_commit(cairn_db::admission_hint::evidence_changed);
                     Ok(())
                 })
             })

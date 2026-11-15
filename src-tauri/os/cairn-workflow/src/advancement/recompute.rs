@@ -539,6 +539,7 @@ pub async fn force_fail_job_turn_conn(
                 params![now, now, turn_id.as_str()],
             )
             .await?;
+            conn.on_commit(cairn_db::admission_hint::evidence_changed);
         }
         other => {
             // Terminal or absent: append a synthetic failed turn so the latest
@@ -576,6 +577,7 @@ pub async fn force_fail_job_turn_conn(
                 ],
             )
             .await?;
+            conn.on_commit(cairn_db::admission_hint::evidence_changed);
         }
     }
     Ok(())
@@ -1059,7 +1061,7 @@ pub async fn missing_output_conn(
         .node_job_facts(conn, job_id, execution_id, node_id, false)
         .await?;
     Ok(
-        blocked_on_missing_output(&gathered.facts).then(|| MissingOutput {
+        blocked_on_missing_output(&gathered.facts).then_some(MissingOutput {
             output_name: gathered.required_artifact_name,
             since: gathered.turn.work_ended_at,
         }),
@@ -1265,15 +1267,16 @@ pub async fn write_job_status(
         }
     }
     if frees_capacity(from, to) {
-        crate::gates::hint::evidence_changed();
+        conn.on_commit(cairn_db::admission_hint::evidence_changed);
     }
     Ok(())
 }
 
 /// Whether a job moving `from` -> `to` may release an execution the queue
-/// holds. A job leaving `pending`/`running` may free a fleet slot; a job
-/// ending, from any status that had not ended (`blocked` and `idle`
-/// included), may drop its issue out of its thread's open-children count.
+/// holds. Leaving `pending`/`running` may free an activity slot; ending from
+/// any nonterminal status also changes the execution's admission evidence.
+/// Head-turn transitions signal separately because job status can remain
+/// `running` while the head becomes parked or stopped.
 pub(crate) fn frees_capacity(from: &JobStatus, to: &JobStatus) -> bool {
     let working = |status: &JobStatus| matches!(status, JobStatus::Pending | JobStatus::Running);
     (working(from) && !working(to)) || (!from.is_terminal() && to.is_terminal())

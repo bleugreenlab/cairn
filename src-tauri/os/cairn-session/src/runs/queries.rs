@@ -1770,6 +1770,7 @@ async fn reconcile_stale_runs_db(
                         params![now, turn_id.as_str()],
                     )
                     .await?;
+                conn.on_commit(cairn_db::admission_hint::evidence_changed);
                 if updated > 0 {
                     orphaned_pending_count += 1;
                     reproject_job_ids.insert(job_id.clone());
@@ -2132,6 +2133,7 @@ pub async fn settle_stranded_turns(
                 params![now, turn_id.as_str()],
             )
             .await?;
+            conn.on_commit(cairn_db::admission_hint::evidence_changed);
             settled.push(settled_as(turn_id, SettledTurnOutcome::YieldedForHeldCall));
             continue;
         }
@@ -2178,6 +2180,7 @@ pub async fn settle_stranded_turns(
             params![target_state, end_reason, now, turn_id.as_str()],
         )
         .await?;
+        conn.on_commit(cairn_db::admission_hint::evidence_changed);
         // The sweep never saw the handoff, so it reverts only what it can prove
         // was undelivered: a run that never started cannot have carried the
         // prompt, while a started one may have, and a native resume of its

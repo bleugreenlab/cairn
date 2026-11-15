@@ -265,6 +265,7 @@ async fn a_superseded_builder_cannot_resume_and_inserts_no_run() {
     let runs_before = count(&db, "SELECT COUNT(*) FROM runs").await;
 
     let refusal = cairn_core::internal::execution::jobs::continue_job_impl(
+        cairn_core::models::WakeCause::Addressed,
         &orch,
         "builder-1",
         None,

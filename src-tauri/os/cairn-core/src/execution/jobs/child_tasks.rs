@@ -188,6 +188,7 @@ pub fn create_child_task(
     super::start_prepared_job_session(
         orch,
         PreparedJob {
+            resume_json: None,
             job_id: job_id.clone(),
             project_id,
             run_id: run_id.clone(),

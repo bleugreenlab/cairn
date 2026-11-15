@@ -483,8 +483,71 @@ pub(crate) async fn resolve_order_conn(
     })
 }
 
+#[derive(Debug)]
+struct ReentryHold {
+    id: String,
+    execution_id: String,
+    number: i64,
+    title: String,
+    created_at: i64,
+    key: i64,
+}
+
+async fn reentry_holds_conn(
+    conn: &TrackedConnection,
+    thread_id: &str,
+) -> DbResult<Vec<ReentryHold>> {
+    let mut rows = conn
+        .query(
+            concat!(
+                "SELECT supply_hold.id,e.id,i.number,i.title,supply_hold.created_at,
+                COALESCE(supply_hold.queue_key,supply_hold.created_at*1000000)
+         FROM provider_limit_holds supply_hold JOIN jobs j ON j.id=supply_hold.job_id
+         JOIN executions e ON e.id=j.execution_id JOIN issues i ON i.id=e.issue_id
+         WHERE i.parent_thread_id=?1 AND i.merged_at IS NULL AND i.closed_at IS NULL
+           AND supply_hold.boundary_source='thread_focus' AND ",
+                cairn_db::live_execution_sql!(),
+                " AND ",
+                cairn_db::reentry_band_hold_sql!(),
+                " ORDER BY 6,supply_hold.id"
+            ),
+            params![thread_id],
+        )
+        .await?;
+    let mut holds = Vec::new();
+    while let Some(row) = rows.next().await? {
+        holds.push(ReentryHold {
+            id: row.text(0)?,
+            execution_id: row.text(1)?,
+            number: row.i64(2)?,
+            title: row.text(3)?,
+            created_at: row.i64(4)?,
+            key: row.i64(5)?,
+        });
+    }
+    Ok(holds)
+}
+
+fn reentry_queue(holds: &[ReentryHold]) -> Vec<ThreadQueued> {
+    let mut seen = HashSet::new();
+    holds
+        .iter()
+        .filter(|hold| seen.insert(hold.execution_id.clone()))
+        .map(|hold| ThreadQueued {
+            execution_id: hold.execution_id.clone(),
+            issue_number: hold.number,
+            issue_title: hold.title.clone(),
+            held_since: hold.created_at,
+            queue_key: hold.key,
+            holds: Vec::new(),
+            dormant: Vec::new(),
+        })
+        .collect()
+}
+
 /// A thread's `order` patch, validated and applied in the caller's ONE write
-/// transaction: every offending entry, with nothing written, or the rotation.
+/// transaction. Re-entries and fresh work are independently rotated: listing a
+/// fresh child first can never lift it above an unlisted re-entry.
 pub(crate) async fn order_thread_queue_conn(
     conn: &TrackedConnection,
     thread_id: &str,
@@ -492,14 +555,49 @@ pub(crate) async fn order_thread_queue_conn(
     order: &[serde_json::Value],
     placed_by: &str,
 ) -> DbResult<Result<Rotation, Vec<String>>> {
-    let set = thread_queue_conn(conn, thread_id).await?;
+    let fresh = thread_queue_conn(conn, thread_id).await?;
+    let mut reentries = reentry_holds_conn(conn, thread_id).await?;
+    let mut set = reentry_queue(&reentries);
+    set.extend(fresh.iter().cloned());
     let front = match resolve_order_conn(conn, thread_id, thread_name, order, &set).await? {
         Ok(front) => front,
         Err(refusals) => return Ok(Err(refusals)),
     };
-    Ok(Ok(
-        rotate_to_front_conn(conn, thread_id, &front, placed_by).await?
-    ))
+    // All validation precedes both bands' writes. Stable sorting preserves the
+    // order of unlisted holds, including several jobs of the same child.
+    let first_key = reentries.iter().map(|hold| hold.key).min().unwrap_or(0);
+    reentries.sort_by_key(|hold| {
+        front
+            .iter()
+            .position(|id| id == &hold.execution_id)
+            .unwrap_or(usize::MAX)
+    });
+    let mut moved = Vec::new();
+    for (index, hold) in reentries.iter_mut().enumerate() {
+        let key = first_key
+            .checked_add(index as i64)
+            .ok_or_else(|| crate::storage::DbError::internal("job hold queue key overflow"))?;
+        if key != hold.key {
+            conn.execute(
+                "UPDATE provider_limit_holds SET queue_key=?2 WHERE id=?1",
+                params![hold.id.as_str(), key],
+            )
+            .await?;
+            hold.key = key;
+            moved.push(hold.execution_id.clone());
+        }
+    }
+    let fresh_front: Vec<String> = front
+        .into_iter()
+        .filter(|id| fresh.iter().any(|entry| &entry.execution_id == id))
+        .collect();
+    let rotation = rotate_to_front_conn(conn, thread_id, &fresh_front, placed_by).await?;
+    moved.extend(rotation.moved);
+    moved.sort();
+    moved.dedup();
+    let mut queue = reentry_queue(&reentries);
+    queue.extend(rotation.queue);
+    Ok(Ok(Rotation { moved, queue }))
 }
 
 /// A thread's queue as an `order` addresses it, by project key and thread
@@ -581,7 +679,14 @@ fn ordered_summary(thread: &str, listed: &[i64], queue: &[ThreadQueued]) -> Stri
         .partition(|queued| listed.contains(&queued.issue_number));
     let named: Vec<String> = front
         .iter()
-        .map(|queued| format!("{} ({})", queued.issue_number, places_phrase(queued, ", ")))
+        .map(|queued| {
+            let place = if queued.holds.is_empty() && queued.dormant.is_empty() {
+                "re-entry".to_string()
+            } else {
+                places_phrase(queued, ", ")
+            };
+            format!("{} ({place})", queued.issue_number)
+        })
         .collect();
     let mut summary = format!("Ordered {thread}'s queue: {}", named.join(", "));
     if !rest.is_empty() {
@@ -1638,6 +1743,48 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn mixed_band_order_keeps_reentries_first_and_preserves_hold_age_atomically() {
+        let w = world("reorder-reentry-bands.db", true).await;
+        for (number, age) in [(401, 10), (402, 20)] {
+            add_started(&w.env, number, Some("ta"), "pending").await;
+            w.env.db.execute_script(format!(
+                "INSERT INTO provider_limit_holds(id,job_id,backend,boundary_source,kind,created_at,updated_at)
+                 VALUES('rh{number}','sj{number}','claude','thread_focus','launch',{age},{age});"
+            )).await.unwrap();
+        }
+        let fresh_before = rows(&w.env).await;
+        assert!(order(&w.env, json!([402, 203, 999]), "alpha")
+            .await
+            .is_err());
+        assert_eq!(rows(&w.env).await, fresh_before);
+        assert_eq!(count(&w.env, "SELECT COUNT(*) FROM provider_limit_holds WHERE id IN ('rh401','rh402') AND queue_key IS NULL").await, 2);
+        let rotation = order(&w.env, json!([203, 402, 202, 401]), "alpha")
+            .await
+            .unwrap();
+        assert_eq!(
+            rotation
+                .queue
+                .iter()
+                .map(|entry| entry.issue_number)
+                .collect::<Vec<_>>(),
+            vec![402, 401, 203, 202, 201],
+            "a listed fresh child cannot cross the re-entry band"
+        );
+        assert_eq!(count(&w.env, "SELECT COUNT(*) FROM provider_limit_holds WHERE (id='rh401' AND created_at=10) OR (id='rh402' AND created_at=20)").await, 2);
+        let again = order(&w.env, json!([201]), "alpha").await.unwrap();
+        assert_eq!(
+            again
+                .queue
+                .iter()
+                .map(|entry| entry.issue_number)
+                .collect::<Vec<_>>(),
+            vec![402, 401, 201, 203, 202],
+            "unlisted re-entries keep their order"
+        );
+        assert_eq!(count(&w.env, "SELECT COUNT(*) FROM provider_limit_holds WHERE id='rh402' AND queue_key < (SELECT queue_key FROM provider_limit_holds WHERE id='rh401')").await, 1);
+    }
+
     /// Every offending entry is named, and a refused order writes nothing.
     #[tokio::test]
     async fn every_refusal_names_each_offending_entry_and_changes_nothing() {
@@ -1755,7 +1902,7 @@ pub(crate) mod tests {
         );
 
         let read =
-            crate::resources::read_thread_queue(&w.env.db, "prj", "alpha", now() + 720).await;
+            crate::resources::read_thread_queue(&w.env.db, "prj", "alpha", now() + 720, 4).await;
         let lines: Vec<&str> = read
             .lines()
             .filter(|line| line.starts_with(char::is_numeric))
@@ -2102,7 +2249,7 @@ pub(crate) mod tests {
             .map(|held| held.execution_id)
             .collect();
         assert_eq!(view[0], w.a3, "the queue page");
-        let read = crate::resources::read_thread_queue(&w.env.db, "prj", "alpha", now()).await;
+        let read = crate::resources::read_thread_queue(&w.env.db, "prj", "alpha", now(), 4).await;
         assert!(read.contains("\n1. [203](cairn://p/prj/203)"), "{read}");
 
         // The fleet fills again and the focus cap frees: the dormant fleet

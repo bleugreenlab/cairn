@@ -896,6 +896,7 @@ pub async fn send_direct_message(
         .map(|key| format!("remote-intent-message:{key}"))
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let direct = cairn_attention::direct::NewDirect {
+        cause: crate::models::WakeCause::Addressed,
         id: message_id.clone(),
         sender_run_id: sender_run_id.clone(),
         sender_name: sender_name.clone(),

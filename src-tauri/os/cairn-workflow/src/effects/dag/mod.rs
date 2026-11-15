@@ -151,6 +151,7 @@ fn reduce_dag_under_guard(
     .map_err(|message| crate::advancement::AdvanceError {
         message,
         claimed_agent_jobs,
+        focus_admitted_job_ids: Vec::new(),
     })
 }
 

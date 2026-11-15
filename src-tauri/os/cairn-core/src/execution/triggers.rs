@@ -286,6 +286,7 @@ pub(crate) fn dispatch_event_recipes(
                     let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
                         execution_id: execution.id.clone(),
                         outbox_entry_id: None,
+                        focus_admitted: false,
                     });
                 } else {
                     log::error!(

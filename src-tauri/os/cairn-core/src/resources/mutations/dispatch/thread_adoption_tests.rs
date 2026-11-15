@@ -132,7 +132,7 @@ async fn a_thread_filing_adopts_an_unparented_issue_before_admission() {
     assert!(
         filed.contains(
             "Filed execution 1 for prj/210 \"Issue 210\" (recipe 'memory-triage'): Queued · \
-             alpha 1/1 open."
+             alpha 1/1 running."
         ),
         "the reply says it is held on alpha's cap: {filed}"
     );

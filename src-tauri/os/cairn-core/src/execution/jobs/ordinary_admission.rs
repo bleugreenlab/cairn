@@ -421,6 +421,7 @@ fn hold_unserved_launch(
     turn_id: &str,
     start_reason: &TurnStartReason,
     refusal: &cairn_models::supply::CapacityRefusal,
+    resume_json: Option<&str>,
 ) -> Result<(), String> {
     let owning = run_db({
         let dbs = orch.db.clone();
@@ -451,7 +452,15 @@ fn hold_unserved_launch(
         }
         crate::orchestrator::wakes::HoldKind::Launch
     };
-    super::hold_refused_launch(&owning, job_id, kind, Some(run_id), Some(turn_id), refusal)
+    super::hold_refused_launch(
+        &owning,
+        job_id,
+        kind,
+        Some(run_id),
+        Some(turn_id),
+        refusal,
+        resume_json,
+    )
 }
 
 pub(super) fn enqueue_or_start(
@@ -535,6 +544,7 @@ pub(super) fn enqueue_or_start(
                         &prepared.turn_id,
                         &prepared.start_reason,
                         &refusal,
+                        prepared.resume_json.as_deref(),
                     )?;
                     return Err(refusal.reason);
                 }
@@ -553,6 +563,7 @@ pub(super) fn enqueue_or_start(
         }
     })?;
     let snapshot = crate::storage::PreparedOrdinaryLaunch {
+        resume_json: prepared.resume_json.clone(),
         request_id: request_id.clone(),
         job_id: prepared.job_id.clone(),
         run_id: prepared.run_id.clone(),
@@ -782,6 +793,7 @@ fn defer_stateless_start(
         .take()
         .unwrap_or_else(|| orch.claim_job_launch(&prepared.job_id, &prepared.run_id));
     let mut deferred = PreparedJob {
+        resume_json: prepared.resume_json.clone(),
         job_id: prepared.job_id.clone(),
         project_id: prepared.project_id.clone(),
         run_id: prepared.run_id.clone(),
@@ -1417,6 +1429,7 @@ fn start_leased_inner(
                             &snapshot.turn_id,
                             &snapshot.reason,
                             &refusal,
+                            snapshot.resume_json.as_deref(),
                         )?;
                     }
                     return Err(text);
@@ -1611,6 +1624,7 @@ fn settle_unlaunched_run(orch: &Orchestrator, run_id: &str, turn_id: &str) -> Re
                             ],
                         )
                         .await?;
+                        conn.on_commit(cairn_db::admission_hint::evidence_changed);
                         Ok(true)
                     })
                 }
@@ -3075,6 +3089,7 @@ mod tests {
         )
         .await;
         let prepared = |orch: &Orchestrator| super::PreparedJob {
+            resume_json: None,
             job_id: "j".into(),
             project_id: "p".into(),
             run_id: "cold".into(),
@@ -3225,12 +3240,84 @@ mod tests {
             .unwrap()
             .unwrap();
         let snapshot = crate::storage::PreparedOrdinaryLaunch {
+            resume_json: None,
             request_id: "req".into(), job_id: "j".into(), run_id: "cold".into(), session_id: "s".into(), turn_id: "t".into(), execution_id: "e".into(), prompt: "queued hello".into(), reason: crate::models::TurnStartReason::FollowUp,
             session_start: crate::storage::PreparedSessionStart::New { session_id: "s".into() }, model: String::new(), agent_config: serde_json::Value::Null, output_schema: None,
             runtime_capability: serde_json::from_value(serde_json::json!({"class":"dedicated_process","lane":"lane","host_requirement":{"requirement":"resident_on","host_kind":"runner"},"claim":{"resident_process_units":1,"server_instance_key":null,"logical_stream_units":1,"estimated_memory_bytes":null},"supports_warm_reuse":true})).unwrap(),
             provider_account_id: None, identity_override: None, origin: crate::storage::LaunchOrigin::Background, created_at: 1,
         };
         (orch, request, snapshot)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_supply_refusal_keeps_reloaded_addressed_input() {
+        let (orch, request, mut snapshot) =
+            lifecycle_fixture("ordinary-deferred-supply-context.db").await;
+        let config = tempfile::tempdir().unwrap();
+        let mut store = crate::credentials::CredentialStore {
+            user_id: "test-user".into(),
+            accounts: Vec::new(),
+            git_identities: Vec::new(),
+            project_overrides: Default::default(),
+            retired_logins: Vec::new(),
+            config_dir: config.path().to_path_buf(),
+        };
+        let account = store
+            .add_account(
+                crate::credentials::ApiProvider::Anthropic,
+                "Managed".into(),
+                crate::credentials::ProviderAuth::ClaudeProfile { oauth: None },
+                None,
+                1,
+            )
+            .id;
+        orch.save_credential_store(store).unwrap();
+        let input =
+            serde_json::json!({"cause":"addressed","message":"original-inline-input"}).to_string();
+        snapshot.resume_json = Some(input.clone());
+        snapshot.provider_account_id = Some(account.clone());
+        crate::storage::persist_prepared_ordinary_launch(&orch.db.local, snapshot)
+            .await
+            .unwrap();
+        let db = orch.db.clone();
+        let services = orch.services.clone();
+        let credentials = orch.get_credential_store();
+        drop(orch);
+        let orch = Orchestrator::builder(db, services, config.path().to_path_buf())
+            .credential_store(credentials)
+            .boot_at(0)
+            .build();
+        // Supply disappears after preparation and a runner restart. Promotion
+        // must use the durable snapshot, not the enqueuer's in-memory context.
+        orch.record_account_health(
+            &account,
+            Vec::new(),
+            Some(crate::credentials::AccountBlock::Declared(4_102_444_800)),
+        )
+        .unwrap();
+        orch.db
+            .local
+            .execute("UPDATE jobs SET current_turn_id='t' WHERE id='j'", ())
+            .await
+            .unwrap();
+        let reloaded = crate::storage::get_prepared_ordinary_launch(&orch.db.local, "req")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.resume_json.as_deref(), Some(input.as_str()));
+        let error =
+            super::start_leased_inner(&orch, &super::OrdinaryLease::Private(request), reloaded)
+                .unwrap_err();
+        assert!(error.contains("no longer available"), "{error}");
+        let held = crate::orchestrator::wakes::active_supply_hold(&orch.db.local, "j")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.kind, crate::orchestrator::wakes::HoldKind::Resume);
+        assert_eq!(held.resume_json.as_deref(), Some(input.as_str()));
+        assert!(held.retry_not_before.is_some());
+        assert_ne!(held.boundary_source, "thread_focus");
+        assert_ne!(orch.process_state.has_process("cold"), Some(true));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4405,6 +4492,7 @@ mod tests {
 
     fn stateless_prepared(orch: &Orchestrator) -> super::PreparedJob {
         super::PreparedJob {
+            resume_json: None,
             job_id: "j".into(),
             project_id: "p".into(),
             run_id: "cold".into(),

@@ -387,6 +387,7 @@ pub(crate) async fn continue_into_host_wait_successor(
         Ok(Some((TurnState::Pending, _))) => {
             launched = true;
             match crate::execution::jobs::continue_job_impl(
+                crate::execution::jobs::WakeCause::Addressed,
                 orch,
                 job_id,
                 Some(content),
@@ -538,6 +539,9 @@ fn settle_undriven_successor_locked(
             )
             .await
             .map_err(|error| error.to_string())?;
+        if settled > 0 {
+            cairn_db::admission_hint::evidence_changed();
+        }
         Ok(settled > 0)
     })
 }

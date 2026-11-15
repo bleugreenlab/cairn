@@ -88,6 +88,7 @@ async fn prepare_parent_for_delegated_wait_db(
                     (now, pred_turn_id.as_str()),
                 )
                 .await?;
+                conn.on_commit(cairn_db::admission_hint::evidence_changed);
             }
 
             let mut session_rows = conn
@@ -565,6 +566,7 @@ async fn claim_dependency_unblock(
                         (now, successor_id.as_str(), parent_job_id.as_str()),
                     )
                     .await?;
+                conn.on_commit(cairn_db::admission_hint::evidence_changed);
                 return Ok(affected == 1);
             }
             let mut rows = conn
@@ -903,6 +905,7 @@ fn resume_parent_after_task_settled(
         ..Default::default()
     });
     crate::execution::jobs::continue_job_impl(
+        crate::execution::jobs::WakeCause::System,
         orch,
         &resume.parent_job_id,
         Some(&resume.message),

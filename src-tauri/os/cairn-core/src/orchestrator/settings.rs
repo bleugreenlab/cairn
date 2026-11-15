@@ -283,6 +283,7 @@ impl Orchestrator {
         // Raising either execution-queue cap may free held starts at once.
         if current.max_concurrent_executions != before.max_concurrent_executions
             || current.max_open_children_per_thread != before.max_open_children_per_thread
+            || current.max_open_prs_per_thread != before.max_open_prs_per_thread
         {
             crate::execution::gates::sweep::notify_gate_evidence_changed();
         }

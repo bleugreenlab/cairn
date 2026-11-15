@@ -41,23 +41,19 @@
 //! re-decided inside the release transaction itself, under one process-wide
 //! admission lock ([`decide`]). And only the operator's Start now skips them.
 //!
-//! ## The two caps count different things
+//! ## One activity rule, two scopes
 //!
-//! - **Fleet slot** protects machines. It counts executions in progress on THIS
-//!   runner's fleet: started, with a job that is working (pending placement, or
-//!   running and not parked off the machine), not waiting on the operator.
-//!   Sub-agent tasks count as part of their execution; threads never count.
-//! - **Thread focus** protects a thread's attention and keeps PRs from going
-//!   stale. It counts the thread's direct child issues, not merged or closed,
-//!   that have live work or an open PR (`cairn_db::open_thread_child_sql!`):
-//!   a child whose PR waits for review counts, and one whose executions all
-//!   ended with no PR does not. The limit is the workspace's
-//!   `maxOpenChildrenPerThread`; a thread has no limit of its own.
+//! Both caps count agent work in flight through [`job_activity`] and the same
+//! row reader. Fleet groups by execution on this runner; focus groups by open,
+//! released direct child across devices. Tasks count through their execution.
+//! Process waits, MCP calls and requested sleeps up to five minutes count;
+//! plans, PRs, operator waits, check waits and longer sleeps are parked.
 //!
-//! Neither is a load bound. The caps gate only STARTS (filing and release);
-//! placement and per-machine admission never consult them, and nothing here
-//! ever parks, stops, or re-holds running work. An answered question, a granted
-//! permission, a wake: none of them is a start, so none of them queues.
+//! System re-entries use job holds ahead of fresh filings. Addressed turns
+//! never wait for focus, and an operator-started execution is exempt at
+//! re-entry. A separate open-PR bound limits new PR-producing launches.
+//! Neither cap is a load bound or interrupts running work: placement and
+//! per-machine admission never consult them.
 //!
 //! ## Why a lock
 //!
@@ -496,77 +492,84 @@ pub(crate) fn carry_queue_facts(fact: &str, prior: Option<&str>, hold: &Capacity
 // Counting
 // ---------------------------------------------------------------------------
 
-/// Whether a job uses a machine right now, judged from its current turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MachineUse {
-    Uses,
-    Free,
+/// Agent work in flight is the one activity rule used by both caps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Activity {
+    InFlight,
+    Parked(ParkCause),
 }
 
-/// The pending durable wait a yielded `wait` turn is parked on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParkCause {
+    Stopped,
+    Operator,
+    Supply,
+    Dependencies,
+    LanesAwaited,
+    SleepingUntil(Option<i64>),
+    Unclassified(String),
+}
+
+/// Pending waits on a yielded turn. Durations use the original requested
+/// length, never the remaining time, so a sleeping job cannot acquire a slot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ParkedWait {
-    /// `agent_waits.condition_json`'s `kind`.
     pub kind: Option<String>,
-    /// For a `checks` wait: the watched node belongs to the waiting job's own
-    /// issue, so the lanes it waits on are this execution's machine work.
-    pub watches_own_issue: bool,
-    /// Any of the job's pending waits occupies a machine (a `run` batch, a
-    /// terminal, checks on its own issue's node). One turn can park several
-    /// calls at once, so the newest wait alone does not decide it.
-    pub any_machine_wait: bool,
+    pub deadline_ms: Option<i64>,
+    pub created_at_ms: Option<i64>,
+    pub any_in_flight_wait: bool,
 }
 
-/// Whether a job's current turn uses a machine. `Err` names a yield this
-/// classification does not know, which then does NOT count: a missed slot
-/// over-releases by one (per-machine admission absorbs that), while a held
-/// slot can deadlock the fleet. The yield reasons are exhaustive over
-/// [`TurnYieldReason`], so a new variant fails to compile here until someone
-/// decides it.
-///
-/// A turn parked on its own child work frees its slot: a coordinator parked on
-/// the children it filed (a `waitFor` duration, or checks on a child's node)
-/// would otherwise hold a slot those capped children need, and six of them
-/// would deadlock the fleet. Delegated sub-agent tasks are jobs of the same
-/// execution, so a `dependency_wait` parent is counted through them.
-pub(crate) fn job_machine_use(
+/// Shared by fleet and focus admission. Unknown waits are not counted and are
+/// logged by the row reader. Yield reasons are exhaustive, so a new reason
+/// requires an explicit decision here. A dead process whose turn still says
+/// running counts until boot recovery or the liveness census corrects it.
+pub(crate) fn job_activity(
     turn_state: Option<&str>,
     yield_reason: Option<&str>,
     wait: &ParkedWait,
-) -> Result<MachineUse, String> {
-    if turn_state != Some("yielded") {
-        return Ok(MachineUse::Uses);
+) -> Result<Activity, String> {
+    match turn_state {
+        Some("interrupted" | "cancelled" | "failed" | "complete") => {
+            return Ok(Activity::Parked(ParkCause::Stopped));
+        }
+        None | Some("pending" | "running") => return Ok(Activity::InFlight),
+        Some("yielded") => {}
+        Some(other) => return Err(format!("turn:{other}")),
     }
     let Some(raw) = yield_reason else {
         return Err("yielded without a reason".to_string());
     };
     let reason: TurnYieldReason = raw.parse().map_err(|_| raw.to_string())?;
     Ok(match reason {
-        // Waiting on the operator; `job_awaits_operator_sql!` usually catches
-        // these first.
-        TurnYieldReason::UserInput | TurnYieldReason::Permission => MachineUse::Free,
-        // Its delegated children count on their own job rows.
-        TurnYieldReason::DependencyWait => MachineUse::Free,
-        // Waiting on the operator or on provider capacity, not on a machine.
-        TurnYieldReason::SafetyPause | TurnYieldReason::ProviderLimit => MachineUse::Free,
-        TurnYieldReason::Wait => return wait_machine_use(wait),
+        TurnYieldReason::UserInput | TurnYieldReason::Permission | TurnYieldReason::SafetyPause => {
+            Activity::Parked(ParkCause::Operator)
+        }
+        TurnYieldReason::DependencyWait => Activity::Parked(ParkCause::Dependencies),
+        TurnYieldReason::ProviderLimit => Activity::Parked(ParkCause::Supply),
+        TurnYieldReason::Wait => return wait_activity(wait),
     })
 }
 
-fn wait_machine_use(wait: &ParkedWait) -> Result<MachineUse, String> {
-    if wait.any_machine_wait {
-        return Ok(MachineUse::Uses);
+fn wait_activity(wait: &ParkedWait) -> Result<Activity, String> {
+    if wait.any_in_flight_wait {
+        return Ok(Activity::InFlight);
     }
     match wait.kind.as_deref() {
-        // A coordinator waiting on its children's progress.
-        Some("duration") => Ok(MachineUse::Free),
-        Some("checks") if wait.watches_own_issue => Ok(MachineUse::Uses),
-        Some("checks") => Ok(MachineUse::Free),
-        // A process, or a `run` batch parked past its grace window: both
-        // occupy a machine.
-        Some("terminal") | Some("run_batch") => Ok(MachineUse::Uses),
-        // An MCP tool call runs on the gateway host, not on an executor.
-        Some("mcp_continuation") => Ok(MachineUse::Free),
+        Some("run_batch" | "terminal" | "mcp_continuation") => Ok(Activity::InFlight),
+        Some("duration") => {
+            let short = wait
+                .deadline_ms
+                .zip(wait.created_at_ms)
+                .and_then(|(deadline, created)| deadline.checked_sub(created))
+                .is_some_and(|requested| (0..=300_000).contains(&requested));
+            Ok(if short {
+                Activity::InFlight
+            } else {
+                Activity::Parked(ParkCause::SleepingUntil(wait.deadline_ms))
+            })
+        }
+        Some("checks") => Ok(Activity::Parked(ParkCause::LanesAwaited)),
         Some(other) => Err(format!("wait:{other}")),
         None => Err("wait:none".to_string()),
     }
@@ -601,26 +604,34 @@ pub fn unclassified_yield_counts() -> BTreeMap<String, u64> {
         .unwrap_or_default()
 }
 
-/// Candidate working jobs of executions the fleet may count, on this device.
-/// Each job reaches its execution by an equality, which the forced
-/// `idx_executions_hold_facts` serves without reading the execution's row.
-pub(super) const FLEET_JOBS_SQL: &str = concat!(
-    "SELECT e.id, j.id, j.issue_id, t.state, t.yield_reason,
+/// Both scopes select identical job/turn/wait facts. Only scope membership
+/// differs: a runner's executions versus a thread's open direct children.
+macro_rules! activity_job_columns_sql {
+    () => {
+        "SELECT e.id, j.id, e.issue_id, t.state, t.yield_reason,
             (SELECT json_extract(aw.condition_json, '$.kind') FROM agent_waits aw
               WHERE aw.job_id = j.id AND aw.state IN ('pending', 'resolving')
               ORDER BY aw.created_at DESC LIMIT 1),
-            (SELECT watched.issue_id FROM agent_waits aw
-               JOIN jobs watched ON watched.id = json_extract(aw.condition_json, '$.job_id')
+            (SELECT aw.deadline_ms FROM agent_waits aw
+              WHERE aw.job_id = j.id AND aw.state IN ('pending', 'resolving')
+              ORDER BY aw.created_at DESC LIMIT 1),
+            (SELECT aw.created_at FROM agent_waits aw
               WHERE aw.job_id = j.id AND aw.state IN ('pending', 'resolving')
               ORDER BY aw.created_at DESC LIMIT 1),
             EXISTS (SELECT 1 FROM agent_waits aw
-               LEFT JOIN jobs watched ON watched.id = json_extract(aw.condition_json, '$.job_id')
               WHERE aw.job_id = j.id AND aw.state IN ('pending', 'resolving')
-                AND (json_extract(aw.condition_json, '$.kind') IN ('terminal', 'run_batch')
-                     OR (json_extract(aw.condition_json, '$.kind') = 'checks'
-                         AND watched.issue_id = j.issue_id)))
-       FROM executions e INDEXED BY idx_executions_hold_facts
+                AND (json_extract(aw.condition_json, '$.kind') IN ('terminal', 'run_batch', 'mcp_continuation')
+                     OR (json_extract(aw.condition_json, '$.kind') = 'duration'
+                         AND aw.deadline_ms - aw.created_at BETWEEN 0 AND 300000))),
+            i.number "
+    };
+}
+
+pub(super) const FLEET_JOBS_SQL: &str = concat!(
+    activity_job_columns_sql!(),
+    "FROM executions e INDEXED BY idx_executions_hold_facts
        JOIN jobs j ON j.execution_id = e.id
+       LEFT JOIN issues i ON i.id = e.issue_id
        LEFT JOIN turns t ON t.id = j.current_turn_id
       WHERE COALESCE(e.runner_device_id, ?1) = ?1 AND ",
     cairn_db::fleet_counted_execution_sql!(),
@@ -628,40 +639,81 @@ pub(super) const FLEET_JOBS_SQL: &str = concat!(
     cairn_db::fleet_working_job_sql!()
 );
 
-struct FleetJobRow {
-    execution_id: String,
-    job_id: String,
-    issue_id: Option<String>,
-    turn_state: Option<String>,
-    yield_reason: Option<String>,
-    wait_kind: Option<String>,
-    watched_issue_id: Option<String>,
-    any_machine_wait: bool,
+macro_rules! focus_jobs_sql {
+    ($scope:literal) => {
+        concat!(
+            activity_job_columns_sql!(),
+            "FROM issues i JOIN executions e ON e.issue_id = i.id
+             JOIN jobs j ON j.execution_id = e.id
+             LEFT JOIN turns t ON t.id = j.current_turn_id
+             WHERE ",
+            $scope,
+            " AND i.merged_at IS NULL AND i.closed_at IS NULL AND ",
+            cairn_db::live_execution_sql!(),
+            " AND NOT (",
+            cairn_db::gated_unreleased_sql!(),
+            ") AND ",
+            cairn_db::fleet_working_job_sql!()
+        )
+    };
+}
+pub(super) const THREAD_JOBS_SQL: &str = focus_jobs_sql!("i.parent_thread_id = ?1");
+const ISSUE_JOBS_SQL: &str = focus_jobs_sql!("i.id = ?1");
+
+pub(crate) enum ActivityScope<'a> {
+    Device(&'a str),
+    Thread(&'a str),
+    Issue(&'a str),
 }
 
-async fn fleet_job_rows(db: &LocalDb, device: &str) -> DbResult<Vec<FleetJobRow>> {
-    let device = device.to_string();
-    db.read(move |conn| {
-        let device = device.clone();
-        Box::pin(async move {
-            let mut rows = conn.query(FLEET_JOBS_SQL, params![device.as_str()]).await?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().await? {
-                out.push(FleetJobRow {
-                    execution_id: row.text(0)?,
-                    job_id: row.text(1)?,
-                    issue_id: row.opt_text(2)?,
-                    turn_state: row.opt_text(3)?,
-                    yield_reason: row.opt_text(4)?,
-                    wait_kind: row.opt_text(5)?,
-                    watched_issue_id: row.opt_text(6)?,
-                    any_machine_wait: row.i64(7)? != 0,
-                });
-            }
-            Ok(out)
-        })
-    })
-    .await
+pub(crate) struct ActivityJobRow {
+    pub execution_id: String,
+    pub job_id: String,
+    pub issue_id: Option<String>,
+    pub number: Option<i64>,
+    pub activity: Activity,
+    pub has_turn: bool,
+}
+
+/// The common reader also records unknown kinds, irrespective of which cap
+/// encountered them. UI standings can retain the named parked cause.
+pub(crate) async fn activity_job_rows_conn(
+    conn: &crate::storage::TrackedConnection,
+    scope: ActivityScope<'_>,
+) -> DbResult<Vec<ActivityJobRow>> {
+    let (sql, scope) = match scope {
+        ActivityScope::Device(device) => (FLEET_JOBS_SQL, device),
+        ActivityScope::Thread(thread) => (THREAD_JOBS_SQL, thread),
+        ActivityScope::Issue(issue) => (ISSUE_JOBS_SQL, issue),
+    };
+    let mut rows = conn.query(sql, params![scope]).await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let wait = ParkedWait {
+            kind: row.opt_text(5)?,
+            deadline_ms: row.opt_i64(6)?,
+            created_at_ms: row.opt_i64(7)?,
+            any_in_flight_wait: row.i64(8)? != 0,
+        };
+        let activity = job_activity(
+            row.opt_text(3)?.as_deref(),
+            row.opt_text(4)?.as_deref(),
+            &wait,
+        )
+        .unwrap_or_else(|reason| {
+            note_unclassified(&reason);
+            Activity::Parked(ParkCause::Unclassified(reason))
+        });
+        out.push(ActivityJobRow {
+            execution_id: row.text(0)?,
+            job_id: row.text(1)?,
+            issue_id: row.opt_text(2)?,
+            number: row.opt_i64(9)?,
+            has_turn: row.opt_text(3)?.is_some(),
+            activity,
+        });
+    }
+    Ok(out)
 }
 
 /// The fleet as the cap sees it: executions in progress on this runner, and
@@ -750,29 +802,18 @@ async fn fleet_working(orch: &Orchestrator) -> Result<HashMap<String, bool>, Str
     let waiting_jobs = orch.fleet.jobs_waiting_for_a_machine();
     let mut working: HashMap<String, bool> = HashMap::new();
     for db in orch.db.all_dbs().await {
-        let rows = fleet_job_rows(&db, &device)
+        let device = device.clone();
+        let rows = db
+            .read(move |conn| {
+                let device = device.clone();
+                Box::pin(async move {
+                    activity_job_rows_conn(conn, ActivityScope::Device(&device)).await
+                })
+            })
             .await
             .map_err(|error| format!("failed to count the fleet: {error}"))?;
         for row in rows {
-            let wait = ParkedWait {
-                watches_own_issue: row.wait_kind.as_deref() == Some("checks")
-                    && row.watched_issue_id.is_some()
-                    && row.watched_issue_id == row.issue_id,
-                kind: row.wait_kind,
-                any_machine_wait: row.any_machine_wait,
-            };
-            let uses = match job_machine_use(
-                row.turn_state.as_deref(),
-                row.yield_reason.as_deref(),
-                &wait,
-            ) {
-                Ok(uses) => uses,
-                Err(reason) => {
-                    note_unclassified(&reason);
-                    MachineUse::Free
-                }
-            };
-            if uses == MachineUse::Uses {
+            if row.activity == Activity::InFlight {
                 let placing = waiting_jobs.contains(&row.job_id);
                 let entry = working.entry(row.execution_id).or_insert(false);
                 *entry |= placing;
@@ -785,19 +826,6 @@ async fn fleet_working(orch: &Orchestrator) -> Result<HashMap<String, bool>, Str
 const THREAD_OF_ISSUE_SQL: &str = "SELECT t.id, t.name, i.number
        FROM issues i JOIN threads t ON t.id = i.parent_thread_id
       WHERE i.id = ?1";
-
-const OPEN_THREAD_CHILDREN_SQL: &str = concat!(
-    "SELECT i.number, i.id FROM issues i WHERE i.parent_thread_id = ?1 AND ",
-    cairn_db::open_thread_child_sql!(),
-    " ORDER BY i.number"
-);
-
-/// Issue `?1` as `(number, id)` when it would count as an open child of a
-/// thread it hung from: the open-child predicate, applied to one issue.
-const OPEN_ISSUE_SQL: &str = concat!(
-    "SELECT i.number, i.id FROM issues i WHERE i.id = ?1 AND ",
-    cairn_db::open_thread_child_sql!()
-);
 
 /// The thread an issue is a child of, as the focus cap reads it.
 #[derive(Debug, Clone)]
@@ -822,19 +850,157 @@ async fn thread_of_issue_conn(
     }
 }
 
-/// A thread's open children, by issue number: `(number, issue id)`.
-async fn open_thread_children_conn(
+/// A child counts once if any of its jobs has agent work in flight.
+pub(crate) async fn active_thread_children_conn(
     conn: &crate::storage::TrackedConnection,
     thread_id: &str,
 ) -> DbResult<Vec<(i64, String)>> {
-    let mut rows = conn
-        .query(OPEN_THREAD_CHILDREN_SQL, params![thread_id])
-        .await?;
-    let mut open = Vec::new();
-    while let Some(row) = rows.next().await? {
-        open.push((row.i64(0)?, row.text(1)?));
+    let rows = activity_job_rows_conn(conn, ActivityScope::Thread(thread_id)).await?;
+    let mut active = BTreeMap::new();
+    for row in rows {
+        if row.activity == Activity::InFlight {
+            if let (Some(number), Some(issue_id)) = (row.number, row.issue_id) {
+                active.insert(number, issue_id);
+            }
+        }
     }
-    Ok(open)
+    Ok(active.into_iter().collect())
+}
+
+pub(crate) async fn thread_reentries_conn(
+    conn: &crate::storage::TrackedConnection,
+    thread_id: &str,
+) -> DbResult<usize> {
+    let mut rows = conn
+        .query(
+            concat!(
+                "SELECT COUNT(*) FROM provider_limit_holds supply_hold
+           JOIN jobs j ON j.id = supply_hold.job_id
+           JOIN executions e ON e.id = j.execution_id
+           JOIN issues i ON i.id = e.issue_id
+          WHERE i.parent_thread_id = ?1 AND i.merged_at IS NULL AND i.closed_at IS NULL
+            AND supply_hold.boundary_source = 'thread_focus' AND ",
+                cairn_db::live_execution_sql!(),
+                " AND ",
+                cairn_db::reentry_band_hold_sql!()
+            ),
+            params![thread_id],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(row.i64(0)? as usize),
+        None => Ok(0),
+    }
+}
+
+/// Admission for a system re-entry. Caller holds the process admission lock.
+/// An already active issue takes no additional focus slot. Holds are a FIFO
+/// band ahead of fresh work, with an id tie-break for simultaneous arrivals.
+pub(crate) async fn focus_admits(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    execution_id: &str,
+    hold_id: Option<&str>,
+) -> Result<bool, String> {
+    focus_admits_inner(orch, db, execution_id, hold_id, None).await
+}
+
+/// A DAG launch has already been claimed as running before it reaches the
+/// host, but it is not work in flight yet. Exclude just that candidate; other
+/// running tasks or nodes of the same child still make it active.
+pub(crate) async fn focus_admits_launch(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    execution_id: &str,
+    job_id: &str,
+    hold_id: Option<&str>,
+) -> Result<bool, String> {
+    focus_admits_inner(orch, db, execution_id, hold_id, Some(job_id)).await
+}
+
+async fn focus_admits_inner(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    execution_id: &str,
+    hold_id: Option<&str>,
+    exclude_job: Option<&str>,
+) -> Result<bool, String> {
+    let execution_id = execution_id.to_string();
+    let hold_id = hold_id.map(str::to_string);
+    let exclude_job = exclude_job.map(str::to_string);
+    let limit = orch.get_settings().max_open_children_per_thread.max(1) as usize;
+    db.read(move |conn| {
+        let (execution_id, hold_id, exclude_job) =
+            (execution_id.clone(), hold_id.clone(), exclude_job.clone());
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT e.issue_id,
+                        COALESCE(json_extract(e.release_override_json, '$.operator'),0) = 1
+                        OR json_extract(e.release_override_json, '$.granted') IS NOT NULL
+                   FROM executions e WHERE e.id = ?1",
+                    params![execution_id.as_str()],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(true);
+            };
+            let issue_id = row.opt_text(0)?;
+            let operator_started = row.i64(1)? != 0;
+            drop(rows);
+            if operator_started {
+                return Ok(true);
+            }
+            let Some(issue_id) = issue_id else {
+                return Ok(true);
+            };
+            let Some(thread) = thread_of_issue_conn(conn, &issue_id).await? else {
+                return Ok(true);
+            };
+            let active: HashSet<String> =
+                activity_job_rows_conn(conn, ActivityScope::Thread(&thread.thread_id))
+                    .await?
+                    .into_iter()
+                    .filter(|row| {
+                        Some(row.job_id.as_str()) != exclude_job.as_deref()
+                            && !(exclude_job.is_some() && row.execution_id == execution_id && !row.has_turn)
+                            && row.activity == Activity::InFlight
+                    })
+                    .filter_map(|row| row.issue_id)
+                    .collect();
+            if active.contains(&issue_id) {
+                return Ok(true);
+            }
+            if active.len() >= limit {
+                return Ok(false);
+            }
+            let mut rows = conn
+                .query(
+                    concat!(
+                        "SELECT EXISTS (SELECT 1 FROM provider_limit_holds supply_hold
+                       JOIN jobs j ON j.id = supply_hold.job_id
+                       JOIN executions e ON e.id = j.execution_id
+                       JOIN issues i ON i.id = e.issue_id
+                      WHERE i.parent_thread_id = ?1 AND i.merged_at IS NULL AND i.closed_at IS NULL
+                        AND supply_hold.boundary_source = 'thread_focus' AND ",
+                        cairn_db::live_execution_sql!(),
+                        " AND ",
+                        cairn_db::reentry_band_hold_sql!(),
+                        " AND (?2 IS NULL OR (supply_hold.id <> ?2 AND
+                         (COALESCE(supply_hold.queue_key, supply_hold.created_at * 1000000), supply_hold.id) <
+                         (SELECT COALESCE(queue_key, created_at * 1000000),id FROM provider_limit_holds WHERE id = ?2))))"
+                    ),
+                    params![thread.thread_id.as_str(), hold_id.as_deref()],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(row.i64(0)? == 0),
+                None => Ok(true),
+            }
+        })
+    })
+    .await
+    .map_err(|error| format!("failed to decide thread focus: {error}"))
 }
 
 /// Every unsatisfied capacity row in one database, with what the queue needs
@@ -987,7 +1153,8 @@ pub(crate) struct QueueSnapshot {
     /// Thread holds in line, per thread: execution -> queue key.
     thread_lines: HashMap<String, HashMap<String, i64>>,
     issues: HashMap<String, IssueThread>,
-    open_children: HashMap<String, Vec<(i64, String)>>,
+    active_children: HashMap<String, Vec<(i64, String)>>,
+    reentries: HashMap<String, usize>,
     /// Whether a start's execution runs on this device's fleet.
     on_device: HashMap<String, bool>,
     /// The newest queue key this read has seen, so a hold first recorded
@@ -1039,7 +1206,8 @@ impl QueueSnapshot {
             fleet_line: HashMap::new(),
             thread_lines: HashMap::new(),
             issues: HashMap::new(),
-            open_children: HashMap::new(),
+            active_children: HashMap::new(),
+            reentries: HashMap::new(),
             on_device: HashMap::new(),
             newest_key: 0,
             order_facts: HashMap::new(),
@@ -1061,7 +1229,7 @@ impl QueueSnapshot {
         }
 
         // Each database the starts live in: one read for their devices,
-        // their issues' threads, and those threads' open children.
+        // their issues' threads, and those threads' active children and re-entries.
         let mut groups: Vec<(&LocalDb, Vec<WantedStart>)> = Vec::new();
         for start in starts {
             let wanted = (
@@ -1077,7 +1245,7 @@ impl QueueSnapshot {
             }
         }
         for (db, wanted) in groups {
-            let known: HashSet<String> = snapshot.open_children.keys().cloned().collect();
+            let known: HashSet<String> = snapshot.active_children.keys().cloned().collect();
             let (devices, issues, children, lanes, turns) = db
                 .read(move |conn| {
                     let (wanted, mut known) = (wanted.clone(), known.clone());
@@ -1105,7 +1273,8 @@ impl QueueSnapshot {
                             if known.insert(thread.thread_id.clone()) {
                                 children.push((
                                     thread.thread_id.clone(),
-                                    open_thread_children_conn(conn, &thread.thread_id).await?,
+                                    active_thread_children_conn(conn, &thread.thread_id).await?,
+                                    thread_reentries_conn(conn, &thread.thread_id).await?,
                                 ));
                             }
                             issues.push((issue_id.clone(), thread));
@@ -1122,7 +1291,10 @@ impl QueueSnapshot {
                 snapshot.on_device.insert(execution_id, on_device);
             }
             snapshot.issues.extend(issues);
-            snapshot.open_children.extend(children);
+            for (thread_id, active, reentries) in children {
+                snapshot.active_children.insert(thread_id.clone(), active);
+                snapshot.reentries.insert(thread_id, reentries);
+            }
         }
         snapshot.recompute_order();
         Ok(snapshot)
@@ -1287,7 +1459,7 @@ impl QueueSnapshot {
     /// sweeps goes to the next in the rotation, never to a fresh filing that
     /// happened to land first. The thread cap holds when it is full, or when a
     /// child of the same thread is held on it with an earlier key. A start
-    /// that re-runs an issue already counted as an open child of its thread
+    /// that re-runs an issue already counted as an active child of its thread
     /// opens no new child, so the thread cap does not hold it; nor does it
     /// when the issue has no thread.
     pub(crate) fn decide(&self, start: &Start<'_>) -> Admission {
@@ -1321,20 +1493,22 @@ impl QueueSnapshot {
         });
         if let Some((issue_id, thread)) = thread {
             let open = self
-                .open_children
+                .active_children
                 .get(&thread.thread_id)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            let already_open = open.iter().any(|(_, id)| id == issue_id);
+            let already_active = open.iter().any(|(_, id)| id == issue_id);
             let ahead = self
                 .thread_lines
                 .get(&thread.thread_id)
                 .map_or(0, |line| ahead(line, self.place(start, THREAD_FOCUS_FACT)));
-            if !already_open && (open.len() >= self.thread_limit || ahead > 0) {
+            let reentries = self.reentries.get(&thread.thread_id).copied().unwrap_or(0);
+            if !already_active && (open.len() >= self.thread_limit || ahead > 0 || reentries > 0) {
                 blocks.push(CapacityHold::Thread {
                     thread: thread.thread_name.clone(),
                     open: open.iter().map(|(number, _)| *number).collect(),
                     limit: self.thread_limit,
+                    reentries,
                     place: None,
                     placed_by: None,
                     pin: None,
@@ -1386,7 +1560,7 @@ impl QueueSnapshot {
         if let Some(issue_id) = start.issue_id {
             if let Some(thread) = self.issues.get(issue_id) {
                 let open = self
-                    .open_children
+                    .active_children
                     .entry(thread.thread_id.clone())
                     .or_default();
                 if !open.iter().any(|(_, id)| id == issue_id) {
@@ -1470,7 +1644,7 @@ impl QueueSnapshot {
     }
 
     /// `hold` with this read's counts: the fleet's load and limit, or the
-    /// thread's name, open children and limit when this read knows the thread.
+    /// thread's name, active children, re-entries and limit when this read knows the thread.
     fn refresh_counts(&self, hold: &mut CapacityHold, thread_id: Option<&str>) {
         match hold {
             CapacityHold::Fleet {
@@ -1487,10 +1661,11 @@ impl QueueSnapshot {
                 thread,
                 open,
                 limit,
+                reentries,
                 ..
             } => {
                 let Some(thread_id) = thread_id else { return };
-                let Some(children) = self.open_children.get(thread_id) else {
+                let Some(children) = self.active_children.get(thread_id) else {
                     return;
                 };
                 if let Some(known) = self
@@ -1502,6 +1677,7 @@ impl QueueSnapshot {
                 }
                 *open = children.iter().map(|(number, _)| *number).collect();
                 *limit = self.thread_limit;
+                *reentries = self.reentries.get(thread_id).copied().unwrap_or(0);
             }
         }
     }
@@ -1528,9 +1704,9 @@ pub async fn decide(
     Ok(snapshot.decide(&start))
 }
 
-/// [`decide`] for a new filing on `issue_id` as if the issue were already a
-/// child of thread `thread_id`: what a filing that adopts the issue first will
-/// meet. Reads only; the issue's own parent edge, if it has one, wins.
+/// Preview a filing after thread adoption, without changing the parent edge.
+/// Existing parentage wins; activity and re-entry priority use the same rules
+/// as a filing after the adoption has committed.
 pub(crate) async fn decide_with_thread(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -1549,13 +1725,10 @@ pub(crate) async fn decide_with_thread(
             .read(move |conn| {
                 let (issue, thread) = (issue.clone(), thread.clone());
                 Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT t.name, i.number FROM threads t, issues i
-                              WHERE t.id = ?1 AND i.id = ?2",
-                            params![thread.as_str(), issue.as_str()],
-                        )
-                        .await?;
+                    let mut rows = conn.query(
+                    "SELECT t.name,i.number FROM threads t,issues i WHERE t.id=?1 AND i.id=?2",
+                    params![thread.as_str(),issue.as_str()],
+                ).await?;
                     let Some(row) = rows.next().await? else {
                         return Ok(None);
                     };
@@ -1565,29 +1738,36 @@ pub(crate) async fn decide_with_thread(
                         number: row.i64(1)?,
                     };
                     drop(rows);
-                    // Once adopted, the issue's own live work or open PR
-                    // makes it one of the thread's open children, which the
-                    // decision exempts from the cap it already counts in.
-                    let mut open = open_thread_children_conn(conn, &thread).await?;
-                    let mut rows = conn.query(OPEN_ISSUE_SQL, params![issue.as_str()]).await?;
-                    if let Some(row) = rows.next().await? {
-                        let own = (row.i64(0)?, row.text(1)?);
-                        if !open.contains(&own) {
-                            open.push(own);
-                            open.sort();
-                        }
+                    let mut active = active_thread_children_conn(conn, &thread).await?;
+                    let own = activity_job_rows_conn(conn, ActivityScope::Issue(&issue)).await?;
+                    if own.iter().any(|row| row.activity == Activity::InFlight)
+                        && !active.iter().any(|(_, id)| id == &issue)
+                    {
+                        active.push((found.number, issue));
+                        active.sort();
                     }
-                    Ok(Some((found, open)))
+                    let reentries = thread_reentries_conn(conn, &thread).await?;
+                    let lane = format!("thread:{thread}");
+                    let mut turns = LaneTurns::new();
+                    read_lane_turns_conn(conn, [lane.as_str()], &mut turns).await?;
+                    Ok(Some((found, active, reentries, lane, turns)))
                 })
             })
             .await
             .map_err(|error| error.to_string())?;
-        if let Some((found, open)) = read {
+        if let Some((found, active, reentries, lane, turns)) = read {
             snapshot
-                .open_children
+                .active_children
                 .entry(thread_id.to_string())
-                .or_insert(open);
+                .or_insert(active);
+            snapshot
+                .reentries
+                .entry(thread_id.to_string())
+                .or_insert(reentries);
+            snapshot.issue_lanes.insert(issue_id.to_string(), lane);
+            snapshot.merge_turns(turns, None);
             snapshot.issues.insert(issue_id.to_string(), found);
+            snapshot.recompute_order();
         }
     }
     Ok(snapshot.decide(&start))
@@ -2157,14 +2337,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn failed_projection_open_pr_still_counts_as_a_thread_child() {
+    async fn failed_projection_open_pr_is_parked_not_active() {
         let env = env("failed-capacity-open-pr.db").await;
         let baseline = fleet(&env).await;
         seed_failed_capacity_dag(&env, false, false).await;
         settle_failed_capacity_dag(&env).await;
         merge_request(&env, 100, "open").await;
         assert_eq!(fleet(&env).await, baseline);
-        assert_eq!(open_children(&env, 100).await, vec![100]);
+        assert!(open_children(&env, 100).await.is_empty());
         env.db
             .execute_script("UPDATE merge_requests SET status='closed' WHERE id='smr100';")
             .await
@@ -2332,7 +2512,7 @@ pub(crate) mod tests {
                     let Some(thread) = thread_of_issue_conn(conn, &issue_id).await? else {
                         return Ok(Vec::new());
                     };
-                    Ok(open_thread_children_conn(conn, &thread.thread_id)
+                    Ok(active_thread_children_conn(conn, &thread.thread_id)
                         .await?
                         .into_iter()
                         .map(|(number, _)| number)
@@ -2689,7 +2869,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn waiting_on_the_operator_frees_the_fleet_slot_but_not_the_thread_count() {
+    async fn waiting_on_the_operator_frees_both_caps() {
         let env = env("cap-operator-waits.db").await;
         add_thread(&env, "th", "harness").await;
         // An artifact awaiting review leaves its job blocked.
@@ -2753,8 +2933,8 @@ pub(crate) mod tests {
         add_issue(&env, 104, Some("th")).await;
         assert_eq!(
             open_children(&env, 104).await,
-            vec![100, 101, 102],
-            "each still counts as an open child of its thread"
+            Vec::<i64>::new(),
+            "operator waits are parked, not active"
         );
     }
 
@@ -2788,11 +2968,11 @@ pub(crate) mod tests {
 
         let filed = file(&env, 105, json!([])).await.unwrap();
         assert!(
-            filed.contains("Queued · harness 4/4 open"),
+            filed.contains("Queued · harness 4/4 running"),
             "the thread cap holds it: {filed}"
         );
         let (id, ..) = execution(&env, 105).await;
-        assert_eq!(summary(&env, &id).await, "Queued · harness 4/4 open");
+        assert_eq!(summary(&env, &id).await, "Queued · harness 4/4 running");
         assert_eq!(
             detail(&env, &id).await,
             "harness · 100, 101, 102, 103",
@@ -2840,7 +3020,7 @@ pub(crate) mod tests {
         let (held, ..) = execution(&env, 106).await;
         assert_eq!(
             summary(&env, &held).await,
-            "Queued · 7/6 running · harness 5/4 open",
+            "Queued · 7/6 running · harness 5/4 running",
             "both caps show"
         );
         assert_eq!(
@@ -2951,7 +3131,7 @@ pub(crate) mod tests {
 
         add_issue(&env, 113, Some("tx")).await;
         let filed = file(&env, 113, json!([])).await.unwrap();
-        assert!(filed.contains("Queued · execution 4/4 open"), "{filed}");
+        assert!(filed.contains("Queued · execution 4/4 running"), "{filed}");
         let (held, ..) = execution(&env, 113).await;
         assert_eq!(
             detail(&env, &held).await,
@@ -3388,7 +3568,7 @@ pub(crate) mod tests {
         resolve_issue(&env, 100, "merged").await;
 
         let filed = file(&env, 106, json!([])).await.unwrap();
-        assert!(filed.contains("Queued · harness 3/4 open"), "{filed}");
+        assert!(filed.contains("Queued · harness 3/4 running"), "{filed}");
         let report = sweep_at(&env.orch, now()).await.unwrap();
         assert_eq!(report.released, vec![older]);
         assert!(is_held(&env, 106).await);
@@ -3428,7 +3608,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             summary(&env, &thread_held).await,
-            "Queued · 1st · harness 4/4 open"
+            "Queued · 1st · harness 4/4 running"
         );
     }
 
@@ -3484,63 +3664,187 @@ pub(crate) mod tests {
         add_issue(&env, 106, Some("th")).await;
         assert_eq!(
             open_children(&env, 106).await,
-            vec![100, 101, 102, 103, 104, 105],
-            "each parked coordinator is still one open child of its thread"
+            Vec::<i64>::new(),
+            "parked coordinators hold neither cap"
         );
     }
 
     #[tokio::test]
-    async fn machine_waits_still_hold_a_fleet_slot() {
-        let env = env("cap-machine-waits.db").await;
+    async fn fleet_and_focus_share_the_activity_table() {
+        let env = env("cap-activity-table.db").await;
         env.db
             .execute("UPDATE jobs SET status = 'idle' WHERE id = 'coord'", ())
             .await
             .unwrap();
-        for number in 100..106 {
-            add_started(&env, number, None, "running").await;
+        add_thread(&env, "th", "harness").await;
+        let cases = [
+            ("pending", None, None, None, true),
+            ("running", None, None, None, true),
+            ("yielded", Some("user_input"), None, None, false),
+            ("yielded", Some("permission"), None, None, false),
+            ("yielded", Some("safety_pause"), None, None, false),
+            ("yielded", Some("provider_limit"), None, None, false),
+            ("yielded", Some("dependency_wait"), None, None, false),
+            ("interrupted", None, None, None, false),
+            ("cancelled", None, None, None, false),
+            ("failed", None, None, None, false),
+            ("complete", None, None, None, false),
+            ("yielded", Some("wait"), Some("run_batch"), None, true),
+            ("yielded", Some("wait"), Some("terminal"), None, true),
+            (
+                "yielded",
+                Some("wait"),
+                Some("mcp_continuation"),
+                None,
+                true,
+            ),
+            ("yielded", Some("wait"), Some("checks"), None, false),
+            (
+                "yielded",
+                Some("wait"),
+                Some("duration"),
+                Some(300_000),
+                true,
+            ),
+            (
+                "yielded",
+                Some("wait"),
+                Some("duration"),
+                Some(300_001),
+                false,
+            ),
+            ("yielded", Some("wait"), Some("duration"), None, false),
+            ("yielded", Some("wait"), Some("something_new"), None, false),
+        ];
+        let mut expected = Vec::new();
+        for (index, (state, reason, kind, duration, counted)) in cases.into_iter().enumerate() {
+            let number = 100 + index as i32;
+            add_started(&env, number, Some("th"), "running").await;
+            if let Some(kind) = kind {
+                park_on(
+                    &env,
+                    number,
+                    json!({"kind":kind,"job_id":format!("sj{number}")}),
+                )
+                .await;
+                if let Some(duration) = duration {
+                    env.db
+                        .execute(
+                            "UPDATE agent_waits SET deadline_ms = created_at + ?1 WHERE id = ?2",
+                            (duration, format!("sw{number}")),
+                        )
+                        .await
+                        .unwrap();
+                }
+            } else {
+                turn(&env, number, state, reason).await;
+            }
+            if counted {
+                expected.push(i64::from(number));
+            }
+            assert_eq!(
+                fleet(&env).await,
+                expected.len(),
+                "{state} {reason:?} {kind:?}"
+            );
+            assert_eq!(
+                open_children(&env, number).await,
+                expected,
+                "{state} {reason:?} {kind:?}"
+            );
         }
-        park_on(
-            &env,
-            100,
-            json!({"kind": "terminal", "uri": "u", "slug": "dev", "on": "exit"}),
+        assert!(unclassified_yield_counts().contains_key("wait:something_new"));
+        add_started(&env, 120, Some("th"), "running").await;
+        park_on(&env, 120, json!({"kind":"checks","job_id":"coord"})).await;
+        assert_eq!(
+            fleet(&env).await,
+            expected.len(),
+            "checks on another issue are also parked"
+        );
+        assert_eq!(open_children(&env, 120).await, expected);
+
+        add_started(&env, 121, Some("th"), "pending").await;
+        expected.push(121);
+        assert_eq!(
+            fleet(&env).await,
+            expected.len(),
+            "a placeable launch without a turn counts"
+        );
+        assert_eq!(open_children(&env, 121).await, expected);
+        env.db.execute_script(
+            "INSERT INTO jobs(id,execution_id,project_id,issue_id,node_name,status,created_at,updated_at)
+               VALUES('downstream121','se121','p','si121','review','pending',1,1);"
+        ).await.unwrap();
+        crate::orchestrator::wakes::arm_thread_hold(
+            &env.db,
+            "sj121",
+            crate::orchestrator::wakes::HoldKind::Launch,
+            "thread_focus",
+            "focus".into(),
+            String::new(),
+            1,
         )
-        .await;
-        park_on(
-            &env,
-            101,
-            json!({"kind": "run_batch", "request_id": "req", "commits": false}),
-        )
-        .await;
-        park_on(
-            &env,
-            102,
-            json!({"kind": "checks", "uri": "cairn://p/prj/102/1/builder", "job_id": "sj102"}),
-        )
-        .await;
-        // A parent parked on its delegated task counts once, through the task.
-        turn(&env, 103, "yielded", Some("dependency_wait")).await;
+        .await
+        .unwrap();
+        expected.pop();
+        assert_eq!(
+            fleet(&env).await,
+            expected.len(),
+            "a held launch and its descendants take no slot"
+        );
+        assert_eq!(open_children(&env, 121).await, expected);
+        // A requested long sleep never becomes short as its deadline nears.
+        // Another process wait beside it, however, keeps work in flight.
         env.db
             .execute_script(
-                "INSERT INTO jobs(id, execution_id, project_id, issue_id, node_name, status,
-                                  parent_job_id, created_at, updated_at)
-                   VALUES('task103', 'se103', 'p', 'si103', 'task', 'running', 'sj103', 1, 1);",
+                "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,
+                                     tool_use_id,condition_json,state,created_at)
+               VALUES('sw-mixed','sj116','sr116','ss116','st116','other',
+                      '{\"kind\":\"run_batch\"}','pending',2);",
             )
             .await
             .unwrap();
-        // With no running task, a dependency wait uses no machine.
-        turn(&env, 104, "yielded", Some("dependency_wait")).await;
-        // A thread's host execution never counts, its task jobs included.
-        add_thread(&env, "tz", "host").await;
+        expected.insert(expected.partition_point(|number| *number < 116), 116);
+        assert_eq!(fleet(&env).await, expected.len());
+        assert_eq!(open_children(&env, 116).await, expected);
+
+        // A task counts its issue even when the parent only waits on it.
         env.db
-            .execute("UPDATE jobs SET thread_id = 'tz' WHERE id = 'sj105'", ())
+            .execute_script(
+                "INSERT INTO jobs(id,execution_id,project_id,issue_id,node_name,status,
+                              parent_job_id,created_at,updated_at)
+               VALUES('task106','se106','p','si106','task','running','sj106',1,1);",
+            )
             .await
             .unwrap();
+        expected.insert(expected.partition_point(|number| *number < 106), 106);
+        assert_eq!(fleet(&env).await, expected.len());
+        assert_eq!(open_children(&env, 106).await, expected);
 
-        assert_eq!(
-            fleet(&env).await,
-            4,
-            "a terminal, a parked run batch, checks on its own node, and a delegated task"
-        );
+        for (scope, sql) in [("fleet", FLEET_JOBS_SQL), ("thread", THREAD_JOBS_SQL)] {
+            let sql = format!("EXPLAIN QUERY PLAN {sql}");
+            let plan = env
+                .db
+                .query_all(&sql, ("th",), |row| row.text(3))
+                .await
+                .unwrap();
+            println!("{scope} activity query plan:\n{}", plan.join("\n"));
+            for detail in &plan {
+                assert!(
+                    ![
+                        "SCAN j",
+                        "SCAN t",
+                        "SCAN aw",
+                        "SCAN jobs",
+                        "SCAN turns",
+                        "SCAN agent_waits"
+                    ]
+                    .iter()
+                    .any(|scan| detail == scan || detail.starts_with(&format!("{scan} "))),
+                    "{scope}: {detail}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3556,94 +3860,96 @@ pub(crate) mod tests {
             filed.starts_with("Started execution 2 for prj/103 \"Issue 103\" (recipe '"),
             "{filed}"
         );
-    }
-
-    /// A child whose executions all ended with no PR gave up its place, so
-    /// rerunning it opens a new child the cap may hold.
-    #[tokio::test]
-    async fn rerunning_a_child_that_stopped_counting_is_a_new_child() {
-        let env = env("cap-rerun-ended-child.db").await;
-        caps(&env, 50, 4);
-        add_thread(&env, "th", "harness").await;
-        for number in 100..104 {
-            add_started(&env, number, Some("th"), "running").await;
-        }
+        // A stopped child's rerun needs a new slot, unlike the active rerun.
         add_started(&env, 104, Some("th"), "failed").await;
         assert_eq!(open_children(&env, 104).await, vec![100, 101, 102, 103]);
         let filed = file(&env, 104, json!([])).await.unwrap();
-        assert!(filed.contains("Queued · harness 4/4 open"), "{filed}");
+        assert!(filed.contains("Queued · harness 4/4 running"), "{filed}");
         assert!(is_held(&env, 104).await);
     }
 
     #[tokio::test]
-    async fn a_child_failed_at_preparation_without_a_pr_does_not_count() {
-        let env = env("cap-preparation-failed.db").await;
-        caps(&env, 50, 4);
+    async fn parked_plans_prs_and_long_sleeps_do_not_hold_a_fresh_child() {
+        let env = env("cap-parked-children.db").await;
+        caps(&env, 50, 2);
         add_thread(&env, "th", "harness").await;
         for number in 100..103 {
-            add_started(&env, number, Some("th"), "running").await;
+            add_started(&env, number, Some("th"), "blocked").await;
         }
-        // cairn/4741's shape, as `mark_job_start_failed` leaves it: a failed
-        // job whose run ended at preparation.
-        add_started(&env, 103, Some("th"), "failed").await;
-        env.db
-            .execute_script(
-                "INSERT INTO runs(id, project_id, job_id, issue_id, status, exit_reason,
-                                  created_at, updated_at)
-                   VALUES('sr103', 'p', 'sj103', 'si103', 'crashed', 'job_preparation_failed', 1, 1);",
-            )
-            .await
-            .unwrap();
-        add_issue(&env, 104, Some("th")).await;
-        assert_eq!(open_children(&env, 104).await, vec![100, 101, 102]);
-        let filed = file(&env, 104, json!([])).await.unwrap();
-        assert!(
-            filed.starts_with("Started execution 1 for prj/104 \"Issue 104\" (recipe '"),
-            "{filed}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_child_with_an_open_pr_counts() {
-        let env = env("cap-failed-with-pr.db").await;
-        caps(&env, 50, 4);
-        add_thread(&env, "th", "harness").await;
-        for number in 100..103 {
-            add_started(&env, number, Some("th"), "running").await;
-        }
-        add_started(&env, 103, Some("th"), "failed").await;
-        merge_request(&env, 103, "open").await;
-        add_issue(&env, 104, Some("th")).await;
-        assert_eq!(open_children(&env, 104).await, vec![100, 101, 102, 103]);
-        let filed = file(&env, 104, json!([])).await.unwrap();
-        assert!(filed.contains("Queued · harness 4/4 open"), "{filed}");
-
-        // Closing the PR ends it.
+        merge_request(&env, 102, "open").await;
+        add_started(&env, 103, Some("th"), "running").await;
+        park_on(&env, 103, json!({"kind":"duration"})).await;
         env.db
             .execute(
-                "UPDATE merge_requests SET status = 'closed' WHERE id = 'smr103'",
+                "UPDATE agent_waits SET deadline_ms = created_at + 1200000 WHERE id = 'sw103'",
                 (),
             )
             .await
             .unwrap();
-        let (id, ..) = execution(&env, 104).await;
-        assert_eq!(sweep_at(&env.orch, now()).await.unwrap().released, vec![id]);
-    }
-
-    #[tokio::test]
-    async fn a_pr_awaiting_review_counts() {
-        let env = env("cap-pr-awaiting-review.db").await;
-        caps(&env, 50, 4);
-        add_thread(&env, "th", "harness").await;
-        for number in 100..103 {
-            add_started(&env, number, Some("th"), "running").await;
-        }
-        add_started(&env, 103, Some("th"), "blocked").await;
-        merge_request(&env, 103, "open").await;
+        add_started(&env, 107, Some("th"), "failed").await;
+        env.db.execute_script(
+            "INSERT INTO runs(id,project_id,job_id,issue_id,status,exit_reason,created_at,updated_at)
+             VALUES('sr107','p','sj107','si107','crashed','job_preparation_failed',1,1);"
+        ).await.unwrap();
         add_issue(&env, 104, Some("th")).await;
-        assert_eq!(open_children(&env, 104).await, vec![100, 101, 102, 103]);
+        assert!(!open_children(&env, 104).await.contains(&107));
         let filed = file(&env, 104, json!([])).await.unwrap();
-        assert!(filed.contains("Queued · harness 4/4 open"), "{filed}");
+        assert!(!is_held(&env, 104).await, "{filed}");
+        assert_eq!(open_children(&env, 104).await, vec![104]);
+
+        // A re-entry's claimed launch and its unlaunched descendants must not
+        // make their own child active before admission.
+        caps(&env, 50, 1);
+        add_started(&env, 105, Some("th"), "running").await;
+        env.db.execute_script(
+            "INSERT INTO jobs(id,execution_id,project_id,issue_id,node_name,status,created_at,updated_at)
+               VALUES('descendant105','se105','p','si105','review','pending',1,1);"
+        ).await.unwrap();
+        assert!(
+            !focus_admits_launch(&env.orch, &env.db, "se105", "sj105", None)
+                .await
+                .unwrap()
+        );
+        // Actual work on another node of the same execution does count.
+        add_started(&env, 106, Some("th"), "running").await;
+        turn(&env, 106, "running", None).await;
+        env.db
+            .execute_script(
+                "UPDATE jobs SET execution_id='se105',issue_id='si105' WHERE id='sj106';",
+            )
+            .await
+            .unwrap();
+        assert!(
+            focus_admits_launch(&env.orch, &env.db, "se105", "sj105", None)
+                .await
+                .unwrap()
+        );
+
+        // Adoption previews must not exempt a parked issue merely because its
+        // PR is open; running work on the issue does retain its existing slot.
+        add_started(&env, 108, None, "blocked").await;
+        merge_request(&env, 108, "open").await;
+        let parked = decide_with_thread(&env.orch, &env.db, "si108", "th")
+            .await
+            .unwrap();
+        assert!(parked
+            .blocks
+            .iter()
+            .any(|hold| matches!(hold, CapacityHold::Thread { .. })));
+        add_started(&env, 109, None, "running").await;
+        let active = decide_with_thread(&env.orch, &env.db, "si109", "th")
+            .await
+            .unwrap();
+        assert!(!active
+            .blocks
+            .iter()
+            .any(|hold| matches!(hold, CapacityHold::Thread { .. })));
+        assert!(env
+            .db
+            .query_opt_text("SELECT parent_thread_id FROM issues WHERE id='si108'", ())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// A sibling that fails while blocked (on review, say) ends its live work;
@@ -3653,21 +3959,21 @@ pub(crate) mod tests {
         let mut env = env("cap-sibling-fails.db").await;
         caps(&env, 50, 2);
         add_thread(&env, "th", "harness").await;
-        add_started(&env, 100, Some("th"), "blocked").await;
-        add_started(&env, 101, Some("th"), "blocked").await;
+        add_started(&env, 100, Some("th"), "running").await;
+        add_started(&env, 101, Some("th"), "running").await;
         add_issue(&env, 102, Some("th")).await;
         file(&env, 102, json!([])).await.unwrap();
         assert!(is_held(&env, 102).await);
         let (id, ..) = execution(&env, 102).await;
 
-        let hints = cairn_workflow::gates::hint::sent_on_this_thread();
+        let hints = cairn_db::admission_hint::sent_on_this_thread();
         env.db
             .write(|conn| {
                 Box::pin(async move {
                     cairn_workflow::advancement::recompute::write_job_status(
                         conn,
                         "sj100",
-                        &crate::models::JobStatus::Blocked,
+                        &crate::models::JobStatus::Running,
                         &crate::models::JobStatus::Failed,
                     )
                     .await
@@ -3676,7 +3982,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            cairn_workflow::gates::hint::sent_on_this_thread() > hints,
+            cairn_db::admission_hint::sent_on_this_thread() > hints,
             "ending the job nudges the queue"
         );
         assert_eq!(open_children(&env, 102).await, vec![101]);
@@ -3796,10 +4102,18 @@ pub(crate) mod tests {
     }
 
     /// Adding a `TurnYieldReason` variant fails to compile in
-    /// [`job_machine_use`] until someone decides whether it uses a machine;
+    /// [`job_activity`] until someone decides whether it uses a machine;
     /// this asserts every variant that exists today has a decision.
     #[test]
     fn every_yield_reason_is_classified() {
+        // With Default this lookup has two valid witnesses and fails to compile.
+        // An unclassified wake must remain impossible to construct implicitly.
+        trait NotDefault<A> {
+            fn witness() {}
+        }
+        impl<T: ?Sized> NotDefault<()> for T {}
+        impl<T: Default> NotDefault<u8> for T {}
+        let _ = <crate::execution::jobs::WakeCause as NotDefault<_>>::witness;
         use TurnYieldReason::*;
         let all = [
             UserInput,
@@ -3815,7 +4129,7 @@ pub(crate) mod tests {
                 ..ParkedWait::default()
             };
             assert!(
-                job_machine_use(Some("yielded"), Some(&reason.to_string()), &wait).is_ok(),
+                job_activity(Some("yielded"), Some(&reason.to_string()), &wait).is_ok(),
                 "{reason} is unclassified"
             );
         }
@@ -3831,11 +4145,11 @@ pub(crate) mod tests {
                 ..ParkedWait::default()
             };
             assert!(
-                job_machine_use(Some("yielded"), Some("wait"), &wait).is_ok(),
+                job_activity(Some("yielded"), Some("wait"), &wait).is_ok(),
                 "wait:{kind}"
             );
         }
-        assert!(job_machine_use(
+        assert!(job_activity(
             Some("yielded"),
             Some("wait"),
             &ParkedWait {
@@ -3845,27 +4159,27 @@ pub(crate) mod tests {
         )
         .is_err());
         assert_eq!(
-            job_machine_use(
+            job_activity(
                 Some("yielded"),
                 Some("wait"),
                 &ParkedWait {
                     kind: Some("duration".to_string()),
-                    any_machine_wait: true,
+                    any_in_flight_wait: true,
                     ..ParkedWait::default()
                 }
             ),
-            Ok(MachineUse::Uses),
+            Ok(Activity::InFlight),
             "a newer duration wait does not hide a parked run batch beside it"
         );
-        assert!(job_machine_use(
+        assert!(job_activity(
             Some("yielded"),
             Some("a_new_reason"),
             &ParkedWait::default()
         )
         .is_err());
         assert_eq!(
-            job_machine_use(Some("running"), None, &ParkedWait::default()),
-            Ok(MachineUse::Uses)
+            job_activity(Some("running"), None, &ParkedWait::default()),
+            Ok(Activity::InFlight)
         );
     }
 
@@ -3886,6 +4200,17 @@ pub(crate) mod tests {
             ),
         ];
         for (path, source) in sources {
+            let source =
+                source
+                    .split_once("\n#[cfg(test)]\n")
+                    .map_or(source, |(production, tests)| {
+                        assert!(
+                            tests.starts_with("mod tests {")
+                                || tests.starts_with("pub(super) mod tests {"),
+                            "{path} must keep its test-only module after production code"
+                        );
+                        production
+                    });
             for needle in [
                 FLEET_SLOT_FACT,
                 THREAD_FOCUS_FACT,
@@ -4052,6 +4377,7 @@ pub(crate) mod tests {
             thread: "harness".to_string(),
             open: vec![5783, 5790],
             limit: 2,
+            reentries: 0,
             place: Some(1),
             placed_by: None,
             pin: None,

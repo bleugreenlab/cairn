@@ -356,6 +356,8 @@ pub struct Settings {
     /// Open started children a thread may have before its new starts hold
     /// (tenet 1350). The workspace default; a thread may override it.
     pub max_open_children_per_thread: i32,
+    /// Open PR children per thread before new PR-producing launches hold (minimum 1).
+    pub max_open_prs_per_thread: i32,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     pub pending_memory_threshold: i32,
     /// Fraction of the model's context window at which a WARM thread session
@@ -464,6 +466,8 @@ pub struct UpdateSettings {
     pub max_concurrent_executions: Option<i32>,
     /// Open started children per thread before the thread's new starts hold.
     pub max_open_children_per_thread: Option<i32>,
+    /// Open PR children per thread before new PR-producing launches hold (minimum 1).
+    pub max_open_prs_per_thread: Option<i32>,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     pub pending_memory_threshold: Option<i32>,
     /// Fraction of the model's context window at which a warm thread session rebuilds.

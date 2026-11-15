@@ -140,13 +140,15 @@ pub enum CapacityHold {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pin: Option<Pin>,
     },
-    /// The thread focus cap: the thread's open children, by issue number,
-    /// against its limit.
+    /// The thread focus cap: children with agent work in flight, by issue number,
+    /// against its limit, with parked work re-entering ahead of fresh starts.
     #[serde(rename_all = "camelCase")]
     Thread {
         thread: String,
         open: Vec<i64>,
         limit: usize,
+        #[serde(default)]
+        reentries: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         place: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

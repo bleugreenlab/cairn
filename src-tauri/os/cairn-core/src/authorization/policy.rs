@@ -62,6 +62,7 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     // here is the operator's to approve.
     "maxConcurrentExecutions",
     "maxOpenChildrenPerThread",
+    "maxOpenPrsPerThread",
 ];
 
 /// Sections that are cosmetic or account-local: they change how this install
@@ -332,6 +333,7 @@ mod tests {
             "channels",
             "maxConcurrentExecutions",
             "maxOpenChildrenPerThread",
+            "maxOpenPrsPerThread",
         ] {
             assert_eq!(
                 classify(&settings(section), false),

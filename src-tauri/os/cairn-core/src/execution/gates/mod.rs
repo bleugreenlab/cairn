@@ -12,6 +12,7 @@ pub mod capacity;
 pub mod census;
 #[cfg(test)]
 mod held_reads_tests;
+pub mod open_prs;
 pub mod pulse;
 pub(crate) mod queue_notice;
 pub mod reorder;

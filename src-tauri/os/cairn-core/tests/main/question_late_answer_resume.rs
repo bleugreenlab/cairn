@@ -256,6 +256,7 @@ async fn late_question_answer_resumes_into_its_successor() {
     let db = Arc::new(db);
     seed_question(&db, &BLOCKING).await;
     let (orch, delivered) = late_answer_host(&temp, db.clone());
+    super::provider_limit_holds::saturate_ingress_focus(&orch, &db, "issue-1", "exec-1").await;
 
     let outcome = answer_q1(&orch, "Option A")
         .await
@@ -294,6 +295,7 @@ async fn late_question_answer_resumes_into_its_successor() {
         delivered_text(&delivered).contains("Option A"),
         "the warm process is prompted with the answer"
     );
+    super::provider_limit_holds::assert_ingress_counts_and_holds_fresh(&orch, &db, "job-1").await;
     assert!(stranded_running_turns(&orch, &db).await.is_empty());
 }
 

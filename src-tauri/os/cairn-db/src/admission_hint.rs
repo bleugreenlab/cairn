@@ -1,10 +1,8 @@
 //! A hint that evidence a held execution reads may have moved.
 //!
-//! The gate sweep lives in `cairn-core`, but some of what frees a hold is
-//! written here: a job leaving `pending`/`running` and a turn yielding free a
-//! fleet slot, and a job ending can drop its issue out of its thread's
-//! open-children count; a capacity-held execution waits on either. Those
-//! writers call [`evidence_changed`]; `cairn-core` installs the sweep's
+//! The gate sweep lives in `cairn-core`; workflow and session transition
+//! writers schedule [`evidence_changed`] with `TrackedConnection::on_commit`
+//! so a rolled-back transition cannot race the sweep. Core installs the
 //! coalescing notifier as the hook. A hint carries nothing: a host with no hook
 //! drops it, and the scheduler's periodic sweep releases whatever it would have.
 

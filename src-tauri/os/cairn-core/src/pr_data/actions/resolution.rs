@@ -892,6 +892,9 @@ async fn claim_merge_request_resolution(
         }
     }
     .map_err(|e| db_error("Failed to update merge request", e))?;
+    if moved > 0 {
+        cairn_db::admission_hint::evidence_changed();
+    }
     Ok(moved > 0)
 }
 
@@ -2152,6 +2155,7 @@ mod tests {
         seed_pr_node_merge_request_for_artifact_job(&db).await;
         let orch = test_orchestrator(db, MockGitClient::new());
         let db = &orch.db.local;
+        let hints = cairn_db::admission_hint::sent_on_this_thread();
 
         let resolved = resolve_observed_pr_node(
             &orch,
@@ -2167,6 +2171,7 @@ mod tests {
         .await
         .expect("the observed merge resolves");
         assert!(resolved, "the first observation resolves the row");
+        assert!(cairn_db::admission_hint::sent_on_this_thread() > hints);
 
         let row = |column: &'static str| {
             let sql = format!("SELECT {column} FROM merge_requests WHERE id = ?1");

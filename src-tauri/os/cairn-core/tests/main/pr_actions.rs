@@ -1819,6 +1819,7 @@ async fn helper_advances_when_mr_has_producing_execution() {
         WorkflowEffect::AdvanceDag {
             execution_id,
             outbox_entry_id,
+            ..
         } => {
             assert_eq!(execution_id, "exec-ad1");
             assert!(

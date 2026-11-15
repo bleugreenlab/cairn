@@ -528,7 +528,14 @@ pub(super) async fn dispatch_ready_agent_jobs(
     })?;
 
     executor
-        .execute(orch, WorkflowEffect::StartAgentJobs(ready_jobs))
+        .execute(
+            orch,
+            WorkflowEffect::StartAgentJobs {
+                jobs: ready_jobs,
+                cause: cairn_workflow::effects::types::WakeCause::System,
+                focus_admitted: false,
+            },
+        )
         .await
         .map(|_| ())
 }

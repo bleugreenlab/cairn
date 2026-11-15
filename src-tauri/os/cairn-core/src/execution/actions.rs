@@ -2241,6 +2241,9 @@ async fn write_merge_request_row(
                     ],
                 )
                 .await?;
+                if status != "open" {
+                    conn.on_commit(cairn_db::admission_hint::evidence_changed);
+                }
                 return Ok(existing_id);
             }
 
@@ -2290,6 +2293,7 @@ async fn write_merge_request_row(
                 ],
             )
             .await?;
+            conn.on_commit(cairn_db::admission_hint::evidence_changed);
             Ok(mr_id)
         })
     })

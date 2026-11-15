@@ -1289,7 +1289,12 @@ async fn send_wake(
     } else {
         urgency_for(level)
     };
-    let mut request = DeliveryRequest::new(&job_id, &text.message, urgency);
+    let mut request = DeliveryRequest::new(
+        &job_id,
+        &text.message,
+        urgency,
+        crate::execution::jobs::WakeCause::System,
+    );
     request.sender = text.sender.as_deref();
     request.message_id = Some(message_id);
     request.receipts = &ids;

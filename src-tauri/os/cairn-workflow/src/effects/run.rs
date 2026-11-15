@@ -34,17 +34,79 @@ pub async fn execute_effects(
     mut effects: Vec<WorkflowEffect>,
 ) -> Result<EffectLoopReport, AdvanceError> {
     let mut report = EffectLoopReport::default();
+    // Admission belongs to this causal chain, not to every effect for the
+    // execution or to a later turn. Synchronous conditions and actions retain it.
+    let mut effects: Vec<_> = effects
+        .drain(..)
+        .map(|effect| (effect, None::<String>))
+        .collect();
 
     while !effects.is_empty() {
         let mut batch = std::mem::take(&mut effects).into_iter();
-        while let Some(effect) = batch.next() {
+        while let Some((mut effect, mut admitted_execution)) = batch.next() {
+            match &mut effect {
+                WorkflowEffect::AdvanceDag {
+                    execution_id,
+                    focus_admitted,
+                    ..
+                } => {
+                    if *focus_admitted {
+                        admitted_execution = Some(execution_id.clone());
+                    } else if admitted_execution.as_deref() == Some(execution_id.as_str()) {
+                        *focus_admitted = true;
+                    } else {
+                        admitted_execution = None;
+                    }
+                }
+                WorkflowEffect::StartAgentJobs {
+                    jobs,
+                    focus_admitted,
+                    ..
+                } => {
+                    *focus_admitted |= admitted_execution.as_ref().is_some_and(|id| {
+                        jobs.iter().all(|job| job.execution_id.as_ref() == Some(id))
+                    });
+                }
+                _ => {}
+            }
             log::debug!("Executing effect: {:?}", effect);
-            match execute_effect(runtime, effect, &mut effects).await {
+            let mut follow_on = Vec::new();
+            let result = execute_effect(runtime, effect, &mut follow_on).await;
+            effects.extend(
+                follow_on
+                    .into_iter()
+                    .map(|effect| (effect, admitted_execution.clone())),
+            );
+            match result {
                 Ok(true) => report.effects_executed += 1,
                 Ok(false) => {}
                 Err(mut error) => {
-                    for unexecuted in batch.chain(effects.drain(..)) {
-                        if let WorkflowEffect::StartAgentJobs(jobs) = unexecuted {
+                    if let Some(id) = &admitted_execution {
+                        error.focus_admitted_job_ids.extend(
+                            error
+                                .claimed_agent_jobs
+                                .iter()
+                                .filter(|job| job.execution_id.as_ref() == Some(id))
+                                .map(|job| job.id.clone()),
+                        );
+                    }
+                    for (unexecuted, inherited) in batch.chain(effects.drain(..)) {
+                        if let WorkflowEffect::StartAgentJobs {
+                            jobs,
+                            focus_admitted,
+                            ..
+                        } = unexecuted
+                        {
+                            error.focus_admitted_job_ids.extend(
+                                jobs.iter()
+                                    .filter(|job| {
+                                        focus_admitted
+                                            || inherited.as_ref().is_some_and(|id| {
+                                                job.execution_id.as_ref() == Some(id)
+                                            })
+                                    })
+                                    .map(|job| job.id.clone()),
+                            );
                             error.claimed_agent_jobs.extend(jobs);
                         }
                     }
@@ -70,11 +132,16 @@ async fn execute_effect(
         WorkflowEffect::AdvanceDag {
             execution_id,
             outbox_entry_id,
+            focus_admitted,
         } => {
             let (agent_jobs, new_effects) =
                 crate::effects::dag::reduce_dag(runtime, &execution_id).await?;
             if !agent_jobs.is_empty() {
-                effects.push(WorkflowEffect::StartAgentJobs(agent_jobs));
+                effects.push(WorkflowEffect::StartAgentJobs {
+                    jobs: agent_jobs,
+                    cause: super::types::WakeCause::System,
+                    focus_admitted,
+                });
             }
             effects.extend(new_effects);
 
@@ -112,6 +179,7 @@ async fn execute_effect(
                 effects.push(WorkflowEffect::AdvanceDag {
                     execution_id,
                     outbox_entry_id: None,
+                    focus_admitted: false,
                 });
             }
         }
@@ -183,14 +251,27 @@ async fn execute_effect(
 
         // Workload execution is the host's responsibility; only the
         // workflow engine turns its result into subsequent effects.
-        WorkflowEffect::StartAgentJobs(jobs) => {
+        WorkflowEffect::StartAgentJobs {
+            jobs,
+            cause,
+            focus_admitted,
+        } => {
             if let Err(message) = runtime
                 .host
-                .execute(Workload::AgentJobs(jobs.clone()))
+                .execute(Workload::AgentJobs {
+                    jobs: jobs.clone(),
+                    cause,
+                    focus_admitted,
+                })
                 .await
             {
                 return Err(AdvanceError {
                     message,
+                    focus_admitted_job_ids: if focus_admitted {
+                        jobs.iter().map(|job| job.id.clone()).collect()
+                    } else {
+                        Vec::new()
+                    },
                     claimed_agent_jobs: jobs,
                 });
             }

@@ -549,7 +549,7 @@ async fn release_holds_on_supply_change(orch: &Orchestrator) {
 /// slot can take only some of them the longest-held work goes first.
 fn sort_oldest_first(holds: &mut [crate::orchestrator::wakes::ProviderLimitHold]) {
     holds.sort_by(|left, right| {
-        (left.created_at, left.id.as_str()).cmp(&(right.created_at, right.id.as_str()))
+        (left.queue_order(), left.id.as_str()).cmp(&(right.queue_order(), right.id.as_str()))
     });
 }
 

@@ -730,6 +730,7 @@ mod tests {
 
     fn direct(id: &str, recipients: &[(&str, &str)]) -> NewDirect {
         NewDirect {
+            cause: crate::models::WakeCause::Addressed,
             id: id.to_string(),
             sender_run_id: Some("run-1".to_string()),
             sender_name: "builder-1".to_string(),

@@ -231,6 +231,7 @@ pub async fn update_turn(
                     ],
                 )
                 .await?;
+                conn.on_commit(cairn_db::admission_hint::evidence_changed);
 
                 load_turn_conn(conn, &turn_id)
                     .await?

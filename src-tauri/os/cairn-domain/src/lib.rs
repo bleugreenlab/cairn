@@ -103,7 +103,7 @@ pub use run::{
 pub use session::{Session, SessionStatus};
 
 // Turn types
-pub use turn::{Turn, TurnEndReason, TurnStartReason, TurnState, TurnYieldReason};
+pub use turn::{Turn, TurnEndReason, TurnStartReason, TurnState, TurnYieldReason, WakeCause};
 
 // Recipe types
 pub use recipe::{

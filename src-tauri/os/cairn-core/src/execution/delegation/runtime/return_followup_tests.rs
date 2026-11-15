@@ -1047,8 +1047,14 @@ async fn a_process_under_a_closed_run_is_stopped_rather_than_reused() {
     on_blocking_thread(&orch, move |orch| {
         // The fresh launch may fail here (the fixture has no provider
         // account); what matters is that it is not a reuse.
-        let _ =
-            crate::execution::jobs::continue_job_impl(orch, &resumed, Some("carry on"), None, None);
+        let _ = crate::execution::jobs::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            orch,
+            &resumed,
+            Some("carry on"),
+            None,
+            None,
+        );
     })
     .await;
 

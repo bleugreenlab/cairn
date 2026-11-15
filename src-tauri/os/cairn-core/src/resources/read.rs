@@ -2797,8 +2797,14 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("thread queue", &params) {
                 error
             } else {
-                super::threads::read_thread_queue(db, &project, &thread, orch.services.clock.now())
-                    .await
+                super::threads::read_thread_queue(
+                    db,
+                    &project,
+                    &thread,
+                    orch.services.clock.now(),
+                    i64::from(orch.get_settings().max_open_children_per_thread),
+                )
+                .await
             }
         }
         CairnResource::ProjectCheckResults { project, revision } => {

@@ -145,8 +145,26 @@ async fn two_concurrent_resumes_mint_one_agent_context() {
 
     let first = orch.clone();
     let second = orch.clone();
-    let first = std::thread::spawn(move || continue_job_impl(&first, "job-1", None, None, None));
-    let second = std::thread::spawn(move || continue_job_impl(&second, "job-1", None, None, None));
+    let first = std::thread::spawn(move || {
+        continue_job_impl(
+            cairn_core::models::WakeCause::Addressed,
+            &first,
+            "job-1",
+            None,
+            None,
+            None,
+        )
+    });
+    let second = std::thread::spawn(move || {
+        continue_job_impl(
+            cairn_core::models::WakeCause::Addressed,
+            &second,
+            "job-1",
+            None,
+            None,
+            None,
+        )
+    });
     let outcomes: Vec<Result<String, String>> = [first.join().unwrap(), second.join().unwrap()]
         .into_iter()
         .map(|result| result.map(|run| run.id))
@@ -258,11 +276,19 @@ async fn a_resume_racing_a_cold_start_attaches_instead_of_launching() {
     let _claim = orch.claim_job_launch("job-1", "run-1");
 
     let resuming = orch.clone();
-    let outcome =
-        std::thread::spawn(move || continue_job_impl(&resuming, "job-1", None, None, None))
-            .join()
-            .unwrap()
-            .map(|run| run.id);
+    let outcome = std::thread::spawn(move || {
+        continue_job_impl(
+            cairn_core::models::WakeCause::Addressed,
+            &resuming,
+            "job-1",
+            None,
+            None,
+            None,
+        )
+    })
+    .join()
+    .unwrap()
+    .map(|run| run.id);
 
     assert_eq!(
         outcome,

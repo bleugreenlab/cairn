@@ -10,6 +10,8 @@
 //! - [`on_job_complete_impl`] — DAG advancement after a job finishes.
 //! - [`create_child_task`] — user-initiated sub-agent under a running job.
 
+pub use cairn_workflow::effects::types::WakeCause;
+
 use crate::agent_process::stream::TranscriptEvent;
 use crate::config::{self, agents as config_agents, ConfigResult};
 use crate::db_records::{db_job_from_row, DbJob, DbRecipeNode, JOB_COLUMNS};
@@ -150,8 +152,9 @@ pub(crate) use inputs::{
     resolve_ctx_self_schemas_with_snapshot, resolve_instruction_prompt_conn,
 };
 pub(crate) use lifecycle::{
-    continue_automatic_retry, continue_job_launch_locked_for_operator_compact,
-    continue_job_launch_locked_for_recovery, OperatorBoundary, RecoveryContinuation,
+    continue_automatic_retry, continue_job_impl_admitted,
+    continue_job_launch_locked_for_operator_compact, continue_job_launch_locked_for_recovery,
+    resume_held_continuation, OperatorBoundary, RecoveryContinuation,
 };
 // The branch-mode coordinate decision. Production reaches it only through
 // `prepare_job`; the delegation edge's regression imports it to run the mode it
@@ -312,6 +315,7 @@ fn hold_start_for_reservation(
                 let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
                     execution_id: execution,
                     outbox_entry_id: Some(outbox_entry_id),
+                focus_admitted: false,
                 });
             }
             None => log::warn!(
@@ -346,6 +350,7 @@ fn hold_refused_launch(
     run_id: Option<&str>,
     turn_id: Option<&str>,
     refusal: &cairn_models::supply::CapacityRefusal,
+    resume_json: Option<&str>,
 ) -> Result<(), String> {
     let backend = refusal
         .subject
@@ -365,8 +370,15 @@ fn hold_refused_launch(
         now: chrono::Utc::now().timestamp(),
     };
     let db = owning_db.clone();
-    let hold =
-        run_db(async move { crate::orchestrator::wakes::arm_supply_hold(&db, refused).await })?;
+    let resume_json = resume_json.map(str::to_string);
+    let hold = run_db(async move {
+        match resume_json {
+            Some(json) => {
+                crate::orchestrator::wakes::arm_supply_resume_hold(&db, refused, json).await
+            }
+            None => crate::orchestrator::wakes::arm_supply_hold(&db, refused).await,
+        }
+    })?;
     log::info!(
         "[supply] job {job_id}: {} hold {} armed, retry at {:?}: {}",
         hold.kind.as_str(),
@@ -706,6 +718,8 @@ pub struct PreparedCallRun {
 /// Returned by [`prepare_job`] after branch preparation, DB work, run creation,
 /// and initial user-event storage are complete.
 pub struct PreparedJob {
+    /// Exact continuation input retained atomically if routing refuses supply.
+    pub resume_json: Option<String>,
     pub job_id: String,
     pub project_id: String,
     pub run_id: String,

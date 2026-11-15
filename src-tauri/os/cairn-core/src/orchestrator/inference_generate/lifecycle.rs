@@ -915,12 +915,14 @@ async fn fence_workflow(orch: &Orchestrator, job_id: &str) -> Result<(), String>
                     params![now, job_id.as_str()],
                 )
                 .await?;
+                conn.on_commit(cairn_db::admission_hint::evidence_changed);
                 conn.execute(
                     "UPDATE turns SET state = 'failed', ended_at = ?1, updated_at = ?1
                       WHERE job_id = ?2 AND state = 'pending'",
                     params![now, job_id.as_str()],
                 )
                 .await?;
+                conn.on_commit(cairn_db::admission_hint::evidence_changed);
                 conn.execute(
                     "UPDATE runs SET status = 'exited', exit_reason = 'inference_generation_retired',
                             exited_at = ?1, updated_at = ?1

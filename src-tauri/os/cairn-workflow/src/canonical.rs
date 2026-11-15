@@ -484,7 +484,7 @@ async fn freeze_execution_conn(
         .await?;
     // Ended jobs may free a fleet slot or a thread's open-children count.
     if cancelled > 0 {
-        crate::gates::hint::evidence_changed();
+        conn.on_commit(cairn_db::admission_hint::evidence_changed);
     }
     // A failed session keeps the reason it failed with; every other session
     // closes as superseded, so a refusal can say why.
@@ -508,6 +508,7 @@ async fn freeze_execution_conn(
         params![TURN_END_REASON_SUPERSEDED, now, execution_id],
     )
     .await?;
+    conn.on_commit(cairn_db::admission_hint::evidence_changed);
 
     Ok(job_ids)
 }

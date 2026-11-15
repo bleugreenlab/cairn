@@ -211,7 +211,12 @@ async fn route_targeted(
         WakeDelivery::Targeted { sender_name, .. } => sender_name.as_deref(),
         _ => None,
     };
-    let mut request = DeliveryRequest::new(subscriber_job_id, &message, urgency);
+    let mut request = DeliveryRequest::new(
+        subscriber_job_id,
+        &message,
+        urgency,
+        wake_cause(&event.source),
+    );
     request.sender = sender;
     request.operator_message_id = operator_message_id(event);
     match runtime.host.deliver(request).await {
@@ -306,7 +311,7 @@ async fn route_broadcast_to(
         return Ok(action);
     }
     let message = format_message_with_prefix(prefix, message);
-    let mut request = DeliveryRequest::new(&job_id, &message, urgency);
+    let mut request = DeliveryRequest::new(&job_id, &message, urgency, wake_cause(&event.source));
     request.operator_message_id = operator_message_id(event);
     let outcome = match event.fact_key.as_deref() {
         Some(fact_key) => {
@@ -597,6 +602,18 @@ async fn consume_one_shots(runtime: &AttentionRuntime, ids: &[String]) -> Result
 
 /// The operator message a user-sourced wake carries, which its delivery
 /// reactivates the recipient's goal for.
+fn wake_cause(source: &WakeSource) -> cairn_domain::WakeCause {
+    use cairn_domain::WakeCause;
+    match source {
+        WakeSource::User | WakeSource::Peer { .. } => WakeCause::Addressed,
+        WakeSource::Issue { .. }
+        | WakeSource::Process { .. }
+        | WakeSource::Resource { .. }
+        | WakeSource::Condition { .. }
+        | WakeSource::Fact { .. } => WakeCause::System,
+    }
+}
+
 fn operator_message_id(event: &WakeEvent) -> Option<&str> {
     if matches!(&event.source, WakeSource::User) {
         event.detail_uri.as_deref()
@@ -609,5 +626,38 @@ fn format_message_with_prefix(prefix: Option<&str>, message: &str) -> String {
     match prefix {
         Some(prefix) => format!("{prefix}{message}"),
         None => message.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod cause_tests {
+    use super::*;
+    #[test]
+    fn only_addressed_sources_bypass_focus() {
+        use cairn_domain::WakeCause;
+        assert_eq!(wake_cause(&WakeSource::User), WakeCause::Addressed);
+        assert_eq!(
+            wake_cause(&WakeSource::Peer { reference: None }),
+            WakeCause::Addressed
+        );
+        for source in [
+            WakeSource::Issue {
+                reference: "i".into(),
+            },
+            WakeSource::Process {
+                reference: "p".into(),
+            },
+            WakeSource::Resource {
+                reference: "r".into(),
+            },
+            WakeSource::Condition {
+                reference: "c".into(),
+            },
+            WakeSource::Fact {
+                clause_ref: "f".into(),
+            },
+        ] {
+            assert_eq!(wake_cause(&source), WakeCause::System);
+        }
     }
 }

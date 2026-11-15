@@ -616,3 +616,40 @@ async fn census_summary(w: &World, execution_id: &str) -> String {
         .unwrap()
         .summary
 }
+
+#[tokio::test]
+async fn start_now_on_a_released_execution_with_a_pr_held_job_still_requires_a_grant() {
+    let w = queue_world("qa-start-job-hold.db", true).await;
+    w.env
+        .db
+        .execute(
+            "UPDATE executions SET released_at=1, status='running' WHERE id=?1",
+            (w.a3.as_str(),),
+        )
+        .await
+        .unwrap();
+    w.env.db.execute(
+        "INSERT INTO jobs(id,execution_id,project_id,issue_id,status,created_at,updated_at)
+           SELECT 'pr-held-job',e.id,i.project_id,e.issue_id,'pending',1,1 FROM executions e JOIN issues i ON i.id=e.issue_id WHERE e.id=?1",
+        (w.a3.as_str(),),
+    ).await.unwrap();
+    w.env.db.execute_script(
+        "INSERT INTO provider_limit_holds(id,job_id,backend,boundary_source,observed_text,kind,created_at,updated_at)
+           VALUES('pr-hold','pr-held-job','claude','thread_open_prs','alpha has 2/2 open PRs: 201, 202','launch',1,1);"
+    ).await.unwrap();
+    let card = start_now(&w, ALPHA, 203, &w.a3).await.card();
+    assert_eq!(card.scope.shorthand(), "workspace/default/queue:run");
+    assert!(
+        card.summary.contains("alpha has 2/2 open PRs: 201, 202"),
+        "{}",
+        card.summary
+    );
+    assert_eq!(
+        count(
+            &w.env,
+            "SELECT COUNT(*) FROM provider_limit_holds WHERE id='pr-hold' AND state='active'"
+        )
+        .await,
+        1
+    );
+}

@@ -26,13 +26,13 @@ pub(super) async fn resolve_thread_id(
     })).await.map_err(|error| format!("Failed to resolve thread: {error}"))
 }
 
-/// `cairn://p/<P>/<thread>/queue`: the thread's children's cap-held
-/// executions, in the order they start, as of `now`.
+/// Canonical text queue; callers supply the workspace focus bound.
 pub(crate) async fn read_thread_queue(
     db: &LocalDb,
     project_key: &str,
     thread: &str,
     now: i64,
+    limit: i64,
 ) -> String {
     let project_key = project_key.to_owned();
     let thread = thread.to_owned();
@@ -59,7 +59,35 @@ pub(crate) async fn read_thread_queue(
                     Ok(queue) => queue,
                     Err(error) => return Ok(format!("Failed to load {thread}'s queue: {error}")),
                 };
-            Ok(render_thread_queue(&project_key, &thread, &queue, now))
+            let standings = crate::execution::gates::census::focus_standings_conn(conn, &thread_id).await.map_err(|e| e.to_string())?;
+            let mut rows = conn.query("SELECT id, number, title FROM issues WHERE parent_thread_id = ?1 ORDER BY number", params![thread_id.as_str()]).await.map_err(|e| e.to_string())?;
+            let mut listed = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
+                let id = row.text(0).map_err(|e| e.to_string())?;
+                if let Some(standing) = standings.get(&id) {
+                    listed.push((row.i64(1).map_err(|e| e.to_string())?, row.text(2).map_err(|e| e.to_string())?, standing.clone()));
+                }
+            }
+            listed.sort_by_key(|(number, _, standing)| (standing.tier(), match standing {
+                crate::execution::gates::census::FocusStanding::Queued { place, .. } => place.unwrap_or(usize::MAX),
+                _ => *number as usize,
+            }));
+            let running = listed.iter().filter(|(_, _, s)| s.tier() == 0).count();
+            let mut out = format!("# Queue — {thread}\n\nRunning {running}/{}\n\n", limit.max(1));
+            for (heading, tiers) in [("Running", vec![0]), ("Queued", vec![1, 2]), ("Held by open-PR bound", vec![3]), ("Parked", vec![4]), ("Stopped", vec![5])] {
+                out.push_str(&format!("## {heading}\n\n"));
+                let mut count = 0;
+                for (number, title, standing) in &listed {
+                    if !tiers.contains(&standing.tier()) { continue; }
+                    count += 1;
+                    out.push_str(&format!("- [{number}](cairn://p/{project_key}/{number}) {title} · {}\n", standing.line(now)));
+                }
+                if count == 0 { out.push_str("None.\n"); }
+                out.push('\n');
+            }
+            // Preserve the reorder's per-cap placement detail and operator provenance.
+            if !queue.is_empty() { out.push_str(&render_thread_queue(&project_key, &thread, &queue, now)); }
+            Ok(out)
         })
     })
     .await
@@ -72,9 +100,7 @@ fn render_thread_queue(
     queue: &[crate::execution::gates::reorder::ThreadQueued],
     now: i64,
 ) -> String {
-    let mut out = format!(
-        "# Queue — {thread}\n\n{thread}'s children that the execution queue's caps hold, in the order they start.\n\n"
-    );
+    let mut out = format!("## Fresh release-order detail — {thread}\n\n");
     if queue.is_empty() {
         out.push_str("No cap-held executions.\n");
         return out;
@@ -311,12 +337,8 @@ pub(super) async fn read_thread(
             out.push_str(&format!("\n{}\n", thread_delivery_semantics(&status)));
             let mut children = match conn
                 .query(
-                    concat!(
-                        "SELECT i.id, i.number, i.title, CASE WHEN ",
-                        cairn_db::open_thread_child_sql!(),
-                        " THEN 1 ELSE 0 END, i.status
-                           FROM issues i WHERE i.parent_thread_id = ?1 ORDER BY i.number"
-                    ),
+                    "SELECT i.id, i.number, i.title, i.status
+                       FROM issues i WHERE i.parent_thread_id = ?1 ORDER BY i.number",
                     params![id.as_str()],
                 )
                 .await
@@ -326,12 +348,12 @@ pub(super) async fn read_thread(
             };
             let mut listed = Vec::new();
             while let Ok(Some(row)) = children.next().await {
-                let (Ok(issue_id), Ok(number), Ok(title), Ok(open), Ok(status)) =
-                    (row.text(0), row.i64(1), row.text(2), row.i64(3), row.text(4))
+                let (Ok(issue_id), Ok(number), Ok(title), Ok(status)) =
+                    (row.text(0), row.i64(1), row.text(2), row.text(3))
                 else {
                     continue;
                 };
-                listed.push((issue_id, number, title, open != 0, status));
+                listed.push((issue_id, number, title, status));
             }
             drop(children);
             let ids: Vec<String> = listed.iter().map(|(id, ..)| id.clone()).collect();
@@ -342,23 +364,16 @@ pub(super) async fn read_thread(
             .unwrap_or_default();
 
             out.push_str("\n## Children\n\n");
-            // The execution queue's focus cap: children with live work or an
-            // open PR. A held start on this thread waits behind them.
-            let open: Vec<String> = listed
-                .iter()
-                .filter(|(_, _, _, open, _)| *open)
-                .map(|(_, number, ..)| number.to_string())
-                .collect();
+            let standings = crate::execution::gates::census::focus_standings_conn(conn, &id).await.map_err(|e| e.to_string())?;
             let limit = default_open_children.max(1);
             if !listed.is_empty() {
-                let numbers = if open.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", open.join(", "))
-                };
-                out.push_str(&format!("Open {}/{limit}{numbers}\n\n", open.len()));
+                let running = standings.values().filter(|s| s.tier() == 0).count();
+                let queued = standings.values().filter(|s| matches!(s, crate::execution::gates::census::FocusStanding::Queued { .. } | crate::execution::gates::census::FocusStanding::HeldForPrs { .. })).count();
+                let parked = standings.values().filter(|s| s.tier() == 4).count();
+                out.push_str(&format!("Running {running}/{limit} · queued {queued} · parked {parked}\n\n"));
             }
-            for (issue_id, number, title, _, status) in &listed {
+            for (issue_id, number, title, status) in &listed {
+                let standing_line = standings.get(issue_id).map(|s| format!(" · {}", s.line(chrono::Utc::now().timestamp()))).unwrap_or_default();
                 let held_line = held
                     .remove(issue_id)
                     .and_then(|gated| gated.held.into_iter().next())
@@ -379,7 +394,7 @@ pub(super) async fn read_thread(
                     String::new()
                 };
                 out.push_str(&format!(
-                    "- [{number} — {title}](cairn://p/{}/{number}){failed_line}{held_line}\n",
+                    "- [{number} — {title}](cairn://p/{}/{number}){failed_line}{standing_line}{held_line}\n",
                     project.project_key
                 ));
             }
@@ -417,7 +432,7 @@ mod children_tests {
             .await
             .unwrap();
         let page = super::read_thread(&env.db, "prj", "harness", &[], 4).await;
-        assert!(page.contains("Open 0/4"), "{page}");
+        assert!(page.contains("Running 0/4"), "{page}");
         assert!(page.contains("Failed"), "{page}");
         assert!(page.contains("Launch refused"), "{page}");
     }
@@ -456,14 +471,212 @@ mod children_tests {
             .unwrap();
 
         let page = super::read_thread(&env.db, "prj", "harness", &[], 4).await;
-        assert!(page.contains("Open 4/4: 100, 101, 102, 103\n"), "{page}");
+        use crate::execution::gates::census::{
+            focus_standings_conn, FocusParkCause, FocusStanding,
+        };
+        let standing = env
+            .db
+            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .await
+            .unwrap();
+        for n in 100..104 {
+            assert_eq!(
+                standing.get(&format!("ci{n}")),
+                Some(&FocusStanding::Running)
+            );
+        }
+        assert!(matches!(
+            standing.get("ci105"),
+            Some(FocusStanding::Queued { reentry: false, .. })
+        ));
+        assert!(page.contains("Running 4/4"), "{page}");
+        for (number, state, reason) in [
+            (100, "interrupted", None),
+            (101, "yielded", Some("wait")),
+            (102, "yielded", Some("permission")),
+        ] {
+            let reason = reason
+                .map(|r| format!("'{r}'"))
+                .unwrap_or_else(|| "NULL".into());
+            env.db.execute_script(format!(
+                "INSERT INTO sessions(id, job_id, status, backend_id, created_at, updated_at)
+                   VALUES('cs{number}', 'cj{number}', 'open', 'backend', 1, 1);
+                 INSERT INTO runs(id,project_id,job_id,issue_id,status,session_id,created_at,updated_at)
+                   VALUES('cr{number}','p','cj{number}','ci{number}','live','cs{number}',1,1);
+                 INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,yield_reason,created_at,updated_at)
+                   VALUES('ct{number}','cs{number}','cr{number}','cj{number}',1,'{state}',{reason},1,1);
+                 UPDATE jobs SET current_turn_id='ct{number}' WHERE id='cj{number}';"
+            )).await.unwrap();
+        }
+        env.db.execute_script(
+            "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at,deadline_ms)
+             VALUES('cw101','cj101','cr101','cs101','ct101','tool','{\"kind\":\"duration\"}','pending',1,1200001);"
+        ).await.unwrap();
+        let standing = env
+            .db
+            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .await
+            .unwrap();
+        assert_eq!(standing.get("ci100"), Some(&FocusStanding::Stopped));
+        assert!(matches!(
+            standing.get("ci101"),
+            Some(FocusStanding::Parked {
+                cause: FocusParkCause::SleepingUntil(Some(1200001))
+            })
+        ));
         assert!(
-            page.contains(
-                "- [105 — Child 105](cairn://p/prj/105) · Queued · 1st · harness 4/4 open\n"
-            ),
-            "{page}"
+            matches!(standing.get("ci102"), Some(FocusStanding::Parked { cause: FocusParkCause::OperatorAwaiting { kind, .. } }) if kind == "permission")
         );
-        assert!(!page.contains("merges or closes"), "{page}");
+        assert_eq!(standing.get("ci103"), Some(&FocusStanding::Running));
+        env.db.execute_script(
+            "UPDATE jobs SET status='pending' WHERE id IN ('cj100','cj101');
+             INSERT INTO provider_limit_holds(id,job_id,backend,boundary_source,observed_text,state,created_at,updated_at,kind)
+             VALUES('ch100','cj100','backend','thread_focus','focus full','active',5,5,'launch'),
+                   ('ch101','cj101','backend','thread_open_prs','harness has 6/6 open PRs','active',6,6,'launch');
+             UPDATE jobs SET status='complete' WHERE id='cj103';
+             UPDATE executions SET status='complete' WHERE id='ce103';
+             INSERT INTO merge_requests(id,job_id,project_id,issue_id,title,source_branch,target_branch,status,opened_at,updated_at,github_pr_number,checks_status)
+             VALUES('cm103','cj103','p','ci103','PR','branch','main','open',1,1,5012,'SUCCESS');"
+        ).await.unwrap();
+        let standing = env
+            .db
+            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            standing.get("ci100"),
+            Some(FocusStanding::Queued {
+                reentry: true,
+                place: Some(1),
+                ..
+            })
+        ));
+        assert!(matches!(
+            standing.get("ci101"),
+            Some(FocusStanding::HeldForPrs { .. })
+        ));
+        assert!(
+            matches!(standing.get("ci103"), Some(FocusStanding::Parked { cause: FocusParkCause::PrAwaiting { number: Some(5012), lanes } }) if lanes == "merge")
+        );
+        env.db.execute_script(
+            "UPDATE turns SET state='complete', yield_reason=NULL WHERE id='ct102';
+             UPDATE jobs SET status='blocked' WHERE id='cj102';
+             INSERT INTO artifacts(id,job_id,artifact_type,data,version,output_name,confirmed,created_at,updated_at)
+             VALUES('ca102','cj102','plan','{}',1,'plan',0,500,500);"
+        ).await.unwrap();
+        let standing = env
+            .db
+            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .await
+            .unwrap();
+        assert!(
+            matches!(standing.get("ci102"), Some(FocusStanding::Parked { cause: FocusParkCause::PlanAwaiting { who, since: 500, .. } }) if who == "you")
+        );
+        // Keep all standing bands populated together, including a stopped
+        // sibling beside a genuinely running job.
+        env.db.execute_script(
+            "INSERT INTO issues(id,project_id,number,title,status,progress,attention,parent_thread_id,created_at,updated_at)
+             VALUES('ci106','p',106,'Running child','active','active','none','th',1,1),
+                   ('ci107','p',107,'Stopped child','active','active','none','th',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+             VALUES('ce106','recipe','ci106','p','running',1,1),
+                   ('ce107','recipe','ci107','p','running',1,1);
+             INSERT INTO jobs(id,execution_id,project_id,issue_id,node_name,status,created_at,updated_at)
+             VALUES('cj106','ce106','p','ci106','builder','running',1,1),
+                   ('cj107','ce107','p','ci107','builder','running',1,1);
+             INSERT INTO sessions(id,job_id,status,backend_id,created_at,updated_at)
+             VALUES('cs107','cj107','open','backend',1,1);
+             INSERT INTO runs(id,project_id,job_id,issue_id,status,session_id,created_at,updated_at)
+             VALUES('cr107','p','cj107','ci107','live','cs107',1,1);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,created_at,updated_at)
+             VALUES('ct107','cs107','cr107','cj107',1,'interrupted',1,1);
+             UPDATE jobs SET current_turn_id='ct107' WHERE id='cj107';"
+        ).await.unwrap();
+        let standing = env
+            .db
+            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .await
+            .unwrap();
+        assert_eq!(standing.get("ci106"), Some(&FocusStanding::Running));
+        assert_eq!(standing.get("ci107"), Some(&FocusStanding::Stopped));
+        let queue = super::read_thread_queue(&env.db, "prj", "harness", 1000, 4).await;
+        let sections = [
+            ("Running", vec![106]),
+            ("Queued", vec![100, 105]),
+            ("Held by open-PR bound", vec![101]),
+            ("Parked", vec![102, 103]),
+            ("Stopped", vec![107]),
+        ];
+        for (heading, numbers) in sections {
+            let section = queue
+                .split(&format!("## {heading}\n\n"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing {heading}: {queue}"))
+                .split("\n## ")
+                .next()
+                .unwrap();
+            for number in numbers {
+                assert!(
+                    section.contains(&format!("cairn://p/prj/{number})")),
+                    "{section}"
+                );
+                assert!(
+                    section.contains(&standing[&format!("ci{number}")].line(1000)),
+                    "{section}"
+                );
+            }
+        }
+        assert!(
+            queue.find("cairn://p/prj/100)").unwrap() < queue.find("cairn://p/prj/105)").unwrap(),
+            "{queue}"
+        );
+        let overview = super::read_thread(&env.db, "prj", "harness", &[], 4).await;
+        assert!(
+            overview.contains("Running 1/4 · queued 3 · parked 2"),
+            "{overview}"
+        );
+        for (id, state) in &standing {
+            let number = id.strip_prefix("ci").unwrap();
+            let line = overview
+                .lines()
+                .find(|line| line.contains(&format!("cairn://p/prj/{number})")))
+                .unwrap();
+            let canonical = state.line(chrono::Utc::now().timestamp());
+            assert!(line.contains(&canonical), "{line}");
+        }
+        super::super::thread_seed::assert_focus_text(&env.db, "th", &standing).await;
+
+        // Three failed launches gate the re-entry: it leaves the band and
+        // reads as stopped, needing the operator, with no place in line.
+        env.db
+            .execute_script(
+                "UPDATE provider_limit_holds SET resume_gate='launch_failed',launch_attempts=3,updated_at=900 WHERE id='ch100';",
+            )
+            .await
+            .unwrap();
+        let standing = env
+            .db
+            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .await
+            .unwrap();
+        assert!(
+            matches!(standing.get("ci100"), Some(FocusStanding::NeedsOperator { reason, since: 900 }) if reason.contains("launch failed 3 times")),
+            "{:?}",
+            standing.get("ci100")
+        );
+        let queue = super::read_thread_queue(&env.db, "prj", "harness", 1000, 4).await;
+        let stopped = queue
+            .split("## Stopped\n\n")
+            .nth(1)
+            .unwrap()
+            .split("\n## ")
+            .next()
+            .unwrap();
+        assert!(
+            stopped.contains("cairn://p/prj/100)")
+                && stopped.contains(&standing["ci100"].line(1000)),
+            "{queue}"
+        );
     }
 }
 

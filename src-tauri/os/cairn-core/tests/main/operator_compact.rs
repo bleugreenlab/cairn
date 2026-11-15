@@ -516,7 +516,37 @@ async fn cold_compact_carries_queued_messages() {
     .unwrap();
     register_process(&orch, "run-1", "session-1");
 
+    let held_input = serde_json::json!({
+        "cause": "system", "operator_goal": null,
+        "message": "inline input retained across Compact",
+        "suppress_user_event": false, "suppress_self_suspend_note": true,
+        "preclaimed_retry_turn_id": null, "preclaimed_successor_turn_id": null,
+        "answers_open_tool_call": false, "goal_owner": null,
+        "force_digest_reseed": false, "reseed_reason": null,
+        "supersede_pending_retry": false
+    });
+    cairn_core::internal::orchestrator::wakes::arm_thread_hold(
+        &db,
+        "job-1",
+        cairn_core::internal::orchestrator::wakes::HoldKind::Resume,
+        "thread_focus",
+        "focus full".into(),
+        held_input.to_string(),
+        4,
+    )
+    .await
+    .unwrap();
+
     compact(&orch).expect("a running job with queued messages compacts");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM provider_limit_holds WHERE job_id='job-1' AND state='active'"
+        )
+        .await,
+        0,
+        "Compact settles the old held continuation"
+    );
 
     assert_eq!(
         count(
@@ -527,7 +557,11 @@ async fn cold_compact_carries_queued_messages() {
         0,
         "both messages were claimed by the successor"
     );
-    for needle in ["%first stuck message%", "%second stuck message%"] {
+    for needle in [
+        "%first stuck message%",
+        "%second stuck message%",
+        "%inline input retained across Compact%",
+    ] {
         let delivered = db
             .query_one(
                 "SELECT COUNT(*) FROM events e JOIN jobs j ON j.id = 'job-1'

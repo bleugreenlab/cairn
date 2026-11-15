@@ -373,7 +373,14 @@ pub(crate) fn reconcile_stranded_memory_reviews(
         }
 
         let before = memory_review_turn_count_for_job(orch.db.local.clone(), &review.job_id)?;
-        match crate::execution::jobs::continue_job_impl(&orch, &review.job_id, None, None, None) {
+        match crate::execution::jobs::continue_job_impl(
+            crate::execution::jobs::WakeCause::System,
+            &orch,
+            &review.job_id,
+            None,
+            None,
+            None,
+        ) {
             Ok(_) => resumed += 1,
             Err(error) => {
                 let after =

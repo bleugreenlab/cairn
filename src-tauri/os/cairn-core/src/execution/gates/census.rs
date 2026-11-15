@@ -147,7 +147,7 @@ pub(crate) fn ordinal(n: usize) -> String {
     format!("{n}{suffix}")
 }
 
-/// A hold's segment of the queued line: `39/30 running`, `harness 5/5 open`.
+/// A hold's segment of the queued line: `39/30 running`, `harness 5/5 running`.
 pub fn segment(hold: &CapacityHold) -> String {
     match hold {
         CapacityHold::Fleet { running, limit, .. } => format!("{running}/{limit} running"),
@@ -155,8 +155,15 @@ pub fn segment(hold: &CapacityHold) -> String {
             thread,
             open,
             limit,
+            reentries,
             ..
-        } => format!("{thread} {}/{limit} open", open.len()),
+        } => {
+            let mut line = format!("{thread} {}/{limit} running", open.len());
+            if *reentries > 0 {
+                line.push_str(&format!(" · {reentries} re-entry ahead"));
+            }
+            line
+        }
     }
 }
 
@@ -192,7 +199,7 @@ fn hold_detail(hold: &CapacityHold) -> String {
     parts.join(" · ")
 }
 
-/// `Queued · 3rd · 39/30 running · harness 5/5 open`. One place shows: the
+/// `Queued · 3rd · 39/30 running · harness 5/5 running`. One place shows: the
 /// first hold's, which is the fleet's when the fleet cap holds (it sorts
 /// first), and none at all when that hold has not been numbered yet.
 fn queued_line(place: Option<usize>, segments: impl IntoIterator<Item = String>) -> String {
@@ -1364,6 +1371,7 @@ mod tests {
         let thread = CapacityHold::Thread {
             thread: "harness".into(),
             open: vec![5783, 5790, 5791, 5792, 5793],
+            reentries: 0,
             limit: 5,
             place: Some(1),
             placed_by: None,
@@ -1391,7 +1399,7 @@ mod tests {
         rendered.push(fleet_only);
 
         let thread_only = read(std::slice::from_ref(&thread_gate));
-        assert_eq!(thread_only.summary, "Queued · 1st · harness 5/5 open");
+        assert_eq!(thread_only.summary, "Queued · 1st · harness 5/5 running");
         assert_eq!(
             thread_only.detail.as_deref(),
             Some("harness · 1st · 5783, 5790, 5791, 5792, 5793")
@@ -1400,7 +1408,7 @@ mod tests {
 
         let both = read(&[fleet_gate.clone(), thread_gate.clone()]);
         assert_eq!(
-            both.summary, "Queued · 3rd · 39/30 running · harness 5/5 open",
+            both.summary, "Queued · 3rd · 39/30 running · harness 5/5 running",
             "one place, the fleet's"
         );
         assert_eq!(
@@ -1421,7 +1429,7 @@ mod tests {
         ]);
         assert_eq!(
             moved.summary,
-            "Queued · 3rd · 39/30 running · harness 5/5 open"
+            "Queued · 3rd · 39/30 running · harness 5/5 running"
         );
         assert_eq!(
             moved.detail.as_deref(),
@@ -1478,5 +1486,481 @@ mod tests {
         let text = format!("{rendered:?}");
         assert!(!text.contains("in progress"), "{text}");
         assert!(!text.contains("waiting for a machine"), "{text}");
+    }
+}
+
+/// Derived display state, never an execution or job status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FocusStanding {
+    Running,
+    Queued {
+        reentry: bool,
+        place: Option<usize>,
+        reason: String,
+        since: i64,
+    },
+    HeldForPrs {
+        reason: String,
+    },
+    Stopped,
+    /// Held by a gated hold that only the operator's Continue or Start now
+    /// releases. It is out of the band, so it has no place in line.
+    NeedsOperator {
+        reason: String,
+        since: i64,
+    },
+    Parked {
+        cause: FocusParkCause,
+    },
+}
+
+impl FocusStanding {
+    pub(crate) fn line(&self, now: i64) -> String {
+        match self {
+            Self::Running => "Running".into(),
+            Self::Stopped => "Stopped".into(),
+            Self::Queued {
+                reentry,
+                place,
+                reason,
+                since,
+            } => {
+                let band = if *reentry { "re-entry" } else { "fresh" };
+                let place = place
+                    .map(|n| format!(" · {}", ordinal(n)))
+                    .unwrap_or_default();
+                format!(
+                    "Queued · {band}{place} · {reason} · held {}",
+                    crate::clock::format_elapsed(now.saturating_sub(*since).max(0))
+                )
+            }
+            Self::HeldForPrs { reason } => format!("Held by open-PR bound · {reason}"),
+            Self::NeedsOperator { reason, since } => format!(
+                "Stopped · needs the operator · {reason} · {}",
+                crate::clock::format_elapsed(now.saturating_sub(*since).max(0))
+            ),
+            Self::Parked { cause } => format!("Parked · {}", cause.line(now)),
+        }
+    }
+
+    pub(crate) fn tier(&self) -> usize {
+        match self {
+            Self::Running => 0,
+            Self::Queued { reentry: true, .. } => 1,
+            Self::Queued { .. } => 2,
+            Self::HeldForPrs { .. } => 3,
+            Self::Parked { .. } => 4,
+            Self::Stopped | Self::NeedsOperator { .. } => 5,
+        }
+    }
+}
+
+/// What a hold's `resume_gate` asks of the operator.
+fn gate_phrase(gate: &str, attempts: i64) -> String {
+    use crate::orchestrator::wakes::{RESUME_GATE_LAUNCH_FAILED, RESUME_GATE_TOOL_IN_FLIGHT};
+    match gate {
+        RESUME_GATE_LAUNCH_FAILED => {
+            format!("launch failed {attempts} times; Continue or Start now retries it")
+        }
+        RESUME_GATE_TOOL_IN_FLIGHT => {
+            "a tool call has no recorded result; Continue resumes it".into()
+        }
+        other => format!("held ({other}); Continue resumes it"),
+    }
+}
+
+/// One batched projection for queue, overview and seed. Listing membership still
+/// comes from the open-child predicate; activity is read through the caps' sole
+/// classifier. A running task outranks every wait on its parent.
+pub(crate) async fn focus_standings_conn(
+    conn: &crate::storage::TrackedConnection,
+    thread_id: &str,
+) -> DbResult<HashMap<String, FocusStanding>> {
+    use super::capacity::{activity_job_rows_conn, Activity, ActivityScope, ParkCause};
+    use cairn_db::turso::params;
+    let mut standings = HashMap::new();
+    let mut children = conn
+        .query(
+            concat!(
+                "SELECT i.id FROM issues i INDEXED BY idx_issues_parent_thread_id WHERE i.parent_thread_id = ?1 AND ",
+                cairn_db::open_thread_child_sql!()
+            ),
+            params![thread_id],
+        )
+        .await?;
+    let mut ids = Vec::new();
+    while let Some(row) = children.next().await? {
+        let id = row.text(0)?;
+        standings.insert(
+            id.clone(),
+            FocusStanding::Parked {
+                cause: FocusParkCause::Inactive,
+            },
+        );
+        ids.push(id);
+    }
+    drop(children);
+
+    // Fresh held starts are not necessarily open under the listing predicate.
+    for (index, queued) in super::reorder::thread_queue_conn(conn, thread_id)
+        .await?
+        .iter()
+        .enumerate()
+    {
+        let mut rows = conn
+            .query(
+                "SELECT issue_id FROM executions WHERE id = ?1",
+                params![queued.execution_id.as_str()],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let id = row.text(0)?;
+            standings.insert(
+                id,
+                FocusStanding::Queued {
+                    reentry: false,
+                    place: Some(index + 1),
+                    reason: super::reorder::places_phrase(queued, " · "),
+                    since: queued.held_since,
+                },
+            );
+        }
+    }
+
+    let mut holds = conn
+        .query(
+            concat!(
+            "SELECT i.id, supply_hold.boundary_source, supply_hold.observed_text, supply_hold.created_at,
+                    supply_hold.resume_gate, supply_hold.launch_attempts, supply_hold.updated_at
+             FROM issues i INDEXED BY idx_issues_parent_thread_id
+             JOIN executions e ON e.issue_id = i.id JOIN jobs j ON j.execution_id = e.id
+             JOIN provider_limit_holds supply_hold ON supply_hold.job_id = j.id
+             WHERE i.parent_thread_id = ?1 AND i.merged_at IS NULL AND i.closed_at IS NULL AND ",
+             cairn_db::live_execution_sql!(),
+             " AND (", cairn_db::supply_hold_owns_job_sql!(),
+             " OR (supply_hold.state = 'active' AND supply_hold.kind = 'yield' AND j.current_turn_id = supply_hold.turn_id))
+             ORDER BY COALESCE(supply_hold.queue_key, supply_hold.created_at * 1000000), supply_hold.id"
+            ),
+            params![thread_id],
+        )
+        .await?;
+    let mut place = 0;
+    while let Some(row) = holds.next().await? {
+        let id = row.text(0)?;
+        let source = row.text(1)?;
+        let reason = row.opt_text(2)?.unwrap_or_else(|| source.clone());
+        // A gated hold is out of the band (`cairn_db::reentry_band_hold_sql!`):
+        // nothing but the operator releases it, so it takes no place in line.
+        let standing = match (row.opt_text(4)?, source.as_str()) {
+            (Some(gate), _) => FocusStanding::NeedsOperator {
+                reason: gate_phrase(&gate, row.i64(5)?),
+                since: row.i64(6)?,
+            },
+            (None, "thread_focus") => {
+                place += 1;
+                FocusStanding::Queued {
+                    reentry: true,
+                    place: Some(place),
+                    reason,
+                    since: row.i64(3)?,
+                }
+            }
+            (None, "thread_open_prs") => FocusStanding::HeldForPrs { reason },
+            (None, _) => FocusStanding::Parked {
+                cause: FocusParkCause::Other(format!("held ({source}) · {reason}")),
+            },
+        };
+        standings
+            .entry(id)
+            .and_modify(|old| {
+                if standing.tier() < old.tier()
+                    || matches!(
+                        old,
+                        FocusStanding::Parked {
+                            cause: FocusParkCause::Inactive
+                        }
+                    )
+                {
+                    *old = standing.clone();
+                }
+            })
+            .or_insert(standing);
+    }
+    drop(holds);
+
+    let scope = crate::execution::approvals::ApprovalScope::Issues(ids);
+    for approval in crate::execution::approvals::pending_approvals_conn(conn, &scope).await? {
+        let mut parent = conn.query(
+            "SELECT p.key, pi.number FROM issues i LEFT JOIN issues pi ON pi.id = i.parent_issue_id
+             LEFT JOIN projects p ON p.id = pi.project_id WHERE i.id = ?1",
+            params![approval.issue_id.as_str()]).await?;
+        let who = match parent.next().await? {
+            Some(row) => match (row.opt_text(0)?, row.opt_i64(1)?) {
+                (Some(key), Some(number)) => format!("{key}/{number}"),
+                _ => "you".into(),
+            },
+            None => "approver unknown".into(),
+        };
+        let cause = FocusParkCause::PlanAwaiting {
+            what: approval.what().into(),
+            who,
+            since: approval.pending_since,
+            deferred_until: approval.deferral.map(|d| d.until_rendered),
+        };
+        if !matches!(
+            standings.get(&approval.issue_id),
+            Some(
+                FocusStanding::Queued { .. }
+                    | FocusStanding::HeldForPrs { .. }
+                    | FocusStanding::NeedsOperator { .. }
+            )
+        ) {
+            standings.insert(approval.issue_id, FocusStanding::Parked { cause });
+        }
+    }
+
+    let mut prs = conn.query(
+        "SELECT i.id, m.github_pr_number, m.checks_status, m.checks_json FROM issues i INDEXED BY idx_issues_parent_thread_id JOIN merge_requests m ON m.issue_id = i.id
+         WHERE i.parent_thread_id = ?1 AND i.merged_at IS NULL AND i.closed_at IS NULL
+         AND m.status = 'open' ORDER BY m.opened_at", params![thread_id]).await?;
+    while let Some(row) = prs.next().await? {
+        let id = row.text(0)?;
+        let number = row.opt_i64(1)?;
+        let status = row.opt_text(2)?;
+        let checks: Option<Vec<crate::models::Check>> = row
+            .opt_text(3)?
+            .and_then(|json| serde_json::from_str(&json).ok());
+        let lanes = match status.as_deref() {
+            Some("SUCCESS") => "merge".into(),
+            Some("FAILURE" | "ERROR") => {
+                let names = checks
+                    .as_ref()
+                    .map(|checks| {
+                        checks
+                            .iter()
+                            .filter(|c| c.state == crate::models::CheckState::Failure)
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                if names.is_empty() {
+                    "red lanes (names unavailable)".into()
+                } else {
+                    format!("red lanes ({names})")
+                }
+            }
+            Some("PENDING") => {
+                let names = checks
+                    .as_ref()
+                    .map(|checks| {
+                        checks
+                            .iter()
+                            .filter(|c| c.state == crate::models::CheckState::Pending)
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                if names.is_empty() {
+                    "lanes (names unavailable)".into()
+                } else {
+                    format!("lanes ({names})")
+                }
+            }
+            _ => "lanes (no current PR verdict available)".into(),
+        };
+        if matches!(
+            standings.get(&id),
+            Some(FocusStanding::Parked {
+                cause: FocusParkCause::Inactive
+            })
+        ) {
+            standings.insert(
+                id,
+                FocusStanding::Parked {
+                    cause: FocusParkCause::PrAwaiting { number, lanes },
+                },
+            );
+        }
+    }
+    drop(prs);
+
+    // Operator waits are excluded from the working-row SQL, so read their head
+    // separately instead of guessing from the denormalised job status.
+    let mut operators = conn
+        .query(
+            concat!("SELECT i.id, t.yield_reason, COALESCE(t.ended_at, t.updated_at) FROM issues i INDEXED BY idx_issues_parent_thread_id
+         JOIN executions e ON e.issue_id = i.id JOIN jobs j ON j.execution_id = e.id
+         JOIN turns t ON t.id = j.current_turn_id
+         WHERE i.parent_thread_id = ?1 AND i.merged_at IS NULL AND i.closed_at IS NULL
+         AND j.status = 'running' AND t.state = 'yielded'
+         AND t.yield_reason IN ('user_input', 'permission', 'safety_pause') AND ", cairn_db::live_execution_sql!(), " AND NOT (", cairn_db::gated_unreleased_sql!(), ")"),
+            params![thread_id],
+        )
+        .await?;
+    while let Some(row) = operators.next().await? {
+        let id = row.text(0)?;
+        if matches!(
+            standings.get(&id),
+            Some(FocusStanding::Parked {
+                cause: FocusParkCause::Inactive
+            })
+        ) || matches!(
+            standings.get(&id),
+            Some(FocusStanding::Parked {
+                cause: FocusParkCause::PrAwaiting { .. }
+            })
+        ) {
+            let kind = if row.text(1)? == "user_input" {
+                "question"
+            } else {
+                "permission"
+            };
+            standings.insert(
+                id,
+                FocusStanding::Parked {
+                    cause: FocusParkCause::OperatorAwaiting {
+                        kind: kind.into(),
+                        who: "operator".into(),
+                        since: row.i64(2)?,
+                    },
+                },
+            );
+        }
+    }
+    drop(operators);
+
+    for row in activity_job_rows_conn(conn, ActivityScope::Thread(thread_id)).await? {
+        let Some(id) = row.issue_id else { continue };
+        if row.activity == Activity::InFlight {
+            standings.insert(id, FocusStanding::Running);
+        } else if !matches!(
+            standings.get(&id),
+            Some(
+                FocusStanding::Running
+                    | FocusStanding::Queued { .. }
+                    | FocusStanding::HeldForPrs { .. }
+                    | FocusStanding::NeedsOperator { .. }
+            )
+        ) {
+            let Activity::Parked(cause) = row.activity else {
+                continue;
+            };
+            let standing = match cause {
+                ParkCause::Stopped => {
+                    // A complete head on a job still running or pending is the
+                    // gap between a turn ending and its flush or follow-up, or
+                    // a published result awaiting merge: not a stop. It keeps
+                    // its parked standing; failed, interrupted and cancelled
+                    // heads read as stopped. Neither counts as in flight.
+                    let mut head = conn.query("SELECT t.state FROM jobs j JOIN turns t ON t.id = j.current_turn_id WHERE j.id = ?1", params![row.job_id.as_str()]).await?;
+                    let complete = match head.next().await? {
+                        Some(head) => head.text(0)? == "complete",
+                        None => false,
+                    };
+                    drop(head);
+                    if complete {
+                        standings.entry(id).or_insert(FocusStanding::Parked {
+                            cause: FocusParkCause::Inactive,
+                        });
+                        continue;
+                    }
+                    FocusStanding::Stopped
+                }
+                ParkCause::Operator => continue,
+                ParkCause::Supply => FocusStanding::Parked {
+                    cause: FocusParkCause::Other("held (supply)".into()),
+                },
+                ParkCause::Dependencies => FocusStanding::Parked {
+                    cause: FocusParkCause::Other("awaiting task work".into()),
+                },
+                ParkCause::LanesAwaited => FocusStanding::Parked {
+                    cause: FocusParkCause::LanesAwaited,
+                },
+                ParkCause::SleepingUntil(deadline) => FocusStanding::Parked {
+                    cause: FocusParkCause::SleepingUntil(deadline),
+                },
+                ParkCause::Unclassified(reason) => FocusStanding::Parked {
+                    cause: FocusParkCause::Other(reason),
+                },
+            };
+            if matches!(
+                standings.get(&id),
+                None | Some(FocusStanding::Parked {
+                    cause: FocusParkCause::Inactive | FocusParkCause::PrAwaiting { .. }
+                })
+            ) {
+                standings.insert(id, standing);
+            }
+        }
+    }
+    Ok(standings)
+}
+
+fn standing_stamp(at: i64) -> String {
+    crate::clock::stamp(at).unwrap_or_else(|| format!("{at} (timestamp unavailable)"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FocusParkCause {
+    Inactive,
+    PlanAwaiting {
+        what: String,
+        who: String,
+        since: i64,
+        deferred_until: Option<String>,
+    },
+    PrAwaiting {
+        number: Option<i64>,
+        lanes: String,
+    },
+    OperatorAwaiting {
+        kind: String,
+        who: String,
+        since: i64,
+    },
+    LanesAwaited,
+    SleepingUntil(Option<i64>),
+    Other(String),
+}
+
+impl FocusParkCause {
+    fn line(&self, now: i64) -> String {
+        match self {
+            Self::Inactive => "no agent work in flight".into(),
+            Self::PlanAwaiting {
+                what,
+                who,
+                since,
+                deferred_until,
+            } => {
+                let waited = now.saturating_sub(*since).max(0);
+                let age = crate::clock::format_elapsed(waited);
+                let head = format!("{what} awaiting {who}");
+                match deferred_until {
+                    Some(until) => format!("{head} · deferred until {until} · {age}"),
+                    None if waited > crate::execution::approvals::STALE_AFTER_SECS => {
+                        format!("{head} · {age} · stale")
+                    }
+                    None => format!("{head} · {age}"),
+                }
+            }
+            Self::PrAwaiting { number, lanes } => format!(
+                "PR {} awaiting {lanes}",
+                number
+                    .map(|n| format!("#{n}"))
+                    .unwrap_or_else(|| "(number unavailable)".into())
+            ),
+            Self::OperatorAwaiting { kind, who, since } => format!(
+                "{kind} awaiting {who} · {}",
+                crate::clock::format_elapsed(now.saturating_sub(*since).max(0))
+            ),
+            Self::LanesAwaited => "awaiting lanes".into(),
+            Self::SleepingUntil(deadline) => deadline
+                .map(|ms| format!("waiting until {}", standing_stamp(ms / 1000)))
+                .unwrap_or_else(|| "sleeping (deadline unavailable)".into()),
+            Self::Other(reason) => reason.clone(),
+        }
     }
 }

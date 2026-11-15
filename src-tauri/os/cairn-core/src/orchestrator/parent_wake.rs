@@ -112,6 +112,7 @@ pub(crate) async fn deliver_direct(
                     ..Default::default()
                 });
         return match crate::execution::jobs::continue_job_impl(
+            request.cause,
             orch,
             job_id,
             Some(request.message),
@@ -167,6 +168,7 @@ pub(crate) async fn deliver_direct(
                     urgency,
                     &message_id,
                     operator.as_deref(),
+                    request.cause,
                 )
                 .await?;
                 if settle_here {

@@ -121,8 +121,6 @@ pub async fn yield_turn(
 
     update_terminal_turn(db, turn_id, TurnState::Yielded, Some(reason), None).await?;
     emit_turn_update(db, turn_id, emitter).await;
-    // A parked turn may free its execution's fleet slot.
-    crate::gates::hint::evidence_changed();
     Ok(())
 }
 
@@ -151,7 +149,7 @@ pub async fn yield_running_turn_conn(
         .await?;
     if changed > 0 {
         // A parked turn may free its execution's fleet slot.
-        crate::gates::hint::evidence_changed();
+        conn.on_commit(cairn_db::admission_hint::evidence_changed);
     }
     Ok(changed > 0)
 }
@@ -257,6 +255,7 @@ async fn update_terminal_turn(
                 ],
             )
             .await?;
+            conn.on_commit(cairn_db::admission_hint::evidence_changed);
             Ok(())
         })
     })
@@ -292,4 +291,78 @@ fn turn_db_error(turn_id: &str, from: &str, to: &str, error: DbError) -> Transit
 async fn emit_turn_update(db: &LocalDb, turn_id: &str, emitter: &dyn EventEmitter) {
     let change = cairn_db::changes::turn_db_change_for_id(db, turn_id, "update").await;
     let _ = emitter.emit("db-change", change);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_db::admission_hint::sent_on_this_thread;
+    use cairn_platform::services::emitter::CapturingEmitter;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activity_transitions_hint_after_commit_not_on_rollback() {
+        let db = crate::storage::migrated_test_db("turn-activity-hint.db").await;
+        let emitter = CapturingEmitter::new();
+        for (sequence, state) in [
+            TurnState::Yielded,
+            TurnState::Complete,
+            TurnState::Failed,
+            TurnState::Interrupted,
+            TurnState::Cancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("hint-{sequence}");
+            db.execute(
+                "INSERT INTO turns(id,session_id,sequence,state,start_reason,created_at,updated_at)
+                 VALUES(?1,'hint-session',?2,'running','initial',1,1)",
+                params![id.as_str(), sequence as i64],
+            )
+            .await
+            .unwrap();
+            let before = sent_on_this_thread();
+            match state {
+                TurnState::Yielded => {
+                    yield_turn(&db, &id, TurnYieldReason::UserInput, &emitter).await
+                }
+                TurnState::Interrupted => interrupt_turn(&db, &id, None, &emitter).await,
+                _ => apply_turn_outcome(&db, &id, state.clone(), None, &emitter).await,
+            }
+            .unwrap();
+            assert_eq!(sent_on_this_thread(), before + 1, "{state}");
+        }
+
+        db.execute(
+            "INSERT INTO turns(id,session_id,sequence,state,start_reason,created_at,updated_at)
+             VALUES('rollback','hint-session',9,'running','initial',1,1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let before = sent_on_this_thread();
+        let result: crate::storage::DbResult<()> = db
+            .write(|conn| {
+                Box::pin(async move {
+                    assert!(
+                        yield_running_turn_conn(conn, "rollback", TurnYieldReason::Wait, 2).await?
+                    );
+                    assert_eq!(sent_on_this_thread(), before, "hint must wait for commit");
+                    Err(DbError::internal("rollback"))
+                })
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(sent_on_this_thread(), before);
+        db.write(|conn| {
+            Box::pin(async move {
+                assert!(yield_running_turn_conn(conn, "rollback", TurnYieldReason::Wait, 2).await?);
+                assert_eq!(sent_on_this_thread(), before);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(sent_on_this_thread(), before + 1);
+    }
 }

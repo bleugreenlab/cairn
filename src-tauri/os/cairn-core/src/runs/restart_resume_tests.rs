@@ -555,6 +555,7 @@ async fn a_wake_inside_the_recovery_window_is_held_and_becomes_the_one_resume() 
     let woken = orch.clone();
     tokio::task::spawn_blocking(move || {
         crate::execution::jobs::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
             &woken,
             "j",
             Some("check results landed"),
@@ -862,7 +863,14 @@ async fn a_pipe_pressure_release_keeps_the_bound_terminal_and_the_next_message_r
 
     let woken = orch.clone();
     tokio::task::spawn_blocking(move || {
-        crate::execution::jobs::continue_job_impl(&woken, "j", Some("next message"), None, None)
+        crate::execution::jobs::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &woken,
+            "j",
+            Some("next message"),
+            None,
+            None,
+        )
     })
     .await
     .unwrap()
@@ -1984,7 +1992,14 @@ async fn a_continuation_after_a_user_stop_carries_no_restart_notice() {
 
     let launcher = orch.clone();
     tokio::task::spawn_blocking(move || {
-        crate::execution::jobs::continue_job_impl(&launcher, "ju", Some("carry on"), None, None)
+        crate::execution::jobs::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &launcher,
+            "ju",
+            Some("carry on"),
+            None,
+            None,
+        )
     })
     .await
     .unwrap()
@@ -3150,7 +3165,14 @@ async fn a_process_end_answers_each_cut_off_call_once_and_the_next_launch_hears_
 
     let launcher = orch.clone();
     tokio::task::spawn_blocking(move || {
-        crate::execution::jobs::continue_job_impl(&launcher, "jp", Some("carry on"), None, None)
+        crate::execution::jobs::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &launcher,
+            "jp",
+            Some("carry on"),
+            None,
+            None,
+        )
     })
     .await
     .unwrap()

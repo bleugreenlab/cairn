@@ -715,12 +715,13 @@ pub(crate) async fn capture_revision(
         },
         CapturePurpose::Run => PreparationRequest::for_run(project_id, branch.clone(), owner),
     };
-    let prepared = prepare_branch(orch, request).await.map_err(|refusal| {
-        RevisionCaptureError::Preparation {
+    // Preparation's nested admission futures must not inflate the capture caller's stack.
+    let prepared = Box::pin(prepare_branch(orch, request))
+        .await
+        .map_err(|refusal| RevisionCaptureError::Preparation {
             branch: branch.clone(),
             refusal: Box::new(refusal),
-        }
-    })?;
+        })?;
     use crate::orchestrator::base_advance::preparation::PreparedExport;
     let mut warnings = prepared.warnings.clone();
     if let PreparedExport::Failed { error, recorded } = &prepared.export {

@@ -388,7 +388,12 @@ async fn start_now_request(
     let issue = cairn_uri::build_issue_uri(&cairn_uri::canonical_project(project), number);
     let label = format!("execution {exec_seq} on {issue}");
     let state = crate::execution::gates::authoring::hold_state(&db, &execution_id).await?;
-    crate::execution::gates::authoring::require_held(&state, &label)?;
+    let job_holds = crate::execution::gates::open_prs::thread_holds(&db, &execution_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if job_holds.is_empty() {
+        crate::execution::gates::authoring::require_held(&state, &label)?;
+    }
     // A thread starts only its own held work: the caps constrain what a thread
     // starts itself (tenet 1319), and putting another thread's work ahead is
     // the move's boundary, not this one. The card says "its held work".
@@ -413,17 +418,24 @@ async fn start_now_request(
         Some(title) => format!("{label} ('{title}')"),
         None => label,
     };
-    Ok((
-        normalize::start_now_request(
-            crate::authorization::WORKSPACE_ID,
-            &asker.thread_id,
-            &asker.thread_name,
-            &execution_id,
-            &what,
-            &holds,
-        ),
-        execution_id,
-    ))
+    let mut authority = normalize::start_now_request(
+        crate::authorization::WORKSPACE_ID,
+        &asker.thread_id,
+        &asker.thread_name,
+        &execution_id,
+        &what,
+        &holds,
+    );
+    if !job_holds.is_empty() {
+        let reasons = job_holds
+            .iter()
+            .map(|(_, reason)| reason.as_str())
+            .collect::<Vec<_>>();
+        authority
+            .summary
+            .push_str(&format!(" Held jobs: {}.", reasons.join("; ")));
+    }
+    Ok((authority, execution_id))
 }
 
 /// Who started a held execution past every cap, under which decision: what a

@@ -89,8 +89,8 @@ pub async fn enqueue_prepared_ordinary_launch(
                 new.request_id
             };
             conn.execute(
-                "INSERT OR IGNORE INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-                params![request_id.clone(),launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at,launch.origin.as_str()],
+                "INSERT OR IGNORE INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin,resume_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                params![request_id.clone(),launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at,launch.origin.as_str(),launch.resume_json],
             ).await?;
             let mut prepared = conn.query(
                 "SELECT 1 FROM prepared_ordinary_launches WHERE request_id=?1",
@@ -409,6 +409,7 @@ impl LaunchOrigin {
 /// request is promoted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PreparedOrdinaryLaunch {
+    pub resume_json: Option<String>,
     pub request_id: String,
     pub job_id: String,
     pub run_id: String,
@@ -471,8 +472,8 @@ pub async fn persist_prepared_ordinary_launch(
         .map(|identity| encode_json(identity, "ordinary launch identity"))
         .transpose()?;
     db.execute(
-        "INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-        params![launch.request_id,launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at,launch.origin.as_str()],
+        "INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin,resume_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+        params![launch.request_id,launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at,launch.origin.as_str(),launch.resume_json],
     ).await?;
     db.provider_admission_changed();
     Ok(())
@@ -483,7 +484,7 @@ pub async fn get_prepared_ordinary_launch(
     request_id: &str,
 ) -> DbResult<Option<PreparedOrdinaryLaunch>> {
     db.query_opt(
-        "SELECT request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin FROM prepared_ordinary_launches WHERE request_id=?1",
+        "SELECT request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin,resume_json FROM prepared_ordinary_launches WHERE request_id=?1",
         (request_id.to_string(),),
         |row| {
             let reason = format!("\"{}\"", row.text(7)?);
@@ -499,6 +500,7 @@ pub async fn get_prepared_ordinary_launch(
                 identity_override: row.opt_text(14)?.map(|value| decode_json(&value, "ordinary launch identity")).transpose()?,
                 created_at: row.i64(15)?,
                 origin: LaunchOrigin::parse(&row.text(16)?)?,
+                resume_json: row.opt_text(17)?,
             })
         },
     ).await
@@ -1748,6 +1750,7 @@ async fn prepared_ordinary_launch_round_trips_and_is_immutable() {
              INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,created_at) VALUES('e','r','s','t',1,1,'user','{\"role\":\"launch\",\"content\":\"durable prompt\"}',1);",
         ).await.unwrap();
     let launch = PreparedOrdinaryLaunch {
+        resume_json: Some(r#"{"cause":"addressed","message":"original inline input"}"#.into()),
         request_id: "ordinary".into(),
         job_id: "j".into(),
         run_id: "r".into(),

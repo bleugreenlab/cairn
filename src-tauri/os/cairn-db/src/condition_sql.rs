@@ -217,23 +217,22 @@ macro_rules! fleet_working_job_sql {
             // and if it awaits the operator the outer test drops it anyway.
             "(j.status = 'running' OR (j.status = 'pending' AND j.execution_id NOT IN (SELECT j.execution_id FROM jobs j WHERE j.execution_id IS NOT NULL AND j.status IN ('blocked', 'pending', 'running') AND (j.status = 'blocked' OR ",
             $crate::job_awaits_operator_sql!(),
+            " OR ",
+            $crate::job_held_sql!(),
             ")))) AND NOT ",
             $crate::job_awaits_operator_sql!(),
             " AND NOT ",
-            $crate::job_supply_held_sql!()
+            $crate::job_held_sql!()
         )
     };
 }
 
-/// True when job `j` waits for supply: its launch or continuation was refused
-/// because no account can serve its model now, and an active hold will release
-/// it (`orchestrator::wakes::provider_limits`). Such a job is not working, so it
-/// holds no fleet slot, and it is not placeable, so advancement does not launch
-/// it into the same refusal. It has not ended either ([`nonterminal_job_sql!`]
-/// still covers it), so its execution stays live. Expects a `jobs` row aliased
-/// `j`.
+/// True when job `j` has an active launch or resume hold (supply, fleet,
+/// thread focus or open-PR bound). Held work is neither working nor placeable,
+/// but remains nonterminal, so its execution stays live. Expects a `jobs` row
+/// aliased `j`.
 #[macro_export]
-macro_rules! job_supply_held_sql {
+macro_rules! job_held_sql {
     () => {
         concat!(
             "EXISTS (SELECT 1 FROM provider_limit_holds supply_hold WHERE supply_hold.job_id = j.id AND ",
@@ -256,6 +255,39 @@ macro_rules! supply_hold_owns_job_sql {
     };
 }
 
+/// Ownership for the re-entry band, including a provider-yield hold that has
+/// subsequently reached the focus boundary. Supply launch/resume ownership
+/// remains separate because those holds also make a node unplaceable.
+#[macro_export]
+macro_rules! reentry_hold_owns_job_sql {
+    () => {
+        concat!(
+            "(", $crate::supply_hold_owns_job_sql!(),
+            " OR (supply_hold.state = 'active' AND supply_hold.kind = 'yield'
+                  AND j.current_turn_id = supply_hold.turn_id
+                  AND EXISTS (SELECT 1 FROM turns held_head WHERE held_head.id = j.current_turn_id
+                               AND held_head.state = 'yielded' AND held_head.yield_reason = 'provider_limit')))"
+        )
+    };
+}
+
+/// A thread hold that waits in its thread's band for a slot: it owns its job
+/// ([`reentry_hold_owns_job_sql!`]) and carries no `resume_gate`. A gated hold
+/// (every automatic launch failed, or a tool call had no recorded result) is
+/// never released automatically, so it is not in line: counting it would hold
+/// every later start on the thread behind work that cannot move. Expects a
+/// `provider_limit_holds` row aliased `supply_hold` and a `jobs` row aliased `j`.
+#[macro_export]
+macro_rules! reentry_band_hold_sql {
+    () => {
+        concat!(
+            "(",
+            $crate::reentry_hold_owns_job_sql!(),
+            " AND supply_hold.resume_gate IS NULL)"
+        )
+    };
+}
+
 /// True when job `j` has not ended: `pending`, `running`, `blocked` or `idle`.
 /// A job that waits on the operator (a question, a permission, a PR or plan
 /// awaiting review) is always one of these, so it is covered; `idle` is
@@ -268,20 +300,12 @@ macro_rules! nonterminal_job_sql {
     };
 }
 
-/// True when issue `i` is an OPEN child for the thread focus cap: not merged
-/// or closed, and either it has live work (an execution that is live, started,
-/// and has a job that has not ended, see [`nonterminal_job_sql!`]) or an open
-/// PR. A PR awaiting review counts on purpose: that is the stale work the cap
-/// exists to hold new work behind. A child whose executions all ended (failed,
-/// cancelled, complete) with no open PR does not count, and a restart makes it
-/// count again. The caller adds `i.parent_thread_id = ?`, so backlog children
-/// (no execution), grandchildren (whose parent is an issue) and sub-agent tasks
-/// (jobs, not issues) never count, and a reparented child moves between counts
-/// at once. Expects an `issues` row aliased `i`.
-///
-/// No device scope, deliberately the opposite of
-/// [`fleet_counted_execution_sql!`]: a thread's open work is open wherever it
-/// runs.
+/// True when issue `i` is an OPEN child for listings: unresolved, with a
+/// released live execution and nonterminal job, or an open PR. Includes both
+/// running and parked work; this is not the focus-cap count. Activity is derived
+/// from each job's head turn and waits by the shared Rust activity classifier.
+/// The caller adds `i.parent_thread_id = ?`. Expects an `issues` row aliased `i`;
+/// intentionally independent of device scope.
 #[macro_export]
 macro_rules! open_thread_child_sql {
     () => {
@@ -318,6 +342,15 @@ macro_rules! queue_lane_sql {
 macro_rules! still_blocked_condition_sql {
     () => {
         "ce.outcome = 'blocked' AND NOT EXISTS (SELECT 1 FROM condition_evaluations routed WHERE routed.execution_id = ce.execution_id AND routed.recipe_node_id = ce.recipe_node_id AND routed.outcome = 'routed')"
+    };
+}
+
+/// True when issue `i` is unresolved and has an open PR. The caller scopes
+/// `i.parent_thread_id`; multiple PR rows still count the child only once.
+#[macro_export]
+macro_rules! thread_open_pr_child_sql {
+    () => {
+        "i.merged_at IS NULL AND i.closed_at IS NULL AND EXISTS (SELECT 1 FROM merge_requests open_pr WHERE open_pr.issue_id = i.id AND open_pr.status = 'open')"
     };
 }
 

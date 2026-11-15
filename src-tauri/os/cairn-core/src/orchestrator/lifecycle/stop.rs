@@ -822,6 +822,7 @@ fn cancel_open_input_and_live_turns_for_job(
                     (now, job_id.as_str()),
                 )
                 .await?;
+                conn.on_commit(cairn_db::admission_hint::evidence_changed);
                 Ok(())
             })
         })

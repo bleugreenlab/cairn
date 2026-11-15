@@ -20,6 +20,7 @@ pub use turso;
 
 pub mod error;
 
+pub mod admission_hint;
 pub mod artifacts;
 pub mod changes;
 mod condition_sql;

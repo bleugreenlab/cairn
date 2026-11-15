@@ -502,7 +502,16 @@ pub(crate) async fn patch_execution_gates(
         cairn_uri::build_issue_uri(&cairn_uri::canonical_project(project_key), number)
     );
     let state = crate::execution::gates::authoring::hold_state(&owning_db, &execution_id).await?;
-    crate::execution::gates::authoring::require_held(&state, &label)?;
+    let job_holds = if matches!(&patch, GatePatch::StartNow) {
+        crate::execution::gates::open_prs::thread_holds(&owning_db, &execution_id)
+            .await
+            .map_err(|error| error.to_string())?
+    } else {
+        Vec::new()
+    };
+    if job_holds.is_empty() {
+        crate::execution::gates::authoring::require_held(&state, &label)?;
+    }
 
     match patch {
         GatePatch::Release => {
@@ -569,6 +578,29 @@ pub(crate) async fn patch_execution_gates(
             .await?;
             let principal = acting_principal(orch, request).await;
             let thread = granted.thread.clone();
+            if !job_holds.is_empty() {
+                let record = serde_json::json!({
+                    "principal": principal, "at": orch.services.clock.now(), "operator": false,
+                    "granted": {"thread": granted.thread, "decision": granted.decision},
+                    "skipped": ["thread_focus", "thread_open_prs"]
+                });
+                let mut started = false;
+                for (hold, _) in &job_holds {
+                    started |= crate::orchestrator::wakes::start_now_thread_hold(
+                        orch,
+                        hold,
+                        record.clone(),
+                    )
+                    .await?;
+                }
+                return if started {
+                    Ok(format!("Started held jobs on {label} now under the operator's grant. Recorded as an override by {thread}."))
+                } else {
+                    Err(format!(
+                        "{label}'s job holds were released by someone else first"
+                    ))
+                };
+            }
             let outcome = sweep::release(
                 orch,
                 &execution_id,

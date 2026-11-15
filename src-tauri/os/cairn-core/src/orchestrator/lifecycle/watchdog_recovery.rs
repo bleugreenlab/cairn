@@ -672,6 +672,15 @@ pub fn recover_provider_watchdog(
         ));
     }
 
+    let admission = crate::storage::run_db_blocking(|| async {
+        orch.admission_lock
+            .acquire(
+                crate::execution::gates::capacity::AdmissionSite::HoldRelease,
+                target.job_id.clone(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+    })?;
     let launch_guard = launch_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -711,6 +720,7 @@ pub fn recover_provider_watchdog(
             });
         }
         let launch = continue_job_launch_locked_for_recovery(
+            admission,
             orch,
             &target.job_id,
             Some(ResumeContext {
@@ -786,6 +796,7 @@ pub fn recover_provider_watchdog(
         return Ok(ProviderWatchdogRecovery::LostClaim);
     }
     let successor_launch = continue_job_launch_locked_for_recovery(
+        admission,
         orch,
         &target.job_id,
         Some(ResumeContext {
@@ -1138,6 +1149,21 @@ pub(crate) fn sweep_stranded_watchdog_jobs(orch: &Orchestrator) -> usize {
 
     let mut recovered = 0;
     for (job_id, identity) in candidates {
+        let admission = match crate::storage::run_db_blocking(|| async {
+            orch.admission_lock
+                .acquire(
+                    crate::execution::gates::capacity::AdmissionSite::HoldRelease,
+                    job_id.clone(),
+                )
+                .await
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(guard) => guard,
+            Err(error) => {
+                log::warn!("stranded watchdog job {job_id} waits for admission: {error}");
+                continue;
+            }
+        };
         let launch_lock = orch.job_launch_lock(&job_id);
         let guard = match launch_lock.try_lock() {
             Ok(guard) => guard,
@@ -1171,6 +1197,7 @@ pub(crate) fn sweep_stranded_watchdog_jobs(orch: &Orchestrator) -> usize {
             continue;
         }
         match continue_job_launch_locked_for_recovery(
+            admission,
             orch,
             &job_id,
             Some(ResumeContext {

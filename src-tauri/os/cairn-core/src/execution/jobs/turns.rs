@@ -1025,6 +1025,7 @@ pub(crate) fn abandon_pending_retry_if_head_matches(
                             params![now, retry_turn_id.as_str()],
                         )
                         .await?;
+                    conn.on_commit(cairn_db::admission_hint::evidence_changed);
                     Ok(changed > 0)
                 })
             })
@@ -1376,32 +1377,16 @@ pub(crate) fn create_followup_turn(
                                 }
                                 return Ok((head.id, false));
                             }
-                            match create_successor_turn_conn(
+                            create_successor_turn_conn(
                                 conn,
                                 &new_turn_id,
                                 &session_id,
                                 &job_id,
                                 &head.id,
-                                start_reason.clone(),
+                                start_reason,
                             )
-                            .await
-                            {
-                                Ok(_) => Ok((new_turn_id, true)),
-                                Err(error) => {
-                                    log::warn!("Failed to create successor turn: {}", error);
-                                    let fallback_id = ids::mint_child(&job_id);
-                                    create_turn_conn(
-                                        conn,
-                                        &fallback_id,
-                                        &session_id,
-                                        &job_id,
-                                        None,
-                                        start_reason.clone(),
-                                    )
-                                    .await?;
-                                    Ok((fallback_id, true))
-                                }
-                            }
+                            .await?;
+                            Ok((new_turn_id, true))
                         } else {
                             create_turn_conn(
                                 conn,

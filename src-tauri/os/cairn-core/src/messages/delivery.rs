@@ -876,6 +876,7 @@ pub(crate) async fn insert_system_direct_push_once_conn(
             recipient_run_id,
             wake,
             now,
+            crate::execution::jobs::WakeCause::System,
         ),
         cairn_attention::direct::OnExisting::Ignore,
     )
@@ -1165,7 +1166,50 @@ fn insert_and_announce_system_direct(
 /// surfaced to this gate through the `waking_push` check. The flush carries no
 /// prompt: `continue_job_impl` claims/injects notices, queued messages, and
 /// pushes itself and supplies its own default lead-in.
+fn pending_wake_cause(
+    db: &LocalDb,
+    job_id: &str,
+    queued_count: usize,
+) -> Result<crate::execution::jobs::WakeCause, String> {
+    use crate::execution::jobs::WakeCause;
+    if queued_count > 0 {
+        return Ok(WakeCause::Addressed);
+    }
+    let job = job_id.to_string();
+    let addressed = run_db_blocking(move || async move {
+        let pending = crate::orchestrator::attention_push::list_pending_live(db, &job)
+            .await
+            .map_err(|e| e.to_string())?;
+        for push in pending {
+            if push.wake == crate::orchestrator::attention_push::Wake::Passive {
+                continue;
+            }
+            if let Some(id) =
+                crate::orchestrator::attention_push::direct_message_id_from_key(&push.key)
+            {
+                let cause = db
+                    .query_opt_text(
+                        "SELECT wake_cause FROM messages WHERE id=?1",
+                        (id.to_string(),),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if cause.as_deref() == Some("addressed") {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    })?;
+    Ok(if addressed {
+        WakeCause::Addressed
+    } else {
+        WakeCause::System
+    })
+}
+
 struct PendingFlush {
+    cause: crate::execution::jobs::WakeCause,
     job_id: String,
     /// Count of detached run-batch results pending for the job, claimed and
     /// injected by `continue_job_impl` with every other side-channel notice;
@@ -1320,7 +1364,10 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Result<PendingFlush,
         }));
     }
 
+    let cause = pending_wake_cause(db, &job_id, queued_count)
+        .map_err(|error| declined(FlushDecline::Unknown(error)))?;
     Ok(PendingFlush {
+        cause,
         job_id,
         notice_count,
         queued_count,
@@ -1433,7 +1480,7 @@ fn flush_on_idle(orch: &Orchestrator, run_id: &str) -> Result<FlushOutcome, Stri
 
     let short = &pending.job_id[..pending.job_id.len().min(8)];
     let handoff_started = std::time::Instant::now();
-    match crate::execution::jobs::continue_job_impl(orch, &pending.job_id, None, None, None) {
+    match crate::execution::jobs::continue_job_impl(pending.cause, orch, &pending.job_id, None, None, None) {
         // `continue_job_impl` returns once the process is spawned, before the
         // provider's first handshake, so `Ok` is a dispatch, not a confirmed
         // launch. A start that fails afterwards settles on the run itself.
@@ -1630,8 +1677,20 @@ fn nudge_unobserved(
     let flushed = if let Some(run_id) = live_run_id.or_else(|| latest_run_for_job(&db, job_id)) {
         flush_on_idle(orch, &run_id)?
     } else {
-        crate::execution::jobs::continue_job_impl(orch, job_id, None, None, None)
-            .map_err(|error| format!("could not resume queued delivery: {error}"))?;
+        crate::execution::jobs::continue_job_impl(
+            pending_wake_cause(
+                &db,
+                job_id,
+                crate::messages::queued::peek_waking_pending_count_for_job(&db, job_id)
+                    .unwrap_or(0),
+            )?,
+            orch,
+            job_id,
+            None,
+            None,
+            None,
+        )
+        .map_err(|error| format!("could not resume queued delivery: {error}"))?;
         FlushOutcome::Resumed
     };
     Ok(match flushed {
@@ -2866,8 +2925,15 @@ mod tests {
         let db = orch.db.local.clone();
         seed_workflow_job_with_pending(&db, true).await;
 
-        let refused = crate::execution::jobs::continue_job_impl(&orch, "job-wf", None, None, None)
-            .expect_err("a workflow job is not resumed");
+        let refused = crate::execution::jobs::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "job-wf",
+            None,
+            None,
+            None,
+        )
+        .expect_err("a workflow job is not resumed");
         assert!(
             refused.contains("re-dispatched by Restart") && !refused.contains("not found"),
             "the refusal names the workflow and its Restart: {refused}"

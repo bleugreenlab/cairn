@@ -1150,6 +1150,11 @@ pub(crate) const SETTINGS_MAX_CONCURRENT_EXECUTIONS: KeySpec = KeySpec::new(
     KeyType::Int,
     "executions in progress across this runner's fleet before new starts hold for a slot (minimum 1)",
 );
+pub(crate) const SETTINGS_MAX_OPEN_PRS_PER_THREAD: KeySpec = KeySpec::new(
+    "maxOpenPrsPerThread",
+    KeyType::Int,
+    "open PR children per thread before new PR-producing launches hold (default 6, minimum 1)",
+);
 pub(crate) const SETTINGS_MAX_OPEN_CHILDREN_PER_THREAD: KeySpec = KeySpec::new(
     "maxOpenChildrenPerThread",
     KeyType::Int,

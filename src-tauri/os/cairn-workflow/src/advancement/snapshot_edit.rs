@@ -267,7 +267,7 @@ pub async fn cancel_job_conn(
     )
     .await?;
     // An ended job may free a fleet slot or a thread's open-children count.
-    crate::gates::hint::evidence_changed();
+    conn.on_commit(cairn_db::admission_hint::evidence_changed);
     close_job_sessions_conn(conn, job_id, reason, now).await?;
     Ok(())
 }

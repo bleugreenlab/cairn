@@ -26,7 +26,11 @@ pub enum WorkflowOwner<'a> {
 /// External work requested by the engine. Durable workflow mutations never
 /// cross this interface.
 pub enum Workload {
-    AgentJobs(Vec<crate::models::Job>),
+    AgentJobs {
+        jobs: Vec<crate::models::Job>,
+        cause: crate::effects::types::WakeCause,
+        focus_admitted: bool,
+    },
     Action {
         action_run_id: String,
         execution_id: String,
@@ -164,6 +168,7 @@ impl WorkflowRuntime {
             let _ = tx.send(WorkflowEffect::AdvanceDag {
                 execution_id: execution_id.to_owned(),
                 outbox_entry_id: Some(id.clone()),
+                focus_admitted: false,
             });
         }
         Ok(id)

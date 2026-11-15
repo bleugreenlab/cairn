@@ -2960,11 +2960,27 @@ impl Drop for ConnectionSlot {
 pub struct TrackedConnection {
     conn: Connection,
     slot: ConnectionSlot,
+    commit_callbacks: std::sync::Mutex<Vec<fn()>>,
 }
 
 impl TrackedConnection {
     pub(super) fn new(conn: Connection, slot: ConnectionSlot) -> Self {
-        Self { conn, slot }
+        Self {
+            conn,
+            slot,
+            commit_callbacks: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Schedule an in-memory hint after this `LocalDb::write`/`exclusive`
+    /// transaction commits. Rollback, conflict retries and cancellation discard
+    /// callbacks. Callbacks must not panic or perform blocking work.
+    pub fn on_commit(&self, callback: fn()) {
+        self.commit_callbacks.lock().unwrap().push(callback);
+    }
+
+    fn take_commit_callbacks(&self) -> Vec<fn()> {
+        std::mem::take(&mut *self.commit_callbacks.lock().unwrap())
     }
 
     /// [`Connection::query`], recording the statement first. The statement
@@ -3109,7 +3125,7 @@ impl TrackedConnection {
     /// free-list holds no transaction, so counting it would hold the drain above
     /// zero forever.
     fn into_connection(self) -> Connection {
-        let Self { conn, slot } = self;
+        let Self { conn, slot, .. } = self;
         drop(slot);
         conn
     }
@@ -3703,6 +3719,8 @@ async fn run_tx<T>(
     begin_sql: &str,
     f: &mut impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
 ) -> TxAttempt<T> {
+    // A pooled connection can be retried after a rolled-back attempt.
+    conn.take_commit_callbacks();
     if let Err(error) = conn.conn.execute(begin_sql, ()).await {
         // A BEGIN that fails opened nothing, but it also means this connection
         // was not in the state the pool guarantees. Retire it rather than reason
@@ -3715,11 +3733,17 @@ async fn run_tx<T>(
 
     match f(conn).await {
         Ok(value) => match end_tx(conn, "COMMIT").await {
-            Ok(()) => TxAttempt {
-                result: Ok(value),
-                reusable: true,
-            },
+            Ok(()) => {
+                for callback in conn.take_commit_callbacks() {
+                    callback();
+                }
+                TxAttempt {
+                    result: Ok(value),
+                    reusable: true,
+                }
+            }
             Err(error) => {
+                conn.take_commit_callbacks();
                 let reusable = end_tx(conn, "ROLLBACK").await.is_ok();
                 TxAttempt {
                     result: Err(error),
@@ -3728,6 +3752,7 @@ async fn run_tx<T>(
             }
         },
         Err(error) => {
+            conn.take_commit_callbacks();
             let reusable = end_tx(conn, "ROLLBACK").await.is_ok();
             TxAttempt {
                 result: Err(error),
@@ -3906,10 +3931,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn a_rolled_back_transaction_returns_a_clean_connection_to_the_pool() {
         let db = test_db().await.unwrap();
         let before = db.connections_created.load(Ordering::Relaxed);
+        let hints = crate::admission_hint::sent_on_this_thread();
 
         let error = db
             .write(|conn| {
@@ -3919,12 +3945,15 @@ mod tests {
                         (),
                     )
                     .await?;
+                    conn.on_commit(crate::admission_hint::evidence_changed);
+                    assert_eq!(crate::admission_hint::sent_on_this_thread(), hints);
                     Err::<(), DbError>(DbError::internal("force rollback"))
                 })
             })
             .await
             .unwrap_err();
         assert!(matches!(error, DbError::Internal(_)));
+        assert_eq!(crate::admission_hint::sent_on_this_thread(), hints);
 
         // Its ROLLBACK succeeded, so the connection went back on the free-list
         // and the next operation reuses it rather than opening another...
@@ -3936,6 +3965,30 @@ mod tests {
             before,
             "a cleanly rolled-back connection must be reused, not retired"
         );
+
+        assert_eq!(crate::admission_hint::sent_on_this_thread(), hints);
+
+        // A retry drops the first attempt's callback, then fires the committed
+        // attempt once, and only after its write is durable.
+        let mut attempts = 0;
+        db.write(|conn| {
+            attempts += 1;
+            let attempt = attempts;
+            Box::pin(async move {
+                conn.on_commit(crate::admission_hint::evidence_changed);
+                assert_eq!(crate::admission_hint::sent_on_this_thread(), hints);
+                if attempt == 1 {
+                    return Err(DbError::Turso(turso::Error::Busy("retry".into())));
+                }
+                conn.execute("UPDATE counters SET value = 1 WHERE id = 'after'", ())
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(crate::admission_hint::sent_on_this_thread(), hints + 1);
 
         // ...carrying no residue from the transaction that was unwound on it.
         assert_eq!(

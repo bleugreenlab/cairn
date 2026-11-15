@@ -8,6 +8,8 @@
 use crate::conditions::ConditionVerdict;
 use crate::models::Job;
 
+pub use cairn_domain::WakeCause;
+
 /// Shared context carried by effects for debugging and correlation.
 #[derive(Debug, Clone)]
 pub struct EffectContext {
@@ -44,6 +46,9 @@ pub enum WorkflowEffect {
         /// Used for precise row-level acknowledgement after processing.
         /// `None` for follow-on effects produced by `reduce_dag` / `reduce_effect_result`.
         outbox_entry_id: Option<String>,
+        /// This pass already admitted fresh work to the thread focus cap.
+        /// Never bypasses the open-PR bound and is never persisted.
+        focus_admitted: bool,
     },
 
     /// Emit a lifecycle system message (job completed/failed/blocked).
@@ -79,7 +84,11 @@ pub enum WorkflowEffect {
 
     // ── Effects requiring external work ─────────────────────────────
     /// Start ready agent jobs from their durable branch coordinates.
-    StartAgentJobs(Vec<Job>),
+    StartAgentJobs {
+        jobs: Vec<Job>,
+        cause: WakeCause,
+        focus_admitted: bool,
+    },
 
     /// Execute an action node (built-in or shell command).
     ExecuteAction {
@@ -174,7 +183,7 @@ impl std::fmt::Debug for WorkflowEffect {
                 .debug_struct("MarkActionRunFailed")
                 .field("action_run_id", action_run_id)
                 .finish(),
-            Self::StartAgentJobs(jobs) => f
+            Self::StartAgentJobs { jobs, .. } => f
                 .debug_struct("StartAgentJobs")
                 .field("count", &jobs.len())
                 .finish(),

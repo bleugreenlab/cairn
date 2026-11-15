@@ -373,7 +373,7 @@ pub async fn job_supply_held_conn(
         .query(
             concat!(
                 "SELECT 1 FROM jobs j WHERE j.id = ?1 AND ",
-                cairn_db::job_supply_held_sql!()
+                cairn_db::job_held_sql!()
             ),
             (job_id,),
         )

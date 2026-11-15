@@ -799,12 +799,14 @@ async fn reset_run_for_redispatch(db: &LocalDb, run_id: &str, job_id: &str) -> R
                 params![now, job_id.as_str()],
             )
             .await?;
+            conn.on_commit(cairn_db::admission_hint::evidence_changed);
             conn.execute(
                 "UPDATE turns SET state = 'failed', ended_at = ?1, updated_at = ?1 \
                  WHERE job_id = ?2 AND state = 'pending'",
                 params![now, job_id.as_str()],
             )
             .await?;
+            conn.on_commit(cairn_db::admission_hint::evidence_changed);
             // `started_at` restarts with the run: the stale-run reaper measures
             // its grace from it, and the old value would leave a re-dispatched
             // run looking long dead before its spawn claims the launch.

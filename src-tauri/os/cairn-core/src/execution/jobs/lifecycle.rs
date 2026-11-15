@@ -137,7 +137,7 @@ struct SessionBoundary {
     initiated_by: Option<&'static str>,
     /// Why a replacement happened, when its kind alone does not say. `None`
     /// keeps every other boundary's payload byte-identical.
-    reason: Option<&'static str>,
+    reason: Option<String>,
 }
 
 /// The boundary reason for a session replaced because its first provider
@@ -219,8 +219,8 @@ impl SessionBoundary {
         self
     }
 
-    fn with_reason(mut self, reason: &'static str) -> Self {
-        self.reason = Some(reason);
+    fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
         self
     }
 
@@ -235,7 +235,7 @@ impl SessionBoundary {
         if let (Some(initiated_by), Some(object)) = (self.initiated_by, raw.as_object_mut()) {
             object.insert("initiatedBy".to_string(), initiated_by.into());
         }
-        if let (Some(reason), Some(object)) = (self.reason, raw.as_object_mut()) {
+        if let (Some(reason), Some(object)) = (self.reason.as_deref(), raw.as_object_mut()) {
             object.insert("reason".to_string(), reason.into());
         }
         if let (Some(cache), Some(object)) = (self.cache, raw.as_object_mut()) {
@@ -439,6 +439,9 @@ impl Drop for PendingLaunchTurnGuard<'_> {
                     .map_err(|error| error.to_string())
                 }
             });
+            if result.as_ref().is_ok_and(|changed| *changed > 0) {
+                cairn_db::admission_hint::evidence_changed();
+            }
             if let Err(error) = result {
                 log::error!(
                     "failed to settle preclaimed successor {turn_id} after launch failure: {error}"
@@ -459,6 +462,9 @@ impl Drop for PendingLaunchTurnGuard<'_> {
                 .map_err(|error| error.to_string())
                 }
             });
+            if result.as_ref().is_ok_and(|changed| *changed > 0) {
+                cairn_db::admission_hint::evidence_changed();
+            }
             if let Err(error) = result {
                 log::error!("failed to cancel pending successor after launch failure: {error}");
             }
@@ -1804,6 +1810,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<JobPreparation, 
                 None,
                 None,
                 capacity,
+                None,
             )?;
         }
         return Err(refusal.into());
@@ -1949,6 +1956,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<JobPreparation, 
     );
 
     Ok(JobPreparation::Prepared(Box::new(PreparedJob {
+        resume_json: None,
         job_id: job_id.to_string(),
         project_id: job.project_id,
         run_id,
@@ -2020,7 +2028,7 @@ enum ContinuationIntent {
     /// Rotate onto a digest-seeded session. `reason` names the cause on the
     /// `digest_reseed` boundary when the system, not the operator, asked.
     ForceDigestReseed {
-        reason: Option<&'static str>,
+        reason: Option<String>,
     },
     /// An operator's cold Compact. Everything live in the old session has
     /// already been torn down under the launch lock this continuation runs
@@ -2046,19 +2054,32 @@ pub(crate) struct OperatorBoundary {
 /// like any other, so whatever the operator sent while the session was stuck
 /// lands in the new session's first turn.
 pub(crate) fn continue_job_launch_locked_for_operator_compact<'a>(
+    admission: crate::execution::gates::capacity::AdmissionGuard,
     orch: &Orchestrator,
     job_id: &str,
     identity_override: Option<crate::identity::UserIdentity>,
     boundary: Option<OperatorBoundary>,
     launch_guard: std::sync::MutexGuard<'a, ()>,
+    held_resume_json: Option<String>,
 ) -> Result<Run, String> {
+    let held = held_resume_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<HeldContinuation>(json).ok());
+    let suppress_user_event = held
+        .as_ref()
+        .filter(|held| held.message.is_some())
+        .is_none_or(|held| held.suppress_user_event);
+    let trigger = held
+        .and_then(|held| held.message)
+        .unwrap_or_else(|| FORCED_DIGEST_RESUME_TRIGGER.to_string());
     continue_job_launch_locked(
+        WakeCause::Addressed,
         orch,
         job_id,
-        Some(FORCED_DIGEST_RESUME_TRIGGER),
+        Some(&trigger),
         identity_override,
         Some(ResumeContext {
-            suppress_user_event: true,
+            suppress_user_event,
             suppress_self_suspend_note: true,
             supersede_pending_retry: true,
             ..Default::default()
@@ -2068,6 +2089,7 @@ pub(crate) fn continue_job_launch_locked_for_operator_compact<'a>(
             id: &ids::mint_child(job_id),
             started: std::time::Instant::now(),
         },
+        LaunchAdmission::Decide { _guard: admission },
         Some(launch_guard),
     )
     .map(|launch| launch.run)
@@ -2078,7 +2100,7 @@ pub fn resume_job_from_digest(
     job_id: &str,
     identity_override: Option<crate::identity::UserIdentity>,
 ) -> Result<Run, String> {
-    force_digest_reseed(orch, job_id, identity_override, None)
+    force_digest_reseed(WakeCause::Addressed, orch, job_id, identity_override, None)
 }
 
 /// The automatic recovery for a resume whose native session handle the backend
@@ -2089,6 +2111,7 @@ pub(crate) fn recover_unresolvable_session_from_digest(
     job_id: &str,
 ) -> Result<Run, String> {
     force_digest_reseed(
+        WakeCause::System,
         orch,
         job_id,
         None,
@@ -2097,6 +2120,7 @@ pub(crate) fn recover_unresolvable_session_from_digest(
 }
 
 fn force_digest_reseed(
+    cause: WakeCause,
     orch: &Orchestrator,
     job_id: &str,
     identity_override: Option<crate::identity::UserIdentity>,
@@ -2118,6 +2142,7 @@ fn force_digest_reseed(
     }
 
     continue_job_impl_with_intent(
+        cause,
         orch,
         job_id,
         Some(FORCED_DIGEST_RESUME_TRIGGER),
@@ -2128,7 +2153,10 @@ fn force_digest_reseed(
             supersede_pending_retry: true,
             ..Default::default()
         }),
-        ContinuationIntent::ForceDigestReseed { reason },
+        ContinuationIntent::ForceDigestReseed {
+            reason: reason.map(str::to_string),
+        },
+        None,
     )
 }
 
@@ -2301,6 +2329,7 @@ fn continue_job_or_enqueue_inner(
         return Ok(latest);
     }
     continue_job_impl(
+        crate::execution::jobs::WakeCause::Addressed,
         orch,
         job_id,
         message,
@@ -2337,6 +2366,7 @@ pub fn continue_job_or_enqueue_with_before_resume_for_test(
 /// forwarded to the agent so the model sees it in context.
 #[derive(Debug, Clone, Default)]
 pub struct ResumeContext {
+    pub(crate) resolving_hold_id: Option<String>,
     /// When true, skip storing the resume message as a `user` transcript event.
     pub(crate) suppress_user_event: bool,
     /// Suppress the self-suspend framing note when the hidden trigger belongs to
@@ -2370,6 +2400,128 @@ pub struct ResumeContext {
     /// rebuilt session. A provider-limit resolution delivers nothing and leaves
     /// this false.
     pub(crate) answers_open_tool_call: bool,
+}
+
+/// Persist refused continuation inputs and their cause, never credentials or
+/// operator identity. Queue and attention deliveries remain in their canonical queues.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct HeldContinuation {
+    cause: WakeCause,
+    operator_goal: Option<(String, Option<String>)>,
+    message: Option<String>,
+    suppress_user_event: bool,
+    suppress_self_suspend_note: bool,
+    preclaimed_retry_turn_id: Option<String>,
+    preclaimed_successor_turn_id: Option<String>,
+    answers_open_tool_call: bool,
+    goal_owner: Option<(String, String)>,
+    force_digest_reseed: bool,
+    reseed_reason: Option<String>,
+    supersede_pending_retry: bool,
+}
+impl HeldContinuation {
+    fn capture(
+        message: Option<&str>,
+        context: Option<&ResumeContext>,
+        intent: &ContinuationIntent,
+        cause: WakeCause,
+    ) -> Self {
+        let c = context.cloned().unwrap_or_default();
+        let operator_goal = match &c.goal_reactivation {
+            Some(GoalReactivation::Operator { kind, id }) => {
+                Some(((*kind).to_string(), id.clone()))
+            }
+            _ => None,
+        };
+        let goal_owner = match c.goal_reactivation {
+            Some(GoalReactivation::OwnedConditionResolved(owner)) => {
+                Some((owner.kind().into(), owner.id().into()))
+            }
+            _ => None,
+        };
+        Self {
+            cause,
+            operator_goal,
+            message: message.map(str::to_string),
+            suppress_user_event: c.suppress_user_event,
+            suppress_self_suspend_note: c.suppress_self_suspend_note,
+            preclaimed_retry_turn_id: c.preclaimed_retry_turn_id,
+            preclaimed_successor_turn_id: c.preclaimed_successor_turn_id,
+            answers_open_tool_call: c.answers_open_tool_call,
+            goal_owner,
+            supersede_pending_retry: c.supersede_pending_retry,
+            force_digest_reseed: matches!(intent, ContinuationIntent::ForceDigestReseed { .. }),
+            reseed_reason: match intent {
+                ContinuationIntent::ForceDigestReseed { reason } => reason.clone(),
+                _ => None,
+            },
+        }
+    }
+}
+
+pub(crate) fn resume_held_continuation(
+    orch: &Orchestrator,
+    job_id: &str,
+    subject: &str,
+    hold_id: &str,
+    cause: WakeCause,
+    admission: Option<crate::execution::gates::capacity::AdmissionGuard>,
+) -> Result<Run, String> {
+    let held: HeldContinuation =
+        serde_json::from_str(subject).map_err(|e| format!("invalid held continuation: {e}"))?;
+    use crate::agent_process::process::GoalPauseOwner;
+    let operator_goal = held
+        .operator_goal
+        .map(|(kind, id)| {
+            let kind = match kind.as_str() {
+                "operator_message" => "operator_message",
+                "explicit_resume" => "explicit_resume",
+                _ => return Err("held goal reactivation has an unknown kind".to_string()),
+            };
+            Ok(GoalReactivation::Operator { kind, id })
+        })
+        .transpose()?;
+    let goal_reactivation = held
+        .goal_owner
+        .and_then(|(kind, id)| match kind.as_str() {
+            "durable_wait" => Some(GoalPauseOwner::DurableWait { wait_id: id }),
+            "dependency_wait" => Some(GoalPauseOwner::DependencyWait { parked_turn_id: id }),
+            "user_input" => Some(GoalPauseOwner::UserInput { request_id: id }),
+            _ => None,
+        })
+        .map(GoalReactivation::OwnedConditionResolved)
+        .or(operator_goal);
+    let intent = if held.force_digest_reseed {
+        ContinuationIntent::ForceDigestReseed {
+            reason: held.reseed_reason,
+        }
+    } else {
+        ContinuationIntent::Normal
+    };
+    continue_job_impl_with_intent(
+        if cause == WakeCause::Addressed {
+            cause
+        } else {
+            held.cause
+        },
+        orch,
+        job_id,
+        held.message.as_deref(),
+        None,
+        Some(ResumeContext {
+            resolving_hold_id: Some(hold_id.to_string()),
+            supersede_pending_retry: held.supersede_pending_retry,
+            suppress_user_event: held.suppress_user_event,
+            suppress_self_suspend_note: held.suppress_self_suspend_note,
+            preclaimed_retry_turn_id: held.preclaimed_retry_turn_id,
+            preclaimed_successor_turn_id: held.preclaimed_successor_turn_id,
+            answers_open_tool_call: held.answers_open_tool_call,
+            goal_reactivation,
+            ..Default::default()
+        }),
+        intent,
+        admission,
+    )
 }
 
 /// Validate a pre-created successor turn (owned-wait `WaitResolved` or
@@ -2436,6 +2588,7 @@ pub(crate) fn continue_automatic_retry(
     retry_turn_id: &str,
 ) -> Result<Run, String> {
     continue_job_impl(
+        crate::execution::jobs::WakeCause::System,
         orch,
         job_id,
         None,
@@ -2443,6 +2596,7 @@ pub(crate) fn continue_automatic_retry(
         Some(ResumeContext {
             suppress_user_event: true,
             suppress_self_suspend_note: false,
+            resolving_hold_id: None,
             preclaimed_retry_turn_id: Some(retry_turn_id.to_string()),
             supersede_pending_retry: false,
             goal_reactivation: None,
@@ -2458,6 +2612,7 @@ pub(crate) fn continue_automatic_retry(
 /// Reuses a warm process if one exists for the job's session, otherwise starts
 /// a new Claude process with `--resume`.
 pub fn continue_job_impl(
+    cause: WakeCause,
     orch: &Orchestrator,
     job_id: &str,
     message: Option<&str>,
@@ -2465,13 +2620,135 @@ pub fn continue_job_impl(
     prompt_resume: Option<ResumeContext>,
 ) -> Result<Run, String> {
     continue_job_impl_with_intent(
+        cause,
         orch,
         job_id,
         message,
         identity_override,
         prompt_resume,
         ContinuationIntent::Normal,
+        None,
     )
+}
+
+/// [`continue_job_impl`] for a caller that already decided admission under
+/// `admission` (a hold release, an owned-wait resolution). The guard is handed
+/// to the launch, which lets it go once the continuation's slot is reserved,
+/// before session preparation, rather than at the caller's return.
+pub(crate) fn continue_job_impl_admitted(
+    admission: Option<crate::execution::gates::capacity::AdmissionGuard>,
+    cause: WakeCause,
+    orch: &Orchestrator,
+    job_id: &str,
+    message: Option<&str>,
+    identity_override: Option<crate::identity::UserIdentity>,
+    prompt_resume: Option<ResumeContext>,
+) -> Result<Run, String> {
+    continue_job_impl_with_intent(
+        cause,
+        orch,
+        job_id,
+        message,
+        identity_override,
+        prompt_resume,
+        ContinuationIntent::Normal,
+        admission,
+    )
+}
+
+/// A System continuation whose admission wait ran out its bound. When all it
+/// carries is durable (queued deliveries, or a forced reseed's fixed trigger),
+/// it is parked as a re-entry hold, so the gate pass retries it the way it
+/// releases any focus hold and the pushes it would have claimed ride that
+/// release. A continuation carrying input of its own (a message, a preclaimed
+/// turn, a hold it is resolving) returns the error to its caller, which owns
+/// that input and its retry.
+fn park_busy_continuation(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job_id: &str,
+    message: Option<&str>,
+    prompt_resume: Option<&ResumeContext>,
+    intent: &ContinuationIntent,
+    busy: crate::execution::gates::capacity::AdmissionBusy,
+) -> Result<Run, String> {
+    let busy_error = format!("thread admission busy: {busy}");
+    let durable_input = (message.is_none()
+        || matches!(intent, ContinuationIntent::ForceDigestReseed { .. }))
+        && prompt_resume.is_none_or(|context| {
+            context.preclaimed_retry_turn_id.is_none()
+                && context.preclaimed_successor_turn_id.is_none()
+                && context.resolving_hold_id.is_none()
+                && !context.answers_open_tool_call
+        });
+    if !durable_input {
+        return Err(busy_error);
+    }
+    let launch_lock = orch.job_launch_lock(job_id);
+    let _launch_guard = launch_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A launch that started meanwhile takes these deliveries at its turn end.
+    if let Some(in_flight) = in_flight_launch(orch, job_id)? {
+        return Ok(in_flight);
+    }
+    let reason = "Waiting for the execution queue's admission lock, which stayed busy past its \
+                  bound; the next gate pass retries this continuation."
+        .to_string();
+    let subject = serde_json::to_string(&HeldContinuation::capture(
+        message,
+        prompt_resume,
+        intent,
+        WakeCause::System,
+    ))
+    .map_err(|e| e.to_string())?;
+    let this_device = orch.anon_device_manager.device_id();
+    // `Some` is a refusal to park, carrying what the caller is told instead.
+    let declined = run_db_borrowed(async {
+        // A hold already standing carries its own input and claims these
+        // deliveries when it releases; re-arming would overwrite that input.
+        if let Some(hold) =
+            crate::orchestrator::wakes::active_supply_hold(owning_db, job_id).await?
+        {
+            return Ok(Some(
+                hold.observed_text.unwrap_or_else(|| busy_error.clone()),
+            ));
+        }
+        let owner = owning_db
+            .query_opt(
+                "SELECT e.runner_device_id FROM jobs j LEFT JOIN executions e ON e.id=j.execution_id WHERE j.id=?1",
+                (job_id.to_string(),),
+                |row| row.opt_text(0),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .flatten();
+        if owner.is_some_and(|owner| owner != this_device) {
+            return Ok(Some(busy_error.clone()));
+        }
+        crate::orchestrator::wakes::arm_thread_hold(
+            owning_db,
+            job_id,
+            crate::orchestrator::wakes::HoldKind::Resume,
+            "thread_focus",
+            reason.clone(),
+            subject,
+            orch.services.clock.now(),
+        )
+        .await
+        .map(|_| None)
+    });
+    match declined {
+        Ok(None) => {}
+        Ok(Some(error)) => return Err(error),
+        Err(error) => {
+            log::warn!("{busy_error}; job {job_id}'s continuation could not park: {error}");
+            return Err(busy_error);
+        }
+    }
+    log::warn!("{busy_error}; parked job {job_id}'s continuation for the gate pass");
+    cairn_db::admission_hint::evidence_changed();
+    Err(reason)
 }
 
 /// The launch funnel for an existing job, and the one place a resume is
@@ -2492,13 +2769,19 @@ pub fn continue_job_impl(
 /// pending side-channel notices, queued messages and attention pushes, so the
 /// launch already in flight carries the waiting caller's content too — and
 /// anything persisted after that claim is swept by the turn-end flush.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the launch funnel carries admission ownership separately from replayable continuation input"
+)]
 fn continue_job_impl_with_intent(
+    cause: WakeCause,
     orch: &Orchestrator,
     job_id: &str,
     message: Option<&str>,
     identity_override: Option<crate::identity::UserIdentity>,
     prompt_resume: Option<ResumeContext>,
     continuation_intent: ContinuationIntent,
+    admitted: Option<crate::execution::gates::capacity::AdmissionGuard>,
 ) -> Result<Run, String> {
     let resume_started = std::time::Instant::now();
     let resume_id = ids::mint_child(job_id);
@@ -2521,6 +2804,39 @@ fn continue_job_impl_with_intent(
     if crate::threads::is_dormant_thread_session_sync(&owning_db, job_id) {
         return Err(crate::threads::dormant_thread_refusal());
     }
+    // Global admission precedes the per-job launch mutex everywhere. Only a
+    // System continuation is decided against the focus cap, and it keeps
+    // admission only until its slot is reserved (see
+    // `continue_job_launch_locked_inner`); an Addressed one runs at once. Hold
+    // release and owned-wait resolution decide admission themselves and hand
+    // their guard in, so it is let go at the same reservation point.
+    let admission = match admitted {
+        Some(guard) => LaunchAdmission::Decided { _guard: guard },
+        None if cause == WakeCause::System => match run_db_borrowed(async {
+            Ok::<_, String>(
+                orch.admission_lock
+                    .acquire(
+                        crate::execution::gates::capacity::AdmissionSite::HoldRelease,
+                        job_id.to_string(),
+                    )
+                    .await,
+            )
+        })? {
+            Ok(guard) => LaunchAdmission::Decide { _guard: guard },
+            Err(busy) => {
+                return park_busy_continuation(
+                    orch,
+                    &owning_db,
+                    job_id,
+                    message,
+                    prompt_resume.as_ref(),
+                    &continuation_intent,
+                    busy,
+                )
+            }
+        },
+        None => LaunchAdmission::Unadmitted,
+    };
     let launch_wait_started = std::time::Instant::now();
     let launch_lock = orch.job_launch_lock(job_id);
     // A poisoned lock means some earlier launch panicked. What it guards is
@@ -2563,6 +2879,7 @@ fn continue_job_impl_with_intent(
     }
 
     continue_job_launch_locked(
+        cause,
         orch,
         job_id,
         message,
@@ -2573,6 +2890,7 @@ fn continue_job_impl_with_intent(
             id: &resume_id,
             started: resume_started,
         },
+        admission,
         Some(_launch_guard),
     )
     .map(|launch| launch.run)
@@ -2664,6 +2982,7 @@ pub fn in_flight_launch_for_test(
 /// provider watchdog (claim epoch and head turn) and the boot resume of jobs a
 /// host restart interrupted (head turn, status, and launch claim).
 pub(crate) fn continue_job_launch_locked_for_recovery<'a>(
+    admission: crate::execution::gates::capacity::AdmissionGuard,
     orch: &Orchestrator,
     job_id: &str,
     prompt_resume: Option<ResumeContext>,
@@ -2674,6 +2993,7 @@ pub(crate) fn continue_job_launch_locked_for_recovery<'a>(
         turn_id,
         started,
     } = continue_job_launch_locked(
+        WakeCause::System,
         orch,
         job_id,
         None,
@@ -2684,6 +3004,7 @@ pub(crate) fn continue_job_launch_locked_for_recovery<'a>(
             id: &ids::mint_child(job_id),
             started: std::time::Instant::now(),
         },
+        LaunchAdmission::Decide { _guard: admission },
         Some(launch_guard),
     )?;
     Ok(if started {
@@ -2697,6 +3018,28 @@ pub(crate) fn continue_job_launch_locked_for_recovery<'a>(
 pub(crate) enum RecoveryContinuation {
     Started { run: Run, turn_id: String },
     Queued { run: Run, turn_id: String },
+}
+
+/// Who holds a launch's admission, and whether thread policy is still to be
+/// decided under it. A launch lets it go exactly once, when its slot is
+/// reserved (see `continue_job_launch_locked_inner`).
+enum LaunchAdmission {
+    /// Nothing to decide: addressed work takes no admission.
+    Unadmitted,
+    /// Held for this launch, which decides thread policy under it.
+    Decide {
+        _guard: crate::execution::gates::capacity::AdmissionGuard,
+    },
+    /// Held by a caller that already decided thread policy under it.
+    Decided {
+        _guard: crate::execution::gates::capacity::AdmissionGuard,
+    },
+}
+
+impl LaunchAdmission {
+    fn release(&mut self) {
+        *self = LaunchAdmission::Unadmitted;
+    }
 }
 
 /// What a continuation launched: the run, the turn it opened, and whether a
@@ -2723,6 +3066,7 @@ struct ResumeTrace<'a> {
 
 #[allow(clippy::too_many_arguments)]
 fn continue_job_launch_locked(
+    cause: WakeCause,
     orch: &Orchestrator,
     job_id: &str,
     message: Option<&str>,
@@ -2730,7 +3074,126 @@ fn continue_job_launch_locked(
     prompt_resume: Option<ResumeContext>,
     continuation_intent: ContinuationIntent,
     trace: ResumeTrace<'_>,
+    admission: LaunchAdmission,
     mut launch_guard: Option<std::sync::MutexGuard<'_, ()>>,
+) -> Result<ContinuationLaunch, String> {
+    // An addressed continuation supersedes the hold, not the input it was
+    // carrying. Queued pushes stay in their queues; only inline held input is
+    // combined here, under this job's launch mutex. A release racing it blocks
+    // on that mutex and then finds the head turn moved, so it stands down.
+    let addressed_hold = if cause == WakeCause::Addressed {
+        run_db_borrowed(async {
+            let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::orchestrator::wakes::active_supply_hold(&db, job_id).await
+        })?
+    } else {
+        None
+    };
+    let old_input = if matches!(continuation_intent, ContinuationIntent::OperatorCompact(_)) {
+        None
+    } else {
+        addressed_hold
+            .as_ref()
+            .and_then(|hold| hold.resume_json.as_deref())
+            .and_then(|json| serde_json::from_str::<HeldContinuation>(json).ok())
+    };
+    let merged_message = old_input
+        .as_ref()
+        .and_then(|held| held.message.as_deref())
+        .map(|old| match message {
+            Some(new) => format!("{old}\n\n{new}"),
+            None => old.to_string(),
+        });
+    let message = merged_message.as_deref().or(message);
+    let continuation_intent = if matches!(continuation_intent, ContinuationIntent::Normal) {
+        match old_input.as_ref().filter(|held| held.force_digest_reseed) {
+            Some(held) => ContinuationIntent::ForceDigestReseed {
+                reason: held.reseed_reason.clone(),
+            },
+            None => continuation_intent,
+        }
+    } else {
+        continuation_intent
+    };
+    let hold_id = prompt_resume
+        .as_ref()
+        .and_then(|c| c.resolving_hold_id.clone());
+    if let Some(hold_id) = &hold_id {
+        let matches=run_db_borrowed(async {
+            let db=crate::execution::routing::owning_db_for_job(&orch.db,job_id).await.map_err(|e|e.to_string())?;
+            let successor=prompt_resume.as_ref().and_then(|c|c.preclaimed_successor_turn_id.clone());
+            db.query_opt_i64("SELECT 1 FROM provider_limit_holds h JOIN jobs j ON j.id=h.job_id WHERE h.id=?1 AND h.state='resolved' AND h.kind='resume' AND (j.current_turn_id=h.turn_id OR (j.current_turn_id=?2 AND EXISTS (SELECT 1 FROM turns t WHERE t.id=?2 AND t.job_id=j.id AND t.predecessor_id=h.turn_id AND t.state='pending')))",(hold_id.clone(),successor)).await.map_err(|e|e.to_string())
+        })?.is_some();
+        if !matches {
+            return Err("This held continuation was superseded by a newer turn.".into());
+        }
+    }
+    let result = continue_job_launch_locked_inner(
+        cause,
+        orch,
+        job_id,
+        message,
+        identity_override,
+        prompt_resume,
+        continuation_intent,
+        trace,
+        admission,
+        &mut launch_guard,
+    );
+    if result.is_err() {
+        let fallback = orch.job_launch_lock(job_id);
+        let _fallback_guard = if launch_guard.is_none() {
+            Some(fallback.lock().unwrap_or_else(|p| p.into_inner()))
+        } else {
+            None
+        };
+        if let Some(hold_id) = hold_id {
+            if let Err(error) = run_db_borrowed(async {
+                let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                crate::orchestrator::wakes::restore_resume_hold_after_launch_failure(
+                    orch,
+                    &db,
+                    &hold_id,
+                    orch.services.clock.now(),
+                )
+                .await
+            }) {
+                log::error!("Could not restore held continuation {hold_id}: {error}");
+            }
+        }
+    }
+    if result.is_ok() {
+        if let Some(hold) = addressed_hold {
+            if let Err(error) = run_db_borrowed(async {
+                let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                db.execute("UPDATE provider_limit_holds SET state='superseded',updated_at=?1 WHERE id=?2 AND state='active' AND turn_id IS ?3 AND resume_json IS ?4",cairn_db::turso::params![orch.services.clock.now(),hold.id,hold.turn_id,hold.resume_json]).await.map_err(|e|e.to_string())?;
+                Ok(())
+            }) {
+                log::error!("Could not retire addressed hold after handoff: {error}");
+            }
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn continue_job_launch_locked_inner(
+    cause: WakeCause,
+    orch: &Orchestrator,
+    job_id: &str,
+    message: Option<&str>,
+    identity_override: Option<crate::identity::UserIdentity>,
+    prompt_resume: Option<ResumeContext>,
+    continuation_intent: ContinuationIntent,
+    trace: ResumeTrace<'_>,
+    mut admission: LaunchAdmission,
+    launch_guard: &mut Option<std::sync::MutexGuard<'_, ()>>,
 ) -> Result<ContinuationLaunch, String> {
     let ResumeTrace {
         id: resume_id,
@@ -2752,6 +3215,47 @@ fn continue_job_launch_locked(
     event.resume_id = Some(resume_id);
     event.job_id = Some(job_id);
     event.emit();
+
+    // Keep admission through the write that makes this child active (released
+    // below, once the slot is reserved). Refusal precedes delivery claims, so
+    // an unstarted continuation spends no wakes.
+    if cause == WakeCause::System && matches!(admission, LaunchAdmission::Decide { .. }) {
+        if let Some(hold) = run_db_borrowed(crate::orchestrator::wakes::active_supply_hold(
+            &owning_db, job_id,
+        ))? {
+            return Err(hold
+                .observed_text
+                .unwrap_or_else(|| "This system continuation is already held.".into()));
+        }
+        if let Some((boundary, reason)) =
+            run_db_borrowed(crate::orchestrator::wakes::thread_job_refusal(
+                orch,
+                &owning_db,
+                job_id,
+                crate::orchestrator::wakes::HoldKind::Resume,
+                None,
+                false,
+            ))?
+        {
+            let subject = serde_json::to_string(&HeldContinuation::capture(
+                message,
+                prompt_resume.as_ref(),
+                &continuation_intent,
+                cause,
+            ))
+            .map_err(|e| e.to_string())?;
+            run_db_borrowed(crate::orchestrator::wakes::arm_thread_hold(
+                &owning_db,
+                job_id,
+                crate::orchestrator::wakes::HoldKind::Resume,
+                boundary,
+                reason.clone(),
+                subject,
+                orch.services.clock.now(),
+            ))?;
+            return Err(reason);
+        }
+    }
 
     // Claim operator-authored follow-ups before session preparation. Delivery is
     // the durable claim itself; provider/session setup must not hold the UI's
@@ -2966,6 +3470,16 @@ fn continue_job_launch_locked(
         emit_resume_step("resume_step_job_running", step_started, resume_id, job_id);
         runnable
     };
+    // The slot is reserved now: a running job whose head turn is pending counts
+    // as in flight to the fleet and focus caps, so the next admission decision
+    // already sees it. Session preparation below can take seconds and decides
+    // nothing, so it runs unadmitted. An unattested status is not yet visible to
+    // those counts, so admission is kept through the launch in that case.
+    if matches!(job_runnable, JobRunnable::Attested) {
+        admission.release();
+    }
+    #[cfg(test)]
+    tests::before_session_preparation(orch, job_id);
 
     // ---- Host agent snapshot ---------------------------------------------
     // A run's fence and sandbox policy resolve through job → execution →
@@ -3053,7 +3567,7 @@ fn continue_job_launch_locked(
     let mut boundary_in_rotation = false;
     let (forced_reseed, operator_compact, reseed_reason) = match &continuation_intent {
         ContinuationIntent::Normal => (false, None, None),
-        ContinuationIntent::ForceDigestReseed { reason } => (true, None, *reason),
+        ContinuationIntent::ForceDigestReseed { reason } => (true, None, reason.as_deref()),
         ContinuationIntent::OperatorCompact(boundary) => (true, Some(boundary.clone()), None),
     };
     let step_started = std::time::Instant::now();
@@ -4157,6 +4671,17 @@ fn continue_job_launch_locked(
         let started = super::start_prepared_job_session(
             orch,
             PreparedJob {
+                resume_json: {
+                    let mut held = HeldContinuation::capture(
+                        message,
+                        prompt_resume.as_ref(),
+                        &continuation_intent,
+                        cause,
+                    );
+                    held.preclaimed_retry_turn_id = None;
+                    held.preclaimed_successor_turn_id = None;
+                    Some(serde_json::to_string(&held).map_err(|e| e.to_string())?)
+                },
                 job_id: job_id.to_string(),
                 project_id: project_id.clone(),
                 run_id: run_id.clone(),
@@ -5923,6 +6448,7 @@ fn mark_stale_active_turn_for_continue(
                     ],
                 )
                 .await?;
+                conn.on_commit(cairn_db::admission_hint::evidence_changed);
 
                 if let Some(run_id) = run_id.as_deref() {
                     conn.execute(
@@ -6019,6 +6545,32 @@ pub fn reconcile_stale_active_turn_for_continue_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn held_context_preserves_forced_recovery_and_retry_supersession() {
+        let context = super::ResumeContext {
+            supersede_pending_retry: true,
+            ..Default::default()
+        };
+        let intent = super::ContinuationIntent::ForceDigestReseed {
+            reason: Some("session_unresolvable".into()),
+        };
+        let held = super::HeldContinuation::capture(
+            Some("reseed"),
+            Some(&context),
+            &intent,
+            super::WakeCause::System,
+        );
+        let decoded: super::HeldContinuation =
+            serde_json::from_str(&serde_json::to_string(&held).unwrap()).unwrap();
+        assert!(decoded.force_digest_reseed);
+        assert!(decoded.supersede_pending_retry);
+        assert_eq!(
+            decoded.reseed_reason.as_deref(),
+            Some("session_unresolvable")
+        );
+        assert_eq!(decoded.message.as_deref(), Some("reseed"));
+    }
+
     use super::{
         apply_reseed_seed, assemble_resume_prompt, build_reseed_seed_content, drain_resume_pushes,
         ensure_reused_process_account, ensure_reused_process_model, prepend_resume_stamp,
@@ -6220,8 +6772,15 @@ mod tests {
         .await
         .unwrap();
 
-        let error = super::continue_job_impl(&orch, "j", None, None, None)
-            .expect_err("a closed session takes no turn");
+        let error = super::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "j",
+            None,
+            None,
+            None,
+        )
+        .expect_err("a closed session takes no turn");
         assert!(error.contains("has been merged"), "{error}");
 
         assert_eq!(
@@ -6278,8 +6837,15 @@ mod tests {
     async fn a_cancelled_job_with_an_open_session_is_refused_before_any_write() {
         let (orch, db) = cancelled_job("cancelled-open-session-refusal", "open", None).await;
 
-        let error = super::continue_job_impl(&orch, "j", Some("carry on"), None, None)
-            .expect_err("a cancelled job takes no turn");
+        let error = super::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "j",
+            Some("carry on"),
+            None,
+            None,
+        )
+        .expect_err("a cancelled job takes no turn");
         assert_eq!(error, super::CANCELLED_JOB_REFUSAL);
 
         assert_eq!(
@@ -6317,8 +6883,15 @@ mod tests {
         )
         .await;
 
-        let error = super::continue_job_impl(&orch, "j", Some("carry on"), None, None)
-            .expect_err("a cancelled job takes no turn");
+        let error = super::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "j",
+            Some("carry on"),
+            None,
+            None,
+        )
+        .expect_err("a cancelled job takes no turn");
         assert!(error.contains("has been merged"), "{error}");
         assert!(error.contains("reopen the issue"), "{error}");
     }
@@ -6470,7 +7043,14 @@ mod tests {
             });
         let launcher = orch.clone();
         tokio::task::spawn_blocking(move || {
-            super::continue_job_impl(&launcher, "j", message, None, resume)
+            super::continue_job_impl(
+                crate::execution::jobs::WakeCause::Addressed,
+                &launcher,
+                "j",
+                message,
+                None,
+                resume,
+            )
         })
         .await
         .unwrap()
@@ -6526,6 +7106,334 @@ mod tests {
             .await,
             (0, "background".to_string())
         );
+    }
+
+    type PreparationHook = Arc<dyn Fn(&Orchestrator) + Send + Sync>;
+
+    /// Per-job stand-ins for slow session preparation, run where a
+    /// continuation's preparation begins. Keyed by job id, so tests sharing a
+    /// process only see their own.
+    static PREPARATION_HOOKS: std::sync::LazyLock<
+        Mutex<std::collections::HashMap<String, PreparationHook>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    pub(super) fn before_session_preparation(orch: &Orchestrator, job_id: &str) {
+        let hook = PREPARATION_HOOKS.lock().unwrap().get(job_id).cloned();
+        if let Some(hook) = hook {
+            hook(orch);
+        }
+    }
+
+    /// `count` idle cold Claude jobs `{prefix}0..`, each on its own top-level
+    /// issue and session, so their continuations share nothing but the
+    /// process-wide admission lock.
+    async fn idle_cold_jobs(prefix: &str, count: usize) -> (Orchestrator, Vec<String>) {
+        let orch = test_orchestrator(migrated_test_db(prefix).await);
+        let mut script = String::from(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);",
+        );
+        let jobs: Vec<String> = (0..count).map(|n| format!("{prefix}{n}")).collect();
+        for (n, job) in jobs.iter().enumerate() {
+            script.push_str(&format!(
+                "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i-{job}','p',{number},'I','active',1,1);
+                 INSERT INTO jobs(id,project_id,issue_id,status,node_name,uri_segment,current_session_id,model,created_at,updated_at)
+                   VALUES('{job}','p','i-{job}','complete','builder','builder','sess-{job}','opus',1,1);
+                 INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
+                   VALUES('sess-{job}','{job}','claude',NULL,'open',1,1,1);
+                 INSERT INTO runs(id,job_id,session_id,status,started_at,start_mode,created_at,updated_at)
+                   VALUES('run-{job}','{job}','sess-{job}','exited',2,'fresh',1,3);
+                 INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at)
+                   VALUES('turn-{job}','sess-{job}','run-{job}','{job}',1,'complete','initial',1,3,3);
+                 UPDATE jobs SET current_turn_id='turn-{job}' WHERE id='{job}';",
+                number = n + 1,
+            ));
+        }
+        orch.db.local.execute_script(&script).await.unwrap();
+        (orch, jobs)
+    }
+
+    /// What concurrent continuations did with admission.
+    #[derive(Debug)]
+    struct AdmissionTrace {
+        wall: std::time::Duration,
+        /// Per continuation: whether it still held admission for itself when
+        /// its session preparation began.
+        admitted_into_preparation: Vec<bool>,
+        /// The longest any one acquisition was seen held (1 ms sampling).
+        longest_hold: std::time::Duration,
+    }
+
+    /// Continue `jobs` concurrently with `cause`, each spending `preparation`
+    /// in session preparation.
+    async fn concurrent_continuations(
+        orch: &Orchestrator,
+        jobs: &[String],
+        cause: crate::execution::jobs::WakeCause,
+        preparation: std::time::Duration,
+    ) -> AdmissionTrace {
+        let admitted_into_preparation = Arc::new(Mutex::new(Vec::new()));
+        for job in jobs {
+            let (seen, job_id) = (admitted_into_preparation.clone(), job.clone());
+            PREPARATION_HOOKS.lock().unwrap().insert(
+                job.clone(),
+                Arc::new(move |orch: &Orchestrator| {
+                    let own = orch
+                        .admission_lock
+                        .holder()
+                        .is_some_and(|holder| holder.subject == job_id);
+                    seen.lock().unwrap().push(own);
+                    std::thread::sleep(preparation);
+                }),
+            );
+        }
+        let _backend =
+            crate::orchestrator::session::install_orchestrator_test_session_backend(orch, || {
+                Box::new(RegisteringBackend)
+            });
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = {
+            let (orch, done) = (orch.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut longest = std::time::Duration::ZERO;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(holder) = orch.admission_lock.holder() {
+                        longest = longest.max(holder.held);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                longest
+            })
+        };
+        let started = std::time::Instant::now();
+        let launches: Vec<_> = jobs
+            .iter()
+            .map(|job| {
+                let (orch, job) = (orch.clone(), job.clone());
+                tokio::task::spawn_blocking(move || {
+                    super::continue_job_impl(cause, &orch, &job, None, None, None)
+                })
+            })
+            .collect();
+        let mut outcomes = Vec::new();
+        for launch in launches {
+            outcomes.push(launch.await.unwrap().map(|_| ()));
+        }
+        let wall = started.elapsed();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let longest_hold = sampler.join().unwrap();
+        for job in jobs {
+            PREPARATION_HOOKS.lock().unwrap().remove(job);
+        }
+        let admitted_into_preparation = admitted_into_preparation.lock().unwrap().clone();
+        let trace = AdmissionTrace {
+            wall,
+            admitted_into_preparation,
+            longest_hold,
+        };
+        for outcome in outcomes {
+            outcome.unwrap_or_else(|error| panic!("a continuation failed: {error}; {trace:?}"));
+        }
+        trace
+    }
+
+    /// An addressed continuation is never decided against a cap, so it does
+    /// not wait behind whoever holds admission (a sweep pass here), and a long
+    /// holder cannot time it out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_addressed_continuation_runs_while_admission_is_held() {
+        use crate::execution::gates::capacity::AdmissionSite;
+        let (orch, jobs) = idle_cold_jobs("addressed-unadmitted-", 1).await;
+        orch.admission_lock
+            .set_wait_bound(std::time::Duration::from_millis(200));
+        let sweep = orch
+            .admission_lock
+            .acquire(AdmissionSite::SweepPass, "175")
+            .await
+            .unwrap();
+        let trace = concurrent_continuations(
+            &orch,
+            &jobs,
+            crate::execution::jobs::WakeCause::Addressed,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        drop(sweep);
+        assert_eq!(trace.admitted_into_preparation, vec![false], "{trace:?}");
+        assert_eq!(
+            orch.admission_lock.acquisitions(AdmissionSite::HoldRelease),
+            0
+        );
+    }
+
+    /// A system delivery whose continuation waits out admission's bound is not
+    /// lost. The idle flush of a system push parks as a re-entry hold, the push
+    /// stays undelivered until the next gate pass launches the job, and that
+    /// pass delivers it exactly once; a later pass launches nothing more. A
+    /// continuation carrying its own input returns the error to the caller that
+    /// owns that input, and parks nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_busy_system_flush_parks_and_the_next_gate_pass_delivers_it_once() {
+        use crate::execution::gates::capacity::AdmissionSite;
+        use crate::execution::jobs::WakeCause;
+        use crate::storage::RowExt as _;
+        let (orch, jobs) = idle_cold_jobs("busy-parks-", 2).await;
+        let (idle, owned) = (jobs[0].clone(), jobs[1].clone());
+        {
+            let idle = idle.clone();
+            orch.db
+                .local
+                .write(move |conn| {
+                    let idle = idle.clone();
+                    Box::pin(async move {
+                        cairn_attention::direct::insert_system_direct_push_with_message_id_conn(
+                            conn,
+                            &idle,
+                            &format!("run-{idle}"),
+                            "the checks settled",
+                            crate::messages::queued::DeliveryUrgency::Steer,
+                            None,
+                            "m-busy",
+                        )
+                        .await
+                        .map(|_| ())
+                    })
+                })
+                .await
+                .unwrap();
+        }
+        let undelivered = |orch: Orchestrator, job: String| async move {
+            orch.db
+                .local
+                .query_opt(
+                    "SELECT COUNT(*) FROM attention_pushes WHERE recipient=?1 AND delivered_event_id IS NULL",
+                    (job,),
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap()
+        };
+        let turns = |orch: Orchestrator, job: String| async move {
+            orch.db
+                .local
+                .query_opt(
+                    "SELECT COUNT(*) FROM turns WHERE job_id=?1",
+                    (job,),
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap()
+        };
+        let gate_pass = |orch: Orchestrator| {
+            tokio::task::spawn_blocking(move || {
+                crate::storage::run_db_blocking(|| async move {
+                    let now = orch.services.clock.now();
+                    crate::orchestrator::wakes::resolve_thread_holds(&orch, now).await
+                })
+            })
+        };
+        assert_eq!(undelivered(orch.clone(), idle.clone()).await, Some(1));
+
+        orch.admission_lock
+            .set_wait_bound(std::time::Duration::from_millis(200));
+        let _backend =
+            crate::orchestrator::session::install_orchestrator_test_session_backend(&orch, || {
+                Box::new(RegisteringBackend)
+            });
+        let sweep = orch
+            .admission_lock
+            .acquire(AdmissionSite::SweepPass, "175")
+            .await
+            .unwrap();
+        let flushed = {
+            let (orch, run) = (orch.clone(), format!("run-{idle}"));
+            tokio::task::spawn_blocking(move || {
+                crate::messages::delivery::flush_pending_directs_on_idle(&orch, &run)
+            })
+            .await
+            .unwrap()
+        };
+        let carried = {
+            let (orch, job) = (orch.clone(), owned.clone());
+            tokio::task::spawn_blocking(move || {
+                super::continue_job_impl(
+                    WakeCause::System,
+                    &orch,
+                    &job,
+                    Some("a delegation result"),
+                    None,
+                    None,
+                )
+            })
+            .await
+            .unwrap()
+        };
+        let flushed = flushed.expect_err("a busy flush does not launch");
+        assert!(flushed.contains("the next gate pass"), "{flushed}");
+        let carried = carried.expect_err("a busy continuation does not launch");
+        assert!(carried.starts_with("thread admission busy"), "{carried}");
+        assert_eq!(
+            undelivered(orch.clone(), idle.clone()).await,
+            Some(1),
+            "the parked flush spent no delivery"
+        );
+        let holds = crate::orchestrator::wakes::load_active_provider_limit_holds(&orch.db.local)
+            .await
+            .unwrap();
+        assert_eq!(holds.len(), 1, "only the durable flush parks: {holds:?}");
+        assert_eq!(holds[0].job_id, idle);
+        assert_eq!(holds[0].boundary_source, "thread_focus");
+        assert_eq!(holds[0].kind, crate::orchestrator::wakes::HoldKind::Resume);
+
+        drop(sweep);
+        gate_pass(orch.clone()).await.unwrap().unwrap();
+        let still = crate::orchestrator::wakes::load_active_provider_limit_holds(&orch.db.local)
+            .await
+            .unwrap();
+        assert!(still.is_empty(), "the gate pass released it: {still:?}");
+        assert_eq!(turns(orch.clone(), idle.clone()).await, Some(2));
+        assert_eq!(
+            undelivered(orch.clone(), idle.clone()).await,
+            Some(0),
+            "the released continuation delivered the push"
+        );
+
+        gate_pass(orch.clone()).await.unwrap().unwrap();
+        assert_eq!(
+            turns(orch.clone(), idle.clone()).await,
+            Some(2),
+            "a later pass launches nothing more"
+        );
+        assert_eq!(turns(orch.clone(), owned.clone()).await, Some(1));
+    }
+
+    /// A system continuation is admitted, but only through the writes that
+    /// reserve its slot: concurrent ones overlap their session preparation
+    /// instead of queueing behind each other's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn system_continuations_release_admission_before_session_preparation() {
+        use crate::execution::gates::capacity::AdmissionSite;
+        const PREPARATION: std::time::Duration = std::time::Duration::from_millis(300);
+        let (orch, jobs) = idle_cold_jobs("system-reservation-only-", 4).await;
+        let trace = concurrent_continuations(
+            &orch,
+            &jobs,
+            crate::execution::jobs::WakeCause::System,
+            PREPARATION,
+        )
+        .await;
+        eprintln!("4 concurrent system continuations, {PREPARATION:?} preparation each: {trace:?}");
+        assert_eq!(
+            orch.admission_lock.acquisitions(AdmissionSite::HoldRelease),
+            4
+        );
+        assert_eq!(
+            trace.admitted_into_preparation,
+            vec![false; 4],
+            "a continuation prepared its session admitted: {trace:?}"
+        );
+        assert!(trace.longest_hold < PREPARATION, "{trace:?}");
+        assert!(trace.wall < PREPARATION * 3, "{trace:?}");
     }
 
     /// Records every byte a test process's stdin receives.
@@ -7644,12 +8552,21 @@ mod tests {
 
         let (orch, db) = standing_node("standing-node-wake").await;
         let before = session_state(&db).await;
+        let admission = orch
+            .admission_lock
+            .acquire(
+                crate::execution::gates::capacity::AdmissionSite::HoldRelease,
+                "j",
+            )
+            .await
+            .unwrap();
         let launch_lock = orch.job_launch_lock("j");
         let launch_guard = launch_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let launch = continue_job_launch_locked_for_recovery(
+            admission,
             &orch,
             "j",
             Some(ResumeContext {
@@ -8372,6 +9289,7 @@ mod tests {
                VALUES('req-queued','private-runtime','lane','ordinary:queued','{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,1,'queued',0,3,3);",
         ).await.unwrap();
         crate::storage::persist_prepared_ordinary_launch(&db, crate::storage::PreparedOrdinaryLaunch {
+            resume_json: None,
             request_id: "req-queued".into(), job_id: "j".into(), run_id: "queued".into(),
             session_id: "s1".into(), turn_id: "pending-turn".into(), execution_id: "e".into(),
             prompt: "queued delivery".into(), reason: crate::models::TurnStartReason::FollowUp,
@@ -9049,8 +9967,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failover_resume_reseeds_from_the_digest_when_it_pays() {
         let (orch, db) = failed_over_node("failover-reseeds", true).await;
-        super::continue_job_impl(&orch, "j", None, None, Some(hold_resolution(false)))
-            .expect("the hold's resolution launches");
+        super::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "j",
+            None,
+            None,
+            Some(hold_resolution(false)),
+        )
+        .expect("the hold's resolution launches");
 
         let successor_session = current_session(&db).await;
         assert_ne!(successor_session, "s1", "the failover resumed natively");
@@ -9087,8 +10012,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failover_resume_keeps_native_when_the_seed_would_not_pay() {
         let (orch, db) = failed_over_node("failover-keeps-native", false).await;
-        super::continue_job_impl(&orch, "j", None, None, Some(hold_resolution(false)))
-            .expect("the hold's resolution launches");
+        super::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "j",
+            None,
+            None,
+            Some(hold_resolution(false)),
+        )
+        .expect("the hold's resolution launches");
 
         assert_eq!(current_session(&db).await, "s1");
         let boundaries = session_boundaries(&db).await;
@@ -9103,8 +10035,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn answering_an_open_tool_call_never_reseeds() {
         let (orch, db) = failed_over_node("answer-keeps-native", true).await;
-        super::continue_job_impl(&orch, "j", None, None, Some(hold_resolution(true)))
-            .expect("the answer launches");
+        super::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "j",
+            None,
+            None,
+            Some(hold_resolution(true)),
+        )
+        .expect("the answer launches");
 
         assert_eq!(current_session(&db).await, "s1");
         for boundary in session_boundaries(&db).await {
@@ -9134,8 +10073,15 @@ mod tests {
             handle.account_id = Some("acct-a".to_string());
             processes.register("r1".to_string(), handle);
         }
-        super::continue_job_impl(&orch, "j", None, None, Some(hold_resolution(false)))
-            .expect("the hold's resolution launches");
+        super::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "j",
+            None,
+            None,
+            Some(hold_resolution(false)),
+        )
+        .expect("the hold's resolution launches");
 
         let boundaries = session_boundaries(&db).await;
         assert_eq!(boundaries.len(), 1, "{boundaries:?}");
@@ -9161,8 +10107,15 @@ mod tests {
         })
         .await
         .unwrap();
-        super::continue_job_impl(&orch, "j", None, None, Some(hold_resolution(false)))
-            .expect("a failed lookup never refuses the launch");
+        super::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "j",
+            None,
+            None,
+            Some(hold_resolution(false)),
+        )
+        .expect("a failed lookup never refuses the launch");
 
         assert_eq!(current_session(&db).await, "s1", "unknown is not cold");
         assert!(
@@ -11073,6 +12026,7 @@ mod tests {
             crate::effects::types::WorkflowEffect::AdvanceDag {
                 execution_id,
                 outbox_entry_id,
+                ..
             } => {
                 assert_eq!(execution_id, "exec-2");
                 assert_eq!(outbox_entry_id.as_deref(), Some(owed.as_str()));
@@ -11453,8 +12407,14 @@ mod tests {
         .await
         .unwrap();
 
-        let continued =
-            super::continue_job_impl(&orch, "j", Some("carry this forward"), None, None);
+        let continued = super::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "j",
+            Some("carry this forward"),
+            None,
+            None,
+        );
 
         let successor = db
             .query_opt_text("SELECT current_session_id FROM jobs WHERE id = 'j'", ())
@@ -11556,8 +12516,15 @@ mod tests {
         .await
         .unwrap();
 
-        let run = super::continue_job_impl(&orch, "j", Some("carry this forward"), None, None)
-            .expect("the continuation launches on a successor");
+        let run = super::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "j",
+            Some("carry this forward"),
+            None,
+            None,
+        )
+        .expect("the continuation launches on a successor");
         let successor = run.session_id.clone().expect("the run names its session");
         assert_ne!(successor, "sess-a");
         assert_eq!(
