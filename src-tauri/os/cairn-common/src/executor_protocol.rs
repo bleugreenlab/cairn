@@ -9419,6 +9419,17 @@ pub struct LearnedResourceEstimate {
 /// borrowed. Only the runner builds or renders process demands, into its own
 /// placement records, so a runner talking to an older executor gets nothing
 /// wrong.
+///
+/// cairn/6948 does not move the number. An executor no longer sends a
+/// resident process's `spec` in a snapshot, and no longer records its
+/// `runtimeAssets`/`runtimePackages` in the cell state it persists. `spec` was
+/// already optional and skipped when absent, and no runner reads it from a
+/// snapshot: the runner names a resident process by kind, generation, status,
+/// reservation and charge. A process's `spec.env`, `CAIRN_MCP_SECRET`
+/// included, therefore no longer travels in snapshots or into `buildSlots`.
+/// What a runner gets wrong talking to an older executor: nothing; it receives
+/// the spec it never reads, as before. A newer runner reading an older
+/// executor's state file sheds the payload on decode.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -15453,6 +15464,51 @@ pub struct ResidentProcessSpec {
     /// link. Absent for a colocated process, whose callback the runner set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<ResidentRelayGrant>,
+}
+
+impl ResidentProcessSpec {
+    /// This spec as a cell's resident-process record keeps it: without its
+    /// runtime assets and packages.
+    ///
+    /// Those are spawn inputs. The executor materializes them from the launch
+    /// request it is handed, and nothing ever reads them back from the record,
+    /// while a thread service or workflow runtime carries its package and the
+    /// `@cairn/sdk` bundle there: hundreds of kilobytes that every rewrite of
+    /// the cell's state file paid for, encoded a JSON number per byte.
+    pub fn as_recorded(&self) -> Self {
+        let Self {
+            program,
+            args,
+            launch_command,
+            cwd,
+            cwd_root,
+            env,
+            sandbox_mode,
+            sandbox_policy,
+            runtime_assets: _,
+            runtime_packages: _,
+            io,
+            stdout_framing,
+            node_scratch,
+            relay,
+        } = self;
+        Self {
+            program: program.clone(),
+            args: args.clone(),
+            launch_command: launch_command.clone(),
+            cwd: cwd.clone(),
+            cwd_root: *cwd_root,
+            env: env.clone(),
+            sandbox_mode: *sandbox_mode,
+            sandbox_policy: sandbox_policy.clone(),
+            runtime_assets: Vec::new(),
+            runtime_packages: Vec::new(),
+            io: io.clone(),
+            stdout_framing: *stdout_framing,
+            node_scratch: node_scratch.clone(),
+            relay: relay.clone(),
+        }
+    }
 }
 
 /// The runner's instruction to relay one resident process's callbacks.

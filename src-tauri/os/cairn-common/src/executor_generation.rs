@@ -102,6 +102,13 @@ pub fn held_cell_authorities(paths: &ExecutorPaths) -> Vec<PathBuf> {
 /// strict at the protocol boundary. The executor and the runner share this one
 /// decoder, so a cell the executor would adopt is never one the runner reads
 /// as empty.
+///
+/// A resident process recorded by an executor that still kept its runtime
+/// payloads is read as one recorded now (see
+/// [`ResidentProcessSpec::as_recorded`]), so the payload leaves the state file
+/// at its next write rather than at the process's next launch.
+///
+/// [`ResidentProcessSpec::as_recorded`]: crate::executor_protocol::ResidentProcessSpec::as_recorded
 pub fn decode_persistent_cell_state(bytes: &[u8]) -> Result<PersistentCellState, String> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("unparseable persistent slot state: {error}"))?;
@@ -118,7 +125,14 @@ pub fn decode_persistent_cell_state(bytes: &[u8]) -> Result<PersistentCellState,
         other => return Err(format!("unknown persistent slot lifecycle: {other:?}")),
     };
     value["lifecycle"] = serde_json::Value::String(migrated.into());
-    serde_json::from_value(value).map_err(|error| format!("invalid persistent slot state: {error}"))
+    let mut state: PersistentCellState = serde_json::from_value(value)
+        .map_err(|error| format!("invalid persistent slot state: {error}"))?;
+    for process in state.occupancy.processes.values_mut() {
+        if let Some(spec) = &mut process.spec {
+            *spec = spec.as_recorded();
+        }
+    }
+    Ok(state)
 }
 
 /// What one cell authority's state file says right now.
