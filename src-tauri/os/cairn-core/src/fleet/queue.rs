@@ -870,15 +870,17 @@ impl ExecutionQueue {
             .collect()
     }
 
-    /// Retain admission evidence in the existing transition journal without
-    /// inventing a second queue state or a second persistence stream.
+    /// [`Self::record_placement_signed`] under the decision's own signature,
+    /// for tests that have no material facts beyond the decision.
+    #[cfg(test)]
     pub(crate) fn record_placement(&self, decision: &super::PlacementDecision) {
         self.record_placement_signed(decision, super::decision_signature(decision, &[]));
     }
 
-    /// [`Self::record_placement`] under a signature the caller computed,
-    /// for a caller that knows of material facts the decision does not
-    /// carry.
+    /// Retain admission evidence in the existing transition journal without
+    /// inventing a second queue state or a second persistence stream, under
+    /// a signature the caller computed so material facts the decision does
+    /// not carry can count as a change.
     ///
     /// The entry's latest decision is always replaced, so the live views stay
     /// current. A row is written only for a signature this entry has not

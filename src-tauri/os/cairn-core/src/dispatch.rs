@@ -141,8 +141,7 @@ pub(crate) fn begin_delivery_effect() -> bool {
 /// take its next effect. `false` when the current delivery was asked to stop
 /// or was abandoned; otherwise the delivery is marked effectful.
 pub(crate) fn delivery_may_take_effect() -> bool {
-    current_delivery()
-        .is_none_or(|delivery| !delivery.stop_requested() && delivery.begin_effect())
+    current_delivery().is_none_or(|delivery| !delivery.stop_requested() && delivery.begin_effect())
 }
 
 pub(crate) fn effective_read_target(payload: &serde_json::Value) -> Option<&str> {

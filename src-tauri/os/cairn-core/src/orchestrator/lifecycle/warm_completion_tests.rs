@@ -2440,7 +2440,10 @@ async fn provider_depletion_answers_the_calls_its_stopped_process_left_open() {
     assert_eq!(results[0]["raw"]["reason"], "process_lost");
     assert_eq!(results[0]["raw"]["exit_reason"], "provider_depleted");
     let text = results[0]["toolResult"].as_str().unwrap();
-    assert!(text.contains("(its provider account is depleted)"), "{text}");
+    assert!(
+        text.contains("(its provider account is depleted)"),
+        "{text}"
+    );
 }
 
 /// cairn/6123: a delegated task's `fail_run` marks its turn `failed` before

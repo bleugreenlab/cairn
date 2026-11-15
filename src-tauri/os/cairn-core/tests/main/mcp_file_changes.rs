@@ -4098,7 +4098,13 @@ async fn an_uncorrelated_resource_write_cut_off_between_items_stops_there() {
     let delivered = parse_report(&write.await.unwrap());
 
     assert_eq!(indices(&delivered, "applied"), vec![0], "{delivered}");
-    assert!(failure_error(&delivered, 1).starts_with("not applied"), "{delivered}");
-    assert!(failure_error(&delivered, 2).starts_with("not applied"), "{delivered}");
+    assert!(
+        failure_error(&delivered, 1).starts_with("not applied"),
+        "{delivered}"
+    );
+    assert!(
+        failure_error(&delivered, 2).starts_with("not applied"),
+        "{delivered}"
+    );
     assert_eq!(item_counts(&repo).await, vec![1, 0, 0]);
 }

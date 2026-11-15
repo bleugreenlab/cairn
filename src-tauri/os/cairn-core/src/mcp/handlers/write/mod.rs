@@ -1939,9 +1939,14 @@ async fn handle_write_attempt(
             #[cfg(feature = "test-utils")]
             if let Some(call) = write_call.as_ref().filter(|_| resource_progress.is_some()) {
                 replay::hold_resource_item(call, index, replay::ItemPhase::BeforeDispatch).await;
-            } else if let Some(run_id) = request.run_id.as_deref().filter(|_| write_call.is_none()) {
-                replay::hold_unclaimed_resource_item(run_id, index, replay::ItemPhase::BeforeDispatch)
-                    .await;
+            } else if let Some(run_id) = request.run_id.as_deref().filter(|_| write_call.is_none())
+            {
+                replay::hold_unclaimed_resource_item(
+                    run_id,
+                    index,
+                    replay::ItemPhase::BeforeDispatch,
+                )
+                .await;
             }
             // A stopped write stops here, between items: an item already
             // dispatching runs to completion.
