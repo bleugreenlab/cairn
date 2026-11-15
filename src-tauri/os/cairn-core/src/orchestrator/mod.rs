@@ -2510,7 +2510,11 @@ impl Orchestrator {
         let mut guard = self.attached_ui.lock().unwrap_or_else(|e| e.into_inner());
         let generation = guard.next_generation;
         guard.next_generation = guard.next_generation.wrapping_add(1);
-        guard.current = Some((generation, pid));
+        let replaced = guard.current.replace((generation, pid));
+        log::info!(
+            "desktop ui attached: pid={pid} generation={generation} replaced={}",
+            Self::describe_ui_registration(replaced)
+        );
         generation
     }
 
@@ -2521,12 +2525,24 @@ impl Orchestrator {
     /// no-op and cannot clobber the live registration.
     pub fn detach_ui_pid(&self, generation: u64) {
         let mut guard = self.attached_ui.lock().unwrap_or_else(|e| e.into_inner());
-        if guard
-            .current
-            .is_some_and(|(current, _)| current == generation)
-        {
-            guard.current = None;
+        match guard.current {
+            Some((current, pid)) if current == generation => {
+                guard.current = None;
+                log::info!("desktop ui detached: pid={pid} generation={generation}");
+            }
+            other => log::info!(
+                "desktop ui detach ignored: generation={generation} is not current (current={})",
+                Self::describe_ui_registration(other)
+            ),
         }
+    }
+
+    /// `pid=<pid> generation=<g>` or `none`, for the attach/detach log lines.
+    fn describe_ui_registration(registration: Option<(u64, u32)>) -> String {
+        registration.map_or_else(
+            || "none".to_string(),
+            |(generation, pid)| format!("pid={pid} generation={generation}"),
+        )
     }
 
     /// The OS process id of the desktop UI attached over `/ws`, or `None` when no
