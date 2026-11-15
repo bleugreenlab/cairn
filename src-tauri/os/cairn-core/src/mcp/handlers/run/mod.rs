@@ -15254,12 +15254,17 @@ pub(crate) mod host_batch_tests {
         control: &Arc<BatchControl>,
         task: tokio::task::JoinHandle<()>,
     ) {
+        // The settle includes the parked call's resolution, which first waits
+        // out the park's fixed handoff grace and then resumes the job: about
+        // 0.3 s on an idle host, and an order of magnitude more under a full
+        // suite. The bound is the one an operator's cancel gets, so `settled`
+        // here asserts the product's contract rather than a test-local guess.
         let report = cancel::cancel_batch(
             orch,
             &orch.db.local,
             &control.request_id,
             "operator",
-            Duration::from_secs(5),
+            cancel::CANCEL_SETTLE_WAIT,
         )
         .await;
         assert_eq!(report, cancel::CancelReport::Stopped { settled: true });
@@ -15708,7 +15713,7 @@ pub(crate) mod host_batch_tests {
             &orch.db.local,
             &control.request_id,
             "operator",
-            Duration::from_secs(10),
+            cancel::CANCEL_SETTLE_WAIT,
         )
         .await;
         assert_eq!(report, cancel::CancelReport::Stopped { settled: true });
@@ -15752,7 +15757,7 @@ pub(crate) mod host_batch_tests {
             &orch.db.local,
             &control.request_id,
             "operator",
-            Duration::from_secs(10),
+            cancel::CANCEL_SETTLE_WAIT,
         )
         .await;
         assert_eq!(report, cancel::CancelReport::Stopped { settled: true });
