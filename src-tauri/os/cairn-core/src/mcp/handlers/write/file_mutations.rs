@@ -142,6 +142,9 @@ pub(super) fn logical_paths_for_changes(
     Ok(paths.into_iter().collect())
 }
 
+const ABANDONED_BEFORE_DISK_WRITE: &str =
+    "not applied: the call was abandoned before this file was written";
+
 pub(super) fn apply_logical_file_batch(
     request: &McpCallbackRequest,
     changes: &[IndexedChange<'_>],
@@ -181,6 +184,15 @@ pub(super) fn apply_prepared_logical(
             } => {
                 let indexed = &changes[*change_pos];
                 if *outside_worktree {
+                    // Written to disk now, and never rolled back: the write's
+                    // first effect, which a dropped callback must not cut off.
+                    if !crate::dispatch::begin_delivery_effect() {
+                        return Err(build_failure(
+                            indexed.index,
+                            indexed.item,
+                            ABANDONED_BEFORE_DISK_WRITE,
+                        ));
+                    }
                     if let Some(parent) = full_path.parent() {
                         std::fs::create_dir_all(parent).map_err(|error| build_failure(indexed.index, indexed.item, format!("Failed to create parent directories for '{target_uri}': {error}")))?;
                     }
@@ -216,6 +228,13 @@ pub(super) fn apply_prepared_logical(
             } => {
                 let indexed = &changes[*change_pos];
                 if *outside_worktree {
+                    if !crate::dispatch::begin_delivery_effect() {
+                        return Err(build_failure(
+                            indexed.index,
+                            indexed.item,
+                            ABANDONED_BEFORE_DISK_WRITE,
+                        ));
+                    }
                     if full_path.exists() {
                         std::fs::remove_file(full_path).map_err(|error| {
                             build_failure(

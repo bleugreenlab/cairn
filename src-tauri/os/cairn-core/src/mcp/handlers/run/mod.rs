@@ -184,6 +184,17 @@ pub(crate) enum RunFailure {
     /// its result is recorded, so one that carried a `commit_msg` may have landed
     /// even though its result is gone.
     LostToRestart { commits: bool },
+    /// The agent process serving the batch ended while the host lived; `opening`
+    /// says how. Its commit may have landed for the same reason.
+    LostWithProcess { commits: bool, opening: String },
+}
+
+fn what_a_lost_batch_landed(commits: bool) -> &'static str {
+    if commits {
+        "Its `commit_msg` may have landed before its result was lost. Look for that message in `cairn:@/vcs/log` and read the files before re-running the batch."
+    } else {
+        "Nothing was committed. Re-run the batch if you still need it."
+    }
 }
 
 impl RunFailure {
@@ -203,16 +214,14 @@ impl RunFailure {
             Self::NotPublished(detail) => format!("{RUN_NOT_PUBLISHED}: {detail}"),
             Self::Cancelled(None) => format!("{RUN_CANCELLED} before it finished."),
             Self::Cancelled(Some(detail)) => format!("{RUN_CANCELLED}: {detail}"),
-            Self::LostToRestart { commits } => {
-                let what_landed = if *commits {
-                    "Its `commit_msg` may have landed before the restart. Look for that message in `cairn:@/vcs/log` and read the files before re-running the batch."
-                } else {
-                    "Nothing was committed. Re-run the batch if you still need it."
-                };
-                format!(
-                    "{RUN_OUTCOME_UNKNOWN}: this host restarted while the batch was still running, so its result was lost. {what_landed}"
-                )
-            }
+            Self::LostToRestart { commits } => format!(
+                "{RUN_OUTCOME_UNKNOWN}: this host restarted while the batch was still running, so its result was lost. {}",
+                what_a_lost_batch_landed(*commits)
+            ),
+            Self::LostWithProcess { commits, opening } => format!(
+                "{RUN_OUTCOME_UNKNOWN}: {opening} {}",
+                what_a_lost_batch_landed(*commits)
+            ),
         }
     }
 }
@@ -364,7 +373,8 @@ mod failure_contract_tests {
             | RunFailure::DispatchedWithoutResult(_)
             | RunFailure::NotPublished(_)
             | RunFailure::Cancelled(_)
-            | RunFailure::LostToRestart { .. } => {}
+            | RunFailure::LostToRestart { .. }
+            | RunFailure::LostWithProcess { .. } => {}
         }
         vec![
             RunFailure::NotExecuted("its environment could not be reached (timeout).".to_string()),
@@ -384,6 +394,10 @@ mod failure_contract_tests {
             RunFailure::Cancelled(Some(RUN_CEILING_DETAIL.to_string())),
             RunFailure::LostToRestart { commits: true },
             RunFailure::LostToRestart { commits: false },
+            RunFailure::LostWithProcess {
+                commits: true,
+                opening: "The agent process serving this call ended (it crashed) before its result reached you.".to_string(),
+            },
         ]
     }
 
@@ -423,9 +437,11 @@ mod failure_contract_tests {
             "RUN_NOT_PUBLISHED",
             "RUN_CANCELLED",
         ] {
-            // These openings each serve two variants.
+            // These openings each serve two variants, and the outcome-unknown
+            // opening three (a silent dispatch, a restart, a process end).
             let expected = match identifier {
-                "RUN_CANCELLED" | "RUN_NOT_EXECUTED" | "RUN_OUTCOME_UNKNOWN" => 4,
+                "RUN_OUTCOME_UNKNOWN" => 5,
+                "RUN_CANCELLED" | "RUN_NOT_EXECUTED" => 4,
                 _ => 3,
             };
             assert_eq!(
@@ -7346,6 +7362,14 @@ pub(crate) const RUN_ITEM_SUSPENDED_MARKER: &str =
 /// leaving the row pending would strand it.
 pub(crate) fn run_batch_lost_to_restart_text(commits: bool) -> String {
     RunFailure::LostToRestart { commits }.text()
+}
+
+pub(crate) fn run_batch_lost_with_process_text(opening: &str, commits: bool) -> String {
+    RunFailure::LostWithProcess {
+        commits,
+        opening: opening.to_string(),
+    }
+    .text()
 }
 
 /// Where a job's process batch obtains its checkout.

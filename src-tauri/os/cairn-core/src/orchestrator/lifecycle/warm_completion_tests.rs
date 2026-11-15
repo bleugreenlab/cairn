@@ -2375,3 +2375,92 @@ mod honest_pause_regressions {
         assert_eq!(set_statuses(&requests), ["paused", "active"]);
     }
 }
+
+/// Record an open `read` call `tool_use_id` on `turn`, as run `run`'s process
+/// made it, in that turn's own session.
+async fn seed_open_read(db: &LocalDb, run: &str, turn: &str, tool_use_id: &str) {
+    let data = serde_json::json!({
+        "eventType": "assistant",
+        "isError": false,
+        "toolUses": [{"id": tool_use_id, "name": "mcp__cairn__read", "input": {"paths": ["file:a.rs"]}}]
+    })
+    .to_string();
+    db.execute(
+        "INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,created_at)
+         SELECT 'e-open-' || ?3, ?1, session_id, id, 50, 50, 'assistant', ?4, 50 FROM turns WHERE id = ?2",
+        cairn_db::turso::params![run, turn, tool_use_id, data],
+    )
+    .await
+    .unwrap();
+}
+
+async fn results_for(orch: &Orchestrator, tool_use_id: &str) -> Vec<Value> {
+    let tool_use_id = tool_use_id.to_string();
+    orch.db
+        .local
+        .read(move |conn| {
+            let tool_use_id = tool_use_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT data FROM events WHERE event_type = 'tool_result'
+                         AND json_extract(data, '$.toolUseId') = ?1",
+                        cairn_db::turso::params![tool_use_id.as_str()],
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(serde_json::from_str(&row.text(0)?).unwrap());
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .unwrap()
+}
+
+/// cairn/6123: provider depletion interrupts the turn and stops its process
+/// before finalizing, so the cut-off gate never sees a running turn. The
+/// calls that process left open are still answered once, with its cause.
+#[tokio::test]
+async fn provider_depletion_answers_the_calls_its_stopped_process_left_open() {
+    let db = test_db().await;
+    seed_top_level_run(&db, "run-dep", "job-dep", "turn-dep", "none").await;
+    seed_open_read(&db, "run-dep", "turn-dep", "toolu-dep").await;
+    let orch = test_orchestrator(db);
+    register_warm_process(&orch, "run-dep", Some("job-dep"));
+    orch.process_state
+        .set_current_turn_id("run-dep", Some("turn-dep"));
+
+    super::interrupt_run_for_provider_depletion(&orch, "run-dep");
+
+    assert_eq!(turn_state(&orch, "turn-dep").await, "interrupted");
+    let results = results_for(&orch, "toolu-dep").await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0]["raw"]["reason"], "process_lost");
+    assert_eq!(results[0]["raw"]["exit_reason"], "provider_depleted");
+    let text = results[0]["toolResult"].as_str().unwrap();
+    assert!(text.contains("(its provider account is depleted)"), "{text}");
+}
+
+/// cairn/6123: a delegated task's `fail_run` marks its turn `failed` before
+/// finalizing, so the cut-off gate never sees it. The calls its process left
+/// open are still answered once, with the failure's reason.
+#[tokio::test]
+async fn a_delegated_fail_run_answers_the_calls_its_process_left_open() {
+    let db = test_db().await;
+    seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
+    seed_open_read(&db, "run-child", "child-turn", "toolu-child").await;
+    let orch = test_orchestrator(db);
+    register_warm_process(&orch, "run-child", Some("j-child"));
+    orch.process_state
+        .set_current_turn_id("run-child", Some("child-turn"));
+
+    super::fail_run(&orch, "run-child", "turn_failed");
+
+    assert_eq!(turn_state(&orch, "child-turn").await, "failed");
+    let results = results_for(&orch, "toolu-child").await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0]["raw"]["reason"], "process_lost");
+    assert_eq!(results[0]["raw"]["exit_reason"], "turn_failed");
+}

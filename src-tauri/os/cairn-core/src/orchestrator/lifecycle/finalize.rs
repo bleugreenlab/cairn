@@ -784,6 +784,10 @@ pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
         .get_current_turn_id(run_id)
         .or_else(|| current_turn_id_for_run(orch, run_id));
     if let Some(turn_id) = turn_id {
+        // The run ends here and its turn ends `failed`, which finalization's
+        // cut-off gate does not read as cut off, so the calls it left open are
+        // answered now, while the turn is still the one that made them.
+        super::settle_calls_cut_off_by_process_end(orch, run_id, &turn_id, reason);
         if let Err(e) = apply_turn_outcome(orch, &turn_id, TurnState::Failed, None) {
             log::warn!(
                 "fail_run: failed to mark turn {} as Failed for run {}: {}",
@@ -868,6 +872,17 @@ pub(crate) fn interrupt_run_for_provider_depletion(orch: &Orchestrator, run_id: 
         }
     }
     release_and_stop_process(orch, run_id);
+    // The turn already ended `provider_depleted`, which finalization's cut-off
+    // gate does not read as cut off: answer the calls the stopped process left
+    // open here, before finalization can flush a delivery into a successor.
+    if let Some(turn_id) = turn_id.as_deref() {
+        super::settle_calls_cut_off_by_process_end(
+            orch,
+            run_id,
+            turn_id,
+            &TurnEndReason::ProviderDepleted.to_string(),
+        );
+    }
     finalize_run(orch, run_id, RunStatus::Crashed);
 }
 
@@ -936,6 +951,41 @@ pub(crate) fn finalize_run_for_operator_compact(
     status: RunStatus,
 ) -> Result<(), String> {
     finalize_run_inner(orch, run_id, status, FinalizeEffects::OperatorCompact, None)
+}
+
+/// The exit reason to answer `turn_id`'s open calls with, when this
+/// finalization is the end of the process that was serving that turn. Paths
+/// that end the turn themselves before finalizing (provider depletion, a
+/// delegated `fail_run`) settle their calls explicitly instead. Here: the
+/// turn is still running under a kill (`cut_off`) or a crash, or a stop or the
+/// watchdog interrupted it and the kill that followed is ending its process.
+///
+/// `None` for a clean exit, whose turn finished its calls; for a host shutting
+/// down, whose boot sweep answers them as a restart; and for an operator
+/// Compact, which discards the session the calls belong to.
+fn process_end_cut_off(
+    orch: &Orchestrator,
+    run_id: &str,
+    turn_id: &str,
+    status: &RunStatus,
+    effects: FinalizeEffects,
+    cut_off: Option<&TurnEndReason>,
+) -> Option<String> {
+    if effects == FinalizeEffects::OperatorCompact || host_shutdown_in_progress(orch, run_id) {
+        return None;
+    }
+    let cut = match turn_state(orch, turn_id)?.as_str() {
+        "running" => cut_off.is_some() || *status == RunStatus::Crashed,
+        "interrupted" => {
+            cut_off.is_some()
+                && turn_end_reason(orch, turn_id).is_some_and(|reason| {
+                    reason == TurnEndReason::UserStop.to_string()
+                        || reason == TurnEndReason::WatchdogRecovery.to_string()
+                })
+        }
+        _ => false,
+    };
+    cut.then(|| run_exit_reason(orch, run_id).unwrap_or_else(|| "crash".to_string()))
 }
 
 /// `cut_off`, when a deliberate kill names one, is the end reason of a turn
@@ -1008,6 +1058,16 @@ fn finalize_run_inner(
         }
         crate::execution::jobs::on_call_run_finalized(orch, run_id);
         return Ok(());
+    }
+    // Answered before the turn is terminalized below, and before anything this
+    // finalization sets off can launch a successor whose prompt must carry the
+    // answers.
+    if let Some(turn_id) = turn_id.as_deref() {
+        if let Some(exit_reason) =
+            process_end_cut_off(orch, run_id, turn_id, &status, effects, cut_off.as_ref())
+        {
+            super::settle_calls_cut_off_by_process_end(orch, run_id, turn_id, &exit_reason);
+        }
     }
     let had_active_turn = turn_id.is_some();
     if let Some(ref turn_id) = turn_id {

@@ -217,6 +217,16 @@ pub fn reap_stale_runs_for_job(orch: &Orchestrator, db: &Arc<LocalDb>, job_id: &
         // An ephemeral call's row still holding a slot is released and its
         // process (if one appears) stopped; a no-op for every other run.
         crate::execution::jobs::on_call_run_finalized(orch, run_id);
+        // The calls the vanished process left open are answered under the
+        // launch lock, before the job is re-derived and can resume.
+        for turn_id in turn_ids {
+            crate::orchestrator::lifecycle::settle_calls_cut_off_by_process_end(
+                orch,
+                run_id,
+                turn_id,
+                STALE_RUN_EXIT_REASON,
+            );
+        }
     }
     emit_settled(orch, db, &settled);
     settled.len()

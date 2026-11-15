@@ -332,6 +332,16 @@ impl WriteCall {
     pub(super) fn tool_use_id(&self) -> &str {
         &self.id
     }
+
+    /// Register the current delivery under this call, for a call its delivery
+    /// did not name and that was found in the transcript instead.
+    pub(super) fn register_found(&self, orch: &Orchestrator) -> WriteRegistration {
+        orch.write_stops.enter(
+            &self.run_id,
+            &self.id,
+            crate::dispatch::current_delivery().unwrap_or_default(),
+        )
+    }
 }
 
 /// The existing write ledger, pinned to the database that owns it. Branch
@@ -760,13 +770,18 @@ pub(super) fn mark_as_replay(report: &str) -> String {
 // - The carrier checkpoints the ledger row after every resource item and once
 //   its commit is sealed, still behind the pending marker, so a redelivery
 //   keeps waiting rather than replaying a partial report.
-// - An operator Stop raises the call's flag in [`WriteStops`]; the carrier
-//   checks it before each resource dispatch and before the commit, so a write
-//   stops between items, never in the middle of one, and seals its row. File
-//   items a stop lands before the commit are `not applied`.
-// - A carrier future dropped before it finalizes (the transport aborting the
-//   call) seals the row from what it last knew ([`ResourceWriteProgress`]'s
-//   `Drop`).
+// - An operator Stop or a process teardown raises the stop flag of every
+//   delivery [`WriteStops`] holds for the run; the carrier checks it before
+//   each resource dispatch and before the commit, so a write stops between
+//   items, never in the middle of one, and seals its row. File items a stop
+//   lands before the commit are `not applied`. A write with no resource claim
+//   stops there too and records no row, because it published nothing.
+// - A transport that drops the callback of a write already taking effect
+//   raises only that delivery's flag and lets it finish
+//   ([`crate::dispatch::Delivery`]), so the drop reaches the same boundary.
+// - A carrier future dropped before it finalizes anyway (an abort, or the
+//   host dying under it) seals the row from what it last knew
+//   ([`ResourceWriteProgress`]'s `Drop`).
 //
 // A sealed row is final, so a redelivery replays it and applies nothing.
 
@@ -779,62 +794,145 @@ const NOT_CONFIRMED: &str =
 const NOT_COMMITTED: &str =
     "not applied: the write was stopped before its file changes were committed";
 
-/// The stop flags of the resource writes now applying items, by
-/// `(run_id, tool_use_id)`.
+type Deliveries =
+    std::collections::HashMap<(String, String), Vec<std::sync::Arc<crate::dispatch::Delivery>>>;
+
+/// The report of a write holding no ledger claim that was stopped at a
+/// boundary (before a resource item, or before its commit). Resource items it
+/// already dispatched took effect and stay applied; its file items were only
+/// interpreted, so they and every item not yet reached are `not applied`.
+pub(super) fn stopped_unclaimed_report(
+    payload: &ChangePayload,
+    applied: &[super::types::AppliedChange],
+    failures: &[super::types::ChangeFailure],
+    atomic: bool,
+) -> String {
+    use crate::mcp::handlers::target::{target_family, TargetFamily};
+    let file_items: std::collections::HashSet<usize> = payload
+        .changes
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| matches!(target_family(&item.target), Ok(TargetFamily::File)))
+        .map(|(index, _)| index)
+        .collect();
+    let applied: Vec<_> = applied
+        .iter()
+        .filter(|change| !file_items.contains(&change.index))
+        .cloned()
+        .collect();
+    let partial_success = !applied.is_empty() && !failures.is_empty();
+    let report =
+        super::empty_change_report(applied, failures.to_vec(), None, partial_success, atomic);
+    let Ok(mut value) = serde_json::to_value(&report) else {
+        return String::new();
+    };
+    let items: Vec<(String, String)> = payload
+        .changes
+        .iter()
+        .map(|item| {
+            (
+                item.target.clone(),
+                super::types::mode_name(item.mode).to_string(),
+            )
+        })
+        .collect();
+    mark_unsettled(&mut value, &items, |index| {
+        if file_items.contains(&index) {
+            NOT_COMMITTED.to_string()
+        } else {
+            NOT_APPLIED.to_string()
+        }
+    });
+    serde_json::to_string(&value).unwrap_or_default()
+}
+
+/// The deliveries of every write now being served, by `(run_id, tool_use_id)`.
+///
+/// One Codex exec cell can make several calls under one tool-use id, so a key
+/// holds each delivery separately: one finishing never unregisters its twin.
 #[derive(Default)]
 pub struct WriteStops {
-    flags: std::sync::Mutex<
-        std::collections::HashMap<(String, String), std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    >,
+    deliveries: std::sync::Mutex<Deliveries>,
+}
+
+/// A write delivery's place in [`WriteStops`], held for as long as the write
+/// is served. Dropping it (the write returning, or its future being aborted)
+/// removes exactly this delivery.
+pub(crate) struct WriteRegistration {
+    stops: std::sync::Arc<WriteStops>,
+    key: (String, String),
+    delivery: std::sync::Arc<crate::dispatch::Delivery>,
+}
+
+impl Drop for WriteRegistration {
+    fn drop(&mut self) {
+        let mut deliveries = self.stops.deliveries();
+        if let Some(entries) = deliveries.get_mut(&self.key) {
+            if let Some(position) = entries
+                .iter()
+                .position(|entry| std::sync::Arc::ptr_eq(entry, &self.delivery))
+            {
+                entries.swap_remove(position);
+            }
+            if entries.is_empty() {
+                deliveries.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl WriteStops {
-    fn flags(
-        &self,
-    ) -> std::sync::MutexGuard<
-        '_,
-        std::collections::HashMap<(String, String), std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    > {
-        self.flags
+    fn deliveries(&self) -> std::sync::MutexGuard<'_, Deliveries> {
+        self.deliveries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn register(&self, call: &WriteCall) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.flags()
-            .insert((call.run_id.clone(), call.id.clone()), flag.clone());
-        flag
+    /// Register `delivery` as serving the write `tool_use_id` of `run_id`.
+    pub(crate) fn enter(
+        self: &std::sync::Arc<Self>,
+        run_id: &str,
+        tool_use_id: &str,
+        delivery: std::sync::Arc<crate::dispatch::Delivery>,
+    ) -> WriteRegistration {
+        let key = (run_id.to_string(), tool_use_id.to_string());
+        self.deliveries()
+            .entry(key.clone())
+            .or_default()
+            .push(delivery.clone());
+        WriteRegistration {
+            stops: self.clone(),
+            key,
+            delivery,
+        }
     }
 
-    fn unregister(&self, call: &WriteCall) {
-        self.flags().remove(&(call.run_id.clone(), call.id.clone()));
-    }
-
-    /// Ask every resource write of `run_id` to stop before its next item.
-    /// Returns how many were asked.
+    /// Ask every write of `run_id` to stop before its next item or commit.
+    /// Returns how many deliveries were asked.
     pub(crate) fn raise(&self, run_id: &str) -> usize {
-        let flags = self.flags();
+        let deliveries = self.deliveries();
         let mut raised = 0;
-        for ((run, _), flag) in flags.iter() {
+        for ((run, _), entries) in deliveries.iter() {
             if run == run_id {
-                flag.store(true, std::sync::atomic::Ordering::Release);
-                raised += 1;
+                for delivery in entries {
+                    delivery.raise_stop();
+                    raised += 1;
+                }
             }
         }
         raised
     }
 
-    /// Whether a stop has asked this call to stop.
+    /// Whether a stop has asked a delivery of this call to stop.
     pub fn is_raised(&self, run_id: &str, tool_use_id: &str) -> bool {
-        self.flags()
+        self.deliveries()
             .get(&(run_id.to_string(), tool_use_id.to_string()))
-            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+            .is_some_and(|entries| entries.iter().any(|delivery| delivery.stop_requested()))
     }
 
-    /// Whether this call is applying items right now.
+    /// Whether a delivery of this call is still being served.
     pub(crate) fn is_applying(&self, run_id: &str, tool_use_id: &str) -> bool {
-        self.flags()
+        self.deliveries()
             .contains_key(&(run_id.to_string(), tool_use_id.to_string()))
     }
 }
@@ -863,8 +961,7 @@ pub(super) struct ResourceWriteProgress {
     /// The indices of the file items, which take effect only at the commit.
     file_items: std::collections::HashSet<usize>,
     atomic: bool,
-    stops: std::sync::Arc<WriteStops>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    delivery: std::sync::Arc<crate::dispatch::Delivery>,
     applied: Vec<super::types::AppliedChange>,
     failures: Vec<super::types::ChangeFailure>,
     commit: Option<super::types::CommitReport>,
@@ -884,7 +981,6 @@ impl ResourceWriteProgress {
         atomic: bool,
     ) -> Self {
         use crate::mcp::handlers::target::{target_family, TargetFamily};
-        let stop = orch.write_stops.register(call);
         Self {
             db: orch.db.local.clone(),
             call: call.clone(),
@@ -906,8 +1002,7 @@ impl ResourceWriteProgress {
                 .map(|(index, _)| index)
                 .collect(),
             atomic,
-            stops: orch.write_stops.clone(),
-            stop,
+            delivery: crate::dispatch::current_delivery().unwrap_or_default(),
             applied: Vec::new(),
             failures: Vec::new(),
             commit: None,
@@ -917,9 +1012,10 @@ impl ResourceWriteProgress {
         }
     }
 
-    /// Whether an operator Stop has asked this write to stop.
+    /// Whether a Stop, a teardown, or its dropped transport has asked this
+    /// write to stop.
     pub(super) fn stop_requested(&self) -> bool {
-        self.stop.load(std::sync::atomic::Ordering::Acquire)
+        self.delivery.stop_requested()
     }
 
     /// Item `index` is about to dispatch.
@@ -1056,13 +1152,11 @@ impl ResourceWriteProgress {
     /// The carrier finalizes the row itself from here on.
     pub(super) fn disarm(&mut self) {
         self.armed = false;
-        self.stops.unregister(&self.call);
     }
 }
 
 impl Drop for ResourceWriteProgress {
     fn drop(&mut self) {
-        self.stops.unregister(&self.call);
         if !self.armed {
             return;
         }
@@ -1290,6 +1384,21 @@ pub fn gate_resource_item(
             Arc::clone(&gate),
         );
     gate
+}
+
+/// [`hold_resource_item`] for a write of `run_id` that holds no ledger claim
+/// (its call could not be named). A test gates it under an empty tool-use id.
+#[cfg(feature = "test-utils")]
+pub(super) async fn hold_unclaimed_resource_item(run_id: &str, index: usize, phase: ItemPhase) {
+    hold_resource_item(
+        &WriteCall {
+            run_id: run_id.to_string(),
+            id: String::new(),
+        },
+        index,
+        phase,
+    )
+    .await;
 }
 
 #[cfg(feature = "test-utils")]

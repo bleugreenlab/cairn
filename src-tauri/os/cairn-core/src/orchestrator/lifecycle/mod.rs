@@ -79,10 +79,12 @@ pub use stop::{
 };
 #[cfg(test)]
 pub(crate) use unanswered_calls::{
-    pending_tool_result_ids, restart_answer, CallEffect, LedgerRow, USER_STOP_TOOL_RESULT,
+    lost_call_answer, pending_tool_result_ids, process_end_opening, CallEffect, LedgerRow, Loss,
+    LostCallAnswer, USER_STOP_TOOL_RESULT,
 };
 pub(crate) use unanswered_calls::{
-    restart_answered_calls_note, settle_unanswered_calls, InterruptCause,
+    lost_calls_note, settle_calls_cut_off_by_process_end, settle_unanswered_calls, InterruptCause,
+    HOST_RESTART_REASON, PROCESS_LOST_REASON,
 };
 pub(crate) use unowned_running::{render_unowned_push_body, sweep_unowned_running};
 pub(crate) use watchdog_recovery::notify_watchdog_successor_started;

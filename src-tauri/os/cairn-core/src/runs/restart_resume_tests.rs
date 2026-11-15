@@ -23,6 +23,7 @@ const BOOT_AT: i64 = 1_000_000;
 /// The opening of the restart notice, as the agent reads it.
 const RESTART_NOTE: &str = "Cairn restarted while your previous turn was in progress";
 const ORPHAN_NOTE: &str = "Cairn restarted before your queued turn started";
+const PROCESS_LOST_NOTE: &str = "The agent process serving your previous turn ended";
 
 fn test_orchestrator(db: LocalDb, recovery_pending: bool) -> Orchestrator {
     let root = tempfile::tempdir().unwrap().keep();
@@ -1327,8 +1328,16 @@ async fn a_rebase_replay_write_cut_off_by_a_restart_resolves_once_and_the_sessio
 #[test]
 fn each_kind_of_call_is_answered_with_what_the_restart_can_know() {
     use crate::mcp::handlers::run::run_batch_lost_to_restart_text;
-    use crate::orchestrator::lifecycle::{restart_answer, CallEffect, LedgerRow};
+    use crate::orchestrator::lifecycle::{lost_call_answer, CallEffect, LedgerRow, Loss};
     use serde_json::json;
+    fn restart_answer(
+        name: &str,
+        input: &serde_json::Value,
+        ledger: Option<&LedgerRow>,
+        twin: bool,
+    ) -> crate::orchestrator::lifecycle::LostCallAnswer {
+        lost_call_answer(Loss::HostRestart, name, input, ledger, twin)
+    }
 
     let opening = "Cairn restarted while this call was in flight, so its result was lost.";
     let resource_write = json!({"changes": [
@@ -1460,6 +1469,208 @@ fn each_kind_of_call_is_answered_with_what_the_restart_can_know() {
         assert!(answer.text.starts_with(opening), "{}", answer.text);
         crate::system_prompt::assert_no_substrate_vocabulary("restart answer", &answer.text);
     }
+}
+
+/// What a process end says about each kind of call. A drained write's ledger
+/// row is complete, so its absence now proves a file write committed nothing;
+/// a write still running when the answer is written is the one left unknown.
+/// Every other row reads as it does after a restart.
+#[test]
+fn each_kind_of_call_is_answered_with_what_a_process_end_can_know() {
+    use crate::mcp::handlers::run::run_batch_lost_with_process_text;
+    use crate::orchestrator::lifecycle::{
+        lost_call_answer, process_end_opening, CallEffect, LedgerRow, Loss,
+    };
+    use serde_json::json;
+
+    let opening = process_end_opening("provider_silence_recovery");
+    assert_eq!(
+        opening,
+        "Cairn stopped the agent process serving this call (provider-silence recovery) before its result reached you."
+    );
+    let drained = Loss::ProcessEnd {
+        opening: &opening,
+        drained: true,
+    };
+    let still_running = Loss::ProcessEnd {
+        opening: &opening,
+        drained: false,
+    };
+    let write = "mcp__cairn__write";
+    let file_write = json!({
+        "changes": [{"target": "file:src/lib.rs", "mode": "patch", "payload": {}}],
+        "commit_msg": "edit",
+    });
+    let outside_write = json!({
+        "changes": [{"target": "file:/tmp/notes.txt", "mode": "create", "payload": {}}],
+    });
+    let resource_write = json!({"changes": [
+        {"target": "cairn:~/todos", "mode": "patch", "payload": {}},
+    ]});
+    let row = |report: &str, finalized: bool| LedgerRow {
+        report: report.to_string(),
+        finalized,
+    };
+    let recorded = r#"{"applied":[{"index":0}],"commit":{"status":"committed"}}"#;
+    let stopped = json!({"applied": [], "failures": [
+        {"index": 0, "kind": crate::mcp::handlers::write::replay::STOPPED_KIND, "error": "not applied"}
+    ]})
+    .to_string();
+    let pending = format!(
+        "{}\n{}",
+        crate::mcp::handlers::write::replay::RESOURCE_PENDING,
+        json!({"applied": []}),
+    );
+
+    /// A case's name, its loss, the write's input, its ledger row, whether it
+    /// has an identical open twin, and the effect its answer must state.
+    type Case<'a> = (
+        &'a str,
+        Loss<'a>,
+        &'a serde_json::Value,
+        Option<LedgerRow>,
+        bool,
+        CallEffect,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "file write, no row",
+            drained,
+            &file_write,
+            None,
+            false,
+            CallEffect::None,
+        ),
+        (
+            "resource write, no row",
+            drained,
+            &resource_write,
+            None,
+            false,
+            CallEffect::None,
+        ),
+        (
+            "outside write, no row",
+            drained,
+            &outside_write,
+            None,
+            false,
+            CallEffect::Unknown,
+        ),
+        (
+            "twin, no row",
+            drained,
+            &resource_write,
+            None,
+            true,
+            CallEffect::Unknown,
+        ),
+        (
+            "pending row",
+            drained,
+            &resource_write,
+            Some(row(&pending, true)),
+            false,
+            CallEffect::Partial,
+        ),
+        (
+            "stopped row",
+            drained,
+            &file_write,
+            Some(row(&stopped, true)),
+            false,
+            CallEffect::Partial,
+        ),
+        (
+            "post-seal row",
+            drained,
+            &file_write,
+            Some(row(recorded, false)),
+            false,
+            CallEffect::Partial,
+        ),
+        (
+            "final row",
+            drained,
+            &file_write,
+            Some(row(recorded, true)),
+            false,
+            CallEffect::Landed,
+        ),
+        (
+            "still running",
+            still_running,
+            &file_write,
+            None,
+            false,
+            CallEffect::Unknown,
+        ),
+        (
+            "still running, row",
+            still_running,
+            &file_write,
+            Some(row(recorded, true)),
+            false,
+            CallEffect::Unknown,
+        ),
+    ];
+    for (case, loss, input, ledger, twin, effect) in cases {
+        let answer = lost_call_answer(loss, write, input, ledger.as_ref(), twin);
+        assert_eq!(answer.effect, effect, "{case}: {}", answer.text);
+        assert!(answer.text.starts_with(&opening), "{case}: {}", answer.text);
+        crate::system_prompt::assert_no_substrate_vocabulary(case, &answer.text);
+        match effect {
+            CallEffect::None => {
+                assert!(
+                    answer.text.contains("None of its items ran"),
+                    "{case}: {}",
+                    answer.text
+                )
+            }
+            CallEffect::Landed => {
+                assert!(
+                    answer.text.contains("Do not retry"),
+                    "{case}: {}",
+                    answer.text
+                );
+                assert!(answer.text.contains(recorded), "{case}: {}", answer.text);
+            }
+            _ => {}
+        }
+    }
+    let finishing = lost_call_answer(still_running, write, &file_write, None, false);
+    assert!(
+        finishing.text.contains("cairn:@/vcs/log"),
+        "{}",
+        finishing.text
+    );
+
+    let read = lost_call_answer(
+        drained,
+        "mcp__cairn__read",
+        &json!({"paths": ["file:a"]}),
+        None,
+        false,
+    );
+    assert_eq!(read.effect, CallEffect::None);
+    assert!(read.text.starts_with(&opening), "{}", read.text);
+    let commit_run = lost_call_answer(
+        drained,
+        "mcp__cairn__run",
+        &json!({"commands": [{"command": "x"}], "commit_msg": "m"}),
+        None,
+        false,
+    );
+    assert_eq!(commit_run.effect, CallEffect::Unknown);
+    assert_eq!(
+        commit_run.text,
+        run_batch_lost_with_process_text(&opening, true)
+    );
+    assert!(commit_run.text.contains(&opening), "{}", commit_run.text);
+
+    assert!(process_end_opening("crash")
+        .starts_with("The agent process serving this call ended (it crashed)"));
+    assert!(process_end_opening("user_stop").contains("(an operator stop)"));
 }
 
 /// A write whose report was recorded took effect, so its answer carries that
@@ -2840,4 +3051,219 @@ async fn shutdown_resume_refused_before_mint_is_not_retried_on_later_boots() {
     .await
     .unwrap();
     assert_eq!(summary.selected, 0, "{summary:?}");
+}
+
+/// Kill run `r-{job}`'s process for `exit_reason`, off the async runtime.
+async fn kill(orch: &Orchestrator, job: &str, exit_reason: &'static str) {
+    let orch = orch.clone();
+    let run_id = format!("r-{job}");
+    tokio::task::spawn_blocking(move || {
+        crate::orchestrator::lifecycle::kill_session_with_reason(
+            &orch,
+            &run_id,
+            exit_reason,
+            crate::orchestrator::lifecycle::TerminalPolicy::Keep,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+/// cairn/6123: provider-silence recovery killed a turn with a write, a read,
+/// and a held `run` call in flight, and nothing answered the first two. The
+/// kill now answers each once with what is known, leaves the held call to its
+/// wait, and the next launch's prompt carries the answers. A later settlement
+/// of the same turn (the reaper finding it) answers nothing twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_process_end_answers_each_cut_off_call_once_and_the_next_launch_hears_them() {
+    let (orch, db, prompts, _backend) = host("process-lost-answers").await;
+    seed_node_job(&db, "jp", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-jp",
+        "jp",
+        Some("r-jp"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    seed_calls(
+        &db,
+        "jp",
+        "turn-jp",
+        2,
+        serde_json::json!([
+            {"id": "toolu_write", "name": "mcp__cairn__write", "input": {
+                "changes": [
+                    {"target": "file:a.rs", "mode": "create", "payload": {"content": "a"}},
+                    {"target": "file:b.rs", "mode": "create", "payload": {"content": "b"}}
+                ],
+                "commit_msg": "two files"
+            }},
+            {"id": "toolu_read", "name": "mcp__cairn__read", "input": {"paths": ["file:a.rs"]}},
+            {"id": "toolu-held", "name": "mcp__cairn__run", "input": {"command": "cargo test"}}
+        ]),
+    )
+    .await;
+    seed_held_run_call(&db, "jp", "turn-jp").await;
+
+    kill(&orch, "jp", "provider_silence_recovery").await;
+
+    assert_eq!(
+        settlement(&db, "turn-jp").await,
+        "interrupted/watchdog_recovery"
+    );
+    let write = results_for(&db, "toolu_write").await;
+    assert_eq!(write.len(), 1, "{write:?}");
+    assert_eq!(write[0]["raw"]["reason"], "process_lost");
+    assert_eq!(write[0]["raw"]["effect"], "none");
+    assert_eq!(write[0]["raw"]["exit_reason"], "provider_silence_recovery");
+    let answer = write[0]["toolResult"].as_str().unwrap().to_string();
+    assert!(answer.contains("None of its items ran"), "{answer}");
+    let read = results_for(&db, "toolu_read").await;
+    assert_eq!(read.len(), 1, "{read:?}");
+    assert_eq!(read[0]["raw"]["effect"], "none");
+    assert!(
+        results_for(&db, "toolu-held")
+            .await
+            .iter()
+            .all(|result| result["raw"]["reason"] != "process_lost"),
+        "the held call stays its wait's to answer"
+    );
+
+    let again = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::orchestrator::lifecycle::settle_calls_cut_off_by_process_end(
+            &again,
+            "r-jp",
+            "turn-jp",
+            crate::runs::reap::STALE_RUN_EXIT_REASON,
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(results_for(&db, "toolu_write").await.len(), 1);
+    assert_eq!(results_for(&db, "toolu_read").await.len(), 1);
+
+    let launcher = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::execution::jobs::continue_job_impl(&launcher, "jp", Some("carry on"), None, None)
+    })
+    .await
+    .unwrap()
+    .expect("the continuation launches");
+    let prompt = launch_prompts(&db, &prompts, "jp").await;
+    assert!(prompt.contains(PROCESS_LOST_NOTE), "{prompt}");
+    assert!(
+        prompt.contains("`write` on `file:a.rs and 1 more`"),
+        "{prompt}"
+    );
+    assert!(prompt.contains(&answer), "{prompt}");
+    assert!(!prompt.contains(RESTART_NOTE), "{prompt}");
+}
+
+/// A Stop answers the write whose row it can read, and the kill that follows
+/// answers the read the Stop leaves open: one result per call, never two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_and_the_kill_after_it_answer_each_call_once() {
+    let (orch, db, _prompts, _backend) = host("process-lost-after-stop").await;
+    seed_node_job(&db, "js", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-js",
+        "js",
+        Some("r-js"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    seed_calls(
+        &db,
+        "js",
+        "turn-js",
+        2,
+        serde_json::json!([
+            {"id": "toolu_todos", "name": "mcp__cairn__write", "input": {"changes": [
+                {"target": "cairn:~/todos", "mode": "patch", "payload": {}}
+            ]}},
+            {"id": "toolu_look", "name": "mcp__cairn__read", "input": {"paths": ["file:a.rs"]}}
+        ]),
+    )
+    .await;
+    seed_ledger_row(
+        &db,
+        "js",
+        "toolu_todos",
+        r#"{"applied":[{"index":0,"target":"cairn:~/todos","mode":"patch"}],"failures":[]}"#,
+    )
+    .await;
+
+    let stopper = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::orchestrator::lifecycle::stop_active_turn_for_run(&stopper, "r-js", true)
+    })
+    .await
+    .unwrap();
+    assert_eq!(results_for(&db, "toolu_todos").await.len(), 1);
+    assert!(results_for(&db, "toolu_look").await.is_empty());
+
+    kill(&orch, "js", "user_stop").await;
+
+    let write = results_for(&db, "toolu_todos").await;
+    assert_eq!(write.len(), 1, "{write:?}");
+    assert_eq!(write[0]["raw"]["reason"], "user_stop_after_write_effect");
+    let read = results_for(&db, "toolu_look").await;
+    assert_eq!(read.len(), 1, "{read:?}");
+    assert_eq!(read[0]["raw"]["reason"], "process_lost");
+    assert!(
+        read[0]["toolResult"]
+            .as_str()
+            .unwrap()
+            .contains("(an operator stop)"),
+        "{}",
+        read[0]
+    );
+}
+
+/// A host shutting down leaves its turns' calls to the boot sweep, which
+/// answers them as a restart; the shutdown kill writes no process-end answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shutdown_kill_leaves_its_calls_to_the_boot_sweep() {
+    let (orch, db, _prompts, _backend) = host("process-lost-shutdown").await;
+    seed_node_job(&db, "jd", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-jd",
+        "jd",
+        Some("r-jd"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    seed_calls(
+        &db,
+        "jd",
+        "turn-jd",
+        2,
+        serde_json::json!([
+            {"id": "toolu_shut", "name": "mcp__cairn__read", "input": {"paths": ["file:a.rs"]}}
+        ]),
+    )
+    .await;
+
+    kill(
+        &orch,
+        "jd",
+        crate::orchestrator::lifecycle::RUNNER_SHUTDOWN_EXIT_REASON,
+    )
+    .await;
+
+    assert!(results_for(&db, "toolu_shut").await.is_empty());
 }

@@ -24,6 +24,127 @@ pub struct DispatchOutput {
     pub reminders: Vec<String>,
 }
 
+/// One delivery of a tool call, shared by the transport waiting on its answer
+/// and the handler serving it.
+///
+/// It decides what a transport that gives up on the call (its connection
+/// closed, its relay revoked) may do to the work. A handler that has taken no
+/// effect yet can be aborted: nothing of it lands. One that has begun an effect
+/// must not be cut off mid-way, because a commit published with no ledger row
+/// is an outcome no reader can decide. It is asked to stop at its next
+/// boundary and left to finish, so it records what it did.
+///
+/// Only a `write` marks its first effect today; every other tool's delivery
+/// stays preparing and is aborted as before.
+#[derive(Debug, Default)]
+pub struct Delivery {
+    phase: std::sync::atomic::AtomicU8,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+const DELIVERY_PREPARING: u8 = 0;
+const DELIVERY_EFFECTFUL: u8 = 1;
+const DELIVERY_ABANDONED: u8 = 2;
+
+/// What a transport does with a delivery it dropped before the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropAction {
+    /// Nothing has taken effect: cancel the handler.
+    Abort,
+    /// An effect is under way: let the handler reach its boundary and record it.
+    Finish,
+}
+
+impl DropAction {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Abort => "abort",
+            Self::Finish => "finish",
+        }
+    }
+}
+
+impl Delivery {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::default()
+    }
+
+    /// The transport dropped this delivery unanswered. A delivery still
+    /// preparing becomes abandoned, so it can never begin an effect; one that
+    /// already began is asked to stop at its next boundary.
+    pub fn on_unanswered_drop(&self) -> DropAction {
+        use std::sync::atomic::Ordering;
+        match self.phase.compare_exchange(
+            DELIVERY_PREPARING,
+            DELIVERY_ABANDONED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(DELIVERY_ABANDONED) => DropAction::Abort,
+            Err(_) => {
+                self.raise_stop();
+                DropAction::Finish
+            }
+        }
+    }
+
+    /// The handler is about to take its first effect. `false` when the
+    /// transport already abandoned the delivery: the handler must take none.
+    pub(crate) fn begin_effect(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        matches!(
+            self.phase.compare_exchange(
+                DELIVERY_PREPARING,
+                DELIVERY_EFFECTFUL,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ),
+            Ok(_) | Err(DELIVERY_EFFECTFUL)
+        )
+    }
+
+    /// Ask the handler to stop before its next item or commit.
+    pub(crate) fn raise_stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+tokio::task_local! {
+    static DELIVERY: std::sync::Arc<Delivery>;
+}
+
+/// Serve `future` as `delivery`, so the handler beneath it marks its effects
+/// on the delivery its transport holds.
+pub fn serve_delivery<F: std::future::Future>(
+    delivery: std::sync::Arc<Delivery>,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    DELIVERY.scope(delivery, future)
+}
+
+/// The delivery the current task serves, if a transport scoped one.
+pub(crate) fn current_delivery() -> Option<std::sync::Arc<Delivery>> {
+    DELIVERY.try_with(std::sync::Arc::clone).ok()
+}
+
+/// [`Delivery::begin_effect`] on the current delivery. With none scoped there
+/// is no transport that could abandon the call, so the effect may proceed.
+pub(crate) fn begin_delivery_effect() -> bool {
+    current_delivery().is_none_or(|delivery| delivery.begin_effect())
+}
+
+/// At a boundary of a handler that holds no other stop record: whether it may
+/// take its next effect. `false` when the current delivery was asked to stop
+/// or was abandoned; otherwise the delivery is marked effectful.
+pub(crate) fn delivery_may_take_effect() -> bool {
+    current_delivery()
+        .is_none_or(|delivery| !delivery.stop_requested() && delivery.begin_effect())
+}
+
 pub(crate) fn effective_read_target(payload: &serde_json::Value) -> Option<&str> {
     payload
         .get("uri")
@@ -1877,5 +1998,60 @@ mod tests {
             1,
             "an unrelated same-shape slug must not suppress via a LIKE wildcard"
         );
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::{Delivery, DropAction};
+
+    /// A delivery dropped before its handler took any effect is aborted, and
+    /// the handler, still running until its next await, can take none.
+    #[test]
+    fn a_delivery_dropped_before_its_first_effect_is_aborted_and_takes_none() {
+        let delivery = Delivery::default();
+        assert_eq!(delivery.on_unanswered_drop(), DropAction::Abort);
+        assert!(!delivery.begin_effect());
+        assert_eq!(delivery.on_unanswered_drop(), DropAction::Abort);
+        assert!(!delivery.stop_requested());
+    }
+
+    /// One already taking effect is asked to stop at its next boundary and
+    /// left to finish.
+    #[test]
+    fn a_delivery_taking_effect_is_asked_to_stop_and_left_to_finish() {
+        let delivery = Delivery::default();
+        assert!(delivery.begin_effect());
+        assert!(delivery.begin_effect(), "a second effect of the same write");
+        assert!(!delivery.stop_requested());
+        assert_eq!(delivery.on_unanswered_drop(), DropAction::Finish);
+        assert!(delivery.stop_requested());
+    }
+
+    /// Two deliveries under one tool-use id (one Codex exec cell's calls) are
+    /// separate: dropping one stops only it, and one finishing leaves its twin
+    /// registered.
+    #[test]
+    fn twin_deliveries_of_one_tool_use_id_are_stopped_and_released_apart() {
+        let stops = std::sync::Arc::new(crate::mcp::handlers::write::replay::WriteStops::default());
+        let (first, twin) = (Delivery::new(), Delivery::new());
+        let first_registration = stops.enter("run", "toolu", first.clone());
+        let twin_registration = stops.enter("run", "toolu", twin.clone());
+        assert!(first.begin_effect() && twin.begin_effect());
+
+        assert_eq!(first.on_unanswered_drop(), DropAction::Finish);
+        assert!(first.stop_requested());
+        assert!(!twin.stop_requested(), "the twin keeps running");
+
+        drop(first_registration);
+        assert!(
+            stops.is_applying("run", "toolu"),
+            "the twin is still served"
+        );
+        assert_eq!(stops.raise("run"), 1);
+        assert!(twin.stop_requested());
+        assert_eq!(stops.raise("other-run"), 0);
+        drop(twin_registration);
+        assert!(!stops.is_applying("run", "toolu"));
     }
 }

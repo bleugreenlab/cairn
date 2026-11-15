@@ -3857,3 +3857,248 @@ fn make_preview_request(cwd: &str, payload: serde_json::Value) -> McpCallbackReq
         origin: None,
     }
 }
+
+/// Every `tool_result` recorded for `tool_use_id`, parsed.
+async fn tool_results_for(db: &LocalDb, tool_use_id: &str) -> Vec<serde_json::Value> {
+    let tool_use_id = tool_use_id.to_string();
+    db.read(move |conn| {
+        let tool_use_id = tool_use_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT data FROM events WHERE event_type = 'tool_result'
+                     AND json_extract(data, '$.toolUseId') = ?1",
+                    params![tool_use_id.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(serde_json::from_str(&row.text(0)?).unwrap());
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// End the fixture run's process as provider-silence recovery does.
+fn kill_for_silence(repo: &ChangeTestRepo) -> tokio::task::JoinHandle<Result<(), String>> {
+    let orch = repo.orch.clone();
+    tokio::task::spawn_blocking(move || {
+        lifecycle::kill_session_with_reason(
+            &orch,
+            "run-change",
+            "provider_silence_recovery",
+            lifecycle::TerminalPolicy::Keep,
+        )
+    })
+}
+
+/// cairn/6123: provider-silence recovery killed a process whose two-file write
+/// was still waiting to seal. The dropped callback aborted the write before it
+/// took any effect, and nothing ever answered the call. Now the kill answers
+/// it once, `none`, and the branch is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_cut_off_before_its_commit_is_answered_once_as_nothing_applied() {
+    use cairn_core::internal::dispatch::{serve_delivery, Delivery, DropAction};
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let tool_use_id = "toolu-cut-before-seal";
+    let payload = json!({
+        "changes": [
+            {"target": "file:one.txt", "mode": "create", "payload": {"content": "1\n"}},
+            {"target": "file:two.txt", "mode": "create", "payload": {"content": "2\n"}}
+        ],
+        "commit_msg": "two files"
+    });
+    let request = guarded_request(&repo, tool_use_id, &payload).await;
+    let head = repo.branch_head();
+    let (reached, _resume) =
+        cairn_core::internal::mcp::handlers::write::test_pause::before_seal(tool_use_id);
+    let delivery = Delivery::new();
+    let orch = repo.orch.clone();
+    let write = tokio::spawn(serve_delivery(delivery.clone(), async move {
+        handle_write(&orch, &request).await
+    }));
+    tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
+        .await
+        .expect("the write parks before it seals");
+
+    // The process is killed; its callback drops. Nothing has taken effect, so
+    // the transport aborts the write.
+    assert_eq!(delivery.on_unanswered_drop(), DropAction::Abort);
+    write.abort();
+    assert!(write.await.unwrap_err().is_cancelled());
+    kill_for_silence(&repo).await.unwrap().unwrap();
+
+    let results = tool_results_for(&repo.orch.db.local, tool_use_id).await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    let result = &results[0];
+    assert_eq!(result["raw"]["reason"], "process_lost", "{result}");
+    assert_eq!(result["raw"]["effect"], "none", "{result}");
+    assert_eq!(
+        result["raw"]["exit_reason"], "provider_silence_recovery",
+        "{result}"
+    );
+    let text = result["toolResult"].as_str().unwrap();
+    assert!(
+        text.starts_with(
+            "Cairn stopped the agent process serving this call (provider-silence recovery)"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("None of its items ran. Re-send it"), "{text}");
+    assert_eq!(repo.branch_head(), head, "nothing was committed");
+    assert!(!repo.logical_exists("one.txt"));
+    assert!(!repo.logical_exists("two.txt"));
+}
+
+/// cairn/6123: a write whose commit was published when its process was killed,
+/// but whose ledger row was not yet recorded. Aborting it there left a landed
+/// commit no reader could decide. Its dropped callback now lets it finish and
+/// record its row, and the kill answers the call once, `landed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_cut_off_after_its_commit_finishes_and_is_answered_once_as_landed() {
+    use cairn_core::internal::dispatch::{serve_delivery, Delivery, DropAction};
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let tool_use_id = "toolu-cut-after-commit";
+    let payload = json!({
+        "changes": [{"target": "file:landed.txt", "mode": "create",
+                     "payload": {"content": "landed\n"}}],
+        "commit_msg": "landed before the kill"
+    });
+    let request = guarded_request(&repo, tool_use_id, &payload).await;
+    let (reached, resume) =
+        cairn_core::internal::mcp::handlers::write::test_pause::after_publication(tool_use_id);
+    let delivery = Delivery::new();
+    let orch = repo.orch.clone();
+    let write = tokio::spawn(serve_delivery(delivery.clone(), async move {
+        handle_write(&orch, &request).await
+    }));
+    tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
+        .await
+        .expect("the write parks after publishing its commit");
+
+    // The commit is the write's effect: the drop lets it finish.
+    assert_eq!(delivery.on_unanswered_drop(), DropAction::Finish);
+    let kill = kill_for_silence(&repo);
+    resume.notify_one();
+    kill.await.unwrap().unwrap();
+    let delivered = parse_report(&write.await.unwrap());
+
+    let sha = delivered["commit"]["sha"]
+        .as_str()
+        .expect("the write committed");
+    assert_eq!(sha, repo.branch_head());
+    assert_eq!(repo.read("landed.txt"), "landed\n");
+    let rows = repo
+        .orch
+        .db
+        .local
+        .query_opt_i64(
+            "SELECT COUNT(*) FROM write_replay_ledger WHERE run_id = 'run-change' AND tool_use_id = ?1",
+            params![tool_use_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, Some(1), "the publication recorded its row");
+    let results = tool_results_for(&repo.orch.db.local, tool_use_id).await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    let result = &results[0];
+    assert_eq!(result["raw"]["reason"], "process_lost", "{result}");
+    assert_eq!(result["raw"]["effect"], "landed", "{result}");
+    assert_eq!(result["isError"], false, "{result}");
+    let text = result["toolResult"].as_str().unwrap();
+    assert!(text.contains("Do not retry"), "{text}");
+    assert!(text.contains(sha), "{text}");
+}
+
+/// cairn/6123 with cairn/5877: a mixed write whose callback drops between its
+/// resource items is asked to stop at the next item, not aborted, so it seals
+/// its row itself (rolling back what its commit would have carried). The kill
+/// answers it `partial`, listing exactly the items that ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mixed_write_cut_off_between_items_stops_there_and_is_answered_partial() {
+    use cairn_core::internal::dispatch::{serve_delivery, Delivery, DropAction};
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let tool_use_id = "toolu-mixed-cut-off";
+    let payload = file_then_three_appends();
+    let request = guarded_request(&repo, tool_use_id, &payload).await;
+    let head = repo.branch_head();
+    let gate = gate_resource_item("run-change", tool_use_id, 3, ItemPhase::BeforeDispatch);
+    let delivery = Delivery::new();
+    let orch = repo.orch.clone();
+    let write = tokio::spawn(serve_delivery(delivery.clone(), async move {
+        handle_write(&orch, &request).await
+    }));
+    tokio::time::timeout(std::time::Duration::from_secs(60), gate.entered())
+        .await
+        .expect("the write parks before item 3");
+
+    assert_eq!(delivery.on_unanswered_drop(), DropAction::Finish);
+    assert!(repo.orch.write_stops.is_raised("run-change", tool_use_id));
+    gate.release();
+    let delivered = parse_report(&write.await.unwrap());
+    assert_eq!(indices(&delivered, "applied"), vec![1, 2], "{delivered}");
+    kill_for_silence(&repo).await.unwrap().unwrap();
+
+    assert_eq!(item_counts(&repo).await, vec![1, 1, 0]);
+    assert_eq!(repo.branch_head(), head, "nothing was committed");
+    let results = tool_results_for(&repo.orch.db.local, tool_use_id).await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0]["raw"]["effect"], "partial", "{}", results[0]);
+    let text = results[0]["toolResult"].as_str().unwrap();
+    let report = parse_report(text.split_once('\n').unwrap().1);
+    assert_eq!(indices(&report, "applied"), vec![1, 2], "{report}");
+    assert!(
+        failure_error(&report, 0).starts_with("not applied"),
+        "{report}"
+    );
+    assert!(
+        failure_error(&report, 3).starts_with("not applied"),
+        "{report}"
+    );
+}
+
+/// cairn/6123 review: a resource write whose call cannot be named holds no
+/// ledger claim, but its dispatched items are still effects. Once one has run,
+/// a dropped callback lets the write finish, and the write stops at its next
+/// item instead of being cut off mid-item or running on to the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uncorrelated_resource_write_cut_off_between_items_stops_there() {
+    use cairn_core::internal::dispatch::{serve_delivery, Delivery, DropAction};
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    // No transcript record and no tool-use id: the call cannot be named.
+    let request = make_request_as_run(repo.cwd(), three_appends(), Some("run-change"));
+    let gate = gate_resource_item("run-change", "", 1, ItemPhase::BeforeDispatch);
+    let delivery = Delivery::new();
+    let orch = repo.orch.clone();
+    let write = tokio::spawn(serve_delivery(delivery.clone(), async move {
+        handle_write(&orch, &request).await
+    }));
+    tokio::time::timeout(std::time::Duration::from_secs(60), gate.entered())
+        .await
+        .expect("the write parks before item 1");
+
+    // Item 0 took effect, so the drop must not abort the write.
+    assert_eq!(delivery.on_unanswered_drop(), DropAction::Finish);
+    gate.release();
+    let delivered = parse_report(&write.await.unwrap());
+
+    assert_eq!(indices(&delivered, "applied"), vec![0], "{delivered}");
+    assert!(failure_error(&delivered, 1).starts_with("not applied"), "{delivered}");
+    assert!(failure_error(&delivered, 2).starts_with("not applied"), "{delivered}");
+    assert_eq!(item_counts(&repo).await, vec![1, 0, 0]);
+}

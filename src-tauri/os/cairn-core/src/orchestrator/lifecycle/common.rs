@@ -350,6 +350,24 @@ pub(super) fn current_turn_id_for_run(orch: &Orchestrator, run_id: &str) -> Opti
     )
 }
 
+pub(super) fn run_exit_reason(orch: &Orchestrator, run_id: &str) -> Option<String> {
+    blocking_text_lookup(
+        orch,
+        run_id,
+        "SELECT exit_reason FROM runs WHERE id = ?1",
+        TextColumn::Optional,
+    )
+}
+
+pub(super) fn turn_end_reason(orch: &Orchestrator, turn_id: &str) -> Option<String> {
+    blocking_text_lookup(
+        orch,
+        turn_id,
+        "SELECT end_reason FROM turns WHERE id = ?1",
+        TextColumn::Optional,
+    )
+}
+
 pub(super) fn turn_state(orch: &Orchestrator, turn_id: &str) -> Option<String> {
     blocking_text_lookup(
         orch,

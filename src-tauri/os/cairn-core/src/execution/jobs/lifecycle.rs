@@ -4262,6 +4262,10 @@ impl Drop for UndeliveredPushes {
 /// cannot know from its transcript whether that call took effect.
 pub(crate) const HOST_RESTART_RESUME_NOTE: &str = "Cairn restarted while your previous turn was in progress, and that turn was interrupted. Any tool call that was in flight when it stopped has an unknown outcome: it may or may not have taken effect. Any 'the user doesn't want to proceed' or 'interrupted by user' text in that call came from the restart, not from the user. Check the worktree, and whatever your last calls touched, before re-running anything. Then continue your work.";
 
+/// Told to an agent whose last turn lost its agent process while tool calls
+/// were in flight, above the list of what each of those calls did.
+pub(crate) const PROCESS_LOST_RESUME_NOTE: &str = "The agent process serving your previous turn ended while some of its tool calls were in flight, so their results never reached you. Cairn has answered each of them below with what is known about its effect, and that list is authoritative: do not re-send a call it says took effect. Then continue your work.";
+
 /// Told to an agent whose queued turn a host restart cancelled before it
 /// started, whether the turn was runless (`orphaned_pending`) or bound to a
 /// stale run that never began it (`host_restart` with no `started_at`). Nothing
@@ -4309,21 +4313,26 @@ fn restart_resume_note(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<String>
     });
     let host_restart = crate::models::TurnEndReason::HostRestart.to_string();
     let orphaned = crate::models::TurnEndReason::OrphanedPending.to_string();
+    let calls_note = |run_id: String, turn_id: String, reason: &'static str| {
+        let db = owning_db.clone();
+        run_db(async move {
+            crate::orchestrator::lifecycle::lost_calls_note(&db, &run_id, &turn_id, &[reason])
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap_or_else(|error| {
+            log::warn!("Could not read the calls a settlement answered: {error}");
+            None
+        })
+    };
     match latest {
         Ok(Some((reason, true, turn_id, run_id))) if reason == host_restart => {
             let calls = run_id.and_then(|run_id| {
-                let db = owning_db.clone();
-                run_db(async move {
-                    crate::orchestrator::lifecycle::restart_answered_calls_note(
-                        &db, &run_id, &turn_id,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())
-                })
-                .unwrap_or_else(|error| {
-                    log::warn!("Could not read the calls a restart answered: {error}");
-                    None
-                })
+                calls_note(
+                    run_id,
+                    turn_id,
+                    crate::orchestrator::lifecycle::HOST_RESTART_REASON,
+                )
             });
             Some(match calls {
                 Some(calls) => format!("{HOST_RESTART_RESUME_NOTE}\n\n{calls}"),
@@ -4333,6 +4342,14 @@ fn restart_resume_note(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<String>
         Ok(Some((reason, _, _, _))) if reason == host_restart || reason == orphaned => {
             Some(ORPHANED_PENDING_RESUME_NOTE.to_string())
         }
+        // Whatever ended the turn (watchdog recovery, a stop, a crash), a
+        // process end that answered its calls owes the agent those answers.
+        Ok(Some((_, true, turn_id, Some(run_id)))) => calls_note(
+            run_id,
+            turn_id,
+            crate::orchestrator::lifecycle::PROCESS_LOST_REASON,
+        )
+        .map(|calls| format!("{PROCESS_LOST_RESUME_NOTE}\n\n{calls}")),
         Ok(_) => None,
         Err(error) => {
             log::warn!(

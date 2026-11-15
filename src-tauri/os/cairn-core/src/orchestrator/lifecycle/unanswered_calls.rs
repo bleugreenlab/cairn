@@ -7,15 +7,20 @@
 //! in-flight work. Each is answered with a synthetic `tool_result` carrying
 //! `{"synthetic":true,"reason":...}` in `raw`.
 //!
-//! The two causes differ in what they may claim. A stop happens beside a live
+//! The causes differ in what they may claim. A stop happens beside a live
 //! carrier, so it answers run and write calls and waits, bounded, for a write
 //! still applying items. After a restart no carrier exists, so every open call is
 //! answered at once, and the answer states what is known about the call's effect
-//! in `raw.effect`. A call an active `agent_waits` row speaks for is left to
-//! `durable_suspend::reconcile`, which is what keeps each call answered once.
+//! in `raw.effect`. When the agent process alone ends (a kill, a crash, a reap)
+//! the host lives on: every write it was serving is asked to stop at its next
+//! boundary and waited for, bounded, so its ledger row then says exactly
+//! whether it took effect, and every open call is answered from that. A call an
+//! active `agent_waits` row speaks for is left to `durable_suspend::reconcile`,
+//! and a call any answer already closed is skipped, which is what keeps each
+//! call answered once.
 
 use crate::agent_process::stream::TranscriptEvent;
-use crate::mcp::handlers::run::run_batch_lost_to_restart_text;
+use crate::mcp::handlers::run::{run_batch_lost_to_restart_text, run_batch_lost_with_process_text};
 use crate::mcp::handlers::tool_use_correlation::answered_or_actively_owned_ids;
 use crate::mcp::handlers::write::replay;
 use crate::orchestrator::Orchestrator;
@@ -26,12 +31,16 @@ use cairn_session::agent_process::stream::{ToolUseInfo, TranscriptJson};
 use std::collections::HashSet;
 
 /// Why a turn's open calls are being answered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InterruptCause {
     /// An operator stopped the turn while its host stayed alive.
     UserStop,
     /// The host serving the turn died; the boot sweep settled it.
     HostRestart,
+    /// The agent process serving the turn ended while its host lived, for the
+    /// run's `exit_reason`: a kill (watchdog recovery, a stop, a provider
+    /// change), a crash, or a reap of a run with no process behind it.
+    ProcessLost { exit_reason: String },
 }
 
 /// What a restart's answer knows about a call's effect, recorded as
@@ -69,6 +78,9 @@ struct PendingToolResult {
     is_error: bool,
     reason: &'static str,
     effect: Option<CallEffect>,
+    /// The run's exit reason, recorded as `raw.exit_reason` when the process
+    /// ending is what lost the result.
+    exit_reason: Option<String>,
     /// The report to seal a still-pending ledger row with, so a redelivery of
     /// this call replays the answer instead of stalling on the pending marker.
     seal_report: Option<String>,
@@ -99,6 +111,11 @@ const DURING_WRITE_STOP_ANNOTATION: &str =
 /// How long a stop waits for a resource write that is applying items to stop
 /// at its next item boundary and seal its report.
 const WRITE_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long a process teardown waits for the writes it cut off to stop at
+/// their next boundary, or finish the publication they had begun, before it
+/// answers them. A write still running past this is answered `unknown`.
+const PROCESS_END_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(crate) const USER_STOP_TOOL_RESULT: &str = "Run interrupted by user stop.";
 
@@ -228,74 +245,148 @@ const RESTART_WRITE_LANDED: &str = "It took effect before its result reached you
 const RESTART_OUTCOME_UNKNOWN: &str =
     "Its outcome is unknown. Check what it touched before retrying it.";
 
-/// What a restart says about one open call.
+const PROCESS_END_WRITE_STILL_RUNNING: &str = "It was still finishing when this answer was written, so it may yet take effect. Look for its commit message in `cairn:@/vcs/log` and read its targets before re-sending it.";
+
+const PROCESS_END_WRITE_OUTSIDE_UNKNOWN: &str = "Files it targets outside the worktree are written as it goes and never rolled back, so some may have been written. Read them before re-sending it.";
+
+/// How a call's result was lost, which decides what its answer may claim.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Loss<'a> {
+    /// The host died under the call. Nothing drained its write, so a file
+    /// write may have committed without ever recording its ledger row.
+    HostRestart,
+    /// The call's process ended while the host lived, as `opening` says. A
+    /// write the teardown let reach its boundary (`drained`) has a ledger row
+    /// exactly when it took effect; one still running when the answer was
+    /// written may yet take effect.
+    ProcessEnd { opening: &'a str, drained: bool },
+}
+
+impl Loss<'_> {
+    fn opening(&self) -> &str {
+        match self {
+            Self::HostRestart => RESTART_OPENING,
+            Self::ProcessEnd { opening, .. } => opening,
+        }
+    }
+}
+
+/// The sentence a process-end answer opens with, naming why the process ended.
+pub(crate) fn process_end_opening(exit_reason: &str) -> String {
+    use super::stop::{PROVIDER_SILENCE_RECOVERY_EXIT_REASON, WATCHDOG_ARM_FAILED_EXIT_REASON};
+    let stopped_by_cairn = |why: &str| {
+        format!("Cairn stopped the agent process serving this call ({why}) before its result reached you.")
+    };
+    let ended = |why: &str| {
+        format!("The agent process serving this call ended ({why}) before its result reached you.")
+    };
+    match exit_reason {
+        PROVIDER_SILENCE_RECOVERY_EXIT_REASON => stopped_by_cairn("provider-silence recovery"),
+        WATCHDOG_ARM_FAILED_EXIT_REASON => stopped_by_cairn("its watchdog could not be armed"),
+        "user_stop" => stopped_by_cairn("an operator stop"),
+        "provider_change" => stopped_by_cairn("a provider change"),
+        crate::runs::reap::STALE_RUN_EXIT_REASON => ended("it was no longer running"),
+        depleted if depleted == crate::models::TurnEndReason::ProviderDepleted.to_string() => {
+            stopped_by_cairn("its provider account is depleted")
+        }
+        "crash" | "" => ended("it crashed"),
+        other => ended(&other.replace('_', " ")),
+    }
+}
+
+/// What a lost call's answer says about it.
 #[derive(Debug, Clone)]
-pub(crate) struct RestartAnswer {
+pub(crate) struct LostCallAnswer {
     pub(crate) text: String,
     pub(crate) effect: CallEffect,
     pub(crate) seal_report: Option<String>,
 }
 
-fn restart_answer_saying(detail: &str, effect: CallEffect) -> RestartAnswer {
-    RestartAnswer {
-        text: format!("{RESTART_OPENING} {detail}"),
+fn answer_saying(loss: Loss<'_>, detail: &str, effect: CallEffect) -> LostCallAnswer {
+    LostCallAnswer {
+        text: format!("{} {detail}", loss.opening()),
         effect,
         seal_report: None,
     }
 }
 
-fn restart_answer_with_report(
+fn answer_with_report(
+    loss: Loss<'_>,
     detail: &str,
     report: &str,
     effect: CallEffect,
     seal_report: Option<String>,
-) -> RestartAnswer {
-    RestartAnswer {
-        text: format!("{RESTART_OPENING} {detail}\n{report}"),
+) -> LostCallAnswer {
+    LostCallAnswer {
+        text: format!("{} {detail}\n{report}", loss.opening()),
         effect,
         seal_report,
     }
 }
 
-fn write_carries_file_targets(input: &serde_json::Value) -> bool {
+fn file_targets(input: &serde_json::Value) -> impl Iterator<Item = &str> {
     use cairn_common::change_validation::{classify_target, TargetKind};
     input
         .get("changes")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|changes| {
-            changes.iter().any(|change| {
-                change
-                    .get("target")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|target| matches!(classify_target(target), TargetKind::File))
-            })
-        })
+        .into_iter()
+        .flatten()
+        .filter_map(|change| change.get("target").and_then(serde_json::Value::as_str))
+        .filter(|target| matches!(classify_target(target), TargetKind::File))
 }
 
-/// What a restart can say about a `write`, from its replay ledger row.
+fn write_carries_file_targets(input: &serde_json::Value) -> bool {
+    file_targets(input).next().is_some()
+}
+
+/// Whether a write may target a file outside its worktree, which it writes to
+/// disk while interpreting and never rolls back. Read from the target text
+/// alone, so an absolute path inside the worktree counts too.
+fn write_may_target_outside_worktree(input: &serde_json::Value) -> bool {
+    file_targets(input).any(|target| {
+        let path = target.strip_prefix("file:").unwrap_or(target);
+        let path = path.split('?').next().unwrap_or(path);
+        path.starts_with('/')
+            || path.starts_with('~')
+            || path.starts_with('\\')
+            || path.as_bytes().get(1) == Some(&b':')
+            || path.split(['/', '\\']).any(|segment| segment == "..")
+    })
+}
+
+/// What can be said about a lost `write`, from its replay ledger row.
 ///
 /// A resource-only batch claims its row before any dispatch, so no row means no
-/// item ran. A batch with file targets records its row only after publication,
-/// so a commit can land before the row exists and no row proves nothing. The
-/// resource claim needs the delivery to have named its own call, which
+/// item ran. A batch with file targets records its row only after publication:
+/// after a restart a commit can have landed before the row existed, so no row
+/// proves nothing; after a drained process end the write either stopped before
+/// its commit or finished recording it, so no row means nothing was committed.
+/// The resource claim needs the delivery to have named its own call, which
 /// byte-identical open twins cannot do: `has_identical_open_twin` marks that case.
-fn restart_write_answer(
+fn lost_write_answer(
+    loss: Loss<'_>,
     input: &serde_json::Value,
     ledger: Option<&LedgerRow>,
     has_identical_open_twin: bool,
-) -> RestartAnswer {
+) -> LostCallAnswer {
+    if let Loss::ProcessEnd { drained: false, .. } = loss {
+        return answer_saying(loss, PROCESS_END_WRITE_STILL_RUNNING, CallEffect::Unknown);
+    }
     let Some(row) = ledger else {
         return if has_identical_open_twin {
-            restart_answer_saying(RESTART_OUTCOME_UNKNOWN, CallEffect::Unknown)
-        } else if write_carries_file_targets(input) {
-            restart_answer_saying(RESTART_WRITE_FILES_UNKNOWN, CallEffect::Unknown)
+            answer_saying(loss, RESTART_OUTCOME_UNKNOWN, CallEffect::Unknown)
+        } else if matches!(loss, Loss::HostRestart) && write_carries_file_targets(input) {
+            answer_saying(loss, RESTART_WRITE_FILES_UNKNOWN, CallEffect::Unknown)
+        } else if write_may_target_outside_worktree(input) {
+            answer_saying(loss, PROCESS_END_WRITE_OUTSIDE_UNKNOWN, CallEffect::Unknown)
         } else {
-            restart_answer_saying(RESTART_WRITE_NEVER_STARTED, CallEffect::None)
+            answer_saying(loss, RESTART_WRITE_NEVER_STARTED, CallEffect::None)
         };
     };
     if replay::is_pending(&row.report) {
         let report = replay::restart_write_report(&row.report, input);
-        return restart_answer_with_report(
+        return answer_with_report(
+            loss,
             RESTART_WRITE_PARTIAL,
             &report,
             CallEffect::Partial,
@@ -303,7 +394,8 @@ fn restart_write_answer(
         );
     }
     if !row.finalized {
-        return restart_answer_with_report(
+        return answer_with_report(
+            loss,
             RESTART_WRITE_POST_SEAL_UNFINISHED,
             &row.report,
             CallEffect::Partial,
@@ -311,34 +403,47 @@ fn restart_write_answer(
         );
     }
     if replay::report_was_stopped(&row.report) {
-        return restart_answer_with_report(
+        return answer_with_report(
+            loss,
             RESTART_WRITE_PARTIAL,
             &row.report,
             CallEffect::Partial,
             None,
         );
     }
-    restart_answer_with_report(RESTART_WRITE_LANDED, &row.report, CallEffect::Landed, None)
+    answer_with_report(
+        loss,
+        RESTART_WRITE_LANDED,
+        &row.report,
+        CallEffect::Landed,
+        None,
+    )
 }
 
-/// What a restart says about the open call `name(input)`. `ledger` and
-/// `has_identical_open_twin` are consulted only for a `write`.
-pub(crate) fn restart_answer(
+/// What `loss` lets an answer say about the open call `name(input)`. `ledger`
+/// and `has_identical_open_twin` are consulted only for a `write`.
+pub(crate) fn lost_call_answer(
+    loss: Loss<'_>,
     name: &str,
     input: &serde_json::Value,
     ledger: Option<&LedgerRow>,
     has_identical_open_twin: bool,
-) -> RestartAnswer {
+) -> LostCallAnswer {
     match normalized_tool_name(name).to_ascii_lowercase().as_str() {
-        "read" => restart_answer_saying(RESTART_READ, CallEffect::None),
-        "write" => restart_write_answer(input, ledger, has_identical_open_twin),
+        "read" => answer_saying(loss, RESTART_READ, CallEffect::None),
+        "write" => lost_write_answer(loss, input, ledger, has_identical_open_twin),
         "run" => {
             let commits = input
                 .get("commit_msg")
                 .and_then(serde_json::Value::as_str)
                 .is_some();
-            RestartAnswer {
-                text: run_batch_lost_to_restart_text(commits),
+            LostCallAnswer {
+                text: match loss {
+                    Loss::HostRestart => run_batch_lost_to_restart_text(commits),
+                    Loss::ProcessEnd { opening, .. } => {
+                        run_batch_lost_with_process_text(opening, commits)
+                    }
+                },
                 effect: if commits {
                     CallEffect::Unknown
                 } else {
@@ -347,7 +452,7 @@ pub(crate) fn restart_answer(
                 seal_report: None,
             }
         }
-        _ => restart_answer_saying(RESTART_OUTCOME_UNKNOWN, CallEffect::Unknown),
+        _ => answer_saying(loss, RESTART_OUTCOME_UNKNOWN, CallEffect::Unknown),
     }
 }
 
@@ -434,6 +539,7 @@ async fn user_stop_results(
                 is_error: true,
                 reason: "user_stop",
                 effect: None,
+                exit_reason: None,
                 seal_report: None,
             });
         } else if is_write_tool_call(&call.tool.name) {
@@ -464,6 +570,7 @@ async fn user_stop_results(
                 is_error: false,
                 reason: "user_stop_after_write_effect",
                 effect: None,
+                exit_reason: None,
                 seal_report: None,
             });
         }
@@ -474,17 +581,33 @@ async fn user_stop_results(
         .collect())
 }
 
-/// Every call of the turn nothing has answered and no active wait speaks for.
+/// Wait, bounded by [`PROCESS_END_DRAIN`], for every open write of `run_id` to
+/// leave [`replay::WriteStops`]: each was asked to stop at its next boundary,
+/// or is finishing the publication it had begun, or was aborted before it took
+/// any effect.
+async fn drain_open_writes(orch: &Orchestrator, run_id: &str, open: &[RecordedCall]) {
+    let deadline = tokio::time::Instant::now() + PROCESS_END_DRAIN;
+    while open.iter().any(|call| {
+        is_write_tool_call(&call.tool.name) && orch.write_stops.is_applying(run_id, &call.tool.id)
+    }) && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Every call of the turn nothing has answered and no active wait speaks for,
+/// answered as `cause` (a restart or a process end) allows.
 ///
 /// Answers are gathered per run, not per turn: a recorded tool result does not
-/// always carry its turn, and a false restart answer laid over a real result
-/// would be worse than leaving the call open. A provider can repeat a tool use
-/// across assistant events, so ids are also deduplicated here.
-async fn host_restart_results(
+/// always carry its turn, and a false answer laid over a real result would be
+/// worse than leaving the call open. A provider can repeat a tool use across
+/// assistant events, so ids are also deduplicated here.
+async fn lost_call_results(
     orch: &Orchestrator,
     db: &LocalDb,
     run_id: &str,
     turn_id: &str,
+    cause: &InterruptCause,
 ) -> Result<Vec<PendingToolResult>, String> {
     let (calls, _) = recorded_calls(db, run_id, turn_id)
         .await
@@ -497,10 +620,32 @@ async fn host_restart_results(
         .into_iter()
         .filter(|call| !closed.contains(&call.tool.id) && seen.insert(call.tool.id.clone()))
         .collect();
+    let (reason, exit_reason, opening) = match cause {
+        InterruptCause::ProcessLost { exit_reason } => {
+            // The host outlives the process, so its writes are still being
+            // served: stop each at its next boundary and wait for it there,
+            // so its ledger row is what decides the answer.
+            orch.write_stops.raise(run_id);
+            drain_open_writes(orch, run_id, &open).await;
+            (
+                PROCESS_LOST_REASON,
+                Some(exit_reason.clone()),
+                Some(process_end_opening(exit_reason)),
+            )
+        }
+        InterruptCause::HostRestart | InterruptCause::UserStop => (HOST_RESTART_REASON, None, None),
+    };
     let mut results = Vec::with_capacity(open.len());
     for call in &open {
         let tool = &call.tool;
         let is_write = is_write_tool_call(&tool.name);
+        let loss = match opening.as_deref() {
+            Some(opening) => Loss::ProcessEnd {
+                opening,
+                drained: !(is_write && orch.write_stops.is_applying(run_id, &tool.id)),
+            },
+            None => Loss::HostRestart,
+        };
         let ledger = if is_write {
             write_ledger_row(&orch.db.local, run_id, &tool.id)
                 .await
@@ -516,7 +661,8 @@ async fn host_restart_results(
                 })
                 .count()
                 > 1;
-        let answer = restart_answer(
+        let answer = lost_call_answer(
+            loss,
             &tool.name,
             &tool.input,
             ledger.as_ref(),
@@ -530,8 +676,9 @@ async fn host_restart_results(
             result: answer.text,
             // A write that landed succeeded; only the delivery of its result failed.
             is_error: answer.effect != CallEffect::Landed,
-            reason: HOST_RESTART_REASON,
+            reason,
             effect: Some(answer.effect),
+            exit_reason: exit_reason.clone(),
             seal_report: answer.seal_report,
         });
     }
@@ -539,7 +686,10 @@ async fn host_restart_results(
 }
 
 /// `raw.reason` of a result the restart settlement wrote.
-const HOST_RESTART_REASON: &str = "host_restart";
+pub(crate) const HOST_RESTART_REASON: &str = "host_restart";
+
+/// `raw.reason` of a result a process teardown's settlement wrote.
+pub(crate) const PROCESS_LOST_REASON: &str = "process_lost";
 
 fn pending_tool_results(
     orch: &Orchestrator,
@@ -557,8 +707,8 @@ fn pending_tool_results(
                 .map_err(|e| e.to_string())?;
             match cause {
                 InterruptCause::UserStop => user_stop_results(&orch, &db, &run_id, &turn_id).await,
-                InterruptCause::HostRestart => {
-                    host_restart_results(&orch, &db, &run_id, &turn_id).await
+                InterruptCause::HostRestart | InterruptCause::ProcessLost { .. } => {
+                    lost_call_results(&orch, &db, &run_id, &turn_id, &cause).await
                 }
             }
         }
@@ -580,10 +730,10 @@ pub(crate) fn pending_tool_result_ids(
 /// Answer every open call of `turn_id` as `cause` dictates, returning how many
 /// results were written.
 ///
-/// A restart answer needs no idempotency key. The boot sweep reports a turn only
-/// for the transition it wrote itself, so a later boot never settles it again, no
-/// process remains that could answer the call, and a call answered by any means
-/// is already excluded when the candidates are read.
+/// A restart or process-end answer needs no idempotency key. No process remains
+/// that could answer the call, and a call answered by any means is excluded
+/// when the candidates are read, so a second settlement of the same turn finds
+/// nothing left to answer.
 pub(crate) fn settle_unanswered_calls(
     orch: &Orchestrator,
     run_id: &str,
@@ -611,6 +761,9 @@ pub(crate) fn settle_unanswered_calls(
         let mut raw = serde_json::json!({ "synthetic": true, "reason": pending_result.reason });
         if let Some(effect) = pending_result.effect {
             raw["effect"] = serde_json::Value::String(effect.as_str().to_string());
+        }
+        if let Some(exit_reason) = pending_result.exit_reason.as_deref() {
+            raw["exit_reason"] = serde_json::Value::String(exit_reason.to_string());
         }
         let event = TranscriptEvent {
             event_type: "tool_result".to_string(),
@@ -672,6 +825,27 @@ pub(crate) fn settle_unanswered_calls(
     Ok(inserted)
 }
 
+/// Answer the open calls of `turn_id`, which the end of run `run_id`'s agent
+/// process cut off while this host lived on, for the run's `exit_reason`.
+///
+/// Called before the turn is terminalized and before any successor can be
+/// launched, because a successor's prompt is composed once and must carry
+/// these answers. A failure is logged and costs the turn only its answers:
+/// the teardown that calls this finalizes the run whatever happens here.
+pub(crate) fn settle_calls_cut_off_by_process_end(
+    orch: &Orchestrator,
+    run_id: &str,
+    turn_id: &str,
+    exit_reason: &str,
+) {
+    let cause = InterruptCause::ProcessLost {
+        exit_reason: exit_reason.to_string(),
+    };
+    if let Err(error) = settle_unanswered_calls(orch, run_id, turn_id, cause) {
+        log::warn!("Could not answer the calls a process end ({exit_reason}) cut off on turn {turn_id}: {error}");
+    }
+}
+
 /// A quoted answer past this many characters is cut, so one write with a huge
 /// report cannot swamp the prompt that resumes its turn.
 const RESTART_NOTE_QUOTE_LIMIT: usize = 4_000;
@@ -717,16 +891,17 @@ fn call_subject(input: &serde_json::Value) -> Option<String> {
     })
 }
 
-/// The list a resume prompt carries: each call the restart settlement answered
-/// on this turn, named, with the settlement's own text. `None` when it answered
-/// none.
+/// The list a resume prompt carries: each call a settlement with one of
+/// `reasons` (`raw.reason`) answered on this turn, named, with the settlement's
+/// own text. `None` when it answered none.
 ///
 /// This prompt is what reaches the model: a native resume reads the provider's
 /// own session file, not the transcript event the settlement wrote.
-pub(crate) async fn restart_answered_calls_note(
+pub(crate) async fn lost_calls_note(
     db: &LocalDb,
     run_id: &str,
     turn_id: &str,
+    reasons: &[&str],
 ) -> DbResult<Option<String>> {
     let run_id = run_id.to_string();
     let turn_id = turn_id.to_string();
@@ -771,7 +946,7 @@ pub(crate) async fn restart_answered_calls_note(
                 .as_ref()
                 .and_then(|raw| raw.get("reason"))
                 .and_then(serde_json::Value::as_str)
-                == Some(HOST_RESTART_REASON)
+                .is_some_and(|reason| reasons.contains(&reason))
         })
         .filter_map(|event| {
             let id = event.tool_use_id.as_deref()?;

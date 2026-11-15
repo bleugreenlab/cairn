@@ -276,7 +276,35 @@ fn apply_snapshot_mutations(
     }
 }
 
-pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
+/// Serve one `write` call.
+///
+/// Returned erased, so a caller's `Send` proof stops here instead of descending
+/// through the whole write, which can itself reach this function again (a
+/// preview's apply).
+pub fn handle_write<'a>(
+    orch: &'a Orchestrator,
+    request: &'a McpCallbackRequest,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
+    Box::pin(async move {
+        // Every write a call names is registered for as long as it is served,
+        // so a Stop or a teardown can ask it to stop at a boundary and wait for
+        // it to get there. The delivery is the one the transport holds when it
+        // scoped one, so a dropped callback and this write agree on whether it
+        // began.
+        let delivery = crate::dispatch::current_delivery().unwrap_or_default();
+        let _registration = request
+            .run_id
+            .as_deref()
+            .zip(request.tool_use_id.as_deref())
+            .map(|(run_id, tool_use_id)| {
+                orch.write_stops
+                    .enter(run_id, tool_use_id, delivery.clone())
+            });
+        crate::dispatch::serve_delivery(delivery, serve_write(orch, request)).await
+    })
+}
+
+async fn serve_write(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
     let mut drained = Vec::new();
     let report = handle_write_under_barrier(orch, request, &mut drained).await;
     if drained.is_empty() {
@@ -441,6 +469,25 @@ pub mod test_pause {
 
     pub(super) async fn sealing(tool_use_id: Option<&str>) {
         pause_at(&SEAL_PAUSES, tool_use_id).await;
+    }
+
+    static PUBLISHED_PAUSES: LazyLock<Mutex<HashMap<String, Pause>>> =
+        LazyLock::new(Default::default);
+
+    /// Park after the commit was published and before its ledger row is
+    /// recorded: the window an aborted write would leave a landed commit with
+    /// no row.
+    pub fn after_publication(tool_use_id: &str) -> Pause {
+        let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        PUBLISHED_PAUSES
+            .lock()
+            .unwrap()
+            .insert(tool_use_id.to_string(), pause.clone());
+        pause
+    }
+
+    pub(super) async fn published(tool_use_id: Option<&str>) {
+        pause_at(&PUBLISHED_PAUSES, tool_use_id).await;
     }
 }
 
@@ -1100,6 +1147,12 @@ async fn handle_write_attempt(
     // batches use the store lock, and any batch carrying a resource item also
     // claims the replay ledger itself before dispatching any effects.
     let write_call = replay::invoking_write_call(orch, request).await;
+    // `handle_write` registered a call its delivery named; one found in the
+    // transcript is registered here, under the id it was found as.
+    let _found_registration = write_call
+        .as_ref()
+        .filter(|_| request.tool_use_id.is_none())
+        .map(|call| call.register_found(orch));
 
     // A generated draft spends one of its generation's bounded attempts, so it
     // applies only under this ledger's resource claim: a delivery that cannot
@@ -1640,6 +1693,11 @@ async fn handle_write_attempt(
         .as_ref()
         .filter(|_| !has_file_targets || has_resource_items)
     {
+        // The claim is this write's first effect: from here a dropped
+        // callback lets it reach its next boundary instead of aborting it.
+        if !crate::dispatch::begin_delivery_effect() {
+            return replay::stopped_unclaimed_report(&payload, &[], &[], atomic);
+        }
         match replay::claim_resource_call(&orch.db.local, call).await {
             replay::ResourceClaim::Claimed => {
                 resource_progress = Some(replay::ResourceWriteProgress::claimed(
@@ -1881,6 +1939,9 @@ async fn handle_write_attempt(
             #[cfg(feature = "test-utils")]
             if let Some(call) = write_call.as_ref().filter(|_| resource_progress.is_some()) {
                 replay::hold_resource_item(call, index, replay::ItemPhase::BeforeDispatch).await;
+            } else if let Some(run_id) = request.run_id.as_deref().filter(|_| write_call.is_none()) {
+                replay::hold_unclaimed_resource_item(run_id, index, replay::ItemPhase::BeforeDispatch)
+                    .await;
             }
             // A stopped write stops here, between items: an item already
             // dispatching runs to completion.
@@ -1897,6 +1958,20 @@ async fn handle_write_attempt(
                     .await;
                 }
                 progress.begin(index, &applied, &failures);
+            } else if !crate::dispatch::delivery_may_take_effect() {
+                // No ledger claim (the call could not be named), but the item is
+                // still an effect: its delivery's stop and abandonment hold here
+                // exactly as a claimed write's do.
+                return stop_unclaimed(
+                    orch,
+                    &payload,
+                    &promoted_memories,
+                    &deferred_pr_syncs,
+                    &mut applied,
+                    &failures,
+                    atomic,
+                )
+                .await;
             }
             // A batch with file targets holds its store guard through here; a
             // resource item on that store runs under it.
@@ -2155,9 +2230,11 @@ async fn handle_write_attempt(
     }
     if let Some(first_file_change) = first_file_change {
         // Nothing is committed yet, so the commit is one more step a Stop can
-        // land before, exactly like a resource item.
+        // land before, exactly like a resource item. Past this point the
+        // commit is this write's effect, and a dropped callback lets it finish
+        // and record its row rather than cutting it off between the two.
         if let Some(progress) = resource_progress.as_mut() {
-            if progress.stop_requested() {
+            if progress.stop_requested() || !crate::dispatch::begin_delivery_effect() {
                 return seal_stopped_before_commit(
                     orch,
                     progress,
@@ -2169,6 +2246,19 @@ async fn handle_write_attempt(
                 .await;
             }
             progress.committing(&applied, &failures);
+        } else if !crate::dispatch::delivery_may_take_effect() {
+            // Unclaimed: no row is recorded, so a file-only write stays freely
+            // retryable, exactly as one that published nothing always was.
+            return stop_unclaimed(
+                orch,
+                &payload,
+                &promoted_memories,
+                &deferred_pr_syncs,
+                &mut applied,
+                &failures,
+                atomic,
+            )
+            .await;
         }
         let _seal_phase = write_store_guard
             .as_ref()
@@ -2256,6 +2346,8 @@ async fn handle_write_attempt(
                 failures.push(failure);
             }
         }
+        #[cfg(feature = "test-utils")]
+        test_pause::published(request.tool_use_id.as_deref()).await;
 
         // Record the publication against the call that produced it, still inside
         // the epoch that published it, so a crash cannot leave a landed commit
@@ -2620,7 +2712,12 @@ async fn handle_write_attempt(
             progress.disarm();
         }
         let mut blocking_checkpointed = false;
-        if let Some(kind) = blocking_kind.filter(|_| !blocking_indices.is_empty()) {
+        // The group is an effect too, and may be this delivery's first. An
+        // abandoned delivery skips it: its task is being aborted, and no one
+        // waits for this report.
+        if let Some(kind) = blocking_kind
+            .filter(|_| !blocking_indices.is_empty() && crate::dispatch::begin_delivery_effect())
+        {
             let mut blocking_request = request.clone();
             let checkpoint = if let Some(call) = write_call.as_ref() {
                 blocking_request.tool_use_id = Some(call.tool_use_id().to_string());
@@ -2782,6 +2879,42 @@ async fn seal_stopped_before_commit(
         });
     }
     progress.seal_stopped(applied, failures).await
+}
+
+/// Stop a write holding no ledger claim at a boundary, the way
+/// [`seal_stopped_before_commit`] stops a claimed one, recording nothing: the
+/// memory promotions it applied are rolled back, its deferred pull-request
+/// syncs never run, and its report lists what it dispatched.
+async fn stop_unclaimed(
+    orch: &Orchestrator,
+    payload: &ChangePayload,
+    promoted_memories: &[(usize, String, String, PromotedMemoryRef)],
+    deferred_pr_syncs: &[(
+        usize,
+        String,
+        String,
+        crate::pr_data::actions::DeferredPrSync,
+    )],
+    applied: &mut Vec<AppliedChange>,
+    failures: &[ChangeFailure],
+    atomic: bool,
+) -> String {
+    for (index, ..) in deferred_pr_syncs {
+        settle_deferred_pr_sync(
+            applied,
+            *index,
+            "pull request not synced: the write was stopped before its commit",
+        );
+    }
+    if !promoted_memories.is_empty() {
+        rollback_promoted_memory_decisions(orch, promoted_memories).await;
+        applied.retain(|change| {
+            !promoted_memories
+                .iter()
+                .any(|(index, ..)| *index == change.index)
+        });
+    }
+    replay::stopped_unclaimed_report(payload, applied, failures, atomic)
 }
 
 /// Replace a deferred create-pr item's pending marker with what its sync did.
