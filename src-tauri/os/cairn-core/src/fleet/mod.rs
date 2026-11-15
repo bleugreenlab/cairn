@@ -4505,9 +4505,9 @@ enum Detachment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase", tag = "outcome")]
 pub enum CancelOutcome {
-    /// Nobody else wanted this answer, so the work has been told to stop. Its
-    /// row clears when the machine reports that it did; a delivered instruction
-    /// is not yet a stopped process.
+    /// Nobody else wanted this answer, so the work has been told to stop.
+    /// Ungranted work ends through the runner's cancellation tail; granted work
+    /// still needs its machine's terminal report, not just a delivered Cancel.
     Stopping,
     /// This requester let go and the work continues for the ones that remain.
     Released { remaining: usize },
@@ -9733,11 +9733,9 @@ impl Fleet {
                 Detachment::Unknown => CancelOutcome::Unknown,
             };
         }
-        let owner = self.queue.attempt_binding_of(request_id);
-        let Some((attempt_id, _, _)) = owner else {
+        let Some(identity) = self.queue.attempt_identity_of(request_id) else {
             return CancelOutcome::Unknown;
         };
-        let identity = (request_id.to_string(), attempt_id);
         self.purposes
             .lock()
             .unwrap()
@@ -9968,6 +9966,20 @@ impl Fleet {
                     attempt_id: request.1.clone(),
                 },
             );
+        }
+    }
+
+    /// Batch cancellation also covers the gap before an attempt entered the
+    /// queue, when a request-addressed fleet cancel could not find it yet.
+    async fn retired_or_stopped(&self, key: &RequestIdentity, stop: Option<&PlacementStop>) {
+        tokio::select! {
+            () = self.retired(key) => {}
+            () = async {
+                match stop {
+                    Some(stop) => stop.stopped().await,
+                    None => std::future::pending().await,
+                }
+            } => {}
         }
     }
 
@@ -13390,7 +13402,7 @@ impl Fleet {
                 }
                 let leader = (request.request_id.clone(), request.attempt_id.clone());
                 let executed = pool
-                    .execute_prepared_accounted(request, None, prepared)
+                    .execute_prepared_accounted(request, None, prepared, None)
                     .await;
                 pool.cancelled_leaders.lock().unwrap().remove(&leader);
                 pool.coalesced_leaders.lock().unwrap().remove(&leader);
@@ -13986,7 +13998,7 @@ impl Fleet {
                                 preparing.last_progress_unix_ms = unix_time_ms();
                             }
                             let executed = pool
-                                .execute_prepared_accounted(request, Some(batch), prepared)
+                                .execute_prepared_accounted(request, Some(batch), prepared, None)
                                 .await;
                             (executed.outcome, executed.account, executed.abandoned_grant)
                         }
@@ -14131,7 +14143,13 @@ impl Fleet {
         orch: &Orchestrator,
         mut request: CellRequest,
         batch: ResolvedRunBatch,
+        stop: &PlacementStop,
     ) -> ExecutedRequest {
+        let identity = (request.request_id.clone(), request.attempt_id.clone());
+        let cancelled = || CellOutcome::Cancelled {
+            request_id: identity.0.clone(),
+            attempt_id: identity.1.clone(),
+        };
         let runner_context_id = uuid::Uuid::new_v4().to_string();
         let output = output_guard::RelayedOutput::shared();
         let run_context = batch.run_context.clone();
@@ -14162,24 +14180,31 @@ impl Fleet {
         let sandbox_mode = if page_call {
             ProcessSandboxMode::PageCall
         } else {
-            let resolved_fence =
-                match crate::mcp::handlers::fence::resolve_run_fence(orch, &batch.request).await {
-                    crate::mcp::handlers::fence::RunFenceResolution::Resolved(_, fence) => {
-                        Some(fence)
+            let resolved = stop
+                .until(crate::mcp::handlers::fence::resolve_run_fence(
+                    orch,
+                    &batch.request,
+                ))
+                .await;
+            let Some(resolved) = resolved else {
+                self.settle_runner_context(&runner_context_id);
+                return cancelled().into();
+            };
+            let resolved_fence = match resolved {
+                crate::mcp::handlers::fence::RunFenceResolution::Resolved(_, fence) => Some(fence),
+                crate::mcp::handlers::fence::RunFenceResolution::Ambient => None,
+                crate::mcp::handlers::fence::RunFenceResolution::Unavailable(diagnostic) => {
+                    self.runner_contexts
+                        .lock()
+                        .unwrap()
+                        .remove(&runner_context_id);
+                    return CellOutcome::Unavailable {
+                        reason: CellUnavailableReason::RunnerContext,
+                        diagnostic,
                     }
-                    crate::mcp::handlers::fence::RunFenceResolution::Ambient => None,
-                    crate::mcp::handlers::fence::RunFenceResolution::Unavailable(diagnostic) => {
-                        self.runner_contexts
-                            .lock()
-                            .unwrap()
-                            .remove(&runner_context_id);
-                        return CellOutcome::Unavailable {
-                            reason: CellUnavailableReason::RunnerContext,
-                            diagnostic,
-                        }
-                        .into();
-                    }
-                };
+                    .into();
+                }
+            };
             Self::batch_sandbox_mode(resolved_fence, &request.repository)
         };
         let node_scratch = batch.node_scratch.clone();
@@ -14206,12 +14231,13 @@ impl Fleet {
         // An agent's batch is the one submission whose requester reads the
         // outcome as a statement about whether its commands ran, so it is the
         // one that keeps the account of a grant without a result.
-        let executed = match self.prepare_execution(orch, &mut request).await {
-            Ok(prepared) => {
-                self.execute_prepared_accounted(request, Some(batch), prepared)
+        let executed = match stop.until(self.prepare_execution(orch, &mut request)).await {
+            Some(Ok(prepared)) => {
+                self.execute_prepared_accounted(request, Some(batch), prepared, Some(stop))
                     .await
             }
-            Err(outcome) => outcome.into(),
+            Some(Err(outcome)) => outcome.into(),
+            None => cancelled().into(),
         };
         output_guard::flush_batch_output(orch, &output, run_context.as_ref());
         self.settle_runner_context(&runner_context_id);
@@ -14269,7 +14295,8 @@ impl Fleet {
         let preparing = &mut request;
         let executed = match off_frame(move || self.prepare_execution(orch, preparing)).await {
             Ok(prepared) => {
-                off_frame(|| self.execute_prepared_accounted(request, Some(batch), prepared)).await
+                off_frame(|| self.execute_prepared_accounted(request, Some(batch), prepared, None))
+                    .await
             }
             Err(outcome) => outcome.into(),
         };
@@ -14717,7 +14744,7 @@ impl Fleet {
         batch: Option<ProcessBatch>,
         prepared: PreparedExecution,
     ) -> CellOutcome {
-        self.execute_prepared_accounted(request, batch, prepared)
+        self.execute_prepared_accounted(request, batch, prepared, None)
             .await
             .outcome
     }
@@ -14775,9 +14802,13 @@ impl Fleet {
         request: CellRequest,
         batch: Option<ProcessBatch>,
         prepared: PreparedExecution,
+        stop: Option<&PlacementStop>,
     ) -> ExecutedRequest {
         let key = (request.request_id.clone(), request.attempt_id.clone());
-        let mut executed = off_frame(|| self.execute_entry(request, batch, prepared)).await;
+        let mut executed = off_frame(|| self.execute_entry(request, batch, prepared, stop)).await;
+        if stop.is_some() {
+            self.cancelled_leaders.lock().unwrap().remove(&key);
+        }
         executed.account.cancel_cause = self.cancel_causes.lock().unwrap().take(&key);
         executed
     }
@@ -14798,6 +14829,7 @@ impl Fleet {
         request: CellRequest,
         batch: Option<ProcessBatch>,
         prepared: PreparedExecution,
+        stop: Option<&PlacementStop>,
     ) -> ExecutedRequest {
         let PreparedExecution {
             executor_config,
@@ -14824,7 +14856,9 @@ impl Fleet {
         }
         // Retired while it was still being prepared: nothing is queued yet,
         // so ending it is the runner's own act and needs no machine.
-        if self.cancelled_leaders.lock().unwrap().remove(&key) {
+        if self.cancelled_leaders.lock().unwrap().remove(&key)
+            || stop.is_some_and(PlacementStop::is_stopped)
+        {
             self.preparing_leaders.lock().unwrap().remove(&key);
             return CellOutcome::Cancelled {
                 request_id: key.0,
@@ -14890,7 +14924,7 @@ impl Fleet {
                 // Retired while waiting for a machine. Nothing was granted, so
                 // the runner ends it here rather than waiting for a claim that
                 // may never come; that `Cancelled` is the attempt's own end.
-                () = self.retired(&key) => {
+                () = self.retired_or_stopped(&key, stop) => {
                     self.queue.withdraw(
                         &key,
                         "withdrawn: retired before any machine claimed it".into(),
@@ -14963,7 +14997,7 @@ impl Fleet {
                 }
                 // Retired with an offer out. The machine may claim it as this
                 // runs, so it is told the grant is never coming.
-                () = self.retired(&key) => {
+                () = self.retired_or_stopped(&key, stop) => {
                     self.queue.withdraw(
                         &key,
                         "withdrawn: retired while offered, before any grant".into(),
@@ -15046,12 +15080,26 @@ impl Fleet {
             withdraw_claim(&selected, &entry_id);
             return executor_unavailable(diagnostic).into();
         }
+        let project_id = request.project_id.clone();
+        let setup_identity = request.project_requirements.setup_identity.clone();
+        let runs_in_home = request.pinned_executor_id.is_some();
+        let granted_at_unix_ms = unix_time_ms();
+        self.claim_check_at_grant(&key, &selected, granted_at_unix_ms)
+            .await;
         // A retirement that landed while this item was being placed stops it
         // here. Granting anyway and chasing it with a Cancel is what made
         // retirement a race the work usually won: the granted item took an
         // occupancy row, and the cancel behind it could be handled before the
         // executor had bound the identity it named.
-        if self.cancelled_leaders.lock().unwrap().remove(&key) {
+        if self.cancelled_leaders.lock().unwrap().remove(&key)
+            || stop.is_some_and(PlacementStop::is_stopped)
+        {
+            self.settle_check_claim(
+                &key,
+                "cancelled",
+                "stopped before the executor grant".into(),
+                true,
+            );
             self.queue
                 .take(&key, queue::TerminalState::Cancelled, unix_time_ms());
             guard.disarm();
@@ -15081,12 +15129,6 @@ impl Fleet {
                 &grant.scratch_id,
             );
         }
-        let project_id = request.project_id.clone();
-        let setup_identity = request.project_requirements.setup_identity.clone();
-        let runs_in_home = request.pinned_executor_id.is_some();
-        let granted_at_unix_ms = unix_time_ms();
-        self.claim_check_at_grant(&key, &selected, granted_at_unix_ms)
-            .await;
         let admission_request = request.clone();
         let admission = self.send_new_admission(
             &selected,
@@ -15111,7 +15153,8 @@ impl Fleet {
         }
         // Retirement can still land in the instant between the gate above and
         // this send, so the delivered form remains.
-        let cancelled_before_correlation = self.cancelled_leaders.lock().unwrap().remove(&key);
+        let cancelled_before_correlation = self.cancelled_leaders.lock().unwrap().remove(&key)
+            || stop.is_some_and(PlacementStop::is_stopped);
         if cancelled_before_correlation && sent {
             let _ = self.send_to(
                 &selected.executor_id,
@@ -16946,7 +16989,9 @@ impl Fleet {
                 self.executor_name_for_text(executor_id)
             ));
         }
-        if wait.declines.is_empty() && wait.offered_to.is_none() {
+        if let Some(diagnostic) = wait.placement_wait.as_deref() {
+            phrase.push_str(&format!("; {diagnostic}"));
+        } else if wait.declines.is_empty() && wait.offered_to.is_none() {
             phrase.push_str(", and no machine has refused it yet");
         }
         for (executor_id, decline) in &wait.declines {
@@ -24983,6 +25028,49 @@ fn describe_runner_stop(stopped_at_unix_ms: u64) -> String {
         .unwrap_or_else(|| format!("unix ms {stopped_at_unix_ms}"))
 }
 
+/// A batch's level-triggered stop, shared with preparation and placement.
+/// Waiting after a stop observes it immediately; no wakeup can be missed.
+pub(crate) struct PlacementStop {
+    stopped: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for PlacementStop {
+    fn default() -> Self {
+        let (stopped, _) = tokio::sync::watch::channel(false);
+        Self { stopped }
+    }
+}
+
+impl PlacementStop {
+    pub(crate) fn stop(&self) {
+        self.stopped.send_replace(true);
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        *self.stopped.borrow()
+    }
+
+    pub(crate) fn stopped(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let mut observed = self.stopped.subscribe();
+            let _ = observed.wait_for(|stopped| *stopped).await;
+        })
+    }
+
+    /// Only for waits whose drop guards can end them. Dropping a residency
+    /// acquisition releases its own queue and route guards, not another caller's.
+    /// A granted command batch must instead await its machine's terminal report.
+    pub(crate) async fn until<T>(&self, work: impl std::future::Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            biased;
+            () = self.stopped() => None,
+            result = work => Some(result),
+        }
+    }
+}
+
 /// The moment this runner began shutting down, published once.
 ///
 /// Level-triggered on purpose: a request that starts waiting after the stop
@@ -25637,6 +25725,158 @@ mod tests {
         .await
         .expect("the successor is not held for a death that already happened");
         assert!(matches!(gate, PurposeGate::Clear));
+    }
+
+    #[tokio::test]
+    async fn cancelling_unclaimed_work_parked_on_an_update_prevents_later_placement() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let (sender, mut machine) = mpsc::unbounded_channel();
+        let generation = orch.fleet.attach_executor(sender);
+        orch.fleet
+            .set_update_hold_for_test(COLOCATED_EXECUTOR_ID, true);
+        let request = provenance_request();
+        let identity = (request.request_id.clone(), request.attempt_id.clone());
+        let submitting = scratch_submission_with_stop(&orch, None, false).await;
+        let entry_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(entry) = orch
+                    .fleet
+                    .queue
+                    .with_entry_by_identity(&identity, |entry| {
+                        matches!(
+                            entry.latest_placement().map(|decision| &decision.outcome),
+                            Some(PlacementOutcome::Waiting { .. })
+                        )
+                        .then(|| entry.id.clone())
+                    })
+                    .flatten()
+                {
+                    break entry;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the pinned batch parks on the update without an offer");
+        assert!(orch
+            .fleet
+            .claimed_executor_of(&request.request_id)
+            .is_none());
+        assert_eq!(
+            orch.fleet.cancel_request(&request.request_id),
+            CancelOutcome::Stopping
+        );
+        let executed = tokio::time::timeout(Duration::from_secs(5), submitting)
+            .await
+            .expect("an unclaimed cancellation needs no machine confirmation")
+            .unwrap();
+        assert!(matches!(executed.outcome, CellOutcome::Cancelled { .. }));
+        assert!(executed.account.placement.is_none());
+        assert!(executed.grant_without_result.is_none());
+        assert_eq!(orch.fleet.queue.len(), 0);
+
+        orch.fleet
+            .set_update_hold_for_test(COLOCATED_EXECUTOR_ID, false);
+        // Even an already-sent, late Claim cannot revive a withdrawn entry.
+        orch.fleet.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::Claim { entry_id },
+        );
+        while let Ok(frame) = machine.try_recv() {
+            assert!(
+                !matches!(
+                    frame,
+                    ExecutorMessage::Offer { .. } | ExecutorMessage::Granted { .. }
+                ),
+                "cancelled work was dispatched after capacity returned: {frame:?}"
+            );
+        }
+        assert_eq!(orch.fleet.queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_batch_stop_before_grant_withdraws_but_after_grant_waits_for_the_machine() {
+        for grant_first in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = Arc::new(test_orchestrator(temp.path()).await);
+            let (sender, mut machine) = mpsc::unbounded_channel();
+            let generation = orch.fleet.attach_executor(sender);
+            let stop = Arc::new(PlacementStop::default());
+            let submitting = scratch_submission_with_stop(&orch, Some(stop.clone()), true).await;
+            let offered = loop {
+                match tokio::time::timeout(Duration::from_secs(5), machine.recv()).await {
+                    Ok(Some(ExecutorMessage::Offer { entry_id, .. })) => break entry_id,
+                    Ok(Some(_)) => {}
+                    other => panic!("expected offer, got {other:?}"),
+                }
+            };
+            orch.fleet.handle_executor_message(
+                COLOCATED_EXECUTOR_ID,
+                generation,
+                ExecutorMessage::Claim { entry_id: offered },
+            );
+            if grant_first {
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(5), machine.recv()).await {
+                        Ok(Some(ExecutorMessage::Granted { .. })) => break,
+                        Ok(Some(_)) => {}
+                        other => panic!("expected grant, got {other:?}"),
+                    }
+                }
+            }
+            // No yield between Claim and stop in the pre-grant case: this
+            // exercises the grant gate even when a claim is already ready.
+            stop.stop();
+            let request = provenance_request();
+            assert_eq!(
+                orch.fleet.cancel_request(&request.request_id),
+                CancelOutcome::Stopping
+            );
+            if grant_first {
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(5), machine.recv()).await {
+                        Ok(Some(ExecutorMessage::Cancel { .. })) => break,
+                        Ok(Some(_)) => {}
+                        other => panic!("expected machine cancel, got {other:?}"),
+                    }
+                }
+                assert!(
+                    !submitting.is_finished(),
+                    "sending Cancel is not a terminal report"
+                );
+                assert_eq!(orch.fleet.queue.len(), 1);
+                orch.fleet.handle_executor_message(
+                    COLOCATED_EXECUTOR_ID,
+                    generation,
+                    ExecutorMessage::Result {
+                        request_id: request.request_id.clone(),
+                        attempt_id: request.attempt_id.clone(),
+                        outcome: CellOutcome::Cancelled {
+                            request_id: request.request_id.clone(),
+                            attempt_id: request.attempt_id.clone(),
+                        },
+                    },
+                );
+            }
+            let executed = tokio::time::timeout(Duration::from_secs(5), submitting)
+                .await
+                .expect("the cancellation settles")
+                .unwrap();
+            assert!(matches!(executed.outcome, CellOutcome::Cancelled { .. }));
+            assert_eq!(executed.account.placement.is_some(), grant_first);
+            assert!(executed.grant_without_result.is_none());
+            assert_eq!(orch.fleet.queue.len(), 0);
+            if !grant_first {
+                while let Ok(frame) = machine.try_recv() {
+                    assert!(
+                        !matches!(frame, ExecutorMessage::Granted { .. }),
+                        "{frame:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Work retired while it is still being prepared is never queued at all.
@@ -27861,6 +28101,50 @@ mod tests {
             )
             .expect("a fresh request identity enqueues")
             .0
+    }
+
+    #[test]
+    fn unplaced_wait_reports_the_queued_placement_diagnostic_until_offered() {
+        let pool = Fleet::default();
+        let key = ("parked-summary".to_string(), "attempt".to_string());
+        let entry = enqueue_owned_entry(&pool, &key);
+        assert!(pool
+            .unplaced_wait(&key.0)
+            .unwrap()
+            .contains("no machine has refused it yet"));
+        let mut request = provenance_request();
+        request.request_id.clone_from(&key.0);
+        request.attempt_id.clone_from(&key.1);
+        for diagnostic in [
+            "waiting on `fedora` to finish its self-update.",
+            "held from new admission: `fedora` is drained for maintenance.",
+        ] {
+            pool.queue.record_placement(&placement_decision(
+                &request,
+                42,
+                None,
+                None,
+                PlacementOutcome::Waiting {
+                    diagnostic: diagnostic.into(),
+                },
+                Vec::new(),
+            ));
+            let summary = pool.unplaced_wait(&key.0).unwrap();
+            assert!(summary.contains(diagnostic), "{summary}");
+            assert!(
+                !summary.contains("no machine has refused it yet"),
+                "{summary}"
+            );
+        }
+        assert!(pool.queue.offer(&entry, "fedora", "fedora", 3, 2_000));
+        let summary = pool.unplaced_wait(&key.0).unwrap();
+        assert!(summary.contains("offered to"), "{summary}");
+        assert!(!summary.contains("held from new admission"), "{summary}");
+        assert_eq!(
+            pool.queue.claim(&entry, "fedora", 3, 2_100),
+            queue::ClaimVerdict::Granted
+        );
+        assert!(pool.unplaced_wait(&key.0).is_none());
     }
 
     #[test]
@@ -30524,6 +30808,18 @@ mod tests {
 
     fn runtime_update_hold_fixture(entry: &mut ExecutorConnectionState, enabled: bool) {
         published_drains_fixture(entry, enabled, false);
+    }
+
+    impl Fleet {
+        pub(crate) fn set_update_hold_for_test(&self, executor_id: &str, enabled: bool) {
+            runtime_update_hold_fixture(
+                self.lock_connections()
+                    .get_mut(executor_id)
+                    .expect("attached executor"),
+                enabled,
+            );
+            self.connection_ready.notify_waiters();
+        }
     }
 
     /// What the published projection leaves on a machine: the self-update
@@ -42602,11 +42898,34 @@ mod tests {
     async fn scratch_submission(
         orch: &Arc<Orchestrator>,
     ) -> tokio::task::JoinHandle<ExecutedRequest> {
+        scratch_submission_with_stop(orch, None, true).await
+    }
+
+    async fn scratch_submission_with_stop(
+        orch: &Arc<Orchestrator>,
+        stop: Option<Arc<PlacementStop>>,
+        resident_home: bool,
+    ) -> tokio::task::JoinHandle<ExecutedRequest> {
         let mut request = provenance_request();
         request.repository = RepositoryLocator::ScratchOnly {
             owner_id: request.project_id.clone(),
         };
-        request.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
+        if resident_home {
+            request.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
+        } else {
+            request.executor = Some(ExecutorSelector {
+                name: Some(LOCAL_EXECUTOR_NAME.into()),
+                ..ExecutorSelector::default()
+            });
+            assert!(matches!(
+                candidate_rejection(
+                    &orch.fleet.lock_connections()[COLOCATED_EXECUTOR_ID],
+                    PlacementScope::of(&request),
+                    unix_time_ms(),
+                ),
+                Some(PlacementRejectionReason::UpdatePending { .. })
+            ));
+        }
         let batch = ProcessBatch {
             files: Vec::new(),
             runtime_packages: Vec::new(),
@@ -42628,7 +42947,7 @@ mod tests {
         let orch = orch.clone();
         tokio::spawn(async move {
             orch.fleet
-                .execute_prepared_accounted(request, Some(batch), prepared)
+                .execute_prepared_accounted(request, Some(batch), prepared, stop.as_deref())
                 .await
         })
     }
@@ -42903,7 +43222,7 @@ mod tests {
             .expect("a scratch request prepares");
         let executed = orch
             .fleet
-            .execute_prepared_accounted(request, None, prepared)
+            .execute_prepared_accounted(request, None, prepared, None)
             .await;
 
         assert!(matches!(

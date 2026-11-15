@@ -561,6 +561,7 @@ pub(crate) struct UnclaimedWait {
     pub(crate) queued_at_unix_ms: u64,
     pub(crate) offered_to: Option<String>,
     pub(crate) declines: Vec<(String, EntryDecline)>,
+    pub(crate) placement_wait: Option<String>,
 }
 
 /// The request at the front of a machine's line for a provisioning hold, as a
@@ -2082,7 +2083,28 @@ impl ExecutionQueue {
             queued_at_unix_ms: entry.queued_at_unix_ms,
             offered_to: entry.state.executor_id().map(str::to_string),
             declines,
+            placement_wait: entry.latest_placement.as_ref().and_then(|decision| {
+                match &decision.outcome {
+                    super::PlacementOutcome::Waiting { diagnostic }
+                        if matches!(entry.state, EntryState::Queued) =>
+                    {
+                        Some(diagnostic.clone())
+                    }
+                    _ => None,
+                }
+            }),
         })
+    }
+
+    /// The live identity, including an entry no machine has been offered yet.
+    pub(crate) fn attempt_identity_of(&self, request_id: &str) -> Option<RequestIdentity> {
+        self.entries
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .find(|entry| entry.request.request_id == request_id)
+            .map(QueueEntry::identity)
     }
 
     /// The live attempt of a request id, and where it is bound.

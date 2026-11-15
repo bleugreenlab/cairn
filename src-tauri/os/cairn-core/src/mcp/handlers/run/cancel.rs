@@ -72,7 +72,7 @@ impl CancelReport {
                 "Cancelled run batch `{request_id}`: it settled as cancelled and committed nothing, and its machine work has ended, so it no longer holds its branch. A call waiting on it resumes once with that result; a detached batch's result reaches its job as a notice."
             ),
             Self::Stopped { settled: false } => format!(
-                "Cancelling run batch `{request_id}`: it was stopped before it began publishing, so it commits nothing, but its machine has not yet confirmed the cancel. It settles as cancelled when it does, and holds its branch until then."
+                "Cancelling run batch `{request_id}`: it was stopped before it began publishing, so it commits nothing, but its task or machine work has not yet finished settling. It holds its branch until that settlement ends."
             ),
             Self::FinishedFirst { verdict } => format!(
                 "Run batch `{request_id}` finished on its own before the cancel reached it ({verdict}); its own result stands, and any commit it made is on the branch."

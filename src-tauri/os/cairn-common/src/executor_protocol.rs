@@ -7138,6 +7138,11 @@ pub struct LearnedResourceEstimate {
 /// variant, into its own placement records; no executor sends or reads it, so
 /// a runner talking to an older executor gets nothing wrong.
 ///
+/// cairn/7176 does not move the number. Batch wait summaries read the queued
+/// placement diagnostic already held by the runner instead of reporting only
+/// offers and declines. No wire field or executor behavior changes, so a runner
+/// talking to an older executor gets nothing wrong.
+///
 /// cairn/7187 does not move the number. Memory admission boxes its private
 /// error result and moves the condition back out before constructing wire
 /// evidence. No condition, field, serialization or admission decision changes;

@@ -8383,9 +8383,9 @@ async fn run_routed_batch(
     let (joined, ceiling_detail) = match tokio::time::timeout_at(ceiling, &mut handle).await {
         Ok(joined) => (joined, routed_cancel_detail(control, false)),
         Err(_) => {
-            // Both halves are needed: the flag stops a batch that is between
-            // placement attempts, and the fleet cancel stops one that is
-            // queued or running inside an attempt.
+            // The signal wakes preparation and placement waits; the fleet
+            // cancel tells a machine holding an attempt to stop. Its terminal
+            // report still ends granted work through the ordinary tail.
             control.stop(orch);
             (handle.await, routed_cancel_detail(control, true))
         }
@@ -8530,10 +8530,21 @@ async fn place_and_run_attempts(
     control: &BatchControl,
     grant_without_result: &mut Option<crate::fleet::GrantWithoutResult>,
 ) -> PlacedBatch {
-    use std::sync::atomic::Ordering;
-
-    let cancelled = control.stop_placement.clone();
+    let cancelled = &control.stop_placement;
     let request_id = placement.template.request_id.clone();
+    let cancelled_batch = |residence| {
+        PlacedBatch::Cell(
+            Box::new(CellOutcome::Cancelled {
+                request_id: request_id.clone(),
+                attempt_id: String::new(),
+            }),
+            residence,
+            PlacementNotes::default(),
+        )
+    };
+    if cancelled.is_stopped() {
+        return cancelled_batch(placement.residence);
+    }
     // Before the home is acquired, and therefore before anything can wait: a
     // batch whose declared executor contradicts where it must run is answered
     // now, with the contradiction, rather than after a queue it was never going
@@ -8592,31 +8603,20 @@ async fn place_and_run_attempts(
                         log::info!("run batch {request_id} carries a commit_msg and is {waiting}");
                     }
                     control.set_waiting(waiting).await;
-                    occupancy::vacancy(&job_id, &request_id, HOME_WAIT_POLL).await;
-                    if cancelled.load(Ordering::SeqCst) {
-                        return PlacedBatch::Cell(
-                            Box::new(CellOutcome::Cancelled {
-                                request_id: request_id.clone(),
-                                attempt_id: String::new(),
-                            }),
-                            placement.residence,
-                            PlacementNotes::default(),
-                        );
+                    if cancelled
+                        .until(occupancy::vacancy(&job_id, &request_id, HOME_WAIT_POLL))
+                        .await
+                        .is_none()
+                    {
+                        return cancelled_batch(placement.residence);
                     }
                 }
             }
         },
     };
     loop {
-        if cancelled.load(Ordering::SeqCst) {
-            return PlacedBatch::Cell(
-                Box::new(CellOutcome::Cancelled {
-                    request_id: request_id.clone(),
-                    attempt_id: String::new(),
-                }),
-                placement.residence,
-                PlacementNotes::default(),
-            );
+        if cancelled.is_stopped() {
+            return cancelled_batch(placement.residence);
         }
         if placement.environment.is_some() {
             control
@@ -8637,27 +8637,36 @@ async fn place_and_run_attempts(
             // so it is never placed on a machine the batch would refuse. The
             // scratch affinity guess reaches it only as a price: the template's
             // estimate of what each machine would cost to bring current.
-            Some(environment) => match crate::fleet::residency::acquire_job_residency(
-                orch,
-                &environment.db,
-                &environment.job_id,
-                &environment.base_commit,
-                placement.ceiling_horizon_unix_ms,
-                placement.template.waiting_since_unix_ms,
-                placement.home_selector.as_ref(),
-                placement.template.scratch_sync.clone(),
-            )
-            .await
+            Some(environment) => match cancelled
+                .until(crate::fleet::residency::acquire_job_residency(
+                    orch,
+                    &environment.db,
+                    &environment.job_id,
+                    &environment.base_commit,
+                    placement.ceiling_horizon_unix_ms,
+                    placement.template.waiting_since_unix_ms,
+                    placement.home_selector.as_ref(),
+                    placement.template.scratch_sync.clone(),
+                ))
+                .await
             {
-                Ok(fence) => Some(fence),
-                Err(refusal) if refusal.verdict.is_capacity() => {
+                Some(Ok(fence)) => Some(fence),
+                Some(Err(refusal)) if refusal.verdict.is_capacity() => {
+                    control
+                        .set_waiting(format!("waiting for room: {}", refusal.diagnostic))
+                        .await;
                     let wait = waiting_for_room.as_mut().unwrap_or(&mut provisioning);
-                    match wait.hold(&request_id, &refusal.diagnostic).await {
-                        Ok(()) => continue,
-                        Err(spent) => return PlacedBatch::NoRoom(spent),
+                    match cancelled
+                        .until(wait.hold(&request_id, &refusal.diagnostic))
+                        .await
+                    {
+                        Some(Ok(())) => continue,
+                        Some(Err(spent)) => return PlacedBatch::NoRoom(spent),
+                        None => return cancelled_batch(placement.residence),
                     }
                 }
-                Err(refusal) => return PlacedBatch::NoEnvironment(refusal.diagnostic),
+                Some(Err(refusal)) => return PlacedBatch::NoEnvironment(refusal.diagnostic),
+                None => return cancelled_batch(placement.residence),
             },
         };
         if waiting_for_room.is_none() {
@@ -8667,12 +8676,13 @@ async fn place_and_run_attempts(
         if let (Some(tenancy), Some(home)) = (tenancy.as_ref(), home.as_ref()) {
             tenancy.located(&home.executor_id);
         }
-        let residence = match placement
-            .residence_for(orch, home.as_ref(), cannot_hold.as_ref())
+        let residence = match cancelled
+            .until(placement.residence_for(orch, home.as_ref(), cannot_hold.as_ref()))
             .await
         {
-            Ok(residence) => residence,
-            Err(refusal) => return PlacedBatch::Refused(refusal),
+            Some(Ok(residence)) => residence,
+            Some(Err(refusal)) => return PlacedBatch::Refused(refusal),
+            None => return cancelled_batch(placement.residence),
         };
         let drained_home = match residence {
             BatchResidence::Home => fence
@@ -8714,7 +8724,10 @@ async fn place_and_run_attempts(
             });
         }
         control.admit().await;
-        let executed = orch.fleet.submit_run_batch(orch, request, attempt).await;
+        let executed = orch
+            .fleet
+            .submit_run_batch(orch, request, attempt, cancelled)
+            .await;
         if let Some(grant) = executed.grant_without_result {
             *grant_without_result = Some(grant);
         }
@@ -8766,9 +8779,10 @@ async fn place_and_run_attempts(
         let wait = waiting_for_room
             .as_mut()
             .expect("the batch began waiting for room before its first presentation");
-        match wait.hold(&request_id, &diagnostic).await {
-            Ok(()) => {}
-            Err(spent) => return PlacedBatch::NoRoom(spent),
+        match cancelled.until(wait.hold(&request_id, &diagnostic)).await {
+            Some(Ok(())) => {}
+            Some(Err(spent)) => return PlacedBatch::NoRoom(spent),
+            None => return cancelled_batch(residence),
         }
     }
 }
@@ -8998,8 +9012,8 @@ struct BatchControl {
     /// cancellation and a durable record both name.
     request_id: String,
     commits: bool,
-    /// Stops placement between attempts; the fleet cancel stops an attempt.
-    stop_placement: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes pre-placement waits; claimed attempts still settle from the fleet.
+    stop_placement: crate::fleet::PlacementStop,
     /// Whether settlement (and with it publication) has begun, or the call
     /// abandoned the batch first. Exactly one of the two wins.
     settle_gate: std::sync::atomic::AtomicU8,
@@ -9046,7 +9060,7 @@ impl BatchControl {
         std::sync::Arc::new(Self {
             request_id: request_id.to_string(),
             commits,
-            stop_placement: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_placement: crate::fleet::PlacementStop::default(),
             settle_gate: std::sync::atomic::AtomicU8::new(SETTLE_RUNNING),
             facts: std::sync::Mutex::new(BatchFacts {
                 store_lock: None,
@@ -9120,7 +9134,13 @@ impl BatchControl {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_deref()
-            .map(|by| format!("cancelled by {by}."))
+            .map(|by| {
+                if self.never_placed().is_some() {
+                    format!("cancelled by {by} before placement.")
+                } else {
+                    format!("cancelled by {by}.")
+                }
+            })
     }
 
     /// The verdict settlement reached, once it has.
@@ -9454,8 +9474,7 @@ impl BatchControl {
     /// cancelled-outcome tail.
     fn stop(&self, orch: &Orchestrator) {
         self.note_stopped(&orch.fleet);
-        self.stop_placement
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop_placement.stop();
         orch.cancel_cell_request(&self.request_id);
     }
 }
@@ -12001,7 +12020,7 @@ mod tests {
         assert!(!refused.contains("Ran on"), "{refused}");
     }
 
-    fn named(name: &str) -> ExecutorSelector {
+    pub(super) fn named(name: &str) -> ExecutorSelector {
         ExecutorSelector {
             name: Some(name.into()),
             ..ExecutorSelector::default()
@@ -12444,7 +12463,7 @@ mod tests {
         assert_eq!(request.executor.as_ref(), Some(&fedora));
     }
 
-    fn test_placement(commit_present: bool) -> BatchPlacement {
+    pub(super) fn test_placement(commit_present: bool) -> BatchPlacement {
         let mut template = identity_request("project", "project");
         template.mutation_policy = MutationPolicy::AllowDelta;
         template.executor = Some(named("local"));
@@ -12461,7 +12480,7 @@ mod tests {
         }
     }
 
-    fn shell(timeout: Option<u32>) -> (String, Result<RunSpec, String>) {
+    pub(super) fn shell(timeout: Option<u32>) -> (String, Result<RunSpec, String>) {
         (
             "shell".into(),
             Ok(RunSpec::Shell {
@@ -13423,6 +13442,7 @@ mod decide_door_tests {
 /// provider, against a seeded run whose turn can park.
 #[cfg(test)]
 pub(crate) mod host_batch_tests {
+    use super::tests::{named, shell, test_placement};
     use super::types::RunSpec;
     use super::*;
 
@@ -15072,10 +15092,7 @@ pub(crate) mod host_batch_tests {
         tokio::spawn(async move {
             let _live = live;
             let text = loop {
-                if control
-                    .stop_placement
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
+                if control.stop_placement.is_stopped() {
                     break failure_without_result(
                         &CellOutcome::Cancelled {
                             request_id: control.request_id.clone(),
@@ -15124,6 +15141,336 @@ pub(crate) mod host_batch_tests {
         let text = answer_call(orch, &request, deadlines, control.clone(), rx).await;
         assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
         finish_tx
+    }
+
+    /// Start at routing rather than synthesizing a cancellation outcome: the
+    /// real attempt loop must return before the routed settlement can answer.
+    async fn park_real_placement(
+        orch: &Orchestrator,
+        control: &Arc<BatchControl>,
+        mut placement: BatchPlacement,
+        start: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let snapshot = json!({
+            "recipe": {"id":"recipe", "name":"Recipe", "trigger":"manual", "nodes":[], "edges":[]},
+            "agents": {"agent": {
+                "id":"agent", "name":"Agent", "description":"Agent",
+                "prompt":"prompt", "tools":[], "fence":"allow"
+            }},
+            "skills": {},
+            "triggerContext": {"issueId":"i", "projectId":"p", "triggerType":"manual"},
+            "delegatedPackets": [], "createdAt":1
+        })
+        .to_string();
+        orch.db
+            .local
+            .execute(
+                "UPDATE jobs SET agent_config_id='agent' WHERE id='job-1'",
+                (),
+            )
+            .await
+            .unwrap();
+        orch.db
+            .local
+            .execute(
+                "UPDATE executions SET snapshot=?1 WHERE id='e'",
+                (snapshot,),
+            )
+            .await
+            .unwrap();
+        let (mut settlement, _) =
+            batch_of(orch, ("true".into(), shell(None).1.unwrap()), true).await;
+        settlement.commit_msg = Some("verify".into());
+        placement.template.request_id = control.request_id.clone();
+        let request = settlement.request.clone();
+        let batch = ResolvedRunBatch {
+            request: request.clone(),
+            run_context: settlement.run_context.clone(),
+            resolved: vec![shell(None)],
+            tool_use_id: "tool-1".into(),
+            stop_on_error: true,
+            originally_sequential: false,
+            execution_residency: None,
+            node_scratch: None,
+        };
+        let deadlines = CallDeadlines::new(
+            tokio::time::Instant::now(),
+            ms(100),
+            ms(300),
+            ms(10_000),
+            None,
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let live = detached::LiveBatch::claim(control);
+        let task_orch = orch.clone();
+        let task_control = control.clone();
+        let task = tokio::spawn(async move {
+            let _live = live;
+            if let Some(start) = start {
+                start.await.unwrap();
+            }
+            let envelope = run_routed_batch(
+                &task_orch,
+                settlement,
+                placement,
+                batch,
+                &task_control,
+                deadlines,
+            )
+            .await;
+            let _ = tx.send(BatchAnswer::from_envelope(envelope));
+        });
+        let text = answer_call(orch, &request, deadlines, control.clone(), rx).await;
+        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
+        task
+    }
+
+    async fn assert_real_placement_cancelled(
+        orch: &Orchestrator,
+        control: &Arc<BatchControl>,
+        task: tokio::task::JoinHandle<()>,
+    ) {
+        let report = cancel::cancel_batch(
+            orch,
+            &orch.db.local,
+            &control.request_id,
+            "operator",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(report, cancel::CancelReport::Stopped { settled: true });
+        tokio::time::timeout(ms(1_000), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let output = eventually(Duration::from_secs(5), || {
+            tool_result_containing(orch, "cancelled by operator before placement")
+        })
+        .await
+        .expect("the durable waiting call resumes naming the canceller before placement");
+        assert!(
+            output.contains("cancelled by operator before placement"),
+            "{output}"
+        );
+        assert!(
+            control.never_placed().is_some(),
+            "no machine claimed any command"
+        );
+        assert_eq!(
+            control.settled_verdict().as_deref(),
+            Some("it was cancelled")
+        );
+        assert!(
+            durable_suspend::pending_run_batch_wait(&orch.db.local, &control.request_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        crate::mcp::handlers::durable_suspend::reconcile(orch).await;
+        assert_eq!(successor_turns(orch).await, 1);
+        assert_eq!(tool_results_for_the_call(orch).await, 1);
+        assert_eq!(run_batch_notices(orch).await, 0);
+        assert!(!detached::batch_is_live(orch, &control.request_id));
+        assert!(orch
+            .fleet
+            .claimed_executor_of(&control.request_id)
+            .is_none());
+        assert_eq!(
+            count(
+                orch,
+                "SELECT COUNT(*) FROM run_batch_detached WHERE holds_branch=1"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_placement_stopped_before_any_attempt_resumes_its_call_once() {
+        let orch = env().await;
+        let control = BatchControl::new(true);
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let task = park_real_placement(&orch, &control, test_placement(true), Some(start_rx)).await;
+        let release_control = control.clone();
+        tokio::spawn(async move {
+            release_control.stop_placement.stopped().await;
+            start_tx.send(()).unwrap();
+        });
+        assert_real_placement_cancelled(&orch, &control, task).await;
+        assert!(orch.fleet.snapshot().queued_requests.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_placement_cancel_during_residency_acquisition_retracts_the_home() {
+        use cairn_common::executor_protocol::{ExecutorMessage, ResidencyHolder};
+        let orch = env().await;
+        let mut frames = orch.fleet.attach_reported_machine_for_test("exec-a", &[]);
+        orch.fleet.set_update_hold_for_test("exec-a", true);
+        let control = BatchControl::new(true);
+        let mut placement = test_placement(true);
+        placement.home_selector = Some(named("exec-a"));
+        placement.environment = Some(JobEnvironment {
+            db: orch.db.local.clone(),
+            job_id: "job-1".into(),
+            base_commit: "base".into(),
+        });
+        let task = park_real_placement(&orch, &control, placement, None).await;
+        let home_request = crate::fleet::residency_queue_entry_id(&ResidencyHolder::Job {
+            job_id: "job-1".into(),
+        });
+        eventually(Duration::from_secs(5), || async {
+            orch.fleet
+                .snapshot()
+                .queued_requests
+                .iter()
+                .any(|request| request.request_id == home_request)
+                .then_some(())
+        })
+        .await
+        .expect("the actual residency acquisition is queued behind the update hold");
+        assert!(orch.fleet.claimed_executor_of(&home_request).is_none());
+        assert!(
+            durable_suspend::pending_run_batch_wait(&orch.db.local, &control.request_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_real_placement_cancelled(&orch, &control, task).await;
+        assert!(!orch
+            .fleet
+            .snapshot()
+            .queued_requests
+            .iter()
+            .any(|request| request.request_id == home_request));
+        orch.fleet.set_update_hold_for_test("exec-a", false);
+        while let Ok(frame) = frames.try_recv() {
+            assert!(
+                !matches!(
+                    frame,
+                    ExecutorMessage::Offer { .. } | ExecutorMessage::ResidencyRequest { .. }
+                ),
+                "{frame:?}"
+            );
+        }
+        assert!(orch.fleet.claimed_executor_of(&home_request).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_placement_cancel_during_capacity_hold_does_not_retry() {
+        use cairn_common::executor_protocol::{
+            AdmissionRejectionReason, CellUnavailableReason, ExecutorMessage, ResidencyFailureKind,
+            ResidencyResult,
+        };
+        let orch = env().await;
+        let mut frames = orch.fleet.attach_reported_machine_for_test("exec-a", &[]);
+        let control = BatchControl::new(true);
+        let mut placement = test_placement(true);
+        placement.home_selector = Some(named("exec-a"));
+        placement.environment = Some(JobEnvironment {
+            db: orch.db.local.clone(),
+            job_id: "job-1".into(),
+            base_commit: "base".into(),
+        });
+        let task = park_real_placement(&orch, &control, placement, None).await;
+        let reply = async {
+            loop {
+                match frames.recv().await.unwrap() {
+                    ExecutorMessage::Offer { entry_id, .. } => {
+                        orch.fleet.handle_executor_message(
+                            "exec-a",
+                            1,
+                            ExecutorMessage::Claim { entry_id },
+                        );
+                    }
+                    ExecutorMessage::ResidencyRequest { correlation_id, .. } => {
+                        orch.fleet.handle_executor_message(
+                            "exec-a",
+                            1,
+                            ExecutorMessage::ResidencyResponse {
+                                correlation_id,
+                                result: ResidencyResult::Failed {
+                                    kind: ResidencyFailureKind::Admission,
+                                    diagnostic: "capacity acceptance refusal".into(),
+                                    cell_outcome: Some(Box::new(CellOutcome::Unavailable {
+                                        reason: CellUnavailableReason::AdmissionRejected {
+                                            reason: AdmissionRejectionReason::QueueFull,
+                                        },
+                                        diagnostic: "capacity acceptance refusal".into(),
+                                    })),
+                                },
+                            },
+                        );
+                        break;
+                    }
+                    ExecutorMessage::DrainModeRequest { .. } => {}
+                    other => panic!("unexpected acquisition frame: {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(ms(5_000), reply).await.unwrap();
+        eventually(Duration::from_secs(5), || async {
+            control.unplaced().filter(|stage| {
+                stage.starts_with("waiting for room:")
+                    && stage.contains("capacity acceptance refusal")
+            })
+        })
+        .await
+        .expect("actual acquisition refusal reaches CapacityWait::hold");
+        assert_real_placement_cancelled(&orch, &control, task).await;
+        assert!(orch.fleet.snapshot().queued_requests.is_empty());
+        while let Ok(frame) = frames.try_recv() {
+            assert!(
+                !matches!(
+                    frame,
+                    ExecutorMessage::Offer { .. } | ExecutorMessage::ResidencyRequest { .. }
+                ),
+                "{frame:?}"
+            );
+        }
+        assert!(orch.fleet.snapshot().queued_requests.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_placement_cancel_while_command_queued_on_update_resumes_once() {
+        use cairn_common::executor_protocol::ExecutorMessage;
+        let orch = env().await;
+        let mut frames = orch.fleet.attach_reported_machine_for_test("exec-a", &[]);
+        orch.fleet.set_update_hold_for_test("exec-a", true);
+        let control = BatchControl::new(true);
+        let mut placement = test_placement(true);
+        placement.template.project_id = "p".into();
+        placement.template.repository = RepositoryLocator::ScratchOnly {
+            owner_id: "job-1".into(),
+        };
+        placement.template.executor = Some(named("exec-a"));
+        placement.template.pinned_executor_id = Some("exec-a".into());
+        let task = park_real_placement(&orch, &control, placement, None).await;
+        eventually(Duration::from_secs(5), || async {
+            orch.fleet
+                .snapshot()
+                .queued_requests
+                .iter()
+                .any(|request| request.request_id == control.request_id)
+                .then_some(())
+        })
+        .await
+        .expect("the actual command is queued unclaimed behind the update hold");
+        assert!(orch
+            .fleet
+            .claimed_executor_of(&control.request_id)
+            .is_none());
+        assert_real_placement_cancelled(&orch, &control, task).await;
+        orch.fleet.set_update_hold_for_test("exec-a", false);
+        assert!(orch.fleet.snapshot().queued_requests.is_empty());
+        while let Ok(frame) = frames.try_recv() {
+            assert!(
+                !matches!(
+                    frame,
+                    ExecutorMessage::Offer { .. } | ExecutorMessage::Granted { .. }
+                ),
+                "{frame:?}"
+            );
+        }
     }
 
     const BUILDER: &str = "cairn://p/prj/1/1/builder";
@@ -15279,7 +15626,7 @@ pub(crate) mod host_batch_tests {
             detached_state(&orch, &b.request_id).await.as_deref(),
             Some("running")
         );
-        assert!(!b.stop_placement.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!b.stop_placement.is_stopped());
         assert!(orch.fleet.claimed_executor_of(&b.request_id).is_some());
         assert_eq!(run_batch_notices(&orch).await, 0);
     }
@@ -15306,9 +15653,7 @@ pub(crate) mod host_batch_tests {
         )
         .await;
         assert_eq!(report, cancel::CancelReport::AlreadySettling);
-        assert!(!control
-            .stop_placement
-            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!control.stop_placement.is_stopped());
         assert_eq!(control.cancelled_detail(), None);
 
         let _ = finish.send("cargo nextest run: ok\n\n\u{2713} Committed changes (abc1234)".into());
@@ -15492,9 +15837,7 @@ pub(crate) mod host_batch_tests {
             .await
             .unwrap_or_else(|refusal| panic!("a node on the same branch may cancel: {refusal}"));
         assert!(sharer.starts_with("Would cancel"), "{sharer}");
-        assert!(!control
-            .stop_placement
-            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!control.stop_placement.is_stopped());
     }
 
     /// Supersession retains the identity of work still running, so a reissue
