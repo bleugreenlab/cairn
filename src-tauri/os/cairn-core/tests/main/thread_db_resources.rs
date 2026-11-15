@@ -3,7 +3,6 @@ use serde_json::json;
 
 const PROJECT: &str = "thread-db";
 const THREAD: &str = "schema-owner";
-const RUN: &str = "thread-db-run";
 const CONDITION_THREAD: &str = "condition-owner";
 const CONDITION_RUN: &str = "thread-db-condition-run";
 const ROWS_THREAD: &str = "rows-owner";
@@ -11,23 +10,20 @@ const ROWS_RUN: &str = "thread-db-rows-run";
 const INTRUDER_THREAD: &str = "intruder";
 const INTRUDER_RUN: &str = "thread-db-intruder-run";
 
-fn fixture_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    &LOCK
-}
-
 async fn fixture() -> (
     tempfile::TempDir,
     std::sync::Arc<cairn_core::internal::storage::LocalDb>,
     cairn_core::internal::orchestrator::Orchestrator,
+    String,
 ) {
+    let run = format!("fixture-{}", uuid::Uuid::new_v4());
     let (temp, db, orch, _repo) = common::project_resource_fixture(PROJECT).await;
-    common::seed_authenticated_thread_run(&db, &format!("project-{PROJECT}"), THREAD, RUN).await;
+    common::seed_authenticated_thread_run(&db, &format!("project-{PROJECT}"), THREAD, &run).await;
     cairn_core::threads::db_store::use_test_path(
-        &format!("thread-{RUN}"),
+        &format!("thread-{run}"),
         temp.path().join("thread-store.db"),
     );
-    (temp, db, orch)
+    (temp, db, orch, run)
 }
 
 fn patch_with_params(sql: &str, params: serde_json::Value) -> serde_json::Value {
@@ -40,8 +36,7 @@ fn patch_with_params(sql: &str, params: serde_json::Value) -> serde_json::Value 
 
 #[tokio::test]
 async fn parameterized_batches_are_atomic_and_single_statement_params_still_work() {
-    let _fixture_guard = fixture_lock().lock().await;
-    let (_temp, _db, orch) = fixture().await;
+    let (_temp, _db, orch, run) = fixture().await;
     let uri = format!("cairn://p/{PROJECT}/{THREAD}/db");
 
     let created = common::change_resource_as_run(
@@ -50,7 +45,7 @@ async fn parameterized_batches_are_atomic_and_single_statement_params_still_work
             "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES (?); INSERT INTO notes(body) VALUES (?)",
             json!([[], ["first"], ["second"]]),
         ),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(created.contains("Applied 3 statements"), "{created}");
@@ -58,7 +53,7 @@ async fn parameterized_batches_are_atomic_and_single_statement_params_still_work
     let flat = common::change_resource_as_run(
         &orch,
         patch_with_params("INSERT INTO notes(body) VALUES (?)", json!(["third"])),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(flat.contains("Applied 1 statements"), "{flat}");
@@ -69,7 +64,7 @@ async fn parameterized_batches_are_atomic_and_single_statement_params_still_work
             "INSERT INTO notes(body) VALUES (?); INSERT INTO missing(body) VALUES (?)",
             json!([["rolled back"], ["failure"]]),
         ),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(failed.contains("statement 2 failed"), "{failed}");
@@ -91,8 +86,7 @@ async fn parameterized_batches_are_atomic_and_single_statement_params_still_work
 /// report success with no rows changed.
 #[tokio::test]
 async fn placeholder_and_value_counts_must_match() {
-    let _fixture_guard = fixture_lock().lock().await;
-    let (_temp, _db, orch) = fixture().await;
+    let (_temp, _db, orch, run) = fixture().await;
     let uri = format!("cairn://p/{PROJECT}/{THREAD}/db");
 
     let created = common::change_resource_as_run(
@@ -101,7 +95,7 @@ async fn placeholder_and_value_counts_must_match() {
             "CREATE TABLE posts(post INTEGER PRIMARY KEY, why TEXT); INSERT INTO posts(post, why) VALUES (206, 'start')",
             json!([[], []]),
         ),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(created.contains("Applied 2 statements"), "{created}");
@@ -112,7 +106,7 @@ async fn placeholder_and_value_counts_must_match() {
         (json!(["text", "206"]), "text"),
     ] {
         let applied =
-            common::change_resource_as_run(&orch, patch_with_params(update, params), Some(RUN))
+            common::change_resource_as_run(&orch, patch_with_params(update, params), Some(&run))
                 .await;
         assert!(applied.contains("(1 rows changed)"), "{applied}");
         let rows = common::read_resource(
@@ -126,7 +120,7 @@ async fn placeholder_and_value_counts_must_match() {
     let short = common::change_resource_as_run(
         &orch,
         patch_with_params(update, json!(["lost"])),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(
@@ -144,14 +138,13 @@ async fn placeholder_and_value_counts_must_match() {
 
 #[tokio::test]
 async fn parameterized_batches_refuse_mismatched_flat_and_mixed_shapes() {
-    let _fixture_guard = fixture_lock().lock().await;
-    let (_temp, _db, orch) = fixture().await;
+    let (_temp, _db, orch, run) = fixture().await;
     let sql = "CREATE TABLE notes(body TEXT); INSERT INTO notes(body) VALUES (?); INSERT INTO notes(body) VALUES (?)";
 
     let mismatch = common::change_resource_as_run(
         &orch,
         patch_with_params(sql, json!([[], ["only two arrays"]])),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(
@@ -163,7 +156,7 @@ async fn parameterized_batches_refuse_mismatched_flat_and_mixed_shapes() {
     let flat = common::change_resource_as_run(
         &orch,
         patch_with_params(sql, json!(["first", "second"])),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(flat.contains("flat array"), "{flat}");
@@ -172,7 +165,7 @@ async fn parameterized_batches_refuse_mismatched_flat_and_mixed_shapes() {
     let mixed = common::change_resource_as_run(
         &orch,
         patch_with_params(sql, json!([[], "second", ["third"]])),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(mixed.contains("cannot mix"), "{mixed}");
@@ -276,8 +269,7 @@ async fn await_condition_push(
 
 #[tokio::test]
 async fn first_write_creates_thread_database_and_preserves_transaction_policy() {
-    let _fixture_guard = fixture_lock().lock().await;
-    let (_temp, _db, orch) = fixture().await;
+    let (_temp, _db, orch, run) = fixture().await;
     let uri = format!("cairn://p/{PROJECT}/{THREAD}/db");
 
     let empty = common::read_resource(&orch, &uri).await;
@@ -286,12 +278,12 @@ async fn first_write_creates_thread_database_and_preserves_transaction_policy() 
     let created = common::change_resource_as_run(
         &orch,
         patch("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES ('first');"),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(created.contains("Applied 2 statements"), "{created}");
 
-    let store = cairn_core::threads::db_store::open_existing(&format!("thread-{RUN}"))
+    let store = cairn_core::threads::db_store::open_existing(&format!("thread-{run}"))
         .await
         .unwrap()
         .expect("the CREATE write creates the store");
@@ -309,7 +301,7 @@ async fn first_write_creates_thread_database_and_preserves_transaction_policy() 
     let rolled_back = common::change_resource_as_run(
         &orch,
         patch("CREATE TABLE doomed(id INTEGER); INSERT INTO missing_table VALUES (1);"),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(rolled_back.contains("statement 2 failed"), "{rolled_back}");
@@ -322,7 +314,7 @@ async fn first_write_creates_thread_database_and_preserves_transaction_policy() 
     let inserted = common::change_resource_as_run(
         &orch,
         patch("INSERT INTO notes(body) VALUES ('second')"),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(inserted.contains("Applied 1 statements"), "{inserted}");
@@ -335,7 +327,7 @@ async fn first_write_creates_thread_database_and_preserves_transaction_policy() 
     let transaction_control = common::change_resource_as_run(
         &orch,
         patch("BEGIN; INSERT INTO notes(body) VALUES ('forbidden'); COMMIT;"),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     assert!(
@@ -482,8 +474,7 @@ async fn a_fired_condition_names_the_row_a_structured_write_touched() {
 /// resource's own vocabulary without disturbing what the owner wrote.
 #[tokio::test]
 async fn the_home_shorthand_writes_and_a_non_owner_is_refused() {
-    let _fixture_guard = fixture_lock().lock().await;
-    let (temp, db, orch) = fixture().await;
+    let (temp, db, orch, run) = fixture().await;
     let canonical = format!("cairn://p/{PROJECT}/{THREAD}/db");
 
     common::seed_authenticated_thread_run(
@@ -503,7 +494,7 @@ async fn the_home_shorthand_writes_and_a_non_owner_is_refused() {
         "mode": "patch",
         "payload": { "sql": "CREATE TABLE ledger(id INTEGER PRIMARY KEY, note TEXT); INSERT INTO ledger(note) VALUES ('owned')" }
     }]);
-    let owned = common::change_resource_as_run(&orch, home, Some(RUN)).await;
+    let owned = common::change_resource_as_run(&orch, home, Some(&run)).await;
     assert!(
         owned.contains("Applied 2 statements"),
         "the owning thread must reach its own store through `cairn:~/db`: {owned}"

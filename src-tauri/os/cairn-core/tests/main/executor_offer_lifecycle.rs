@@ -17,6 +17,7 @@ use cairn_exec::{ExecutorRuntime, Fleet as ExecutorPool};
 
 fn offer(request_id: &str, project_id: &str) -> OfferSummary {
     OfferSummary {
+        headroom: None,
         request_id: request_id.into(),
         attempt_id: "attempt".into(),
         project_id: project_id.into(),

@@ -6,10 +6,12 @@ use cairn_core::credentials::{ClaudeAuth, CredentialStore};
 use cairn_core::identity::{CredentialStoreExt, UserIdentity};
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cairn_core::internal::agent_process::process::AgentProcessState;
 use cairn_core::internal::db::DbState;
+use cairn_core::internal::dispatch::dispatch_tool;
+use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::attention_push::list_pending;
 use cairn_core::internal::orchestrator::lifecycle::{evaluate_review_readiness, finalize_run};
 use cairn_core::internal::orchestrator::Orchestrator;
@@ -19,7 +21,8 @@ use cairn_core::internal::services::testing::{
 use cairn_core::internal::services::GitOutput;
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
 use cairn_core::models::{
-    ExecutionSnapshot, IssueStatus, NodePosition, RecipeNode, RecipeNodeType, RecipeSnapshot,
+    AgentNodeConfig, ArtifactNodeConfig, ConfirmPolicy, ExecutionSnapshot, IssueStatus,
+    NodePosition, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot,
     RecipeTrigger, RunStatus, TriggerContext, TriggerType,
 };
 use cairn_db::turso::params;
@@ -215,6 +218,137 @@ async fn seed_coordinator_and_child(db: &LocalDb, root: &std::path::Path) {
     .unwrap();
 }
 
+fn agent_node(id: &str) -> RecipeNode {
+    RecipeNode {
+        id: id.to_string(),
+        node_type: RecipeNodeType::Agent,
+        name: id.to_string(),
+        position: NodePosition { x: 0.0, y: 0.0 },
+        parent_id: None,
+        trigger_config: None,
+        agent_config: Some(AgentNodeConfig {
+            agent_config_id: Some(id.to_string()),
+            models: None,
+            constraints: Default::default(),
+            output_schema: None,
+            git_config: None,
+        }),
+        action_config: None,
+        checkpoint_config: None,
+        artifact_config: None,
+        condition_config: None,
+        decision_config: None,
+        context_config: None,
+    }
+}
+
+fn artifact_node(id: &str, name: &str, policy: ConfirmPolicy) -> RecipeNode {
+    RecipeNode {
+        id: id.to_string(),
+        node_type: RecipeNodeType::Artifact,
+        name: id.to_string(),
+        position: NodePosition { x: 0.0, y: 0.0 },
+        parent_id: None,
+        trigger_config: None,
+        agent_config: None,
+        action_config: None,
+        checkpoint_config: None,
+        artifact_config: Some(ArtifactNodeConfig {
+            name: name.to_string(),
+            schema: Some(serde_json::json!({"type": "object"})),
+            confirm_policy: policy,
+            content: None,
+        }),
+        condition_config: None,
+        decision_config: None,
+        context_config: None,
+    }
+}
+
+fn ctx_edge(id: &str, from: &str, to: &str) -> RecipeEdge {
+    RecipeEdge {
+        id: id.to_string(),
+        edge_type: RecipeEdgeType::Context,
+        source_node_id: from.to_string(),
+        source_handle: "context-out".to_string(),
+        target_node_id: to.to_string(),
+        target_handle: "context-in".to_string(),
+    }
+}
+
+/// A planbuild child parked at its plan gate:
+/// `planner --context-out-> plan(user) --context-out-> builder`, with the
+/// planner's plan artifact written but unconfirmed, its builder still pending,
+/// and no PR anywhere.
+///
+/// The planner's `context-out` terminates in an artifact consumed by the
+/// builder, so its branch ships no PR and the turn-end check cadence skips it;
+/// no PR exists, so the PR-open edge cannot fire either. The recompute
+/// review-readiness hook is the only edge left, and the planner's turn ends by
+/// deriving **Blocked** under the `user` confirm gate rather than any terminal
+/// status.
+///
+/// The builder job is seeded exactly as a real execution leaves it — `pending`,
+/// no turn, not DAG-ready behind the blocked planner — so it contributes no
+/// status change of its own: a sibling transition into a status the hook
+/// already accepted would mask the gate.
+async fn seed_plan_gate_child(db: &LocalDb) {
+    let snapshot = ExecutionSnapshot::new(
+        RecipeSnapshot {
+            id: "planbuild".to_string(),
+            name: "Plan Build".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            nodes: vec![
+                agent_node("planner"),
+                artifact_node("plan-node", "plan", ConfirmPolicy::User),
+                agent_node("builder"),
+            ],
+            edges: vec![
+                ctx_edge("e1", "planner", "plan-node"),
+                ctx_edge("e2", "plan-node", "builder"),
+            ],
+        },
+        HashMap::new(),
+        HashMap::new(),
+        TriggerContext {
+            issue_id: Some("child".to_string()),
+            project_id: "project".to_string(),
+            trigger_type: TriggerType::Manual,
+            event_payload: None,
+            initiated_via: None,
+        },
+    )
+    .to_json()
+    .unwrap()
+    .replace('\'', "''");
+    db.execute_script(format!(
+        "
+        INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+          VALUES('child-exec','planbuild','child','project','running',1,1,'{snapshot}');
+        INSERT INTO jobs(id, execution_id, recipe_node_id, project_id, issue_id, status,
+                         uri_segment, node_name, created_at, updated_at)
+          VALUES('child-planner','child-exec','planner','project','child','running',
+                 'planner','Planner',1,1);
+        INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at)
+          VALUES('child-plan-run','project','child','child-planner','complete',1,1);
+        INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason,
+                          created_at, ended_at, updated_at)
+          VALUES('child-plan-turn','child-plan-session','child-plan-run','child-planner',1,
+                 'complete','initial',1,2,2);
+        INSERT INTO artifacts(id, job_id, artifact_type, confirmed, data, version,
+                              output_name, created_at, updated_at)
+          VALUES('child-plan','child-planner','plan',0,'{{}}',1,'plan',1,1);
+        INSERT INTO jobs(id, execution_id, recipe_node_id, project_id, issue_id, status,
+                         uri_segment, node_name, created_at, updated_at)
+          VALUES('child-builder','child-exec','builder','project','child','pending',
+                 'builder','Builder',1,1);
+        "
+    ))
+    .await
+    .unwrap();
+}
+
 /// How long a wait in this file may run before it is reported as a broken
 /// fixture. It is not a latency budget. Every wait polls for an observable the
 /// code under test produces on its own detached task or thread, and how long
@@ -242,6 +376,17 @@ where
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+}
+
+/// Wait for the pushes under `key`. The review-readiness hook is detached from
+/// the recompute sweep, so the wake lands after `recompute_job` returns.
+async fn await_push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<String>)> {
+    poll_until(move || async move {
+        let rows = push_rows(db, key).await;
+        (!rows.is_empty()).then_some(rows)
+    })
+    .await
+    .unwrap_or_else(|| panic!("no attention push was created for {key} within {FIXTURE_GUARD:?}"))
 }
 
 async fn push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<String>)> {
@@ -336,6 +481,348 @@ async fn settled_child_review_wakes_idle_coordinator_while_checks_are_running() 
         1,
         "later check completion must not duplicate an unchanged review"
     );
+}
+
+/// A planbuild child parks at its plan gate — the planner's turn ends
+/// **Blocked** (plan present, unconfirmed, `user` confirm policy) — and the
+/// review-readiness hook must treat that transition as settling, minting a wake
+/// for the coordinator that actually resumes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_plan_gate_wakes_idle_coordinator() {
+    let (temp, db) = common::migrated_db().await;
+    seed_coordinator(&db, temp.path()).await;
+    seed_plan_gate_child(&db).await;
+    let db = Arc::new(db);
+    let (orch, recorder) = orchestrator(&temp, db.clone());
+
+    // The production edge: the planner's turn has ended, so its status is
+    // recomputed. Nothing else is invoked — no check cadence, no PR.
+    cairn_core::internal::execution::advancement::recompute_job(&orch, "child-planner").unwrap();
+
+    assert_eq!(
+        common::scalar_text_by_id(&db, "SELECT status FROM jobs WHERE id=?1", "child-planner")
+            .await,
+        Some("blocked".to_string()),
+        "a written-but-unconfirmed plan under a user gate derives Blocked"
+    );
+
+    let rows = await_push_rows(&db, &format!("review:{CHILD_URI}")).await;
+    assert_eq!(rows.len(), 1, "one review wake per gated plan");
+    assert_eq!(rows[0].0, "coordinator");
+    assert_eq!(
+        rows[0].1, "wake",
+        "a gate blocks the child on the coordinator's judgment, so it rouses"
+    );
+
+    let content_ref = common::scalar_text_by_id(
+        &db,
+        "SELECT content_ref FROM attention_pushes WHERE recipient=?1 ORDER BY created_at DESC LIMIT 1",
+        "coordinator",
+    )
+    .await
+    .expect("the review push carries a content_ref");
+    assert!(
+        content_ref.ends_with("/planner/plan"),
+        "the coordinator is pointed at the plan awaiting its confirmation, got {content_ref}"
+    );
+
+    // The nudge trails push creation inside the same detached evaluation, so give
+    // it the same bounded window the push itself got.
+    await_spawn_count(&recorder, 1).await;
+    assert_eq!(
+        recorder.spawn_count(),
+        1,
+        "the idle coordinator must actually be resumed, not merely have a row written"
+    );
+}
+
+const ADOPTED_URI: &str = "cairn://p/coord/3";
+
+/// A live run's creation time: after this test's orchestrator boots, as a run
+/// that runner spawned is, so its tool calls are served (a run older than the
+/// boot belonged to an exited runner and is refused).
+fn live_since() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 60
+}
+
+/// A project with one thread, `arb`, whose session is live in a turn, and one
+/// issue that hangs from nothing: no parent of either kind, no subscription.
+async fn seed_thread_and_unparented_issue(db: &LocalDb, root: &std::path::Path) {
+    let root = root.to_string_lossy().to_string();
+    let live = live_since();
+    db.execute_script(format!(
+        "
+        INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+          VALUES('project','default','Coordinator','coord','{root}',1,1);
+        INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+          VALUES('arb','project','arb','active','none',1,1);
+        INSERT INTO jobs(id, project_id, thread_id, status, uri_segment, node_name,
+                         current_session_id, created_at, updated_at)
+          VALUES('arb-session','project','arb','running','thread','Thread','arb-sess',1,1);
+        INSERT INTO sessions(id, job_id, backend, backend_id, status, sequence, created_at, updated_at)
+          VALUES('arb-sess','arb-session','claude','claude-arb','open',1,2000000000,2000000000);
+        INSERT INTO runs(id, project_id, job_id, session_id, status, created_at, updated_at, start_mode)
+          VALUES('arb-run','project','arb-session','arb-sess','live',{live},{live},'resume');
+        INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+          VALUES('arb-turn','arb-sess','arb-run','arb-session',1,'running','initial',1,1);
+        UPDATE jobs SET current_turn_id='arb-turn' WHERE id='arb-session';
+        INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+          VALUES('loose','project',3,'Loose','backlog','backlog','none',1,1);
+        "
+    ))
+    .await
+    .unwrap();
+}
+
+/// The bundled planbuild recipe and the agents it names, so the filing runs
+/// the recipe a real thread would start.
+fn install_planbuild(temp: &TempDir) {
+    let config = temp.path().join("config");
+    std::fs::write(
+        config.join("recipes/planbuild.yaml"),
+        include_str!("../../../../packs/core/recipes/planbuild.yaml"),
+    )
+    .unwrap();
+    for (name, body) in [
+        (
+            "planner",
+            include_str!("../../../../packs/core/agents/planner.md"),
+        ),
+        (
+            "build",
+            include_str!("../../../../packs/core/agents/build.md"),
+        ),
+        (
+            "pr-review",
+            include_str!("../../../../packs/core/agents/pr-review.md"),
+        ),
+    ] {
+        std::fs::write(config.join(format!("agents/{name}.md")), body).unwrap();
+    }
+}
+
+async fn write_as(orch: &Orchestrator, run_id: &str, changes: serde_json::Value) -> String {
+    let request = McpCallbackRequest {
+        answer_bound_ms: None,
+        thread_id: None,
+        cwd: "/tmp".to_string(),
+        run_id: Some(run_id.to_string()),
+        tool: "write".to_string(),
+        payload: serde_json::json!({ "changes": changes }),
+        tool_use_id: None,
+        origin: None,
+    };
+    let cursors = Mutex::new(HashMap::new());
+    dispatch_tool(orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content
+}
+
+async fn text(db: &LocalDb, sql: &str) -> Option<String> {
+    db.query_opt_text(sql, ()).await.unwrap()
+}
+
+/// Report 302 (arb/37): a thread started planbuild on an issue that hung from
+/// nothing, so no watcher existed, the plan gate minted no wake, and the issue
+/// sat ten hours on a confirmation nobody was told about. The thread's filing
+/// now adopts the issue, so the gate reaches the thread that asked for the
+/// work, through the same parent-derived routing every thread child has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_thread_filing_on_an_unparented_issue_hears_its_plan_gate() {
+    let (temp, db) = common::migrated_db().await;
+    seed_thread_and_unparented_issue(&db, temp.path()).await;
+    let db = Arc::new(db);
+    let (orch, recorder) = orchestrator(&temp, db.clone());
+    install_planbuild(&temp);
+
+    // The thread's own live run files the work through the write dispatcher.
+    let filed = write_as(
+        &orch,
+        "arb-run",
+        serde_json::json!([{
+            "target": format!("{ADOPTED_URI}/executions"),
+            "mode": "append",
+            "payload": { "recipe": "planbuild" },
+        }]),
+    )
+    .await;
+    assert!(
+        filed.contains("Adopted coord/3 under thread arb"),
+        "the filing adopts the issue and says so: {filed}"
+    );
+    assert_eq!(
+        text(&db, "SELECT parent_thread_id FROM issues WHERE id='loose'").await,
+        Some("arb".to_string())
+    );
+    assert_eq!(
+        text(&db, "SELECT parent_issue_id FROM issues WHERE id='loose'").await,
+        None,
+        "a thread edge introduces no issue ancestry"
+    );
+    assert_eq!(
+        text(&db, "SELECT status FROM executions WHERE issue_id='loose'").await,
+        Some("running".to_string()),
+        "{filed}"
+    );
+    let planner = match text(
+        &db,
+        "SELECT j.id FROM jobs j JOIN executions e ON e.id = j.execution_id
+          WHERE e.issue_id='loose' AND j.node_name='Planner'",
+    )
+    .await
+    {
+        Some(planner) => planner,
+        None => panic!(
+            "the planbuild execution has its planner; its jobs are {:?}",
+            text(
+                &db,
+                "SELECT group_concat(j.id || ':' || COALESCE(j.recipe_node_id, '-') || ':' ||
+                        COALESCE(j.node_name, '-') || ':' || j.status, ' ')
+                   FROM jobs j JOIN executions e ON e.id = j.execution_id
+                  WHERE e.issue_id='loose'",
+            )
+            .await
+        ),
+    };
+    let segment =
+        common::scalar_text_by_id(&db, "SELECT uri_segment FROM jobs WHERE id=?1", &planner)
+            .await
+            .expect("the planner has an address");
+
+    // The thread's turn ends, and it goes idle with nothing subscribed.
+    db.execute_script(
+        "UPDATE turns SET state='complete' WHERE id='arb-turn';
+         UPDATE runs SET status='complete' WHERE id='arb-run';
+         UPDATE jobs SET status='complete' WHERE id='arb-session';",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        common::query_i64(&db, "SELECT COUNT(*) FROM wake_subscriptions")
+            .await
+            .unwrap(),
+        0,
+        "nothing watches the issue: the parent edge alone must route the gate"
+    );
+
+    // The planner's turn: it writes its plan through the artifact write, and
+    // the turn ends.
+    let live = live_since();
+    db.execute_script(format!(
+        "UPDATE jobs SET status='running' WHERE id='{planner}';
+         INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at)
+           VALUES('planner-run','project','loose','{planner}','live',{live},{live});
+         INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason,
+                           created_at, updated_at)
+           VALUES('planner-turn','planner-session','planner-run','{planner}',1,
+                  'running','initial',1,1);"
+    ))
+    .await
+    .unwrap();
+    let written = write_as(
+        &orch,
+        "planner-run",
+        serde_json::json!([{
+            "target": format!("{ADOPTED_URI}/1/{segment}/plan"),
+            "mode": "create",
+            "payload": { "title": "Plan", "content": "Do the work." },
+        }]),
+    )
+    .await;
+    assert!(
+        !written.contains("\"failures\":[{"),
+        "the plan is written: {written}"
+    );
+    db.execute_script(format!(
+        "UPDATE turns SET state='complete', ended_at=2, updated_at=2 WHERE id='planner-turn';
+         UPDATE runs SET status='complete' WHERE id='planner-run';"
+    ))
+    .await
+    .unwrap();
+    cairn_core::internal::execution::advancement::recompute_job(&orch, &planner).unwrap();
+
+    assert_eq!(
+        common::scalar_text_by_id(&db, "SELECT status FROM jobs WHERE id=?1", &planner).await,
+        Some("blocked".to_string()),
+        "the unconfirmed plan under planbuild's user gate holds the planner"
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT CAST(confirmed AS TEXT) FROM artifacts WHERE job_id=?1 ORDER BY version DESC LIMIT 1",
+            &planner,
+        )
+        .await,
+        Some("0".to_string()),
+        "the plan is unconfirmed"
+    );
+    assert_eq!(
+        text(
+            &db,
+            "SELECT j.status FROM jobs j JOIN executions e ON e.id = j.execution_id
+              WHERE e.issue_id='loose' AND j.node_name='Builder'",
+        )
+        .await,
+        Some("pending".to_string()),
+        "the builder stays gated behind the plan"
+    );
+
+    let key = format!("review:{ADOPTED_URI}");
+    let rows = await_push_rows(&db, &key).await;
+    assert_eq!(rows.len(), 1, "one review wake per gated plan: {rows:?}");
+    assert_eq!(
+        rows[0].0, "arb-session",
+        "the wake reaches the thread: {rows:?}"
+    );
+    assert_eq!(rows[0].1, "wake");
+    let content_ref = common::scalar_text_by_id(
+        &db,
+        "SELECT content_ref FROM attention_pushes WHERE key=?1",
+        &key,
+    )
+    .await
+    .expect("the review push carries a content_ref");
+    assert!(
+        content_ref.ends_with(&format!("/{segment}/plan")),
+        "the thread is pointed at the plan awaiting confirmation, got {content_ref}"
+    );
+
+    await_spawn_count(&recorder, 1).await;
+    assert_eq!(
+        recorder.spawn_count(),
+        1,
+        "the idle thread is resumed, once"
+    );
+    // By set, not recency: the filing run is dated past the boot.
+    assert_eq!(
+        common::query_i64(
+            &db,
+            "SELECT COUNT(*) FROM runs WHERE job_id='arb-session' AND id <> 'arb-run'"
+        )
+        .await
+        .unwrap(),
+        1,
+        "the wake creates exactly one successor run for the thread"
+    );
+    assert!(
+        push_rows(&db, &key).await[0].2.is_some(),
+        "the resume drains and stamps the push"
+    );
+    let body = attention_event_body(&db).await;
+    assert!(body.contains(ADOPTED_URI), "{body}");
+
+    evaluate_review_readiness(&orch, "loose").await;
+    assert_eq!(
+        push_rows(&db, &key).await.len(),
+        1,
+        "re-evaluating unchanged readiness mints no second wake"
+    );
+    assert_eq!(recorder.spawn_count(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]

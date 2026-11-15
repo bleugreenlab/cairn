@@ -193,7 +193,15 @@ pub(crate) fn framed_resolution(
         None => ".".to_string(),
     };
     match resolution {
-        PromptResolution::Answered(_) => format!("{subject} was answered:\n\n{rendered}"),
+        PromptResolution::Answered(_) => {
+            let closer = if closer == "the operator" {
+                "The operator"
+            } else {
+                closer
+            };
+            let subject = subject.replacen("Your question", "your question", 1);
+            format!("{closer} answered {subject}:\n\n{rendered}")
+        }
         PromptResolution::Closed(Closure::Handled { note }) => format!(
             "{subject} was marked handled by {closer}{}",
             with_note(note.as_deref())
@@ -212,20 +220,11 @@ pub(crate) fn framed_resolution(
 /// Who closed a question, as its asker is told: the agent whose home patched
 /// the question's resource, or the operator for every operator surface.
 fn closer_label(provenance: Option<&crate::turns::queries::ResolutionProvenance>) -> String {
-    match provenance {
-        Some(provenance)
-            if matches!(
-                provenance.surface,
-                cairn_common::identity::AppearanceTransport::ResourcePatch
-            ) =>
-        {
-            provenance
-                .actor
-                .clone()
-                .unwrap_or_else(|| "an agent".to_string())
-        }
-        _ => "the operator".to_string(),
-    }
+    provenance
+        .map(|p| {
+            super::permission::answerer_label(p.surface, p.actor.as_deref(), p.provider.as_deref())
+        })
+        .unwrap_or_else(|| "the question's condition".to_string())
 }
 
 /// Create the ordinary Cairn question surface for input requested by an
@@ -1183,6 +1182,9 @@ fn validate_selection(question: &Question, selection: &str) -> Result<(), String
     }
 }
 
+/// Test-local answer without a model callback identity. Resource patches use
+/// the authenticated caller and explicit provenance instead.
+#[cfg(any(test, feature = "test-utils"))]
 pub async fn answer_node_question(
     orch: &Orchestrator,
     project_key: &str,
@@ -1192,63 +1194,7 @@ pub async fn answer_node_question(
     prompt_segment: &str,
     payload: &Value,
 ) -> Result<PromptAnswerOutcome, String> {
-    answer_node_question_as(
-        orch,
-        None,
-        project_key,
-        issue_number,
-        exec_seq,
-        node_segment,
-        prompt_segment,
-        payload,
-    )
-    .await
-}
-
-/// The canonical home of the job a run belongs to.
-async fn home_uri_for_run(orch: &Orchestrator, run_id: &str) -> Option<String> {
-    let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
-        .await
-        .ok()?;
-    let run_id = run_id.to_string();
-    db.read(move |conn| {
-        let run_id = run_id.clone();
-        Box::pin(async move {
-            let job = crate::storage::query_opt_text_conn(
-                conn,
-                "SELECT job_id FROM runs WHERE id = ?1",
-                params![run_id.as_str()],
-            )
-            .await?;
-            match job {
-                Some(job) => crate::jobs::queries::home_uri_for_job_conn(conn, &job).await,
-                None => Ok(None),
-            }
-        })
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// [`answer_node_question`] by the agent whose run patched the question's
-/// resource: its home is the resolution's actor, which the asker is told.
-#[allow(clippy::too_many_arguments)]
-pub async fn answer_node_question_as(
-    orch: &Orchestrator,
-    caller_run_id: Option<&str>,
-    project_key: &str,
-    issue_number: i32,
-    exec_seq: i32,
-    node_segment: &str,
-    prompt_segment: &str,
-    payload: &Value,
-) -> Result<PromptAnswerOutcome, String> {
-    let caller_home = match caller_run_id {
-        Some(run_id) => home_uri_for_run(orch, run_id).await,
-        None => None,
-    };
-    let (prompt_id, resolution, home_uri) = resolve_node_question(
+    answer_node_question_with_provenance(
         orch,
         project_key,
         issue_number,
@@ -1256,32 +1202,16 @@ pub async fn answer_node_question_as(
         node_segment,
         prompt_segment,
         payload,
-    )
-    .await?;
-    // Provenance names the job's CANONICAL home, never the coordinate the
-    // caller happened to address it by. A thread is addressed through the
-    // reserved `(0, 0, thread-name)` coordinate, so reassembling the actor from
-    // these arguments would persist `cairn://p/{key}/0/0/{thread}` — a sentinel
-    // that resolves to nothing — into every resolution receipt a thread ever
-    // writes. The fallback keeps issue behavior identical when a job somehow has
-    // no home to report.
-    let actor = caller_home.or(home_uri).unwrap_or_else(|| {
-        format!("cairn://p/{project_key}/{issue_number}/{exec_seq}/{node_segment}")
-    });
-    resolve_prompt(
-        orch,
-        &prompt_id,
-        resolution,
-        Some(crate::turns::queries::ResolutionProvenance::new(
-            cairn_common::identity::AppearanceTransport::ResourcePatch,
-            Some(actor),
-        )),
+        crate::turns::queries::ResolutionProvenance::new(
+            cairn_common::identity::AppearanceTransport::LocalInvoke,
+            None,
+        ),
     )
     .await
 }
 
 /// Resolve a node-coordinate question to its prompt, its normalized
-/// resolution, and the answering job's canonical home URI.
+/// resolution, and the asking job's canonical home URI.
 async fn resolve_node_question(
     orch: &Orchestrator,
     project_key: &str,
@@ -1669,6 +1599,7 @@ async fn resolve_prompt_impl(
                         &closer,
                         now,
                         &process_state,
+                        &provenance,
                     )
                     .await?
                     {
@@ -1894,6 +1825,49 @@ async fn announce_queued_answer(
     });
 }
 
+pub(crate) async fn queue_question_resolution(
+    orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+    prompt_id: &str,
+    content: &str,
+    provenance: Option<&crate::turns::queries::ResolutionProvenance>,
+) -> Result<(), String> {
+    let job_id = job_id.to_string();
+    let prompt_id = prompt_id.to_string();
+    let content = content.to_string();
+    let provenance = provenance.cloned();
+    let now = chrono::Utc::now().timestamp();
+    db.write(|conn| {
+        let job_id = job_id.clone();
+        let prompt_id = prompt_id.clone();
+        let content = content.clone();
+        let provenance = provenance.clone();
+        Box::pin(async move {
+            crate::messages::queued::insert_question_answer_conn(
+                conn,
+                &prompt_id,
+                &job_id,
+                &content,
+                crate::messages::queued::Delivery::Queue,
+                now,
+                provenance.as_ref(),
+            )
+            .await
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    announce_queued_answer(
+        orch,
+        db,
+        Some(&job_id),
+        crate::messages::queued::Delivery::Queue,
+    )
+    .await;
+    Ok(())
+}
+
 /// Deliver an answer to a job whose asking turn has ended: into the answer's
 /// own `prompt_response` successor when it has one, or through the job's queue
 /// when the job is busy or something else (a steer, a follow-up) already
@@ -1976,25 +1950,31 @@ async fn resume_answered_question(
                 suppress_user_event,
                 answers_open_tool_call,
                 queued_content: Some(framed),
+                resolution: provenance.cloned(),
             };
             continue_into_host_wait_successor(orch, owning_db, &wait, job_id, turn_id, &driven)
                 .await
         }
-        _ => match crate::execution::jobs::continue_job_or_enqueue(
-            orch,
-            job_id,
-            Some(&framed),
-            None,
-            Some(prompt_id),
-        ) {
-            Ok(_) => HostWaitContinuation::Queued,
-            Err(error) => {
-                let reason = format!("the job was busy and queueing the answer failed: {error}");
-                record_resume_error(orch, owning_db, HostWaitKind::Question, prompt_id, &reason)
+        _ => {
+            match queue_question_resolution(orch, owning_db, job_id, prompt_id, &framed, provenance)
+                .await
+            {
+                Ok(_) => HostWaitContinuation::Queued,
+                Err(error) => {
+                    let reason =
+                        format!("the job was busy and queueing the answer failed: {error}");
+                    record_resume_error(
+                        orch,
+                        owning_db,
+                        HostWaitKind::Question,
+                        prompt_id,
+                        &reason,
+                    )
                     .await;
-                HostWaitContinuation::Refused { reason }
+                    HostWaitContinuation::Refused { reason }
+                }
             }
-        },
+        }
     }
 }
 
@@ -2186,6 +2166,7 @@ async fn record_prompt_response_conn(
     closer: &str,
     answered_at: i64,
     process_state: &crate::agent_process::process::AgentProcessState,
+    provenance: &Option<crate::turns::queries::ResolutionProvenance>,
 ) -> DbResult<PromptRecord> {
     // First, before an MCP continuation can claim the answer: a withdrawn
     // question takes no answer from any path.
@@ -2342,6 +2323,7 @@ async fn record_prompt_response_conn(
             &framed,
             delivery,
             answered_at,
+            provenance.as_ref(),
         )
         .await?;
     }

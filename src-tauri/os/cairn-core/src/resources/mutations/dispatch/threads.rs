@@ -236,24 +236,6 @@ pub(super) async fn head_placed_by(
     Ok(placed_by)
 }
 
-/// The name of the thread issue `number` of `project` is a child of.
-pub(super) async fn issue_parent_thread(
-    orch: &Orchestrator,
-    project: &str,
-    number: i32,
-) -> Result<Option<String>, String> {
-    let db = orch.db.for_project(project).await;
-    db.query_opt_text(
-        "SELECT t.name FROM issues i
-           JOIN projects p ON p.id = i.project_id
-           JOIN threads t ON t.id = i.parent_thread_id
-          WHERE p.key = ?1 AND i.number = ?2",
-        (cairn_uri::canonical_project(project), number),
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
 /// The thread a write acts for, by id and name, if it acts for one.
 pub(super) async fn acting_thread(
     orch: &Orchestrator,
@@ -277,6 +259,84 @@ pub(super) async fn acting_thread(
     }
     let name = name.unwrap_or_else(|| acting.clone());
     Some((acting, name))
+}
+
+/// The thread a write acts for, by id and name, only when that thread belongs
+/// to `project` itself. Membership is checked by id in the project's own
+/// database: a thread of another project that happens to share a name never
+/// qualifies.
+pub(super) async fn acting_thread_in_project(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+) -> Option<(String, String)> {
+    let (db, project_id) = project_id(orch, project).await.ok()?;
+    let acting = acting_thread_id(orch, request, project, &db, &project_id).await?;
+    let name = db
+        .query_opt_text(
+            "SELECT name FROM threads WHERE id = ?1 AND project_id = ?2",
+            (acting.clone(), project_id),
+        )
+        .await
+        .ok()
+        .flatten()?;
+    Some((acting, name))
+}
+
+/// Issue `number` of `project`'s semantic parent, as its row stands now.
+pub(super) struct IssueParents {
+    pub(super) has_issue_parent: bool,
+    /// The parent thread's name, when the issue hangs from a thread.
+    pub(super) thread: Option<String>,
+}
+
+impl IssueParents {
+    pub(super) fn is_unparented(&self) -> bool {
+        !self.has_issue_parent && self.thread.is_none()
+    }
+}
+
+/// [`IssueParents`] of issue `number`, or `None` when there is no such issue
+/// (the filing's own resolution reports that).
+pub(super) async fn issue_parents(
+    orch: &Orchestrator,
+    project: &str,
+    number: i32,
+) -> Result<Option<IssueParents>, String> {
+    let db = orch.db.for_project(project).await;
+    let key = cairn_uri::canonical_project(project);
+    db.read(move |conn| {
+        let key = key.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT i.parent_issue_id, i.parent_thread_id, t.name FROM issues i
+                       JOIN projects p ON p.id = i.project_id
+                       LEFT JOIN threads t ON t.id = i.parent_thread_id
+                      WHERE p.key = ?1 AND i.number = ?2",
+                    cairn_db::turso::params![key.as_str(), number],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            use crate::storage::RowExt;
+            let has_issue_parent = row.opt_text(0)?.is_some();
+            // A thread edge whose thread row is unreadable still counts as a
+            // parent: adoption must never paper over an existing edge.
+            let thread = match (row.opt_text(1)?, row.opt_text(2)?) {
+                (Some(_), Some(name)) => Some(name),
+                (Some(id), None) => Some(id),
+                (None, _) => None,
+            };
+            Ok(Some(IssueParents {
+                has_issue_parent,
+                thread,
+            }))
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// The title of issue `number` of `project`, for a prompt's summary.

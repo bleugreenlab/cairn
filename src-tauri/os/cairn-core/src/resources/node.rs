@@ -5277,7 +5277,7 @@ mod history_parity_tests {
 #[cfg(test)]
 mod hold_header_tests {
     use super::render_job_summary_header;
-    use crate::messages::delivery::Hold;
+    use crate::messages::delivery::{Hold, ProviderLimitGate};
 
     /// `running` alone reads exactly like a node mid-turn, so a held node's
     /// title carries the hold and the summary says what releases it.
@@ -5285,6 +5285,7 @@ mod hold_header_tests {
     fn a_held_node_names_its_hold_beside_the_status_and_beneath_it() {
         let limit = Hold::ProviderLimit {
             retry_not_before: Some(1_790_000_000),
+            gate: None,
         };
         let header = render_job_summary_header("builder", "running", None, None, Some(&limit));
         assert!(
@@ -5299,6 +5300,24 @@ mod hold_header_tests {
             header.contains("Not taking a turn: it is held for a provider usage limit until "),
             "{header}"
         );
+
+        // A gated hold never resumes at its reset, so neither the title nor the
+        // summary may name one.
+        let gated = Hold::ProviderLimit {
+            retry_not_before: Some(1_790_000_000),
+            gate: Some(ProviderLimitGate::ToolInFlight),
+        };
+        let header = render_job_summary_header("builder", "running", None, None, Some(&gated));
+        assert!(
+            header.starts_with("# builder [◐ held: provider limit, needs continue]"),
+            "{header}"
+        );
+        assert!(
+            header.contains("once the operator continues it"),
+            "{header}"
+        );
+        assert!(!header.contains("when the limit resets"), "{header}");
+        assert!(!header.contains(" until "), "{header}");
 
         let wait = Hold::Wait {
             labels: vec!["waitFor: duration".into()],

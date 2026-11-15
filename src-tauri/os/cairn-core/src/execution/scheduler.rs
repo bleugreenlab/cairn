@@ -924,6 +924,35 @@ edges:
         OrchestratorBuilder::new(db_state, services, config_dir).build()
     }
 
+    /// The scheduler's supply wake hangs off the credential store's change
+    /// listener. If adding an account did not notify it, a node held for a
+    /// provider limit would wait for its reset although an account that can
+    /// serve it now exists.
+    #[tokio::test]
+    async fn adding_an_account_notifies_supply_changed() {
+        use crate::credentials::{ApiProvider, ProviderAuth};
+
+        let db = crate::storage::migrated_test_db("scheduler-supply-changed.db").await;
+        let config_dir = tempfile::tempdir().unwrap().keep().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let orch = orchestrator_with_config(db, config_dir);
+        let supply_changed = orch.supply_changed();
+
+        orch.add_account(
+            ApiProvider::Anthropic,
+            "Added".to_string(),
+            ProviderAuth::ApiKey {
+                value: "sk-ant-test".to_string(),
+            },
+            None,
+        )
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), supply_changed.notified())
+            .await
+            .expect("adding an account wakes the supply release pass");
+    }
+
     fn daily_config() -> ScheduleConfig {
         ScheduleConfig {
             every: ScheduleEvery::Period(SchedulePeriod::Day),

@@ -808,6 +808,61 @@ pub(crate) async fn update_issue_by_project_number(
     ))
 }
 
+/// Hang issue `number` of `project_key` from thread `thread_id` when it has no
+/// parent of either kind, through the one conditional write
+/// ([`crate::issues::crud::adopt_unparented_into_thread_conn`]): an existing
+/// parent, including one assigned a moment ago, stands. A changed edge is
+/// announced the way an explicit reparent is, since it moves the issue into
+/// that thread's focus count and re-points its attention; an unchanged one
+/// announces nothing.
+pub(crate) async fn adopt_unparented_issue_into_thread(
+    orch: &Orchestrator,
+    project_key: &str,
+    number: i32,
+    thread_id: &str,
+) -> Result<crate::issues::crud::ThreadAdoption, String> {
+    let db = orch.db.for_project(project_key).await;
+    let ctx = lookup_project_by_key(&db, project_key).await?;
+    let issue_id = relations::issue_id_for_project_number(&db, &ctx.project_key, number)
+        .await
+        .map_err(|e| format!("Failed to resolve issue: {e}"))?
+        .ok_or_else(|| format!("Issue {}/{} not found", ctx.project_key, number))?;
+    let now = chrono::Utc::now().timestamp();
+    let adoption = db
+        .write(|conn| {
+            let (project_id, issue_id, thread_id) = (
+                ctx.project_id.clone(),
+                issue_id.clone(),
+                thread_id.to_string(),
+            );
+            Box::pin(async move {
+                crate::issues::crud::adopt_unparented_into_thread_conn(
+                    conn,
+                    &project_id,
+                    &issue_id,
+                    &thread_id,
+                    now,
+                )
+                .await
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to adopt issue: {e}"))?;
+    if matches!(adoption, crate::issues::crud::ThreadAdoption::Adopted(_)) {
+        crate::execution::gates::sweep::notify_gate_evidence_changed();
+        if let Ok(Some(issue)) = crate::issues::crud::get(&db, &issue_id).await {
+            if let Err(e) = orch.services.emitter.emit(
+                "db-change",
+                crate::notify::issue_db_change(&issue, "update"),
+            ) {
+                log::error!("Failed to emit db-change event: {}", e);
+            }
+        }
+        orch.invalidate_sidebar_active_issues();
+    }
+    Ok(adoption)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

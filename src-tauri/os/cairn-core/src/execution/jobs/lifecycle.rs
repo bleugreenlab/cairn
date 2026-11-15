@@ -2780,6 +2780,9 @@ fn continue_job_launch_locked(
     );
     event.emit();
     let has_queued = !queued_messages.is_empty();
+    let has_operator_queued = queued_messages
+        .iter()
+        .any(|message| message.is_operator_message());
     let mut claimed_messages = ClaimedMessagesLaunchGuard {
         orch,
         db: owning_db.clone(),
@@ -3796,7 +3799,13 @@ fn continue_job_launch_locked(
         Some(
             queued_messages
                 .iter()
-                .map(|m| m.content.clone())
+                .map(|m| {
+                    if m.is_operator_message() {
+                        m.content.clone()
+                    } else {
+                        m.render()
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n\n"),
         )
@@ -3838,7 +3847,7 @@ fn continue_job_launch_locked(
     // continuation is not the operator's and cites nothing.
     let operator_text = queued_messages
         .iter()
-        .filter(|_| has_queued)
+        .filter(|queued| queued.is_operator_message())
         .map(|queued| queued.content.as_str())
         .chain((!trigger.synthetic).then_some(trigger.message.as_str()))
         .collect::<Vec<_>>()
@@ -3960,13 +3969,11 @@ fn continue_job_launch_locked(
     // its own "You" block and drops out of the pending strip.
     if has_queued {
         for queued in &queued_messages {
-            let display_message = queued.content.clone();
-            store_queued_user_event_with_turn(
+            snapshots::store_queued_event_with_turn(
                 orch,
                 &run_id,
                 &session_id,
-                &queued.id,
-                &display_message,
+                queued,
                 now,
                 Some(&turn_id),
             )?;
@@ -4162,7 +4169,11 @@ fn continue_job_launch_locked(
                 execution_id: job.execution_id.clone(),
                 turn_id: turn_id.clone(),
                 start_reason: TurnStartReason::FollowUp,
-                origin: continuation_origin(has_queued, prompt_resume.as_ref(), &drained_pushes),
+                origin: continuation_origin(
+                    has_operator_queued,
+                    prompt_resume.as_ref(),
+                    &drained_pushes,
+                ),
                 launch_claim: None,
             },
             identity_override,
@@ -4391,8 +4402,8 @@ struct ResumeTrigger {
 /// Who a continuation launch serves, read from the typed records of what it
 /// carries, never from delivery urgency (a peer may send `interrupt`, and an
 /// operator's Enter is `queue`). It serves an operator when it claimed a
-/// `queued_messages` row (only operator ingress writes that table, see
-/// `messages::queued`), when its resume context carries an operator goal
+/// operator-kind `queued_messages` row (question resolutions carry their own
+/// authorship and never count as operator chat), when its resume context carries an operator goal
 /// reactivation (an explicit resume), or when it drained a direct push keyed
 /// with the operator-message marker (an operator's thread message, routed as a
 /// `WakeSource::User` wake). Peer messages, wakes, owned-wait resolutions,

@@ -115,24 +115,36 @@ pub(super) async fn dispatch(
                 item.payload.as_ref().and_then(|p| p.get("place")),
                 "payload.place",
             )?;
-            let place = if head {
-                let parent = super::threads::issue_parent_thread(orch, project, *number)
-                    .await
-                    .map_err(|error| build_failure(index, item, error))?;
-                let placed_by = super::threads::head_placed_by(
-                    orch,
-                    request,
-                    project,
-                    parent.as_deref(),
-                    &format!("{project}/{number}"),
-                    !after.is_empty(),
-                )
+            // A same-project thread filing work on an issue that hangs from
+            // nothing adopts it, so the issue's attention (its plan gates, its
+            // reviews, its failure) reaches the thread that asked for it, and
+            // its thread's focus cap and queue govern it. Only the trusted
+            // acting thread qualifies; an issue with either kind of parent,
+            // and every start that is not a thread's, is left as it is.
+            let parents = super::threads::issue_parents(orch, project, *number)
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                crate::execution::recipe::QueuePlace::Head { placed_by }
-            } else {
-                crate::execution::recipe::QueuePlace::Tail
+            let adopter = match &parents {
+                Some(parents) if parents.is_unparented() => {
+                    super::threads::acting_thread_in_project(orch, request, project).await
+                }
+                _ => None,
             };
+            let effective_thread = parents
+                .as_ref()
+                .and_then(|parents| parents.thread.clone())
+                .or_else(|| adopter.as_ref().map(|(_, name)| name.clone()));
+            let mut place = file_place(
+                orch,
+                request,
+                project,
+                *number,
+                head,
+                effective_thread.as_deref(),
+                !after.is_empty(),
+            )
+            .await
+            .map_err(|error| build_failure(index, item, error))?;
             // With no recipe named, Cairn chooses; either way the recipe is
             // resolved before anything is written, so a refusal files nothing.
             let creator =
@@ -151,9 +163,51 @@ pub(super) async fn dispatch(
             )
             .await
             .map_err(|error| build_failure(index, item, error))?;
+            // An adoption outlives the launch, so a filing that would adopt is
+            // refused here, before the edge is written, by every check the
+            // launch would make of its configuration.
+            if adopter.is_some() {
+                executions::check_filing(
+                    orch,
+                    project,
+                    *number,
+                    &filing,
+                    overrides.as_ref(),
+                    branch_target,
+                    continuity.clone(),
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+            }
             if dry_run {
+                // The adoption moves the issue into the thread's focus count,
+                // so the queue is asked as it will stand after it. A filing
+                // with `after:` takes no place until its gates clear.
+                let adopts = match &adopter {
+                    Some((thread_id, name)) => {
+                        let queue = if after.is_empty() {
+                            executions::prospective_queue_line(orch, project, *number, thread_id)
+                                .await
+                                .map_err(|error| build_failure(index, item, error))?
+                        } else {
+                            None
+                        };
+                        let queue = match queue {
+                            Some(line) => format!(
+                                " It would count against {name}'s focus cap, and the queue \
+                                 would hold it now: {line}"
+                            ),
+                            None => format!(" It would count against {name}'s focus cap."),
+                        };
+                        format!(
+                            "\nWould adopt {project}/{number} under thread {name} first: it has \
+                             no parent.{queue}"
+                        )
+                    }
+                    None => String::new(),
+                };
                 format!(
-                    "Would {} an execution for {project}/{number}\n{}",
+                    "Would {} an execution for {project}/{number}{adopts}\n{}",
                     if after.is_empty() {
                         "start"
                     } else {
@@ -162,7 +216,53 @@ pub(super) async fn dispatch(
                     filing.resolution.line()
                 )
             } else {
-                executions::start_execution_from_collection(
+                // Adopt before the launch: admission reads the issue's thread
+                // for its focus cap and queue, so the edge must be durable
+                // before the start is decided.
+                let mut adopted = None;
+                let mut adoption_note = String::new();
+                if let Some((thread_id, thread_name)) = &adopter {
+                    match crate::mcp::handlers::issues::adopt_unparented_issue_into_thread(
+                        orch, project, *number, thread_id,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?
+                    {
+                        crate::issues::crud::ThreadAdoption::Adopted(_) => {
+                            adoption_note = format!(
+                                "\nAdopted {project}/{number} under thread {thread_name}: it had no \
+                                 parent, so its attention (plan gates, reviews, failures) now \
+                                 reaches {thread_name}. Patch cairn://p/{project}/{number} \
+                                 {{parent:...}} to move it."
+                            );
+                            adopted = Some(thread_name.clone());
+                        }
+                        // Someone gave it a parent between the read above and
+                        // this write; that parent stands, and a head place is
+                        // decided again against it.
+                        crate::issues::crud::ThreadAdoption::AlreadyParented(_) => {
+                            let current = super::threads::issue_parents(orch, project, *number)
+                                .await
+                                .map_err(|error| build_failure(index, item, error))?;
+                            place = file_place(
+                                orch,
+                                request,
+                                project,
+                                *number,
+                                head,
+                                current.and_then(|parents| parents.thread).as_deref(),
+                                !after.is_empty(),
+                            )
+                            .await
+                            .map_err(|error| build_failure(index, item, error))?;
+                            adoption_note = format!(
+                                "\n{project}/{number} gained a parent before {thread_name} could \
+                                 adopt it; that parent stands."
+                            );
+                        }
+                    }
+                }
+                let started = executions::start_execution_from_collection(
                     orch,
                     project,
                     *number,
@@ -174,8 +274,24 @@ pub(super) async fn dispatch(
                     after,
                     place,
                 )
-                .await
-                .map_err(|error| build_failure(index, item, error))?
+                .await;
+                match started {
+                    Ok(summary) => format!("{summary}{adoption_note}"),
+                    // The adoption records the thread's demonstrated ownership
+                    // and stays: undoing it unconditionally could erase a
+                    // parent someone set since, so the failure says it held.
+                    Err(error) => {
+                        let error = match adopted {
+                            Some(thread_name) => format!(
+                                "{error}\n{project}/{number} was adopted under thread \
+                                 {thread_name} before the start failed and keeps that parent; \
+                                 retrying adopts nothing twice."
+                            ),
+                            None => error,
+                        };
+                        return Err(build_failure(index, item, error));
+                    }
+                }
             }
         }
         (
@@ -244,6 +360,33 @@ pub(super) async fn dispatch(
         _ => return Ok(None),
     };
     Ok(Some(summary))
+}
+
+/// Where a filing queues: at the tail, or, for `place:"head"`, at the head of
+/// `thread`'s own queue (the issue's parent thread, or the thread about to
+/// adopt it), checked before anything is written.
+async fn file_place(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+    number: i32,
+    head: bool,
+    thread: Option<&str>,
+    has_after: bool,
+) -> Result<crate::execution::recipe::QueuePlace, String> {
+    if !head {
+        return Ok(crate::execution::recipe::QueuePlace::Tail);
+    }
+    let placed_by = super::threads::head_placed_by(
+        orch,
+        request,
+        project,
+        thread,
+        &format!("{project}/{number}"),
+        has_after,
+    )
+    .await?;
+    Ok(crate::execution::recipe::QueuePlace::Head { placed_by })
 }
 
 /// Parse an `after` array of gate clause objects, refusing prose, malformed

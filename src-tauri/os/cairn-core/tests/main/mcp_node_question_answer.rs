@@ -137,13 +137,16 @@ async fn a_thread_answering_its_question_records_the_canonical_thread_actor() {
 
     let result = handle_write(
         &orch,
-        &change_request(json!({
-            "changes": [{
-                "target": "cairn://p/tqt/design/questions/q-1",
-                "mode": "patch",
-                "payload": {"answer": "Yes"}
-            }]
-        })),
+        &McpCallbackRequest {
+            run_id: Some("run-t1".to_string()),
+            ..change_request(json!({
+                "changes": [{
+                    "target": "cairn://p/tqt/design/questions/q-1",
+                    "mode": "patch",
+                    "payload": {"answer": "Yes"}
+                }]
+            }))
+        },
     )
     .await;
     assert!(
@@ -184,13 +187,16 @@ async fn answering_a_threads_question_clears_its_attention() {
 
     let result = handle_write(
         &orch,
-        &change_request(json!({
-            "changes": [{
-                "target": "cairn://p/tqt/design/questions/q-1",
-                "mode": "patch",
-                "payload": {"answer": "Yes"}
-            }]
-        })),
+        &McpCallbackRequest {
+            run_id: Some("run-t1".to_string()),
+            ..change_request(json!({
+                "changes": [{
+                    "target": "cairn://p/tqt/design/questions/q-1",
+                    "mode": "patch",
+                    "payload": {"answer": "Yes"}
+                }]
+            }))
+        },
     )
     .await;
     assert!(result.contains("Answered question q-1"), "{result}");
@@ -464,9 +470,12 @@ async fn node_question_patch_answers_prompt_once() {
     let target = "cairn://p/tqa/1/1/builder/questions/q-1";
     let result = handle_write(
         &orch,
-        &change_request(json!({
-            "changes": [{"target": target, "mode": "patch", "payload": {"answer": "Yes"}}]
-        })),
+        &McpCallbackRequest {
+            run_id: Some("run-1".to_string()),
+            ..change_request(json!({
+                "changes": [{"target": target, "mode": "patch", "payload": {"answer": "Yes"}}]
+            }))
+        },
     )
     .await;
     assert!(
@@ -478,9 +487,12 @@ async fn node_question_patch_answers_prompt_once() {
 
     let duplicate = handle_write(
         &orch,
-        &change_request(json!({
-            "changes": [{"target": target, "mode": "patch", "payload": {"answer": "Yes"}}]
-        })),
+        &McpCallbackRequest {
+            run_id: Some("run-1".to_string()),
+            ..change_request(json!({
+                "changes": [{"target": target, "mode": "patch", "payload": {"answer": "Yes"}}]
+            }))
+        },
     )
     .await;
     assert!(

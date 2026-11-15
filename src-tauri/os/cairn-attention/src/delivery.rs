@@ -785,10 +785,11 @@ pub const CATCHUP_DIGEST_CHARS: usize = 240;
 /// carries that bounded fact inline and the URI supplies context on demand.
 ///
 /// The one source is `queued_messages`, because it is the one durable record
-/// whose every row is text a human typed at this job: the composer's queued
-/// follow-up, and the idle-child send that goes straight into a resume (recorded
-/// delivered on arrival). The child's own transcript cannot serve here. A `user`
-/// event is a *role*, not an author — the job's launch prompt, a delegated
+/// whose `operator` rows record text a human typed at this job: the composer's
+/// queued follow-up, and the idle-child send that goes straight into a resume
+/// (recorded delivered on arrival). Question answers share the queue's delivery
+/// timing, not its authorship, and are excluded regardless of their answerer.
+/// The child's own transcript cannot serve here. A `user` event is a *role*, not an author — the job's launch prompt, a delegated
 /// artifact payload delivered to a review node, and every machinery resume land
 /// in the same slot as the operator's typed `^`, distinguishable only by reading
 /// their content. Scanning that role told coordinators "the operator sent" over
@@ -853,7 +854,7 @@ async fn operator_messages_since(
             let mut rows = conn
                 .query(
                     "SELECT created_at, content, delivered_at FROM queued_messages
-                     WHERE job_id = ?1
+                     WHERE job_id = ?1 AND kind = 'operator'
                        AND (delivered_at IS NULL OR created_at >= ?2)
                      ORDER BY created_at DESC
                      LIMIT ?3",

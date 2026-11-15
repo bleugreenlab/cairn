@@ -90,6 +90,54 @@ pub(crate) async fn resolve_filing(
     })
 }
 
+/// Whether filing `filing` on issue `number` would get past the launch's
+/// configuration checks (the recipe loads and is enabled, the overrides
+/// compile, the branch target is one it declares), without filing anything.
+pub(crate) async fn check_filing(
+    orch: &Orchestrator,
+    project_key: &str,
+    number: i32,
+    filing: &ExecutionFiling,
+    overrides: Option<&crate::models::LaunchDeltas>,
+    branch_target: Option<crate::models::BranchTarget>,
+    continuity: Option<crate::models::Continuity>,
+) -> Result<(), String> {
+    let owning_db = orch.db.for_project(project_key).await;
+    let (project_id, issue_id, _) =
+        resolve_project_and_issue(&owning_db, project_key, number).await?;
+    crate::execution::recipe::check_issue_launch(
+        orch,
+        &issue_id,
+        &filing.resolution.recipe,
+        &project_id,
+        overrides
+            .cloned()
+            .map(crate::models::LaunchCustomization::Deltas),
+        branch_target,
+        continuity,
+    )
+    .await
+}
+
+/// What the execution queue would do with a new filing on issue `number` once
+/// thread `thread_id` has adopted it: `None` when it would start, or the line
+/// naming the caps that would hold it. Read-only.
+pub(crate) async fn prospective_queue_line(
+    orch: &Orchestrator,
+    project_key: &str,
+    number: i32,
+    thread_id: &str,
+) -> Result<Option<String>, String> {
+    let owning_db = orch.db.for_project(project_key).await;
+    let (_, issue_id, _) = resolve_project_and_issue(&owning_db, project_key, number).await?;
+    let admission = crate::execution::gates::capacity::decide_with_thread(
+        orch, &owning_db, &issue_id, thread_id,
+    )
+    .await?;
+    Ok((!admission.blocks.is_empty())
+        .then(|| crate::execution::gates::census::queued_summary(&admission.blocks)))
+}
+
 /// The reply's resolution block: the recipe and why, one line per agent step,
 /// and the ways to change it.
 ///

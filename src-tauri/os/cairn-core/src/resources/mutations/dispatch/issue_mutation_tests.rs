@@ -4326,3 +4326,97 @@ fn rebuild_ledger_mutations_are_refused_before_dispatch() {
         }
     }
 }
+
+async fn question_attribution_fixture() -> (Orchestrator, i32, String) {
+    let orch = seeded_orch().await;
+    let (number, job_id, run_id) = seed_running_node(&orch).await;
+    let project_id = crate::mcp::handlers::run_context::project_id_by_key(&orch.db.local, "cairn")
+        .await
+        .unwrap();
+    let (_, _, answering_run) = seed_thread_session_run(&orch, &project_id, "answerer").await;
+    exec_sql(
+        &orch,
+        format!(
+            "INSERT INTO prompts(id, run_id, job_id, questions, created_at, uri_segment, background) \
+             VALUES ('question-attribution', '{run_id}', '{job_id}', \
+             '[{{\"question\":\"Which path?\",\"options\":[],\"multiSelect\":false}}]', 1, 'q-1', 1)"
+        ),
+    )
+    .await;
+    (orch, number, answering_run)
+}
+
+#[tokio::test]
+async fn question_resource_patch_names_the_actual_answering_node() {
+    let (orch, number, answering_run) = question_attribution_fixture().await;
+    apply_as_run(
+        &orch,
+        &change_item(
+            &format!("cairn://p/cairn/{number}/1/builder/questions/q-1"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"answer": "Use the canonical caller"})),
+        ),
+        &answering_run,
+    )
+    .await
+    .unwrap();
+    let rendered = crate::resources::node::read_node_question(
+        &orch.db.local,
+        "cairn",
+        number,
+        1,
+        "builder",
+        "q-1",
+    )
+    .await;
+    assert!(
+        rendered.contains("Resolved resource_patch by cairn://p/cairn/answerer"),
+        "the receipt must name the answering node rather than the asker: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn question_resource_patch_never_substitutes_the_asker_for_an_unknown_caller() {
+    let (orch, number, _) = question_attribution_fixture().await;
+    let failure = apply_as_run(
+        &orch,
+        &change_item(
+            &format!("cairn://p/cairn/{number}/1/builder/questions/q-1"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"answer": "Do not attribute this to the asker"})),
+        ),
+        "missing-answering-run",
+    )
+    .await
+    .expect_err("an unresolvable caller must not answer under the asker's identity");
+    assert!(
+        failure.error.contains("missing-answering-run"),
+        "{failure:?}"
+    );
+}
+
+#[tokio::test]
+async fn question_resource_patch_requires_a_caller_instead_of_impersonating_the_asker() {
+    let (orch, number, _) = question_attribution_fixture().await;
+    apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/cairn/{number}/1/builder/questions/q-1"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"answer": "Unattributed answer"})),
+        ),
+    )
+    .await
+    .expect_err("a resource patch needs a caller, not the addressed node's identity");
+    let rendered = crate::resources::node::read_node_question(
+        &orch.db.local,
+        "cairn",
+        number,
+        1,
+        "builder",
+        "q-1",
+    )
+    .await;
+    assert!(!rendered.contains("Resolved resource_patch"), "{rendered}");
+    assert!(!rendered.contains("Unattributed answer"), "{rendered}");
+}

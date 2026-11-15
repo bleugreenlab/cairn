@@ -351,9 +351,9 @@ async fn answer_with_a_foreign_successor_queues_and_reports_applied() {
         .unwrap()
         .expect("one queued message keyed by the prompt");
     assert!(
-        queued.starts_with("Your question cairn://")
+        queued.contains("answered your question cairn://")
             && queued.contains("/questions/q-1 (")
-            && queued.contains(") was answered:")
+            && queued.contains("):")
             && queued.contains("Option A"),
         "{queued}"
     );
@@ -725,9 +725,9 @@ async fn answers_at_boundary(orch: &Orchestrator) -> usize {
 /// The answer as the asker reads it: the question's URI and first line, then
 /// the answer.
 fn is_framed_answer(text: &str) -> bool {
-    text.contains("Your question cairn://")
+    text.contains("answered your question cairn://")
         && text.contains("/questions/q-1 (")
-        && text.contains(") was answered:")
+        && text.contains("):")
 }
 
 async fn pending_answer_rows(db: &LocalDb) -> i64 {
@@ -995,9 +995,7 @@ async fn an_answer_outlives_a_turn_that_ends_before_its_next_tool_boundary() {
     nudge_job_for_urgency(&orch, "job-1", Delivery::Steer).expect("the job resumes");
 
     assert_eq!(
-        delivered_text(&delivered)
-            .matches(") was answered:")
-            .count(),
+        delivered_text(&delivered).matches("):").count(),
         1,
         "the resume delivers the framed answer once: {}",
         delivered_text(&delivered)
@@ -1235,4 +1233,117 @@ async fn a_background_answer_on_an_open_turn_another_wait_holds_still_reaches_th
         Some(HostWaitContinuation::AtNextToolBoundary)
     );
     assert_eq!(pending_answer_rows(&db).await, 1);
+}
+
+const ANSWERING_NODE: &str = "cairn://p/lateq/execution";
+
+async fn assert_answer_author_delivery(operator: bool, resume: bool) {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    seed_question(&db, &BACKGROUND_MID_TURN).await;
+    let orch = common::orchestrator(&temp, db.clone());
+    let delivered = common::register_recording_process(&orch, "run-1", "session-1");
+    let provenance = if operator {
+        ResolutionProvenance::new(AppearanceTransport::AuthenticatedDesktop, None)
+    } else {
+        ResolutionProvenance::new(
+            AppearanceTransport::ResourcePatch,
+            Some(
+                serde_json::json!({
+                    "kind": "agent", "node": ANSWERING_NODE, "run_id": null
+                })
+                .to_string(),
+            ),
+        )
+    };
+    answer_prompt_id(&orch, "prompt-1", answer("Author sentinel"), provenance)
+        .await
+        .unwrap();
+    let text = if resume {
+        db.execute(
+            "UPDATE jobs SET memory_review_state = 'sent' WHERE id = 'job-1'",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE turns SET state = 'complete' WHERE id = 'turn-ask'",
+            (),
+        )
+        .await
+        .unwrap();
+        orch.process_state.transition_to_warm("run-1");
+        nudge_job_for_urgency(&orch, "job-1", Delivery::Steer).unwrap();
+        assert_eq!(
+            db.query_text("SELECT start_reason FROM turns WHERE job_id = 'job-1' ORDER BY sequence DESC LIMIT 1", ())
+                .await.unwrap().as_deref(),
+            Some("follow_up"),
+            "an answer is real work, never a memory-review turn",
+        );
+        let delivered = delivered_text(&delivered);
+        let envelope: serde_json::Value = serde_json::from_str(delivered.trim()).unwrap();
+        envelope["message"]["content"].as_str().unwrap().to_string()
+    } else {
+        dispatch_tool(
+            &orch,
+            &model_call(Some("run-1"), &[]),
+            &Mutex::new(HashMap::new()),
+        )
+        .await
+        .into_inner()
+        .reminders
+        .join("\n\n")
+    };
+    let author = if operator {
+        "The operator"
+    } else {
+        ANSWERING_NODE
+    };
+    assert!(text.contains(&format!("{author} answered your question cairn://p/lateq/1/1/builder/questions/q-1 (\"Which approach?\"):")), "{text}");
+    assert!(
+        !text.contains("The user sent a follow-up message:"),
+        "{text}"
+    );
+    assert!(text.contains("Author sentinel"), "{text}");
+    assert_eq!(pending_answer_rows(&db).await, 0);
+    assert_eq!(count(&db,
+        "SELECT COUNT(*) FROM events WHERE event_type = 'user' AND data LIKE '%Author sentinel%'"
+    ).await, 0, "an answer is not an operator-authored chat message");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_author_operator_at_tool_boundary() {
+    assert_answer_author_delivery(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_author_node_at_tool_boundary() {
+    assert_answer_author_delivery(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_author_operator_on_resume_claim() {
+    assert_answer_author_delivery(true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_author_node_on_resume_claim() {
+    assert_answer_author_delivery(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_author_is_not_a_composer_draft() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    seed_question(&db, &BACKGROUND_MID_TURN).await;
+    let orch = common::orchestrator(&temp, db.clone());
+    common::register_recording_process(&orch, "run-1", "session-1");
+    answer_q1(&orch, "not a draft").await.unwrap();
+    assert!(
+        cairn_core::messages::queued::list_pending_for_job(&db, "job-1")
+            .unwrap()
+            .is_empty(),
+        "answers must not appear as editable composer chips"
+    );
+    assert_eq!(pending_answer_rows(&db).await, 1, "hidden, not discarded");
 }

@@ -202,7 +202,9 @@ async fn answered_write_question_preserves_report_and_opaque_answer() {
     assert_eq!(&result[stream.byte_offset()..], suffix);
     // The waiting call's result names the question it answers, then carries
     // the answer bytes unchanged.
-    let framed = format!("Your question (\"Which approach?\") was answered:\n\n{answer}");
+    let framed = format!(
+        "a reply on test-provider answered your question (\"Which approach?\"):\n\n{answer}"
+    );
     let mut expected = original;
     expected["blocking"] = json!({"text": framed, "answers": [{"index": 0, "answer": answer}]});
     assert_eq!(

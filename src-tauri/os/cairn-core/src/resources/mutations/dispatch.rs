@@ -74,6 +74,8 @@ mod queue_authority_tests;
 #[cfg(test)]
 mod resource_gate_tests;
 #[cfg(test)]
+mod thread_adoption_tests;
+#[cfg(test)]
 mod thread_mutation_tests;
 
 use super::{

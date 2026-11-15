@@ -5670,6 +5670,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn queued_answer_authorship_backfills_only_prompt_rows() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("queued-answer-authorship.turso.db"))
+            .await
+            .unwrap();
+        let name = "queued_answer_authorship";
+        let before: Vec<_> = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != name)
+            .copied()
+            .collect();
+        let migration = *TURSO_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name() == name)
+            .unwrap();
+        assert!(TEAM_MIGRATIONS
+            .iter()
+            .any(|migration| migration.name() == name));
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p','default','P','p','/tmp/p',1,1);
+             INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+               VALUES('j','p','running',1,1);
+             INSERT INTO runs(id, job_id, project_id, status, created_at, updated_at)
+               VALUES('r','j','p','live',1,1);
+             INSERT INTO prompts(id,run_id,job_id,questions,response,created_at,answered_at,
+                                 resolution_id,resolution_surface,resolution_actor)
+               VALUES('answer','r','j','[]','stored answer',1,2,
+                      'resolution','resource_patch','cairn://p/p/execution'),
+                     ('unknown','r','j','[]','legacy answer',1,2,NULL,NULL,NULL);
+             INSERT INTO queued_messages(id,job_id,content,delivery,created_at,delivered_at)
+               VALUES('operator','j','typed words','queue',1,NULL),
+                     ('answer','j','answer text','steer',2,NULL),
+                     ('unknown','j','old answer text','steer',2,3);",
+        )
+        .await
+        .unwrap();
+        MigrationRunner::new(vec![migration])
+            .run(&db)
+            .await
+            .unwrap();
+        let rows = db
+            .query_all(
+                "SELECT id, kind, resolution, delivered_at FROM queued_messages ORDER BY id",
+                (),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.text(1)?,
+                        row.opt_text(2)?,
+                        row.opt_i64(3)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[1].0, "operator");
+        assert_eq!(rows[1].1, "operator");
+        assert!(rows[1].2.is_none());
+        assert_eq!(rows[0].1, "question_answer");
+        let receipt: crate::models::ResolutionReceipt =
+            serde_json::from_str(rows[0].2.as_ref().unwrap()).unwrap();
+        assert_eq!(receipt.id.as_deref(), Some("resolution"));
+        assert_eq!(receipt.surface, "resource_patch");
+        assert_eq!(receipt.actor.as_deref(), Some("cairn://p/p/execution"));
+        assert_eq!(receipt.resolved_at, 2000);
+        assert_eq!(rows[2].1, "question_answer");
+        let legacy: crate::models::ResolutionReceipt =
+            serde_json::from_str(rows[2].2.as_ref().unwrap()).unwrap();
+        assert_eq!(legacy.surface, "legacy_unknown");
+        assert!(
+            legacy.actor.is_none(),
+            "unknown authorship must stay unknown"
+        );
+        assert_eq!(rows[2].3, Some(3), "delivery stamps survive the migration");
+    }
+
     /// cairn/5537: each addressed direct's recipient moves off `messages` into
     /// `message_recipients`, keyed by the run's job; a direct whose run is gone
     /// keeps its run id with no job, and one that named no run gets no row. The

@@ -212,15 +212,23 @@ pub(super) async fn dispatch(
                 .await
                 .map_err(|error| build_failure(index, item, error))?
             } else {
-                let outcome = planning::answer_node_question_as(
+                let actor =
+                    crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?
+                        .home;
+                let outcome = planning::answer_node_question_with_provenance(
                     orch,
-                    request.run_id.as_deref(),
                     project,
                     *number,
                     *exec_seq,
                     node_id,
                     segment,
                     payload,
+                    crate::turns::queries::ResolutionProvenance::new(
+                        cairn_common::identity::AppearanceTransport::ResourcePatch,
+                        Some(actor),
+                    ),
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;

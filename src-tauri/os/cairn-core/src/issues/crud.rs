@@ -375,6 +375,69 @@ pub(crate) async fn resolve_parent_edge(
     )))
 }
 
+/// What a conditional thread adoption found: the issue hung from nothing and
+/// now hangs from the thread, or it already had a parent, which stands.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ThreadAdoption {
+    Adopted(String),
+    AlreadyParented(ParentEdge),
+}
+
+/// Hang issue `issue_id` from thread `thread_id` only if it has no semantic
+/// parent of either kind, in one statement, so a parent assigned concurrently
+/// (by an explicit patch, or another filing) is never overwritten. The thread
+/// must belong to the issue's own project. `parent_job_id` is creator
+/// provenance and is left exactly as it was.
+pub(crate) async fn adopt_unparented_into_thread_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    project_id: &str,
+    issue_id: &str,
+    thread_id: &str,
+    now: i64,
+) -> DbResult<ThreadAdoption> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM threads WHERE id = ?1 AND project_id = ?2 LIMIT 1",
+            params![thread_id, project_id],
+        )
+        .await?;
+    if rows.next().await?.is_none() {
+        return Err(DbError::Row(format!(
+            "thread {thread_id} is not in the issue's project, so it cannot adopt it"
+        )));
+    }
+    drop(rows);
+    let changed = conn
+        .execute(
+            "UPDATE issues SET parent_thread_id = ?1, updated_at = ?2
+              WHERE id = ?3 AND project_id = ?4
+                AND parent_issue_id IS NULL AND parent_thread_id IS NULL",
+            params![thread_id, now, issue_id, project_id],
+        )
+        .await?;
+    if changed == 1 {
+        return Ok(ThreadAdoption::Adopted(thread_id.to_string()));
+    }
+    let mut rows = conn
+        .query(
+            "SELECT parent_issue_id, parent_thread_id FROM issues
+              WHERE id = ?1 AND project_id = ?2",
+            params![issue_id, project_id],
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| DbError::Row(format!("issue {issue_id} not found")))?;
+    match (row.opt_text(0)?, row.opt_text(1)?) {
+        (Some(issue), _) => Ok(ThreadAdoption::AlreadyParented(ParentEdge::Issue(issue))),
+        (None, Some(thread)) => Ok(ThreadAdoption::AlreadyParented(ParentEdge::Thread(thread))),
+        (None, None) => Err(DbError::Row(format!(
+            "issue {issue_id} has no parent but could not be adopted"
+        ))),
+    }
+}
+
 pub async fn create(
     db: &LocalDb,
     clock: &dyn Clock,
@@ -1331,6 +1394,103 @@ mod tests {
             vec!["i-two", "i-one"]
         );
         assert_eq!(children[1].labels, issue_one.labels);
+    }
+
+    /// The conditional adoption sets a thread edge only on an issue that hangs
+    /// from nothing. A parent assigned before it runs (the race an explicit
+    /// patch between a filing's read and its write makes) stands and is
+    /// reported; a thread of another project is refused; creator provenance
+    /// is never touched.
+    #[tokio::test]
+    async fn adoption_sets_a_thread_edge_only_where_none_exists() {
+        let db = crate::storage::migrated_test_db("issue-adopt-conditional.db").await;
+        db.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+            VALUES('p', 'default', 'P', 'P', '/tmp/p', 1, 1),
+                  ('q', 'default', 'Q', 'Q', '/tmp/q', 1, 1);
+            INSERT INTO threads(id, project_id, name, created_at, updated_at)
+            VALUES('t-mine', 'p', 'mine', 1, 1), ('t-other', 'p', 'other', 1, 1),
+                  ('t-foreign', 'q', 'mine', 1, 1);
+            INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+            VALUES('creator', 'p', 'running', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention,
+                               parent_job_id, created_at, updated_at)
+            VALUES('loose', 'p', 1, 'Loose', 'active', 'active', 'none', 'creator', 1, 1),
+                  ('raced', 'p', 2, 'Raced', 'active', 'active', 'none', NULL, 1, 1),
+                  ('raced-issue', 'p', 3, 'Raced', 'active', 'active', 'none', NULL, 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+        let adopt = |issue: &'static str, thread: &'static str| {
+            let db = &db;
+            async move {
+                db.write(move |conn| {
+                    Box::pin(async move {
+                        adopt_unparented_into_thread_conn(conn, "p", issue, thread, 7).await
+                    })
+                })
+                .await
+            }
+        };
+        let edge = |issue: &'static str| {
+            let db = &db;
+            async move {
+                db.query_one(
+                    "SELECT parent_issue_id, parent_thread_id, parent_job_id FROM issues WHERE id = ?1",
+                    params![issue],
+                    |row| Ok((row.opt_text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        assert_eq!(
+            adopt("loose", "t-mine").await.unwrap(),
+            ThreadAdoption::Adopted("t-mine".into())
+        );
+        assert_eq!(
+            edge("loose").await,
+            (None, Some("t-mine".into()), Some("creator".into()))
+        );
+
+        // A parent set in between, of either kind, wins.
+        db.execute(
+            "UPDATE issues SET parent_thread_id = 't-other' WHERE id = 'raced'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            adopt("raced", "t-mine").await.unwrap(),
+            ThreadAdoption::AlreadyParented(ParentEdge::Thread("t-other".into()))
+        );
+        assert_eq!(edge("raced").await.1.as_deref(), Some("t-other"));
+        db.execute(
+            "UPDATE issues SET parent_issue_id = 'loose' WHERE id = 'raced-issue'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            adopt("raced-issue", "t-mine").await.unwrap(),
+            ThreadAdoption::AlreadyParented(ParentEdge::Issue("loose".into()))
+        );
+        assert_eq!(
+            edge("raced-issue").await,
+            (Some("loose".into()), None, None)
+        );
+
+        db.execute(
+            "UPDATE issues SET parent_thread_id = NULL WHERE id = 'raced'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(adopt("raced", "t-foreign").await.is_err());
+        assert_eq!(edge("raced").await, (None, None, None));
     }
 
     /// The desktop's `Issue` type is hand-maintained TypeScript, so nothing but

@@ -10,7 +10,7 @@ use cairn_core::internal::execution::advancement::recompute_job_status_conn;
 use cairn_core::internal::execution::jobs::{continue_job_impl, promote_private_lanes_for_test};
 use cairn_core::internal::orchestrator::lifecycle::{finalize_run, stop_job};
 use cairn_core::internal::orchestrator::wakes::{
-    load_active_provider_limit_holds, resolve_provider_limit_hold,
+    load_active_provider_limit_holds, release_on_supply_change, resolve_provider_limit_hold,
     supersede_orphaned_provider_limit_holds, ProviderLimitHold, SUPPLY_RECHECK_SECS,
 };
 use cairn_core::internal::orchestrator::Orchestrator;
@@ -23,6 +23,7 @@ use cairn_core::internal::services::{
 use cairn_core::internal::storage::{LocalDb, SearchIndex};
 use cairn_core::models::{JobStatus, RunStatus};
 use cairn_db::turso::params;
+use cairn_models::subscription::testing::TempHomes;
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{mpsc, Arc, Mutex, Weak};
@@ -131,6 +132,16 @@ fn orchestrator_with_spawn_failure(
     claude_auth: Option<ClaudeAuth>,
     fail_spawn: bool,
 ) -> (Orchestrator, RecordedProcesses) {
+    build_orchestrator(temp, db, claude_auth, fail_spawn, None)
+}
+
+fn build_orchestrator(
+    temp: &TempDir,
+    db: Arc<LocalDb>,
+    claude_auth: Option<ClaudeAuth>,
+    fail_spawn: bool,
+    homes: Option<TempHomes>,
+) -> (Orchestrator, RecordedProcesses) {
     let search_path = tempfile::Builder::new()
         .prefix("search-")
         .tempdir_in(temp.path())
@@ -188,18 +199,45 @@ fn orchestrator_with_spawn_failure(
         })
     });
 
-    (
-        Orchestrator::builder(db_state, services, config_dir)
-            .boot_at(0)
-            .process_state(process_state)
-            .managed_tools(managed)
-            .credential_store(credential_store)
-            .build(),
-        recorder,
-    )
+    let mut builder = Orchestrator::builder(db_state, services, config_dir)
+        .boot_at(0)
+        .process_state(process_state)
+        .managed_tools(managed)
+        .credential_store(credential_store);
+    if let Some(homes) = homes {
+        builder = builder.subscriptions(Arc::new(homes));
+    }
+    (builder.build(), recorder)
 }
 
 async fn fixture() -> (TempDir, Arc<LocalDb>, Orchestrator, RecordedProcesses) {
+    let (temp, db) = seeded().await;
+    let (orch, recorder) = orchestrator(&temp, db.clone());
+    (temp, db, orch, recorder)
+}
+
+/// [`fixture`], with subscription support, so a signed-in managed Claude
+/// account can launch rather than being refused as a test build refuses it.
+async fn subscribed_fixture() -> (
+    TempDir,
+    Arc<LocalDb>,
+    Orchestrator,
+    RecordedProcesses,
+    TempHomes,
+) {
+    let (temp, db) = seeded().await;
+    let homes = TempHomes::new(temp.path().join("claude-profiles"));
+    let (orch, recorder) = build_orchestrator(
+        &temp,
+        db.clone(),
+        Some(ClaudeAuth::ApiKey("test-key".to_string())),
+        false,
+        Some(homes.clone()),
+    );
+    (temp, db, orch, recorder, homes)
+}
+
+async fn seeded() -> (TempDir, Arc<LocalDb>) {
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
     let root = temp.path().to_string_lossy().replace('\'', "''");
@@ -242,8 +280,7 @@ async fn fixture() -> (TempDir, Arc<LocalDb>, Orchestrator, RecordedProcesses) {
           VALUES('turn','session','run','a',1,'running','initial',1,1);
         UPDATE jobs SET current_session_id='session', current_turn_id='turn' WHERE id='a';
     ")).await.unwrap();
-    let (orch, recorder) = orchestrator(&temp, db.clone());
-    (temp, db, orch, recorder)
+    (temp, db)
 }
 
 fn result(orch: &Orchestrator, db: &Arc<LocalDb>, run: &str, text: &str, is_error: bool, now: i64) {
@@ -434,24 +471,32 @@ async fn resolution_claims_and_launches_exactly_one_successor() {
     assert_eq!(recorder.spawn_count(), 1);
 }
 
-/// Two managed Claude accounts, with the session pinned to the first.
-async fn two_accounts(orch: &Orchestrator, db: &LocalDb) -> (String, String) {
-    let [exhausted, replacement] = ["Work Max", "Personal Max"].map(|label| {
-        orch.add_account(
-            cairn_core::credentials::ApiProvider::Anthropic,
-            label.to_string(),
-            cairn_core::credentials::ProviderAuth::ClaudeProfile { oauth: None },
-            None,
-        )
-        .unwrap()
-        .id
-    });
+/// Add a managed Claude account through the operator's path.
+fn managed_account(orch: &Orchestrator, label: &str) -> String {
+    orch.add_account(
+        cairn_core::credentials::ApiProvider::Anthropic,
+        label.to_string(),
+        cairn_core::credentials::ProviderAuth::ClaudeProfile { oauth: None },
+        None,
+    )
+    .unwrap()
+    .id
+}
+
+async fn pin_session(db: &LocalDb, account: &str) {
     db.execute(
         "UPDATE sessions SET account_id=?1 WHERE id='session'",
-        params![exhausted.as_str()],
+        params![account],
     )
     .await
     .unwrap();
+}
+
+/// Two managed Claude accounts, with the session pinned to the first.
+async fn two_accounts(orch: &Orchestrator, db: &LocalDb) -> (String, String) {
+    let [exhausted, replacement] =
+        ["Work Max", "Personal Max"].map(|label| managed_account(orch, label));
+    pin_session(db, &exhausted).await;
     (exhausted, replacement)
 }
 
@@ -621,6 +666,123 @@ async fn a_blocking_rate_limit_exit_without_a_result_holds_and_fails_over() {
         .await
         .unwrap());
     assert_eq!(common::scalar_i64_by_id(&db, "SELECT COUNT(*) FROM turns WHERE job_id=?1 AND start_reason='wait_resolved' AND predecessor_id='turn'", "a").await, 1);
+}
+
+/// A blocking limit whose reset is far off: 2100-01-01.
+const FAR_RESET: i64 = 4102444800;
+const BLOCKING_LIMIT: &str =
+    r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":4102444800}}"#;
+
+// cairn/5378, the 10-21 shape: the only account hits its limit, so nothing can
+// take the work and it holds for the declared reset. The operator then adds an
+// account. That change, not the reset and not a message, releases the hold, and
+// the work continues once on the account just added.
+#[tokio::test]
+async fn an_added_account_releases_a_limit_held_session_before_its_reset() {
+    let (_temp, db, orch, recorder, homes) = subscribed_fixture().await;
+    let exhausted = managed_account(&orch, "Work Max");
+    homes.sign_in(&exhausted);
+    pin_session(&db, &exhausted).await;
+    register_live_process(&orch, &exhausted);
+    read_stream(&orch, &db, BLOCKING_LIMIT);
+
+    let hold = only_hold(&db).await;
+    assert_eq!(
+        hold.boundary_source, "rate_limit_event",
+        "with one account there is nothing to fail over to"
+    );
+    assert_eq!(hold.resume_gate, None);
+    let due = hold.next_due_at().expect("a timed hold");
+    assert!((FAR_RESET..=FAR_RESET + 120).contains(&due), "{due}");
+    let now = chrono::Utc::now().timestamp();
+    assert!(
+        !resolve_provider_limit_hold(&orch, &hold, now)
+            .await
+            .unwrap(),
+        "its clock is far from due"
+    );
+    assert_held(&db).await;
+    assert_eq!(recorder.spawn_count(), 0);
+
+    let added = managed_account(&orch, "Personal Max");
+    homes.sign_in(&added);
+    assert!(
+        release_on_supply_change(&orch, &hold, now).await.unwrap(),
+        "an account that can serve the work releases the hold"
+    );
+    assert_eq!(
+        text(
+            &db,
+            "SELECT state FROM provider_limit_holds WHERE id=?1",
+            &hold.id
+        )
+        .await,
+        "resolved"
+    );
+    assert_eq!(turns(&db).await, 2);
+    assert_eq!(common::scalar_i64_by_id(&db, "SELECT COUNT(*) FROM turns WHERE job_id=?1 AND start_reason='wait_resolved' AND predecessor_id='turn'", "a").await, 1);
+    assert_eq!(
+        text(
+            &db,
+            "SELECT s.account_id FROM jobs j JOIN sessions s ON s.id=j.current_session_id WHERE j.id=?1",
+            "a"
+        )
+        .await,
+        added,
+        "the session leaves {exhausted} for the account just added"
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &db,
+            "SELECT COUNT(*) FROM events WHERE run_id=?1
+               AND data LIKE '%\"kind\":\"provider_limit_resolved\"%'
+               AND data LIKE '%\"trigger\":\"supply_changed\"%'",
+            "run"
+        )
+        .await,
+        1,
+        "the transcript says the accounts, not the reset, released it"
+    );
+
+    await_admission(&orch, "a", "active").await;
+    let spawned = recorder.recorder.spawned();
+    assert_eq!(spawned.len(), 1, "the work continues exactly once");
+    let home = spawned[0].env.get("CLAUDE_CONFIG_DIR");
+    assert!(
+        home.is_some_and(|home| home.contains(added.as_str())),
+        "it launches in the added account's home: {home:?}"
+    );
+}
+
+// A hold gated on the operator is not a supply question, so a new account does
+// not release it: resuming could run the unanswered tool call a second time.
+#[tokio::test]
+async fn an_added_account_does_not_release_a_tool_in_flight_hold() {
+    let (_temp, db, orch, recorder, homes) = subscribed_fixture().await;
+    let exhausted = managed_account(&orch, "Work Max");
+    homes.sign_in(&exhausted);
+    pin_session(&db, &exhausted).await;
+    read_stream(&orch, &db, TOOL_IN_FLIGHT);
+
+    let hold = only_hold(&db).await;
+    assert_eq!(hold.resume_gate.as_deref(), Some("tool_in_flight"));
+
+    let added = managed_account(&orch, "Personal Max");
+    homes.sign_in(&added);
+    let now = chrono::Utc::now().timestamp();
+    assert!(!release_on_supply_change(&orch, &hold, now).await.unwrap());
+    assert_held(&db).await;
+    assert_eq!(turns(&db).await, 1);
+    assert_eq!(recorder.spawn_count(), 0);
+    assert_eq!(
+        text(
+            &db,
+            "SELECT state FROM provider_limit_holds WHERE id=?1",
+            &hold.id
+        )
+        .await,
+        "active"
+    );
 }
 
 // The credits shape: the CLI's synthetic credits message, then a generic error

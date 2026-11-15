@@ -1215,10 +1215,7 @@ async fn drain_tool_boundary(
     // messages, then child side-channel notices. The CLI wraps each body in a
     // `<system-reminder>` envelope, reproducing the legacy text byte-for-byte.
     for msg in &queued_steer {
-        reminders.push(format!(
-            "The user sent a follow-up message:\n{}",
-            msg.content
-        ));
+        reminders.push(msg.render());
     }
     for notice in &side_channel_notices {
         reminders.push(notice.render());

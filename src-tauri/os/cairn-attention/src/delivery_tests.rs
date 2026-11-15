@@ -351,6 +351,46 @@ async fn catchup_with_operator_messages_keeps_digest_and_adds_line() {
 }
 
 #[tokio::test]
+async fn catchup_question_answers_are_never_operator_words() {
+    let (runtime, db) = fixture("delivery-catchup-answer-authorship.db").await;
+    queued(&db, "operator steering stays visible", 100).await;
+    for (id, delivered_at) in [
+        ("pending-answer", None),
+        ("delivered-answer", Some(250_i64)),
+    ] {
+        db.execute(
+            "INSERT INTO queued_messages(id,job_id,content,delivery,created_at,delivered_at,kind,resolution)
+             VALUES(?1,'child-job',?2,'queue',200,?3,'question_answer',?4)",
+            params![
+                id,
+                format!("node-authored {id}"),
+                delivered_at,
+                r#"{"id":"resolution-1","surface":"resource_patch","provider":null,"conversation":null,"actor":"cairn://p/proj/watcher","resolvedAt":200000}"#
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let (_, rendered) = catchup(&runtime, 0).await;
+    assert!(
+        rendered.contains("operator steering stays visible"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("node-authored"), "{rendered}");
+
+    db.execute("DELETE FROM queued_messages WHERE kind='operator'", ())
+        .await
+        .unwrap();
+    assert!(
+        crate::delivery::catchup_operator_digest(&db, "watcher", "child-job")
+            .await
+            .is_none(),
+        "answers alone must never produce an operator digest"
+    );
+}
+
+#[tokio::test]
 async fn long_assistant_text_is_cut_at_a_boundary_with_the_uri_kept() {
     let (runtime, db) = fixture("delivery-catchup-long.db").await;
     let long = "The rebase reordered the integration tests so they pass again. ".repeat(10);

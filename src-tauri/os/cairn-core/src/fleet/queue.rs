@@ -74,6 +74,56 @@ const DECLINE_RECHECK_MS: u64 = 120_000;
 /// against a placement pass, short against a provisioning.
 const PROVISIONING_TURN_GRACE_MS: u64 = 10_000;
 
+/// The forecast is captured once: a moving estimate must not move an overdue
+/// request's entitlement farther into the future. Unknown forecasts use the
+/// absolute bound. Targets are generation-fenced and stay singular while room
+/// accumulates, rather than following each momentary placement-score change.
+#[derive(Debug, Clone)]
+pub(crate) struct HeadroomPlan {
+    pub(crate) forecast_ms: Option<u64>,
+    pub(crate) reserve_from_unix_ms: u64,
+    pub(crate) target: Option<HeadroomTarget>,
+    forecast_recorded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeadroomTarget {
+    pub(crate) executor_id: String,
+    pub(crate) generation: u64,
+    /// Revocation stops liveness confirmation before another machine is
+    /// authorized; its posted hold must disappear before the target moves.
+    pub(crate) enabled: bool,
+    pub(crate) offered: bool,
+}
+
+impl HeadroomPlan {
+    const MIN_WAIT_MS: u64 = 60_000;
+    const MAX_WAIT_MS: u64 = 15 * 60_000;
+
+    fn new(waiting_since_unix_ms: u64) -> Self {
+        Self {
+            forecast_ms: None,
+            reserve_from_unix_ms: waiting_since_unix_ms.saturating_add(Self::MAX_WAIT_MS),
+            target: None,
+            forecast_recorded: false,
+        }
+    }
+
+    fn observe_forecast(&mut self, waiting_since_unix_ms: u64, forecast_ms: Option<u64>) {
+        if self.forecast_recorded {
+            return;
+        }
+        self.forecast_recorded = true;
+        self.forecast_ms = forecast_ms;
+        let wait = forecast_ms.map_or(Self::MAX_WAIT_MS, |forecast| {
+            forecast
+                .saturating_mul(2)
+                .clamp(Self::MIN_WAIT_MS, Self::MAX_WAIT_MS)
+        });
+        self.reserve_from_unix_ms = waiting_since_unix_ms.saturating_add(wait);
+    }
+}
+
 /// A queue entry's own identity, minted fresh per entry.
 ///
 /// Deliberately not the request identity. One request may be enqueued, expire,
@@ -217,6 +267,7 @@ pub(crate) struct QueueEntry {
     /// The latest journaled decision stays with live work, independent of the
     /// bounded historical window on the fleet.
     latest_placement: Option<super::PlacementDecision>,
+    headroom: HeadroomPlan,
     /// A re-offer to the machine whose decline is this entry's latest binding
     /// step, not yet journaled. It is journaled when it resolves into anything
     /// other than the same decline again; an identical re-decline folds into
@@ -347,11 +398,12 @@ impl QueueEntry {
             admission_kind: self.admission_kind,
             interactive: self.interactive,
             priority: attempt.priority,
-            waiting_since_unix_ms: attempt.waiting_since_unix_ms,
+            waiting_since_unix_ms: self.queued_at_unix_ms,
             wait_horizon_unix_ms: attempt.wait_horizon_unix_ms,
             predicted_cost_ms,
             execution_residency: self.execution_residency.clone(),
             command_class: attempt.command_class,
+            headroom: None,
         }
     }
 
@@ -377,10 +429,15 @@ impl QueueEntry {
         generation: u64,
         now_unix_ms: u64,
     ) -> bool {
-        !self
-            .declined
-            .get(executor_id)
-            .is_some_and(|decline| decline.stands_on(generation, now_unix_ms))
+        let entitled = self.headroom.target.as_ref().is_some_and(|target| {
+            target.enabled && target.executor_id == executor_id && target.generation == generation
+        });
+        !self.declined.get(executor_id).is_some_and(|decline| {
+            decline.stands_on(generation, now_unix_ms)
+                && !(entitled
+                    && (!self.headroom.target.as_ref().unwrap().offered
+                        || decline.superseded_at_unix_ms.is_some()))
+        })
     }
 
     fn answer(&mut self, outcome: CellOutcome) {
@@ -857,6 +914,10 @@ impl ExecutionQueue {
             sequence,
             standing: new.standing,
             requesting_job_id: new.request.requesting_job_id.clone(),
+            headroom: HeadroomPlan::new(match new.request.waiting_since_unix_ms {
+                0 => now_unix_ms,
+                stated => stated.min(now_unix_ms),
+            }),
             request: new.request,
             admission_kind: new.admission_kind,
             interactive: new.interactive,
@@ -912,6 +973,52 @@ impl ExecutionQueue {
         state.entries.get(id).map(read)
     }
 
+    pub(crate) fn headroom_plan(&self, id: &str, now_unix_ms: u64) -> Option<HeadroomPlan> {
+        self.with_entry(id, |entry| {
+            (!entry.interactive
+                && !matches!(entry.state, EntryState::Claimed { .. })
+                && now_unix_ms < entry.horizon_unix_ms
+                && entry
+                    .waiter
+                    .as_ref()
+                    .is_some_and(|waiter| !waiter.is_closed()))
+            .then(|| entry.headroom.clone())
+        })
+        .flatten()
+    }
+
+    pub(crate) fn observe_queue_forecast(&self, id: &str, forecast_ms: Option<u64>) {
+        if let Some(entry) = self.entries.lock().unwrap().entries.get_mut(id) {
+            entry
+                .headroom
+                .observe_forecast(entry.queued_at_unix_ms, forecast_ms);
+        }
+    }
+
+    pub(crate) fn set_headroom_target(&self, id: &str, target: Option<HeadroomTarget>) {
+        if let Some(entry) = self.entries.lock().unwrap().entries.get_mut(id) {
+            if !matches!(entry.state, EntryState::Claimed { .. }) {
+                entry.headroom.target = target;
+            }
+        }
+    }
+
+    /// Only an acknowledgement from the target's own generation can finish a
+    /// revocation. Posted absence may have been captured before its offer.
+    pub(crate) fn headroom_released(&self, id: &str, executor_id: &str, generation: u64) -> bool {
+        let mut state = self.entries.lock().unwrap();
+        let Some(entry) = state.entries.get_mut(id) else {
+            return false;
+        };
+        let matches = entry.headroom.target.as_ref().is_some_and(|target| {
+            !target.enabled && target.executor_id == executor_id && target.generation == generation
+        });
+        if matches {
+            entry.headroom.target = None;
+        }
+        matches
+    }
+
     pub(crate) fn state_of(&self, id: &str) -> Option<EntryState> {
         self.with_entry(id, |entry| entry.state.clone())
     }
@@ -941,6 +1048,11 @@ impl ExecutionQueue {
         // offer that ignores one would be answered the same way twice.
         if !entry.may_offer_to(executor_id, generation, now_unix_ms) {
             return false;
+        }
+        if let Some(target) = entry.headroom.target.as_mut().filter(|target| {
+            target.enabled && target.executor_id == executor_id && target.generation == generation
+        }) {
+            target.offered = true;
         }
         let reasks_last_decliner = matches!(
             entry.chain.last(),
@@ -1889,8 +2001,14 @@ impl ExecutionQueue {
             .entries
             .values()
             .filter(|entry| {
-                entry.state.executor_id() == Some(executor_id)
-                    && entry.state.generation() == Some(generation)
+                ((entry.state.executor_id() == Some(executor_id)
+                    && entry.state.generation() == Some(generation))
+                    || entry.headroom.target.as_ref().is_some_and(|target| {
+                        target.enabled
+                            && target.executor_id == executor_id
+                            && target.generation == generation
+                            && !matches!(entry.state, EntryState::Claimed { .. })
+                    }))
                     && entry
                         .waiter
                         .as_ref()
@@ -2654,6 +2772,114 @@ pub(super) mod tests {
                 serde_json::from_value(json["placementDecision"].clone()).unwrap();
             assert_eq!(restored, decision);
         }
+    }
+
+    #[test]
+    fn aging_entitlement_uses_the_first_forecast_and_bounds_unknown_waits() {
+        let mut plan = HeadroomPlan::new(1_000);
+        assert_eq!(plan.reserve_from_unix_ms, 901_000);
+        plan.observe_forecast(1_000, Some(50_000));
+        assert_eq!(plan.reserve_from_unix_ms, 101_000);
+        plan.observe_forecast(1_000, Some(900_000));
+        assert_eq!(plan.forecast_ms, Some(50_000));
+        assert_eq!(plan.reserve_from_unix_ms, 101_000);
+        for (forecast, delay) in [
+            (Some(0), 60_000),
+            (Some(u64::MAX), 900_000),
+            (None, 900_000),
+        ] {
+            let mut plan = HeadroomPlan::new(1_000);
+            plan.observe_forecast(1_000, forecast);
+            assert_eq!(plan.reserve_from_unix_ms, 1_000 + delay);
+        }
+        let mut skewed = HeadroomPlan::new(u64::MAX - 1);
+        skewed.observe_forecast(u64::MAX - 1, Some(1));
+        assert_eq!(skewed.reserve_from_unix_ms, u64::MAX);
+    }
+
+    #[test]
+    fn aging_offer_carries_the_same_normalized_wait_as_its_entitlement() {
+        let queue = ExecutionQueue::default();
+        let (id, _waiter) = enqueue(&queue, "fresh", PlacementMobility::SpillEligible);
+        queue
+            .with_entry(&id, |entry| {
+                assert_eq!(entry.summary(&entry.request, None).waiting_since_unix_ms, 1);
+            })
+            .unwrap();
+        let (id, _waiter) = queue
+            .enqueue(
+                NewEntry {
+                    request: CellRequest {
+                        waiting_since_unix_ms: 500,
+                        ..request("skewed", PlacementMobility::SpillEligible)
+                    },
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                    standing: false,
+                },
+                100,
+            )
+            .unwrap();
+        queue
+            .with_entry(&id, |entry| {
+                assert_eq!(
+                    entry.summary(&entry.request, None).waiting_since_unix_ms,
+                    100
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn aging_reservation_liveness_is_singular_revocable_and_not_running_work() {
+        let queue = ExecutionQueue::default();
+        let (id, _waiter) = enqueue(&queue, "senior", PlacementMobility::SpillEligible);
+        let target = HeadroomTarget {
+            executor_id: "one".into(),
+            generation: 7,
+            enabled: true,
+            offered: false,
+        };
+        queue.set_headroom_target(&id, Some(target.clone()));
+        assert_eq!(queue.waiting_request_ids("one", 7), vec!["senior"]);
+        assert!(queue.waiting_request_ids("two", 7).is_empty());
+        assert!(queue.waiting_request_ids("one", 8).is_empty());
+        queue.set_headroom_target(
+            &id,
+            Some(HeadroomTarget {
+                enabled: false,
+                ..target.clone()
+            }),
+        );
+        assert!(queue.waiting_request_ids("one", 7).is_empty());
+        queue.set_headroom_target(&id, Some(target));
+        assert!(queue.offer(&id, "two", "two", 9, 2));
+        assert_eq!(queue.claim(&id, "two", 9, 3), ClaimVerdict::Granted);
+        assert!(queue.waiting_request_ids("one", 7).is_empty());
+        assert_eq!(queue.waiting_request_ids("two", 9), vec!["senior"]);
+        assert!(queue.headroom_plan(&id, 3).is_none());
+    }
+
+    #[test]
+    fn aging_entitlement_excludes_interactive_expired_and_withdrawn_requests() {
+        let queue = ExecutionQueue::default();
+        let (id, waiter) = enqueue(&queue, "senior", PlacementMobility::SpillEligible);
+        assert!(queue.headroom_plan(&id, 2).is_some());
+        assert!(queue.headroom_plan(&id, 10_000).is_none());
+        drop(waiter);
+        assert!(queue.headroom_plan(&id, 2).is_none());
+        let (interactive, _interactive_waiter) =
+            enqueue(&queue, "interactive", PlacementMobility::SpillEligible);
+        queue
+            .entries
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&interactive)
+            .unwrap()
+            .interactive = true;
+        assert!(queue.headroom_plan(&interactive, 2).is_none());
     }
 
     pub(crate) fn request(request_id: &str, mobility: PlacementMobility) -> CellRequest {

@@ -404,26 +404,37 @@ pub(crate) async fn insert_queued_user_events(
 
     for msg in messages {
         let event_id = ids::mint_child(run_id);
-        let transcript_event = crate::execution::jobs::queued_user_transcript_event(
-            session_id.unwrap_or_default(),
-            &msg.id,
-            &msg.content,
-        );
+        let transcript_event =
+            crate::execution::jobs::queued_transcript_event(session_id.unwrap_or_default(), msg);
         let data = transcript_event.observed().to_event_json();
 
-        if let Err(error) = insert_user_event(
-            &db,
-            &orch.services.emitter,
-            &event_id,
-            run_id,
-            session_id,
-            &data,
-            now,
-        )
-        .await
-        {
-            log::warn!("Failed to insert queued user event: {}", error);
-            continue;
+        let result = if msg.is_operator_message() {
+            insert_user_event(
+                &db,
+                &orch.services.emitter,
+                &event_id,
+                run_id,
+                session_id,
+                &data,
+                now,
+            )
+            .await
+        } else {
+            insert_system_event(
+                &db,
+                &orch.services.emitter,
+                &event_id,
+                run_id,
+                session_id,
+                "system:message",
+                &data,
+                now,
+                &[],
+            )
+            .await
+        };
+        if let Err(error) = result {
+            log::warn!("Failed to insert queued event: {error}");
         }
     }
 }
@@ -881,6 +892,8 @@ mod tests {
             delivery: Delivery::Steer,
             created_at: 1,
             delivered_at: None,
+            kind: crate::messages::queued::QueuedMessageKind::Operator,
+            resolution: None,
         };
         insert_queued_user_events(&orch, "run-1", Some("session-1"), &[msg]).await;
 

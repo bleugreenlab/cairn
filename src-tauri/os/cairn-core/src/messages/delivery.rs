@@ -451,8 +451,15 @@ pub enum Hold {
     Question,
     /// Waiting for the operator to decide its permission request.
     Permission,
-    /// Held for a provider usage limit until `retry_not_before` (unix seconds).
-    ProviderLimit { retry_not_before: Option<i64> },
+    /// Held for a provider usage limit. Ungated, it releases at
+    /// `retry_not_before` (unix seconds), or on the bounded re-check when no
+    /// reset is known, and sooner when an account that can serve it is added
+    /// or signed in. Gated, it never resumes by itself: only the operator's
+    /// continue releases it, whatever its clock or the accounts say.
+    ProviderLimit {
+        retry_not_before: Option<i64>,
+        gate: Option<ProviderLimitGate>,
+    },
     /// Its launch or continuation was refused because nothing can serve
     /// `subject` now. It retries at `retry_not_before` (the soonest declared
     /// reset, on `account`), or on the bounded re-check when none is declared,
@@ -466,6 +473,30 @@ pub enum Hold {
     /// Supply can serve its work again, but the fleet cap is full; it takes
     /// the next free slot, oldest held first, asking again at `next_at`.
     FleetSlot { next_at: Option<i64> },
+}
+
+/// Why a provider-limit hold waits for the operator rather than for a reset or
+/// an account: its row's `resume_gate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderLimitGate {
+    /// The limit landed while a tool call had no recorded result, so resuming
+    /// could run that call a second time.
+    ToolInFlight,
+    /// Every automatic resume since the limit failed.
+    LaunchFailed,
+}
+
+impl ProviderLimitGate {
+    /// The gate a hold row's non-NULL `resume_gate` names. Any gate turns off
+    /// automatic resolution, so a value this build does not know still reads
+    /// as waiting for the operator, never as ungated.
+    pub(crate) fn from_resume_gate(gate: &str) -> Self {
+        if gate == crate::orchestrator::wakes::RESUME_GATE_TOOL_IN_FLIGHT {
+            Self::ToolInFlight
+        } else {
+            Self::LaunchFailed
+        }
+    }
 }
 
 impl Hold {
@@ -501,15 +532,29 @@ impl Hold {
                 "it is waiting for the operator to decide its permission request; it reads this once the request is decided".into()
             }
             Hold::ProviderLimit {
+                gate: Some(ProviderLimitGate::ToolInFlight),
+                ..
+            } => {
+                "it is held after a provider usage limit that landed while a tool call had no recorded result; it does not resume by itself, because resuming could run that call twice, so it reads this once the operator continues it".into()
+            }
+            Hold::ProviderLimit {
+                gate: Some(ProviderLimitGate::LaunchFailed),
+                ..
+            } => {
+                "it is held after a provider usage limit, and every automatic resume since has failed; it reads this once the operator continues it".into()
+            }
+            Hold::ProviderLimit {
                 retry_not_before: Some(at),
+                gate: None,
             } => format!(
-                "it is held for a provider usage limit until {}; it reads this when the limit resets or the operator resumes it sooner",
+                "it is held for a provider usage limit until {}; it reads this when the limit resets, when an account that can serve it is added or signed in, or when the operator resumes it sooner",
                 Self::time(*at)
             ),
             Hold::ProviderLimit {
                 retry_not_before: None,
+                gate: None,
             } => format!(
-                "it is held for a provider usage limit with no known reset time; it re-checks every {} minutes and reads this when the limit clears or the operator resumes it",
+                "it is held for a provider usage limit with no known reset time; it re-checks every {} minutes, and sooner when an account is added or signed in, and reads this when the limit clears or the operator resumes it",
                 crate::orchestrator::wakes::SUPPLY_RECHECK_SECS / 60
             ),
             Hold::NoSupply {
@@ -584,8 +629,12 @@ impl Hold {
             Hold::Tasks { .. } => "waiting: dependencies".into(),
             Hold::Question => "waiting: operator answer".into(),
             Hold::Permission => "waiting: permission decision".into(),
+            Hold::ProviderLimit { gate: Some(_), .. } => {
+                "held: provider limit, needs continue".into()
+            }
             Hold::ProviderLimit {
                 retry_not_before: Some(at),
+                gate: None,
             } => format!("held: provider limit until {}", Self::time(*at)),
             Hold::ProviderLimit { .. } => "held: provider limit".into(),
             Hold::NoSupply {
@@ -658,24 +707,33 @@ pub(crate) async fn describe_hold(db: &LocalDb, job_id: &str) -> Option<Hold> {
         TurnYieldReason::UserInput => Hold::Question,
         TurnYieldReason::Permission => Hold::Permission,
         TurnYieldReason::ProviderLimit => {
-            let (retry_not_before, source) = db
+            let (retry_not_before, source, resume_gate) = db
                 .query_opt(
-                    "SELECT retry_not_before, boundary_source FROM provider_limit_holds
+                    "SELECT retry_not_before, boundary_source, resume_gate FROM provider_limit_holds
                      WHERE job_id = ?1 AND state = 'active'
                      ORDER BY created_at DESC LIMIT 1",
                     params![job_id],
-                    |row| Ok((row.opt_i64(0)?, row.text(1)?)),
+                    |row| Ok((row.opt_i64(0)?, row.text(1)?, row.opt_text(2)?)),
                 )
                 .await
                 .ok()
                 .flatten()
-                .unwrap_or((None, String::new()));
-            if source == "fleet_slot" {
+                .unwrap_or((None, String::new(), None));
+            let gate = resume_gate
+                .as_deref()
+                .map(ProviderLimitGate::from_resume_gate);
+            // A launch that failed after waiting for a slot keeps the
+            // `fleet_slot` source when it gates, and a gated hold no longer
+            // waits for a slot, so the gate decides first.
+            if source == "fleet_slot" && gate.is_none() {
                 Hold::FleetSlot {
                     next_at: retry_not_before,
                 }
             } else {
-                Hold::ProviderLimit { retry_not_before }
+                Hold::ProviderLimit {
+                    retry_not_before,
+                    gate,
+                }
             }
         }
         TurnYieldReason::SafetyPause => return None,
@@ -2012,12 +2070,21 @@ mod tests {
         assert_eq!(describe_hold(&db, "job-1").await, None);
     }
 
-    async fn seed_provider_limit_hold(db: &LocalDb, job_id: &str, retry_not_before: i64) {
+    async fn seed_provider_limit_hold(
+        db: &LocalDb,
+        job_id: &str,
+        retry_not_before: i64,
+        boundary_source: &str,
+        resume_gate: Option<&str>,
+    ) {
+        db.execute("DELETE FROM provider_limit_holds", ())
+            .await
+            .unwrap();
         db.execute(
             "INSERT INTO provider_limit_holds
-               (id, job_id, run_id, turn_id, backend, retry_not_before, boundary_source, created_at, updated_at)
-             VALUES ('hold-1', ?1, 'run-1', 't-head', 'claude', ?2, 'rate_limit_event', 1, 1)",
-            params![job_id, retry_not_before],
+               (id, job_id, run_id, turn_id, backend, retry_not_before, boundary_source, resume_gate, created_at, updated_at)
+             VALUES ('hold-1', ?1, 'run-1', 't-head', 'claude', ?2, ?3, ?4, 1, 1)",
+            params![job_id, retry_not_before, boundary_source, resume_gate],
         )
         .await
         .unwrap();
@@ -2047,47 +2114,148 @@ mod tests {
         .unwrap();
         let reset = chrono::Utc::now().timestamp() + 3_600;
 
-        for (reason, expected, release) in [
+        for (reason, gate, expected, release) in [
             (
                 "dependency_wait",
+                None,
                 Hold::Tasks { pending: 1 },
                 "when they return",
             ),
             (
                 "user_input",
+                None,
                 Hold::Question,
                 "once the question is answered",
             ),
             (
                 "permission",
+                None,
                 Hold::Permission,
                 "once the request is decided",
             ),
             (
                 "provider_limit",
+                None,
                 Hold::ProviderLimit {
                     retry_not_before: Some(reset),
+                    gate: None,
                 },
                 "when the limit resets",
+            ),
+            (
+                "provider_limit",
+                Some(crate::orchestrator::wakes::RESUME_GATE_TOOL_IN_FLIGHT),
+                Hold::ProviderLimit {
+                    retry_not_before: Some(reset),
+                    gate: Some(ProviderLimitGate::ToolInFlight),
+                },
+                "once the operator continues it",
+            ),
+            (
+                "provider_limit",
+                Some(crate::orchestrator::wakes::RESUME_GATE_LAUNCH_FAILED),
+                Hold::ProviderLimit {
+                    retry_not_before: Some(reset),
+                    gate: Some(ProviderLimitGate::LaunchFailed),
+                },
+                "once the operator continues it",
             ),
         ] {
             set_head_turn(&db, "job-1", "yielded", Some(reason)).await;
             if reason == "provider_limit" {
-                seed_provider_limit_hold(&db, "job-1", reset).await;
+                seed_provider_limit_hold(&db, "job-1", reset, "rate_limit_event", gate).await;
             }
             let outcome =
                 nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &escalation())
                     .unwrap();
-            assert_eq!(outcome, NudgeOutcome::Held(expected.clone()), "{reason}");
+            assert_eq!(
+                outcome,
+                NudgeOutcome::Held(expected.clone()),
+                "{reason} {gate:?}"
+            );
             let said = expected.render();
-            assert!(said.contains(release), "{reason}: {said}");
+            assert!(said.contains(release), "{reason} {gate:?}: {said}");
+            if gate.is_some() {
+                // A gated hold never resumes at its reset, so it must not say so.
+                assert!(!said.contains("when the limit resets"), "{said}");
+                assert_eq!(expected.qualifier(), "held: provider limit, needs continue");
+            }
         }
+
+        // A hold that waited for a fleet slot keeps that source when its
+        // launches then fail and gate it, but it waits for the operator now.
+        set_head_turn(&db, "job-1", "yielded", Some("provider_limit")).await;
+        seed_provider_limit_hold(&db, "job-1", reset, "fleet_slot", None).await;
+        assert_eq!(
+            describe_hold(&db, "job-1").await,
+            Some(Hold::FleetSlot {
+                next_at: Some(reset)
+            })
+        );
+        seed_provider_limit_hold(
+            &db,
+            "job-1",
+            reset,
+            "fleet_slot",
+            Some(crate::orchestrator::wakes::RESUME_GATE_LAUNCH_FAILED),
+        )
+        .await;
+        let gated = describe_hold(&db, "job-1").await.unwrap();
+        assert_eq!(
+            gated,
+            Hold::ProviderLimit {
+                retry_not_before: Some(reset),
+                gate: Some(ProviderLimitGate::LaunchFailed),
+            }
+        );
+        assert_eq!(gated.qualifier(), "held: provider limit, needs continue");
+
+        // Any gate turns automatic resolution off, so a gate this build does
+        // not know must still read as waiting for the operator.
+        seed_provider_limit_hold(
+            &db,
+            "job-1",
+            reset,
+            "rate_limit_event",
+            Some("some_future_gate"),
+        )
+        .await;
+        let unknown = describe_hold(&db, "job-1").await.unwrap();
+        assert!(
+            matches!(unknown, Hold::ProviderLimit { gate: Some(_), .. }),
+            "{unknown:?}"
+        );
+        assert!(
+            !unknown.render().contains("when the limit resets"),
+            "{}",
+            unknown.render()
+        );
+        assert_eq!(unknown.qualifier(), "held: provider limit, needs continue");
 
         let at = crate::clock::stamp(reset).unwrap_or_else(|| reset.to_string());
         let limit = Hold::ProviderLimit {
             retry_not_before: Some(reset),
+            gate: None,
         };
         assert!(limit.render().contains(&at), "{}", limit.render());
+        assert!(
+            limit
+                .render()
+                .contains("when an account that can serve it is added or signed in"),
+            "{}",
+            limit.render()
+        );
+        let untimed = Hold::ProviderLimit {
+            retry_not_before: None,
+            gate: None,
+        };
+        assert!(
+            untimed
+                .render()
+                .contains("sooner when an account is added or signed in"),
+            "{}",
+            untimed.render()
+        );
         assert_eq!(
             limit.qualifier(),
             format!("held: provider limit until {at}")

@@ -174,7 +174,7 @@ pub(crate) use lifecycle::{select_job_coordinate, CoordinateRequest, ParentCoord
 pub use persistence::live_run_for_job;
 pub(crate) use persistence::load_job_conn;
 pub(crate) use slash_commands::resolve_skill_slash_command;
-pub(crate) use snapshots::queued_user_transcript_event;
+pub(crate) use snapshots::queued_transcript_event;
 pub(crate) use turns::{admit_codex_goal_turn, CodexGoalTurnAdmission};
 // Delegation reaches the host-execution invariant here: a job that arrives at
 // delegation with no execution gets one carrying its OWN agent, not an empty

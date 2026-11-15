@@ -9309,7 +9309,17 @@ pub struct LearnedResourceEstimate {
 /// newer executor refuses as a stream without its magic, and could not decode
 /// a `materializationRefused` outcome. Both pairings are refused at the
 /// handshake until the executor self-updates, which is the point of the bump.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 172;
+///
+/// Version 173 (cairn/5187) makes aged, runner-authorized offers retain
+/// standing headroom on one eligible executor. Older executors forget declines
+/// and admit younger work into that room indefinitely; a runner must not treat
+/// them as enforcing the authorization. `headroom` on offers and
+/// `headroomReservations` on admission health carry the authorization and the
+/// live holds. `ReleaseHeadroom` and `HeadroomReleased` make target transfer
+/// causal rather than guessing from a snapshot older than the offer. The
+/// version handshake requires an update before either side
+/// relies on this admission contract.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -11590,6 +11600,14 @@ pub struct MemoryGrantShortfall {
 }
 
 impl ResourceReservation {
+    /// The minimum available-memory floor standing headroom protects. This is
+    /// separate from its nominal budget charge, which remains `memory_bytes`.
+    pub fn headroom_memory_floor_bytes(&self) -> u64 {
+        self.solve_memory_grant(1, u64::MAX, admission_memory_floor(0))
+            .expect("an unbounded budget holds even a saturated memory charge")
+            .charge_bytes
+    }
+
     /// Widest compile width whose actual charge fits, without clamping that
     /// charge to the limit. Missing or empty process evidence keeps the whole charge;
     /// a declared charge remains fixed. The caller supplies any non-scalable
@@ -12428,10 +12446,82 @@ impl HomeAffinity {
     }
 }
 
+/// Runner authorization to protect an overdue offer on this machine only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadroomAuthorization {
+    pub reserve_from_unix_ms: u64,
+    pub forecast_ms: Option<u64>,
+}
+
+/// Queued headroom, not a running allocation. Only the oldest currently
+/// eligible entry protects room; these reservations are never summed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadroomReservation {
+    pub entry_id: String,
+    pub request_id: String,
+    pub attempt_id: String,
+    pub reservation: ResourceReservation,
+    pub waiting_since_unix_ms: u64,
+    pub forecast_ms: Option<u64>,
+    pub reserved_at_unix_ms: u64,
+    /// Physical memory floor protected in addition to the nominal budget in
+    /// `reservation.memory_bytes`. Absent means legacy/unknown, not zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_floor_bytes: Option<u64>,
+    /// Selected by the executor's last live admission evaluation. Other entries
+    /// are candidates, not additional simultaneous protected allocations.
+    #[serde(default)]
+    pub protected: bool,
+}
+
+impl HeadroomReservation {
+    pub fn describe(&self, machine: &str, now_unix_ms: u64) -> String {
+        let gib = 1024.0 * 1024.0 * 1024.0;
+        let mut room = self.memory_floor_bytes.map_or_else(
+            || "memory floor unknown".into(),
+            |bytes| format!("{:.1} GiB memory floor", bytes as f64 / gib),
+        );
+        if self.memory_floor_bytes != Some(self.reservation.memory_bytes) {
+            room.push_str(&format!(
+                ", {:.1} GiB budget",
+                self.reservation.memory_bytes as f64 / gib
+            ));
+        }
+        if self.reservation.concurrency_units != 0 {
+            room.push_str(&format!(
+                ", {} concurrency unit(s)",
+                self.reservation.concurrency_units
+            ));
+        }
+        if self.reservation.disk_growth_bytes != 0 {
+            room.push_str(&format!(
+                ", {:.1} GiB disk",
+                self.reservation.disk_growth_bytes as f64 / gib
+            ));
+        }
+        let waited = now_unix_ms.saturating_sub(self.waiting_since_unix_ms) / 1_000;
+        let forecast = self.forecast_ms.map_or_else(
+            || "unknown forecast".into(),
+            |ms| format!("forecast {} s", ms / 1_000),
+        );
+        format!(
+            "{status} {room} on {machine} for {}, waited {waited} s of {forecast}",
+            self.request_id,
+            status = if self.protected {
+                "holding"
+            } else {
+                "queued for"
+            }
+        )
+    }
+}
+
 /// What one machine is told about one queue entry, so it can answer from live
 /// facts.
 ///
-/// Deliberately not the request. An offer confers nothing, so it carries only
+/// Deliberately not the request. An offer does not authorize execution, so it carries only
 /// what admission actually reads: how much the work reserves, whether it needs
 /// provisioning and against which checkout, and how long the requester will
 /// wait. The batch, the environment, and the object-plane grant ride
@@ -12439,6 +12529,9 @@ impl HomeAffinity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct OfferSummary {
+    /// Only the one machine selected by the runner may protect this entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headroom: Option<HeadroomAuthorization>,
     pub request_id: String,
     pub attempt_id: String,
     pub project_id: String,
@@ -16082,6 +16175,9 @@ pub struct QueueClassHealth {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AdmissionHealth {
+    /// Standing offers, distinct from claims and running occupancy.
+    #[serde(default)]
+    pub headroom_reservations: Vec<HeadroomReservation>,
     pub concurrency_capacity: Option<u32>,
     #[serde(default)]
     pub interactive_reserve: u32,
@@ -25189,11 +25285,22 @@ pub enum ExecutorMessage {
     ///
     /// It carries what the machine needs to answer from its own live facts and
     /// nothing more: no batch, no config, no checkout, and so no access to any
-    /// of them. An offer that is never claimed costs the machine nothing and
-    /// leaves nothing behind to revoke.
+    /// of them. Without `headroom`, an unclaimed offer leaves nothing behind.
+    /// An authorized overdue offer may protect standing headroom while queued;
+    /// waiting-request liveness, withdrawal and link loss release that room.
     Offer {
         entry_id: String,
         summary: OfferSummary,
+    },
+    /// Runner → executor. Revoke only standing queued headroom, never a
+    /// claim or running work. Processed in offer order before acknowledging.
+    ReleaseHeadroom {
+        entry_id: String,
+    },
+    /// Executor → runner. The release was processed, even if no hold existed.
+    /// Unlike a cached snapshot, this is causal evidence for target transfer.
+    HeadroomReleased {
+        entry_id: String,
     },
     /// Executor → runner. "I have the capacity now and I am taking it."
     ///
@@ -26682,9 +26789,16 @@ mod tests {
                     emitted_at_unix_ms: 1,
                 },
             },
+            ExecutorMessage::ReleaseHeadroom {
+                entry_id: "entry".into(),
+            },
+            ExecutorMessage::HeadroomReleased {
+                entry_id: "entry".into(),
+            },
             ExecutorMessage::Offer {
                 entry_id: "entry".into(),
                 summary: OfferSummary {
+                    headroom: None,
                     request_id: request.request_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     project_id: request.project_id.clone(),
@@ -27002,7 +27116,7 @@ mod tests {
     /// Every variant, by position. No wildcard arm, so a new variant does not
     /// compile here until it is counted, and `every_message_variant` is held
     /// to it by the tests below.
-    const MESSAGE_VARIANTS: usize = 56;
+    const MESSAGE_VARIANTS: usize = 58;
     fn message_variant_ordinal(message: &ExecutorMessage) -> usize {
         use ExecutorMessage::*;
         match message {
@@ -27062,6 +27176,8 @@ mod tests {
             ResidentRelayRequest { .. } => 53,
             RelayReattach { .. } => 54,
             InfrastructureDiagnostic { .. } => 55,
+            ReleaseHeadroom { .. } => 56,
+            HeadroomReleased { .. } => 57,
         }
     }
 
@@ -27447,6 +27563,7 @@ mod tests {
     fn an_offer_names_its_execution_residency_and_an_older_offer_decodes_without_one() {
         let request = sample_request();
         let fresh = OfferSummary {
+            headroom: None,
             request_id: request.request_id.clone(),
             attempt_id: request.attempt_id.clone(),
             project_id: request.project_id.clone(),
@@ -27463,6 +27580,34 @@ mod tests {
             command_class: CellCommandClass::Other,
         };
         let json = serde_json::to_value(&fresh).unwrap();
+        assert!(json.get("headroom").is_none());
+        let authorized = OfferSummary {
+            headroom: Some(HeadroomAuthorization {
+                reserve_from_unix_ms: 42,
+                forecast_ms: Some(500),
+            }),
+            ..fresh.clone()
+        };
+        let mut with_headroom = serde_json::to_value(&authorized).unwrap();
+        assert_eq!(with_headroom["headroom"]["reserveFromUnixMs"], 42);
+        assert_eq!(
+            serde_json::from_value::<OfferSummary>(with_headroom.clone()).unwrap(),
+            authorized
+        );
+        with_headroom.as_object_mut().unwrap().remove("headroom");
+        assert_eq!(
+            serde_json::from_value::<OfferSummary>(with_headroom).unwrap(),
+            fresh
+        );
+        let mut old_health = serde_json::to_value(AdmissionHealth::default()).unwrap();
+        old_health
+            .as_object_mut()
+            .unwrap()
+            .remove("headroomReservations");
+        assert!(serde_json::from_value::<AdmissionHealth>(old_health)
+            .unwrap()
+            .headroom_reservations
+            .is_empty());
         assert!(json.get("executionResidency").is_none());
         assert_eq!(serde_json::from_value::<OfferSummary>(json).unwrap(), fresh);
 
@@ -29487,6 +29632,7 @@ mod tests {
                     ..sample_advertisement()
                 },
                 admission: AdmissionHealth {
+                    headroom_reservations: Vec::new(),
                     concurrency_capacity: Some(8),
                     interactive_reserve: 0,
                     memory_capacity_bytes: Some(22),

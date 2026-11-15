@@ -1867,6 +1867,18 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         executor.captured_at_unix_ms,
     )));
     let admission = &health.admission;
+    if !admission.headroom_reservations.is_empty() {
+        out.push_str("\n### Standing headroom holds\n\nQueued work holding future room, not running occupancy or main's cadence line. Only the oldest eligible candidate protects room; other candidates are not additive. Interactive and running work are unaffected.\n\n");
+        for hold in &admission.headroom_reservations {
+            out.push_str(&format!(
+                "- {} (entry {}, attempt {})\n",
+                hold.describe(&executor.name, executor.captured_at_unix_ms),
+                hold.entry_id,
+                hold.attempt_id,
+            ));
+        }
+        out.push('\n');
+    }
     let reserved = admission.active_reservation.concurrency_units;
     match admission.concurrency_capacity {
         Some(u32::MAX) => out.push_str(&format!("- Concurrency: {reserved} reserved\n")),
@@ -10500,6 +10512,31 @@ mod tests {
             ),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn standing_headroom_is_distinct_from_active_occupancy() {
+        use cairn_common::executor_protocol::HeadroomReservation;
+        let mut executor = inspection("held-room", false);
+        assert!(!render_executor(&executor).contains("### Standing headroom holds"));
+        let hold = HeadroomReservation {
+            memory_floor_bytes: Some(4 * 1024 * 1024 * 1024),
+            protected: true,
+            entry_id: "queued-entry".into(),
+            request_id: "queued-request".into(),
+            attempt_id: "queued-attempt".into(),
+            reservation: executor.health.admission.active_reservation.clone(),
+            waiting_since_unix_ms: 1,
+            forecast_ms: Some(60_000),
+            reserved_at_unix_ms: 2,
+        };
+        let sentence = hold.describe(&executor.name, executor.captured_at_unix_ms);
+        executor.health.admission.headroom_reservations.push(hold);
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("### Standing headroom holds"));
+        assert!(rendered.contains(&sentence));
+        assert!(rendered.contains("not running occupancy or main's cadence line"));
+        assert!(rendered.contains("entry queued-entry, attempt queued-attempt"));
     }
 
     #[test]

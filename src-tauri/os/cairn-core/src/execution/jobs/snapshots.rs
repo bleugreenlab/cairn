@@ -6,13 +6,12 @@ pub(super) struct AgentSnapshotData {
     pub(super) agent: Option<AgentConfig>,
 }
 
-/// Store a queued user message while preserving its durable queue identity.
-pub(crate) fn store_queued_user_event_with_turn(
+/// Store a queued message with its actual authorship and durable identity.
+pub(crate) fn store_queued_event_with_turn(
     orch: &Orchestrator,
     run_id: &str,
     session_id: &str,
-    queued_message_id: &str,
-    content: &str,
+    message: &crate::messages::queued::QueuedMessage,
     now: i32,
     turn_id: Option<&str>,
 ) -> Result<String, String> {
@@ -22,9 +21,26 @@ pub(crate) fn store_queued_user_event_with_turn(
         session_id,
         now,
         turn_id,
-        queued_user_transcript_event(session_id, queued_message_id, content),
+        queued_transcript_event(session_id, message),
         &[],
     )
+}
+
+pub(crate) fn queued_transcript_event(
+    session_id: &str,
+    message: &crate::messages::queued::QueuedMessage,
+) -> TranscriptEvent {
+    let mut event = queued_user_transcript_event(session_id, &message.id, &message.content);
+    if !message.is_operator_message() {
+        event.event_type = "system:message".to_string();
+        event.content = Some(message.render());
+        event.raw = Some(serde_json::json!({
+            "queued_message_id": message.id,
+            "kind": message.kind,
+            "resolution": message.resolution,
+        }));
+    }
+    event
 }
 
 pub(crate) fn queued_user_transcript_event(

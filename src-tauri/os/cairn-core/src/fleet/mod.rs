@@ -4217,6 +4217,12 @@ enum Selection {
     Waiting {
         rejected: Vec<PlacementRejection>,
     },
+    /// This pass was waiting for an explicit release acknowledgement. Kept in
+    /// the result because an acknowledgement may clear live queue state before
+    /// the outer placement loop classifies this pass's wait.
+    ReleasingHeadroom {
+        rejected: Vec<PlacementRejection>,
+    },
 }
 
 impl Selection {
@@ -4224,7 +4230,7 @@ impl Selection {
     fn placed(self) -> Option<Placement> {
         match self {
             Self::Placed(placement) => Some(*placement),
-            Self::Waiting { .. } => None,
+            Self::Waiting { .. } | Self::ReleasingHeadroom { .. } => None,
         }
     }
 }
@@ -6920,6 +6926,12 @@ impl Fleet {
             // A machine takes responsibility for an entry it was offered. This
             // is the moment work binds; the placement pass waiting on the entry
             // sees the transition and sends the grant.
+            ExecutorMessage::HeadroomReleased { entry_id } => {
+                self.queue
+                    .headroom_released(&entry_id, executor_id, generation);
+                self.connection_ready.notify_waiters();
+                false
+            }
             ExecutorMessage::Claim { entry_id } => {
                 match self
                     .queue
@@ -7765,10 +7777,15 @@ impl Fleet {
             ),
             Some((_, since_unix_ms, (raw_declines, waited_behind, placement), owner)) => {
                 let takes_room_on = self.room_taken_first_on(identity, unix_time_ms());
-                let turn = if takes_room_on.is_empty() {
+                let cadence = if takes_room_on.is_empty() {
                     waited_behind
                 } else {
                     Some(describe_room_taken_first(&takes_room_on))
+                };
+                let turn = match (self.headroom_status(identity, unix_time_ms()), cadence) {
+                    (Some((_, hold)), Some(cadence)) => Some(format!("{hold}; {cadence}")),
+                    (Some((_, hold)), None) => Some(hold),
+                    (None, cadence) => cadence,
                 };
                 let mut declines: Vec<_> = raw_declines
                     .into_iter()
@@ -15621,6 +15638,24 @@ impl Fleet {
                     .and_then(|estimate| estimate.upper_duration_ms),
             )
         });
+        let summary = summary.map(|mut summary| {
+            summary.headroom =
+                self.queue
+                    .headroom_plan(entry_id, unix_time_ms())
+                    .and_then(|plan| {
+                        plan.target
+                            .filter(|target| {
+                                target.enabled
+                                    && target.executor_id == selected.executor_id
+                                    && target.generation == selected.generation
+                            })
+                            .map(|_| cairn_common::executor_protocol::HeadroomAuthorization {
+                                reserve_from_unix_ms: plan.reserve_from_unix_ms,
+                                forecast_ms: plan.forecast_ms,
+                            })
+                    });
+            summary
+        });
         let reached = summary.is_some_and(|summary| {
             match self.send_new_admission(
                 selected,
@@ -15918,7 +15953,11 @@ impl Fleet {
         // The reasons the last recorded wait named, so a request parked on them
         // is recorded once per change rather than on every pass.
         let mut recorded_wait: Option<Vec<(String, String)>> = None;
+        let mut last_rejected = Vec::new();
         loop {
+            if unix_time_ms() >= request.wait_horizon_unix_ms {
+                return Err(self.refuse_at_horizon(request, policy, entry_id, last_rejected));
+            }
             // A machine that posted new state may have become willing, so its
             // report wakes this wait as surely as a new connection does. That is
             // the whole of the retry rule: posted state, not a clock.
@@ -15940,7 +15979,7 @@ impl Fleet {
                 )
             })
             .await;
-            let rejected = match selection {
+            let (rejected, releasing_headroom) = match selection {
                 Ok(Selection::Placed(placement)) => return Ok(*placement),
                 Err(refused) => {
                     let mut decision = refused.decision;
@@ -15951,7 +15990,8 @@ impl Fleet {
                         diagnostic: refused.diagnostic,
                     });
                 }
-                Ok(Selection::Waiting { rejected }) => rejected,
+                Ok(Selection::Waiting { rejected }) => (rejected, false),
+                Ok(Selection::ReleasingHeadroom { rejected }) => (rejected, true),
             };
             let mut rejected = rejected;
             self.stamp_update_bounds(&mut rejected);
@@ -16007,13 +16047,38 @@ impl Fleet {
                 ),
                 None => Vec::new(),
             };
-            if let Some(mut waiting) =
-                wait_decision(request, policy, &rejected, &updates, &takes_room_on)
-            {
+            let headroom = self.headroom_status(
+                &(request.request_id.clone(), request.attempt_id.clone()),
+                now,
+            );
+            let mut waiting = wait_decision(request, policy, &rejected, &updates, &takes_room_on);
+            if let Some((_, sentence)) = &headroom {
+                match waiting.as_mut().map(|decision| &mut decision.outcome) {
+                    Some(PlacementOutcome::Waiting { diagnostic }) => {
+                        *diagnostic = format!("{sentence}. {diagnostic}");
+                    }
+                    _ => {
+                        waiting = Some(placement_decision(
+                            request,
+                            now,
+                            Some(policy_evidence(request, policy, false)),
+                            None,
+                            PlacementOutcome::Waiting {
+                                diagnostic: sentence.clone(),
+                            },
+                            rejected.clone(),
+                        ));
+                    }
+                }
+            }
+            if let Some(mut waiting) = waiting {
                 let mut signature: Vec<(String, String)> = takes_room_on
                     .iter()
                     .map(|name| (name.clone(), "takesRoomFirst".to_string()))
                     .collect();
+                if let Some((hold_signature, _)) = headroom {
+                    signature.push(("headroom".into(), hold_signature));
+                }
                 signature.extend(rejected.iter().map(|rejection| {
                     (
                         rejection.executor_id.clone(),
@@ -16070,7 +16135,15 @@ impl Fleet {
             // A machine that declined is attached, alive, and capable, which is
             // better evidence of something to wait for than any substrate
             // declaration.
-            if transient.is_none() && !targeted && parked_on.is_empty() {
+            let headroom_pending = entry_id
+                .and_then(|id| self.queue.headroom_plan(id, now))
+                .is_some_and(|plan| plan.target.is_some());
+            if transient.is_none()
+                && !targeted
+                && parked_on.is_empty()
+                && !headroom_pending
+                && !releasing_headroom
+            {
                 return Err(executor_unavailable(
                     generation_held.unwrap_or_else(|| NO_COLOCATED_EXECUTOR.into()),
                 ));
@@ -16083,6 +16156,7 @@ impl Fleet {
                 // is owed both what it asked for and what exists.
                 return Err(self.refuse_at_horizon(request, policy, entry_id, rejected));
             }
+            last_rejected = rejected;
             let _ = tokio::time::timeout(Duration::from_millis(remaining.clamp(1, 250)), notified)
                 .await;
         }
@@ -16121,6 +16195,23 @@ impl Fleet {
             survey_candidates(&connections, &unattached, request, now, declined, view)
                 .map(|survey| self.defer_to_provisioning_lines(survey, request, now))
                 .map(|survey| self.defer_to_cadence_lanes(survey, now));
+        // A decline/backoff describes availability now, not eligibility for an
+        // aging reservation. Price a second survey through the SAME ranking
+        // gates, without those historical refusals, to choose its one target.
+        let headroom_survey = view.entry_id.as_deref().and_then(|id| {
+            self.queue.headroom_plan(id, now)?;
+            survey_candidates(
+                &connections,
+                &unattached,
+                request,
+                now,
+                &HashMap::new(),
+                view,
+            )
+            .map(|survey| self.defer_to_provisioning_lines(survey, request, now))
+            .map(|survey| self.defer_to_cadence_lanes(survey, now))
+            .ok()
+        });
         let shadow_request = hermetic_shadow_request(request);
         let shadow_survey = shadow_request.as_ref().and_then(|shadow| {
             survey_candidates(&connections, &unattached, shadow, now, declined, view).ok()
@@ -16140,6 +16231,16 @@ impl Fleet {
             .as_ref()
             .map(|survey| survey.usable.clone())
             .unwrap_or_default();
+        if let Some(survey) = headroom_survey.as_ref() {
+            for entry in &survey.usable {
+                if !estimation_entries
+                    .iter()
+                    .any(|candidate| candidate.identity.executor_id == entry.identity.executor_id)
+                {
+                    estimation_entries.push(entry);
+                }
+            }
+        }
         if let Some(shadow) = shadow_survey.as_ref() {
             for entry in &shadow.usable {
                 if !estimation_entries
@@ -16283,6 +16384,60 @@ impl Fleet {
         // asynchronous prediction work, so concurrent waves cannot spend the
         // same exploration slot.
         let cadence_lane = self.cadence_lane_restart(request);
+        if let Some(id) = view.entry_id.as_deref() {
+            let target = self.prepare_headroom_target(
+                id,
+                request,
+                headroom_survey,
+                &connections,
+                SurveyRankingContext {
+                    reservations: &reservations,
+                    predictions: &predictions,
+                    sync_costs: &sync_costs,
+                    cache_distances: &cache_distances,
+                    policy,
+                    now_unix_ms: now,
+                    exploration: &ExplorationState::default(),
+                    cadence_lane: cadence_lane.as_ref(),
+                },
+            );
+            if let Some(target) = target {
+                if !target.enabled {
+                    return Ok(Selection::ReleasingHeadroom {
+                        rejected: actual_survey
+                            .map(|survey| survey.rejected)
+                            .unwrap_or_default(),
+                    });
+                }
+                let mut offer_declines = declined.clone();
+                let ready = self
+                    .queue
+                    .with_entry(id, |entry| {
+                        entry.may_offer_to(&target.executor_id, target.generation, now)
+                    })
+                    .unwrap_or(false);
+                if ready {
+                    offer_declines.remove(&target.executor_id);
+                }
+                actual_survey = survey_candidates(
+                    &connections,
+                    &unattached,
+                    request,
+                    now,
+                    &offer_declines,
+                    view,
+                )
+                .map(|mut survey| {
+                    survey.usable.retain(|machine| {
+                        machine.identity.executor_id == target.executor_id
+                            && machine.generation == target.generation
+                    });
+                    survey
+                })
+                .map(|survey| self.defer_to_provisioning_lines(survey, request, now))
+                .map(|survey| self.defer_to_cadence_lanes(survey, now));
+            }
+        }
         let mut exploration_by_work_class = self.exploration_by_work_class.lock().unwrap();
         let exploration = exploration_by_work_class
             .entry(request.placement_work_class)
@@ -16481,6 +16636,127 @@ impl Fleet {
         });
         survey.rejected.extend(deferred);
         survey
+    }
+
+    /// Live reservation evidence for a queued request, never inferred from its
+    /// authorization. The stable key lets the journal record transitions without
+    /// appending another decision for every second the age display advances.
+    fn headroom_status(
+        &self,
+        identity: &RequestIdentity,
+        now_unix_ms: u64,
+    ) -> Option<(String, String)> {
+        let id = self
+            .queue
+            .with_entry_by_identity(identity, |entry| entry.id.clone())?;
+        let plan = self.queue.headroom_plan(&id, now_unix_ms)?;
+        let target = plan.target?;
+        let connections = self.lock_connections();
+        let machine = connections
+            .get(&target.executor_id)
+            .filter(|machine| machine.generation == target.generation)?;
+        if !target.enabled {
+            return Some((
+                format!("releasing:{}:{}", target.executor_id, target.generation),
+                format!(
+                    "releasing headroom on {} for {} before choosing another machine",
+                    executor_public_name(machine),
+                    identity.0
+                ),
+            ));
+        }
+        let hold = machine
+            .health
+            .admission
+            .headroom_reservations
+            .iter()
+            .find(|hold| {
+                hold.entry_id == id
+                    && hold.request_id == identity.0
+                    && hold.attempt_id == identity.1
+            })?;
+        Some((
+            format!(
+                "{}:{}:{}:{:?}:{:?}:{}",
+                target.executor_id,
+                target.generation,
+                hold.reserved_at_unix_ms,
+                hold.reservation,
+                hold.memory_floor_bytes,
+                hold.protected
+            ),
+            hold.describe(&executor_public_name(machine), now_unix_ms),
+        ))
+    }
+
+    /// Choose one target with ordinary placement's gates and prices, retaining
+    /// it while it remains eligible so headroom can accumulate. Revocation is
+    /// acknowledged by the old generation before another
+    /// machine can receive authorization; stale liveness cannot reserve two.
+    fn prepare_headroom_target(
+        &self,
+        id: &str,
+        request: &CellRequest,
+        survey: Option<CandidateSurvey<'_>>,
+        connections: &HashMap<String, ExecutorConnectionState>,
+        context: SurveyRankingContext<'_>,
+    ) -> Option<queue::HeadroomTarget> {
+        let plan = self.queue.headroom_plan(id, context.now_unix_ms)?;
+        let choose = |survey| {
+            rank_survey(request, survey, context)
+                .ok()?
+                .selected
+                .filter(|(_, selection)| selection.memory_ceiling.is_none())
+        };
+        if let Some(mut target) = plan.target {
+            let existing = survey.as_ref().and_then(|survey| {
+                let mut one = survey.clone();
+                one.usable.retain(|machine| {
+                    machine.identity.executor_id == target.executor_id
+                        && machine.generation == target.generation
+                });
+                choose(one)
+            });
+            if target.enabled && existing.is_some() {
+                return Some(target);
+            }
+            let current = connections
+                .get(&target.executor_id)
+                .filter(|machine| machine.generation == target.generation);
+            if let Some(machine) = current {
+                if target.enabled {
+                    target.enabled = false;
+                    self.queue.set_headroom_target(id, Some(target.clone()));
+                    let _ = machine.sender.send(ExecutorMessage::ReleaseHeadroom {
+                        entry_id: id.to_string(),
+                    });
+                }
+                return Some(target);
+            }
+            // A generation ending drops its standing holds. Otherwise only
+            // HeadroomReleased may clear a target, never a cached empty list.
+            self.queue.set_headroom_target(id, None);
+        }
+        let (selected, selection) = choose(survey?)?;
+        self.queue.observe_queue_forecast(
+            id,
+            selection
+                .prediction
+                .as_ref()
+                .and_then(|prediction| prediction.queue.predicted_ms()),
+        );
+        let plan = self.queue.headroom_plan(id, context.now_unix_ms)?;
+        if context.now_unix_ms < plan.reserve_from_unix_ms {
+            return None;
+        }
+        let target = queue::HeadroomTarget {
+            executor_id: selected.executor_id,
+            generation: selected.generation,
+            enabled: true,
+            offered: false,
+        };
+        self.queue.set_headroom_target(id, Some(target.clone()));
+        Some(target)
     }
 
     /// The main-cadence lanes that hold precedence for a machine's freed room
@@ -17518,6 +17794,7 @@ fn placement_settled_by_caller(request: &CellRequest) -> bool {
 
 /// The machines that survived the structural filters, and the ones that did not
 /// with the reason each was passed over.
+#[derive(Clone)]
 struct CandidateSurvey<'a> {
     usable: Vec<&'a ExecutorConnectionState>,
     rejected: Vec<PlacementRejection>,
@@ -19640,6 +19917,7 @@ fn untrusted_verdict_platform_diagnostic(
     )
 }
 
+#[derive(Clone, Copy)]
 struct SurveyRankingContext<'a> {
     reservations: &'a HashMap<String, resource_profiles::ResolvedResourceProfile>,
     predictions: &'a HashMap<String, PlacementPrediction>,
@@ -31011,10 +31289,435 @@ mod tests {
             );
             entries.push((request, entry));
         }
+        assert_eq!(
+            pool.queue
+                .supersede_declines_for("fedora", now, |_, _, _| false),
+            !parked.is_empty()
+        );
+        (pool, entries)
+    }
+
+    fn aging_entry(
+        pool: &Fleet,
+        now: u64,
+    ) -> (CellRequest, String, oneshot::Receiver<CellOutcome>) {
+        let mut request = spillable_request();
+        request.request_id = "aging-senior".into();
+        request.attempt_id = "aging-attempt".into();
+        request.waiting_since_unix_ms = now - 120_000;
+        request.wait_horizon_unix_ms = now + 600_000;
+        request.verdict_platforms = vec!["linux".into()];
+        let (id, waiter) = pool
+            .queue
+            .enqueue(
+                queue::NewEntry {
+                    request: request.clone(),
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                    standing: false,
+                },
+                now,
+            )
+            .unwrap();
+        pool.queue.observe_queue_forecast(&id, Some(50_000));
+        (request, id, waiter)
+    }
+
+    #[tokio::test]
+    async fn aging_target_and_first_forecast_follow_canonical_ranking_despite_historical_decline() {
+        let (pool, _) = room_freed_on_fedora(&[]);
+        let now = unix_time_ms();
+        let mut request = spillable_request();
+        request.request_id = "aging-best".into();
+        request.waiting_since_unix_ms = now - 120_000;
+        request.wait_horizon_unix_ms = now + 600_000;
+        let (other_id, mut other) = fleet_entry_at("other", "linux", 0, &[], now);
+        measured_at(&mut other, 0.01, 8_000_000_000, 8_000_000_000, now);
+        pool.lock_connections().insert(other_id, other);
+        for machine in pool.lock_connections().values_mut() {
+            Arc::make_mut(&mut machine.health)
+                .admission
+                .concurrency_capacity = Some(4);
+        }
+        let canonical = pool
+            .select_executor_once_with(
+                &request,
+                None,
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap()
+            .placed()
+            .unwrap();
+        let best = canonical.selected.executor_id.clone();
+        let forecast = match &canonical.decision.outcome {
+            PlacementOutcome::Selected(selection) => selection
+                .prediction
+                .as_ref()
+                .and_then(|prediction| prediction.queue.predicted_ms()),
+            _ => panic!("canonical selection"),
+        };
+        assert_eq!(
+            forecast,
+            Some(0),
+            "this fixture has measured free admission capacity, not an unknown fifteen-minute wait"
+        );
+        let (id, _waiter) = pool
+            .queue
+            .enqueue(
+                queue::NewEntry {
+                    request: request.clone(),
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                    standing: false,
+                },
+                now,
+            )
+            .unwrap();
+        let generation = pool.lock_connections()[&best].generation;
+        assert!(pool.queue.offer(&id, &best, &best, generation, now));
+        pool.queue.decline(
+            &id,
+            &best,
+            generation,
+            DeclineReason::Capacity,
+            None,
+            None,
+            None,
+            now,
+        );
+        let placed = select_entry(&pool, &request, &id)
+            .await
+            .placed()
+            .expect("historical decline cannot promote an inferior reservation target");
+        assert_eq!(placed.selected.executor_id, best);
+        let plan = pool.queue.headroom_plan(&id, now).unwrap();
+        assert_eq!(plan.forecast_ms, forecast);
+        assert_eq!(plan.target.unwrap().executor_id, best);
+    }
+
+    #[tokio::test]
+    async fn aging_target_is_eligible_and_authorization_does_not_wait_for_old_backoff() {
+        let (pool, _) = room_freed_on_fedora(&[]);
+        let now = unix_time_ms();
+        let (request, id, _waiter) = aging_entry(&pool, now);
+        let generation = pool.lock_connections()["fedora"].generation;
+        assert!(pool.queue.offer(&id, "fedora", "fedora", generation, now));
+        pool.queue.decline(
+            &id,
+            "fedora",
+            generation,
+            DeclineReason::Capacity,
+            None,
+            None,
+            None,
+            now,
+        );
+        assert!(!pool
+            .queue
+            .with_entry(&id, |entry| entry.may_offer_to("fedora", generation, now))
+            .unwrap());
+        let placed = select_entry(&pool, &request, &id)
+            .await
+            .placed()
+            .expect("aged authorization reaches the eligible executor immediately");
+        assert_eq!(placed.selected.executor_id, "fedora");
+        let plan = pool.queue.headroom_plan(&id, now).unwrap();
+        assert_eq!(plan.forecast_ms, Some(50_000));
+        assert_eq!(
+            plan.reserve_from_unix_ms,
+            request.waiting_since_unix_ms + 100_000
+        );
+        assert_eq!(plan.target.unwrap().executor_id, "fedora");
         assert!(pool
             .queue
-            .supersede_declines_for("fedora", now, |_, _, _| false));
-        (pool, entries)
+            .with_entry(&id, |entry| entry.may_offer_to("fedora", generation, now))
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn aging_target_revokes_before_moving_when_its_machine_becomes_ineligible() {
+        let (pool, _) = room_freed_on_fedora(&[]);
+        let now = unix_time_ms();
+        let (request, id, _waiter) = aging_entry(&pool, now);
+        select_entry(&pool, &request, &id)
+            .await
+            .placed()
+            .expect("initial target");
+        let generation = pool.lock_connections()["fedora"].generation;
+        {
+            let mut machines = pool.lock_connections();
+            let fedora = machines.get_mut("fedora").unwrap();
+            Arc::make_mut(&mut fedora.health)
+                .admission
+                .headroom_reservations
+                .push(cairn_common::executor_protocol::HeadroomReservation {
+                    memory_floor_bytes: Some(request.resource_reservation.memory_charge_bytes()),
+                    protected: true,
+                    entry_id: id.clone(),
+                    request_id: request.request_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    reservation: request.resource_reservation.clone(),
+                    waiting_since_unix_ms: request.waiting_since_unix_ms,
+                    forecast_ms: Some(50_000),
+                    reserved_at_unix_ms: now,
+                });
+            Arc::make_mut(&mut fedora.advertisement).capabilities.os = "macos".into();
+            let (other_id, mut other) = fleet_entry_at("other", "linux", 0, &[], now);
+            measured_at(&mut other, 0.01, 8_000_000_000, 8_000_000_000, now);
+            machines.insert(other_id, other);
+        }
+        assert!(matches!(
+            select_entry(&pool, &request, &id).await,
+            Selection::ReleasingHeadroom { .. }
+        ));
+        let revoking = pool.queue.headroom_plan(&id, now).unwrap().target.unwrap();
+        assert_eq!(revoking.executor_id, "fedora");
+        assert!(!revoking.enabled);
+        assert!(pool
+            .queue
+            .waiting_request_ids("fedora", generation)
+            .is_empty());
+        Arc::make_mut(&mut pool.lock_connections().get_mut("fedora").unwrap().health)
+            .admission
+            .headroom_reservations
+            .clear();
+        assert!(
+            matches!(
+                select_entry(&pool, &request, &id).await,
+                Selection::ReleasingHeadroom { .. }
+            ),
+            "an empty cached snapshot is not release acknowledgement"
+        );
+        assert!(!pool.queue.headroom_released(&id, "fedora", generation + 1));
+        assert!(!pool.queue.headroom_released(&id, "other", generation));
+        let releasing_pass = select_entry(&pool, &request, &id).await;
+        assert!(pool.queue.headroom_released(&id, "fedora", generation));
+        assert!(
+            matches!(releasing_pass, Selection::ReleasingHeadroom { .. }),
+            "a fast acknowledgement cannot erase this pass's transient wait evidence"
+        );
+        let placed = select_entry(&pool, &request, &id)
+            .await
+            .placed()
+            .expect("new eligible target after old hold release");
+        assert_eq!(placed.selected.executor_id, "other");
+        assert_eq!(
+            pool.queue
+                .headroom_plan(&id, now)
+                .unwrap()
+                .target
+                .unwrap()
+                .executor_id,
+            "other"
+        );
+    }
+
+    #[tokio::test]
+    async fn aging_revocation_is_a_live_wait_in_the_full_remote_only_selection_loop() {
+        let (pool, _) = room_freed_on_fedora(&[]);
+        let now = unix_time_ms();
+        let (request, id, _waiter) = aging_entry(&pool, now);
+        select_entry(&pool, &request, &id)
+            .await
+            .placed()
+            .expect("initial target");
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let generation = {
+            let mut machines = pool.lock_connections();
+            let old = machines.get_mut("fedora").unwrap();
+            old.sender = sender;
+            Arc::make_mut(&mut old.advertisement).capabilities.os = "macos".into();
+            let generation = old.generation;
+            let (other_id, mut other) = fleet_entry_at("other", "linux", 0, &[], now);
+            measured_at(&mut other, 0.01, 8_000_000_000, 8_000_000_000, now);
+            machines.insert(other_id, other);
+            generation
+        };
+        let policy = ActivePlacementPolicy::default_profile();
+        let mut selecting = Box::pin(pool.select_executor(&request, None, &policy, Some(&id)));
+        tokio::select! {
+            biased;
+            result = &mut selecting => panic!("release is a wait, not unavailable: {result:?}"),
+            frame = receiver.recv() => assert!(matches!(frame, Some(ExecutorMessage::ReleaseHeadroom { entry_id }) if entry_id == id)),
+        }
+        let status = pool
+            .headroom_status(
+                &(request.request_id.clone(), request.attempt_id.clone()),
+                now,
+            )
+            .unwrap()
+            .1;
+        assert!(status.contains("releasing headroom on fedora"), "{status}");
+        assert!(pool.queue.headroom_released(&id, "fedora", generation));
+        pool.connection_ready.notify_waiters();
+        let placed = selecting
+            .await
+            .expect("another eligible remote after acknowledged release");
+        assert_eq!(placed.selected.executor_id, "other");
+    }
+
+    #[tokio::test]
+    async fn aging_revocation_wait_ends_at_the_requesters_horizon() {
+        let (pool, _) = room_freed_on_fedora(&[]);
+        let now = unix_time_ms();
+        let (mut request, id, _waiter) = aging_entry(&pool, now);
+        select_entry(&pool, &request, &id)
+            .await
+            .placed()
+            .expect("initial target");
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        pool.lock_connections().get_mut("fedora").unwrap().sender = sender;
+        Arc::make_mut(
+            &mut pool
+                .lock_connections()
+                .get_mut("fedora")
+                .unwrap()
+                .advertisement,
+        )
+        .capabilities
+        .os = "macos".into();
+        let (other_id, mut other) = fleet_entry_at("other", "linux", 0, &[], now);
+        measured_at(&mut other, 0.01, 8_000_000_000, 8_000_000_000, now);
+        pool.lock_connections().insert(other_id, other);
+        request.wait_horizon_unix_ms = unix_time_ms() + 250;
+        let policy = ActivePlacementPolicy::default_profile();
+        let mut selecting = Box::pin(pool.select_executor(&request, None, &policy, Some(&id)));
+        tokio::select! {
+            biased;
+            result = &mut selecting => panic!("must begin by waiting for release: {result:?}"),
+            frame = receiver.recv() => assert!(matches!(frame, Some(ExecutorMessage::ReleaseHeadroom { entry_id }) if entry_id == id)),
+        }
+        assert!(
+            selecting.await.is_err(),
+            "an unanswered release cannot extend the requester horizon or run elsewhere after it"
+        );
+        assert!(matches!(
+            pool.queue.state_of(&id),
+            Some(queue::EntryState::Queued)
+        ));
+    }
+
+    #[tokio::test]
+    async fn aging_review_revokes_for_main_cadence_and_interactive_work_stays_exempt() {
+        let (pool, _) = room_freed_on_fedora(&[]);
+        let now = unix_time_ms();
+        let (review, review_id, _review_waiter) = aging_entry(&pool, now);
+        select_entry(&pool, &review, &review_id)
+            .await
+            .placed()
+            .expect("review target");
+        let generation = pool.lock_connections()["fedora"].generation;
+        Arc::make_mut(&mut pool.lock_connections().get_mut("fedora").unwrap().health)
+            .admission
+            .headroom_reservations
+            .push(cairn_common::executor_protocol::HeadroomReservation {
+                memory_floor_bytes: Some(review.resource_reservation.memory_charge_bytes()),
+                protected: true,
+                entry_id: review_id.clone(),
+                request_id: review.request_id.clone(),
+                attempt_id: review.attempt_id.clone(),
+                reservation: review.resource_reservation.clone(),
+                waiting_since_unix_ms: review.waiting_since_unix_ms,
+                forecast_ms: Some(50_000),
+                reserved_at_unix_ms: now,
+            });
+        let main = CellRequest {
+            request_id: "main".into(),
+            attempt_id: "main-attempt".into(),
+            waiting_since_unix_ms: now - 10_000,
+            ..review.clone()
+        };
+        let (main_id, _main_waiter) = pool
+            .queue
+            .enqueue(
+                queue::NewEntry {
+                    request: main.clone(),
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                    standing: true,
+                },
+                now - 5_000,
+            )
+            .unwrap();
+        assert!(pool
+            .queue
+            .offer(&main_id, "fedora", "fedora", generation, now - 5_000));
+        pool.queue.decline(
+            &main_id,
+            "fedora",
+            generation,
+            DeclineReason::Capacity,
+            None,
+            None,
+            None,
+            now - 5_000,
+        );
+        arm_main_cadence(&pool, &main, now);
+        assert!(matches!(
+            select_entry(&pool, &review, &review_id).await,
+            Selection::ReleasingHeadroom { .. }
+        ));
+        assert!(
+            !pool
+                .queue
+                .headroom_plan(&review_id, now)
+                .unwrap()
+                .target
+                .unwrap()
+                .enabled
+        );
+        let interactive = CellRequest {
+            request_id: "interactive".into(),
+            priority: CellPriority::AgentInteractive,
+            ..review.clone()
+        };
+        let (interactive_id, _interactive_waiter) = pool
+            .queue
+            .enqueue(
+                queue::NewEntry {
+                    request: interactive.clone(),
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: true,
+                    execution_residency: None,
+                    standing: false,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            select_entry(&pool, &interactive, &interactive_id)
+                .await
+                .placed()
+                .unwrap()
+                .selected
+                .executor_id,
+            "fedora"
+        );
+        assert!(pool
+            .queue
+            .headroom_released(&review_id, "fedora", generation));
+        Arc::make_mut(&mut pool.lock_connections().get_mut("fedora").unwrap().health)
+            .admission
+            .headroom_reservations
+            .clear();
+        pool.queue
+            .supersede_declines_for("fedora", now, |_, _, _| false);
+        assert_eq!(
+            select_entry(&pool, &main, &main_id)
+                .await
+                .placed()
+                .unwrap()
+                .selected
+                .executor_id,
+            "fedora"
+        );
     }
 
     /// Make `request` the live answer to main's rust-tests question on linux:

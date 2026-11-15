@@ -1,13 +1,8 @@
 //! User-controlled message queue for the job chat composer (CAIRN-1309).
 //!
-//! Every row is text the operator typed at a job, which makes this table the
-//! durable record of what the operator said to that job — the record the
-//! watcher catch-up digest reads (CAIRN-3390). Nothing else may write here: a
-//! machinery- or agent-authored message recorded as a row would be reported to
-//! coordinators as the operator's own words. The one other writer is a question's
-//! answer on its way to its asker, keyed by the prompt id
-//! ([`insert_question_answer_conn`]): an answer is someone's words to this job,
-//! and it needs the same boundary timing.
+//! Operator messages and question answers share durable delivery timing, but
+//! not authorship. `kind` keeps answers out of the operator's composer and watcher
+//! digest; their canonical resolution receipt records who actually answered.
 //!
 //! While a job's agent is running, a user-typed follow-up is persisted here
 //! rather than starting a competing turn. The [`Delivery`] tag records the
@@ -50,6 +45,43 @@ pub struct QueuedMessage {
     pub(crate) delivery: Delivery,
     pub(crate) created_at: i64,
     pub(crate) delivered_at: Option<i64>,
+    pub(crate) kind: QueuedMessageKind,
+    pub(crate) resolution: Option<cairn_db::models::ResolutionReceipt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QueuedMessageKind {
+    Operator,
+    QuestionAnswer,
+}
+
+impl QueuedMessage {
+    pub(crate) fn is_operator_message(&self) -> bool {
+        self.kind == QueuedMessageKind::Operator
+    }
+
+    pub(crate) fn render(&self) -> String {
+        if self.is_operator_message() {
+            return format!("The user sent a follow-up message:\n{}", self.content);
+        }
+        let label = self
+            .resolution
+            .as_ref()
+            .map(|receipt| {
+                serde_json::from_value(serde_json::Value::String(receipt.surface.clone()))
+                    .map(|surface| {
+                        crate::mcp::handlers::permission::answerer_label(
+                            surface,
+                            receipt.actor.as_deref(),
+                            receipt.provider.as_deref(),
+                        )
+                    })
+                    .unwrap_or_else(|_| "an unknown answerer".to_string())
+            })
+            .unwrap_or_else(|| "an unknown answerer".to_string());
+        format!("Question resolution from {label}:\n{}", self.content)
+    }
 }
 
 impl ClaimFilter {
@@ -89,10 +121,27 @@ fn message_from_row(row: &cairn_db::turso::Row) -> DbResult<QueuedMessage> {
         delivery,
         created_at: row.i64(4)?,
         delivered_at: row.opt_i64(5)?,
+        kind: match row.text(6)?.as_str() {
+            "operator" => QueuedMessageKind::Operator,
+            "question_answer" => QueuedMessageKind::QuestionAnswer,
+            kind => {
+                return Err(crate::storage::DbError::Row(format!(
+                    "unknown queued kind: {kind}"
+                )))
+            }
+        },
+        resolution: row
+            .opt_text(7)?
+            .map(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|error| crate::storage::DbError::Row(error.to_string()))
+            })
+            .transpose()?,
     })
 }
 
-const SELECT_COLUMNS: &str = "id, job_id, content, delivery, created_at, delivered_at";
+const SELECT_COLUMNS: &str =
+    "id, job_id, content, delivery, created_at, delivered_at, kind, resolution";
 
 // ---------------------------------------------------------------------------
 // CRUD
@@ -171,7 +220,8 @@ async fn record_operator_message(
                 let mut rows = conn.query(&sql, params![id.as_str()]).await?;
                 if let Some(row) = rows.next().await? {
                     let existing = message_from_row(&row)?;
-                    if existing.job_id != job_id
+                    if !existing.is_operator_message()
+                        || existing.job_id != job_id
                         || existing.content != content
                         || existing.delivery != delivery
                     {
@@ -204,6 +254,8 @@ async fn record_operator_message(
                         delivery,
                         created_at: now,
                         delivered_at,
+                        kind: QueuedMessageKind::Operator,
+                        resolution: None,
                     },
                     true,
                 ))
@@ -262,12 +314,32 @@ pub(crate) async fn insert_question_answer_conn(
     content: &str,
     delivery: Delivery,
     now: i64,
+    provenance: Option<&crate::turns::queries::ResolutionProvenance>,
 ) -> DbResult<()> {
+    let resolution = cairn_db::models::ResolutionReceipt {
+        id: provenance.map(|p| p.id.clone()),
+        surface: provenance
+            .map(|p| p.surface_name())
+            .unwrap_or_else(|| "legacy_unknown".into()),
+        provider: provenance.and_then(|p| p.provider.clone()),
+        conversation: provenance.and_then(|p| p.conversation.clone()),
+        actor: provenance.and_then(|p| p.actor.clone()),
+        resolved_at: now * 1000,
+    };
+    let resolution = serde_json::to_string(&resolution)
+        .map_err(|error| crate::storage::DbError::Row(error.to_string()))?;
     conn.execute(
         "INSERT OR IGNORE INTO queued_messages
-         (id, job_id, content, delivery, created_at, delivered_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-        params![prompt_id, job_id, content, delivery.as_str(), now],
+         (id, job_id, content, delivery, created_at, delivered_at, kind, resolution)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'question_answer', ?6)",
+        params![
+            prompt_id,
+            job_id,
+            content,
+            delivery.as_str(),
+            now,
+            resolution
+        ],
     )
     .await?;
     Ok(())
@@ -308,10 +380,17 @@ pub(crate) async fn take_question_answer_for_reader(
     .map_err(|error| format!("Failed to stamp a question's queued answer: {error}"))
 }
 
-/// Pending (undelivered) queued messages for a job, oldest first.
+/// Pending operator drafts for the composer, oldest first. Answer deliveries
+/// remain pending for claims but are never editable composer chips.
 pub fn list_pending_for_job(db: &LocalDb, job_id: &str) -> Result<Vec<QueuedMessage>, String> {
     let job_id = job_id.to_string();
-    run_db_blocking(move || async move { list_pending_for_job_async(db, &job_id).await })
+    run_db_blocking(move || async move {
+        Ok(list_pending_for_job_async(db, &job_id)
+            .await?
+            .into_iter()
+            .filter(QueuedMessage::is_operator_message)
+            .collect())
+    })
 }
 
 async fn list_pending_for_job_async(
@@ -353,7 +432,7 @@ pub async fn find_for_job_async(
     id: &str,
 ) -> Result<Option<QueuedMessage>, String> {
     db.query_all(
-        format!("SELECT {SELECT_COLUMNS} FROM queued_messages WHERE id = ?1 AND job_id = ?2"),
+        format!("SELECT {SELECT_COLUMNS} FROM queued_messages WHERE id = ?1 AND job_id = ?2 AND kind = 'operator'"),
         params![id.to_string(), job_id.to_string()],
         message_from_row,
     )
@@ -369,7 +448,7 @@ pub fn update_content(db: &LocalDb, id: &str, content: &str) -> Result<bool, Str
     run_db_blocking(move || async move {
         db.execute(
             "UPDATE queued_messages SET content = ?1
-             WHERE id = ?2 AND delivered_at IS NULL",
+             WHERE id = ?2 AND delivered_at IS NULL AND kind = 'operator'",
             params![content.as_str(), id.as_str()],
         )
         .await
@@ -390,7 +469,7 @@ pub fn set_delivery(db: &LocalDb, id: &str, delivery: Delivery) -> Result<String
                 let mut rows = conn
                     .query(
                         "SELECT job_id FROM queued_messages
-                         WHERE id = ?1 AND delivered_at IS NULL",
+                         WHERE id = ?1 AND delivered_at IS NULL AND kind = 'operator'",
                         params![id.as_str()],
                     )
                     .await?;
@@ -402,7 +481,7 @@ pub fn set_delivery(db: &LocalDb, id: &str, delivery: Delivery) -> Result<String
                 let job_id = row.text(0)?;
                 conn.execute(
                     "UPDATE queued_messages SET delivery = ?1
-                     WHERE id = ?2 AND delivered_at IS NULL",
+                     WHERE id = ?2 AND delivered_at IS NULL AND kind = 'operator'",
                     params![delivery.as_str(), id.as_str()],
                 )
                 .await?;
@@ -432,7 +511,7 @@ pub fn delete(db: &LocalDb, id: &str) -> Result<(), String> {
             let id = id.clone();
             Box::pin(async move {
                 conn.execute(
-                    "DELETE FROM queued_messages WHERE id = ?1 AND delivered_at IS NULL",
+                    "DELETE FROM queued_messages WHERE id = ?1 AND delivered_at IS NULL AND kind = 'operator'",
                     params![id.as_str()],
                 )
                 .await?;
@@ -649,6 +728,77 @@ mod tests {
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("queued-messages.db").await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn answer_receipts_survive_claims_and_are_not_operator_drafts() {
+        let db = migrated_db().await;
+        let provenance = crate::turns::queries::ResolutionProvenance::new(
+            cairn_common::identity::AppearanceTransport::ResourcePatch,
+            Some("cairn://p/demo/execution".to_string()),
+        );
+        let expected = provenance.clone();
+        db.write(|conn| {
+            let provenance = provenance.clone();
+            Box::pin(async move {
+                insert_question_answer_conn(
+                    conn,
+                    "prompt-answer",
+                    "job-a",
+                    "answer body",
+                    Delivery::Steer,
+                    1,
+                    Some(&provenance),
+                )
+                .await?;
+                // A replay cannot replace the original author or content.
+                insert_question_answer_conn(
+                    conn,
+                    "prompt-answer",
+                    "job-a",
+                    "changed",
+                    Delivery::Steer,
+                    2,
+                    None,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+        assert!(list_pending_for_job(&db, "job-a").unwrap().is_empty());
+        assert!(find_for_job_async(&db, "job-a", "prompt-answer")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!update_content(&db, "prompt-answer", "edited").unwrap());
+        assert!(set_delivery(&db, "prompt-answer", Delivery::Interrupt).is_err());
+        delete(&db, "prompt-answer").unwrap();
+        assert!(enqueue_idempotent(
+            &db,
+            "job-a",
+            "answer body",
+            Delivery::Steer,
+            "prompt-answer",
+        )
+        .is_err());
+
+        let messages = claim_tool_boundary_for_job_async(&db, "job-a")
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        assert_eq!(message.kind, QueuedMessageKind::QuestionAnswer);
+        assert_eq!(message.content, "answer body");
+        let receipt = message.resolution.as_ref().unwrap();
+        assert_eq!(receipt.id.as_deref(), Some(expected.id.as_str()));
+        assert_eq!(receipt.actor, expected.actor);
+        assert_eq!(receipt.surface, "resource_patch");
+        assert!(message.render().contains("cairn://p/demo/execution"));
+        restore_claimed(&db, std::slice::from_ref(&message.id)).unwrap();
+        let resumed = claim_all_for_job_async(&db, "job-a").await.unwrap();
+        assert_eq!(resumed[0].resolution, message.resolution);
+        assert_eq!(resumed[0].render(), message.render());
     }
 
     #[tokio::test(flavor = "current_thread")]

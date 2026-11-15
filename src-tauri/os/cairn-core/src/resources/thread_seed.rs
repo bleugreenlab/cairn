@@ -3847,42 +3847,50 @@ mod tests {
     /// then ten recent. Of the four old turns, one is plain conversation, two
     /// discuss a child that has since merged, and one touches a child that is
     /// still open.
-    async fn thread_fixture(name: &str) -> LocalDb {
+    struct ThreadFixture {
+        db: LocalDb,
+        thread_id: String,
+    }
+
+    impl std::ops::Deref for ThreadFixture {
+        type Target = LocalDb;
+
+        fn deref(&self) -> &Self::Target {
+            &self.db
+        }
+    }
+
+    async fn thread_fixture(name: &str) -> ThreadFixture {
         let db = migrated_test_db(name).await;
-        // Every fixture shares the thread id, and the redirect is process-wide,
-        // so they share one temporary store rather than the real thread-database
-        // path. A per-fixture path would move under a parallel test mid-compose.
-        static STORE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let thread_id = format!("seed-{}", uuid::Uuid::new_v4());
+        // Redirects are keyed by thread id. Each fixture owns an id and path
+        // that no parallel fixture can re-point or write into.
         crate::threads::db_store::use_test_path(
-            "t-thread",
-            STORE
-                .get_or_init(|| tempfile::tempdir().unwrap().keep().join("t-thread.db"))
-                .clone(),
+            &thread_id,
+            tempfile::tempdir().unwrap().keep().join("thread.db"),
         );
-        // A thread mints its store at creation; minting it here keeps a
-        // parallel fixture's first open from changing the store census between
-        // two composes of another test.
-        crate::threads::db_store::open("t-thread").await.unwrap();
-        db.execute_script(
+        // A thread mints its store at creation, before composing its seed.
+        crate::threads::db_store::open(&thread_id).await.unwrap();
+        db.execute_script(format!(
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
                VALUES ('p','default','P','prj','/tmp/p',1,1);
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
                VALUES ('i-thread','p',1,'Platform thread','active','none',1,1);
              INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
-               VALUES ('t-thread','p','platform','active','none',1,1);
+               VALUES ('{thread_id}','p','platform','active','none',1,1);
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
-               VALUES ('i-done','p',20,'Running panel for the executor fleet','merged','none',1,1,'t-thread');
+               VALUES ('i-done','p',20,'Running panel for the executor fleet','merged','none',1,1,'{thread_id}');
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
-               VALUES ('i-open','p',21,'Lease renewal backoff','active','none',1,1,'t-thread');
+               VALUES ('i-open','p',21,'Lease renewal backoff','active','none',1,1,'{thread_id}');
              INSERT INTO executions(id, recipe_id, project_id, status, started_at, seq)
                VALUES ('e','recipe','p','running',1,1);
              INSERT INTO jobs(id, execution_id, thread_id, project_id, status, uri_segment, node_name, current_session_id, created_at, updated_at)
-               VALUES ('job-thread','e','t-thread','p','running','thread','thread','sess-1',1,1);
+               VALUES ('job-thread','e','{thread_id}','p','running','thread','thread','sess-1',1,1);
              INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
                VALUES ('sess-1','job-thread','claude','open',1,1,1);
              INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
                VALUES ('run-1','job-thread','i-thread','running',1,1);",
-        )
+        ))
         .await
         .unwrap();
 
@@ -3920,7 +3928,7 @@ mod tests {
             )
             .await;
         }
-        db
+        ThreadFixture { db, thread_id }
     }
 
     async fn turn(db: &LocalDb, sequence: i64, user: &str, assistant: Option<&str>) {
@@ -4006,8 +4014,8 @@ mod tests {
     }
 
     /// Patch the fixture thread's intent row, as `cairn:~/db/intent/1` does.
-    async fn write_intent(intent: &str) {
-        crate::threads::db_store::open("t-thread")
+    async fn write_intent(thread_id: &str, intent: &str) {
+        crate::threads::db_store::open(thread_id)
             .await
             .unwrap()
             .execute(
@@ -4019,8 +4027,8 @@ mod tests {
     }
 
     /// Append one row to the fixture thread's journal.
-    async fn append_journal(kind: &str, note: &str) {
-        crate::threads::db_store::open("t-thread")
+    async fn append_journal(thread_id: &str, kind: &str, note: &str) {
+        crate::threads::db_store::open(thread_id)
             .await
             .unwrap()
             .execute(
@@ -4035,8 +4043,12 @@ mod tests {
     async fn a_composed_seed_uses_eras_and_a_token_budget_without_rendering_chapters() {
         let db = thread_fixture("thread-seed-compose.db").await;
         mark_done_child(&db).await;
-        write_intent("Getting the fleet onto lease-based residency.").await;
-        append_journal("question", "Who owns lease renewal?").await;
+        write_intent(
+            &db.thread_id,
+            "Getting the fleet onto lease-based residency.",
+        )
+        .await;
+        append_journal(&db.thread_id, "question", "Who owns lease renewal?").await;
 
         // A budget the composed seed can actually honor. At 300 this fixture
         // costs more than the bound it is given, so what it demonstrated was the
@@ -4133,7 +4145,7 @@ mod tests {
         let db = thread_fixture("thread-seed-held-child.db").await;
         db.execute_script(
             "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
-               VALUES ('i-held','p',22,'Rerun after the fix','backlog','none',1,1,'t-thread');
+               VALUES ('i-held','p',22,'Rerun after the fix','backlog','none',1,1,(SELECT thread_id FROM jobs WHERE id = 'job-thread'));
              INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                VALUES ('e-held','build','i-held','p','held',3,1);",
         )
@@ -4162,13 +4174,13 @@ mod tests {
         for n in 0..(CENSUS_TERMINAL_CHILDREN as i64 + 2) {
             script.push_str(&format!(
                 "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
-                   VALUES ('i-old-{n}','p',{},'Old work {n}','merged','none',1,1,'t-thread');\n",
+                   VALUES ('i-old-{n}','p',{},'Old work {n}','merged','none',1,1,(SELECT thread_id FROM jobs WHERE id = 'job-thread'));\n",
                 100 + n
             ));
         }
         script.push_str(
             "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
-               VALUES ('i-retry','p',500,'Retry once green','failed','none',1,1,'t-thread');
+               VALUES ('i-retry','p',500,'Retry once green','failed','none',1,1,(SELECT thread_id FROM jobs WHERE id = 'job-thread'));
              INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
                VALUES ('e-failed','build','i-retry','p','failed',1,1,'superseded');
              INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -4194,7 +4206,7 @@ mod tests {
         let written = now - age;
         db.execute_script(format!(
             "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
-               VALUES ('i-plan','p',23,'Plan the backoff','active','none',1,1,'t-thread');
+               VALUES ('i-plan','p',23,'Plan the backoff','active','none',1,1,(SELECT thread_id FROM jobs WHERE id = 'job-thread'));
              INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                VALUES ('e-plan','plan','i-plan','p','running',1,1);
              INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
@@ -4248,7 +4260,7 @@ mod tests {
         )
         .await;
         db.execute(
-            "UPDATE issues SET parent_thread_id = 't-thread' WHERE id = 'i-plan'",
+            "UPDATE issues SET parent_thread_id = (SELECT thread_id FROM jobs WHERE id = 'job-thread') WHERE id = 'i-plan'",
             (),
         )
         .await
@@ -4293,7 +4305,11 @@ mod tests {
         use crate::storage::SearchIndex;
         use std::sync::Arc;
 
-        let db = Arc::new(thread_fixture("thread-seed-missing-output-silent.db").await);
+        let db = Arc::new(
+            thread_fixture("thread-seed-missing-output-silent.db")
+                .await
+                .db,
+        );
         let now = NOW + 100 * DAY;
         child_with_missing_plan(&db, now, 3600).await;
         // The sweep has not yet seen the turn end: the job still reads running.
@@ -4490,7 +4506,11 @@ mod tests {
         let db = thread_fixture("thread-seed-children.db").await;
         mark_done_child(&db).await;
         make_open_child_live(&db).await;
-        write_intent("Getting the fleet onto lease-based residency.").await;
+        write_intent(
+            &db.thread_id,
+            "Getting the fleet onto lease-based residency.",
+        )
+        .await;
 
         let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
@@ -4557,7 +4577,7 @@ mod tests {
             "stale attempt leaked: {}",
             seed.content
         );
-        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
         let collapsed = collapsed_census(&children, "cairn://p/prj/platform", usize::MAX);
         assert!(
             collapsed.contains("review Failed: Review backend refused the session"),
@@ -4580,7 +4600,7 @@ mod tests {
         .await
         .unwrap();
 
-        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
         let child = children
             .iter()
             .find(|child| child.uri == OPEN_CHILD)
@@ -4607,7 +4627,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
         let child = children
             .iter()
             .find(|child| child.uri == OPEN_CHILD)
@@ -4623,7 +4643,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
         let child = children
             .iter()
             .find(|child| child.uri == OPEN_CHILD)
@@ -4661,7 +4681,7 @@ mod tests {
             let number = 100 + n;
             db.execute_script(format!(
                 "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
-                   VALUES ('{issue}','p',{number},'Lease renewal backoff for executor {number}, with the retry curve still unsettled','active','none',1,1,'t-thread');
+                   VALUES ('{issue}','p',{number},'Lease renewal backoff for executor {number}, with the retry curve still unsettled','active','none',1,1,(SELECT thread_id FROM jobs WHERE id = 'job-thread'));
                  INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                    VALUES ('e-{issue}','build','{issue}','p','running',1,1);
                  INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
@@ -4685,7 +4705,11 @@ mod tests {
         // this budget; the same twenty as one addressable line each do not.
         let db = thread_fixture("thread-seed-oversized-census.db").await;
         many_live_open_children(&db, 20).await;
-        write_intent("Getting the fleet onto lease-based residency.").await;
+        write_intent(
+            &db.thread_id,
+            "Getting the fleet onto lease-based residency.",
+        )
+        .await;
 
         let policy = SeedPolicy {
             budget_tokens: 1_500,
@@ -4744,7 +4768,11 @@ mod tests {
         // floor would pass it straight through, and dropping it would hand the
         // thread a seed with no present in it.
         let db = thread_fixture("thread-seed-oversized-turn.db").await;
-        write_intent("Getting the fleet onto lease-based residency.").await;
+        write_intent(
+            &db.thread_id,
+            "Getting the fleet onto lease-based residency.",
+        )
+        .await;
         turn(
             &db,
             15,
@@ -4793,7 +4821,11 @@ mod tests {
         // caller should ever pass.
         let db = thread_fixture("thread-seed-budget-below-framing.db").await;
         make_open_child_live(&db).await;
-        write_intent("Getting the fleet onto lease-based residency.").await;
+        write_intent(
+            &db.thread_id,
+            "Getting the fleet onto lease-based residency.",
+        )
+        .await;
 
         // Below the tokenizer's own message framing no string can qualify, the
         // empty one included, so the sweep starts where the claim is meaningful.
@@ -4831,7 +4863,11 @@ mod tests {
         // saw the intent's version would act on it.
         let db = thread_fixture("thread-seed-children-vs-intent.db").await;
         make_open_child_live(&db).await;
-        write_intent("21 is still unstarted and has no PR; nothing is waiting on me.").await;
+        write_intent(
+            &db.thread_id,
+            "21 is still unstarted and has no PR; nothing is waiting on me.",
+        )
+        .await;
 
         let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
@@ -4884,7 +4920,11 @@ mod tests {
         // thread be after I compact it", which is the question the menu is asked.
         let db = thread_fixture("thread-seed-preview-boundary.db").await;
         mark_done_child(&db).await;
-        write_intent("Getting the fleet onto lease-based residency.").await;
+        write_intent(
+            &db.thread_id,
+            "Getting the fleet onto lease-based residency.",
+        )
+        .await;
 
         let seed = compose_thread_seed_with_policy(
             &db,
@@ -4919,7 +4959,7 @@ mod tests {
         let db = thread_fixture("thread-seed-preview-intent.db").await;
         mark_done_child(&db).await;
 
-        write_intent("Short intent.").await;
+        write_intent(&db.thread_id, "Short intent.").await;
         let small = DigestPreview::of(
             &compose_thread_seed(&db, THREAD_JOB, NOW)
                 .await
@@ -4927,7 +4967,11 @@ mod tests {
                 .content,
         );
 
-        write_intent(&"A much longer statement of intent. ".repeat(40)).await;
+        write_intent(
+            &db.thread_id,
+            &"A much longer statement of intent. ".repeat(40),
+        )
+        .await;
         let large = DigestPreview::of(
             &compose_thread_seed(&db, THREAD_JOB, NOW)
                 .await
@@ -4950,7 +4994,11 @@ mod tests {
         // one and the number must move with it.
         let db = thread_fixture("thread-seed-preview-transcript.db").await;
         mark_done_child(&db).await;
-        write_intent("Getting the fleet onto lease-based residency.").await;
+        write_intent(
+            &db.thread_id,
+            "Getting the fleet onto lease-based residency.",
+        )
+        .await;
 
         let before = DigestPreview::of(
             &compose_thread_seed(&db, THREAD_JOB, NOW)
@@ -5141,10 +5189,10 @@ mod tests {
         // things, so editing one must not move the other.
         let db = thread_fixture("thread-seed-intent-independence.db").await;
         mark_done_child(&db).await;
-        write_intent("FIRST INTENT").await;
+        write_intent(&db.thread_id, "FIRST INTENT").await;
         let first = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
-        write_intent("SECOND INTENT").await;
+        write_intent(&db.thread_id, "SECOND INTENT").await;
         let second = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         assert!(first.content.contains("FIRST INTENT"));
@@ -6024,7 +6072,7 @@ mod tests {
         .await
         .unwrap();
 
-        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
         let child = children
             .iter()
             .find(|child| child.uri == OPEN_CHILD)
@@ -6049,7 +6097,7 @@ mod tests {
             ("activity", CHILD_ACTIVITY_SQL),
         ];
         for (label, sql) in FACETS {
-            let live = thread_rows(&db, sql, "t-thread", |_| Ok(Some(())))
+            let live = thread_rows(&db, sql, &db.thread_id, |_| Ok(Some(())))
                 .await
                 .unwrap();
             assert!(!live.is_empty(), "{label}: reads a live child");
@@ -6062,7 +6110,7 @@ mod tests {
             .await
             .unwrap();
             for (label, sql) in FACETS {
-                let resolved = thread_rows(&db, sql, "t-thread", |_| Ok(Some(())))
+                let resolved = thread_rows(&db, sql, &db.thread_id, |_| Ok(Some(())))
                     .await
                     .unwrap();
                 assert!(resolved.is_empty(), "{label}: skips a {status} child");
@@ -6075,7 +6123,7 @@ mod tests {
         .await
         .unwrap();
         for (label, sql) in FACETS {
-            let failed = thread_rows(&db, sql, "t-thread", |_| Ok(Some(())))
+            let failed = thread_rows(&db, sql, &db.thread_id, |_| Ok(Some(())))
                 .await
                 .unwrap();
             assert!(
@@ -6094,16 +6142,16 @@ mod tests {
         let db = thread_fixture("thread-seed-resolved-order.db").await;
         db.execute_script(
             "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id, merged_at)
-               VALUES ('i-merged','p',30,'Merged','merged','none',1,1,'t-thread',500);
+               VALUES ('i-merged','p',30,'Merged','merged','none',1,1,(SELECT thread_id FROM jobs WHERE id = 'job-thread'),500);
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id, closed_at, completed_at)
-               VALUES ('i-closed','p',31,'Closed','closed','none',1,1,'t-thread',900,1);
+               VALUES ('i-closed','p',31,'Closed','closed','none',1,1,(SELECT thread_id FROM jobs WHERE id = 'job-thread'),900,1);
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id, completed_at)
-               VALUES ('i-failed','p',32,'Failed','failed','none',1,1,'t-thread',700);",
+               VALUES ('i-failed','p',32,'Failed','failed','none',1,1,(SELECT thread_id FROM jobs WHERE id = 'job-thread'),700);",
         )
         .await
         .unwrap();
 
-        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
         let rendered = render_children(&children, NOW);
         let at = |uri: &str| {
             rendered

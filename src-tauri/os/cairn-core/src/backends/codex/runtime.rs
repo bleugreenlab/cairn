@@ -1686,7 +1686,8 @@ mod tests {
         assert_eq!(
             describe_hold(&db, "j").await,
             Some(Hold::ProviderLimit {
-                retry_not_before: None
+                retry_not_before: None,
+                gate: None,
             }),
             "the child reads as held"
         );

@@ -142,6 +142,7 @@ pub(crate) struct HostWaitAnswer {
     /// What the job's queue receives when the result cannot drive the
     /// successor itself. `None` queues the driven content unchanged.
     pub(crate) queued_content: Option<String>,
+    pub(crate) resolution: Option<crate::turns::queries::ResolutionProvenance>,
 }
 
 impl HostWaitAnswer {
@@ -153,6 +154,7 @@ impl HostWaitAnswer {
             suppress_user_event: true,
             answers_open_tool_call: true,
             queued_content: None,
+            resolution: None,
         }
     }
 }
@@ -438,13 +440,21 @@ pub(crate) async fn continue_into_host_wait_successor(
     }
 
     let queued = wait.queued_content.as_deref().unwrap_or(content);
-    match crate::execution::jobs::continue_job_or_enqueue(
-        orch,
-        job_id,
-        Some(queued),
-        None,
-        Some(id),
-    ) {
+    let result = if wait.kind == HostWaitKind::Question {
+        super::planning::queue_question_resolution(
+            orch,
+            owning_db,
+            job_id,
+            id,
+            queued,
+            wait.resolution.as_ref(),
+        )
+        .await
+    } else {
+        crate::execution::jobs::continue_job_or_enqueue(orch, job_id, Some(queued), None, Some(id))
+            .map(|_| ())
+    };
+    match result {
         Ok(_) => {
             log::info!(
                 "{label} {id}: successor {successor_turn_id} is owned by another \

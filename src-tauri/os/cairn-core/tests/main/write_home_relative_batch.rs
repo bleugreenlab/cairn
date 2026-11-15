@@ -25,15 +25,17 @@ async fn fixture() -> (
     tempfile::TempDir,
     std::sync::Arc<LocalDb>,
     cairn_core::internal::orchestrator::Orchestrator,
+    String,
 ) {
+    let run = format!("fixture-{}", uuid::Uuid::new_v4());
     let (temp, db, orch, _repo) = common::project_resource_fixture(PROJECT).await;
-    common::seed_authenticated_thread_run(&db, &format!("project-{PROJECT}"), PLACEHOLDER, RUN)
+    common::seed_authenticated_thread_run(&db, &format!("project-{PROJECT}"), PLACEHOLDER, &run)
         .await;
     cairn_core::threads::db_store::use_test_path(
-        &format!("thread-{RUN}"),
+        &format!("thread-{run}"),
         temp.path().join("thread-store.db"),
     );
-    (temp, db, orch)
+    (temp, db, orch, run)
 }
 
 /// A normal authenticated CLI write must fit on a Tokio runtime worker's stack.
@@ -75,8 +77,9 @@ async fn thread_name(db: &LocalDb) -> String {
 }
 
 /// The thread's written intent, or `None` while its intent row is unwritten.
-async fn written_intent() -> Option<String> {
-    let store = cairn_core::threads::db_store::open(&format!("thread-{RUN}"))
+async fn written_intent(run: &str) -> Option<String> {
+    let thread_id = format!("thread-{run}");
+    let store = cairn_core::threads::db_store::open(&thread_id)
         .await
         .unwrap();
     store
@@ -105,7 +108,7 @@ fn patch_intent(intent: &str) -> serde_json::Value {
 /// name.
 #[tokio::test]
 async fn a_thread_renames_itself_and_writes_its_intent_in_one_batch() {
-    let (_temp, db, orch) = fixture().await;
+    let (_temp, db, orch, run) = fixture().await;
 
     let result = common::change_resource_as_run(
         &orch,
@@ -113,7 +116,7 @@ async fn a_thread_renames_itself_and_writes_its_intent_in_one_batch() {
             rename_to("execution"),
             patch_intent("Placing work on machines.")
         ]),
-        Some(RUN),
+        Some(&run),
     )
     .await;
 
@@ -134,7 +137,7 @@ async fn a_thread_renames_itself_and_writes_its_intent_in_one_batch() {
 
     assert_eq!(thread_name(&db).await, "execution");
     assert_eq!(
-        written_intent().await.as_deref(),
+        written_intent(&run).await.as_deref(),
         Some("Placing work on machines.")
     );
 }
@@ -144,14 +147,14 @@ async fn a_thread_renames_itself_and_writes_its_intent_in_one_batch() {
 /// Reporting a missing thread here would describe a lookup rather than a cause.
 #[tokio::test]
 async fn an_item_that_resolves_through_a_failed_rename_names_the_rename() {
-    let (_temp, db, orch) = fixture().await;
+    let (_temp, db, orch, run) = fixture().await;
 
     // A name the thread-name contract refuses, so item 0 fails on its own terms
     // and item 1's resolution is left hanging off a rename that never happened.
     let result = common::change_resource_as_run(
         &orch,
         json!([rename_to("Execution_Thread"), patch_intent("Placing work.")]),
-        Some(RUN),
+        Some(&run),
     )
     .await;
 
@@ -174,7 +177,7 @@ async fn an_item_that_resolves_through_a_failed_rename_names_the_rename() {
         "a refused rename leaves the thread where it was"
     );
     assert_eq!(
-        written_intent().await,
+        written_intent(&run).await,
         None,
         "the dependent item wrote nothing"
     );
@@ -186,7 +189,7 @@ async fn an_item_that_resolves_through_a_failed_rename_names_the_rename() {
 /// it happened to reach used.
 #[tokio::test]
 async fn an_unresolvable_home_fails_the_item_naming_the_shorthand() {
-    let (_temp, _db, orch) = fixture().await;
+    let (_temp, _db, orch, run) = fixture().await;
 
     // No run id: there is no authenticated run whose home `cairn:~` could name.
     let result =
@@ -203,7 +206,7 @@ async fn an_unresolvable_home_fails_the_item_naming_the_shorthand() {
             && result.contains("`cairn://p/PROJECT/...`"),
         "an outside caller is told where `~` resolves and what to address instead: {result}"
     );
-    assert_eq!(written_intent().await, None, "nothing was written");
+    assert_eq!(written_intent(&run).await, None, "nothing was written");
 }
 
 /// Whatever a home-derived item fails on, the rejection names the bridge the
@@ -213,7 +216,7 @@ async fn an_unresolvable_home_fails_the_item_naming_the_shorthand() {
 /// never wrote.
 #[tokio::test]
 async fn a_home_derived_failure_names_the_shorthand_and_what_it_resolved_to() {
-    let (_temp, _db, orch) = fixture().await;
+    let (_temp, _db, orch, run) = fixture().await;
 
     let result = common::change_resource_as_run(
         &orch,
@@ -222,7 +225,7 @@ async fn a_home_derived_failure_names_the_shorthand_and_what_it_resolved_to() {
             "mode": "patch",
             "payload": { "census": "a column the intent row does not have" }
         }]),
-        Some(RUN),
+        Some(&run),
     )
     .await;
 
@@ -244,7 +247,7 @@ async fn a_home_derived_failure_names_the_shorthand_and_what_it_resolved_to() {
 /// rather than dispatched as an ordinary resource write.
 #[tokio::test]
 async fn a_home_relative_tasks_append_is_still_classified_as_a_blocking_append() {
-    let (_temp, _db, orch) = fixture().await;
+    let (_temp, _db, orch, run) = fixture().await;
 
     let result = common::change_resource_as_run(
         &orch,
@@ -257,7 +260,7 @@ async fn a_home_relative_tasks_append_is_still_classified_as_a_blocking_append()
                 "prompt": "Trace how executors are placed."
             }
         }]),
-        Some(RUN),
+        Some(&run),
     )
     .await;
 
@@ -275,7 +278,7 @@ async fn a_home_relative_tasks_append_is_still_classified_as_a_blocking_append()
         "the blocking group must be the path that ran: {result}"
     );
     assert_eq!(
-        written_intent().await,
+        written_intent(&run).await,
         None,
         "a tasks append writes no record"
     );
@@ -283,7 +286,7 @@ async fn a_home_relative_tasks_append_is_still_classified_as_a_blocking_append()
 
 #[tokio::test]
 async fn blocking_envelope_keeps_successes_and_failures_in_the_same_report() {
-    let (_temp, _db, orch) = fixture().await;
+    let (_temp, _db, orch, run) = fixture().await;
     let result = common::change_resource_as_run(
         &orch,
         json!([
@@ -307,7 +310,7 @@ async fn blocking_envelope_keeps_successes_and_failures_in_the_same_report() {
                 }
             }
         ]),
-        Some(RUN),
+        Some(&run),
     )
     .await;
     let report: serde_json::Value = serde_json::from_str(&result).unwrap();

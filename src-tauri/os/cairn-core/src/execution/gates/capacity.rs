@@ -792,6 +792,13 @@ const OPEN_THREAD_CHILDREN_SQL: &str = concat!(
     " ORDER BY i.number"
 );
 
+/// Issue `?1` as `(number, id)` when it would count as an open child of a
+/// thread it hung from: the open-child predicate, applied to one issue.
+const OPEN_ISSUE_SQL: &str = concat!(
+    "SELECT i.number, i.id FROM issues i WHERE i.id = ?1 AND ",
+    cairn_db::open_thread_child_sql!()
+);
+
 /// The thread an issue is a child of, as the focus cap reads it.
 #[derive(Debug, Clone)]
 struct IssueThread {
@@ -1518,6 +1525,71 @@ pub async fn decide(
         execution_id,
     };
     let snapshot = QueueSnapshot::load(orch, std::slice::from_ref(&start)).await?;
+    Ok(snapshot.decide(&start))
+}
+
+/// [`decide`] for a new filing on `issue_id` as if the issue were already a
+/// child of thread `thread_id`: what a filing that adopts the issue first will
+/// meet. Reads only; the issue's own parent edge, if it has one, wins.
+pub(crate) async fn decide_with_thread(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    issue_id: &str,
+    thread_id: &str,
+) -> Result<Admission, String> {
+    let start = Start {
+        db,
+        issue_id: Some(issue_id),
+        execution_id: None,
+    };
+    let mut snapshot = QueueSnapshot::load(orch, std::slice::from_ref(&start)).await?;
+    if !snapshot.issues.contains_key(issue_id) {
+        let (issue, thread) = (issue_id.to_string(), thread_id.to_string());
+        let read = db
+            .read(move |conn| {
+                let (issue, thread) = (issue.clone(), thread.clone());
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT t.name, i.number FROM threads t, issues i
+                              WHERE t.id = ?1 AND i.id = ?2",
+                            params![thread.as_str(), issue.as_str()],
+                        )
+                        .await?;
+                    let Some(row) = rows.next().await? else {
+                        return Ok(None);
+                    };
+                    let found = IssueThread {
+                        thread_id: thread.clone(),
+                        thread_name: row.text(0)?,
+                        number: row.i64(1)?,
+                    };
+                    drop(rows);
+                    // Once adopted, the issue's own live work or open PR
+                    // makes it one of the thread's open children, which the
+                    // decision exempts from the cap it already counts in.
+                    let mut open = open_thread_children_conn(conn, &thread).await?;
+                    let mut rows = conn.query(OPEN_ISSUE_SQL, params![issue.as_str()]).await?;
+                    if let Some(row) = rows.next().await? {
+                        let own = (row.i64(0)?, row.text(1)?);
+                        if !open.contains(&own) {
+                            open.push(own);
+                            open.sort();
+                        }
+                    }
+                    Ok(Some((found, open)))
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some((found, open)) = read {
+            snapshot
+                .open_children
+                .entry(thread_id.to_string())
+                .or_insert(open);
+            snapshot.issues.insert(issue_id.to_string(), found);
+        }
+    }
     Ok(snapshot.decide(&start))
 }
 

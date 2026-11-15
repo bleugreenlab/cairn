@@ -435,112 +435,19 @@ async fn launch_recipe_execution(
         }
     }
 
-    // Get project path for file-based recipe loading
-    let project_path = project_path_for_recipe(&db, project_id).await?;
-
-    // Every caller resolves its recipe before it gets here: an unnamed
-    // execution create through `recipe_resolution`, the composer and the
-    // scheduler by naming one.
-    let recipe = match recipe_id {
-        Some(id) => get_selected_recipe(&orch.config_dir, &project_path, project_id, id)?,
-        None => return Err("No recipe specified for execution".to_string()),
-    };
-
-    // The snapshot carries each agent's allotment, and a pin only where an
-    // operator chose one. Each node selects its model at its own launch.
-    let mut snapshot = build_execution_snapshot_from_files(
+    let (recipe, snapshot) = compose_launch_snapshot(
         orch,
-        Some(&project_path),
-        &recipe,
-        Some(issue_id),
+        &db,
+        issue_id,
+        recipe_id,
         project_id,
-        trigger_type.clone(),
-        None,
-    )?;
-    snapshot.trigger_context.initiated_via = initiated_via.map(str::to_string);
-
-    // A delta is compiled against the recipe as it just resolved, into exactly
-    // the overrides the composer would have sent. Everything below this line
-    // sees one grammar and cannot tell which door the launch came through.
-    let overrides = match customization {
-        None => None,
-        Some(LaunchCustomization::Snapshot(overrides)) => Some(overrides),
-        Some(LaunchCustomization::Deltas(deltas)) => {
-            let resolve_agent =
-                |agent_id: &str| -> Result<Option<crate::models::AgentSnapshot>, String> {
-                    match config_agents::get_agent(
-                        &LibraryRoots::at(&orch.config_dir, Some(&project_path)),
-                        agent_id,
-                    ) {
-                        Ok(Some(file_agent)) => Ok(Some(file_agent.snapshot())),
-                        Ok(None) => Ok(None),
-                        Err(error) => Err(format!("Failed to load agent '{agent_id}': {error}")),
-                    }
-                };
-            Some(deltas.compile(&snapshot, &resolve_agent)?)
-        }
-    };
-
-    // Apply overrides if provided
-    if let Some(overrides) = overrides {
-        if let Some(recipe_override) = overrides.recipe {
-            snapshot.recipe = recipe_override;
-        }
-        if let Some(agents_override) = overrides.agents {
-            // Composer output is stored verbatim: a pin with its extras, or an
-            // allotment the node selects within at launch.
-            for (agent_id, agent_snapshot) in agents_override {
-                snapshot.agents.insert(agent_id, agent_snapshot);
-            }
-        }
-
-        // Load any new agents referenced by the overridden recipe that aren't in the snapshot
-        let new_agent_ids: Vec<String> = snapshot
-            .recipe
-            .nodes
-            .iter()
-            .filter(|n| n.node_type == RecipeNodeType::Agent)
-            .filter_map(|n| {
-                n.agent_config
-                    .as_ref()
-                    .and_then(|cfg| cfg.agent_config_id.clone())
-            })
-            .filter(|id| !snapshot.agents.contains_key(id))
-            .collect();
-
-        if !new_agent_ids.is_empty() {
-            // Load each new agent
-            for agent_id in new_agent_ids {
-                if let Ok(Some(file_agent)) = config_agents::get_agent(
-                    &LibraryRoots::at(&orch.config_dir, Some(&project_path)),
-                    &agent_id,
-                ) {
-                    snapshot
-                        .agents
-                        .insert(agent_id.clone(), file_agent.snapshot());
-                }
-            }
-        }
-    }
-
-    // Resolve the branch target LAST, so a launch-time graph edit from the
-    // composer is transformed too rather than bypassing it.
-    crate::execution::branch_target::apply_branch_target(
-        &mut snapshot,
+        customization,
+        initiated_via,
         branch_target,
-        &recipe.branch_targets,
-    )?;
-
-    // What this execution does with committed work its predecessors left. Read
-    // at branch-mint time by `execution::continuity`; `None` is `Auto`, which is
-    // what every launch that does not think about it should get.
-    snapshot.continuity = continuity.unwrap_or_default();
-
-    // A constraint reads an upstream node's stored selection at launch, so the
-    // graph the execution will actually run is checked now, before any row
-    // exists, rather than refusing mid-run.
-    check_node_constraints(&snapshot.recipe)?;
-
+        continuity,
+        trigger_type.clone(),
+    )
+    .await?;
     let snapshot_json = snapshot.to_json()?;
 
     // Gates whose evidence is already in wait on nothing, so the cycle refusal
@@ -647,6 +554,166 @@ async fn launch_recipe_execution(
         execution,
         held_by: caps,
     })
+}
+
+/// The recipe and the snapshot a launch of `recipe_id` on `issue_id` freezes:
+/// the recipe loaded and enabled for the project, the caller's customization
+/// compiled and applied, the branch target and continuity resolved, and the
+/// node constraints checked. It reads configuration and writes nothing, so a
+/// caller that must refuse before it changes anything runs exactly the checks
+/// the launch will ([`check_issue_launch`]).
+#[allow(clippy::too_many_arguments)]
+async fn compose_launch_snapshot(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    issue_id: &str,
+    recipe_id: Option<&str>,
+    project_id: &str,
+    customization: Option<LaunchCustomization>,
+    initiated_via: Option<&str>,
+    branch_target: Option<BranchTarget>,
+    continuity: Option<Continuity>,
+    trigger_type: TriggerType,
+) -> Result<(crate::models::Recipe, ExecutionSnapshot), String> {
+    // Get project path for file-based recipe loading
+    let project_path = project_path_for_recipe(db, project_id).await?;
+
+    // Every caller resolves its recipe before it gets here: an unnamed
+    // execution create through `recipe_resolution`, the composer and the
+    // scheduler by naming one.
+    let recipe = match recipe_id {
+        Some(id) => get_selected_recipe(&orch.config_dir, &project_path, project_id, id)?,
+        None => return Err("No recipe specified for execution".to_string()),
+    };
+
+    // The snapshot carries each agent's allotment, and a pin only where an
+    // operator chose one. Each node selects its model at its own launch.
+    let mut snapshot = build_execution_snapshot_from_files(
+        orch,
+        Some(&project_path),
+        &recipe,
+        Some(issue_id),
+        project_id,
+        trigger_type,
+        None,
+    )?;
+    snapshot.trigger_context.initiated_via = initiated_via.map(str::to_string);
+
+    // A delta is compiled against the recipe as it just resolved, into exactly
+    // the overrides the composer would have sent. Everything below this line
+    // sees one grammar and cannot tell which door the launch came through.
+    let overrides = match customization {
+        None => None,
+        Some(LaunchCustomization::Snapshot(overrides)) => Some(overrides),
+        Some(LaunchCustomization::Deltas(deltas)) => {
+            let resolve_agent =
+                |agent_id: &str| -> Result<Option<crate::models::AgentSnapshot>, String> {
+                    match config_agents::get_agent(
+                        &LibraryRoots::at(&orch.config_dir, Some(&project_path)),
+                        agent_id,
+                    ) {
+                        Ok(Some(file_agent)) => Ok(Some(file_agent.snapshot())),
+                        Ok(None) => Ok(None),
+                        Err(error) => Err(format!("Failed to load agent '{agent_id}': {error}")),
+                    }
+                };
+            Some(deltas.compile(&snapshot, &resolve_agent)?)
+        }
+    };
+
+    // Apply overrides if provided
+    if let Some(overrides) = overrides {
+        if let Some(recipe_override) = overrides.recipe {
+            snapshot.recipe = recipe_override;
+        }
+        if let Some(agents_override) = overrides.agents {
+            // Composer output is stored verbatim: a pin with its extras, or an
+            // allotment the node selects within at launch.
+            for (agent_id, agent_snapshot) in agents_override {
+                snapshot.agents.insert(agent_id, agent_snapshot);
+            }
+        }
+
+        // Load any new agents referenced by the overridden recipe that aren't in the snapshot
+        let new_agent_ids: Vec<String> = snapshot
+            .recipe
+            .nodes
+            .iter()
+            .filter(|n| n.node_type == RecipeNodeType::Agent)
+            .filter_map(|n| {
+                n.agent_config
+                    .as_ref()
+                    .and_then(|cfg| cfg.agent_config_id.clone())
+            })
+            .filter(|id| !snapshot.agents.contains_key(id))
+            .collect();
+
+        if !new_agent_ids.is_empty() {
+            // Load each new agent
+            for agent_id in new_agent_ids {
+                if let Ok(Some(file_agent)) = config_agents::get_agent(
+                    &LibraryRoots::at(&orch.config_dir, Some(&project_path)),
+                    &agent_id,
+                ) {
+                    snapshot
+                        .agents
+                        .insert(agent_id.clone(), file_agent.snapshot());
+                }
+            }
+        }
+    }
+
+    // Resolve the branch target LAST, so a launch-time graph edit from the
+    // composer is transformed too rather than bypassing it.
+    crate::execution::branch_target::apply_branch_target(
+        &mut snapshot,
+        branch_target,
+        &recipe.branch_targets,
+    )?;
+
+    // What this execution does with committed work its predecessors left. Read
+    // at branch-mint time by `execution::continuity`; `None` is `Auto`, which is
+    // what every launch that does not think about it should get.
+    snapshot.continuity = continuity.unwrap_or_default();
+
+    // A constraint reads an upstream node's stored selection at launch, so the
+    // graph the execution will actually run is checked now, before any row
+    // exists, rather than refusing mid-run.
+    check_node_constraints(&snapshot.recipe)?;
+    Ok((recipe, snapshot))
+}
+
+/// Whether a launch of `recipe_id` on `issue_id` with these options would get
+/// past its configuration checks, without filing anything: the same
+/// composition [`launch_recipe_execution`] runs. What it cannot answer is
+/// decided inside the launch's own transaction (admission, a wait cycle).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn check_issue_launch(
+    orch: &Orchestrator,
+    issue_id: &str,
+    recipe_id: &str,
+    project_id: &str,
+    customization: Option<LaunchCustomization>,
+    branch_target: Option<BranchTarget>,
+    continuity: Option<Continuity>,
+) -> Result<(), String> {
+    let db = resolve_owning_db_for_project(orch, project_id).await?;
+    compose_launch_snapshot(
+        orch,
+        &db,
+        issue_id,
+        Some(recipe_id),
+        project_id,
+        customization,
+        Some("external"),
+        branch_target,
+        continuity,
+        TriggerType::Manual,
+    )
+    .await?
+    .1
+    .to_json()
+    .map(|_| ())
 }
 
 /// The snapshot a launch of `recipe_id` in `project_id` would freeze, with no

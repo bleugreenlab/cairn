@@ -609,23 +609,28 @@ mod tests {
 
     /// [`orchestrator`], handing back the emitter it announces through.
     async fn orchestrator_capturing(name: &str) -> (Orchestrator, Arc<CapturingEmitter>) {
+        let general_id = format!("operator-general-{}", uuid::Uuid::new_v4());
+        let other_id = format!("operator-other-{}", uuid::Uuid::new_v4());
         let emitter = Arc::new(CapturingEmitter::new());
         let dir = tempfile::tempdir().unwrap().keep();
         let local = LocalDb::open_migrated_for_test(dir.join("t.db"))
             .await
             .unwrap();
         local
-            .execute_script(
+            .execute_script(format!(
                 "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);
                  INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at)
                  VALUES ('p','w','P','prj','/tmp/p',1,1);
                  INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
-                 VALUES ('t-general', 'p', 'general', 'active', 1, 1),
-                        ('t-other', 'p', 'other', 'active', 1, 1);",
-            )
+                 VALUES ('{general_id}', 'p', 'general', 'active', 1, 1),
+                        ('{other_id}', 'p', 'other', 'active', 1, 1);",
+            ))
             .await
             .unwrap();
-        for (thread, run) in [("t-general", "r-live"), ("t-other", "r-other")] {
+        for (thread, run) in [
+            (general_id.as_str(), "r-live"),
+            (other_id.as_str(), "r-other"),
+        ] {
             crate::threads::db_store::use_test_path(
                 thread,
                 dir.join(format!("{name}-{thread}.db")),
@@ -660,6 +665,15 @@ mod tests {
         )
         .build();
         (orch, emitter)
+    }
+
+    async fn general_thread_id(orch: &Orchestrator) -> String {
+        orch.db
+            .local
+            .query_opt_text("SELECT id FROM threads WHERE name = 'general'", ())
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     fn request(run_id: Option<&str>) -> McpCallbackRequest {
@@ -912,7 +926,7 @@ mod tests {
             message.headline.as_deref(),
             Some("cairn://p/prj/general/db/headlines/1")
         );
-        let store = crate::threads::db_store::open_existing("t-general")
+        let store = crate::threads::db_store::open_existing(&general_thread_id(&orch).await)
             .await
             .unwrap()
             .unwrap();
@@ -932,9 +946,14 @@ mod tests {
         assert_eq!(row.conversation, "+15551234567");
         assert_eq!(row.status, "pending");
 
-        let seen = crate::operator::messages::cursor_moved(&orch, "t-general", 1, 1_000)
-            .await
-            .unwrap();
+        let seen = crate::operator::messages::cursor_moved(
+            &orch,
+            &general_thread_id(&orch).await,
+            1,
+            1_000,
+        )
+        .await
+        .unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(
             state_of(&orch, &id).await,
@@ -961,12 +980,15 @@ mod tests {
             content.contains(&messages::message_uri(&id)) && content.contains("I merge at 5pm"),
             "{content}"
         );
-        assert!(
-            crate::operator::messages::cursor_moved(&orch, "t-general", 1, 2_000)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(crate::operator::messages::cursor_moved(
+            &orch,
+            &general_thread_id(&orch).await,
+            1,
+            2_000
+        )
+        .await
+        .unwrap()
+        .is_empty());
     }
 
     /// A read receipt fed to a sent row stamps `read_at` once and sees the
@@ -1090,7 +1112,7 @@ mod tests {
             orch.db
                 .local
                 .query_opt_text(
-                    "SELECT content FROM messages WHERE channel_type = 'thread' AND channel_id = 't-general' ORDER BY created_at DESC LIMIT 1",
+                    "SELECT content FROM messages WHERE channel_type = 'thread' AND channel_id = (SELECT id FROM threads WHERE name = 'general') ORDER BY created_at DESC LIMIT 1",
                     (),
                 )
                 .await
@@ -1331,7 +1353,7 @@ mod tests {
             .local
             .execute_script(
                 "DROP TRIGGER refuse_answer;
-                 UPDATE threads SET status = 'closed' WHERE id = 't-general';",
+                 UPDATE threads SET status = 'closed' WHERE id = (SELECT id FROM threads WHERE name = 'general');",
             )
             .await
             .unwrap();
@@ -1349,7 +1371,7 @@ mod tests {
         orch.db
             .local
             .execute(
-                "UPDATE threads SET status = 'active' WHERE id = 't-general'",
+                "UPDATE threads SET status = 'active' WHERE id = (SELECT id FROM threads WHERE name = 'general')",
                 (),
             )
             .await
