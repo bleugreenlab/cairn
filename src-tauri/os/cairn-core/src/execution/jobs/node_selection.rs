@@ -888,9 +888,9 @@ pub(super) mod tests {
         let reads_pin = launch(&orch, &db, "review-pinned").unwrap();
         assert_eq!(model_ref(&reads_pin.chosen), "codex/gpt-5.6-sol");
         assert!(
-            reads_pin
-                .provenance
-                .ends_with("maker openai differs from builder-pinned's anthropic"),
+            reads_pin.provenance.ends_with(
+                "maker openai differs from builder-pinned's anthropic; effort: provider default"
+            ),
             "{}",
             reads_pin.provenance
         );
@@ -901,7 +901,7 @@ pub(super) mod tests {
         assert_eq!(model_ref(&open.chosen), "codex/gpt-5.6-sol");
         assert!(
             open.provenance.ends_with(
-                "no model from a maker other than openai in [codex/gpt-5.6-sol, codex/gpt-5.6-terra]; same maker as builder-2"
+                "no model from a maker other than openai in [codex/gpt-5.6-sol, codex/gpt-5.6-terra]; same maker as builder-2; effort: provider default"
             ),
             "{}",
             open.provenance
