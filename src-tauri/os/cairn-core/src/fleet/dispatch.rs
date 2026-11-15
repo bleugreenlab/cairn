@@ -3406,6 +3406,11 @@ impl Fleet {
             .iter()
             .map(|(_, suite, _)| suite.clone())
             .collect();
+        let batch_classes: Vec<_> = plan
+            .batch_suites
+            .iter()
+            .map(|(_, _, class)| *class)
+            .collect();
         let batch_items_share_the_machine = plan.parallel_width > 1;
         let profile_identity = request.command_resource_identity.clone();
         let standing = self.purposes.lock().unwrap().live_key_of(&key).is_some();
@@ -3887,8 +3892,6 @@ impl Fleet {
                     profile_identity.as_ref(),
                     &profile_context,
                     metadata,
-                    false,
-                    selected.capabilities.memory_budget_bytes,
                 )
                 .await;
                 let kind = resource_profiles::CompletionKind::classify(
@@ -3898,6 +3901,7 @@ impl Fleet {
                 resource_profiles::observe_suite(
                     db.clone(),
                     request_suite.as_deref(),
+                    admission_request.command_class,
                     &profile_context,
                     metadata,
                     kind,
@@ -3954,6 +3958,7 @@ impl Fleet {
                     resource_profiles::observe_suite(
                         db.clone(),
                         batch_suites.get(index).and_then(|suite| suite.as_deref()),
+                        batch_classes[index],
                         &profile_context,
                         &metadata.for_batch_item(item),
                         resource_profiles::CompletionKind::classify(
@@ -3996,8 +4001,6 @@ impl Fleet {
                         Some(identity),
                         &profile_context,
                         &item_meta,
-                        batch_items_share_the_machine,
-                        selected.capabilities.memory_budget_bytes,
                     )
                     .await;
                     resource_profiles::observe_completed(

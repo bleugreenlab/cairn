@@ -9347,6 +9347,17 @@ pub struct LearnedResourceEstimate {
 /// version handshake requires an update before either side
 /// relies on this admission contract.
 ///
+/// cairn/7242 does not move the number. Cause-aware kill events are optional,
+/// defaulted runner-side diagnostic evidence; executors already send OomKilled
+/// bound_bytes. An older executor supplies that existing field, or leaves its
+/// cause unknown. Placement also refuses a minimum admissible charge above
+/// the already advertised service-unit memory.max, using the existing grant
+/// solver. ExceedsExecutorMemoryBound is runner-only placement vocabulary;
+/// no executor decodes it. An older executor receives fewer offers but reads
+/// every offer unchanged; no executor message, charge, launch or admission
+/// semantics change. An older runner ignores the defaulted event diagnostic.
+/// Host-size inference retirement is runner-local policy.
+///
 /// cairn/7098 does not move the number. The runner-only `fleet/mod.rs` is split
 /// into sibling files (`listener`, `colocated`, `relay_authority`,
 /// `residency_routes`, `purpose_debts`, `selection`, `dispatch`, `health`,
@@ -11637,6 +11648,10 @@ pub struct MemoryGrant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryGrantShortfall {
     pub minimum_charge_bytes: u64,
+    /// Whether the minimum is one build job's charge from a usable job census.
+    /// Without one the whole measured tree is charged, which is missing width
+    /// evidence rather than a measured one-job excess.
+    pub width_measured: bool,
 }
 
 impl ResourceReservation {
@@ -11671,6 +11686,7 @@ impl ResourceReservation {
         if minimum_charge_bytes > limit_bytes {
             return Err(MemoryGrantShortfall {
                 minimum_charge_bytes,
+                width_measured: widest.is_some(),
             });
         }
         let Some(mut high) = widest else {
@@ -22227,26 +22243,70 @@ pub struct MemoryKill {
     pub victim_resident_bytes: u64,
     /// When the most recent kill happened.
     pub killed_at_unix_ms: u64,
-    /// The machine's memory, when a kill happened while nothing else of
-    /// Cairn's ran there and no run has succeeded here since. Such a kill is
-    /// the machine's answer that it cannot run the command at all, not a
-    /// crowding fact.
+    /// Legacy start-time isolation inference, retained for decoding old records.
+    /// It is not proof of host demand and current policy never consumes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alone_on_machine_bytes: Option<u64>,
+    /// One event, never assembled from independently aggregated maxima.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<MemoryKillEvent>,
+}
+
+/// What bounded one kernel kill, as far as the executor's report shows: the
+/// unit's `memory.max` when the report carries it, otherwise unknown. No
+/// executor can yet tell a host-global kill from a cgroup one, or say whether
+/// the victim was alone when it died, so neither has a variant; missing
+/// evidence is never global OOM.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MemoryKillCause {
+    ExecutorCgroup,
+    #[default]
+    Unknown,
+}
+
+/// One kill as reported, kept whole rather than assembled from aggregated
+/// maxima.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryKillEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub victim_resident_bytes: Option<u64>,
+    pub killed_at_unix_ms: u64,
+    pub bound_bytes: Option<u64>,
+    pub cause: MemoryKillCause,
+}
+
+impl MemoryKillEvent {
+    pub fn describe_bound(&self) -> String {
+        match (self.cause, self.bound_bytes) {
+            (MemoryKillCause::ExecutorCgroup, Some(bound)) => format!(
+                "executor cgroup memory.max {:.2} GiB",
+                bound as f64 / (1024.0 * 1024.0 * 1024.0)
+            ),
+            _ => "bound unknown".into(),
+        }
+    }
 }
 
 impl MemoryKill {
     fn describe(&self, ceiling: &str) -> String {
-        let resident = describe_gib(self.victim_resident_bytes);
-        match self.alone_on_machine_bytes {
-            Some(machine) => format!(
-                "the kernel killed it here for memory at {resident} resident while it ran alone on this {} machine, which can hold at most {ceiling} for one request",
-                describe_gib(machine)
-            ),
-            None => format!(
-                "the kernel killed it here for memory at {resident} resident, more than this machine can ever hold ({ceiling})"
-            ),
-        }
+        let floor = describe_gib(self.victim_resident_bytes);
+        let event = self.event.map_or_else(
+            || "legacy aggregate only; bound unknown".into(),
+            |event| {
+                let victim = event
+                    .victim_resident_bytes
+                    .map_or_else(|| "victim size unknown".into(), describe_gib);
+                format!(
+                    "latest event at {}: victim {victim}, {}",
+                    event.killed_at_unix_ms,
+                    event.describe_bound()
+                )
+            },
+        );
+        format!("historical maximum kill-victim floor {floor} exceeds this request's ceiling ({ceiling}); {event}; a representative clean run reassesses kill policy, not the measured process guard")
     }
 }
 
@@ -22292,11 +22352,6 @@ pub struct ProcessMisfit {
     /// holds free.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_bytes: Option<u64>,
-    /// Kills of this suite on this machine at this total while it ran alone
-    /// there, under the machine's current admission, when the count rather
-    /// than the size decided the misfit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kills_here: Option<u32>,
     /// Kills of this suite here while other commands shared the machine.
     /// They decided nothing; they are named so a reader does not take them
     /// for the machine's answer.
@@ -22439,13 +22494,7 @@ impl ProcessMisfit {
             "needs one process of ~{} ({evidence})",
             describe_gib(self.process_bytes)
         );
-        let decided = match self.kills_here {
-            Some(kills) => format!(
-                "{demand}; the kernel killed it here for memory {kills} times while it ran alone on this {} machine, which is its answer until its memory changes",
-                describe_gib(self.total_bytes)
-            ),
-            None => format!("{demand}; {capacity}"),
-        };
+        let decided = format!("{demand}; {capacity}");
         match &self.crowded_kills {
             Some(crowded) => format!("{decided}; {}", crowded.describe()),
             None => decided,
@@ -22963,6 +23012,16 @@ pub enum PlacementRejectionReason {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         killed_here: Option<MemoryKill>,
     },
+    /// The minimum admissible charge cannot fit the executor unit's physical
+    /// bound. Runner-only placement evidence, never sent to an executor.
+    ExceedsExecutorMemoryBound {
+        charge_bytes: u64,
+        bound_bytes: u64,
+        /// [`MemoryGrantShortfall::width_measured`]: false when no local job
+        /// census priced the work, so its whole tree was charged.
+        #[serde(default)]
+        width_measured: bool,
+    },
     /// The kernel killed this command for memory on this machine while nothing
     /// else of Cairn's ran there: the machine's own answer that it cannot run
     /// the command. Unlike [`Self::ExceedsMemoryCeiling`] this is never placed
@@ -23258,6 +23317,19 @@ impl PlacementRejectionReason {
                 required_bytes,
                 free_bytes,
             } => format!("needs {required_bytes} bytes of volume, has {free_bytes}"),
+            Self::ExceedsExecutorMemoryBound {
+                charge_bytes,
+                bound_bytes,
+                width_measured,
+            } => {
+                let charge = *charge_bytes as f64 / (1u64 << 30) as f64;
+                let bound = *bound_bytes as f64 / (1u64 << 30) as f64;
+                if *width_measured {
+                    format!("minimum admissible charge {charge:.2} GiB at one build job exceeds executor cgroup memory.max {bound:.2} GiB")
+                } else {
+                    format!("no local job census; charged its whole measured tree of {charge:.2} GiB, above executor cgroup memory.max {bound:.2} GiB (missing width evidence, not a measured one-job excess)")
+                }
+            }
             Self::ExceedsMemoryCeiling {
                 estimate_bytes,
                 ceiling_bytes,
@@ -25795,6 +25867,38 @@ pub fn encode_executor_message(message: &ExecutorMessage) -> Result<String, serd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_kill_legacy_decode_preserves_unknown_event_and_atomic_bound() {
+        let legacy = serde_json::json!({
+            "victimResidentBytes": 17_495_982_080_u64,
+            "killedAtUnixMs": 10,
+            "aloneOnMachineBytes": 66_482_995_200_u64
+        });
+        let mut kill: MemoryKill = serde_json::from_value(legacy).unwrap();
+        assert_eq!(kill.event, None);
+        assert!(!serde_json::to_value(kill)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("event"));
+        kill.event = Some(MemoryKillEvent {
+            pid: Some(237152),
+            victim_resident_bytes: Some(8_000_000_000),
+            killed_at_unix_ms: 20,
+            bound_bytes: Some(49_660_559_360),
+            cause: MemoryKillCause::ExecutorCgroup,
+        });
+        let encoded = serde_json::to_value(kill).unwrap();
+        let decoded: MemoryKill = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, kill);
+        assert_eq!(
+            decoded.event.unwrap().describe_bound(),
+            "executor cgroup memory.max 46.25 GiB"
+        );
+        assert_eq!(decoded.victim_resident_bytes, 17_495_982_080);
+        assert_eq!(encoded["event"]["victimResidentBytes"], 8_000_000_000_u64);
+    }
 
     #[test]
     fn memory_diagnostic_bounds_and_absent_report_envelope() {

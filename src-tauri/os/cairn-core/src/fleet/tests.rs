@@ -7668,6 +7668,7 @@ async fn process_fit_fleet(
     resource_profiles::observe_suite(
         db.clone(),
         suite.as_deref(),
+        CellCommandClass::CargoTest,
         &measured_on.unwrap(),
         &CellExecutionMeta {
             stop: None,
@@ -8275,6 +8276,7 @@ async fn a_cold_compile_is_offered_the_small_machine_last_on_the_class_prior() {
             resource_profiles::observe_suite(
                 db.clone(),
                 Some(&format!("{}/rust-tests", request.project_id)),
+                CellCommandClass::CargoTest,
                 &small.unwrap(),
                 &CellExecutionMeta {
                     stop: None,
@@ -8424,6 +8426,7 @@ async fn the_only_macos_machine_is_offered_a_suite_its_unnamed_peak_would_have_r
     resource_profiles::observe_suite(
         db.clone(),
         suite.as_deref(),
+        CellCommandClass::CargoTest,
         &context,
         &CellExecutionMeta {
             stop: None,
@@ -8586,8 +8589,6 @@ async fn killed_fleet_in(
                 co_resident_compile_jobs,
                 now,
             ),
-            false,
-            Some(UB_BUDGET),
         )
         .await;
     }
@@ -8643,57 +8644,36 @@ async fn a_command_killed_for_memory_is_not_placed_back_where_it_does_not_fit() 
     assert_eq!(
         refused.reason,
         PlacementRejectionReason::InsufficientMemory {
-            required_bytes: 3_650_722_201,
+            required_bytes: 4_563_402_751,
             available_bytes: available,
         }
     );
 }
 
-/// Killed while it ran alone, the command is excluded from that machine
-/// however idle it is now, and the exclusion names the kill.
+/// A command's start-load isolation cannot veto an otherwise safe candidate.
 #[tokio::test]
-async fn a_command_killed_alone_is_placed_elsewhere_however_idle_its_machine_is() {
-    const GIB: u64 = 1024 * 1024 * 1024;
+async fn a_command_killed_with_zero_start_load_remains_a_candidate() {
+    const GIB: u64 = 1 << 30;
     let (pool, db, request) = killed_fleet("oom-alone-placement.db", 10 * GIB, 0).await;
+    pool.lock_connections().remove("fedora");
     let placement = place_once(&pool, db, &request).await;
-    assert_eq!(placement.selected.executor_id, "fedora");
+    assert_eq!(placement.selected.executor_id, "bgsrv-ub");
     assert!(placement.above_ceiling.is_none());
-    assert_excluded_by_its_kill(&placement.decision.rejected);
-}
-
-fn assert_excluded_by_its_kill(rejected: &[PlacementRejection]) {
-    let refused = rejected
-        .iter()
-        .find(|rejection| rejection.executor_id == "bgsrv-ub")
-        .expect("the killed machine is on the record");
-    let PlacementRejectionReason::MemoryKillExcluded {
-        victim_resident_bytes,
-        machine_total_bytes,
-        ..
-    } = &refused.reason
-    else {
-        panic!(
-            "expected the exclusion naming the kill, got {:?}",
-            refused.reason
-        );
-    };
-    assert_eq!(*victim_resident_bytes, 3_650_722_201);
-    assert_eq!(*machine_total_bytes, 13_000_000_000);
-    let said = refused.reason.describe();
-    assert!(said.starts_with("excluded:"), "{said}");
     assert!(
-        said.contains("while it ran alone on this 12.1 GiB machine"),
-        "{said}"
+        placement
+            .reservation
+            .as_ref()
+            .unwrap()
+            .reservation
+            .memory_bytes
+            >= 3_650_722_201
     );
 }
 
-/// cairn/5472: the kill ledger is the database the runner opens, read on
-/// every decision, so a runner booting onto a ledger an earlier one wrote
-/// refuses the machine on its very first placement. There is no warm-up in
-/// which the machine the command died on alone is fair game.
+/// Reopening persisted kill evidence applies the same causal policy immediately.
 #[tokio::test]
-async fn a_runner_booting_onto_a_kill_ledger_refuses_the_machine_on_its_first_decision() {
-    const GIB: u64 = 1024 * 1024 * 1024;
+async fn a_runner_booting_onto_a_kill_ledger_retires_the_false_host_exclusion() {
+    const GIB: u64 = 1 << 30;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("oom-boot.db");
     {
@@ -8710,63 +8690,17 @@ async fn a_runner_booting_onto_a_kill_ledger_refuses_the_machine_on_its_first_de
             .unwrap(),
     );
     let (pool, request) = killed_fleet_in(db.clone(), 10 * GIB, 0, false).await;
-    let placement = place_once(&pool, db, &request).await;
-    assert_eq!(placement.selected.executor_id, "fedora");
-    assert_excluded_by_its_kill(&placement.decision.rejected);
-}
-
-/// cairn/5472: when the only machine that could take the work is one the
-/// command was killed on alone, the request waits rather than being placed
-/// there; the queue view says why while it waits, and the horizon's
-/// refusal names the exclusion.
-#[tokio::test]
-async fn a_request_whose_only_taker_is_an_excluded_machine_waits_and_says_why() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let (pool, db, mut request) = killed_fleet("oom-alone-only-taker.db", 10 * GIB, 0).await;
     pool.lock_connections().remove("fedora");
-    let plan = ReservationPlan::new(db, &request, None);
-    let policy = ActivePlacementPolicy::default_profile();
-
-    let selection = pool
-        .select_executor_once_with(
-            &request,
-            Some(&plan),
-            &policy,
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .expect("an exclusion is waited out, not refused");
-    let Selection::Waiting { rejected } = selection else {
-        panic!("placed on the machine the command was killed on alone");
-    };
-    assert_excluded_by_its_kill(&rejected);
-
-    request.wait_horizon_unix_ms = unix_time_ms() + 400;
-    let refusal = pool
-        .select_executor(&request, Some(&plan), &policy, None)
-        .await
-        .expect_err("nothing else ever became usable");
-    let CellOutcome::Unavailable { diagnostic, .. } = refusal else {
-        panic!("expected a refusal at the horizon, got {refusal:?}");
-    };
-    assert!(diagnostic.contains("wait horizon"), "{diagnostic}");
-    assert!(diagnostic.contains("bgsrv-ub: excluded:"), "{diagnostic}");
-
-    let waits: Vec<String> = pool
-        .placements_naming("bgsrv-ub")
-        .into_iter()
-        .filter_map(|decision| match decision.outcome {
-            PlacementOutcome::Waiting { diagnostic } => Some(diagnostic),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(waits.len(), 1, "recorded once while unchanged: {waits:?}");
+    let placement = place_once(&pool, db, &request).await;
+    assert_eq!(placement.selected.executor_id, "bgsrv-ub");
     assert!(
-        waits[0].contains("bgsrv-ub: excluded:") && waits[0].contains("12.1 GiB machine"),
-        "{}",
-        waits[0]
+        placement
+            .reservation
+            .as_ref()
+            .unwrap()
+            .reservation
+            .memory_bytes
+            >= 3_650_722_201
     );
 }
 
@@ -8944,49 +8878,6 @@ async fn a_learned_peak_above_every_eligible_ceiling_places_a_probe_rather_than_
         placement.above_ceiling.is_some(),
         "the probe is placed at the clamp, and says so"
     );
-}
-
-/// The exclusion is the machine's answer at the size it was killed at.
-/// Growth past it, by more than a reading's jitter, lifts it; an unread
-/// total does not, and a crowded kill never excluded anything.
-#[test]
-fn a_kill_alone_stops_excluding_only_once_the_machine_has_grown() {
-    const TOTAL: u64 = 13_000_000_000;
-    let kill = cairn_common::executor_protocol::MemoryKill {
-        victim_resident_bytes: 6_871_947_673,
-        killed_at_unix_ms: 10,
-        alone_on_machine_bytes: Some(TOTAL),
-    };
-    let machine = |total_bytes: u64| cairn_common::executor_protocol::MachineTelemetry {
-        host_temp: None,
-        memory: Measurement::measured(
-            1,
-            cairn_common::executor_protocol::MachineMemory {
-                total_bytes,
-                available_bytes: total_bytes / 2,
-            },
-        ),
-        ..Default::default()
-    };
-    assert!(memory_kill_exclusion(&kill, &machine(TOTAL)).is_some());
-    assert!(
-        memory_kill_exclusion(&kill, &machine(TOTAL + TOTAL / 32)).is_some(),
-        "jitter in the reported total is not a new machine"
-    );
-    assert!(memory_kill_exclusion(&kill, &machine(2 * TOTAL)).is_none());
-    assert!(
-        memory_kill_exclusion(
-            &kill,
-            &cairn_common::executor_protocol::MachineTelemetry::default()
-        )
-        .is_some(),
-        "an unread total keeps the exclusion"
-    );
-    let crowded = cairn_common::executor_protocol::MemoryKill {
-        alone_on_machine_bytes: None,
-        ..kill
-    };
-    assert!(memory_kill_exclusion(&crowded, &machine(TOTAL)).is_none());
 }
 
 #[test]
@@ -12605,6 +12496,117 @@ fn the_journal_replaces_readings_but_not_structural_reasons() {
     assert!(matches!(rows[1].reason, PlacementRejectionReason::Drained));
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[2].executor_id, "gone");
+}
+
+#[test]
+fn executor_unit_bound_is_hard_but_planning_ceiling_is_not() {
+    const CHARGE: u64 = 56_839_822_320;
+    const BOUND: u64 = 49_660_559_360;
+    const CAP: u64 = 31_658_606_592;
+    let machine = |id: &str, bound| {
+        let (key, mut state) = fleet_entry(id, "linux", 0, &[]);
+        measured(&mut state, 0.01, 64 << 30, 500 << 30);
+        Arc::make_mut(&mut state.advertisement)
+            .capabilities
+            .service_bounds = Some(cairn_common::executor_protocol::ServiceBounds {
+            memory_max_bytes: bound,
+            ..Default::default()
+        });
+        (key, state)
+    };
+    let demand = resource_profiles::ResolvedResourceProfile {
+        duration: test_prior_duration(),
+        item_durations: Vec::new(),
+        reservation: ResourceReservation {
+            memory_bytes: CHARGE,
+            source: ResourceReservationSource::Unmeasured,
+            ..Default::default()
+        },
+        learned_estimate: None,
+        rationale: unresolved_rationale(&ResourceReservation::default()),
+        memory_fit: resource_profiles::MemoryFit::Exceeds(
+            cairn_common::executor_protocol::MemoryCeiling {
+                estimate_bytes: CHARGE,
+                ceiling_bytes: CAP,
+                killed_here: None,
+            },
+        ),
+        process_evidence: Default::default(),
+    };
+    let reason = PlacementRejectionReason::ExceedsExecutorMemoryBound {
+        charge_bytes: CHARGE,
+        bound_bytes: BOUND,
+        width_measured: false,
+    };
+    assert_eq!(
+        reason.describe(),
+        "no local job census; charged its whole measured tree of 52.94 GiB, above executor cgroup memory.max 46.25 GiB (missing width evidence, not a measured one-job excess)"
+    );
+    let reservations = HashMap::from([
+        ("bbs".into(), demand.clone()),
+        ("other".into(), demand.clone()),
+    ]);
+    let connections = HashMap::from([
+        machine("bbs", Some(BOUND)),
+        machine("other", Some(64 << 30)),
+    ]);
+    let choose =
+        |connections: &HashMap<String, ExecutorConnectionState>,
+         request: &CellRequest,
+         reservations: &HashMap<String, resource_profiles::ResolvedResourceProfile>| {
+            choose_executor_with(
+                connections,
+                request,
+                reservations,
+                |_, _| SyncCost::Known(0),
+                NOW,
+            )
+        };
+    let draft = choose(&connections, &spillable_request(), &reservations).unwrap();
+    assert_eq!(chosen(&draft).executor_id, "other");
+    assert_eq!(rejection_for(&draft, "bbs"), &reason);
+
+    let only = HashMap::from([machine("bbs", Some(BOUND))]);
+    let draft = choose(&only, &spillable_request(), &reservations).unwrap();
+    assert!(
+        draft.selected.is_none(),
+        "the only candidate cannot use the clamp"
+    );
+    assert_eq!(rejection_for(&draft, "bbs"), &reason);
+    let mut pinned = spillable_request();
+    pinned.pinned_executor_id = Some("bbs".into());
+    let failure = choose(&only, &pinned, &reservations).unwrap_err();
+    assert!(failure.contains("executor cgroup memory.max 46.25 GiB"));
+    assert!(failure.contains(&reason.describe()));
+
+    for bound in [None, Some(CHARGE)] {
+        let only = HashMap::from([machine("bbs", bound)]);
+        let draft = choose(&only, &spillable_request(), &reservations).unwrap();
+        assert_eq!(chosen(&draft).executor_id, "bbs");
+    }
+    let mut missing = HashMap::from([machine("bbs", Some(BOUND))]);
+    Arc::make_mut(&mut missing.get_mut("bbs").unwrap().advertisement)
+        .capabilities
+        .service_bounds = None;
+    assert_eq!(
+        chosen(&choose(&missing, &spillable_request(), &reservations).unwrap()).executor_id,
+        "bbs"
+    );
+
+    let mut modeled = demand;
+    modeled.reservation.build_job_memory =
+        Some(cairn_common::executor_protocol::BuildJobMemoryEvidence {
+            largest_bytes: 8 << 30,
+            typical_bytes: 4 << 30,
+            samples: 1,
+        });
+    assert!(modeled.reservation.memory_charge_at(Some(16)) > BOUND);
+    let modeled = HashMap::from([("bbs".into(), modeled)]);
+    assert_eq!(
+        chosen(&choose(&only, &spillable_request(), &modeled).unwrap()).executor_id,
+        "bbs",
+        "a usable narrow modeled width must survive a wide charge above the bound"
+    );
 }
 
 /// Fit is the first ranking key, so a machine that measurably cannot hold the
@@ -22772,9 +22774,9 @@ async fn an_identity_free_batch_teaches_each_items_suite_and_counts_its_kills() 
                 build_job_processes: None,
             }
         };
-        let killed = || {
+        let killed = |pid| {
             Some(cairn_common::executor_protocol::CommandStop::OomKilled {
-                pid: 7,
+                pid,
                 rss_bytes: Some(3 * GIB),
                 machine_total_bytes: Some(13_000_000_000),
                 process_name: Some("rustc".into()),
@@ -22782,8 +22784,8 @@ async fn an_identity_free_batch_teaches_each_items_suite_and_counts_its_kills() 
             })
         };
         let outcomes = vec![
-            item("cargo-core", 2 * GIB, killed()),
-            item("cargo-db", 2 * GIB, killed()),
+            item("cargo-core", 2 * GIB, killed(7)),
+            item("cargo-db", 2 * GIB, killed(8)),
             item("vitest", GIB, None),
         ];
         let mut outcome = completed_for(&request, COLOCATED_EXECUTOR_ID, generation);

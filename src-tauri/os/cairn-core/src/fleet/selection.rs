@@ -3333,16 +3333,10 @@ pub(super) fn excluded_by_memory_kill(reason: &PlacementRejectionReason) -> bool
     matches!(
         reason,
         PlacementRejectionReason::MemoryKillExcluded { .. }
+            | PlacementRejectionReason::ExceedsExecutorMemoryBound { .. }
             | PlacementRejectionReason::ProcessTooLarge(_)
     )
 }
-
-/// Two kills of a suite while it ran alone on one machine at one total, under
-/// the machine's current memory-brake state, end its fit there whatever their
-/// size: one can be a fluke of the input, a second is the machine's answer. A
-/// kill while other commands shared the machine never counts
-/// ([`resource_profiles::SuiteKills`]). A constant, not a setting.
-pub(super) const KILLS_THAT_END_FIT: u32 = 2;
 
 /// Whether this machine's memory brake exists: its memory-stall instrument
 /// has measured, so admission can hold new work there. An executor that
@@ -3390,15 +3384,8 @@ pub(super) fn process_fit(
     evidence: &resource_profiles::ProcessEvidence,
     entry: &ExecutorConnectionState,
 ) -> Option<ProcessFit> {
-    let mut evidence = evidence.clone();
-    if let Some(demand) = evidence.demand.as_mut() {
-        demand.kills_here = demand
-            .kills_here
-            .take()
-            .map(|kills| kills.under_brake(memory_brake_exists(entry)));
-    }
     judge_process_evidence(
-        &evidence,
+        evidence,
         entry.health.machine.memory.value()?.total_bytes,
         entry.health.memory_record.standing_bytes,
         entry.advertisement.capabilities.memory_budget_bytes,
@@ -3422,7 +3409,7 @@ pub(super) fn process_fit(
 /// A measurement borrowed from another platform refuses like one taken here.
 /// A class prior defers instead: it is the project's largest rustc, not this
 /// work's, so a machine too small for it is offered the work last rather than
-/// never, unless the work's own kills here have already answered.
+/// never.
 pub(super) fn judge_process_evidence(
     evidence: &resource_profiles::ProcessEvidence,
     total_bytes: u64,
@@ -3444,7 +3431,7 @@ pub(super) fn judge_process_evidence(
         )
     };
     if let Some(misfit) = evidence.demand.as_ref().and_then(judge) {
-        let prior = misfit.basis.is_class_prior() && misfit.kills_here.is_none();
+        let prior = misfit.basis.is_class_prior();
         return Some(match (kernel_kills, prior) {
             (false, _) => ProcessFit::Waived(ProcessFitWaiver {
                 misfit,
@@ -3479,11 +3466,7 @@ pub(super) fn judge_process_fit(
         bound_bytes,
     );
     let too_large = demand.peak_bytes > 0 && demand.demand_bytes() > capacity_bytes;
-    let killed_out = demand.kills_here.as_ref().filter(|kills| {
-        kills.alone >= KILLS_THAT_END_FIT
-            && resource_profiles::same_machine_total(kills.machine_total_bytes, total_bytes)
-    });
-    if !too_large && killed_out.is_none() {
+    if !too_large {
         return None;
     }
     Some(cairn_common::executor_protocol::ProcessMisfit {
@@ -3502,10 +3485,6 @@ pub(super) fn judge_process_fit(
         total_bytes,
         standing_bytes,
         bound_bytes: bound_bytes.filter(|bound| *bound < unbounded),
-        kills_here: (!too_large)
-            .then_some(killed_out)
-            .flatten()
-            .map(|kills| kills.alone),
         crowded_kills: demand
             .kills_here
             .as_ref()
@@ -3543,6 +3522,21 @@ pub(super) fn executor_memory_bound(entry: &ExecutorConnectionState) -> Option<u
         .capabilities
         .service_bounds
         .and_then(|bounds| bounds.memory_max_bytes)
+}
+
+/// A planning ceiling is a preference; the unit's enforced bound is not.
+/// Ask the shared solver for the minimum admissible charge, not the wide modeled charge.
+fn executor_bound_rejection(
+    entry: &ExecutorConnectionState,
+    demand: &ResourceReservation,
+) -> Option<PlacementRejectionReason> {
+    let bound_bytes = executor_memory_bound(entry)?;
+    let shortfall = demand.solve_memory_grant(1, bound_bytes, 0).err()?;
+    Some(PlacementRejectionReason::ExceedsExecutorMemoryBound {
+        charge_bytes: shortfall.minimum_charge_bytes,
+        bound_bytes,
+        width_measured: shortfall.width_measured,
+    })
 }
 
 /// [`single_process_capacity`] for a connected machine, `None` while its
@@ -3743,32 +3737,6 @@ pub(super) fn wait_decision(
     ))
 }
 
-/// How far past the size it had at the kill a machine's total memory must grow
-/// before a kill there while alone stops excluding it: a sixteenth. A margin
-/// rather than any change, so a kernel update that moves the reported total by
-/// a few megabytes does not read as a new machine.
-pub(super) const MEMORY_KILL_GROWTH_DIVISOR: u64 = 16;
-
-/// The exclusion a kill while alone imposes on this machine, or `None` when the
-/// kill was crowded or the machine has since grown past the size it was killed
-/// at. An unread total keeps the exclusion: a command with a kill history here
-/// is not placed here on the strength of a reading that is missing.
-pub(super) fn memory_kill_exclusion(
-    kill: &cairn_common::executor_protocol::MemoryKill,
-    machine: &cairn_common::executor_protocol::MachineTelemetry,
-) -> Option<PlacementRejectionReason> {
-    let machine_total_bytes = kill.alone_on_machine_bytes?;
-    let grown = machine.memory.value().is_some_and(|memory| {
-        memory.total_bytes
-            > machine_total_bytes.saturating_add(machine_total_bytes / MEMORY_KILL_GROWTH_DIVISOR)
-    });
-    (!grown).then_some(PlacementRejectionReason::MemoryKillExcluded {
-        victim_resident_bytes: kill.victim_resident_bytes,
-        machine_total_bytes,
-        killed_at_unix_ms: kill.killed_at_unix_ms,
-    })
-}
-
 /// Logged placement rejections, keyed by request and machine.
 pub(super) type PlacementRejectionLog = crate::repeat_report::KeyedRepeatReporter<(String, String)>;
 
@@ -3808,6 +3776,7 @@ pub(super) fn placement_rejection_signature(reason: &PlacementRejectionReason) -
         PlacementRejectionReason::InsufficientMemory { .. } => "insufficientMemory",
         PlacementRejectionReason::InsufficientVolume { .. } => "insufficientVolume",
         PlacementRejectionReason::ExceedsMemoryCeiling { .. } => "exceedsMemoryCeiling",
+        PlacementRejectionReason::ExceedsExecutorMemoryBound { .. } => "exceedsExecutorMemoryBound",
         PlacementRejectionReason::MemoryKillExcluded { .. } => "memoryKillExcluded",
         PlacementRejectionReason::ProcessTooLarge(_) => "processTooLarge",
         PlacementRejectionReason::ProcessDeferred(_) => "processDeferred",
@@ -4271,7 +4240,8 @@ pub(super) fn rank_survey(
                 rejected,
             });
         }
-        // A machine the command was killed on while alone is never chosen, so
+        // A machine whose executor bound cannot hold the work's minimum charge,
+        // or that cannot give one of its processes enough, is never chosen, so
         // when it is all there is the work waits for another machine, which is
         // the whole of the remedy: placing it there repeats the death. Work the
         // caller settled on that machine cannot wait for another, so it is
@@ -4594,9 +4564,10 @@ pub(super) struct ScoredCandidate<'a> {
     /// will ever reserve. A fact about the machine's size rather than its
     /// readings, so it holds whether or not the machine is blind.
     pub(super) over_ceiling: Option<PlacementRejectionReason>,
-    /// Set when the kernel killed this command for memory here while nothing
-    /// else of Cairn's ran beside it. Unlike `over_ceiling` it is a filter, not
-    /// a ranking key: such a machine is never selected, not even at the clamp.
+    /// An executor bound below the work's minimum charge, or a measured
+    /// single-process excess. Unlike `over_ceiling` it is a filter, not a
+    /// ranking key. No count of kills sets it: no executor yet reports a
+    /// kill's cause or whether its victim was alone when it died.
     pub(super) excluded: Option<PlacementRejectionReason>,
     /// The single-process refusal this machine would have met and did not,
     /// and why; carried onto the record if it wins.
@@ -4778,9 +4749,7 @@ impl<'a> ScoredCandidate<'a> {
                     && resolved.process_evidence.demand.is_none()
             })
             .map(|_| entry_process_capacity(entry));
-        let excluded = ceiling
-            .and_then(|ceiling| memory_kill_exclusion(ceiling.killed_here.as_ref()?, machine))
-            .or(too_large);
+        let excluded = executor_bound_rejection(entry, demand).or(too_large);
         let over_ceiling = ceiling.map(|ceiling| PlacementRejectionReason::ExceedsMemoryCeiling {
             estimate_bytes: ceiling.estimate_bytes,
             ceiling_bytes: ceiling.ceiling_bytes,
@@ -4881,9 +4850,9 @@ impl<'a> ScoredCandidate<'a> {
 /// that is idle right now runs it into its memory limit. Neither is a filter,
 /// so a fleet where nothing can hold the work still places it, at the clamp
 /// (unless a capable machine has only declined for now; see [`rank_survey`]).
-/// The one memory fact that is a filter is a kill while the command ran alone
-/// (`excluded`): the machine has already answered that it cannot run the
-/// command, and no ranking may choose it. Fit is a ranking key
+/// An executor bound below the work's minimum charge, or a measured
+/// single-process excess, is a filter (`excluded`), and no ranking may choose
+/// it; a kill raises only its victim's floor. Fit is a ranking key
 /// rather than a hard filter on purpose: reserving capacity and queueing for it
 /// belong to the executor's admission, and placement refusing work the executor
 /// would have queued would be a second, quieter queue.

@@ -149,7 +149,7 @@ use dispatch::{
 pub(crate) use dispatch::{
     BatchPace, ExecutedRequest, GrantWithoutResult, PlacementStop, RequestReport,
 };
-pub(crate) use health::SnapshotReceipt;
+pub(crate) use health::{evidence_context, SnapshotReceipt};
 #[cfg(test)]
 use health::{executor_link_status, held_request_key, EXECUTOR_LINK_STALE_AFTER_MS};
 use health::{
@@ -204,13 +204,13 @@ use selection::{
     choose_executor_with_policy, clamp_declared_concurrency, describe_declines,
     detached_candidate_rejection, excluded_by_memory_kill, forecast_queue_wait,
     hermetic_shadow_request, judge_process_evidence, kernel_kills_for_memory, measured_sync_cost,
-    memory_kill_exclusion, model_room_rejection, no_matching_executor_diagnostic,
-    own_label_refusal, pipe_health_rejection, placement_prediction,
-    placement_prediction_with_contention, placement_rejection_signature, price_host_stall,
-    price_reliability, prior_predictions, rank_candidates, rank_survey, repository_sync_cost,
-    sequential_memory_envelope, unpredicted_candidate, unresolved_rationale, wait_decision,
-    warm_root_holds_commit, CandidateSurvey, PlacementDraft, QueuePrices, ScoredCandidate,
-    Selection, SurveyRankingContext, RECENT_PLACEMENT_DECISIONS,
+    model_room_rejection, no_matching_executor_diagnostic, own_label_refusal,
+    pipe_health_rejection, placement_prediction, placement_prediction_with_contention,
+    placement_rejection_signature, price_host_stall, price_reliability, prior_predictions,
+    rank_candidates, rank_survey, repository_sync_cost, sequential_memory_envelope,
+    unpredicted_candidate, unresolved_rationale, wait_decision, warm_root_holds_commit,
+    CandidateSurvey, PlacementDraft, QueuePrices, ScoredCandidate, Selection, SurveyRankingContext,
+    RECENT_PLACEMENT_DECISIONS,
 };
 use selection::{
     candidate_rejection, deadline_evidence, declared_project_requirements_at,

@@ -202,6 +202,14 @@ pub fn commit_and_maybe_push(paths: &[PathBuf], msg: &str, push_root: Option<&Pa
 /// repo with a bare origin; production reaches it through the detached thread
 /// spawned by [`commit_and_maybe_push`].
 pub fn push_workspace_repo_best_effort(repo_root: &Path) {
+    // Back-to-back config writes each spawn a detached push. Run concurrently,
+    // two pushes to one ref collide on the remote's ref lock ("cannot lock ref"),
+    // and the loser is dropped: if the winner resolved an older HEAD, origin stays
+    // behind with nothing left to retry. Serializing makes each push resolve and
+    // send the then-current HEAD, so the last one always carries the latest commit.
+    static PUSH_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = PUSH_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
     // No origin configured -> nothing to push.
     match cairn_platform::env::git()
         .args(["remote", "get-url", "origin"])

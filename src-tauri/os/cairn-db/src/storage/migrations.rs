@@ -2649,6 +2649,13 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "suite_memory_evidence",
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
+    // Exact observations cannot be reconstructed from lossy profile maxima.
+    (
+        "memory_kill_events",
+        TableScope::Private(PrivateReason::AuthoritativeContent {
+            owner: "cairn/7242",
+        }),
+    ),
     // Which resident out-of-memory kills the suite evidence above already
     // counts; machine-local and rebuildable with it.
     (
@@ -6310,6 +6317,82 @@ mod tests {
                 .await
                 .unwrap(),
             "keep-this-thread"
+        );
+        assert!(runner.run(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_kill_migration_retires_only_unsupported_host_inference() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("kill-cause.db"))
+            .await
+            .unwrap();
+        let previous = TURSO_MIGRATIONS
+            .iter()
+            .copied()
+            .filter(|migration| migration.name() != "memory_kill_cause")
+            .collect::<Vec<_>>();
+        MigrationRunner::new(previous).run(&db).await.unwrap();
+        db.execute_script(
+            "INSERT INTO command_resource_profiles
+             (identity_version,command_identity,executor_class,os,arch,toolchain_fingerprint,
+              sample_count,updated_at_unix_ms,confidence_millis,oom_victim_rss_bytes,
+              oom_killed_at_unix_ms,oom_alone_machine_bytes)
+             VALUES (1,'identity','device:bbs','linux','x86_64','rust',0,10,0,
+                     17495982080,10,66482995200);
+             INSERT INTO suite_memory_evidence
+             (suite_key,executor_class,os,arch,oom_kill_count,oom_machine_total_bytes,
+              updated_at_unix_ms,oom_kill_memory_brake)
+             VALUES ('rust-tests','device:bbs','linux','x86_64',1,66482995200,10,1);",
+        )
+        .await
+        .unwrap();
+        let runner = MigrationRunner::new(TURSO_MIGRATIONS.to_vec());
+        let applied = runner.run(&db).await.unwrap();
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM command_resource_profiles WHERE oom_alone_machine_bytes IS NOT NULL").await.unwrap(),
+            0
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT oom_victim_rss_bytes FROM command_resource_profiles"
+            )
+            .await
+            .unwrap(),
+            17_495_982_080
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT oom_killed_at_unix_ms FROM command_resource_profiles"
+            )
+            .await
+            .unwrap(),
+            10
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT oom_kill_count FROM suite_memory_evidence")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM command_resource_profiles WHERE oom_event_json IS NOT NULL"
+            )
+            .await
+            .unwrap(),
+            0,
+            "lossy legacy aggregates cannot manufacture causal events"
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM memory_kill_events")
+                .await
+                .unwrap(),
+            0
         );
         assert!(runner.run(&db).await.unwrap().is_empty());
     }

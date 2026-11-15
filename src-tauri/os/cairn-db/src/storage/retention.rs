@@ -636,6 +636,10 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "bounded by suite and machine-context cardinality; one high-water row each",
     ),
     keep(
+        "memory_kill_events",
+        "causal memory-kill audit history, retained independently of resettable aggregates; unpruned, one row per recorded kill observation, so growth is bounded by how often the kernel kills Cairn's work",
+    ),
+    keep(
         "resident_kills_learned",
         "pruned to two days of out-of-memory kills as rows are added",
     ),

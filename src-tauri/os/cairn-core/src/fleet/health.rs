@@ -8,6 +8,24 @@ pub(crate) struct SnapshotReceipt {
     pub received: u64,
 }
 
+/// The machine context a machine's learned memory evidence is keyed by, as
+/// placement itself derives it, so a reader outside placement asks for exactly
+/// the rows placement wrote: executor class, OS, architecture, and toolchain
+/// fingerprint, in that order.
+pub(crate) fn evidence_context(executor: &ExecutorInspection) -> [String; 4] {
+    let context = ReservationPlan::context_for(
+        &executor.health.identity.device_id,
+        &executor.health.identity.executor_id,
+        &executor.health.advertisement.capabilities,
+    );
+    [
+        context.executor_class,
+        context.os,
+        context.arch,
+        context.toolchain_fingerprint,
+    ]
+}
+
 impl Fleet {
     pub(super) fn update_advertisement(
         &self,

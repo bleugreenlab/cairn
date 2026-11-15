@@ -521,6 +521,7 @@ pub(super) fn transient_placement_refusal(
         | Reason::NotColocated
         | Reason::RepositoryNotTransferable { .. }
         | Reason::ExceedsMemoryCeiling { .. }
+        | Reason::ExceedsExecutorMemoryBound { .. }
         | Reason::MemoryKillExcluded { .. }
         | Reason::ProcessTooLarge(_)
         | Reason::UntrustedVerdictPlatform { .. }

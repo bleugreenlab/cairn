@@ -1469,8 +1469,18 @@ fn render_planning_memory(budget: Option<u64>) -> String {
     )
 }
 
-/// Render one machine's compact operational status.
+/// Render a fixture without querying the runner's kill history.
+#[cfg(test)]
 pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
+    render_executor_with_kills(executor, None)
+}
+
+/// Render one machine's operational status with optional runner kill history.
+/// Only the async read path can query that history; `None` omits it.
+pub(crate) fn render_executor_with_kills(
+    executor: &ExecutorInspection,
+    recorded_kills: Option<&RecordedKills>,
+) -> String {
     let health = &executor.health;
     let capabilities = &health.advertisement.capabilities;
     let mut out = format!("# Executor {}\n\n", executor.name);
@@ -1721,6 +1731,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         &health.memory_record,
         executor.captured_at_unix_ms,
         &executor.recent_placements,
+        recorded_kills,
     ));
 
     out.push_str(&render_gpus(
@@ -4311,12 +4322,11 @@ fn describe_rationale(rationale: &ReservationRationale) -> String {
     let killed = rationale
         .memory_kill
         .map(|kill| {
-            let alone = kill
-                .alone_on_machine_bytes
-                .map(|machine| format!(" while it ran alone on {}", bytes(machine)))
-                .unwrap_or_default();
+            let bound = kill
+                .event
+                .map_or_else(|| "bound unknown".into(), |event| event.describe_bound());
             format!(
-                "; memory floored at {} by an out-of-memory kill here{alone}",
+                "; historical maximum kill-victim floor {}; latest retained kill event: {bound}; aggregate pressure is not proof of host misfit; a representative clean run reassesses kill policy, while measured process and effective memory bounds still apply",
                 bytes(kill.victim_resident_bytes)
             )
         })
@@ -4377,6 +4387,35 @@ mod rationale_tests {
             build_jobs_price: None,
             unreadable_memory: Vec::new(),
         }
+    }
+
+    #[test]
+    fn kill_rationale_names_the_event_bound_without_asserting_isolation() {
+        use cairn_common::executor_protocol::{MemoryKill, MemoryKillCause, MemoryKillEvent};
+        let mut rationale = rationale(1, None);
+        rationale.memory_kill = Some(MemoryKill {
+            victim_resident_bytes: 17_495_982_080,
+            killed_at_unix_ms: 10,
+            alone_on_machine_bytes: Some(66_482_995_200),
+            event: Some(MemoryKillEvent {
+                pid: Some(237152),
+                victim_resident_bytes: Some(17_495_982_080),
+                killed_at_unix_ms: 10,
+                bound_bytes: Some(49_660_559_360),
+                cause: MemoryKillCause::ExecutorCgroup,
+            }),
+        });
+        let rendered = describe_rationale(&rationale);
+        assert!(
+            rendered.contains("executor cgroup memory.max 46.25 GiB"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("representative clean run"), "{rendered}");
+        assert!(!rendered.contains("ran alone"), "{rendered}");
+        rationale.memory_kill.as_mut().unwrap().event = None;
+        let rendered = describe_rationale(&rationale);
+        assert!(rendered.contains("bound unknown"), "{rendered}");
+        assert!(!rendered.contains("61.9 GiB"), "{rendered}");
     }
 
     #[test]
@@ -5484,6 +5523,7 @@ fn render_oom_kills(
     record: &cairn_common::executor_protocol::MemoryRecord,
     captured_at_unix_ms: u64,
     placements: &[PlacementDecision],
+    recorded: Option<&RecordedKills>,
 ) -> String {
     let recent: Vec<&cairn_common::executor_protocol::OomKillReport> = record
         .oom_kills
@@ -5495,7 +5535,8 @@ fn render_oom_kills(
     let any = !recent.is_empty()
         || record.unattributed_kills > 0
         || record.cgroup_oom_kills.is_some_and(|count| count > 0)
-        || record.machine_oom_kills.is_some_and(|count| count > 0);
+        || record.machine_oom_kills.is_some_and(|count| count > 0)
+        || recorded.is_some_and(|recorded| recorded.as_ref().map_or(true, |s| !s.is_empty()));
     if !any {
         return String::new();
     }
@@ -5518,8 +5559,11 @@ fn render_oom_kills(
     if let Some(method) = &record.attribution {
         summary.push(format!("victims chosen by {method}"));
     }
-    let mut out = String::from("## Out-of-memory kills (24 h)\n");
+    let mut out = String::from("## Out-of-memory kills\n");
     out.push_str(&format!("- {}\n", summary.join("; ")));
+    if let Some(recorded) = recorded {
+        out.push_str(&render_recorded_kills(recorded, captured_at_unix_ms));
+    }
     for kill in recent.iter().rev() {
         out.push_str(&format!(
             "- {}: {}{}\n",
@@ -5530,6 +5574,129 @@ fn render_oom_kills(
     }
     out.push('\n');
     out
+}
+
+/// How far back the page's per-suite tally of recorded kills reaches.
+pub(crate) const RECORDED_KILLS_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// One suite's kill records in one machine context within the window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SuiteKillTally {
+    pub suite: String,
+    pub records: u64,
+    /// Records per cause, keyed by the cause string the event stored, so a
+    /// value is shown as recorded and never re-derived.
+    pub causes: std::collections::BTreeMap<String, u64>,
+    pub latest_unix_ms: u64,
+}
+
+/// The runner's recorded suite kills for one machine, or why they could not
+/// be read.
+pub(crate) type RecordedKills = Result<Vec<SuiteKillTally>, String>;
+
+/// The suite-scoped rows of `memory_kill_events` in this machine's exact
+/// evidence context (the context placement keys them by), whose recorded time
+/// lies in the last [`RECORDED_KILLS_WINDOW_MS`] before `now_unix_ms`, tallied
+/// per suite and cause, most records first.
+///
+/// A row is one observation, not one kernel event: a completion records its
+/// kill at the command's finish time and a resident's kill report at the
+/// kernel's kill time, and nothing joins the two, so the tally counts records.
+/// A row whose JSON cannot be read is counted under `unreadable`, not dropped.
+pub(crate) async fn recorded_suite_kills(
+    db: &crate::storage::LocalDb,
+    executor: &ExecutorInspection,
+    now_unix_ms: u64,
+) -> RecordedKills {
+    use crate::storage::RowExt;
+
+    let [executor_class, os, arch, toolchain_fingerprint] =
+        crate::fleet::evidence_context(executor);
+    let since = now_unix_ms.saturating_sub(RECORDED_KILLS_WINDOW_MS);
+    let rows = db
+        .query_all(
+            "SELECT scope_key, killed_at_unix_ms, event_json
+             FROM memory_kill_events
+             WHERE scope_kind = 'suite' AND executor_class = ?1 AND os = ?2 AND arch = ?3
+               AND toolchain_fingerprint = ?4
+               AND killed_at_unix_ms >= ?5 AND killed_at_unix_ms <= ?6",
+            (
+                executor_class,
+                os,
+                arch,
+                toolchain_fingerprint,
+                i64::try_from(since).unwrap_or(i64::MAX),
+                i64::try_from(now_unix_ms).unwrap_or(i64::MAX),
+            ),
+            |row| Ok((row.text(0)?, row.i64(1)?, row.text(2)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut suites: std::collections::BTreeMap<String, SuiteKillTally> = Default::default();
+    for (suite, killed_at, json) in rows {
+        let cause = serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|event| event.get("cause")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unreadable".into());
+        let tally = suites
+            .entry(suite.clone())
+            .or_insert_with(|| SuiteKillTally {
+                suite,
+                ..Default::default()
+            });
+        tally.records += 1;
+        *tally.causes.entry(cause).or_default() += 1;
+        tally.latest_unix_ms = tally
+            .latest_unix_ms
+            .max(u64::try_from(killed_at).unwrap_or(0));
+    }
+    let mut tallies: Vec<SuiteKillTally> = suites.into_values().collect();
+    tallies.sort_by(|a, b| {
+        b.records
+            .cmp(&a.records)
+            .then_with(|| a.suite.cmp(&b.suite))
+    });
+    Ok(tallies)
+}
+
+/// The recorded cause as the page names it.
+fn recorded_cause(cause: &str) -> String {
+    match cause {
+        "executorCgroup" => "executor cgroup memory.max".into(),
+        "unknown" => "cause unknown".into(),
+        "unreadable" => "unreadable record".into(),
+        other => format!("recorded as `{other}`"),
+    }
+}
+
+/// The kill section's per-suite line block for the runner's recorded kills,
+/// so a machine killing the same suite again and again is seen in one read.
+fn render_recorded_kills(recorded: &RecordedKills, captured_at_unix_ms: u64) -> String {
+    const LEAD: &str = "- Kill records the runner holds for this machine in the last 7 days";
+    const RECORDS: &str = "one per completion or resident kill report; a completion is recorded at its finish time and a resident's report at the kernel's, and nothing joins them, so these count records, not distinct kernel kills";
+    match recorded {
+        Err(error) => format!("{LEAD}: unreadable ({error})\n"),
+        Ok(tallies) if tallies.is_empty() => format!("{LEAD}: none\n"),
+        Ok(tallies) => {
+            let mut out = format!("{LEAD}, by suite ({RECORDS}):\n");
+            for tally in tallies {
+                let causes = tally
+                    .causes
+                    .iter()
+                    .map(|(cause, count)| format!("{count} {}", recorded_cause(cause)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "  - `{}`: {} record{} ({causes}); latest {}\n",
+                    tally.suite,
+                    tally.records,
+                    if tally.records == 1 { "" } else { "s" },
+                    age(captured_at_unix_ms.saturating_sub(tally.latest_unix_ms)),
+                ));
+            }
+            out
+        }
+    }
 }
 
 /// For a killed command whose placement record shows it was placed with no
@@ -12574,7 +12741,7 @@ mod tests {
     fn an_out_of_memory_kill_is_a_line_on_the_page() {
         use cairn_common::executor_protocol::{LiveUsageSubject, MemoryRecord, OomKillReport};
         assert!(
-            render_oom_kills(&MemoryRecord::default(), CAPTURED_AT, &[]).is_empty(),
+            render_oom_kills(&MemoryRecord::default(), CAPTURED_AT, &[], None).is_empty(),
             "a machine that killed nothing says nothing"
         );
         let record = MemoryRecord {
@@ -12598,9 +12765,9 @@ mod tests {
             machine_oom_kills: Some(46),
             attribution: Some("oom_score".into()),
         };
-        let rendered = render_oom_kills(&record, CAPTURED_AT, &[]);
+        let rendered = render_oom_kills(&record, CAPTURED_AT, &[], None);
         assert!(
-            rendered.starts_with("## Out-of-memory kills (24 h)\n"),
+            rendered.starts_with("## Out-of-memory kills\n"),
             "{rendered}"
         );
         assert!(
@@ -12621,8 +12788,160 @@ mod tests {
             ..record
         };
         assert!(
-            !render_oom_kills(&old, CAPTURED_AT + OOM_KILLS_SHOWN_MS, &[]).contains("rustc"),
+            !render_oom_kills(&old, CAPTURED_AT + OOM_KILLS_SHOWN_MS, &[], None).contains("rustc"),
             "a kill older than a day is counted, not listed"
+        );
+    }
+
+    /// execution ada1dda0: a kill loop on a machine is seen in one read. The
+    /// page tallies the runner's suite kill records in this machine's exact
+    /// context over the last seven days, by suite and recorded cause, and calls
+    /// them records rather than distinct kernel kills. Other machines, other
+    /// toolchain contexts, command-scoped rows and older rows are not counted;
+    /// an unreadable row is counted as such rather than dropped.
+    #[tokio::test]
+    async fn the_kill_section_tallies_seven_days_of_suite_kill_records_by_cause() {
+        use cairn_common::executor_protocol::MemoryRecord;
+        const HOUR: u64 = 60 * 60 * 1_000;
+        const NOW: u64 = 30 * 24 * HOUR;
+        let db = crate::storage::migrated_test_db("executors_recorded_kills.db").await;
+        let executor = inspection("bbs", false);
+        let here = crate::fleet::evidence_context(&executor);
+        assert_eq!(
+            here,
+            [
+                "device-9f3c1a:executor-7b21ce".to_string(),
+                "linux".into(),
+                "x86_64".into(),
+                "bun\u{1f}rust".into(),
+            ],
+            "the context placement writes kill rows under"
+        );
+        let unit = r#"{"pid":7,"victimResidentBytes":17500000000,"killedAtUnixMs":1,"boundBytes":49660000000,"cause":"executorCgroup"}"#;
+        let unknown = r#"{"pid":8,"victimResidentBytes":null,"killedAtUnixMs":2,"boundBytes":null,"cause":"unknown"}"#;
+        let other_class = "other-device:other-executor".to_string();
+        let rows: [(&str, &str, &String, &String, u64, &str); 8] = [
+            ("suite", "rust-tests", &here[0], &here[3], NOW - HOUR, unit),
+            (
+                "suite",
+                "rust-tests",
+                &here[0],
+                &here[3],
+                NOW - 2 * HOUR,
+                unknown,
+            ),
+            (
+                "suite",
+                "workspace-compile",
+                &here[0],
+                &here[3],
+                NOW - 72 * HOUR,
+                "not json",
+            ),
+            // Older than seven days.
+            (
+                "suite",
+                "rust-tests",
+                &here[0],
+                &here[3],
+                NOW - 8 * 24 * HOUR,
+                unit,
+            ),
+            // Another machine.
+            (
+                "suite",
+                "rust-tests",
+                &other_class,
+                &here[3],
+                NOW - HOUR,
+                unit,
+            ),
+            // This machine under another toolchain context.
+            (
+                "suite",
+                "rust-tests",
+                &here[0],
+                &"rust".to_string(),
+                NOW - HOUR,
+                unit,
+            ),
+            // The same kill's command-scoped row.
+            (
+                "command",
+                "1:check:rust",
+                &here[0],
+                &here[3],
+                NOW - HOUR,
+                unit,
+            ),
+            // Recorded after the reading's instant.
+            ("suite", "rust-tests", &here[0], &here[3], NOW + 1, unit),
+        ];
+        for (scope_kind, scope_key, class, toolchains, at, json) in rows {
+            db.execute(
+                format!(
+                    "INSERT INTO memory_kill_events (scope_kind, scope_key, executor_class, os, arch, toolchain_fingerprint, killed_at_unix_ms, event_json)
+                     VALUES ('{scope_kind}', ?1, ?2, 'linux', 'x86_64', ?3, ?4, ?5)"
+                ),
+                (
+                    scope_key.to_string(),
+                    class.clone(),
+                    toolchains.clone(),
+                    at as i64,
+                    json.to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let recorded = recorded_suite_kills(&db, &executor, NOW).await;
+        let tallies = recorded.as_ref().unwrap();
+        assert_eq!(
+            tallies
+                .iter()
+                .map(|tally| (tally.suite.as_str(), tally.records))
+                .collect::<Vec<_>>(),
+            [("rust-tests", 2), ("workspace-compile", 1)]
+        );
+
+        // Shown even when the executor's own 24-hour list is empty: the
+        // runner's record is what outlives it.
+        let rendered = render_oom_kills(&MemoryRecord::default(), NOW, &[], Some(&recorded));
+        assert!(
+            rendered.starts_with("## Out-of-memory kills\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- Kill records the runner holds for this machine in the last 7 days, by suite (one per completion or resident kill report; a completion is recorded at its finish time and a resident's report at the kernel's, and nothing joins them, so these count records, not distinct kernel kills):\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "  - `rust-tests`: 2 records (1 executor cgroup memory.max, 1 cause unknown); latest 1h ago\n"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - `workspace-compile`: 1 record (1 unreadable record); latest "),
+            "{rendered}"
+        );
+        for invented in ["host", "alone", "isolated"] {
+            assert!(!rendered.contains(invented), "{invented}: {rendered}");
+        }
+
+        assert!(
+            render_oom_kills(&MemoryRecord::default(), NOW, &[], Some(&Ok(Vec::new()))).is_empty(),
+            "a machine with nothing killed and nothing recorded says nothing"
+        );
+        let failed = render_oom_kills(
+            &MemoryRecord::default(),
+            NOW,
+            &[],
+            Some(&Err("no such table".into())),
+        );
+        assert!(
+            failed.contains("in the last 7 days: unreadable (no such table)\n"),
+            "a failed read is a gap, never a zero: {failed}"
         );
     }
 
@@ -12662,7 +12981,7 @@ mod tests {
                 panic!("the sample placement is a selection");
             };
             selection.process_demand = demand;
-            render_oom_kills(&record, CAPTURED_AT, &placements)
+            render_oom_kills(&record, CAPTURED_AT, &placements, None)
         };
         let rendered = with_demand(Some(ProcessDemandRecord::Unmeasured {
             capacity_bytes: Some(10_307_921_510),

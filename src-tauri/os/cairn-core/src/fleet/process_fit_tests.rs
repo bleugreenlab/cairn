@@ -15,6 +15,7 @@ fn rustc(peak_bytes: u64, kills_here: Option<(u32, u64)>) -> resource_profiles::
                 machine_total_bytes,
                 memory_brake: Some(true),
                 crowded: None,
+                event: None,
             },
         ),
         basis: Default::default(),
@@ -60,61 +61,23 @@ fn crowded_kills_do_not_end_a_machines_fit() {
     );
 }
 
-/// sp1's rows as the rebuild found them: three kills counted before the
-/// ledger recorded admission, so with no brake state. The fit reads them
-/// under the machine's current brake, which exists, and they no longer
-/// count; judged without that reading they would still refuse.
+/// A size misfit names the crowded kills beside it as admission's, not as the
+/// machine's answer.
 #[test]
-fn kills_from_before_the_brake_expire_once_it_is_live() {
-    let legacy = resource_profiles::SuiteKills {
-        alone: 3,
-        machine_total_bytes: SP1_TOTAL,
-        memory_brake: None,
-        crowded: None,
-    };
-    assert!(refuse(
-        &sp1_rustc(legacy.clone()),
-        SP1_TOTAL,
-        Some(SP1_STANDING),
-        None,
-        SP1
-    )
-    .is_some());
-    assert_eq!(
-        refuse(
-            &sp1_rustc(legacy.under_brake(true)),
-            SP1_TOTAL,
-            Some(SP1_STANDING),
-            None,
-            SP1
-        ),
-        None
-    );
-}
-
-/// A refusal on alone kills says so and is the machine's answer; the
-/// crowded kills beside it are named as admission's, not the machine's.
-#[test]
-fn the_refusal_text_tells_alone_kills_from_crowded_ones() {
-    let Some(PlacementRejectionReason::ProcessTooLarge(misfit)) = refuse(
-        &sp1_rustc(resource_profiles::SuiteKills {
-            alone: 2,
-            machine_total_bytes: SP1_TOTAL,
-            memory_brake: Some(true),
+fn a_size_misfit_names_crowded_kills_as_admissions() {
+    let demand = resource_profiles::ProcessDemand {
+        kills_here: Some(resource_profiles::SuiteKills {
             crowded: Some(sp1_crowded()),
+            ..Default::default()
         }),
-        SP1_TOTAL,
-        Some(SP1_STANDING),
-        None,
-        SP1,
-    ) else {
-        panic!("two alone kills end fit");
+        ..rustc(200 * GIB, None)
+    };
+    let Some(PlacementRejectionReason::ProcessTooLarge(misfit)) =
+        refuse(&demand, SP1_TOTAL, Some(SP1_STANDING), None, SP1)
+    else {
+        panic!("a 200 GiB rustc does not fit sp1");
     };
     let text = misfit.describe();
-    assert!(
-        text.contains("the kernel killed it here for memory 2 times while it ran alone on this 121.7 GiB machine, which is its answer until its memory changes"),
-        "{text}"
-    );
     assert!(
         text.contains("the kernel killed it here 3 times while up to 18 other commands shared the machine with no memory brake (last 11-08 UTC), which says admission over-committed the machine then, not that one process cannot fit it"),
         "{text}"
@@ -211,28 +174,33 @@ fn without_standing_use_the_cap_is_the_capacity() {
     assert!(misfit.describe().contains("its standing use is unmeasured"));
 }
 
-/// Two kills at one machine total end fit whatever their size, and a
-/// machine whose memory changed is offered the work again.
+/// Repeated kills whose cause is unit-bound or unknown do not by themselves
+/// end a machine's fit (cairn/6496's two-kill rule is suspended until a kill's
+/// cause can be established), and they never waive the per-process bound.
 #[test]
-fn two_kills_at_one_total_end_fit_until_the_memory_changes() {
+fn repeated_unknown_kills_preserve_the_process_size_guard() {
     let total = 13 * GIB;
-    let small = |kills| rustc(2 * GIB, Some((kills, total)));
     let here = "bgsrv-ub-device:bgsrv-ub";
-    assert_eq!(refuse(&small(1), total, Some(GIB), None, here), None);
-    let Some(PlacementRejectionReason::ProcessTooLarge(misfit)) =
-        refuse(&small(2), total, Some(GIB), None, here)
-    else {
-        panic!("two kills end fit");
-    };
-    assert_eq!(misfit.kills_here, Some(2));
-    assert!(misfit
-        .describe()
-        .contains("killed it here for memory 2 times"));
-    assert_eq!(
-        refuse(&small(2), 32 * GIB, Some(GIB), None, here),
-        None,
-        "a machine with more memory is a new machine"
-    );
+    for kills in [1, 2, 3] {
+        assert_eq!(
+            refuse(
+                &rustc(2 * GIB, Some((kills, total))),
+                total,
+                Some(GIB),
+                None,
+                here
+            ),
+            None
+        );
+        assert!(refuse(
+            &rustc(20 * GIB, Some((kills, total))),
+            total,
+            Some(GIB),
+            None,
+            here
+        )
+        .is_some());
+    }
 }
 
 /// cairn/6310's specimen: bgsrv-mac's only evidence for the whole suite
@@ -535,6 +503,7 @@ async fn the_class_prior_defers_the_small_machine() {
     resource_profiles::observe_suite(
         db.clone(),
         Some("cairn/rust-tests"),
+        CellCommandClass::CargoTest,
         &linux("bgsrv-ub2-device:bgsrv-ub2", "x86_64"),
         &rustc_completion(KILLED_RUSTC, 1),
         resource_profiles::CompletionKind::Failed,
@@ -592,6 +561,7 @@ async fn a_suite_killed_here_at_its_measured_size_is_refused_on_the_next_request
         resource_profiles::observe_suite(
             db.clone(),
             Some("cairn/workspace-compile"),
+            CellCommandClass::CargoTest,
             &linux(UB, "x86_64"),
             &kill,
             resource_profiles::CompletionKind::Failed,

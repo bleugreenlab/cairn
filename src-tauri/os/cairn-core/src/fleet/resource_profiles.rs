@@ -5,9 +5,9 @@ use cairn_common::executor_protocol::{
     CommandResourceIdentity, CommandStop, ContentionEstimate, ContentionEvidence,
     ContentionFallback, CrowdedKills, DurationEstimate, DurationEvidence, DurationFallback,
     ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality, MemoryCeiling,
-    MemoryKill, ProcessDemandBasis, ReservationFallback, ReservationRationale, TestPhaseEvidence,
-    TestPhaseMeasurement, DURATION_PROFILE_STALE_AFTER_MS, DURATION_SAMPLE_WINDOW,
-    MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
+    MemoryKill, MemoryKillCause, MemoryKillEvent, ProcessDemandBasis, ReservationFallback,
+    ReservationRationale, TestPhaseEvidence, TestPhaseMeasurement, DURATION_PROFILE_STALE_AFTER_MS,
+    DURATION_SAMPLE_WINDOW, MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
     MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_db::turso::params;
@@ -389,6 +389,20 @@ impl ResolvedResourceProfile {
             return;
         }
         let local = self.process_evidence.build_job_memory.is_some();
+        if !local && self.rationale.memory_kill.is_some() {
+            // A retired host-size inference does not justify narrowing an
+            // unresolved local demand using another machine's job model.
+            let conservative = self
+                .reservation
+                .memory_charge_bytes()
+                .max(self.rationale.upper_peak_rss_bytes.map_or(0, with_headroom))
+                .max(self.rationale.memory_kill.as_ref().map_or(0, kill_floor));
+            self.reservation.build_job_memory = None;
+            self.reservation.memory_bytes = conservative;
+            self.rationale.build_jobs_price = None;
+            self.memory_fit = MemoryFit::of(Some(conservative), memory_budget_bytes);
+            return;
+        }
         if self.reservation.source == ResourceReservationSource::Learned && !local {
             return;
         }
@@ -554,21 +568,22 @@ impl ProcessDemand {
     }
 }
 
-/// A suite's out-of-memory kills in one machine context, split by what each
-/// says about one process on this machine.
+/// A suite's out-of-memory kills in one machine context.
 ///
-/// A kill while the victim ran alone is the machine's answer that one process
-/// of the suite does not fit it. A kill while other commands shared the
-/// machine is admission's over-commitment: evidence for the owed accounting
-/// and the memory brake, never for the single-process fit. Counting the second
-/// kind as the first excluded bginf-sp1 (121.7 GiB) from every Rust test lane
-/// for a 32.5 GiB rustc after three kills under nineteen stacked lanes and no
-/// memory brake (cairn/6496).
+/// No count of these decides fit. A kill whose command started with nothing
+/// else admitted is not proof that its victim was alone when it died, and no
+/// executor yet reports whether the host or a cgroup ran out, so cairn/6496's
+/// two-kill exclusion has no evidence to stand on and is suspended until
+/// executor telemetry can establish both at the kill. What a kill decides is
+/// its victim's floor (`kill_floor`); crowded kills are named beside a size
+/// misfit so a reader does not take them for the machine's answer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct SuiteKills {
-    /// Kills while the victim ran alone, at `machine_total_bytes`, under
-    /// `memory_brake`. A kill at another total, or under another brake state,
-    /// started the count again.
+    /// The newest kill as reported, with its recorded cause.
+    pub event: Option<MemoryKillEvent>,
+    /// Kills whose command started alone, at `machine_total_bytes`, under
+    /// `memory_brake`: start-load history. A kill at another total, or under
+    /// another brake state, started the count again.
     pub alone: u32,
     pub machine_total_bytes: u64,
     /// Whether the machine's memory brake existed at the alone kills. `None`
@@ -579,20 +594,21 @@ pub(super) struct SuiteKills {
 }
 
 impl SuiteKills {
-    /// These kills as the machine's admission now reads them. An alone kill
-    /// is read from the load at its command's start; with no brake, work
-    /// admitted after that start could crowd it unseen, so an alone kill under
-    /// another brake state than the machine's current one has lost its basis
-    /// and no longer counts (tenet 297).
-    pub(super) fn under_brake(mut self, memory_brake_now: bool) -> Self {
-        if self.memory_brake != Some(memory_brake_now) {
-            self.alone = 0;
-        }
-        self
-    }
-
-    /// Fold one kill in.
+    /// Fold one kill in. A kill older than the newest event already held is a
+    /// late delivery and changes nothing.
     fn fold(mut self, kill: &SuiteKill, killed_at_unix_ms: u64) -> Self {
+        if self
+            .event
+            .is_some_and(|held| held.killed_at_unix_ms > killed_at_unix_ms)
+        {
+            return self;
+        }
+        if kill.event.is_some_and(|event| {
+            self.event
+                .is_none_or(|held| event.killed_at_unix_ms >= held.killed_at_unix_ms)
+        }) {
+            self.event = kill.event;
+        }
         match (kill.admission.alone(), kill.machine_total_bytes) {
             (true, Some(total)) => {
                 let same_regime = self.alone > 0
@@ -679,6 +695,7 @@ fn co_resident_commands(metadata: &CellExecutionMeta, batch_siblings: u32) -> Op
 /// One out-of-memory kill as the suite ledger folds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SuiteKill {
+    pub event: Option<MemoryKillEvent>,
     pub machine_total_bytes: Option<u64>,
     pub admission: KillAdmission,
 }
@@ -1208,6 +1225,7 @@ fn suite_kills_from_row(
     let total = row.get::<Option<i64>>(first + 1)?;
     let crowded_count = row.get::<i64>(first + 5)?.max(0) as u32;
     Ok(SuiteKills {
+        event: None,
         alone: if total.is_some() { alone } else { 0 },
         machine_total_bytes: total.map_or(0, |total| total.max(0) as u64),
         memory_brake: row.get::<Option<i64>>(first + 4)?.map(|brake| brake != 0),
@@ -1302,10 +1320,13 @@ pub(super) fn same_machine_total(killed_at_total: u64, total_bytes: u64) -> bool
 /// runs say nothing about the cold compile, and one process's working set
 /// depends on the code, not on how busy the machine was. The kills are not: a
 /// successful run of the suite here is the machine's later answer that it can
-/// hold it, and clears them.
+/// hold it, and clears them. Compile-class work must also measure enough job
+/// processes to represent its width-dependent demand; a warm no-op cannot
+/// release its kill policy.
 pub(super) async fn observe_suite(
     db: Arc<LocalDb>,
     suite_key: Option<&str>,
+    class: CellCommandClass,
     context: &ProfileContext,
     metadata: &CellExecutionMeta,
     kind: CompletionKind,
@@ -1324,6 +1345,8 @@ pub(super) async fn observe_suite(
         rss_bytes,
         machine_total_bytes,
         process_name,
+        bound_bytes,
+        pid,
         ..
     }) = &metadata.stop
     {
@@ -1333,10 +1356,26 @@ pub(super) async fn observe_suite(
             }
         }
         kills = KillsSeen::Killed(SuiteKill {
+            event: Some(MemoryKillEvent {
+                pid: Some(*pid),
+                victim_resident_bytes: *rss_bytes,
+                killed_at_unix_ms: metadata.finished_at_unix_ms,
+                bound_bytes: *bound_bytes,
+                cause: if bound_bytes.is_some() {
+                    MemoryKillCause::ExecutorCgroup
+                } else {
+                    MemoryKillCause::Unknown
+                },
+            }),
             machine_total_bytes: *machine_total_bytes,
             admission: KillAdmission::of(metadata, machine),
         });
-    } else if kind == CompletionKind::Succeeded {
+    } else if kind == CompletionKind::Succeeded
+        && (!class.is_compile_class()
+            || metadata
+                .build_job_processes
+                .is_some_and(|jobs| jobs.speaks_for_a_typical_job()))
+    {
         kills = KillsSeen::CleanRun;
     }
     let _ = record_suite_evidence(
@@ -1398,7 +1437,7 @@ pub(crate) async fn forget_kills_on(db: &LocalDb, executor_id: &str) -> Result<u
 const FORGET_SUITE_KILLS: &str = "oom_kill_count = 0, oom_machine_total_bytes = NULL,
      oom_kill_memory_brake = NULL, oom_crowded_kill_count = 0,
      oom_crowded_most_co_resident = NULL, oom_crowded_memory_brake = NULL,
-     oom_crowded_killed_at_unix_ms = NULL";
+     oom_crowded_killed_at_unix_ms = NULL, oom_event_json = NULL";
 
 /// One out-of-memory kill of a suite's process outside any completion: a
 /// resident's, which the executor reports on its health rather than on a
@@ -1430,6 +1469,13 @@ pub(super) async fn observe_suite_kill(
         kill.killed_at_unix_ms,
         victim,
         KillsSeen::Killed(SuiteKill {
+            event: Some(MemoryKillEvent {
+                pid: Some(kill.pid),
+                victim_resident_bytes: kill.footprint_bytes,
+                killed_at_unix_ms: kill.killed_at_unix_ms,
+                bound_bytes: None,
+                cause: MemoryKillCause::Unknown,
+            }),
             machine_total_bytes,
             admission: KillAdmission {
                 co_resident_commands: None,
@@ -1515,53 +1561,54 @@ async fn record_suite_evidence(
                 context.os.clone(),
                 context.arch.clone()
             ];
-            if peak.is_none()
-                && kills == KillsSeen::CleanRun
-                && test_phase.is_none()
-                && build_jobs.is_none()
-            {
-                // Nothing to learn but that the kills are over: a row that
-                // does not exist has none to forget.
-                conn.execute(
-                    &format!(
-                        "UPDATE suite_memory_evidence SET {FORGET_SUITE_KILLS}
-                         WHERE suite_key=?1 AND executor_class=?2 AND os=?3 AND arch=?4"
-                    ),
-                    key,
-                )
-                .await?;
-                return Ok(());
-            }
-            let held = {
+            let (held, policy_observed_at) = {
                 let mut rows = conn
                     .query(
                         "SELECT oom_kill_count, oom_machine_total_bytes, 0, 0,
                                 oom_kill_memory_brake, oom_crowded_kill_count,
                                 oom_crowded_most_co_resident, oom_crowded_memory_brake,
-                                oom_crowded_killed_at_unix_ms
+                                oom_crowded_killed_at_unix_ms, oom_event_json, oom_policy_observed_at_unix_ms
                          FROM suite_memory_evidence
                          WHERE suite_key=?1 AND executor_class=?2 AND os=?3 AND arch=?4",
                         key,
                     )
                     .await?;
                 match rows.next().await? {
-                    Some(row) => suite_kills_from_row(&row, 0)?,
-                    None => SuiteKills::default(),
+                    Some(row) => {
+                        let mut kills = suite_kills_from_row(&row, 0)?;
+                        kills.event = row.get::<Option<String>>(9)?.and_then(|json| serde_json::from_str(&json).ok());
+                        (kills, row.get::<i64>(10)?.max(0) as u64)
+                    },
+                    None => (SuiteKills::default(), 0),
                 }
             };
+            let mut new_kill = true;
+            if let KillsSeen::Killed(kill) = kills {
+                if let Some(event) = kill.event {
+                    let json = serde_json::to_string(&event).expect("kill event serializes");
+                    new_kill = conn.execute("INSERT INTO memory_kill_events (scope_kind, scope_key, executor_class, os, arch, toolchain_fingerprint, killed_at_unix_ms, event_json) VALUES ('suite',?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING",
+                        params![suite_key.clone(), context.executor_class.clone(), context.os.clone(), context.arch.clone(), context.toolchain_fingerprint.clone(), event.killed_at_unix_ms as i64, json]).await? > 0;
+                }
+            }
+            // Persist clean-first watermarks too: a delayed older kill report
+            // must not resurrect policy even when no peak was measured.
+            let policy_at = if kills == KillsSeen::Neither { policy_observed_at } else { policy_observed_at.max(finished_at_unix_ms) };
+            // Distinct victims can share a census timestamp. Replay identity,
+            // not time equality, deduplicates kills; a clean run must be later.
             let ledger = match kills {
-                KillsSeen::Killed(kill) => held.fold(&kill, finished_at_unix_ms),
-                KillsSeen::CleanRun => SuiteKills::default(),
-                KillsSeen::Neither => held,
+                KillsSeen::Killed(kill) if new_kill && finished_at_unix_ms >= policy_observed_at => held.fold(&kill, finished_at_unix_ms),
+                KillsSeen::CleanRun if finished_at_unix_ms > policy_observed_at => SuiteKills::default(),
+                _ => held,
             };
+            let event_json = ledger.event.map(|event| serde_json::to_string(&event).expect("kill event serializes"));
             let crowded = ledger.crowded.as_ref();
             let (peak_bytes, peak_name) = match &peak {
                 Some((bytes, name)) => (Some(*bytes as i64), name.clone()),
                 None => (None, None),
             };
             conn.execute(
-                r#"INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, upper_process_peak_bytes, process_peak_name, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms, oom_kill_memory_brake, oom_crowded_kill_count, oom_crowded_most_co_resident, oom_crowded_memory_brake, oom_crowded_killed_at_unix_ms, upper_test_phase_peak_bytes, upper_test_phase_bytes_per_test, upper_job_largest_bytes, upper_job_typical_bytes, job_census_samples)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                r#"INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, upper_process_peak_bytes, process_peak_name, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms, oom_kill_memory_brake, oom_crowded_kill_count, oom_crowded_most_co_resident, oom_crowded_memory_brake, oom_crowded_killed_at_unix_ms, upper_test_phase_peak_bytes, upper_test_phase_bytes_per_test, upper_job_largest_bytes, upper_job_typical_bytes, job_census_samples, oom_event_json, oom_policy_observed_at_unix_ms)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
                    ON CONFLICT(suite_key, executor_class, os, arch) DO UPDATE SET
                      upper_process_peak_bytes=CASE WHEN ?5 IS NULL THEN suite_memory_evidence.upper_process_peak_bytes WHEN suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes THEN ?5 ELSE suite_memory_evidence.upper_process_peak_bytes END,
                      process_peak_name=CASE WHEN ?5 IS NOT NULL AND (suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes) THEN COALESCE(?6, suite_memory_evidence.process_peak_name) ELSE suite_memory_evidence.process_peak_name END,
@@ -1577,6 +1624,8 @@ async fn record_suite_evidence(
                      upper_test_phase_bytes_per_test=CASE WHEN ?16 IS NULL THEN suite_memory_evidence.upper_test_phase_bytes_per_test WHEN suite_memory_evidence.upper_test_phase_bytes_per_test IS NULL OR ?16 > suite_memory_evidence.upper_test_phase_bytes_per_test THEN ?16 ELSE suite_memory_evidence.upper_test_phase_bytes_per_test END,
                      upper_job_largest_bytes=CASE WHEN ?17 IS NULL THEN suite_memory_evidence.upper_job_largest_bytes WHEN suite_memory_evidence.upper_job_largest_bytes IS NULL OR ?17 > suite_memory_evidence.upper_job_largest_bytes THEN ?17 ELSE suite_memory_evidence.upper_job_largest_bytes END,
                      upper_job_typical_bytes=CASE WHEN ?18 IS NULL THEN suite_memory_evidence.upper_job_typical_bytes WHEN suite_memory_evidence.upper_job_typical_bytes IS NULL OR ?18 > suite_memory_evidence.upper_job_typical_bytes THEN ?18 ELSE suite_memory_evidence.upper_job_typical_bytes END,
+                     oom_event_json=?20,
+                     oom_policy_observed_at_unix_ms=?21,
                      job_census_samples=suite_memory_evidence.job_census_samples + ?19"#,
                 params![
                     suite_key.clone(),
@@ -1597,7 +1646,9 @@ async fn record_suite_evidence(
                     test_phase.map(|phase| phase.bytes_per_concurrent_test() as i64),
                     build_jobs.map(|jobs| jobs.largest_bytes as i64),
                     build_jobs.map(|jobs| jobs.typical_bytes as i64),
-                    i64::from(build_jobs.is_some())
+                    i64::from(build_jobs.is_some()),
+                    event_json,
+                    policy_at as i64
                 ],
             )
             .await?;
@@ -2156,12 +2207,17 @@ pub(super) async fn resolve_reservation(
     floored_by_kill(resolved, profile.memory_kill, memory_budget_bytes)
 }
 
-/// What a kill proved this command needs on this machine: the victim's
-/// resident size at death, or the whole machine when the command was killed
-/// while nothing else of Cairn's ran beside it.
+/// What a kill proved this command needs on this machine: the larger of the
+/// historical victim maximum and the latest event's own victim. A kernel
+/// victim is a process lower bound; the bound it was killed under is not a
+/// process size, so neither a unit's `memory.max` nor the machine's total
+/// enters the floor.
 fn kill_floor(kill: &MemoryKill) -> u64 {
-    kill.victim_resident_bytes
-        .max(kill.alone_on_machine_bytes.unwrap_or(0))
+    kill.victim_resident_bytes.max(
+        kill.event
+            .and_then(|event| event.victim_resident_bytes)
+            .unwrap_or(0),
+    )
 }
 
 /// Raise a resolution to what an out-of-memory kill on this machine proved.
@@ -2390,54 +2446,50 @@ async fn learn_speed(
 /// floor ([`floored_by_kill`]) so the kill reaches the next placement of the
 /// same command here.
 ///
-/// A kill while nothing else of Cairn's ran on the machine also records the
-/// machine's size: it is the machine's answer that it cannot run the command,
-/// not a crowding fact, and the floor it implies is a ceiling placement routes
-/// around until a run succeeds here or the machine grows past it. The load
-/// context is read at the command's start, so work admitted beside it later is
-/// invisible here; `shared_with_siblings` is what the caller knows that the
-/// load context does not, that a parallel batch's items ran beside each other.
+/// Start-load occupancy cannot diagnose the cause at death. Keep the bound
+/// supplied by this completion and retain an unknown cause when it is missing.
 pub(super) async fn observe_memory_kill(
     db: Arc<LocalDb>,
     identity: Option<&CommandResourceIdentity>,
     context: &ProfileContext,
     metadata: &CellExecutionMeta,
-    shared_with_siblings: bool,
-    memory_budget_bytes: Option<u64>,
 ) {
     let Some(identity) = identity else { return };
     let Some(CommandStop::OomKilled {
-        rss_bytes: Some(victim_resident_bytes),
-        machine_total_bytes,
+        rss_bytes: victim_resident_bytes,
+        bound_bytes,
+        pid,
         ..
     }) = &metadata.stop
     else {
         return;
     };
-    let alone = !shared_with_siblings
-        && metadata.load_context.as_ref().is_some_and(|load| {
-            load.co_resident_compile_jobs == 0 && load.co_resident_light_jobs == 0
-        });
-    let alone_on_machine_bytes = alone
-        .then_some(machine_total_bytes.or(memory_budget_bytes))
-        .flatten();
     let _ = record_memory_kill(
         db,
         identity,
         context,
         MemoryKill {
-            victim_resident_bytes: *victim_resident_bytes,
+            victim_resident_bytes: victim_resident_bytes.unwrap_or(0),
             killed_at_unix_ms: metadata.finished_at_unix_ms,
-            alone_on_machine_bytes,
+            alone_on_machine_bytes: None,
+            event: Some(MemoryKillEvent {
+                pid: Some(*pid),
+                victim_resident_bytes: *victim_resident_bytes,
+                killed_at_unix_ms: metadata.finished_at_unix_ms,
+                bound_bytes: *bound_bytes,
+                cause: if bound_bytes.is_some() {
+                    MemoryKillCause::ExecutorCgroup
+                } else {
+                    MemoryKillCause::Unknown
+                },
+            }),
         },
     )
     .await;
 }
 
-/// Fold one kill into a context's record, creating the row if the context has
-/// never completed the command. The victim floor only ever rises; a kill alone
-/// overwrites the machine size, and a crowded one leaves an earlier solo kill
-/// standing.
+/// Retain exact events independently of the monotone historical victim floor.
+/// Only a newer event replaces the latest-event projection.
 async fn record_memory_kill(
     db: Arc<LocalDb>,
     identity: &CommandResourceIdentity,
@@ -2450,14 +2502,20 @@ async fn record_memory_kill(
         let identity = identity.clone();
         let context = context.clone();
         Box::pin(async move {
+            if let Some(event) = kill.event {
+                let json = serde_json::to_string(&event).expect("kill event serializes");
+                conn.execute("INSERT INTO memory_kill_events (scope_kind, scope_key, executor_class, os, arch, toolchain_fingerprint, killed_at_unix_ms, event_json) VALUES ('command',?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING",
+                    params![format!("{}:{}", identity.version, identity.key), context.executor_class.clone(), context.os.clone(), context.arch.clone(), context.toolchain_fingerprint.clone(), event.killed_at_unix_ms as i64, json]).await?;
+            }
             conn.execute(
-                r#"INSERT INTO command_resource_profiles (identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint, sample_count, updated_at_unix_ms, confidence_millis, oom_victim_rss_bytes, oom_killed_at_unix_ms, oom_alone_machine_bytes)
-                   VALUES (?1,?2,?3,?4,?5,?6,0,?7,0,?8,?7,?9)
+                r#"INSERT INTO command_resource_profiles (identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint, sample_count, updated_at_unix_ms, confidence_millis, oom_victim_rss_bytes, oom_killed_at_unix_ms, oom_alone_machine_bytes, oom_event_json)
+                   VALUES (?1,?2,?3,?4,?5,?6,0,?7,0,?8,?7,NULL,?9)
                    ON CONFLICT(identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint) DO UPDATE SET
                      updated_at_unix_ms=MAX(command_resource_profiles.updated_at_unix_ms, excluded.updated_at_unix_ms),
                      oom_victim_rss_bytes=MAX(COALESCE(command_resource_profiles.oom_victim_rss_bytes, 0), excluded.oom_victim_rss_bytes),
                      oom_killed_at_unix_ms=MAX(COALESCE(command_resource_profiles.oom_killed_at_unix_ms, 0), excluded.oom_killed_at_unix_ms),
-                     oom_alone_machine_bytes=COALESCE(excluded.oom_alone_machine_bytes, command_resource_profiles.oom_alone_machine_bytes)"#,
+                     oom_alone_machine_bytes=NULL,
+                     oom_event_json=CASE WHEN excluded.oom_killed_at_unix_ms > COALESCE(command_resource_profiles.oom_killed_at_unix_ms, 0) THEN excluded.oom_event_json ELSE command_resource_profiles.oom_event_json END"#,
                 params![
                     identity.version as i64,
                     identity.key,
@@ -2467,7 +2525,7 @@ async fn record_memory_kill(
                     context.toolchain_fingerprint,
                     kill.killed_at_unix_ms as i64,
                     kill.victim_resident_bytes as i64,
-                    kill.alone_on_machine_bytes.map(|bytes| bytes as i64)
+                    kill.event.and_then(|event| serde_json::to_string(&event).ok())
                 ],
             )
             .await?;
@@ -2657,7 +2715,7 @@ async fn load_profile(
         Box::pin(async move {
             let mut rows = conn.query(
                 "SELECT sample_count, upper_peak_rss_bytes, upper_disk_delta_bytes, upper_duration_ms,
-                        oom_victim_rss_bytes, oom_killed_at_unix_ms, oom_alone_machine_bytes
+                        oom_victim_rss_bytes, oom_killed_at_unix_ms, oom_alone_machine_bytes, oom_event_json
                  FROM command_resource_profiles
                  WHERE identity_version=?1 AND command_identity=?2 AND executor_class=?3
                    AND os=?4 AND arch=?5 AND toolchain_fingerprint=?6",
@@ -2674,9 +2732,8 @@ async fn load_profile(
                         (Some(victim), Some(killed_at)) => Some(MemoryKill {
                             victim_resident_bytes: victim as u64,
                             killed_at_unix_ms: killed_at as u64,
-                            alone_on_machine_bytes: row
-                                .get::<Option<i64>>(6)?
-                                .map(|value| value as u64),
+                            alone_on_machine_bytes: None,
+                            event: row.get::<Option<String>>(7)?.and_then(|json| serde_json::from_str(&json).ok()),
                         }),
                         _ => None,
                     },
@@ -2989,6 +3046,7 @@ mod process_peak_tests {
                 victim_resident_bytes: 9 * GIB,
                 killed_at_unix_ms: 2,
                 alone_on_machine_bytes: None,
+                event: None,
             },
         )
         .await
@@ -2996,6 +3054,7 @@ mod process_peak_tests {
         observe_suite(
             db.clone(),
             Some("cairn/rust-tests"),
+            CellCommandClass::CargoTest,
             &here,
             &completed(12 * GIB, 1),
             CompletionKind::Succeeded,
@@ -3144,6 +3203,7 @@ mod process_peak_tests {
         observe_suite(
             db.clone(),
             suite.as_deref(),
+            CellCommandClass::CargoTest,
             &context("fedora:fedora"),
             &CellExecutionMeta {
                 build_job_processes: Some(BuildJobProcesses {
@@ -3261,9 +3321,28 @@ mod process_peak_tests {
             victim_resident_bytes: 35 * GIB,
             killed_at_unix_ms: 1,
             alone_on_machine_bytes: None,
+            event: None,
         });
         killed.price_at_width(20, &class_prior, Some(budget));
-        assert_eq!(killed.reservation.memory_bytes, 35 * GIB);
+        assert_eq!(killed.reservation.memory_bytes, 40 * GIB);
+        // Retiring the inferred host floor does not justify borrowed narrowing
+        // when local width evidence is missing.
+        killed.rationale.upper_peak_rss_bytes = Some(45_471_857_856);
+        killed
+            .rationale
+            .memory_kill
+            .as_mut()
+            .unwrap()
+            .victim_resident_bytes = 17_495_982_080;
+        killed.reservation.memory_bytes = 17_495_982_080;
+        killed.price_at_width(17, &class_prior, Some(42_211_475_456));
+        assert_eq!(killed.reservation.memory_bytes, 56_839_822_320);
+        assert_eq!(killed.rationale.build_jobs_price, None);
+        assert_eq!(killed.reservation.build_job_memory, None);
+        let MemoryFit::Exceeds(ceiling) = killed.memory_fit else {
+            panic!("unresolved whole demand must remain above the planning ceiling");
+        };
+        assert_eq!(ceiling.ceiling_bytes, 31_658_606_592);
         // Without build jobs measured anywhere the borrowed figure stands.
         let mut blind = resolved(ResourceReservationSource::Unmeasured, borrowed_tree);
         blind.process_evidence = ProcessEvidence::default();
@@ -3296,6 +3375,7 @@ mod process_peak_tests {
                 observe_suite(
                     db,
                     suite.as_deref(),
+                    CellCommandClass::CargoTest,
                     &fedora,
                     &meta,
                     CompletionKind::Succeeded,
@@ -3391,6 +3471,7 @@ mod process_peak_tests {
             observe_suite(
                 db.clone(),
                 suite.as_deref(),
+                CellCommandClass::CargoTest,
                 &fedora,
                 &meta,
                 CompletionKind::Succeeded,
@@ -3461,6 +3542,7 @@ mod process_peak_tests {
         observe_suite(
             db.clone(),
             suite.as_deref(),
+            CellCommandClass::CargoTest,
             &fedora,
             &completed(10 * GIB, 1),
             CompletionKind::Succeeded,
@@ -3554,6 +3636,7 @@ mod process_peak_tests {
         observe_suite(
             db.clone(),
             Some("cairn/rust-tests"),
+            CellCommandClass::CargoTest,
             &ub,
             &completed(9 * GIB, 1),
             CompletionKind::Succeeded,
@@ -3590,6 +3673,7 @@ mod process_peak_tests {
         observe_suite(
             db.clone(),
             compile_suite.as_deref(),
+            CellCommandClass::CargoTest,
             &spark,
             &completed(10 * GIB, 2),
             CompletionKind::Succeeded,
@@ -3616,6 +3700,7 @@ mod process_peak_tests {
         observe_suite(
             db.clone(),
             compile_suite.as_deref(),
+            CellCommandClass::CargoTest,
             &context("bbs-device:bbs"),
             &completed(8 * GIB, 3),
             CompletionKind::Succeeded,
@@ -3642,6 +3727,7 @@ mod process_peak_tests {
         observe_suite(
             db.clone(),
             class.as_deref(),
+            CellCommandClass::CargoTest,
             &fedora,
             &completed(10 * GIB, 1),
             CompletionKind::Failed,
@@ -3710,6 +3796,7 @@ mod process_peak_tests {
             observe_suite(
                 db.clone(),
                 suite.as_deref(),
+                CellCommandClass::CargoTest,
                 &ub,
                 &kill(3 * GIB, total, at),
                 CompletionKind::Failed,
@@ -3738,6 +3825,7 @@ mod process_peak_tests {
         observe_suite(
             db.clone(),
             suite.as_deref(),
+            CellCommandClass::CargoTest,
             &ub,
             &kill(GIB, 2 * total, 3),
             CompletionKind::Failed,
@@ -3796,6 +3884,7 @@ mod process_peak_tests {
                 observe_suite(
                     db,
                     Some(suite),
+                    CellCommandClass::CargoTest,
                     &sp1,
                     &meta,
                     kind,
@@ -3807,6 +3896,22 @@ mod process_peak_tests {
                 .await
             }
         };
+        // A representative success may arrive before an older kill report.
+        let representative = |at| CellExecutionMeta {
+            build_job_processes: Some(BuildJobProcesses {
+                processes: 8,
+                largest_bytes: GIB,
+                typical_bytes: GIB / 2,
+            }),
+            ..completed(GIB, at)
+        };
+        observe(representative(5), CompletionKind::Succeeded, true).await;
+        observe(rustc_killed(GIB, total, 0, 4), CompletionKind::Failed, true).await;
+        assert_eq!(
+            kills_on(db.clone(), suite, &sp1).await,
+            None,
+            "a clean-first watermark suppresses old kill policy"
+        );
         for (co_resident, at) in [(18, 10), (6, 20)] {
             observe(
                 rustc_killed(20 * GIB, total, co_resident, at),
@@ -3815,6 +3920,11 @@ mod process_peak_tests {
             )
             .await;
         }
+        observe(completed(GIB, 25), CompletionKind::Succeeded, true).await;
+        assert!(
+            kills_on(db.clone(), suite, &sp1).await.is_some(),
+            "a warm success without census does not release policy"
+        );
         observe(
             rustc_killed(19 * GIB, total, 0, 30),
             CompletionKind::Failed,
@@ -3837,6 +3947,11 @@ mod process_peak_tests {
         observe(
             CellExecutionMeta {
                 stop: None,
+                build_job_processes: Some(BuildJobProcesses {
+                    processes: 8,
+                    largest_bytes: 21 * GIB,
+                    typical_bytes: GIB,
+                }),
                 peak_process: Some(cairn_common::executor_protocol::PeakProcess {
                     bytes: 21 * GIB,
                     name: Some("rustc".into()),
@@ -3848,6 +3963,17 @@ mod process_peak_tests {
         )
         .await;
         assert_eq!(kills_on(db.clone(), suite, &sp1).await, None);
+        observe(
+            rustc_killed(20 * GIB, total, 0, 35),
+            CompletionKind::Failed,
+            true,
+        )
+        .await;
+        assert_eq!(
+            kills_on(db.clone(), suite, &sp1).await,
+            None,
+            "late kill cannot resurrect a released generation"
+        );
         let peak = resolve_process_demand(db, None, Some(suite), CellCommandClass::CargoTest, &sp1)
             .await
             .demand
@@ -3859,6 +3985,68 @@ mod process_peak_tests {
         );
     }
 
+    #[tokio::test]
+    async fn clean_release_requires_a_census_only_for_compile_classes() {
+        let db = Arc::new(crate::storage::migrated_test_db("suite-clean-classes.db").await);
+        let host = context("device:executor");
+        for class in [
+            CellCommandClass::CargoCheck,
+            CellCommandClass::CargoTest,
+            CellCommandClass::CargoClippy,
+            CellCommandClass::Build,
+            CellCommandClass::ReleaseBuild,
+            CellCommandClass::Vitest,
+            CellCommandClass::Typecheck,
+            CellCommandClass::Other,
+        ] {
+            let suite = format!("cairn/{}", class.as_str());
+            let observe = |meta: CellExecutionMeta, kind| {
+                let db = db.clone();
+                let host = host.clone();
+                let suite = suite.clone();
+                async move {
+                    observe_suite(
+                        db,
+                        Some(&suite),
+                        class,
+                        &host,
+                        &meta,
+                        kind,
+                        MachineAdmission::default(),
+                    )
+                    .await;
+                }
+            };
+            // No measurement exists yet, but the clean watermark must survive
+            // a delayed kill report for noncompile work.
+            let mut clean = completed(GIB, 5);
+            clean.peak_process = None;
+            observe(clean.clone(), CompletionKind::Succeeded).await;
+            observe(rustc_killed(GIB, 16 * GIB, 0, 4), CompletionKind::Failed).await;
+            assert_eq!(
+                kills_on(db.clone(), &suite, &host).await.is_some(),
+                class.is_compile_class(),
+            );
+            observe(rustc_killed(GIB, 16 * GIB, 0, 10), CompletionKind::Failed).await;
+            clean.finished_at_unix_ms = 20;
+            observe(clean.clone(), CompletionKind::SelectedNothing).await;
+            assert!(kills_on(db.clone(), &suite, &host).await.is_some());
+            observe(clean.clone(), CompletionKind::Succeeded).await;
+            assert_eq!(
+                kills_on(db.clone(), &suite, &host).await.is_some(),
+                class.is_compile_class(),
+            );
+            clean.finished_at_unix_ms = 30;
+            clean.build_job_processes = Some(BuildJobProcesses {
+                processes: 8,
+                largest_bytes: GIB,
+                typical_bytes: GIB / 2,
+            });
+            observe(clean, CompletionKind::Succeeded).await;
+            assert!(kills_on(db.clone(), &suite, &host).await.is_none());
+        }
+    }
+
     /// Batch siblings share the machine though the load at the start does
     /// not show them, so a kill beside them is crowded.
     #[tokio::test]
@@ -3868,6 +4056,7 @@ mod process_peak_tests {
         observe_suite(
             db.clone(),
             Some("cairn/rust-tests"),
+            CellCommandClass::CargoTest,
             &ub,
             &rustc_killed(3 * GIB, 13_000_000_000, 0, 1),
             CompletionKind::Failed,
@@ -3883,9 +4072,8 @@ mod process_peak_tests {
     }
 
     /// An alone kill under another brake state than the count's starts the
-    /// count again, and a count read under another brake state than the
-    /// machine's current one does not count, including the counts recorded
-    /// before the ledger stamped a brake state at all.
+    /// count again, and a row counted before the ledger stamped a brake state
+    /// reads with none.
     #[tokio::test]
     async fn alone_kills_count_only_under_the_brake_state_they_happened_in() {
         let db = Arc::new(crate::storage::migrated_test_db("suite-kills-brake.db").await);
@@ -3895,6 +4083,7 @@ mod process_peak_tests {
             observe_suite(
                 db.clone(),
                 Some("cairn/rust-tests"),
+                CellCommandClass::CargoTest,
                 &ub,
                 &rustc_killed(3 * GIB, total, 0, at),
                 CompletionKind::Failed,
@@ -3907,8 +4096,6 @@ mod process_peak_tests {
         }
         let kills = kills_on(db.clone(), "cairn/rust-tests", &ub).await.unwrap();
         assert_eq!((kills.alone, kills.memory_brake), (1, Some(true)));
-        assert_eq!(kills.clone().under_brake(true).alone, 1);
-        assert_eq!(kills.under_brake(false).alone, 0);
 
         // A row the ledger counted before it recorded admission.
         db.execute(
@@ -3925,8 +4112,6 @@ mod process_peak_tests {
         .unwrap();
         let legacy = kills_on(db, "cairn/class:cargoTest", &ub).await.unwrap();
         assert_eq!((legacy.alone, legacy.memory_brake), (3, None));
-        assert_eq!(legacy.clone().under_brake(true).alone, 0);
-        assert_eq!(legacy.under_brake(false).alone, 0);
     }
 
     /// The operator's `repaired` forgets every kill the machine holds, in
@@ -3941,6 +4126,7 @@ mod process_peak_tests {
                 observe_suite(
                     db.clone(),
                     Some("cairn/rust-tests"),
+                    CellCommandClass::CargoTest,
                     machine,
                     &rustc_killed(3 * GIB, 130_000_000_000, 0, at),
                     CompletionKind::Failed,
@@ -3988,6 +4174,7 @@ mod process_peak_tests {
             observe_suite(
                 db.clone(),
                 suite.as_deref(),
+                CellCommandClass::CargoTest,
                 &host,
                 &unnamed,
                 CompletionKind::Succeeded,
@@ -5226,15 +5413,7 @@ mod tests {
         let (identity, context) = killed_here();
         let mut killed = oom_killed_for_test(CROWDED_VICTIM, Some(SPECIMEN_TOTAL), 1, 10);
         killed.peak_rss_bytes = Some(SPECIMEN_BUDGET);
-        observe_memory_kill(
-            db.clone(),
-            Some(&identity),
-            &context,
-            &killed,
-            false,
-            Some(SPECIMEN_BUDGET),
-        )
-        .await;
+        observe_memory_kill(db.clone(), Some(&identity), &context, &killed).await;
         observe_completed(
             db.clone(),
             Some(&identity),
@@ -5248,6 +5427,22 @@ mod tests {
             victim_resident_bytes: CROWDED_VICTIM,
             killed_at_unix_ms: 10,
             alone_on_machine_bytes: None,
+            event: match killed.stop {
+                Some(CommandStop::OomKilled {
+                    pid, bound_bytes, ..
+                }) => Some(MemoryKillEvent {
+                    pid: Some(pid),
+                    victim_resident_bytes: Some(CROWDED_VICTIM),
+                    killed_at_unix_ms: 10,
+                    bound_bytes,
+                    cause: if bound_bytes.is_some() {
+                        MemoryKillCause::ExecutorCgroup
+                    } else {
+                        MemoryKillCause::Unknown
+                    },
+                }),
+                _ => None,
+            },
         };
         let profile = load_profile(db.clone(), &identity, &context)
             .await
@@ -5276,99 +5471,93 @@ mod tests {
         );
     }
 
-    /// A kill with nothing else of Cairn's on the machine is the machine's
-    /// answer that it cannot run the command at all. It stands as a ceiling
-    /// naming the kill, survives a later crowded kill, and gives way only when
-    /// the machine has held the command; the victim's floor outlives it.
+    /// The suite ledger keeps the newest event with its recorded cause and
+    /// ignores a late delivery of an older one; a kill's floor is the larger
+    /// of the historical victim maximum and the event's own victim.
+    #[test]
+    fn suite_ledger_keeps_the_newest_event_and_floors_on_the_largest_victim() {
+        let event = |at, victim, bound: Option<u64>| MemoryKillEvent {
+            pid: Some(1),
+            victim_resident_bytes: Some(victim),
+            killed_at_unix_ms: at,
+            bound_bytes: bound,
+            cause: if bound.is_some() {
+                MemoryKillCause::ExecutorCgroup
+            } else {
+                MemoryKillCause::Unknown
+            },
+        };
+        let kill = |event| SuiteKill {
+            event: Some(event),
+            machine_total_bytes: Some(64 * GIB),
+            admission: KillAdmission {
+                co_resident_commands: Some(0),
+                memory_brake: true,
+            },
+        };
+        let unit = event(2, 3 * GIB, Some(46 * GIB));
+        let ledger = SuiteKills::default()
+            .fold(&kill(event(1, GIB, None)), 1)
+            .fold(&kill(unit), 2);
+        assert_eq!(ledger.event, Some(unit));
+        assert_eq!(ledger.alone, 2);
+        assert_eq!(
+            ledger.clone().fold(&kill(event(1, 9 * GIB, None)), 1),
+            ledger,
+            "late delivery of an older kill changes nothing"
+        );
+        let floor = |historical| {
+            kill_floor(&MemoryKill {
+                victim_resident_bytes: historical,
+                killed_at_unix_ms: 2,
+                alone_on_machine_bytes: None,
+                event: Some(unit),
+            })
+        };
+        assert_eq!(floor(GIB), 3 * GIB);
+        assert_eq!(floor(5 * GIB), 5 * GIB);
+    }
+
+    /// Start-time isolation does not establish a host-sized demand. Exact
+    /// events remain separate when a later kill has a smaller victim.
     #[tokio::test]
-    async fn a_kill_while_alone_is_a_ceiling_here_until_the_machine_holds_the_command() {
+    async fn start_alone_unit_kill_retains_victim_and_exact_events_not_host_floor() {
         let db = Arc::new(crate::storage::migrated_test_db("resource-profile-oom-alone.db").await);
         let (identity, context) = killed_here();
         let victim = 6_871_947_673;
-        let kill = |db: Arc<LocalDb>, meta: CellExecutionMeta| {
-            let identity = identity.clone();
-            let context = context.clone();
-            async move {
-                observe_memory_kill(
-                    db,
-                    Some(&identity),
-                    &context,
-                    &meta,
-                    false,
-                    Some(SPECIMEN_BUDGET),
-                )
-                .await
+        for (at, rss, bound) in [
+            (10, victim, Some(8 * GIB)),
+            (20, victim / 2, None),
+            (20, victim / 2, None),
+        ] {
+            let mut meta = oom_killed_for_test(rss, Some(SPECIMEN_TOTAL), 0, at);
+            if let Some(CommandStop::OomKilled { bound_bytes, .. }) = meta.stop.as_mut() {
+                *bound_bytes = bound;
             }
-        };
-        kill(
-            db.clone(),
-            oom_killed_for_test(victim, Some(SPECIMEN_TOTAL), 0, 10),
-        )
-        .await;
-
-        let excluded = resolve_killed(db.clone(), &identity, &context).await;
-        let MemoryFit::Exceeds(ceiling) = excluded.memory_fit else {
-            panic!(
-                "a 6.4 GiB victim fits the cap; the solo kill is what excludes: {:?}",
-                excluded.memory_fit
-            );
-        };
-        assert_eq!(ceiling.ceiling_bytes, SPECIMEN_CAP);
-        assert_eq!(
-            ceiling.killed_here,
-            Some(MemoryKill {
-                victim_resident_bytes: victim,
-                killed_at_unix_ms: 10,
-                alone_on_machine_bytes: Some(SPECIMEN_TOTAL),
-            })
-        );
-        assert_eq!(excluded.reservation.memory_bytes, SPECIMEN_CAP);
-        let said = ceiling.describe();
-        assert!(
-            said.contains("killed it here for memory at 6.4 GiB resident while it ran alone on this 12.1 GiB machine"),
-            "{said}"
-        );
-
-        kill(
-            db.clone(),
-            oom_killed_for_test(victim / 2, Some(SPECIMEN_TOTAL), 2, 20),
-        )
-        .await;
-        let still = resolve_killed(db.clone(), &identity, &context).await;
-        let MemoryFit::Exceeds(ceiling) = still.memory_fit else {
-            panic!("a crowded kill does not answer for a solo one");
-        };
-        let recorded = ceiling.killed_here.unwrap();
-        assert_eq!(
-            recorded.victim_resident_bytes, victim,
-            "the floor only rises"
-        );
-        assert_eq!(recorded.killed_at_unix_ms, 20);
-
-        let mut held = oom_killed_for_test(GIB, Some(SPECIMEN_TOTAL), 0, 30);
-        held.stop = None;
-        observe_completed(
-            db.clone(),
-            Some(&identity),
-            &context,
-            &held,
-            CompletionKind::Succeeded,
-        )
-        .await;
-        let after = resolve_killed(db, &identity, &context).await;
-        assert!(
-            !matches!(after.memory_fit, MemoryFit::Exceeds(_)),
-            "the machine held it: {:?}",
-            after.memory_fit
-        );
-        assert_eq!(after.reservation.memory_bytes, victim);
-        assert_eq!(
-            after
-                .rationale
-                .memory_kill
-                .map(|kill| kill.alone_on_machine_bytes),
-            Some(None)
-        );
+            observe_memory_kill(db.clone(), Some(&identity), &context, &meta).await;
+        }
+        let resolved = resolve_killed(db.clone(), &identity, &context).await;
+        assert!(!matches!(resolved.memory_fit, MemoryFit::Exceeds(_)));
+        assert_eq!(resolved.reservation.memory_bytes, victim);
+        let kill = resolved.rationale.memory_kill.unwrap();
+        assert_eq!(kill.alone_on_machine_bytes, None);
+        assert_eq!(kill.victim_resident_bytes, victim);
+        let event = kill.event.unwrap();
+        assert_eq!(event.victim_resident_bytes, Some(victim / 2));
+        assert_eq!(event.killed_at_unix_ms, 20);
+        assert_eq!(event.cause, MemoryKillCause::Unknown);
+        assert_eq!(event.bound_bytes, None);
+        let events = db.read(|conn| Box::pin(async move {
+            let mut rows = conn.query("SELECT event_json FROM memory_kill_events WHERE scope_kind='command' ORDER BY killed_at_unix_ms", ()).await?;
+            let mut events = Vec::new();
+            while let Some(row) = rows.next().await? { events.push(row.get::<String>(0)?); }
+            Ok(events)
+        })).await.unwrap();
+        assert_eq!(events.len(), 2);
+        let first: MemoryKillEvent = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(first.victim_resident_bytes, Some(victim));
+        assert_eq!(first.bound_bytes, Some(8 * GIB));
+        assert_eq!(first.cause, MemoryKillCause::ExecutorCgroup);
     }
 
     /// An item of a parallel batch ran beside its siblings, whatever the load
@@ -5381,15 +5570,7 @@ mod tests {
         let (identity, context) = killed_here();
         let mut not_killed = oom_killed_for_test(CROWDED_VICTIM, Some(SPECIMEN_TOTAL), 0, 5);
         not_killed.stop = None;
-        observe_memory_kill(
-            db.clone(),
-            Some(&identity),
-            &context,
-            &not_killed,
-            false,
-            Some(SPECIMEN_BUDGET),
-        )
-        .await;
+        observe_memory_kill(db.clone(), Some(&identity), &context, &not_killed).await;
         assert!(load_profile(db.clone(), &identity, &context)
             .await
             .unwrap()
@@ -5400,8 +5581,6 @@ mod tests {
             Some(&identity),
             &context,
             &oom_killed_for_test(CROWDED_VICTIM, Some(SPECIMEN_TOTAL), 0, 10),
-            true,
-            Some(SPECIMEN_BUDGET),
         )
         .await;
         let kill = load_profile(db, &identity, &context)

@@ -2537,7 +2537,16 @@ async fn render_resource_body(
                 match executors.iter().find(|executor| executor.name == name) {
                     Some(executor) => match (view, request_id) {
                         (None, _) => {
-                            let mut rendered = crate::resources::executors::render_executor(executor);
+                            let recorded_kills = crate::resources::executors::recorded_suite_kills(
+                                &orch.db.local,
+                                executor,
+                                captured_at,
+                            )
+                            .await;
+                            let mut rendered = crate::resources::executors::render_executor_with_kills(
+                                executor,
+                                Some(&recorded_kills),
+                            );
                             rendered.push_str(&crate::resources::executors::render_room_line(
                                 &orch.fleet.room_line(&executor.health.identity.executor_id, captured_at),
                                 &executor.name,
