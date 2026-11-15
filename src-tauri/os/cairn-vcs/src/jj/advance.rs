@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::{AsyncReadExt as _, StreamExt as _};
+use futures::StreamExt as _;
 use jj_lib::backend::{CommitId, CopyId, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::matchers::EverythingMatcher;
@@ -2500,26 +2500,12 @@ async fn file_content(
     match value.as_resolved() {
         Some(None) => Ok(super::FileContent::Absent),
         Some(Some(TreeValue::File { id, .. })) => {
-            let mut reader = commit
-                .store()
-                .read_file(&path, id)
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut bytes = Vec::new();
-            let mut chunk = [0u8; 65536];
-            loop {
+            let bytes = super::three_way::read_file_bytes(commit.store(), &path, id, || {
                 deadline
                     .check()
-                    .map_err(|_| "candidate read deadline exhausted".to_string())?;
-                let count = reader
-                    .read(&mut chunk)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if count == 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&chunk[..count]);
-            }
+                    .map_err(|_| "candidate read deadline exhausted".to_string())
+            })
+            .await?;
             Ok(match String::from_utf8(bytes) {
                 Ok(text) => super::FileContent::Text(text),
                 Err(_) => super::FileContent::Binary,

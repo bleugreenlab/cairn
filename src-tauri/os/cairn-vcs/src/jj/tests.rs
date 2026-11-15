@@ -1338,6 +1338,98 @@ fn ensure_bookmark_on_origin_publishes_store_bookmark() {
 /// The regression fence for the defect the three-way merge primitive exists to
 /// close, over a real store rather than in the abstract.
 ///
+/// The in-process side reader answers exactly as the jj reader does for every
+/// kind of value a path can hold — text, absence, a directory named as a path,
+/// binary content, edge whitespace, and a recorded conflict — and reads every
+/// plain file without starting jj, which is what lets an assessment over
+/// hundreds of conflicting paths finish inside its budget.
+#[test]
+#[serial_test::serial(jj)]
+fn merge_sides_read_in_process_match_the_jj_reader() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping merge_sides_read_in_process_match_the_jj_reader: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let commit = |parents: &[&str], files: &[(&str, Option<&[u8]>)]| {
+        let mut args = vec!["new"];
+        args.extend(parents);
+        jj.run(&store, &args, "new fixture commit").unwrap();
+        for (path, content) in files {
+            let file = store.join(path);
+            match content {
+                Some(bytes) => {
+                    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    std::fs::write(file, bytes).unwrap();
+                }
+                None => std::fs::remove_file(file).unwrap(),
+            }
+        }
+        jj.run(&store, &["describe", "-m", "fixture"], "describe fixture")
+            .unwrap();
+        jj.run(
+            &store,
+            &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+            "fixture commit id",
+        )
+        .unwrap()
+    };
+    let base = commit(
+        &["main"],
+        &[
+            ("shared.txt", Some(b"one\ntwo\n")),
+            ("dir/inner.txt", Some(b"inner\n")),
+            ("blob.bin", Some(&[0xff, 0xfe, 0x00])),
+        ],
+    );
+    let ours = commit(
+        &[&base],
+        &[
+            ("shared.txt", Some(b"ours\ntwo\n")),
+            ("added.txt", Some(b"  edge whitespace  \n\n")),
+        ],
+    );
+    let theirs = commit(
+        &[&base],
+        &[("shared.txt", Some(b"theirs\ntwo\n")), ("blob.bin", None)],
+    );
+    // Merging the two edits of `shared.txt` records a conflict there.
+    let conflicted = commit(&[&ours, &theirs], &[]);
+    let paths: Vec<String> = ["shared.txt", "added.txt", "blob.bin", "dir", "missing.txt"]
+        .map(String::from)
+        .to_vec();
+    let commands_built = || super::env::COMMANDS_BUILT.with(std::cell::Cell::get);
+
+    for (tip, jj_commands) in [(&ours, 0), (&conflicted, 2)] {
+        let expected = read_sides_via_cli(&jj, &store, &base, tip, &theirs, &paths);
+        let before = commands_built();
+        let read = read_sides_for_paths(&jj, &store, &base, tip, &theirs, &paths);
+        assert_eq!(
+            commands_built() - before,
+            jj_commands,
+            "only a recorded conflict is asked of jj, one probe and one read"
+        );
+        assert_eq!(read, expected, "tip {tip}");
+    }
+    let read = read_sides_for_paths(&jj, &store, &base, &conflicted, &theirs, &paths);
+    let Ok(MergeSides {
+        ours: FileContent::Text(shared),
+        ..
+    }) = &read[0].1
+    else {
+        panic!("the conflicted side reads as text: {:?}", read[0]);
+    };
+    assert!(
+        shared.contains("<<<<<<<"),
+        "a recorded conflict reads with jj's markers: {shared}"
+    );
+}
+
 /// The shape is the one that produced it: a small conflict at the top of a file,
 /// and a block of incoming work further down that the branch never touched. A
 /// top-only resolution looks complete to the agent who wrote it, and

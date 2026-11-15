@@ -4818,9 +4818,8 @@ impl Context<'_> {
     /// assessment only ever adds entries to it (`basis_after`), so the earlier
     /// basis is a subset of the assessed one: it can make a later
     /// take-committed-tip replay refuse a path, never lose one. A timeout must
-    /// not end the preparation: the assessment shells out per path and side
-    /// and can be irreducibly longer than any budget on a large store, and
-    /// refusing here strands the owner's commit at every base move.
+    /// not end the preparation: refusing here would strand the owner's commit
+    /// at every base move, for an answer that only ever adds credit.
     async fn bounded_inherited_basis(
         &self,
         coordinate: &crate::jj::AdvanceCoordinate,

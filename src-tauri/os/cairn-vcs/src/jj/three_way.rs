@@ -32,8 +32,13 @@
 //! would silently throw work away is refused instead.
 
 use super::*;
+use futures::AsyncReadExt as _;
+use jj_lib::backend::{CommitId, FileId, TreeValue};
+use jj_lib::commit::Commit;
+use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// A cooperative deadline for the in-process merge work in this module.
@@ -193,10 +198,16 @@ pub fn file_at_revision(
         ],
         "jj file show (merge preview)",
     )?;
-    Ok(match String::from_utf8(bytes) {
-        Ok(text) => FileContent::Text(text),
-        Err(_) => FileContent::Binary,
-    })
+    Ok(FileContent::from_bytes(bytes))
+}
+
+impl FileContent {
+    fn from_bytes(bytes: Vec<u8>) -> Self {
+        match String::from_utf8(bytes) {
+            Ok(text) => Self::Text(text),
+            Err(_) => Self::Binary,
+        }
+    }
 }
 
 /// One path's UTF-8 text at one revision, or `None` when the path does not
@@ -833,9 +844,12 @@ pub struct PathAssessment {
     pub verdict: RestoreVerdict,
 }
 
-/// Read the three sides of every named path, in as few jj calls as the question
-/// allows: one presence probe per side for the whole set, then one content read
-/// per side per present path.
+/// Read the three sides of every named path.
+///
+/// Three full commit IDs are read in this process, through one store open (see
+/// [`read_sides_in_process`]); a store or a revision that cannot be read that
+/// way is read through jj, with one presence probe per side for the whole set
+/// and then one content read per side per present path. The two answer alike.
 ///
 /// A path whose CONTENT cannot be read degrades to an `Err` for that path alone.
 /// This is an instrument on a read path; one unreadable file must not take the
@@ -851,6 +865,26 @@ pub struct PathAssessment {
 /// hiccup. `an_empty_base_would_falsely_certify_a_lossy_restore` holds that
 /// specific corruption, so the reason this is an error survives the next reader.
 pub fn read_sides_for_paths(
+    jj: &JjEnv,
+    store: &Path,
+    base_rev: &str,
+    ours_rev: &str,
+    theirs_rev: &str,
+    paths: &[String],
+) -> Vec<(String, Result<MergeSides, String>)> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let revs = [base_rev, ours_rev, theirs_rev];
+    match commits_in_process(store, &revs) {
+        Some(commits) => read_sides_in_process(jj, store, revs, &commits, paths),
+        None => read_sides_via_cli(jj, store, base_rev, ours_rev, theirs_rev, paths),
+    }
+}
+
+/// [`read_sides_for_paths`] through jj alone: the reader for a revision that is
+/// not a full commit ID, and the reference the in-process reader is held to.
+pub(super) fn read_sides_via_cli(
     jj: &JjEnv,
     store: &Path,
     base_rev: &str,
@@ -886,6 +920,136 @@ pub fn read_sides_for_paths(
             (path.clone(), sides)
         })
         .collect()
+}
+
+/// The commits `revs` name, opened through jj-lib for reads in this process.
+///
+/// One `jj` process per path per side is what made a many-path assessment
+/// unfinishable: tens of milliseconds each, times three sides, times every
+/// conflicting path, outlasts any assessment budget once a few hundred paths
+/// conflict. In process, one store open serves every read.
+///
+/// A commit read by its ID loads no operation, so this needs no operation pin
+/// and cannot settle a split operation log. `None` when any revision is not a
+/// full commit ID the store holds, or the store cannot be opened; the caller
+/// then asks jj, which resolves symbolic revisions and words the failure.
+fn commits_in_process(store: &Path, revs: &[&str]) -> Option<Vec<Commit>> {
+    let ids = revs
+        .iter()
+        .map(|rev| CommitId::try_from_hex(rev).filter(|_| !rev.is_empty()))
+        .collect::<Option<Vec<_>>>()?;
+    let workspace = crate::load_workspace(store)
+        .map_err(|error| log::debug!("merge sides are read through jj: {error}"))
+        .ok()?;
+    let commits = workspace.repo_loader().store().clone();
+    ids.iter()
+        .map(|id| commits.get_commit(id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| log::debug!("merge sides are read through jj: {error}"))
+        .ok()
+}
+
+/// Every named path's three sides, read in this process from `commits` (the
+/// commits `revs` name, in the same order).
+///
+/// Answers what jj would for a regular file (its bytes), a missing path, and a
+/// directory named as a path (absent: `jj file list` names the files below a
+/// directory, never the directory). A recorded conflict, a symlink, a
+/// submodule, or a name jj-lib does not take as a repository path is asked of
+/// jj for that path and side alone, so whatever `jj file show` prints for it
+/// (conflict markers included) stays the answer.
+fn read_sides_in_process(
+    jj: &JjEnv,
+    store: &Path,
+    revs: [&str; 3],
+    commits: &[Commit],
+    paths: &[String],
+) -> Vec<(String, Result<MergeSides, String>)> {
+    let deadline = jj.merge_deadline();
+    futures::executor::block_on(async {
+        let mut read = Vec::with_capacity(paths.len());
+        for path in paths {
+            let sides = sides_in_process(jj, store, revs, commits, path, deadline).await;
+            read.push((path.clone(), sides));
+        }
+        read
+    })
+}
+
+async fn sides_in_process(
+    jj: &JjEnv,
+    store: &Path,
+    revs: [&str; 3],
+    commits: &[Commit],
+    path: &str,
+    deadline: MergeDeadline,
+) -> Result<MergeSides, String> {
+    Ok(MergeSides {
+        base: side_in_process(jj, store, revs[0], &commits[0], path, deadline).await?,
+        ours: side_in_process(jj, store, revs[1], &commits[1], path, deadline).await?,
+        theirs: side_in_process(jj, store, revs[2], &commits[2], path, deadline).await?,
+    })
+}
+
+async fn side_in_process(
+    jj: &JjEnv,
+    store: &Path,
+    rev: &str,
+    commit: &Commit,
+    path: &str,
+    deadline: MergeDeadline,
+) -> Result<FileContent, String> {
+    const CTX: &str = "file read (merge preview)";
+    deadline.check(CTX)?;
+    let via_jj = || {
+        let present = paths_present_at(jj, store, rev, &[path.to_string()])?;
+        file_at_revision(jj, store, rev, path, &present)
+    };
+    let Ok(repo_path) = RepoPathBuf::from_internal_string(path) else {
+        return via_jj();
+    };
+    let value = commit
+        .tree()
+        .path_value(&repo_path)
+        .await
+        .map_err(|error| format!("read `{path}` at {rev}: {error}"))?;
+    match value.as_resolved() {
+        Some(None) | Some(Some(TreeValue::Tree(_))) => Ok(FileContent::Absent),
+        Some(Some(TreeValue::File { id, .. })) => {
+            let bytes = read_file_bytes(commit.store(), &repo_path, id, || deadline.check(CTX))
+                .await
+                .map_err(|error| format!("read `{path}` at {rev}: {error}"))?;
+            Ok(FileContent::from_bytes(bytes))
+        }
+        _ => via_jj(),
+    }
+}
+
+/// One file's bytes from the store, with `check` consulted between chunks so a
+/// spent budget stops a large read part way.
+pub(super) async fn read_file_bytes(
+    store: &Arc<jj_lib::store::Store>,
+    path: &RepoPath,
+    id: &FileId,
+    check: impl Fn() -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
+    let mut reader = store
+        .read_file(path, id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        check()?;
+        let count = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
 }
 
 /// Require all three per-revision presence probes to have answered.
