@@ -362,6 +362,43 @@ fn rollup_insert_sql() -> String {
     )
 }
 
+/// Whether one candidate run still needs a fold: it has a rollup-relevant event
+/// past its watermark (the [`NEEDING_FOLD_SQL`] predicate, keyed to `?1`). A
+/// fold chunk runs it inside its write transaction for each of its candidates,
+/// so the write never re-walks every run.
+const CANDIDATE_NEEDS_FOLD_SQL: &str = "SELECT 1 FROM events e
+    WHERE e.run_id = ?1
+      AND (e.event_type = 'assistant' OR e.event_type LIKE 'result%' OR e.cost_usd IS NOT NULL)
+      AND e.created_at > COALESCE(
+          (SELECT w.processed_through FROM token_rollup_runs w WHERE w.run_id = ?1), -1)
+    LIMIT 1";
+
+/// The most candidate runs one fold write transaction takes.
+pub(crate) const FOLD_CHUNK_RUNS: usize = 50;
+
+/// The rebuild work one fold write transaction does before it commits. The
+/// budget is checked between runs, so a chunk always takes at least one run and
+/// never splits one.
+const FOLD_CHUNK_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The pause between fold chunks: a moment with no fold transaction open, in
+/// which the checkpoint (which needs zero open transactions) and other writers
+/// get their turn.
+const FOLD_CHUNK_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// What one [`fold_token_rollup_chunks`] call did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FoldProgress {
+    /// Runs the pooled read found needing a fold.
+    pub candidates: usize,
+    /// Runs re-derived (a candidate another fold already advanced is skipped).
+    pub folded: usize,
+    /// Write transactions committed.
+    pub chunks: usize,
+    /// The most runs one committed chunk re-derived.
+    pub widest_chunk: usize,
+}
+
 /// Incrementally fold new events into `token_rollup`, watermark-gated per run.
 ///
 /// Called once from the startup historical backfill (`run_historical_backfill`),
@@ -371,42 +408,98 @@ fn rollup_insert_sql() -> String {
 /// and immutable, so the fold is forward-only: a run with new relevant events is
 /// re-derived wholesale (delete-then-reinsert per run, idempotent), every other
 /// run is skipped by its watermark.
+pub(crate) async fn fold_token_rollup(db: &LocalDb) -> DbResult<FoldProgress> {
+    fold_token_rollup_chunks(db, None).await
+}
+
+/// [`fold_token_rollup`], committing at most `max_chunks` chunks when given.
 ///
-/// Concurrency: an analytics page fires several rollup queries at once, so this
-/// runs concurrently. The detect-delete-reinsert-advance cycle therefore happens
-/// inside ONE serialized write transaction; a loser of the race re-evaluates an
-/// empty needing-set against the now-advanced watermark and no-ops, instead of
-/// double-folding and briefly exposing a partial rollup to a concurrent reader.
-/// A read-only fast path skips the write transaction entirely when the watermark
-/// is already current (the warm case).
-pub(crate) async fn fold_token_rollup(db: &LocalDb) -> DbResult<()> {
-    let needing = db
-        .query_all(NEEDING_FOLD_SQL, (), |row| row.text(0))
-        .await?;
-    if needing.is_empty() {
-        return Ok(());
+/// A pooled read enumerates the candidate runs; a warm rollup stops there. The
+/// candidates are then folded in bounded write transactions (at most
+/// [`FOLD_CHUNK_RUNS`] runs, closing early once [`FOLD_CHUNK_BUDGET`] of work is
+/// done), each committing its runs' rows and watermarks together, with a pause
+/// between chunks. Live event inserts upsert `token_rollup` meanwhile; a long
+/// transaction over every run would conflict with one of them and retry from
+/// the start forever, where a chunk that conflicts retries only its own runs.
+///
+/// Per-run atomicity is the invariant: a reader never sees a run's rows half
+/// re-derived, and a run's rows always commit with its watermark, which is the
+/// resume point. A fold stopped between chunks (a restart, or `max_chunks`)
+/// leaves every run either folded and advanced or untouched, and the next fold
+/// takes up the runs still past their watermark.
+///
+/// Concurrency: folds may race (startup, tests). Each chunk re-checks every one
+/// of its candidates inside its write transaction ([`CANDIDATE_NEEDS_FOLD_SQL`]),
+/// so a run another fold already advanced is skipped, never double-folded. A
+/// run that turns dirty after the read is the next fold's.
+pub(crate) async fn fold_token_rollup_chunks(
+    db: &LocalDb,
+    max_chunks: Option<usize>,
+) -> DbResult<FoldProgress> {
+    let candidates: std::sync::Arc<Vec<String>> = std::sync::Arc::new(
+        db.query_all(NEEDING_FOLD_SQL, (), |row| row.text(0))
+            .await?,
+    );
+    let mut progress = FoldProgress {
+        candidates: candidates.len(),
+        ..FoldProgress::default()
+    };
+    let insert_sql = std::sync::Arc::new(rollup_insert_sql());
+    let mut next = 0;
+    while next < candidates.len() {
+        if max_chunks.is_some_and(|max| progress.chunks >= max) {
+            return Ok(progress);
+        }
+        if progress.chunks > 0 {
+            tokio::time::sleep(FOLD_CHUNK_PAUSE).await;
+        }
+        let (taken, folded) = fold_chunk(db, candidates.clone(), next, insert_sql.clone()).await?;
+        next += taken;
+        progress.folded += folded;
+        progress.chunks += 1;
+        progress.widest_chunk = progress.widest_chunk.max(folded);
     }
-    let insert_sql = rollup_insert_sql();
+    Ok(progress)
+}
+
+/// One fold write transaction over the candidates from `start`: re-check each,
+/// and delete, re-insert and advance the watermark of each that still needs it,
+/// until [`FOLD_CHUNK_RUNS`] are taken or [`FOLD_CHUNK_BUDGET`] is spent.
+/// Returns (candidates taken, runs folded).
+async fn fold_chunk(
+    db: &LocalDb,
+    candidates: std::sync::Arc<Vec<String>>,
+    start: usize,
+    insert_sql: std::sync::Arc<String>,
+) -> DbResult<(usize, usize)> {
     db.write(move |conn| {
+        let candidates = candidates.clone();
         let insert_sql = insert_sql.clone();
         Box::pin(async move {
-            // Re-detect inside the write txn so a concurrent fold that already
-            // advanced the watermark collapses this call to a no-op.
-            let mut runs: Vec<String> = Vec::new();
-            {
-                let mut rows = conn.query(NEEDING_FOLD_SQL, ()).await?;
-                while let Some(row) = rows.next().await? {
-                    runs.push(row.text(0)?);
-                }
-            }
+            let began = std::time::Instant::now();
             let now = chrono::Utc::now().timestamp();
-            for run_id in &runs {
+            let (mut taken, mut folded) = (0, 0);
+            for run_id in &candidates[start..] {
+                if taken == FOLD_CHUNK_RUNS || (taken > 0 && began.elapsed() >= FOLD_CHUNK_BUDGET) {
+                    break;
+                }
+                taken += 1;
+                let needs_fold = conn
+                    .query(CANDIDATE_NEEDS_FOLD_SQL, params![run_id.as_str()])
+                    .await?
+                    .next()
+                    .await?
+                    .is_some();
+                if !needs_fold {
+                    continue;
+                }
                 conn.execute(
                     "DELETE FROM token_rollup WHERE run_id = ?1",
                     params![run_id.as_str()],
                 )
                 .await?;
-                conn.execute(&insert_sql, params![run_id.as_str()]).await?;
+                conn.execute(insert_sql.as_str(), params![run_id.as_str()])
+                    .await?;
                 conn.execute(
                     "INSERT INTO token_rollup_runs(run_id, processed_through, updated_at)
                      VALUES (
@@ -423,8 +516,9 @@ pub(crate) async fn fold_token_rollup(db: &LocalDb) -> DbResult<()> {
                     params![run_id.as_str(), now],
                 )
                 .await?;
+                folded += 1;
             }
-            Ok(())
+            Ok((taken, folded))
         })
     })
     .await
@@ -432,13 +526,17 @@ pub(crate) async fn fold_token_rollup(db: &LocalDb) -> DbResult<()> {
 
 /// Runs whose events key by the model the provider reported
 /// ([`model_key_expr`]): their job selected no model, or a bare Claude alias.
+/// Bound param `?1` is the pass's cursor: only runs ordered after it, in id
+/// order.
 fn report_keyed_runs_sql() -> String {
     format!(
         "SELECT r.id
         FROM runs r
         LEFT JOIN sessions s ON s.id = r.session_id
         JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
-        WHERE {SELECTED_MODEL} IS NULL OR LOWER({SELECTED_MODEL}) IN ({spellings})",
+        WHERE r.id > ?1
+          AND ({SELECTED_MODEL} IS NULL OR LOWER({SELECTED_MODEL}) IN ({spellings}))
+        ORDER BY r.id",
         spellings = alias_spellings(),
     )
 }
@@ -453,9 +551,25 @@ const REPORTED_MODEL_PAGE: i64 = 200;
 /// archived event's `data` is only an envelope, so each page is read through
 /// `reconstruct_events`. A one-time pass inside the historical backfill: live
 /// events get the column from the insert seam.
+///
+/// The pass walks runs in id order and records the last run it finished in
+/// `analytics_rollup_backfill_state.reported_models_through`, so a restart
+/// before the backfill completes resumes after it. Without the cursor a rerun
+/// would re-read and re-reconstruct every event it already examined and could
+/// not attribute (an archived turn whose body names no model stays NULL
+/// forever). Marking the backfill complete clears the cursor, so a migration
+/// that reopens the backfill restarts the pass from the first run.
 pub(crate) async fn backfill_reported_models(db: &LocalDb) -> DbResult<()> {
+    let through = db
+        .query_one(
+            "SELECT reported_models_through FROM analytics_rollup_backfill_state WHERE id = 1",
+            (),
+            |row| row.opt_text(0),
+        )
+        .await?
+        .unwrap_or_default();
     let runs = db
-        .query_all(report_keyed_runs_sql(), (), |row| row.text(0))
+        .query_all(report_keyed_runs_sql(), (through,), |row| row.text(0))
         .await?;
     let page_sql = format!(
         "SELECT {cols} FROM events
@@ -514,6 +628,11 @@ pub(crate) async fn backfill_reported_models(db: &LocalDb) -> DbResult<()> {
                 break;
             }
         }
+        db.execute(
+            "UPDATE analytics_rollup_backfill_state SET reported_models_through = ?1 WHERE id = 1",
+            (run_id,),
+        )
+        .await?;
     }
     Ok(())
 }

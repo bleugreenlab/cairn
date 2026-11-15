@@ -3142,6 +3142,205 @@ async fn fold_token_rollup_is_idempotent() {
     assert_eq!(first, second, "a second fold must change nothing");
 }
 
+/// `runs` claude runs (`run-cold{i}`), each with `per_run` billable assistant
+/// events in separate hours, stored by raw SQL so the rollup stays cold until a
+/// fold, as history from before the per-event seam is.
+async fn seed_cold_runs(db: &LocalDb, runs: usize, per_run: usize) {
+    for i in 0..runs {
+        seed_run(db, &format!("cold{i}"), "claude", "claude-sonnet-4-5").await;
+        let values: Vec<String> = (0..per_run)
+            .map(|k| {
+                let ts = 3600 * k + i;
+                format!(
+                    "('cold{i}-{k}', 'run-cold{i}', 'sess-cold{i}', {k}, {ts}, 'assistant', '{{}}',
+                      NULL, {ts}, {input}, 1, 2, 3, 0)",
+                    input = 10 + k
+                )
+            })
+            .collect();
+        db.execute_script(format!(
+            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                 parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                 cache_create_tokens, output_tokens, thinking_tokens)
+             VALUES {};",
+            values.join(", ")
+        ))
+        .await
+        .unwrap();
+    }
+}
+
+async fn count(db: &LocalDb, sql: &str) -> i64 {
+    db.query_one(sql, (), |row| row.i64(0)).await.unwrap()
+}
+
+/// The historical fold commits in chunks while live events land through the
+/// insert seam, both on a run the fold never saw and on runs it is folding.
+/// The fold completes, and the rollup it leaves equals the event scan and a
+/// from-scratch re-fold of the same events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fold_under_live_inserts_matches_event_scan_oracle() {
+    let db = std::sync::Arc::new(cost_db().await);
+    seed_cold_runs(&db, 3 * queries::FOLD_CHUNK_RUNS, 3).await;
+    seed_run(&db, "live", "claude", "claude-sonnet-4-5").await;
+
+    let fold = tokio::spawn({
+        let db = db.clone();
+        async move { queries::fold_token_rollup(&db).await.unwrap() }
+    });
+    let live = tokio::spawn({
+        let db = db.clone();
+        async move {
+            for k in 0..60i32 {
+                // Even inserts land on a run outside the fold; odd ones on a
+                // cold run the fold is re-deriving, some in a bucket it also
+                // writes (hour 0) and some in a new one.
+                let suffix = if k % 2 == 0 {
+                    "live".to_string()
+                } else {
+                    format!("cold{}", k * 2)
+                };
+                let ts = if k % 4 == 1 { 30 } else { 7200 * k };
+                seam_insert(
+                    &db,
+                    ev_insert(
+                        &format!("live-{k}"),
+                        &format!("run-{suffix}"),
+                        &format!("sess-{suffix}"),
+                        100 + k,
+                        "assistant",
+                        ts,
+                        5,
+                        0,
+                        0,
+                        1,
+                        0,
+                        None,
+                    ),
+                )
+                .await;
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    let (progress, live) = tokio::join!(fold, live);
+    live.unwrap();
+    let progress = progress.unwrap();
+    assert_eq!(progress.folded, progress.candidates, "{progress:?}");
+    assert!(progress.chunks >= 3, "{progress:?}");
+    assert!(progress.widest_chunk <= queries::FOLD_CHUNK_RUNS);
+
+    let scope = Scope::new(None);
+    let range = TimeRange::default();
+    assert_token_components_eq(
+        queries::token_components(&db, &scope, &range, Bucket::Hour)
+            .await
+            .unwrap(),
+        queries::token_components_live(&db, &scope, &range, Bucket::Hour)
+            .await
+            .unwrap(),
+        "fold under live inserts",
+    );
+    let folded = dump_rollup(&db).await;
+    refold(&db).await;
+    assert_eq!(dump_rollup(&db).await, folded);
+}
+
+/// A fold stopped after one chunk leaves each run either wholly folded with
+/// its watermark or untouched, and the next fold takes up exactly the rest,
+/// ending in the rollup an uninterrupted fold produces.
+#[tokio::test]
+async fn interrupted_fold_resumes_to_the_uninterrupted_rollup() {
+    let runs = 2 * queries::FOLD_CHUNK_RUNS + 20;
+    let whole = cost_db().await;
+    seed_cold_runs(&whole, runs, 2).await;
+    let uninterrupted = queries::fold_token_rollup(&whole).await.unwrap();
+    assert_eq!(uninterrupted.folded, runs);
+    assert!(uninterrupted.chunks >= runs.div_ceil(queries::FOLD_CHUNK_RUNS));
+    assert!(uninterrupted.widest_chunk <= queries::FOLD_CHUNK_RUNS);
+
+    let resumed = cost_db().await;
+    seed_cold_runs(&resumed, runs, 2).await;
+    let first = queries::fold_token_rollup_chunks(&resumed, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(first.chunks, 1);
+    assert!((1..=queries::FOLD_CHUNK_RUNS).contains(&first.folded));
+    assert_eq!(
+        count(&resumed, "SELECT COUNT(*) FROM token_rollup_runs").await,
+        first.folded as i64
+    );
+    assert_eq!(
+        count(
+            &resumed,
+            "SELECT COUNT(*) FROM token_rollup
+             WHERE run_id NOT IN (SELECT run_id FROM token_rollup_runs)"
+        )
+        .await,
+        0,
+        "a run's rows commit with its watermark"
+    );
+
+    let rest = queries::fold_token_rollup(&resumed).await.unwrap();
+    assert_eq!(rest.candidates, runs - first.folded);
+    assert_eq!(first.folded + rest.folded, runs);
+    assert_eq!(dump_rollup(&resumed).await, dump_rollup(&whole).await);
+}
+
+/// The reported-model pass skips the runs its cursor says it finished, moves
+/// the cursor past each run it does, and completing the backfill clears it.
+#[tokio::test]
+async fn reported_model_pass_resumes_after_its_cursor() {
+    let db = cost_db().await;
+    seed_job(&db, "a", "NULL", "NULL").await;
+    seed_job(&db, "b", "NULL", "NULL").await;
+    db.execute(
+        "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+             parent_tool_use_id, created_at, input_tokens)
+         VALUES ('ea', 'run-a', 'sess-a', 1, 100, 'assistant', ?1, NULL, 100, 5),
+                ('eb', 'run-b', 'sess-b', 1, 100, 'assistant', ?1, NULL, 100, 5)",
+        (claude_message("claude-opus-5-5"),),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE analytics_rollup_backfill_state SET reported_models_through = 'run-a' WHERE id = 1",
+        (),
+    )
+    .await
+    .unwrap();
+
+    queries::backfill_reported_models(&db).await.unwrap();
+    let reported = db
+        .query_all(
+            "SELECT id, reported_model FROM events ORDER BY id",
+            (),
+            |row| Ok((row.text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reported,
+        vec![
+            ("ea".to_string(), None),
+            ("eb".to_string(), Some("claude-opus-5-5".to_string())),
+        ]
+    );
+    let cursor = || async {
+        db.query_one(
+            "SELECT reported_models_through FROM analytics_rollup_backfill_state WHERE id = 1",
+            (),
+            |row| row.opt_text(0),
+        )
+        .await
+        .unwrap()
+    };
+    assert_eq!(cursor().await.as_deref(), Some("run-b"));
+
+    run_historical_backfill(&db).await.unwrap();
+    assert_eq!(cursor().await, None);
+}
+
 #[tokio::test]
 async fn effective_cost_counts_a_removed_account_for_the_months_it_was_held() {
     let db = cost_db().await;

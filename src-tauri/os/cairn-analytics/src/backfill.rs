@@ -22,8 +22,12 @@ pub async fn backfill_tool_invocations(db: &LocalDb) -> DbResult<ToolBackfillSum
 /// reconstruct-based tool-invocation backfill — then records completion so it
 /// never re-scans the whole events table on later startups. Before folding, it
 /// fills `events.reported_model` for model-less jobs' events stored before that
-/// column existed, so the fold can attribute them. A second marker
-/// versions the narrower result-timestamp repair added after `result_ts`
+/// column existed, so the fold can attribute them. Both passes are resumable: a
+/// restart before completion continues the reported-model pass after its
+/// cursor and folds only the runs still past their watermark, in bounded write
+/// transactions, so live inserts never force the whole pass to start over.
+///
+/// A second marker versions the narrower result-timestamp repair added after `result_ts`
 /// existed: installs that already completed the original pass only revisit runs
 /// that have NULL-result tool_invocations rows.
 pub async fn run_historical_backfill(db: &LocalDb) -> DbResult<()> {
@@ -31,7 +35,14 @@ pub async fn run_historical_backfill(db: &LocalDb) -> DbResult<()> {
         false
     } else {
         queries::backfill_reported_models(db).await?;
-        queries::fold_token_rollup(db).await?;
+        let fold = queries::fold_token_rollup(db).await?;
+        log::info!(
+            "analytics token fold: candidates={} folded={} chunks={} widest_chunk={}",
+            fold.candidates,
+            fold.folded,
+            fold.chunks,
+            fold.widest_chunk
+        );
         queries::backfill_tool_invocations(db).await?;
         mark_historical_backfill_complete(db).await?;
         true
@@ -59,7 +70,9 @@ async fn historical_backfill_complete(db: &LocalDb) -> DbResult<bool> {
 async fn mark_historical_backfill_complete(db: &LocalDb) -> DbResult<()> {
     let now = chrono::Utc::now().timestamp();
     db.execute(
-        "UPDATE analytics_rollup_backfill_state SET backfilled_at = ?1 WHERE id = 1",
+        "UPDATE analytics_rollup_backfill_state
+         SET backfilled_at = ?1, reported_models_through = NULL
+         WHERE id = 1",
         (now,),
     )
     .await

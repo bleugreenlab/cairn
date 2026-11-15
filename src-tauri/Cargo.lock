@@ -884,6 +884,7 @@ dependencies = [
  "cairn-db",
  "cairn-models-types",
  "chrono",
+ "log",
  "serde",
  "serde_json",
  "tempfile",
