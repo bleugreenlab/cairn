@@ -65,7 +65,7 @@ async fn fence_orchestrator(with_process: bool) -> Orchestrator {
                 live_checkout: false,
                 executor_binding: Some(RunnerContextExecutorBinding {
                     executor_id: "executor-1".into(),
-                    generation: 7,
+                    link: BatchLink::Bound(7),
                     request_id: "request-1".into(),
                     attempt_id: "attempt-1".into(),
                 }),
@@ -410,15 +410,55 @@ async fn a_fence_wait_whose_batch_settles_is_withdrawn_and_never_parks() {
     assert!(!orch.park_slots.armed(RUN));
 }
 
+fn announced_batch() -> cairn_common::executor_protocol::RelayIdentity {
+    cairn_common::executor_protocol::RelayIdentity::Batch {
+        runner_context_id: "ctx".into(),
+        request_id: "request-1".into(),
+        attempt_id: "attempt-1".into(),
+    }
+}
+
+/// A link close withdraws the fence wait parked then, whose answer has
+/// nowhere to go, and leaves the batch's context in place: the batch runs on.
 #[tokio::test(start_paused = true)]
 async fn link_drop_withdraws_with_executor_link_dropped() {
     let orch = fence_orchestrator(true).await;
     let result = close_mid_wait(&orch, |fleet| {
-        fleet.revoke_mcp_relay_contexts_for_executor("executor-1", 7);
+        fleet.relay_link_closed("executor-1", 7);
     })
     .await;
     assert_withdrawn_reply(&result);
     assert_withdrawn_with(&orch, "executor_link_dropped").await;
+    assert!(orch.fleet.holds_runner_context("ctx"));
+}
+
+/// The cause a past link close recorded does not stand over the context's
+/// next life: after the reattach, a new fence wait on it runs its full
+/// budget and suspends as any other would.
+#[tokio::test(start_paused = true)]
+async fn a_fence_wait_after_the_reattach_is_not_withdrawn_by_the_past_link_drop() {
+    let orch = fence_orchestrator(true).await;
+    orch.fleet.relay_link_closed("executor-1", 7);
+    orch.fleet
+        .reattach_relays("executor-1", 8, &[announced_batch()]);
+    let task = raise(&orch).await;
+    tokio::time::sleep(RELAYED_FENCE_WAIT_BUDGET + Duration::from_millis(10)).await;
+    assert_eq!(task.await.unwrap(), RunnerCallbackResult::Suspended);
+    assert_eq!(permission(&orch).await.1, "pending");
+}
+
+/// A reattach that does not name the batch ends it there, and a fence wait
+/// parked on it is withdrawn saying so.
+#[tokio::test(start_paused = true)]
+async fn an_unannounced_batch_withdraws_with_executor_did_not_reannounce() {
+    let orch = fence_orchestrator(true).await;
+    let result = close_mid_wait(&orch, |fleet| {
+        fleet.reattach_relays("executor-1", 8, &[]);
+    })
+    .await;
+    assert_withdrawn_reply(&result);
+    assert_withdrawn_with(&orch, "executor_did_not_reannounce").await;
+    assert!(!orch.fleet.holds_runner_context("ctx"));
 }
 
 #[tokio::test(start_paused = true)]

@@ -61,7 +61,7 @@ impl Drop for CoalescedLeaderCompletionGuard {
         lock_through_poison(&self.pool.coalesced_leaders).remove(&self.leader);
         lock_through_poison(&self.pool.preparing_leaders).remove(&self.leader);
         if let Some(id) = &self.runner_context_id {
-            lock_through_poison(&self.pool.runner_contexts).remove(id);
+            self.pool.end_runner_context(id);
         }
         // The leader's queue entry is withdrawn by its own guard, which drops
         // first, so the binding is usually gone by now; the machine's last
@@ -2723,10 +2723,7 @@ impl Fleet {
                 crate::mcp::handlers::fence::RunFenceResolution::Resolved(_, fence) => Some(fence),
                 crate::mcp::handlers::fence::RunFenceResolution::Ambient => None,
                 crate::mcp::handlers::fence::RunFenceResolution::Unavailable(diagnostic) => {
-                    self.runner_contexts
-                        .lock()
-                        .unwrap()
-                        .remove(&runner_context_id);
+                    self.end_runner_context(&runner_context_id);
                     return CellOutcome::Unavailable {
                         reason: CellUnavailableReason::RunnerContext,
                         diagnostic,
@@ -2856,7 +2853,7 @@ impl Fleet {
             .map(|entry| entry.context.clone())
         else {
             return RunnerCallbackResult::Failed {
-                diagnostic: "unknown or expired runner callback context".into(),
+                diagnostic: self.describe_unheld_context(context_id),
             };
         };
         // Scrubbed before it is published, against this runner's registry rather
@@ -2938,7 +2935,7 @@ impl Fleet {
             .map(|entry| (entry.context.clone(), entry.closed.subscribe()))
         else {
             return RunnerCallbackResult::Failed {
-                diagnostic: "unknown or expired runner callback context".into(),
+                diagnostic: self.describe_unheld_context(context_id),
             };
         };
         match callback {

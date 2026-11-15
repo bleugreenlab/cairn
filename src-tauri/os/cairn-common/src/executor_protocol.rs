@@ -9398,6 +9398,17 @@ pub struct LearnedResourceEstimate {
 /// test-only and now names it by its home module. The executor compiles none
 /// of it and no frame, field or behaviour changes, so a runner talking to an
 /// older executor gets nothing wrong.
+///
+/// cairn/5631 does not move the number. [`RelayIdentity::Batch`] gains its
+/// first sender: an executor names each running batch's relay context in the
+/// [`ExecutorMessage::RelayReattach`] it sends first on every link, and a
+/// runner that detached the context at the last link close rebinds it, instead
+/// of revoking it at that close. No frame, variant or field changes. What a
+/// runner gets wrong talking to an older executor: nothing it decodes
+/// differently. That executor announces no batches, so the runner revokes the
+/// batch contexts it held detached for it at the first reattach, which fails
+/// closed exactly as the link close did before. An older runner already
+/// decodes the batch entries and skips them.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -25903,8 +25914,9 @@ pub enum RelayIdentity {
         process_key: String,
         process_generation: u64,
     },
-    /// A running batch's relay context. Declared so one frame serves both
-    /// kinds; no executor sends it yet and a runner ignores it (cairn/5631).
+    /// A running batch's relay context, with the attempt it was granted for.
+    /// The runner rebinds a held context it finds here for the same attempt,
+    /// and revokes one bound to this executor that is missing (cairn/5631).
     #[serde(rename_all = "camelCase")]
     Batch {
         runner_context_id: String,

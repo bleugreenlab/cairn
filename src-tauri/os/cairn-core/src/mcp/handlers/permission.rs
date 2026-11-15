@@ -76,6 +76,9 @@ pub enum HandoffClosed {
     BatchSettled,
     /// The context was dropped by a path that recorded no cause.
     ContextDropped,
+    /// The executor reattached without announcing the batch, so the batch is
+    /// no longer running there.
+    ExecutorDidNotReannounce,
 }
 
 impl HandoffClosed {
@@ -100,6 +103,7 @@ pub enum WithdrawalCause {
     ExecutorLinkDropped,
     BatchSettled,
     ContextDropped,
+    ExecutorDidNotReannounce,
     /// The operator compacted the session that raised the ask.
     OperatorCompact,
     /// The operator stopped the job whose turn raised the ask.
@@ -118,6 +122,7 @@ impl From<HandoffClosed> for WithdrawalCause {
             HandoffClosed::ExecutorLinkDropped => Self::ExecutorLinkDropped,
             HandoffClosed::BatchSettled => Self::BatchSettled,
             HandoffClosed::ContextDropped => Self::ContextDropped,
+            HandoffClosed::ExecutorDidNotReannounce => Self::ExecutorDidNotReannounce,
         }
     }
 }
@@ -133,6 +138,9 @@ impl WithdrawalCause {
                  stopped waiting before the inline budget"
             }
             Self::ContextDropped => "its batch context was dropped (cause not recorded)",
+            Self::ExecutorDidNotReannounce => {
+                "the executor reconnected without naming the batch that raised it"
+            }
             Self::OperatorCompact => {
                 "the operator compacted the session that raised it, which stopped that session"
             }

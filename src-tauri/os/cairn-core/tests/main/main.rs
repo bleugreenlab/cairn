@@ -32,6 +32,8 @@ mod artifact_confirm_authority;
 mod artifact_revision_delivery;
 mod artifact_seen;
 mod authority_protected_document;
+#[cfg(unix)]
+mod batch_relay_reconnect;
 mod concurrent_job_launch;
 mod condition;
 mod config_scope;

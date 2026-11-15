@@ -37,17 +37,21 @@ pub(super) struct RunnerCallbackContext {
 /// it into every item as `CAIRN_MCP_SECRET`, so a batch that dumps its own
 /// environment echoes it straight back. Registering it inside the entry means
 /// its scrub lifetime is exactly its authorization lifetime — batch completion,
-/// `revoke_runner_contexts_for_request`, `revoke_mcp_relay_contexts_for_executor`
+/// `revoke_runner_contexts_for_request`, a reattach that does not announce it
 /// and the coalesced-leader guard all remove from this map, so none of them can
 /// forget to release it. That is the CAIRN-3385 property held by construction
-/// rather than by four call sites agreeing.
+/// rather than by four call sites agreeing. A link close only detaches it: the
+/// batch is still running on its executor (cairn/5631).
 pub(super) struct RunnerContextEntry {
     pub(super) context: RunnerCallbackContext,
     /// Why this context closed, for a fence wait still holding a callback that
     /// arrived under it. Every removal path records what it observed before
     /// the entry goes; `Drop` records [`HandoffClosed::ContextDropped`] for a
     /// path that recorded nothing, so no waiter is left hanging and none is
-    /// told a cause nobody measured.
+    /// told a cause nobody measured. A link close records
+    /// [`HandoffClosed::ExecutorLinkDropped`] for the waits parked then, whose
+    /// answers have nowhere to go, and installs a fresh watch so a wait raised
+    /// after the reattach is not withdrawn by that past close.
     pub(super) closed: tokio::sync::watch::Sender<Option<HandoffClosed>>,
     /// Held, never read: dropping it is the whole contract.
     pub(super) _capability: Option<crate::security::SecretGuard<'static>>,
@@ -69,6 +73,20 @@ impl RunnerContextEntry {
             *closed = Some(cause);
             true
         });
+    }
+
+    /// The link carrying this context closed while its batch runs on: release
+    /// the waits parked on it now, and keep the context open for the next.
+    fn detach(&mut self, at_unix_ms: u64) {
+        let Some(binding) = self.context.executor_binding.as_mut() else {
+            return;
+        };
+        binding.link = BatchLink::Detached {
+            generation: binding.link.generation(),
+            at_unix_ms,
+        };
+        self.close(HandoffClosed::ExecutorLinkDropped);
+        self.closed = tokio::sync::watch::channel(None).0;
     }
 
     pub(super) fn new(
@@ -122,9 +140,101 @@ impl RunnerContextEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RunnerContextExecutorBinding {
     pub(super) executor_id: String,
-    pub(super) generation: u64,
+    pub(super) link: BatchLink,
     pub(super) request_id: String,
     pub(super) attempt_id: String,
+}
+
+/// Which link of its executor a batch's relay context answers on.
+///
+/// A batch is bound to its own life and its executor's identity, never to one
+/// link session: the executor keeps running it across a link gap and names it
+/// again on its next link. So a link close only detaches the context, and it
+/// ends when the batch does or when a reattach does not name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BatchLink {
+    /// Relayed calls are taken from this generation of the executor's link.
+    Bound(u64),
+    /// The link it was bound to closed at this moment, and no link has
+    /// announced it since.
+    Detached { generation: u64, at_unix_ms: u64 },
+}
+
+impl BatchLink {
+    /// The link this context was last bound to.
+    pub(super) fn generation(self) -> u64 {
+        match self {
+            Self::Bound(generation) | Self::Detached { generation, .. } => generation,
+        }
+    }
+}
+
+/// How many ended contexts the runner remembers the ending of, so a call on
+/// one is refused with why it ended rather than as unknown.
+pub(super) const CLOSED_RUNNER_CONTEXT_MEMORY: usize = 4_096;
+
+/// Why a runner callback context ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ContextEnding {
+    Settled,
+    Cancelled,
+    /// Its executor reattached on `generation` without announcing it.
+    NotReannounced {
+        executor: String,
+        generation: u64,
+    },
+    /// It ended without its batch running or settling: the batch was never
+    /// submitted, or its leader ended without an outcome.
+    Ended,
+}
+
+/// The endings of the last [`CLOSED_RUNNER_CONTEXT_MEMORY`] contexts, oldest
+/// forgotten first.
+///
+/// Keyed by the SHA-256 of the context id, never the id: the id is the batch's
+/// capability, and its scrub registration ends with the context, so a raw id
+/// kept here would outlive the guard that keeps it out of every output. Read
+/// only to word a refusal; nothing is ever re-admitted from here.
+#[derive(Default)]
+pub(super) struct ClosedRunnerContexts {
+    order: std::collections::VecDeque<[u8; 32]>,
+    endings: HashMap<[u8; 32], (ContextEnding, u64)>,
+}
+
+impl ClosedRunnerContexts {
+    pub(super) fn key(runner_context_id: &str) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(runner_context_id.as_bytes()).into()
+    }
+
+    fn record(&mut self, runner_context_id: &str, ending: ContextEnding, at_unix_ms: u64) {
+        let key = Self::key(runner_context_id);
+        if self.endings.insert(key, (ending, at_unix_ms)).is_some() {
+            return;
+        }
+        self.order.push_back(key);
+        while self.order.len() > CLOSED_RUNNER_CONTEXT_MEMORY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.endings.remove(&oldest);
+            }
+        }
+    }
+
+    fn ending(&self, runner_context_id: &str) -> Option<&(ContextEnding, u64)> {
+        self.endings.get(&Self::key(runner_context_id))
+    }
+
+    #[cfg(test)]
+    pub(super) fn keys(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.endings.keys()
+    }
+}
+
+fn rfc3339(unix_ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(unix_ms as i64).map_or_else(
+        || format!("{unix_ms} ms"),
+        |at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
 }
 
 impl Fleet {
@@ -144,15 +254,29 @@ impl Fleet {
             return Err("relayed MCP requests cannot select a thread identity".into());
         }
         let contexts = self.runner_contexts.lock().unwrap();
-        let context = contexts
-            .get(runner_context_id)
-            .map(|entry| &entry.context)
-            .ok_or_else(|| "unknown or expired runner callback context".to_string())?;
+        let Some(context) = contexts.get(runner_context_id).map(|entry| &entry.context) else {
+            drop(contexts);
+            return Err(self.describe_unheld_context(runner_context_id));
+        };
         let binding = context.executor_binding.as_ref().ok_or_else(|| {
             "runner callback context is not bound to an active process batch".to_string()
         })?;
-        if binding.executor_id != executor_id || binding.generation != generation {
+        if binding.executor_id != executor_id {
             return Err("runner callback context belongs to a different executor session".into());
+        }
+        match binding.link {
+            BatchLink::Bound(bound) if bound == generation => {}
+            BatchLink::Bound(_) => {
+                return Err(
+                    "runner callback context belongs to a different executor session".into(),
+                )
+            }
+            BatchLink::Detached { at_unix_ms, .. } => {
+                return Err(format!(
+                    "relay detached by a link loss at {}; the executor has not reattached",
+                    rfc3339(at_unix_ms)
+                ))
+            }
         }
         let expected_run_id = context
             .request
@@ -187,11 +311,111 @@ impl Fleet {
             .ok_or_else(|| "process batch names an unknown runner callback context".to_string())?;
         context.executor_binding = Some(RunnerContextExecutorBinding {
             executor_id: executor_id.to_string(),
-            generation,
+            link: BatchLink::Bound(generation),
             request_id: request.request_id.clone(),
             attempt_id: request.attempt_id.clone(),
         });
         Ok(())
+    }
+
+    /// Why a relay or callback names a context this runner does not hold, as
+    /// the refusal the caller reads.
+    pub(super) fn describe_unheld_context(&self, runner_context_id: &str) -> String {
+        let ledger = lock_through_poison(&self.closed_runner_contexts);
+        match ledger.ending(runner_context_id) {
+            Some((ContextEnding::Settled, at)) => format!(
+                "the batch that held this relay settled at {}",
+                rfc3339(*at)
+            ),
+            Some((ContextEnding::Cancelled, at)) => format!(
+                "the batch that held this relay was cancelled at {}",
+                rfc3339(*at)
+            ),
+            Some((
+                ContextEnding::NotReannounced {
+                    executor,
+                    generation,
+                },
+                at,
+            )) => format!(
+                "relay revoked: executor {executor} reattached at {} (link {generation}) without announcing this batch",
+                rfc3339(*at)
+            ),
+            Some((ContextEnding::Ended, at)) => format!(
+                "the batch that held this relay ended at {} without settling",
+                rfc3339(*at)
+            ),
+            None => format!(
+                "unknown runner callback context: not issued by this runner process, or ended before the last {CLOSED_RUNNER_CONTEXT_MEMORY} closures it remembers"
+            ),
+        }
+    }
+
+    fn record_context_endings(&self, runner_context_ids: &[String], ending: &ContextEnding) {
+        if runner_context_ids.is_empty() {
+            return;
+        }
+        let at = unix_time_ms();
+        let mut ledger = lock_through_poison(&self.closed_runner_contexts);
+        for id in runner_context_ids {
+            ledger.record(id, ending.clone(), at);
+        }
+    }
+
+    /// Remove one context whose batch ended without running or settling. Safe
+    /// in a destructor: it never panics on a poisoned lock.
+    pub(super) fn end_runner_context(&self, runner_context_id: &str) {
+        let removed = lock_through_poison(&self.runner_contexts).remove(runner_context_id);
+        if removed.is_some() {
+            self.record_context_endings(&[runner_context_id.to_string()], &ContextEnding::Ended);
+        }
+    }
+
+    /// Admit a batch context bound to `generation` of `executor_id`, as a
+    /// dispatched batch's would be, for tests that drive a link directly.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn admit_bound_batch_context_for_test(
+        &self,
+        runner_context_id: &str,
+        executor_id: &str,
+        generation: u64,
+        request_id: &str,
+        attempt_id: &str,
+        run_id: &str,
+    ) {
+        self.runner_contexts.lock().unwrap().insert(
+            runner_context_id.to_string(),
+            RunnerContextEntry::new(
+                runner_context_id,
+                &format!("{request_id}:{attempt_id}"),
+                RunnerCallbackContext {
+                    request: Some(cairn_common::protocol::CallbackRequest {
+                        run_id: Some(run_id.to_string()),
+                        ..Default::default()
+                    }),
+                    run_context: None,
+                    check_status_board: None,
+                    run_batch_request_id: None,
+                    live_checkout: false,
+                    executor_binding: Some(RunnerContextExecutorBinding {
+                        executor_id: executor_id.to_string(),
+                        link: BatchLink::Bound(generation),
+                        request_id: request_id.to_string(),
+                        attempt_id: attempt_id.to_string(),
+                    }),
+                    output: output_guard::RelayedOutput::shared(),
+                },
+            ),
+        );
+    }
+
+    /// Whether this runner still holds a callback context.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn holds_runner_context(&self, runner_context_id: &str) -> bool {
+        self.runner_contexts
+            .lock()
+            .unwrap()
+            .contains_key(runner_context_id)
     }
 
     /// Revoke the contexts of an attempt whose terminal result arrived.
@@ -237,13 +461,21 @@ impl Fleet {
             }
             !matches
         });
+        let ending = match cause {
+            HandoffClosed::BatchCancelled => ContextEnding::Cancelled,
+            HandoffClosed::BatchSettled => ContextEnding::Settled,
+            _ => ContextEnding::Ended,
+        };
+        self.record_context_endings(&revoked, &ending);
         revoked
     }
 
     /// Remove one context whose batch has settled.
     pub(super) fn settle_runner_context(&self, id: &str) {
-        if let Some(entry) = self.runner_contexts.lock().unwrap().remove(id) {
+        let removed = self.runner_contexts.lock().unwrap().remove(id);
+        if let Some(entry) = removed {
             entry.close(HandoffClosed::BatchSettled);
+            self.record_context_endings(&[id.to_string()], &ContextEnding::Settled);
         }
     }
 
@@ -251,44 +483,28 @@ impl Fleet {
         lock_through_poison(&self.resident_relays)
     }
 
-    /// A link closed: its resident relays wait for the executor to announce
-    /// them on its next one. Unlike a batch's context, a resident process
-    /// outlives the link that started it.
-    pub fn detach_resident_relays(&self, executor_id: &str, generation: u64) {
-        self.resident_relays().detach(executor_id, generation);
-    }
-
-    /// The executor opened link `generation` naming the relays it still serves.
-    pub fn reattach_resident_relays(
-        &self,
-        executor_id: &str,
-        generation: u64,
-        relays: &[cairn_common::executor_protocol::RelayIdentity],
-    ) {
-        self.resident_relays()
-            .reattach(executor_id, generation, relays);
-    }
-
-    pub fn revoke_mcp_relay_contexts_for_executor(
-        &self,
-        executor_id: &str,
-        generation: u64,
-    ) -> Vec<String> {
-        let mut revoked = Vec::new();
-        self.runner_contexts.lock().unwrap().retain(|id, entry| {
-            let matches = entry
+    /// Link `generation` of `executor_id` closed. Every relay bound to it, a
+    /// running batch's or a resident process's, waits for the executor to
+    /// announce it on its next link: the work outlives the link.
+    ///
+    /// A context bound to a later link, an overlapping redial that reattached
+    /// before this close was seen, is not touched.
+    pub fn relay_link_closed(&self, executor_id: &str, generation: u64) {
+        let at = unix_time_ms();
+        for entry in self.runner_contexts.lock().unwrap().values_mut() {
+            let bound_here = entry
                 .context
                 .executor_binding
                 .as_ref()
                 .is_some_and(|binding| {
-                    binding.executor_id == executor_id && binding.generation == generation
+                    binding.executor_id == executor_id
+                        && binding.link == BatchLink::Bound(generation)
                 });
-            if matches {
-                entry.close(HandoffClosed::ExecutorLinkDropped);
-                revoked.push(id.clone());
+            if bound_here {
+                entry.detach(at);
             }
-            !matches
-        });
+        }
+        self.resident_relays().detach(executor_id, generation);
         // A link that dies mid-stream never delivers the exits that would have
         // drained its resident processes, so their scrubbers are dropped here
         // rather than left to accumulate.
@@ -296,7 +512,108 @@ impl Fleet {
             .lock()
             .unwrap()
             .forget_executor(executor_id);
-        revoked
+    }
+
+    /// The executor opened link `generation` naming the relays it still serves.
+    ///
+    /// One rule for both kinds. An announced relay this runner holds for that
+    /// executor, for the same process or attempt, is bound to the new link,
+    /// whether it was detached or still bound to an older link whose close
+    /// has not been seen. A held relay for that executor that was not
+    /// announced is gone from it and is revoked, unless it is already bound to
+    /// this link: that one was dispatched after the executor composed the
+    /// announcement. An announced relay this runner does not hold is ignored.
+    ///
+    /// Only the executor's current link may announce. A superseded link's
+    /// connection task outlives an overlapping redial, so its announcement can
+    /// arrive after the new link's; applied, it would bind live relays back to
+    /// the dead link or revoke ones the new link has just started. It is
+    /// dropped whole, and a batch's binding never moves to an older link even
+    /// when no connection record says which link is current.
+    pub fn reattach_relays(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        relays: &[cairn_common::executor_protocol::RelayIdentity],
+    ) {
+        use cairn_common::executor_protocol::RelayIdentity;
+        let current = self
+            .lock_connections()
+            .get(executor_id)
+            .map(|connection| connection.generation);
+        if current.is_some_and(|current| current != generation) {
+            log::warn!(
+                "ignored a relay announcement from superseded link {generation} of executor {executor_id}; its current link is {}",
+                current.unwrap_or_default()
+            );
+            return;
+        }
+        self.resident_relays()
+            .reattach(executor_id, generation, relays);
+        let announced: HashMap<&str, (&str, &str)> = relays
+            .iter()
+            .filter_map(|relay| match relay {
+                RelayIdentity::Batch {
+                    runner_context_id,
+                    request_id,
+                    attempt_id,
+                } => Some((
+                    runner_context_id.as_str(),
+                    (request_id.as_str(), attempt_id.as_str()),
+                )),
+                RelayIdentity::Resident { .. } => None,
+            })
+            .collect();
+        let mut revoked = Vec::new();
+        self.runner_contexts.lock().unwrap().retain(|id, entry| {
+            let Some(binding) = entry.context.executor_binding.as_mut() else {
+                return true;
+            };
+            if binding.executor_id != executor_id || binding.link.generation() > generation {
+                return true;
+            }
+            let same_attempt =
+                announced
+                    .get(id.as_str())
+                    .is_some_and(|(request_id, attempt_id)| {
+                        binding.request_id == *request_id && binding.attempt_id == *attempt_id
+                    });
+            if same_attempt {
+                binding.link = BatchLink::Bound(generation);
+                return true;
+            }
+            if binding.link == BatchLink::Bound(generation) {
+                return true;
+            }
+            entry.close(HandoffClosed::ExecutorDidNotReannounce);
+            revoked.push(id.clone());
+            false
+        });
+        if revoked.is_empty() {
+            return;
+        }
+        let executor = self
+            .executor_public_name(executor_id)
+            .unwrap_or_else(|| executor_id.to_string());
+        log::warn!(
+            "executor {executor} reattached on link {generation} without announcing {} running batch relay(s); revoked",
+            revoked.len()
+        );
+        self.record_context_endings(
+            &revoked,
+            &ContextEnding::NotReannounced {
+                executor,
+                generation,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn closed_runner_context_keys(&self) -> Vec<[u8; 32]> {
+        lock_through_poison(&self.closed_runner_contexts)
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// Scrub one resident-process event, and drain the process when it exits.

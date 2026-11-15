@@ -4,7 +4,7 @@
 
 pub mod sync_server;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -466,11 +466,19 @@ pub fn forget_lost_claim(pool: &ExecutorPool, entry_id: &str) {
 /// test process's environment, and a test run from an agent shell carries the
 /// LIVE host's callback URL and secret there; without the rewrite, a child that
 /// called the SDK or the CLI would act on that host.
+///
+/// Across a link gap it does what the executor's relay does: a batch's call
+/// waits, for at most [`RELAY_GAP_WAIT_MS`], for a link that has re-announced
+/// the batch ([`reannounce_link`]), and is otherwise refused with the
+/// executor's 503 naming the gap.
 #[derive(Clone)]
 struct TestMcpRelay {
     url: String,
     origin: String,
-    live_contexts: Arc<Mutex<HashSet<String>>>,
+    /// Each live batch context, with the request and attempt it serves.
+    live_contexts: Arc<Mutex<HashMap<String, (String, String)>>>,
+    /// When the link went down, or `None` while one is up and announced.
+    link: Arc<tokio::sync::watch::Sender<Option<std::time::SystemTime>>>,
     residents: Arc<Mutex<HashMap<ResidentRelayId, RelayIdentity>>>,
     orch: Orchestrator,
     executor_id: &'static str,
@@ -481,8 +489,12 @@ struct TestMcpRelay {
 /// Revokes a batch's callback context on the executor side when the batch ends.
 struct LiveContext {
     id: String,
-    live_contexts: Arc<Mutex<HashSet<String>>>,
+    live_contexts: Arc<Mutex<HashMap<String, (String, String)>>>,
 }
+
+/// How long a test relay holds a batch's call through a link gap: the
+/// executor's `RELAY_LINK_WAIT` unless a test shortens it.
+pub static RELAY_GAP_WAIT_MS: AtomicU64 = AtomicU64::new(30_000);
 
 impl Drop for LiveContext {
     fn drop(&mut self) {
@@ -516,6 +528,7 @@ impl TestMcpRelay {
             url: format!("http://{address}/api/mcp"),
             origin: format!("http://{address}"),
             live_contexts: Arc::default(),
+            link: Arc::new(tokio::sync::watch::Sender::new(None)),
             residents: Arc::default(),
             orch: orch.clone(),
             executor_id,
@@ -547,6 +560,8 @@ impl TestMcpRelay {
     fn admit(
         &self,
         batch: Option<&mut cairn_common::executor_protocol::ProcessBatch>,
+        request_id: &str,
+        attempt_id: &str,
     ) -> Option<LiveContext> {
         let batch = batch?;
         let context = batch.runner_context_id.clone();
@@ -566,11 +581,54 @@ impl TestMcpRelay {
             }
         }
         let id = context?;
-        self.live_contexts.lock().unwrap().insert(id.clone());
+        self.live_contexts
+            .lock()
+            .unwrap()
+            .insert(id.clone(), (request_id.to_owned(), attempt_id.to_owned()));
         Some(LiveContext {
             id,
             live_contexts: self.live_contexts.clone(),
         })
+    }
+
+    /// Every relay this machine still serves, as its next link names them.
+    fn announcement(&self) -> Vec<RelayIdentity> {
+        let mut relays: Vec<RelayIdentity> =
+            self.residents.lock().unwrap().values().cloned().collect();
+        relays.extend(self.live_contexts.lock().unwrap().iter().map(
+            |(runner_context_id, (request_id, attempt_id))| RelayIdentity::Batch {
+                runner_context_id: runner_context_id.clone(),
+                request_id: request_id.clone(),
+                attempt_id: attempt_id.clone(),
+            },
+        ));
+        relays
+    }
+
+    /// Wait, as the executor's relay does, for a link that has announced this
+    /// machine's relays; past the bound, the executor's 503.
+    async fn await_announced_link(&self) -> Result<(), Response> {
+        let bound = std::time::Duration::from_millis(RELAY_GAP_WAIT_MS.load(Ordering::Relaxed));
+        let started = std::time::Instant::now();
+        let mut link = self.link.subscribe();
+        let announced = matches!(
+            tokio::time::timeout(bound, link.wait_for(Option::is_none)).await,
+            Ok(Ok(_))
+        );
+        if announced {
+            return Ok(());
+        }
+        let since = (*self.link.borrow()).unwrap_or_else(std::time::SystemTime::now);
+        let since = chrono::DateTime::<chrono::Utc>::from(since)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "relay detached by a link loss at {since}; the executor has not reattached within {}s; retry",
+                started.elapsed().as_secs()
+            ),
+        )
+            .into_response())
     }
 
     /// What the executor binary's relay does for a resident process: serve it
@@ -685,7 +743,7 @@ async fn relay_test_callback(
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|context| relay.live_contexts.lock().unwrap().contains(*context));
+        .filter(|context| relay.live_contexts.lock().unwrap().contains_key(*context));
     let Some(context) = context else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -705,6 +763,9 @@ async fn answer_batch(
     context: &str,
     request: McpCallbackRequest,
 ) -> Response {
+    if let Err(down) = relay.await_announced_link().await {
+        return down;
+    }
     if let Err(diagnostic) = relay.orch.fleet.authorize_mcp_relay(
         relay.executor_id,
         relay.generation.load(Ordering::Acquire),
@@ -897,7 +958,7 @@ mod callback_socket {
                         .live_contexts
                         .lock()
                         .unwrap()
-                        .contains(&runner_context_id)
+                        .contains_key(&runner_context_id)
                 }) else {
                     return (
                         StatusCode::UNAUTHORIZED,
@@ -926,6 +987,82 @@ mod callback_socket {
             }
         }
     }
+}
+
+/// What a link bounce needs of one attached test machine.
+struct TestLink {
+    config_dir: PathBuf,
+    executor_id: &'static str,
+    colocated: bool,
+    projects_served: Arc<Vec<String>>,
+    tx: mpsc::UnboundedSender<ExecutorMessage>,
+    generation: Arc<AtomicU64>,
+    relay: TestMcpRelay,
+    pool: ExecutorPool,
+    warm_roots: Arc<cairn_exec::warm_roots::WarmRootTracker>,
+}
+
+/// Every attached test machine, by its runner's config directory and its id.
+static TEST_LINKS: Mutex<Vec<TestLink>> = Mutex::new(Vec::new());
+
+fn with_test_link<T>(
+    orch: &Orchestrator,
+    executor_id: &str,
+    use_link: impl FnOnce(&TestLink) -> T,
+) -> T {
+    let links = TEST_LINKS.lock().unwrap();
+    let link = links
+        .iter()
+        .rev()
+        .find(|link| link.config_dir == orch.config_dir && link.executor_id == executor_id)
+        .unwrap_or_else(|| panic!("no test machine {executor_id} is attached to this runner"));
+    use_link(link)
+}
+
+/// Lose `executor_id`'s link and open its next one, as a peer reset and a
+/// redial would: the runner sees the close (`relay_link_closed`, then the
+/// disconnect) and a new attach at a new generation, which is returned. The
+/// machine's work keeps running throughout. Its relays are not re-announced:
+/// until [`reannounce_link`], a batch's call waits in the gap.
+pub fn drop_link(orch: &Orchestrator, executor_id: &str) -> u64 {
+    with_test_link(orch, executor_id, |link| {
+        link.relay
+            .link
+            .send_replace(Some(std::time::SystemTime::now()));
+        let old = link.generation.load(Ordering::Acquire);
+        orch.fleet.relay_link_closed(executor_id, old);
+        assert!(orch.fleet.disconnect_advertised_executor(executor_id, old));
+        let hello = test_executor_advertisement(
+            executor_id,
+            link.colocated,
+            &link.projects_served,
+            Some(&link.pool),
+        );
+        let next = orch
+            .fleet
+            .attach_advertised_executor(
+                hello,
+                link.warm_roots.whole(&Arc::new(link.pool.warm_roots())),
+                link.tx.clone(),
+                link.colocated,
+                None,
+                None,
+            )
+            .expect("re-attach the test executor");
+        link.generation.store(next, Ordering::Release);
+        next
+    })
+}
+
+/// The new link's first frame, as the executor sends it: every relay the
+/// machine still serves, after which its waiting calls go through.
+pub fn reannounce_link(orch: &Orchestrator, executor_id: &str) {
+    with_test_link(orch, executor_id, |link| {
+        let generation = link.generation.load(Ordering::Acquire);
+        orch.fleet
+            .reattach_relays(executor_id, generation, &link.relay.announcement());
+        link.relay.link.send_replace(None);
+    })
 }
 
 /// A machine whose readings are measured and unremarkable. Placement refuses a
@@ -1042,6 +1179,8 @@ fn attach_executor(
     };
     let executor_pool = ExecutorPool::new(runtime.with_admission_limits(admission));
     let (tx, mut rx) = mpsc::unbounded_channel();
+    // Kept for a re-attach, so a bounced link's frames reach the same loop.
+    let link_tx = tx.clone();
     // What the machine's home already holds is part of how it arrives: a
     // machine that was offline when a node closed is cleaned on attach.
     let mut hello = test_executor_advertisement(executor_id, colocated, &projects_served, None);
@@ -1058,6 +1197,19 @@ fn attach_executor(
         )
         .expect("attach the test executor");
     generation.store(attached_generation, Ordering::Release);
+    // Every frame below goes out on whichever link is current, as a real
+    // executor's does, so a link bounced by [`drop_link`] carries on.
+    TEST_LINKS.lock().unwrap().push(TestLink {
+        config_dir: orch.config_dir.clone(),
+        executor_id,
+        colocated,
+        projects_served: projects_served.clone(),
+        tx: link_tx,
+        generation: generation.clone(),
+        relay: relay.clone(),
+        pool: executor_pool.clone(),
+        warm_roots: warm_roots.clone(),
+    });
     // Beat as a real machine does, on the production interval and whatever it
     // is doing. Placement judges a link stale once nothing has crossed it for
     // `EXECUTOR_PROGRESS_FRESHNESS_MS`, and refuses untargeted work outright
@@ -1076,6 +1228,7 @@ fn attach_executor(
         let pool = executor_pool.clone();
         let projects_served = projects_served.clone();
         let warm_roots = warm_roots.clone();
+        let generation = generation.clone();
         tokio::spawn(async move {
             let interval = std::time::Duration::from_millis(EXECUTOR_HEARTBEAT_INTERVAL_MS);
             let mut beat =
@@ -1087,12 +1240,13 @@ fn attach_executor(
                     pool.refresh_liveness().await;
                 }
                 pool.record_protocol_heartbeat();
+                let current = generation.load(Ordering::Acquire);
                 publish_warm_roots(&warm_roots, &pool, |message| {
-                    core_pool.handle_executor_message(executor_id, attached_generation, message);
+                    core_pool.handle_executor_message(executor_id, current, message);
                 });
                 core_pool.handle_executor_message(
                     executor_id,
-                    attached_generation,
+                    current,
                     ExecutorMessage::Heartbeat {
                         advertisement: test_executor_advertisement(
                             executor_id,
@@ -1142,10 +1296,11 @@ fn attach_executor(
         // Carry its frames over the same generation-bound path as a real link.
         executor_pool.spawn_cpu_pressure_sampler();
         let sample_pool = core_pool.clone();
+        let sample_generation = generation.clone();
         executor_pool.spawn_machine_sample_publisher(move |sample| {
             sample_pool.handle_executor_message(
                 executor_id,
-                attached_generation,
+                sample_generation.load(Ordering::Acquire),
                 ExecutorMessage::MachineSampled { sample },
             );
             true
@@ -1166,7 +1321,9 @@ fn attach_executor(
     // arrival order, as the executor's link-control worker runs it. The pool's
     // blocking guard therefore sees here what it sees in production, and the
     // runner's half of each exchange stays on this task.
+    let link_generation = generation.clone();
     tokio::spawn(async move {
+        let current = move || link_generation.load(Ordering::Acquire);
         while let Some(message) = rx.recv().await {
             match message {
                 // Answer the offer the way a real machine does: from admission,
@@ -1176,7 +1333,7 @@ fn attach_executor(
                 ExecutorMessage::Offer { entry_id, summary } => {
                     let pool = executor_pool.clone();
                     let answer = offload(move || answer_offer(&pool, entry_id, &summary)).await;
-                    core_pool.handle_executor_message(executor_id, attached_generation, answer);
+                    core_pool.handle_executor_message(executor_id, current(), answer);
                 }
                 ExecutorMessage::Lost { entry_id } => {
                     let pool = executor_pool.clone();
@@ -1200,10 +1357,11 @@ fn attach_executor(
                     let projects_served = projects_served.clone();
                     let relay = relay.clone();
                     let warm_roots = warm_roots.clone();
+                    let current = current.clone();
                     tokio::spawn(async move {
                         let request_id = request.request_id.clone();
                         let attempt_id = request.attempt_id.clone();
-                        let context = relay.admit(batch.as_mut());
+                        let context = relay.admit(batch.as_mut(), &request_id, &attempt_id);
                         let outcome = executor_pool.run_granted(request, batch).await;
                         drop(context);
                         // The link handler revokes a batch's callback contexts
@@ -1211,7 +1369,7 @@ fn attach_executor(
                         core_pool.settle_runner_contexts_for_request(&request_id, &attempt_id);
                         core_pool.handle_executor_message(
                             executor_id,
-                            attached_generation,
+                            current(),
                             ExecutorMessage::Result {
                                 request_id,
                                 attempt_id,
@@ -1219,15 +1377,11 @@ fn attach_executor(
                             },
                         );
                         publish_warm_roots(&warm_roots, &executor_pool, |message| {
-                            core_pool.handle_executor_message(
-                                executor_id,
-                                attached_generation,
-                                message,
-                            );
+                            core_pool.handle_executor_message(executor_id, current(), message);
                         });
                         core_pool.handle_executor_message(
                             executor_id,
-                            attached_generation,
+                            current(),
                             ExecutorMessage::AdvertisementUpdated {
                                 advertisement: test_executor_advertisement(
                                     executor_id,
@@ -1250,11 +1404,12 @@ fn attach_executor(
                 ExecutorMessage::DeleteNodeScratch { scratch_id } => {
                     let pool = executor_pool.clone();
                     let core_pool = core_pool.clone();
+                    let current = current.clone();
                     tokio::spawn(async move {
                         if pool.delete_node_scratch(&scratch_id).await.is_ok() {
                             core_pool.handle_executor_message(
                                 executor_id,
-                                attached_generation,
+                                current(),
                                 ExecutorMessage::NodeScratchDeleted { scratch_id },
                             );
                         }
@@ -1272,13 +1427,14 @@ fn attach_executor(
                     }
                     let executor_pool = executor_pool.clone();
                     let core_pool = core_pool.clone();
+                    let current = current.clone();
                     tokio::spawn(async move {
                         let result = executor_pool
                             .operate_residency(operation, granted_entry_id)
                             .await;
                         core_pool.handle_executor_message(
                             executor_id,
-                            attached_generation,
+                            current(),
                             ExecutorMessage::ResidencyResponse {
                                 correlation_id,
                                 result,
@@ -1292,7 +1448,7 @@ fn attach_executor(
                         offload(move || (pool.snapshot(), pool.substrate_report())).await;
                     core_pool.handle_executor_message(
                         executor_id,
-                        attached_generation,
+                        current(),
                         ExecutorMessage::SnapshotResponse {
                             correlation_id,
                             snapshot,

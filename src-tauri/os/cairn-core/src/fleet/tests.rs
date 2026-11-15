@@ -1078,7 +1078,7 @@ fn insert_bound_relay_context(pool: &Fleet) {
                 live_checkout: false,
                 executor_binding: Some(RunnerContextExecutorBinding {
                     executor_id: "executor-1".into(),
-                    generation: 7,
+                    link: BatchLink::Bound(7),
                     request_id: "request-1".into(),
                     attempt_id: "attempt-1".into(),
                 }),
@@ -1179,6 +1179,260 @@ fn mcp_relay_authorization_binds_context_executor_generation_and_run() {
         .authorize_mcp_relay("executor-1", 7, "context", &foreign_thread)
         .unwrap_err()
         .contains("thread identity"));
+}
+
+fn announced(
+    runner_context_id: &str,
+    request_id: &str,
+    attempt_id: &str,
+) -> cairn_common::executor_protocol::RelayIdentity {
+    cairn_common::executor_protocol::RelayIdentity::Batch {
+        runner_context_id: runner_context_id.into(),
+        request_id: request_id.into(),
+        attempt_id: attempt_id.into(),
+    }
+}
+
+fn authorize(pool: &Fleet, generation: u64) -> Result<(), String> {
+    pool.authorize_mcp_relay(
+        "executor-1",
+        generation,
+        "context",
+        &relay_request(Some("run-1")),
+    )
+}
+
+/// A link gap detaches a batch's relay rather than ending it: calls on either
+/// link are refused naming the gap, output keeps being accepted, and the
+/// reattach that names the batch for the same attempt binds it to the new
+/// link (cairn/5631).
+#[tokio::test]
+async fn a_link_gap_detaches_a_batch_relay_and_its_reannouncement_rebinds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let orch = test_orchestrator(dir.path()).await;
+    let pool = &orch.fleet;
+    insert_bound_relay_context(pool);
+
+    pool.relay_link_closed("executor-1", 7);
+    assert!(pool.holds_runner_context("context"));
+    for generation in [7, 8] {
+        let refused = authorize(pool, generation).unwrap_err();
+        assert!(
+            refused.starts_with("relay detached by a link loss at ")
+                && refused.ends_with("; the executor has not reattached"),
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        pool.handle_runner_callback(
+            &orch,
+            RunnerCallback::ProcessEvent {
+                runner_context_id: "context".into(),
+                stream_id: "tool-1:0".into(),
+                payload: "still running".into(),
+            },
+        )
+        .await,
+        RunnerCallbackResult::Completed,
+        "a detached batch's output is still taken"
+    );
+
+    pool.reattach_relays(
+        "executor-1",
+        8,
+        &[announced("context", "request-1", "attempt-1")],
+    );
+    assert!(authorize(pool, 8).is_ok());
+    assert!(
+        authorize(pool, 7).is_err(),
+        "the old link is not the batch's"
+    );
+
+    // A late close of the link it has left does not detach it again.
+    pool.relay_link_closed("executor-1", 7);
+    assert!(authorize(pool, 8).is_ok());
+
+    // Its end is remembered, and a call after it is refused by that end.
+    pool.settle_runner_contexts_for_request("request-1", "attempt-1");
+    let refused = authorize(pool, 8).unwrap_err();
+    assert!(
+        refused.starts_with("the batch that held this relay settled at "),
+        "{refused}"
+    );
+}
+
+/// An overlapping redial: the new link reattaches before the old one's close
+/// is seen. The batch is rebound straight from the old link, and that close,
+/// arriving late, leaves it bound.
+#[test]
+fn an_overlapping_redial_rebinds_a_batch_still_bound_to_the_old_link() {
+    let pool = Fleet::default();
+    insert_bound_relay_context(&pool);
+    pool.reattach_relays(
+        "executor-1",
+        8,
+        &[announced("context", "request-1", "attempt-1")],
+    );
+    pool.relay_link_closed("executor-1", 7);
+    assert!(authorize(&pool, 8).is_ok());
+}
+
+/// A superseded link's announcement, arriving after the new link's, changes
+/// nothing: neither one naming the batch (which would bind it back to the dead
+/// link) nor one omitting it (which would revoke a live batch).
+#[test]
+fn a_late_announcement_from_a_superseded_link_neither_rebinds_nor_revokes() {
+    let pool = Fleet::default();
+    let (old_tx, _old_rx) = mpsc::unbounded_channel();
+    let old = pool.attach_executor(old_tx);
+    let authorize_at = |generation| {
+        pool.authorize_mcp_relay(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            "context",
+            &relay_request(Some("run-1")),
+        )
+    };
+    insert_bound_relay_context(&pool);
+    {
+        let mut contexts = pool.runner_contexts.lock().unwrap();
+        let binding = contexts
+            .get_mut("context")
+            .unwrap()
+            .context
+            .executor_binding
+            .as_mut()
+            .unwrap();
+        binding.executor_id = COLOCATED_EXECUTOR_ID.into();
+        binding.link = BatchLink::Bound(old);
+    }
+    let (new_tx, _new_rx) = mpsc::unbounded_channel();
+    let new = pool.attach_executor(new_tx);
+    assert!(new > old);
+    let batch = announced("context", "request-1", "attempt-1");
+    pool.reattach_relays(COLOCATED_EXECUTOR_ID, new, std::slice::from_ref(&batch));
+    assert!(authorize_at(new).is_ok());
+
+    pool.reattach_relays(COLOCATED_EXECUTOR_ID, old, std::slice::from_ref(&batch));
+    assert!(authorize_at(new).is_ok(), "a stale naming does not rebind");
+    pool.reattach_relays(COLOCATED_EXECUTOR_ID, old, &[]);
+    assert!(
+        pool.holds_runner_context("context"),
+        "a stale omission does not revoke"
+    );
+    assert!(authorize_at(new).is_ok());
+}
+
+/// With no connection record to say which link is current, a batch's binding
+/// still never moves to an older link, and an older link's omission does not
+/// revoke a batch bound to a newer one.
+#[test]
+fn a_batch_binding_never_moves_to_an_older_link() {
+    let pool = Fleet::default();
+    insert_bound_relay_context(&pool);
+    pool.reattach_relays(
+        "executor-1",
+        9,
+        &[announced("context", "request-1", "attempt-1")],
+    );
+    pool.relay_link_closed("executor-1", 9);
+    pool.reattach_relays(
+        "executor-1",
+        8,
+        &[announced("context", "request-1", "attempt-1")],
+    );
+    pool.reattach_relays("executor-1", 8, &[]);
+    assert!(pool.holds_runner_context("context"));
+    assert!(authorize(&pool, 8)
+        .unwrap_err()
+        .starts_with("relay detached"));
+    pool.reattach_relays(
+        "executor-1",
+        10,
+        &[announced("context", "request-1", "attempt-1")],
+    );
+    assert!(authorize(&pool, 10).is_ok());
+}
+
+/// A reattach that names the batch for another attempt, names another
+/// context, or comes from another executor does not rebind it; once its own
+/// executor reattaches without it, it is revoked, and a call on it says so.
+#[test]
+fn a_batch_relay_not_reannounced_for_its_attempt_is_revoked_by_name() {
+    for (executor, announcement) in [
+        ("executor-1", announced("context", "request-2", "attempt-1")),
+        ("executor-1", announced("context", "request-1", "attempt-2")),
+        ("executor-1", announced("other", "request-1", "attempt-1")),
+        ("executor-2", announced("context", "request-1", "attempt-1")),
+    ] {
+        let pool = Fleet::default();
+        insert_bound_relay_context(&pool);
+        pool.relay_link_closed("executor-1", 7);
+        pool.reattach_relays(executor, 8, &[announcement.clone()]);
+        if executor == "executor-2" {
+            assert!(
+                pool.holds_runner_context("context"),
+                "another executor's reattach says nothing about this batch"
+            );
+            pool.reattach_relays("executor-1", 8, &[]);
+        }
+        assert!(!pool.holds_runner_context("context"), "{announcement:?}");
+        let refused = authorize(&pool, 8).unwrap_err();
+        assert!(
+            refused.starts_with("relay revoked: executor executor-1 reattached at ")
+                && refused.ends_with(" (link 8) without announcing this batch"),
+            "{refused}"
+        );
+    }
+}
+
+/// A batch dispatched on the new link after the executor composed its
+/// announcement is bound to that link already, and is kept.
+#[test]
+fn a_batch_bound_to_the_reattaching_link_is_kept_unannounced() {
+    let pool = Fleet::default();
+    insert_bound_relay_context(&pool);
+    pool.runner_contexts
+        .lock()
+        .unwrap()
+        .get_mut("context")
+        .unwrap()
+        .context
+        .executor_binding
+        .as_mut()
+        .unwrap()
+        .link = BatchLink::Bound(8);
+    pool.reattach_relays("executor-1", 8, &[]);
+    assert!(authorize(&pool, 8).is_ok());
+}
+
+/// The ledger that words a late refusal holds digests, never the capability
+/// itself, and a context it never saw is named as unknown.
+#[test]
+fn the_closed_context_ledger_keys_by_digest_only() {
+    let pool = Fleet::default();
+    insert_bound_relay_context(&pool);
+    pool.cancel_runner_contexts_for_request("request-1", "attempt-1");
+    let keys = pool.closed_runner_context_keys();
+    assert_eq!(
+        keys,
+        [relay_authority::ClosedRunnerContexts::key("context")]
+    );
+    assert!(keys.iter().all(|key| !key
+        .windows("context".len())
+        .any(|window| window == b"context")));
+    assert!(authorize(&pool, 7)
+        .unwrap_err()
+        .starts_with("the batch that held this relay was cancelled at "));
+    assert!(pool
+        .authorize_mcp_relay(
+            "executor-1",
+            7,
+            "never-issued",
+            &relay_request(Some("run-1"))
+        )
+        .unwrap_err()
+        .starts_with("unknown runner callback context: not issued by this runner process"));
 }
 
 #[test]
@@ -21731,7 +21985,7 @@ fn revoking_a_runner_context_unregisters_its_capability() {
                 live_checkout: false,
                 executor_binding: Some(RunnerContextExecutorBinding {
                     executor_id: "executor-3824".into(),
-                    generation: 1,
+                    link: BatchLink::Bound(1),
                     request_id: "request-3824".into(),
                     attempt_id: "attempt-3824".into(),
                 }),

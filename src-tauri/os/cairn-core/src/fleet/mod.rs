@@ -166,7 +166,8 @@ pub(crate) use purpose_debts::default_wait_horizon_unix_ms;
 pub use purpose_debts::BlockedQuestion;
 use purpose_debts::{PurposeAdmissionGuard, PurposeDebtsLoaded, PurposeGate, PurposeJoiners};
 #[cfg(test)]
-use relay_authority::RunnerContextExecutorBinding;
+#[cfg(test)]
+use relay_authority::{BatchLink, RunnerContextExecutorBinding};
 use relay_authority::{RunnerCallbackContext, RunnerContextEntry};
 pub use requirements::GITHUB_PROBE_REPOSITORY_LIMIT;
 use requirements::{
@@ -1426,6 +1427,9 @@ pub struct Fleet {
     preparing_leaders: Arc<Mutex<HashMap<RequestIdentity, LeaderPreparation>>>,
     in_flight: Arc<Mutex<InFlightRegistry>>,
     runner_contexts: Arc<Mutex<HashMap<String, RunnerContextEntry>>>,
+    /// Why recently ended runner contexts ended, so a late call on one is
+    /// refused by name. Locked after `runner_contexts`, never before it.
+    closed_runner_contexts: Arc<Mutex<relay_authority::ClosedRunnerContexts>>,
     /// The callback relays of resident processes on machines other than this
     /// runner's. See [`resident_relay`].
     resident_relays: Arc<Mutex<resident_relay::ResidentRelays>>,
