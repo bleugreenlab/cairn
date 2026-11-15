@@ -78,6 +78,7 @@ pub(super) fn map_post(row: &turso::Row) -> DbResult<Post> {
         author_display: None,
         camp_id: row.opt_text(7)?,
         camp: None,
+        routing: Vec::new(),
         created_at: row.i64(6)?,
     })
 }

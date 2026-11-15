@@ -57,6 +57,13 @@ const UNCHARTERED: &str =
        ('t-old', 'p', 'old', 'Retired.', 'closed', 'none', 1, 1),
        ('t-scratch', 'p', 'scratch', NULL, 'active', 'none', 1, 1);";
 
+/// A running session for the chartered `devops` thread, so its delivery wakes.
+const DEVOPS_SESSION: &str =
+    "INSERT INTO jobs(id, thread_id, project_id, status, uri_segment, created_at, updated_at)
+       VALUES('j-devops', 't-devops', 'p', 'running', 'thread', 1, 1);
+     INSERT INTO runs(id, job_id, status, created_at, updated_at)
+       VALUES('r-devops', 'j-devops', 'running', 1, 1);";
+
 fn chartered() -> String {
     let rows: Vec<String> = CHARTERS
         .iter()
@@ -353,6 +360,34 @@ async fn route_messages(orch: &Orchestrator) -> i64 {
         .unwrap_or_default()
 }
 
+/// `(recipient job, urgency)` of every direct message the route wrote: the
+/// wake its thread delivery persists for a running session.
+async fn route_wakes(orch: &Orchestrator) -> Vec<(String, Option<String>)> {
+    orch.db
+        .local
+        .query_all(
+            "SELECT r.recipient_job_id, m.urgency FROM messages m JOIN message_recipients r ON r.message_id = m.id
+              WHERE m.channel_type = 'direct' AND m.sender_name = ?1 ORDER BY r.recipient_job_id",
+            (format!("route:{ROUTE}"),),
+            |row| Ok((row.text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .unwrap()
+}
+
+/// How many pushes marked their turn as the operator's own.
+async fn operator_pushes(orch: &Orchestrator) -> i64 {
+    orch.db
+        .local
+        .query_opt_i64(
+            "SELECT COUNT(*) FROM attention_pushes WHERE key LIKE '%:operator_message:%'",
+            (),
+        )
+        .await
+        .unwrap()
+        .unwrap_or_default()
+}
+
 async fn firings(orch: &Orchestrator) -> Vec<crate::storage::RouteFiringRecord> {
     crate::storage::list_route_firings(&orch.db.local, "workspace", ROUTE, 100)
         .await
@@ -557,7 +592,7 @@ fn assert_route_floors(record: &Value) {
 async fn one_admitted_thread_hears_the_message_and_the_conversation_hears_where_it_went() {
     let (orch, server) = ambient_workspace(
         vec![choice_reply("devops", &[("devops", 0.9)])],
-        &[&chartered(), UNCHARTERED],
+        &[&chartered(), UNCHARTERED, DEVOPS_SESSION],
     )
     .await;
     let inbound = Inbound::ambient("in-1", FIRST, "ada", "Who owns the release pipeline?");
@@ -579,7 +614,21 @@ async fn one_admitted_thread_hears_the_message_and_the_conversation_hears_where_
         body.contains(&event),
         "the delivered text cites the fact that produced it"
     );
-    assert_eq!(route_messages(&orch).await, 1, "no message anywhere else");
+    assert_eq!(
+        route_wakes(&orch).await,
+        [("j-devops".to_string(), Some("queue".to_string()))],
+        "the route's wake queues for the thread's next turn rather than steering this one"
+    );
+    assert_eq!(
+        operator_pushes(&orch).await,
+        0,
+        "a Discord message routed by judgment never wakes a thread as the operator"
+    );
+    assert_eq!(
+        route_messages(&orch).await,
+        2,
+        "the thread message and its session's wake, nothing else"
+    );
 
     let record = one_acknowledgement(
         &routed,

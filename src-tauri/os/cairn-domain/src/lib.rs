@@ -70,7 +70,7 @@ pub use issue::{
     IssueStatus, SidebarActiveIssue, UpdateIssue,
 };
 pub use label::{CreateLabel, Label, UpdateLabel};
-pub use post::{CreatePost, CreatePostComment, Post, PostCamp, PostComment};
+pub use post::{CreatePost, CreatePostComment, Post, PostCamp, PostComment, PostRouting};
 
 // Thread types
 pub use thread::{CreateThread, Thread, ThreadStatus, UpdateThread};

@@ -497,7 +497,12 @@ impl Default for FactRegistry {
         // delivery, so a thread that rotated sessions receives on the new one.
         // A muted Posts watch is still told, quietly (CAIRN-1900).
         // A camp post addresses its camp, which the lane fans out by role
-        // exactly as it does a camp notice.
+        // exactly as it does a camp notice. `addressed` is true when the post
+        // has a camp or `mentions` names a home (node, task or thread URI) or
+        // a camp; an issue, post, diff or file URI is a citation and does not
+        // count.
+        // `text` is the post as its wake renders it, hydrated from the post
+        // record and never stored.
         let post_created = SourceSpec {
             dedupe: LogDedupe::Unique,
             max_stored_chars: None,
@@ -515,6 +520,8 @@ impl Default for FactRegistry {
                 ("title", Scalar, STORED),
                 ("camp", Scalar, STORED),
                 ("mentions", List, STORED),
+                ("addressed", Scalar, STORED),
+                ("text", Scalar, HYDRATED),
             ]),
         };
         // A comment is not a feed event: it addresses the post's author, the
@@ -904,9 +911,21 @@ pub(crate) fn source_fields_problem(source: &str, spec: &SourceSpec) -> Option<S
 pub const COMPARISON_OPERATORS: &[&str] = &["gt", "gte", "lt", "lte"];
 
 /// What is wrong with one clause value's shape, if anything: an operator
-/// object must name only known operators, each over a number, and a
-/// `...Prefix` key takes a string.
+/// object must name only known operators, each over a number, a
+/// `...Prefix` key takes a string, and a list must name at least one value,
+/// because list matching is intersection and an empty list intersects
+/// nothing, so the clause would validate and then never match.
 pub fn clause_value_problem(key: &str, value: &Value) -> Option<String> {
+    if value.as_array().is_some_and(Vec::is_empty) {
+        let hint = if key == "mentions" {
+            "; to match a post that names no one, use addressed: false"
+        } else {
+            ""
+        };
+        return Some(format!(
+            "{key}: [] can never match (an empty list intersects nothing){hint}"
+        ));
+    }
     let Value::Object(operators) = value else {
         return None;
     };
@@ -1198,6 +1217,62 @@ mod tests {
         assert_eq!(status("attention"), FieldVocabulary::Enum(ISSUE_STATUSES));
     }
 
+    /// List matching is intersection, so an empty list matches nothing; it
+    /// is refused where it is written rather than loaded as a dead clause.
+    #[test]
+    fn an_empty_list_clause_value_is_refused_because_it_can_never_match() {
+        let registry = FactRegistry::default();
+        let clause = |fact: &str, field: &str| {
+            BTreeMap::from([
+                ("fact".to_string(), Value::String(fact.into())),
+                (field.to_string(), serde_json::json!([])),
+            ])
+        };
+        assert_eq!(
+            registry
+                .validate_clause("post_created", &clause("post_created", "mentions"))
+                .unwrap_err(),
+            "mentions: [] can never match (an empty list intersects nothing); to match a post that names no one, use addressed: false"
+        );
+        assert_eq!(
+            registry
+                .validate_clause("attention", &clause("attention", "label"))
+                .unwrap_err(),
+            "label: [] can never match (an empty list intersects nothing)"
+        );
+        assert!(registry
+            .validate_clause(
+                "post_created",
+                &BTreeMap::from([
+                    ("fact".to_string(), Value::String("post_created".into())),
+                    ("addressed".to_string(), Value::Bool(false)),
+                ])
+            )
+            .is_ok());
+
+        let route = |trigger: &str, edge: &str| {
+            format!("name: R\ndescription: r\nnodes:\n  - {{ id: in, type: trigger, when: {trigger} }}\n  - {{ id: out, type: sink, sink: {{ kind: message, target: 'cairn://p/cairn/1' }} }}\nedges:\n  - {{ from: in, to: out{edge} }}\n")
+        };
+        let refused = crate::routes::parse_definition(
+            &route("{ fact: post_created, mentions: [] }", ""),
+            &registry,
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("mentions: [] can never match"),
+            "{refused}"
+        );
+        let refused = crate::routes::parse_definition(
+            &route("{ fact: post_created }", ", when: { mentions: [] }"),
+            &registry,
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("mentions: [] can never match"),
+            "{refused}"
+        );
+    }
+
     #[test]
     fn only_content_fields_are_hydrated() {
         let registry = FactRegistry::default();
@@ -1216,12 +1291,8 @@ mod tests {
         assert_eq!(hydrated("channel_message"), vec!["text"]);
         assert_eq!(hydrated("github_comment"), vec!["body"]);
         assert_eq!(hydrated("ingress"), vec!["body"]);
-        for source in [
-            "attention",
-            "file_changed",
-            "post_created",
-            "post_commented",
-        ] {
+        assert_eq!(hydrated("post_created"), vec!["text"]);
+        for source in ["attention", "file_changed", "post_commented"] {
             assert!(hydrated(source).is_empty(), "{source} hydrates nothing");
         }
         assert_eq!(

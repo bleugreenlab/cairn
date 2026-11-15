@@ -24,6 +24,21 @@ pub struct Post {
     #[serde(default)]
     pub camp: Option<PostCamp>,
     pub created_at: i64,
+    /// How routes delivered this post to threads it named no one in, read on
+    /// the way to a surface from the route firing journal and never stored.
+    /// Empty when no route delivered it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routing: Vec<PostRouting>,
+}
+
+/// One route's delivery of a post: the route by name, the decision citation
+/// of each pick it delivered to, in rank order, and the event to answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PostRouting {
+    pub route: String,
+    pub citations: Vec<String>,
+    pub event: String,
 }
 
 /// A camp post's camp as a surface names it.

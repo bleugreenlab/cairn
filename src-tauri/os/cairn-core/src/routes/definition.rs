@@ -1657,7 +1657,7 @@ mod tests {
 
     #[test]
     fn literal_sinks_and_the_core_pack_routes_load_and_re_save_unchanged() {
-        for name in ["ambient-channel", "github-mention"] {
+        for name in ["ambient-channel", "github-mention", "post-relevance"] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("../../packs/core/routes/{name}.yaml"));
             let yaml = std::fs::read_to_string(path).unwrap();

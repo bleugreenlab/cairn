@@ -290,6 +290,7 @@ mod tests {
             "responses/conveyor.md",
             "routes/ambient-channel.yaml",
             "routes/github-mention.yaml",
+            "routes/post-relevance.yaml",
             "skills/browser/SKILL.md",
             "workflows/fan-out/workflow.yaml",
         ] {
@@ -300,7 +301,7 @@ mod tests {
             assert!(!repo.join(path).exists(), "{path} is not copied out");
         }
         let core = pack_lock::read_lock(&repo, "core").expect("core lock");
-        for id in ["ambient-channel", "github-mention"] {
+        for id in ["ambient-channel", "github-mention", "post-relevance"] {
             assert!(
                 core.item(PackItemKind::Route, id).is_some(),
                 "core must record shipped route `{id}` as a pack item"

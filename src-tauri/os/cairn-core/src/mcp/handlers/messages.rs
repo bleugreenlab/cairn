@@ -331,9 +331,9 @@ pub async fn append_thread_message(
         orch,
         &owning_db,
         thread_id,
-        sender_run_id.as_deref(),
-        &sender_name,
+        crate::messages::delivery::ThreadSender::from_parts(sender_run_id.as_deref(), &sender_name),
         &content,
+        crate::messages::queued::DeliveryUrgency::Steer,
     )
     .await
 }

@@ -151,6 +151,29 @@ pub async fn list_firings_for_fact(
     )
     .await
 }
+/// Every firing journaled against any of these fact log rows, oldest first:
+/// [`list_firings_for_fact`] for a page of facts in one query.
+pub async fn list_firings_for_facts(
+    db: &LocalDb,
+    fact_log_ids: &[i64],
+) -> DbResult<Vec<RouteFiringRecord>> {
+    if fact_log_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = fact_log_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    db.query_all(
+        format!(
+            "SELECT {COLUMNS} FROM route_firings WHERE fact_log_id IN ({list}) ORDER BY created_at, seq"
+        ),
+        (),
+        from_row,
+    )
+    .await
+}
 pub async fn count_route_firings(db: &LocalDb, scope: &str, route: &str) -> DbResult<i64> {
     Ok(db
         .query_opt_i64(

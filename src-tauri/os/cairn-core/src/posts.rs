@@ -327,6 +327,32 @@ pub async fn attach_camps(orch: &Orchestrator, posts: &mut [Post]) {
     }
 }
 
+/// Fill each post's `routing` with how routes delivered it, read by
+/// reference from its `post_created` fact's firings. Nothing in the posts
+/// domain is written; a post no route delivered keeps an empty list.
+pub async fn attach_routing(orch: &Orchestrator, posts: &mut [Post]) {
+    let subjects: Vec<String> = posts
+        .iter()
+        .map(|post| crate::orchestrator::wakes::post_uri(post.id))
+        .collect();
+    let routed = match crate::routes::feedback::routings_for_subjects(
+        orch,
+        crate::orchestrator::wakes::POST_CREATED,
+        &subjects,
+    )
+    .await
+    {
+        Ok(routed) => routed,
+        Err(error) => {
+            log::warn!("could not read post routing: {error}");
+            return;
+        }
+    };
+    for (post, subject) in posts.iter_mut().zip(&subjects) {
+        post.routing = routed.get(subject).cloned().unwrap_or_default();
+    }
+}
+
 /// The target for a post to camp `slug` of project `project_id`. Whether the
 /// author may post there is [`publish_post`]'s to decide.
 pub async fn camp_target(

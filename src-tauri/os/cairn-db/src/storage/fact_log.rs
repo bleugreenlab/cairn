@@ -422,6 +422,46 @@ pub async fn latest_for_source(
     .await
 }
 
+/// The newest row of `source` that records `record_ref`, through
+/// `idx_fact_log_subject`: how a canonical record finds the fact minted for it.
+pub async fn latest_fact_for_subject(
+    db: &LocalDb,
+    source: &str,
+    record_ref: &str,
+) -> DbResult<Option<FactRow>> {
+    db.query_opt(
+        format!("SELECT {COLUMNS} FROM fact_log WHERE source=?1 AND record_ref=?2 ORDER BY id DESC LIMIT 1"),
+        params![source.to_string(), record_ref.to_string()],
+        from_row,
+    )
+    .await
+}
+
+/// [`latest_fact_for_subject`] for many records in one query: the newest row
+/// of `source` for each of `record_refs` that has one, in id order.
+pub async fn facts_for_subjects(
+    db: &LocalDb,
+    source: &str,
+    record_refs: &[String],
+) -> DbResult<Vec<FactRow>> {
+    if record_refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let quoted = record_refs
+        .iter()
+        .map(|record| format!("'{}'", record.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    db.query_all(
+        format!(
+            "SELECT {COLUMNS} FROM fact_log WHERE id IN (SELECT MAX(id) FROM fact_log WHERE source=?1 AND record_ref IN ({quoted}) GROUP BY record_ref) ORDER BY id"
+        ),
+        params![source.to_string()],
+        from_row,
+    )
+    .await
+}
+
 /// Which sources one prune pass covers. A source with its own retention is
 /// pruned by name; the default retention covers every other source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -800,6 +840,77 @@ mod tests {
             route_provenance: None,
             minted_at,
         }
+    }
+
+    #[tokio::test]
+    async fn a_record_finds_its_newest_fact_by_subject_alone_and_in_a_batch() {
+        let db = crate::storage::migrated_test_db("fact-log-subjects.db").await;
+        let first = insert_fact(
+            &db,
+            fact("post_created", "a", "cairn://posts/1", 1),
+            LogDedupe::Unique,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut again = fact("post_created", "a2", "cairn://posts/1", 2);
+        again.identity = "a-again".into();
+        let newest = insert_fact(&db, again, LogDedupe::Unique)
+            .await
+            .unwrap()
+            .unwrap();
+        let other = insert_fact(
+            &db,
+            fact("post_created", "b", "cairn://posts/2", 3),
+            LogDedupe::Unique,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        insert_fact(
+            &db,
+            fact("post_commented", "c", "cairn://posts/1", 4),
+            LogDedupe::Unique,
+        )
+        .await
+        .unwrap();
+        assert!(first < newest);
+
+        let one = latest_fact_for_subject(&db, "post_created", "cairn://posts/1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            one.id, newest,
+            "the newest row of that source, not another source's"
+        );
+        assert!(
+            latest_fact_for_subject(&db, "post_created", "cairn://posts/9")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let batch = facts_for_subjects(
+            &db,
+            "post_created",
+            &[
+                "cairn://posts/1".into(),
+                "cairn://posts/2".into(),
+                "cairn://posts/9".into(),
+                "it's quoted".into(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            batch.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![newest, other]
+        );
+        assert!(facts_for_subjects(&db, "post_created", &[])
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

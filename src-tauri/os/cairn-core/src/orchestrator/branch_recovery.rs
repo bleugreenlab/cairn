@@ -1358,9 +1358,11 @@ async fn announce(
                     orch,
                     db,
                     &thread_id,
-                    None,
-                    "jj branch recovery",
+                    crate::messages::delivery::ThreadSender::Operator {
+                        name: "jj branch recovery",
+                    },
                     notice,
+                    crate::messages::queued::DeliveryUrgency::Steer,
                 )
                 .await?;
                 delivered += 1;

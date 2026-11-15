@@ -49,14 +49,15 @@ pub use error::{DbError, DbResult};
 pub use fact_log::{
     claim_due_wake as claim_due_fact_wake, claim_for_index, claim_next_queued,
     coalesce_wake as coalesce_fact_wake, coalesce_wake_conn as coalesce_fact_wake_conn,
-    count_facts, finish as finish_fact, finish_wake as finish_fact_wake, get_fact,
-    get_wakes as get_fact_wakes, hold_wake_until_conn as hold_fact_wake_until_conn, insert_fact,
-    latest_for_source, latest_per_source, list_all_facts_after, list_facts, list_facts_after,
-    prune as prune_facts, prune_receipts as prune_delivery_receipts,
-    prune_wakes as prune_fact_wakes, raise_wake_level_conn as raise_fact_wake_level_conn,
-    recover_on_start as recover_fact_log, requeue_wake as requeue_fact_wake, route_state,
-    set_index_outcome, FactFilter, FactRow, FactScope, FactWake, LogDedupe, NewFact, PruneSelector,
-    Recovery, WakeMatch, WakeWindow, PASSIVE_CAMP_FACT_REF_PREFIX,
+    count_facts, facts_for_subjects, finish as finish_fact, finish_wake as finish_fact_wake,
+    get_fact, get_wakes as get_fact_wakes, hold_wake_until_conn as hold_fact_wake_until_conn,
+    insert_fact, latest_fact_for_subject, latest_for_source, latest_per_source,
+    list_all_facts_after, list_facts, list_facts_after, prune as prune_facts,
+    prune_receipts as prune_delivery_receipts, prune_wakes as prune_fact_wakes,
+    raise_wake_level_conn as raise_fact_wake_level_conn, recover_on_start as recover_fact_log,
+    requeue_wake as requeue_fact_wake, route_state, set_index_outcome, FactFilter, FactRow,
+    FactScope, FactWake, LogDedupe, NewFact, PruneSelector, Recovery, WakeMatch, WakeWindow,
+    PASSIVE_CAMP_FACT_REF_PREFIX,
 };
 pub use failed_dependencies::{failed_dependency_candidates, failed_dependency_candidates_conn};
 pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEED_PAGE_MAX};
@@ -82,7 +83,8 @@ pub use response_invocations::{
 };
 pub use route_firings::{
     count_route_firings, firing_snapshot, get_route_firing, has_recent_fact, insert_route_firing,
-    list_firings_for_fact, list_route_firings, NewRouteFiring, RouteFiringRecord, SNAPSHOT_CHARS,
+    list_firings_for_fact, list_firings_for_facts, list_route_firings, NewRouteFiring,
+    RouteFiringRecord, SNAPSHOT_CHARS,
 };
 pub use row::{
     next_i64, next_opt_text, next_text, query_opt_i64_conn, query_opt_text_conn, query_text_conn,

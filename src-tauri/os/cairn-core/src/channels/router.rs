@@ -1700,9 +1700,9 @@ impl ChannelRouter {
                     &self.orch,
                     &db,
                     &thread_id,
-                    None,
-                    &sender_name,
+                    crate::messages::delivery::ThreadSender::from_parts(None, &sender_name),
                     text,
+                    crate::messages::queued::DeliveryUrgency::Steer,
                 )
                 .await
                 .map(|_| ())

@@ -34,7 +34,7 @@ async fn homes(db: &LocalDb) {
     .unwrap();
 }
 
-fn agent(node: &str) -> (PrincipalRef, AppearanceSnapshot) {
+pub(super) fn agent(node: &str) -> (PrincipalRef, AppearanceSnapshot) {
     let run = "d575806b-1a4d-4a1e-9b0e-2f3c4d5e6f70";
     let author = PrincipalRef::Agent {
         node: node.to_string(),
@@ -65,7 +65,7 @@ fn agent(node: &str) -> (PrincipalRef, AppearanceSnapshot) {
     (author, appearance)
 }
 
-fn human() -> (PrincipalRef, AppearanceSnapshot) {
+pub(super) fn human() -> (PrincipalRef, AppearanceSnapshot) {
     let author = PrincipalRef::Human {
         issuer: "https://identity.example".to_string(),
         subject: "operator".to_string(),
@@ -95,7 +95,7 @@ fn human() -> (PrincipalRef, AppearanceSnapshot) {
 }
 
 /// Write a post the way the write sites do: the row, then its fact.
-async fn post(
+pub(super) async fn post(
     orch: &Orchestrator,
     project: Option<&str>,
     title: &str,
@@ -345,6 +345,65 @@ async fn a_post_citing_an_issue_wakes_each_watcher_once_and_never_its_author() {
     assert!(events_received(&db, "writer-run").await.is_empty());
 }
 
+/// `addressed` is true exactly when a post names someone: a home (thread,
+/// node, or qualified `project/thread`), a camp it cites, or the camp it is
+/// posted to. A post that cites only an issue or another post named no one.
+#[tokio::test]
+async fn addressed_is_true_exactly_when_a_post_names_a_home_or_a_camp() {
+    let temp = tempfile::tempdir().unwrap();
+    let (orch, db) = orchestrator(temp.path(), &[]).await;
+    homes(&db).await;
+    db.ensure_base_camp("p", 1).await.unwrap();
+    let cases = [
+        ("Nothing named here.", false),
+        ("See cairn://posts/1 for context.", false),
+        ("Please look at cairn://p/cairn/42 before Friday.", false),
+        ("For cairn://p/cairn/ui to decide.", true),
+        ("For cairn://p/cairn/42/1/builder to decide.", true),
+        ("Ask cairn/other about it.", true),
+        ("For cairn://p/cairn/camps/base to hear.", true),
+    ];
+    for (content, addressed) in cases {
+        let written = post(&orch, Some("p"), "Case", content, human(), None).await;
+        assert_eq!(
+            fields(&row_of(&db, &post_uri(&written)).await)["addressed"],
+            serde_json::json!(addressed),
+            "{content}"
+        );
+    }
+
+    let camp_id = db
+        .query_opt_text("SELECT id FROM camps WHERE slug = 'base'", ())
+        .await
+        .unwrap()
+        .expect("base camp");
+    let (author, appearance) = human();
+    let camp_post = orch
+        .db
+        .local
+        .create_post(CreatePost {
+            project_id: Some("p".into()),
+            camp_id: Some(camp_id),
+            title: Some("To the camp".into()),
+            content: "Nothing named in the text.".into(),
+            author,
+            appearance,
+        })
+        .await
+        .unwrap();
+    crate::orchestrator::wakes::mint_post_created(&orch, &camp_post, None)
+        .await
+        .unwrap()
+        .expect("a camp post mints a row");
+    let row = fields(&row_of(&db, &post_uri(&camp_post)).await);
+    assert_eq!(row["camp"], "cairn://p/cairn/camps/base");
+    assert_eq!(
+        row["addressed"],
+        serde_json::json!(true),
+        "a camp post is addressed"
+    );
+}
+
 /// Acceptance 2. Only structural references are mentions, and a qualified
 /// thread name reaches the session the thread holds when the row is indexed.
 #[tokio::test]
@@ -583,7 +642,15 @@ async fn the_wake_carries_the_writing_and_the_row_holds_no_body() {
         .all(|key| spec.fields.get(key.as_str()).is_some_and(|f| f.stored)));
     assert_eq!(
         stored.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["author", "mentions", "postUri", "project", "scope", "title"]
+        vec![
+            "addressed",
+            "author",
+            "mentions",
+            "postUri",
+            "project",
+            "scope",
+            "title"
+        ]
     );
     assert_eq!(stored["author"], WRITER_HOME);
     assert_eq!(stored["scope"], "cairn");

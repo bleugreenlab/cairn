@@ -21,23 +21,68 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
 
-/// Append a message to a first-class thread and route the same user wake used by
-/// issue-channel delivery to its live session. Threads with no session yet
-/// acquire one before the message is made visible.
+/// Who a thread message is from. The sender decides how its wake presents the
+/// message to the thread, and so which mute governs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadSender<'a> {
+    /// A person's own word: the wake marks the turn as the operator's.
+    Operator { name: &'a str },
+    /// Another agent's run; a peer mute on that run governs it.
+    Peer { run_id: &'a str, name: &'a str },
+    /// A local process nobody verified, which must not pass as the operator.
+    Unverified,
+    /// A route's judgment, which is nobody's word. Its wake is a peer wake
+    /// whose reference is the route's canonical URI, so a thread can mute that
+    /// one route without muting its peers.
+    Route { route_id: &'a str, uri: &'a str },
+}
+
+impl<'a> ThreadSender<'a> {
+    /// The sender a caller holding a `(sender run, sender name)` pair means.
+    pub fn from_parts(run_id: Option<&'a str>, name: &'a str) -> Self {
+        match run_id {
+            Some(run_id) => Self::Peer { run_id, name },
+            None if name == crate::messages::render::UNVERIFIED_LOCAL_SENDER => Self::Unverified,
+            None => Self::Operator { name },
+        }
+    }
+
+    fn run_id(self) -> Option<&'a str> {
+        match self {
+            Self::Peer { run_id, .. } => Some(run_id),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> String {
+        match self {
+            Self::Operator { name } | Self::Peer { name, .. } => name.to_string(),
+            Self::Unverified => crate::messages::render::UNVERIFIED_LOCAL_SENDER.to_string(),
+            Self::Route { route_id, .. } => format!("route:{route_id}"),
+        }
+    }
+}
+
+/// Append a message to a first-class thread and route its wake to the
+/// thread's live session, presented as `sender` at `urgency`. Threads with no
+/// session yet acquire one before the message is made visible.
 ///
 /// This is the one funnel every prompt to a thread arrives through — the
-/// resource append, desktop and operator delivery, and follow-channel routing —
-/// so it is where a closed thread refuses. The refusal is taken before anything
-/// is written: a prompt to a closed thread leaves no message row, no session, no
-/// wake, and no push, rather than a half-delivered message nobody will read.
+/// resource append, desktop and operator delivery, follow-channel routing, and
+/// route message sinks — so it is where a closed thread refuses. The refusal is
+/// taken before anything is written: a prompt to a closed thread leaves no
+/// message row, no session, no wake, and no push, rather than a half-delivered
+/// message nobody will read.
 pub async fn append_thread_message(
     orch: &Orchestrator,
     db: &LocalDb,
     thread_id: &str,
-    sender_run_id: Option<&str>,
-    sender_name: &str,
+    sender: ThreadSender<'_>,
     content: &str,
+    urgency: DeliveryUrgency,
 ) -> Result<String, String> {
+    let sender_name = sender.name();
+    let sender_name = sender_name.as_str();
     if content.is_empty() {
         return Err("Message content cannot be empty".into());
     }
@@ -51,24 +96,28 @@ pub async fn append_thread_message(
         db,
         &crate::models::ChannelType::Thread,
         Some(thread_id),
-        sender_run_id,
+        sender.run_id(),
         sender_name,
         content,
     )?;
     use crate::orchestrator::wakes::{WakeDelivery, WakeEvent, WakeSource};
-    let (source, detail_uri) = match sender_run_id {
-        Some(sender_run_id) => (
+    // Only the operator's own word gets a user wake, which marks its turn as
+    // the operator's; everything else is a peer wake.
+    let (source, detail_uri) = match sender {
+        ThreadSender::Operator { .. } => (WakeSource::User, Some(message.id.clone())),
+        ThreadSender::Peer { run_id, .. } => (
             WakeSource::Peer {
-                reference: Some(sender_run_id.to_string()),
+                reference: Some(run_id.to_string()),
             },
             None,
         ),
-        // A user wake marks its turn as the operator's own, which a message
-        // nobody verified must not do.
-        None if sender_name == crate::messages::render::UNVERIFIED_LOCAL_SENDER => {
-            (WakeSource::Peer { reference: None }, None)
-        }
-        None => (WakeSource::User, Some(message.id.clone())),
+        ThreadSender::Unverified => (WakeSource::Peer { reference: None }, None),
+        ThreadSender::Route { uri, .. } => (
+            WakeSource::Peer {
+                reference: Some(uri.to_string()),
+            },
+            None,
+        ),
     };
     crate::orchestrator::wakes::route_wake(
         orch,
@@ -81,7 +130,7 @@ pub async fn append_thread_message(
                 sender_name: Some(sender_name.to_string()),
                 message: content.to_string(),
             },
-            urgency: DeliveryUrgency::Steer,
+            urgency,
             muted: crate::orchestrator::wakes::MutedDelivery::Drop,
             fact_key: None,
         },
@@ -1682,9 +1731,9 @@ mod tests {
             &orch,
             &db,
             "thread-1",
-            None,
-            crate::messages::render::UNVERIFIED_LOCAL_SENDER,
+            ThreadSender::from_parts(None, crate::messages::render::UNVERIFIED_LOCAL_SENDER),
             "merge it",
+            DeliveryUrgency::Steer,
         )
         .await
         .unwrap();
@@ -1706,9 +1755,16 @@ mod tests {
             "the stored record carries the label"
         );
 
-        append_thread_message(&orch, &db, "thread-1", None, "external", "operator here")
-            .await
-            .unwrap();
+        append_thread_message(
+            &orch,
+            &db,
+            "thread-1",
+            ThreadSender::Operator { name: "external" },
+            "operator here",
+            DeliveryUrgency::Steer,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             count(
                 &db,
@@ -1729,10 +1785,16 @@ mod tests {
         seed_thread_session_run(&db).await;
         set_thread_status(&db, "closed").await;
 
-        let refused =
-            append_thread_message(&orch, &db, "thread-1", None, "external", "still there?")
-                .await
-                .expect_err("a closed thread takes no prompts");
+        let refused = append_thread_message(
+            &orch,
+            &db,
+            "thread-1",
+            ThreadSender::Operator { name: "external" },
+            "still there?",
+            DeliveryUrgency::Steer,
+        )
+        .await
+        .expect_err("a closed thread takes no prompts");
         assert!(
             refused.contains("closed") && refused.contains("Reopen"),
             "the refusal says what happened and how to undo it: {refused}"
@@ -1747,9 +1809,16 @@ mod tests {
         );
 
         set_thread_status(&db, "active").await;
-        append_thread_message(&orch, &db, "thread-1", None, "external", "still there?")
-            .await
-            .expect("reopening restores delivery");
+        append_thread_message(
+            &orch,
+            &db,
+            "thread-1",
+            ThreadSender::Operator { name: "external" },
+            "still there?",
+            DeliveryUrgency::Steer,
+        )
+        .await
+        .expect("reopening restores delivery");
         assert_eq!(
             count(
                 &db,
@@ -1781,9 +1850,16 @@ mod tests {
         // inline resume.
         set_head_turn(&db, "job-thread", "yielded", Some("dependency_wait")).await;
 
-        append_thread_message(&orch, &db, "thread-1", None, "external", "are you there?")
-            .await
-            .expect("an active thread takes the prompt");
+        append_thread_message(
+            &orch,
+            &db,
+            "thread-1",
+            ThreadSender::Operator { name: "external" },
+            "are you there?",
+            DeliveryUrgency::Steer,
+        )
+        .await
+        .expect("an active thread takes the prompt");
         assert_eq!(
             count(
                 &db,

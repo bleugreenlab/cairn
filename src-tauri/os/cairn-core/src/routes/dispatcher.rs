@@ -104,10 +104,25 @@ fn resolve_message_target(target: &str) -> Result<(MessageTarget, String), Strin
     }
 }
 
-/// Append a route's message to `target`, authored as the route.
+/// The canonical URI a route's deliveries name it by: the reference a thread
+/// mutes to silence that one route.
+fn route_uri(route: &crate::config::routes::FileRoute, fact: &RouteFact) -> String {
+    match fact.fields.get("project").and_then(Value::as_str) {
+        Some(project) if route.is_project_scoped() => {
+            cairn_uri::build_project_route_uri(project, &route.id)
+        }
+        _ => cairn_uri::build_route_uri(&route.id),
+    }
+}
+
+/// Append a route's message to `target`, authored as the route. A thread
+/// hears it as the route's judgment, queued for its next turn rather than
+/// steering the one in progress: a route raises a delivery, never the
+/// operator's voice and never an interruption.
 async fn deliver_message(
     orch: &Orchestrator,
     route_id: &str,
+    route_uri: &str,
     target: &MessageTarget,
     text: &str,
 ) -> Result<(), String> {
@@ -148,9 +163,12 @@ async fn deliver_message(
                 orch,
                 &db,
                 &thread.id,
-                None,
-                &format!("route:{route_id}"),
+                crate::messages::delivery::ThreadSender::Route {
+                    route_id,
+                    uri: route_uri,
+                },
                 text,
+                crate::messages::queued::DeliveryUrgency::Queue,
             )
             .await
             .map(|_| ())
@@ -233,7 +251,7 @@ impl Outcome {
 /// Why a sink will not deliver to an address it resolved on a firing.
 #[derive(Debug, Clone, PartialEq)]
 struct SinkDrop {
-    /// `unbound_target`, `undeliverable`, or `fan_out_limit`.
+    /// `unbound_target`, `undeliverable`, `fan_out_limit`, or `actor`.
     reason: &'static str,
     /// The address it resolved to, when it resolved to one.
     sink_ref: Option<String>,
@@ -339,6 +357,56 @@ fn message_targets(bindings: &Bindings<'_>, target: &Bindable<String>) -> Vec<Ta
             }
         })
         .collect()
+}
+
+/// [`message_targets`] with every address that is the fact's own actor
+/// dropped as `actor`: a route never hands a home its own writing, the rule
+/// the index lane applies to wakes. Addresses and the actor are compared as
+/// resolved homes, so a thread URI and its session's node URI are one home.
+/// Only a source that declares an actor field has one; the others' targets
+/// pass through unchanged. In a fan-out only the actor's address drops.
+async fn message_targets_for_fact(
+    orch: &Orchestrator,
+    bindings: &Bindings<'_>,
+    target: &Bindable<String>,
+    fact: &RouteFact,
+) -> Vec<TargetPlan> {
+    let plans = message_targets(bindings, target);
+    let registry = super::FactRegistry::default();
+    let Some(spec) = registry.source(&fact.source) else {
+        return plans;
+    };
+    let actor = match super::worker::actor_home_recipient(orch, spec, &fact.fields).await {
+        Ok(Some(actor)) => actor,
+        Ok(None) => return plans,
+        Err(error) => {
+            log::warn!("route message sink could not resolve the fact's actor: {error}");
+            return plans;
+        }
+    };
+    let mut checked = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let TargetPlan::Deliver { canonical, .. } = &plan else {
+            checked.push(plan);
+            continue;
+        };
+        let is_actor =
+            crate::orchestrator::wakes::home_recipient_for_uri(&orch.db.local, canonical)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|home| home == actor);
+        checked.push(if is_actor {
+            TargetPlan::SinkDrop(SinkDrop::new(
+                "actor",
+                Some(canonical.clone()),
+                format!("{canonical} wrote this fact, and a route never delivers a fact to its own actor"),
+            ))
+        } else {
+            plan
+        });
+    }
+    checked
 }
 
 /// The conversation a bound channel destination resolved to on one firing:
@@ -882,6 +950,7 @@ async fn sink_preview(
     orch: &Orchestrator,
     delivery: &Delivery<'_>,
     bindings: &Bindings<'_>,
+    fact: &RouteFact,
 ) -> Value {
     let fields = &delivery.fields;
     let node_id = delivery.node_id;
@@ -919,7 +988,7 @@ async fn sink_preview(
             preview
         }
         RouteSink::Message { target, .. } => {
-            let plans = message_targets(bindings, target);
+            let plans = message_targets_for_fact(orch, bindings, target, fact).await;
             let targets: Vec<Value> = plans
                 .iter()
                 .map(|plan| match plan {
@@ -1003,7 +1072,7 @@ pub async fn test_definition(
             fields: &delivery.fields,
             outputs: &walked.outputs,
         };
-        let mut preview = sink_preview(orch, delivery, &bindings).await;
+        let mut preview = sink_preview(orch, delivery, &bindings, &fact).await;
         if context.event.is_none() && body_names_event(delivery.sink) {
             preview["note"] = Value::String(format!(
                 "{{{{event}}}} rendered as {EVENT_PLACEHOLDER}: this sample has no fact log row; a live firing binds the row's URI"
@@ -1432,12 +1501,13 @@ async fn dispatch_into(
                     // A bound list fans out here, one delivery and one journal
                     // row per address, so a decision asked once can reach
                     // several targets while every other sink still fires once.
-                    for plan in message_targets(&bindings, target) {
+                    let uri = route_uri(route, fact);
+                    for plan in message_targets_for_fact(orch, &bindings, target, fact).await {
                         let outcome = match plan {
                             TargetPlan::Deliver { target, canonical } => {
                                 let delivered = super::with_provenance(
                                     route.id.clone(),
-                                    deliver_message(orch, &route.id, &target, &prepared.text),
+                                    deliver_message(orch, &route.id, &uri, &target, &prepared.text),
                                 )
                                 .await
                                 .map(|()| canonical);
@@ -2720,7 +2790,15 @@ mod tests {
             transforms: Vec::new(),
             position: 0,
         };
-        let preview = sink_preview(&orch, &delivery, &bindings).await;
+        let fact = RouteFact {
+            source: "channel_message".into(),
+            identity: "channel-message:preview".into(),
+            fields: fields.clone(),
+            origin: None,
+            summary: None,
+            route_provenance: None,
+        };
+        let preview = sink_preview(&orch, &delivery, &bindings, &fact).await;
         assert_eq!(preview["text"], "Routed to devops (0.82, native, rev 1a2b3c4d5e6f), execution (0.61, native, rev 9f8e7d6c5b4a).\nVia #ambient · cairn · Discord from operator. If this isn't yours, say so.\ntransformed producer text");
         assert!(route.contains("body:"));
     }

@@ -334,7 +334,7 @@ pub(super) async fn read_posts(
     }
 }
 
-pub(super) async fn read_post(
+pub(crate) async fn read_post(
     db: &LocalDb,
     orch: Option<&Orchestrator>,
     id: i64,
@@ -360,7 +360,25 @@ pub(super) async fn read_post(
         return serde_json::json!({"post": post, "comments": comments}).to_string();
     }
     let context = PostContext::resolve(db, orch, std::slice::from_ref(&post)).await;
-    let mut output = format!("# {}\n\n{}\n\n- Post: cairn://posts/{id}\n- Scope: {}\n- Author: {}\n- Created: {}\n\n## Comments\n",
+    let mut post = post;
+    if let Some(orch) = orch {
+        crate::posts::attach_routing(orch, std::slice::from_mut(&mut post)).await;
+    }
+    // How routes delivered the post, by reference to their firings; a post no
+    // route delivered says nothing rather than claiming it was not relevant.
+    let routing: String = post
+        .routing
+        .iter()
+        .map(|routed| {
+            format!(
+                "- Routed by {}: {} (event {})\n",
+                routed.route,
+                routed.citations.join(", "),
+                routed.event
+            )
+        })
+        .collect();
+    let mut output = format!("# {}\n\n{}\n\n- Post: cairn://posts/{id}\n- Scope: {}\n- Author: {}\n- Created: {}\n{routing}\n## Comments\n",
         post.title.as_deref().unwrap_or("Untitled"), post.content,
         context.scope(post.project_id.as_deref(), post.camp_id.as_deref()),
         context.author(&post.author, &post.appearance), crate::clock::age(post.created_at));

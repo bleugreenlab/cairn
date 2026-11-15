@@ -690,9 +690,9 @@ pub async fn deliver_answer(
             orch,
             &db,
             &thread_id,
-            None,
-            sender_name,
+            crate::messages::delivery::ThreadSender::from_parts(None, sender_name),
             &delivered,
+            crate::messages::queued::DeliveryUrgency::Steer,
         )
         .await
         .map(Some);

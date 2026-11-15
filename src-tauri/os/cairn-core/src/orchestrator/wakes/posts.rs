@@ -21,7 +21,17 @@
 //! on the new one.
 //!
 //! **The wake carries the writing.** The row holds no body. The wake renders
-//! the post or comment from its canonical record ([`render_post_wake`]).
+//! the post or comment from its canonical record ([`render_post_wake`]), and
+//! so does a route reading `post_created.text`, which the lane hydrates from
+//! the same renderer.
+//!
+//! **`addressed` says whether the post named anyone.** It is true when the
+//! post goes to a camp, or its `mentions` include a home (a node, task or
+//! thread URI, or a qualified `project/thread`) or a camp, whose members the
+//! lane reaches as it does a camp post. An issue URI does not count:
+//! the issue's watchers get their own wake, but such a post named no thread.
+//! Post, diff, chat and file URIs are citations. The test reads the URI's
+//! shape and resolves no job, so delivery still resolves late.
 
 use std::collections::BTreeMap;
 
@@ -42,7 +52,8 @@ pub const POST_CREATED: &str = "post_created";
 /// The fact source a new comment is minted on.
 pub const POST_COMMENTED: &str = "post_commented";
 
-fn post_uri(post_id: i64) -> String {
+/// A post's canonical URI, which its `post_created` row records as its subject.
+pub(crate) fn post_uri(post_id: i64) -> String {
     format!("cairn://posts/{post_id}")
 }
 
@@ -136,8 +147,18 @@ pub async fn mint_post_created(
         text.push_str(title);
     }
     let mentions = crate::routes::structural_mentions(db, &text).await;
+    let names_an_audience = mentions.iter().any(|mention| {
+        cairn_uri::parse_uri(mention).is_some_and(|resource| {
+            super::names_home(&resource) || matches!(resource, CairnResource::ProjectCamp { .. })
+        })
+    });
+    let camp = crate::posts::post_camp_uri(orch, post).await;
     let mut fields = BTreeMap::from([
         ("postUri".to_string(), Value::String(uri.clone())),
+        (
+            "addressed".to_string(),
+            Value::Bool(camp.is_some() || names_an_audience),
+        ),
         (
             "scope".to_string(),
             Value::String(match (&post.project_id, &key) {
@@ -160,7 +181,7 @@ pub async fn mint_post_created(
     if let Some(title) = &post.title {
         fields.insert("title".into(), Value::String(title.clone()));
     }
-    if let Some(camp) = crate::posts::post_camp_uri(orch, post).await {
+    if let Some(camp) = camp {
         fields.insert("camp".into(), Value::String(camp));
     }
     mint_post_fact(

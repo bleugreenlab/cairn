@@ -715,21 +715,36 @@ async fn actor_recipients(
             Err(error) => log::warn!("could not resolve actor job of fact {}: {error}", row.id),
         }
     }
-    let home = spec
-        .actor_home
-        .and_then(|field| fields.get(field))
-        .and_then(Value::as_str);
-    if let Some(home) = home {
-        match crate::orchestrator::wakes::home_recipient_for_uri(&orch.db.local, home).await {
-            Ok(Some(recipient)) if !actors.contains(&recipient) => actors.push(recipient),
-            Ok(_) => {}
-            Err(error) => log::warn!(
-                "could not resolve actor home {home} of fact {}: {error}",
-                row.id
-            ),
-        }
+    match actor_home_recipient(orch, spec, fields).await {
+        Ok(Some(recipient)) if !actors.contains(&recipient) => actors.push(recipient),
+        Ok(_) => {}
+        Err(error) => log::warn!(
+            "could not resolve the actor home of fact {}: {error}",
+            row.id
+        ),
     }
     actors
+}
+
+/// The home a fact's declared actor field names, resolved to the stable
+/// recipient it is now: the one resolution both the index lane and a route's
+/// message sink compare against, so two URI forms of one home are one actor.
+/// `None` when the source declares no actor field or the fact's names no home.
+pub(super) async fn actor_home_recipient(
+    orch: &Orchestrator,
+    spec: &super::SourceSpec,
+    fields: &BTreeMap<String, Value>,
+) -> Result<Option<StableRecipient>, String> {
+    let Some(home) = spec
+        .actor_home
+        .and_then(|field| fields.get(field))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    crate::orchestrator::wakes::home_recipient_for_uri(&orch.db.local, home)
+        .await
+        .map_err(|error| format!("actor home {home}: {error}"))
 }
 
 /// The URIs one addressee field of a stored fact holds: a scalar or a list.
@@ -1984,6 +1999,10 @@ mod posts_tests;
 #[cfg(test)]
 #[path = "worker_ambient_tests.rs"]
 mod ambient_tests;
+
+#[cfg(test)]
+#[path = "worker_post_relevance_tests.rs"]
+mod post_relevance_tests;
 
 #[cfg(test)]
 mod tests {

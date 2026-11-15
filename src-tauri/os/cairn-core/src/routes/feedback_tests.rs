@@ -34,6 +34,95 @@ fn an_event_is_cited_by_its_uri_or_by_name_never_by_a_longer_id() {
     assert!(!cites_event("12", 12));
 }
 
+/// One `post-relevance` message firing of post 1 to `sink`, journaling `history`.
+fn post_firing(
+    history: &str,
+    status: &str,
+    drop_reason: Option<&str>,
+    sink: &str,
+) -> RouteFiringRecord {
+    RouteFiringRecord {
+        id: sink.into(),
+        route_id: "post-relevance".into(),
+        scope_key: "workspace".into(),
+        seq: 1,
+        project_id: Some("p".into()),
+        trigger_source: "post_created".into(),
+        fact_identity: "cairn://posts/1".into(),
+        fact_summary: None,
+        status: status.into(),
+        drop_reason: drop_reason.map(str::to_owned),
+        transforms_json: Some(history.into()),
+        sink_kind: "message".into(),
+        sink_ref: Some(sink.into()),
+        payload_text: None,
+        error: None,
+        created_at: 1,
+        fact_log_id: Some(1),
+    }
+}
+
+/// A post's attribution cites only picks whose message actually fired: the
+/// pick dropped as the fact's actor, and a failed delivery, cite nothing.
+#[test]
+fn a_delivered_decision_cites_only_the_picks_whose_message_fired() {
+    let history = json!([{
+        "decision": "relevance",
+        "asked": {"questions": [{"name": "route", "source": "chartered_threads"}]},
+        "answers": {"route": {
+            "outcome": "admitted",
+            "pick": "devops",
+            "picks": ["devops", "docs", "ui"],
+            "addresses": [DEVOPS, DOCS, "cairn://p/cairn/ui"],
+            "citations": ["devops (0.48, native, rev a)", "docs (0.47, native, rev b)", "ui (0.45, native, rev c)"],
+        }},
+    }])
+    .to_string();
+    let firing = |status: &str, drop_reason: Option<&str>, sink: &str| {
+        post_firing(&history, status, drop_reason, sink)
+    };
+    assert_eq!(
+        delivered_decisions(&[
+            firing("dropped", Some("actor"), DEVOPS),
+            firing("fired", None, DOCS),
+            firing("failed", None, "cairn://p/cairn/ui"),
+        ]),
+        [DeliveredDecision {
+            route_id: "post-relevance".into(),
+            citations: vec!["docs (0.47, native, rev b)".into()],
+        }]
+    );
+    assert!(delivered_decisions(&[firing("dropped", Some("actor"), DEVOPS)]).is_empty());
+}
+
+/// `addresses` keeps only the picks that have one, so a literal-option pick
+/// naming no thread must not shift the thread pick onto its citation.
+#[test]
+fn a_pick_without_an_address_does_not_lend_its_citation_to_the_next() {
+    let history = json!([{
+        "decision": "relevance",
+        "asked": {"questions": [{"name": "route", "options": [
+            {"value": "later"},
+            {"value": "docs", "address": DOCS},
+        ]}]},
+        "answers": {"route": {
+            "outcome": "admitted",
+            "pick": "later",
+            "picks": ["later", "docs"],
+            "addresses": [DOCS],
+            "citations": ["later (0.5, native)", "docs (0.45, native, rev b)"],
+        }},
+    }])
+    .to_string();
+    assert_eq!(
+        delivered_decisions(&[post_firing(&history, "fired", None, DOCS)]),
+        [DeliveredDecision {
+            route_id: "post-relevance".into(),
+            citations: vec!["docs (0.45, native, rev b)".into()],
+        }]
+    );
+}
+
 #[test]
 fn a_citation_carries_its_revision() {
     assert_eq!(

@@ -95,6 +95,29 @@ async fn home_recipient(
         .map(Some)
 }
 
+/// Whether `resource` has the shape of a home: a node, a sub-agent task, a
+/// thread, or one of a thread's tasks. Shape only, resolving no job, so a post
+/// that names a home is addressed whether or not that home has a session yet,
+/// and which session receives is still decided at delivery.
+pub(crate) fn names_home(resource: &CairnResource) -> bool {
+    match resource {
+        CairnResource::Node { .. } | CairnResource::Task { .. } => true,
+        CairnResource::Thread { path, .. } => thread_home_task(path).is_some(),
+        _ => false,
+    }
+}
+
+/// Which home a thread URI's sub-path names: `Some(None)` for the thread
+/// itself, `Some(Some(task))` for one of its tasks, `None` for a deeper path,
+/// which cites one of the thread's surfaces rather than a home.
+fn thread_home_task(path: &[String]) -> Option<Option<&String>> {
+    match path {
+        [] => Some(None),
+        [task, segment] if task == "task" => Some(Some(segment)),
+        _ => None,
+    }
+}
+
 /// A home URI's current job, through the canonical coordinate resolvers.
 ///
 /// Threads resolve through their own helpers rather than the node coordinate so
@@ -139,13 +162,10 @@ async fn home_job_for_resource(
             path,
         } => {
             let (project, name) = (project.clone(), name.clone());
-            // Only the thread itself and the tasks beneath it are homes; a
-            // deeper sub-resource path is a citation of one of its surfaces.
-            let task = match path.as_slice() {
-                [] => None,
-                [task, segment] if task == "task" => Some(segment.clone()),
-                _ => return Ok(None),
+            let Some(task) = thread_home_task(path) else {
+                return Ok(None);
             };
+            let task = task.cloned();
             db.read(move |conn| {
                 let (project, name, task) = (project.clone(), name.clone(), task.clone());
                 Box::pin(async move {

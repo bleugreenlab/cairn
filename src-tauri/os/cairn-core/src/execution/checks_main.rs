@@ -3331,10 +3331,17 @@ async fn try_deliver(
         .await
         .map_err(|error| format!("main cadence notify thread lookup failed: {error}"))?
         .ok_or_else(|| format!("main cadence notify thread {thread:?} does not exist"))?;
-    crate::messages::delivery::append_thread_message(orch, db, &thread_id, None, SENDER, content)
-        .await
-        .map(|_| ())
-        .map_err(|error| format!("main cadence delivery to thread {thread:?} failed: {error}"))
+    crate::messages::delivery::append_thread_message(
+        orch,
+        db,
+        &thread_id,
+        crate::messages::delivery::ThreadSender::Operator { name: SENDER },
+        content,
+        crate::messages::queued::DeliveryUrgency::Steer,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("main cadence delivery to thread {thread:?} failed: {error}"))
 }
 
 // ---------------------------------------------------------------------------

@@ -74,6 +74,9 @@ pub(crate) struct ThreadDecision {
     pub revision: Option<String>,
     pub addresses: Vec<String>,
     pub citations: Vec<String>,
+    /// Each pick's own address, index-aligned with `picks` and `citations`;
+    /// `addresses` holds only the picks that had one.
+    pub pick_addresses: Vec<Option<String>>,
 }
 
 fn strings(value: &Value) -> Vec<String> {
@@ -94,6 +97,42 @@ fn citation_revision(citation: &str) -> Option<String> {
     let rest = &citation[start..];
     let end = rest.find(')').unwrap_or(rest.len());
     Some(rest[..end].trim().to_string()).filter(|revision| !revision.is_empty())
+}
+
+/// Each pick's address, in pick order. `addresses` keeps only the picks that
+/// had one, so it lines up with `picks` exactly when every pick did; otherwise
+/// each pick's address is read from the option it was asked as.
+fn pick_addresses(
+    entry: &Value,
+    question: &str,
+    picks: &[String],
+    addresses: &[String],
+) -> Vec<Option<String>> {
+    if addresses.len() == picks.len() {
+        return addresses.iter().cloned().map(Some).collect();
+    }
+    let options = entry
+        .get("asked")
+        .and_then(|asked| asked.get("questions"))
+        .and_then(Value::as_array)
+        .and_then(|questions| {
+            questions
+                .iter()
+                .find(|q| q.get("name").and_then(Value::as_str) == Some(question))
+        })
+        .and_then(|q| q.get("options"))
+        .and_then(Value::as_array);
+    picks
+        .iter()
+        .map(|pick| {
+            options?
+                .iter()
+                .find(|option| option.get("value").and_then(Value::as_str) == Some(pick.as_str()))?
+                .get("address")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 /// Read the thread decision from one journaled decision entry: the outcome
@@ -142,6 +181,9 @@ fn decision_from_entry(entry: &Value, route: &str, question: &str) -> Option<Thr
             .or_else(|| citations.first().cloned())
             .and_then(|citation| citation_revision(&citation))
     });
+    let picks = strings(answer.get("picks").unwrap_or(&Value::Null));
+    let addresses = strings(answer.get("addresses").unwrap_or(&Value::Null));
+    let pick_addresses = pick_addresses(entry, question, &picks, &addresses);
     Some(ThreadDecision {
         route_id: route.to_string(),
         decision_node: entry.get("decision")?.as_str()?.to_string(),
@@ -160,15 +202,16 @@ fn decision_from_entry(entry: &Value, route: &str, question: &str) -> Option<Thr
             .map(str::to_owned),
         outcome,
         pick,
-        picks: strings(answer.get("picks").unwrap_or(&Value::Null)),
+        picks,
         probability,
         measured_by: answer
             .get("measuredBy")
             .and_then(Value::as_str)
             .map(str::to_owned),
         revision,
-        addresses: strings(answer.get("addresses").unwrap_or(&Value::Null)),
+        addresses,
         citations,
+        pick_addresses,
     })
 }
 
@@ -242,6 +285,129 @@ pub(crate) fn delivered_threads(firings: &[RouteFiringRecord]) -> Vec<String> {
         }
     }
     threads
+}
+
+/// What one route delivered of a fact: the citation of each pick whose
+/// message firing is `fired`, in rank order. A pick dropped as the fact's
+/// actor, a failed delivery, and a non-admitted outcome cite nothing, so this
+/// never claims a delivery that did not happen.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DeliveredDecision {
+    pub route_id: String,
+    pub citations: Vec<String>,
+}
+
+pub(crate) fn delivered_decisions(firings: &[RouteFiringRecord]) -> Vec<DeliveredDecision> {
+    let mut delivered: Vec<DeliveredDecision> = Vec::new();
+    for decision in decisions(firings) {
+        if decision.outcome != "admitted" {
+            continue;
+        }
+        let own: Vec<RouteFiringRecord> = firings
+            .iter()
+            .filter(|firing| firing.route_id == decision.route_id)
+            .cloned()
+            .collect();
+        let threads = delivered_threads(&own);
+        let citations: Vec<String> = decision
+            .pick_addresses
+            .iter()
+            .zip(&decision.citations)
+            .filter(|(address, _)| {
+                address.as_deref().is_some_and(|address| {
+                    threads.contains(&cairn_uri::canonicalize_uri_identity(address))
+                })
+            })
+            .map(|(_, citation)| citation.clone())
+            .collect();
+        if citations.is_empty() {
+            continue;
+        }
+        match delivered
+            .iter_mut()
+            .find(|existing| existing.route_id == decision.route_id)
+        {
+            Some(existing) => {
+                for citation in citations {
+                    if !existing.citations.contains(&citation) {
+                        existing.citations.push(citation);
+                    }
+                }
+            }
+            None => delivered.push(DeliveredDecision {
+                route_id: decision.route_id.clone(),
+                citations,
+            }),
+        }
+    }
+    delivered
+}
+
+/// How routes delivered the `source` fact minted for each of `subjects`,
+/// keyed by subject: read by reference through the subject index and the
+/// firing journal, two queries for the whole page. A subject with no fact, no
+/// firing, or no delivered pick is absent. The firing journal is a bounded
+/// ring per route, so an old enough delivery is absent too.
+pub(crate) async fn routings_for_subjects(
+    orch: &Orchestrator,
+    source: &str,
+    subjects: &[String],
+) -> Result<HashMap<String, Vec<crate::models::PostRouting>>, String> {
+    let local = &orch.db.local;
+    let facts = crate::storage::facts_for_subjects(local, source, subjects)
+        .await
+        .map_err(|e| e.to_string())?;
+    let ids: Vec<i64> = facts.iter().map(|fact| fact.id).collect();
+    let firings = crate::storage::list_firings_for_facts(local, &ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    let now = orch.services.clock.now();
+    let mut names: HashMap<Option<String>, std::sync::Arc<super::index::RouteSet>> = HashMap::new();
+    let mut routed = HashMap::new();
+    for fact in &facts {
+        let own: Vec<RouteFiringRecord> = firings
+            .iter()
+            .filter(|firing| firing.fact_log_id == Some(fact.id))
+            .cloned()
+            .collect();
+        let delivered = delivered_decisions(&own);
+        if delivered.is_empty() {
+            continue;
+        }
+        let routes = match names.get(&fact.project_id) {
+            Some(routes) => Some(routes.clone()),
+            None => match current_routes(orch, fact, now).await {
+                Ok(routes) => {
+                    names.insert(fact.project_id.clone(), routes.clone());
+                    Some(routes)
+                }
+                Err(error) => {
+                    log::info!("post routing: no route names for fact {}: {error}", fact.id);
+                    None
+                }
+            },
+        };
+        let event = super::worker::event_uri(orch, fact).await;
+        let routings = delivered
+            .into_iter()
+            .map(|decision| crate::models::PostRouting {
+                route: routes
+                    .as_ref()
+                    .and_then(|routes| {
+                        routes
+                            .routes_for(&fact.source)
+                            .find(|route| route.id == decision.route_id)
+                            .map(|route| route.definition.name.clone())
+                    })
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(decision.route_id),
+                citations: decision.citations,
+                event: event.clone(),
+            })
+            .collect();
+        routed.insert(fact.record_ref.clone(), routings);
+    }
+    Ok(routed)
 }
 
 /// A fact's mint time in epoch seconds (the log stores milliseconds).

@@ -305,6 +305,17 @@ pub async fn hydrate(orch: &Orchestrator, row: &FactRow) -> Result<Hydrated, Str
         fact.fields
             .insert("text".into(), Value::String(inbound.text));
     }
+    if row.source == crate::orchestrator::wakes::POST_CREATED {
+        // The same bounded rendering a post wake carries, title included. A
+        // post deleted since its row was minted leaves `text` unbound rather
+        // than failing the row: its stored fields still match, and whatever
+        // reads `text` reports it missing.
+        if let Some(text) =
+            crate::orchestrator::wakes::render_post_wake(&orch.db.local, &row.record_ref).await
+        {
+            fact.fields.insert("text".into(), Value::String(text));
+        }
+    }
     Ok(Hydrated {
         fact,
         presence: presence_from_str(&row.presence),

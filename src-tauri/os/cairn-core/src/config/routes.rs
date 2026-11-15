@@ -275,6 +275,8 @@ mod tests {
 
     const GITHUB_MENTION_ID: &str = "github-mention";
     const AMBIENT_ID: &str = "ambient-channel";
+    const POST_RELEVANCE_ID: &str = "post-relevance";
+    const SHIPPED: [&str; 3] = [GITHUB_MENTION_ID, AMBIENT_ID, POST_RELEVANCE_ID];
 
     /// A workspace config dir synced from the packs this repository ships, so
     /// the routes under test are the real shipped files as the pack sync
@@ -322,7 +324,7 @@ mod tests {
         .unwrap();
 
         let workspace = list_routes(&LibraryRoots::workspace(&config)).unwrap();
-        for id in [GITHUB_MENTION_ID, AMBIENT_ID] {
+        for id in SHIPPED {
             let route = ok_route(&workspace, id);
             assert_eq!(route.origin, Origin::Pack { id: "core".into() });
             assert_eq!(
@@ -335,16 +337,26 @@ mod tests {
         let routes = list_routes(&crate::config::trusted_roots(&config, &project)).unwrap();
         assert_eq!(
             routes.len(),
-            2,
+            SHIPPED.len(),
             "the project copy shadows, never duplicates"
         );
         let route = ok_route(&routes, GITHUB_MENTION_ID);
         assert!(route.is_project_scoped());
         assert_eq!(route.definition.name, "Project route");
         assert!(!ok_route(&routes, AMBIENT_ID).is_project_scoped());
+        let post_relevance = ok_route(&routes, POST_RELEVANCE_ID);
+        assert!(!post_relevance.is_project_scoped());
+        assert!(
+            post_relevance
+                .definition
+                .nodes
+                .iter()
+                .all(|node| node.position.is_none()),
+            "the shipped file omits positions; the editor lays it out"
+        );
         assert_eq!(
             workspace.len(),
-            2,
+            SHIPPED.len(),
             "one workspace route per shipped filename"
         );
     }
@@ -382,8 +394,9 @@ mod tests {
         assert_eq!(invalid.len(), 1, "{invalid:?}");
         assert!(invalid[0].0.ends_with("followed-thread-stream.yaml"));
         assert!(invalid[0].1.contains("thread_stream"), "{}", invalid[0].1);
-        ok_route(&routes, GITHUB_MENTION_ID);
-        ok_route(&routes, AMBIENT_ID);
+        for id in SHIPPED {
+            ok_route(&routes, id);
+        }
     }
 
     /// Deleting a shipped route records its removal from the pack, and the
