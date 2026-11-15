@@ -143,11 +143,11 @@ pub fn runtime_label(runtime: &[(String, String)]) -> String {
 /// declaring an empty `verdictPlatforms` list. Executor selectors are an
 /// independent capability constraint and never broaden this trust set.
 ///
-/// Undeclared resolves to the runner's own platform, because that is what a
-/// project's gate has always meant. Checks ran on the machine holding the
-/// checkout, so that machine's platform is the only one any green was ever
-/// observed on; reading the silence as "anywhere" is what let one idle Windows
-/// box publish `#[cfg(windows)]` dead-code findings as a PR's lane verdict.
+/// Undeclared resolves to the runner's own platform. A lane that cannot leave
+/// the runner's machine is therefore always on a trusted platform, and a lane
+/// free to move goes only to machines on that platform. Reading the silence as
+/// "anywhere" is what let one idle Windows box publish `#[cfg(windows)]`
+/// dead-code findings as a PR's lane verdict.
 pub fn verdict_platforms(check: &CheckCommand) -> Vec<String> {
     check
         .verdict_platforms
@@ -156,7 +156,8 @@ pub fn verdict_platforms(check: &CheckCommand) -> Vec<String> {
 }
 
 /// The platform a project gates on when it has not said otherwise: the one the
-/// runner is on, which is the machine every undeclared check has always run on.
+/// runner itself is on, which is also the colocated executor's platform. An
+/// undeclared check counts verdicts only from machines on it.
 pub fn gating_platform() -> &'static str {
     std::env::consts::OS
 }

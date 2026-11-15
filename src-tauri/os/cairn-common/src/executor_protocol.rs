@@ -7130,6 +7130,14 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/7220 does not move the number. For work that cannot leave its home,
+/// only the home's own rejection row decides: it is waited on, or refused
+/// naming the home, and never another machine's row by id. A fresh-pipe floor
+/// on that home is waited out, recorded as the new
+/// [`AdmissionHoldEvidence::FreshPipeFloor`]. The runner alone produces that
+/// variant, into its own placement records; no executor sends or reads it, so
+/// a runner talking to an older executor gets nothing wrong.
+///
 /// cairn/7187 does not move the number. Memory admission boxes its private
 /// error result and moves the condition back out before constructing wire
 /// evidence. No condition, field, serialization or admission decision changes;
@@ -21538,6 +21546,13 @@ pub enum AdmissionHoldEvidence {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inodes: Option<InodeShortfall>,
     },
+    /// The machine's fresh-pipe floor holds new processes, read for work that
+    /// cannot leave it. The floor lifts by itself once its recovery readings
+    /// arrive, and such work has nowhere else to go, so it waits; work free to
+    /// move is passed over as [`PlacementRejectionReason::PipeDegraded`].
+    FreshPipeFloor {
+        assessment: crate::pipe_health::PipeHealthAssessment,
+    },
 }
 
 /// A volume's free inodes under their line ([`free_inode_line`]).
@@ -21571,6 +21586,7 @@ impl AdmissionHoldEvidence {
             Self::ProjectProvisioning { .. } => "projectProvisioning",
             Self::Pressure { .. } => "pressure",
             Self::Disk { .. } => "disk",
+            Self::FreshPipeFloor { .. } => "freshPipeFloor",
         }
     }
 
@@ -21668,6 +21684,9 @@ impl AdmissionHoldEvidence {
                     "no sweep in flight"
                 }
             ),
+            Self::FreshPipeFloor { assessment } => {
+                format!("held: fresh-pipe floor; {}", assessment.describe())
+            }
         }
     }
 }
@@ -22993,8 +23012,9 @@ pub enum PlacementRejectionReason {
     /// evidence has just expired and is inside the bounded stale hold
     /// ([`crate::pipe_health`]). Any new process there may block forever on a
     /// pipe write, so it is filtered for every kind of work, pins and residency
-    /// homes included, and never waited on: work free to move goes elsewhere,
-    /// and work that is not is refused at once by name.
+    /// homes included: work free to move goes elsewhere. For work that cannot
+    /// leave the machine, placement records the floor as
+    /// [`AdmissionHoldEvidence::FreshPipeFloor`] instead and waits it out.
     PipeDegraded {
         assessment: crate::pipe_health::PipeHealthAssessment,
     },

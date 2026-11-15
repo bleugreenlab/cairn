@@ -18226,9 +18226,9 @@ fn candidate_rejection(
     } else if let Some(reason) = pipe_health_rejection(entry, scope.pipe_floor, now_unix_ms) {
         // Binds every pin, a residency's included, and an explicit name: a
         // process started there may block forever on its first pipe write, so
-        // a pin is not a safety override. Structural, never waited on, so
-        // pinned work is refused at once with the reading, and movable work
-        // goes to a machine whose pipes are healthy.
+        // a pin is not a safety override. Movable work goes to a machine whose
+        // pipes are healthy; work that cannot leave this one waits the floor
+        // out (see `survey_candidates`).
         Some(reason)
     } else if scope
         .avoided_executor_ids
@@ -18322,6 +18322,8 @@ fn survey_candidates<'a>(
 ) -> Result<CandidateSurvey<'a>, PlacementFailure> {
     let scope = PlacementScope::of(request);
     let targeted = scope.targeted();
+    let immobile = request.pinned_executor_id.is_some()
+        || (!targeted && !request.placement_mobility.may_spill());
 
     // Deterministic order in, deterministic rejections out: an operator reading
     // two decisions about the same fleet must not see the machines reshuffle.
@@ -18348,6 +18350,20 @@ fn survey_candidates<'a>(
                     .get(&entry.identity.executor_id)
                     .filter(|decline| decline.stands_on(entry.generation, now_unix_ms))
                     .map(declined_rejection)
+            })
+            .map(|reason| match reason {
+                // The floor recovers by itself, and work tied to this machine
+                // has nowhere else to go: refusing it protects nothing and
+                // loses the verdict, so it is a hold to wait out.
+                PlacementRejectionReason::PipeDegraded { assessment }
+                    if immobile
+                        && is_immobile_home(request, connections, &entry.identity.executor_id) =>
+                {
+                    PlacementRejectionReason::Held {
+                        evidence: AdmissionHoldEvidence::FreshPipeFloor { assessment },
+                    }
+                }
+                other => other,
             });
         match reason {
             Some(reason) => rejected.push(PlacementRejection {
@@ -18402,10 +18418,22 @@ fn survey_candidates<'a>(
         .collect();
     journal.sort_by(|a, b| a.executor_id.cmp(&b.executor_id));
     // A capable machine that has said "not yet" is something to wait for, so
-    // neither immediate refusal below applies while one stands.
-    let awaiting_decliner = rejected
-        .iter()
-        .any(|rejection| waits_on_machine(&rejection.reason));
+    // neither immediate refusal below applies while one stands. Work tied to
+    // one machine waits only on that machine's answer, and a home that said
+    // it could never take the work is not a "not yet".
+    let home_row = immobile
+        .then(|| {
+            rejected
+                .iter()
+                .find(|rejection| is_immobile_home(request, connections, &rejection.executor_id))
+        })
+        .flatten();
+    let awaiting_decliner = match home_row {
+        Some(home) => waits_on_machine(&home.reason) && !declined_for_good(&home.reason),
+        None => rejected
+            .iter()
+            .any(|rejection| waits_on_machine(&rejection.reason)),
+    };
 
     // A caller that named a machine or a platform is owed an immediate answer
     // naming what exists. An untargeted request with nothing usable is instead
@@ -18432,51 +18460,18 @@ fn survey_candidates<'a>(
     // the difference between a legible config error and a suite that silently
     // stalls out its horizon on every commit.
     if usable.is_empty() && !request.placement_mobility.may_spill() && !awaiting_decliner {
-        // Work that cannot leave home, on a home whose role refuses it, would
-        // wait out its horizon on a fact only an operator changes.
-        if let Some(rejection) = rejected.iter().find(|rejection| {
-            matches!(
-                rejection.reason,
-                PlacementRejectionReason::RoleExcluded { .. }
-            ) && connections
-                .get(&rejection.executor_id)
-                .is_some_and(|entry| entry.colocated)
-        }) {
-            return Err(PlacementFailure {
-                diagnostic: format!(
-                    "this request cannot leave {name}, and {name} {}. Nothing was run. Its role is set by an operator on cairn://executors/{name}.",
-                    rejection.reason.describe(),
-                    name = rejection.executor_name,
-                ),
-                rejected,
-            });
-        }
-        if let Some(rejection) = rejected.iter().find(|rejection| {
-            matches!(
-                rejection.reason,
-                PlacementRejectionReason::UntrustedVerdictPlatform { .. }
-            )
-        }) {
-            return Err(PlacementFailure {
-                diagnostic: untrusted_verdict_platform_diagnostic(request, rejection),
-                rejected,
-            });
-        }
-        // The same contradiction for a machine that cannot prepare the
-        // project: work that cannot leave it would wait out its horizon on a
-        // fact time does not change.
-        if let Some(rejection) = rejected
+        // Only the machine the work is tied to can answer for it. Every other
+        // row is a machine it was never going to use, and quoting the first of
+        // those by id told a lane held on the runner's Mac that it could not
+        // leave bbs (cairn/7220). A home with no row (not attached) is waited
+        // for like any untargeted request's executor.
+        if let Some(diagnostic) = rejected
             .iter()
-            .find(|rejection| is_preparation_rejection(&rejection.reason))
+            .find(|rejection| is_immobile_home(request, connections, &rejection.executor_id))
+            .and_then(|home| immobile_home_refusal(request, home))
         {
             return Err(PlacementFailure {
-                diagnostic: format!(
-                    "this request cannot leave {}, and {} {}. Nothing was run. Read cairn://executors/{} for what it advertises.",
-                    rejection.executor_name,
-                    rejection.executor_name,
-                    rejection.reason.describe(),
-                    rejection.executor_name
-                ),
+                diagnostic,
                 rejected,
             });
         }
@@ -18498,6 +18493,66 @@ fn survey_candidates<'a>(
         journal,
         memory_budgets,
     })
+}
+
+/// Whether `executor_id` is the one machine work that cannot move may run on:
+/// its pin, or for untargeted work the machine holding the runner's checkout.
+fn is_immobile_home(
+    request: &CellRequest,
+    connections: &HashMap<String, ExecutorConnectionState>,
+    executor_id: &str,
+) -> bool {
+    match request.pinned_executor_id.as_deref() {
+        Some(pinned) => pinned == executor_id,
+        None => connections
+            .get(executor_id)
+            .is_some_and(|entry| entry.colocated),
+    }
+}
+
+/// The immediate refusal owed to work that cannot leave `home`, when the
+/// home's own reason is one time does not change: waiting would only run out
+/// the horizon on it. `None` leaves the request to wait as it otherwise would.
+fn immobile_home_refusal(request: &CellRequest, home: &PlacementRejection) -> Option<String> {
+    let name = &home.executor_name;
+    let reason = home.reason.describe();
+    match &home.reason {
+        PlacementRejectionReason::RoleExcluded { .. } => Some(format!(
+            "this request cannot leave {name}, and {name} {reason}. Nothing was run. Its role is set by an operator on cairn://executors/{name}."
+        )),
+        PlacementRejectionReason::UntrustedVerdictPlatform { .. } => {
+            Some(untrusted_verdict_platform_diagnostic(request, home))
+        }
+        other if is_preparation_rejection(other) => Some(format!(
+            "this request cannot leave {name}, and {name} {reason}. Nothing was run. Read cairn://executors/{name} for what it advertises."
+        )),
+        other if declined_for_good(other) => Some(format!(
+            "this request cannot leave {name}, and {name} said it could never take it: {reason}. Nothing was run."
+        )),
+        PlacementRejectionReason::GithubCredentialMissing { .. } => Some(format!(
+            "this request cannot leave {name}, and {name} {reason}. Nothing was run. Read cairn://executors/{name} for its credentials."
+        )),
+        // Only an operator ends this drain, and only a new link a closed or
+        // expired one; neither is a wait with an end.
+        PlacementRejectionReason::Drained
+        | PlacementRejectionReason::ConnectionClosed
+        | PlacementRejectionReason::AbsenceExpired { .. } => Some(format!(
+            "this request cannot leave {name}, and {name} {reason}. Nothing was run. Read cairn://executors/{name} for its state."
+        )),
+        _ => None,
+    }
+}
+
+/// A machine's own decline that says it could never take the work, whatever
+/// its load: not a "not yet" to wait on for work that cannot go elsewhere.
+fn declined_for_good(reason: &PlacementRejectionReason) -> bool {
+    matches!(
+        reason,
+        PlacementRejectionReason::Declined {
+            reason: DeclineReason::Constraint,
+            ..
+        }
+    )
 }
 
 /// Whether a rejection is something to wait for rather than a reason to
@@ -31222,6 +31277,411 @@ mod tests {
             .placed()
             .expect("the junior's turn");
         assert_eq!(placed.selected.executor_id, "fedora");
+    }
+
+    /// cairn/7220: a write check that cannot leave the runner's Mac, whose
+    /// verdict counts only from macOS, was refused naming bbs three
+    /// milliseconds after the Mac declined it for memory. Its home's decline
+    /// is something to wait for, and the wait names the home.
+    #[tokio::test]
+    async fn a_colocated_pressure_decline_parks_immobile_work_on_its_home() {
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let (local_id, mut local) = fleet_entry_at(COLOCATED_EXECUTOR_ID, "macos", 0, &[], now);
+        measured_at(&mut local, 0.01, 8_000_000_000, 8_000_000_000, now);
+        let generation = local.generation;
+        let mut connections = HashMap::from([(local_id, local)]);
+        for id in ["bbs", "fedora"] {
+            let (id, mut remote) = fleet_entry_at(id, "linux", 0, &[], now);
+            measured_at(&mut remote, 0.01, 8_000_000_000, 8_000_000_000, now);
+            connections.insert(id, remote);
+        }
+        *pool.lock_connections() = connections;
+        let mut request = spillable_request();
+        request.placement_mobility = PlacementMobility::PinnedOrColocated;
+        request.verdict_platforms = vec!["macos".into()];
+        request.repository = RepositoryLocator::ColocatedPath {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            absolute_path: "/repo".into(),
+        };
+        request.wait_horizon_unix_ms = now + 600_000;
+        let (entry, _waiter) = pool
+            .queue
+            .enqueue(
+                queue::NewEntry {
+                    request: request.clone(),
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                    standing: false,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(pool
+            .queue
+            .offer(&entry, COLOCATED_EXECUTOR_ID, "local", generation, now));
+        pool.queue.decline(
+            &entry,
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            DeclineReason::Pressure,
+            Some("memory short: owed 111.4 GiB + 2.0 GiB for this request > available 53.5 GiB of 128.0 GiB".into()),
+            None,
+            None,
+            now,
+        );
+        let (declined, view) = pool
+            .queue
+            .with_entry(&entry, |held| {
+                (held.declined.clone(), held.admission_view())
+            })
+            .unwrap();
+        let selection = pool
+            .select_executor_once_with(
+                &request,
+                None,
+                &ActivePlacementPolicy::default_profile(),
+                &declined,
+                &view,
+                |_, _| SyncCost::Known(0),
+            )
+            .await;
+        let rejected = match selection {
+            Ok(Selection::Waiting { rejected }) => rejected,
+            Ok(other) => panic!(
+                "expected a wait on the home, got {}",
+                match other {
+                    Selection::Placed(_) => "placed",
+                    Selection::ReleasingHeadroom { .. } => "releasing headroom",
+                    Selection::Waiting { .. } => unreachable!(),
+                }
+            ),
+            Err(refused) => panic!("refused instead of waiting: {}", refused.diagnostic),
+        };
+        let waiting = wait_decision(
+            &request,
+            &ActivePlacementPolicy::default_profile(),
+            &rejected,
+            &[],
+            &[],
+        )
+        .expect("the wait is recorded");
+        let PlacementOutcome::Waiting { diagnostic } = waiting.outcome else {
+            panic!("expected a wait");
+        };
+        assert!(diagnostic.contains("local"), "{diagnostic}");
+        assert!(diagnostic.contains("memory short"), "{diagnostic}");
+        assert!(!diagnostic.contains("bbs"), "{diagnostic}");
+
+        // A check has no placement deadline, so nothing but room ends this
+        // wait; what the write wave's Progress line reads names the home and
+        // its current decline for as long as it lasts.
+        let Some(CheckDispatchPhase::Placing { declines, .. }) =
+            pool.request_dispatch_phase(&(request.request_id.clone(), request.attempt_id.clone()))
+        else {
+            panic!("a parked write check reads as placing");
+        };
+        assert!(
+            declines
+                .iter()
+                .any(|decline| decline.executor_name == "local"
+                    && decline.reason == DeclineReason::Pressure
+                    && decline
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("memory short"))),
+            "{declines:?}"
+        );
+
+        // Room freed: the home posts new state and the same request is placed
+        // on it, never anywhere else.
+        let mut recovered = declined.clone();
+        let decline = recovered.get_mut(COLOCATED_EXECUTOR_ID).unwrap();
+        decline.superseded_at_unix_ms = Some(now);
+        decline.retry_after_unix_ms = 0;
+        let placed = pool
+            .select_executor_once_with(
+                &request,
+                None,
+                &ActivePlacementPolicy::default_profile(),
+                &recovered,
+                &view,
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap_or_else(|refused| panic!("refused after recovery: {}", refused.diagnostic))
+            .placed()
+            .expect("placed once the home has room");
+        assert_eq!(placed.selected.executor_id, COLOCATED_EXECUTOR_ID);
+
+        // Where a horizon exists (a run batch pinned to its home, bounded by
+        // its declared timeout), the refusal it ends in carries the home's
+        // last answer.
+        let mut pinned = request.clone();
+        pinned.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
+        pinned.priority = CellPriority::AgentInteractive;
+        pinned.wait_horizon_unix_ms = unix_time_ms() + 300;
+        let refusal = pool
+            .select_executor(
+                &pinned,
+                None,
+                &ActivePlacementPolicy::default_profile(),
+                Some(&entry),
+            )
+            .await
+            .expect_err("the home never recovers inside the horizon");
+        let CellOutcome::Unavailable { diagnostic, .. } = refusal else {
+            panic!("expected a refusal at the horizon, got {refusal:?}");
+        };
+        assert!(diagnostic.contains("wait horizon"), "{diagnostic}");
+        assert!(diagnostic.contains("local"), "{diagnostic}");
+        assert!(diagnostic.contains("memory short"), "{diagnostic}");
+    }
+
+    /// cairn/7220, the execution thread's ruling: a fresh-pipe floor latched
+    /// on the home of work that cannot leave it is waited out, visibly, and
+    /// the home posting recovery is what places the parked entry there.
+    #[tokio::test]
+    async fn immobile_work_waits_out_its_homes_pipe_floor_and_places_on_recovery() {
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let degraded_at = now - 10_000;
+        let (local_id, mut local) = fleet_entry_at(COLOCATED_EXECUTOR_ID, "macos", 0, &[], now);
+        measured_at(&mut local, 0.01, 8_000_000_000, 8_000_000_000, now);
+        pipes_reading(&mut local, degraded_at, 512);
+        let mut connections = HashMap::from([(local_id, local)]);
+        for id in ["bbs", "fedora"] {
+            let (id, mut remote) = fleet_entry_at(id, "linux", 0, &[], now);
+            measured_at(&mut remote, 0.01, 8_000_000_000, 8_000_000_000, now);
+            connections.insert(id, remote);
+        }
+        *pool.lock_connections() = connections;
+        let mut request = spillable_request();
+        request.placement_mobility = PlacementMobility::PinnedOrColocated;
+        request.verdict_platforms = vec!["macos".into()];
+        request.repository = RepositoryLocator::ColocatedPath {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            absolute_path: "/repo".into(),
+        };
+        request.wait_horizon_unix_ms = now + 60_000;
+        let (entry, _waiter) = pool
+            .queue
+            .enqueue(
+                queue::NewEntry {
+                    request: request.clone(),
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                    standing: false,
+                },
+                now,
+            )
+            .unwrap();
+        let placing = tokio::spawn({
+            let pool = pool.clone();
+            let request = request.clone();
+            let entry = entry.clone();
+            async move {
+                pool.select_executor(
+                    &request,
+                    None,
+                    &ActivePlacementPolicy::default_profile(),
+                    Some(&entry),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !placing.is_finished(),
+            "a latched home is waited out, not refused"
+        );
+
+        // What the write wave's Progress line reads names the home's floor.
+        let Some(CheckDispatchPhase::Placing {
+            placement: Some(pass),
+            ..
+        }) = pool.request_dispatch_phase(&(request.request_id.clone(), request.attempt_id.clone()))
+        else {
+            panic!("a parked request reads as placing, with its latest pass");
+        };
+        let home = pass
+            .candidates
+            .iter()
+            .find(|candidate| candidate.executor_name == "local")
+            .expect("the home is on the pass");
+        assert!(
+            matches!(
+                &home.status,
+                CheckCandidateStatus::NotOffered(PlacementRejectionReason::Held {
+                    evidence: AdmissionHoldEvidence::FreshPipeFloor { .. }
+                })
+            ),
+            "{:?}",
+            home.status
+        );
+
+        // The home posts two spaced healthy readings: the floor lifts, and
+        // the parked entry is placed there.
+        {
+            let mut connections = pool.lock_connections();
+            let local = connections.get_mut(COLOCATED_EXECUTOR_ID).unwrap();
+            pipes_reading(local, degraded_at + 5_000, 65_536);
+            pipes_reading(local, unix_time_ms(), 65_536);
+        }
+        pool.connection_ready.notify_waiters();
+        let placed = tokio::time::timeout(Duration::from_secs(5), placing)
+            .await
+            .expect("recovery places the parked entry promptly")
+            .unwrap()
+            .unwrap_or_else(|refusal| panic!("refused after recovery: {refusal:?}"));
+        assert_eq!(placed.selected.executor_id, COLOCATED_EXECUTOR_ID);
+    }
+
+    /// cairn/7220's contract, row by row, for work pinned to its home and for
+    /// untargeted work that cannot leave the colocated machine: an answer
+    /// from the home that can clear parks the work; one that cannot is
+    /// refused at once, naming the home.
+    #[test]
+    fn an_immobile_request_waits_on_its_home_only_when_the_home_can_clear() {
+        let fleet = || {
+            let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]);
+            measured(&mut local, 0.01, 48 * GIB, 900 * GIB);
+            let mut connections = HashMap::from([(local_id, local)]);
+            for id in ["bbs", "fedora"] {
+                let (id, mut remote) = fleet_entry(id, "linux", 0, &[]);
+                measured(&mut remote, 0.01, 48 * GIB, 900 * GIB);
+                connections.insert(id, remote);
+            }
+            connections
+        };
+        let mut colocated_only = spillable_request();
+        colocated_only.placement_mobility = PlacementMobility::PinnedOrColocated;
+        colocated_only.verdict_platforms = vec!["macos".into()];
+        let mut pinned = colocated_only.clone();
+        pinned.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
+
+        let declines = [
+            (DeclineReason::Capacity, true),
+            (DeclineReason::Pressure, true),
+            (DeclineReason::Disk, true),
+            (DeclineReason::ProjectProvisioning, true),
+            (DeclineReason::BuildVolumeAbsent, true),
+            (DeclineReason::Unknown, true),
+            (DeclineReason::Constraint, false),
+        ];
+        for request in [&colocated_only, &pinned] {
+            let connections = fleet();
+            let view = AdmissionView::of_request(request);
+            for (reason, waits) in declines {
+                let declined = HashMap::from([(
+                    COLOCATED_EXECUTOR_ID.to_string(),
+                    queue::EntryDecline {
+                        generation: connections[COLOCATED_EXECUTOR_ID].generation,
+                        reason,
+                        detail: Some(format!("declined for {reason:?}")),
+                        disk: None,
+                        at_unix_ms: NOW,
+                        condition: None,
+                        backoff_ms: 0,
+                        retry_after_unix_ms: 0,
+                        superseded_at_unix_ms: None,
+                    },
+                )]);
+                let placed = place_entry(&connections, request, &declined, &view);
+                let pin = request.pinned_executor_id.is_some();
+                if waits {
+                    let draft = placed.unwrap_or_else(|refusal| {
+                        panic!("{reason:?} (pinned {pin}) must wait: {refusal}")
+                    });
+                    assert!(draft.selected.is_none(), "{reason:?} (pinned {pin})");
+                } else {
+                    let refusal = placed.expect_err("a home that can never take it refuses");
+                    assert!(
+                        refusal.contains("local"),
+                        "{reason:?} (pinned {pin}): {refusal}"
+                    );
+                    assert!(!refusal.contains("cannot leave bbs"), "{refusal}");
+                }
+            }
+
+            // The home's fresh-pipe floor recovers by itself: waited out.
+            let mut piped = fleet();
+            pipes_reading(piped.get_mut(COLOCATED_EXECUTOR_ID).unwrap(), NOW, 512);
+            let draft = place_entry(
+                &piped,
+                request,
+                &HashMap::new(),
+                &AdmissionView::of_request(request),
+            )
+            .unwrap_or_else(|refusal| panic!("a latched pipe floor must wait: {refusal}"));
+            assert!(draft.selected.is_none());
+            assert!(matches!(
+                rejection_for(&draft, COLOCATED_EXECUTOR_ID),
+                PlacementRejectionReason::Held {
+                    evidence: AdmissionHoldEvidence::FreshPipeFloor { .. }
+                }
+            ));
+
+            // The home's own standing state, rather than its answer.
+            let mut drained = fleet();
+            drained.get_mut(COLOCATED_EXECUTOR_ID).unwrap().drained = true;
+            let mut closed = fleet();
+            let (sender, receiver) = mpsc::unbounded_channel();
+            drop(receiver);
+            closed.get_mut(COLOCATED_EXECUTOR_ID).unwrap().sender = sender;
+            for (label, connections) in [("drained", drained), ("closed", closed)] {
+                let refusal = place_entry(
+                    &connections,
+                    request,
+                    &HashMap::new(),
+                    &AdmissionView::of_request(request),
+                )
+                .expect_err("only an operator or a new link changes it");
+                let pin = request.pinned_executor_id.is_some();
+                assert!(
+                    refusal.contains("local"),
+                    "{label} (pinned {pin}): {refusal}"
+                );
+                assert!(!refusal.contains("cannot leave bbs"), "{refusal}");
+            }
+        }
+    }
+
+    /// cairn/7220: the parked write lanes' refusals quoted bbs, the first
+    /// untrusted remote by id, as the machine they could not leave. Work that
+    /// cannot move is answered by its home alone: a home that cannot prepare
+    /// the project says so, and a declared trust set its home is outside says
+    /// so, each naming the home.
+    #[test]
+    fn an_immobile_refusal_names_its_home_and_never_another_machine() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]);
+        measured(&mut local, 0.01, 48 * GIB, 900 * GIB);
+        advertising(&mut local, &[]);
+        let mut connections = HashMap::from([(local_id, local)]);
+        for id in ["bbs", "fedora"] {
+            let (id, mut remote) = fleet_entry(id, "linux", 0, &[]);
+            measured(&mut remote, 0.01, 48 * GIB, 900 * GIB);
+            connections.insert(id, remote);
+        }
+        let mut request = spillable_request();
+        request.placement_mobility = PlacementMobility::PinnedOrColocated;
+        request.verdict_platforms = vec!["macos".into()];
+        request.project_requirements = project_needs(&["bun"], &[]).into();
+
+        let refusal = place(&connections, &request).expect_err("the home cannot prepare it");
+        assert!(refusal.contains("cannot leave local"), "{refusal}");
+        assert!(refusal.contains("requires bun"), "{refusal}");
+        assert!(!refusal.contains("bbs"), "{refusal}");
+
+        request.project_requirements = Default::default();
+        request.verdict_platforms = vec!["linux".into()];
+        let refusal = place(&connections, &request).expect_err("the home is not gated on");
+        assert!(refusal.contains("cannot leave local"), "{refusal}");
+        assert!(refusal.contains("counts only from linux"), "{refusal}");
     }
 
     /// One request parked on fedora for room: `(request id, how long it has
