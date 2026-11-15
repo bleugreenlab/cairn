@@ -9353,6 +9353,12 @@ pub struct LearnedResourceEstimate {
 /// `requirements`), each item moved byte for byte and re-exported from
 /// `fleet/mod.rs` at its original reach. No frame, variant, field or behaviour
 /// changes. What a runner gets wrong talking to an older executor: nothing.
+///
+/// cairn/7270 does not move the number. The runner-only `fleet/mod.rs` stops
+/// re-exporting `decision_signature`, whose one caller outside `selection` is
+/// test-only and now names it by its home module. The executor compiles none
+/// of it and no frame, field or behaviour changes, so a runner talking to an
+/// older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
 
 /// The version `build.rs` derived from the paragraphs above

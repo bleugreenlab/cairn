@@ -285,7 +285,7 @@ pub(crate) struct QueueEntry {
     /// Stays with live work, independent of the bounded historical window on
     /// the fleet.
     latest_placement: Option<super::PlacementDecision>,
-    /// Signatures (see [`super::decision_signature`]) of the decisions this
+    /// Signatures (see [`super::selection::decision_signature`]) of the decisions this
     /// entry has journaled, newest last, at most [`JOURNALED_SIGNATURES`].
     /// A set rather than the last one alone: a request parked between two
     /// pressured machines alternates which one is chosen, so consecutive
@@ -874,7 +874,10 @@ impl ExecutionQueue {
     /// for tests that have no material facts beyond the decision.
     #[cfg(test)]
     pub(crate) fn record_placement(&self, decision: &super::PlacementDecision) {
-        self.record_placement_signed(decision, super::decision_signature(decision, &[]));
+        self.record_placement_signed(
+            decision,
+            super::selection::decision_signature(decision, &[]),
+        );
     }
 
     /// Retain admission evidence in the existing transition journal without

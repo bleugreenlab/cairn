@@ -213,7 +213,7 @@ use selection::{
     Selection, SurveyRankingContext, RECENT_PLACEMENT_DECISIONS,
 };
 use selection::{
-    candidate_rejection, deadline_evidence, decision_signature, declared_project_requirements_at,
+    candidate_rejection, deadline_evidence, declared_project_requirements_at,
     describe_cadence_turns, environment_identity, memory_brake_exists, missing_wait_reason_is_new,
     pipe_health_assessment, placement_decision, presence_cause, process_fit,
     queued_placement_evidence, record_command_outcome, repository_is_transferable,
