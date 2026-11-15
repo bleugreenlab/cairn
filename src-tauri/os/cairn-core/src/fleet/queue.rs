@@ -124,11 +124,17 @@ impl HeadroomPlan {
     }
 }
 
-/// A queue entry's own identity, minted fresh per entry.
+/// A queue entry's own identity, minted fresh per entry and unique for the
+/// life of the store.
 ///
 /// Deliberately not the request identity. One request may be enqueued, expire,
 /// and be enqueued again, and the journal has to tell those apart; the
 /// at-most-one-live-entry rule for a request identity is a separate index.
+/// The journal keys rows by `(entry_id, sequence)` across every runner
+/// incarnation, so a process-local ordinal is not enough: it restarts at zero
+/// with each start, and a residency acquisition re-issues the same request and
+/// attempt for the same holder, so an id built from the three collided with an
+/// earlier process's entry and its rows were dropped (cairn/7261).
 pub(crate) type EntryId = String;
 
 /// A claim carried across a link gap onto the connection that came back.
@@ -1010,7 +1016,7 @@ impl ExecutionQueue {
         }
         let sequence = state.next_sequence;
         state.next_sequence += 1;
-        let id = format!("{}-{}-{sequence}", identity.0, identity.1);
+        let id = format!("{}-{}-{}", identity.0, identity.1, uuid::Uuid::now_v7());
         let mut entry = QueueEntry {
             id: id.clone(),
             horizon_unix_ms: new.request.wait_horizon_unix_ms,
@@ -2315,6 +2321,10 @@ pub(crate) fn spawn_queue_journal(
                 ),
                 Err(error) => log::warn!("{error}"),
             }
+            // Rows the insert ignored because their `(entry_id, sequence)` was
+            // already journaled. Each one is a transition the journal does
+            // not record, so it is counted and said, never swallowed.
+            let mut ignored_total: u64 = 0;
             while let Some(batch) = receiver.recv().await {
                 let incarnation = runner_incarnation.clone();
                 let written = db
@@ -2322,8 +2332,9 @@ pub(crate) fn spawn_queue_journal(
                     let batch = batch.clone();
                     let incarnation = incarnation.clone();
                     Box::pin(async move {
+                        let mut ignored = Vec::new();
                         for row in &batch {
-                            conn.execute(
+                            let inserted = conn.execute(
                                 "INSERT OR IGNORE INTO execution_queue(
                                      event_id, entry_id, sequence, runner_incarnation,
                                      request_id, attempt_id, project_id, state,
@@ -2350,18 +2361,37 @@ pub(crate) fn spawn_queue_journal(
                                 ),
                             )
                             .await?;
+                            if inserted == 0 {
+                                ignored.push(format!(
+                                    "{}:{}:{}",
+                                    row.entry_id, row.state, row.sequence
+                                ));
+                            }
                         }
-                        Ok(())
+                        Ok(ignored)
                     })
                 })
                 .await;
-                if let Err(error) = written {
-                    // Recorded rather than thrown. The queue is authoritative and
-                    // keeps working; what is lost is explanation, not correctness.
-                    if let Some(queue) = queue.upgrade() {
-                        *queue.journal_error.lock().unwrap() =
-                            Some(format!("execution queue journal write failed: {error}"));
+                // Recorded rather than thrown. The queue is authoritative and
+                // keeps working; what is lost is explanation, not correctness.
+                let error = match written {
+                    Ok(ignored) if ignored.is_empty() => None,
+                    Ok(ignored) => {
+                        ignored_total += ignored.len() as u64;
+                        let error = format!(
+                            "execution queue journal ignored {} row(s) already journaled \
+                             under the same entry and sequence ({ignored_total} since start), \
+                             first {}",
+                            ignored.len(),
+                            ignored[0]
+                        );
+                        log::warn!("{error}");
+                        Some(error)
                     }
+                    Err(error) => Some(format!("execution queue journal write failed: {error}")),
+                };
+                if let (Some(error), Some(queue)) = (error, queue.upgrade()) {
+                    *queue.journal_error.lock().unwrap() = Some(error);
                 }
             }
         },
@@ -4422,6 +4452,127 @@ pub(super) mod tests {
             1,
             at + REOFFER_BACKOFF_MAX_MS
         ));
+    }
+
+    /// A residency acquisition re-issues the same request and attempt for the
+    /// same holder, and a new process's ordinal starts at zero again. The
+    /// second lifecycle keeps its own journal, a row the journal already holds
+    /// is said rather than dropped silently, and retention a week later takes
+    /// only the lifecycle that ended.
+    #[test]
+    fn a_request_enqueued_again_after_a_restart_keeps_its_own_journal() {
+        use cairn_db::storage::retention::{run_rules, Eviction, EvictorBudget, EvictorState};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let db = std::sync::Arc::new(runtime.block_on(crate::storage::migrated_test_db(
+            "queue_restart_identity.db",
+        )));
+        let landed = |request: &str, incarnation: &str| {
+            runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while db
+                        .query_opt(
+                            "SELECT 1 FROM execution_queue
+                             WHERE request_id = ?1 AND runner_incarnation = ?2",
+                            (request.to_string(), incarnation.to_string()),
+                            |row| row.i64(0),
+                        )
+                        .await
+                        .unwrap()
+                        .is_none()
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("no {request} row from {incarnation}"))
+            })
+        };
+
+        let first = std::sync::Arc::new(ExecutionQueue::default());
+        spawn_queue_journal(db.clone(), "runner-1".into(), first.clone());
+        let (first_id, _first_waiter) =
+            enqueue(&first, "residency", PlacementMobility::SpillEligible);
+        landed("residency", "runner-1");
+        drop(first);
+
+        // The next process: its sweep expires the first entry, and its
+        // ordinal is back at zero when the same request and attempt arrive.
+        let second = std::sync::Arc::new(ExecutionQueue::default());
+        spawn_queue_journal(db.clone(), "runner-2".into(), second.clone());
+        let (second_id, _second_waiter) =
+            enqueue(&second, "residency", PlacementMobility::SpillEligible);
+        let (_marker, _marker_waiter) =
+            enqueue(&second, "marker", PlacementMobility::SpillEligible);
+        landed("marker", "runner-2");
+        assert_ne!(first_id, second_id);
+        let rows = |db: &crate::storage::LocalDb| {
+            runtime
+                .block_on(db.query_all(
+                    "SELECT entry_id, state, runner_incarnation FROM execution_queue
+                 WHERE request_id = 'residency' ORDER BY rowid",
+                    (),
+                    |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+                ))
+                .unwrap()
+        };
+        let owned = |id: &str, state: &str, incarnation: &str| {
+            (id.to_string(), state.to_string(), incarnation.to_string())
+        };
+        assert_eq!(
+            rows(&db),
+            vec![
+                owned(&first_id, "queued", "runner-1"),
+                owned(&first_id, "expired", "runner-2"),
+                owned(&second_id, "queued", "runner-2"),
+            ]
+        );
+        assert_eq!(second.journal_error(), None);
+
+        // A row whose entry and sequence are already journaled is ignored by
+        // the insert, and that is said.
+        let mut duplicate = journal_row_for_test(&second_id);
+        duplicate.sequence = 0;
+        second.journal(vec![duplicate]);
+        let (_marker, _again) = enqueue(&second, "marker-2", PlacementMobility::SpillEligible);
+        landed("marker-2", "runner-2");
+        let error = second.journal_error().expect("the ignored row is reported");
+        assert!(error.contains("ignored 1 row"), "{error}");
+        assert!(error.contains(&second_id), "{error}");
+
+        // A week after the first lifecycle ended, retention takes it and
+        // leaves the live one.
+        let later = chrono::Utc::now().timestamp() + 8 * 86_400;
+        let report = runtime.block_on(run_rules(
+            &db,
+            later,
+            EvictorBudget::PRODUCTION,
+            &mut EvictorState::default(),
+            &[Eviction::SettledQueueEntries],
+        ));
+        assert!(report.rules[0].error.is_none(), "{report}");
+        assert_eq!(rows(&db), vec![owned(&second_id, "queued", "runner-2")]);
+    }
+
+    fn journal_row_for_test(entry_id: &str) -> QueueJournalRow {
+        QueueJournalRow {
+            entry_id: entry_id.to_string(),
+            sequence: 0,
+            request_id: "residency".into(),
+            attempt_id: "attempt".into(),
+            project_id: "p".into(),
+            state: "queued".into(),
+            executor_id: None,
+            generation: None,
+            decline_reason: None,
+            detail: None,
+            constraints_json: "{}".into(),
+            scoring_json: "{}".into(),
+            horizon_unix_ms: 0,
+            created_at: 1,
+        }
     }
 
     #[test]

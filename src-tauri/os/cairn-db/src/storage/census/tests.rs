@@ -200,10 +200,12 @@ async fn wide_rows_get_short_windows() {
     assert!(within(measured.bytes, bytes, 0.02));
 }
 
-/// The oldest rows of a table can be far narrower than its newest; the
-/// windows are sized by both, so none reads a run of wide rows.
+/// The oldest rows of a table can be far narrower than its newest. Windows
+/// are sized by the mean width of every row read so far, so the first window
+/// to meet the wide rows can read a run of them, and every window after it is
+/// shorter.
 #[tokio::test]
-async fn windows_are_sized_by_the_newest_row_as_well_as_the_oldest() {
+async fn windows_after_a_run_of_wide_rows_are_shorter() {
     let (_temp, db) = bare_db().await;
     db.execute_batch("CREATE TABLE widening(id INTEGER PRIMARY KEY, body TEXT);")
         .await
@@ -213,12 +215,44 @@ async fn windows_are_sized_by_the_newest_row_as_well_as_the_oldest() {
     let mut clock = Clock::new();
     let measured = measure_table(&db, "widening", 9, &mut clock).await.unwrap();
     assert!(!measured.exact);
-    // 64 narrow rows from the start, the newest row, then one-row windows.
+    // 64 narrow rows from the start and the newest row, then windows that
+    // would each read 64 rows had none of them shrunk.
+    let full = 64 + 1 + 64 * measured.strata;
     assert!(
-        measured.sampled_rows as i64 <= 64 + 1 + STRATA,
-        "sampled {}",
+        measured.sampled_rows < full,
+        "sampled {} of {full}",
         measured.sampled_rows
     );
+    let (_, bytes) = exact_of(&db, "widening").await;
+    assert!(
+        within(measured.bytes, bytes, 0.5),
+        "{} bytes estimated, {bytes} actual",
+        measured.bytes
+    );
+}
+
+/// One huge newest row among narrow ones is one row of the sample, not its
+/// width: on 11-13 a 780 KB newest row cut `execution_queue`'s sample to the
+/// minimum strata of one row each.
+#[tokio::test]
+async fn one_huge_newest_row_does_not_cut_the_sample_to_a_row_per_stratum() {
+    let (_temp, db) = bare_db().await;
+    db.execute_batch("CREATE TABLE journal(id INTEGER PRIMARY KEY, body TEXT);")
+        .await
+        .unwrap();
+    fill(&db, "journal", 1, 1, 2_000, 1_000).await;
+    fill(&db, "journal", 2_001, 1, 1, 700_000).await;
+    let mut clock = Clock::new();
+    let measured = measure_table(&db, "journal", 5, &mut clock).await.unwrap();
+    assert!(!measured.exact);
+    assert!(
+        measured.strata > MIN_STRATA as u32 && measured.estimate_rows > 3 * MIN_STRATA as u32,
+        "{} strata read {} rows",
+        measured.strata,
+        measured.estimate_rows
+    );
+    let (rows, _) = exact_of(&db, "journal").await;
+    assert!(within(measured.rows, rows, 0.05));
 }
 
 fn sampled(rows: i64, bytes: i64, low: i64, high: i64, sampled: u32) -> TableCensus {
@@ -229,6 +263,7 @@ fn sampled(rows: i64, bytes: i64, low: i64, high: i64, sampled: u32) -> TableCen
         rows,
         bytes,
         sampled_rows: sampled,
+        estimate_rows: sampled,
         ..TableCensus::default()
     }
 }
@@ -259,6 +294,17 @@ fn sampled_estimates_pool_with_the_previous_census() {
     );
     assert_eq!(second.pool_weight, 40.0 + carried);
     assert_eq!(second.day_rows, Some(1_000));
+    assert!(!second.pool_reset);
+
+    // Rows ten times wider than the pool's: the table changed, and the pool
+    // restarts from today rather than averaging the change away.
+    let mut shifted = sampled(1_000, 3_000_000, 1_001, 2_000, 40);
+    pool(&mut shifted, Some(&second));
+    assert!(shifted.pool_reset);
+    assert_eq!(
+        (shifted.rows, shifted.bytes, shifted.pool_weight),
+        (1_000, 3_000_000, 40.0)
+    );
 
     let mut exact = sampled(10, 100, 1, 10, 10);
     exact.exact = true;
@@ -639,4 +685,116 @@ fn a_clone_tool_refuses_a_live_directory_and_its_archive() {
         live_directories(None, None, None).is_err(),
         "no HOME fails closed"
     );
+}
+
+/// The table that went unmeasured for a week (cairn/7252): small rows for two
+/// thirds of its rowids, then rows thirty times wider with a few of 700 KB,
+/// the newest among them, after days of censuses that saw only the small
+/// rows. One huge newest row used to cut the sample to a row per stratum, and
+/// the pool weighed today's few rows against days of small ones.
+#[tokio::test]
+async fn a_table_whose_rows_grew_is_estimated_within_2x_the_day_they_grow() {
+    let (temp, db) = bare_db().await;
+    db.execute_batch("CREATE TABLE journal(id INTEGER PRIMARY KEY, body TEXT);")
+        .await
+        .unwrap();
+    fill(&db, "journal", 1, 1, 1_000, 2_000).await;
+    let budget = Duration::from_secs(60);
+    let mut previous: Vec<CensusReport> = Vec::new();
+    for day in (1..=4).rev() {
+        let report = take_after(&db, NOW - day * DAY_S, temp.path(), budget, &previous)
+            .await
+            .unwrap();
+        previous.insert(0, report);
+    }
+
+    fill(&db, "journal", 1_001, 1, 499, 60_000).await;
+    let huge = "x".repeat(700_000);
+    for id in [1_100, 1_250, 1_400] {
+        db.execute(
+            "UPDATE journal SET body = ?1 WHERE id = ?2",
+            (huge.clone(), id),
+        )
+        .await
+        .unwrap();
+    }
+    db.execute(
+        "INSERT INTO journal(id, body) VALUES (1500, ?1)",
+        (huge.clone(),),
+    )
+    .await
+    .unwrap();
+
+    let report = take_after(&db, NOW, temp.path(), budget, &previous)
+        .await
+        .unwrap();
+    let journal = report.tables.iter().find(|t| t.table == "journal").unwrap();
+    let (_, exact) = exact_of(&db, "journal").await;
+    assert!(
+        journal.bytes * 2 >= exact && journal.bytes <= exact * 2,
+        "{} bytes estimated, {exact} exact: {journal:?}",
+        journal.bytes
+    );
+    assert!(journal.pool_reset, "{journal:?}");
+}
+
+async fn fold(db: &LocalDb) {
+    let report = db
+        .checkpoint(
+            3,
+            Duration::from_millis(250),
+            crate::storage::DrainBudget::PRODUCTION,
+        )
+        .await
+        .unwrap();
+    assert!(report.succeeded(), "{report}");
+}
+
+/// The alarm that does not depend on the sampler: a file whose pages are
+/// mostly payload no table accounts for. A declared `rowid` column leaves a
+/// table unsized, so its overflow pages are exactly such payload.
+#[tokio::test]
+async fn a_file_mostly_of_unmeasured_payload_is_flagged() {
+    let (temp, db) = bare_db().await;
+    db.execute_batch(
+        "CREATE TABLE seen(id INTEGER PRIMARY KEY, body TEXT);
+         CREATE TABLE hidden(rowid TEXT, body TEXT);",
+    )
+    .await
+    .unwrap();
+    fill(&db, "seen", 1, 1, 200, 5_000).await;
+    fold(&db).await;
+    let report = take_within(&db, NOW, temp.path(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let unaccounted = report.unaccounted_bytes.unwrap();
+    assert!(
+        !report.mostly_unaccounted,
+        "{unaccounted} unaccounted of {} payload",
+        report.payload_bytes
+    );
+
+    let body = "y".repeat(50_000);
+    for row in 0..60 {
+        db.execute(
+            "INSERT INTO hidden(rowid, body) VALUES (?1, ?2)",
+            (row.to_string(), body.clone()),
+        )
+        .await
+        .unwrap();
+    }
+    fold(&db).await;
+    let report = take_within(&db, NOW, temp.path(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(report.unmeasured.contains(&"hidden".to_string()));
+    let unaccounted = report.unaccounted_bytes.unwrap();
+    assert!(
+        report.mostly_unaccounted && unaccounted >= 60 * 50_000,
+        "{unaccounted} unaccounted of {} payload",
+        report.payload_bytes
+    );
+    let summary = report.summary(3);
+    assert_eq!(summary["unaccounted_bytes"], unaccounted);
+    assert_eq!(summary["mostly_unaccounted"], true);
 }

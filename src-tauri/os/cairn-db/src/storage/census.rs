@@ -279,6 +279,15 @@ pub struct TableCensus {
     pub day_bytes: Option<i64>,
     /// The decayed sample weight behind the pooled figures.
     pub pool_weight: f64,
+    /// The rows today's estimate stands on, and so today's pooling weight:
+    /// those the strata's windows read, not the survey's window that only
+    /// sized them.
+    #[serde(default)]
+    pub estimate_rows: u32,
+    /// Today's estimate was more than [`REGIME_RATIO`] from the pooled one, so
+    /// the pool restarted from today's rather than averaging the change away.
+    #[serde(default)]
+    pub pool_reset: bool,
     /// Time spent measuring the table.
     pub measure_ms: u64,
 }
@@ -406,6 +415,18 @@ pub struct CensusReport {
     pub freelist_count: Option<i64>,
     /// Estimated payload across every measured table.
     pub payload_bytes: i64,
+    /// The bytes of the file's used pages that the measured payload does not
+    /// account for: `(page_count - freelist_count) * page_size -
+    /// payload_bytes`. Indexes and b-tree slack always sit here; the rest is
+    /// payload the census missed, in an unmeasured table or an estimate that
+    /// is too low. Freed pages a deletion leaves are on the freelist, so this
+    /// shrinks as they are reused.
+    #[serde(default)]
+    pub unaccounted_bytes: Option<i64>,
+    /// The payload accounts for less than half of the used pages: the census
+    /// is missing most of what fills the file, whatever its sampler says.
+    #[serde(default)]
+    pub mostly_unaccounted: bool,
     pub tables: Vec<TableCensus>,
     pub over_budget: Vec<String>,
     pub unmeasured: Vec<String>,
@@ -486,6 +507,8 @@ impl CensusReport {
             "file_bytes": self.file_bytes,
             "log_bytes": self.log_bytes,
             "payload_bytes": self.payload_bytes,
+            "unaccounted_bytes": self.unaccounted_bytes,
+            "mostly_unaccounted": self.mostly_unaccounted,
             "tables": self.tables.len(),
             "unmeasured": self.unmeasured,
             "over_budget": self
@@ -809,6 +832,15 @@ impl Survey {
         mean(&self.first).max(mean(&self.newest)).max(1.0)
     }
 
+    /// The mean width of the rows the survey read, weighted by rows. The
+    /// newest row is one row, not a window: on 11-13 one 780 KB newest row of
+    /// `execution_queue` sized every window at one row and the strata at the
+    /// minimum, and a day was estimated from 69 rows instead of about 640.
+    fn row_mean(&self) -> f64 {
+        let rows: Vec<(i64, i64)> = self.first.iter().chain(&self.newest).copied().collect();
+        mean(&rows).max(1.0)
+    }
+
     /// What the survey implies at its widest rows, to order sampling by: the
     /// oldest rows can be a tenth the width of the newest (`executions`), and a
     /// table ranked by them alone can miss the deadline it most needs to meet.
@@ -842,6 +874,7 @@ impl Survey {
                 bytes: self.first.iter().map(|(_, b)| *b).sum(),
                 exact: true,
                 sampled_rows: self.first.len() as u32,
+                estimate_rows: self.first.len() as u32,
                 strata: 1,
                 ..Measured::default()
             };
@@ -855,6 +888,7 @@ impl Survey {
             bytes: bytes.round() as i64,
             exact: false,
             sampled_rows: (self.first.len() + self.newest.len()) as u32,
+            estimate_rows: (self.first.len() + self.newest.len()) as u32,
             new_row_bytes: newest,
             strata: 1,
             rowid_hidden: false,
@@ -942,13 +976,22 @@ async fn sample(
     if survey.complete || survey.rowid_hidden {
         return Ok(survey.measured());
     }
-    // The lowest rows are the oldest and need not look like the rest: on
-    // `executions` they are a tenth the width of today's. The newest row sizes
-    // the windows too, and any wider window met on the way shrinks the rest.
-    let mut widest = survey.widest();
-    let mut rows_per_window = survey.rows_per_window.min(window_rows(widest));
+    // Windows are sized by the mean width of every row read so far, weighted
+    // by rows: the survey's oldest window and newest row first, then each
+    // window as it is read, so a run of wider rows shrinks the windows after
+    // it. Sizing by the widest window instead let one huge row stand for the
+    // whole table and cut the sample to a row per stratum.
+    let (mut read_rows, mut read_bytes) = survey
+        .first
+        .iter()
+        .chain(&survey.newest)
+        .fold((0usize, 0.0f64), |(rows, bytes), (_, b)| {
+            (rows + 1, bytes + *b as f64)
+        });
+    let width = survey.row_mean();
+    let mut rows_per_window = window_rows(width);
     let span = high - low + 1;
-    let per_window = rows_per_window as f64 * widest;
+    let per_window = rows_per_window as f64 * width;
     let count = ((TABLE_SAMPLE_BYTES / per_window) as i64)
         .clamp(MIN_STRATA, STRATA)
         .min(span)
@@ -956,6 +999,7 @@ async fn sample(
     let bound = |k: i64| low + (i128::from(span) * i128::from(k) / i128::from(count)) as i64;
     let mut offsets = Offsets::new(seed, table);
     let mut sampled = survey.first.len() + survey.newest.len();
+    let mut estimate_rows = 0usize;
     // Every stratum, the first included, is measured by counting the rows in
     // an interval at a random place inside it. The survey's window from the
     // lowest rowid sizes the windows but stands for no stratum: the oldest rows
@@ -986,6 +1030,7 @@ async fn sample(
             )
             .await?;
         sampled += rows.len();
+        estimate_rows += rows.len();
         let density = interval_density(from, to, rows_per_window, &rows);
         found += rows.len() as f64;
         covered += match rows.last() {
@@ -995,10 +1040,9 @@ async fn sample(
         // Half a row keeps an empty interval from reading as zero density,
         // which would make the next interval the whole stratum.
         expected = (found + 0.5) / covered;
-        if !rows.is_empty() {
-            widest = widest.max(mean(&rows));
-        }
-        rows_per_window = rows_per_window.min(window_rows(widest));
+        read_rows += rows.len();
+        read_bytes += rows.iter().map(|(_, b)| *b as f64).sum::<f64>();
+        rows_per_window = window_rows(read_bytes / read_rows.max(1) as f64);
         strata.push(Stratum {
             start,
             end,
@@ -1014,6 +1058,7 @@ async fn sample(
         bytes: bytes.round() as i64,
         exact: false,
         sampled_rows: sampled as u32,
+        estimate_rows: estimate_rows as u32,
         new_row_bytes: newest,
         strata: count as u32,
         rowid_hidden: false,
@@ -1029,6 +1074,7 @@ struct Measured {
     bytes: i64,
     exact: bool,
     sampled_rows: u32,
+    estimate_rows: u32,
     new_row_bytes: Option<f64>,
     strata: u32,
     rowid_hidden: bool,
@@ -1059,6 +1105,7 @@ fn apply(census: &mut TableCensus, measured: Measured) {
     census.bytes = measured.bytes;
     census.exact = measured.exact;
     census.sampled_rows = measured.sampled_rows;
+    census.estimate_rows = measured.estimate_rows;
     census.strata = measured.strata;
     census.new_row_bytes = measured.new_row_bytes;
     census.over_budget = census.bytes as f64 > f64::from(census.budget_mb) * BYTES_PER_MB;
@@ -1621,6 +1668,18 @@ pub fn project(current: &CensusReport, previous: &[CensusReport]) -> Option<Proj
 /// How much of a table's pooled sample survives each day.
 const POOL_DECAY: f64 = 0.75;
 
+/// How far apart today's estimate and the pooled one may be, in density or
+/// bytes per row, before the pool restarts from today's. Pooling averages
+/// out sampling noise; a change this large is the table changing, and
+/// averaging it in kept `execution_queue` about 10x low for days after its
+/// rows grew 40-fold (cairn/7252).
+pub(crate) const REGIME_RATIO: f64 = 3.0;
+
+/// Whether two positive measures are more than [`REGIME_RATIO`] apart.
+fn regime_change(today: f64, then: f64) -> bool {
+    today > 0.0 && then > 0.0 && today.max(then) / today.min(then) > REGIME_RATIO
+}
+
 /// Pool a sampled table's estimate with the previous census's. One day's
 /// windows land on a dozen or so rows, which misjudges tables whose rows vary
 /// widely (a few huge `execution_history` packs among small ones) or whose
@@ -1628,11 +1687,13 @@ const POOL_DECAY: f64 = 0.75;
 /// carries two decayed, sample-weighted means, live rows per rowid and bytes
 /// per row, and applies them to today's exact rowid span. An eviction still
 /// shows the same day, because it moves the span; sampling noise averages
-/// over about `1 / (1 - POOL_DECAY)` days of windows.
+/// over about `1 / (1 - POOL_DECAY)` days of windows. Today weighs the rows
+/// its strata read, and a [`regime_change`] restarts the pool from today.
 fn pool(census: &mut TableCensus, before: Option<&TableCensus>) {
     census.day_rows = None;
     census.day_bytes = None;
     census.pool_weight = 0.0;
+    census.pool_reset = false;
     let (Some(low), Some(high)) = (census.low_water, census.high_water) else {
         return;
     };
@@ -1640,7 +1701,7 @@ fn pool(census: &mut TableCensus, before: Option<&TableCensus>) {
         return;
     }
     let span = (high - low + 1) as f64;
-    let weight = f64::from(census.sampled_rows).max(1.0);
+    let weight = f64::from(census.estimate_rows).max(1.0);
     census.day_rows = Some(census.rows);
     census.day_bytes = Some(census.bytes);
     census.pool_weight = weight;
@@ -1652,17 +1713,23 @@ fn pool(census: &mut TableCensus, before: Option<&TableCensus>) {
     let (Some(before_low), Some(before_high)) = (before.low_water, before.high_water) else {
         return;
     };
-    let carried = POOL_DECAY * before.pool_weight;
-    let mix = |today: f64, then: f64| (weight * today + carried * then) / (weight + carried);
-    let density = mix(
+    let (today_density, then_density) = (
         census.rows as f64 / span,
         before.rows as f64 / (before_high - before_low + 1) as f64,
-    )
-    .min(1.0);
-    let row_bytes = mix(
+    );
+    let (today_row_bytes, then_row_bytes) = (
         census.bytes as f64 / census.rows as f64,
         before.bytes as f64 / before.rows as f64,
     );
+    if regime_change(today_density, then_density) || regime_change(today_row_bytes, then_row_bytes)
+    {
+        census.pool_reset = true;
+        return;
+    }
+    let carried = POOL_DECAY * before.pool_weight;
+    let mix = |today: f64, then: f64| (weight * today + carried * then) / (weight + carried);
+    let density = mix(today_density, then_density).min(1.0);
+    let row_bytes = mix(today_row_bytes, then_row_bytes);
     census.rows = (density * span).round() as i64;
     census.bytes = (census.rows as f64 * row_bytes).round() as i64;
     census.pool_weight = weight + carried;
@@ -1761,13 +1828,16 @@ pub async fn take_after(
     }
 
     // Sample the largest first, so a census that runs out of time leaves only
-    // small tables at their survey's one-window estimate.
+    // small tables unsampled. Those are reported unmeasured: a survey's one
+    // window from the oldest rows says nothing about the rest of the table.
     pending.sort_by(|(_, a), (_, b)| b.rough_bytes().total_cmp(&a.rough_bytes()));
     for (index, survey) in pending {
-        if Instant::now() >= tables_deadline {
-            break;
-        }
         let census = &mut tables[index];
+        if Instant::now() >= tables_deadline {
+            census.error =
+                Some("surveyed but not sampled within the census's time budget".to_string());
+            continue;
+        }
         let started = Instant::now();
         match sample(db, &census.table.clone(), &survey, seed, &mut clock).await {
             Ok(measured) => apply(census, measured),
@@ -1850,6 +1920,8 @@ pub async fn take_after(
             .filter(|t| t.measured())
             .map(|t| t.bytes)
             .sum(),
+        unaccounted_bytes: None,
+        mostly_unaccounted: false,
         over_budget: tables
             .iter()
             .filter(|t| t.over_budget)
@@ -1867,10 +1939,21 @@ pub async fn take_after(
         projection: None,
         deleting_rules: Vec::new(),
     };
+    report.unaccounted_bytes = unaccounted_bytes(&report);
+    // Payload under half the used pages is unaccounted bytes over the payload.
+    report.mostly_unaccounted = report
+        .unaccounted_bytes
+        .is_some_and(|unaccounted| unaccounted > report.payload_bytes);
     report.deleting_rules = deleting_rules(&report.tables);
     report.projection = project(&report, previous);
     report.duration_ms = clock.started.elapsed().as_millis() as u64;
     Ok(report)
+}
+
+/// [`CensusReport::unaccounted_bytes`], when the engine reported its pages.
+fn unaccounted_bytes(report: &CensusReport) -> Option<i64> {
+    let used = report.page_count? - report.freelist_count.unwrap_or(0);
+    Some(used * report.page_size? - report.payload_bytes)
 }
 
 /// Store `report` as the newest census and drop all but the newest

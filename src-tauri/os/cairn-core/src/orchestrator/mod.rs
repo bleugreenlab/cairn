@@ -3284,6 +3284,16 @@ impl Orchestrator {
         } else {
             log::info!("retention pass: {report}");
         }
+        // The pass as a row, so its figures are one query rather than a log
+        // search: `runner_events` where `kind = 'retention_pass'`.
+        {
+            use crate::fleet::runner_events::{RunnerEvent, RunnerEventKind};
+            self.fleet.runner_events().record(
+                RunnerEvent::new(RunnerEventKind::RetentionPass)
+                    .cause(report.to_string())
+                    .detail(report.to_json()),
+            );
+        }
         match crate::execution::main_incidents_store::source_health(
             &self.db.local,
             None,

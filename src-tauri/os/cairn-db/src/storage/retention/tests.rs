@@ -210,6 +210,19 @@ async fn every_selection_and_delete_seeks() {
         "idx_permission_requests_status",
     )
     .await;
+    for (walk, binds) in [
+        (QUEUE_NEXT_INCARNATION, 1),
+        (QUEUE_SETTLED_ENTRIES, 4),
+        (QUEUE_INCARNATION_ROW, 1),
+    ] {
+        assert_seeks(&db, walk, binds, "idx_execution_queue_live").await;
+    }
+    // The proof that the terminal row is the entry's newest, and the entry's
+    // rows, both from an `(entry_id, sequence)` index: the engine picks the
+    // table's UNIQUE autoindex or `idx_execution_queue_entry`, both that key.
+    assert_seeks(&db, QUEUE_SETTLED_ENTRIES, 4, "(entry_id=? AND sequence>?)").await;
+    assert_seeks(&db, QUEUE_ENTRY_ROWS, 2, "(entry_id=?)").await;
+    assert_seeks(&db, QUEUE_MARKER_WALK, 2, ROWID).await;
     assert_seeks(
         &db,
         WATCHDOG_WALK,
@@ -232,6 +245,8 @@ async fn every_selection_and_delete_seeks() {
         "artifacts",
         "agent_waits",
         "branch_regenerations",
+        "execution_queue",
+        "execution_queue_closed_incarnations",
     ] {
         let delete = format!("DELETE FROM {table} WHERE rowid IN ({})", placeholders(3));
         assert_seeks(&db, &delete, 3, ROWID).await;
@@ -414,6 +429,7 @@ fn the_next_pass_starts_where_this_one_was_cut_short() {
         eviction,
         pages: 1,
         rows: 1,
+        bytes: 0,
         max_page_rows: 1,
         select_ms: Vec::new(),
         write_ms: Vec::new(),
@@ -1608,4 +1624,263 @@ async fn watchdog_lifecycle_finds_old_rows_behind_a_full_page_of_recent_insertio
         count(&db, "SELECT count(*) FROM codex_watchdog_lifecycle").await,
         (PAGE_ROWS + 1) as i64,
     );
+}
+
+// --- Settled placement-journal entries. ---
+
+/// One journal row of `entry`, written by `incarnation`.
+async fn insert_queue(
+    db: &LocalDb,
+    entry: &str,
+    sequence: i64,
+    incarnation: &str,
+    state: &str,
+    created_at_ms: i64,
+) {
+    insert_queue_scored(db, entry, sequence, state, created_at_ms, "{}", incarnation).await;
+}
+
+/// [`insert_queue`] with a given `scoring_json`.
+async fn insert_queue_scored(
+    db: &LocalDb,
+    entry: &str,
+    sequence: i64,
+    state: &str,
+    created_at_ms: i64,
+    scoring: &str,
+    incarnation: &str,
+) {
+    db.execute(
+        "INSERT INTO execution_queue (event_id, entry_id, sequence, runner_incarnation, request_id,
+             attempt_id, project_id, state, constraints_json, scoring_json, horizon_unix_ms, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?2, 'attempt', 'p', ?5, '{}', ?7, 0, ?6)",
+        (
+            format!("{entry}:{sequence}"),
+            entry.to_string(),
+            sequence,
+            incarnation.to_string(),
+            state.to_string(),
+            created_at_ms,
+            scoring.to_string(),
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// An entry's rows, one per state, all at `created_at_ms`.
+async fn insert_entry(
+    db: &LocalDb,
+    entry: &str,
+    incarnation: &str,
+    states: &[&str],
+    created_at_ms: i64,
+) {
+    for (sequence, state) in states.iter().enumerate() {
+        insert_queue(
+            db,
+            entry,
+            sequence as i64,
+            incarnation,
+            state,
+            created_at_ms,
+        )
+        .await;
+    }
+}
+
+async fn close_incarnation(db: &LocalDb, incarnation: &str, closed_by: &str) {
+    db.execute(
+        "INSERT INTO execution_queue_closed_incarnations
+             (runner_incarnation, closed_by, expired_entries, closed_at) VALUES (?1, ?2, 0, 0)",
+        (incarnation.to_string(), closed_by.to_string()),
+    )
+    .await
+    .unwrap();
+}
+
+async fn queue_entries(db: &LocalDb) -> Vec<String> {
+    ids(
+        db,
+        "SELECT DISTINCT entry_id FROM execution_queue ORDER BY entry_id",
+    )
+    .await
+}
+
+async fn markers(db: &LocalDb) -> Vec<String> {
+    ids(
+        db,
+        "SELECT runner_incarnation FROM execution_queue_closed_incarnations \
+         ORDER BY runner_incarnation",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn settled_queue_entries_go_a_week_after_they_end_and_live_ones_never_do() {
+    let (_temp, db) = private_db().await;
+    let old = NOW_MS - 8 * DAY_MS;
+    let recent = NOW_MS - 2 * DAY_MS;
+    // runner-1 is an earlier incarnation; runner-2's start closed it and is
+    // the running one.
+    close_incarnation(&db, "runner-1", "runner-2").await;
+    let r1 = "runner-1";
+    insert_entry(
+        &db,
+        "r1-completed",
+        r1,
+        &["queued", "offered", "claimed", "completed"],
+        old,
+    )
+    .await;
+    insert_entry(&db, "r1-cancelled", r1, &["queued", "cancelled"], old).await;
+    insert_entry(&db, "admission-refusal:r1", r1, &["completed"], old).await;
+    // Expired by runner-2's sweep: the expiry row is runner-2's.
+    insert_entry(&db, "r1-expired", r1, &["queued", "offered"], old).await;
+    insert_queue(&db, "r1-expired", 2, "runner-2", "expired", old).await;
+    // An earlier incarnation's open entry the sweep has not expired.
+    insert_entry(&db, "r1-open", r1, &["queued", "offered"], old).await;
+    // The running incarnation: an entry that ended two days ago, and one that
+    // is still live with week-old rows.
+    insert_entry(&db, "r2-recent", "runner-2", &["queued"], old).await;
+    insert_queue(&db, "r2-recent", 1, "runner-2", "completed", recent).await;
+    insert_entry(
+        &db,
+        "r2-live",
+        "runner-2",
+        &["queued", "offered", "claimed"],
+        old,
+    )
+    .await;
+
+    let report = run(&db, UNBOUNDED, &[Eviction::SettledQueueEntries]).await;
+
+    let rule = &report.rules[0];
+    assert!(rule.finished, "{rule:?}");
+    assert_eq!(rule.rows, 4 + 2 + 1 + 3, "{rule:?}");
+    assert_eq!(
+        queue_entries(&db).await,
+        vec!["r1-open", "r2-live", "r2-recent"]
+    );
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM execution_queue").await,
+        2 + 3 + 2
+    );
+    // runner-1 still has rows, so its marker stays.
+    assert_eq!(markers(&db).await, vec!["runner-1"]);
+}
+
+#[tokio::test]
+async fn a_large_settled_entry_is_deleted_over_pages_terminal_row_last() {
+    let (_temp, db) = private_db().await;
+    let old = NOW_MS - 8 * DAY_MS;
+    let mut states = vec!["queued"; 199];
+    states.push("completed");
+    insert_entry(&db, "big", "runner-1", &states, old).await;
+
+    let mut cursor = Cursor::default();
+    let mut pages = 0;
+    loop {
+        let page = Eviction::SettledQueueEntries
+            .page(&db, NOW, &mut cursor)
+            .await
+            .unwrap();
+        assert!(page.rows <= QUEUE_PAGE_ROWS, "{page:?}");
+        if page.rows > 0 {
+            pages += 1;
+        }
+        let left = count(&db, "SELECT count(*) FROM execution_queue").await;
+        let terminal = count(
+            &db,
+            "SELECT count(*) FROM execution_queue WHERE state = 'completed'",
+        )
+        .await;
+        // Until the last row goes, the terminal row is among those left, so
+        // the entry is still found by the next page.
+        assert_eq!(terminal, i64::from(left > 0), "{left} rows left");
+        if page.done {
+            break;
+        }
+        assert!(pages <= 200, "the walk does not end");
+    }
+    assert_eq!(pages, 200_usize.div_ceil(QUEUE_PAGE_ROWS));
+    assert_eq!(count(&db, "SELECT count(*) FROM execution_queue").await, 0);
+}
+
+/// Backlog rows reach 780 KB, so a page is cut by its stored bytes as well as
+/// its rows, and a row larger than the budget is a page by itself.
+#[tokio::test]
+async fn a_page_of_large_journal_rows_stops_at_its_byte_budget() {
+    let (_temp, db) = private_db().await;
+    let old = NOW_MS - 8 * DAY_MS;
+    let megabyte = "x".repeat(1_000_000);
+    for sequence in 0..10 {
+        insert_queue_scored(&db, "wide", sequence, "queued", old, &megabyte, "r").await;
+    }
+    insert_queue(&db, "wide", 10, "r", "completed", old).await;
+    let huge = "x".repeat(5_000_000);
+    insert_queue_scored(&db, "huge", 0, "completed", old, &huge, "r").await;
+
+    let mut cursor = Cursor::default();
+    let mut pages = Vec::new();
+    loop {
+        let page = Eviction::SettledQueueEntries
+            .page(&db, NOW, &mut cursor)
+            .await
+            .unwrap();
+        if page.rows > 0 {
+            pages.push((page.rows, page.bytes));
+        }
+        if page.done {
+            break;
+        }
+        assert!(pages.len() <= 20, "the walk does not end: {pages:?}");
+    }
+    // Four 1 MB rows fill a 4 MiB page; the last three go with the terminal
+    // row; the 5 MB row goes alone.
+    let rows: Vec<usize> = pages.iter().map(|(rows, _)| *rows).collect();
+    assert_eq!(rows, vec![4, 4, 3, 1], "{pages:?}");
+    for (rows, bytes) in &pages[..3] {
+        assert!(*bytes <= QUEUE_PAGE_BYTES as u64, "{rows} rows, {bytes} B");
+    }
+    assert!(pages[3].1 >= 5_000_000);
+    assert_eq!(count(&db, "SELECT count(*) FROM execution_queue").await, 0);
+
+    let report = run(&db, UNBOUNDED, &[Eviction::SettledQueueEntries]).await;
+    assert_eq!(report.rules[0].bytes, 0);
+    assert!(report
+        .to_string()
+        .contains("settled_queue_entries rows=0 bytes=0"));
+    assert_eq!(report.to_json()["rules"][0]["bytes"], 0);
+}
+
+#[tokio::test]
+async fn a_closed_incarnation_marker_goes_only_once_its_rows_are_gone() {
+    let (_temp, db) = private_db().await;
+    let old = NOW_MS - 8 * DAY_MS;
+    let recent = NOW_MS - 2 * DAY_MS;
+    // runner-0's rows are long gone; runner-1 has one old and one recent
+    // settled entry; runner-2 is running and has no marker.
+    close_incarnation(&db, "runner-0", "runner-1").await;
+    close_incarnation(&db, "runner-1", "runner-2").await;
+    insert_entry(&db, "old", "runner-1", &["queued", "completed"], old).await;
+    insert_entry(&db, "recent", "runner-1", &["queued", "completed"], recent).await;
+    insert_entry(&db, "running", "runner-2", &["queued"], old).await;
+
+    run(&db, UNBOUNDED, &[Eviction::SettledQueueEntries]).await;
+    assert_eq!(queue_entries(&db).await, vec!["recent", "running"]);
+    assert_eq!(markers(&db).await, vec!["runner-1"]);
+
+    // A week later the recent entry has aged out. The pass that deletes its
+    // incarnation's last rows read the marker beside them, so the marker
+    // goes on the next pass, never before the rows.
+    let later = NOW + 7 * 24 * HOUR;
+    let mut state = EvictorState::default();
+    let rules = [Eviction::SettledQueueEntries];
+    run_rules(&db, later, UNBOUNDED, &mut state, &rules).await;
+    assert_eq!(queue_entries(&db).await, vec!["running"]);
+    assert_eq!(markers(&db).await, vec!["runner-1"]);
+    run_rules(&db, later, UNBOUNDED, &mut state, &rules).await;
+    assert_eq!(queue_entries(&db).await, vec!["running"]);
+    assert_eq!(markers(&db).await, Vec::<String>::new());
 }

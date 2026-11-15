@@ -85,10 +85,13 @@ pub enum RunnerEventKind {
     TransportOutage,
     JournalGap,
     MemoryEvidenceUnreadable,
+    /// One retention evictor pass: its line as the cause, and its end, rows,
+    /// duration and per-rule rows, bytes and write times as the detail.
+    RetentionPass,
 }
 
 impl RunnerEventKind {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::RunnerStarted,
         Self::RunnerHandoff,
         Self::RuntimeStall,
@@ -105,6 +108,7 @@ impl RunnerEventKind {
         Self::TransportOutage,
         Self::JournalGap,
         Self::MemoryEvidenceUnreadable,
+        Self::RetentionPass,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -125,6 +129,7 @@ impl RunnerEventKind {
             Self::TransportOutage => "transport_outage",
             Self::JournalGap => "journal_gap",
             Self::MemoryEvidenceUnreadable => "memory_evidence_unreadable",
+            Self::RetentionPass => "retention_pass",
         }
     }
 }
@@ -1023,6 +1028,7 @@ mod tests {
                 "transport_outage",
                 "journal_gap",
                 "memory_evidence_unreadable",
+                "retention_pass",
             ]
         );
         assert_eq!(strings.iter().collect::<HashSet<_>>().len(), strings.len());

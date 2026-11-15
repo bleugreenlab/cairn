@@ -424,16 +424,13 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "team_ordinary_admission_authority",
         "prepared_ordinary_launches",
     ),
-    undecided(
-        "execution_queue",
-        "cairn/5543",
-        "14 days by newest row per entry (cairn/5542 has landed)",
-    )
-    .budget(512),
-    undecided(
+    // A week of settled entries plus the live ones. Unmeasured since the
+    // journal stopped repeating snapshots (cairn/7252): at 65-185k state rows
+    // a day of about 400 B, a week is 0.2-0.5 GB, so this leaves headroom.
+    evict("execution_queue", Eviction::SettledQueueEntries).budget(1_024),
+    evict(
         "execution_queue_closed_incarnations",
-        "cairn/5543",
-        "one row per runner start; delete an incarnation once the queue rule has deleted its entries",
+        Eviction::SettledQueueEntries,
     ),
     undecided(
         "job_file_activity",
@@ -831,6 +828,25 @@ const RETIRED_REGENERATION_AGE_S: i64 = 7 * DAY_S;
 /// Wait rows carry the settled batch's output: about 3 KB on average and up to
 /// 3.3 MB on the 11-02 database, so a typical write stays near 400 KB.
 const WAIT_PAGE_ROWS: usize = 128;
+/// How long a settled placement-journal entry stays readable. The journal is
+/// read by the placement view and `holder_of` while someone investigates a
+/// request; the runner's in-memory window empties on restart, so the journal
+/// has to outlive an incident investigation, not a release cycle. Evidence
+/// that matters longer is cited in the issue that found it (tenet 300). The
+/// execution thread set this window as its forensic need (cairn/7252).
+const QUEUE_ENTRY_AGE_S: i64 = 7 * DAY_S;
+/// Journal rows written before cairn/7252 reach 780 KB, so a page is also cut
+/// at [`QUEUE_PAGE_BYTES`].
+const QUEUE_PAGE_ROWS: usize = 32;
+/// The most stored bytes one page deletes, as the census measures them; a row
+/// larger than this is a page by itself. It is what the code-map rule (four
+/// rows of about 1 MB) and the arc rule (eight of up to 0.5 MB) already
+/// delete per page. The backlog's first passes run unmeasured (no clone was
+/// taken for cairn/7261), so the bound is by construction, not by a timing.
+const QUEUE_PAGE_BYTES: i64 = 4 * 1024 * 1024;
+/// The states an entry ends in. An entry whose newest row is in one of them
+/// is settled; any other newest row (`queued`, `offered`, `claimed`) is live.
+const QUEUE_TERMINAL_STATES: [&str; 3] = ["completed", "cancelled", "expired"];
 /// The resolution `durable_suspend::relinquish_to_inner_wait` writes when a
 /// permission takes over a call's continuation. Withdrawing that permission
 /// moves the row back to `pending` (`reclaim_from_inner_wait`), so such a row is
@@ -889,6 +905,37 @@ pub(crate) const REGENERATION_WALK: &str = "SELECT id, project_id, bookmark, sta
 pub(crate) const REGENERATION_BRANCH: &str = "SELECT id, rule_json FROM branch_regenerations \
      WHERE project_id = ?1 AND bookmark = ?2";
 
+/// The journal's next runner incarnation after `?1`: one seek into
+/// `idx_execution_queue_live`, as the restart sweep lists them.
+pub(crate) const QUEUE_NEXT_INCARNATION: &str = "SELECT runner_incarnation FROM execution_queue \
+     WHERE runner_incarnation > ?1 ORDER BY runner_incarnation LIMIT 1";
+/// Entries of one incarnation that ended in one terminal state before the
+/// cutoff, as the entry and its terminal row's sequence: a range of
+/// `idx_execution_queue_live`, and one probe of `idx_execution_queue_entry`
+/// per row proving the terminal row is the entry's newest. An expiry row is
+/// written under the incarnation that expired it, so an entry is found under
+/// the incarnation that ended it, whichever wrote its other rows.
+pub(crate) const QUEUE_SETTLED_ENTRIES: &str = "SELECT settled.entry_id, settled.sequence \
+     FROM execution_queue settled \
+     WHERE settled.runner_incarnation = ?1 AND settled.state = ?2 AND settled.created_at < ?3 \
+     AND NOT EXISTS (SELECT 1 FROM execution_queue newer \
+         WHERE newer.entry_id = settled.entry_id AND newer.sequence > settled.sequence) \
+     LIMIT ?4";
+/// One entry's rows, oldest first, through its `(entry_id, sequence)` key,
+/// with each row's stored bytes (its text columns, as the census's payload
+/// counts them) so a page stops at [`QUEUE_PAGE_BYTES`]. Measuring reads the
+/// row, so a page reads at most its budget plus the one row that would have
+/// crossed it; the walk stops consuming there.
+pub(crate) const QUEUE_ENTRY_ROWS: &str = "SELECT rowid, sequence, \
+     length(CAST(scoring_json AS BLOB)) + length(CAST(constraints_json AS BLOB)) \
+     + coalesce(length(CAST(detail AS BLOB)), 0) \
+     FROM execution_queue WHERE entry_id = ?1 ORDER BY sequence LIMIT ?2";
+pub(crate) const QUEUE_MARKER_WALK: &str = "SELECT rowid, runner_incarnation \
+     FROM execution_queue_closed_incarnations WHERE rowid > ?1 ORDER BY rowid LIMIT ?2";
+/// Whether any journal row of an incarnation remains.
+pub(crate) const QUEUE_INCARNATION_ROW: &str =
+    "SELECT 1 FROM execution_queue WHERE runner_incarnation = ?1 LIMIT 1";
+
 /// Whether a live job ([`crate::db_records::LIVE_JOB_PREDICATE`]) still holds
 /// a branch of a project.
 pub(crate) fn live_branch_sql() -> String {
@@ -928,12 +975,18 @@ pub enum Eviction {
     /// and the newest row of each rule on a live branch (its stale marker, the
     /// rebase page's account and what a re-dispatch runs), are never deleted.
     SettledRegenerations,
+    /// `execution_queue` entries whose newest row is terminal (`completed`,
+    /// `cancelled` or `expired`) and older than a week, every row of the entry
+    /// with it, and an earlier incarnation's marker in
+    /// `execution_queue_closed_incarnations` once none of its rows remain. A
+    /// live entry is never deleted, whatever its age.
+    SettledQueueEntries,
 }
 
 impl Eviction {
     /// The initial order before budget-driven rotation. Watchdog evidence gets
     /// the first runtime turn rather than waiting behind payload-heavy journals.
-    pub const ALL: [Eviction; 8] = [
+    pub const ALL: [Eviction; 9] = [
         Eviction::WatchdogLifecycle,
         Eviction::DoneOutbox,
         Eviction::TerminalStreams,
@@ -942,6 +995,7 @@ impl Eviction {
         Eviction::SettledWaits,
         Eviction::AppliedSearchOutbox,
         Eviction::SettledRegenerations,
+        Eviction::SettledQueueEntries,
     ];
 
     pub fn name(self) -> &'static str {
@@ -954,6 +1008,7 @@ impl Eviction {
             Eviction::SettledWaits => "settled_waits",
             Eviction::WatchdogLifecycle => "watchdog_lifecycle",
             Eviction::SettledRegenerations => "settled_regenerations",
+            Eviction::SettledQueueEntries => "settled_queue_entries",
         }
     }
 
@@ -968,7 +1023,15 @@ impl Eviction {
             Eviction::SettledWaits => &["agent_waits"],
             Eviction::WatchdogLifecycle => &["codex_watchdog_lifecycle"],
             Eviction::SettledRegenerations => &["branch_regenerations"],
+            Eviction::SettledQueueEntries => {
+                &["execution_queue", "execution_queue_closed_incarnations"]
+            }
         }
+    }
+
+    /// Whether [`RuleReport::bytes`] is measured for this rule.
+    pub fn measures_bytes(self) -> bool {
+        matches!(self, Eviction::SettledQueueEntries)
     }
 
     async fn page(self, db: &LocalDb, now: i64, cursor: &mut Cursor) -> DbResult<Page> {
@@ -982,6 +1045,7 @@ impl Eviction {
             Eviction::SettledWaits => select_settled_waits(db, now, cursor).await?,
             Eviction::WatchdogLifecycle => select_watchdog_lifecycle(db, now).await?,
             Eviction::SettledRegenerations => select_settled_regenerations(db, now, cursor).await?,
+            Eviction::SettledQueueEntries => select_settled_queue_entries(db, now, cursor).await?,
         };
         let select = started.elapsed();
         let rows = selection.rows();
@@ -1003,6 +1067,7 @@ impl Eviction {
         }
         Ok(Page {
             rows,
+            bytes: selection.bytes,
             select,
             write: started.elapsed(),
             done: selection.done,
@@ -1023,6 +1088,20 @@ struct Cursor {
     /// finished, and the time the walk has stepped past in its current phase.
     waits_stamped: bool,
     after_at: Option<i64>,
+    queue: QueueWalk,
+}
+
+/// Where the settled-queue walk stands: the incarnation and terminal state
+/// whose rows it is reading, then the closed-incarnation markers.
+#[derive(Debug, Default)]
+struct QueueWalk {
+    /// `None` before the first incarnation is found.
+    incarnation: Option<String>,
+    /// Index into [`QUEUE_TERMINAL_STATES`].
+    state: usize,
+    /// Every incarnation's entries are walked; the markers are next.
+    markers: bool,
+    after_marker: i64,
 }
 
 /// What one page read chose to delete.
@@ -1034,6 +1113,9 @@ struct Selection {
     unlink_parents: Vec<String>,
     /// The rule has nothing more to delete in this pass.
     done: bool,
+    /// Stored bytes of the selected rows, where the rule measures them
+    /// ([`Eviction::measures_bytes`]).
+    bytes: u64,
 }
 
 impl Selection {
@@ -1045,6 +1127,7 @@ impl Selection {
 #[derive(Debug)]
 struct Page {
     rows: usize,
+    bytes: u64,
     select: Duration,
     write: Duration,
     done: bool,
@@ -1173,6 +1256,7 @@ fn journal_page(
         },
         unlink_parents: Vec::new(),
         done,
+        bytes: 0,
     }
 }
 
@@ -1307,6 +1391,7 @@ async fn select_terminal_streams(
                         deletes,
                         unlink_parents: Vec::new(),
                         done,
+                        bytes: 0,
                     },
                     next,
                 ))
@@ -1379,6 +1464,7 @@ async fn select_invalidated_codemaps(
                         deletes,
                         unlink_parents: Vec::new(),
                         done,
+                        bytes: 0,
                     },
                     next,
                 ))
@@ -1470,6 +1556,7 @@ async fn select_superseded_arcs(db: &LocalDb, cursor: &mut Cursor) -> DbResult<S
         },
         unlink_parents: ids,
         done: false,
+        bytes: 0,
     })
 }
 
@@ -1551,6 +1638,7 @@ async fn select_settled_waits(db: &LocalDb, now: i64, cursor: &mut Cursor) -> Db
         },
         unlink_parents: Vec::new(),
         done,
+        bytes: 0,
     })
 }
 
@@ -1667,6 +1755,147 @@ async fn select_settled_regenerations(
             vec![("branch_regenerations", rowids)]
         },
         unlink_parents: Vec::new(),
+        bytes: 0,
+    })
+}
+
+/// Settled placement-journal entries ([`Eviction::SettledQueueEntries`]), at
+/// most [`QUEUE_PAGE_ROWS`] rows and [`QUEUE_PAGE_BYTES`] a page.
+///
+/// An entry goes whole, in ascending sequence. One larger than a page (a
+/// backlog entry parked for hours carries thousands of rows) is deleted over
+/// several pages with its terminal row last, so it stays selectable until it
+/// is gone; meanwhile a reader of a week-old entry may see its history
+/// truncated from the front, never a live entry touched. Deleted rows leave
+/// the index, so each incarnation and state is re-read from its start rather
+/// than from a cursor.
+///
+/// A marker goes only once no row of its incarnation remains. The running
+/// incarnation has no marker until a later start closes it, and no rows are
+/// ever written under a closed one, so a marker read as empty stays empty
+/// until the write that deletes it.
+async fn select_settled_queue_entries(
+    db: &LocalDb,
+    now: i64,
+    cursor: &mut Cursor,
+) -> DbResult<Selection> {
+    let cutoff = (now - QUEUE_ENTRY_AGE_S) * 1_000;
+    let walk = std::mem::take(&mut cursor.queue);
+    let (rows, bytes, markers, done, walk) = db
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut walk = walk;
+                let mut rows: Vec<i64> = Vec::new();
+                let mut bytes: i64 = 0;
+                let mut full = false;
+                while !walk.markers && !full {
+                    if walk.incarnation.is_none() || walk.state == QUEUE_TERMINAL_STATES.len() {
+                        let after = walk.incarnation.clone().unwrap_or_default();
+                        let mut next = conn.query(QUEUE_NEXT_INCARNATION, (after,)).await?;
+                        let found = match next.next().await? {
+                            Some(row) => Some(row.text(0)?),
+                            None => None,
+                        };
+                        drop(next);
+                        match found {
+                            Some(incarnation) => {
+                                walk.incarnation = Some(incarnation);
+                                walk.state = 0;
+                            }
+                            None => walk.markers = true,
+                        }
+                        continue;
+                    }
+                    let room = QUEUE_PAGE_ROWS - rows.len();
+                    let incarnation = walk.incarnation.clone().unwrap_or_default();
+                    let state = QUEUE_TERMINAL_STATES[walk.state];
+                    let mut settled = Vec::new();
+                    let mut found = conn
+                        .query(
+                            QUEUE_SETTLED_ENTRIES,
+                            (incarnation, state, cutoff, room as i64),
+                        )
+                        .await?;
+                    while let Some(row) = found.next().await? {
+                        settled.push((row.text(0)?, row.i64(1)?));
+                    }
+                    drop(found);
+                    let exhausted = settled.len() < room;
+                    for (entry, terminal) in settled {
+                        let room = QUEUE_PAGE_ROWS - rows.len();
+                        if room == 0 {
+                            full = true;
+                            break;
+                        }
+                        let mut last = None;
+                        let mut cut = false;
+                        let mut found = conn.query(QUEUE_ENTRY_ROWS, (entry, room as i64)).await?;
+                        while let Some(row) = found.next().await? {
+                            let size = row.opt_i64(2)?.unwrap_or(0);
+                            // At least one row a page, however large.
+                            if !rows.is_empty() && bytes + size > QUEUE_PAGE_BYTES {
+                                cut = true;
+                                break;
+                            }
+                            rows.push(row.i64(0)?);
+                            bytes += size;
+                            last = Some(row.i64(1)?);
+                        }
+                        drop(found);
+                        let emptied = !cut && last.is_some_and(|seq| seq >= terminal);
+                        if !emptied {
+                            // The rest of this entry, terminal row last, on
+                            // the next page.
+                            full = true;
+                            break;
+                        }
+                    }
+                    if rows.len() == QUEUE_PAGE_ROWS {
+                        full = true;
+                    } else if exhausted && !full {
+                        walk.state += 1;
+                    }
+                }
+                let mut markers = Vec::new();
+                let mut done = false;
+                if walk.markers && !full {
+                    let room = QUEUE_PAGE_ROWS - rows.len();
+                    let mut walked = Vec::new();
+                    let mut found = conn
+                        .query(QUEUE_MARKER_WALK, (walk.after_marker, room as i64))
+                        .await?;
+                    while let Some(row) = found.next().await? {
+                        walked.push((row.i64(0)?, row.text(1)?));
+                    }
+                    drop(found);
+                    done = walked.len() < room;
+                    for (rowid, incarnation) in walked {
+                        walk.after_marker = rowid;
+                        let mut left = conn.query(QUEUE_INCARNATION_ROW, (incarnation,)).await?;
+                        let emptied = left.next().await?.is_none();
+                        drop(left);
+                        if emptied {
+                            markers.push(rowid);
+                        }
+                    }
+                }
+                Ok((rows, bytes, markers, done, walk))
+            })
+        })
+        .await?;
+    cursor.queue = walk;
+    let mut deletes = Vec::new();
+    if !rows.is_empty() {
+        deletes.push(("execution_queue", rows));
+    }
+    if !markers.is_empty() {
+        deletes.push(("execution_queue_closed_incarnations", markers));
+    }
+    Ok(Selection {
+        deletes,
+        unlink_parents: Vec::new(),
+        done,
+        bytes: bytes.max(0) as u64,
     })
 }
 
@@ -1893,6 +2122,9 @@ pub struct RuleReport {
     pub eviction: Eviction,
     pub pages: usize,
     pub rows: usize,
+    /// Stored bytes of the deleted rows, for a rule that measures them
+    /// ([`Eviction::measures_bytes`]); 0 otherwise.
+    pub bytes: u64,
     /// Rows deleted by the largest single write.
     pub max_page_rows: usize,
     pub select_ms: Vec<u64>,
@@ -2016,6 +2248,30 @@ impl PassReport {
     pub fn rows(&self) -> usize {
         self.rules.iter().map(|rule| rule.rows).sum()
     }
+
+    /// The pass as one JSON record, the per-rule figures beside the pass's
+    /// own, for a journal row the pass line alone cannot be queried as.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "end": format!("{:?}", self.end),
+            "rows": self.rows(),
+            "duration_ms": self.duration.as_millis() as u64,
+            "folds": self.folds.len(),
+            "log_peak_bytes": self.log_peak_bytes,
+            "rules": self.rules.iter().map(|rule| serde_json::json!({
+                "rule": rule.eviction.name(),
+                "rows": rule.rows,
+                "bytes": rule.eviction.measures_bytes().then_some(rule.bytes),
+                "pages": rule.pages,
+                "max_page_rows": rule.max_page_rows,
+                "select_ms_total": rule.select_ms.iter().sum::<u64>(),
+                "write_ms_total": rule.write_ms.iter().sum::<u64>(),
+                "write_ms_max": rule.write_ms.iter().max().copied().unwrap_or(0),
+                "finished": rule.finished,
+                "error": rule.error,
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 /// The `q`-quantile of `values` (nearest rank), or 0 when there are none.
@@ -2065,9 +2321,14 @@ impl std::fmt::Display for PassReport {
         for rule in &self.rules {
             write!(
                 f,
-                "; {} rows={} pages={} write_ms_p50={} p99={} max={}{}",
+                "; {} rows={}{} pages={} write_ms_p50={} p99={} max={}{}",
                 rule.eviction.name(),
                 rule.rows,
+                if rule.eviction.measures_bytes() {
+                    format!(" bytes={}", rule.bytes)
+                } else {
+                    String::new()
+                },
                 rule.pages,
                 quantile(&rule.write_ms, 0.5),
                 quantile(&rule.write_ms, 0.99),
@@ -2135,6 +2396,7 @@ pub async fn run_rules(
             eviction,
             pages: 0,
             rows: 0,
+            bytes: 0,
             max_page_rows: 0,
             select_ms: Vec::new(),
             write_ms: Vec::new(),
@@ -2175,6 +2437,7 @@ pub async fn run_rules(
                         }
                         rule.pages += 1;
                         rule.rows += page.rows;
+                        rule.bytes += page.bytes;
                         rule.max_page_rows = rule.max_page_rows.max(page.rows);
                         rule.write_ms.push(page.write.as_millis() as u64);
                         rows_total += page.rows;
