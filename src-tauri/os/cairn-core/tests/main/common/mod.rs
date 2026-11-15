@@ -18,10 +18,10 @@ use axum::{Json, Router};
 
 use cairn_common::executor_protocol::{
     CpuPressure, DeclineReason, ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity,
-    ExecutorMessage, MachineMemory, Measurement, MeasurementGap, ObjectChannelCredential,
-    OfferSummary, RelayAuthorization, RelayIdentity, ResidencyRuntimeConfig, ResidentRelayId,
-    EXECUTOR_HEARTBEAT_INTERVAL_MS,
+    ExecutorMessage, MachineMemory, ObjectChannelCredential, OfferSummary, RelayAuthorization,
+    RelayIdentity, ResidencyRuntimeConfig, EXECUTOR_HEARTBEAT_INTERVAL_MS,
 };
+use cairn_common::wire_vocabulary::{Measurement, MeasurementGap, ResidentRelayId};
 use cairn_core::internal::db::DbState;
 use cairn_core::internal::dispatch::{dispatch_tool, DispatchOutput};
 use cairn_core::internal::jj;

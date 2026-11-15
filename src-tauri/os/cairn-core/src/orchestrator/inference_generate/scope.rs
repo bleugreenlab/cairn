@@ -1817,9 +1817,8 @@ mod tests {
         use crate::fleet::resident_relay::{
             authorize_resident_relay, RegisteredAuthority, ResidentRelayCall,
         };
-        use cairn_common::executor_protocol::{
-            RelayAuthorization, ResidencyHolder, ResidentRelayId,
-        };
+        use cairn_common::executor_protocol::{RelayAuthorization, ResidencyHolder};
+        use cairn_common::wire_vocabulary::ResidentRelayId;
 
         let orch = scoped_orchestrator().await;
         let cursors = std::sync::Mutex::new(std::collections::HashMap::new());

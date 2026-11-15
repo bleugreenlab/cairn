@@ -755,9 +755,8 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
 /// is refreshed, which installs it, so a decision can be offered on it without
 /// the workspace enabling anything.
 async fn seed_inference(orch: &Orchestrator) {
-    use cairn_common::executor_protocol::{
-        GpuDevice, GpuMemory, GpuVendor, HostHealth, Measurement, MeasurementReading,
-    };
+    use cairn_common::executor_protocol::{GpuDevice, GpuMemory, GpuVendor, HostHealth};
+    use cairn_common::wire_vocabulary::{Measurement, MeasurementReading};
     use cairn_db::turso::params;
 
     orch.fleet.seed_host_for_test(

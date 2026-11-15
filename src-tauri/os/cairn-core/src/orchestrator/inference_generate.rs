@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 
 use cairn_common::executor_protocol::{
     model_gpus, ExecutorHealthSnapshot, GpuDevice, GpuMemory, GpuVendor, MachineMemory,
-    MeasurementReading,
 };
+use cairn_common::wire_vocabulary::MeasurementReading;
 use cairn_inference::fit::{self, Arch, HwMemory, MachineHw, PoolHw, Predicted};
 use cairn_inference::hf::{self, RepoFiles};
 use cairn_inference::{
@@ -1316,7 +1316,7 @@ requirements:
 
     #[test]
     fn a_machine_s_accelerator_is_its_reported_gpu_s_and_unknown_is_refused_by_name() {
-        use cairn_common::executor_protocol::MeasurementGap;
+        use cairn_common::wire_vocabulary::MeasurementGap;
         let fedora = MachineName::from("fedora");
         let memory = MeasurementReading::Measured {
             value: MachineMemory {

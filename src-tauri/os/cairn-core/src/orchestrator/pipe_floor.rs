@@ -870,8 +870,8 @@ impl ReleaseWorld for LiveWorld<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_common::executor_protocol::Measurement;
     use cairn_common::pipe_health::{PipeAdmission, PipeCapacity, PipeHealth};
+    use cairn_common::wire_vocabulary::Measurement;
 
     fn assessment(bytes: u64, recovered: bool) -> PipeHealthAssessment {
         let mut health = PipeHealth::new(true);

@@ -57,12 +57,12 @@ use cairn_common::executor_protocol::StallInstrumentState;
 #[cfg(test)]
 use cairn_common::executor_protocol::MACHINE_SAMPLE_BLIND_AFTER_MS;
 use cairn_common::executor_protocol::{
-    aged_priority, CacheWarmthEvidence, CellAdmissionKind, CellCheckoutKind, CellCommandClass,
-    CellResidency, ContentionEstimate, DeclineReason, DurationEstimate, DurationFallback,
-    EnrolledRemote, ExecutionLoadContext, ExecutionWarmth, ExecutorAdvertisement,
-    ExecutorCapabilities, ExecutorConfig, ExecutorHealthSnapshot, ExecutorHealthStatus,
-    ExecutorIdentity, ExecutorInspection, ExecutorListenerAdvertisement, ExecutorMessage,
-    ExecutorSelector, ExecutorSubstrateEvidence, ExecutorSubstrateReport, ExecutorSubstrateState,
+    aged_priority, CacheWarmthEvidence, CellCheckoutKind, CellCommandClass, CellResidency,
+    ContentionEstimate, DeclineReason, DurationEstimate, DurationFallback, EnrolledRemote,
+    ExecutionLoadContext, ExecutionWarmth, ExecutorAdvertisement, ExecutorCapabilities,
+    ExecutorConfig, ExecutorHealthSnapshot, ExecutorHealthStatus, ExecutorIdentity,
+    ExecutorInspection, ExecutorListenerAdvertisement, ExecutorMessage, ExecutorSelector,
+    ExecutorSubstrateEvidence, ExecutorSubstrateReport, ExecutorSubstrateState,
     GenerationEndMemory, InventoryAuthorityState, MachineMeasurement,
     MaterializationReadFailureKind, MaterializationReadRequest, MaterializationReadResult,
     ObjectTransferCoordinate, ObservationReuse, PlacementCounterfactualWinner, PlacementDecision,
@@ -89,6 +89,7 @@ use cairn_common::executor_protocol::{
     PublishIsolationEvidence, PublishIsolationVerdict, PUBLISH_ISOLATION_STALE_AFTER_MS,
 };
 use cairn_common::pipe_health::PipeFloorWork;
+use cairn_common::wire_vocabulary::CellAdmissionKind;
 use cairn_uri::normalize_executor_name;
 use decline_condition::{AdmissionView, PostedHold};
 use serde::{Deserialize, Serialize};
@@ -104,13 +105,14 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::Instant;
 
 pub use cairn_common::executor_protocol::{
-    ActiveCellRequest, CellExecutionMeta, CellOutcome, CellPriority, CellRequest,
-    CellUnavailableReason, CommandResourceIdentity, ExecutingCellRequest, FleetSnapshot,
-    MutationDelta, MutationPolicy, PersistentCellLifecycle, PersistentCellState,
-    PlacementWorkClass, ProjectCapability, ProjectPlacementRequirements, QueuedCellRequest,
-    ResourceReservation, ResourceReservationSource,
+    ActiveCellRequest, CellExecutionMeta, CellOutcome, CellRequest, CellUnavailableReason,
+    CommandResourceIdentity, ExecutingCellRequest, FleetSnapshot, MutationDelta, MutationPolicy,
+    PersistentCellLifecycle, PersistentCellState, PlacementWorkClass, ProjectCapability,
+    ProjectPlacementRequirements, QueuedCellRequest, ResourceReservation,
+    ResourceReservationSource,
 };
 use cairn_common::toolchain_requirements::project_placement_requirements;
+pub use cairn_common::wire_vocabulary::CellPriority;
 use cairn_platform::stack::off_frame;
 
 use crate::mcp::handlers::permission::HandoffClosed;

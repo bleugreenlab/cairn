@@ -287,7 +287,7 @@ mod tests {
     use cairn_common::dev_instance_protocol::{
         DevInstanceLaunchEvent, DevInstanceLaunchFailure, DevInstanceLaunchRequest,
     };
-    use cairn_common::executor_protocol::ResidentRelayId;
+    use cairn_common::wire_vocabulary::ResidentRelayId;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use tokio::sync::mpsc;

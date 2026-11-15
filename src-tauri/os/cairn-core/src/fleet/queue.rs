@@ -44,9 +44,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use cairn_common::executor_protocol::{
-    queue_rank, BindingEvent, CellAdmissionKind, CellOutcome, CellRequest, DeclineReason,
-    DiskDecline, DiskReliefOutlook, OfferSummary, QueueRank, QueuedCellRequest, ResidencyFence,
+    queue_rank, BindingEvent, CellOutcome, CellRequest, DeclineReason, DiskDecline,
+    DiskReliefOutlook, OfferSummary, QueueRank, QueuedCellRequest, ResidencyFence,
 };
+use cairn_common::wire_vocabulary::CellAdmissionKind;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -2724,9 +2725,9 @@ pub(super) mod tests {
     use super::*;
     use crate::storage::RowExt;
     use cairn_common::executor_protocol::{
-        CellCommandClass, CellPriority, MutationPolicy, PlacementMobility, PlacementWorkClass,
-        RepositoryLocator,
+        CellCommandClass, MutationPolicy, PlacementMobility, PlacementWorkClass, RepositoryLocator,
     };
+    use cairn_common::wire_vocabulary::CellPriority;
 
     /// Journal rows for `entries` entries of `incarnation`, each queued then
     /// offered, then completed, except every `open_every`th entry (counting

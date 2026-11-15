@@ -5,9 +5,9 @@
 use async_trait::async_trait;
 use cairn_common::executor_protocol::{
     OwnerDeathPolicy, ProcessSandboxMode, ResidencyFootprint, ResidentProcessCwdRoot,
-    ResidentProcessEventKind, ResidentProcessStatus, ResidentProcessStream, ResidentRuntimeAsset,
-    ResidentStreamFraming,
+    ResidentProcessEventKind, ResidentProcessStatus, ResidentProcessStream, ResidentStreamFraming,
 };
+use cairn_common::wire_vocabulary::ResidentRuntimeAsset;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;

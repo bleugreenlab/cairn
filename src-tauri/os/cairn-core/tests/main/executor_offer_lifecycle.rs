@@ -10,9 +10,9 @@
 use crate::common;
 
 use cairn_common::executor_protocol::{
-    CellAdmissionKind, CellPriority, DeclineReason, ExecutorMessage, OfferSummary,
-    RepositoryLocator, ResourceReservation,
+    DeclineReason, ExecutorMessage, OfferSummary, RepositoryLocator, ResourceReservation,
 };
+use cairn_common::wire_vocabulary::{CellAdmissionKind, CellPriority};
 use cairn_exec::{ExecutorRuntime, Fleet as ExecutorPool};
 
 fn offer(request_id: &str, project_id: &str) -> OfferSummary {

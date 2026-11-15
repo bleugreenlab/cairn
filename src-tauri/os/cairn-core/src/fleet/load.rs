@@ -10,9 +10,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use cairn_common::executor_protocol::{
-    FleetSnapshot, LiveUsage, LiveUsageSample, LiveUsageSubject, MachineSample, Measurement,
-    MeasurementGap, MeasurementReading,
+    FleetSnapshot, LiveUsage, LiveUsageSample, LiveUsageSubject, MachineSample,
 };
+use cairn_common::wire_vocabulary::{Measurement, MeasurementGap, MeasurementReading};
 use serde::Serialize;
 
 /// Points kept per machine: ten minutes at the five-second sample.

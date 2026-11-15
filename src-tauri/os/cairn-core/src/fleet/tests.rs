@@ -1049,10 +1049,10 @@ use crate::services::testing::TestServicesBuilder;
 use crate::storage::{LocalDb, SearchIndex};
 use cairn_codec::testutil::{commit_all, init_repo, write_file};
 use cairn_common::executor_protocol::{
-    CellAdmissionKind, CellOccupancy, GitObjectFormat, MachineMemory, Measurement, ResidencyFence,
-    ResidentOccupancyEvidence, WarmRepositoryRoots, WarmRootChange, WarmRootInventory,
-    EXECUTOR_LINK_STALL_REMEDIATION_MS,
+    CellOccupancy, GitObjectFormat, MachineMemory, ResidencyFence, ResidentOccupancyEvidence,
+    WarmRepositoryRoots, WarmRootChange, WarmRootInventory, EXECUTOR_LINK_STALL_REMEDIATION_MS,
 };
+use cairn_common::wire_vocabulary::{CellAdmissionKind, Measurement};
 
 fn relay_request(run_id: Option<&str>) -> cairn_common::protocol::CallbackRequest {
     cairn_common::protocol::CallbackRequest {
@@ -9614,7 +9614,8 @@ fn priced_home_and_remote(
 /// thrashing: it adds nothing and says why.
 #[test]
 fn a_machine_thrashing_on_memory_ranks_behind_an_idle_one() {
-    use cairn_common::executor_protocol::{HostStallPrice, MeasurementGap, MemoryPressure};
+    use cairn_common::executor_protocol::{HostStallPrice, MemoryPressure};
+    use cairn_common::wire_vocabulary::MeasurementGap;
     let (_, mut thrashing) = fleet_entry("bgsrv-ub", "linux", 0, &[]);
     let (_, mut idle) = fleet_entry("fedora", "linux", 0, &[]);
     let (_, unmeasured) = fleet_entry("mini", "linux", 0, &[]);
@@ -9746,9 +9747,8 @@ fn a_machine_thrashing_on_memory_ranks_behind_an_idle_one() {
 /// machine that cannot measure I/O pressure adds nothing and says why.
 #[test]
 fn a_machine_stalled_on_storage_ranks_behind_an_idle_one() {
-    use cairn_common::executor_protocol::{
-        HostStallPrice, IoPressure, MeasurementGap, MemoryPressure,
-    };
+    use cairn_common::executor_protocol::{HostStallPrice, IoPressure, MemoryPressure};
+    use cairn_common::wire_vocabulary::MeasurementGap;
     let (_, mut stalled) = fleet_entry("bbs", "linux", 0, &[]);
     let (_, mut idle) = fleet_entry("fedora", "linux", 0, &[]);
     let (_, unmeasured) = fleet_entry("mini", "linux", 0, &[]);
@@ -10167,7 +10167,8 @@ fn exploration_never_spends_a_lane_where_the_run_cannot_teach() {
 /// predicted at its count-only run and says why.
 #[test]
 fn a_short_lane_ranks_a_disk_stalled_machine_below_an_idle_one() {
-    use cairn_common::executor_protocol::{HostStallPrice, MeasurementGap};
+    use cairn_common::executor_protocol::HostStallPrice;
+    use cairn_common::wire_vocabulary::MeasurementGap;
     let (_, mut stalled) = fleet_entry("bbs", "linux", 0, &[]);
     let (_, mut idle) = fleet_entry("bginf-sp2", "linux", 0, &[]);
     let (_, mut unmeasured) = fleet_entry("bgsrv-mac", "macos", 0, &[]);
@@ -11855,7 +11856,7 @@ fn a_placement_gap_excludes_a_remote_and_never_reads_as_idle() {
     );
     Arc::make_mut(&mut remote.health).machine.volume = Measurement::unavailable(
         NOW,
-        cairn_common::executor_protocol::MeasurementGap::SamplingFailed,
+        cairn_common::wire_vocabulary::MeasurementGap::SamplingFailed,
     );
     let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
 
@@ -11865,7 +11866,7 @@ fn a_placement_gap_excludes_a_remote_and_never_reads_as_idle() {
         rejection_for(&draft, "bglab-ub"),
         &PlacementRejectionReason::TelemetryGap {
             measurement: MachineMeasurement::Volume,
-            gap: cairn_common::executor_protocol::MeasurementGap::SamplingFailed,
+            gap: cairn_common::wire_vocabulary::MeasurementGap::SamplingFailed,
         }
     );
 }
@@ -12278,7 +12279,7 @@ fn a_diagnostic_gap_does_not_exclude_a_candidate() {
         .process
         .physical_footprint_bytes = Measurement::unavailable(
         NOW,
-        cairn_common::executor_protocol::MeasurementGap::UnsupportedPlatform,
+        cairn_common::wire_vocabulary::MeasurementGap::UnsupportedPlatform,
     );
     let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
 
@@ -12477,7 +12478,7 @@ fn a_platform_constrained_spill_batch_with_only_blind_remotes_refuses() {
     let (win_id, mut win) = fleet_entry("bglab-win", "linux", 0, &[]);
     Arc::make_mut(&mut win.health).machine.cpu = Measurement::unavailable(
         NOW,
-        cairn_common::executor_protocol::MeasurementGap::SamplingFailed,
+        cairn_common::wire_vocabulary::MeasurementGap::SamplingFailed,
     );
     let connections = HashMap::from([(ub_id, ub), (win_id, win)]);
     let mut request = spillable_request();
@@ -12588,7 +12589,7 @@ fn an_unmeasurable_fleet_with_no_home_refuses_with_its_evidence() {
     let (id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
     Arc::make_mut(&mut remote.health).machine.volume = Measurement::unavailable(
         NOW,
-        cairn_common::executor_protocol::MeasurementGap::SamplingFailed,
+        cairn_common::wire_vocabulary::MeasurementGap::SamplingFailed,
     );
     let connections = HashMap::from([(id, remote)]);
     let refusal = place(&connections, &spillable_request()).unwrap_err();
@@ -12615,7 +12616,7 @@ fn a_machine_that_has_not_sampled_yet_takes_work_nothing_seeing_can() {
     assert_eq!(selection.reason, PlacementReason::MeasuredBlindFleet);
     assert_eq!(
         selection.readings.cpu.gap(),
-        Some(cairn_common::executor_protocol::MeasurementGap::NotSampled),
+        Some(cairn_common::wire_vocabulary::MeasurementGap::NotSampled),
         "the decision names the missing reading"
     );
     assert_eq!(
@@ -14920,7 +14921,7 @@ fn the_telemetry_frame_matches_the_inspection_projection() {
         memory_phase: None,
     }];
     Arc::make_mut(&mut busy.health).machine.memory =
-        cairn_common::executor_protocol::Measurement::measured(
+        cairn_common::wire_vocabulary::Measurement::measured(
             NOW,
             cairn_common::executor_protocol::MachineMemory {
                 total_bytes: 1_000,
@@ -18324,8 +18325,9 @@ fn executing_fixture(request_id: &str) -> ExecutingCellRequest {
 #[test]
 fn snapshot_work_carries_each_running_attempts_stall_window() {
     use cairn_common::executor_protocol::{
-        LiveUsage, LiveUsageSample, LiveUsageSubject, Measurement, MeasurementQuality, QuietWindow,
+        LiveUsage, LiveUsageSample, LiveUsageSubject, MeasurementQuality, QuietWindow,
     };
+    use cairn_common::wire_vocabulary::Measurement;
 
     let (_, mut entry) = fleet_entry("remote-a", "linux", 0, &[]);
     let mut judged = executing_fixture("r1");

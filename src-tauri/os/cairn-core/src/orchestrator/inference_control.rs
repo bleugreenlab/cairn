@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use cairn_common::executor_protocol::{
     DeploymentOperation, DeploymentPhaseReport, DeploymentScript, ExecutorHealthSnapshot,
-    MeasurementReading,
 };
+use cairn_common::wire_vocabulary::MeasurementReading;
 use cairn_db::turso::params;
 use cairn_inference::control::{
     self, Allocation, AllocationWatch, LoadOutcome, Observation, Phase, Report, Request,

@@ -41,7 +41,7 @@
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
-use crate::executor_protocol::{
+use crate::wire_vocabulary::{
     ResidentRuntimeAsset, MAX_RESIDENT_RUNTIME_ASSETS, MAX_RESIDENT_RUNTIME_ASSETS_BYTES,
     MAX_RESIDENT_RUNTIME_ASSET_BYTES,
 };

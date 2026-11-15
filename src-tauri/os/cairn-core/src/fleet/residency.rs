@@ -1,10 +1,11 @@
 use std::path::Path;
 
 use cairn_common::executor_protocol::{
-    CellOutcome, CellOwnerRef, CellPriority, ExecutorSelector, OwnerDeathPolicy, RepositoryLocator,
+    CellOutcome, CellOwnerRef, ExecutorSelector, OwnerDeathPolicy, RepositoryLocator,
     ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence, ResidencyFootprint,
     ResidencyHolder, ResidencyOperation, ResidencyResult, ScratchSyncEstimate,
 };
+use cairn_common::wire_vocabulary::CellPriority;
 
 use crate::fleet::placement::{classify_residency_failure, PlacementRefusal};
 use crate::fleet::HomePrices;

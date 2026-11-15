@@ -36,7 +36,7 @@ use super::run_state::{resolve_run_db, transition_run_to_live};
 use crate::models::RunStatus;
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
-use cairn_common::executor_protocol::ResidentRuntimeAsset;
+use cairn_common::wire_vocabulary::ResidentRuntimeAsset;
 
 const WORKFLOW_BACKEND_NAME: &str = "Workflow";
 
@@ -66,6 +66,7 @@ pub(crate) async fn spawn_workflow_process(
     params: WorkflowSpawnParams,
 ) -> Result<(), String> {
     use cairn_common::executor_protocol::*;
+    use cairn_common::wire_vocabulary::CellPriority;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     let run_db = resolve_run_db(WORKFLOW_BACKEND_NAME, orch, &params.run_id)?;

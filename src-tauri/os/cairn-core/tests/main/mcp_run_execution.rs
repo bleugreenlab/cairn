@@ -1416,12 +1416,12 @@ fn a_runner_installed_ancestor_tree_resolves_a_bare_specifier() {
 
     let package = |marker: &str| {
         vec![
-            cairn_common::executor_protocol::ResidentRuntimeAsset {
+            cairn_common::wire_vocabulary::ResidentRuntimeAsset {
                 path: "@cairn/sdk/package.json".into(),
                 data: br#"{"name":"@cairn/sdk","type":"module","exports":{".":"./index.ts"}}"#
                     .to_vec(),
             },
-            cairn_common::executor_protocol::ResidentRuntimeAsset {
+            cairn_common::wire_vocabulary::ResidentRuntimeAsset {
                 path: "@cairn/sdk/index.ts".into(),
                 data: format!("export const marker = \"{marker}\";\n").into_bytes(),
             },

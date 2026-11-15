@@ -27,12 +27,13 @@
 use std::borrow::Cow;
 
 use cairn_common::executor_protocol::{
-    admission_memory_floor, admission_provisions, memory_short, AdmissionHoldEvidence,
-    CellPriority, CellRequest, CpuArm, DeclineReason, DiskHealthStatus, DiskWriteArmHold,
-    ExecutorSubstrateReport, FleetSnapshot, InodeShortfall, LoweredWaitHold, MachineVolume,
-    ProvisioningHold, RepositoryLocator, ResidencyFence, StallGauge, StallInstrument,
-    StallInstrumentState, StoragePressureOutcome, StorageSweepStatus,
+    admission_memory_floor, admission_provisions, memory_short, AdmissionHoldEvidence, CellRequest,
+    CpuArm, DeclineReason, DiskHealthStatus, DiskWriteArmHold, ExecutorSubstrateReport,
+    FleetSnapshot, InodeShortfall, LoweredWaitHold, MachineVolume, ProvisioningHold,
+    RepositoryLocator, ResidencyFence, StallGauge, StallInstrument, StallInstrumentState,
+    StoragePressureOutcome, StorageSweepStatus,
 };
+use cairn_common::wire_vocabulary::CellPriority;
 
 /// How the executor will judge one piece of work: the facts the offer carries
 /// beside the request, which change what its admission checks.
@@ -585,10 +586,11 @@ pub(crate) fn posted_condition(
 mod tests {
     use super::*;
     use cairn_common::executor_protocol::{
-        ExecutingCellRequest, LiveUsageSample, MachineMemory, MachineVolume, Measurement,
-        MeasurementQuality, ProvisioningHold, ResourceReservation, StallInstrumentHealth,
+        ExecutingCellRequest, LiveUsageSample, MachineMemory, MachineVolume, MeasurementQuality,
+        ProvisioningHold, ResourceReservation, StallInstrumentHealth,
         MACHINE_SAMPLE_BLIND_AFTER_MS,
     };
+    use cairn_common::wire_vocabulary::Measurement;
 
     const GIB: u64 = 1024 * 1024 * 1024;
     const NOW: u64 = 10_000_000;

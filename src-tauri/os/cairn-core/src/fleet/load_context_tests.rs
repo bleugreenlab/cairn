@@ -1,5 +1,6 @@
 use super::*;
-use cairn_common::executor_protocol::{HostHealth, IoPressure, Measurement, MeasurementGap};
+use cairn_common::executor_protocol::{HostHealth, IoPressure};
+use cairn_common::wire_vocabulary::{Measurement, MeasurementGap};
 
 /// A forecast sees the candidate's advertised storage pressure, and a
 /// machine that cannot measure it is unknown there, never quiet.

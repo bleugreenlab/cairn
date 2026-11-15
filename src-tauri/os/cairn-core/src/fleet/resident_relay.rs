@@ -42,8 +42,9 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use cairn_common::executor_protocol::{
-    RelayAuthorization, RelayIdentity, ResidencyHolder, ResidentRelayGrant, ResidentRelayId,
+    RelayAuthorization, RelayIdentity, ResidencyHolder, ResidentRelayGrant,
 };
+use cairn_common::wire_vocabulary::ResidentRelayId;
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::security::lease::LeaseAudience;

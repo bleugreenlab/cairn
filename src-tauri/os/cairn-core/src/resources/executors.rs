@@ -22,8 +22,8 @@
 
 use cairn_common::executor_protocol::{
     BindingEvent, DeclineReason, ExecutorHealthStatus, ExecutorInspection, MachineRole,
-    Measurement, MeasurementReading, PlacementDecision, PlacementOutcome, PlacementPrediction,
-    PlacementReason, PlacementRejectionReason, PlacementSyncCost, ReservationRationale,
+    PlacementDecision, PlacementOutcome, PlacementPrediction, PlacementReason,
+    PlacementRejectionReason, PlacementSyncCost, ReservationRationale,
     MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_common::executor_protocol::{
@@ -32,6 +32,7 @@ use cairn_common::executor_protocol::{
     StoragePressureOutcome, StoragePressureReport, StorageReclaimRung, StorageRungReclaim,
     StorageWithheld, StorageWithheldReason,
 };
+use cairn_common::wire_vocabulary::{Measurement, MeasurementReading};
 
 /// Questions held back from their next answer because an earlier answer may
 /// still be running, or nothing when none are.
@@ -1689,7 +1690,7 @@ pub(crate) fn render_executor_with_kills(
     ));
     out.push_str(&format!(
         "- Executor bound: {}\n",
-        cairn_common::executor_protocol::describe_executor_bound(
+        cairn_common::wire_vocabulary::describe_executor_bound(
             &capabilities.os,
             capabilities.service_bounds.as_ref()
         )
@@ -4761,7 +4762,7 @@ fn stall_brake_summary(
 /// such reading.
 fn render_lowered_work(lowered: &Measurement<LoweredCpu>, captured_at_unix_ms: u64) -> String {
     if let MeasurementReading::Unavailable {
-        reason: cairn_common::executor_protocol::MeasurementGap::UnsupportedPlatform,
+        reason: cairn_common::wire_vocabulary::MeasurementGap::UnsupportedPlatform,
         detail: Some(detail),
     } = &lowered.reading
     {
@@ -6289,7 +6290,7 @@ fn render_quarantine_census(
 /// the fleet pane reads, from the same join, so the two cannot disagree.
 fn render_running_now(
     occupancy: &cairn_common::executor_protocol::FleetSnapshot,
-    gap: Option<cairn_common::executor_protocol::MeasurementGap>,
+    gap: Option<cairn_common::wire_vocabulary::MeasurementGap>,
     now: u64,
 ) -> String {
     let residents: Vec<_> = occupancy
@@ -7218,12 +7219,12 @@ mod storage_section_tests {
     use super::{external_cache_breakdown, render_executor};
     use cairn_common::executor_protocol::{
         DiskAccounting, DiskCategoryAccounting, DiskHealthStatus, DiskPathUsage,
-        ExternalCacheBreakdown, MachineVolume, Measurement, OccupiedTreeSkip,
-        PersistentCellLifecycle, QuarantineTargetStrip, SkippedEntry, SkippedEntryOperation,
-        SkippedEntryReason, SlotState, StoragePressureBand, StoragePressureOutcome,
-        StoragePressureReport, StorageReclaimRung, StorageRungReclaim, StorageWithheld,
-        StorageWithheldReason,
+        ExternalCacheBreakdown, MachineVolume, OccupiedTreeSkip, PersistentCellLifecycle,
+        QuarantineTargetStrip, SkippedEntry, SkippedEntryOperation, SkippedEntryReason, SlotState,
+        StoragePressureBand, StoragePressureOutcome, StoragePressureReport, StorageReclaimRung,
+        StorageRungReclaim, StorageWithheld, StorageWithheldReason,
     };
+    use cairn_common::wire_vocabulary::Measurement;
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -7580,8 +7581,9 @@ mod storage_section_tests {
     #[test]
     fn the_storage_section_names_the_build_root_present_absent_and_pending() {
         use cairn_common::executor_protocol::{
-            BuildVolumeReport, BuildVolumeState, Measurement, SuspendedCellReport,
+            BuildVolumeReport, BuildVolumeState, SuspendedCellReport,
         };
+        use cairn_common::wire_vocabulary::Measurement;
         const TIB: u64 = 1024 * GIB;
         let mut executor = tight_local();
         let at = executor.captured_at_unix_ms;
@@ -8547,8 +8549,8 @@ mod blocked_question_tests {
 
 #[cfg(test)]
 mod tests {
-    use cairn_common::executor_protocol::MeasurementGap;
     use cairn_common::executor_protocol::{ExecutorRetainedState, ProcessTelemetry, RetainedOwner};
+    use cairn_common::wire_vocabulary::MeasurementGap;
 
     use super::*;
     use cairn_common::executor_protocol::{
@@ -11937,7 +11939,8 @@ mod tests {
     /// and a platform without PSI says so rather than showing a quiet machine.
     #[test]
     fn memory_pressure_renders_beside_cpu_and_io_or_names_its_gap() {
-        use cairn_common::executor_protocol::{MeasurementGap, MemoryPressure};
+        use cairn_common::executor_protocol::MemoryPressure;
+        use cairn_common::wire_vocabulary::MeasurementGap;
         let mut executor = inspection("bgsrv-ub", false);
         executor.health.host.memory_pressure = Measurement::measured(
             CAPTURED_AT - 3_000,
@@ -11969,7 +11972,8 @@ mod tests {
     /// disk.
     #[test]
     fn io_pressure_renders_beside_cpu_and_memory_or_names_its_gap() {
-        use cairn_common::executor_protocol::{DeviceWriteLatency, IoPressure, MeasurementGap};
+        use cairn_common::executor_protocol::{DeviceWriteLatency, IoPressure};
+        use cairn_common::wire_vocabulary::MeasurementGap;
         let mut executor = inspection("bbs", false);
         executor.health.host.io_pressure = Measurement::measured(
             CAPTURED_AT - 3_000,

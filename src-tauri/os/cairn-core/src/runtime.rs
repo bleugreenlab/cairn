@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cairn_common::executor_protocol::ResidentRuntimeAsset;
+use cairn_common::wire_vocabulary::ResidentRuntimeAsset;
 
 /// The npm scope every Cairn-owned package lives under.
 pub const SCOPE: &str = "@cairn";

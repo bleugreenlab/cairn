@@ -18,9 +18,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cairn_common::executor_protocol::{
-    model_gpus, ExecutorHealthSnapshot, GpuMemory, GpuVendor, MeasurementReading,
-};
+use cairn_common::executor_protocol::{model_gpus, ExecutorHealthSnapshot, GpuMemory, GpuVendor};
+use cairn_common::wire_vocabulary::MeasurementReading;
 use cairn_inference::control::Phase;
 use cairn_inference::metrics::EngineSummary;
 use cairn_inference::served::{self, EngineMeasure};

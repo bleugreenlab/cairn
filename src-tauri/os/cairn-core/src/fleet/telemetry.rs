@@ -242,8 +242,8 @@ mod tests {
     use cairn_common::executor_protocol::{
         CpuPressure, ExecutorAdvertisement, ExecutorCapabilities, ExecutorHealthSnapshot,
         ExecutorIdentity, ExecutorSubstrateReport, FleetSnapshot, MachineMemory, MachineTelemetry,
-        Measurement, MeasurementGap,
     };
+    use cairn_common::wire_vocabulary::{Measurement, MeasurementGap};
 
     fn inspection(name: &str, machine: MachineTelemetry) -> ExecutorInspection {
         let identity = ExecutorIdentity {

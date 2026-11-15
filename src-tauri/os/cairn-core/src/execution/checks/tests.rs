@@ -121,7 +121,7 @@ fn no_matching_executor_classifies_immutable_refusals() {
         },
         Reason::TelemetryGap {
             measurement: MachineMeasurement::Cpu,
-            gap: cairn_common::executor_protocol::MeasurementGap::NotSampled,
+            gap: cairn_common::wire_vocabulary::MeasurementGap::NotSampled,
         },
         Reason::UpdatePending {
             returns_by_unix_ms: Some(123_000),

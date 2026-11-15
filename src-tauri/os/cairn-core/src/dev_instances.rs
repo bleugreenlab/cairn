@@ -9,12 +9,13 @@ use cairn_common::dev_instance_protocol::{
     DevInstanceLaunchRequest, DevInstanceReadiness,
 };
 use cairn_common::executor_protocol::{
-    CellOwnerRef, CellPriority, OwnerDeathPolicy, ProcessSandboxMode, RepositoryLocator,
-    ResidencyAcquireRequest, ResidencyFootprint, ResidencyHolder, ResidencyOperation,
-    ResidencyResult, ResidentProcessCwdRoot, ResidentProcessEvent, ResidentProcessEventKind,
-    ResidentProcessIoMode, ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus,
-    ResidentStreamFraming, ResourceReservation, ResourceReservationSource,
+    CellOwnerRef, OwnerDeathPolicy, ProcessSandboxMode, RepositoryLocator, ResidencyAcquireRequest,
+    ResidencyFootprint, ResidencyHolder, ResidencyOperation, ResidencyResult,
+    ResidentProcessCwdRoot, ResidentProcessEvent, ResidentProcessEventKind, ResidentProcessIoMode,
+    ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus, ResidentStreamFraming,
+    ResourceReservation, ResourceReservationSource,
 };
+use cairn_common::wire_vocabulary::CellPriority;
 use cairn_db::turso::params;
 use cairn_uri::CairnResource;
 use tokio::sync::mpsc;
@@ -2817,7 +2818,7 @@ pub mod launch_ticket {
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
-    use cairn_common::executor_protocol::ResidentRelayId;
+    use cairn_common::wire_vocabulary::ResidentRelayId;
     use sha2::{Digest, Sha256};
 
     const LIFETIME: Duration = Duration::from_secs(60);

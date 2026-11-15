@@ -19,9 +19,9 @@
 use std::collections::BTreeMap;
 
 use cairn_common::executor_protocol::{
-    model_gpus, GpuMemory, HostHealth, MachineModelResident, MeasurementReading,
-    PlacementRejectionReason,
+    model_gpus, GpuMemory, HostHealth, MachineModelResident, PlacementRejectionReason,
 };
+use cairn_common::wire_vocabulary::MeasurementReading;
 use cairn_inference::control::gib;
 
 /// How long a reserving start lets the restartable batch work already on its
@@ -508,8 +508,9 @@ mod tests {
     #[test]
     fn an_integrated_gpu_beside_a_card_adds_nothing_to_its_vram() {
         use cairn_common::executor_protocol::{
-            GpuDevice, GpuVendor, Measurement, UnifiedAllocationSource, UnifiedPool,
+            GpuDevice, GpuVendor, UnifiedAllocationSource, UnifiedPool,
         };
+        use cairn_common::wire_vocabulary::Measurement;
         let device = |vendor, memory| GpuDevice {
             index: 0,
             vendor,

@@ -668,7 +668,7 @@ pub struct RunBatchEnvelope {
 /// [`RunBatchEnvelope::over_ceiling`]): each one's output was past
 /// `ceiling_bytes`, or would have carried the batch past
 /// `batch_ceiling_bytes`, which is measured as the text crosses the wire
-/// ([`crate::executor_protocol::relay_wire_len`]) so the response fits one
+/// (`executor_protocol::relay_wire_len`) so the response fits one
 /// executor-link frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverCeiling {

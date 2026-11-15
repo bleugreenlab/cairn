@@ -5,11 +5,12 @@
 //! fence, and a value only the request consumer can build.
 
 use cairn_common::executor_protocol::{
-    CellCommandClass, CellOutcome, CellPriority, CellRequest, ExecutorSelector, MutationPolicy,
+    CellCommandClass, CellOutcome, CellRequest, ExecutorSelector, MutationPolicy,
     PlacementMobility, PlacementWorkClass, ProcessBatch, ProcessBatchExecution, ProcessBatchItem,
     ProcessSandboxMode, RepositoryLocator,
 };
 use cairn_common::run_contract::RUN_BATCH_CEILING_MS;
+use cairn_common::wire_vocabulary::CellPriority;
 
 use super::{output_guard, unix_time_ms, Fleet, RunnerCallbackContext, RunnerContextEntry};
 use crate::operator_requests::fenced_command::{credential_floor_envelope, OperatorAct};

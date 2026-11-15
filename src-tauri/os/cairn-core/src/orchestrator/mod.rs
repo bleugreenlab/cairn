@@ -4928,9 +4928,9 @@ mod tests {
             AdmissionHealth, CpuPressure, DiskAccounting, DiskHealth, DiskHealthStatus,
             ExecutorAdvertisement, ExecutorCapabilities, ExecutorHealthSnapshot,
             ExecutorHealthStatus, ExecutorIdentity, ExecutorRuntimePolicy, HostHealth,
-            MachineMemory, MachineTelemetry, MachineVolume, Measurement, MeasurementGap,
-            ProcessTelemetry,
+            MachineMemory, MachineTelemetry, MachineVolume, ProcessTelemetry,
         };
+        use cairn_common::wire_vocabulary::{Measurement, MeasurementGap};
 
         let identity = ExecutorIdentity {
             device_id: "device".into(),
@@ -5065,9 +5065,8 @@ mod tests {
     /// the machine pressure placement actually reads.
     #[test]
     fn a_healthy_non_macos_executor_stays_healthy_despite_its_unsupported_footprint() {
-        use cairn_common::executor_protocol::{
-            MachineMeasurement, MeasurementGap, SubstrateHealthStatus,
-        };
+        use cairn_common::executor_protocol::{MachineMeasurement, SubstrateHealthStatus};
+        use cairn_common::wire_vocabulary::MeasurementGap;
 
         let executor = healthy_non_macos_executor();
         // The gaps are real and still visible on the machine itself — they are
@@ -5109,9 +5108,9 @@ mod tests {
     #[test]
     fn a_missing_placement_input_still_reaches_the_verdict() {
         use cairn_common::executor_protocol::{
-            MachineMeasurement, Measurement, MeasurementGap, SubstrateHealthReason,
-            SubstrateHealthStatus,
+            MachineMeasurement, SubstrateHealthReason, SubstrateHealthStatus,
         };
+        use cairn_common::wire_vocabulary::{Measurement, MeasurementGap};
 
         let mut executor = healthy_non_macos_executor();
         executor.machine.memory = Measurement::unavailable(10, MeasurementGap::SamplingFailed);
@@ -5139,9 +5138,10 @@ mod tests {
     #[test]
     fn substrate_health_status_precedence_reaches_unknown() {
         use cairn_common::executor_protocol::{
-            MachineMeasurement, MeasurementGap, SkippedEntry, SkippedEntryOperation,
-            SkippedEntryReason, SubstrateHealthReason, SubstrateHealthStatus,
+            MachineMeasurement, SkippedEntry, SkippedEntryOperation, SkippedEntryReason,
+            SubstrateHealthReason, SubstrateHealthStatus,
         };
+        use cairn_common::wire_vocabulary::MeasurementGap;
 
         assert_eq!(substrate_health_status(&[]), SubstrateHealthStatus::Healthy);
         assert_eq!(

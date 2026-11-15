@@ -8,9 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use cairn_common::executor_protocol::{
-    CellPriority, DeploymentOperation, DeploymentPhaseReport, ExecutorMessage,
-    MACHINE_READING_STALE_AFTER_MS,
+    DeploymentOperation, DeploymentPhaseReport, ExecutorMessage, MACHINE_READING_STALE_AFTER_MS,
 };
+use cairn_common::wire_vocabulary::CellPriority;
 use cairn_inference::control::gib;
 use tokio::sync::mpsc;
 

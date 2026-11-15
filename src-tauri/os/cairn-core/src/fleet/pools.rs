@@ -322,9 +322,9 @@ impl super::Fleet {
 mod tests {
     use super::*;
     use cairn_common::executor_protocol::{
-        GpuDevice, GpuMemory, GpuVendor, Interconnect, InterconnectKind, Measurement,
-        MeasurementGap, MeasurementReading,
+        GpuDevice, GpuMemory, GpuVendor, Interconnect, InterconnectKind,
     };
+    use cairn_common::wire_vocabulary::{Measurement, MeasurementGap, MeasurementReading};
 
     fn gb10() -> GpuDevice {
         GpuDevice {

@@ -3288,8 +3288,8 @@ mod tests {
     /// holds nothing.
     #[tokio::test]
     async fn the_pipe_floor_holds_process_launches_and_passes_the_rest() {
-        use cairn_common::executor_protocol::Measurement;
         use cairn_common::pipe_health::{PipeCapacity, PipeHealth, PipeHealthAssessment};
+        use cairn_common::wire_vocabulary::Measurement;
         let db = crate::storage::migrated_test_db("admission-pipe-floor.db").await;
         enqueue_admission_request(&db, estimated("spawn", 1, Some(400 * MIB)))
             .await

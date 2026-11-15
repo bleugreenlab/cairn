@@ -5,6 +5,10 @@
 //! or ambiguously replay an admitted request.
 
 use crate::protocol::{CallbackRequest, CallbackResponse};
+use crate::wire_vocabulary::{
+    CellAdmissionKind, CellPriority, Measurement, MeasurementGap, MeasurementReading,
+    ResidentRelayId, ResidentRuntimeAsset, ServiceBounds,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -33,10 +37,6 @@ pub const EXECUTOR_RESTART_EXIT_CODE: u8 = 75;
 /// into the same held lock on a cadence.
 pub const EXECUTOR_GENERATION_HELD_EXIT_CODE: u8 = 69;
 
-/// Environment and argument names read directly by the independently installed
-/// executor. Runner launch and probe builders use these same constants so one
-/// side cannot silently rename an input without the other.
-pub const EXECUTOR_RUNNER_URL_ENV: &str = "CAIRN_EXECUTOR_RUNNER_URL";
 /// Files a resident executor reads out of its own Cairn home, and that the SSH
 /// bootstrap ceremony writes there. Named here for the same reason the
 /// environment variables are: the ceremony and the daemon are on opposite sides
@@ -49,19 +49,10 @@ pub const EXECUTOR_CREDENTIAL_FILE_NAME: &str = "executor_credential";
 /// in a log the runner does not read; this record is the same fact in a shape
 /// the bootstrap ceremony can ask for over the ssh session it already holds.
 pub const EXECUTOR_LAST_EXIT_FILE_NAME: &str = "executor_last_exit.json";
-pub const EXECUTOR_AUTH_TOKEN_ENV: &str = "CAIRN_MCP_AUTH_TOKEN";
-pub const EXECUTOR_CAIRN_HOME_ENV: &str = "CAIRN_HOME";
-pub const EXECUTOR_ID_ENV: &str = "CAIRN_EXECUTOR_ID";
-pub const EXECUTOR_DEVICE_ID_ENV: &str = "CAIRN_EXECUTOR_DEVICE_ID";
-pub const EXECUTOR_DISPLAY_NAME_ENV: &str = "CAIRN_EXECUTOR_DISPLAY_NAME";
-pub const EXECUTOR_PROJECTS_ENV: &str = "CAIRN_EXECUTOR_PROJECTS";
-pub const EXECUTOR_ENROLLMENT_TOKEN_ENV: &str = "CAIRN_EXECUTOR_ENROLLMENT_TOKEN";
-pub const EXECUTOR_RUNNER_DEVICE_ID_ENV: &str = "CAIRN_EXECUTOR_RUNNER_DEVICE_ID";
-/// The value a supervisor hands one launch of an executor, so that launch can
-/// later be told apart from any other process running the same binary. A
-/// colocated executor presents it in its enrollment; the runner admits only the
-/// one it last issued.
-pub const EXECUTOR_SUPERVISION_NONCE_ENV: &str = "CAIRN_EXECUTOR_SUPERVISION_NONCE";
+/// Argument names read directly by the independently installed executor.
+/// Runner launch and probe builders use these same constants so one side
+/// cannot silently rename an input without the other; the environment names
+/// it reads are in [`crate::wire_vocabulary`].
 pub const EXECUTOR_DISTRIBUTION_INFO_ARG: &str = "--distribution-info";
 
 /// Where a runner serves the [`ExecutorDistributionManifest`] for the build it
@@ -9409,6 +9400,15 @@ pub struct LearnedResourceEstimate {
 /// batch contexts it held detached for it at the first reattach, which fails
 /// closed exactly as the link close did before. An older runner already
 /// decodes the batch entries and skips them.
+///
+/// cairn/7100 does not move the number. `ResidentRelayId`, `ServiceBounds`,
+/// `CellPriority`, `CellAdmissionKind`, the `Measurement` vocabulary,
+/// `ResidentRuntimeAsset` and its limits, and the `EXECUTOR_*_ENV` names move
+/// to `wire_vocabulary.rs` with their serde attributes verbatim, and their
+/// importers follow them. Every frame serializes to the same bytes
+/// (`moved_vocabulary_frames_are_byte_identical`), so an older peer on either
+/// side reads exactly what it read before. What a runner gets wrong talking to
+/// an older executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -10809,83 +10809,6 @@ pub struct ExecutorCapabilities {
     pub service_bounds: Option<ServiceBounds>,
 }
 
-/// The bounds a service manager enforces on an executor, as the kernel
-/// reports them. Each is `None` when it is unbounded or could not be read.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ServiceBounds {
-    /// The unit cgroup's `memory.max`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_max_bytes: Option<u64>,
-    /// Its `memory.swap.max`; zero means the unit never swaps.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub swap_max_bytes: Option<u64>,
-    /// Its `pids.max`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tasks_max: Option<u64>,
-    /// The watchdog interval systemd armed for the daemon.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub watchdog_secs: Option<u64>,
-    /// The machine's own memory, which the memory bound sits below. The
-    /// machine reading says the same where it is the host's; this one is the
-    /// host's whatever that reading measures.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_memory_bytes: Option<u64>,
-}
-
-impl ServiceBounds {
-    /// Whether any bound was read. The host's memory is context, not a bound.
-    pub fn is_empty(&self) -> bool {
-        self.memory_max_bytes.is_none()
-            && self.swap_max_bytes.is_none()
-            && self.tasks_max.is_none()
-            && self.watchdog_secs.is_none()
-    }
-
-    /// `memory 11.25 GiB of 15.4 GiB (swap 0), tasks 18714, watchdog 180 s`:
-    /// each bound that was read.
-    pub fn describe(&self) -> String {
-        const GIB: f64 = (1u64 << 30) as f64;
-        let mut parts = Vec::new();
-        if let Some(max) = self.memory_max_bytes {
-            let mut memory = format!("memory {:.2} GiB", max as f64 / GIB);
-            if let Some(host) = self.host_memory_bytes {
-                memory.push_str(&format!(" of {:.1} GiB", host as f64 / GIB));
-            }
-            match self.swap_max_bytes {
-                Some(0) => memory.push_str(" (swap 0)"),
-                Some(swap) => memory.push_str(&format!(" (swap {:.2} GiB)", swap as f64 / GIB)),
-                None => {}
-            }
-            parts.push(memory);
-        }
-        if let Some(tasks) = self.tasks_max {
-            parts.push(format!("tasks {tasks}"));
-        }
-        if let Some(secs) = self.watchdog_secs {
-            parts.push(format!("watchdog {secs} s"));
-        }
-        parts.join(", ")
-    }
-}
-
-/// The executor-bound line a page shows for a machine on `os` that reported
-/// `bounds`. A macOS or Windows executor has no service-level bound to
-/// report, and says why rather than nothing.
-pub fn describe_executor_bound(os: &str, bounds: Option<&ServiceBounds>) -> String {
-    match bounds {
-        Some(bounds) if !bounds.is_empty() => bounds.describe(),
-        _ if os.eq_ignore_ascii_case("macos") => {
-            "no service-level bound: launchd has no memory accounting; admission is the only bound"
-                .to_string()
-        }
-        _ if os.eq_ignore_ascii_case("windows") => {
-            "no service-level bound; admission only".to_string()
-        }
-        _ => "no unit bound (unbounded install or not under systemd)".to_string(),
-    }
-}
-
 /// What the executor's GitHub credential probe measured: whether git, run as
 /// the executor account with the environment its cells get and with every
 /// prompt disabled, gets a credential for github.com, and whether a private
@@ -11391,7 +11314,7 @@ pub enum ExecutorEnrollmentIdentity {
     /// token.
     ///
     /// `supervision_nonce` is what the supervisor handed this launch through
-    /// [`EXECUTOR_SUPERVISION_NONCE_ENV`]. The token alone survives the runner
+    /// [`EXECUTOR_SUPERVISION_NONCE_ENV`](crate::wire_vocabulary::EXECUTOR_SUPERVISION_NONCE_ENV). The token alone survives the runner
     /// that issued it, so without the nonce an executor orphaned by a killed
     /// runner reattaches to the next one as though it were its child.
     ///
@@ -11453,14 +11376,6 @@ impl EnrollmentRejectionReason {
             _ => None,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(rename_all = "camelCase")]
-pub enum CellPriority {
-    ReviewCheck,
-    WriteCheck,
-    AgentInteractive,
 }
 
 /// How long a queued request waits before priority aging promotes it one tier.
@@ -15530,28 +15445,6 @@ pub struct ResidentProcessSpec {
     pub relay: Option<ResidentRelayGrant>,
 }
 
-/// The runner's routing name for one resident process's relay.
-///
-/// Random and minted fresh for every start, so it names one incarnation of one
-/// process and nothing else. It is not the credential the process presents,
-/// but it is the path that process's calls arrive on, so it is kept out of
-/// `Debug` output and the logs built from it.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ResidentRelayId(pub String);
-
-impl std::fmt::Debug for ResidentRelayId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ResidentRelayId(<redacted>)")
-    }
-}
-
-impl ResidentRelayId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// The runner's instruction to relay one resident process's callbacks.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -15565,17 +15458,6 @@ impl std::fmt::Debug for ResidentRelayGrant {
             .field("relay_id", &self.relay_id)
             .finish()
     }
-}
-
-pub const MAX_RESIDENT_RUNTIME_ASSET_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_RESIDENT_RUNTIME_ASSETS_BYTES: usize = 32 * 1024 * 1024;
-pub const MAX_RESIDENT_RUNTIME_ASSETS: usize = 256;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ResidentRuntimeAsset {
-    pub path: String,
-    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -16325,16 +16207,6 @@ impl PersistentCellState {
     }
 }
 
-/// What an admission request is asking the fleet for: a cell to run a command
-/// batch in, or a cell to hold as a residency.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum CellAdmissionKind {
-    #[default]
-    Command,
-    Residency,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct QueuedCellRequest {
@@ -16962,148 +16834,6 @@ pub struct AdmissionHealth {
     pub accepted_count: u64,
     pub rejected_count: u64,
     pub timed_out_count: u64,
-}
-
-/// Why a measurement is absent.
-///
-/// A consumer renders a named gap from one of these rather than inventing a
-/// meaning for a null. The codes are stable because both the operator panel and
-/// the placement seam branch on them: "this platform cannot answer" and "this
-/// platform tried and failed" are different facts about the same machine.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "camelCase")]
-pub enum MeasurementGap {
-    /// No implementation exists for this reading on this platform.
-    UnsupportedPlatform,
-    /// The platform API exists, was called, and failed.
-    SamplingFailed,
-    /// The reading requires a permission this executor does not hold.
-    PermissionDenied,
-    /// No attempt has completed yet. This is the state a freshly started
-    /// executor is honestly in, and it is what a defaulted measurement means.
-    NotSampled,
-    /// The reading is of the build volume, and that volume is not mounted.
-    BuildVolumeAbsent,
-}
-
-impl MeasurementGap {
-    /// Why there is no value, in the words every surface uses. One home for the
-    /// vocabulary, so a placement rejection and the operator panel cannot come
-    /// to describe the same gap differently.
-    pub fn describe(self) -> &'static str {
-        match self {
-            Self::UnsupportedPlatform => "this platform has no reading",
-            Self::SamplingFailed => "sampling failed",
-            Self::PermissionDenied => "permission denied",
-            Self::NotSampled => "not sampled yet",
-            Self::BuildVolumeAbsent => "the build volume is not mounted",
-        }
-    }
-}
-
-/// The outcome of one attempt to take a reading: a value, or a named reason
-/// there is none.
-///
-/// Deliberately not `Option<T>`. A null cannot say whether the platform has no
-/// implementation, refused the call, or has simply not been asked yet, and the
-/// three lead to different actions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum MeasurementReading<T> {
-    Measured {
-        value: T,
-    },
-    Unavailable {
-        reason: MeasurementGap,
-        /// Bounded diagnostic text where the reason alone is not enough to act
-        /// on — an OS error string, say. Never a path on the executor's disk.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-}
-
-/// One machine reading, carrying when it was taken.
-///
-/// The timestamp belongs to the *attempt*, not to the heartbeat that ships it:
-/// a fresh beat cannot freshen a cached fact, and a failed refresh publishes an
-/// unavailable reading stamped for the failure rather than resending the last
-/// good value under a new time. Consumers compute age from
-/// `measured_at_unix_ms` and never from the beat.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "camelCase")]
-pub struct Measurement<T> {
-    pub measured_at_unix_ms: u64,
-    pub reading: MeasurementReading<T>,
-}
-
-impl<T> Default for Measurement<T> {
-    fn default() -> Self {
-        Self {
-            measured_at_unix_ms: 0,
-            reading: MeasurementReading::Unavailable {
-                reason: MeasurementGap::NotSampled,
-                detail: None,
-            },
-        }
-    }
-}
-
-impl<T> Measurement<T> {
-    pub fn measured(measured_at_unix_ms: u64, value: T) -> Self {
-        Self {
-            measured_at_unix_ms,
-            reading: MeasurementReading::Measured { value },
-        }
-    }
-
-    pub fn unavailable(measured_at_unix_ms: u64, reason: MeasurementGap) -> Self {
-        Self {
-            measured_at_unix_ms,
-            reading: MeasurementReading::Unavailable {
-                reason,
-                detail: None,
-            },
-        }
-    }
-
-    pub fn unavailable_with(
-        measured_at_unix_ms: u64,
-        reason: MeasurementGap,
-        detail: impl Into<String>,
-    ) -> Self {
-        Self {
-            measured_at_unix_ms,
-            reading: MeasurementReading::Unavailable {
-                reason,
-                detail: Some(detail.into()),
-            },
-        }
-    }
-
-    pub fn value(&self) -> Option<&T> {
-        match &self.reading {
-            MeasurementReading::Measured { value } => Some(value),
-            MeasurementReading::Unavailable { .. } => None,
-        }
-    }
-
-    pub fn gap(&self) -> Option<MeasurementGap> {
-        match &self.reading {
-            MeasurementReading::Measured { .. } => None,
-            MeasurementReading::Unavailable { reason, .. } => Some(*reason),
-        }
-    }
-
-    /// How long ago this reading was taken, relative to a capture instant.
-    /// Distinct from heartbeat age, which describes the link rather than the
-    /// fact.
-    pub fn age_ms(&self, now_unix_ms: u64) -> u64 {
-        now_unix_ms.saturating_sub(self.measured_at_unix_ms)
-    }
 }
 
 /// How much of the machine's processor time was spent working, over the window
@@ -26576,6 +26306,13 @@ pub fn encode_executor_message(message: &ExecutorMessage) -> Result<String, serd
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire_vocabulary::{
+        describe_executor_bound, EXECUTOR_AUTH_TOKEN_ENV, EXECUTOR_CAIRN_HOME_ENV,
+        EXECUTOR_DEVICE_ID_ENV, EXECUTOR_DISPLAY_NAME_ENV, EXECUTOR_ENROLLMENT_TOKEN_ENV,
+        EXECUTOR_ID_ENV, EXECUTOR_PROJECTS_ENV, EXECUTOR_RUNNER_DEVICE_ID_ENV,
+        EXECUTOR_RUNNER_URL_ENV, EXECUTOR_SUPERVISION_NONCE_ENV, MAX_RESIDENT_RUNTIME_ASSETS,
+        MAX_RESIDENT_RUNTIME_ASSETS_BYTES, MAX_RESIDENT_RUNTIME_ASSET_BYTES,
+    };
 
     #[test]
     fn memory_kill_legacy_decode_preserves_unknown_event_and_atomic_bound() {
@@ -30859,6 +30596,177 @@ mod tests {
              `UPDATE_FIXTURES=1 cargo test -p cairn-common running_panel_fixture` and \
              rerun the desktop tests that read it.",
             path.display()
+        );
+    }
+
+    /// Frames carrying every item of `wire_vocabulary`'s set, as one typed
+    /// value. Serialized directly rather than through `serde_json::Value`, whose
+    /// map sorts keys and would hide a reordered field.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WireVocabularyFrames {
+        hello: ExecutorMessage,
+        heartbeat: ExecutorMessage,
+        cell_request: CellRequest,
+        queued_cell_request: QueuedCellRequest,
+        start_process: ResidencyOperation,
+        executor_bound_lines: Vec<String>,
+        env_names: Vec<String>,
+        runtime_asset_limits: Vec<usize>,
+    }
+
+    fn wire_vocabulary_frames() -> WireVocabularyFrames {
+        let bounds = ServiceBounds {
+            memory_max_bytes: Some(12 << 30),
+            swap_max_bytes: Some(0),
+            tasks_max: Some(18_714),
+            watchdog_secs: Some(180),
+            host_memory_bytes: Some(16 << 30),
+        };
+        let mut advertisement = sample_advertisement();
+        advertisement.capabilities.service_bounds = Some(bounds);
+        let hello = ExecutorMessage::Hello {
+            protocol_version: 171,
+            advertisement: advertisement.clone(),
+            warm_roots: WarmRootInventory::default(),
+            enrollment: ExecutorEnrollmentIdentity::Colocated {
+                supervision_nonce: "nonce".into(),
+            },
+            executor_build_id: None,
+            last_update: None,
+        };
+        let heartbeat = ExecutorMessage::Heartbeat {
+            advertisement,
+            health: ExecutorSubstrateReport::default(),
+            last_update: None,
+            machine: Some(MachineSample {
+                memory: Measurement::measured(
+                    8,
+                    MachineMemory {
+                        total_bytes: 16,
+                        available_bytes: 4,
+                    },
+                ),
+                volume: Measurement::unavailable_with(
+                    9,
+                    MeasurementGap::PermissionDenied,
+                    "EACCES",
+                ),
+                build_volume: Some(Measurement::unavailable(
+                    9,
+                    MeasurementGap::BuildVolumeAbsent,
+                )),
+                ..MachineSample::default()
+            }),
+        };
+        let queued_cell_request = QueuedCellRequest {
+            admission_kind: CellAdmissionKind::Residency,
+            executor_id: "e".into(),
+            request_id: "r".into(),
+            attempt_id: "a".into(),
+            project_id: "p".into(),
+            command: "true".into(),
+            command_class: CellCommandClass::Other,
+            owner: None,
+            priority: CellPriority::WriteCheck,
+            effective_priority: Some(CellPriority::AgentInteractive),
+            requesting_job_id: Some("j".into()),
+            affinity_key: None,
+            command_resource_identity: None,
+            queued_at_unix_ms: 3,
+            resource_reservation: ResourceReservation::default(),
+            learned_estimate: None,
+            subscriber_count: 1,
+            substrate_hold: None,
+            placement: None,
+        };
+        let kind = ResidentProcessKind::DevInstance {
+            source_terminal_session_id: None,
+        };
+        let mut process = sample_resident_process(kind.clone()).spec.unwrap();
+        process.relay = Some(ResidentRelayGrant {
+            relay_id: ResidentRelayId("relay-1".into()),
+        });
+        process.runtime_packages = vec![ResidentRuntimeAsset {
+            path: "@cairn/sdk/package.json".into(),
+            data: b"{}".to_vec(),
+        }];
+        let start_process = ResidencyOperation::StartProcess {
+            fence: ResidencyFence {
+                holder: sample_holder(),
+                incarnation_id: "incarnation".into(),
+                cell_epoch: 3,
+            },
+            process_key: "dev".into(),
+            kind,
+            process,
+            reservation: None,
+        };
+        WireVocabularyFrames {
+            hello,
+            heartbeat,
+            cell_request: sample_request(),
+            queued_cell_request,
+            start_process,
+            executor_bound_lines: vec![
+                describe_executor_bound("linux", Some(&bounds)),
+                describe_executor_bound("linux", None),
+                describe_executor_bound("macos", None),
+                describe_executor_bound("windows", Some(&ServiceBounds::default())),
+            ],
+            env_names: [
+                EXECUTOR_RUNNER_URL_ENV,
+                EXECUTOR_AUTH_TOKEN_ENV,
+                EXECUTOR_CAIRN_HOME_ENV,
+                EXECUTOR_ID_ENV,
+                EXECUTOR_DEVICE_ID_ENV,
+                EXECUTOR_DISPLAY_NAME_ENV,
+                EXECUTOR_PROJECTS_ENV,
+                EXECUTOR_ENROLLMENT_TOKEN_ENV,
+                EXECUTOR_RUNNER_DEVICE_ID_ENV,
+                EXECUTOR_SUPERVISION_NONCE_ENV,
+            ]
+            .map(String::from)
+            .to_vec(),
+            runtime_asset_limits: vec![
+                MAX_RESIDENT_RUNTIME_ASSET_BYTES,
+                MAX_RESIDENT_RUNTIME_ASSETS_BYTES,
+                MAX_RESIDENT_RUNTIME_ASSETS,
+            ],
+        }
+    }
+
+    /// The frames that carry the vocabulary `wire_vocabulary.rs` holds, as the
+    /// bytes this serializer emits: written before that vocabulary moved out of
+    /// this file, so the move is shown to leave every frame byte for byte as
+    /// it was. The fixture also decodes and re-encodes to itself.
+    ///
+    /// Regenerate with `UPDATE_FIXTURES=1 cargo test -p cairn-common
+    /// moved_vocabulary_frames` only for a deliberate wire change.
+    #[test]
+    fn moved_vocabulary_frames_are_byte_identical() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/executor-wire-vocabulary-frames.json");
+        let rendered = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&wire_vocabulary_frames()).unwrap()
+        );
+        if std::env::var_os("UPDATE_FIXTURES").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &rendered).unwrap();
+        }
+        let checked_in = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            checked_in,
+            rendered,
+            "{} no longer matches what this serializer emits: a moved wire item \
+             changed shape.",
+            path.display()
+        );
+        let decoded: WireVocabularyFrames = serde_json::from_str(&checked_in).unwrap();
+        assert_eq!(
+            format!("{}\n", serde_json::to_string_pretty(&decoded).unwrap()),
+            checked_in
         );
     }
 

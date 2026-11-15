@@ -3003,7 +3003,7 @@ pub(crate) mod slot_publication_tests {
             owner: None,
             cwd: String::new(),
             env: Vec::new(),
-            priority: cairn_common::executor_protocol::CellPriority::ReviewCheck,
+            priority: cairn_common::wire_vocabulary::CellPriority::ReviewCheck,
             wait_horizon_unix_ms: u64::MAX,
             waiting_since_unix_ms: 0,
             timeout_ms: 1_000,

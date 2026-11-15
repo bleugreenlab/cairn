@@ -80,7 +80,7 @@ pub enum DispatchOrigin {
 /// The resident process a relay verified a call came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayedProcess {
-    pub relay_id: crate::executor_protocol::ResidentRelayId,
+    pub relay_id: crate::wire_vocabulary::ResidentRelayId,
     pub process_key: String,
 }
 

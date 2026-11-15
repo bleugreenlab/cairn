@@ -5,8 +5,9 @@
 
 use crate::agent_process::process::{AgentProcessState, RunnerMemoryObserver};
 use crate::services::EventEmitter;
-use cairn_common::executor_protocol::{Measurement, MeasurementGap, MACHINE_SAMPLE_INTERVAL_MS};
+use cairn_common::executor_protocol::MACHINE_SAMPLE_INTERVAL_MS;
 use cairn_common::process_identity::ProcessAnchor;
+use cairn_common::wire_vocabulary::{Measurement, MeasurementGap};
 use cairn_procmem::{
     BatchObserver, ProcessTreeSampler, SamplingStatus, TickBatch, TickClocks, WatchId,
 };

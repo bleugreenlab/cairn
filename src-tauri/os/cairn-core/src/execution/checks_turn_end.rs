@@ -4190,11 +4190,12 @@ mod tests {
     use super::*;
     use crate::execution::checks_status::{NodeCheckState, NodeCheckStatus};
     use cairn_common::executor_protocol::{
-        ActiveCellRequest, CellAdmissionKind, CellCheckoutKind, CellCommandClass, CellOccupancy,
-        CellOwnerRef, CellPriority, CellResidency, OwnerDeathPolicy, PersistentCellLifecycle,
-        PersistentCellState, QueuedCellRequest, RepositoryLocator, ResidencyFootprint,
-        ResidencyHolder, ResidencyPhase, ResourceReservation,
+        ActiveCellRequest, CellCheckoutKind, CellCommandClass, CellOccupancy, CellOwnerRef,
+        CellResidency, OwnerDeathPolicy, PersistentCellLifecycle, PersistentCellState,
+        QueuedCellRequest, RepositoryLocator, ResidencyFootprint, ResidencyHolder, ResidencyPhase,
+        ResourceReservation,
     };
+    use cairn_common::wire_vocabulary::{CellAdmissionKind, CellPriority};
 
     fn timed_lane(
         slot: &str,

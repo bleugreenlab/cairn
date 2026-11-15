@@ -313,7 +313,7 @@ fn enforced_bounds_are_read_from_the_units_cgroup() {
     }
     assert_eq!(
         read_enforced_bounds(root.path(), UNIT_CGROUP, watchdog),
-        Some(crate::executor_protocol::ServiceBounds {
+        Some(crate::wire_vocabulary::ServiceBounds {
             memory_max_bytes: Some(12_079_595_520),
             swap_max_bytes: Some(0),
             tasks_max: Some(18_714),
@@ -331,7 +331,7 @@ fn enforced_bounds_are_read_from_the_units_cgroup() {
 /// The page's line, which the fleet panel's `executorBoundText` mirrors.
 #[test]
 fn the_executor_bound_line_names_the_bound_or_why_there_is_none() {
-    use crate::executor_protocol::{describe_executor_bound, ServiceBounds};
+    use crate::wire_vocabulary::{describe_executor_bound, ServiceBounds};
     let bounds = ServiceBounds {
         memory_max_bytes: Some(12_079_595_520),
         swap_max_bytes: Some(0),

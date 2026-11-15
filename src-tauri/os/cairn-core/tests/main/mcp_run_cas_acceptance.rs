@@ -16,12 +16,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use cairn_common::executor_protocol::{
-    CatalogFetchResponse, CatalogPackDescriptor, CellCommandClass, CellOutcome, CellPriority,
-    CellRequest, CloudObjectGrant, CloudObjectGrantRequest, CloudObjectOperation,
-    DeltaUploadReceipt, MutationDeltaUploadRequest, MutationPolicy, ObjectFetchFailure,
-    ObjectFetchFailureCode, ObjectTransferCoordinate, RepositoryLocator,
-    CLOUD_OBJECT_GRANT_VERSION,
+    CatalogFetchResponse, CatalogPackDescriptor, CellCommandClass, CellOutcome, CellRequest,
+    CloudObjectGrant, CloudObjectGrantRequest, CloudObjectOperation, DeltaUploadReceipt,
+    MutationDeltaUploadRequest, MutationPolicy, ObjectFetchFailure, ObjectFetchFailureCode,
+    ObjectTransferCoordinate, RepositoryLocator, CLOUD_OBJECT_GRANT_VERSION,
 };
+use cairn_common::wire_vocabulary::CellPriority;
 use cairn_core::internal::orchestrator::object_plane::{
     content_sha256, object_fetch_refusal, open_runner_fetch, RunnerFetchRequest,
 };

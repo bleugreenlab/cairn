@@ -172,9 +172,9 @@ pub const CALLBACK_CREDENTIAL_ENV: &str = "CAIRN_MCP_SECRET";
 /// credential, on a colocated executor), its enrollment token, and the nonce its
 /// supervisor admits it by. They are the executor's alone, on every platform.
 pub const EXECUTOR_LAUNCH_CREDENTIAL_ENV: [&str; 3] = [
-    crate::executor_protocol::EXECUTOR_AUTH_TOKEN_ENV,
-    crate::executor_protocol::EXECUTOR_ENROLLMENT_TOKEN_ENV,
-    crate::executor_protocol::EXECUTOR_SUPERVISION_NONCE_ENV,
+    crate::wire_vocabulary::EXECUTOR_AUTH_TOKEN_ENV,
+    crate::wire_vocabulary::EXECUTOR_ENROLLMENT_TOKEN_ENV,
+    crate::wire_vocabulary::EXECUTOR_SUPERVISION_NONCE_ENV,
 ];
 
 /// Every credential that never reaches the launch environment of a process

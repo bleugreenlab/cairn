@@ -2,13 +2,13 @@ use crate::fleet::placement::PlacementRefusal;
 use crate::fleet::unix_time_ms;
 use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::{
-    CellPriority, ExecutorSelector, OwnerDeathPolicy, ProcessSandboxMode, RepositoryLocator,
+    ExecutorSelector, OwnerDeathPolicy, ProcessSandboxMode, RepositoryLocator,
     ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence, ResidencyFootprint,
     ResidencyHolder, ResidencyOperation, ResidencyResult, ResidentProcessCwdRoot,
     ResidentProcessEvent, ResidentProcessEventKind, ResidentProcessIoMode, ResidentProcessKind,
-    ResidentProcessSpec, ResidentProcessStatus, ResidentProcessStream, ResidentRuntimeAsset,
-    ResidentStreamFraming,
+    ResidentProcessSpec, ResidentProcessStatus, ResidentProcessStream, ResidentStreamFraming,
 };
+use cairn_common::wire_vocabulary::{CellPriority, ResidentRuntimeAsset};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};

@@ -18,9 +18,8 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cairn_common::executor_protocol::{
-    CompileCacheHealth, CompileCacheState, CompileCacheStats, Measurement, MeasurementGap,
-};
+use cairn_common::executor_protocol::{CompileCacheHealth, CompileCacheState, CompileCacheStats};
+use cairn_common::wire_vocabulary::{Measurement, MeasurementGap};
 use sha2::{Digest, Sha256};
 
 use crate::config::build_services::{

@@ -1507,7 +1507,8 @@ mod tests {
 
     #[test]
     fn request_authorization_binds_every_coordinate_dimension() {
-        use cairn_common::executor_protocol::{CellPriority, MutationPolicy, RepositoryLocator};
+        use cairn_common::executor_protocol::{MutationPolicy, RepositoryLocator};
+        use cairn_common::wire_vocabulary::CellPriority;
         let state = ObjectPlaneState::default();
         let request = CellRequest {
             request_id: "request".into(),

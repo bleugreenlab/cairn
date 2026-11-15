@@ -35,8 +35,9 @@ use cairn_common::executor_protocol::{
     ExecutorSelector, ProcessSandboxMode, ResidencyFence, ResidencyHolder, ResidencyOperation,
     ResidencyResult, ResidentProcessCwdRoot, ResidentProcessEvent, ResidentProcessEventKind,
     ResidentProcessIoMode, ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus,
-    ResidentProcessStream, ResidentRuntimeAsset, ResidentStreamFraming,
+    ResidentProcessStream, ResidentStreamFraming,
 };
+use cairn_common::wire_vocabulary::ResidentRuntimeAsset;
 use store::{ReplExitReason, ReplRowStatus};
 
 /// Max bytes retained for a single exchange's stdout/stderr capture. Output

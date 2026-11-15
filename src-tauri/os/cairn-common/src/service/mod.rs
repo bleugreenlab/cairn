@@ -192,7 +192,7 @@ pub fn machine_facts() -> Option<MachineFacts> {
 /// cgroup `/proc/self/cgroup` names and the watchdog systemd armed, so what
 /// is reported is what is enforced rather than what a template meant. `None`
 /// where nothing bounds it, including everywhere but Linux.
-pub fn enforced_bounds() -> Option<crate::executor_protocol::ServiceBounds> {
+pub fn enforced_bounds() -> Option<crate::wire_vocabulary::ServiceBounds> {
     #[cfg(target_os = "linux")]
     {
         let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
@@ -201,7 +201,7 @@ pub fn enforced_bounds() -> Option<crate::executor_protocol::ServiceBounds> {
             &cgroup,
             sd_notify::watchdog().map(sd_notify::SystemdWatchdog::interval),
         )
-        .map(|bounds| crate::executor_protocol::ServiceBounds {
+        .map(|bounds| crate::wire_vocabulary::ServiceBounds {
             host_memory_bytes: crate::memory::host_total_bytes(),
             ..bounds
         });
@@ -217,7 +217,7 @@ fn read_enforced_bounds(
     root: &Path,
     proc_self_cgroup: &str,
     watchdog: Option<std::time::Duration>,
-) -> Option<crate::executor_protocol::ServiceBounds> {
+) -> Option<crate::wire_vocabulary::ServiceBounds> {
     let relative = crate::memory::unified_cgroup_path(proc_self_cgroup)?.trim_start_matches('/');
     let unit = root.join(relative);
     let limit = |file: &str| -> Option<u64> {
@@ -227,7 +227,7 @@ fn read_enforced_bounds(
             .parse()
             .ok()
     };
-    let bounds = crate::executor_protocol::ServiceBounds {
+    let bounds = crate::wire_vocabulary::ServiceBounds {
         memory_max_bytes: limit("memory.max"),
         swap_max_bytes: limit("memory.swap.max"),
         tasks_max: limit("pids.max"),

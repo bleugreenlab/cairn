@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::executor_protocol::{
+use crate::wire_vocabulary::{
     CellAdmissionKind, CellPriority, Measurement, MeasurementGap, MeasurementReading,
 };
 

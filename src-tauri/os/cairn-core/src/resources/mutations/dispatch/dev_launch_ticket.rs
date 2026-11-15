@@ -112,7 +112,8 @@ mod tests {
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, SearchIndex};
-    use cairn_common::executor_protocol::{RelayAuthorization, ResidencyHolder, ResidentRelayId};
+    use cairn_common::executor_protocol::{RelayAuthorization, ResidencyHolder};
+    use cairn_common::wire_vocabulary::ResidentRelayId;
     use std::sync::Arc;
 
     const TICKET: &str = "cairn://dev/launch-ticket";

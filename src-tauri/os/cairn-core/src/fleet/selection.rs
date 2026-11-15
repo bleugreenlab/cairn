@@ -5748,11 +5748,12 @@ pub(super) fn placement_prediction_with_contention(
 /// nothing: unmeasured is never zero, and a stale stall is not this machine
 /// now.
 pub(super) fn priced_stall_share<T>(
-    reading: &cairn_common::executor_protocol::Measurement<T>,
+    reading: &cairn_common::wire_vocabulary::Measurement<T>,
     now_unix_ms: u64,
     share: impl Fn(&T) -> u32,
 ) -> Result<u32, cairn_common::executor_protocol::HostStallPrice> {
-    use cairn_common::executor_protocol::{HostStallPrice, MeasurementGap};
+    use cairn_common::executor_protocol::HostStallPrice;
+    use cairn_common::wire_vocabulary::MeasurementGap;
     match reading.value() {
         None => Err(HostStallPrice::Unmeasured {
             gap: reading.gap().unwrap_or(MeasurementGap::NotSampled),
@@ -5968,7 +5969,7 @@ pub(super) fn blind_only_for_want_of_a_first_sample(
     machine: &cairn_common::executor_protocol::MachineTelemetry,
     now_unix_ms: u64,
 ) -> bool {
-    use cairn_common::executor_protocol::MeasurementGap;
+    use cairn_common::wire_vocabulary::MeasurementGap;
     let gaps = machine.placement_gaps();
     !gaps.is_empty()
         && gaps
