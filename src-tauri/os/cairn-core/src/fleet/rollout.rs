@@ -2364,6 +2364,14 @@ mod tests {
             );
             assert!(!rollout.holds(&machine.executor_id));
             assert!(step.direct.is_none());
+            assert!(
+                matches!(
+                    phase(&rollout, &machine, &artifacts),
+                    SelfUpdatePhase::WaitingForSettlement { ref blockers, .. }
+                        if blockers == &["`suite/attempt-1`".to_string()]
+                ),
+                "stale progress cannot erase a still-listed physical holder"
+            );
         }
     }
 

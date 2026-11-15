@@ -9312,6 +9312,13 @@ pub struct LearnedResourceEstimate {
 /// What a runner gets wrong talking to an older executor: nothing; it receives
 /// the same result and acknowledgement vocabulary and can settle that result
 /// even when the consumer has gone away.
+/// cairn/7197 does not move the number. The runner reconciles disappearance
+/// only after the same ordered snapshot stream witnessed the exact grant;
+/// older executors already take that hold before spawning and retain it through
+/// result acknowledgement. No frame or field changes, and an older executor
+/// gets the same grants and acknowledgements. Unserialized SnapshotResponse
+/// frames are no longer used as authoritative accounts; production sends no
+/// SnapshotRequest. Mixed versions therefore do not misread any wire evidence.
 ///
 /// Version 172 (cairn/7167) replaces the runner object fetch's single raw
 /// pack with a versioned stream of independently validated, non-thin packs

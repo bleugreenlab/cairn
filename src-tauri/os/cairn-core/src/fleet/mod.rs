@@ -4028,6 +4028,9 @@ struct ExecutorConnectionState {
     /// received after any moment was built after that moment: this count is
     /// how a reader proves an advertisement is causally fresh.
     snapshots_received: u64,
+    /// Grants observed on this connection's ordered stream, kept through
+    /// completion-only accounts until the attempt is fully absent.
+    witnessed_grants: HashSet<RequestIdentity>,
     last_progress_unix_ms: u64,
     health: Arc<ExecutorSubstrateReport>,
     /// Whether this executor publishes [`MachineSample`]s. Once it has, no
@@ -4896,6 +4899,7 @@ impl Fleet {
             sender,
             snapshot: Arc::default(),
             snapshots_received: 0,
+            witnessed_grants: HashSet::new(),
             last_progress_unix_ms: unix_time_ms(),
             health: Arc::default(),
             publishes_machine_samples: false,
@@ -7178,10 +7182,11 @@ impl Fleet {
                 }
                 false
             }
-            ExecutorMessage::SnapshotResponse {
-                snapshot, health, ..
-            }
-            | ExecutorMessage::SnapshotUpdated { snapshot, health } => {
+            // Solicited responses are composed outside the serialized snapshot
+            // publisher and can arrive after a newer account. They cannot
+            // replace posted state or establish disappearance.
+            ExecutorMessage::SnapshotResponse { .. } => false,
+            ExecutorMessage::SnapshotUpdated { snapshot, health } => {
                 self.apply_executor_snapshot(executor_id, generation, snapshot, health)
             }
             ExecutorMessage::Heartbeat {
@@ -7269,21 +7274,36 @@ impl Fleet {
         snapshot: FleetSnapshot,
         health: ExecutorSubstrateReport,
     ) -> bool {
+        // Read before storing this account. A grant witnessed on this same
+        // ordered stream proves the executor handled Granted, including taking
+        // its hold before spawning work. An earlier empty snapshot can cross a
+        // start still in flight and is not evidence of death.
+        let Some((first_of_connection, witnessed)) =
+            self.lock_connections()
+                .get_mut(executor_id)
+                .filter(|entry| entry.generation == generation)
+                .map(|entry| {
+                    entry.witnessed_grants.extend(
+                        snapshot.granted_attempts.iter().map(|attempt| {
+                            (attempt.request_id.clone(), attempt.attempt_id.clone())
+                        }),
+                    );
+                    (
+                        entry.snapshots_received == 0,
+                        entry.witnessed_grants.clone(),
+                    )
+                })
+        else {
+            return false;
+        };
         self.reconcile_held_executions(executor_id, generation, &snapshot);
-        // Read before the snapshot is stored, which is what counts it.
-        let first_of_connection = self
-            .lock_connections()
-            .get(executor_id)
-            .filter(|entry| entry.generation == generation)
-            .map(|entry| entry.snapshots_received == 0);
-        if let Some(first_of_connection) = first_of_connection {
-            self.settle_purpose_debts_from_account(
-                executor_id,
-                generation,
-                first_of_connection,
-                &snapshot,
-            );
-        }
+        self.reconcile_witnessed_attempts(executor_id, generation, &witnessed, &snapshot);
+        self.settle_purpose_debts_from_account(
+            executor_id,
+            generation,
+            first_of_connection,
+            &snapshot,
+        );
         // New posted state is what makes reconsidering a machine that declined
         // meaningful, but only state that bears on the reason it gave: a
         // snapshot whose free-disk figure moved says nothing new about a CPU
@@ -17253,6 +17273,79 @@ impl Fleet {
         rebound
     }
 
+    /// An ordered account after a witnessed grant can prove loss without a
+    /// reconnect. The grant hold spans every start phase and retained result;
+    /// serialized publication prevents a pre-start account overtaking it.
+    fn reconcile_witnessed_attempts(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        witnessed: &HashSet<RequestIdentity>,
+        snapshot: &FleetSnapshot,
+    ) {
+        let absent: HashSet<RequestIdentity> = witnessed
+            .iter()
+            .filter(|key| {
+                !snapshot
+                    .granted_attempts
+                    .iter()
+                    .any(|a| (&a.request_id, &a.attempt_id) == (&key.0, &key.1))
+                    && !snapshot
+                        .executing_requests
+                        .iter()
+                        .any(|a| (&a.request_id, &a.attempt_id) == (&key.0, &key.1))
+                    && !snapshot
+                        .queued_requests
+                        .iter()
+                        .any(|a| (&a.request_id, &a.attempt_id) == (&key.0, &key.1))
+                    && !snapshot
+                        .recent_completions
+                        .iter()
+                        .any(|a| (&a.request_id, &a.attempt_id) == (&key.0, &key.1))
+            })
+            .cloned()
+            .collect();
+        if absent.is_empty() {
+            return;
+        }
+        let protected = self.protected_check_claims(executor_id);
+        for key in &absent {
+            self.account_witnessed_check_absence(executor_id, generation, key);
+            self.queue.settle(
+                key,
+                Some((executor_id, generation)),
+                queue::TerminalState::Completed,
+                executor_unavailable(format!(
+                    "executor {executor_id} no longer lists witnessed request {} attempt {} at generation {generation}; no result is coming",
+                    key.0, key.1
+                )),
+                unix_time_ms(),
+            );
+        }
+        let settled =
+            self.purposes
+                .lock()
+                .unwrap()
+                .settle_on_machine(executor_id, |key, placement| {
+                    placement.generation == generation
+                        && !placement.awaiting_post_boot_account
+                        && absent.contains(key)
+                        && !protected.contains(key)
+                });
+        self.note_purpose_settlements(
+            &settled,
+            "the machine's ordered same-generation report no longer lists its witnessed grant",
+        );
+        if let Some(entry) = self
+            .lock_connections()
+            .get_mut(executor_id)
+            .filter(|entry| entry.generation == generation)
+        {
+            entry.witnessed_grants.retain(|key| !absent.contains(key));
+        }
+        self.binding_changed.notify_waiters();
+    }
+
     /// Settle work held across a gap against what the machine says it has.
     ///
     /// The first snapshot of the new connection is the machine's own account of
@@ -25656,7 +25749,9 @@ mod tests {
         item
     }
 
-    fn completion_of(item: &RequestIdentity) -> cairn_common::executor_protocol::CellCompletion {
+    pub(super) fn completion_of(
+        item: &RequestIdentity,
+    ) -> cairn_common::executor_protocol::CellCompletion {
         cairn_common::executor_protocol::CellCompletion {
             executor_id: String::new(),
             request_id: item.0.clone(),
@@ -26510,6 +26605,48 @@ mod tests {
             ),
             "the settlement names the generation that lost the work: {outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_witnessed_grant_disappearing_on_the_same_connection_settles_its_waiter() {
+        let pool = Fleet::default();
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(sender);
+        let key = ("request".to_string(), "attempt".to_string());
+        let mut result_rx = claim_entry(&pool, &key, COLOCATED_EXECUTOR_ID, generation, None);
+        let apply = |snapshot| {
+            pool.apply_executor_snapshot(
+                COLOCATED_EXECUTOR_ID,
+                generation,
+                snapshot,
+                ExecutorSubstrateReport::default(),
+            );
+        };
+        apply(FleetSnapshot::default());
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        apply(FleetSnapshot {
+            granted_attempts: vec![cairn_common::executor_protocol::GrantedAttempt {
+                request_id: key.0.clone(),
+                attempt_id: key.1.clone(),
+            }],
+            ..FleetSnapshot::default()
+        });
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        apply(FleetSnapshot::default());
+        assert!(matches!(
+            result_rx.await.unwrap(),
+            CellOutcome::Unavailable {
+                reason: CellUnavailableReason::ExecutorUnavailable,
+                ref diagnostic,
+            } if diagnostic.contains("no longer lists witnessed request")
+        ));
+        assert!(!pool.queue.holds(&key));
     }
 
     /// Granted work that has not spawned a process yet (acquiring its cell,
@@ -31112,6 +31249,7 @@ mod tests {
                 sender,
                 snapshot: Arc::default(),
                 snapshots_received: 0,
+                witnessed_grants: HashSet::new(),
                 last_progress_unix_ms: observed_at_unix_ms,
                 health: Arc::new(ExecutorSubstrateReport {
                     applied_policy: cairn_common::executor_protocol::ExecutorRuntimePolicy {
@@ -31989,7 +32127,7 @@ mod tests {
         assert!(refusal.contains("requires bun"), "{refusal}");
         assert!(!refusal.contains("bbs"), "{refusal}");
 
-        request.project_requirements = Default::default();
+        *request.project_requirements = Default::default();
         request.verdict_platforms = vec!["linux".into()];
         let refusal = place(&connections, &request).expect_err("the home is not gated on");
         assert!(refusal.contains("cannot leave local"), "{refusal}");

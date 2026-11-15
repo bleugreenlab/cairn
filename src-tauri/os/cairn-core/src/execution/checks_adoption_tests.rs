@@ -655,6 +655,12 @@ pub(super) fn batch_item(
 
 #[tokio::test]
 #[serial_test::serial(jj)]
+async fn cadence_joining_a_three_suite_manual_grant_survives_restart_and_acks_after_all_rows() {
+    shared_manual_batch(false, false, false, false, false).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(jj)]
 async fn a_rejected_second_observation_retains_the_entire_batch_until_the_store_recovers() {
     shared_manual_batch(true, false, false, false, false).await;
 }

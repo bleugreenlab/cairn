@@ -1423,6 +1423,30 @@ impl Fleet {
             .collect()
     }
 
+    pub(super) fn account_witnessed_check_absence(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        key: &RequestIdentity,
+    ) {
+        if !self
+            .check_claim(key)
+            .is_some_and(|claim| claim.executor_id == executor_id)
+        {
+            return;
+        }
+        let received = self.check_adoptions.lock().unwrap().received.contains(key);
+        if received {
+            self.retry_check_settlement(key);
+        } else {
+            self.authorize_check_release(key);
+            self.settle_check_claim(key, "lost", format!(
+                "executor {executor_id}'s ordered report at connection generation {generation} omits request {} attempt {} after reporting its grant; no result was received",
+                key.0, key.1
+            ), true);
+        }
+    }
+
     pub(super) fn account_check_claims(
         &self,
         executor_id: &str,
@@ -3161,6 +3185,216 @@ mod tests {
                 | ExecutorMessage::Offer { .. }
         )));
         assert!(orch.fleet.check_claim(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_check_result_releases_update_only_after_durable_settlement_and_ack() {
+        let source = claim("write", "running");
+        let key = identity(&source);
+        let (fleet, db, mut remote) = fixture(source.clone()).await;
+        let now = super::super::unix_time_ms() - super::super::rollout::UNMEASURED_HOLD_MS;
+        {
+            let mut connections = fleet.lock_connections();
+            let entry = connections.get_mut(&source.executor_id).unwrap();
+            entry.executor_build_id = Some("old".into());
+            entry.snapshots_received = 2;
+            fleet.executor_artifact_builds.lock().unwrap().insert(
+                super::super::executor_artifact_target(entry)
+                    .unwrap()
+                    .into(),
+                super::super::rollout::ArtifactBuild::Resolved("new".into()),
+            );
+        }
+        let advance = |at| fleet.advance_self_update_rollout(at, |_| Ok(())).unwrap();
+        let generation = fleet.link_generation(&source.executor_id).unwrap();
+        {
+            let mut state = fleet.check_adoptions.lock().unwrap();
+            state.reloaded.remove(&key);
+            state.direct.insert(key.clone(), Some(generation));
+        }
+        fleet.apply_executor_snapshot(
+            &source.executor_id,
+            generation,
+            FleetSnapshot {
+                granted_attempts: vec![cairn_common::executor_protocol::GrantedAttempt {
+                    request_id: key.0.clone(),
+                    attempt_id: key.1.clone(),
+                }],
+                ..FleetSnapshot::default()
+            },
+            Default::default(),
+        );
+        advance(now);
+        {
+            let entry = fleet.lock_connections()[&source.executor_id].clone();
+            let candidate = super::super::rollout_candidate(&entry, now);
+            let status = fleet
+                .self_update
+                .lock()
+                .unwrap()
+                .status(&candidate, &fleet.executor_artifact_builds.lock().unwrap())
+                .unwrap();
+            assert!(matches!(
+                status.phase,
+                cairn_common::executor_protocol::SelfUpdatePhase::Draining { .. }
+            ));
+        }
+        send_result(&fleet, &source);
+        // Even witnessed disappearance cannot discard a received result's
+        // durable settlement debt or authorize its acknowledgement.
+        fleet.apply_executor_snapshot(
+            &source.executor_id,
+            generation,
+            FleetSnapshot::default(),
+            Default::default(),
+        );
+        assert!(fleet.check_claim(&key).is_some());
+        assert!(take_frames(&mut remote).is_empty());
+        advance(now + super::super::rollout::UNMEASURED_HOLD_MS);
+        {
+            let rollout = fleet.self_update.lock().unwrap();
+            let entry = fleet
+                .lock_connections()
+                .get(&source.executor_id)
+                .unwrap()
+                .clone();
+            let candidate = super::super::rollout_candidate(&entry, now);
+            let status = rollout
+                .status(&candidate, &fleet.executor_artifact_builds.lock().unwrap())
+                .unwrap();
+            assert!(matches!(
+                status.phase,
+                cairn_common::executor_protocol::SelfUpdatePhase::WaitingForSettlement {
+                    ref blockers, ..
+                } if blockers.len() == 1
+            ));
+        }
+        assert!(take_frames(&mut remote).is_empty());
+        record_and_deliver(&fleet, &db, &source).await;
+        assert_eq!(
+            store::lookup(&db, &key.0, &key.1)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "recorded"
+        );
+        assert!(matches!(take_frames(&mut remote).as_slice(),
+            [ExecutorMessage::ResultAck { request_id, attempt_id }]
+                if (request_id, attempt_id) == (&key.0, &key.1)));
+        assert!(fleet.check_claim(&key).is_none());
+        for tick in 1..=4 {
+            fleet.apply_executor_snapshot(
+                &source.executor_id,
+                fleet.link_generation(&source.executor_id).unwrap(),
+                FleetSnapshot::default(),
+                Default::default(),
+            );
+            advance(now + super::super::rollout::UNMEASURED_HOLD_MS + tick);
+        }
+        assert!(take_frames(&mut remote).iter().any(|frame|
+            matches!(frame, ExecutorMessage::UpdateDirected { build_id, .. } if build_id == "new")));
+    }
+
+    #[tokio::test]
+    async fn authoritative_same_generation_absence_releases_update_but_prestart_and_stale_do_not() {
+        let source = claim("write", "running");
+        let key = identity(&source);
+        let (fleet, db, mut remote) = fixture(source.clone()).await;
+        let generation = fleet.link_generation(&source.executor_id).unwrap();
+        {
+            let mut state = fleet.check_adoptions.lock().unwrap();
+            state.reloaded.remove(&key);
+            state.direct.insert(key.clone(), Some(generation));
+        }
+        let now = unix_time_ms() - super::super::rollout::UNMEASURED_HOLD_MS;
+        {
+            let mut connections = fleet.lock_connections();
+            let entry = connections.get_mut(&source.executor_id).unwrap();
+            entry.executor_build_id = Some("old".into());
+            entry.snapshots_received = 2;
+            fleet.executor_artifact_builds.lock().unwrap().insert(
+                super::super::executor_artifact_target(entry)
+                    .unwrap()
+                    .into(),
+                super::super::rollout::ArtifactBuild::Resolved("new".into()),
+            );
+        }
+        let advance = |at| fleet.advance_self_update_rollout(at, |_| Ok(())).unwrap();
+        let apply = |generation, snapshot| {
+            fleet.apply_executor_snapshot(
+                &source.executor_id,
+                generation,
+                snapshot,
+                ExecutorSubstrateReport::default(),
+            );
+        };
+        advance(now);
+        // A grant can still be in flight: repeated empty accounts are not death.
+        apply(generation, FleetSnapshot::default());
+        apply(generation, FleetSnapshot::default());
+        advance(now + super::super::rollout::UNMEASURED_HOLD_MS);
+        assert!(fleet.check_claim(&key).is_some());
+        assert!(take_frames(&mut remote).is_empty());
+        apply(
+            generation,
+            FleetSnapshot {
+                granted_attempts: vec![cairn_common::executor_protocol::GrantedAttempt {
+                    request_id: key.0.clone(),
+                    attempt_id: key.1.clone(),
+                }],
+                ..FleetSnapshot::default()
+            },
+        );
+        // A solicited response was not composed by the ordered publisher and
+        // cannot overwrite the witness or establish absence.
+        fleet.handle_executor_message(
+            &source.executor_id,
+            generation,
+            ExecutorMessage::SnapshotResponse {
+                correlation_id: "stale-response".into(),
+                snapshot: FleetSnapshot::default(),
+                health: ExecutorSubstrateReport::default(),
+            },
+        );
+        assert!(fleet.check_claim(&key).is_some());
+        // A dead link's late account cannot erase the current grant witness.
+        apply(generation.saturating_sub(1), FleetSnapshot::default());
+        assert!(fleet.check_claim(&key).is_some());
+        assert!(take_frames(&mut remote).is_empty());
+        // Bounded display history may outlive a vanished grant. It must not
+        // erase the causal witness when that history subsequently ages out.
+        apply(
+            generation,
+            FleetSnapshot {
+                recent_completions: vec![super::super::tests::completion_of(&key)],
+                ..FleetSnapshot::default()
+            },
+        );
+        assert!(fleet.check_claim(&key).is_some());
+        assert!(take_frames(&mut remote).is_empty());
+        apply(generation, FleetSnapshot::default());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fleet.check_claim(&key).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authoritative disappearance must settle without a reconnect");
+        assert_eq!(
+            store::lookup(&db, &key.0, &key.1)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "lost"
+        );
+        for tick in 1..=4 {
+            apply(generation, FleetSnapshot::default());
+            advance(now + super::super::rollout::UNMEASURED_HOLD_MS + tick);
+        }
+        assert!(take_frames(&mut remote).iter().any(|frame|
+            matches!(frame, ExecutorMessage::UpdateDirected { build_id, .. } if build_id == "new")));
     }
 
     #[tokio::test]
