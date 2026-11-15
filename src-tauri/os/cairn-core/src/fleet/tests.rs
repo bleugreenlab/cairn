@@ -12990,7 +12990,7 @@ fn executor_unit_bound_is_hard_but_planning_ceiling_is_not() {
         measured(&mut state, 0.01, 64 << 30, 500 << 30);
         Arc::make_mut(&mut state.advertisement)
             .capabilities
-            .service_bounds = Some(cairn_common::executor_protocol::ServiceBounds {
+            .service_bounds = Some(cairn_common::wire_vocabulary::ServiceBounds {
             memory_max_bytes: bound,
             ..Default::default()
         });
