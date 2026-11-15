@@ -165,6 +165,7 @@ pub(super) async fn dispatch(
                     )
                     .await?
                 } else if dry_run {
+                    validate_wake_source(index, item, &filter)?;
                     format!(
                         "Would subscribe wake: {} {:?}",
                         filter.kind, filter.reference
@@ -262,6 +263,10 @@ pub(super) async fn dispatch(
                         None => None,
                     };
                     if dry_run {
+                        validate_wake_source(index, item, &filter)?;
+                        if let Some(until) = &until {
+                            validate_wake_source(index, item, until)?;
+                        }
                         format!("Would mute wake: {} {:?}", filter.kind, filter.reference)
                     } else {
                         let sub = crate::orchestrator::wakes::mute(
@@ -379,6 +384,7 @@ pub(super) async fn dispatch(
                 )
                 .await?;
                 if dry_run {
+                    validate_wake_source(index, item, &filter)?;
                     format!("Would unmute wake: {} {:?}", filter.kind, filter.reference)
                 } else {
                     let count = crate::orchestrator::wakes::unmute_matching(
@@ -459,17 +465,28 @@ pub(super) async fn dispatch(
                     format!("Removed {} wake {}(s)", usize::from(changed), kind.label())
                 }
             } else {
-                let filter = normalize_posts_filter(
+                let filter = normalize_checks_filter(
+                    orch,
                     index,
                     item,
-                    normalize_rebuild_filter(
+                    normalize_posts_filter(
                         index,
                         item,
-                        parse_wake_filter(index, item, value, "unsubscribe")?,
-                        project,
+                        normalize_rebuild_filter(
+                            index,
+                            item,
+                            parse_wake_filter(index, item, value, "unsubscribe")?,
+                            project,
+                        )?,
                     )?,
-                )?;
+                    project,
+                    *number,
+                    *exec_seq,
+                    node_id,
+                )
+                .await?;
                 if dry_run {
+                    validate_wake_source(index, item, &filter)?;
                     format!(
                         "Would unsubscribe wake: {} {:?}",
                         filter.kind, filter.reference
@@ -502,6 +519,18 @@ pub(super) fn parse_schedule_reference(
 ) -> ResourceMutationResult<Option<String>> {
     Ok(parse_home_wake_reference(index, item, value, field)?
         .and_then(|(kind, id)| matches!(kind, HomeWakeKind::Schedule).then_some(id)))
+}
+
+/// Refuse in a preview exactly what apply refuses: every stored-subscription
+/// write resolves its normalized filter through `WakeSource::from_parts`.
+fn validate_wake_source(
+    index: usize,
+    item: &ChangeItem,
+    filter: &WakeFilterPayload,
+) -> ResourceMutationResult<()> {
+    crate::orchestrator::wakes::WakeSource::from_parts(&filter.kind, filter.reference.as_deref())
+        .map(drop)
+        .map_err(|error| build_failure(index, item, error))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -798,7 +827,17 @@ fn parse_home_wake_reference(
     };
     let kind = match obj.get("kind").and_then(serde_json::Value::as_str) {
         Some("schedule") => HomeWakeKind::Schedule,
-        Some("condition") => HomeWakeKind::Condition,
+        // A thread's SQL condition is named by its id. A Cairn URI names the
+        // source of a `condition` subscription row instead (what the checks
+        // alias stores), which the subscription path addresses.
+        Some("condition")
+            if !obj
+                .get("ref")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reference| reference.trim().starts_with("cairn:")) =>
+        {
+            HomeWakeKind::Condition
+        }
         _ => return Ok(None),
     };
     let id = obj

@@ -654,7 +654,9 @@ pub async fn unmute_matching(
 /// row to flip, so without a recorded refusal the derivation would keep
 /// re-adding it (CAIRN-3293). An unscoped unsubscribe (`ref` omitted, meaning
 /// "every row of this kind") stays a pure state flip — there is no single source
-/// to tombstone.
+/// to tombstone. Neither does a `condition` source: only an explicit subscription
+/// (the `checks` alias) ever watches one and nothing derives it, so a tombstone
+/// would refuse nothing and an unsubscribe that matched no row reports zero.
 pub async fn unsubscribe_matching(
     db: &LocalDb,
     job_id: &str,
@@ -671,7 +673,7 @@ pub async fn unsubscribe_matching(
         WakeSubscriptionState::Unsubscribed,
     )
     .await?;
-    if changed > 0 {
+    if changed > 0 || matches!(source, WakeSource::Condition { .. }) {
         return Ok(changed);
     }
     let Some(reference) = source.reference() else {
