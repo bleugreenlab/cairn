@@ -1234,11 +1234,32 @@ fn verify_pack_manifest(index_path: &Path) -> Result<Vec<ObjectSize>, String> {
     Ok(objects)
 }
 
+/// Copy `from` to a new file at `to`, durable before it is published.
+///
+/// The flush goes through the handle the bytes were written with: Windows'
+/// `FlushFileBuffers` refuses a read-only handle, and git packs are read-only,
+/// so neither reopening the copy read-only nor reopening it writable after
+/// `fs::copy` carried the read-only attribute across can sync it. The source's
+/// permissions are applied only once the bytes are on disk.
 fn copy_synced(from: &Path, to: &Path) -> Result<(), String> {
-    fs::copy(from, to).map_err(|e| format!("copying {}: {e}", from.display()))?;
-    File::open(to)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| format!("syncing {}: {e}", to.display()))
+    let mut source = File::open(from).map_err(|e| format!("opening {}: {e}", from.display()))?;
+    let permissions = source
+        .metadata()
+        .map_err(|e| format!("reading {}: {e}", from.display()))?
+        .permissions();
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+        .map_err(|e| format!("creating {}: {e}", to.display()))?;
+    std::io::copy(&mut source, &mut destination)
+        .map_err(|e| format!("copying {}: {e}", from.display()))?;
+    destination
+        .sync_all()
+        .map_err(|e| format!("syncing {}: {e}", to.display()))?;
+    drop(destination);
+    fs::set_permissions(to, permissions)
+        .map_err(|e| format!("setting permissions on {}: {e}", to.display()))
 }
 
 /// Run git in `cwd` with its standard output written to `stdout` and its
@@ -1420,6 +1441,32 @@ mod tests {
         let mut trailing = first;
         trailing.push(0);
         assert!(unframe_pack(&trailing).is_err());
+    }
+
+    #[test]
+    fn a_synced_copy_of_a_read_only_file_keeps_its_bytes_and_read_only_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pack-source.pack");
+        let copy = directory.path().join("pack-copy.pack");
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(70_000).collect();
+        fs::write(&source, &bytes).unwrap();
+        let writable = fs::metadata(&source).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_readonly(true);
+        fs::set_permissions(&source, read_only).unwrap();
+
+        let copied = copy_synced(&source, &copy);
+        let copy_read_only = fs::metadata(&copy).map(|m| m.permissions().readonly());
+        let copy_bytes = fs::read(&copy);
+        // Restore write access so the tempdir can be removed on every platform.
+        fs::set_permissions(&source, writable.clone()).unwrap();
+        if copy.exists() {
+            fs::set_permissions(&copy, writable).unwrap();
+        }
+
+        copied.unwrap();
+        assert_eq!(copy_bytes.unwrap(), bytes);
+        assert!(copy_read_only.unwrap());
     }
 
     #[test]
