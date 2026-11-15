@@ -47,6 +47,7 @@ pub mod inference_verify;
 mod integrity_sweep;
 pub(crate) mod landing;
 pub mod lifecycle;
+mod maintenance;
 pub mod model_defaults;
 pub mod model_selection;
 pub mod models;

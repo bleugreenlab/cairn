@@ -150,7 +150,7 @@ const KEEP_REF_GRACE: Duration = Duration::from_secs(60 * 60);
 /// another process on this machine (a dev instance) may still be running.
 const CHECK_REF_GRACE: Duration = Duration::from_secs(60 * 60);
 
-const MEASURE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub(crate) const MEASURE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub(crate) const PRUNE_INTERVAL: Duration = Duration::from_secs(DAY);
 /// An enabled store whose operation log has gone this long without a
 /// truncation is not being bounded, whatever its ref sweeps report. Every
@@ -215,29 +215,7 @@ pub(crate) struct ProjectStore {
     pub(crate) base_branches: Vec<String>,
 }
 
-impl Orchestrator {
-    /// Measure every project's ref store hourly and prune the enabled ones
-    /// daily. Each pass is its own task, so a panic in one is logged and the
-    /// next hour's pass still runs.
-    pub fn spawn_ref_store_maintenance(&self) {
-        let orch = self.clone();
-        tokio::spawn(async move {
-            loop {
-                let pass = orch.clone();
-                let joined = crate::orchestrator::base_advance::supervised_sweep_pass(async move {
-                    run_pass(&pass).await;
-                })
-                .await;
-                if let Err(error) = joined {
-                    log::error!("ref-store maintenance pass ended abnormally: {error}");
-                }
-                tokio::time::sleep(MEASURE_INTERVAL).await;
-            }
-        });
-    }
-}
-
-async fn run_pass(orch: &Orchestrator) {
+pub(crate) async fn run_pass(orch: &Orchestrator) {
     for project in project_stores(orch).await {
         retire_unheld_check_refs(&project).await;
         let started = unix_now();

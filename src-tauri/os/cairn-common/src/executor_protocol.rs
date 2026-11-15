@@ -9346,6 +9346,13 @@ pub struct LearnedResourceEstimate {
 /// causal rather than guessing from a snapshot older than the offer. The
 /// version handshake requires an update before either side
 /// relies on this admission contract.
+///
+/// cairn/7098 does not move the number. The runner-only `fleet/mod.rs` is split
+/// into sibling files (`listener`, `colocated`, `relay_authority`,
+/// `residency_routes`, `purpose_debts`, `selection`, `dispatch`, `health`,
+/// `requirements`), each item moved byte for byte and re-exported from
+/// `fleet/mod.rs` at its original reach. No frame, variant, field or behaviour
+/// changes. What a runner gets wrong talking to an older executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
 
 /// The version `build.rs` derived from the paragraphs above

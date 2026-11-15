@@ -4,28 +4,23 @@
 //! run on. Only Cairn's own home, `~/.cairn/codex`, is pruned; the user's
 //! `~/.codex` is never opened.
 
-use super::cairn_codex_home;
-use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_db::turso::params;
-use cairn_models::session::codex::retention::{
-    prune_codex_home, unix_now, RetentionReport, RetentionStop,
-};
-use std::collections::HashMap;
+use cairn_models::session::codex::retention::{RetentionReport, RetentionStop};
 use std::time::Duration;
 
 /// How long one pass may spend deleting. Codex's `thread/delete` rescans every
 /// rollout's header, about two seconds a thread on a home of 9,500 rollouts,
 /// so a large backlog is worked off over several passes, each cheaper than the
 /// last.
-const PASS_BUDGET: Duration = Duration::from_secs(10 * 60);
+pub(crate) const PASS_BUDGET: Duration = Duration::from_secs(10 * 60);
 
 /// The wait after a pass its budget cut short.
-const BACKLOG_INTERVAL: Duration = Duration::from_secs(30 * 60);
+pub(crate) const BACKLOG_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// The wait after a pass that finished: a day of sessions ages past the
 /// window a few dozen threads at a time.
-const STEADY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+pub(crate) const STEADY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Every Codex thread a Cairn session is bound to, with the unix seconds the
 /// session was last active: its own last update or close, or its runs' latest
@@ -46,72 +41,11 @@ pub(crate) async fn thread_activity(db: &LocalDb, now: i64) -> DbResult<Vec<(Str
     .await
 }
 
-impl Orchestrator {
-    /// Prune Cairn's Codex home now and then on a schedule: again after
-    /// [`BACKLOG_INTERVAL`] while a pass ends on its budget, otherwise after
-    /// [`STEADY_INTERVAL`].
-    pub fn spawn_codex_home_retention(&self) {
-        let orch = self.clone();
-        tokio::spawn(async move {
-            loop {
-                let backlog = orch
-                    .run_codex_home_retention()
-                    .await
-                    .is_some_and(|report| report.stopped == Some(RetentionStop::Budget));
-                tokio::time::sleep(if backlog {
-                    BACKLOG_INTERVAL
-                } else {
-                    STEADY_INTERVAL
-                })
-                .await;
-            }
-        });
-    }
-
-    /// One pass, or `None` when none could run: Codex is not installed, or
-    /// Cairn's session record could not be read, without which nothing is
-    /// deleted.
-    async fn run_codex_home_retention(&self) -> Option<RetentionReport> {
-        let Some(installed) = self.models_runtime().managed.codex.installed() else {
-            log::debug!("Codex home retention skipped: Codex is not installed");
-            return None;
-        };
-        let now = unix_now();
-        let mut activity: HashMap<String, i64> = HashMap::new();
-        for db in self.db.all_dbs().await {
-            match thread_activity(&db, now).await {
-                Ok(rows) => {
-                    for (thread_id, active) in rows {
-                        let latest = activity.entry(thread_id).or_insert(active);
-                        *latest = (*latest).max(active);
-                    }
-                }
-                Err(error) => {
-                    log::warn!(
-                        "Codex home retention skipped: Cairn's session record could not be read: {error}"
-                    );
-                    return None;
-                }
-            }
-        }
-        let codex = installed.path.to_string_lossy().into_owned();
-        let home = cairn_codex_home();
-        let report = tokio::task::spawn_blocking(move || {
-            prune_codex_home(&codex, &home, &activity, now, PASS_BUDGET)
-        })
-        .await
-        .map_err(|error| log::error!("Codex home retention pass ended abnormally: {error}"))
-        .ok()?;
-        log_report(&report);
-        Some(report)
-    }
-}
-
 fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
-fn log_report(report: &RetentionReport) {
+pub(crate) fn log_report(report: &RetentionReport) {
     let summary = format!(
         "Codex home retention: {} threads ({}) scanned; kept {} with an active session and {} written recently; \
          {} idle ({}): deleted {}, already gone {}, refused {}, not reached {}; reclaimed {} in {:.1}s",
