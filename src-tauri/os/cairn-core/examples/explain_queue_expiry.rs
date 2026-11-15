@@ -64,7 +64,10 @@ const EXPIRE_ENTRY: &str = "INSERT OR IGNORE INTO execution_queue(
      SELECT
          live.entry_id || ':expired:restart', live.entry_id, live.sequence + 1, ?1,
          live.request_id, live.attempt_id, live.project_id, 'expired',
-         live.constraints_json, live.scoring_json, live.horizon_unix_ms,
+         live.constraints_json,
+         CASE WHEN live.scoring_json LIKE '{\"placementDecision\":%' THEN '{}'
+              ELSE live.scoring_json END,
+         live.horizon_unix_ms,
          unixepoch() * 1000, 'runner restarted'
      FROM execution_queue live
      WHERE live.entry_id = ?2

@@ -2427,10 +2427,11 @@ fn is_routine_placement(decision: &PlacementDecision) -> bool {
     // A decline is the interesting case by definition: a machine placement
     // chose was asked and said no. Collapsing such a decision into the routine
     // count would hide the one thing the binding chain exists to show.
-    if decision
-        .binding
-        .iter()
-        .any(|event| matches!(event, BindingEvent::Declined { .. }))
+    if decision.binding_elided > 0
+        || decision
+            .binding
+            .iter()
+            .any(|event| matches!(event, BindingEvent::Declined { .. }))
     {
         return false;
     }
@@ -2455,6 +2456,9 @@ fn describe_binding(decision: &PlacementDecision) -> Option<String> {
         return None;
     }
     let mut steps: Vec<String> = Vec::new();
+    if decision.binding_elided > 0 {
+        steps.push(format!("{} earlier steps", decision.binding_elided));
+    }
     for event in &decision.binding {
         match event {
             BindingEvent::Offered { executor_name, .. } => steps.push(executor_name.clone()),
@@ -3778,12 +3782,17 @@ pub(crate) struct JournaledDecision {
     pub(crate) entry_id: String,
     pub(crate) sequence: i64,
     pub(crate) recorded_at_unix_ms: u64,
+    /// Evaluations between the entry's previous decision row and this one
+    /// that repeated a decision already journaled, and so were not written.
+    pub(crate) unchanged_evaluations: u64,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JournaledScoring {
     placement_decision: PlacementDecision,
+    #[serde(default)]
+    unchanged_evaluations: u64,
 }
 
 /// The single-decision view: the runner's recent window first, then the
@@ -3844,6 +3853,7 @@ async fn journaled_placement(
             match serde_json::from_str::<JournaledScoring>(&scoring) {
                 Ok(JournaledScoring {
                     placement_decision: decision,
+                    unchanged_evaluations,
                 }) if decision.request_id == request_id
                     && decision.mentions_executor(executor_id) =>
                 {
@@ -3852,6 +3862,7 @@ async fn journaled_placement(
                         entry_id,
                         sequence,
                         recorded_at_unix_ms: u64::try_from(created_at).unwrap_or(0),
+                        unchanged_evaluations,
                     });
                     return journal;
                 }
@@ -3885,12 +3896,16 @@ pub(crate) fn render_placement(
     );
     if let (None, Some(journaled)) = (recent, journaled) {
         out.push_str(&format!(
-            "- From the queue journal: the runner's recent window no longer holds this decision; read from entry `{}` sequence {}, recorded {}\n",
+            "- From the queue journal: the runner's recent window no longer holds this decision; read from entry `{}` sequence {}, recorded {}, and its figures are as of then{}\n",
             journaled.entry_id,
             journaled.sequence,
             age(executor
                 .captured_at_unix_ms
-                .saturating_sub(journaled.recorded_at_unix_ms))
+                .saturating_sub(journaled.recorded_at_unix_ms)),
+            match journaled.unchanged_evaluations {
+                0 => String::new(),
+                n => format!("; {n} evaluation(s) before it repeated an already-journaled decision and were not written"),
+            }
         ));
     }
     if let Some(journal) = journal.filter(|journal| journal.unreadable > 0) {
@@ -4089,6 +4104,12 @@ fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
     // which is the half that used to leave no evidence but a log line.
     if !decision.binding.is_empty() {
         out.push_str("  - Binding:\n");
+        if decision.binding_elided > 0 {
+            out.push_str(&format!(
+                "    - {} earlier offer/decline steps: see the entry's journal rows\n",
+                decision.binding_elided
+            ));
+        }
         for event in &decision.binding {
             let line = match event {
                 BindingEvent::Offered {
@@ -12880,6 +12901,7 @@ mod tests {
             pinned_executor_id: None,
             unpinned_winner: None,
             binding: Vec::new(),
+            binding_elided: 0,
             policy: None,
             outcome: PlacementOutcome::Selected(Box::new(PlacementSelection {
                 cache_distance: None,

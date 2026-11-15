@@ -262,11 +262,38 @@ pub(crate) struct QueueEntry {
     /// kept rather than erased, so a request that reaches its horizon can still
     /// say who refused it and why.
     pub(crate) declined: HashMap<String, EntryDecline>,
-    /// Offer, claim, decline, in order, for the placement record.
+    /// The newest [`BINDING_TAIL`] offer, claim and decline steps, in order,
+    /// for the placement record. Pushed only through
+    /// [`QueueEntry::push_binding`], which keeps the cap.
+    ///
+    /// The full history is the entry's own journal rows: every step that is
+    /// not folded writes its own `offered`, `queued` (with the decline's
+    /// reason and words) or `claimed` row. The chain is the short context a
+    /// decision carries, not a second home for that history.
     pub(crate) chain: Vec<BindingEvent>,
-    /// The latest journaled decision stays with live work, independent of the
-    /// bounded historical window on the fleet.
+    /// How many steps have been dropped from the front of `chain`.
+    chain_elided: u64,
+    /// Every (machine, reason) this entry has been declined with, for
+    /// [`DeclineRecord::Recorded::repeat`], which must not forget a decline
+    /// that has scrolled out of the tail.
+    declined_reasons: Vec<(String, DeclineReason)>,
+    /// Generations of the claiming machine that ended after the latest claim;
+    /// `None` before any claim. Counted as steps are pushed, so the answer
+    /// does not depend on the claim still being in the tail.
+    connection_drops_since_claim: Option<usize>,
+    /// The latest decision placement made for this entry, journaled or not.
+    /// Stays with live work, independent of the bounded historical window on
+    /// the fleet.
     latest_placement: Option<super::PlacementDecision>,
+    /// Signatures (see [`super::decision_signature`]) of the decisions this
+    /// entry has journaled, newest last, at most [`JOURNALED_SIGNATURES`].
+    /// A set rather than the last one alone: a request parked between two
+    /// pressured machines alternates which one is chosen, so consecutive
+    /// decisions differ while the entry's situation does not.
+    journaled_signatures: VecDeque<String>,
+    /// Decisions recorded since the last journaled one without being written,
+    /// because their signature was already journaled for this entry.
+    unchanged_evaluations: u64,
     headroom: HeadroomPlan,
     /// A re-offer to the machine whose decline is this entry's latest binding
     /// step, not yet journaled. It is journaled when it resolves into anything
@@ -301,9 +328,69 @@ impl QueueEntry {
         self.queued_at_unix_ms
     }
 
-    /// The latest placement decision journaled for this entry.
+    /// The latest placement decision made for this entry. Always the newest,
+    /// whether or not it was journaled.
     pub(crate) fn latest_placement(&self) -> Option<&super::PlacementDecision> {
         self.latest_placement.as_ref()
+    }
+
+    /// How many binding steps have scrolled out of [`Self::chain`].
+    pub(crate) fn chain_elided(&self) -> u64 {
+        self.chain_elided
+    }
+
+    /// How many of the claiming machine's connections ended after the latest
+    /// claim. A claim survives a link gap (it is held and rebound to the next
+    /// connection), and every generation that ends under it is one
+    /// replacement; generations that ended before the latest claim belong to
+    /// an earlier binding. `None` when the entry was never claimed.
+    pub(crate) fn connection_drops_since_claim(&self) -> Option<usize> {
+        self.connection_drops_since_claim
+    }
+
+    /// Append one binding step, keeping the chain to its newest
+    /// [`BINDING_TAIL`] steps and every fact read across the whole history.
+    fn push_binding(&mut self, event: BindingEvent) {
+        match &event {
+            BindingEvent::Claimed { .. } => self.connection_drops_since_claim = Some(0),
+            BindingEvent::GenerationEnded { .. } => {
+                if let Some(drops) = self.connection_drops_since_claim.as_mut() {
+                    *drops += 1;
+                }
+            }
+            BindingEvent::Declined {
+                executor_id,
+                reason,
+                ..
+            } => {
+                if !self
+                    .declined_reasons
+                    .iter()
+                    .any(|(decliner, earlier)| decliner == executor_id && earlier == reason)
+                {
+                    self.declined_reasons.push((executor_id.clone(), *reason));
+                }
+            }
+            BindingEvent::Offered { .. } | BindingEvent::Lost { .. } => {}
+        }
+        if self.chain.len() >= BINDING_TAIL {
+            let excess = self.chain.len() + 1 - BINDING_TAIL;
+            self.chain.drain(..excess);
+            self.chain_elided += excess as u64;
+        }
+        self.chain.push(event);
+    }
+
+    /// Journal the latest decision if later evaluations were folded after the
+    /// last one written, so an entry's journal ends on the decision it
+    /// actually last had. Called on every path that takes an entry out.
+    fn flush_placement(&mut self, rows: &mut Vec<QueueJournalRow>) {
+        if self.unchanged_evaluations == 0 {
+            return;
+        }
+        if let Some(decision) = self.latest_placement.clone() {
+            rows.push(placement_row(self, &decision));
+        }
     }
 
     /// Where this entry stands in a line for something one machine does for
@@ -700,6 +787,20 @@ struct QueueState {
 /// because a caller that stopped awaiting never collects its own.
 const SETTLED_BINDINGS: usize = 256;
 
+/// How many binding steps an entry keeps, and so how many a placement
+/// decision carries. Enough to show the current back-and-forth between a few
+/// machines; the entry's journal rows hold every step. Unbounded, a request
+/// parked for hours between two pressured machines carried thousands of steps
+/// into every decision it journaled, so its bytes grew with the square of its
+/// wait.
+const BINDING_TAIL: usize = 16;
+
+/// How many distinct decision signatures an entry remembers as journaled.
+/// Covers the few situations a parked entry cycles between (each machine
+/// chosen in turn, all of them declined); a signature that falls out is
+/// journaled again when it recurs.
+const JOURNALED_SIGNATURES: usize = 8;
+
 #[derive(Default)]
 struct SettledBindings {
     order: VecDeque<RequestIdentity>,
@@ -772,6 +873,26 @@ impl ExecutionQueue {
     /// Retain admission evidence in the existing transition journal without
     /// inventing a second queue state or a second persistence stream.
     pub(crate) fn record_placement(&self, decision: &super::PlacementDecision) {
+        self.record_placement_signed(decision, super::decision_signature(decision, &[]));
+    }
+
+    /// [`Self::record_placement`] under a signature the caller computed,
+    /// for a caller that knows of material facts the decision does not
+    /// carry.
+    ///
+    /// The entry's latest decision is always replaced, so the live views stay
+    /// current. A row is written only for a signature this entry has not
+    /// journaled: a parked request is re-evaluated on every post of every
+    /// machine, and writing each pass journaled the same situation thousands
+    /// of times. What it skipped is counted on the next row it writes, and
+    /// the newest decision is written when the entry leaves (see
+    /// [`QueueEntry::flush_placement`]), so an entry's journal holds its first
+    /// decision, each material change, and its last.
+    pub(crate) fn record_placement_signed(
+        &self,
+        decision: &super::PlacementDecision,
+        signature: String,
+    ) {
         let mut state = self.entries.lock().unwrap();
         let identity = (decision.request_id.clone(), decision.attempt_id.clone());
         let Some(id) = state.by_identity.get(&identity).cloned() else {
@@ -781,35 +902,15 @@ impl ExecutionQueue {
             return;
         };
         entry.latest_placement = Some(decision.clone());
-        let phase = entry.state.name();
-        let binding = match &entry.state {
-            EntryState::Offered {
-                executor_id,
-                generation,
-                ..
-            }
-            | EntryState::Claimed {
-                executor_id,
-                generation,
-                ..
-            } => Some((executor_id.clone(), *generation)),
-            EntryState::Queued => None,
-        };
-        let mut row = journal_row(
-            entry,
-            phase,
-            binding
-                .as_ref()
-                .map(|(id, generation)| (id.as_str(), *generation)),
-            None,
-            decision.decided_at_unix_ms,
-        );
-        row.scoring_json = serde_json::json!({ "placementDecision": decision }).to_string();
-        row.detail = Some(match &decision.outcome {
-            super::PlacementOutcome::Refused { diagnostic }
-            | super::PlacementOutcome::Waiting { diagnostic } => diagnostic.clone(),
-            _ => "placement decision".into(),
-        });
+        if entry.journaled_signatures.contains(&signature) {
+            entry.unchanged_evaluations += 1;
+            return;
+        }
+        if entry.journaled_signatures.len() >= JOURNALED_SIGNATURES {
+            entry.journaled_signatures.pop_front();
+        }
+        entry.journaled_signatures.push_back(signature);
+        let row = placement_row(entry, decision);
         drop(state);
         self.journal(vec![row]);
     }
@@ -926,7 +1027,12 @@ impl ExecutionQueue {
             state: EntryState::Queued,
             declined: HashMap::new(),
             chain: Vec::new(),
+            chain_elided: 0,
+            declined_reasons: Vec::new(),
+            connection_drops_since_claim: None,
             latest_placement: None,
+            journaled_signatures: VecDeque::new(),
+            unchanged_evaluations: 0,
             reoffer: None,
             journaled_rows: 0,
             waiter: Some(waiter),
@@ -1064,7 +1170,7 @@ impl ExecutionQueue {
             generation,
             at_unix_ms: now_unix_ms,
         };
-        entry.chain.push(BindingEvent::Offered {
+        entry.push_binding(BindingEvent::Offered {
             executor_id: executor_id.to_string(),
             executor_name: executor_name.to_string(),
             generation,
@@ -1124,7 +1230,7 @@ impl ExecutionQueue {
             decline.backoff_ms = 0;
             decline.retry_after_unix_ms = 0;
         }
-        entry.chain.push(BindingEvent::Claimed {
+        entry.push_binding(BindingEvent::Claimed {
             executor_id: executor_id.to_string(),
             generation,
             at_unix_ms: now_unix_ms,
@@ -1178,13 +1284,10 @@ impl ExecutionQueue {
         {
             return DeclineRecord::Stale;
         }
-        let repeat = entry.chain.iter().any(|event| {
-            matches!(
-                event,
-                BindingEvent::Declined { executor_id: decliner, reason: earlier, .. }
-                    if decliner == executor_id && *earlier == reason
-            )
-        });
+        let repeat = entry
+            .declined_reasons
+            .iter()
+            .any(|(decliner, earlier)| decliner == executor_id && *earlier == reason);
         entry.state = EntryState::Queued;
         let backoff_ms = match entry.declined.get(executor_id) {
             Some(previous)
@@ -1238,7 +1341,7 @@ impl ExecutionQueue {
             }
             return DeclineRecord::Recorded { repeat: true };
         }
-        entry.chain.push(BindingEvent::Declined {
+        entry.push_binding(BindingEvent::Declined {
             executor_id: executor_id.to_string(),
             reason,
             detail: detail.clone(),
@@ -1544,6 +1647,7 @@ impl ExecutionQueue {
         });
         let mut rows = Vec::new();
         entry.flush_reoffer(&mut rows);
+        entry.flush_placement(&mut rows);
         rows.push(journal_row(
             &mut entry,
             terminal.name(),
@@ -1605,6 +1709,7 @@ impl ExecutionQueue {
         });
         let mut rows = Vec::new();
         entry.flush_reoffer(&mut rows);
+        entry.flush_placement(&mut rows);
         let mut row = journal_row(
             &mut entry,
             terminal.name(),
@@ -1666,7 +1771,7 @@ impl ExecutionQueue {
         for id in ids {
             let entry = state.entries.get_mut(&id).expect("entry just listed");
             entry.flush_reoffer(&mut rows);
-            entry.chain.push(BindingEvent::GenerationEnded {
+            entry.push_binding(BindingEvent::GenerationEnded {
                 executor_id: executor_id.to_string(),
                 generation,
                 at_unix_ms: now_unix_ms,
@@ -1718,6 +1823,7 @@ impl ExecutionQueue {
                         GenerationEndCause::RunnerStopping { .. } => TerminalState::Cancelled,
                         _ => TerminalState::Completed,
                     };
+                    entry.flush_placement(&mut rows);
                     let mut row = journal_row(
                         entry,
                         terminal.name(),
@@ -1881,6 +1987,43 @@ fn journal_row(
         horizon_unix_ms: entry.horizon_unix_ms,
         created_at: now_unix_ms,
     }
+}
+
+/// One decision's journal row: the entry's state row with the decision as its
+/// scoring, and the count of evaluations folded since the entry's previous
+/// decision row.
+///
+/// `placementDecision` stays the first key: the journal's reader selects
+/// decision rows by that prefix.
+fn placement_row(entry: &mut QueueEntry, decision: &super::PlacementDecision) -> QueueJournalRow {
+    let phase = entry.state.name();
+    let binding = entry.state.executor_id().map(|executor_id| {
+        (
+            executor_id.to_string(),
+            entry.state.generation().unwrap_or_default(),
+        )
+    });
+    let mut row = journal_row(
+        entry,
+        phase,
+        binding
+            .as_ref()
+            .map(|(id, generation)| (id.as_str(), *generation)),
+        None,
+        decision.decided_at_unix_ms,
+    );
+    let mut scoring = serde_json::json!({ "placementDecision": decision });
+    if entry.unchanged_evaluations > 0 {
+        scoring["unchangedEvaluations"] = entry.unchanged_evaluations.into();
+    }
+    entry.unchanged_evaluations = 0;
+    row.scoring_json = scoring.to_string();
+    row.detail = Some(match &decision.outcome {
+        super::PlacementOutcome::Refused { diagnostic }
+        | super::PlacementOutcome::Waiting { diagnostic } => diagnostic.clone(),
+        _ => "placement decision".into(),
+    });
+    row
 }
 
 pub(crate) fn disk_decline_summary(disk: &DiskDecline) -> String {
@@ -2253,6 +2396,11 @@ const OPEN_ENTRIES_OF_INCARNATION: &str = "SELECT live.entry_id, live.sequence
 /// One entry's expiry row, rechecked against the journal as it is written: a
 /// point lookup and one index probe, so a row that stopped being the latest
 /// between the read that found it and this write is skipped, not expired.
+///
+/// The expiry is not a placement decision, so it never copies one: when the
+/// latest row carried a decision, the expiry's scoring is empty and a reader
+/// of decisions falls through to that row.
+/// `examples/explain_queue_expiry.rs` mirrors this statement.
 const EXPIRE_ENTRY: &str = "INSERT OR IGNORE INTO execution_queue(
          event_id, entry_id, sequence, runner_incarnation,
          request_id, attempt_id, project_id, state,
@@ -2267,7 +2415,8 @@ const EXPIRE_ENTRY: &str = "INSERT OR IGNORE INTO execution_queue(
          live.project_id,
          'expired',
          live.constraints_json,
-         live.scoring_json,
+         CASE WHEN live.scoring_json LIKE '{\"placementDecision\":%' THEN '{}'
+              ELSE live.scoring_json END,
          live.horizon_unix_ms,
          unixepoch() * 1000,
          'runner restarted'
@@ -2701,6 +2850,47 @@ pub(super) mod tests {
     /// short transaction per incarnation it closes, and nothing at all when
     /// there is nothing left to close. (A write held for hours by the
     /// whole-journal statement this replaced is what blocked every checkpoint.)
+    /// An expiry is not a decision. When the entry's latest row carried one,
+    /// the expiry does not copy it (a parked entry's decision was the largest
+    /// thing in the journal); a state row's small scoring is kept.
+    #[tokio::test]
+    async fn restart_expiry_does_not_copy_the_snapshot() {
+        let db = crate::storage::migrated_test_db("queue_expiry_snapshot.db").await;
+        db.execute(
+            "INSERT INTO execution_queue(
+                 event_id, entry_id, sequence, runner_incarnation, request_id, attempt_id,
+                 project_id, state, constraints_json, scoring_json, horizon_unix_ms, created_at)
+             VALUES ('decided:0', 'decided', 0, 'runner-1', 'request-d', 'attempt', 'p',
+                     'queued', '{}', '{\"placementDecision\":{\"requestId\":\"request-d\"}}', 0, 1),
+                    ('stated:0', 'stated', 0, 'runner-1', 'request-s', 'attempt', 'p',
+                     'offered', '{}', '{\"priority\":\"reviewCheck\"}', 0, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let sweep = expire_previous_incarnations(&db, "runner-2").await.unwrap();
+        assert_eq!(sweep.entries_expired, 2);
+        let expired = db
+            .query_all(
+                "SELECT entry_id, scoring_json FROM execution_queue
+                 WHERE state = 'expired' ORDER BY entry_id",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            expired,
+            vec![
+                ("decided".to_string(), "{}".to_string()),
+                (
+                    "stated".to_string(),
+                    "{\"priority\":\"reviewCheck\"}".to_string()
+                ),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn a_sweep_finds_outside_any_write_and_writes_once_per_incarnation() {
         let db = crate::storage::migrated_test_db("queue_expiry_writes.db").await;
@@ -3409,6 +3599,300 @@ pub(super) mod tests {
         assert!(matches!(chain[2], BindingEvent::Offered { .. }));
         assert!(matches!(chain[3], BindingEvent::Claimed { .. }));
         assert_eq!(chain.len(), 4);
+    }
+
+    /// A decision whose only rejections are `rejected`, waiting.
+    fn waiting_on(
+        request_id: &str,
+        at: u64,
+        rejected: Vec<(
+            &str,
+            cairn_common::executor_protocol::PlacementRejectionReason,
+        )>,
+    ) -> super::super::PlacementDecision {
+        super::super::placement_decision(
+            &request(request_id, PlacementMobility::SpillEligible),
+            at,
+            None,
+            None,
+            super::super::PlacementOutcome::Waiting {
+                diagnostic: format!("waiting at {at}"),
+            },
+            rejected
+                .into_iter()
+                .map(
+                    |(executor_id, reason)| cairn_common::executor_protocol::PlacementRejection {
+                        unreadable_memory: Vec::new(),
+                        executor_id: executor_id.into(),
+                        executor_name: executor_id.into(),
+                        reason,
+                        prediction: None,
+                        drain_blockers: Vec::new(),
+                    },
+                )
+                .collect(),
+        )
+    }
+
+    fn drain_rows(
+        receiver: &mut mpsc::UnboundedReceiver<QueueJournalBatch>,
+    ) -> Vec<QueueJournalRow> {
+        let mut rows = Vec::new();
+        while let Ok(batch) = receiver.try_recv() {
+            rows.extend(batch);
+        }
+        rows
+    }
+
+    fn is_decision_row(row: &QueueJournalRow) -> bool {
+        row.scoring_json.starts_with("{\"placementDecision\":")
+    }
+
+    /// The measured shape of the growth: a request parked for hours between
+    /// two machines that take turns refusing it for memory, each refusal in
+    /// fresh words, and placement re-evaluating it after every answer. Its
+    /// situation never changes, so its journal holds a decision for each of
+    /// the two situations and the last one, not one per evaluation, and no
+    /// decision carries more than the binding tail. Every offer and decline
+    /// still writes its own small state row, which is the decline time series
+    /// the forensics read.
+    #[test]
+    fn n_unchanged_re_evaluations_of_a_parked_entry_write_one_snapshot() {
+        use cairn_common::executor_protocol::PlacementRejectionReason;
+        const EVALUATIONS: u64 = 1_000;
+        let queue = ExecutionQueue::default();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        queue.attach_journal(sender);
+        let (entry, _waiter) = enqueue(&queue, "parked", PlacementMobility::SpillEligible);
+        let declined = |at| PlacementRejectionReason::Declined {
+            reason: DeclineReason::Pressure,
+            detail: Some(format!("memory short at {at}: {}", "x".repeat(300))),
+            declined_at_unix_ms: at,
+        };
+        let mut newest = None;
+        for evaluation in 0..EVALUATIONS {
+            let at = 1_000 + evaluation * 200_000;
+            let (asked, other) = if evaluation % 2 == 0 {
+                ("bginf-sp1", "bginf-sp2")
+            } else {
+                ("bginf-sp2", "bginf-sp1")
+            };
+            assert!(queue.offer(&entry, asked, asked, 1, at));
+            let record = queue.decline(
+                &entry,
+                asked,
+                1,
+                DeclineReason::Pressure,
+                Some(format!(
+                    "needs 40 GiB, has {} MiB; {}",
+                    at % 997,
+                    "y".repeat(300)
+                )),
+                None,
+                None,
+                at + 1,
+            );
+            assert_eq!(
+                record,
+                DeclineRecord::Recorded {
+                    repeat: evaluation >= 2
+                }
+            );
+            let mut decision = waiting_on(
+                "parked",
+                at + 2,
+                vec![
+                    (asked, declined(at + 1)),
+                    (other, PlacementRejectionReason::Drained),
+                ],
+            );
+            (decision.binding, decision.binding_elided) = queue
+                .with_entry(&entry, |held| (held.chain.clone(), held.chain_elided()))
+                .unwrap();
+            queue.record_placement(&decision);
+            newest = Some(decision);
+        }
+        let newest = newest.unwrap();
+        assert_eq!(
+            queue
+                .with_entry(&entry, |held| held.latest_placement().cloned())
+                .unwrap()
+                .as_ref(),
+            Some(&newest),
+            "the live views read the newest decision, journaled or not"
+        );
+        assert!(queue.settle(
+            &("parked".into(), "attempt".into()),
+            None,
+            TerminalState::Cancelled,
+            super::super::executor_unavailable("gone".into()),
+            EVALUATIONS * 200_000,
+        ));
+
+        let rows = drain_rows(&mut receiver);
+        let (decisions, states): (Vec<_>, Vec<_>) =
+            rows.iter().partition(|row| is_decision_row(row));
+        assert_eq!(decisions.len(), 3, "one per situation, then the last");
+        let decision_bytes: usize = decisions.iter().map(|row| row.scoring_json.len()).sum();
+        assert!(
+            decision_bytes < 64 * 1024,
+            "{decision_bytes} bytes of decisions"
+        );
+        let last: serde_json::Value = serde_json::from_str(&decisions[2].scoring_json).unwrap();
+        assert_eq!(last["unchangedEvaluations"], EVALUATIONS - 2);
+        let restored: super::super::PlacementDecision =
+            serde_json::from_value(last["placementDecision"].clone()).unwrap();
+        assert_eq!(restored, newest);
+        assert_eq!(restored.binding.len(), BINDING_TAIL);
+        assert_eq!(
+            restored.binding_elided,
+            2 * EVALUATIONS - BINDING_TAIL as u64
+        );
+        assert_eq!(
+            decisions[2].sequence + 1,
+            states.last().unwrap().sequence,
+            "the flushed decision sits just ahead of the terminal row"
+        );
+
+        // queued, then an offer and a decline row per evaluation, then the
+        // terminal row: the decline time series, each row small.
+        assert_eq!(states.len() as u64, 2 + 2 * EVALUATIONS);
+        assert_eq!(
+            states
+                .iter()
+                .filter(|row| row.decline_reason.is_some() && row.detail.is_some())
+                .count() as u64,
+            EVALUATIONS
+        );
+        assert!(states.iter().all(|row| row.scoring_json.len() < 1_024));
+    }
+
+    /// What changes the situation journals it: a new kind of rejection, a
+    /// different outcome, a reconnect bound that moves to another minute. The
+    /// same bound within its minute does not.
+    #[test]
+    fn a_material_change_writes_a_snapshot() {
+        use cairn_common::executor_protocol::PlacementRejectionReason;
+        let queue = ExecutionQueue::default();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        queue.attach_journal(sender);
+        let (_entry, _waiter) = enqueue(&queue, "r", PlacementMobility::SpillEligible);
+        receiver.try_recv().unwrap();
+        let reconnecting =
+            |returns_by_unix_ms| PlacementRejectionReason::Reconnecting { returns_by_unix_ms };
+        let mut journaled = |decision: super::super::PlacementDecision| {
+            queue.record_placement(&decision);
+            drain_rows(&mut receiver).len()
+        };
+
+        assert_eq!(
+            journaled(waiting_on(
+                "r",
+                1,
+                vec![("m", PlacementRejectionReason::Drained)]
+            )),
+            1
+        );
+        assert_eq!(
+            journaled(waiting_on(
+                "r",
+                2,
+                vec![("m", PlacementRejectionReason::Drained)]
+            )),
+            0
+        );
+        assert_eq!(
+            journaled(waiting_on("r", 3, vec![("m", reconnecting(60_000))])),
+            1
+        );
+        assert_eq!(
+            journaled(waiting_on("r", 4, vec![("m", reconnecting(119_999))])),
+            0
+        );
+        assert_eq!(
+            journaled(waiting_on("r", 5, vec![("m", reconnecting(120_000))])),
+            1
+        );
+        let mut refused = waiting_on("r", 6, vec![("m", reconnecting(120_000))]);
+        refused.outcome = super::super::PlacementOutcome::Refused {
+            diagnostic: "at the horizon".into(),
+        };
+        assert_eq!(journaled(refused), 1);
+    }
+
+    /// The tail keeps the newest steps and counts the rest, and nothing read
+    /// across the whole history forgets what scrolled out: a machine whose
+    /// first refusal is long gone still refuses as a repeat.
+    #[test]
+    fn the_binding_chain_is_capped_and_counts_what_it_dropped() {
+        const CYCLES: u64 = 10_000;
+        let queue = ExecutionQueue::default();
+        let (entry, _waiter) = enqueue(&queue, "r", PlacementMobility::SpillEligible);
+        let cycle = |machine: &str, at: u64| {
+            assert!(queue.offer(&entry, machine, machine, 1, at));
+            queue.decline(
+                &entry,
+                machine,
+                1,
+                DeclineReason::Pressure,
+                Some(format!("at {at}")),
+                None,
+                None,
+                at + 1,
+            )
+        };
+        assert_eq!(cycle("c", 0), DeclineRecord::Recorded { repeat: false });
+        for n in 0..CYCLES {
+            let machine = if n % 2 == 0 { "a" } else { "b" };
+            assert_eq!(
+                cycle(machine, (n + 1) * 200_000),
+                DeclineRecord::Recorded { repeat: n >= 2 }
+            );
+        }
+        let (chain, elided) = queue
+            .with_entry(&entry, |held| (held.chain.clone(), held.chain_elided()))
+            .unwrap();
+        assert_eq!(chain.len(), BINDING_TAIL);
+        assert_eq!(elided, 2 * (CYCLES + 1) - BINDING_TAIL as u64);
+        assert!(chain.iter().all(|event| event.executor_id() != "c"));
+        assert_eq!(
+            cycle("c", (CYCLES + 2) * 200_000),
+            DeclineRecord::Recorded { repeat: true }
+        );
+    }
+
+    /// A claim is carried across every link gap of the machine holding it, and
+    /// each generation that ends under it is one replacement. Generations that
+    /// ended before the latest claim belong to an earlier binding and do not
+    /// count against this one, and the count survives the claim scrolling out
+    /// of the binding tail.
+    #[test]
+    fn connection_drops_count_only_what_ended_under_the_latest_claim() {
+        let queue = ExecutionQueue::default();
+        let (entry, _waiter) = enqueue(&queue, "r", PlacementMobility::SpillEligible);
+        let drops = || {
+            queue
+                .with_entry(&entry, QueueEntry::connection_drops_since_claim)
+                .unwrap()
+        };
+        assert_eq!(drops(), None);
+        assert!(queue.offer(&entry, "m", "m", 1, 2));
+        queue.end_generation("m", 1, GenerationEndCause::LinkGap, "gap", 3);
+        assert_eq!(drops(), None, "an offer's lost link is not a claim's");
+        assert!(queue.offer(&entry, "m", "m", 2, 4));
+        assert_eq!(queue.claim(&entry, "m", 2, 5), ClaimVerdict::Granted);
+        assert_eq!(drops(), Some(0));
+        for generation in 2..(2 + 2 * BINDING_TAIL as u64) {
+            queue.end_generation("m", generation, GenerationEndCause::LinkGap, "gap", 6);
+            queue.rebind("m", generation + 1);
+        }
+        assert!(queue
+            .with_entry(&entry, |held| held
+                .chain
+                .iter()
+                .all(|event| !matches!(event, BindingEvent::Claimed { .. })))
+            .unwrap());
+        assert_eq!(drops(), Some(2 * BINDING_TAIL));
     }
 
     /// A machine posting new state makes it offerable again, but what it said

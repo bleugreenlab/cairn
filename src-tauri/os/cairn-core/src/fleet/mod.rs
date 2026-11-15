@@ -4448,10 +4448,49 @@ fn placement_decision(
         pinned_executor_id: request.pinned_executor_id.clone(),
         unpinned_winner,
         binding: Vec::new(),
+        binding_elided: 0,
         policy,
         outcome,
         rejected,
     }
+}
+
+/// What makes two placement decisions for one queue entry materially the same,
+/// as one string: the outcome's kind, the machine it chose, and each machine
+/// passed over with its reason's signature (see
+/// [`placement_rejection_signature`]) and the drains holding it. `extra`
+/// carries material facts the decision does not, such as a wait's room line.
+///
+/// Forecasts, readings and prose are left out: they change on every pass
+/// without the situation changing. So is the binding chain: each binding step
+/// is journaled as its own state row.
+fn decision_signature(decision: &PlacementDecision, extra: &[(String, String)]) -> String {
+    let outcome = match &decision.outcome {
+        PlacementOutcome::Selected(selection) => format!("selected:{}", selection.executor_id),
+        PlacementOutcome::Waiting { .. } => "waiting".to_string(),
+        PlacementOutcome::Refused { .. } => "refused".to_string(),
+    };
+    let mut parts: Vec<(String, String)> = decision
+        .rejected
+        .iter()
+        .map(|rejection| {
+            let blockers: Vec<(&str, &str)> = rejection
+                .drain_blockers
+                .iter()
+                .map(|blocker| (blocker.owner.as_str(), blocker.reason.as_str()))
+                .collect();
+            (
+                rejection.executor_id.clone(),
+                format!(
+                    "{}:{blockers:?}",
+                    placement_rejection_signature(&rejection.reason)
+                ),
+            )
+        })
+        .chain(extra.iter().cloned())
+        .collect();
+    parts.sort();
+    format!("{outcome}|{parts:?}")
 }
 
 /// How many placement decisions the runner keeps. Bounded because this is a
@@ -9073,7 +9112,14 @@ impl Fleet {
 
     /// Keep one placement decision, evicting the oldest past the bound.
     fn record_placement_decision(&self, decision: PlacementDecision) {
-        self.queue.record_placement(&decision);
+        let signature = decision_signature(&decision, &[]);
+        self.record_signed_placement_decision(decision, signature);
+    }
+
+    /// [`Self::record_placement_decision`] under a signature the caller built
+    /// with [`decision_signature`], for facts the decision does not carry.
+    fn record_signed_placement_decision(&self, decision: PlacementDecision, signature: String) {
+        self.queue.record_placement_signed(&decision, signature);
         let now = std::time::Instant::now();
         let mut logged = self.placement_rejection_log.lock().unwrap();
         for rejection in &decision.rejected {
@@ -15295,9 +15341,7 @@ impl Fleet {
                 granted_at_unix_ms,
                 connection_drops: self
                     .queue
-                    .with_entry(&entry_id, |entry| {
-                        connection_drops_since_claim(&entry.chain)
-                    })
+                    .with_entry(&entry_id, queue::QueueEntry::connection_drops_since_claim)
                     .flatten(),
             });
         // Left armed, the guard takes the entry out of the queue with the cause
@@ -15638,9 +15682,11 @@ impl Fleet {
     /// placement record explains what happened to the machine it chose and not
     /// merely which machine that was.
     fn record_binding_chain(&self, decision: &mut PlacementDecision, entry_id: &str) {
-        decision.binding = self
+        (decision.binding, decision.binding_elided) = self
             .queue
-            .with_entry(entry_id, |entry| entry.chain.clone())
+            .with_entry(entry_id, |entry| {
+                (entry.chain.clone(), entry.chain_elided())
+            })
             .unwrap_or_default();
     }
 
@@ -15995,7 +16041,7 @@ impl Fleet {
     ) -> Result<Placement, CellOutcome> {
         // The reasons the last recorded wait named, so a request parked on them
         // is recorded once per change rather than on every pass.
-        let mut recorded_wait: Option<Vec<(String, String)>> = None;
+        let mut recorded_wait: Option<String> = None;
         let mut last_rejected = Vec::new();
         loop {
             if unix_time_ms() >= request.wait_horizon_unix_ms {
@@ -16115,29 +16161,19 @@ impl Fleet {
                 }
             }
             if let Some(mut waiting) = waiting {
-                let mut signature: Vec<(String, String)> = takes_room_on
+                let mut extra: Vec<(String, String)> = takes_room_on
                     .iter()
                     .map(|name| (name.clone(), "takesRoomFirst".to_string()))
                     .collect();
                 if let Some((hold_signature, _)) = headroom {
-                    signature.push(("headroom".into(), hold_signature));
+                    extra.push(("headroom".into(), hold_signature));
                 }
-                signature.extend(rejected.iter().map(|rejection| {
-                    (
-                        rejection.executor_id.clone(),
-                        format!(
-                            "{}:{:?}",
-                            placement_rejection_signature(&rejection.reason),
-                            rejection.drain_blockers
-                        ),
-                    )
-                }));
-                signature.sort();
+                let signature = decision_signature(&waiting, &extra);
                 if recorded_wait.as_ref() != Some(&signature) {
                     if let Some(entry_id) = entry_id {
                         self.record_binding_chain(&mut waiting, entry_id);
                     }
-                    self.record_placement_decision(waiting);
+                    self.record_signed_placement_decision(waiting, signature.clone());
                     recorded_wait = Some(signature);
                 }
             }
@@ -24984,26 +25020,6 @@ fn grant_left_without_result(outcome: &CellOutcome) -> bool {
     matches!(
         outcome,
         CellOutcome::Unavailable { .. } | CellOutcome::StorageFailure { .. }
-    )
-}
-
-/// How many of the claiming machine's connections ended after the latest claim.
-///
-/// A claim survives a link gap (it is held and rebound to the next connection),
-/// and every generation that ends under it leaves a `GenerationEnded` step in
-/// the entry's chain. `None` when the chain records no claim.
-fn connection_drops_since_claim(
-    chain: &[cairn_common::executor_protocol::BindingEvent],
-) -> Option<usize> {
-    use cairn_common::executor_protocol::BindingEvent;
-    let claimed = chain
-        .iter()
-        .rposition(|event| matches!(event, BindingEvent::Claimed { .. }))?;
-    Some(
-        chain[claimed + 1..]
-            .iter()
-            .filter(|event| matches!(event, BindingEvent::GenerationEnded { .. }))
-            .count(),
     )
 }
 
@@ -42805,35 +42821,6 @@ mod tests {
             other => panic!("not a withdrawal: {other:?}"),
         })
         .await;
-    }
-
-    /// A claim is carried across every link gap of the machine holding it, and
-    /// each generation that ends under it is one replacement. Generations that
-    /// ended before the latest claim belong to an earlier binding and do not
-    /// count against this one.
-    #[test]
-    fn connection_drops_count_only_what_ended_under_the_latest_claim() {
-        use cairn_common::executor_protocol::BindingEvent;
-        let claimed = |generation| BindingEvent::Claimed {
-            executor_id: "machine".into(),
-            generation,
-            at_unix_ms: 0,
-        };
-        let ended = |generation| BindingEvent::GenerationEnded {
-            executor_id: "machine".into(),
-            generation,
-            at_unix_ms: 0,
-        };
-
-        assert_eq!(connection_drops_since_claim(&[]), None);
-        assert_eq!(
-            connection_drops_since_claim(&[ended(1), claimed(2)]),
-            Some(0)
-        );
-        assert_eq!(
-            connection_drops_since_claim(&[claimed(1), ended(1), ended(2)]),
-            Some(2)
-        );
     }
 
     /// The silence bound the granted-attempt tests run under, short enough that

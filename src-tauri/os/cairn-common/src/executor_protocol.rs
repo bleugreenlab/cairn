@@ -7138,6 +7138,13 @@ pub struct LearnedResourceEstimate {
 /// variant, into its own placement records; no executor sends or reads it, so
 /// a runner talking to an older executor gets nothing wrong.
 ///
+/// cairn/7252 does not move the number. [`PlacementDecision`] gains the
+/// additive `bindingElided`, omitted when zero, and its `binding` becomes the
+/// queue entry's newest steps rather than all of them. The runner alone
+/// builds placement decisions, into its own records and journal; no executor
+/// sends or reads one, so a runner talking to an older executor gets nothing
+/// wrong, and a journal row written before this decodes with a zero count.
+///
 /// cairn/7176 does not move the number. Batch wait summaries read the queued
 /// placement diagnostic already held by the runner instead of reporting only
 /// offers and declines. No wire field or executor behavior changes, so a runner
@@ -20693,8 +20700,14 @@ pub struct PlacementDecision {
     /// unrecorded — a machine that took an order and then sat on it left no
     /// evidence but a log line about being parked. Empty on a refusal, which
     /// never reached a machine at all.
+    ///
+    /// The newest steps only: an entry keeps a bounded tail, and every step
+    /// is also the entry's own row in the runner's queue journal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub binding: Vec<BindingEvent>,
+    /// How many earlier binding steps were dropped ahead of [`Self::binding`].
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub binding_elided: u64,
 }
 
 /// One step in the chain from "placement chose a machine" to "a machine is
@@ -27966,6 +27979,7 @@ mod tests {
             pinned_executor_id: None,
             unpinned_winner: None,
             binding: Vec::new(),
+            binding_elided: 0,
             policy: None,
             outcome: PlacementOutcome::Selected(Box::new(PlacementSelection {
                 cache_distance: None,
