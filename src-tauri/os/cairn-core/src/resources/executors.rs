@@ -5089,12 +5089,13 @@ pub(crate) fn render_placement_work(
         }
     }
     out.push_str(&format!(
-        "- Since start: {} placement passes, {} fit evaluations, {} offers, {} refusals, {} reservations\n",
+        "- Since start: {} placement passes, {} fit evaluations, {} offers, {} refusals, {} reservations, {} needs worked out\n",
         totals.placement_passes,
         totals.fit_evaluations,
         totals.offers,
         totals.refusals,
-        totals.reservations
+        totals.reservations,
+        totals.needs_worked_out
     ));
     out
 }

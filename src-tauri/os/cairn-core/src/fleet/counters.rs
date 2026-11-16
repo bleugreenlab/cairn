@@ -25,6 +25,7 @@ pub(crate) struct FleetCounters {
     offers: AtomicU64,
     refusals: AtomicU64,
     reservations: AtomicU64,
+    needs_worked_out: AtomicU64,
     last_minute: Mutex<Option<CountedWindow>>,
 }
 
@@ -41,6 +42,9 @@ pub(crate) struct PlacementCounts {
     pub(crate) refusals: u64,
     /// Offers that carried a headroom authorization for aged work.
     pub(crate) reservations: u64,
+    /// Times a queued request's needs on one machine were read from the
+    /// profile store, rather than reused.
+    pub(crate) needs_worked_out: u64,
 }
 
 impl PlacementCounts {
@@ -53,6 +57,9 @@ impl PlacementCounts {
             offers: self.offers.saturating_sub(earlier.offers),
             refusals: self.refusals.saturating_sub(earlier.refusals),
             reservations: self.reservations.saturating_sub(earlier.reservations),
+            needs_worked_out: self
+                .needs_worked_out
+                .saturating_sub(earlier.needs_worked_out),
         }
     }
 }
@@ -77,7 +84,7 @@ impl CountedWindow {
     pub(crate) fn sentence(&self) -> String {
         let counts = self.counts;
         format!(
-            "{} placement passes ({:.1}/s), {} fit evaluations ({:.1}/s), {} offers, {} refusals, {} reservations",
+            "{} placement passes ({:.1}/s), {} fit evaluations ({:.1}/s), {} offers, {} refusals, {} reservations, {} needs worked out",
             counts.placement_passes,
             self.per_second(counts.placement_passes),
             counts.fit_evaluations,
@@ -85,6 +92,7 @@ impl CountedWindow {
             counts.offers,
             counts.refusals,
             counts.reservations,
+            counts.needs_worked_out,
         )
     }
 }
@@ -110,8 +118,16 @@ impl FleetCounters {
         self.refusals.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// `count` needs were read from the profile store for a waiting request.
+    pub(crate) fn needs_worked_out(&self, count: u64) {
+        if count > 0 {
+            self.needs_worked_out.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn totals(&self) -> PlacementCounts {
         PlacementCounts {
+            needs_worked_out: self.needs_worked_out.load(Ordering::Relaxed),
             placement_passes: self.placement_passes.load(Ordering::Relaxed),
             fit_evaluations: self.fit_evaluations.load(Ordering::Relaxed),
             offers: self.offers.load(Ordering::Relaxed),
@@ -175,6 +191,7 @@ mod tests {
         counters.offer(true);
         counters.offer(false);
         counters.refusal();
+        counters.needs_worked_out(3);
         let window = CountedWindow {
             ended_at_unix_ms: 0,
             window_ms: 2_000,
@@ -188,11 +205,12 @@ mod tests {
                 offers: 2,
                 refusals: 1,
                 reservations: 1,
+                needs_worked_out: 3,
             }
         );
         assert_eq!(
             window.sentence(),
-            "2 placement passes (1.0/s), 14 fit evaluations (7.0/s), 2 offers, 1 refusals, 1 reservations"
+            "2 placement passes (1.0/s), 14 fit evaluations (7.0/s), 2 offers, 1 refusals, 1 reservations, 3 needs worked out"
         );
     }
 }

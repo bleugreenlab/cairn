@@ -1691,6 +1691,9 @@ impl Fleet {
             }
             predictions.insert(entry.identity.executor_id.clone(), prediction);
         }
+        if let Some(plan) = plan {
+            self.counters.needs_worked_out(plan.take_needs_worked_out());
+        }
         // A machine that is only away for now (it declined this entry, is
         // backing off, updating, drained, or another request has its turn)
         // left the usable set before anything was priced for it, yet whether
@@ -1729,6 +1732,7 @@ impl Fleet {
                 away_reservations.insert(row.executor_id.clone(), resolved);
             }
             judge_machines_away_for_now(&mut survey.rejected, &connections, &away_reservations);
+            self.counters.needs_worked_out(plan.take_needs_worked_out());
         }
         // Stage three: rank on when each machine is predicted to answer. Budget
         // inspection and consumption share one short critical section, after all
@@ -6179,6 +6183,22 @@ pub(super) struct ReservationPlan {
         Option<String>,
         cairn_common::executor_protocol::CellCommandClass,
     )>,
+    /// Every profile scope this request's needs are read from: its identities,
+    /// its suites, and their projects.
+    needs_scopes: Vec<String>,
+    /// What this request needs on each machine context, worked out when the
+    /// context was first asked about and again only when a profile write
+    /// names one of `needs_scopes`.
+    needs: std::sync::Mutex<HashMap<String, WorkedOutNeeds>>,
+    /// Needs worked out since the last [`Self::take_needs_worked_out`].
+    needs_worked_out: std::sync::atomic::AtomicU64,
+}
+
+/// One machine context's needs for a request, and what they were derived from.
+struct WorkedOutNeeds {
+    capabilities: ExecutorCapabilities,
+    stamp: profile_reads::NeedsStamp,
+    resolved: resource_profiles::ResolvedResourceProfile,
 }
 
 impl ReservationPlan {
@@ -6226,6 +6246,30 @@ impl ReservationPlan {
                     .collect()
             })
             .unwrap_or_default();
+        let suite = resource_profiles::suite_key(
+            &request.project_id,
+            request.command_resource_identity.as_ref(),
+            request.command_class,
+        );
+        let mut needs_scopes: Vec<String> = request
+            .command_resource_identity
+            .iter()
+            .chain(
+                batch_suites
+                    .iter()
+                    .filter_map(|(identity, _, _)| identity.as_ref()),
+            )
+            .map(profile_reads::identity_scope)
+            .collect();
+        for key in suite.iter().chain(
+            batch_suites
+                .iter()
+                .filter_map(|(_, suite, _)| suite.as_ref()),
+        ) {
+            needs_scopes.extend(profile_reads::suite_scopes(key));
+        }
+        needs_scopes.sort();
+        needs_scopes.dedup();
         Self {
             db,
             command_class: request.command_class,
@@ -6243,13 +6287,20 @@ impl ReservationPlan {
             parallel_width: batch.filter(|batch| !batch.sequential).map_or(1, |batch| {
                 u32::try_from(batch.items.len()).unwrap_or(u32::MAX).max(1)
             }),
-            suite: resource_profiles::suite_key(
-                &request.project_id,
-                request.command_resource_identity.as_ref(),
-                request.command_class,
-            ),
+            suite,
             batch_suites,
+            needs_scopes,
+            needs: Default::default(),
+            needs_worked_out: Default::default(),
         }
+    }
+
+    /// How many (context, request) needs were worked out since this was last
+    /// asked, which is the number of times a parked request cost the profile
+    /// store anything.
+    pub(super) fn take_needs_worked_out(&self) -> u64 {
+        self.needs_worked_out
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The batch items' identities, skipping items that have none.
@@ -6334,6 +6385,70 @@ impl ReservationPlan {
         duration_context: resource_profiles::DurationContext,
     ) -> resource_profiles::ResolvedResourceProfile {
         let context = Self::context_for(device_id, executor_id, capabilities);
+        // The needs are a function of the request, the machine's context and
+        // size, and what the profile store has learned about the request's
+        // identities and suites. None of those changes between two passes
+        // unless a writer says so, so a pass that finds the stamp unchanged
+        // reads nothing. Only the duration depends on the pass (it is
+        // warmth-keyed and ranking alone reads it), so it is read fresh.
+        //
+        // Rows nothing here wrote (retention's pruning) are not noticed: a
+        // request parked past a prune keeps the larger evidence it was queued
+        // under, which is the safe side of the error.
+        let stamp = profile_reads::needs_stamp(&self.db, &self.needs_scopes);
+        let held = self
+            .needs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&context.executor_class)
+            .filter(|held| held.stamp == stamp && held.capabilities == *capabilities)
+            .map(|held| held.resolved.clone());
+        let mut resolved = match held {
+            Some(resolved) => resolved,
+            None => {
+                let resolved = self
+                    .work_out_needs(request, &context, capabilities, duration_context)
+                    .await;
+                self.needs_worked_out
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.needs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        context.executor_class.clone(),
+                        WorkedOutNeeds {
+                            capabilities: capabilities.clone(),
+                            stamp,
+                            resolved: resolved.clone(),
+                        },
+                    );
+                resolved
+            }
+        };
+        resolved.duration = self.predict_duration(&context, duration_context).await;
+        resolved
+    }
+
+    #[cfg(test)]
+    pub(super) fn needs_held(&self) -> usize {
+        self.needs.lock().unwrap().len()
+    }
+
+    /// [`Self::resolve_for`]'s figures, read from the profile store.
+    ///
+    /// A batch's figure is derived here and nowhere else: the heaviest
+    /// member's memory, disk and units, and for a sequential group the
+    /// envelope of its members' figures (`sequential_memory_envelope`). A
+    /// member's figure is its own context's, so a wave's figure is the same
+    /// whichever pass or placement path asks.
+    async fn work_out_needs(
+        &self,
+        request: &CellRequest,
+        context: &resource_profiles::ProfileContext,
+        capabilities: &ExecutorCapabilities,
+        duration_context: resource_profiles::DurationContext,
+    ) -> resource_profiles::ResolvedResourceProfile {
+        let context = context.clone();
         if !self.resolves {
             // A caller-stated reservation is not a caller-stated duration. The
             // prediction still comes from this machine's own history, because a

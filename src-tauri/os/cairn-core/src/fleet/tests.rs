@@ -3701,6 +3701,97 @@ fn check_dispatch_phase_is_none_once_the_execution_settles() {
     );
 }
 
+/// cairn/7318: a request that waits costs the profile store nothing. Its
+/// needs on a machine are worked out once, and are worked out again only when
+/// a lesson names something they were derived from, so one command finishing
+/// leaves every other parked command's needs standing.
+#[tokio::test]
+async fn a_parked_requests_needs_are_worked_out_once_and_only_its_own_lessons_redo_them() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let db = Arc::new(crate::storage::migrated_test_db("needs-worked-out-once.db").await);
+    let capabilities = capabilities_with_cores(16);
+    let identity = |key: &str| CommandResourceIdentity {
+        version: 1,
+        key: key.into(),
+        suite: None,
+    };
+    let (x, y) = (identity("needs-x"), identity("needs-y"));
+    let request_for = |identity: &CommandResourceIdentity| {
+        let mut request = provenance_request();
+        request.command_resource_identity = Some(identity.clone());
+        request
+    };
+    let (request_x, request_y) = (request_for(&x), request_for(&y));
+    let (plan_x, plan_y) = (
+        ReservationPlan::new(db.clone(), &request_x, None),
+        ReservationPlan::new(db.clone(), &request_y, None),
+    );
+    let duration = resource_profiles::DurationContext {
+        class: request_x.command_class,
+        warmth: ExecutionWarmth::Cold,
+        now_unix_ms: NOW,
+    };
+    macro_rules! place {
+        ($plan:expr, $request:expr) => {
+            $plan.resolve_for($request, "device", "executor", &capabilities, duration)
+        };
+    }
+
+    // Queued: one resolution each.
+    let unmeasured = place!(&plan_x, &request_x).await;
+    place!(&plan_y, &request_y).await;
+    assert_eq!(plan_x.take_needs_worked_out(), 1);
+    assert_eq!(plan_y.take_needs_worked_out(), 1);
+    assert_eq!(
+        unmeasured.reservation.source,
+        ResourceReservationSource::Unmeasured
+    );
+
+    // Parked through two hundred placement passes: nothing is worked out and
+    // the store is not read for needs.
+    let before = db.read_statement_count();
+    for _ in 0..200 {
+        assert_eq!(
+            place!(&plan_x, &request_x).await.reservation,
+            unmeasured.reservation
+        );
+        place!(&plan_y, &request_y).await;
+    }
+    assert_eq!(plan_x.take_needs_worked_out(), 0);
+    assert_eq!(plan_y.take_needs_worked_out(), 0);
+    assert_eq!(
+        db.read_statement_count(),
+        before,
+        "a pass that learned nothing reads nothing"
+    );
+
+    // X finishes on a machine: X's needs are worked out again and see it, and
+    // Y's are untouched.
+    let context = ReservationPlan::context_for("device", "executor", &capabilities);
+    resource_profiles::seed_memory_profile_for_test(db.clone(), &x, &context, 6 * GIB).await;
+    let learned = place!(&plan_x, &request_x).await;
+    place!(&plan_y, &request_y).await;
+    assert_eq!(plan_x.take_needs_worked_out(), 1);
+    assert_eq!(plan_y.take_needs_worked_out(), 0);
+    assert_eq!(
+        learned.reservation.source,
+        ResourceReservationSource::Learned
+    );
+    assert!(learned.reservation.memory_bytes >= 6 * GIB);
+
+    // A write to rows no need reads (contention, durations) redoes nothing.
+    drop(super::profile_reads::Writing::apart_from_needs(&db));
+    place!(&plan_x, &request_x).await;
+    assert_eq!(plan_x.take_needs_worked_out(), 0);
+
+    // A different machine of the same request is its own context.
+    plan_x
+        .resolve_for(&request_x, "device", "other", &capabilities, duration)
+        .await;
+    assert_eq!(plan_x.take_needs_worked_out(), 1);
+    assert_eq!(plan_x.needs_held(), 2);
+}
+
 fn provenance_request() -> CellRequest {
     CellRequest {
         request_id: "provenance".into(),

@@ -157,7 +157,7 @@ async fn record_contention(
     finished: u64,
     multiplier_millis: u64,
 ) -> Result<(), String> {
-    let _written = Writing::of(&db);
+    let _written = Writing::apart_from_needs(&db);
     // Borrowed, not consumed: an array's by-value iterator held across these
     // awaits nests deep enough in 1.99's std that proving the transport's
     // invoke future Send overflows the trait-recursion limit (E0275).
@@ -1727,7 +1727,7 @@ async fn record_suite_evidence(
     build_jobs: Option<BuildJobProcesses>,
     width: Option<WidthSample>,
 ) -> Result<(), String> {
-    let _written = Writing::of(&db);
+    let _written = Writing::teaching(&db, super::profile_reads::suite_scopes(suite_key));
     if peak.is_none()
         && kills == KillsSeen::Neither
         && test_phase.is_none()
@@ -2724,7 +2724,7 @@ async fn record_memory_kill(
     context: &ProfileContext,
     kill: MemoryKill,
 ) -> Result<(), String> {
-    let _written = Writing::of(&db);
+    let _written = Writing::teaching(&db, vec![super::profile_reads::identity_scope(identity)]);
     let identity = identity.clone();
     let context = context.clone();
     db.write(move |conn| {
@@ -3138,7 +3138,7 @@ async fn record_duration(
     finished: u64,
     duration_ms: u64,
 ) -> Result<(), String> {
-    let _written = Writing::of(&db);
+    let _written = Writing::apart_from_needs(&db);
     let identity = identity.clone();
     let context = context.clone();
     db.write(move |conn| {
@@ -3227,7 +3227,7 @@ async fn update_profile_with(
     peak_decay_divisor: u64,
     peak_process: Option<&cairn_common::executor_protocol::PeakProcess>,
 ) -> Result<(), String> {
-    let _written = Writing::of(&db);
+    let _written = Writing::teaching(&db, vec![super::profile_reads::identity_scope(identity)]);
     let identity = identity.clone();
     let context = context.clone();
     let process_bytes = peak_process.map(|peak| peak.bytes as i64);

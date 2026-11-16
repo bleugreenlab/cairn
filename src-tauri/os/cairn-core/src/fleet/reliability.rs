@@ -127,7 +127,7 @@ pub(super) async fn record(
     duration_ms: Option<u64>,
     finished_at_unix_ms: u64,
 ) -> Result<(), String> {
-    let _written = super::profile_reads::Writing::of(&db);
+    let _written = super::profile_reads::Writing::apart_from_needs(&db);
     let identity = identity.clone();
     let os = os.to_string();
     let executor_id = executor_id.to_string();

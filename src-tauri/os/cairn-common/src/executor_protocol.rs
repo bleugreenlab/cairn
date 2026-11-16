@@ -9443,6 +9443,13 @@ pub struct LearnedResourceEstimate {
 /// sends, the declines it receives and the offers that authorize headroom,
 /// and shows them on its executors page. No frame, field or executor behavior
 /// changes, so a runner talking to an older executor gets nothing wrong.
+///
+/// cairn/7318's step 2 does not move the number. The runner works out each
+/// queued request's reservation once per machine context and reuses it until
+/// the profile store learns something that bears on it, instead of on every
+/// placement pass. It sends the same `ResourceReservation` in the same fields,
+/// computed from the same rows, so an older executor receives exactly what it
+/// received before and a runner talking to one gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
 
 /// The version `build.rs` derived from the paragraphs above

@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use crate::storage::LocalDb;
+use cairn_common::executor_protocol::CommandResourceIdentity;
 
 /// How long a memoized read stands without a write through this module.
 pub(super) const PROFILE_READ_TTL_MS: u64 = 30_000;
@@ -39,8 +40,14 @@ struct Memo {
 
 #[derive(Default)]
 struct Reads {
-    /// Each database instance's profile revision.
+    /// Each database instance's profile revision: every write advances it.
     revisions: HashMap<u64, u64>,
+    /// Advanced by the writes that can change any request's needs without
+    /// naming whom (an operator forgetting a machine's kills).
+    needs_epochs: HashMap<u64, u64>,
+    /// Advanced by the writes that name what they taught: an identity, a
+    /// suite, a project.
+    scopes: HashMap<(u64, String), u64>,
     memos: HashMap<(u64, String), Memo>,
 }
 
@@ -122,23 +129,115 @@ impl Lookup {
     }
 }
 
+/// What a request's needs were worked out from, as one comparable value.
+/// Equal stamps mean nothing the needs were derived from has been written
+/// since; see [`needs_stamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NeedsStamp {
+    epoch: u64,
+    scoped: u64,
+}
+
+/// The scope a command identity's rows are written under.
+pub(super) fn identity_scope(identity: &CommandResourceIdentity) -> String {
+    format!("identity\u{1f}{}:{}", identity.version, identity.key)
+}
+
+/// The scopes a suite's evidence is written under: the suite, and its
+/// project, whose class prior reads every suite the project has.
+pub(super) fn suite_scopes(suite_key: &str) -> Vec<String> {
+    let mut scopes = vec![format!("suite\u{1f}{suite_key}")];
+    if let Some((project_id, _)) = suite_key.split_once('/') {
+        scopes.push(format!("project\u{1f}{project_id}"));
+    }
+    scopes
+}
+
+/// The stamp of what a request's needs depend on, given every scope its
+/// identities and suites name.
+///
+/// A write that taught the store about one identity advances only that
+/// identity's scope, so a finish of one command leaves every other queued
+/// request's needs standing. A write that names nothing advances the epoch,
+/// which every stamp includes.
+pub(super) fn needs_stamp(db: &LocalDb, scopes: &[String]) -> NeedsStamp {
+    let instance = db.instance();
+    let reads = reads();
+    NeedsStamp {
+        epoch: reads.needs_epochs.get(&instance).copied().unwrap_or(0),
+        scoped: scopes
+            .iter()
+            .map(|scope| {
+                reads
+                    .scopes
+                    .get(&(instance, scope.clone()))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum(),
+    }
+}
+
+enum Taught {
+    /// Anything may have changed: the default, which errs toward re-reading.
+    Anything,
+    /// Only these scopes' needs may have changed.
+    Scopes(Vec<String>),
+    /// Nothing a request's needs read: contention, duration and reliability
+    /// rows, which ranking reads and needs do not.
+    NoNeeds,
+}
+
 /// Held by a writer of the profile tables for the length of its write.
 /// Dropping it, on every path out of the writer, advances the instance's
-/// revision, so no read from before the write is answered after it.
+/// revision, so no read from before the write is answered after it, and the
+/// needs stamp of whatever the write taught.
 pub(super) struct Writing {
     instance: u64,
+    taught: Taught,
 }
 
 impl Writing {
+    /// A write that may change any request's needs.
     pub(super) fn of(db: &LocalDb) -> Self {
         Self {
             instance: db.instance(),
+            taught: Taught::Anything,
+        }
+    }
+
+    /// A write that taught the store about `scopes` only.
+    pub(super) fn teaching(db: &LocalDb, scopes: Vec<String>) -> Self {
+        Self {
+            instance: db.instance(),
+            taught: Taught::Scopes(scopes),
+        }
+    }
+
+    /// A write to rows no request's needs read.
+    pub(super) fn apart_from_needs(db: &LocalDb) -> Self {
+        Self {
+            instance: db.instance(),
+            taught: Taught::NoNeeds,
         }
     }
 }
 
 impl Drop for Writing {
     fn drop(&mut self) {
-        *reads().revisions.entry(self.instance).or_default() += 1;
+        let mut reads = reads();
+        *reads.revisions.entry(self.instance).or_default() += 1;
+        match &self.taught {
+            Taught::Anything => *reads.needs_epochs.entry(self.instance).or_default() += 1,
+            Taught::Scopes(scopes) => {
+                for scope in scopes {
+                    *reads
+                        .scopes
+                        .entry((self.instance, scope.clone()))
+                        .or_default() += 1;
+                }
+            }
+            Taught::NoNeeds => {}
+        }
     }
 }
