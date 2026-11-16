@@ -938,6 +938,7 @@ impl OrchestratorBuilder {
             sidebar_active_issues_rebuild: Arc::new(TokioMutex::new(())),
             sidebar_active_issues_rebuild_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             admission_lock: admission_lock.clone(),
+            launch_admission_waits: Arc::default(),
             sweep_pulse: Arc::new(crate::execution::gates::pulse::SweepPulse::new(
                 admission_lock,
             )),
@@ -1968,6 +1969,9 @@ pub struct Orchestrator {
     /// never interleave over a count that spans databases. Bounded and
     /// attributed; see `execution::gates::capacity::AdmissionLock`.
     pub(crate) admission_lock: Arc<crate::execution::gates::capacity::AdmissionLock>,
+    /// Dispatched launches admission refused, while they are re-driven; see
+    /// `orchestrator::wakes::launch_admission`.
+    pub(crate) launch_admission_waits: Arc<crate::orchestrator::wakes::LaunchAdmissionWaits>,
     /// The gate sweep loop's liveness and each held execution's last
     /// evaluation; see `execution::gates::pulse`.
     pub sweep_pulse: Arc<crate::execution::gates::pulse::SweepPulse>,

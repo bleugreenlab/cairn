@@ -720,17 +720,24 @@ fn waiting_launch(
     created_at: i64,
     problem_detail: Option<String>,
 ) -> TaskLaunch {
+    let admission_wait = || {
+        orch.launch_admission_waits
+            .get(job_id)
+            .map(|wait| wait.describe())
+    };
     if status == "pending" {
         TaskLaunch::WaitingToStart {
             since_unix: created_at,
             stage: StartStage::Queued,
-            detail: problem_detail,
+            detail: problem_detail.or_else(admission_wait),
         }
     } else {
         TaskLaunch::WaitingToStart {
             since_unix: started_at.unwrap_or(created_at),
             stage: StartStage::Preparing,
-            detail: problem_detail.or_else(|| preparation_wait_detail(orch, job_id)),
+            detail: problem_detail
+                .or_else(|| preparation_wait_detail(orch, job_id))
+                .or_else(admission_wait),
         }
     }
 }
@@ -2207,6 +2214,131 @@ pub(super) mod unstarted_child_tests {
             .as_deref(),
             Some("failed")
         );
+    }
+
+    /// A claimed child whose launch admission refuses, because another
+    /// admission holds the lock past its bound, is not dropped (cairn/7296):
+    /// its task page says it waits for launch admission, and it is handed to
+    /// the runner again once the lock is free.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_launch_admission_is_reported_and_dispatched_again() {
+        use crate::execution::gates::capacity::AdmissionSite;
+        let (orch, executor) = parent_fixture("refused-admission-redriven.db").await;
+        let outcome = spawn_background(&orch, "map the fleet").await;
+        let task = &outcome.spawned[0];
+        let child = task.job_id.clone();
+        assert_eq!(*executor.started.lock().unwrap(), vec![child.clone()]);
+
+        orch.launch_admission_waits
+            .set_backoff(vec![Duration::from_millis(50)]);
+        orch.admission_lock
+            .set_wait_bound(Duration::from_millis(20));
+        let holder = orch
+            .admission_lock
+            .acquire(AdmissionSite::Release, "another admission")
+            .await
+            .unwrap();
+        let admitted = crate::orchestrator::wakes::admit_dispatched_launch(
+            &orch,
+            &child,
+            crate::execution::jobs::WakeCause::System,
+            false,
+        )
+        .await;
+        assert!(admitted.is_none(), "the lock is held past the bound");
+        orch.admission_lock.set_wait_bound(Duration::from_secs(30));
+        drop(holder);
+
+        let wait = orch
+            .launch_admission_waits
+            .get(&child)
+            .expect("the refusal is recorded, not dropped");
+        assert_eq!((wait.refusals, wait.attempts_allowed), (1, 2));
+        assert!(
+            wait.last_refusal
+                .contains("launch admission was busy: this launch waited 0 s")
+                && !wait.last_refusal.contains("AdmissionBusy"),
+            "{wait:?}"
+        );
+        assert!(wait.next_attempt_unix.is_some(), "{wait:?}");
+        let request = crate::mcp::types::McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: "/tmp".to_string(),
+            run_id: None,
+            tool: "read".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+            origin: None,
+        };
+        let page = crate::resources::read_cairn_resource(
+            &orch,
+            &request,
+            task.task_uri.as_deref().unwrap(),
+        )
+        .await;
+        assert!(
+            page.contains("waiting for Cairn to admit its launch since")
+                && page.contains("1 of 2 attempts refused")
+                && page.contains("next attempt at")
+                && page.contains("Nothing is needed from you"),
+            "{page}"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while executor.started.lock().unwrap().len() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the refused launch was never dispatched again"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            *executor.started.lock().unwrap(),
+            vec![child.clone(), child]
+        );
+    }
+
+    /// A launch refused through every attempt fails with the refusal, and the
+    /// parent parked on the task is answered rather than left waiting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_launch_refused_through_every_attempt_fails_and_answers_the_parent() {
+        let (orch, child, _requests) = spawn_and_park("refused-admission-exhausted.db").await;
+        orch.launch_admission_waits.set_backoff(Vec::new());
+
+        crate::orchestrator::wakes::redrive_refused_launch(
+            &orch,
+            &child,
+            "launch admission was busy: this launch waited 30 s while another admission held it",
+        );
+
+        await_successor(&orch).await;
+        assert_eq!(successor_count(&orch).await, 1);
+        let delivered = delivered_tool_result(&orch)
+            .await
+            .expect("the wake delivers the failure to the spawning call");
+        assert!(delivered.contains("failed"), "{delivered}");
+        assert_eq!(
+            text(
+                &orch,
+                &format!("SELECT status FROM jobs WHERE id = '{child}'")
+            )
+            .await
+            .as_deref(),
+            Some("failed")
+        );
+        let reason = text(
+            &orch,
+            &format!("SELECT error_message FROM runs WHERE job_id = '{child}'"),
+        )
+        .await
+        .unwrap_or_default();
+        assert!(
+            reason.contains("its launch was never admitted: 1 attempts were refused")
+                && reason.contains("this launch waited 30 s"),
+            "{reason}"
+        );
+        assert!(orch.launch_admission_waits.get(&child).is_none());
     }
 
     /// Advancement's DAG reduction waits for the execution snapshot lock that

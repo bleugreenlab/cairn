@@ -918,8 +918,16 @@ mod tests {
         assert!(tasks.contains("research"), "{tasks}");
         assert!(!tasks.contains("/0/0/"), "{tasks}");
 
-        let task =
-            super::super::node::read_task(&db, "thr", 0, 0, "design-review", "research").await;
+        let task = super::super::node::read_task(
+            &db,
+            &Default::default(),
+            "thr",
+            0,
+            0,
+            "design-review",
+            "research",
+        )
+        .await;
         assert!(task.contains("research"), "{task}");
         assert!(!task.contains("/0/0/"), "{task}");
 

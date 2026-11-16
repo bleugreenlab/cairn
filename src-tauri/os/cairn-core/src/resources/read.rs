@@ -2933,7 +2933,16 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("task", &params) {
                 error
             } else {
-                read_task(db, &project, number, exec_seq, &node_id, &task_name).await
+                read_task(
+                    db,
+                    &orch.launch_admission_waits,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    &task_name,
+                )
+                .await
             }
         }
         CairnResource::NodeChat {

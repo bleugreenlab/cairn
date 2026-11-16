@@ -188,7 +188,11 @@ enum RecipientJob {
         job_id: String,
         run_id: String,
     },
+    /// No run yet. `claimed` is a job advancement already claimed `running`
+    /// for a start that has not produced its run.
     Pending {
+        job_id: String,
+        claimed: bool,
         parent_segment: Option<String>,
         delegated: bool,
     },
@@ -300,10 +304,14 @@ async fn find_recipient_job(
                     let job_id = row.text(0)?;
                     match row.opt_text(1)? {
                         Some(run_id) => Ok(RecipientJob::Started { job_id, run_id }),
-                        None if row.text(2)? == "pending" => Ok(RecipientJob::Pending {
-                            parent_segment: row.opt_text(3)?,
-                            delegated: row.i64(4)? != 0,
-                        }),
+                        None if matches!(row.text(2)?.as_str(), "pending" | "running") => {
+                            Ok(RecipientJob::Pending {
+                                claimed: row.text(2)? == "running",
+                                parent_segment: row.opt_text(3)?,
+                                delegated: row.i64(4)? != 0,
+                                job_id,
+                            })
+                        }
                         None => Err(DbError::Internal(format!(
                             "recipient job {job_id} has no run but is not pending"
                         ))),
@@ -639,16 +647,26 @@ async fn resolve_recipient(
         {
             RecipientJob::Started { job_id, run_id } => (job_id, run_id),
             RecipientJob::Pending {
+                job_id,
+                claimed,
                 parent_segment,
                 delegated,
             } => {
                 use crate::jobs::queries::PendingDispatch;
-                let pending = match (delegated, parent_segment.as_deref()) {
-                    (true, _) => PendingDispatch::Delegated,
-                    (false, Some(parent)) => PendingDispatch::AfterParent(parent),
-                    (false, None) => PendingDispatch::AfterRecipe,
+                let condition = if let Some(wait) = orch.launch_admission_waits.get(&job_id) {
+                    wait.describe()
+                } else if claimed {
+                    crate::jobs::queries::PREPARING_DESCRIPTION
+                        .trim_end_matches('.')
+                        .to_string()
+                } else {
+                    let pending = match (delegated, parent_segment.as_deref()) {
+                        (true, _) => PendingDispatch::Delegated,
+                        (false, Some(parent)) => PendingDispatch::AfterParent(parent),
+                        (false, None) => PendingDispatch::AfterRecipe,
+                    };
+                    crate::jobs::queries::pending_dispatch_description(pending)
                 };
-                let condition = crate::jobs::queries::pending_dispatch_description(pending);
                 return Err(format!("{addressed_uri}: {condition}."));
             }
         }

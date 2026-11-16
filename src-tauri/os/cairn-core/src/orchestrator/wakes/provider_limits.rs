@@ -470,6 +470,24 @@ async fn owns_held_job(orch: &Orchestrator, db: &LocalDb, job_id: &str) -> Resul
     }))
 }
 
+/// A refused launch admission as a sentence: it is the reason a waiting
+/// parent, a node page and a failed run all read.
+fn launch_admission_refusal(busy: &crate::execution::gates::capacity::AdmissionBusy) -> String {
+    let waited = busy.waited.as_secs();
+    match &busy.holder {
+        Some(holder) => format!(
+            "launch admission was busy: this launch waited {waited} s while another admission \
+             ({} of {}) held it for {} s",
+            holder.site,
+            holder.subject,
+            holder.held.as_secs()
+        ),
+        None => format!(
+            "launch admission was busy: this launch waited {waited} s and gave up just as another admission let go"
+        ),
+    }
+}
+
 /// The host's cold-launch seam, shared by DAG dispatch and owner pickup.
 /// Hold the returned guard until the pending/running job reserves its slot.
 pub async fn admit_thread_launch(
@@ -488,7 +506,7 @@ pub async fn admit_thread_launch(
             job_id.to_string(),
         )
         .await
-        .map_err(|e| format!("launch admission busy: {e:?}"))?;
+        .map_err(|busy| launch_admission_refusal(&busy))?;
     if active_supply_hold(&db, job_id).await?.is_some() {
         return Ok(None);
     }

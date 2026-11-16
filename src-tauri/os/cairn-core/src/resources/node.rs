@@ -2515,7 +2515,11 @@ pub(super) async fn read_node(
         output.push_str(&format!("Failure: {reason}\n\n"));
     }
     push_placement_default(&mut output, db, &job.id).await;
-    if job.status == "pending" && job.started_at.is_none() {
+    let admission_wait = orch.launch_admission_waits.get(&job.id);
+    if let Some(wait) = admission_wait.as_ref() {
+        output.push_str(&wait.describe());
+        output.push_str(".\n\n");
+    } else if job.status == "pending" && job.started_at.is_none() {
         use crate::jobs::queries::PendingDispatch;
         let pending = if job.delegated {
             PendingDispatch::Delegated
@@ -2546,6 +2550,7 @@ pub(super) async fn read_node(
     if job.status == "running"
         && launch.is_none()
         && preparation.is_none()
+        && admission_wait.is_none()
         && crate::jobs::queries::latest_run_id_for_job(db, &job.id)
             .await
             .is_none()
@@ -3700,8 +3705,11 @@ pub(super) async fn read_node_artifact(
 }
 
 /// Read a sub-agent task job's base summary — the task analogue of `read_node`.
+/// `admission_waits` says what a task whose launch admission refused is
+/// waiting on.
 pub(super) async fn read_task(
     db: &LocalDb,
+    admission_waits: &crate::orchestrator::wakes::LaunchAdmissionWaits,
     project_key: &str,
     number: i32,
     exec_seq: i32,
@@ -3742,7 +3750,10 @@ pub(super) async fn read_task(
         hold.as_ref(),
     );
     push_placement_default(&mut output, db, &task_job.id).await;
-    if let Some(parent_segment) = parent_segment {
+    if let Some(wait) = admission_waits.get(&task_job.id) {
+        output.push_str(&wait.describe());
+        output.push_str(".\n\n");
+    } else if let Some(parent_segment) = parent_segment {
         use crate::jobs::queries::PendingDispatch;
         let pending = if task_job.delegated {
             PendingDispatch::Delegated
