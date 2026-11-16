@@ -235,7 +235,10 @@ async fn sibling_items(h: &Harness) -> i64 {
     .unwrap()
 }
 
-use crate::orchestrator::base_advance::preparation::tests::{on_compute, starve_compute};
+use crate::orchestrator::base_advance::preparation::tests::{
+    expire_install, on_compute, starve_compute,
+};
+use crate::orchestrator::base_advance::preparation::ConflictRecord;
 use crate::orchestrator::base_advance::replay_cost::{
     self as cost, branch_blockers, branch_samples, BudgetClass, CostOutcome,
 };
@@ -387,10 +390,7 @@ async fn a_background_timeout_never_blocks_an_explicit_replay() {
     h.commit(&h.branch_ws, BRANCH, "own.txt", "one\n");
     let base = h.advance_main("incoming.txt", "theirs\n");
     starve_compute(&h.store, true);
-    let refusal = h
-        .prepare(PreparationPurpose::OwnerCommit)
-        .await
-        .unwrap_err();
+    let refusal = h.prepare(PreparationPurpose::Run).await.unwrap_err();
     assert!(
         matches!(refusal, PreparationRefusal::TimedOut { .. }),
         "{refusal}"
@@ -411,6 +411,249 @@ async fn a_background_timeout_never_blocks_an_explicit_replay() {
         .unwrap();
     assert!(answer.starts_with("Replayed"), "{answer}");
     assert!(h.is_ancestor(&base, &h.tip(BRANCH)));
+}
+
+async fn quarantine(h: &Harness) -> Option<String> {
+    crate::orchestrator::base_advance::load_reconcile_quarantine(&h.db, "proj-1", &h.store, BRANCH)
+        .await
+        .unwrap()
+        .map(|quarantine| format!("{}={}", quarantine.failure_kind, quarantine.fingerprint))
+}
+
+fn timed_out_at(refusal: &PreparationRefusal, at: &str) -> bool {
+    matches!(refusal, PreparationRefusal::TimedOut { head, .. } if head == at)
+}
+
+/// cairn/7237: an automatic timeout's cooldown holds automatic preparation of
+/// the unchanged head (cairn/6070), but never the owner's commit. That commit
+/// publishes on the branch's own head with the advance pending and named, and
+/// the new head it makes releases the cooldown: automatic preparation retries.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn an_owner_commit_passes_an_automatic_timeout_cooldown_with_the_advance_pending() {
+    let h = harness_or_skip!("owner_commit_passes_cooldown");
+    let head = h.commit(&h.branch_ws, BRANCH, "own.txt", "one\n");
+    let base = h.advance_main("incoming.txt", "theirs\n");
+    starve_compute(&h.store, true);
+
+    let first = h.prepare(PreparationPurpose::Run).await.unwrap_err();
+    assert!(timed_out_at(&first, &head), "{first}");
+    assert_eq!(
+        quarantine(&h).await,
+        Some(format!("{}={head}:{base}", crate::jj::RECONCILE_TIMEOUT))
+    );
+    let second = h.prepare(PreparationPurpose::Run).await.unwrap_err();
+    assert!(
+        matches!(second, PreparationRefusal::Cooldown { .. }),
+        "the unchanged head cools down: {second}"
+    );
+    assert!(second.to_string().contains("cairn:~/rebase"), "{second}");
+
+    let owner = h.prepare(PreparationPurpose::OwnerCommit).await.unwrap();
+    assert!(!owner.advanced && owner.session.is_none());
+    assert_eq!(
+        (owner.head_before.as_str(), owner.head_after.as_str()),
+        (head.as_str(), head.as_str())
+    );
+    assert_eq!(
+        owner.base_commit, base,
+        "revalidation still guards this base"
+    );
+    let pending = owner
+        .advance_pending
+        .as_deref()
+        .expect("the advance is owed");
+    for expected in [
+        "base advance",
+        "`main`",
+        base.as_str(),
+        "cooling down",
+        "cairn:~/rebase",
+    ] {
+        assert!(pending.contains(expected), "{expected}: {pending}");
+    }
+    assert_eq!(h.tip(BRANCH), head, "preparing the commit moved nothing");
+
+    // The commit lands on the branch's own head, and that new head is no
+    // longer the one the cooldown holds.
+    let next = h.commit(&h.branch_ws, BRANCH, "own.txt", "two\n");
+    assert!(h.is_ancestor(&head, &next) && !h.is_ancestor(&base, &next));
+    let retried = h.prepare(PreparationPurpose::Run).await.unwrap_err();
+    assert!(
+        timed_out_at(&retried, &next),
+        "retried, not held: {retried}"
+    );
+}
+
+/// The owner's commit that meets a fresh timeout, not only the cooldown after
+/// one, publishes with the advance pending.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn an_owner_commit_meeting_a_fresh_timeout_publishes_with_the_advance_pending() {
+    let h = harness_or_skip!("owner_commit_fresh_timeout");
+    let head = h.commit(&h.branch_ws, BRANCH, "own.txt", "one\n");
+    let base = h.advance_main("incoming.txt", "theirs\n");
+    starve_compute(&h.store, true);
+    let owner = h.prepare(PreparationPurpose::OwnerCommit).await.unwrap();
+    starve_compute(&h.store, false);
+    assert!(!owner.advanced && owner.head_after == head);
+    let pending = owner.advance_pending.as_deref().unwrap();
+    assert!(
+        pending.contains("exceeded") && pending.contains(&base),
+        "{pending}"
+    );
+    assert_eq!(
+        quarantine(&h).await,
+        Some(format!("{}={head}:{base}", crate::jj::RECONCILE_TIMEOUT)),
+        "automatic preparation of this head still cools down"
+    );
+    assert_eq!(
+        newest_sample(&h).await.outcome,
+        CostOutcome::ComputeExhausted
+    );
+}
+
+/// An owner's commit whose computed advance expires before it installs
+/// publishes pending, and its cost sample records a timeout outside
+/// computation, not a conflict: nothing conflicted.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn an_owner_commit_whose_install_expires_records_a_timeout_not_a_conflict() {
+    let h = harness_or_skip!("owner_commit_install_expiry");
+    let head = h.commit(&h.branch_ws, BRANCH, "own.txt", "one\n");
+    let base = h.advance_main("incoming.txt", "theirs\n");
+    expire_install(&h.store, true);
+    let owner = h.prepare(PreparationPurpose::OwnerCommit).await;
+    expire_install(&h.store, false);
+    let owner = owner.unwrap();
+    assert!(!owner.advanced && owner.head_after == head);
+    assert!(
+        owner.advance_pending.as_deref().unwrap().contains(&base),
+        "{:?}",
+        owner.advance_pending
+    );
+    assert_eq!(
+        h.tip(BRANCH),
+        head,
+        "the expired candidate installed nothing"
+    );
+    assert_eq!(newest_sample(&h).await.outcome, CostOutcome::TimedOut);
+}
+
+/// The specimen: an explicit replay records a session at H while an automatic
+/// timeout row stands at H (an ordering race). The owner's resolution write
+/// prepares at H under that session, and the cooldown never refuses it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn an_owner_commit_under_its_open_session_is_never_held_by_a_timeout_cooldown() {
+    let h = harness_or_skip!("owner_commit_session_cooldown");
+    let head = h.commit(&h.branch_ws, BRANCH, "shared.txt", "original\nX\n");
+    let base = h.advance_main("shared.txt", "original\nA\n");
+    let _ = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None).await;
+    let session = load_active_session(&h.db, BRANCH)
+        .await
+        .unwrap()
+        .expect("the explicit replay records the conflict");
+    crate::orchestrator::base_advance::record_reconcile_timeout(
+        &h.db,
+        "proj-1",
+        &h.store,
+        BRANCH,
+        &head,
+        &base,
+        "reconcile timeout: detached preparation exceeded its 10s budget",
+    )
+    .await
+    .unwrap();
+
+    let owner = h.prepare(PreparationPurpose::OwnerCommit).await.unwrap();
+    assert!(!owner.advanced && owner.head_after == head);
+    assert_eq!(
+        owner.session.map(|bound| bound.intent_id),
+        Some(session.intent_id),
+        "published under the open session"
+    );
+    assert!(owner.advance_pending.is_none(), "nothing was deferred");
+}
+
+/// An explicit replay that records a session retires the automatic timeout
+/// cooldown at that head, and the session takes over what the cooldown did:
+/// automatic preparation of the head is answered from it, without computing.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn an_explicit_replay_session_replaces_the_timeout_cooldown_at_its_head() {
+    let h = harness_or_skip!("explicit_session_replaces_cooldown");
+    let head = h.commit(&h.branch_ws, BRANCH, "shared.txt", "original\nX\n");
+    h.advance_main("shared.txt", "original\nA\n");
+    starve_compute(&h.store, true);
+    let timed_out = h.prepare(PreparationPurpose::Run).await.unwrap_err();
+    assert!(timed_out_at(&timed_out, &head), "{timed_out}");
+    assert!(quarantine(&h).await.is_some());
+
+    starve_compute(&h.store, false);
+    let _ = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None).await;
+    let session = load_active_session(&h.db, BRANCH)
+        .await
+        .unwrap()
+        .expect("the explicit replay records the conflict");
+    assert_eq!(quarantine(&h).await, None, "the cooldown is retired");
+
+    // Starved again: anything that computed would time out.
+    starve_compute(&h.store, true);
+    for purpose in [PreparationPurpose::Run, PreparationPurpose::Check] {
+        let answered = h.prepare(purpose).await.unwrap_err();
+        let PreparationRefusal::Conflict(conflict) = &answered else {
+            panic!("the session answers, not a cooldown or a timeout: {answered}");
+        };
+        assert_eq!(
+            conflict.record,
+            ConflictRecord::Session {
+                intent_id: session.intent_id.clone(),
+                reopened: false
+            }
+        );
+        assert_eq!(conflict.paths, vec!["shared.txt".to_string()]);
+    }
+    starve_compute(&h.store, false);
+    assert_eq!(quarantine(&h).await, None, "and nothing re-cooled");
+    assert_eq!(h.tip(BRANCH), head);
+}
+
+/// cairn/7237 changes cairn/6752's merge-mode rule for the timeout class: an
+/// owner's commit that meets a cooldown publishes with the catch-up pending
+/// even with no session open.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn a_merge_mode_owner_commit_passes_a_cooldown_without_a_session() {
+    let h = harness_or_skip!("merge_owner_commit_cooldown");
+    let head = h.commit(&h.branch_ws, BRANCH, "own.txt", "one\n");
+    let main = h.tip("main");
+    crate::orchestrator::catch_up::set(
+        &h.db,
+        crate::orchestrator::catch_up::SetCatchUpMode {
+            project_id: "proj-1",
+            store: &h.store,
+            bookmark: BRANCH,
+            job_id: JOB,
+            actor: "operator (test)",
+            review_paths: &[],
+            reviewed_through: &main,
+        },
+    )
+    .await
+    .unwrap();
+    let base = h.advance_main("incoming.txt", "theirs\n");
+    starve_compute(&h.store, true);
+    let first = h.prepare(PreparationPurpose::Run).await.unwrap_err();
+    assert!(timed_out_at(&first, &head), "{first}");
+    let owner = h.prepare(PreparationPurpose::OwnerCommit).await.unwrap();
+    starve_compute(&h.store, false);
+    assert!(!owner.advanced && owner.session.is_none() && owner.head_after == head);
+    let pending = owner.advance_pending.as_deref().unwrap();
+    assert!(
+        pending.contains("catch-up merge") && pending.contains(&base),
+        "{pending}"
+    );
 }
 
 /// Time an explicit attempt lost before computing (here, its computation was

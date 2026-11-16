@@ -1716,6 +1716,35 @@ async fn release_reconcile_quarantine(
     .map_err(|error| format!("release reconcile quarantine: {error}"))
 }
 
+/// Delete the branch's automatic timeout cooldown only when it was recorded at
+/// `tip`. Every other quarantine (a merge catch-up's, a rolled-back conflict's,
+/// a timeout at another tip) is left as it is.
+async fn release_timeout_cooldown_at(
+    db: &LocalDb,
+    project_id: &str,
+    store_path: &Path,
+    bookmark: &str,
+    tip: &str,
+) -> Result<(), String> {
+    // The fingerprint is `tip:destination` (see `record_reconcile_timeout`);
+    // commit ids never contain ':', so the prefix names exactly one tip.
+    db.execute(
+        "DELETE FROM jj_reconcile_quarantines
+         WHERE project_id = ?1 AND store_path = ?2 AND bookmark = ?3
+           AND failure_kind = ?4 AND substr(fingerprint, 1, length(?5) + 1) = ?5 || ':'",
+        params![
+            project_id,
+            store_path.to_string_lossy().as_ref(),
+            bookmark,
+            RECONCILE_TIMEOUT,
+            tip
+        ],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("release timeout cooldown: {error}"))
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct SiblingJob {
     pub(super) id: String,
@@ -4644,6 +4673,63 @@ mod tests {
             Some("tip-b"),
             "external advance main-b"
         ));
+    }
+
+    /// Only an automatic timeout recorded at the named tip is released.
+    #[tokio::test]
+    async fn releasing_a_timeout_cooldown_at_a_tip_spares_every_other_quarantine() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let store = Path::new("/store");
+        let error = "jj rebase timed out after 10s and was killed";
+        record_reconcile_timeout(&db, "proj-1", store, "agent/a", "tip-a", "main-a", error)
+            .await
+            .unwrap();
+        record_reconcile_timeout(&db, "proj-1", store, "agent/b", "tip-b", "main-a", error)
+            .await
+            .unwrap();
+        db.execute(
+            "INSERT INTO jj_reconcile_quarantines
+             (project_id, store_path, bookmark, failure_kind, fingerprint, last_diagnostic,
+              strike_count, created_at, updated_at)
+             VALUES ('proj-1', '/store', 'agent/c', ?1, 'tip-a:main-a', '{}', 1, 1, 1)",
+            (crate::orchestrator::catch_up::MERGE_CONFLICT_QUARANTINE,),
+        )
+        .await
+        .unwrap();
+
+        for branch in ["agent/a", "agent/b", "agent/c"] {
+            release_timeout_cooldown_at(&db, "proj-1", store, branch, "tip-a")
+                .await
+                .unwrap();
+        }
+        // A tip that merely starts with another tip's id names a different tip.
+        release_timeout_cooldown_at(&db, "proj-1", store, "agent/b", "tip")
+            .await
+            .unwrap();
+
+        let kept = |branch: &'static str| {
+            let db = &db;
+            async move {
+                load_reconcile_quarantine(db, "proj-1", store, branch)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(
+            kept("agent/a").await.is_none(),
+            "the timeout at tip-a is released"
+        );
+        assert_eq!(
+            kept("agent/b").await.map(|q| q.fingerprint).as_deref(),
+            Some("tip-b:main-a"),
+            "a timeout at another tip stands"
+        );
+        assert_eq!(
+            kept("agent/c").await.map(|q| q.failure_kind).as_deref(),
+            Some(crate::orchestrator::catch_up::MERGE_CONFLICT_QUARANTINE),
+            "a merge quarantine at the same tip stands"
+        );
     }
 
     /// The durable base record this reconcile leaves on a job.

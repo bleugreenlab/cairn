@@ -650,15 +650,25 @@ impl std::fmt::Display for RevisionCaptureError {
                         base_branch,
                         base_commit,
                         paths,
-                        ..
+                        record,
                     } = &**conflict;
+                    use crate::orchestrator::base_advance::preparation::ConflictRecord;
+                    let owner = match record {
+                        ConflictRecord::Session { intent_id, .. } => format!(
+                            "The branch's owner already holds this conflict in its open conflict \
+                             session {intent_id} (`cairn:~/rebase` on its node)"
+                        ),
+                        ConflictRecord::CheckEvidence { .. } => "The branch's owner meets this \
+                                                                 conflict at its next commit or \
+                                                                 merge"
+                            .to_string(),
+                    };
                     write!(
                         f,
                         "Conflicts with base: branch `{branch}` at {} cannot take its base \
                      `{base_branch}@{}` cleanly (conflicting paths: {}). Nothing on the branch \
                      changed, nobody was woken, and nothing ran, so this is not a test result. \
-                     The branch's owner meets this conflict at its next commit or merge; to test \
-                     the branch as it stands, name its commit {} instead.",
+                     {owner}; to test the branch as it stands, name its commit {} instead.",
                         short_commit(head),
                         short_commit(base_commit),
                         if paths.is_empty() {

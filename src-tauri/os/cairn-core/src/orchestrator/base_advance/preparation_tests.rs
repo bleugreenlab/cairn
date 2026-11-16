@@ -397,6 +397,26 @@ pub(in crate::orchestrator::base_advance) fn starve_compute(store: &Path, starve
     }
 }
 
+fn expired_installs() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static EXPIRED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    EXPIRED.get_or_init(Default::default)
+}
+
+/// Fault injection: every computed candidate of `store` expires before its
+/// install, as one held behind lock or reservation waits does.
+pub(super) fn install_expired(store: &Path) -> bool {
+    expired_installs().lock().unwrap().contains(store)
+}
+
+pub(in crate::orchestrator::base_advance) fn expire_install(store: &Path, expired: bool) {
+    let mut stores = expired_installs().lock().unwrap();
+    if expired {
+        stores.insert(store.to_path_buf());
+    } else {
+        stores.remove(store);
+    }
+}
+
 fn refused_heals() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
     static REFUSED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
     REFUSED.get_or_init(Default::default)

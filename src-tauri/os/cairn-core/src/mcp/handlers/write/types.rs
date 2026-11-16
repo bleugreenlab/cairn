@@ -36,6 +36,11 @@ pub(super) struct ChangeReport {
     /// this write's own changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) held_publications: Vec<String>,
+    /// The base advance this write's preparation deferred: the commit landed
+    /// on the branch's own head, and this says what is still owed and how to
+    /// run it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) advance_pending: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +152,7 @@ pub(super) fn empty_change_report(
         target_hashes: Vec::new(),
         replayed: None,
         held_publications: Vec::new(),
+        advance_pending: None,
     }
 }
 

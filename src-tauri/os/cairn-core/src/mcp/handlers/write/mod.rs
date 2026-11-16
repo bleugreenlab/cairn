@@ -2711,6 +2711,11 @@ async fn handle_write_attempt(
 
         let mut report = empty_change_report(applied, failures, commit, false, atomic);
         report.partial_success = !report.applied.is_empty() && !report.failures.is_empty();
+        if report.commit.is_some() {
+            report.advance_pending = prepared_write
+                .as_ref()
+                .and_then(|prepared| prepared.coordinate.advance_pending.clone());
+        }
         // From here the carrier settles the row itself: the blocking group
         // through its own checkpoints, everything else just below.
         if let Some(progress) = resource_progress.as_mut() {

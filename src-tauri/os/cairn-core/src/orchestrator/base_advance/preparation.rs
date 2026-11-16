@@ -84,8 +84,8 @@ use super::{
     load_project_default_branch, load_project_repo_path, load_reconcile_quarantine,
     mark_publication_unconfirmed, materialize_markers_for_branch, persist_reconcile_item,
     quarantine_blocks_automatic_replay, record_reconcile_timeout, refresh_residencies_for_branch,
-    release_reconcile_quarantine, replay_kept_patch, ReconcileItemUpdate, DELEGATOR_ON_BRANCH_JOIN,
-    LIVE_JOB_PREDICATE, OWNS_BRANCH,
+    release_reconcile_quarantine, release_timeout_cooldown_at, replay_kept_patch,
+    ReconcileItemUpdate, DELEGATOR_ON_BRANCH_JOIN, LIVE_JOB_PREDICATE, OWNS_BRANCH,
 };
 use crate::messages::delivery::{latest_run_for_job, queue_system_direct_once};
 use crate::messages::queued::DeliveryUrgency;
@@ -344,6 +344,10 @@ pub(crate) struct PreparedBranch {
     /// Follow-up work after an accepted install that did not complete. The
     /// coordinate above is accepted regardless.
     pub(crate) warnings: Vec<String>,
+    /// The base advance an owner's commit was published without (see
+    /// [`Context::with_advance_pending`]): what was deferred, why, and how to
+    /// run it now. `None` when nothing is owed.
+    pub(crate) advance_pending: Option<String>,
 }
 
 /// The recorded conflict a resolution commit proceeds under.
@@ -702,8 +706,12 @@ impl std::fmt::Display for PreparationRefusal {
                 retry_at,
             } => write!(
                 f,
-                "preparing this unchanged head timed out before at {fingerprint}; it is cooling \
-                 down until Unix time {retry_at} (a new commit on the branch releases it)"
+                "automatic preparation of this unchanged head timed out at {fingerprint} and is \
+                 cooling down until {} (Unix {retry_at}). The owner's `replay` action on its \
+                 rebase page (`cairn:~/rebase`) runs it now under its own budget, and the \
+                 owner's next commit, which this cooldown never holds, restarts automatic \
+                 preparation",
+                unix_rfc3339(*retry_at)
             ),
             Self::Conflict(conflict) => {
                 let BaseConflict {
@@ -1983,6 +1991,9 @@ struct AttemptCost {
     phases: super::replay_cost::PhaseTimings,
     compute_exhausted: bool,
     failure_phase: Option<String>,
+    /// What the refusal an owner's commit was published past would have
+    /// recorded (see [`Context::with_advance_pending`]).
+    deferred: Option<super::replay_cost::CostOutcome>,
 }
 
 /// Where a preparation ran out of time.
@@ -2118,13 +2129,10 @@ impl Context<'_> {
         cost.phases.total_ms = replay_cost::millis(started.elapsed());
         let outcome = match result {
             Ok(prepared) if prepared.advanced => CostOutcome::Installed,
-            Ok(_) => CostOutcome::AlreadyCurrent,
-            Err(PreparationRefusal::Conflict(_)) => CostOutcome::Conflicted,
-            Err(PreparationRefusal::TimedOut { .. }) if cost.compute_exhausted => {
-                CostOutcome::ComputeExhausted
-            }
-            Err(PreparationRefusal::TimedOut { .. }) => CostOutcome::TimedOut,
-            Err(other) => CostOutcome::Refused(other.kind().to_string()),
+            // An owner's commit published with its advance pending records
+            // what became of the advance it deferred, never "already current".
+            Ok(_) => cost.deferred.take().unwrap_or(CostOutcome::AlreadyCurrent),
+            Err(refusal) => refusal_outcome(refusal, cost.compute_exhausted),
         };
         let (host, load1) = replay_cost::host_context();
         let evidence = ReplayCostEvidence {
@@ -2397,8 +2405,18 @@ impl Context<'_> {
             // and coordinate-keyed cooldown as a timed-out replay.
             Err(crate::jj::AdvanceComputeError::TimedOut) => {
                 drop(guard);
-                return self
+                let timed_out = self
                     .timed_out(&relationship, &coordinate, TimeoutPhase::Probe)
+                    .await;
+                return self
+                    .with_advance_pending(
+                        merge_mode,
+                        &relationship,
+                        &coordinate,
+                        attempt,
+                        recovered_export,
+                        timed_out,
+                    )
                     .await;
             }
             Err(crate::jj::AdvanceComputeError::Repository(error)) => {
@@ -2437,6 +2455,7 @@ impl Context<'_> {
                 export: recovered_export,
                 attempts: attempt,
                 session: None,
+                advance_pending: None,
             })));
         }
         if let Some(debt) = debt {
@@ -2475,13 +2494,58 @@ impl Context<'_> {
                 (guard, snapshot)
             }
         };
+        // An ordinary resolution commit proceeds under its recorded session
+        // before any cooldown is consulted: it never replays, so a timeout at
+        // this head has nothing to hold. An explicit replay request is asking
+        // for the catch-up itself.
+        let guard =
+            if request.purpose == PreparationPurpose::OwnerCommit && !request.explicit_replay {
+                let (returned, bound) = self.bound_session(guard, &coordinate, false).await?;
+                if let Some(bound) = bound {
+                    let (returned, tree) = self.tree_of(returned, &coordinate.head).await?;
+                    drop(returned);
+                    return Ok(Attempt::Prepared(Box::new(PreparedBranch {
+                        project_id: request.project_id.clone(),
+                        store: self.store.clone(),
+                        branch: branch.to_string(),
+                        head_before: coordinate.head.clone(),
+                        pinned_base: self.is_pinned(&coordinate.base),
+                        head_after: coordinate.head,
+                        tree,
+                        relationship,
+                        base_commit: coordinate.base,
+                        advanced: false,
+                        export: recovered_export,
+                        attempts: attempt,
+                        session: Some(bound),
+                        warnings: Vec::new(),
+                        advance_pending: None,
+                    })));
+                }
+                returned
+            } else {
+                guard
+            };
+        // A session recorded at exactly this head and base already holds what
+        // a replay here would compute: the same conflict. It is answered from
+        // the record, so automatic preparation of the head the session holds
+        // costs nothing and never times out again. This, not the timeout
+        // cooldown, is what stops automatic retries at a head an explicit
+        // replay recorded a session for (see [`Self::conflicted`]).
+        if !request.explicit_replay && request.carry.is_none() && !settlement.applied() {
+            if let Some(conflict) = self.session_at(&coordinate).await? {
+                drop(guard);
+                return Err(PreparationRefusal::Conflict(conflict));
+            }
+        }
         if let Some(quarantine) =
             load_reconcile_quarantine(self.db, &request.project_id, &self.store, branch)
                 .await
                 .map_err(PreparationRefusal::Repository)?
         {
             // Demand preparation respects the coordinate-keyed timeout
-            // cooldown; an owner's explicit replay request is never held by it.
+            // cooldown; an owner's explicit replay request is never held by it,
+            // and an owner's commit it meets publishes with the advance pending.
             if !request.explicit_replay
                 && quarantine.failure_kind == crate::jj::RECONCILE_TIMEOUT
                 && quarantine_blocks_automatic_replay(
@@ -2498,7 +2562,7 @@ impl Context<'_> {
                 };
                 drop(guard);
                 return self
-                    .with_catch_up_pending(
+                    .with_advance_pending(
                         merge_mode,
                         &relationship,
                         &coordinate,
@@ -2509,54 +2573,26 @@ impl Context<'_> {
                     .await;
             }
         }
-        // An ordinary resolution commit proceeds under its recorded session;
-        // an explicit replay request is asking for the catch-up itself.
-        if request.purpose == PreparationPurpose::OwnerCommit && !request.explicit_replay {
-            let (returned, bound) = self.bound_session(guard, &coordinate, false).await?;
-            if let Some(bound) = bound {
-                let (returned, tree) = self.tree_of(returned, &coordinate.head).await?;
-                drop(returned);
-                return Ok(Attempt::Prepared(Box::new(PreparedBranch {
-                    project_id: request.project_id.clone(),
-                    store: self.store.clone(),
-                    branch: branch.to_string(),
-                    head_before: coordinate.head.clone(),
-                    pinned_base: self.is_pinned(&coordinate.base),
-                    head_after: coordinate.head,
-                    tree,
-                    relationship,
-                    base_commit: coordinate.base,
-                    advanced: false,
-                    export: recovered_export,
-                    attempts: attempt,
-                    session: Some(bound),
-                    warnings: Vec::new(),
-                })));
-            }
-            return off_frame(|| {
-                self.continue_attempt(
-                    attempt,
-                    returned,
-                    relationship,
-                    snapshot,
-                    recovered_export,
-                    settlement,
-                    merge_mode,
-                )
-            })
-            .await;
-        }
-        off_frame(|| {
+        let continued = off_frame(|| {
             self.continue_attempt(
                 attempt,
                 guard,
-                relationship,
+                relationship.clone(),
                 snapshot,
-                recovered_export,
+                recovered_export.clone(),
                 settlement,
                 merge_mode,
             )
         })
+        .await;
+        self.with_advance_pending(
+            merge_mode,
+            &relationship,
+            &coordinate,
+            attempt,
+            recovered_export,
+            continued,
+        )
         .await
     }
 
@@ -2592,18 +2628,8 @@ impl Context<'_> {
                     let cached = self.merge_quarantine_payload().await?;
                     if let Ok(cached) = serde_json::from_str::<CachedMergeConflict>(&cached) {
                         drop(guard);
-                        let conflict = self
-                            .conflicted(&relationship, &coordinate, cached.diagnostic(), true)
-                            .await;
                         return self
-                            .with_catch_up_pending(
-                                merge_mode,
-                                &relationship,
-                                &coordinate,
-                                attempt,
-                                recovered_export,
-                                conflict,
-                            )
+                            .conflicted(&relationship, &coordinate, cached.diagnostic(), true)
                             .await;
                     }
                     return Err(PreparationRefusal::Repository(cached));
@@ -2804,18 +2830,8 @@ impl Context<'_> {
             }
             Err(crate::jj::AdvanceComputeError::TimedOut) => {
                 self.with_cost(|cost| cost.compute_exhausted = true);
-                let timed_out = self
-                    .timed_out(&relationship, &coordinate, TimeoutPhase::Compute)
-                    .await;
                 return self
-                    .with_catch_up_pending(
-                        merge_mode,
-                        &relationship,
-                        &coordinate,
-                        attempt,
-                        recovered_export,
-                        timed_out,
-                    )
+                    .timed_out(&relationship, &coordinate, TimeoutPhase::Compute)
                     .await;
             }
             Err(crate::jj::AdvanceComputeError::AmbiguousOwnership { commit }) => {
@@ -2921,18 +2937,8 @@ impl Context<'_> {
                         SettleOutcome::None => {}
                     }
                 }
-                let conflict = self
-                    .conflicted(&relationship, &coordinate, diagnostic, assess_basis)
-                    .await;
                 return self
-                    .with_catch_up_pending(
-                        merge_mode,
-                        &relationship,
-                        &coordinate,
-                        attempt,
-                        recovered_export,
-                        conflict,
-                    )
+                    .conflicted(&relationship, &coordinate, diagnostic, assess_basis)
                     .await;
             }
         };
@@ -2955,6 +2961,7 @@ impl Context<'_> {
                 attempts: attempt,
                 session: None,
                 warnings: Vec::new(),
+                advance_pending: None,
             })));
         }
 
@@ -3004,7 +3011,15 @@ impl Context<'_> {
             }
         };
         let jj = self.jj.clone();
+        // Fault injection: the candidate expires before it installs.
+        #[cfg(test)]
+        let expired = tests::install_expired(&self.store);
+        #[cfg(not(test))]
+        let expired = false;
         let (guard, local) = under_guard(guard, "install prepared branch", move || {
+            if expired {
+                return Err(crate::jj::AdvanceInstallError::Expired);
+            }
             crate::jj::install_branch_advance_local(&jj, candidate)
         })
         .await?;
@@ -3163,6 +3178,7 @@ impl Context<'_> {
             attempts: attempt,
             session: None,
             warnings,
+            advance_pending: None,
         })))
     }
 
@@ -3412,6 +3428,7 @@ impl Context<'_> {
             attempts: attempt,
             session: None,
             warnings: Vec::new(),
+            advance_pending: None,
         })))
     }
 
@@ -3457,7 +3474,7 @@ impl Context<'_> {
     /// base binds nothing; the commit then prepares, and a conflict reopens
     /// the session at the current base. `any_base` drops only the exact-base
     /// requirement, for a merge-mode commit whose catch-up stays pending (see
-    /// [`Self::with_catch_up_pending`]).
+    /// [`Self::with_advance_pending`]).
     async fn bound_session(
         &self,
         guard: JjStoreGuard,
@@ -3573,20 +3590,13 @@ impl Context<'_> {
         if request.purpose == PreparationPurpose::OwnerMerge {
             drop(snapshot);
             drop(guard);
-            return Err(PreparationRefusal::Conflict(Box::new(BaseConflict {
-                branch: request.branch.clone(),
-                head: coordinate.head,
-                base_branch: coordinate.base_branch,
-                base_commit: recorded,
-                paths: session
-                    .conflicting()
-                    .map(|file| file.path.clone())
-                    .collect(),
-                record: ConflictRecord::Session {
-                    intent_id: session.intent_id,
-                    reopened: false,
-                },
-            })));
+            return Err(PreparationRefusal::Conflict(session_conflict(
+                &request.branch,
+                coordinate.head,
+                coordinate.base_branch,
+                recorded,
+                session,
+            )));
         }
         drop(snapshot);
         log::info!(
@@ -3604,22 +3614,63 @@ impl Context<'_> {
         Ok((guard, snapshot))
     }
 
-    /// An owner's ordinary commit on a merge-mode branch whose catch-up could
-    /// not be installed: published on the branch's own head under its open
-    /// conflict session, with the catch-up merge left pending.
+    /// The open session recorded at exactly `coordinate`'s head and base, as
+    /// the conflict it holds. A heal refusal is not a content conflict and
+    /// answers nothing here; neither does a session recorded at another head
+    /// or base, or by an older diagnostic version.
+    async fn session_at(
+        &self,
+        coordinate: &crate::jj::AdvanceCoordinate,
+    ) -> Result<Option<Box<BaseConflict>>, PreparationRefusal> {
+        let Some(session) = load_active_session(self.db, &self.request.branch)
+            .await
+            .map_err(PreparationRefusal::Repository)?
+        else {
+            return Ok(None);
+        };
+        if session.project_id != self.request.project_id
+            || session.store_path != self.store.to_string_lossy()
+            || session.target_branch != coordinate.base_branch
+            || session.destination_commit != coordinate.base
+            || session.ours.as_deref() != Some(coordinate.head.as_str())
+            || !session.version_is_current()
+            || session.is_heal_refused()
+        {
+            return Ok(None);
+        }
+        Ok(Some(session_conflict(
+            &self.request.branch,
+            coordinate.head.clone(),
+            coordinate.base_branch.clone(),
+            coordinate.base.clone(),
+            session,
+        )))
+    }
+
+    /// An owner's ordinary commit whose base advance could not be taken now:
+    /// published on the branch's own head, with the advance left pending.
     ///
-    /// In merge mode the catch-up is one extra merge commit on top of the
-    /// owner's history and never rewrites it, so the owner's commit does not
-    /// depend on the merge at all: holding it until the merge succeeds only
-    /// stops the owner (and every child merged into an integration branch)
-    /// while the base keeps moving. A refusal is kept when it is not about the
-    /// catch-up (a fence, a busy store, a moved branch), when this is not an
-    /// owner's ordinary commit, or when no open session the head descends from
-    /// records that the catch-up is outstanding; a merge-mode branch with no
-    /// session has nothing telling its owner the merge is pending. The
-    /// refusal's cooldown or session record stands as written, and the next
-    /// preparation retries the merge as before.
-    async fn with_catch_up_pending(
+    /// The commit does not depend on the advance, and publishing it without
+    /// one is safe. A coordinate with `advanced: false` records nothing as
+    /// absorbed: the durable base, the session close and the quarantine
+    /// release all happen only at an install. Revalidation still refuses a
+    /// base that moved after this answer (and, under a session, a session that
+    /// closed). And the commit is a new head, which releases a timeout
+    /// cooldown keyed on the old one, so the next automatic preparation
+    /// retries the advance. Holding the commit instead strands the owner's
+    /// work while the base keeps moving.
+    ///
+    /// Relief covers the timeout class (a fresh timeout or the cooldown one
+    /// left) in either catch-up mode, under the open session when there is
+    /// one and without one when there is not. In merge mode it also covers a
+    /// recorded conflict, under the open session the head descends from: the
+    /// catch-up there is one merge on top of the owner's history, and the
+    /// session tells the owner it is outstanding. A replay-mode conflict keeps
+    /// its refusal, since the owner resolves it through its session. Every
+    /// other refusal (a fence, a busy store, a moved branch), every other
+    /// purpose and an explicit replay keep theirs, so automatic preparation of
+    /// an unchanged head stays on its cooldown.
+    async fn with_advance_pending(
         &self,
         merge_mode: bool,
         relationship: &BaseRelationship,
@@ -3633,38 +3684,64 @@ impl Context<'_> {
             Err(refusal) => refusal,
         };
         let request = self.request;
-        let about_the_catch_up = match &refusal {
-            PreparationRefusal::Conflict(conflict) => {
-                matches!(conflict.record, ConflictRecord::Session { .. })
-            }
-            PreparationRefusal::TimedOut { .. } | PreparationRefusal::Cooldown { .. } => true,
-            _ => false,
-        };
-        if !merge_mode
-            || request.purpose != PreparationPurpose::OwnerCommit
+        let timeout_class = matches!(
+            refusal,
+            PreparationRefusal::TimedOut { .. } | PreparationRefusal::Cooldown { .. }
+        );
+        let merge_conflict = merge_mode
+            && matches!(
+                &refusal,
+                PreparationRefusal::Conflict(conflict)
+                    if matches!(conflict.record, ConflictRecord::Session { .. })
+            );
+        if request.purpose != PreparationPurpose::OwnerCommit
             || request.explicit_replay
-            || !about_the_catch_up
+            || !(timeout_class || merge_conflict)
         {
             return Err(refusal);
         }
         let branch = request.branch.as_str();
-        let guard = self.lock("publish with the catch-up pending").await?;
+        let guard = self.lock("publish with the base advance pending").await?;
         if let Some(raced) = self.moved_since(relationship, coordinate).await? {
             return Ok(Attempt::Raced(raced));
         }
         self.refuse_fenced(&guard, &[branch]).await?;
-        let (guard, bound) = self.bound_session(guard, coordinate, true).await?;
-        let Some(bound) = bound else {
+        let (guard, bound) = self.bound_session(guard, coordinate, merge_mode).await?;
+        if bound.is_none() && !timeout_class {
             return Err(refusal);
-        };
+        }
         let (guard, tree) = self.tree_of(guard, &coordinate.head).await?;
         drop(guard);
-        let pending = format!(
-            "`{branch}` catches up by merge: this commit lands on its head under conflict \
-             session {}, and the merge onto `{}` at {} is still pending ({refusal})",
-            bound.intent_id, coordinate.base_branch, coordinate.base
+        let pending = match &bound {
+            Some(bound) if !timeout_class => format!(
+                "`{branch}` catches up by merge: this commit lands on its head under conflict \
+                 session {}, and the merge onto `{}` at {} is still pending ({refusal})",
+                bound.intent_id, coordinate.base_branch, coordinate.base
+            ),
+            _ => format!(
+                "the {} of `{branch}` onto `{}` at {} is deferred ({}); this commit lands on the \
+                 branch's own head{}. The rebase page's `replay` action (`cairn:~/rebase`) runs \
+                 it now under its own budget",
+                if merge_mode {
+                    "catch-up merge"
+                } else {
+                    "base advance"
+                },
+                coordinate.base_branch,
+                coordinate.base,
+                deferral_reason(&refusal),
+                match &bound {
+                    Some(bound) => format!(" under conflict session {}", bound.intent_id),
+                    None => String::new(),
+                },
+            ),
+        };
+        log::info!(
+            "branch preparation[{branch}] owner commit published, advance pending: {pending}"
         );
-        log::info!("catch-up[{branch}] owner commit published with the merge pending: {pending}");
+        self.with_cost(|cost| {
+            cost.deferred = Some(refusal_outcome(&refusal, cost.compute_exhausted));
+        });
         Ok(Attempt::Prepared(Box::new(PreparedBranch {
             project_id: request.project_id.clone(),
             store: self.store.clone(),
@@ -3678,8 +3755,9 @@ impl Context<'_> {
             advanced: false,
             export,
             attempts: attempt,
-            session: Some(bound),
-            warnings: vec![pending],
+            session: bound,
+            warnings: Vec::new(),
+            advance_pending: Some(pending),
         })))
     }
 
@@ -5015,6 +5093,23 @@ impl Context<'_> {
                     .await
                     .map_err(PreparationRefusal::Repository)?;
             }
+            // The session this explicit replay holds now stops automatic
+            // retries at this head ([`Self::session_at`]), so the automatic
+            // timeout cooldown that led here no longer has to, and must not
+            // outlive the session as a second, stale answer.
+            if self.request.explicit_replay {
+                if let Err(error) = release_timeout_cooldown_at(
+                    self.db,
+                    &self.request.project_id,
+                    &self.store,
+                    branch,
+                    &coordinate.head,
+                )
+                .await
+                {
+                    log::warn!("branch preparation of `{branch}`: {error}");
+                }
+            }
             drop(guard);
             self.steer_owner(&intent_id, coordinate, &diagnostic, already_open)
                 .await?;
@@ -5827,6 +5922,68 @@ fn with_carried_paths(
         }
     }
     diagnostic
+}
+
+/// The conflict refusal an open session answers with: what it lists as
+/// conflicting at `base_commit`, recorded on that session and left as it was.
+fn session_conflict(
+    branch: &str,
+    head: String,
+    base_branch: String,
+    base_commit: String,
+    session: ConflictSession,
+) -> Box<BaseConflict> {
+    Box::new(BaseConflict {
+        branch: branch.to_string(),
+        head,
+        base_branch,
+        base_commit,
+        paths: session
+            .conflicting()
+            .map(|file| file.path.clone())
+            .collect(),
+        record: ConflictRecord::Session {
+            intent_id: session.intent_id,
+            reopened: false,
+        },
+    })
+}
+
+/// Why an owner's commit was published with its base advance pending.
+/// The cost outcome a refusal records. `compute_exhausted` separates detached
+/// computation running out from a budgeted step outside it (the probe, an
+/// install that expired waiting) running out.
+fn refusal_outcome(
+    refusal: &PreparationRefusal,
+    compute_exhausted: bool,
+) -> super::replay_cost::CostOutcome {
+    use super::replay_cost::CostOutcome;
+    match refusal {
+        PreparationRefusal::Conflict(_) => CostOutcome::Conflicted,
+        PreparationRefusal::TimedOut { .. } if compute_exhausted => CostOutcome::ComputeExhausted,
+        PreparationRefusal::TimedOut { .. } => CostOutcome::TimedOut,
+        other => CostOutcome::Refused(other.kind().to_string()),
+    }
+}
+
+fn deferral_reason(refusal: &PreparationRefusal) -> String {
+    match refusal {
+        PreparationRefusal::TimedOut { budget, .. } => {
+            format!("preparing it exceeded its {}s budget", budget.as_secs())
+        }
+        PreparationRefusal::Cooldown { retry_at, .. } => format!(
+            "an automatic attempt at this head timed out and is cooling down until {}",
+            unix_rfc3339(*retry_at)
+        ),
+        other => other.to_string(),
+    }
+}
+
+fn unix_rfc3339(seconds: i64) -> String {
+    chrono::DateTime::from_timestamp(seconds, 0).map_or_else(
+        || format!("Unix time {seconds}"),
+        |at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
 }
 
 fn keep(warnings: &mut Vec<String>, what: &str, result: Result<(), String>) {
