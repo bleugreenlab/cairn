@@ -7136,6 +7136,13 @@ pub struct LearnedResourceEstimate {
 /// sends or reads one, so a runner talking to an older executor gets nothing
 /// wrong, and a journal row written before this decodes with a zero count.
 ///
+/// cairn/7301 does not move the number. The runner records a pressure decline
+/// it cannot reproduce against the executor's already-posted executing
+/// requests and headroom reservations, keeps the re-offer backoff of a
+/// decline tied to nothing posted even for a headroom target, and memoizes
+/// its own profile-store reads. No wire field or executor behavior changes,
+/// so a runner talking to an older executor gets nothing wrong.
+///
 /// cairn/7176 does not move the number. Batch wait summaries read the queued
 /// placement diagnostic already held by the runner instead of reporting only
 /// offers and declines. No wire field or executor behavior changes, so a runner

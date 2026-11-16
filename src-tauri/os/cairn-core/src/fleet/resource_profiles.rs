@@ -1,3 +1,4 @@
+use super::profile_reads::{Lookup, Writing};
 use super::{ResourceReservation, ResourceReservationSource};
 use crate::storage::LocalDb;
 use cairn_common::executor_protocol::{
@@ -119,9 +120,19 @@ async fn load_contention_profile(
     executor_class: &str,
     load: &ExecutionLoadContext,
 ) -> Result<Option<ContentionProfile>, String> {
+    let lookup = Lookup::new(
+        &db,
+        format!(
+            "contention\u{1f}{executor_class}\u{1f}{}\u{1f}{}",
+            load.co_resident_compile_jobs, load.co_resident_light_jobs
+        ),
+    );
+    if let Some(hit) = lookup.hit() {
+        return Ok(hit);
+    }
     let executor_class = executor_class.to_string();
     let load = load.clone();
-    db.read(|conn| Box::pin(async move {
+    let read = db.read(|conn| Box::pin(async move {
         let mut rows = conn.query(
             "SELECT sample_count, updated_at_unix_ms, recent_multiplier_millis FROM command_contention_profiles WHERE executor_class=?1 AND compile_jobs=?2 AND light_jobs=?3",
             params![executor_class, load.co_resident_compile_jobs as i64, load.co_resident_light_jobs as i64],
@@ -134,7 +145,9 @@ async fn load_contention_profile(
             })),
             None => Ok(None),
         }
-    })).await.map_err(|error| error.to_string())
+    })).await.map_err(|error| error.to_string());
+    lookup.keep(&read);
+    read
 }
 
 async fn record_contention(
@@ -144,6 +157,7 @@ async fn record_contention(
     finished: u64,
     multiplier_millis: u64,
 ) -> Result<(), String> {
+    let _written = Writing::of(&db);
     // Borrowed, not consumed: an array's by-value iterator held across these
     // awaits nests deep enough in 1.99's std that proving the transport's
     // invoke future Send overflows the trait-recursion limit (E0275).
@@ -319,6 +333,14 @@ pub(super) async fn resolve_contention(
 }
 
 impl ProfileContext {
+    /// All four keys, as a memoized lookup names the context it read for.
+    fn lookup_key(&self) -> String {
+        format!(
+            "{}\u{1e}{}\u{1e}{}\u{1e}{}",
+            self.executor_class, self.os, self.arch, self.toolchain_fingerprint
+        )
+    }
+
     /// The context key in one readable line, for the rationale a placement
     /// decision carries. A profile learned on one platform never speaks for
     /// another, and this is what makes that visible without a second lookup.
@@ -1081,6 +1103,7 @@ fn platform_label(os: &str, arch: &str, context: &ProfileContext) -> String {
 /// its name and the context that measured it, and its kills in this
 /// context; elsewhere, its largest named process with the context and the
 /// platform that measured it.
+#[derive(Clone)]
 struct SuiteEvidence {
     peak: Option<(u64, Option<String>, String)>,
     kills_here: Option<SuiteKills>,
@@ -1101,9 +1124,21 @@ async fn load_identity_process_peak(
     identity: &CommandResourceIdentity,
     context: &ProfileContext,
 ) -> Result<(ProcessEvidence, Option<ProcessDemand>), String> {
+    let lookup = Lookup::new(
+        &db,
+        format!(
+            "identity_process_peak\u{1f}{}\u{1f}{}\u{1f}{}",
+            identity.version,
+            identity.key,
+            context.lookup_key()
+        ),
+    );
+    if let Some(hit) = lookup.hit() {
+        return Ok(hit);
+    }
     let identity = identity.clone();
     let context = context.clone();
-    db.read(|conn| {
+    let read = db.read(|conn| {
         let identity = identity.clone();
         let context = context.clone();
         Box::pin(async move {
@@ -1167,7 +1202,9 @@ async fn load_identity_process_peak(
         })
     })
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string());
+    lookup.keep(&read);
+    read
 }
 
 async fn load_suite_evidence(
@@ -1175,15 +1212,26 @@ async fn load_suite_evidence(
     suite_key: &str,
     context: &ProfileContext,
 ) -> Result<Option<SuiteEvidence>, String> {
+    let lookup = Lookup::new(
+        &db,
+        format!(
+            "suite_evidence\u{1f}{suite_key}\u{1f}{}",
+            context.lookup_key()
+        ),
+    );
+    if let Some(hit) = lookup.hit() {
+        return Ok(hit);
+    }
     let suite_key = suite_key.to_string();
     let context = context.clone();
-    db.read(|conn| {
-        let suite_key = suite_key.clone();
-        let context = context.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT executor_class, upper_process_peak_bytes, process_peak_name,
+    let read = db
+        .read(|conn| {
+            let suite_key = suite_key.clone();
+            let context = context.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT executor_class, upper_process_peak_bytes, process_peak_name,
                             oom_kill_count, oom_machine_total_bytes, os, arch,
                             oom_kill_memory_brake, oom_crowded_kill_count,
                             oom_crowded_most_co_resident, oom_crowded_memory_brake,
@@ -1194,121 +1242,131 @@ async fn load_suite_evidence(
                             upper_job_marginal_bytes, marginal_jobs, marginal_tree_peak_bytes
                      FROM suite_memory_evidence
                      WHERE suite_key=?1",
-                    params![suite_key],
-                )
-                .await?;
-            let mut evidence = SuiteEvidence {
-                peak: None,
-                kills_here: None,
-                elsewhere: None,
-                test_phase: None,
-                build_job_memory: None,
-                build_jobs_elsewhere: None,
-            };
-            let mut any = false;
-            while let Some(row) = rows.next().await? {
-                any = true;
-                let executor_class = row.get::<String>(0)?;
-                let os = row.get::<String>(5)?;
-                let arch = row.get::<String>(6)?;
-                let samples = row.get::<i64>(16)?;
-                let jobs = match (row.get::<Option<i64>>(14)?, row.get::<Option<i64>>(15)?) {
-                    (Some(largest), Some(typical)) if largest > 0 && typical > 0 && samples > 0 => {
-                        let unsigned =
-                            |value: Option<i64>| value.map_or(0, |value| value.max(0) as u64);
-                        let width = match (row.get::<Option<i64>>(17)?, row.get::<Option<i64>>(18)?)
-                        {
-                            (Some(widest), Some(tree)) if widest > 0 => Some(JobWidthEvidence {
-                                widest_jobs: u32::try_from(widest).unwrap_or(u32::MAX),
-                                widest_tree_bytes: tree.max(0) as u64,
-                                marginal_bytes: unsigned(row.get::<Option<i64>>(19)?),
-                                marginal_jobs: u32::try_from(unsigned(row.get::<Option<i64>>(20)?))
-                                    .unwrap_or(u32::MAX),
-                                marginal_tree_bytes: unsigned(row.get::<Option<i64>>(21)?),
-                            }),
-                            _ => None,
-                        };
-                        Some(BuildJobMemoryEvidence {
-                            largest_bytes: largest as u64,
-                            typical_bytes: typical as u64,
-                            samples: u32::try_from(samples).unwrap_or(u32::MAX),
-                            width,
-                        })
-                    }
-                    _ => None,
+                        params![suite_key],
+                    )
+                    .await?;
+                let mut evidence = SuiteEvidence {
+                    peak: None,
+                    kills_here: None,
+                    elsewhere: None,
+                    test_phase: None,
+                    build_job_memory: None,
+                    build_jobs_elsewhere: None,
                 };
-                // Another machine's widths say nothing about what this one
-                // has measured: borrowed figures price, they never unlock a
-                // width here.
-                if let Some(jobs) = jobs
-                    .filter(|_| executor_class != context.executor_class)
-                    .map(|jobs| BuildJobMemoryEvidence {
-                        width: None,
-                        ..jobs
-                    })
-                {
-                    let same_platform = os == context.os && arch == context.arch;
-                    let better = evidence.build_jobs_elsewhere.as_ref().is_none_or(|held| {
-                        (same_platform, jobs.largest_bytes)
-                            > (held.same_platform, held.evidence.largest_bytes)
-                    });
-                    if better {
-                        evidence.build_jobs_elsewhere = Some(PricingJobs {
-                            evidence: jobs,
-                            measured_on: Some(executor_class.clone()),
-                            same_platform,
-                        });
-                    }
-                }
-                if os != context.os || arch != context.arch {
-                    let peak = row.get::<Option<i64>>(1)?.map(|value| value as u64);
-                    if let (Some(peak), Some(name)) = (peak, row.get::<Option<String>>(2)?) {
-                        if evidence
-                            .elsewhere
-                            .as_ref()
-                            .is_none_or(|(held, ..)| peak > *held)
+                let mut any = false;
+                while let Some(row) = rows.next().await? {
+                    any = true;
+                    let executor_class = row.get::<String>(0)?;
+                    let os = row.get::<String>(5)?;
+                    let arch = row.get::<String>(6)?;
+                    let samples = row.get::<i64>(16)?;
+                    let jobs = match (row.get::<Option<i64>>(14)?, row.get::<Option<i64>>(15)?) {
+                        (Some(largest), Some(typical))
+                            if largest > 0 && typical > 0 && samples > 0 =>
                         {
-                            evidence.elsewhere = Some((
-                                peak,
-                                name,
-                                executor_class,
-                                platform_label(&os, &arch, &context),
-                            ));
+                            let unsigned =
+                                |value: Option<i64>| value.map_or(0, |value| value.max(0) as u64);
+                            let width =
+                                match (row.get::<Option<i64>>(17)?, row.get::<Option<i64>>(18)?) {
+                                    (Some(widest), Some(tree)) if widest > 0 => {
+                                        Some(JobWidthEvidence {
+                                            widest_jobs: u32::try_from(widest).unwrap_or(u32::MAX),
+                                            widest_tree_bytes: tree.max(0) as u64,
+                                            marginal_bytes: unsigned(row.get::<Option<i64>>(19)?),
+                                            marginal_jobs: u32::try_from(unsigned(
+                                                row.get::<Option<i64>>(20)?,
+                                            ))
+                                            .unwrap_or(u32::MAX),
+                                            marginal_tree_bytes: unsigned(
+                                                row.get::<Option<i64>>(21)?,
+                                            ),
+                                        })
+                                    }
+                                    _ => None,
+                                };
+                            Some(BuildJobMemoryEvidence {
+                                largest_bytes: largest as u64,
+                                typical_bytes: typical as u64,
+                                samples: u32::try_from(samples).unwrap_or(u32::MAX),
+                                width,
+                            })
+                        }
+                        _ => None,
+                    };
+                    // Another machine's widths say nothing about what this one
+                    // has measured: borrowed figures price, they never unlock a
+                    // width here.
+                    if let Some(jobs) = jobs
+                        .filter(|_| executor_class != context.executor_class)
+                        .map(|jobs| BuildJobMemoryEvidence {
+                            width: None,
+                            ..jobs
+                        })
+                    {
+                        let same_platform = os == context.os && arch == context.arch;
+                        let better = evidence.build_jobs_elsewhere.as_ref().is_none_or(|held| {
+                            (same_platform, jobs.largest_bytes)
+                                > (held.same_platform, held.evidence.largest_bytes)
+                        });
+                        if better {
+                            evidence.build_jobs_elsewhere = Some(PricingJobs {
+                                evidence: jobs,
+                                measured_on: Some(executor_class.clone()),
+                                same_platform,
+                            });
                         }
                     }
-                    continue;
-                }
-                if let Some(peak) = row.get::<Option<i64>>(1)?.map(|value| value as u64) {
-                    if evidence
-                        .peak
-                        .as_ref()
-                        .is_none_or(|(held, _, _)| peak > *held)
-                    {
-                        evidence.peak =
-                            Some((peak, row.get::<Option<String>>(2)?, executor_class.clone()));
+                    if os != context.os || arch != context.arch {
+                        let peak = row.get::<Option<i64>>(1)?.map(|value| value as u64);
+                        if let (Some(peak), Some(name)) = (peak, row.get::<Option<String>>(2)?) {
+                            if evidence
+                                .elsewhere
+                                .as_ref()
+                                .is_none_or(|(held, ..)| peak > *held)
+                            {
+                                evidence.elsewhere = Some((
+                                    peak,
+                                    name,
+                                    executor_class,
+                                    platform_label(&os, &arch, &context),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(peak) = row.get::<Option<i64>>(1)?.map(|value| value as u64) {
+                        if evidence
+                            .peak
+                            .as_ref()
+                            .is_none_or(|(held, _, _)| peak > *held)
+                        {
+                            evidence.peak =
+                                Some((peak, row.get::<Option<String>>(2)?, executor_class.clone()));
+                        }
+                    }
+                    if executor_class == context.executor_class {
+                        let kills = suite_kills_from_row(&row, 3)?;
+                        if kills.alone > 0 || kills.crowded.is_some() {
+                            evidence.kills_here = Some(kills);
+                        }
+                        let peak = row.get::<Option<i64>>(12)?;
+                        let per_test = row.get::<Option<i64>>(13)?;
+                        if let (Some(peak), Some(per_test)) = (peak, per_test) {
+                            evidence.test_phase = Some(TestPhaseEvidence {
+                                peak_bytes: peak.max(0) as u64,
+                                bytes_per_concurrent_test: per_test.max(0) as u64,
+                            });
+                        }
+                        evidence.build_job_memory = jobs;
                     }
                 }
-                if executor_class == context.executor_class {
-                    let kills = suite_kills_from_row(&row, 3)?;
-                    if kills.alone > 0 || kills.crowded.is_some() {
-                        evidence.kills_here = Some(kills);
-                    }
-                    let peak = row.get::<Option<i64>>(12)?;
-                    let per_test = row.get::<Option<i64>>(13)?;
-                    if let (Some(peak), Some(per_test)) = (peak, per_test) {
-                        evidence.test_phase = Some(TestPhaseEvidence {
-                            peak_bytes: peak.max(0) as u64,
-                            bytes_per_concurrent_test: per_test.max(0) as u64,
-                        });
-                    }
-                    evidence.build_job_memory = jobs;
-                }
-            }
-            Ok(any.then_some(evidence))
+                Ok(any.then_some(evidence))
+            })
         })
-    })
-    .await
-    .map_err(|error| error.to_string())
+        .await
+        .map_err(|error| error.to_string());
+    lookup.keep(&read);
+    read
 }
 
 /// The kill columns of a `suite_memory_evidence` row, from `first`:
@@ -1356,44 +1414,57 @@ async fn load_class_prior(
     project_id: &str,
     context: &ProfileContext,
 ) -> Result<Option<ProcessDemand>, String> {
+    let lookup = Lookup::new(
+        &db,
+        format!(
+            "class_prior\u{1f}{project_id}\u{1f}{}",
+            context.lookup_key()
+        ),
+    );
+    if let Some(hit) = lookup.hit() {
+        return Ok(hit);
+    }
     let prefix = format!("{project_id}/");
     let context = context.clone();
-    db.read(|conn| {
-        let prefix = prefix.clone();
-        let context = context.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT suite_key, executor_class, os, arch, upper_process_peak_bytes
+    let read = db
+        .read(|conn| {
+            let prefix = prefix.clone();
+            let context = context.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT suite_key, executor_class, os, arch, upper_process_peak_bytes
                      FROM suite_memory_evidence
                      WHERE substr(suite_key, 1, ?2) = ?1 AND process_peak_name = ?3
                        AND upper_process_peak_bytes IS NOT NULL
                      ORDER BY upper_process_peak_bytes DESC
                      LIMIT 1",
-                    params![prefix.clone(), prefix.len() as i64, RUST_COMPILER_PROCESS],
-                )
-                .await?;
-            let Some(row) = rows.next().await? else {
-                return Ok(None);
-            };
-            let suite_key = row.get::<String>(0)?;
-            let os = row.get::<String>(2)?;
-            let arch = row.get::<String>(3)?;
-            Ok(Some(ProcessDemand {
-                peak_bytes: row.get::<i64>(4)?.max(0) as u64,
-                name: Some(RUST_COMPILER_PROCESS.to_string()),
-                suite: Some(suite_display(&suite_key)),
-                measured_on: Some(row.get::<String>(1)?),
-                kills_here: None,
-                basis: ProcessDemandBasis::ClassPrior {
-                    platform: (os != context.os || arch != context.arch)
-                        .then(|| platform_label(&os, &arch, &context)),
-                },
-            }))
+                        params![prefix.clone(), prefix.len() as i64, RUST_COMPILER_PROCESS],
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok(None);
+                };
+                let suite_key = row.get::<String>(0)?;
+                let os = row.get::<String>(2)?;
+                let arch = row.get::<String>(3)?;
+                Ok(Some(ProcessDemand {
+                    peak_bytes: row.get::<i64>(4)?.max(0) as u64,
+                    name: Some(RUST_COMPILER_PROCESS.to_string()),
+                    suite: Some(suite_display(&suite_key)),
+                    measured_on: Some(row.get::<String>(1)?),
+                    kills_here: None,
+                    basis: ProcessDemandBasis::ClassPrior {
+                        platform: (os != context.os || arch != context.arch)
+                            .then(|| platform_label(&os, &arch, &context)),
+                    },
+                }))
+            })
         })
-    })
-    .await
-    .map_err(|error| error.to_string())
+        .await
+        .map_err(|error| error.to_string());
+    lookup.keep(&read);
+    read
 }
 
 /// How far a machine's total memory must move from the total its kills
@@ -1545,6 +1616,7 @@ enum KillsSeen {
 /// operator's `repaired`, the word for what no run of the machine has had the
 /// chance to show. Returns the suites cleared.
 pub(crate) async fn forget_kills_on(db: &LocalDb, executor_id: &str) -> Result<u64, String> {
+    let _written = Writing::of(db);
     // A context is `device:executor`; the device can be unknown to a runner
     // the machine is not connected to, so the executor's half identifies it.
     let suffix = format!(":{executor_id}");
@@ -1655,6 +1727,7 @@ async fn record_suite_evidence(
     build_jobs: Option<BuildJobProcesses>,
     width: Option<WidthSample>,
 ) -> Result<(), String> {
+    let _written = Writing::of(&db);
     if peak.is_none()
         && kills == KillsSeen::Neither
         && test_phase.is_none()
@@ -2651,6 +2724,7 @@ async fn record_memory_kill(
     context: &ProfileContext,
     kill: MemoryKill,
 ) -> Result<(), String> {
+    let _written = Writing::of(&db);
     let identity = identity.clone();
     let context = context.clone();
     db.write(move |conn| {
@@ -2862,9 +2936,21 @@ async fn load_profile(
     identity: &CommandResourceIdentity,
     context: &ProfileContext,
 ) -> Result<Option<ResourceProfile>, String> {
+    let lookup = Lookup::new(
+        &db,
+        format!(
+            "profile\u{1f}{}\u{1f}{}\u{1f}{}",
+            identity.version,
+            identity.key,
+            context.lookup_key()
+        ),
+    );
+    if let Some(hit) = lookup.hit() {
+        return Ok(hit);
+    }
     let identity = identity.clone();
     let context = context.clone();
-    db.read(|conn| {
+    let read = db.read(|conn| {
         let identity = identity.clone();
         let context = context.clone();
         Box::pin(async move {
@@ -2896,7 +2982,9 @@ async fn load_profile(
                 None => Ok(None),
             }
         })
-    }).await.map_err(|error| error.to_string())
+    }).await.map_err(|error| error.to_string());
+    lookup.keep(&read);
+    read
 }
 
 /// Every OTHER machine context's high-water marks for one command identity.
@@ -2915,43 +3003,58 @@ async fn load_fleet_evidence(
     identity: &CommandResourceIdentity,
     context: &ProfileContext,
 ) -> Result<FleetEvidence, String> {
+    let lookup = Lookup::new(
+        &db,
+        format!(
+            "fleet_evidence\u{1f}{}\u{1f}{}\u{1f}{}",
+            identity.version,
+            identity.key,
+            context.lookup_key()
+        ),
+    );
+    if let Some(hit) = lookup.hit() {
+        return Ok(hit);
+    }
     let identity = identity.clone();
     let context = context.clone();
-    db.read(|conn| {
-        let identity = identity.clone();
-        let context = context.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT upper_peak_rss_bytes, upper_disk_delta_bytes
+    let read = db
+        .read(|conn| {
+            let identity = identity.clone();
+            let context = context.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT upper_peak_rss_bytes, upper_disk_delta_bytes
                  FROM command_resource_profiles
                  WHERE identity_version=?1 AND command_identity=?2 AND sample_count>=?3
                    AND NOT (executor_class=?4 AND os=?5 AND arch=?6 AND toolchain_fingerprint=?7)",
-                    params![
-                        identity.version as i64,
-                        identity.key,
-                        MIN_CONFIDENT_SAMPLES as i64,
-                        context.executor_class,
-                        context.os,
-                        context.arch,
-                        context.toolchain_fingerprint
-                    ],
-                )
-                .await?;
-            let mut evidence = FleetEvidence::default();
-            while let Some(row) = rows.next().await? {
-                if let Some(peak) = row.get::<Option<i64>>(0)? {
-                    evidence.peaks.push(peak as u64);
+                        params![
+                            identity.version as i64,
+                            identity.key,
+                            MIN_CONFIDENT_SAMPLES as i64,
+                            context.executor_class,
+                            context.os,
+                            context.arch,
+                            context.toolchain_fingerprint
+                        ],
+                    )
+                    .await?;
+                let mut evidence = FleetEvidence::default();
+                while let Some(row) = rows.next().await? {
+                    if let Some(peak) = row.get::<Option<i64>>(0)? {
+                        evidence.peaks.push(peak as u64);
+                    }
+                    if let Some(disk) = row.get::<Option<i64>>(1)? {
+                        evidence.disks.push(disk as u64);
+                    }
                 }
-                if let Some(disk) = row.get::<Option<i64>>(1)? {
-                    evidence.disks.push(disk as u64);
-                }
-            }
-            Ok(evidence)
+                Ok(evidence)
+            })
         })
-    })
-    .await
-    .map_err(|error| error.to_string())
+        .await
+        .map_err(|error| error.to_string());
+    lookup.keep(&read);
+    read
 }
 
 async fn load_duration_profile(
@@ -2960,41 +3063,57 @@ async fn load_duration_profile(
     context: &ProfileContext,
     warmth: ExecutionWarmth,
 ) -> Result<Option<DurationProfile>, String> {
+    let lookup = Lookup::new(
+        &db,
+        format!(
+            "duration_profile\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            identity.version,
+            identity.key,
+            context.lookup_key(),
+            warmth.as_str()
+        ),
+    );
+    if let Some(hit) = lookup.hit() {
+        return Ok(hit);
+    }
     let identity = identity.clone();
     let context = context.clone();
-    db.read(|conn| {
-        let identity = identity.clone();
-        let context = context.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT sample_count, updated_at_unix_ms, recent_duration_ms
+    let read = db
+        .read(|conn| {
+            let identity = identity.clone();
+            let context = context.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT sample_count, updated_at_unix_ms, recent_duration_ms
                  FROM command_duration_profiles
                  WHERE identity_version=?1 AND command_identity=?2 AND executor_class=?3
                    AND os=?4 AND arch=?5 AND toolchain_fingerprint=?6 AND warmth=?7",
-                    params![
-                        identity.version as i64,
-                        identity.key,
-                        context.executor_class,
-                        context.os,
-                        context.arch,
-                        context.toolchain_fingerprint,
-                        warmth.as_str()
-                    ],
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => Ok(Some(DurationProfile {
-                    sample_count: row.get::<i64>(0)? as u64,
-                    updated_at_unix_ms: row.get::<i64>(1)? as u64,
-                    recent_ms: decode_window(&row.get::<String>(2)?),
-                })),
-                None => Ok(None),
-            }
+                        params![
+                            identity.version as i64,
+                            identity.key,
+                            context.executor_class,
+                            context.os,
+                            context.arch,
+                            context.toolchain_fingerprint,
+                            warmth.as_str()
+                        ],
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some(DurationProfile {
+                        sample_count: row.get::<i64>(0)? as u64,
+                        updated_at_unix_ms: row.get::<i64>(1)? as u64,
+                        recent_ms: decode_window(&row.get::<String>(2)?),
+                    })),
+                    None => Ok(None),
+                }
+            })
         })
-    })
-    .await
-    .map_err(|error| error.to_string())
+        .await
+        .map_err(|error| error.to_string());
+    lookup.keep(&read);
+    read
 }
 
 /// A window that cannot be decoded is an empty window, not a zero-length run.
@@ -3019,6 +3138,7 @@ async fn record_duration(
     finished: u64,
     duration_ms: u64,
 ) -> Result<(), String> {
+    let _written = Writing::of(&db);
     let identity = identity.clone();
     let context = context.clone();
     db.write(move |conn| {
@@ -3107,6 +3227,7 @@ async fn update_profile_with(
     peak_decay_divisor: u64,
     peak_process: Option<&cairn_common::executor_protocol::PeakProcess>,
 ) -> Result<(), String> {
+    let _written = Writing::of(&db);
     let identity = identity.clone();
     let context = context.clone();
     let process_bytes = peak_process.map(|peak| peak.bytes as i64);
@@ -3240,6 +3361,7 @@ mod process_peak_tests {
             ),
         ] {
             let sql = format!("ALTER TABLE {table} RENAME COLUMN {column} TO unavailable_column");
+            drop(Writing::of(&db));
             db.write(move |conn| {
                 let sql = sql.clone();
                 Box::pin(async move {
@@ -3319,6 +3441,7 @@ mod process_peak_tests {
             assert!(failure.describe().contains(query));
             assert!(failure.error.contains(column), "{failure:?}");
             let sql = format!("ALTER TABLE {table} RENAME COLUMN unavailable_column TO {column}");
+            drop(Writing::of(&db));
             db.write(move |conn| {
                 let sql = sql.clone();
                 Box::pin(async move {
@@ -4633,6 +4756,7 @@ mod process_peak_tests {
         assert_eq!((kills.alone, kills.memory_brake), (1, Some(true)));
 
         // A row the ledger counted before it recorded admission.
+        drop(Writing::of(&db));
         db.execute(
             "INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms)
              VALUES ('cairn/class:cargoTest', ?1, ?2, ?3, 3, ?4, 1)",

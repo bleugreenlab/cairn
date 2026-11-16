@@ -27,6 +27,7 @@ pub(crate) mod placement_default;
 pub mod pools;
 pub(crate) mod preparation;
 mod pricing;
+mod profile_reads;
 pub(crate) mod purpose;
 pub(crate) mod queue;
 mod reliability;

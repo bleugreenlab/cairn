@@ -517,6 +517,14 @@ impl QueueEntry {
     /// backoff has run. `generation` is the machine's current one: a decline
     /// recorded against an older link says nothing about this one, because the
     /// process behind it may have been replaced entirely.
+    ///
+    /// The machine this entry's aging headroom targets is asked once when it
+    /// becomes the target, and again without waiting out the backoff when the
+    /// posted condition its decline was recorded on changes, because that
+    /// change may be the room it has been reserving. A decline recorded on no
+    /// condition is superseded by any post at all, so it keeps its backoff
+    /// even here: skipping it re-asked such a target on every placement tick
+    /// (cairn/7301).
     pub(crate) fn may_offer_to(
         &self,
         executor_id: &str,
@@ -530,7 +538,8 @@ impl QueueEntry {
             decline.stands_on(generation, now_unix_ms)
                 && !(entitled
                     && (!self.headroom.target.as_ref().unwrap().offered
-                        || decline.superseded_at_unix_ms.is_some()))
+                        || (decline.superseded_at_unix_ms.is_some()
+                            && decline.condition.is_some())))
         })
     }
 
@@ -4132,6 +4141,102 @@ pub(super) mod tests {
         };
         assert!(queue.supersede_declines_for("machine", 100_000, still_posted));
         assert!(queue.offer(&entry, "machine", "machine", 1, 100_001));
+    }
+
+    /// cairn/7301: an aged entry entitled to a machine's headroom was declined
+    /// there for memory three to ten times a second, because the runner's
+    /// reading did not reproduce the refusal, every sample superseded it, and
+    /// the entitlement skipped a superseded decline's backoff. Against a
+    /// machine whose memory account does not change, a minute of 250 ms
+    /// placement ticks, each with a fresh sample, offers the entry once; when
+    /// the work it waits on ends it is offered on the next tick.
+    #[test]
+    fn a_pressure_decline_is_answered_once_per_fact_not_once_per_tick() {
+        use super::super::decline_condition::{posted_condition, still_posted, PostedState};
+        use cairn_common::executor_protocol::{
+            ExecutingCellRequest, ExecutorSubstrateReport, FleetSnapshot,
+        };
+        const TICK_MS: u64 = 250;
+        for entitled in [true, false] {
+            let queue = ExecutionQueue::default();
+            let (entry, _waiter) = enqueue(&queue, "aged", PlacementMobility::SpillEligible);
+            if entitled {
+                queue.set_headroom_target(
+                    &entry,
+                    Some(HeadroomTarget {
+                        executor_id: "machine".into(),
+                        generation: 1,
+                        enabled: true,
+                        offered: false,
+                    }),
+                );
+            }
+            let occupant: ExecutingCellRequest = serde_json::from_value(serde_json::json!({
+                "requestId": "occupant",
+                "attemptId": "a",
+                "startedAtUnixMs": 0,
+                "processIds": [],
+            }))
+            .unwrap();
+            let mut snapshot = FleetSnapshot {
+                executing_requests: vec![occupant],
+                ..FleetSnapshot::default()
+            };
+            let mut health = ExecutorSubstrateReport::default();
+            // One answered placement tick: the machine's latest sample is
+            // applied, then placement offers the entry if it may.
+            let tick = |now: u64, snapshot: &FleetSnapshot, health: &ExecutorSubstrateReport| {
+                let machine = PostedState {
+                    snapshot,
+                    health,
+                    colocated: false,
+                };
+                queue.supersede_declines_for("machine", now, |request, view, decline| {
+                    still_posted(decline, view, request, machine)
+                });
+                if !queue.offer(&entry, "machine", "machine", 1, now) {
+                    return false;
+                }
+                let condition = queue
+                    .with_entry(&entry, |held| {
+                        posted_condition(
+                            DeclineReason::Pressure,
+                            &held.admission_view(),
+                            &held.request,
+                            machine,
+                        )
+                    })
+                    .unwrap();
+                queue.decline(
+                    &entry,
+                    "machine",
+                    1,
+                    DeclineReason::Pressure,
+                    Some("holding headroom for senior: memory short".into()),
+                    None,
+                    condition,
+                    now,
+                );
+                true
+            };
+            let mut offers = 0;
+            let mut now = 1_000;
+            while now < 61_000 {
+                health.host.cpu_admission.reading = Some((now % 97) as f64 / 100.0);
+                health.host.cpu_admission.measured_at_unix_ms = Some(now);
+                offers += usize::from(tick(now, &snapshot, &health));
+                now += TICK_MS;
+            }
+            assert_eq!(
+                offers, 1,
+                "entitled={entitled}: {offers} offers in a minute"
+            );
+            snapshot.executing_requests.clear();
+            assert!(
+                tick(now, &snapshot, &health),
+                "entitled={entitled}: the work it waited on ending re-offers it at once"
+            );
+        }
     }
 
     /// A condition the runner reads as unchanged is still re-asked after two

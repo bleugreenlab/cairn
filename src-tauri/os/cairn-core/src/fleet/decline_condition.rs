@@ -11,10 +11,21 @@
 //! reason* changes. [`posted_condition`] reads that condition from the state
 //! the machine posted; the queue records it beside the decline and supersedes
 //! the decline only when a later post reads differently. When nothing posted
-//! explains a decline (an older executor, a request-specific refusal, a reason
-//! with no posted counterpart) the answer is `None` and any new posted state
-//! supersedes it, as before. Either way the queue's per-machine re-offer
-//! backoff is the ceiling, so a condition that flaps cannot loop either.
+//! explains a decline (a request-specific refusal, a reason with no posted
+//! counterpart) the answer is `None` and any new posted state supersedes it,
+//! as before. Either way the queue's per-machine re-offer backoff is the
+//! ceiling, so a condition that flaps cannot loop either.
+//!
+//! A pressure refusal is never left at `None`. The executor prices things the
+//! runner's reading of its posts cannot reproduce (the headroom it holds for
+//! another request, a build width it has not measured there), and on 11-16 a
+//! refusal recorded as unexplained was superseded by every machine sample, so
+//! an aged request entitled to that machine's headroom was re-offered on every
+//! placement tick, three to ten times a second for hours (cairn/7301). When the
+//! reading does not show the pressure, the decline records the machine's
+//! memory account instead: the admitted work that owes its memory and the
+//! headroom holds it keeps. Those change only when work is admitted or ends or
+//! a hold moves, which are the events that can relieve the refusal.
 //!
 //! The same posted state answers the forward question too. [`posted_hold`]
 //! asks, before an offer, whether the machine's own admission would decline
@@ -461,6 +472,15 @@ pub(crate) enum PostedCondition {
         disk_write_stalled: bool,
         memory_short: bool,
     },
+    /// A pressure refusal the runner's reading does not reproduce, tied to
+    /// the machine's memory account: the admitted work executing there, whose
+    /// charges are the memory it owes, and its headroom holds with whether
+    /// each is the one it protects. The memory readings themselves are left
+    /// out, because they move on every sample while the refusal does not.
+    MemoryAccount {
+        admitted: Vec<(String, String)>,
+        headroom_holds: Vec<(String, bool)>,
+    },
     /// The machine's disk verdict, the state of the work that could relieve
     /// it, and its posted headroom: free space less the floor admission would
     /// charge this request (see `disk_floor_bytes`). Admission refuses when
@@ -536,13 +556,54 @@ impl PostedCondition {
     }
 }
 
+/// The machine's memory account, as [`PostedCondition::MemoryAccount`] reads
+/// it, in an order that does not depend on how the machine listed it.
+fn memory_account(machine: PostedState<'_>) -> PostedCondition {
+    let mut admitted: Vec<(String, String)> = machine
+        .snapshot
+        .executing_requests
+        .iter()
+        .map(|work| (work.request_id.clone(), work.attempt_id.clone()))
+        .collect();
+    admitted.sort();
+    admitted.dedup();
+    let mut headroom_holds: Vec<(String, bool)> = machine
+        .health
+        .admission
+        .headroom_reservations
+        .iter()
+        .map(|hold| (hold.entry_id.clone(), hold.protected))
+        .collect();
+    headroom_holds.sort();
+    PostedCondition::MemoryAccount {
+        admitted,
+        headroom_holds,
+    }
+}
+
+/// Whether `machine`'s posted state still bears out `decline`, which it gave
+/// the entry `view` describes. A decline recorded with no condition is borne
+/// out by nothing, so any post supersedes it.
+pub(crate) fn still_posted(
+    decline: &super::queue::EntryDecline,
+    view: &AdmissionView,
+    request: &CellRequest,
+    machine: PostedState<'_>,
+) -> bool {
+    decline.condition.as_ref().is_some_and(|recorded| {
+        recorded.still_holds(posted_condition(decline.reason, view, request, machine).as_ref())
+    })
+}
+
 /// The posted condition behind `reason` for `request`, or `None` when the
 /// machine's posted state does not show it.
 ///
 /// `None` is not "clear". It means the decline cannot be tied to anything the
 /// machine posts, so the caller falls back to superseding it on any new post.
 /// That is the safe direction: a decline tied to a condition that never
-/// changes would park the request until its horizon.
+/// changes would park the request until its horizon. Pressure is always
+/// tied to something: to the reading when it shows the pressure, and to the
+/// machine's memory account when it does not.
 pub(crate) fn posted_condition(
     reason: DeclineReason,
     view: &AdmissionView,
@@ -550,7 +611,12 @@ pub(crate) fn posted_condition(
     machine: PostedState<'_>,
 ) -> Option<PostedCondition> {
     let reading = match reason {
-        DeclineReason::Pressure => read_pressure(request, machine),
+        DeclineReason::Pressure => {
+            return Some(
+                read_pressure(request, machine)
+                    .map_or_else(|| memory_account(machine), |reading| reading.condition),
+            );
+        }
         DeclineReason::Disk => read_disk(view, request, machine),
         DeclineReason::Capacity => {
             let health = machine.health;
@@ -925,13 +991,29 @@ mod tests {
         );
     }
 
-    /// A pressure decline the posted state does not explain (memory the
-    /// runner reads as fine, a CPU verdict that is not pressured) is tied to
-    /// nothing, so any post may supersede it.
+    /// A pressure decline the reading does not explain (memory the runner
+    /// reads as fine, a CPU verdict that is not pressured) stands on the
+    /// machine's memory account: memory readings moving do not supersede it,
+    /// and work ending or a headroom hold moving does.
     #[test]
-    fn an_unexplained_pressure_decline_has_no_condition() {
-        let snapshot = FleetSnapshot::default();
+    fn an_unexplained_pressure_decline_stands_on_the_memory_account() {
+        let mut snapshot = FleetSnapshot {
+            executing_requests: vec![executing("occupant", ResourceReservation::default(), 0)],
+            ..FleetSnapshot::default()
+        };
         let mut fine = with_cpu(health(), StallInstrumentState::Accepting);
+        fine.admission.headroom_reservations =
+            vec![cairn_common::executor_protocol::HeadroomReservation {
+                entry_id: "senior-entry".into(),
+                request_id: "senior".into(),
+                attempt_id: "a".into(),
+                reservation: ResourceReservation::default(),
+                waiting_since_unix_ms: 0,
+                forecast_ms: None,
+                reserved_at_unix_ms: 0,
+                memory_floor_bytes: None,
+                protected: true,
+            }];
         fine.machine.memory = Measurement::measured(
             1,
             MachineMemory {
@@ -939,10 +1021,35 @@ mod tests {
                 available_bytes: 32 * GIB,
             },
         );
+        let recorded = condition(DeclineReason::Pressure, &request(), &snapshot, &fine);
         assert_eq!(
-            condition(DeclineReason::Pressure, &request(), &snapshot, &fine),
-            None
+            recorded,
+            Some(PostedCondition::MemoryAccount {
+                admitted: vec![("occupant".into(), "a".into())],
+                headroom_holds: vec![("senior-entry".into(), true)],
+            })
         );
+        let recorded = recorded.unwrap();
+        fine.machine.memory = Measurement::measured(
+            2,
+            MachineMemory {
+                total_bytes: 64 * GIB,
+                available_bytes: 31 * GIB,
+            },
+        );
+        assert!(recorded.still_holds(
+            condition(DeclineReason::Pressure, &request(), &snapshot, &fine).as_ref()
+        ));
+        let mut moved = fine.clone();
+        moved.admission.headroom_reservations[0].protected = false;
+        assert!(!recorded.still_holds(
+            condition(DeclineReason::Pressure, &request(), &snapshot, &moved).as_ref()
+        ));
+        snapshot.executing_requests.clear();
+        assert!(!recorded.still_holds(
+            condition(DeclineReason::Pressure, &request(), &snapshot, &fine).as_ref()
+        ));
+        let snapshot = FleetSnapshot::default();
         fine.machine.memory = Measurement::measured(
             2,
             MachineMemory {

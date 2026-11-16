@@ -9105,6 +9105,57 @@ async fn place_once(
     .unwrap()
 }
 
+/// cairn/7301: a parked request is re-priced against every candidate on each
+/// placement pass, at least four times a second, and every pricing re-read
+/// the same profile rows, which held twelve of the runner host's cores. A
+/// pass over parked requests against machines nothing has taught anything
+/// since the last pass issues no statement, and a profile written between
+/// passes is read by the next one.
+#[tokio::test]
+async fn re_pricing_unchanged_requests_against_unchanged_machines_reads_nothing() {
+    let (pool, db, request) = killed_fleet("re-pricing-reads.db", 2_684_354_560, 1).await;
+    let parked: Vec<CellRequest> = (0..4)
+        .map(|n| CellRequest {
+            request_id: format!("parked-{n}"),
+            ..request.clone()
+        })
+        .collect();
+    for request in &parked {
+        place_once(&pool, db.clone(), request).await;
+    }
+    let before = db.read_statement_count();
+    for _ in 0..3 {
+        for request in &parked {
+            place_once(&pool, db.clone(), request).await;
+        }
+    }
+    assert_eq!(
+        db.read_statement_count() - before,
+        0,
+        "three more passes over {} parked requests read the store again",
+        parked.len()
+    );
+
+    let ub = pool.lock_connections()["bgsrv-ub"].clone();
+    resource_profiles::seed_memory_profile_for_test(
+        db.clone(),
+        request.command_resource_identity.as_ref().unwrap(),
+        &ReservationPlan::context_for(
+            &ub.identity.device_id,
+            &ub.identity.executor_id,
+            &ub.advertisement.capabilities,
+        ),
+        1024 * 1024 * 1024,
+    )
+    .await;
+    let before = db.read_statement_count();
+    place_once(&pool, db.clone(), &parked[0]).await;
+    assert!(
+        db.read_statement_count() > before,
+        "a profile written between passes is read by the next one"
+    );
+}
+
 /// cairn/5416's specimen: a `rustc` killed at 3.4 GiB beside another
 /// compile on a 12.1 GiB machine now showing 2.5 GiB free. The re-armed
 /// lane is charged the kill, not the 2 GiB class prior that fit, so it goes

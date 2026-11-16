@@ -338,12 +338,7 @@ impl Fleet {
             executor_id,
             unix_time_ms(),
             |request, view, decline| {
-                decline.condition.as_ref().is_some_and(|recorded| {
-                    recorded.still_holds(
-                        decline_condition::posted_condition(decline.reason, view, request, machine)
-                            .as_ref(),
-                    )
-                })
+                decline_condition::still_posted(decline, view, request, machine)
             },
         );
         if superseded {

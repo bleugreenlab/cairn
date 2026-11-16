@@ -127,6 +127,7 @@ pub(super) async fn record(
     duration_ms: Option<u64>,
     finished_at_unix_ms: u64,
 ) -> Result<(), String> {
+    let _written = super::profile_reads::Writing::of(&db);
     let identity = identity.clone();
     let os = os.to_string();
     let executor_id = executor_id.to_string();
@@ -232,51 +233,85 @@ fn price_window(window: &[Recent]) -> Option<WindowPrice> {
     })
 }
 
+/// The machine's latest outcomes of `identity` inside the horizon, newest
+/// first.
+///
+/// The newest [`RELIABILITY_WINDOW`] rows are read regardless of age and the
+/// horizon is applied here. Rows newest first inside the horizon are a prefix
+/// of rows newest first, so this is the same window the horizon applied in
+/// the query would give, and the read does not depend on the clock, which is
+/// what lets placement passes share it.
 async fn load_window(
     db: Arc<LocalDb>,
     identity: &CommandResourceIdentity,
     executor_id: &str,
     now_unix_ms: u64,
 ) -> Result<Vec<Recent>, String> {
-    let identity = identity.clone();
-    let executor_id = executor_id.to_string();
-    db.read(move |conn| {
-        let identity = identity.clone();
-        let executor_id = executor_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT outcome, COALESCE(signature, ''), COALESCE(duration_ms, -1)
-                       FROM command_outcome_history
-                      WHERE identity_version = ?1 AND command_identity = ?2
-                        AND executor_id = ?3 AND finished_at_unix_ms >= ?4
-                      ORDER BY finished_at_unix_ms DESC, rowid DESC
-                      LIMIT ?5",
-                    params![
-                        identity.version as i64,
-                        identity.key,
-                        executor_id,
-                        now_unix_ms.saturating_sub(RELIABILITY_HORIZON_MS) as i64,
-                        RELIABILITY_WINDOW as i64
-                    ],
-                )
-                .await?;
-            let mut window = Vec::new();
-            while let Some(row) = rows.next().await? {
-                let outcome = row.get::<String>(0)?;
-                let signature = row.get::<String>(1)?;
-                let duration = row.get::<i64>(2)?;
-                window.push(Recent {
-                    failed_signature: (outcome != "completed" && !signature.is_empty())
-                        .then_some(signature),
-                    duration_ms: (duration >= 0).then_some(duration as u64),
-                });
-            }
-            Ok(window)
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())
+    let horizon = now_unix_ms.saturating_sub(RELIABILITY_HORIZON_MS);
+    let lookup = super::profile_reads::Lookup::new(
+        &db,
+        format!(
+            "reliability_window\u{1f}{}\u{1f}{}\u{1f}{executor_id}",
+            identity.version, identity.key
+        ),
+    );
+    let latest: Vec<(u64, Recent)> = match lookup.hit() {
+        Some(hit) => hit,
+        None => {
+            let identity = identity.clone();
+            let executor_id = executor_id.to_string();
+            let read = db
+                .read(move |conn| {
+                    let identity = identity.clone();
+                    let executor_id = executor_id.clone();
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT outcome, COALESCE(signature, ''), COALESCE(duration_ms, -1),
+                                        finished_at_unix_ms
+                                   FROM command_outcome_history
+                                  WHERE identity_version = ?1 AND command_identity = ?2
+                                    AND executor_id = ?3
+                                  ORDER BY finished_at_unix_ms DESC, rowid DESC
+                                  LIMIT ?4",
+                                params![
+                                    identity.version as i64,
+                                    identity.key,
+                                    executor_id,
+                                    RELIABILITY_WINDOW as i64
+                                ],
+                            )
+                            .await?;
+                        let mut window = Vec::new();
+                        while let Some(row) = rows.next().await? {
+                            let outcome = row.get::<String>(0)?;
+                            let signature = row.get::<String>(1)?;
+                            let duration = row.get::<i64>(2)?;
+                            let finished_at = row.get::<i64>(3)?.max(0) as u64;
+                            window.push((
+                                finished_at,
+                                Recent {
+                                    failed_signature: (outcome != "completed"
+                                        && !signature.is_empty())
+                                    .then_some(signature),
+                                    duration_ms: (duration >= 0).then_some(duration as u64),
+                                },
+                            ));
+                        }
+                        Ok(window)
+                    })
+                })
+                .await
+                .map_err(|error| error.to_string());
+            lookup.keep(&read);
+            read?
+        }
+    };
+    Ok(latest
+        .into_iter()
+        .filter(|(finished_at, _)| *finished_at >= horizon)
+        .map(|(_, recent)| recent)
+        .collect())
 }
 
 /// What `executor_id`'s own recent history of these commands adds to its time
