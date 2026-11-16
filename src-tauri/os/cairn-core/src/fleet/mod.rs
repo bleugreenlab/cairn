@@ -7,6 +7,7 @@
 mod check_adoptions;
 pub(crate) use check_adoptions::{CheckConsumerGuard, RETAINED_RESULT_RETRY};
 mod coalescing;
+pub(crate) mod counters;
 mod drain_projection;
 pub use drain_projection::AdmissionFenceToken;
 pub(crate) mod decline_condition;
@@ -1476,6 +1477,8 @@ pub struct Fleet {
     /// What syncing a candidate and rebuilding its warm slots would cost, priced
     /// once per commit pair in the background (see [`pricing`]).
     placement_prices: Arc<pricing::PlacementPrices>,
+    /// What placing queued work has cost this runner (see [`counters`]).
+    counters: Arc<counters::FleetCounters>,
     /// Rate limit for the pushed telemetry frame. One per runner rather than
     /// one per connection: an N-machine fleet beating independently would
     /// otherwise emit at N times the intended cadence, each connection
@@ -1658,6 +1661,16 @@ impl Fleet {
         runner_incarnation: String,
     ) {
         queue::spawn_queue_journal(db, runner_incarnation, self.queue.clone());
+    }
+
+    /// What placing queued work has cost this runner so far.
+    pub(crate) fn placement_counters(&self) -> &counters::FleetCounters {
+        &self.counters
+    }
+
+    /// Log [`Self::placement_counters`] once a minute for the life of this fleet.
+    pub(crate) fn spawn_placement_counter_log(&self) {
+        counters::spawn_minute_log(&self.counters);
     }
 
     /// Give this runner's lifecycle facts a durable journal, opening it with
@@ -2450,6 +2463,9 @@ const NOW: u64 = 1_000_000_000;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod bench;
 
 /// A fence wait relayed from an executor batch, end to end through
 /// [`Fleet::handle_runner_callback`]: what happens to the permission and the

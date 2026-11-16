@@ -1000,6 +1000,9 @@ impl Fleet {
                     });
             summary
         });
+        let reserving = summary
+            .as_ref()
+            .is_some_and(|summary| summary.headroom.is_some());
         let reached = summary.is_some_and(|summary| {
             match self.send_new_admission(
                 selected,
@@ -1029,6 +1032,9 @@ impl Fleet {
                 }
             }
         });
+        if reached {
+            self.counters.offer(reserving);
+        }
         if !reached {
             if let PlacementOutcome::Refused { diagnostic } = &decision.outcome {
                 self.queue.retract_unsent_offer(
@@ -1527,6 +1533,7 @@ impl Fleet {
         // metadata first so that neither ever holds the connection lock needed by
         // transport-side heartbeat and snapshot processing.
         let connections = self.lock_connections().clone();
+        self.counters.placement_pass(connections.len());
         let unattached = self.unattached_enrolled_remotes();
         let now = unix_time_ms();
         // Stage one: which machines could structurally take this at all, and

@@ -1368,7 +1368,7 @@ fn a_batch_relay_not_reannounced_for_its_attempt_is_revoked_by_name() {
         let pool = Fleet::default();
         insert_bound_relay_context(&pool);
         pool.relay_link_closed("executor-1", 7);
-        pool.reattach_relays(executor, 8, &[announcement.clone()]);
+        pool.reattach_relays(executor, 8, std::slice::from_ref(&announcement));
         if executor == "executor-2" {
             assert!(
                 pool.holds_runner_context("context"),
@@ -6280,7 +6280,7 @@ impl Fleet {
     }
 }
 
-fn fleet_entry_at(
+pub(super) fn fleet_entry_at(
     id: &str,
     os: &str,
     load: usize,
@@ -6379,7 +6379,7 @@ fn measured(
     );
 }
 
-fn measured_at(
+pub(super) fn measured_at(
     entry: &mut ExecutorConnectionState,
     cpu_utilization: f64,
     available_memory_bytes: u64,
@@ -6418,7 +6418,7 @@ fn measured_at(
     };
 }
 
-fn spillable_request() -> CellRequest {
+pub(super) fn spillable_request() -> CellRequest {
     let mut request = targeted_request("linux");
     request.executor = None;
     request.placement_mobility = PlacementMobility::SpillEligible;

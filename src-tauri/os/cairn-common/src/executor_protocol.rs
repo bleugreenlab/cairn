@@ -9437,6 +9437,12 @@ pub struct LearnedResourceEstimate {
 /// What a runner gets wrong talking to an older executor: nothing; it receives
 /// the spec it never reads, as before. A newer runner reading an older
 /// executor's state file sheds the payload on decode.
+///
+/// cairn/7303's placement counters do not move the number. The runner counts
+/// its own placement passes, the machines each pass judges, the offers it
+/// sends, the declines it receives and the offers that authorize headroom,
+/// and shows them on its executors page. No frame, field or executor behavior
+/// changes, so a runner talking to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
 
 /// The version `build.rs` derived from the paragraphs above

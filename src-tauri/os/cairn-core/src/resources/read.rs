@@ -2436,6 +2436,12 @@ async fn render_resource_body(
                         |executor_id| orch.fleet.executor_name_for_text(executor_id),
                         captured_at,
                     ));
+                    let counters = orch.fleet.placement_counters();
+                    rendered.push_str(&crate::resources::executors::render_placement_work(
+                        counters.totals(),
+                        counters.last_minute(),
+                        captured_at,
+                    ));
                     rendered.push_str(&crate::resources::executors::render_runner_pipe_floor(
                         &orch.process_floor(),
                     ));

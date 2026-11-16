@@ -616,6 +616,7 @@ impl Fleet {
                 detail,
                 disk,
             } => {
+                self.counters.refusal();
                 // The id alone is not what an operator searches for: the
                 // colocated machine's id is `colocated`, while every surface
                 // calls it `local`. Both are named so either finds the line.

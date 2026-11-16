@@ -806,6 +806,7 @@ impl OrchestratorBuilder {
         // process. Entries a previous incarnation left open are closed rather
         // than resurrected: the futures waiting on them ended with that process.
         fleet.attach_queue_journal(self.db.local.clone(), runner_incarnation);
+        fleet.spawn_placement_counter_log();
         // Machines that could not prepare a project's cells stay excluded for
         // that project across a runner restart, until their evidence changes.
         fleet.attach_preparation_store(self.db.local.clone());

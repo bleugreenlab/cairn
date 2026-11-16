@@ -5070,6 +5070,35 @@ pub(crate) fn render_compile_cache_fitness(sentences: &[String]) -> String {
     out
 }
 
+/// What placing queued work has cost this runner: the last whole minute's
+/// growth, which is the rate a reader compares, and the totals since start.
+pub(crate) fn render_placement_work(
+    totals: crate::fleet::counters::PlacementCounts,
+    last_minute: Option<crate::fleet::counters::CountedWindow>,
+    captured_at_unix_ms: u64,
+) -> String {
+    let mut out = String::from("\n## Placement work\n\n");
+    match last_minute {
+        Some(window) => out.push_str(&format!(
+            "- Last minute (closed {} ago): {}\n",
+            age(captured_at_unix_ms.saturating_sub(window.ended_at_unix_ms)),
+            window.sentence()
+        )),
+        None => {
+            out.push_str("- Last minute: not yet closed; the first closes a minute after start\n")
+        }
+    }
+    out.push_str(&format!(
+        "- Since start: {} placement passes, {} fit evaluations, {} offers, {} refusals, {} reservations\n",
+        totals.placement_passes,
+        totals.fit_evaluations,
+        totals.offers,
+        totals.refusals,
+        totals.reservations
+    ));
+    out
+}
+
 /// The runner's own lifecycle facts over the last hour, read from the
 /// `runner_events` journal: a local table read, never a probe.
 ///
