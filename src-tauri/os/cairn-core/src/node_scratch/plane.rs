@@ -34,7 +34,7 @@ use cairn_common::executor_protocol::{
     NODE_SCRATCH_TRANSFER_BATCH_BYTES, SCRATCH_SERVED_HEADER, SCRATCH_UPLOAD_HEADER,
 };
 
-use super::owner::{self, NodeScratch, Replica};
+use super::owner::{self, NodeScratch};
 use super::{merge, store};
 use crate::orchestrator::Orchestrator;
 
@@ -686,16 +686,15 @@ async fn complete(
                 ));
             }
             let written_bytes = scratch.written_bytes + added;
-            if let Err(error) = owner::record_replica(
+            // A refusal an earlier batch met stays recorded: the batch this
+            // write-back belongs to reports it cleared when it settles.
+            if let Err(error) = owner::record_state(
                 &orch.db.local,
-                &Replica {
-                    scratch_id: scratch.id.clone(),
-                    executor_id: executor.clone(),
-                    synced_commit: Some(head.clone()),
-                    synced_written_bytes: written_bytes,
-                    dirty: false,
-                    refused_bytes: None,
-                },
+                &scratch.id,
+                &executor,
+                Some(&head),
+                written_bytes,
+                false,
             )
             .await
             {

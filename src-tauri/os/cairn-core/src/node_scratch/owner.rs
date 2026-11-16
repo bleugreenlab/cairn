@@ -387,6 +387,11 @@ pub struct Replica {
     pub refused_bytes: Option<u64>,
 }
 
+/// Record everything settlement knows about a replica, its pending refusal
+/// included. Only [`super::report::settle`] calls this: it reports a refusal
+/// once, or reports it cleared once, and carries or clears `refused_bytes` in
+/// the same write. Every other writer of a replica's state uses
+/// [`record_state`].
 pub async fn record_replica(local: &LocalDb, replica: &Replica) -> DbResult<()> {
     local
         .execute(
@@ -406,6 +411,44 @@ pub async fn record_replica(local: &LocalDb, replica: &Replica) -> DbResult<()> 
                 replica.synced_written_bytes as i64,
                 i64::from(replica.dirty),
                 replica.refused_bytes.map(|bytes| bytes as i64),
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )
+        .await
+        .map(|_| ())
+}
+
+/// Record a replica's current state: the commit it has synced, the monotonic
+/// byte count at that commit, and whether it holds writes the head lacks.
+///
+/// Never names `refused_bytes`. A refusal is a pending fact the report path
+/// owns until a settle has reported it, so an advertisement or a landed
+/// write-back that reaches the runner before the batch's settle must leave it
+/// for settle to report as cleared. A row this creates has no refusal.
+pub async fn record_state(
+    local: &LocalDb,
+    scratch_id: &str,
+    executor_id: &str,
+    synced_commit: Option<&str>,
+    synced_written_bytes: u64,
+    dirty: bool,
+) -> DbResult<()> {
+    local
+        .execute(
+            "INSERT INTO node_scratch_replicas(scratch_id, executor_id, synced_commit,
+                 synced_written_bytes, dirty, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(scratch_id, executor_id) DO UPDATE SET
+                 synced_commit = excluded.synced_commit,
+                 synced_written_bytes = excluded.synced_written_bytes,
+                 dirty = excluded.dirty,
+                 updated_at = excluded.updated_at",
+            params![
+                scratch_id,
+                executor_id,
+                synced_commit,
+                synced_written_bytes as i64,
+                i64::from(dirty),
                 chrono::Utc::now().timestamp_millis()
             ],
         )

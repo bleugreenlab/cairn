@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use cairn_common::executor_protocol::{ExecutorMessage, NodeScratchReplica};
 
-use super::owner::{self, NodeScratch, Replica};
+use super::owner::{self, NodeScratch};
 use super::store;
 use crate::db::DbState;
 use crate::fleet::{Fleet, NodeScratchEvent};
@@ -168,20 +168,16 @@ async fn reconcile_advertised(
             (Some(known), _) => known.synced_written_bytes,
             _ => 0,
         };
-        let _ = owner::record_replica(
+        // The replica's current state only: a refusal stays pending for the
+        // next settle on this machine to report, whatever order this
+        // advertisement and that settle reach the runner in.
+        let _ = owner::record_state(
             local,
-            &Replica {
-                scratch_id: scratch.id.clone(),
-                executor_id: executor_id.to_owned(),
-                synced_commit: replica.synced_commit.clone(),
-                synced_written_bytes,
-                dirty: replica.dirty,
-                refused_bytes: if replica.dirty {
-                    known.and_then(|known| known.refused_bytes)
-                } else {
-                    None
-                },
-            },
+            &scratch.id,
+            executor_id,
+            replica.synced_commit.as_deref(),
+            synced_written_bytes,
+            replica.dirty,
         )
         .await;
     }
@@ -239,16 +235,13 @@ pub async fn close_scratch(orch: &Orchestrator, scratch: &NodeScratch) {
     for advertised in orch.fleet.node_scratch_replicas(&scratch.id) {
         if !holders.contains(&advertised.executor_id) {
             holders.push(advertised.executor_id.clone());
-            let _ = owner::record_replica(
+            let _ = owner::record_state(
                 local,
-                &Replica {
-                    scratch_id: scratch.id.clone(),
-                    executor_id: advertised.executor_id,
-                    synced_commit: advertised.replica.synced_commit,
-                    synced_written_bytes: 0,
-                    dirty: advertised.replica.dirty,
-                    refused_bytes: None,
-                },
+                &scratch.id,
+                &advertised.executor_id,
+                advertised.replica.synced_commit.as_deref(),
+                0,
+                advertised.replica.dirty,
             )
             .await;
         }
@@ -349,5 +342,151 @@ pub struct Subscribed(Arc<AtomicBool>);
 impl Subscribed {
     pub fn swap(&self, value: bool, ordering: Ordering) -> bool {
         self.0.swap(value, ordering)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Who may erase a write-back refusal. An advertisement and a batch's
+    //! settle reach the runner in either order; each order is driven here
+    //! directly, so the outcome never depends on which task ran first.
+
+    use std::sync::Arc;
+
+    use cairn_common::executor_protocol::{
+        NodeScratchReplica, ScratchRefusal, ScratchSyncReport, ScratchWriteBackOutcome,
+        ScratchWriteBackReport,
+    };
+
+    use super::{reconcile_advertised, Lifecycle};
+    use crate::db::DbState;
+    use crate::node_scratch::owner::{self, NodeScratch, Replica, ScratchOwner};
+    use crate::node_scratch::report::settle;
+    use crate::orchestrator::Orchestrator;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, SearchIndex};
+
+    const MACHINE: &str = "machine-a";
+    const REFUSED: u64 = 2 * 1024 * 1024 + 5;
+    const CLEARED: &str = "Scratch write-back refusal cleared";
+
+    async fn world() -> (tempfile::TempDir, Orchestrator, NodeScratch) {
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalDb::open_migrated_for_test(temp.path().join("db.turso.db"))
+            .await
+            .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(Arc::new(local), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            temp.path().to_path_buf(),
+        )
+        .build();
+        let scratch = owner::open_for_owner(
+            &orch.db.local,
+            &ScratchOwner {
+                job_id: "job".into(),
+                uri: "cairn://p/nsc/1/1/builder".into(),
+                project_id: "p".into(),
+                thread_id: None,
+                issue_id: Some("issue".into()),
+            },
+        )
+        .await
+        .unwrap();
+        (temp, orch, scratch)
+    }
+
+    fn refused() -> ScratchSyncReport {
+        ScratchSyncReport {
+            write_back: Some(ScratchWriteBackReport {
+                bytes: 0,
+                ms: 12,
+                outcome: ScratchWriteBackOutcome::Refused(ScratchRefusal {
+                    owner_uri: "cairn://p/nsc/1/1/builder".into(),
+                    merged_bytes: REFUSED,
+                    ceiling_bytes: 1024 * 1024,
+                    largest: Vec::new(),
+                    largest_directories: Vec::new(),
+                    oversized: Vec::new(),
+                }),
+            }),
+            bytes: REFUSED,
+            dirty: true,
+            ..ScratchSyncReport::default()
+        }
+    }
+
+    /// The batch that deleted the oversized file: nothing left to write back.
+    fn shrunk() -> ScratchSyncReport {
+        ScratchSyncReport::default()
+    }
+
+    async fn advertise_clean(orch: &Orchestrator, scratch: &NodeScratch) {
+        reconcile_advertised(
+            &Lifecycle::of(orch),
+            &orch.fleet,
+            MACHINE,
+            1,
+            &[NodeScratchReplica {
+                scratch_id: scratch.id.clone(),
+                synced_commit: None,
+                bytes: 5,
+                dirty: false,
+                in_use: false,
+            }],
+        )
+        .await;
+    }
+
+    async fn mine(orch: &Orchestrator, scratch: &NodeScratch) -> Replica {
+        owner::replicas(&orch.db.local, &scratch.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|replica| replica.executor_id == MACHINE)
+            .expect("the machine's replica is recorded")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clean_advertisement_before_settle_leaves_the_refusal_for_settle_to_clear_once() {
+        let (_temp, orch, scratch) = world().await;
+        let text = settle(&orch, &scratch, &refused(), MACHINE).await.unwrap();
+        assert!(text.contains("Scratch write-back refused"), "{text}");
+        assert_eq!(mine(&orch, &scratch).await.refused_bytes, Some(REFUSED));
+
+        advertise_clean(&orch, &scratch).await;
+        let advertised = mine(&orch, &scratch).await;
+        assert!(!advertised.dirty, "the advertisement moves current state");
+        assert_eq!(
+            advertised.refused_bytes,
+            Some(REFUSED),
+            "an advertisement never erases an unreported refusal"
+        );
+
+        let text = settle(&orch, &scratch, &shrunk(), MACHINE).await.unwrap();
+        assert_eq!(text.matches(CLEARED).count(), 1, "{text}");
+        assert_eq!(mine(&orch, &scratch).await.refused_bytes, None);
+        assert_eq!(
+            settle(&orch, &scratch, &shrunk(), MACHINE).await,
+            None,
+            "cleared is reported once"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_clean_advertisement_after_settle_cleared_brings_nothing_back() {
+        let (_temp, orch, scratch) = world().await;
+        settle(&orch, &scratch, &refused(), MACHINE).await.unwrap();
+        let text = settle(&orch, &scratch, &shrunk(), MACHINE).await.unwrap();
+        assert_eq!(text.matches(CLEARED).count(), 1, "{text}");
+
+        // Sent by the same generation before that settle, arriving after it.
+        advertise_clean(&orch, &scratch).await;
+        assert_eq!(mine(&orch, &scratch).await.refused_bytes, None);
+        assert_eq!(settle(&orch, &scratch, &shrunk(), MACHINE).await, None);
+        advertise_clean(&orch, &scratch).await;
+        assert_eq!(mine(&orch, &scratch).await.refused_bytes, None);
+        assert_eq!(settle(&orch, &scratch, &shrunk(), MACHINE).await, None);
     }
 }
