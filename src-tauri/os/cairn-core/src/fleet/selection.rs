@@ -6469,7 +6469,6 @@ impl ReservationPlan {
                 learned_estimate: request.learned_estimate.clone(),
                 rationale: resource_profiles::declared_rationale(&context, self.stated.clone()),
                 duration: self.predict_duration(&context, duration_context).await,
-                item_durations: Vec::new(),
                 // A stated reservation is the caller's own number, not a
                 // measurement this machine's cap could be hiding.
                 memory_fit: resource_profiles::MemoryFit::Unknown,
@@ -6634,7 +6633,6 @@ impl ReservationPlan {
     ) -> resource_profiles::ResolvedResourceProfile {
         let mut reservation = ResourceReservation::default();
         let mut learned_estimates = Vec::with_capacity(self.batch_identities.len());
-        let mut item_durations = Vec::with_capacity(self.batch_identities.len());
         // No item has spoken yet, so there is no rationale to seed: an unconsulted
         // batch must not carry a stand-in explanation that could survive as one.
         let mut rationale: Option<ReservationRationale> = None;
@@ -6716,7 +6714,6 @@ impl ReservationPlan {
             }
             memory_fits.push(item.memory_fit);
             learned_estimates.push(item.learned_estimate);
-            item_durations.push(item.duration);
         }
         let mut memory_fit = resource_profiles::MemoryFit::of_batch(memory_fits);
         let mut evidence = process_evidence.unwrap_or_default();
@@ -6758,7 +6755,6 @@ impl ReservationPlan {
                 rationale
             },
             duration: self.predict_batch_duration(context, duration_context).await,
-            item_durations,
             memory_fit,
             process_evidence: evidence,
         }

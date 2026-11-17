@@ -16,14 +16,23 @@
 //! that every parked request is still waiting, so a row measures a live fleet
 //! declining, never one placement has stopped considering.
 //!
+//! Each row also reports what parking cost: the needs worked out and the
+//! statements read in the five seconds before the window, while every request
+//! is first placed. That is also what a runner restart costs, because a
+//! restart closes the queue and every request placed again is placed afresh.
+//!
 //! Ignored by default because each row takes its whole window. Run it by name:
 //!
 //! ```text
 //! bun run test:rust -p cairn-core --lib -- fleet::bench --ignored --nocapture
 //! ```
 //!
-//! `CAIRN_PARK_BENCH_SECS` sets the window (120 by default) and
-//! `CAIRN_PARK_BENCH_N` the parked counts (`0,50,200` by default).
+//! `CAIRN_PARK_BENCH_SECS` sets the window (120 by default),
+//! `CAIRN_PARK_BENCH_N` the parked counts (`0,50,200` by default) and
+//! `CAIRN_PARK_BENCH_IDENTITIES` whether the parked requests run one command
+//! (`shared`, the default and the step 1 baseline's shape) or one each
+//! (`distinct`, which is what a live queue holds and the shape a per-request
+//! read shows up under rather than hiding behind one shared memo).
 
 use std::time::Instant;
 
@@ -45,6 +54,16 @@ struct Measured {
     cpu_s: f64,
     counts: counters::PlacementCounts,
     statements: usize,
+    /// What placing every request the first time cost, before the window.
+    parking: counters::PlacementCounts,
+    parking_statements: usize,
+}
+
+/// Which command each parked request runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Identities {
+    Shared,
+    Distinct,
 }
 
 fn process_cpu_seconds() -> f64 {
@@ -85,14 +104,17 @@ fn fleet_of_machines(
     (fleet, frames)
 }
 
-fn parked_request(n: usize, now: u64) -> CellRequest {
+fn parked_request(n: usize, now: u64, identities: Identities) -> CellRequest {
     let mut request = spillable_request();
     request.request_id = format!("parked-{n}");
     request.wait_horizon_unix_ms = now + 60 * 60 * 1_000;
     request.command_class = CellCommandClass::CargoTest;
     request.command_resource_identity = Some(CommandResourceIdentity {
         version: 1,
-        key: "test:rust".into(),
+        key: match identities {
+            Identities::Shared => "test:rust".into(),
+            Identities::Distinct => format!("test:rust-{n}"),
+        },
         suite: None,
     });
     request.repository = RepositoryLocator::ManagedObjects {
@@ -266,11 +288,17 @@ async fn keep_links_fresh(fleet: Fleet) {
     }
 }
 
-async fn measure(parked: usize, posting: bool, window: Duration) -> Measured {
+async fn measure(
+    parked: usize,
+    posting: bool,
+    window: Duration,
+    identities: Identities,
+) -> Measured {
     let now = unix_time_ms();
     let db = Arc::new(
         crate::storage::migrated_test_db(&format!("park-bench-{parked}-{posting}.db")).await,
     );
+    let before_parking = fleet_counts_and_statements(None, &db);
     let (fleet, frames) = fleet_of_machines(now);
     let executor_ids: Vec<String> = frames.iter().map(|(id, _)| id.clone()).collect();
     let mut tasks = Vec::new();
@@ -296,13 +324,18 @@ async fn measure(parked: usize, posting: bool, window: Duration) -> Measured {
             tokio::spawn(wait_for_a_machine(
                 fleet.clone(),
                 db.clone(),
-                parked_request(n, now),
+                parked_request(n, now, identities),
             ))
         })
         .collect();
     // Every request is offered and declined at the start; the window measures
     // the wait after that, which is what grows with N.
     tokio::time::sleep(Duration::from_secs(5)).await;
+    let (parking, parking_statements) = {
+        let (counts, statements) = fleet_counts_and_statements(Some(&fleet), &db);
+        let (earlier, earlier_statements) = before_parking;
+        (counts.since(earlier), statements - earlier_statements)
+    };
     if posting {
         tasks.push(tokio::spawn(post_samples(
             fleet.clone(),
@@ -327,6 +360,8 @@ async fn measure(parked: usize, posting: bool, window: Duration) -> Measured {
         cpu_s: process_cpu_seconds() - cpu,
         counts: fleet.placement_counters().totals().since(counts),
         statements: db.read_statement_count() - statements,
+        parking,
+        parking_statements,
     };
     let now = unix_time_ms();
     let stale: Vec<String> = fleet
@@ -350,6 +385,20 @@ async fn measure(parked: usize, posting: bool, window: Duration) -> Measured {
     measured
 }
 
+/// The placement counts so far and the statements read so far. A fleet not
+/// yet built has counted nothing.
+fn fleet_counts_and_statements(
+    fleet: Option<&Fleet>,
+    db: &cairn_db::storage::LocalDb,
+) -> (counters::PlacementCounts, usize) {
+    (
+        fleet.map_or_else(Default::default, |fleet| {
+            fleet.placement_counters().totals()
+        }),
+        db.read_statement_count(),
+    )
+}
+
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
         .ok()
@@ -366,12 +415,16 @@ async fn print_table(posting: bool) {
         .split(',')
         .filter_map(|n| n.trim().parse().ok())
         .collect();
-    println!("| Parked | Machines | Window s | CPU cores | Passes/s | Fit evaluations/s | Offers | Refusals | Statements/s |");
-    println!("|---|---|---|---|---|---|---|---|---|");
+    let identities = match std::env::var("CAIRN_PARK_BENCH_IDENTITIES").as_deref() {
+        Ok("distinct") => Identities::Distinct,
+        _ => Identities::Shared,
+    };
+    println!("| Parked | Machines | Window s | CPU cores | Passes/s | Fit evaluations/s | Offers | Refusals | Statements/s | Needs worked out in window | Parking: needs worked out | Parking: statements |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
     for &parked in &sizes {
-        let row = measure(parked, posting, window).await;
+        let row = measure(parked, posting, window, identities).await;
         println!(
-            "| {} | {} | {:.0} | {:.2} | {:.1} | {:.1} | {} | {} | {:.1} |",
+            "| {} | {} | {:.0} | {:.2} | {:.1} | {:.1} | {} | {} | {:.1} | {} | {} | {} |",
             row.parked,
             if row.posting { "posting" } else { "silent" },
             row.window_s,
@@ -381,8 +434,135 @@ async fn print_table(posting: bool) {
             row.counts.offers,
             row.counts.refusals,
             row.statements as f64 / row.window_s,
+            row.counts.needs_worked_out,
+            row.parking.needs_worked_out,
+            row.parking_statements,
         );
     }
+}
+
+/// Polls `done` until it holds, failing the test after thirty seconds.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Waits until every parked request has gone through `passes` more placement
+/// passes each.
+async fn passes_each(fleet: &Fleet, parked: usize, passes: u64) {
+    let from = fleet.placement_counters().totals().placement_passes;
+    until("placement passes", || {
+        fleet.placement_counters().totals().placement_passes >= from + parked as u64 * passes
+    })
+    .await;
+}
+
+/// A parked request costs the profile store nothing, however many placement
+/// passes it goes through, while nothing its needs were derived from is
+/// written; and one command finishing works out that command's needs again
+/// and no other's. Each request runs its own command, so a read per request
+/// cannot hide behind one shared memo.
+///
+/// Statements are counted over a window far shorter than the profile reads'
+/// thirty-second memo, which ranking's duration, contention and reliability
+/// reads still go through: past it those are read again per request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parked_passes_read_nothing_and_a_finish_redoes_only_its_own_needs() {
+    const PARKED: usize = 20;
+    let now = unix_time_ms();
+    let db = Arc::new(crate::storage::migrated_test_db("parked-passes-read-nothing.db").await);
+    let (fleet, frames) = fleet_of_machines(now);
+    let executor_ids: Vec<String> = frames.iter().map(|(id, _)| id.clone()).collect();
+    let mut tasks = vec![tokio::spawn(keep_links_fresh(fleet.clone()))];
+    for (executor_id, frames) in frames {
+        tasks.push(tokio::spawn(decline_every_offer(
+            fleet.clone(),
+            executor_id,
+            frames,
+        )));
+    }
+    let requests: Vec<CellRequest> = (0..PARKED)
+        .map(|n| parked_request(n, now, Identities::Distinct))
+        .collect();
+    let waits: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            tokio::spawn(wait_for_a_machine(
+                fleet.clone(),
+                db.clone(),
+                request.clone(),
+            ))
+        })
+        .collect();
+    tasks.push(tokio::spawn(post_samples(
+        fleet.clone(),
+        executor_ids.clone(),
+    )));
+    let needs = || fleet.placement_counters().totals().needs_worked_out;
+
+    // Parked: settled once a round of passes works nothing out.
+    loop {
+        let settled = needs();
+        passes_each(&fleet, PARKED, 4).await;
+        if needs() == settled {
+            break;
+        }
+    }
+    assert!(
+        needs() >= PARKED as u64,
+        "every request's needs were worked out when it was first placed"
+    );
+
+    // Waiting: passes go on, and neither needs nor statements are paid for.
+    let (needs_before, statements_before) = (needs(), db.read_statement_count());
+    passes_each(&fleet, PARKED, 10).await;
+    assert_eq!(
+        needs() - needs_before,
+        0,
+        "a pass that learned nothing works nothing out"
+    );
+    assert_eq!(
+        db.read_statement_count() - statements_before,
+        0,
+        "a pass that learned nothing reads nothing"
+    );
+
+    // One command finishes on one machine: only its request's needs are
+    // worked out again, once on each machine it is placed against.
+    let finished = fleet
+        .lock_connections()
+        .get(&executor_ids[0])
+        .map(|entry| {
+            ReservationPlan::context_for(
+                &entry.identity.device_id,
+                &entry.identity.executor_id,
+                &entry.advertisement.capabilities,
+            )
+        })
+        .unwrap();
+    let needs_before = needs();
+    resource_profiles::seed_memory_profile_for_test(
+        db.clone(),
+        requests[0].command_resource_identity.as_ref().unwrap(),
+        &finished,
+        6 * GIB,
+    )
+    .await;
+    passes_each(&fleet, PARKED, 10).await;
+    let redone = needs() - needs_before;
+    assert!(
+        (1..=MACHINES as u64).contains(&redone),
+        "one finish redoes one request's needs, at most once per machine; redone {redone}"
+    );
+
+    let ended = waits.iter().filter(|wait| wait.is_finished()).count();
+    for task in tasks.into_iter().chain(waits) {
+        task.abort();
+    }
+    assert_eq!(ended, 0, "every parked request is still waiting");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

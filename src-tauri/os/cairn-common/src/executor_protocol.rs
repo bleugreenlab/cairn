@@ -9484,6 +9484,10 @@ pub struct LearnedResourceEstimate {
 /// batch, which is the latency this version removes; an older runner talking
 /// to a newer executor ignores the result it is sent. The handshake refuses
 /// both pairings, as for every bump, so neither is kept.
+///
+/// cairn/7318's removal of `ResolvedResourceProfile::item_durations` does not
+/// move the number: the field was the runner's own, never serialized, and no
+/// frame carried it.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 174;
 
 /// The version `build.rs` derived from the paragraphs above

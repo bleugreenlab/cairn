@@ -364,8 +364,6 @@ pub(super) struct ResolvedResourceProfile {
     /// against a duration, and it exists so placement can rank machines by when
     /// they would answer rather than by how unloaded they look.
     pub duration: DurationEstimate,
-    /// Per-item durations when this profile represents a process batch.
-    pub item_durations: Vec<DurationEstimate>,
     /// Whether this machine can ever hold the measured memory demand. When it
     /// cannot, `reservation` holds the clamp rather than the demand. Admission
     /// is unchanged by it; placement reads it to prefer a machine that can
@@ -2297,7 +2295,6 @@ pub(super) async fn resolve_reservation(
                 Some(ReservationFallback::NoCommandIdentity),
             ),
             duration,
-            item_durations: Vec::new(),
             memory_fit: MemoryFit::Unknown,
             process_evidence: ProcessEvidence::default(),
         };
@@ -2370,7 +2367,6 @@ pub(super) async fn resolve_reservation(
                     None,
                 ),
                 duration,
-                item_durations: Vec::new(),
                 memory_fit: MemoryFit::Unknown,
                 process_evidence: ProcessEvidence::default(),
             }
@@ -2381,7 +2377,6 @@ pub(super) async fn resolve_reservation(
                 learned_estimate: None,
                 rationale: rationale(Some(ReservationFallback::ProfileLookupFailed), None),
                 duration,
-                item_durations: Vec::new(),
                 memory_fit: MemoryFit::Unknown,
                 process_evidence: ProcessEvidence::default(),
             }
@@ -2425,7 +2420,6 @@ pub(super) async fn resolve_reservation(
             Some(&profile),
         ),
         duration,
-        item_durations: Vec::new(),
         // This machine's own measurement only. A quarantined own peak measured
         // this machine's saturation, so it says nothing about fit and leaves
         // it unknown.
@@ -3700,7 +3694,6 @@ mod process_peak_tests {
                 ExecutionWarmth::default(),
                 DurationFallback::NoCommandIdentity,
             ),
-            item_durations: Vec::new(),
             memory_fit: MemoryFit::Unknown,
             process_evidence: evidence.clone(),
         };

@@ -12023,7 +12023,6 @@ fn a_posted_hold_is_read_against_the_reservation_resolved_for_that_machine() {
 
     let demand = resource_profiles::ResolvedResourceProfile {
         duration: test_prior_duration(),
-        item_durations: Vec::new(),
         reservation: ResourceReservation {
             memory_bytes: GIB,
             disk_growth_bytes: 4 * GIB,
@@ -13143,7 +13142,6 @@ fn executor_unit_bound_is_hard_but_planning_ceiling_is_not() {
     };
     let demand = resource_profiles::ResolvedResourceProfile {
         duration: test_prior_duration(),
-        item_durations: Vec::new(),
         reservation: ResourceReservation {
             memory_bytes: CHARGE,
             source: ResourceReservationSource::Unmeasured,
@@ -13267,7 +13265,6 @@ fn resolved_demand_that_does_not_fit_loses_to_a_machine_that_holds_it() {
 
     let demand = resource_profiles::ResolvedResourceProfile {
         duration: test_prior_duration(),
-        item_durations: Vec::new(),
         reservation: ResourceReservation {
             memory_bytes: 2 * 1024 * 1024 * 1024,
             disk_growth_bytes: 1024 * 1024 * 1024,
@@ -13326,7 +13323,6 @@ fn an_all_memory_constrained_fleet_still_places_for_capacity_waiting() {
     let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
     let demand = resource_profiles::ResolvedResourceProfile {
         duration: test_prior_duration(),
-        item_durations: Vec::new(),
         reservation: ResourceReservation {
             memory_bytes: 2 * 1024 * 1024 * 1024,
             disk_growth_bytes: 1024 * 1024 * 1024,
@@ -13461,7 +13457,6 @@ fn the_volume_misfit_includes_the_machines_watermark() {
     let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
     let demand = resource_profiles::ResolvedResourceProfile {
         duration: test_prior_duration(),
-        item_durations: Vec::new(),
         reservation: ResourceReservation {
             memory_bytes: GIB,
             disk_growth_bytes: 2 * GIB,
