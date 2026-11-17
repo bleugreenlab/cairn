@@ -9462,6 +9462,13 @@ pub struct LearnedResourceEstimate {
 /// ignored by an older runner, and a newer runner reading an older executor
 /// gets none and leaves the lane-floor sentence off its page. What a runner
 /// gets wrong talking to an older executor: nothing.
+///
+/// cairn/6253 does not move the number. An executor instance now ends every
+/// task it started when it stops, and its fresh-pipe sampler wakes the CPU
+/// sampler instead of sampling itself, so a stopped instance lets go of its
+/// runtime and build-root fence. Nothing it sends or reads changes, and the
+/// floor's transitions reach the runner in the same machine samples as
+/// before, so a runner talking to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
 
 /// The version `build.rs` derived from the paragraphs above
