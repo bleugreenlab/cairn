@@ -98,6 +98,7 @@ fn passed_batch(request: &CellRequest, header: &str, generation: u64) -> CellOut
             started_at_unix_ms: 1,
             finished_at_unix_ms: 2,
             duration_ms: Some(1),
+            commands_exited_at_unix_ms: None,
             peak_rss_bytes: None,
             peak_physical_footprint_bytes: None,
             peak_process: None,

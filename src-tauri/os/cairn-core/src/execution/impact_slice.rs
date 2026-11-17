@@ -497,6 +497,7 @@ fn unix_ms() -> u64 {
 /// executor is the coordinator itself.
 fn runner_account(started_at: u64, duration_ms: u64) -> CellExecutionMeta {
     CellExecutionMeta {
+        commands_exited_at_unix_ms: None,
         warmth: None,
         load_context: None,
         cell_origin: None,

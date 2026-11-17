@@ -530,6 +530,7 @@ mod tests {
             output: String::new(),
             timed_out: false,
             metadata: CellExecutionMeta {
+                commands_exited_at_unix_ms: None,
                 warmth: None,
                 load_context: None,
                 executor_id: "e".into(),

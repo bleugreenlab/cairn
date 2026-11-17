@@ -9505,6 +9505,20 @@ pub struct LearnedResourceEstimate {
 /// batches and manual checks; the key is read opaquely by its idle-cell
 /// claim. No field, callback or variant changes, so a runner talking to an
 /// older executor gets nothing wrong.
+///
+/// cairn/6193 does not move the number. A completed batch's Cargo dependency
+/// catalog publication now runs after its Result is produced rather than
+/// before, with the cell kept from every other claim (its maintenance lease,
+/// or for a held cell its residency's operation lock) until it ends; before,
+/// the Result waited for it. Two evidence fields ride along under tenet 1368:
+/// [`CellExecutionMeta::commands_exited_at_unix_ms`] and
+/// [`FleetSnapshot::finishing_requests`], both skipped when absent and gating
+/// nothing. Under tenet 541 nothing about capacity or placement differs by
+/// version: the reorder is the executor's own, and every runner reads the
+/// earlier Result and the cell's release the same way. What a runner gets
+/// wrong talking to an older executor: nothing; it receives no finishing
+/// requests and no exit instant, and logs a Result's receipt without the
+/// time since its commands exited. An older runner ignores both fields.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 174;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -13432,6 +13446,14 @@ pub struct CellExecutionMeta {
     pub finished_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// When the request's last command exited, on the executor's clock.
+    /// Everything between it and the Result leaving the executor (node
+    /// scratch write-back, the bracket seal, the delta upload, the cell's
+    /// release) is the executor's own finishing work, so a Result that
+    /// arrives long after it names a slow executor rather than a slow command.
+    /// Evidence only; `None` from an executor that does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commands_exited_at_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_rss_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -14353,6 +14375,7 @@ impl CellExecutionMeta {
         let mut meta = self.clone();
         meta.started_at_unix_ms = item.started_at_unix_ms;
         meta.finished_at_unix_ms = item.finished_at_unix_ms;
+        meta.commands_exited_at_unix_ms = Some(item.finished_at_unix_ms);
         meta.duration_ms = Some(item.duration_ms);
         meta.peak_rss_bytes = item.peak_rss_bytes;
         meta.peak_process = item.peak_process.clone();
@@ -16714,6 +16737,58 @@ pub struct FleetSnapshot {
     /// posted in `slots` for such a cell is the last one that reached disk.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cell_transitions: Vec<CellTransitionInFlight>,
+    /// Each attempt whose commands have all exited and whose Result has not
+    /// yet been produced: the window `executingRequests` no longer names and
+    /// the Result does not yet close. Evidence only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finishing_requests: Vec<FinishingCellRequest>,
+}
+
+/// An attempt between its last command's exit and its Result. See
+/// [`FleetSnapshot::finishing_requests`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FinishingCellRequest {
+    #[serde(rename = "slotId")]
+    pub cell_id: String,
+    pub request_id: String,
+    pub attempt_id: String,
+    #[serde(default)]
+    pub command: String,
+    pub phase: FinishingPhase,
+    pub commands_exited_at_unix_ms: u64,
+    pub phase_since_unix_ms: u64,
+}
+
+/// What an executor is doing for a request after its commands exited and
+/// before its Result is produced.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FinishingPhase {
+    /// Writing the batch's node scratch back to the runner.
+    ScratchWriteBack,
+    /// Reading what the batch changed in its cell, and undoing it for a
+    /// verdict-only batch.
+    Sealing,
+    /// Uploading the sealed mutation delta.
+    DeltaUpload,
+    /// Persisting the cell's release.
+    Releasing,
+    /// A phase this reader does not know.
+    #[serde(other)]
+    Other,
+}
+
+impl FinishingPhase {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::ScratchWriteBack => "node scratch write-back",
+            Self::Sealing => "sealing the cell",
+            Self::DeltaUpload => "uploading the delta",
+            Self::Releasing => "releasing the cell",
+            Self::Other => "finishing",
+        }
+    }
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -30598,6 +30673,7 @@ mod tests {
             },
             inventory,
             fleet: FleetSnapshot {
+                finishing_requests: Vec::new(),
                 cells: vec![cell, branched, detached, service],
                 queued_requests: vec![QueuedCellRequest {
                     command_resource_identity: None,
@@ -30659,6 +30735,7 @@ mod tests {
                     resource_reservation: Some(reservation.clone()),
                     learned_estimate: Some(learned_estimate),
                     actuals: Some(CellExecutionMeta {
+                        commands_exited_at_unix_ms: None,
                         warmth: None,
                         load_context: None,
                         executor_id: "executor-a".into(),
@@ -33055,6 +33132,7 @@ mod tests {
             output: "failed".into(),
             timed_out: false,
             metadata: CellExecutionMeta {
+                commands_exited_at_unix_ms: None,
                 warmth: None,
                 load_context: None,
                 executor_id: "e".into(),

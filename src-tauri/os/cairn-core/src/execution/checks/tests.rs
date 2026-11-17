@@ -6115,6 +6115,7 @@ async fn merge_gate_classifies_all_substrate_failures_as_infrastructure() {
         output: String::new(),
         timed_out: false,
         metadata: cairn_common::executor_protocol::CellExecutionMeta {
+            commands_exited_at_unix_ms: None,
             warmth: None,
             load_context: None,
             executor_id: "executor".to_string(),
@@ -7953,6 +7954,7 @@ fn a_macos_row_records_the_lanes_attested_nested_seatbelt_state() {
     };
     let meta = |platform: &str, sandbox: Option<SandboxCapabilityEvidence>| {
         cairn_common::executor_protocol::CellExecutionMeta {
+            commands_exited_at_unix_ms: None,
             warmth: None,
             load_context: None,
             executor_id: "local".to_string(),
@@ -8007,6 +8009,7 @@ fn a_macos_row_records_the_lanes_attested_nested_seatbelt_state() {
 async fn remote_executor_without_environment_identity_is_not_reusable() {
     let db = cache_db().await;
     let provenance = cairn_common::executor_protocol::CellExecutionMeta {
+        commands_exited_at_unix_ms: None,
         warmth: None,
         load_context: None,
         executor_id: "executor-a".to_string(),
@@ -8857,6 +8860,7 @@ fn exec_on_executor(
         timed_out: false,
         duration_ms: Some(1),
         provenance: Some(cairn_common::executor_protocol::CellExecutionMeta {
+            commands_exited_at_unix_ms: None,
             warmth: None,
             load_context: None,
             executor_id: executor_id.to_string(),

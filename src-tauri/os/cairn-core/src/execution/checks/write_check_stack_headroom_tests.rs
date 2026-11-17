@@ -59,6 +59,7 @@ pub(super) fn passed_batch(request: &CellRequest, header: &str, generation: u64)
         output: serde_json::to_string(&[item]).unwrap(),
         timed_out: false,
         metadata: CellExecutionMeta {
+            commands_exited_at_unix_ms: None,
             warmth: None,
             load_context: None,
             executor_id: crate::fleet::COLOCATED_EXECUTOR_ID.into(),

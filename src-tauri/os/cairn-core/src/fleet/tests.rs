@@ -1799,6 +1799,7 @@ async fn a_result_read_off_the_replaced_link_settles_the_rebound_claim() {
         output: "ran".into(),
         timed_out: false,
         metadata: CellExecutionMeta {
+            commands_exited_at_unix_ms: None,
             warmth: None,
             cell_origin: None,
             load_context: None,
@@ -22258,6 +22259,7 @@ fn a_terminal_outcome_is_scrubbed_before_its_waiter_sees_it() {
         output: format!("CAIRN_MCP_SECRET={RESIDENT_SECRET}"),
         timed_out: false,
         metadata: CellExecutionMeta {
+            commands_exited_at_unix_ms: None,
             warmth: None,
             load_context: None,
             executor_id: "executor".into(),
@@ -22900,6 +22902,7 @@ fn completed_for(request: &CellRequest, executor_id: &str, generation: u64) -> C
         output: format!("ran {}", request.request_id),
         timed_out: false,
         metadata: CellExecutionMeta {
+            commands_exited_at_unix_ms: None,
             warmth: None,
             load_context: None,
             executor_id: executor_id.into(),

@@ -2875,6 +2875,7 @@ pub(super) fn oom_killed_for_test(
     finished_at_unix_ms: u64,
 ) -> CellExecutionMeta {
     CellExecutionMeta {
+        commands_exited_at_unix_ms: None,
         warmth: Some(ExecutionWarmth::PreparedWarmSlot),
         load_context: Some(ExecutionLoadContext {
             co_resident_compile_jobs,
@@ -5537,6 +5538,7 @@ mod tests {
             toolchain_fingerprint: "toolchain".into(),
         };
         let metadata = CellExecutionMeta {
+            commands_exited_at_unix_ms: None,
             warmth: None,
             load_context: None,
             executor_id: "executor".into(),
@@ -5615,6 +5617,7 @@ mod tests {
             toolchain_fingerprint: "toolchain".into(),
         };
         let metadata = CellExecutionMeta {
+            commands_exited_at_unix_ms: None,
             warmth: None,
             load_context: None,
             executor_id: "executor".into(),
@@ -6341,6 +6344,7 @@ mod tests {
         duration_ms: u64,
     ) -> CellExecutionMeta {
         CellExecutionMeta {
+            commands_exited_at_unix_ms: None,
             warmth,
             load_context: Some(ExecutionLoadContext::default()),
             environment_fingerprint: String::new(),

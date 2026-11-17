@@ -524,8 +524,12 @@ pub(crate) fn render_executors(
                 recommendation.flag
             ));
         }
+        let finishing = match executor.occupancy.finishing_requests.len() {
+            0 => String::new(),
+            count => format!(", finishing {count}"),
+        };
         out.push_str(&format!(
-            "- Running now: {} (queued {})\n",
+            "- Running now: {} (queued {}{finishing})\n",
             executor.occupancy.executing_requests.len(),
             executor.occupancy.queued_requests.len()
         ));
@@ -6375,7 +6379,10 @@ fn render_running_now(
                 .map(move |(key, process)| (cell, key, process))
         })
         .collect();
-    if occupancy.executing_requests.is_empty() && residents.is_empty() {
+    if occupancy.executing_requests.is_empty()
+        && occupancy.finishing_requests.is_empty()
+        && residents.is_empty()
+    {
         return String::new();
     }
     let mut out = String::from("\n## Running now\n");
@@ -6443,6 +6450,19 @@ fn render_running_now(
             request.command_class.as_str(),
             age(now.saturating_sub(request.started_at_unix_ms)),
             usage(request.live_usage)
+        ));
+    }
+    // Commands done, Result not yet produced: the executor's own work, named
+    // so a slow one reads as a slow executor rather than a hung command.
+    for finishing in &occupancy.finishing_requests {
+        let command: String = finishing.command.chars().take(80).collect();
+        out.push_str(&format!(
+            "- {}: `{command}` (request {}): finishing: {} for {} (commands exited {})\n",
+            finishing.cell_id,
+            finishing.request_id,
+            finishing.phase.describe(),
+            span(now.saturating_sub(finishing.phase_since_unix_ms)),
+            age(now.saturating_sub(finishing.commands_exited_at_unix_ms)),
         ));
     }
     for (cell, key, process) in residents {
@@ -14276,6 +14296,35 @@ mod running_now_tests {
             }],
             ..FleetSnapshot::default()
         }
+    }
+
+    /// A request whose commands exited and whose Result has not left is
+    /// listed under Running now with what the executor is doing for it,
+    /// rather than omitted as if nothing ran.
+    #[test]
+    fn a_request_finishing_after_its_commands_is_listed_with_its_phase() {
+        use cairn_common::executor_protocol::{FinishingCellRequest, FinishingPhase};
+        let snapshot = FleetSnapshot {
+            finishing_requests: vec![FinishingCellRequest {
+                cell_id: "slot-7".into(),
+                request_id: "e891a0ee".into(),
+                attempt_id: "53b6178b".into(),
+                command: "bun run check:rust".into(),
+                phase: FinishingPhase::ScratchWriteBack,
+                commands_exited_at_unix_ms: 0,
+                phase_since_unix_ms: 30_000,
+            }],
+            ..FleetSnapshot::default()
+        };
+        let rendered = render_running_now(&snapshot, None, 60_000);
+        assert!(rendered.contains("## Running now"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "- slot-7: `bun run check:rust` (request e891a0ee): finishing: node scratch write-back for "
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("(commands exited "), "{rendered}");
     }
 
     /// A compile held to four jobs on an eight-core machine says so where the

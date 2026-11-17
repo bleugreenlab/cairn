@@ -980,6 +980,7 @@ pub(super) fn adopted_release_metadata(
     measured: &cairn_common::executor_protocol::AdoptedTreeMeasurement,
 ) -> CellExecutionMeta {
     CellExecutionMeta {
+        commands_exited_at_unix_ms: None,
         executor_id: selected.executor_id.clone(),
         executor_device_id: selected.device_id.clone(),
         executor_connection_generation: selected.generation,
