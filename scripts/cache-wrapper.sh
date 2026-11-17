@@ -247,9 +247,14 @@ if command -v sccache >/dev/null 2>&1; then
   if [ -z "${SCCACHE_DIR+x}" ]; then
     # Cache home is where Cairn's build caches live (scripts/lib/cache-home.ts).
     # One that is not a directory is a build volume that is not mounted, and the
-    # cache must not quietly land on the internal disk in its place.
+    # cache must not quietly land on the internal disk in its place. A build
+    # root marker beside it means the volume is there and only the leaf is not.
     if [ -n "${CAIRN_CACHE_HOME:-}" ] && [ ! -d "$CAIRN_CACHE_HOME" ]; then
-      echo "build volume absent: $CAIRN_CACHE_HOME" >&2
+      if [ -f "$(dirname "$CAIRN_CACHE_HOME")/.cairn-build-root" ]; then
+        echo "cache home missing under a present build root: $CAIRN_CACHE_HOME" >&2
+      else
+        echo "build volume absent: $CAIRN_CACHE_HOME" >&2
+      fi
       exit 1
     fi
     SCCACHE_DIR=${CAIRN_CACHE_HOME:-$HOME}/.cache/sccache

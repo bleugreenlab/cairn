@@ -168,6 +168,11 @@ pub fn is_per_call_dir_name(name: &str) -> bool {
 }
 /// Cache home's directory under a configured build root.
 pub const CACHE_HOME_DIR: &str = "cache-home";
+/// The directory beneath cache home that a fenced spawn may write: the asset
+/// cache and sccache's local cache, but not the dev and CI target roots beside
+/// it. The same split `$HOME/.cache` gives the home layout
+/// (`cairn_sandbox::cache_home_grant`).
+pub const CACHE_HOME_WRITABLE_DIR: &str = ".cache";
 /// The environment variable naming cache home to processes Cairn launches.
 /// Unset means the user's home directory.
 pub const CACHE_HOME_ENV: &str = "CAIRN_CACHE_HOME";
@@ -224,6 +229,62 @@ impl BuildRootDeclaration {
 /// The id in `root`'s build-root marker, trimmed.
 pub fn read_build_root_marker(root: &Path) -> std::io::Result<String> {
     std::fs::read_to_string(root.join(BUILD_ROOT_MARKER)).map(|id| id.trim().to_string())
+}
+
+/// A directory the executor names to every process it runs, through `env`.
+///
+/// Every consumer of one of these requires it to exist. Cache home's
+/// consumers go further: one that is missing reads as an unmounted build
+/// volume and they refuse, so a name exported without its directory fails
+/// every build with a message naming the wrong cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedDir {
+    pub env: &'static str,
+    pub path: PathBuf,
+    /// The deepest directory to create for it: `path` itself, or the part of
+    /// it a fence grants. A grant must exist when the policy is built (Linux
+    /// landlock ignores a path it cannot open), and a fenced spawn could not
+    /// create it under a parent it may not write.
+    pub create: PathBuf,
+}
+
+/// Create `dir` if it is missing, and say why when it is not created.
+///
+/// A directory under the declared `build_root` is created only while that root
+/// carries its marker with the declared id, which is the same evidence the
+/// executor admits work on: the volume is mounted and is this build root. An
+/// unmounted mount point, or another drive mounted in its place, gains
+/// nothing. A directory outside any declared build root (the home layout) is
+/// created as it is.
+///
+/// A directory that already exists costs one `stat`, and the marker is read
+/// only when there is something to create.
+pub fn ensure_exported_dir(
+    dir: &Path,
+    build_root: Option<&BuildRootDeclaration>,
+) -> Result<(), String> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(root) = build_root.filter(|root| dir.starts_with(&root.path)) {
+        match read_build_root_marker(&root.path) {
+            Ok(id) if id == root.id => {}
+            Ok(_) => {
+                return Err(format!(
+                    "not created: the build root {}'s {BUILD_ROOT_MARKER} names another build root",
+                    root.path.display()
+                ))
+            }
+            Err(error) => {
+                return Err(format!(
+                    "not created: the build root {} has no readable {BUILD_ROOT_MARKER} ({}), so its volume is not mounted",
+                    root.path.display(),
+                    error.kind()
+                ))
+            }
+        }
+    }
+    std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))
 }
 
 /// Write `id` into `root`'s build-root marker. `root` must already exist: the
@@ -357,6 +418,33 @@ impl ExecutorPaths {
     /// filesystem root, which has nowhere to keep them.
     pub fn cache_home(&self) -> Option<&Path> {
         self.cache_home.as_deref()
+    }
+
+    /// Every directory the executor names to the processes it runs, with the
+    /// variable that names it: the tool cache always, and cache home when it
+    /// sits under a build root apart from the home. (The home layout's cache
+    /// home is the user's home directory, which needs no naming and no
+    /// creating.)
+    ///
+    /// The executor exports exactly this list at bootstrap and ensures exactly
+    /// this list before each spawn (`cairn-exec`'s `ensure_exported_dirs`), so
+    /// a directory a process is told to use cannot be named without being
+    /// created. A new exported directory belongs here, never in a `set_var` of
+    /// its own.
+    pub fn exported_dirs(&self) -> Vec<ExportedDir> {
+        let mut dirs = vec![ExportedDir {
+            env: TOOL_CACHE_ENV,
+            path: self.tool_cache(),
+            create: self.tool_cache(),
+        }];
+        if let Some(cache_home) = self.cache_home().filter(|_| self.has_separate_build_root()) {
+            dirs.push(ExportedDir {
+                env: CACHE_HOME_ENV,
+                path: cache_home.to_path_buf(),
+                create: cache_home.join(CACHE_HOME_WRITABLE_DIR),
+            });
+        }
+        dirs
     }
 
     /// Every directory that holds cell authorities: the machine authority
@@ -562,6 +650,93 @@ mod tests {
         assert!(ExecutorPaths::new(temp.path())
             .with_build_root(&missing)
             .has_separate_build_root());
+    }
+
+    #[test]
+    fn a_separate_build_root_exports_its_tool_cache_and_cache_home() {
+        let home = ExecutorPaths::new("/Users/u/.cairn");
+        assert_eq!(
+            home.exported_dirs(),
+            vec![ExportedDir {
+                env: TOOL_CACHE_ENV,
+                path: PathBuf::from("/Users/u/.cairn/tool-cache"),
+                create: PathBuf::from("/Users/u/.cairn/tool-cache"),
+            }],
+            "the home layout's cache home is the user's home, never exported"
+        );
+        let moved = home.with_build_root("/Volumes/Builds/cairn");
+        assert_eq!(
+            moved.exported_dirs(),
+            vec![
+                ExportedDir {
+                    env: TOOL_CACHE_ENV,
+                    path: PathBuf::from("/Volumes/Builds/cairn/tool-cache"),
+                    create: PathBuf::from("/Volumes/Builds/cairn/tool-cache"),
+                },
+                ExportedDir {
+                    env: CACHE_HOME_ENV,
+                    path: PathBuf::from("/Volumes/Builds/cairn/cache-home"),
+                    create: PathBuf::from("/Volumes/Builds/cairn/cache-home/.cache"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_exported_dir_is_created_under_a_build_root_only_while_its_marker_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("volume");
+        std::fs::create_dir(&root).unwrap();
+        let declaration = BuildRootDeclaration {
+            path: root.clone(),
+            id: "root-id".into(),
+        };
+        let paths = ExecutorPaths::new(temp.path().join("home")).with_build_root(&root);
+        let ensure_all = || {
+            paths
+                .exported_dirs()
+                .iter()
+                .map(|dir| ensure_exported_dir(&dir.create, Some(&declaration)))
+                .collect::<Vec<_>>()
+        };
+
+        // An empty mount point: no marker, nothing written.
+        for result in ensure_all() {
+            assert!(result.unwrap_err().contains("not mounted"));
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        // Another drive at the same path: its marker names another root.
+        write_build_root_marker(&root, "other-id").unwrap();
+        for result in ensure_all() {
+            assert!(result.unwrap_err().contains("another build root"));
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+        // This build root: every exported directory exists afterwards.
+        write_build_root_marker(&root, "root-id").unwrap();
+        for result in ensure_all() {
+            result.unwrap();
+        }
+        for dir in paths.exported_dirs() {
+            assert!(dir.path.is_dir(), "{} was not created", dir.path.display());
+            assert!(
+                dir.create.is_dir(),
+                "{} was not created",
+                dir.create.display()
+            );
+        }
+        // Present already: nothing to do, even with the marker gone.
+        std::fs::remove_file(root.join(BUILD_ROOT_MARKER)).unwrap();
+        for result in ensure_all() {
+            result.unwrap();
+        }
+
+        // Outside any declared build root, the home layout creates as it is.
+        let home_cache = temp.path().join("home").join(TOOL_CACHE_DIR);
+        ensure_exported_dir(&home_cache, Some(&declaration)).unwrap();
+        ensure_exported_dir(&home_cache, None).unwrap();
+        assert!(home_cache.is_dir());
     }
 
     #[test]

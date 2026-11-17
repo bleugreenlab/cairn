@@ -9527,6 +9527,17 @@ pub struct LearnedResourceEstimate {
 /// wrong talking to an older executor: nothing; it receives no finishing
 /// requests and no exit instant, and logs a Result's receipt without the
 /// time since its commands exited. An older runner ignores both fields.
+///
+/// cairn/6076 does not move the number. An executor exports its tool cache
+/// and cache home from one list (`ExecutorPaths::exported_dirs`) and creates
+/// both before each spawn, a directory under the build root only while the
+/// root's marker matches. Its fenced policies grant the cache home's `.cache`,
+/// and a resident policy the runner serialized gains the executor's own
+/// cache grants when the executor materializes it. Every one of these is a
+/// fact about the executor's host, decided there; no frame, field or value
+/// changes. What a runner gets wrong talking to an older executor: nothing it
+/// decodes; that executor's first build after a build root is configured
+/// still fails with `build volume absent` until the directory is made by hand.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 174;
 
 /// The version `build.rs` derived from the paragraphs above

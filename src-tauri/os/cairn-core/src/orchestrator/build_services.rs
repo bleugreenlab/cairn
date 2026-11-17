@@ -2704,10 +2704,20 @@ struct GrantSite {
 /// SCCACHE_ERROR_LOG file (under stateDir) before starting the server, and a
 /// missing parent dir would fail that and take the whole server down on a
 /// fresh machine.
-fn ensure_state_dir(cfg: &BuildServiceConfig, templates: &Templates) {
+///
+/// The documented state dir is under `{cacheHome}`, which a configured build
+/// root moves onto its volume, so this is where the runner's own host creates
+/// cache home. It follows the executor's rule (`ensure_exported_dir`): under
+/// the build root, only while the root carries its marker, so an unmounted
+/// volume's mount point never gains a cache tree on the internal disk.
+fn ensure_state_dir(
+    cfg: &BuildServiceConfig,
+    templates: &Templates,
+    build_root: Option<&cairn_common::executor_paths::BuildRootDeclaration>,
+) {
     if let Some(dir) = cfg.expanded_state_dir(templates) {
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            log::debug!("create build service state dir {dir:?}: {e}");
+        if let Err(reason) = cairn_common::executor_paths::ensure_exported_dir(&dir, build_root) {
+            log::warn!("build service state dir {}: {reason}", dir.display());
         }
     }
 }
@@ -3309,7 +3319,13 @@ impl Orchestrator {
         } else {
             log::info!("build service '{name}' down; launching");
         }
-        ensure_state_dir(cfg, templates);
+        ensure_state_dir(
+            cfg,
+            templates,
+            settings::load_fleet(&self.config_dir)
+                .colocated_build_root
+                .as_ref(),
+        );
 
         let grant = LaunchGrant {
             dir: &site.dir,
@@ -3477,7 +3493,13 @@ impl Orchestrator {
         }
 
         self.kill_build_service_child(name);
-        ensure_state_dir(cfg, templates);
+        ensure_state_dir(
+            cfg,
+            templates,
+            settings::load_fleet(&self.config_dir)
+                .colocated_build_root
+                .as_ref(),
+        );
         let grant = LaunchGrant {
             dir: &site.dir,
             roots: &site.launch_roots,

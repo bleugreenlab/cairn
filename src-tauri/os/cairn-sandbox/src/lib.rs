@@ -1111,9 +1111,10 @@ pub fn default_writable_extra() -> Vec<PathBuf> {
     // directory under the root is granted exactly that one through
     // `SandboxPolicy::grant_tmpdir`; see `scratch_refusal`.
     // The executor's tool cache, where a project's setup caches the tools it
-    // builds for itself (the pinned `tursodb`). Existence-filtered like the uv
-    // cache: the executor creates it before every spawn.
-    dirs.extend(tool_cache_grant());
+    // builds for itself (the pinned `tursodb`), and the `.cache` of the cache
+    // home it moved to a build volume. The executor creates both directories
+    // it exports before every spawn.
+    dirs.extend(executor_cache_grants());
     // Cairn's own log directory is deliberately absent; see
     // `the_cairn_log_dir_is_never_writable`.
     dirs
@@ -1131,6 +1132,43 @@ pub(crate) fn tool_cache_grant() -> Option<PathBuf> {
     tool_cache_grant_from(std::env::var_os(
         cairn_common::executor_paths::TOOL_CACHE_ENV,
     ))
+}
+
+/// The writable caches the executor that started this process exported to it:
+/// [`tool_cache_grant`] and [`cache_home_grant`]. Facts about this host, so an
+/// executor adds them to a policy another machine composed for it.
+pub fn executor_cache_grants() -> Vec<PathBuf> {
+    tool_cache_grant()
+        .into_iter()
+        .chain(cache_home_grant())
+        .collect()
+}
+
+/// The `.cache` beneath the cache home the executor exported, when its build
+/// root moved cache home off the user's home directory.
+///
+/// The parity grant: in the home layout cache home is `$HOME`, whose `.cache`
+/// (the asset cache, sccache's local cache) [`toolchain_writable_dirs_in`]
+/// already grants while the dev and CI target roots beside it stay read-only.
+/// A moved cache home keeps that same split. Only a directory carrying the
+/// layout's leaf name is accepted, for the reason [`tool_cache_grant`] gives.
+/// The executor creates the `.cache` with cache home before every spawn
+/// (`ExportedDir::create`), since Linux landlock ignores a grant it cannot
+/// open.
+pub(crate) fn cache_home_grant() -> Option<PathBuf> {
+    cache_home_grant_from(std::env::var_os(
+        cairn_common::executor_paths::CACHE_HOME_ENV,
+    ))
+}
+
+fn cache_home_grant_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let home = PathBuf::from(value?);
+    let named = home.file_name()
+        == Some(std::ffi::OsStr::new(
+            cairn_common::executor_paths::CACHE_HOME_DIR,
+        ));
+    (named && home.is_absolute() && home.is_dir())
+        .then(|| home.join(cairn_common::executor_paths::CACHE_HOME_WRITABLE_DIR))
 }
 
 fn tool_cache_grant_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
@@ -1824,6 +1862,33 @@ mod tests {
             tool_cache_grant_from(Some("tool-cache".into())),
             None,
             "a relative value would resolve against each spawn's cwd"
+        );
+    }
+
+    #[test]
+    fn a_moved_cache_home_grants_its_dot_cache_and_nothing_beside_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_home = temp
+            .path()
+            .join(cairn_common::executor_paths::CACHE_HOME_DIR);
+        assert_eq!(
+            cache_home_grant_from(Some(cache_home.clone().into())),
+            None,
+            "a cache home that is not there is an unmounted volume"
+        );
+        std::fs::create_dir(&cache_home).unwrap();
+        // The dev and CI target roots beside `.cache` stay read-only, as
+        // they are under `$HOME`.
+        assert_eq!(
+            cache_home_grant_from(Some(cache_home.clone().into())),
+            Some(cache_home.join(".cache"))
+        );
+        assert_eq!(cache_home_grant_from(None), None);
+        assert_eq!(cache_home_grant_from(Some("cache-home".into())), None);
+        // A home directory named by an inherited variable grants nothing.
+        assert_eq!(
+            cache_home_grant_from(Some(temp.path().as_os_str().to_owned())),
+            None
         );
     }
 

@@ -215,7 +215,20 @@ fn cache_dir() -> Option<PathBuf> {
     // bundle must not be cached on the internal disk in its place.
     if let Some(home) = env::var_os("CAIRN_CACHE_HOME").filter(|home| !home.is_empty()) {
         let home = PathBuf::from(home);
-        assert!(home.is_dir(), "build volume absent: {}", home.display());
+        if !home.is_dir() {
+            // A build root marker beside it means the volume is mounted and
+            // only the leaf is missing.
+            let marked = home
+                .parent()
+                .is_some_and(|root| root.join(".cairn-build-root").is_file());
+            if marked {
+                panic!(
+                    "cache home missing under a present build root: {}",
+                    home.display()
+                );
+            }
+            panic!("build volume absent: {}", home.display());
+        }
         return Some(home.join(".cache").join("cairn-assets"));
     }
     env::var_os("HOME")
