@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 use cairn_core::internal::agent_process::process::RunHandle;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::runs::reap::{
-    reap_stale_runs, reap_stale_runs_for_job, STALE_RUN_EXIT_REASON,
+    read_pending_launch_claims, reap_stale_runs, reap_stale_runs_for_job,
+    reap_stale_runs_for_job_reading_claims, STALE_RUN_EXIT_REASON,
 };
 use cairn_core::internal::storage::LocalDb;
 use cairn_db::turso::params;
@@ -379,6 +380,60 @@ async fn admission_state(db: &LocalDb, run_id: &str) -> Option<String> {
         &format!("req-{run_id}"),
     )
     .await
+}
+
+/// A durably admitted call is promoted with no launch lock and no in-memory
+/// claim: it registers its process, then moves its row from `starting` to
+/// `active`. If both happen after the reaper's first process check and before
+/// its durable read, the read no longer covers the run, and only a process
+/// check after that read keeps a live call from being settled and stopped.
+#[tokio::test(flavor = "current_thread")]
+async fn a_call_that_registers_between_the_reapers_checks_is_left_alone() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    let db = orch.db.local.clone();
+    seed_job(&db).await;
+    insert_run(&db, "run-call", "starting", seconds_ago(7200)).await;
+    insert_turn(&db, "turn-1", "run-call", "running", true).await;
+    db.execute_script(
+        "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at)
+           VALUES('req-run-call','local-runtime','claude-cli','call:run-call','{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,1,'starting','local-call-promoter',1,9999999999,1,1);
+         INSERT INTO prepared_runtime_calls(request_id,run_id,prepared_json,created_at)
+           VALUES('req-run-call','run-call','{}',1);",
+    )
+    .await
+    .unwrap();
+
+    let settled = reap_stale_runs_for_job_reading_claims(&orch, &db, "job-1", |orch| {
+        // The promoter finishes the start while the reaper is between looks.
+        register_process(orch, "run-call");
+        cairn_core::internal::storage::run_db_blocking({
+            let db = orch.db.local.clone();
+            move || async move {
+                db.execute(
+                    "UPDATE runtime_admission_requests SET state='active' WHERE request_id='req-run-call'",
+                    (),
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+        })?;
+        read_pending_launch_claims(orch)
+    });
+
+    assert_eq!(settled, 0, "a registered call is alive");
+    assert_eq!(
+        run_status(&db, "run-call").await.as_deref(),
+        Some("starting")
+    );
+    assert_eq!(
+        orch.process_state.has_process("run-call"),
+        Some(true),
+        "the call's process was not stopped"
+    );
+    assert_eq!(
+        admission_state(&db, "run-call").await.as_deref(),
+        Some("active")
+    );
 }
 
 /// An `active` row means a process registered. With no handle behind it the

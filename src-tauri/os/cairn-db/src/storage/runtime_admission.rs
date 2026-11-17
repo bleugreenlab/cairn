@@ -1514,6 +1514,29 @@ const AWAITING_LAUNCH: &str = "(r.state IN ('leased','starting') OR (r.state='qu
 /// runner-local and carry their launch identity as `call:{run_id}`.
 pub const CALL_ADMISSION_WORKSPACE: &str = "local-runtime";
 
+const ORDINARY_LAUNCH_PREFIX: &str = "ordinary:";
+const CALL_LAUNCH_PREFIX: &str = "call:";
+
+/// The admission `launch_key` of an ordinary launch of `run_id`, private or
+/// team. The stale-run reaper reads the run back out of the key
+/// ([`pending_launch_run_ids`]), so every writer builds it here.
+pub fn ordinary_launch_key(run_id: &str) -> String {
+    format!("{ORDINARY_LAUNCH_PREFIX}{run_id}")
+}
+
+/// The admission `launch_key` of an ephemeral call of `run_id`.
+pub fn call_launch_key(run_id: &str) -> String {
+    format!("{CALL_LAUNCH_PREFIX}{run_id}")
+}
+
+/// The run a `launch_key` launches, for a key built by [`ordinary_launch_key`]
+/// or [`call_launch_key`]; `None` for any other key.
+pub fn launch_run_id(launch_key: &str) -> Option<&str> {
+    launch_key
+        .strip_prefix(ORDINARY_LAUNCH_PREFIX)
+        .or_else(|| launch_key.strip_prefix(CALL_LAUNCH_PREFIX))
+}
+
 /// Run ids whose launch is durably between enqueue and process registration:
 /// an ordinary launch `queued`, `leased` or `starting` (private or team), or an
 /// ephemeral call in the same three states. These are launch claims as surely
@@ -1521,25 +1544,31 @@ pub const CALL_ADMISSION_WORKSPACE: &str = "local-runtime";
 /// which may take minutes to reach process registration. An `active` row is
 /// deliberately excluded: it means a process registered, so a run holding one
 /// with no process handle really is stale.
+///
+/// A pending row with no prepared record is no claim: nothing can ever launch
+/// it, so covering its run would leave that run reading mid-turn for as long
+/// as the row waits in its lane.
+///
+/// The run is read from the row's own `launch_key`, and the prepared record is
+/// only probed for existence by primary key, so the statement is a seek of
+/// `idx_runtime_admission_state` per listed state that never opens a ledger
+/// row or a prepared record; its cost is the pending set rather than the
+/// ledger's history. The team-mirror exception in [`AWAITING_LAUNCH`] cannot
+/// match a call row, because team authority rows exist only for ordinary
+/// launches.
 pub async fn pending_launch_run_ids(db: &LocalDb) -> DbResult<HashSet<String>> {
-    let mut pending: HashSet<String> = db
+    let keys = db
         .query_all(
-            format!("SELECT p.run_id FROM prepared_ordinary_launches p JOIN runtime_admission_requests r ON r.request_id=p.request_id WHERE {AWAITING_LAUNCH}"),
+            format!("SELECT r.launch_key FROM runtime_admission_requests r WHERE r.state IN ('queued','leased','starting') AND {AWAITING_LAUNCH} AND (EXISTS (SELECT 1 FROM prepared_ordinary_launches p WHERE p.request_id=r.request_id) OR EXISTS (SELECT 1 FROM prepared_runtime_calls c WHERE c.request_id=r.request_id))"),
             (),
             |row| row.text(0),
         )
-        .await?
-        .into_iter()
-        .collect();
-    pending.extend(
-        db.query_all(
-            "SELECT c.run_id FROM prepared_runtime_calls c JOIN runtime_admission_requests r ON r.request_id=c.request_id WHERE r.state IN ('queued','leased','starting')",
-            (),
-            |row| row.text(0),
-        )
-        .await?,
-    );
-    Ok(pending)
+        .await?;
+    Ok(keys
+        .iter()
+        .filter_map(|key| launch_run_id(key))
+        .map(str::to_string)
+        .collect())
 }
 
 /// A launch waiting on this session prevents rotation even after its in-memory
@@ -1603,7 +1632,7 @@ pub async fn withdraw_queued_call_admission(
             "UPDATE runtime_admission_requests SET state='cancelled',failure_detail=?3,updated_at=?4 WHERE workspace_key=?1 AND launch_key=?2 AND state='queued'",
             params![
                 CALL_ADMISSION_WORKSPACE,
-                format!("call:{run_id}"),
+                call_launch_key(run_id),
                 detail.to_string(),
                 now
             ],
@@ -1680,7 +1709,7 @@ pub async fn withdraw_queued_ordinary_admission(
     if !has_admission_table(conn).await? {
         return Ok(None);
     }
-    let launch_key = format!("ordinary:{run_id}");
+    let launch_key = ordinary_launch_key(run_id);
     let mut rows = conn
         .query(
             "SELECT r.request_id,r.workspace_key,r.resource_lane,p.turn_id FROM runtime_admission_requests r LEFT JOIN prepared_ordinary_launches p ON p.request_id=r.request_id WHERE r.launch_key=?1 AND r.state='queued'",
@@ -3640,6 +3669,47 @@ mod tests {
             .await
             .unwrap()
             .contains("call-queued"));
+    }
+
+    #[test]
+    fn launch_keys_round_trip_their_run_id() {
+        assert_eq!(launch_run_id(&ordinary_launch_key("run-1")), Some("run-1"));
+        assert_eq!(launch_run_id(&call_launch_key("run-2")), Some("run-2"));
+        assert_eq!(launch_run_id("workflow:run-3"), None);
+        assert_eq!(launch_run_id("run-4"), None);
+    }
+
+    /// The run comes from the row's `launch_key`, but only a row something can
+    /// launch is a claim: a pending row with no prepared record is not, and a
+    /// key that names no run is skipped even with a prepared record.
+    #[tokio::test]
+    async fn a_claim_needs_a_prepared_record_and_a_key_that_names_its_run() {
+        let db = crate::storage::migrated_test_db("admission-claim-shapes.db").await;
+        for (seq, (request, key)) in [
+            ("req-bare", "ordinary:run-bare"),
+            ("req-odd", "unprefixed-run"),
+            ("req-ready", "call:run-ready"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.execute_script(format!(
+                "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_generation,created_at,updated_at)
+                   VALUES('{request}','local-runtime','lane','{key}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,{seq},'queued',0,1,1);"
+            ))
+            .await
+            .unwrap();
+        }
+        db.execute_script(
+            "INSERT INTO prepared_runtime_calls(request_id,run_id,prepared_json,created_at) VALUES('req-odd','run-odd','{}',1);
+             INSERT INTO prepared_runtime_calls(request_id,run_id,prepared_json,created_at) VALUES('req-ready','run-ready','{}',1);",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_launch_run_ids(&db).await.unwrap(),
+            HashSet::from(["run-ready".to_string()])
+        );
     }
 
     #[tokio::test]

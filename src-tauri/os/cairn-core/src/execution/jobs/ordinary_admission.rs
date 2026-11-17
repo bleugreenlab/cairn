@@ -219,7 +219,7 @@ fn enqueue_request_from_snapshot(
     };
     crate::runtime_admission::EnqueueAdmissionRequest {
         id: launch.request_id.clone(),
-        launch_key: format!("ordinary:{}", launch.run_id),
+        launch_key: crate::storage::ordinary_launch_key(&launch.run_id),
         workspace_id,
         execution_id: (!launch.execution_id.is_empty()).then(|| launch.execution_id.clone()),
         job_id: Some(launch.job_id.clone()),
@@ -638,7 +638,7 @@ pub(super) fn enqueue_or_start(
                     request_id: durable_request_id,
                     workspace_key: queue_workspace,
                     resource_lane: lane,
-                    launch_key: format!("ordinary:{run_id}"),
+                    launch_key: crate::storage::ordinary_launch_key(&run_id),
                     resource_claim: crate::storage::RuntimeResourceClaim {
                         resident_process_units: claim.resident_process_units,
                         server_instance_key: claim.server_instance_key,
@@ -674,7 +674,7 @@ pub(super) fn enqueue_or_start(
             orch,
             crate::runtime_admission::EnqueueAdmissionRequest {
                 id: request_id,
-                launch_key: format!("ordinary:{}", prepared.run_id),
+                launch_key: crate::storage::ordinary_launch_key(&prepared.run_id),
                 workspace_id: team_id,
                 execution_id: prepared.execution_id.clone(),
                 job_id: Some(prepared.job_id.clone()),

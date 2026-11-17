@@ -91,14 +91,14 @@ pub use row::{
     FromDbRow, QueryConn, QueryRows, RowExt,
 };
 pub use runtime_admission::{
-    admission_status, advance_team_mirror_phase, awaiting_launch_run_for_session,
+    admission_status, advance_team_mirror_phase, awaiting_launch_run_for_session, call_launch_key,
     cancel_queued_admission, clear_team_ordinary_terminal, enqueue_admission_request,
     enqueue_prepared_ordinary_launch, finish_admission_by_launch_key, get_admission_request,
     get_admission_request_by_launch_key, get_prepared_ordinary_launch, get_prepared_runtime_call,
-    heartbeat_admission, host_in_flight_bytes, lane_occupancy, lease_next_admission,
+    heartbeat_admission, host_in_flight_bytes, lane_occupancy, launch_run_id, lease_next_admission,
     lease_next_admission_with_capacity, lease_next_admission_within,
     list_pending_team_ordinary_terminals, list_queued_ordinary_launches,
-    list_recoverable_team_ordinary_launches, list_unsettled_call_admissions,
+    list_recoverable_team_ordinary_launches, list_unsettled_call_admissions, ordinary_launch_key,
     pending_launch_run_ids, persist_prepared_ordinary_launch, persist_prepared_runtime_call,
     persist_team_ordinary_lease, provider_admission_records, queue_team_ordinary_terminal,
     reap_expired_admissions, renew_admission_leases, requeue_orphaned_admissions,

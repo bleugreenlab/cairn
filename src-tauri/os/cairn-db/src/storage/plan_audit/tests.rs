@@ -221,9 +221,16 @@ const HELD_EXECUTIONS: &str = concat!(
     crate::awaiting_release_sql!()
 );
 
-/// The reaper's two `pending_launch_run_ids` statements (cairn/5864).
-const PENDING_ORDINARY_LAUNCHES: &str = "SELECT p.run_id FROM prepared_ordinary_launches p JOIN runtime_admission_requests r ON r.request_id=p.request_id WHERE (r.state IN ('leased','starting') OR (r.state='queued' AND NOT EXISTS (SELECT 1 FROM team_ordinary_admission_authority a WHERE a.request_id=r.request_id)))";
-const PENDING_RUNTIME_CALLS: &str = "SELECT c.run_id FROM prepared_runtime_calls c JOIN runtime_admission_requests r ON r.request_id=c.request_id WHERE r.state IN ('queued','leased','starting')";
+/// The reaper's two `pending_launch_run_ids` statements before cairn/5864:
+/// each recovered the run id by joining a prepared-launch table, and with no
+/// index leading on `state` each walked the whole ledger history.
+const PENDING_ORDINARY_LAUNCHES_BEFORE: &str = "SELECT p.run_id FROM prepared_ordinary_launches p JOIN runtime_admission_requests r ON r.request_id=p.request_id WHERE (r.state IN ('leased','starting') OR (r.state='queued' AND NOT EXISTS (SELECT 1 FROM team_ordinary_admission_authority a WHERE a.request_id=r.request_id)))";
+const PENDING_RUNTIME_CALLS_BEFORE: &str = "SELECT c.run_id FROM prepared_runtime_calls c JOIN runtime_admission_requests r ON r.request_id=c.request_id WHERE r.state IN ('queued','leased','starting')";
+
+/// The one statement after: the run id is in the row's own `launch_key`, the
+/// covering `idx_runtime_admission_state` is sought per state, and each
+/// prepared record is only probed for existence by its primary key.
+const PENDING_LAUNCHES_AFTER: &str = "SELECT r.launch_key FROM runtime_admission_requests r WHERE r.state IN ('queued','leased','starting') AND (r.state IN ('leased','starting') OR (r.state='queued' AND NOT EXISTS (SELECT 1 FROM team_ordinary_admission_authority a WHERE a.request_id=r.request_id))) AND (EXISTS (SELECT 1 FROM prepared_ordinary_launches p WHERE p.request_id=r.request_id) OR EXISTS (SELECT 1 FROM prepared_runtime_calls c WHERE c.request_id=r.request_id))";
 
 /// The job chat-turn count before #4664 (cairn/5876): every event the job's
 /// runs wrote, each opened for its `turn_id`.
@@ -241,14 +248,7 @@ const FIXTURES: &[(&str, &[&str])] = &[
         &["range-past-blob on agent_waits.pending_prompt_id"],
     ),
     (HELD_EXECUTIONS, &[]),
-    (
-        PENDING_ORDINARY_LAUNCHES,
-        &["wide-scan on prepared_ordinary_launches"],
-    ),
-    (
-        PENDING_RUNTIME_CALLS,
-        &["wide-scan on runtime_admission_requests"],
-    ),
+    (PENDING_LAUNCHES_AFTER, &[]),
     (
         CHAT_TURNS_BEFORE_4664,
         &["range-past-blob on events.turn_id"],
@@ -271,9 +271,9 @@ const FIXTURES: &[(&str, &[&str])] = &[
 ];
 
 /// Red for exactly the statements the 11-02 fixes changed, and clean for what
-/// they changed them to. The reaper's statements (5864) are not fixed on this
-/// tree, so they are red here; when that lands, its own plan pins say what is
-/// clean, and this test's expectations move with it.
+/// they changed them to. A fix that is an index is also pinned by dropping
+/// it: its statement must turn red again, so a missing index cannot leave the
+/// witness silently clean.
 #[tokio::test]
 async fn the_eleven_two_statements_are_flagged_and_their_fixes_are_not() {
     let (_temp, db) = private_db().await;
@@ -287,6 +287,30 @@ async fn the_eleven_two_statements_are_flagged_and_their_fixes_are_not() {
         &db,
         WIDE_ROW_TABLES,
         &[(HELD_EXECUTIONS, &["wide-scan on executions"])],
+    )
+    .await;
+
+    // The reaper's claim read, on the schema before its index.
+    db.execute_batch("DROP INDEX idx_runtime_admission_state")
+        .await
+        .unwrap();
+    assert_cases(
+        &db,
+        WIDE_ROW_TABLES,
+        &[
+            (
+                PENDING_ORDINARY_LAUNCHES_BEFORE,
+                &["wide-scan on prepared_ordinary_launches"],
+            ),
+            (
+                PENDING_RUNTIME_CALLS_BEFORE,
+                &["wide-scan on runtime_admission_requests"],
+            ),
+            (
+                PENDING_LAUNCHES_AFTER,
+                &["wide-scan on runtime_admission_requests"],
+            ),
+        ],
     )
     .await;
 }
@@ -460,7 +484,7 @@ async fn a_finding_names_the_index_it_goes_through() {
         )],
         "5643:\n{listing}"
     );
-    let (table_walk, listing) = index_of(PENDING_ORDINARY_LAUNCHES.to_string()).await;
+    let (table_walk, listing) = index_of(A_WIDE_WALK.to_string()).await;
     assert_eq!(
         table_walk,
         [("prepared_ordinary_launches".to_string(), None)],
@@ -1267,6 +1291,10 @@ reason = "a bulk scan by design"
 
 // --- The hook: first sighting, once, and the opt-outs. ---
 
+/// A full walk of a wide table: flagged on any schema, so the hook tests below
+/// never depend on what some fixed statement plans as today.
+const A_WIDE_WALK: &str = "SELECT prompt FROM prepared_ordinary_launches";
+
 /// What this process has reported from `file:line`.
 fn reported_at(site: &std::panic::Location<'_>) -> Vec<String> {
     let prefix = format!("{}:{} ", site.file(), site.line());
@@ -1287,7 +1315,7 @@ async fn a_statement_is_explained_once_per_call_site() {
     let mut site = None;
     for _ in 0..3 {
         site = Some(std::panic::Location::caller());
-        db.query_all(PENDING_ORDINARY_LAUNCHES, (), |row| row.text(0))
+        db.query_all(A_WIDE_WALK, (), |row| row.text(0))
             .await
             .unwrap();
     }
@@ -1318,7 +1346,7 @@ async fn a_tracked_statement_is_seen_and_an_exempt_or_raw_one_is_not() {
         .read(|conn| {
             Box::pin(async move {
                 let site = std::panic::Location::caller();
-                let mut rows = conn.query(PENDING_RUNTIME_CALLS, ()).await?;
+                let mut rows = conn.query(A_WIDE_WALK, ()).await?;
                 while rows.next().await?.is_some() {}
                 Ok(site)
             })
@@ -1330,7 +1358,7 @@ async fn a_tracked_statement_is_seen_and_an_exempt_or_raw_one_is_not() {
             Box::pin(async move {
                 conn.exempt_from_plan_audit();
                 let site = std::panic::Location::caller();
-                let mut rows = conn.query(PENDING_RUNTIME_CALLS, ()).await?;
+                let mut rows = conn.query(A_WIDE_WALK, ()).await?;
                 while rows.next().await?.is_some() {}
                 Ok(site)
             })
@@ -1342,7 +1370,7 @@ async fn a_tracked_statement_is_seen_and_an_exempt_or_raw_one_is_not() {
             Box::pin(async move {
                 let raw: &crate::turso::Connection = conn;
                 let site = std::panic::Location::caller();
-                let mut rows = raw.query(PENDING_RUNTIME_CALLS, ()).await?;
+                let mut rows = raw.query(A_WIDE_WALK, ()).await?;
                 while rows.next().await?.is_some() {}
                 Ok(site)
             })
@@ -1377,7 +1405,7 @@ async fn a_helper_statement_is_attributed_to_the_helpers_caller() {
         .read(|conn| {
             Box::pin(async move {
                 let site = std::panic::Location::caller();
-                crate::storage::query_opt_text_conn(conn, PENDING_ORDINARY_LAUNCHES, ()).await?;
+                crate::storage::query_opt_text_conn(conn, A_WIDE_WALK, ()).await?;
                 Ok(site)
             })
         })
@@ -1407,7 +1435,7 @@ async fn a_multi_row_helper_is_audited_at_its_caller() {
     let (_temp, db) = private_db().await;
     let conn = db.connect().await.unwrap();
     let line = line!() + 1;
-    let mut rows = forward(&conn, PENDING_ORDINARY_LAUNCHES).await.unwrap();
+    let mut rows = forward(&conn, A_WIDE_WALK).await.unwrap();
     while rows.next().await.unwrap().is_some() {}
     let prefix = format!("{}:{line} ", file!());
     assert!(
@@ -1516,7 +1544,7 @@ fn first_sighting_cost_probe() {
     let audit = PlanAudit::new();
     let site = std::panic::Location::caller();
     let short = "SELECT 1";
-    let long = PENDING_ORDINARY_LAUNCHES;
+    let long = PENDING_ORDINARY_LAUNCHES_BEFORE;
     for sql in [short, long] {
         assert!(audit.first_sighting(site, sql).is_some());
         let mut best = u128::MAX;

@@ -49,6 +49,16 @@
 //!    in-memory claim from before residency acquisition until its lease binds,
 //!    which covers a cold provision however long it takes.
 //!
+//!    The evidence is read in the order a launch hands off between its
+//!    covers. The in-memory claim comes before the durable rows, because the
+//!    row commits before that claim drops. Process presence comes after them,
+//!    because a launch registers its process before its row leaves
+//!    `starting`. The durable read is the costly one, so it happens only for
+//!    a run a first look at the in-memory evidence (process, claim, grace)
+//!    leaves looking stale, and that evidence is read again after it. It is
+//!    never shared across jobs as a sweep-wide snapshot, which would be older
+//!    than each job's in-memory read.
+//!
 //! ## What settling releases
 //!
 //! Settling withdraws a still-queued admission row in the same write. A call
@@ -83,6 +93,7 @@
 //! that lock from run insert through process registration, and a slow one (a
 //! digest reseed, a cold spawn) can outlast the grace.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use cairn_db::turso::params;
@@ -123,6 +134,31 @@ struct RunCandidate {
 /// process registration — a window with no handle and no claim, which this would
 /// otherwise read as stale.
 pub fn reap_stale_runs_for_job(orch: &Orchestrator, db: &Arc<LocalDb>, job_id: &str) -> usize {
+    reap_stale_runs_for_job_reading_claims(orch, db, job_id, read_pending_launch_claims)
+}
+
+/// The durable launch claims on this host: every run whose admission row is
+/// `queued`, `leased` or `starting`. Admission rows are runner-local even for a
+/// team job, so they always come from this host's own database.
+pub fn read_pending_launch_claims(orch: &Orchestrator) -> Result<HashSet<String>, String> {
+    run_db_blocking({
+        let local = orch.db.local.clone();
+        move || async move {
+            crate::storage::pending_launch_run_ids(&local)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+}
+
+/// [`reap_stale_runs_for_job`] with its durable-claim read supplied, so a test
+/// can advance a launch between the reaper's in-memory checks and that read.
+pub fn reap_stale_runs_for_job_reading_claims(
+    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
+    job_id: &str,
+    read_claims: impl FnOnce(&Orchestrator) -> Result<HashSet<String>, String>,
+) -> usize {
     let now = chrono::Utc::now().timestamp();
     let candidates = match run_db_blocking({
         let db = db.clone();
@@ -139,17 +175,28 @@ pub fn reap_stale_runs_for_job(orch: &Orchestrator, db: &Arc<LocalDb>, job_id: &
         return 0;
     }
 
+    // A cheap first look at the in-memory evidence, so the common case (a warm
+    // process, a fresh run) never reads the admission ledger at all.
     let claimed_launch = orch.claimed_launch_run(job_id);
-    // Admission rows are runner-local even for a team job, so the durable claims
-    // always come from this host's own database.
-    let admitted = match run_db_blocking({
-        let local = orch.db.local.clone();
-        move || async move {
-            crate::storage::pending_launch_run_ids(&local)
-                .await
-                .map_err(|error| error.to_string())
-        }
-    }) {
+    let survivors: Vec<RunCandidate> = candidates
+        .into_iter()
+        .filter(|candidate| is_stale(orch, claimed_launch.as_deref(), candidate, now))
+        .collect();
+    if survivors.is_empty() {
+        return 0;
+    }
+
+    // The durable read sits between two looks at the in-memory evidence, one
+    // for each handoff a launch makes:
+    //
+    // - Enqueue: a launch commits its admission row before it drops its
+    //   in-memory claim, so the claim must be read before the rows. That is
+    //   also why the rows are read per job and never as one snapshot shared
+    //   across a sweep, which would be older than each job's claim read.
+    // - Registration: a launch registers its process before its row leaves
+    //   `starting` (a durably admitted call does so with no launch lock and no
+    //   in-memory claim), so process presence must be read after the rows.
+    let admitted = match read_claims(orch) {
         Ok(admitted) => admitted,
         Err(error) => {
             // Without the durable claims a queued launch is indistinguishable
@@ -158,7 +205,8 @@ pub fn reap_stale_runs_for_job(orch: &Orchestrator, db: &Arc<LocalDb>, job_id: &
             return 0;
         }
     };
-    let stale: Vec<String> = candidates
+    let claimed_launch = orch.claimed_launch_run(job_id);
+    let stale: Vec<String> = survivors
         .into_iter()
         .filter(|candidate| {
             !admitted.contains(&candidate.run_id)

@@ -615,7 +615,7 @@ fn lane_unit_holders(orch: &Orchestrator, lane: &str) -> Result<HashSet<String>,
         .await
         .map(|keys| {
             keys.into_iter()
-                .filter_map(|key| key.strip_prefix("ordinary:").map(str::to_string))
+                .filter_map(|key| crate::storage::launch_run_id(&key).map(str::to_string))
                 .collect()
         })
         .map_err(|error| error.to_string())

@@ -317,7 +317,7 @@ pub(crate) fn start_call_run(
                     request_id,
                     workspace_key: crate::storage::CALL_ADMISSION_WORKSPACE.into(),
                     resource_lane: lane,
-                    launch_key: format!("call:{run_id}"),
+                    launch_key: crate::storage::call_launch_key(&run_id),
                     resource_claim: crate::storage::RuntimeResourceClaim {
                         resident_process_units: claim.resident_process_units,
                         server_instance_key: claim.server_instance_key,
@@ -716,7 +716,7 @@ struct SettledCallAdmission {
 fn settle_call_admission(orch: &Orchestrator, run_id: &str) -> Option<SettledCallAdmission> {
     let request = run_db({
         let db = orch.db.local.clone();
-        let key = format!("call:{run_id}");
+        let key = crate::storage::call_launch_key(run_id);
         async move {
             crate::storage::get_admission_request_by_launch_key(
                 &db,
@@ -1150,7 +1150,7 @@ async fn recover_calls_on_startup(
 
     let mut failed = 0usize;
     for run_id in run_ids {
-        let launch_key = format!("call:{run_id}");
+        let launch_key = crate::storage::call_launch_key(&run_id);
         if let Ok(Some(request)) = crate::storage::get_admission_request_by_launch_key(
             &orch.db.local,
             crate::storage::CALL_ADMISSION_WORKSPACE,
