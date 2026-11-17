@@ -455,7 +455,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("check_result_observations", "project_id = ?1"),
     // Delete pending sources before observations so project removal bypasses their retention guard.
     spec("main_incident_sources", "project_id = ?1"),
-    delete_only("manual_check_handles", "project_id = ?1"),
+    delete_only("check_requests", "project_id = ?1"),
     delete_only("check_test_results", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_observation_relabels", "project_id = ?1 OR observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_deferred_tests", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
@@ -1683,9 +1683,9 @@ pub(super) mod tests {
               VALUES ('project-delete', 'incident-delete', 'observation:observation-delete', '{}', 'incident evidence', 'observation-delete', '{}', '{}', 1, 'issue-delete', 'cairn://p/delete/1', 1, 'comment-delete', 2);
             INSERT INTO main_incident_sources(project_id, event_key, observation_id, check_name, platform, commit_sha, created_at, processed_at)
               VALUES ('project-delete', 'observation:observation-delete', 'observation-delete', 'check', 'linux', 'commit', 1, 2);
-            INSERT INTO manual_check_handles(handle, project_id, observation_id, created_at)
-              VALUES ('recorded-handle-delete', 'project-delete', 'observation-delete', 1),
-                     ('unrecorded-handle-delete', 'project-delete', NULL, 1);
+            INSERT INTO check_requests(id, project_id, observation_id, suite, consumer, requester_ref, priority, state, accepted_at_ms, state_since_ms, updated_ms)
+              VALUES ('recorded-handle-delete', 'project-delete', 'observation-delete', 'check', 'requested', 'operator', 'review_check', 'recorded', 1, 1, 1),
+                     ('unrecorded-handle-delete', 'project-delete', NULL, 'check', 'requested', 'operator', 'review_check', 'queued', 1, 1, 1);
             INSERT INTO check_test_results(observation_id, test_id, status, flaky)
               VALUES ('observation-delete', 'test', 'passed', 0);
             INSERT INTO check_deferred_tests(observation_id, test_id, duration_ms)

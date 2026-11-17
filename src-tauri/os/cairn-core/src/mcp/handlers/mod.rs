@@ -5,7 +5,6 @@
 pub mod authority;
 pub(crate) mod branch;
 pub mod bug_report;
-pub(crate) mod check_run;
 pub mod comments_artifacts;
 pub(crate) mod durable_images;
 pub(crate) mod durable_suspend;

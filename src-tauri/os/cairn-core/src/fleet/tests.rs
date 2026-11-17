@@ -20923,15 +20923,15 @@ async fn shared_publication_registration_allows_pending_retry_but_not_settled_mo
     db.execute_script(
         "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
              VALUES('p','default','P','pub','/unused',1,1);
-             INSERT INTO manual_check_handles(handle,project_id,created_at)
-             VALUES('pending','p',1),('receipt','p',1),('attached','p',1);
+             INSERT INTO check_requests(id,project_id,accepted_at_ms,suite,consumer,requester_ref,priority,state,state_since_ms,updated_ms)
+             VALUES('pending','p',1,'smoke','requested','test','review_check','queued',1,1),('receipt','p',1,'smoke','requested','test','review_check','queued',1,1),('attached','p',1,'smoke','requested','test','review_check','queued',1,1);
              INSERT INTO check_result_observations(
                id,project_id,commit_sha,tree_hash,check_name,input_hash,environment_fingerprint,
                exit_code,verdict,complete,reusable,parser_version,result_schema_version,
                ran_at,duration_ms,cadence,output_tail)
              VALUES('source','p','commit','tree','suite','input','env',0,'passed',1,1,1,1,1,1,'review','ok');
-             UPDATE manual_check_handles SET response_json='{}',publication_id='receipt-group' WHERE handle='receipt';
-             UPDATE manual_check_handles SET observation_id='source',publication_id='attached-group' WHERE handle='attached';"
+             UPDATE check_requests SET outcome_json='{}',publication_id='receipt-group' WHERE id='receipt';
+             UPDATE check_requests SET observation_id='source',publication_id='attached-group' WHERE id='attached';"
     ).await.unwrap();
     let first = PublicationCoordination::new();
     let retry = PublicationCoordination::new();
@@ -20946,7 +20946,7 @@ async fn shared_publication_registration_allows_pending_retry_but_not_settled_mo
     }
     let registered = db
         .query_one(
-            "SELECT publication_id FROM manual_check_handles WHERE handle='pending'",
+            "SELECT publication_id FROM check_requests WHERE id='pending'",
             (),
             |row| row.text(0),
         )
@@ -20963,7 +20963,7 @@ async fn shared_publication_registration_allows_pending_retry_but_not_settled_mo
         .is_err());
     }
     let bindings = db.query_all(
-        "SELECT publication_id FROM manual_check_handles WHERE handle IN ('receipt','attached') ORDER BY handle",
+        "SELECT publication_id FROM check_requests WHERE id IN ('receipt','attached') ORDER BY id",
         (), |row| row.text(0),
     ).await.unwrap();
     assert_eq!(bindings, vec!["attached-group", "receipt-group"]);
@@ -20980,7 +20980,7 @@ async fn shared_publication_registration_allows_pending_retry_but_not_settled_mo
     .is_err());
     assert_eq!(
         db.query_one(
-            "SELECT publication_id FROM manual_check_handles WHERE handle='pending'",
+            "SELECT publication_id FROM check_requests WHERE id='pending'",
             (),
             |row| row.text(0),
         )

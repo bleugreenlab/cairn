@@ -121,6 +121,7 @@ resource_samples! {
     ProjectVcsLog { project: project() } => Parser,
     ProjectVcsBlame { project: project() } => Parser,
     ProjectCheckObservation { project: project(), handle: "rust-tests@main".to_string() } => Parser,
+    ProjectCheckRequest { project: project(), id: "0b6a1c2e-4f3d-4c55-9e1f-2a7b8c9d0e1f".to_string() } => Parser,
     ProjectTerminal { project: project(), slug: "build".to_string() } => Parser,
     ProjectBrowser { project: project(), slug: "default".to_string() } => Parser,
     ProjectBrowserNetworkRequest {

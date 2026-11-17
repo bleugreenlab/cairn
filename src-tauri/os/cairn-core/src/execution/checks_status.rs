@@ -2115,7 +2115,8 @@ fn assemble_statuses(
 pub(crate) fn main_only_notice(name: &str) -> String {
     format!(
         "main cadence only: runs on the default branch after merges; \
-         `cairn check run {name} --branch <ref>` answers it on demand"
+         a check request answers it on demand: append {{suite:\"{name}\",revision:\"<ref>\"}} \
+         to cairn:~/checks, then run waitFor on the request URI"
     )
 }
 

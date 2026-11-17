@@ -70,6 +70,15 @@ pub(crate) enum Condition {
     /// A node's project check lanes settling. The job id is resolved once, when
     /// the wait is armed, so a restart re-arms against the same node rather than
     /// re-resolving a URI whose node may since have been renamed or archived.
+    /// Durable check requests settling: one by its URI, or every request a
+    /// node had open when the wait armed (`cairn:~/checks/requests`). Waiting
+    /// on your own requests is allowed: a request never depends on its
+    /// requester's turn ending, so the wait cannot deadlock.
+    CheckRequests {
+        uri: String,
+        project_id: String,
+        ids: Vec<String>,
+    },
     Checks {
         uri: String,
         job_id: String,
@@ -578,7 +587,10 @@ impl Condition {
     pub(crate) fn is_wait_for(&self) -> bool {
         matches!(
             self,
-            Condition::Duration | Condition::Terminal { .. } | Condition::Checks { .. }
+            Condition::Duration
+                | Condition::Terminal { .. }
+                | Condition::Checks { .. }
+                | Condition::CheckRequests { .. }
         )
     }
 
@@ -589,6 +601,7 @@ impl Condition {
             Condition::Duration => "duration",
             Condition::Terminal { .. } => "terminal",
             Condition::Checks { .. } => "checks",
+            Condition::CheckRequests { .. } => "check_requests",
             Condition::McpContinuation { .. } => "mcp_continuation",
             Condition::RunBatch { .. } => "run_batch",
             Condition::OperatorRequest { .. } => "operator_request",
@@ -611,6 +624,7 @@ impl Condition {
                 };
                 format!("waitFor: terminal {slug} {on}")
             }
+            Condition::CheckRequests { uri, .. } => format!("waitFor: check requests {uri}"),
             Condition::Checks { suite: None, .. } => "waitFor: checks settled".to_string(),
             Condition::Checks {
                 suite: Some(suite), ..
@@ -3489,7 +3503,10 @@ async fn resolution_after_restart(
         }
         // Level-triggered conditions re-arm from their own durable state, so a
         // restart simply asks them again.
-        Condition::Duration | Condition::Terminal { .. } | Condition::Checks { .. } => {
+        Condition::Duration
+        | Condition::Terminal { .. }
+        | Condition::Checks { .. }
+        | Condition::CheckRequests { .. } => {
             match super::owned_wait::trigger(orch.clone(), db.clone(), record.clone()).await {
                 Ok(result) => result,
                 Err(error) => serde_json::json!({"outcome":"error","error":error}).to_string(),

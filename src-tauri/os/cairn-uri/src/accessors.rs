@@ -161,6 +161,7 @@ impl CairnResource {
             | Self::ProjectHeadlines { project }
             | Self::ProjectCheckResults { project, .. }
             | Self::ProjectCheckObservation { project, .. }
+            | Self::ProjectCheckRequest { project, .. }
             | Self::ProjectVcsDiff { project }
             | Self::ProjectVcsAncestry { project }
             | Self::ProjectVcsLog { project }
@@ -583,7 +584,8 @@ impl CairnResource {
             | Self::ProjectImages { .. }
             | Self::ProjectAttachment { .. }
             | Self::ProjectAttachments { .. }
-            | Self::ProjectCheckObservation { .. } => None,
+            | Self::ProjectCheckObservation { .. }
+            | Self::ProjectCheckRequest { .. } => None,
         }
     }
 

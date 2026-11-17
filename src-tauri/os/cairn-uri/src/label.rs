@@ -343,6 +343,10 @@ impl CairnResource {
             Self::ProjectCheckObservation { project, handle } => {
                 in_project(project, format!("check {handle}"))
             }
+            Self::ProjectCheckRequest { project, id } => {
+                let short = id.get(..8).unwrap_or(id);
+                in_project(project, format!("check request {short}"))
+            }
             Self::ProjectVcsDiff { project } => in_project(project, "vcs diff"),
             Self::ProjectVcsAncestry { project } => in_project(project, "vcs ancestry"),
             Self::ProjectVcsLog { project } => in_project(project, "vcs log"),

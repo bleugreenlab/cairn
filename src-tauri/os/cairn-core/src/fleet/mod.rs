@@ -783,6 +783,9 @@ pub(crate) struct LeftRunningAttempt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdoptionOwner {
     MainCadence,
+    /// A durable check request (`check_requests`), whose driver re-binds to
+    /// the lane at boot.
+    CheckRequest,
 }
 
 /// One eligible machine placement cannot decide on right now, because a
@@ -925,9 +928,9 @@ async fn register_manual_check_publications(
                 // Once its source or response is attached, admission cannot move it.
                 let changed = conn
                     .execute(
-                        "UPDATE manual_check_handles SET publication_id=?3
-                     WHERE project_id=?1 AND handle=?2
-                       AND observation_id IS NULL AND response_json IS NULL",
+                        "UPDATE check_requests SET publication_id=?3
+                     WHERE project_id=?1 AND id=?2
+                       AND observation_id IS NULL AND outcome_json IS NULL",
                         cairn_db::turso::params![
                             project_id.as_str(),
                             handle.as_str(),

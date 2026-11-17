@@ -18,6 +18,7 @@ mod batches;
 mod browsers;
 mod bug;
 mod channels;
+mod checks;
 mod events;
 mod executions;
 mod executors;
@@ -500,6 +501,15 @@ pub(crate) async fn dispatch_resource_change_under_store(
         summary
     } else if let Some(summary) =
         off_frame(|| batches::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    {
+        summary
+    } else if let Some(summary) = {
+        let (resource, applied_data) = (&resource, &mut applied_data);
+        off_frame(move || {
+            checks::dispatch(orch, request, index, item, dry_run, resource, applied_data)
+        })
+    }
+    .await?
     {
         summary
     } else if let Some(summary) =

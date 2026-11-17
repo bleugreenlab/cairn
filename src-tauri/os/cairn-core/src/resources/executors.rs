@@ -2150,7 +2150,12 @@ pub(crate) fn render_executor_with_kills(
         "- Running: {}\n",
         occupancy.executing_requests.len()
     ));
-    out.push_str(&format!("- Queued: {}\n", occupancy.queued_requests.len()));
+    // The machine's own queue. Check requests the runner holds for this
+    // machine are listed separately, under their own heading.
+    out.push_str(&format!(
+        "- Queued on this machine: {}\n",
+        occupancy.queued_requests.len()
+    ));
     out.push_str(&format!(
         "- Resident processes: {}\n",
         occupancy

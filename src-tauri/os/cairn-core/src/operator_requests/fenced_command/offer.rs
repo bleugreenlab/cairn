@@ -23,8 +23,9 @@ pub(crate) fn offer_for(
     if declared_check {
         offer.push_str(
             "This command is a check the project declares, and declared checks already run \
-             unfenced as checks: `cairn check run <suite>` runs it that way and records the \
-             verdict, with no request needed.\n",
+             unfenced as checks: a check request (append {suite} to cairn:~/checks, or \
+             `cairn check run <suite>` from a shell) runs it that way and records the verdict, \
+             with no operator request needed.\n",
         );
     }
     let executor = match (executor, floor) {

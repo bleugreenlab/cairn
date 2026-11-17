@@ -72,11 +72,32 @@ pub(crate) const PROJECT_CHECK_OBSERVATION_CONTRACT: ResourceContract = Resource
     uri_template: "cairn://p/{project}/check-observations/{handle}",
     name: "Check observation",
     description:
-        "One check observation (read-only). A 24-hex handle names one immutable ledger row; the UUID request handle `cairn check run` prints names that request and reads its pending progress, its settled verdict with the ledger row it recorded, or its error",
+        "One immutable check ledger row, by its 24-hex handle (read-only). A check request reads at check-requests/<id>",
     read_projections: &[],
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
     mutations: NO_MUTATIONS,
+};
+
+pub(crate) const PROJECT_CHECK_REQUEST_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectCheckRequest,
+    uri_template: "cairn://p/{project}/check-requests/{id}",
+    name: "Check request",
+    description:
+        "One durable check request: one suite on one revision, filed with a write to a node's checks. Reads where it stands (queued since when, pinned to which machine, that machine's latest refusal in its own words; or running on which machine since when) and, once settled, its verdict with the ledger observation it recorded, or why it has none. Wait for it with run waitFor kind:\"checks\" ref:<this URI>; a patch with action:cancel withdraws it",
+    read_projections: &[ProjectionSpec {
+        key: "format",
+        values: "json: the request's facts and answer as one JSON object",
+    }],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[KeySpec::new("action", KeyType::Str, "cancel")],
+        optional: &[],
+        label: "cancel this check request",
+        example: "write({changes:[{target:\"cairn://p/PROJECT/check-requests/ID\",mode:\"patch\",payload:{action:\"cancel\"}}]})",
+    }],
 };
 
 pub(crate) const PROJECT_IMAGES_CONTRACT: ResourceContract = ResourceContract {

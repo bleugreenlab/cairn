@@ -475,11 +475,14 @@ impl Fleet {
         if !can_adopt_claim(claim) {
             return None;
         }
-        state
-            .consumers
-            .get(identity)
-            .filter(|waiters| waiters.iter().any(|waiter| waiter.is_cadence_adopter()))
-            .map(|_| AdoptionOwner::MainCadence)
+        let waiters = state.consumers.get(identity)?;
+        if waiters.iter().any(|waiter| waiter.is_cadence_adopter()) {
+            Some(AdoptionOwner::MainCadence)
+        } else if waiters.iter().any(|waiter| waiter.is_request_adopter()) {
+            Some(AdoptionOwner::CheckRequest)
+        } else {
+            None
+        }
     }
 
     pub(super) fn left_running_attempt(
@@ -1089,13 +1092,9 @@ impl Fleet {
         check_name: &str,
         observation_id: &str,
     ) -> Result<(), String> {
-        let (gate, db, reloaded) = {
+        let (gate, db) = {
             let state = self.check_adoptions.lock().unwrap();
-            (
-                state.mutation.clone(),
-                state.db.clone(),
-                state.reloaded.contains(identity),
-            )
+            (state.mutation.clone(), state.db.clone())
         };
         let Some(db) = db else {
             return Ok(());
@@ -1126,30 +1125,9 @@ impl Fleet {
                     .map_err(|error| error.to_string())?;
                 continue;
             }
-            let state_name = if reloaded {
-                if waiter.consumer == "main_cadence" {
-                    "recorded"
-                } else {
-                    "recorded_undelivered"
-                }
-            } else {
-                "recorded"
-            };
-            let evidence = (state_name == "recorded_undelivered").then(|| {
-                format!(
-                    "no adopter for {} in this build; observation {observation_id}",
-                    waiter.consumer
-                )
-            });
-            store::transition_waiter(
-                &db,
-                waiter,
-                state_name,
-                evidence.as_deref(),
-                Some(observation_id),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+            store::transition_waiter(&db, waiter, "recorded", None, Some(observation_id))
+                .await
+                .map_err(|e| e.to_string())?;
         }
         self.maybe_finish_check_locked(&db, &claim).await
     }
@@ -2046,7 +2024,11 @@ mod tests {
         physical.recording_plans = vec![serde_json::json!({"fixture": true}); 3];
         let (fleet, db, mut remote) = fixture(physical.clone()).await;
         let key = identity(&physical);
-        assert_eq!(fleet.adoption_owner(&key), None);
+        // A check request owns its lane across a restart on its own.
+        assert_eq!(
+            fleet.adoption_owner(&key),
+            Some(AdoptionOwner::CheckRequest)
+        );
         let source = claim("main_cadence", "running");
         let gate = fleet.check_adoptions.lock().unwrap().mutation.clone();
         {
@@ -2077,9 +2059,10 @@ mod tests {
         assert_eq!(
             consumers
                 .iter()
-                .filter(|w| w.consumer == "manual" && w.state == "recorded_undelivered")
+                .filter(|w| w.consumer == "manual" && w.state == "recorded")
                 .count(),
-            3
+            3,
+            "a reloaded request's waiter is recorded for its driver to deliver"
         );
         let cadence = consumers
             .iter()
@@ -2089,6 +2072,12 @@ mod tests {
             .deliver_check_waiter(cadence, "observation-a")
             .await
             .unwrap();
+        for waiter in consumers.iter().filter(|w| w.consumer == "manual") {
+            fleet
+                .deliver_check_waiter(waiter, &format!("observation-{}", waiter.check_name))
+                .await
+                .unwrap();
+        }
         assert_eq!(
             store::lookup(&db, &key.0, &key.1)
                 .await
@@ -2202,8 +2191,10 @@ mod tests {
             &purpose::PurposeKey::from_persisted(source.consumer_ref),
             &old_key,
         );
+        // The withdrawn cadence waiter no longer owns the old grant; the
+        // check request still waiting on it does.
         tokio::time::timeout(Duration::from_secs(10), async {
-            while fleet.adoption_owner(&old_key).is_some() {
+            while fleet.adoption_owner(&old_key) != Some(AdoptionOwner::CheckRequest) {
                 tokio::task::yield_now().await;
             }
         })

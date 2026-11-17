@@ -27,8 +27,14 @@ pub(crate) fn default_callback_url() -> String {
     format!("http://127.0.0.1:{}/api/mcp", port)
 }
 
+/// A check request's answer, from a read of `<request URI>?format=json`. The
+/// read returns the request's object alone; anything around it is tolerated.
 fn parse_check_run_observation(raw: &str) -> Result<serde_json::Value, String> {
-    let value: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+    let body = match (raw.find('{'), raw.rfind('}')) {
+        (Some(start), Some(end)) if end > start => &raw[start..=end],
+        _ => raw,
+    };
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|error| {
         format!(
             "invalid observation response: {error}; body: {:?}",
             cairn_mcp_server::output::truncate_chars(raw, 1000)
@@ -42,7 +48,7 @@ fn parse_check_run_observation(raw: &str) -> Result<serde_json::Value, String> {
         return Err(value
             .get("error")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("manual check observation failed")
+            .unwrap_or("check request read failed")
             .to_string());
     }
 
@@ -50,9 +56,17 @@ fn parse_check_run_observation(raw: &str) -> Result<serde_json::Value, String> {
         .get("observation")
         .ok_or_else(|| "observation response did not contain an observation".to_string())?;
     match observation.get("state").and_then(serde_json::Value::as_str) {
-        Some("queued" | "running" | "parked" | "complete" | "failed" | "conflictsWithBase") => {
-            Ok(observation.clone())
-        }
+        Some(
+            "queued"
+            | "running"
+            | "parked"
+            | "complete"
+            | "failed"
+            | "conflictsWithBase"
+            | "regenerationPending"
+            | "cancelled"
+            | "lost",
+        ) => Ok(observation.clone()),
         Some(state) => Err(format!(
             "observation response contained unknown state {state:?}"
         )),
@@ -60,17 +74,26 @@ fn parse_check_run_observation(raw: &str) -> Result<serde_json::Value, String> {
     }
 }
 
-fn check_run_status_request(client: &CairnMcpServer, observation_handle: &str) -> CallbackRequest {
+/// A read of one check request as JSON: what `cairn check watch` polls.
+fn check_run_status_request(client: &CairnMcpServer, request_uri: &str) -> CallbackRequest {
     CallbackRequest {
         answer_bound_ms: None,
         thread_id: None,
         cwd: client.cwd().to_string(),
         run_id: client.run_id().map(ToString::to_string),
-        tool: "check_run".to_string(),
-        payload: serde_json::json!({ "observationHandle": observation_handle }),
+        tool: "read".to_string(),
+        payload: serde_json::json!({ "path": format!("{request_uri}?format=json") }),
         tool_use_id: None,
         origin: None,
     }
+}
+
+/// The exact `run` item that waits for a check request's verdict, holding no
+/// batch, slot or branch while it waits.
+fn wait_line(request_uri: &str) -> String {
+    format!(
+        "run({{commands:[{{waitFor:{{kind:\"checks\",ref:\"{request_uri}\",on:\"verdict\"}}}}]}})"
+    )
 }
 
 /// Callback URL for CLI use: explicit env var (set by the runner or a remote
@@ -444,36 +467,100 @@ fn check_placement(
     })
 }
 
-fn check_run_request(
+/// The write `cairn check run` is: one append to the run's own node's checks,
+/// filing one request per suite.
+fn check_request_filing(
     client: &CairnMcpServer,
-    suite: String,
+    suites: &[String],
     branch: Option<String>,
     retry: bool,
     placement: Option<&CheckPlacement>,
 ) -> CallbackRequest {
-    let mut payload = serde_json::json!({ "suite": suite });
+    let mut filing = serde_json::json!({ "suites": suites });
     if let Some(branch) = branch {
-        payload["branch"] = serde_json::Value::String(branch);
+        filing["revision"] = serde_json::Value::String(branch);
     }
     if retry {
-        payload["retry"] = serde_json::Value::Bool(true);
+        filing["retry"] = serde_json::Value::Bool(true);
     }
     if let Some(placement) = placement {
-        payload["executor"] =
+        filing["executor"] =
             serde_json::to_value(&placement.selector).expect("an executor selector serializes");
-        payload["selectorSource"] =
+        filing["selectorSource"] =
             serde_json::to_value(placement.source).expect("a selector source serializes");
     }
+    let mut payload = serde_json::json!({
+        "changes": [{ "target": "cairn:~/checks", "mode": "append", "payload": filing }]
+    });
+    cairn_common::protocol::stamp_callback_origin(&mut payload, "cli");
     CallbackRequest {
         answer_bound_ms: None,
         thread_id: None,
         cwd: client.cwd().to_string(),
         run_id: client.run_id().map(ToString::to_string),
-        tool: "check_run".to_string(),
+        tool: "write".to_string(),
         payload,
         tool_use_id: None,
         origin: None,
     }
+}
+
+/// The requests a filing's change report names, or why it filed none.
+fn filed_requests(raw: &str) -> Result<Vec<serde_json::Value>, String> {
+    let report: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| raw.trim().to_string())?;
+    if let Some(requests) = report["applied"]
+        .as_array()
+        .and_then(|applied| applied.first())
+        .and_then(|change| change["data"]["requests"].as_array())
+    {
+        return Ok(requests.clone());
+    }
+    let failure = report["failures"].as_array().and_then(|f| f.first());
+    Err(failure
+        .and_then(|failure| {
+            ["error", "message", "reason"]
+                .iter()
+                .find_map(|key| failure[*key].as_str())
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| raw.trim().to_string()))
+}
+
+/// One filed request as `cairn check run` prints it: its address, where it
+/// stands, and the wait that holds nothing.
+fn filed_request_line(request: &serde_json::Value) -> String {
+    let text = |key: &str| request[key].as_str().unwrap_or_default();
+    let uri = text("uri");
+    let joined = if request["joined"].as_bool() == Some(true) {
+        " (already open; this is the same request)"
+    } else {
+        ""
+    };
+    match request["verdict"].as_str() {
+        Some(verdict) => format!("{}: {uri}{joined}: {verdict}", text("suite")),
+        None => format!(
+            "{}: {uri} is {}{joined}; nothing is placed for you but the check, and it runs to its verdict whatever this shell does.\n  wait for it: {}",
+            text("suite"),
+            text("state"),
+            wait_line(uri)
+        ),
+    }
+}
+
+/// Why `cairn check run` cannot file from a shell with no run.
+const CHECK_RUN_NEEDS_A_RUN: &str = "cairn check run files check requests on the node whose run this shell belongs to, and this shell carries no run. File on a node's checks directly: cairn write '{\"changes\":[{\"target\":\"cairn://p/PROJECT/ISSUE/EXEC/NODE/checks\",\"mode\":\"append\",\"payload\":{\"suite\":\"<suite>\"}}]}'";
+
+/// Why `cairn check watch` refuses inside an agent's run batch: the batch
+/// would hold a slot and the branch for as long as the check takes, which is
+/// exactly what a check request exists not to do.
+fn watch_refusal(run_id: Option<&str>, request_uri: &str) -> Option<String> {
+    run_id.filter(|run| !run.is_empty()).map(|_| {
+        format!(
+            "cairn check watch waits inside this run batch, and a batch that waits holds a slot and your branch for as long as the check takes. Wait without holding anything: {}",
+            wait_line(request_uri)
+        )
+    })
 }
 
 /// The machine a verdict came from, as the result line names it: `fedora
@@ -732,6 +819,9 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
     ))
 }
 
+/// File one check request per suite and exit. Nothing waits here: the
+/// request is durable from the moment it is filed, and an agent waits for it
+/// with the `waitFor` line printed for each.
 pub(crate) async fn run_cli_check(
     suites: Vec<String>,
     branch: Option<String>,
@@ -739,6 +829,14 @@ pub(crate) async fn run_cli_check(
     os: Option<String>,
     executor: Option<String>,
 ) -> i32 {
+    if env::var("CAIRN_RUN_ID")
+        .ok()
+        .filter(|run| !run.is_empty())
+        .is_none()
+    {
+        eprintln!("cairn check run: {CHECK_RUN_NEEDS_A_RUN}");
+        return 2;
+    }
     let placement = check_placement(os, executor, env::var(BATCH_EXECUTOR_ENV).ok());
     let callback_url = cli_callback_url();
     if !ensure_callback_reachable(&callback_url).await {
@@ -746,140 +844,52 @@ pub(crate) async fn run_cli_check(
         return 2;
     }
     let client = build_cli_client(callback_url);
-    let requests = suites
-        .into_iter()
-        .map(|suite| {
-            let request = check_run_request(
-                &client,
-                suite.clone(),
-                branch.clone(),
-                retry,
-                placement.as_ref(),
-            );
-            (suite, request)
-        })
-        .collect();
-    let stop = stop_requested();
-    tokio::pin!(stop);
-    let starts = match start_check_runs(&client, requests, retry, &mut stop, |line| {
-        eprintln!("cairn check run: {line}");
-    })
-    .await
-    {
-        Ok(starts) => starts,
-        Err(exit_code) => return exit_code,
-    };
-    follow_check_runs_until_stop(&client, &starts.started, starts.exit_code, &mut stop).await
-}
-
-struct CheckStarts {
-    started: Vec<(String, String)>,
-    exit_code: i32,
-}
-
-async fn start_check_runs(
-    client: &CairnMcpServer,
-    requests: Vec<(String, CallbackRequest)>,
-    retry: bool,
-    stop: &mut (impl std::future::Future<Output = i32> + Unpin),
-    mut report: impl FnMut(String),
-) -> Result<CheckStarts, i32> {
-    use futures::{stream::FuturesUnordered, StreamExt};
-
-    let mut pending: Vec<_> = requests
-        .iter()
-        .map(|(suite, _)| Some(suite.clone()))
-        .collect();
-    let mut starts: FuturesUnordered<_> =
-        requests
-            .into_iter()
-            .enumerate()
-            .map(|(index, (suite, request))| async move {
-                (index, suite, client.callback(&request).await)
-            })
-            .collect();
-    let mut exit_code = 0;
-    let mut started: Vec<(String, String)> = Vec::new();
-    while !starts.is_empty() {
-        let next = tokio::select! {
-            biased;
-            code = &mut *stop => {
-                for (suite, handle) in &started {
-                    report(check_run_stop_line(None, suite, handle, unix_now_ms()));
-                }
-                for suite in pending.iter().flatten() {
-                    report(format!(
-                        "stopped waiting for {suite} start acknowledgement; the start may have been admitted, but no observation handle was received; stopping this client does not stop admitted checks"
-                    ));
-                }
-                return Err(code);
-            }
-            next = starts.next() => next,
-        };
-        let Some((index, suite, outcome)) = next else {
-            break;
-        };
-        pending[index] = None;
-        if !outcome.transport_ok {
-            report(outcome.result.trim_end().to_string());
-            exit_code = 2;
-            continue;
-        }
-        let start: serde_json::Value = match serde_json::from_str(&outcome.result) {
-            Ok(value) => value,
-            Err(error) => {
-                report(format!(
-                    "invalid start response: {error}; body: {:?}",
-                    cairn_mcp_server::output::truncate_chars(&outcome.result, 1000)
-                ));
-                exit_code = 2;
-                continue;
-            }
-        };
-        if let Some(error) = start
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .filter(|ok| !ok)
-            .and_then(|_| start.get("error"))
-            .and_then(serde_json::Value::as_str)
-        {
-            report(error.to_string());
-            exit_code = 2;
-            continue;
-        }
-        let Some(handle) = start
-            .get("observationHandle")
-            .and_then(serde_json::Value::as_str)
-        else {
-            report("start response did not contain an observation handle".into());
-            exit_code = 2;
-            continue;
-        };
-        let line = check_run_start_line(&suite, handle, retry);
-        report(
-            match start
-                .get("observationRef")
-                .and_then(serde_json::Value::as_str)
-            {
-                Some(reference) => format!("{line}; read resource: {reference}"),
-                None => line,
-            },
-        );
-        started.push((suite, handle.to_string()));
+    let outcome = client
+        .callback(&check_request_filing(
+            &client,
+            &suites,
+            branch,
+            retry,
+            placement.as_ref(),
+        ))
+        .await;
+    if !outcome.transport_ok {
+        eprintln!("cairn check run: {}", outcome.result.trim_end());
+        return 2;
     }
-    Ok(CheckStarts { started, exit_code })
+    match filed_requests(&outcome.result) {
+        Ok(requests) => {
+            for request in &requests {
+                println!("{}", filed_request_line(request));
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("cairn check run: {error}");
+            2
+        }
+    }
 }
 
-/// Resume observation without starting or retrying an execution.
-pub(crate) async fn run_cli_check_watch(handle: String) -> i32 {
+/// Follow one check request to its answer, for a person at a terminal. An
+/// agent waits with `run` waitFor instead, which holds nothing.
+pub(crate) async fn run_cli_check_watch(request: String) -> i32 {
+    if let Some(refusal) = watch_refusal(env::var("CAIRN_RUN_ID").ok().as_deref(), &request) {
+        eprintln!("cairn check watch: {refusal}");
+        return 2;
+    }
+    if !(request.starts_with("cairn://") && request.contains("/check-requests/")) {
+        eprintln!("cairn check watch: pass the check request URI cairn check run printed (cairn://p/PROJECT/check-requests/<id>)");
+        return 2;
+    }
     let callback_url = cli_callback_url();
     if !ensure_callback_reachable(&callback_url).await {
         print_unreachable_callback(&callback_url);
-        eprintln!("cairn check watch: stopped waiting; resume with cairn check watch {handle}");
+        eprintln!("cairn check watch: stopped waiting; resume with cairn check watch {request}");
         return 2;
     }
     let client = build_cli_client(callback_url);
-    follow_check_runs(&client, &[("check".into(), handle)], 0).await
+    follow_check_runs(&client, &[("check".into(), request)], 0).await
 }
 
 /// Exit 1 requires an observed failed check. Exit 2 means the requested
@@ -901,7 +911,7 @@ async fn follow_check_runs_until_stop(
     stop: &mut (impl std::future::Future<Output = i32> + Unpin),
 ) -> i32 {
     follow_check_runs_reporting(client, started, exit_code, stop, |line| {
-        eprintln!("cairn check run: {line}");
+        eprintln!("cairn check watch: {line}");
     })
     .await
 }
@@ -1065,20 +1075,6 @@ impl CheckWatch {
     }
 }
 
-fn check_run_start_line(suite: &str, handle: &str, retry: bool) -> String {
-    // Both halves are what the runner does: an identical request coalesces onto
-    // the execution in flight whatever `--retry` says, and without `--retry` a
-    // reusable recorded row answers before anything is placed.
-    let rejoin = if retry {
-        "re-running with --retry joins it while it runs, and runs it afresh once its row is recorded"
-    } else {
-        "re-running the same command joins it while it runs, and reuses its verdict once recorded where that verdict is reusable"
-    };
-    format!(
-        "{suite} observation {handle}; the check runs to its recorded row even if this command is stopped; {rejoin}; read without rerunning: cairn check watch {handle}"
-    )
-}
-
 fn check_run_stop_line(
     last: Option<&CheckWatch>,
     suite: &str,
@@ -1090,7 +1086,7 @@ fn check_run_stop_line(
         |watch| format!("is {}", watch.standing(now_unix_ms)),
     );
     format!(
-        "stopped waiting; {suite} {standing}; stopping this client does not stop the check (observation {handle}); read its outcome with: cairn check watch {handle}"
+        "stopped waiting; {suite} {standing}; stopping this client does not stop the check (request {handle}); read its outcome with: cairn check watch {handle}"
     )
 }
 
@@ -1117,11 +1113,11 @@ async fn watch_check_run(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if watch.is_news_after(last.as_ref()) {
-                eprintln!("cairn check run: {suite}: {}", watch.diagnostic);
+                eprintln!("cairn check watch: {suite}: {}", watch.diagnostic);
                 last_printed = tokio::time::Instant::now();
             } else if last_printed.elapsed() >= CHECK_RUN_HEARTBEAT {
                 eprintln!(
-                    "cairn check run: {}",
+                    "cairn check watch: {}",
                     watch.heartbeat_line(suite, unix_now_ms())
                 );
                 last_printed = tokio::time::Instant::now();
@@ -1147,8 +1143,30 @@ async fn watch_check_run(
                 return Err(observation
                     .get("error")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("manual check ended without a result")
+                    .unwrap_or("the check request ended without a result")
                     .to_string());
+            }
+            // Neither is a verdict, and neither is a failed check: the lane
+            // was withdrawn, or the machine running it is gone.
+            Some("cancelled") => {
+                return Err(format!(
+                    "no verdict: {}",
+                    observation["reason"].as_str().unwrap_or("cancelled")
+                ));
+            }
+            Some("lost") => {
+                return Err(format!(
+                    "lost, no verdict and not a failed check: {}",
+                    observation["evidence"]
+                        .as_str()
+                        .unwrap_or("its lane is gone")
+                ));
+            }
+            Some("regenerationPending") => {
+                return Err(
+                    "no verdict owed: the branch conflicts with its base only in regenerable paths"
+                        .to_string(),
+                );
             }
             _ => tokio::time::sleep(Duration::from_secs(1)).await,
         }
@@ -1337,36 +1355,93 @@ mod tests {
         assert!(err.contains("exactly one target"));
     }
 
-    #[test]
-    fn check_run_request_omits_default_branch() {
-        let client = fixed_server(
+    fn filing_client() -> CairnMcpServer {
+        fixed_server(
             "http://localhost".into(),
             "/repo".into(),
             Some("run-1".into()),
             None,
-        );
-        let request = check_run_request(&client, "rust-tests".into(), None, false, None);
-        assert_eq!(request.tool, "check_run");
-        assert_eq!(
-            request.payload,
-            serde_json::json!({ "suite": "rust-tests" })
-        );
-        assert_eq!(request.run_id.as_deref(), Some("run-1"));
+        )
     }
 
+    /// `cairn check run` is one write to the run's own node's checks: every
+    /// suite in one append, and nothing else.
     #[test]
-    fn check_run_request_carries_explicit_retry() {
-        let client = fixed_server(
-            "http://localhost".into(),
-            "/repo".into(),
-            Some("run-1".into()),
+    fn check_run_is_one_write_to_the_nodes_checks() {
+        let request = check_request_filing(
+            &filing_client(),
+            &["rust-tests".into(), "lint".into()],
+            None,
+            false,
             None,
         );
-        let request = check_run_request(&client, "rust-tests".into(), None, true, None);
+        assert_eq!(request.tool, "write");
+        assert_eq!(request.run_id.as_deref(), Some("run-1"));
+        let change = &request.payload["changes"][0];
+        assert_eq!(change["target"], "cairn:~/checks");
+        assert_eq!(change["mode"], "append");
         assert_eq!(
-            request.payload,
-            serde_json::json!({ "suite": "rust-tests", "retry": true })
+            change["payload"],
+            serde_json::json!({ "suites": ["rust-tests", "lint"] })
         );
+        let retried = check_request_filing(
+            &filing_client(),
+            &["rust-tests".into()],
+            Some("main@origin".into()),
+            true,
+            None,
+        );
+        assert_eq!(
+            retried.payload["changes"][0]["payload"],
+            serde_json::json!({ "suites": ["rust-tests"], "revision": "main@origin", "retry": true })
+        );
+    }
+
+    /// The filing prints each request's address and the exact wait that holds
+    /// nothing; a verdict the ledger already had is printed instead.
+    #[test]
+    fn check_run_prints_each_request_and_its_wait_line() {
+        let report = serde_json::json!({"applied":[{"index":0,"data":{"requests":[
+            {"id":"a","uri":"cairn://p/proj/check-requests/a","suite":"rust-lint","state":"queued","joined":false,"verdict":null},
+            {"id":"b","uri":"cairn://p/proj/check-requests/b","suite":"lint","state":"recorded","joined":false,"verdict":"recorded passed (cached), cairn://p/proj/check-observations/x"}
+        ]}}]})
+        .to_string();
+        let requests = filed_requests(&report).unwrap();
+        let queued = filed_request_line(&requests[0]);
+        assert!(
+            queued.contains("cairn://p/proj/check-requests/a is queued"),
+            "{queued}"
+        );
+        assert!(
+            queued.contains(
+                "run({commands:[{waitFor:{kind:\"checks\",ref:\"cairn://p/proj/check-requests/a\",on:\"verdict\"}}]})"
+            ),
+            "{queued}"
+        );
+        let recorded = filed_request_line(&requests[1]);
+        assert!(recorded.contains("recorded passed (cached)"), "{recorded}");
+        assert!(!recorded.contains("waitFor"), "{recorded}");
+
+        let refused = serde_json::json!({"applied":[],"failures":[{"index":0,"error":"configured suite name must not be empty"}]}).to_string();
+        assert_eq!(
+            filed_requests(&refused).unwrap_err(),
+            "configured suite name must not be empty"
+        );
+    }
+
+    /// Waiting inside an agent's batch is the wrapper this replaced: refused,
+    /// naming the wait that holds nothing.
+    #[test]
+    fn check_watch_refuses_inside_an_agent_batch_and_names_the_wait() {
+        let uri = "cairn://p/proj/check-requests/a";
+        let refusal = watch_refusal(Some("run-1"), uri).unwrap();
+        assert!(
+            refusal.contains("holds a slot and your branch"),
+            "{refusal}"
+        );
+        assert!(refusal.contains(&wait_line(uri)), "{refusal}");
+        assert_eq!(watch_refusal(None, uri), None);
+        assert_eq!(watch_refusal(Some(""), uri), None);
     }
 
     #[test]
@@ -1399,47 +1474,35 @@ mod tests {
     }
 
     #[test]
-    fn check_run_request_carries_the_selector_and_its_source() {
-        let client = fixed_server(
-            "http://localhost".into(),
-            "/repo".into(),
-            Some("run-1".into()),
-            None,
-        );
+    fn check_run_filing_carries_the_selector_and_its_source() {
+        let suites = ["rust-tests".to_string()];
         let placement = check_placement(Some("linux".into()), None, None).unwrap();
         let request =
-            check_run_request(&client, "rust-tests".into(), None, false, Some(&placement));
+            check_request_filing(&filing_client(), &suites, None, false, Some(&placement));
         assert_eq!(
-            request.payload,
+            request.payload["changes"][0]["payload"],
             serde_json::json!({
-                "suite": "rust-tests",
+                "suites": ["rust-tests"],
                 "executor": { "os": "linux" },
                 "selectorSource": "explicit"
             })
         );
         let inherited = check_placement(None, None, Some(r#"{"name":"fedora"}"#.into())).unwrap();
         let request =
-            check_run_request(&client, "rust-tests".into(), None, false, Some(&inherited));
-        assert_eq!(request.payload["selectorSource"], "inherited");
-        assert_eq!(
-            request.payload["executor"],
-            serde_json::json!({ "name": "fedora" })
-        );
+            check_request_filing(&filing_client(), &suites, None, false, Some(&inherited));
+        let filing = &request.payload["changes"][0]["payload"];
+        assert_eq!(filing["selectorSource"], "inherited");
+        assert_eq!(filing["executor"], serde_json::json!({ "name": "fedora" }));
     }
 
+    /// Watching reads the request resource as JSON; it never files anything.
     #[test]
-    fn check_run_status_request_carries_only_the_observation_handle() {
-        let client = fixed_server(
-            "http://localhost".into(),
-            "/repo".into(),
-            Some("run-1".into()),
-            None,
-        );
-        let request = check_run_status_request(&client, "manual-obs-1");
-        assert_eq!(request.tool, "check_run");
+    fn check_watch_reads_the_request_resource_as_json() {
+        let request = check_run_status_request(&filing_client(), "cairn://p/proj/check-requests/a");
+        assert_eq!(request.tool, "read");
         assert_eq!(
             request.payload,
-            serde_json::json!({ "observationHandle": "manual-obs-1" })
+            serde_json::json!({ "path": "cairn://p/proj/check-requests/a?format=json" })
         );
     }
 
@@ -1452,12 +1515,10 @@ mod tests {
         }
 
         async fn call(&self, request: &CallbackRequest) -> cairn_mcp_server::CallbackOutcome {
-            assert_eq!(request.tool, "check_run");
-            assert!(request.payload.get("observationHandle").is_some());
-            assert!(
-                request.payload.get("suite").is_none(),
-                "watch must never start work"
-            );
+            assert_eq!(request.tool, "read", "watch must never start work");
+            assert!(request.payload["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("?format=json")));
             let (transport_ok, result) = self.0.lock().unwrap().pop_front().expect("one poll");
             cairn_mcp_server::CallbackOutcome {
                 result,
@@ -1476,130 +1537,6 @@ mod tests {
                 cwd: "/repo".into(),
             },
         )
-    }
-
-    struct CheckStartsCallback {
-        delayed_started: std::sync::Arc<tokio::sync::Notify>,
-    }
-
-    #[async_trait::async_trait]
-    impl cairn_mcp_server::CallbackSink for CheckStartsCallback {
-        fn describe(&self) -> &str {
-            "delayed check start test"
-        }
-
-        async fn call(&self, request: &CallbackRequest) -> cairn_mcp_server::CallbackOutcome {
-            assert_eq!(request.tool, "check_run");
-            assert!(request.payload.get("observationHandle").is_none());
-            let suite = request.payload["suite"].as_str().unwrap();
-            if suite == "delayed" {
-                self.delayed_started.notify_one();
-                return std::future::pending().await;
-            }
-            cairn_mcp_server::CallbackOutcome {
-                result: serde_json::json!({
-                    "ok": true, "observationHandle": format!("obs-{suite}"),
-                    "observationRef": format!("cairn://p/proj/check-observations/obs-{suite}")
-                })
-                .to_string(),
-                transport_ok: true,
-                reminders: Vec::new(),
-                failure: None,
-            }
-        }
-    }
-
-    fn check_start_client(delayed_started: std::sync::Arc<tokio::sync::Notify>) -> CairnMcpServer {
-        CairnMcpServer::new(
-            std::sync::Arc::new(CheckStartsCallback { delayed_started }),
-            cairn_mcp_server::Caller::Fixed {
-                run_id: Some("run-1".into()),
-                cwd: "/repo".into(),
-            },
-        )
-    }
-
-    #[tokio::test]
-    async fn check_run_interrupted_start_preserves_acknowledged_handle() {
-        for signal_code in [130, 143] {
-            let delayed_started = std::sync::Arc::new(tokio::sync::Notify::new());
-            let acknowledged = tokio::sync::Notify::new();
-            let client = check_start_client(delayed_started.clone());
-            // Put the stalled request first so ordered collection would lose
-            // the later suite's acknowledged handle.
-            let requests = ["delayed", "validator"]
-                .into_iter()
-                .map(|suite| {
-                    (
-                        suite.to_string(),
-                        check_run_request(&client, suite.into(), None, false, None),
-                    )
-                })
-                .collect();
-            let stop = async {
-                delayed_started.notified().await;
-                acknowledged.notified().await;
-                signal_code
-            };
-            tokio::pin!(stop);
-            let mut lines = Vec::new();
-            let result = tokio::time::timeout(
-                Duration::from_secs(1),
-                start_check_runs(&client, requests, false, &mut stop, |line| {
-                    if line.starts_with("validator observation obs-validator;") {
-                        acknowledged.notify_one();
-                    }
-                    lines.push(line);
-                }),
-            )
-            .await
-            .expect("stop must not wait for the delayed start");
-            assert!(matches!(result, Err(code) if code == signal_code));
-            assert_eq!(lines.len(), 3, "{lines:?}");
-            assert_eq!(
-                lines[0],
-                format!(
-                    "{}; read resource: cairn://p/proj/check-observations/obs-validator",
-                    check_run_start_line("validator", "obs-validator", false)
-                )
-            );
-            assert_eq!(
-                lines[1],
-                check_run_stop_line(None, "validator", "obs-validator", 0)
-            );
-            assert!(lines[2].contains("delayed start acknowledgement"));
-            assert!(lines[2].contains("may have been admitted"));
-            assert!(lines[2].contains("no observation handle was received"));
-        }
-    }
-
-    #[tokio::test]
-    async fn check_run_completed_starts_retain_all_handles() {
-        let client = check_start_client(std::sync::Arc::new(tokio::sync::Notify::new()));
-        let requests = ["validator", "lint"]
-            .into_iter()
-            .map(|suite| {
-                (
-                    suite.to_string(),
-                    check_run_request(&client, suite.into(), None, true, None),
-                )
-            })
-            .collect();
-        let mut stop = std::future::pending();
-        let mut lines = Vec::new();
-        let starts = start_check_runs(&client, requests, true, &mut stop, |line| lines.push(line))
-            .await
-            .unwrap_or_else(|code| panic!("unexpected stop {code}"));
-        assert_eq!(starts.exit_code, 0);
-        assert_eq!(starts.started.len(), 2);
-        for suite in ["validator", "lint"] {
-            let handle = format!("obs-{suite}");
-            assert!(starts.started.contains(&(suite.into(), handle.clone())));
-            assert!(lines.contains(&format!(
-                "{}; read resource: cairn://p/proj/check-observations/{handle}",
-                check_run_start_line(suite, &handle, true)
-            )));
-        }
     }
 
     fn settled_check(passed: bool) -> String {
@@ -1624,7 +1561,10 @@ mod tests {
             }
 
             async fn call(&self, request: &CallbackRequest) -> cairn_mcp_server::CallbackOutcome {
-                let handle = request.payload["observationHandle"].as_str().unwrap();
+                let handle = request.payload["path"]
+                    .as_str()
+                    .unwrap()
+                    .trim_end_matches("?format=json");
                 let result = match handle {
                     "request-fast" => settled_check(true),
                     "request-slow" | "request-other" => serde_json::json!({
@@ -1762,12 +1702,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_run_an_interrupted_request_after_restart_is_not_a_check_failure() {
+    async fn check_run_a_lost_request_is_not_a_check_failure() {
         let response = serde_json::json!({
             "ok": true,
             "observation": {
-                "state": "failed",
-                "error": "manual check was interrupted before its terminal answer was persisted; no recorded answer is available for this handle"
+                "state": "lost",
+                "evidence": "lost on bginf-sp2 (request r attempt a); last sign of life 2026-11-17 09:14:00Z: its first report does not list the request"
             }
         }).to_string();
         let client = check_poll_client(vec![(true, response.clone())]);
@@ -1777,10 +1717,10 @@ mod tests {
             watch_check_run(&client, "rust-tests", "request-1", &last),
         )
         .await
-        .expect("an interrupted request must terminate the wait")
+        .expect("a lost request must terminate the wait")
         .unwrap_err();
-        assert!(error.contains("interrupted"), "{error}");
-        assert!(error.contains("no recorded answer"), "{error}");
+        assert!(error.contains("not a failed check"), "{error}");
+        assert!(error.contains("bginf-sp2"), "{error}");
 
         let client = check_poll_client(vec![(true, response)]);
         assert_eq!(
@@ -1867,17 +1807,6 @@ mod tests {
     }
 
     #[test]
-    fn check_run_start_line_names_the_handle_and_what_rerunning_does() {
-        let line = check_run_start_line("rust-tests", "obs-1", false);
-        assert_eq!(
-            line,
-            "rust-tests observation obs-1; the check runs to its recorded row even if this command is stopped; re-running the same command joins it while it runs, and reuses its verdict once recorded where that verdict is reusable; read without rerunning: cairn check watch obs-1"
-        );
-        assert!(check_run_start_line("rust-tests", "obs-1", true)
-            .contains("runs it afresh once its row is recorded"));
-    }
-
-    #[test]
     fn check_run_news_is_a_move_of_state_machine_or_since() {
         let running = running_on_fedora();
         assert!(running.is_news_after(None));
@@ -1925,12 +1854,12 @@ mod tests {
         );
         assert_eq!(
             line,
-            "stopped waiting; rust-tests is RUNNING on fedora since 09:48:09Z (3h5m elapsed); stopping this client does not stop the check (observation obs-1); read its outcome with: cairn check watch obs-1"
+            "stopped waiting; rust-tests is RUNNING on fedora since 09:48:09Z (3h5m elapsed); stopping this client does not stop the check (request obs-1); read its outcome with: cairn check watch obs-1"
         );
         assert!(!line.contains("timed out"));
         assert_eq!(
             check_run_stop_line(None, "lint", "obs-2", CLAIMED_AT),
-            "stopped waiting; lint was started; stopping this client does not stop the check (observation obs-2); read its outcome with: cairn check watch obs-2"
+            "stopped waiting; lint was started; stopping this client does not stop the check (request obs-2); read its outcome with: cairn check watch obs-2"
         );
     }
 
@@ -2486,24 +2415,5 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("unknown"));
-    }
-
-    #[test]
-    fn check_run_request_forwards_branch_as_an_opaque_revision() {
-        let client = fixed_server("http://localhost".into(), "/repo".into(), None, None);
-        let request = check_run_request(
-            &client,
-            "rust-tests".into(),
-            Some("main@origin".into()),
-            false,
-            None,
-        );
-        assert_eq!(
-            request.payload,
-            serde_json::json!({
-                "suite": "rust-tests",
-                "branch": "main@origin"
-            })
-        );
     }
 }

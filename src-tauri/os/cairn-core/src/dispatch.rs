@@ -688,12 +688,7 @@ async fn execute_tool(
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| NO_ATTACHED_UI_PID.to_string()),
 
-        // Run tools. `check_run` is the trusted configured-suite producer; unlike
-        // `run`, its payload cannot carry executable text or asserted evidence.
         "run" => off_frame(|| crate::mcp::handlers::run::handle_run(orch, request)).await,
-        "check_run" => {
-            off_frame(|| crate::mcp::handlers::check_run::handle_check_run(orch, request)).await
-        }
 
         // Externally-driven attention long-poll (no polling)
         "watch" => off_frame(|| crate::mcp::handlers::watch::handle_watch(orch, request)).await,

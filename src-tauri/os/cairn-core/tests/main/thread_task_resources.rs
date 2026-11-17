@@ -186,6 +186,8 @@ async fn every_writable_thread_task_descendant_reaches_dispatch() {
             "append",
             json!({"content": "x"}),
         ),
+        // A task files check requests the way its node does.
+        (format!("{base}/checks"), "append", json!({"suite": "x"})),
     ];
 
     for (target, mode, payload) in cases {
@@ -209,7 +211,7 @@ async fn every_writable_thread_task_descendant_reaches_dispatch() {
     // mutation and then reports a defect. Both canonical phrases are asserted:
     // the gate's rejection and the reason, which together are what tell a caller
     // the address was right and the mode was not.
-    for target in [format!("{base}/chat"), format!("{base}/checks")] {
+    for target in [format!("{base}/chat")] {
         let read_only = common::change_resource(
             &orch,
             json!([{ "target": target, "mode": "append", "payload": {"content": "x"} }]),

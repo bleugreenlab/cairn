@@ -402,10 +402,15 @@ async fn normalize(
             suite,
             ..
         } => {
-            let suite = checks_suite(on, suite.as_deref())?;
             let home = super::run_context::lookup_home_uri_routed(&orch.db, request)
                 .await
                 .ok();
+            if let Some(condition) =
+                check_requests_condition(orch, reference, home.as_deref(), suite.as_deref()).await?
+            {
+                return Ok((condition, None));
+            }
+            let suite = checks_suite(on, suite.as_deref())?;
             let target = resolve_checks_target(orch, reference, home.as_deref()).await?;
             // Your own lanes are the one thing this cannot answer. Turn-end
             // checks are armed by the END of a turn, so a node waiting on its
@@ -443,6 +448,73 @@ async fn normalize(
         }
     }
 }
+/// A checks wait whose ref names check requests rather than a node's lanes:
+/// one request's URI, or `<node>/checks/requests` for every request that node
+/// has open now. `None` when the ref is a node's or task's checks.
+async fn check_requests_condition(
+    orch: &Orchestrator,
+    reference: &str,
+    home: Option<&str>,
+    suite: Option<&str>,
+) -> Result<Option<Condition>, String> {
+    use crate::execution::checks::requests;
+    let reference = reference.trim();
+    let expanded = if crate::resources::mutations::is_home_relative_target(reference) {
+        let Some(home) = home else {
+            return Ok(None);
+        };
+        match crate::resources::resolve_home_relative_against(home, reference) {
+            Some(expanded) => expanded,
+            None => return Ok(None),
+        }
+    } else {
+        reference.to_string()
+    };
+    let canonical = expanded.trim_end_matches('/');
+    let refuse_suite = || {
+        suite.map(str::trim).filter(|s| !s.is_empty()).map(|_| {
+            "a check request already names its suite; drop suite from this wait".to_string()
+        })
+    };
+    if let Some(cairn_uri::CairnResource::ProjectCheckRequest { project, id }) =
+        cairn_uri::parse_uri(canonical)
+    {
+        if let Some(error) = refuse_suite() {
+            return Err(error);
+        }
+        let db = orch.db.for_project(&project).await;
+        let project_id = super::run_context::project_id_by_key(&db, &project).await?;
+        let request_db = requests::request_db(orch, &project_id).await?;
+        requests::load_request(&request_db, &project_id, &id)
+            .await?
+            .ok_or_else(|| format!("no check request {id} in {project}; nothing to wait for"))?;
+        return Ok(Some(Condition::CheckRequests {
+            uri: requests::request_uri(&project, &id),
+            project_id,
+            ids: vec![id],
+        }));
+    }
+    let Some(checks) = canonical.strip_suffix("/requests") else {
+        return Ok(None);
+    };
+    if let Some(error) = refuse_suite() {
+        return Err(error);
+    }
+    let target = resolve_checks_target(orch, checks, home).await?;
+    let open = requests::requests_of_requester(orch, &target.job_id, 0).await?;
+    let open: Vec<_> = open.into_iter().filter(|row| row.is_open()).collect();
+    let Some(first) = open.first() else {
+        return Err(format!(
+            "{checks} has no open check requests, so there is nothing to wait for. File one with write({{changes:[{{target:\"{checks}\",mode:\"append\",payload:{{suite:\"<suite>\"}}}}]}})"
+        ));
+    };
+    Ok(Some(Condition::CheckRequests {
+        uri: format!("{checks}/requests"),
+        project_id: first.project_id.clone(),
+        ids: open.iter().map(|row| row.id.clone()).collect(),
+    }))
+}
+
 /// The lane set a checks wait watches, from the `on`/`suite` pair.
 ///
 /// The two keys are one decision, so a mismatched pair is refused rather than
@@ -512,6 +584,11 @@ pub(super) async fn trigger(
         Condition::Checks { uri, job_id, suite } => {
             checks(&orch, &db, &r.id, uri, job_id, suite.as_deref(), r.created).await
         }
+        Condition::CheckRequests {
+            uri,
+            project_id,
+            ids,
+        } => check_requests(&orch, &db, &r.id, uri, project_id, ids, r.created).await,
         // A run batch has no pollable condition: its trigger is the awaited
         // executor result, which only the suspending host holds.
         Condition::RunBatch { .. }
@@ -626,6 +703,80 @@ async fn checks(
             QUIET_POLL
         };
         tokio::time::sleep(interval).await;
+    }
+}
+
+/// Wait for check requests to settle, woken by each settlement rather than a
+/// poll. Level-triggered on the rows, so a restart re-arms it from the same
+/// ids; the slow heartbeat only notices a wait settled by someone else.
+async fn check_requests(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    wait_id: &str,
+    uri: &str,
+    project_id: &str,
+    ids: &[String],
+    created: i64,
+) -> Result<String, String> {
+    use crate::execution::checks::requests;
+    const HEARTBEAT: Duration = Duration::from_secs(60);
+    let request_db = requests::request_db(orch, project_id).await?;
+    let project_key = request_db
+        .query_opt_text(
+            "SELECT key FROM projects WHERE id=?1",
+            (project_id.to_string(),),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    loop {
+        stand_down_if_settled(db, wait_id).await?;
+        // Subscribed before reading, so a settlement between the read and the
+        // wait still wakes it.
+        let mut settled = requests::subscribe_settlements();
+        let mut rows = Vec::new();
+        for id in ids {
+            if let Some(row) = requests::load_request(&request_db, project_id, id).await? {
+                rows.push(row);
+            }
+        }
+        if rows.iter().all(|row| !row.is_open()) {
+            let mut answers = Vec::new();
+            let mut verdict = "passed";
+            for row in &rows {
+                let answer = requests::request_answer(orch, request_db.clone(), row).await?;
+                let passed = matches!(
+                    &answer,
+                    requests::CheckRequestAnswer::Complete { result }
+                        if result.passed && result.no_verdict.is_none() && result.placement_unmet.is_none()
+                );
+                let failed = matches!(
+                    &answer,
+                    requests::CheckRequestAnswer::Complete { result }
+                        if !result.passed && result.no_verdict.is_none()
+                );
+                verdict = match (verdict, passed, failed) {
+                    ("failed", ..) | (_, _, true) => "failed",
+                    ("none", ..) | (_, false, false) => "none",
+                    _ => verdict,
+                };
+                answers.push(serde_json::json!({
+                    "uri": requests::request_uri(&project_key, &row.id),
+                    "suite": row.suite,
+                    "state": row.state,
+                    "answer": requests::verdict_words(&answer),
+                }));
+            }
+            return Ok(serde_json::json!({
+                "outcome": "settled",
+                "checks": uri,
+                "verdict": verdict,
+                "requests": answers,
+                "elapsedMs": chrono::Utc::now().timestamp_millis() - created,
+            })
+            .to_string());
+        }
+        let _ = tokio::time::timeout(HEARTBEAT, settled.changed()).await;
     }
 }
 

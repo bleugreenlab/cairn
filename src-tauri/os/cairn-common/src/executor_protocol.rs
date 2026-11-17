@@ -7136,6 +7136,14 @@ pub struct LearnedResourceEstimate {
 /// sends or reads one, so a runner talking to an older executor gets nothing
 /// wrong, and a journal row written before this decodes with a zero count.
 ///
+/// cairn/7322 does not move the number. A check request becomes one durable
+/// runner-side row (`check_requests`) that the runner files, re-drives and
+/// adopts across its own restarts, and the fleet's coalesced-publication
+/// registration writes that row instead of the old manual handle. Requests
+/// reach executors through the same `CellRequest` and recorded results come
+/// back the same way; no wire field or executor behavior changes, so a runner
+/// talking to an older executor gets nothing wrong.
+///
 /// cairn/7301 does not move the number. The runner records a pressure decline
 /// it cannot reproduce against the executor's already-posted executing
 /// requests and headroom reservations, keeps the re-offer backoff of a

@@ -1430,8 +1430,9 @@ fn build_project_checks_section(
     {
         out.push_str(
             "- `when: main` checks never run on your branch: they run on the default branch \
-             after merges, and `cairn check run <suite> --branch <revision>` answers one on \
-             demand.\n",
+             after merges, and a check request answers one on demand: append \
+             `{suite, revision}` to `cairn:~/checks`, then `run` waitFor on the request URI it \
+             returns.\n",
         );
     }
     out.push_str(
@@ -1440,9 +1441,11 @@ fn build_project_checks_section(
          commands exist for iterating on a failure a check surfaced, not for re-verifying a \
          finished diff. When a suite verdict on another revision is genuinely the question — is \
          this red already on the base, is there a baseline for whoever comes next — \
-         `cairn check run <suite>... [--branch <revision>] [--os <os> | --executor <name>]` answers it and \
-         records the observation through the \
-         same trusted path; a suite you run in a shell answers only for that shell. What checks \
+         a check request answers it and records the observation through the same trusted \
+         path: `write` an append of `{suite, revision?, executor?}` to `cairn:~/checks`, then \
+         `run({commands:[{waitFor:{kind:\"checks\",ref:\"<request URI>\",on:\"verdict\"}}]})`, \
+         which holds no batch, slot or branch while it waits (`cairn check run` files the same \
+         request from a shell and exits); a suite you run in a shell answers only for that shell. What checks \
          do NOT cover: live UI/feature verification and cross-system integration still need a \
          browser or a dev instance.\n\n",
     );

@@ -380,12 +380,16 @@ enum Command {
 
 #[derive(clap::Subcommand)]
 enum CheckCommand {
-    /// Read an existing manual observation to completion without executing a check.
+    /// Follow one check request to its answer, at a terminal. An agent waits
+    /// with run waitFor on the request URI instead; inside an agent's batch
+    /// this refuses and prints that wait.
     Watch {
-        /// Request handle printed by cairn check run.
+        /// The check request URI cairn check run printed.
         handle: String,
     },
-    /// Run one or more named configured suites, reusing exact immutable observations when possible.
+    /// File one check request per named configured suite and exit, printing
+    /// each request URI and the run waitFor line that waits for its verdict.
+    /// Nothing waits here; a reusable recorded verdict answers at once.
     Run {
         /// Suite names from the project's `.cairn/config.yaml` `checks` contract.
         #[arg(required = true, num_args = 1..)]

@@ -153,30 +153,52 @@ pub(super) struct ManualRunRow {
 /// Read a manual run's coordinates from `db`, which must be the run's OWNING
 /// database. A team job lives wholly in its team replica, so asking the private
 /// database for it finds nothing.
+#[cfg(test)]
 pub(super) async fn load_manual_run_row(
     db: &LocalDb,
     run_id: &str,
 ) -> Result<ManualRunRow, String> {
-    let run_id = run_id.to_string();
+    let job_id = job_of_run(db, run_id).await?;
+    load_manual_job_row(db, &job_id).await
+}
+
+/// The job a run works for, read from the run's owning database.
+pub(crate) async fn job_of_run(db: &LocalDb, run_id: &str) -> Result<String, String> {
+    db.query_opt_text(
+        "SELECT job_id FROM runs WHERE id = ?1 AND job_id IS NOT NULL",
+        (run_id.to_string(),),
+    )
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| format!("run {run_id} has no resolvable job coordinate"))
+}
+
+/// Read a job's check coordinates from `db`, which must be the job's OWNING
+/// database. A check request names the job whose head it judges, not the run
+/// that filed it, so a request re-driven after its run ended still resolves.
+pub(super) async fn load_manual_job_row(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<ManualRunRow, String> {
+    let job_id = job_id.to_string();
     db.read(move |conn| {
-        let run_id = run_id.clone();
+        let job_id = job_id.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT r.job_id, r.project_id, p.key, p.repo_path,
+                    "SELECT j.id, j.project_id, p.key, p.repo_path,
                             COALESCE(j.base_branch, p.default_branch, 'main'),
                             j.branch
-                     FROM runs r
-                     JOIN projects p ON p.id = r.project_id
-                     JOIN jobs j ON j.id = r.job_id
-                     WHERE r.id = ?1
+                     FROM jobs j
+                     JOIN projects p ON p.id = j.project_id
+                     WHERE j.id = ?1
                      LIMIT 1",
-                    (run_id.as_str(),),
+                    (job_id.as_str(),),
                 )
                 .await?;
             let row = rows.next().await?.ok_or_else(|| {
                 crate::storage::DbError::Row(format!(
-                    "run {run_id} has no resolvable job coordinate"
+                    "job {job_id} has no resolvable check coordinate"
                 ))
             })?;
             Ok(ManualRunRow {
@@ -347,15 +369,15 @@ pub(super) async fn manual_check_store(
 /// callers must not consult the live project config again during this operation.
 pub(super) async fn resolve_manual_check_contract_snapshot(
     orch: &Orchestrator,
-    run_id: &str,
+    job_id: &str,
     check_name: &str,
     revision: ManualCheckRevision,
     placement_override: Option<&crate::execution::check_placement::CheckPlacementOverride>,
 ) -> Result<CheckContractSnapshot, ManualCheckError> {
-    let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
         .map_err(|error| error.to_string())?;
-    let row = load_manual_run_row(&db, run_id).await?;
+    let row = load_manual_job_row(&db, job_id).await?;
     // Capture the coordinate FIRST: the captured commit supplies the content to
     // check AND the definition to check it with, and nothing after this point
     // resolves the requested name again.
@@ -387,74 +409,33 @@ pub(super) async fn resolve_manual_check_contract_snapshot(
     Ok(snapshot)
 }
 
-/// What a manual check's one snapshot fixed, for boundary tests: the judged
-/// commit and every stage's view of it.
-#[cfg(test)]
-pub(crate) struct ManualCaptureEvidence {
-    pub(crate) commit: String,
-    pub(crate) defined_by: String,
-    pub(crate) tree_hash: String,
-    pub(crate) input_hash: String,
-    pub(crate) change_head: String,
-    pub(crate) change_base: String,
-    pub(crate) changed: Vec<String>,
-    pub(crate) capture: Option<CheckCapture>,
-}
-
-#[cfg(test)]
-pub(crate) async fn manual_capture_evidence(
-    orch: &Orchestrator,
-    run_id: &str,
-    check_name: &str,
-    revision: ManualCheckRevision,
-) -> Result<ManualCaptureEvidence, String> {
-    let snapshot = resolve_manual_check_contract_snapshot(orch, run_id, check_name, revision, None)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(ManualCaptureEvidence {
-        commit: snapshot.context.commit_sha.clone(),
-        defined_by: snapshot.defined_by_commit.clone(),
-        tree_hash: snapshot.context.tree_hash.clone(),
-        input_hash: snapshot.context.input_hash.clone(),
-        change_head: snapshot.change.head.clone(),
-        change_base: snapshot.change.base.clone(),
-        changed: snapshot
-            .change
-            .changed
-            .iter()
-            .map(|change| change.path.clone())
-            .collect(),
-        capture: snapshot.capture.clone(),
-    })
-}
-
 /// The forms `--branch` takes, named in each refusal that would otherwise leave
 /// the caller guessing which one it got wrong.
 pub(super) const MANUAL_CHECK_BRANCH_FORMS: &str = "--branch takes a branch name (`main`, \
      `agent/cairn-123-builder-0`), a commit id, or a node URI \
      (`cairn://p/PROJECT/ISSUE/EXEC/NODE`), the same forms `read ?branch=` and `run branch:` take";
 
-/// Classify the revision a manual check names with `--branch`, in the project
-/// of the run that asked.
+/// Classify the revision a check request names with `--branch`, in the project
+/// of the job it resolves against.
 ///
-/// The check-run handler calls this before it mints an observation, so a
-/// revision that names nothing is refused before anything is queued. An exact
-/// revision is captured here, at its commit; a managed branch is only
-/// classified, because preparing it can take the whole preparation budget and
-/// belongs to the run, which prepares it exactly once.
+/// Filing calls this before the request's row exists, so a revision that
+/// names nothing is refused before anything is queued. An exact revision is
+/// captured here, at its commit; a managed branch is only classified, because
+/// preparing it can take the whole preparation budget and belongs to the
+/// request's driver, which prepares it exactly once.
 pub(crate) async fn classify_manual_check_revision(
     orch: &Orchestrator,
-    run_id: &str,
+    job_id: &str,
     branch: &str,
 ) -> Result<ManualCheckRevision, String> {
     use crate::mcp::handlers::branch::{
         capture_revision, resolve_typed_revision, CapturePurpose, RevisionAuthority,
         RevisionCaptureError, RevisionScope,
     };
-    let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
         .map_err(|error| error.to_string())?;
-    let row = load_manual_run_row(&db, run_id).await?;
+    let row = load_manual_job_row(&db, job_id).await?;
     let revision = resolve_typed_revision(orch, RevisionScope::Project(&row.project_id), branch)
         .await
         .map_err(|error| manual_check_branch_refusal(&error))?;
@@ -906,9 +887,13 @@ pub async fn manual_check_cache_context(
     run_id: &str,
     check_name: &str,
 ) -> Result<ManualCheckCacheContext, String> {
+    let db = crate::execution::routing::owning_db_for_run(&orch.db, run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let job_id = job_of_run(&db, run_id).await?;
     Ok(resolve_manual_check_contract_snapshot(
         orch,
-        run_id,
+        &job_id,
         check_name,
         ManualCheckRevision::OwnHeadLiteral,
         None,
@@ -1192,9 +1177,13 @@ pub struct ManualCheckProgressUpdate {
     pub executor: Option<String>,
     /// When the current state began.
     pub since_unix_ms: Option<u64>,
+    /// The fleet request the check was submitted as, once it has been.
+    pub request_id: Option<String>,
+    /// What holds a queued check, in the declining machines' own words.
+    pub held_by: Option<String>,
 }
 
-pub(super) type ManualCheckProgress = Arc<dyn Fn(ManualCheckProgressUpdate) + Send + Sync>;
+pub(crate) type ManualCheckProgress = Arc<dyn Fn(ManualCheckProgressUpdate) + Send + Sync>;
 
 /// What a manual check's requester is shown for one board update.
 ///
@@ -1204,6 +1193,7 @@ pub(super) type ManualCheckProgress = Arc<dyn Fn(ManualCheckProgressUpdate) + Se
 pub(super) fn manual_progress_update(
     checks: &[CheckStatusEntry],
     phase: CheckPhaseStatus,
+    request_id: Option<String>,
 ) -> ManualCheckProgressUpdate {
     let state = match phase.phase.as_deref() {
         Some("queued") => "parked".to_string(),
@@ -1222,32 +1212,35 @@ pub(super) fn manual_progress_update(
         diagnostic,
         executor: phase.executor,
         since_unix_ms: phase.since_unix_ms,
+        request_id,
+        held_by: phase.held_by,
     }
 }
 
-/// One manual check request: the configured suite, the revision its run
-/// names (captured at most once, by the run), and the durable request handle
-/// its answer is recorded under, when the request has one.
+/// One manual check request: the configured suite, the revision it names
+/// (captured at most once, by its driver), and the durable check request its
+/// answer is recorded under, when it has one.
 pub(crate) struct ManualCheckRequest<'a> {
     pub check_name: &'a str,
     pub revision: ManualCheckRevision,
     pub placement: Option<crate::execution::check_placement::CheckPlacementOverride>,
     pub retry: bool,
-    pub manual_handle: Option<&'a str>,
+    /// The `check_requests` row this run resolves and records under.
+    pub check_request: Option<&'a str>,
 }
 
-/// Execute one named configured suite at the revision a run's check names,
-/// reporting progress as it goes.
+/// Execute one named configured suite at the revision a check request names,
+/// against the head of `job_id`, reporting progress as it goes.
 ///
 /// This is the trusted manual producer. It deliberately accepts no raw command or
-/// caller-asserted result metadata: the durable run resolves ownership, the
+/// caller-asserted result metadata: the durable job resolves ownership, the
 /// one capture of `revision` fixes the commit, the contract that commit declares
 /// supplies the command, and the normal planned-check path computes identities,
 /// performs conservative reuse, executes misses, parses results, and records
 /// immutable observations.
 pub(crate) async fn run_manual_configured_check_with_progress(
     orch: &Orchestrator,
-    run_id: &str,
+    job_id: &str,
     request: ManualCheckRequest<'_>,
     progress: ManualCheckProgress,
 ) -> Result<ManualConfiguredCheckResult, ManualCheckError> {
@@ -1256,11 +1249,11 @@ pub(crate) async fn run_manual_configured_check_with_progress(
         revision,
         placement,
         retry,
-        manual_handle,
+        check_request,
     } = request;
     let contract = resolve_manual_check_contract_snapshot(
         orch,
-        run_id,
+        job_id,
         check_name,
         revision,
         placement.as_ref(),
@@ -1270,7 +1263,7 @@ pub(crate) async fn run_manual_configured_check_with_progress(
         .await
         .map_err(|error| error.to_string())?;
     let job_id = contract.context.job_id.clone();
-    if let Some(handle) = manual_handle {
+    if let Some(handle) = check_request {
         let recovery = ManualCheckRecoveryContext {
             project_key: contract.context.project_key.clone(),
             command: Some(contract.plan.command.clone()),
@@ -1284,22 +1277,28 @@ pub(crate) async fn run_manual_configured_check_with_progress(
                 .collect(),
         };
         let context = serde_json::to_string(&recovery).map_err(|error| error.to_string())?;
+        // The commit a request resolved to is fixed the first time it is
+        // written: a re-driven request judges that commit again, never a head
+        // that moved on while the runner was down.
         let updated = db
             .execute(
-                "UPDATE manual_check_handles SET context_json=?1,commit_sha=?4,tree_hash=?5,input_hash=?6,disposition='fresh'
-                 WHERE project_id=?2 AND handle=?3",
+                "UPDATE check_requests SET context_json=?1,commit_sha=?4,tree_hash=?5,input_hash=?6,disposition='fresh',
+                        state=CASE WHEN state='accepted' THEN 'queued' ELSE state END,
+                        queued_at_ms=COALESCE(queued_at_ms,?7),updated_ms=?7
+                 WHERE project_id=?2 AND id=?3 AND (commit_sha IS NULL OR commit_sha=?4)",
                 cairn_db::turso::params![
                     context, contract.context.project_id.as_str(), handle,
                     contract.context.commit_sha.as_str(), contract.context.tree_hash.as_str(),
-                    contract.context.input_hash.as_str(),
+                    contract.context.input_hash.as_str(), chrono::Utc::now().timestamp_millis(),
                 ],
             )
             .await
-            .map_err(|error| format!("could not persist manual check request context: {error}"))?;
+            .map_err(|error| format!("could not persist check request context: {error}"))?;
         if updated != 1 {
-            return Err(ManualCheckError::Other(
-                "manual check request has no durable handle".to_string(),
-            ));
+            return Err(ManualCheckError::Other(format!(
+                "check request {handle} has no durable row, or it already resolved to a different commit than {}",
+                contract.context.commit_sha
+            )));
         }
     }
     execute_check_contract(
@@ -1308,9 +1307,9 @@ pub(crate) async fn run_manual_configured_check_with_progress(
         contract,
         CheckRunProducer {
             adopt: None,
-            tool_use_id: match manual_handle {
-                Some(handle) => format!("manual-check:{run_id}:handle={handle}:{check_name}"),
-                None => format!("manual-check:{run_id}:{check_name}"),
+            tool_use_id: match check_request {
+                Some(handle) => format!("manual-check:{job_id}:handle={handle}:{check_name}"),
+                None => format!("manual-check:{job_id}:{check_name}"),
             },
             node_kind: "manual-check".to_string(),
             owner_job_id: Some(job_id),
@@ -1547,10 +1546,16 @@ pub(crate) async fn execute_check_contract(
     let keyed = vec![(plan.clone(), context.input_hash.clone())];
     let sealed_coordinates = vec![contract.sealed_coordinate];
     let progress_notify = progress.clone();
-    let status_board = CheckStatusBoard::new(
+    let request_cell: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+    let noted_request = request_cell.clone();
+    let mut status_board = CheckStatusBoard::new(
         &keyed,
-        Arc::new(move |checks, phase| progress_notify(manual_progress_update(&checks, phase))),
+        Arc::new(move |checks, phase| {
+            let request_id = noted_request.lock().unwrap().clone();
+            progress_notify(manual_progress_update(&checks, phase, request_id))
+        }),
     );
+    status_board.request = request_cell;
     let timeout_ms = contract.timeout_ms;
     let store_dir = crate::jj::project_store_dir(&orch.config_dir, &repository);
     let CheckRunProducer {
@@ -1820,14 +1825,14 @@ pub(crate) async fn recover_manual_check_result(
                     o.id,o.public_handle,o.check_name,o.environment_fingerprint,o.reusable,o.ran_at,
                     o.exit_code,o.verdict,o.failure_kind,o.verdict_result_json,o.output_tail,o.duration_ms,
                     o.executor_id,o.verdict_platform,o.toolchain_fingerprint
-               FROM manual_check_handles h
+               FROM check_requests h
                JOIN check_result_observations o ON o.project_id=h.project_id
                 AND o.id=COALESCE(h.observation_id, (
                     SELECT p.id FROM check_result_observations p
                      WHERE p.project_id=h.project_id AND p.publication_id=h.publication_id
                        AND p.publication_id IS NOT NULL
                 ))
-              WHERE h.project_id=?1 AND h.handle=?2",
+              WHERE h.project_id=?1 AND h.id=?2",
             cairn_db::turso::params![project, handle],
         ).await?;
         let row = rows.next().await?.ok_or_else(|| crate::storage::DbError::internal(

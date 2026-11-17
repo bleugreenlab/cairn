@@ -201,12 +201,32 @@ pub(crate) struct Waiter {
 impl Waiter {
     /// A withdrawn consumer keeps its observation, but no longer owns adoption.
     pub(crate) fn is_cadence_adopter(&self) -> bool {
-        self.consumer == "main_cadence"
-            && matches!(
-                self.state.as_str(),
-                "running" | "awaiting_adoption" | "joined" | "recorded" | "delivered"
-            )
+        self.consumer == "main_cadence" && self.owns_adoption()
     }
+
+    /// A check request's waiter (`consumer_ref` is its `check_requests` id):
+    /// the request's driver adopts the lane after a restart.
+    pub(crate) fn is_request_adopter(&self) -> bool {
+        self.consumer == "manual" && self.owns_adoption()
+    }
+
+    fn owns_adoption(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            "running" | "awaiting_adoption" | "joined" | "recorded" | "delivered"
+        )
+    }
+}
+
+/// The newest attempt of a physical request, open or settled: what a check
+/// request's row learns about its lane after a restart.
+pub(crate) async fn latest_for_request(db: &LocalDb, request_id: &str) -> DbResult<Option<Claim>> {
+    db.query_opt(
+        format!("SELECT {COLUMNS} FROM check_lane_adoptions WHERE request_id=?1 ORDER BY granted_at_ms DESC, attempt_id DESC LIMIT 1"),
+        (request_id.to_owned(),),
+        from_row,
+    )
+    .await
 }
 
 fn waiter_from_row(row: &Row) -> DbResult<Waiter> {

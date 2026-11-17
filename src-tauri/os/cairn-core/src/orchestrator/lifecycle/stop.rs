@@ -933,6 +933,13 @@ fn stop_session_with_pause_intent(
             if cancelled > 0 {
                 log::info!("stop cancelled {cancelled} in-flight batch(es) for job {job_id}");
             }
+            // Its check requests end with it, durably, so a restart does not
+            // re-drive work the stopped node abandoned.
+            let orch = orch.clone();
+            tokio::spawn(async move {
+                crate::execution::checks::requests::cancel_requests_of_stopped_job(&orch, &job_id)
+                    .await;
+            });
         }
     }
 

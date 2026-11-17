@@ -1047,6 +1047,11 @@ pub(super) async fn read_node_checks(
             out.push_str(&format!("\n{why}\n"));
         }
     }
+    if let Some(requested) =
+        super::check_requests::requested_section(orch, project_key, &job.id).await
+    {
+        out.push_str(&requested);
+    }
     out
 }
 
@@ -1087,6 +1092,11 @@ pub(super) async fn read_task_checks(
                     .await;
             out.push_str(&format!("\n{why}\n"));
         }
+    }
+    if let Some(requested) =
+        super::check_requests::requested_section(orch, project_key, &task_job.id).await
+    {
+        out.push_str(&requested);
     }
     out
 }

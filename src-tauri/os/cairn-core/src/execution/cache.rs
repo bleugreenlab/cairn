@@ -3125,10 +3125,10 @@ async fn attach_manual_check_observation_conn(
     };
     let changed = conn
         .execute(
-            "UPDATE manual_check_handles
+            "UPDATE check_requests
          SET observation_id=?3,commit_sha=?4,tree_hash=?5,input_hash=?6,disposition=?7
-         WHERE project_id=?1 AND handle=?2
-           AND (response_json IS NULL OR
+         WHERE project_id=?1 AND id=?2
+           AND (outcome_json IS NULL OR
                 (observation_id IS NULL AND commit_sha=?4 AND tree_hash=?5 AND input_hash=?6))
            AND (observation_id IS NULL OR observation_id=?3)
            AND EXISTS (SELECT 1 FROM check_result_observations WHERE project_id=?1 AND id=?3)",
@@ -3147,7 +3147,7 @@ async fn attach_manual_check_observation_conn(
         // A replay can reach a handle whose response was already persisted.
         // Accept only the exact association; never rewrite a settled answer.
         let mut existing = conn.query(
-            "SELECT 1 FROM manual_check_handles WHERE project_id=?1 AND handle=?2 AND observation_id=?3 AND commit_sha=?4 AND tree_hash=?5 AND input_hash=?6",
+            "SELECT 1 FROM check_requests WHERE project_id=?1 AND id=?2 AND observation_id=?3 AND commit_sha=?4 AND tree_hash=?5 AND input_hash=?6",
             params![project_id, handle, observation_id, commit_sha, tree_hash, input_hash],
         ).await?;
         if existing.next().await?.is_none() {
@@ -6982,8 +6982,8 @@ pub(crate) mod tests {
     async fn manual_fresh_handle_attachment_is_atomic_with_the_ledger() {
         let db = cache_db().await;
         db.execute_script(
-            "INSERT INTO manual_check_handles(handle,project_id,created_at)
-               VALUES('fresh-handle','project-a',1),('foreign-handle','project-b',1);",
+            "INSERT INTO check_requests(id,project_id,accepted_at_ms,suite,consumer,requester_ref,priority,state,state_since_ms,updated_ms)
+               VALUES('fresh-handle','project-a',1,'smoke','requested','test','review_check','queued',1,1),('foreign-handle','project-b',1,'smoke','requested','test','review_check','queued',1,1);",
         )
         .await
         .unwrap();
@@ -6992,8 +6992,8 @@ pub(crate) mod tests {
         record_fresh_check_observation(db.clone(), write).unwrap();
         let attached = db
             .query_one(
-                "SELECT observation_id,commit_sha,disposition,response_json
-             FROM manual_check_handles WHERE handle='fresh-handle'",
+                "SELECT observation_id,commit_sha,disposition,outcome_json
+             FROM check_requests WHERE id='fresh-handle'",
                 (),
                 |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?, row.opt_text(3)?)),
             )
@@ -7035,8 +7035,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         db.execute_script(
-            "INSERT INTO manual_check_handles(handle,project_id,created_at,commit_sha,tree_hash,input_hash,response_json)
-             VALUES('shutdown-handle','project-a',1,'commit-1','tree-commit-1','input-rust','{\"awaitingAdoption\":true}');",
+            "INSERT INTO check_requests(id,project_id,accepted_at_ms,suite,consumer,requester_ref,priority,state,state_since_ms,updated_ms,commit_sha,tree_hash,input_hash,outcome_json)
+             VALUES('shutdown-handle','project-a',1,'smoke','requested','test','review_check','queued',1,1,'commit-1','tree-commit-1','input-rust','{\"awaitingAdoption\":true}');",
         ).await.unwrap();
         for (project, commit, tree, input) in [
             ("project-b", "commit-1", "tree-commit-1", "input-rust"),
@@ -7059,7 +7059,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             db.query_one(
-                "SELECT observation_id FROM manual_check_handles WHERE handle='shutdown-handle'",
+                "SELECT observation_id FROM check_requests WHERE id='shutdown-handle'",
                 (),
                 |row| row.opt_text(0),
             )
@@ -7079,10 +7079,14 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let saved = db.query_one(
-            "SELECT observation_id,response_json FROM manual_check_handles WHERE handle='shutdown-handle'",
-            (), |row| Ok((row.text(0)?,row.text(1)?)),
-        ).await.unwrap();
+        let saved = db
+            .query_one(
+                "SELECT observation_id,outcome_json FROM check_requests WHERE id='shutdown-handle'",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             saved,
             (
@@ -7096,8 +7100,8 @@ pub(crate) mod tests {
     async fn settled_manual_handle_replay_accepts_only_its_exact_association() {
         let db = cache_db().await;
         db.execute_script(
-            "INSERT INTO manual_check_handles(handle,project_id,created_at)
-             VALUES('settled-handle','project-a',1);",
+            "INSERT INTO check_requests(id,project_id,accepted_at_ms,suite,consumer,requester_ref,priority,state,state_since_ms,updated_ms)
+             VALUES('settled-handle','project-a',1,'smoke','requested','test','review_check','queued',1,1);",
         )
         .await
         .unwrap();
@@ -7110,8 +7114,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         db.execute_script(
-            "UPDATE manual_check_handles SET response_json='{\"settled\":true}'
-             WHERE handle='settled-handle';",
+            "UPDATE check_requests SET outcome_json='{\"settled\":true}'
+             WHERE id='settled-handle';",
         )
         .await
         .unwrap();
@@ -7178,10 +7182,14 @@ pub(crate) mod tests {
             .await
             .is_err());
         }
-        let saved = db.query_one(
-            "SELECT observation_id,response_json FROM manual_check_handles WHERE handle='settled-handle'",
-            (), |row| Ok((row.text(0)?, row.text(1)?)),
-        ).await.unwrap();
+        let saved = db
+            .query_one(
+                "SELECT observation_id,outcome_json FROM check_requests WHERE id='settled-handle'",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             saved,
             ("settled-source".into(), "{\"settled\":true}".into())
@@ -7197,8 +7205,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         db.execute_script(
-            "INSERT INTO manual_check_handles(handle,project_id,created_at)
-               VALUES('cached-handle','project-a',1);",
+            "INSERT INTO check_requests(id,project_id,accepted_at_ms,suite,consumer,requester_ref,priority,state,state_since_ms,updated_ms)
+               VALUES('cached-handle','project-a',1,'smoke','requested','test','review_check','queued',1,1);",
         )
         .await
         .unwrap();
@@ -7227,8 +7235,8 @@ pub(crate) mod tests {
         .unwrap();
         let attached = db
             .query_one(
-                "SELECT observation_id,commit_sha,tree_hash,disposition,response_json
-             FROM manual_check_handles WHERE handle='cached-handle'",
+                "SELECT observation_id,commit_sha,tree_hash,disposition,outcome_json
+             FROM check_requests WHERE id='cached-handle'",
                 (),
                 |row| {
                     Ok((

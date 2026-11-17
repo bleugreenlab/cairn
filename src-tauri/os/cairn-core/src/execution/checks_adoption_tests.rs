@@ -443,7 +443,7 @@ async fn replay_after_observation_commit_before_claim_commit_reuses_the_original
         .apply_executor_snapshot(REMOTE, 1, Default::default(), Default::default());
     let db = project_db(home.path()).await;
     db.execute(
-        "INSERT INTO manual_check_handles(handle,project_id,created_at) VALUES(?1,'project-a',1)",
+        "INSERT INTO check_requests(id,project_id,accepted_at_ms,suite,consumer,requester_ref,priority,state,state_since_ms,updated_ms) VALUES(?1,'project-a',1,'smoke','requested','test','review_check','queued',1,1)",
         (handle.clone(),),
     )
     .await
@@ -496,14 +496,14 @@ async fn replay_after_observation_commit_before_claim_commit_reuses_the_original
         .expect("the recorder committed before the claim failure");
     let receipt = db
         .query_opt_text(
-            "SELECT observation_id FROM manual_check_handles WHERE handle=?1",
+            "SELECT observation_id FROM check_requests WHERE id=?1",
             (handle.clone(),),
         )
         .await
         .unwrap();
     assert_eq!(receipt.as_deref(), Some(original_id.as_str()));
     db.execute(
-        "UPDATE manual_check_handles SET response_json='{}' WHERE handle=?1",
+        "UPDATE check_requests SET outcome_json='{}' WHERE id=?1",
         (handle.clone(),),
     )
     .await
@@ -576,7 +576,7 @@ async fn replay_after_observation_commit_before_claim_commit_reuses_the_original
     assert_eq!(replay.observation_id.as_deref(), Some(original_id.as_str()));
     let receipt = db
         .query_opt(
-            "SELECT observation_id,response_json FROM manual_check_handles WHERE handle=?1",
+            "SELECT observation_id,outcome_json FROM check_requests WHERE id=?1",
             (handle,),
             |row| Ok((row.text(0)?, row.text(1)?)),
         )
@@ -598,6 +598,236 @@ async fn replay_after_observation_commit_before_claim_commit_reuses_the_original
         .await
         .unwrap();
     assert_eq!(ack_count.load(Ordering::SeqCst), 1);
+}
+
+/// What each check request's adopt driver does once its item is recorded:
+/// deliver its waiter. The batch tests run the cadence adopter alone, so this
+/// stands in for the request drivers they do not start.
+async fn deliver_recorded_request_waiters(orch: Orchestrator, local: Arc<LocalDb>) {
+    loop {
+        if let Ok(waiters) = claims::waiters(&local, REQUEST, ATTEMPT).await {
+            for waiter in waiters
+                .iter()
+                .filter(|w| w.consumer == "manual" && w.state == "recorded")
+            {
+                if let Some(observation) = waiter.observation_id.clone() {
+                    let _ = orch.fleet.deliver_check_waiter(waiter, &observation).await;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A runner restarted with one check request whose lane an earlier runner
+/// granted on `REMOTE`: the request row is `running` and names that fleet
+/// request, and the claim's one waiter is the request.
+async fn requested_lane(home: &Path) -> (Orchestrator, String) {
+    let local = Arc::new(
+        LocalDb::open_migrated_for_test(home.join("runner.db"))
+            .await
+            .unwrap(),
+    );
+    local
+        .execute(
+            "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES('project-a','default','A','PA','/fixture',1,1)",
+            (),
+        )
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut physical = claim("running", "manual");
+    physical.consumer_ref = id.clone();
+    physical.recording_plans = vec![recording_plan(
+        "smoke",
+        "original-input",
+        "job-a",
+        &format!("manual-check:job-a:handle={id}:smoke"),
+    )];
+    claims::insert_grant(&local, &physical, &[waiter(&physical)])
+        .await
+        .unwrap();
+    local
+        .execute(
+            "INSERT INTO check_requests(id,project_id,suite,subject_job_id,consumer,requester_ref,requester_job_id,
+                priority,state,request_id,executor,accepted_at_ms,state_since_ms,updated_ms)
+             VALUES(?1,'project-a','smoke','job-a','requested','cairn://p/PA/1/1/builder','job-a',
+                'review_check','running',?2,?3,1,1,1)",
+            (id.clone(), REQUEST.to_string(), REMOTE.to_string()),
+        )
+        .await
+        .unwrap();
+    (boot(home, local).await, id)
+}
+
+async fn request_row(
+    orch: &Orchestrator,
+    id: &str,
+) -> crate::execution::checks::requests::CheckRequestRow {
+    crate::execution::checks::requests::load_request(&orch.db.local, "project-a", id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn until_settled(orch: &Orchestrator, id: &str) {
+    use crate::execution::checks::requests;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let mut settled = requests::subscribe_settlements();
+            if !request_row(orch, id).await.is_open() {
+                return;
+            }
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(200), settled.changed())
+                .await;
+        }
+    })
+    .await
+    .expect("the request settles");
+}
+
+/// A restart alone is not death evidence. A request whose granted lane has
+/// not been heard from since stays `running`, owned for adoption rather than
+/// cancelled, and says what it is waiting to learn.
+#[tokio::test]
+async fn a_granted_request_with_no_evidence_stays_running_and_says_what_it_waits_for() {
+    let home = tempfile::tempdir().unwrap();
+    let (orch, id) = requested_lane(home.path()).await;
+    assert_eq!(
+        orch.fleet
+            .adoption_owner(&(REQUEST.to_string(), ATTEMPT.to_string())),
+        Some(crate::fleet::AdoptionOwner::CheckRequest)
+    );
+    crate::execution::checks::requests::rearm_at_boot(&orch).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let row = request_row(&orch, &id).await;
+    assert_eq!(row.state, "running");
+    let waiting = row.waiting_to_learn.clone().unwrap();
+    assert!(waiting.contains(REMOTE), "{waiting}");
+    assert!(
+        waiting.contains("waiting for it to report the item or for its link to be superseded"),
+        "{waiting}"
+    );
+    assert_eq!(
+        crate::execution::checks::requests::standing(&row),
+        waiting,
+        "every surface says the same thing"
+    );
+    let claim = claims::lookup(&orch.db.local, REQUEST, ATTEMPT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        claim.state, "cancelled",
+        "a restart cancelled a requested lane"
+    );
+}
+
+/// A runner that shuts down while an adopted request's lane is still running
+/// leaves the request open and `running` for the next runner to adopt again.
+/// It is not settled, and its lane is not cancelled.
+#[tokio::test]
+async fn a_runner_shutting_down_leaves_an_adopted_request_running_for_the_next() {
+    use crate::execution::checks::requests;
+    let home = tempfile::tempdir().unwrap();
+    let (orch, id) = requested_lane(home.path()).await;
+    let _frames = orch.fleet.attach_unreported_machine_for_test(REMOTE);
+    requests::rearm_at_boot(&orch).await;
+    assert!(
+        requests::driving_for_test(&id),
+        "the request re-bound to its lane"
+    );
+    orch.fleet.begin_runner_shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while requests::driving_for_test(&id) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the driver returns when its runner shuts down");
+    let row = request_row(&orch, &id).await;
+    assert_eq!(row.state, "running", "{:?}", row.evidence);
+    assert!(
+        row.outcome_json.is_none(),
+        "a left-running lane was settled"
+    );
+    let waiting = row.waiting_to_learn.unwrap();
+    assert!(waiting.contains("left running on"), "{waiting}");
+    let claim = claims::lookup(&orch.db.local, REQUEST, ATTEMPT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(claim.state, "cancelled");
+}
+
+/// The machine's first report after the restart omits the item: that is
+/// death evidence, and the request settles `lost` naming the machine and its
+/// last sign of life. It is never a pass.
+#[tokio::test]
+async fn a_granted_request_whose_machine_reports_it_gone_settles_lost() {
+    let home = tempfile::tempdir().unwrap();
+    let (orch, id) = requested_lane(home.path()).await;
+    let _frames = orch.fleet.attach_unreported_machine_for_test(REMOTE);
+    crate::execution::checks::requests::rearm_at_boot(&orch).await;
+    orch.fleet
+        .apply_executor_snapshot(REMOTE, 1, Default::default(), Default::default());
+    until_settled(&orch, &id).await;
+    let row = request_row(&orch, &id).await;
+    assert_eq!(row.state, "lost");
+    let evidence = row.evidence.unwrap();
+    assert!(
+        evidence.contains(&format!("lost on {REMOTE}")),
+        "{evidence}"
+    );
+    assert!(evidence.contains("last sign of life"), "{evidence}");
+    assert!(evidence.contains("does not list"), "{evidence}");
+    let outcome: serde_json::Value = serde_json::from_str(&row.outcome_json.unwrap()).unwrap();
+    assert_eq!(outcome["state"], "lost");
+}
+
+/// The machine resends the result it retained across the restart: the request
+/// adopts it, records exactly one observation, and settles `recorded`.
+#[tokio::test]
+async fn a_granted_request_adopts_its_retained_result_and_records_once() {
+    let home = tempfile::tempdir().unwrap();
+    let (orch, id) = requested_lane(home.path()).await;
+    let mut frames = orch.fleet.attach_unreported_machine_for_test(REMOTE);
+    let retained = result(&orch);
+    orch.fleet.handle_executor_message(
+        REMOTE,
+        1,
+        ExecutorMessage::Result {
+            request_id: REQUEST.into(),
+            attempt_id: ATTEMPT.into(),
+            outcome: retained.outcome.clone(),
+        },
+    );
+    assert_eq!(adopt(&orch, retained).await, Adoption::HeldForCheckLane);
+    orch.fleet
+        .apply_executor_snapshot(REMOTE, 1, Default::default(), Default::default());
+    crate::execution::checks::requests::rearm_at_boot(&orch).await;
+    until_settled(&orch, &id).await;
+    let row = request_row(&orch, &id).await;
+    assert_eq!(row.state, "recorded", "{:?}", row.evidence);
+    let observations = orch
+        .db
+        .local
+        .query_opt(
+            "SELECT COUNT(*) FROM check_result_observations WHERE check_name='smoke'",
+            (),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observations, 1);
+    assert!(row.observation_id.is_some());
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        take_frames_contain_ack(&mut frames),
+        "the delivered request releases the retained result"
+    );
 }
 
 fn recording_plan(name: &str, input: &str, job: &str, stream: &str) -> serde_json::Value {
@@ -687,7 +917,9 @@ async fn a_manual_consumer_withdrawn_before_result_keeps_its_cancelled_receipt_w
 #[tokio::test]
 #[serial_test::serial(jj)]
 async fn cadence_adoption_delivered_receipt_retries_physical_commit_before_ack() {
-    shared_manual_grant(false, false, false, false, true).await;
+    // The request consumers are withdrawn, so the cadence is the lane's last
+    // live consumer and its delivery is the one that finalizes the lane.
+    shared_manual_grant(false, false, false, true, true).await;
 }
 
 /// A manual check grant for `second`, joined by that suite's main cadence,
@@ -759,7 +991,7 @@ async fn shared_manual_grant(
     let stream = format!("manual-check:run:handle={handle}:0");
     local
         .execute(
-            "INSERT INTO manual_check_handles(handle,project_id,created_at) VALUES(?1,'p',1)",
+            "INSERT INTO check_requests(id,project_id,accepted_at_ms,suite,consumer,requester_ref,priority,state,state_since_ms,updated_ms) VALUES(?1,'p',1,'second','requested','test','review_check','queued',1,1)",
             (handle.clone(),),
         )
         .await
@@ -961,14 +1193,20 @@ async fn shared_manual_grant(
         .expect("a detached manual consumer must commit cancellation before the result");
         // The caller has already received its cancellation response; replaying
         // the physical result must not overwrite that user-visible settlement.
-        local.execute(
-            "UPDATE manual_check_handles SET response_json=?2,commit_sha=?3,tree_hash=?4,input_hash=?5
-             WHERE handle=?1 AND observation_id IS NULL",
-            cairn_db::turso::params![
-                handle.clone(), r#"{"cancelled":true}"#.to_string(), commit.clone(),
-                contract.context.tree_hash.clone(), input.clone(),
-            ],
-        ).await.unwrap();
+        local
+            .execute(
+                "UPDATE check_requests SET outcome_json=?2,commit_sha=?3,tree_hash=?4,input_hash=?5
+             WHERE id=?1 AND observation_id IS NULL",
+                cairn_db::turso::params![
+                    handle.clone(),
+                    r#"{"cancelled":true}"#.to_string(),
+                    commit.clone(),
+                    contract.context.tree_hash.clone(),
+                    input.clone(),
+                ],
+            )
+            .await
+            .unwrap();
         let before_result = claims::waiters(&local, REQUEST, ATTEMPT).await.unwrap();
         let manuals = before_result
             .iter()
@@ -1176,7 +1414,7 @@ async fn shared_manual_grant(
                      AND state='cancelled' AND observation_id IS NOT NULL"
                 } else {
                     "SELECT COUNT(*) FROM check_lane_adoption_waiters WHERE consumer='manual'
-                     AND state='recorded_undelivered' AND observation_id IS NOT NULL"
+                     AND state='delivered' AND observation_id IS NOT NULL"
                 }).await?,
                 count("SELECT COUNT(*) FROM check_lane_adoption_waiters WHERE consumer='main_cadence'
                     AND state='delivered' AND observation_id IS NOT NULL").await?,
@@ -1187,7 +1425,7 @@ async fn shared_manual_grant(
         if cancelled_manual {
             crate::storage::run_db_blocking(|| async {
                 assert_eq!(probe_db.query_opt(
-                    "SELECT COUNT(*) FROM manual_check_handles WHERE project_id='p' AND response_json=?1",
+                    "SELECT COUNT(*) FROM check_requests WHERE project_id='p' AND outcome_json=?1",
                     (r#"{"cancelled":true}"#.to_string(),), |row| row.i64(0),
                 ).await.map_err(|e| e.to_string())?, Some(1),
                     "adoption must preserve the original manual cancellation response");
@@ -1217,6 +1455,10 @@ async fn shared_manual_grant(
         crate::execution::checks_main::adopt_check_batch(&driver_orch, &driver_claim, waiters)
             .await;
     });
+    let request_drivers = tokio::spawn(deliver_recorded_request_waiters(
+        restarted.clone(),
+        local.clone(),
+    ));
     if reject_finalization {
         let failure = tokio::time::timeout(std::time::Duration::from_secs(20), retries.recv())
             .await
@@ -1302,6 +1544,14 @@ async fn shared_manual_grant(
         .await
         .expect("the same physical grant finishes after observation storage recovers")
         .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while probes.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the lane is released once every request has its observation");
+    request_drivers.abort();
     assert_eq!(probes.load(Ordering::SeqCst), 1);
     if withdrawn_sibling {
         let withdrawn = claims::waiters(&local, REQUEST, ATTEMPT)

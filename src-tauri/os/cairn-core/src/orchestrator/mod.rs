@@ -3791,6 +3791,11 @@ impl Orchestrator {
         tokio::spawn(async move {
             crate::execution::checks_main::arm_at_boot(&orch).await;
         });
+        // Every open check request is re-driven or re-adopted beside it.
+        let orch = self.clone();
+        tokio::spawn(async move {
+            crate::execution::checks::requests::rearm_at_boot(&orch).await;
+        });
     }
 
     /// Settle the publications a restart interrupted, drive any still queued,

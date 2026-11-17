@@ -8,6 +8,7 @@ mod agents;
 pub mod browsers;
 mod camps;
 pub(crate) mod channels;
+mod check_requests;
 mod check_results;
 mod codemap;
 mod common;

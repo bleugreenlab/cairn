@@ -7290,6 +7290,7 @@ fn a_manual_requester_keeps_the_running_diagnostic_and_its_machine() {
                 Some("running on fedora since 09:48:09Z".into()),
             )
         },
+        Some("fleet-request".into()),
     );
     assert_eq!(
         update,
@@ -7298,11 +7299,14 @@ fn a_manual_requester_keeps_the_running_diagnostic_and_its_machine() {
             diagnostic: "running on fedora since 09:48:09Z".into(),
             executor: Some("fedora".into()),
             since_unix_ms: Some(PARKED_AT + 9_000),
+            request_id: Some("fleet-request".into()),
+            held_by: None,
         }
     );
     let parked = manual_progress_update(
         &[],
         check_phase_status(Some("queued"), Some("queued"), None),
+        None,
     );
     assert_eq!(parked.state, "parked");
     assert_eq!(parked.diagnostic, "parked waiting for check capacity");

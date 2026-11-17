@@ -74,6 +74,10 @@ pub(crate) struct CheckStatusBoard {
     /// Who hears this board's request, phases and output, when anyone does.
     /// See [`Self::observed`].
     pub(super) observer: Option<BatchObserver>,
+    /// The fleet request this board's batch was last submitted as, so a
+    /// status sink can name it (a check request records it to cancel or adopt
+    /// the physical lane).
+    pub(super) request: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl CheckStatusBoard {
@@ -100,6 +104,7 @@ impl CheckStatusBoard {
             notify,
             engine_owned: false,
             observer: None,
+            request: Arc::default(),
         }
     }
 
@@ -124,6 +129,7 @@ impl CheckStatusBoard {
             notify: Arc::new(move |_, phase| phases(BatchProgress::Phase(phase))),
             engine_owned: false,
             observer: Some(observer),
+            request: Arc::default(),
         }
     }
 
@@ -134,6 +140,7 @@ impl CheckStatusBoard {
     }
 
     pub(crate) fn note_request(&self, request_id: &str) {
+        *self.request.lock().unwrap() = Some(request_id.to_string());
         if let Some(observer) = &self.observer {
             observer(BatchProgress::Request(request_id.to_string()));
         }

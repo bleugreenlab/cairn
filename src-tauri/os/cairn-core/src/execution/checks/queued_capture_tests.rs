@@ -133,7 +133,7 @@ fn a_queued_manual_check_stays_on_its_capture_while_branch_base_and_contract_mov
             granted_tx.send(materialized).unwrap();
         });
 
-        let revision = classify_manual_check_revision(&orch, "run", FOREIGN)
+        let revision = classify_manual_check_revision(&orch, "job", FOREIGN)
             .await
             .unwrap();
         assert!(
@@ -144,13 +144,13 @@ fn a_queued_manual_check_stays_on_its_capture_while_branch_base_and_contract_mov
         let check = tokio::spawn(async move {
             run_manual_configured_check_with_progress(
                 &check_orch,
-                "run",
+                "job",
                 ManualCheckRequest {
                     check_name: "unit",
                     revision,
                     placement: None,
                     retry: false,
-                    manual_handle: None,
+                    check_request: None,
                 },
                 Arc::new(|_| {}),
             )

@@ -110,6 +110,7 @@ mod failure;
 mod manual;
 mod planning;
 mod render;
+pub(crate) mod requests;
 mod write_wave;
 
 #[cfg(test)]
@@ -151,15 +152,13 @@ pub(crate) use manual::{
     CheckRunTarget, ManualCheckError, ManualCheckRequest, ManualCheckRevision,
     NO_VERDICT_SUPPRESSED,
 };
-#[cfg(test)]
-pub(crate) use manual::{
-    manual_capture_evidence, AdoptedAttempt, BaseRelativeChange, NO_VERDICT_LEFT_RUNNING,
-};
 pub use manual::{
     manual_check_cache_context, CheckCapture, CheckMachine, ManualCheckCacheContext,
     ManualCheckNoVerdict, ManualCheckProgressUpdate, ManualConfiguredCheckResult,
 };
 use manual::{uncached_retry_command, UNCACHED_RETRY_PREFIX};
+#[cfg(test)]
+pub(crate) use manual::{AdoptedAttempt, BaseRelativeChange, NO_VERDICT_LEFT_RUNNING};
 #[cfg(test)]
 use planning::{
     attribute_capacity_wait, capacity_retry_decision, describe_capacity_waits,

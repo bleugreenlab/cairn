@@ -1363,6 +1363,7 @@ pub(crate) async fn produce_cairn_resource(
             | CairnResource::TaskArtifact { .. }
             | CairnResource::NodePage { .. }
             | CairnResource::ThreadService { .. }
+            | CairnResource::ProjectCheckRequest { .. }
     ) && find_query_value(&split.params, "format") == Some("json");
     // A raw artifact read returns the stored JSON and nothing else, so a caller
     // can parse the read result directly: guidance belongs in the Markdown
@@ -2558,6 +2559,12 @@ async fn render_resource_body(
                                 &executor.name,
                                 captured_at,
                             ));
+                            if let Some(pinned) =
+                                crate::resources::check_requests::pinned_section(orch, &executor.name)
+                                    .await
+                            {
+                                rendered.push_str(&pinned);
+                            }
                             rendered.push_str(&crate::execution::checks_main::render_machine_adoptions(orch, &executor.name));
                             rendered.push_str(&crate::execution::checks_main::render_machine_restart_streaks(
                                 orch,
@@ -2834,6 +2841,28 @@ async fn render_resource_body(
         }
         CairnResource::ProjectVcsBlame { project } => {
             super::vcs::read_vcs(orch, request, &project, super::vcs::VcsOp::Blame, &params).await
+        }
+        CairnResource::ProjectCheckRequest { project, id } => {
+            match params.iter().find(|param| param.key != "format") {
+                Some(param) => format!(
+                    "Unsupported query parameter for a check request: {}",
+                    param.key
+                ),
+                None => match find_query_value(&params, "format") {
+                    None | Some("json") => {
+                        crate::resources::check_requests::read_check_request(
+                            orch,
+                            &project,
+                            &id,
+                            find_query_value(&params, "format").is_some(),
+                        )
+                        .await
+                    }
+                    Some(other) => {
+                        format!("Unsupported check request format `{other}`: expected format=json")
+                    }
+                },
+            }
         }
         CairnResource::ProjectCheckObservation { project, handle } => {
             if let Some(error) = reject_query_params("check observation", &params) {

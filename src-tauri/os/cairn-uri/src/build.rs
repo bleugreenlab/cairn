@@ -61,6 +61,10 @@ pub fn build_project_check_observation_uri(project: &str, handle: &str) -> Strin
     format!("{}/check-observations/{handle}", build_project_uri(project))
 }
 
+pub fn build_project_check_request_uri(project: &str, id: &str) -> String {
+    format!("{}/check-requests/{id}", build_project_uri(project))
+}
+
 pub fn build_project_uri(project: &str) -> String {
     format!("cairn://{}/{}", PROJECT_SCOPE, canonical_project(project))
 }
@@ -1222,6 +1226,9 @@ impl CairnResource {
             Self::ProjectVcsBlame { project } => build_project_vcs_uri(project, "blame"),
             Self::ProjectCheckObservation { project, handle } => {
                 build_project_check_observation_uri(project, handle)
+            }
+            Self::ProjectCheckRequest { project, id } => {
+                build_project_check_request_uri(project, id)
             }
             Self::ProjectImages { project, scope } => build_project_images_uri(project, scope),
             Self::ProjectImage { project, reference } => {

@@ -265,6 +265,12 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 handle: (*handle).to_string(),
             })
         }
+        [PROJECT_SCOPE, project, "check-requests", id] if !id.is_empty() => {
+            Some(CairnResource::ProjectCheckRequest {
+                project: canonical_project(project),
+                id: (*id).to_string(),
+            })
+        }
         [PROJECT_SCOPE, project, "images", hash] if valid_content_hash(hash) => {
             Some(CairnResource::ProjectImage {
                 project: canonical_project(project),

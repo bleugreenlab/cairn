@@ -137,6 +137,11 @@ pub enum CairnResource {
         project: String,
         handle: String,
     },
+    /// One durable check request (`check_requests`), by its id.
+    ProjectCheckRequest {
+        project: String,
+        id: String,
+    },
     ProjectIssues {
         project: String,
     },
@@ -1289,6 +1294,7 @@ impl CairnResource {
             Self::ProjectVcsLog { .. } => ResourceKind::ProjectVcsLog,
             Self::ProjectVcsBlame { .. } => ResourceKind::ProjectVcsBlame,
             Self::ProjectCheckObservation { .. } => ResourceKind::ProjectCheckObservation,
+            Self::ProjectCheckRequest { .. } => ResourceKind::ProjectCheckRequest,
             Self::ProjectImage { .. } => ResourceKind::ProjectImage,
             Self::ProjectImages { .. } => ResourceKind::ProjectImages,
             Self::ProjectAttachment { .. } => ResourceKind::ProjectAttachment,

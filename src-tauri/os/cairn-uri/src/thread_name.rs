@@ -11,6 +11,7 @@ pub const RESERVED_PROJECT_SEGMENTS: &[&str] = &[
     "camps",
     "chat",
     "check-observations",
+    "check-requests",
     "check-results",
     "codemap",
     "comments",

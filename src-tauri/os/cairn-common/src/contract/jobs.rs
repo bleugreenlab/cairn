@@ -41,16 +41,49 @@ pub(crate) const JOB_TODOS_CONTRACT: ResourceContract =
         ],
     };
 
+/// Filing a check request: one suite (or several) on this node's head or a
+/// named revision. Shared by a node's, a task's and a thread's checks.
+const FILE_CHECK_REQUEST: MutationSpec = MutationSpec {
+    mode: ChangeMode::Append,
+    required: &[],
+    optional: &[
+        KeySpec::new("suite", KeyType::Str, "one configured suite"),
+        KeySpec::new("suites", KeyType::Array, "several configured suites, one request each"),
+        KeySpec::new(
+            "revision",
+            KeyType::Str,
+            "a branch name, commit id or node URI; omitted: this node's own head",
+        ),
+        KeySpec::new(
+            "executor",
+            KeyType::Object,
+            "{name} for one machine or {os} for a platform",
+        ),
+        KeySpec::new(
+            "selectorSource",
+            KeyType::Str,
+            "explicit (default) | inherited: who chose executor",
+        ),
+        KeySpec::new(
+            "retry",
+            KeyType::Bool,
+            "run afresh even when a reusable verdict is recorded",
+        ),
+    ],
+    label: "file a check request (nothing is placed for you but the check; wait with run waitFor on the request URI it returns)",
+    example: "write({changes:[{target:\"cairn:~/checks\",mode:\"append\",payload:{suite:\"rust-lint\",revision:\"main\"}}]})",
+};
+
 pub(crate) const NODE_CHECKS_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::NodeChecks,
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/checks",
         name: "Node checks",
-        description: "Turn-end project check results for a node job — running: live log tail; done: cached pass/fail verdicts (read-only)",
+        description: "Project check results for a node job — running: live log tail; done: cached pass/fail verdicts — and the check requests it filed (Requested). Append files a check request; wait for one with run waitFor kind:\"checks\" ref:<request URI>, or for all of this node's open requests with ref:\"cairn:~/checks/requests\" on:\"settled\"",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
-        mutations: NO_MUTATIONS,
+        mutations: &[FILE_CHECK_REQUEST],
     };
 
 pub(crate) const NODE_BATCHES_CONTRACT: ResourceContract = ResourceContract {
@@ -85,11 +118,11 @@ pub(crate) const TASK_CHECKS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::TaskChecks,
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/checks",
     name: "Task checks",
-    description: "Turn-end project check results for a sub-agent task job (read-only)",
+    description: "Project check results for a sub-agent task job, and the check requests it filed. Append files a check request",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: NO_MUTATIONS,
+    mutations: &[FILE_CHECK_REQUEST],
 };
 
 pub(crate) const NODE_WAKES_CONTRACT: ResourceContract =

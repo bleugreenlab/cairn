@@ -60,10 +60,15 @@ async fn assert_projection(
         )
     );
     for (handle, commit) in handles.iter().zip([a, b]) {
-        let attached = db.query_opt(
-            "SELECT observation_id,commit_sha,input_hash FROM manual_check_handles WHERE handle=?1",
-            (handle.clone(),), |row| Ok((row.text(0)?,row.text(1)?,row.text(2)?)),
-        ).await.unwrap().unwrap();
+        let attached = db
+            .query_opt(
+                "SELECT observation_id,commit_sha,input_hash FROM check_requests WHERE id=?1",
+                (handle.clone(),),
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             attached,
             (id.clone(), commit.into(), input.into()),
@@ -165,7 +170,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
         .collect::<Vec<_>>();
     for handle in &handles {
         db.execute(
-            "INSERT INTO manual_check_handles(handle,project_id,created_at) VALUES(?1,'p',1)",
+            "INSERT INTO check_requests(id,project_id,accepted_at_ms,suite,consumer,requester_ref,priority,state,state_since_ms,updated_ms) VALUES(?1,'p',1,'smoke','requested','test','review_check','queued',1,1)",
             (handle.clone(),),
         )
         .await
@@ -533,7 +538,23 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
         crate::execution::checks_main::adopt_check_batch(&restarted, &physical, waiters),
     )
     .await
-    .expect("fresh replay must finish observation and cadence delivery before acknowledgement");
+    .expect("fresh replay must finish observation and cadence delivery");
+    assert_eq!(
+        probe.load(Ordering::SeqCst),
+        0,
+        "the result stays retained until each check request has its observation"
+    );
+    // A reloaded request's driver delivers its own waiter; these rows have
+    // none, so they are delivered here exactly as `drive_adopted` does.
+    let identity = (REQUEST.to_string(), ATTEMPT.to_string());
+    let observation = format!("remote-check:{REQUEST}:{ATTEMPT}:smoke");
+    for handle in &handles {
+        restarted
+            .fleet
+            .deliver_check_consumer(&identity, "smoke", "manual", handle, &observation)
+            .await
+            .unwrap();
+    }
     assert_projection(&db, &a, &b, &tree_b, &input, &handles).await;
     assert_eq!(probe.load(Ordering::SeqCst), 1);
     assert_one_ack(&mut replay_frames);
@@ -560,7 +581,7 @@ fn install_ack_probe(
             let rows=claims::waiters(&db,REQUEST,ATTEMPT).await.map_err(|e|e.to_string())?;
             assert_eq!(rows.len(),if replayed {3} else {2});
             for row in rows {
-                assert_eq!(row.state,if (replayed && row.consumer != "main_cadence") || (aborted && row.consumer_ref == handles[1]) {"recorded_undelivered"} else {"delivered"},
+                assert_eq!(row.state,if aborted && row.consumer_ref == handles[1] {"recorded_undelivered"} else {"delivered"},
                     "every consumer must have a durable disposition at the instant ResultAck is sent");
                 assert_eq!(row.observation_id.as_deref(),
                     Some(format!("remote-check:{REQUEST}:{ATTEMPT}:smoke").as_str()));
