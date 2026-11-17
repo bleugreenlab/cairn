@@ -55,19 +55,18 @@ pub(crate) enum BatchProgress {
 pub(crate) type BatchObserver = Arc<dyn Fn(BatchProgress) + Send + Sync>;
 
 #[derive(Clone)]
-pub(super) struct CheckStatusGroup {
-    pub(super) indices: Vec<usize>,
-    pub(super) phase: CheckPhaseStatus,
-}
-
-#[derive(Clone)]
 pub(crate) struct CheckStatusBoard {
     pub(super) entries: Arc<std::sync::Mutex<Vec<CheckStatusEntry>>>,
+    /// The phase of a board whose lanes share one request: a lease, or a
+    /// one-item board.
     pub(super) phase: Arc<std::sync::Mutex<CheckPhaseStatus>>,
-    pub(super) groups: Arc<std::sync::Mutex<Vec<CheckStatusGroup>>>,
+    /// Each lane submitted as its own request, by plan index, with where that
+    /// request stands. Empty while every lane shares [`Self::phase`].
+    pub(super) lanes: Arc<std::sync::Mutex<BTreeMap<usize, CheckPhaseStatus>>>,
     pub(super) durability_errors:
         Arc<std::sync::Mutex<Vec<crate::execution::checks_turn_end::ReviewDurabilityError>>>,
-    pub(super) group: Option<usize>,
+    /// The lane this handle reports for, when it is one lane's request.
+    pub(super) lane: Option<usize>,
     pub(super) notify: CheckStatusNotify,
     /// Whether the check engine, not the executor's per-item report, owns
     /// this board's verdicts. See [`Self::for_review_wave`].
@@ -95,9 +94,9 @@ impl CheckStatusBoard {
                     .collect(),
             )),
             phase: Arc::new(std::sync::Mutex::new(CheckPhaseStatus::default())),
-            groups: Arc::new(std::sync::Mutex::new(Vec::new())),
+            lanes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             durability_errors: Arc::new(std::sync::Mutex::new(Vec::new())),
-            group: None,
+            lane: None,
             notify,
             engine_owned: false,
             observer: None,
@@ -119,9 +118,9 @@ impl CheckStatusBoard {
                 since_unix_ms: None,
             }])),
             phase: Arc::new(std::sync::Mutex::new(CheckPhaseStatus::default())),
-            groups: Arc::new(std::sync::Mutex::new(Vec::new())),
+            lanes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             durability_errors: Arc::new(std::sync::Mutex::new(Vec::new())),
-            group: None,
+            lane: None,
             notify: Arc::new(move |_, phase| phases(BatchProgress::Phase(phase))),
             engine_owned: false,
             observer: Some(observer),
@@ -149,8 +148,8 @@ impl CheckStatusBoard {
     /// The board a turn-end review wave publishes while it runs, indexed by
     /// plan position like the wave's stream ids.
     ///
-    /// Its verdicts belong to the check engine, which records each completed
-    /// placement group: an item the executor stopped (a silent tree, a
+    /// Its verdicts belong to the check engine, which records each lane as
+    /// its own request settles: an item the executor stopped (a silent tree, a
     /// cancel) is a non-verdict whatever its exit code says. So an executor's
     /// per-item completion marks a lane `finished`, an interim state annotated
     /// with its exit and duration, never `passed` or `failed`. `on_change` runs
@@ -198,47 +197,35 @@ impl CheckStatusBoard {
             .clone()
     }
 
-    /// Scope dispatch reports to original plan indices, sharing the root entries.
-    /// Members remain sequential within this group, independently of siblings.
-    pub(crate) fn for_group(&self, indices: &[usize]) -> Self {
-        let mut groups = self.groups.lock().unwrap();
-        let group = groups
-            .iter()
-            .position(|group| group.indices == indices)
-            .unwrap_or_else(|| {
-                groups.push(CheckStatusGroup {
-                    indices: indices.to_vec(),
-                    phase: CheckPhaseStatus::default(),
-                });
-                groups.len() - 1
-            });
+    /// The handle one lane's own request reports through: its dispatch phases
+    /// are that lane's alone, while entries stay shared with the whole board.
+    pub(crate) fn for_lane(&self, index: usize) -> Self {
+        self.lanes.lock().unwrap().entry(index).or_default();
         Self {
-            group: Some(group),
+            lane: Some(index),
             ..self.clone()
         }
     }
 
-    /// The lane's placement-group entries, never a sibling group's runner.
+    /// The entries that share the lane's request: the lane alone when it is
+    /// its own request, else every lane that is not.
     pub(crate) fn lane_snapshot(&self, name: &str) -> Vec<CheckStatusEntry> {
         let entries = self.snapshot();
         let Some(entry) = entries.iter().find(|entry| entry.name == name) else {
             return Vec::new();
         };
-        let groups = self.groups.lock().unwrap();
-        match groups
-            .iter()
-            .find(|group| group.indices.contains(&entry.index))
-        {
-            Some(group) => entries
-                .iter()
-                .filter(|entry| group.indices.contains(&entry.index))
-                .cloned()
-                .collect(),
-            None if groups.is_empty() => entries,
-            None => vec![entry.clone()],
+        let lanes = self.lanes.lock().unwrap();
+        if lanes.contains_key(&entry.index) {
+            vec![entry.clone()]
+        } else {
+            entries
+                .into_iter()
+                .filter(|entry| !lanes.contains_key(&entry.index))
+                .collect()
         }
     }
 
+    /// Where the lane's request stands.
     pub(crate) fn lane_phase(&self, name: &str) -> CheckPhaseStatus {
         let index = self
             .entries
@@ -247,34 +234,35 @@ impl CheckStatusBoard {
             .iter()
             .find(|entry| entry.name == name)
             .map(|entry| entry.index);
-        let groups = self.groups.lock().unwrap();
-        groups
-            .iter()
-            .find(|group| index.is_some_and(|index| group.indices.contains(&index)))
-            .map(|group| group.phase.clone())
-            .unwrap_or_else(|| {
-                if groups.is_empty() {
-                    self.phase.lock().unwrap().clone()
-                } else {
-                    CheckPhaseStatus::default()
-                }
-            })
+        let lanes = self.lanes.lock().unwrap();
+        index
+            .and_then(|index| lanes.get(&index).cloned())
+            .unwrap_or_else(|| self.phase.lock().unwrap().clone())
     }
 
-    /// A root board names a machine only when every group has the same claim.
+    /// The machine this handle's request runs on. A whole board of separate
+    /// requests names one only when every request has the same claim.
     pub(crate) fn executor(&self) -> Option<String> {
-        let groups = self.groups.lock().unwrap();
-        if let Some(group) = self.group {
-            return groups[group].phase.executor.clone();
+        let lanes = self.lanes.lock().unwrap();
+        if let Some(lane) = self.lane {
+            return lanes.get(&lane).and_then(|phase| phase.executor.clone());
         }
-        let Some(first) = groups.first() else {
+        let Some(first) = lanes.values().next() else {
             return self.phase.lock().unwrap().executor.clone();
         };
-        let executor = first.phase.executor.clone()?;
-        groups
-            .iter()
-            .all(|group| group.phase.executor.as_ref() == Some(&executor))
+        let executor = first.executor.clone()?;
+        lanes
+            .values()
+            .all(|phase| phase.executor.as_ref() == Some(&executor))
             .then_some(executor)
+    }
+
+    /// The lane `update` applies to: this handle's own, else the lane `index`
+    /// names when it is its own request.
+    fn phase_lane(&self, index: Option<usize>) -> Option<usize> {
+        let lanes = self.lanes.lock().unwrap();
+        self.lane
+            .or_else(|| index.filter(|index| lanes.contains_key(index)))
     }
 
     pub(super) fn update_phase(
@@ -282,40 +270,38 @@ impl CheckStatusBoard {
         index: Option<usize>,
         update: impl FnOnce(&mut CheckPhaseStatus),
     ) {
-        let mut groups = self.groups.lock().unwrap();
-        let group = self.group.or_else(|| {
-            index.and_then(|index| {
-                groups
-                    .iter()
-                    .position(|group| group.indices.contains(&index))
-            })
-        });
-        if let Some(group) = group {
-            update(&mut groups[group].phase);
-        } else {
-            update(&mut self.phase.lock().unwrap());
+        match self.phase_lane(index) {
+            Some(lane) => update(self.lanes.lock().unwrap().entry(lane).or_default()),
+            None => update(&mut self.phase.lock().unwrap()),
         }
     }
 
-    pub(super) fn group_is_recorded(&self, index: usize) -> bool {
-        let entries = self.entries.lock().unwrap();
-        let groups = self.groups.lock().unwrap();
-        let group = self
-            .group
-            .map(|group| &groups[group])
-            .or_else(|| groups.iter().find(|group| group.indices.contains(&index)));
-        entries
+    /// Whether every lane sharing `index`'s request holds a recorded state.
+    pub(super) fn request_is_recorded(&self, index: usize) -> bool {
+        let lane = self.phase_lane(Some(index));
+        let lanes = self.lanes.lock().unwrap();
+        self.entries
+            .lock()
+            .unwrap()
             .iter()
-            .filter(|entry| group.is_none_or(|group| group.indices.contains(&entry.index)))
+            .filter(|entry| match lane {
+                Some(lane) => lane == entry.index,
+                None => !lanes.contains_key(&entry.index),
+            })
             .all(|entry| matches!(entry.state.as_str(), "passed" | "failed" | "unverified"))
     }
 
     pub(super) fn emit(&self) {
         let entries = self.entries.lock().unwrap().clone();
-        let phase = if let Some(group) = self.group {
-            self.groups.lock().unwrap()[group].phase.clone()
-        } else {
-            self.phase.lock().unwrap().clone()
+        let phase = match self.lane {
+            Some(lane) => self
+                .lanes
+                .lock()
+                .unwrap()
+                .get(&lane)
+                .cloned()
+                .unwrap_or_default(),
+            None => self.phase.lock().unwrap().clone(),
         };
         (self.notify)(entries, phase);
     }
@@ -364,7 +350,7 @@ impl CheckStatusBoard {
                     phase.held_by = None;
                 }
             });
-        } else if self.group_is_recorded(index) {
+        } else if self.request_is_recorded(index) {
             self.update_phase(Some(index), |phase| *phase = CheckPhaseStatus::default());
         }
         self.emit();

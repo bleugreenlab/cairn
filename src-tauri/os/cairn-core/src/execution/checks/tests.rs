@@ -339,168 +339,6 @@ fn only_pure_verdict_check_batches_are_free_to_move() {
     );
 }
 
-/// The selector partition runs before dispatch, so a group that named two
-/// contradictory machines is refused as the configuration error it is rather
-/// than becoming a placement problem.
-#[test]
-fn only_a_pure_verdict_batch_partitions_by_placement() {
-    assert!(partitions_by_placement(&MutationPolicy::PureVerdict));
-    assert!(!partitions_by_placement(&MutationPolicy::AllowDelta));
-}
-
-fn completed_placement_group(index: usize) -> PlannedCheckBatchOutcome {
-    PlannedCheckBatchOutcome {
-        results: HashMap::from([(
-            index,
-            exec_ok(Some(0), format!("group {index}")).map_err(CheckExecutionFailure::from),
-        )]),
-        request: None,
-        delta: None,
-        store_dir: None,
-    }
-}
-
-#[tokio::test]
-async fn a_held_placement_group_does_not_delay_its_siblings_completion() {
-    let (release, held) = tokio::sync::oneshot::channel();
-    let (completed, mut received) = tokio::sync::mpsc::unbounded_channel();
-    let groups = [(0, Some(held)), (1, None)]
-        .into_iter()
-        .map(|(index, held)| {
-            let completed = completed.clone();
-            async move {
-                if let Some(held) = held {
-                    held.await.unwrap();
-                }
-                let outcome = completed_placement_group(index);
-                completed.send(index).unwrap();
-                outcome
-            }
-        });
-    let wave = collect_placement_group_results(groups);
-    tokio::pin!(wave);
-    tokio::select! {
-        biased;
-        _ = &mut wave => panic!("the first group must still be held"),
-        completed = received.recv() => assert_eq!(completed, Some(1)),
-    }
-    release.send(()).unwrap();
-    let results = wave.await;
-    assert!(results[&0].is_ok());
-    assert!(results[&1].is_ok());
-}
-
-#[tokio::test]
-async fn a_placement_group_error_preserves_other_results_and_its_own_reason() {
-    let results = collect_placement_group_results([
-        std::future::ready(placement_group_outcome(
-            &[0, 2],
-            Err("group-specific configuration fault".into()),
-        )),
-        std::future::ready(completed_placement_group(1)),
-    ])
-    .await;
-    assert!(results[&1].is_ok());
-    for index in [0, 2] {
-        let Err(CheckExecutionFailure::Substrate(failure)) = &results[&index] else {
-            panic!("a submission fault is not a command verdict");
-        };
-        assert_eq!(failure.shape(), SubstrateFailureShape::Dispatch);
-        assert_eq!(failure.diagnostic(), "group-specific configuration fault");
-    }
-}
-
-#[tokio::test]
-async fn placement_capacity_retry_never_resubmits_or_rerecords_a_completed_sibling() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let attempts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
-    let recorded = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
-    let (completed, mut received) = tokio::sync::mpsc::unbounded_channel();
-    let complete: CheckGroupCompletion = {
-        let recorded = recorded.clone();
-        Arc::new(move |results| {
-            for (&index, result) in results {
-                assert!(result.is_ok(), "a capacity refusal is not a final result");
-                recorded[index].fetch_add(1, Ordering::SeqCst);
-                completed.send(index).unwrap();
-            }
-            Box::pin(std::future::ready(CheckGroupUnrecorded::new()))
-        })
-    };
-    let groups = (0..2).map(|index| {
-        let attempts = attempts.clone();
-        let complete = complete.clone();
-        async move {
-            submit_placement_group_until_final(&[index], Some(&complete), || {
-                let attempt = attempts[index].fetch_add(1, Ordering::SeqCst);
-                let outcome = if index == 0 && attempt == 0 {
-                    PlannedCheckBatchOutcome::failed(
-                        vec![index],
-                        SubstrateFailure::new(
-                            SubstrateFailureShape::Capacity,
-                            "provisioning a cell",
-                        ),
-                    )
-                } else {
-                    completed_placement_group(index)
-                };
-                std::future::ready((
-                    GroupWait {
-                        description: "the group's own capacity hold".into(),
-                        relief_ms: None,
-                        unforecastable: false,
-                    },
-                    Ok(outcome),
-                ))
-            })
-            .await
-        }
-    });
-    let wave = collect_placement_group_results(groups);
-    tokio::pin!(wave);
-    tokio::select! {
-        biased;
-        _ = &mut wave => panic!("group zero must still be waiting to retry"),
-        completed = received.recv() => assert_eq!(completed, Some(1)),
-    }
-    assert_eq!(attempts[0].load(Ordering::SeqCst), 1);
-    let results = wave.await;
-    assert!(results.values().all(Result::is_ok));
-    assert_eq!(attempts[0].load(Ordering::SeqCst), 2);
-    assert_eq!(attempts[1].load(Ordering::SeqCst), 1);
-    assert_eq!(recorded[0].load(Ordering::SeqCst), 1);
-    assert_eq!(recorded[1].load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn cancelling_a_placement_wave_drops_every_pending_group() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    struct Interest(Arc<AtomicUsize>);
-    impl Drop for Interest {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-    let active = Arc::new(AtomicUsize::new(0));
-    let groups = (0..3).map(|_| {
-        let active = active.clone();
-        async move {
-            active.fetch_add(1, Ordering::SeqCst);
-            let _interest = Interest(active);
-            std::future::pending::<PlannedCheckBatchOutcome>().await
-        }
-    });
-    let mut wave = Box::pin(collect_placement_group_results(groups));
-    std::future::poll_fn(|cx| {
-        assert!(std::future::Future::poll(wave.as_mut(), cx).is_pending());
-        std::task::Poll::Ready(())
-    })
-    .await;
-    assert_eq!(active.load(Ordering::SeqCst), 3);
-    drop(wave);
-    assert_eq!(active.load(Ordering::SeqCst), 0);
-}
-
 #[test]
 fn platform_scoped_checks_are_not_members_of_an_other_platform_batch() {
     let checks = HashMap::from([
@@ -1306,22 +1144,20 @@ async fn the_write_wave_board_feeds_its_dispatch_to_the_inline_wait() {
     );
 }
 
+/// Each review lane is its own request, so its own claim and its own
+/// recording never touch a sibling's, and a lane still waiting is never read
+/// as queued behind a sibling that runs elsewhere.
 #[test]
-fn group_status_board_keeps_concurrent_runners_and_blockers_local() {
+fn lane_status_board_keeps_each_requests_runner_and_recording_its_own() {
     use crate::execution::checks_status::{grouped_lane_progress, LaneProgress};
-    let plans = [
-        "linux-run",
-        "mac-run",
-        "linux-next",
-        "mac-next",
-        "unscheduled",
-    ]
-    .into_iter()
-    .map(|name| (plan(name, "true"), "input".into()))
-    .collect::<Vec<_>>();
+    let plans = ["linux-run", "mac-run", "waiting"]
+        .into_iter()
+        .map(|name| (plan(name, "true"), "input".into()))
+        .collect::<Vec<_>>();
     let board = CheckStatusBoard::for_review_wave(&plans, || {});
-    let linux = board.for_group(&[0, 2]);
-    let mac = board.for_group(&[1, 3]);
+    let linux = board.for_lane(0);
+    let mac = board.for_lane(1);
+    board.for_lane(2);
     linux.show_phase(CheckPhaseStatus {
         phase: Some("running".into()),
         executor: Some("linux-box".into()),
@@ -1337,53 +1173,19 @@ fn group_status_board_keeps_concurrent_runners_and_blockers_local() {
     linux.transition(0, "running", None);
     mac.transition(1, "running", None);
     assert_eq!(
-        board
-            .snapshot()
-            .iter()
-            .filter(|entry| entry.state == "running")
-            .count(),
-        2
+        grouped_lane_progress(&board, "waiting", None),
+        Some(LaneProgress::Queued { behind: None }),
+        "a lane of its own is never queued behind a sibling"
     );
-    for (name, behind, machine) in [
-        ("linux-next", "linux-run", "linux-box"),
-        ("mac-next", "mac-run", "mac-box"),
-    ] {
-        assert_eq!(
-            grouped_lane_progress(&board, name, None),
-            Some(LaneProgress::Queued {
-                behind: Some(behind.into())
-            })
-        );
-        assert_eq!(board.lane_phase(name).executor.as_deref(), Some(machine));
-    }
-    assert_eq!(
-        grouped_lane_progress(&board, "unscheduled", None),
-        Some(LaneProgress::Queued { behind: None })
-    );
-    assert_eq!(board.executor(), None);
+    assert_eq!(board.executor(), None, "two requests on two machines");
+    assert_eq!(linux.executor().as_deref(), Some("linux-box"));
     let since = board.snapshot()[0].since_unix_ms;
     linux.transition(0, "running", None);
     assert_eq!(board.snapshot()[0].since_unix_ms, since);
     assert_eq!(board.lane_phase("linux-run").since_unix_ms, Some(100));
 
-    linux.transition(
-        0,
-        "finished",
-        Some("finished in 2s (exit 0); awaiting recording".into()),
-    );
-    assert_eq!(board.snapshot()[0].state, "finished");
-    assert!(grouped_lane_progress(&board, "linux-run", None)
-        .unwrap()
-        .describe(300)
-        .contains("awaiting recording"));
-    // Recording one group neither finishes nor changes a sibling's claim.
+    // Recording one lane ends its own request's phase and no sibling's.
     board.transition(0, "passed", None);
-    assert_eq!(board.snapshot()[0].state, "passed");
-    assert_eq!(
-        board.lane_phase("linux-run").executor.as_deref(),
-        Some("linux-box")
-    );
-    board.transition(2, "unverified", None);
     assert_eq!(board.lane_phase("linux-run"), CheckPhaseStatus::default());
     assert_eq!(board.snapshot()[1].state, "running");
     assert_eq!(
@@ -1392,16 +1194,18 @@ fn group_status_board_keeps_concurrent_runners_and_blockers_local() {
     );
 }
 
+/// A review lane whose request is still queued renders queued with its own
+/// hold cause, never `running` because a sibling's request is.
 #[test]
-fn group_status_board_projects_a_held_groups_own_dispatch_phase() {
+fn a_queued_lane_renders_its_own_requests_hold_cause() {
     use crate::execution::checks_status::{grouped_lane_progress, LaneProgress};
     let plans = ["busy", "held"]
         .into_iter()
         .map(|name| (plan(name, "true"), "input".into()))
         .collect::<Vec<_>>();
     let board = CheckStatusBoard::for_review_wave(&plans, || {});
-    let busy = board.for_group(&[0]);
-    let held = board.for_group(&[1]);
+    let busy = board.for_lane(0);
+    let held = board.for_lane(1);
     busy.show_phase(CheckPhaseStatus {
         phase: Some("running".into()),
         executor: Some("busy-box".into()),
@@ -1434,92 +1238,6 @@ fn group_status_board_projects_a_held_groups_own_dispatch_phase() {
     assert_eq!(json["phase"], "dispatching");
     assert_eq!(json["dispatchPhase"], "queued");
     assert_eq!(json["sinceUnixMs"], 7);
-}
-
-/// cairn/5893. A member whose delivery lands as an executed verdict reaches
-/// its batch's completion at once, under its plan index; a member the wave
-/// could not judge yet waits for its group, as does everything once the runner
-/// is stopping. The group's final call then hands over only what is new.
-#[tokio::test]
-async fn a_landed_member_reaches_its_completion_at_once_and_only_once() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<(usize, bool)>>::new()));
-    let seen = calls.clone();
-    let inner: CheckGroupCompletion = Arc::new(move |results: &CheckGroupResults| {
-        let mut members: Vec<_> = results
-            .iter()
-            .map(|(index, result)| (*index, result.is_ok()))
-            .collect();
-        members.sort_unstable();
-        seen.lock().unwrap().push(members);
-        Box::pin(async { CheckGroupUnrecorded::new() })
-    });
-    let complete = complete_each_member_once(inner);
-    let stopping = Arc::new(AtomicBool::new(false));
-    let stop = stopping.clone();
-    let sink = complete_members_as_they_land(
-        complete.clone(),
-        vec![4, 7, 9],
-        move || stop.load(Ordering::SeqCst),
-        std::time::Instant::now(),
-    );
-    let identity = ("wave".to_string(), "attempt".to_string());
-    let delivered = |exit: i32| -> crate::fleet::CoalescedDelivery {
-        Ok(crate::fleet::CoalescedCellOutcome {
-            outcome: CellOutcome::Completed {
-                request_id: identity.0.clone(),
-                attempt_id: identity.1.clone(),
-                exit_code: Some(exit),
-                output: "output".into(),
-                timed_out: false,
-                metadata: serde_json::from_value(serde_json::json!({
-                    "slotId": "cell",
-                    "cellEpoch": 1,
-                    "startedAtUnixMs": 1,
-                    "finishedAtUnixMs": 2
-                }))
-                .unwrap(),
-                mutation_delta: None,
-                sandbox_denials: Vec::new(),
-                tracked_modifications: None,
-                node_scratch: None,
-            },
-            publication: crate::fleet::PublicationCoordination::for_request(identity.clone()),
-            account: crate::fleet::CellAccount::default(),
-        })
-    };
-
-    sink(0, &delivered(0)).await;
-    assert_eq!(*calls.lock().unwrap(), [vec![(4, true)]]);
-    sink(1, &Err(crate::fleet::CoalescedWaitError::LeaderVanished)).await;
-    stopping.store(true, Ordering::SeqCst);
-    sink(2, &delivered(1)).await;
-    assert_eq!(
-        calls.lock().unwrap().len(),
-        1,
-        "a member with no verdict yet, or one landing as the runner stops, waits for its group"
-    );
-
-    let result = || {
-        Ok(crate::mcp::handlers::run::CheckExecResult {
-            exit_code: Some(0),
-            output: "output".into(),
-            timed_out: false,
-            duration_ms: Some(1),
-            provenance: None,
-            publication: None,
-        })
-    };
-    complete(&HashMap::from([
-        (4, result()),
-        (7, Err(CheckExecutionFailure::Process("vanished".into()))),
-        (9, result()),
-    ]))
-    .await;
-    assert_eq!(
-        *calls.lock().unwrap(),
-        [vec![(4, true)], vec![(7, false), (9, true)]]
-    );
 }
 
 /// cairn/5893. A member its completion reports unrecorded is not answered:
@@ -1651,7 +1369,6 @@ async fn a_runner_lane_marks_its_wave_admitted_as_it_starts() {
         status_board: Some(board),
         on_group_complete: None,
         purpose: None,
-        cell_groups: Default::default(),
         publication: None,
     };
 
@@ -13610,59 +13327,6 @@ fn review_batch_selectors_union_toolchains_and_reject_scalar_conflicts() {
     assert!(mixed.contains("conflicting executor selectors"), "{mixed}");
 }
 
-/// The cross-pattern. Two checks in one wave, each suppressed on a
-/// DIFFERENT machine: there is no single placement that satisfies both, so
-/// the wave splits and each half goes where it is clear. Merging them into
-/// an avoid-union would strand both.
-#[test]
-fn disjoint_environment_suppressions_split_a_batch() {
-    let item = |index: usize, avoid: &str| PlannedCheckBatchItem {
-        recording_plan: None,
-        index,
-        name: format!("check-{index}"),
-        input_hash: format!("hash-{index}"),
-        resource_identity: CheckResourceIdentityInput::Checkpoint {
-            name: format!("resource-{index}"),
-            command: format!("resource-{index}"),
-        },
-        command: "true".into(),
-        stream_id: format!("stream-{index}"),
-        env: Vec::new(),
-        timeout_ms: 1,
-        executor: None,
-        verdict_platforms: Vec::new(),
-        resource_class: CheckResourceClass::Shared,
-        verdict_environment_names: Vec::new(),
-        infra_scopes: InfraScopes {
-            head: "head".into(),
-            platform_heads: Vec::new(),
-            fleet: None,
-            environments: vec![
-                ("machine-a".into(), "env-a".into()),
-                ("machine-b".into(), "env-b".into()),
-            ],
-            fleet_blind: Vec::new(),
-            lane_breaker: false,
-        },
-        avoid_executor_ids: vec![avoid.to_string()],
-    };
-
-    let groups =
-        partition_check_items_by_placement(vec![item(0, "machine-a"), item(1, "machine-b")]);
-    assert_eq!(
-        groups.len(),
-        2,
-        "checks that disagree about where they may NOT go cannot share one cell"
-    );
-    assert_eq!(groups[0].0.avoid, vec!["machine-a".to_string()]);
-    assert_eq!(groups[1].0.avoid, vec!["machine-b".to_string()]);
-
-    // And each half still has somewhere to go.
-    for (_, items) in &groups {
-        assert!(merge_batch_avoid(items).unwrap().len() < 2);
-    }
-}
-
 /// A batch that cannot split and has no machine clear for all of it refuses
 /// rather than placing an item on a bounded environment. Suppression that a
 /// later placement can override is advisory, and this one may not be.
@@ -13722,459 +13386,6 @@ fn a_batch_with_no_common_machine_refuses_rather_than_placing() {
     assert_eq!(
         merge_batch_avoid(&[wide, other]).unwrap(),
         vec!["machine-a".to_string(), "machine-b".to_string()]
-    );
-}
-
-/// The normal case costs nothing. With no avoid sets anywhere, grouping is
-/// byte-identical to what it was before avoidance existed.
-#[test]
-fn an_empty_avoid_set_partitions_exactly_as_before() {
-    let item = |index: usize| PlannedCheckBatchItem {
-        recording_plan: None,
-        index,
-        name: format!("check-{index}"),
-        input_hash: format!("hash-{index}"),
-        resource_identity: CheckResourceIdentityInput::Checkpoint {
-            name: format!("resource-{index}"),
-            command: format!("resource-{index}"),
-        },
-        command: "true".into(),
-        stream_id: format!("stream-{index}"),
-        env: Vec::new(),
-        timeout_ms: 1,
-        executor: None,
-        verdict_platforms: Vec::new(),
-        resource_class: CheckResourceClass::Shared,
-        verdict_environment_names: Vec::new(),
-        infra_scopes: InfraScopes::head_only("job", "commit"),
-        avoid_executor_ids: Vec::new(),
-    };
-    let groups = partition_check_items_by_placement(vec![item(0), item(1), item(2)]);
-    assert_eq!(groups.len(), 1, "one placement, one cell, no fan-out");
-    assert!(merge_batch_avoid(&groups[0].1).unwrap().is_empty());
-}
-
-fn grouped_item(
-    index: usize,
-    name: &str,
-    executor: Option<ExecutorSelector>,
-    verdict_platforms: &[&str],
-) -> PlannedCheckBatchItem {
-    PlannedCheckBatchItem {
-        recording_plan: None,
-        index,
-        name: name.into(),
-        input_hash: format!("hash-{index}"),
-        resource_identity: CheckResourceIdentityInput::Checkpoint {
-            name: name.into(),
-            command: name.into(),
-        },
-        command: "true".into(),
-        stream_id: format!("stream-{index}"),
-        env: Vec::new(),
-        timeout_ms: 1,
-        executor,
-        verdict_platforms: verdict_platforms.iter().map(|p| p.to_string()).collect(),
-        resource_class: CheckResourceClass::Shared,
-        verdict_environment_names: Vec::new(),
-        infra_scopes: InfraScopes::head_only("job", "commit"),
-        avoid_executor_ids: Vec::new(),
-    }
-}
-
-fn rust_toolchains(nested_sandbox: bool) -> Option<ExecutorSelector> {
-    Some(ExecutorSelector {
-        required_toolchains: vec!["bun".into(), "rust".into()],
-        requires_macos_nested_sandbox_write: nested_sandbox,
-        ..Default::default()
-    })
-}
-
-fn rust_cell_group() -> BTreeMap<String, Vec<String>> {
-    BTreeMap::from([(
-        "rust".to_string(),
-        vec![
-            "rust-lint".to_string(),
-            "rust-tests".to_string(),
-            "source-scans".to_string(),
-        ],
-    )])
-}
-
-/// The review wave's Rust lanes share one cell, in the group's declared
-/// order whatever order the wave planned them in, on the intersection of
-/// their platforms. rust-tests' nested-sandbox requirement means something
-/// only on macOS, so the Linux group does not carry it (execution's
-/// condition E1 on cairn/6771). The TS lane keeps its own cell.
-#[test]
-fn a_cell_group_is_one_batch_in_declared_order_on_the_shared_platform() {
-    let (groups, fallbacks) = partition_check_items_with_cell_groups(
-        vec![
-            grouped_item(0, "source-scans", rust_toolchains(false), &["linux"]),
-            grouped_item(1, "typecheck", None, &[]),
-            grouped_item(2, "rust-tests", rust_toolchains(true), &["linux", "macos"]),
-            grouped_item(3, "rust-lint", rust_toolchains(false), &["linux", "macos"]),
-        ],
-        &rust_cell_group(),
-        &|_, _| None,
-    );
-    assert!(fallbacks.is_empty(), "{fallbacks:?}");
-    assert_eq!(groups.len(), 2, "one Rust cell and one TS cell");
-    let (placement, members) = &groups[0];
-    assert_eq!(placement.cell_group.as_deref(), Some("rust"));
-    assert_eq!(
-        members
-            .iter()
-            .map(|item| item.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["rust-lint", "rust-tests", "source-scans"],
-        "rust-lint runs first, so a compile error is the fastest red"
-    );
-    assert_eq!(placement.verdict_platforms, vec!["linux".to_string()]);
-    let selector = placement.executor.as_ref().unwrap();
-    assert!(!selector.requires_macos_nested_sandbox_write);
-    assert_eq!(selector.required_toolchains, vec!["bun", "rust"]);
-    // The submission computes the same placement from the same items.
-    let (executor, platforms) = merge_batch_selector(members).unwrap();
-    assert_eq!(executor.as_ref(), Some(selector));
-    assert_eq!(platforms, placement.verdict_platforms);
-    assert_eq!(groups[1].0.cell_group, None);
-    assert_eq!(groups[1].1[0].name, "typecheck");
-
-    // A lone rust-tests keeps its requirement: it may land on macOS.
-    let (alone, _) = merge_batch_selector(&[grouped_item(
-        0,
-        "rust-tests",
-        rust_toolchains(true),
-        &["linux", "macos"],
-    )])
-    .unwrap();
-    assert!(alone.unwrap().requires_macos_nested_sandbox_write);
-}
-
-#[test]
-fn a_member_the_group_cannot_place_is_placed_alone_and_reported() {
-    let pinned = Some(ExecutorSelector {
-        name: Some("bgsrv-mac".into()),
-        ..Default::default()
-    });
-    let named = Some(ExecutorSelector {
-        name: Some("bginf-sp1".into()),
-        ..Default::default()
-    });
-    let (groups, fallbacks) = partition_check_items_with_cell_groups(
-        vec![
-            grouped_item(0, "rust-lint", named.clone(), &["linux"]),
-            grouped_item(1, "rust-tests", named, &["linux"]),
-            grouped_item(2, "source-scans", pinned, &["linux"]),
-        ],
-        &rust_cell_group(),
-        &|_, _| None,
-    );
-    assert_eq!(fallbacks.len(), 1);
-    assert_eq!(
-        (fallbacks[0].name.as_str(), fallbacks[0].group.as_str()),
-        ("source-scans", "rust")
-    );
-    assert!(
-        fallbacks[0].reason.contains("conflicting"),
-        "{:?}",
-        fallbacks[0]
-    );
-    assert_eq!(groups.len(), 2);
-    assert_eq!(
-        groups[0].1.len(),
-        2,
-        "the members that agree still share a cell"
-    );
-    assert_eq!(groups[1].1[0].name, "source-scans");
-
-    // A group reduced to one member is no group at all.
-    let (groups, _) = partition_check_items_with_cell_groups(
-        vec![grouped_item(
-            0,
-            "rust-lint",
-            rust_toolchains(false),
-            &["linux"],
-        )],
-        &rust_cell_group(),
-        &|_, _| None,
-    );
-    assert_eq!(groups[0].0.cell_group, None);
-}
-
-/// Two merges that each succeed can still contradict each other: a member
-/// asking for macOS and one counting only Linux merge into a selector that
-/// no trusted machine satisfies. That member is placed alone, where it
-/// runs, rather than taking the group down with it.
-#[test]
-fn a_member_whose_selector_contradicts_the_groups_platforms_is_placed_alone() {
-    let on_mac = Some(ExecutorSelector {
-        os: Some("macos".into()),
-        required_toolchains: vec!["rust".into()],
-        ..Default::default()
-    });
-    let (groups, fallbacks) = partition_check_items_with_cell_groups(
-        vec![
-            grouped_item(0, "rust-lint", rust_toolchains(false), &["linux"]),
-            grouped_item(1, "rust-tests", on_mac, &["linux", "macos"]),
-            grouped_item(2, "source-scans", rust_toolchains(false), &["linux"]),
-        ],
-        &rust_cell_group(),
-        &|_, _| None,
-    );
-    assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
-    assert_eq!(fallbacks[0].name, "rust-tests");
-    assert!(
-        fallbacks[0]
-            .reason
-            .contains("ask for macos but counts verdicts only on linux"),
-        "{:?}",
-        fallbacks[0]
-    );
-    assert_eq!(
-        groups[0]
-            .1
-            .iter()
-            .map(|item| item.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["rust-lint", "source-scans"]
-    );
-    assert_eq!(groups[0].0.verdict_platforms, vec!["linux".to_string()]);
-    assert_eq!(groups[1].1[0].name, "rust-tests");
-}
-
-/// The reviewer's specimen: Linux L and Mac M. rust-lint counts both and is
-/// suppressed on L, so alone it runs on M; source-scans counts Linux only,
-/// so alone it runs on L. Together they could run only on L, which is
-/// avoided, though the union of their machines still shows M clear. The
-/// later member is placed alone and both lanes still run.
-#[test]
-fn a_member_whose_shared_machines_are_all_suppressed_is_placed_alone() {
-    let scoped =
-        |index: usize, name: &str, platforms: &[&str], machines: &[&str], avoid: &[&str]| {
-            let mut item = grouped_item(index, name, rust_toolchains(false), platforms);
-            item.infra_scopes.environments = machines
-                .iter()
-                .map(|machine| (machine.to_string(), format!("env-{machine}")))
-                .collect();
-            item.avoid_executor_ids = avoid.iter().map(|id| id.to_string()).collect();
-            item
-        };
-    let (groups, fallbacks) = partition_check_items_with_cell_groups(
-        vec![
-            scoped(0, "rust-lint", &["linux", "macos"], &["L", "M"], &["L"]),
-            scoped(1, "source-scans", &["linux"], &["L"], &[]),
-        ],
-        &rust_cell_group(),
-        &|_, _| None,
-    );
-    assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
-    assert_eq!(fallbacks[0].name, "source-scans");
-    assert!(
-        fallbacks[0]
-            .reason
-            .contains("suppressed for one of them: L"),
-        "{:?}",
-        fallbacks[0]
-    );
-    assert_eq!(groups.len(), 2, "each lane keeps a machine it can run on");
-    assert!(groups
-        .iter()
-        .all(|(placement, _)| placement.cell_group.is_none()));
-    assert_eq!(
-        merge_batch_avoid(&groups[0].1).unwrap(),
-        vec!["L".to_string()]
-    );
-
-    // With M clear for both, they share it and stay grouped.
-    let (groups, fallbacks) = partition_check_items_with_cell_groups(
-        vec![
-            scoped(0, "rust-lint", &["linux", "macos"], &["L", "M"], &["L"]),
-            scoped(1, "source-scans", &["linux", "macos"], &["L", "M"], &[]),
-        ],
-        &rust_cell_group(),
-        &|_, _| None,
-    );
-    assert!(fallbacks.is_empty(), "{fallbacks:?}");
-    assert_eq!(groups[0].0.cell_group.as_deref(), Some("rust"));
-    assert_eq!(groups[0].0.avoid, vec!["L".to_string()]);
-}
-
-/// A union no single machine satisfies (here, toolchains) is the fleet's
-/// to judge, and the group asks it before seating each member.
-#[test]
-fn a_member_the_fleet_cannot_place_with_the_group_is_placed_alone() {
-    let wants_wasm = Some(ExecutorSelector {
-        required_toolchains: vec!["rust".into(), "wasm-pack".into()],
-        ..Default::default()
-    });
-    let fleet = |selector: Option<&ExecutorSelector>, _: &[String]| {
-        selector
-            .is_some_and(|selector| {
-                selector
-                    .required_toolchains
-                    .iter()
-                    .any(|t| t == "wasm-pack")
-                    && selector.required_toolchains.iter().any(|t| t == "bun")
-            })
-            .then(|| "no machine advertises bun with wasm-pack".to_string())
-    };
-    let (groups, fallbacks) = partition_check_items_with_cell_groups(
-        vec![
-            grouped_item(0, "rust-lint", rust_toolchains(false), &["linux"]),
-            grouped_item(1, "rust-tests", wants_wasm, &["linux"]),
-            grouped_item(2, "source-scans", rust_toolchains(false), &["linux"]),
-        ],
-        &rust_cell_group(),
-        &fleet,
-    );
-    assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
-    assert!(fallbacks[0].reason.contains("bun with wasm-pack"));
-    assert_eq!(groups[0].1.len(), 2);
-    assert_eq!(groups[1].1[0].name, "rust-tests");
-}
-
-/// With no cell groups, or none of their members in the wave, the wave
-/// partitions exactly as it did before groups existed.
-#[test]
-fn an_ungrouped_wave_partitions_exactly_as_before() {
-    let wave = || {
-        vec![
-            grouped_item(0, "typecheck", None, &[]),
-            grouped_item(1, "rust-tests", rust_toolchains(true), &["linux", "macos"]),
-            grouped_item(2, "lint", None, &[]),
-        ]
-    };
-    let names = |groups: &[(CheckBatchPlacement, Vec<PlannedCheckBatchItem>)]| {
-        groups
-            .iter()
-            .map(|(placement, items)| {
-                (
-                    placement.cell_group.clone(),
-                    items.iter().map(|item| item.index).collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    let before = partition_check_items_by_placement(wave());
-    for groups in [BTreeMap::new(), rust_cell_group()] {
-        let (after, fallbacks) =
-            partition_check_items_with_cell_groups(wave(), &groups, &|_, _| None);
-        assert!(fallbacks.is_empty());
-        assert_eq!(names(&after), names(&before));
-    }
-}
-
-/// The gate is read by the lanes' own processes, so it has to arrive in
-/// each spawned process's environment: the wire's per-item `env`, which is
-/// all a pure-verdict batch spawns with.
-#[test]
-fn a_cell_groups_batch_carries_its_compile_gate_and_no_other_batch_does() {
-    let items = vec![
-        grouped_item(0, "rust-lint", None, &[]),
-        grouped_item(1, "rust-tests", None, &[]),
-    ];
-    let mut placement = CheckBatchPlacement {
-        executor: None,
-        verdict_platforms: Vec::new(),
-        avoid: Vec::new(),
-        cell_group: None,
-    };
-    let mut batch = PlannedCheckBatchRequest {
-        project_id: "p".into(),
-        repository: "/repo".into(),
-        store_dir: "/store".into(),
-        sealed_commit: "abc123".into(),
-        requesting_job_id: "job".into(),
-        owner: cairn_common::executor_protocol::CellOwnerRef::default(),
-        affinity_key: None,
-        priority: CellPriority::ReviewCheck,
-        env: Vec::new(),
-        items,
-        cell_groups: rust_cell_group(),
-        run_context: None,
-        mutation_policy: MutationPolicy::PureVerdict,
-        status_board: None,
-        on_group_complete: None,
-        purpose: None,
-        publication: None,
-    };
-    let spawned_env = |batch: &PlannedCheckBatchRequest| {
-        crate::execution::wire::build_check_batch_wire(
-            batch,
-            "request".into(),
-            "attempt".into(),
-            None,
-            Vec::new(),
-            Vec::new(),
-        )
-        .items
-        .into_iter()
-        .map(|item| item.process.env)
-        .collect::<Vec<_>>()
-    };
-    gate_cell_group(&mut batch, &placement);
-    assert!(spawned_env(&batch).iter().all(Vec::is_empty));
-    placement.cell_group = Some("rust".into());
-    gate_cell_group(&mut batch, &placement);
-    let token = (CELL_GROUP_GATE_ENV.to_string(), "abc123:rust".to_string());
-    assert_eq!(
-        spawned_env(&batch),
-        vec![vec![token.clone()], vec![token]],
-        "every lane's process sees the token"
-    );
-}
-
-#[test]
-fn pure_verdict_batches_keep_untargeted_and_targeted_checks_separate() {
-    let item = |index, executor| PlannedCheckBatchItem {
-        recording_plan: None,
-        index,
-        name: format!("check-{index}"),
-        input_hash: format!("hash-{index}"),
-        resource_identity: CheckResourceIdentityInput::Checkpoint {
-            name: format!("resource-{index}"),
-            command: format!("resource-{index}"),
-        },
-        command: "true".into(),
-        stream_id: format!("stream-{index}"),
-        env: Vec::new(),
-        timeout_ms: 1,
-        executor,
-        verdict_platforms: Vec::new(),
-        resource_class: CheckResourceClass::Shared,
-        verdict_environment_names: Vec::new(),
-        infra_scopes: InfraScopes::head_only("job", "commit"),
-        avoid_executor_ids: Vec::new(),
-    };
-    let groups = partition_check_items_by_placement(vec![
-        item(0, None),
-        item(
-            1,
-            Some(ExecutorSelector {
-                os: Some("linux".into()),
-                ..Default::default()
-            }),
-        ),
-        item(2, None),
-    ]);
-    assert_eq!(groups.len(), 2);
-    assert_eq!(
-        groups[0]
-            .1
-            .iter()
-            .map(|item| item.index)
-            .collect::<Vec<_>>(),
-        vec![0, 2]
-    );
-    assert_eq!(
-        groups[1]
-            .1
-            .iter()
-            .map(|item| item.index)
-            .collect::<Vec<_>>(),
-        vec![1]
     );
 }
 

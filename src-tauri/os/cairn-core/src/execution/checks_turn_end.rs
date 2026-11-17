@@ -51,13 +51,12 @@
 //!
 //! ## Slot-backed concurrency
 //!
-//! Cache-miss review checks are split into placement groups, and each group runs
-//! sequentially through one persistent cell lease while the groups run in
-//! parallel. Lanes that place alike share a group; a declared cell group
-//! (`cellGroups`, the Rust lanes) is seated as one group in its declared order
-//! even where its members' placements differ, so they compile once into one
-//! target directory ([`crate::execution::checks`]'s partitioning). The slot
-//! scheduler owns admission and backpressure; the shared check engine still
+//! Each cache-miss review check is its own request, placed and priced by
+//! itself, and the requests run concurrently. A request's cell affinity is the
+//! job and the suite ([`crate::execution::checks::check_affinity_key`]), so
+//! each suite returns to the cell holding its own previous build. Each suite's
+//! verdict is recorded as its request settles; delivery and the failure wake
+//! wait for the whole set. The slot scheduler owns admission and backpressure; the shared check engine still
 //! owns caching, parsing, ordered results, cancellation, and wake delivery. There
 //! is no clone or in-place fallback. Substrate failures become infrastructure
 //! verdicts and the command is never invoked elsewhere.
@@ -106,10 +105,10 @@ use cairn_uri::{build_node_checks_uri, build_task_checks_uri};
 use sha2::{Digest, Sha256};
 
 use crate::execution::checks::{
-    check_input_hashes, execute_check_contract, load_checks_contract_at_commit,
-    resolve_check_contract_at_commit, resolve_check_timeout_ms, submit_planned_check_batch,
+    check_affinity_key, check_input_hashes, execute_check_contract, load_checks_contract_at_commit,
+    resolve_check_contract_at_commit, resolve_check_timeout_ms, submit_planned_check,
     turn_end_plans, CheckExecMode, CheckFailureKind, CheckOutcome, CheckRunProducer,
-    CheckRunTarget, CheckStatusBoard, PlannedCheckBatchItem, PlannedCheckBatchRequest,
+    CheckRunTarget, CheckStatusBoard, PlannedCheckBatchItem, PlannedCheckRequest,
     CHECKS_CONFIG_PATH, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
 };
 use crate::execution::inputs::{
@@ -1761,14 +1760,13 @@ async fn run_turn_end_checks_inner(
     // about. Definition and content come from the same tree, so a branch's own
     // `.cairn/config.yaml` edit governs its own cadence and no sibling's
     // (CAIRN-3333).
-    let (checks, extra_inputs, unsupported, budgets, cell_groups, defined_by_commit) =
+    let (checks, extra_inputs, unsupported, budgets, defined_by_commit) =
         match load_checks_contract_at_commit(&repo_root, &sealed_commit).await {
             Some(loaded) if !loaded.contract.checks.is_empty() => (
                 loaded.contract.checks,
                 loaded.contract.extra_inputs,
                 loaded.contract.unsupported,
                 loaded.contract.budgets,
-                loaded.contract.cell_groups,
                 loaded.defined_by_commit,
             ),
             _ => {
@@ -2209,15 +2207,15 @@ async fn run_turn_end_checks_inner(
         }
     );
 
-    // 10. Retain the job's earlier log evidence. Each completed placement
-    // group replaces only its own members' files; a held or cancelled sibling
-    // cannot erase the finished group's output.
+    // 10. Retain the job's earlier log evidence. Each settled request replaces
+    // only its own suite's files; a held or cancelled sibling cannot erase a
+    // finished suite's output.
     let log_dir = turn_end_log_dir(orch, job_id);
     prepare_log_dir(&log_dir);
 
-    // The executor reports member progress by original plan index. Placement
-    // groups run independently; their completion callbacks record onto the same
-    // board before the wave as a whole finishes.
+    // The executor reports progress by original plan index. Each suite's
+    // request runs independently, and its completion callback records onto
+    // the same board before the turn's other requests finish.
     let board = review_wave_board(orch, job_id, &to_run);
     cancel.set_wave_board(board.clone());
     let _ = orch.services.emitter.emit(
@@ -2244,9 +2242,10 @@ async fn run_turn_end_checks_inner(
         );
     }
 
-    // 12. Submit remaining misses as pure-verdict placement groups. Each group's
-    // callback feeds its original indices through the canonical engine immediately.
-    // Cache-covered members are resolved separately and delivery stays in plan order.
+    // 12. Submit each remaining miss as its own pure-verdict request. Each
+    // request's callback feeds its suite through the canonical engine as that
+    // request settles. Cache-covered suites are resolved separately, and
+    // delivery waits for the whole set and stays in plan order.
     let timeouts: Vec<u32> = to_run
         .iter()
         .map(|(plan, _)| {
@@ -2312,11 +2311,11 @@ async fn run_turn_end_checks_inner(
             short_id(job_id)
         );
     } else {
-        let items: Vec<_> = submit
+        let requests: Vec<_> = submit
             .iter()
             .map(|&index| {
                 let (plan, input_hash) = &to_run[index];
-                PlannedCheckBatchItem {
+                let item = PlannedCheckBatchItem {
                     recording_plan: Some(
                         crate::execution::checks::CheckAdoptionRecordingPlan::new(
                             plan,
@@ -2351,39 +2350,37 @@ async fn run_turn_end_checks_inner(
                     resource_class: plan.resource_class,
                     infra_scopes: infra_scopes[index].clone(),
                     avoid_executor_ids: Vec::new(),
+                };
+                PlannedCheckRequest {
+                    project_id: coords.project_id.clone(),
+                    repository: canonical_repo.clone(),
+                    store_dir: store_dir.clone(),
+                    sealed_commit: sealed_commit.clone(),
+                    requesting_job_id: job_id.to_string(),
+                    owner: cairn_common::executor_protocol::CellOwnerRef {
+                        project_id: coords.project_id.clone(),
+                        project_key: Some(coords.project_key.clone()),
+                        issue_number: Some(coords.number),
+                        job_id: Some(job_id.to_string()),
+                        execution_seq: Some(coords.exec_seq),
+                        node_kind: Some(coords.node_segment.clone()),
+                    },
+                    // Each suite returns to the cell its own last run left.
+                    affinity_key: Some(check_affinity_key(job_id, &plan.name)),
+                    priority: CellPriority::ReviewCheck,
+                    env: extra_env.clone(),
+                    item,
+                    run_context: None,
+                    status_board: Some(board.for_lane(index)),
+                    on_complete: Some(recorder.callback()),
+                    // A turn-end request answers for one node's own tip, so no
+                    // other request asks its question and there is nothing for
+                    // it to displace.
+                    purpose: None,
+                    publication: None,
                 }
             })
             .collect();
-        let batch = PlannedCheckBatchRequest {
-            project_id: coords.project_id.clone(),
-            repository: canonical_repo,
-            store_dir,
-            sealed_commit: sealed_commit.clone(),
-            requesting_job_id: job_id.to_string(),
-            owner: cairn_common::executor_protocol::CellOwnerRef {
-                project_id: coords.project_id.clone(),
-                project_key: Some(coords.project_key.clone()),
-                issue_number: Some(coords.number),
-                job_id: Some(job_id.to_string()),
-                execution_seq: Some(coords.exec_seq),
-                node_kind: Some(coords.node_segment.clone()),
-            },
-            affinity_key: Some(job_id.to_string()),
-            priority: CellPriority::ReviewCheck,
-            env: extra_env,
-            items,
-            run_context: None,
-            mutation_policy: crate::fleet::MutationPolicy::PureVerdict,
-            status_board: Some(board.clone()),
-            on_group_complete: Some(recorder.callback()),
-            // A turn-end wave answers for one node's own tip, so no other wave
-            // is asking its question and there is nothing for it to displace.
-            purpose: None,
-            // The commit's own groups: the Rust lanes it declares together run
-            // in one cell, in the declared order, on one target directory.
-            cell_groups,
-            publication: None,
-        };
         // The last decision before the machine is asked for anything. Everything
         // since the first check took minutes, and a merge landing inside that window
         // is exactly the specimen this closes: the wave withdraws here having taken
@@ -2419,9 +2416,9 @@ async fn run_turn_end_checks_inner(
                     reason.describe(),
                     submit.len()
                 );
-                // Returning drops the batch future, and that is the whole
-                // cancellation: each lane's subscriber guard releases this
-                // wave's interest, and a shared execution keeps running for
+                // Returning drops every request's future, and that is the
+                // whole cancellation: each lane's subscriber guard releases
+                // this turn's interest, and a shared execution keeps running for
                 // whoever else in this job still waits on it — a manual check,
                 // a write-cadence check, a merge gate. A job-wide cancel here
                 // detached those consumers too, and they read it as the
@@ -2435,8 +2432,20 @@ async fn run_turn_end_checks_inner(
                     reason.describe()
                 )));
             }
-            results = submit_planned_check_batch(orch, batch) => results
-                .map_err(|error| format!("turn-end check batch configuration failed: {error}"))?,
+            submitted = futures_util::future::join_all(
+                requests
+                    .into_iter()
+                    .map(|request| Box::pin(submit_planned_check(orch, request))),
+            ) => {
+                let refused: Vec<String> =
+                    submitted.into_iter().filter_map(Result::err).collect();
+                if !refused.is_empty() {
+                    return Err(format!(
+                        "turn-end check request configuration failed: {}",
+                        refused.join("; ")
+                    ));
+                }
+            }
         };
     }
     // Every final group must acknowledge receipt. Report a missing callback as
@@ -7310,6 +7319,10 @@ pinBumps:
 #[cfg(test)]
 #[path = "checks_turn_end_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "checks_turn_end_requests_tests.rs"]
+mod requests_tests;
 
 #[cfg(test)]
 mod capture_provenance_tests {

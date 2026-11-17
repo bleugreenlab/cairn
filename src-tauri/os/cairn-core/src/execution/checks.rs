@@ -161,23 +161,18 @@ pub use manual::{
 };
 use manual::{uncached_retry_command, UNCACHED_RETRY_PREFIX};
 #[cfg(test)]
-use planning::complete_members_as_they_land;
-#[cfg(test)]
 use planning::{
-    attribute_capacity_wait, capacity_retry_decision, collect_placement_group_results,
-    describe_capacity_waits, gate_cell_group, key_review_tree_plans, merge_batch_avoid,
-    merge_batch_executor, merge_batch_selector, partition_check_items_by_placement,
-    partition_check_items_with_cell_groups, partitions_by_placement, placement_group_outcome,
-    record_cancelled_check, review_tree_gate_result, run_planned_checks_at_commit,
-    run_planned_checks_at_commit_with_env, submit_placement_group_until_final, CapacityRetry,
-    CheckBatchPlacement, CELL_GROUP_GATE_ENV, SLOT_CHECK_DEV_DEBUG_ENV,
+    attribute_capacity_wait, capacity_retry_decision, describe_capacity_waits,
+    key_review_tree_plans, merge_batch_avoid, merge_batch_executor, record_cancelled_check,
+    review_tree_gate_result, run_planned_checks_at_commit, run_planned_checks_at_commit_with_env,
+    CapacityRetry, SLOT_CHECK_DEV_DEBUG_ENV,
 };
 pub(crate) use planning::{
     cancel_stale_review_on_branch_advance, cancel_stale_review_on_branch_advance_except,
     execute_job_verdict, head_infra_scopes, jobs_sharing_branch, plan_infra_scopes,
     record_suppressed_check, review_placement_occupancy, run_planned_checks_selected,
-    run_planned_checks_with_board, submit_planned_check_batch, verify_review_tree, BranchAdvance,
-    CheckPlacementQuestion, CheckRunCommit, InfraScopeInputs, ReviewTreeGateResult,
+    run_planned_checks_with_board, submit_check_lease, submit_planned_check, verify_review_tree,
+    BranchAdvance, CheckPlacementQuestion, CheckRunCommit, InfraScopeInputs, ReviewTreeGateResult,
 };
 #[cfg(test)]
 pub(crate) use planning::{
@@ -189,7 +184,7 @@ use planning::{
     slot_check_env, unmet_placement, GroupWait,
 };
 use render::{
-    batch_dispatch, clock_utc, describe_ms, live_node_base, narrate_dispatch, summary_annotation,
+    check_dispatch, clock_utc, describe_ms, live_node_base, narrate_dispatch, summary_annotation,
     tail, write_check_attributions,
 };
 #[cfg(test)]
@@ -1191,6 +1186,72 @@ pub(crate) type CheckGroupCompletion = Arc<
 /// not be written: a failure to persist, not a decision about the verdict.
 pub(crate) const OBSERVATION_WRITE_FAILED: &str = "the observation write failed: ";
 
+/// One check suite, on one revision, asked of the fleet for a verdict.
+///
+/// A verdict request carries exactly one suite, so it is placed, priced and
+/// recorded by itself: no caller can compose two suites into one cell, and a
+/// suite's verdict lands when its own request settles rather than with a
+/// slower sibling's. Callers that want several verdicts submit several
+/// requests concurrently.
+#[derive(Clone)]
+pub(crate) struct PlannedCheckRequest {
+    pub project_id: String,
+    pub repository: String,
+    pub store_dir: std::path::PathBuf,
+    pub sealed_commit: String,
+    pub requesting_job_id: String,
+    pub owner: cairn_common::executor_protocol::CellOwnerRef,
+    /// Which idle cell the executor prefers. A job's check requests key it by
+    /// suite ([`check_affinity_key`]), so each suite returns to the cell
+    /// holding its own previous build.
+    pub affinity_key: Option<String>,
+    pub priority: CellPriority,
+    pub env: Vec<(String, String)>,
+    pub item: PlannedCheckBatchItem,
+    pub run_context: Option<RunContext>,
+    pub status_board: Option<CheckStatusBoard>,
+    /// Awaited with the request's result before it is returned.
+    pub on_complete: Option<CheckGroupCompletion>,
+    /// See [`PlannedCheckBatchRequest::purpose`].
+    pub purpose: Option<crate::fleet::purpose::PurposeKey>,
+    /// See [`PlannedCheckBatchRequest::publication`].
+    pub publication: Option<crate::fleet::PublicationCustody>,
+}
+
+impl PlannedCheckRequest {
+    fn into_batch(self) -> PlannedCheckBatchRequest {
+        PlannedCheckBatchRequest {
+            project_id: self.project_id,
+            repository: self.repository,
+            store_dir: self.store_dir,
+            sealed_commit: self.sealed_commit,
+            requesting_job_id: self.requesting_job_id,
+            owner: self.owner,
+            affinity_key: self.affinity_key,
+            priority: self.priority,
+            env: self.env,
+            items: vec![self.item],
+            run_context: self.run_context,
+            mutation_policy: MutationPolicy::PureVerdict,
+            status_board: self.status_board,
+            on_group_complete: self.on_complete,
+            purpose: self.purpose,
+            publication: self.publication,
+        }
+    }
+}
+
+/// The cell-affinity key a job's request for one suite carries: the job and
+/// the suite, so concurrent suites of one job never contend for one warm cell
+/// and each comes back to the target directory its own last run left.
+pub(crate) fn check_affinity_key(job_id: &str, suite: &str) -> String {
+    format!("{job_id}:{suite}")
+}
+
+/// The carrier every submission is planned through. Built directly only for
+/// a change-returning lease ([`MutationPolicy::AllowDelta`]), whose items run
+/// in order in one cell because a later command must see what an earlier one
+/// wrote. A verdict is asked for with a [`PlannedCheckRequest`].
 #[derive(Clone)]
 pub(crate) struct PlannedCheckBatchRequest {
     pub project_id: String,
@@ -1203,13 +1264,10 @@ pub(crate) struct PlannedCheckBatchRequest {
     pub priority: CellPriority,
     pub env: Vec<(String, String)>,
     pub items: Vec<PlannedCheckBatchItem>,
-    /// The project's cell groups (`cellGroups`), each an ordered member list.
-    /// Only a pure-verdict batch, which partitions by placement, seats them.
-    pub cell_groups: BTreeMap<String, Vec<String>>,
     pub run_context: Option<RunContext>,
     pub mutation_policy: MutationPolicy,
     pub status_board: Option<CheckStatusBoard>,
-    /// Awaited once for each final placement group before returning its results.
+    /// Awaited with the batch's results before they are returned.
     pub on_group_complete: Option<CheckGroupCompletion>,
     /// The question this batch answers, when it answers a standing one.
     ///

@@ -103,7 +103,6 @@ fn manual_check_wire(
         status_board: None,
         on_group_complete: None,
         purpose: None,
-        cell_groups: Default::default(),
         publication: None,
     };
     crate::execution::wire::build_check_batch_wire(

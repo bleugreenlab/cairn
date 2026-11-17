@@ -9496,6 +9496,15 @@ pub struct LearnedResourceEstimate {
 /// exists, read by every executor as before, so a runner talking to an older
 /// executor gets nothing wrong: that executor charges the smaller figure the
 /// runner sent.
+///
+/// cairn/7321 does not move the number. The runner stops composing several
+/// check suites into one sequential pure-verdict batch: every check request
+/// is a batch of one item, with an affinity key of `{job}:{suite}` instead of
+/// the job alone. A one-item batch, its per-item reports and the affinity key
+/// are all things an older executor already receives and handles from agent
+/// batches and manual checks; the key is read opaquely by its idle-cell
+/// claim. No field, callback or variant changes, so a runner talking to an
+/// older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 174;
 
 /// The version `build.rs` derived from the paragraphs above

@@ -478,9 +478,9 @@ pub(crate) async fn execute_job_verdict(
         .await
         .map_err(|error| format!("checkpoint branch '{branch}' is unresolvable: {error}"))?;
 
-    let outcome = submit_planned_check_batch(
+    let outcome = submit_planned_check(
         orch,
-        PlannedCheckBatchRequest {
+        PlannedCheckRequest {
             project_id: project_id.clone(),
             repository,
             store_dir,
@@ -494,14 +494,14 @@ pub(crate) async fn execute_job_verdict(
                 execution_seq: None,
                 node_kind: Some(name.to_string()),
             },
-            affinity_key: Some(job_id.to_string()),
+            affinity_key: Some(check_affinity_key(job_id, name)),
             priority: CellPriority::ReviewCheck,
             // No PATH: a check resolves its tools against the PATH the executor
             // composed on the machine that runs it, the same as every other
             // check batch. Stating this host's PATH here would name directories
             // that exist on the runner and nowhere else.
             env: Vec::new(),
-            items: vec![PlannedCheckBatchItem {
+            item: PlannedCheckBatchItem {
                 recording_plan: None,
                 index: 0,
                 name: name.to_string(),
@@ -530,13 +530,11 @@ pub(crate) async fn execute_job_verdict(
                 // question to derive a fleet counter from.
                 infra_scopes: InfraScopes::head_only(job_id, &coordinate),
                 avoid_executor_ids: Vec::new(),
-            }],
+            },
             run_context: None,
-            mutation_policy: MutationPolicy::PureVerdict,
             status_board: None,
-            on_group_complete: None,
+            on_complete: None,
             purpose: None,
-            cell_groups: Default::default(),
             publication: None,
         },
     )
@@ -1009,11 +1007,28 @@ impl GroupWait {
     }
 }
 
-pub(crate) async fn submit_planned_check_batch(
+/// Ask the fleet for one suite's verdict. The request is placed and priced by
+/// itself; a caller wanting several suites submits several requests.
+pub(crate) async fn submit_planned_check(
     orch: &Orchestrator,
-    batch: PlannedCheckBatchRequest,
+    request: PlannedCheckRequest,
 ) -> Result<PlannedCheckBatchOutcome, String> {
-    submit_admitted_check_batch(orch, batch).await
+    submit_admitted_check_batch(orch, request.into_batch()).await
+}
+
+/// Run a change-returning lease: its items in order in one cell, whose
+/// changes come back with the results. A verdict is never a lease.
+pub(crate) async fn submit_check_lease(
+    orch: &Orchestrator,
+    lease: PlannedCheckBatchRequest,
+) -> Result<PlannedCheckBatchOutcome, String> {
+    if lease.mutation_policy == MutationPolicy::PureVerdict {
+        return Err(
+            "a verdict is asked for one suite at a time; a lease is only for work whose changes come back"
+                .into(),
+        );
+    }
+    submit_admitted_check_batch(orch, lease).await
 }
 
 pub(super) async fn submit_admitted_check_batch(
@@ -1251,119 +1266,16 @@ pub(crate) fn complete_each_member_once(complete: CheckGroupCompletion) -> Check
     })
 }
 
-/// The sink a pure-verdict batch hands the fleet, so each member reaches the
-/// group's completion as its delivery lands rather than with its slowest
-/// sibling. `indexed` maps a member's position in the batch to its plan index.
-///
-/// Only an executed verdict goes early, and only one no capacity retry could
-/// re-present; a refusal or a cancellation waits for its group, as does
-/// everything once the runner is stopping (the group then reads whether its
-/// lane was left running). The batch's completion answers each member once
-/// ([`complete_each_member_once`]), so the group's final call skips these.
-pub(super) fn complete_members_as_they_land(
-    complete: CheckGroupCompletion,
-    indexed: Vec<usize>,
-    runner_stopping: impl Fn() -> bool + Send + Sync + 'static,
-    submitted_at: std::time::Instant,
-) -> Box<crate::fleet::PureVerdictItemSink> {
-    Box::new(
-        move |position: usize, delivery: &crate::fleet::CoalescedDelivery| {
-            let early = match delivery {
-                Ok(delivered)
-                    if matches!(delivered.outcome, CellOutcome::Completed { .. })
-                        && !runner_stopping() =>
-                {
-                    let mut results: CheckGroupResults = HashMap::from([(
-                        indexed[position],
-                        check_result_from_delivery(Ok(delivered.clone())),
-                    )]);
-                    stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
-                    Some(results).filter(|results| !results.values().any(awaits_capacity_retry))
-                }
-                _ => None,
-            };
-            let complete = complete.clone();
-            Box::pin(async move {
-                if let Some(results) = early {
-                    complete(&results).await;
-                }
-            }) as futures_util::future::BoxFuture<'static, ()>
-        },
-    )
-}
-
 pub(super) struct PresentedBatch {
     pub(super) outcome: PlannedCheckBatchOutcome,
 }
 
-pub(super) fn partitions_by_placement(policy: &MutationPolicy) -> bool {
-    *policy == MutationPolicy::PureVerdict
-}
-
 pub(super) async fn submit_reserved_check_batch(
     orch: &Orchestrator,
-    mut batch: PlannedCheckBatchRequest,
+    batch: PlannedCheckBatchRequest,
     patience: &CheckPatience,
 ) -> Result<PresentedBatch, String> {
-    if partitions_by_placement(&batch.mutation_policy) {
-        let (mut groups, fallbacks) = partition_check_items_with_cell_groups(
-            std::mem::take(&mut batch.items),
-            &batch.cell_groups,
-            &|selector, platforms| orch.fleet.unplaceable_reason(selector, platforms),
-        );
-        report_cell_group_fallbacks(&batch, &fallbacks);
-        if groups.len() > 1 {
-            let mut combined = PlannedCheckBatchOutcome {
-                results: HashMap::new(),
-                request: None,
-                delta: None,
-                store_dir: Some(batch.store_dir.clone()),
-            };
-            let submissions = groups.into_iter().map(|(placement, items)| {
-                let mut group = PlannedCheckBatchRequest {
-                    items,
-                    ..batch.clone()
-                };
-                gate_cell_group(&mut group, &placement);
-                let indices: Vec<_> = group.items.iter().map(|item| item.index).collect();
-                group.status_board = group
-                    .status_board
-                    .as_ref()
-                    .map(|board| board.for_group(&indices));
-                async move {
-                    submit_placement_group_until_final(
-                        &indices,
-                        group.on_group_complete.as_ref(),
-                        || async {
-                            let wait = patience.for_group(
-                                orch,
-                                &group,
-                                placement.executor.as_ref(),
-                                &placement.verdict_platforms,
-                                &placement.avoid,
-                            );
-                            let submitted = submit_single_planned_check_batch(
-                                orch,
-                                group.clone(),
-                                &wait,
-                                patience,
-                            )
-                            .await;
-                            (wait, submitted)
-                        },
-                    )
-                    .await
-                }
-            });
-            combined.results = collect_placement_group_results(submissions).await;
-            return Ok(PresentedBatch { outcome: combined });
-        }
-        if let Some((placement, items)) = groups.pop() {
-            batch.items = items;
-            gate_cell_group(&mut batch, &placement);
-        }
-    }
-    // One group, whose selector is whatever its items agree on. A conflict is a
+    // The selector is whatever the items agree on. A conflict is a
     // configuration error the submission below reports; there is no forecast to
     // scope by a selector that cannot exist, so it reads as unconstrained here.
     let (forecast_selector, forecast_verdict_platforms) =
@@ -1387,112 +1299,14 @@ pub(super) async fn submit_reserved_check_batch(
     Ok(PresentedBatch { outcome })
 }
 
-/// Retry only this group's transient refusals, and hand its final result to
-/// recording exactly once. Siblings are neither re-presented nor re-recorded.
-pub(super) async fn submit_placement_group_until_final<F, Fut>(
-    indices: &[usize],
-    complete: Option<&CheckGroupCompletion>,
-    mut submit: F,
-) -> PlannedCheckBatchOutcome
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = (GroupWait, Result<PlannedCheckBatchOutcome, String>)>,
-{
-    loop {
-        let (wait, submitted) = submit().await;
-        let mut outcome = placement_group_outcome(indices, submitted);
-        attribute_capacity_wait(&mut outcome, &wait);
-        if let CapacityRetry::Again { backoff } = capacity_retry_decision(&outcome) {
-            tokio::time::sleep(backoff).await;
-            continue;
-        }
-        if let Some(complete) = complete {
-            complete(&outcome.results).await;
-        }
-        return outcome;
-    }
-}
-
-/// Poll every group under the caller's cancellation boundary. Dropping this
-/// future drops every group's subscriber guards, not just the first request.
-/// Completion work lives inside each group future, so a held sibling cannot
-/// postpone another group's durable acceptance.
-pub(super) async fn collect_placement_group_results<F>(
-    groups: impl IntoIterator<Item = F>,
-) -> HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>>
-where
-    F: std::future::Future<Output = PlannedCheckBatchOutcome>,
-{
-    futures_util::future::join_all(groups)
-        .await
-        .into_iter()
-        .flat_map(|outcome| outcome.results)
-        .collect()
-}
-
-pub(super) fn placement_group_outcome(
-    indices: &[usize],
-    submitted: Result<PlannedCheckBatchOutcome, String>,
-) -> PlannedCheckBatchOutcome {
-    submitted.unwrap_or_else(|reason| {
-        // A malformed group's submission is a dispatch failure, never a
-        // command exit. Keep its own reason without discarding other groups.
-        PlannedCheckBatchOutcome::failed(
-            indices.to_vec(),
-            SubstrateFailure::new(SubstrateFailureShape::Dispatch, reason),
-        )
-    })
-}
-
-/// The placement question one batch can ask: where its checks may run, and which
-/// platforms' answers they count.
-///
-/// A batch travels as one cell, so every check in it is placed by a single
-/// decision. Two checks that disagree about any of these cannot share that
-/// decision — a wave carrying one macOS-gated suite and one platform-agnostic
-/// suite splits and each half is placed on its own terms, rather than the whole
-/// wave travelling to wherever the strictest or the loosest member allowed.
-///
-/// Where the work may NOT go is the third half of the same question, and it
-/// belongs here for the same reason: a check suppressed on machine A and one
-/// suppressed on machine B have no single placement that satisfies both, so
-/// they must be placed separately rather than merged into an avoid-union that
-/// would strand them both.
-#[derive(Clone, PartialEq, Eq)]
-pub(super) struct CheckBatchPlacement {
-    pub(super) executor: Option<ExecutorSelector>,
-    pub(super) verdict_platforms: Vec<String>,
-    /// Sorted executor ids. Grouping is by SET EQUALITY, matching how the
-    /// selector and the trusted platforms already behave. It over-splits mildly
-    /// — avoid `{A}` and avoid `{}` separate even though the second could have
-    /// joined the first — which is the safe direction, and costs nothing in the
-    /// normal case where every avoid set is empty and the grouping is
-    /// byte-identical to what it was before avoidance existed.
-    pub(super) avoid: Vec<String>,
-    /// The cell group (`cellGroups`) this batch is, when it is one. Its
-    /// members run in the group's declared order in one cell, so they build in
-    /// one target directory.
-    pub(super) cell_group: Option<String>,
-}
-
-/// A cell group member that could not join its group's placement and was
-/// placed on its own terms instead. Never silent: the wave reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct CellGroupFallback {
-    pub(super) index: usize,
-    pub(super) name: String,
-    pub(super) group: String,
-    pub(super) reason: String,
-}
-
 /// A batch's executor selector and the platforms it may be placed on, merged
 /// over its items.
 ///
 /// A requirement that means something on one platform only is dropped when
 /// the batch cannot land there: `requiresMacosNestedSandboxWrite` constrains
-/// macOS machines alone, so a batch that only Linux can run (rust-tests in a
-/// Linux cell group) carries no such requirement, and placement does not wait
-/// on a capability report that cannot matter.
+/// macOS machines alone, so a batch that only Linux can run carries no such
+/// requirement, and placement does not wait on a capability report that
+/// cannot matter.
 pub(super) fn merge_batch_selector(
     items: &[PlannedCheckBatchItem],
 ) -> Result<(Option<ExecutorSelector>, Vec<String>), String> {
@@ -1512,268 +1326,14 @@ pub(super) fn merge_batch_selector(
     Ok((executor, verdict_platforms))
 }
 
-/// One cell group's placement: what every member's selector, platforms and
-/// avoid set allow at once.
-///
-/// Two merges that each succeed can still contradict each other or the fleet:
-/// one member asking for `os: macos` and another counting only `linux` merge
-/// into a selector no trusted machine satisfies, and a union of toolchains
-/// may exist on no single machine. So the merged placement is asked the same
-/// question every lane's own placement is (`placeable`, which is
-/// [`crate::fleet::Fleet::unplaceable_reason`] in production) before it is
-/// accepted.
-pub(super) fn cell_group_placement(
-    group: &str,
-    members: &[PlannedCheckBatchItem],
-    placeable: GroupPlaceability<'_>,
-) -> Result<CheckBatchPlacement, String> {
-    let (executor, verdict_platforms) = merge_batch_selector(members)?;
-    if let Some(os) = executor
-        .as_ref()
-        .and_then(|selector| selector.os.as_deref())
-    {
-        if !verdict_platforms.is_empty()
-            && !verdict_platforms
-                .iter()
-                .any(|platform| platform.eq_ignore_ascii_case(os))
-        {
-            return Err(format!(
-                "the group would ask for {os} but counts verdicts only on {}",
-                verdict_platforms.join(", ")
-            ));
-        }
-    }
-    if let Some(reason) = placeable(executor.as_ref(), &verdict_platforms) {
-        return Err(format!("no machine could run the group together: {reason}"));
-    }
-    group_has_a_clear_machine(members)?;
-    let avoid = merge_batch_avoid(members)?;
-    Ok(CheckBatchPlacement {
-        executor,
-        verdict_platforms,
-        avoid,
-        cell_group: Some(group.to_string()),
-    })
-}
-
-/// Whether some machine every member may run on is clear of every member's
-/// suppression.
-///
-/// A member's `infra_scopes.environments` are the machines it is eligible for,
-/// so the group is eligible only where they all overlap. The union
-/// [`merge_batch_avoid`] reads is the right question for a batch that cannot
-/// split, not for one choosing whether to: with Linux L and Mac M, a lane
-/// counting both and suppressed on L, and a lane counting Linux only, share
-/// just L, which is avoided, while the union still shows M clear. A member
-/// with no environments is bounded by none and narrows nothing.
-pub(super) fn group_has_a_clear_machine(members: &[PlannedCheckBatchItem]) -> Result<(), String> {
-    let mut shared: Option<BTreeSet<&str>> = None;
-    for member in members {
-        if member.infra_scopes.environments.is_empty() {
-            continue;
-        }
-        let eligible: BTreeSet<&str> = member
-            .infra_scopes
-            .environments
-            .iter()
-            .map(|(executor_id, _)| executor_id.as_str())
-            .collect();
-        shared = Some(match shared {
-            None => eligible,
-            Some(current) => current.intersection(&eligible).copied().collect(),
-        });
-    }
-    let Some(shared) = shared else {
-        return Ok(());
-    };
-    let avoided: BTreeSet<&str> = members
-        .iter()
-        .flat_map(|member| member.avoid_executor_ids.iter().map(String::as_str))
-        .collect();
-    if shared
-        .iter()
-        .any(|executor_id| !avoided.contains(executor_id))
-    {
-        return Ok(());
-    }
-    Err(if shared.is_empty() {
-        "the members share no machine they are all eligible for".to_string()
-    } else {
-        format!(
-            "every machine all members may use is suppressed for one of them: {}",
-            shared.into_iter().collect::<Vec<_>>().join(", ")
-        )
-    })
-}
-
-/// Partition a pure-verdict wave, seating each declared cell group in one
-/// batch first.
-///
-/// A group's members join in the group's declared order while the merged
-/// placement still admits them; a member that would make it unplaceable (a
-/// conflicting selector, or an avoid set that leaves no machine clear for the
-/// whole group) is placed on its own terms and reported. A group left with
-/// one member is no group. Everything else partitions exactly as
-/// [`partition_check_items_by_placement`] always has, in its original order.
-pub(super) fn partition_check_items_with_cell_groups(
-    items: Vec<PlannedCheckBatchItem>,
-    cell_groups: &BTreeMap<String, Vec<String>>,
-    placeable: GroupPlaceability<'_>,
-) -> (
-    Vec<(CheckBatchPlacement, Vec<PlannedCheckBatchItem>)>,
-    Vec<CellGroupFallback>,
-) {
-    let mut rest: Vec<(usize, PlannedCheckBatchItem)> = Vec::new();
-    let mut seated: BTreeMap<&str, Vec<(usize, usize, PlannedCheckBatchItem)>> = BTreeMap::new();
-    for (ordinal, item) in items.into_iter().enumerate() {
-        let seat = cell_groups.iter().find_map(|(group, members)| {
-            members
-                .iter()
-                .position(|member| member == &item.name)
-                .map(|position| (group.as_str(), position))
-        });
-        match seat {
-            Some((group, position)) => seated
-                .entry(group)
-                .or_default()
-                .push((position, ordinal, item)),
-            None => rest.push((ordinal, item)),
-        }
-    }
-    let mut groups = Vec::new();
-    let mut fallbacks = Vec::new();
-    for (group, mut members) in seated {
-        members.sort_by_key(|(position, _, _)| *position);
-        let mut joined: Vec<(usize, PlannedCheckBatchItem)> = Vec::new();
-        // The placement the members joined so far were proven under. Kept, not
-        // recomputed: the fleet may change between two asks.
-        let mut proven: Option<CheckBatchPlacement> = None;
-        for (_, ordinal, item) in members {
-            let candidate: Vec<_> = joined
-                .iter()
-                .map(|(_, member)| member.clone())
-                .chain(std::iter::once(item.clone()))
-                .collect();
-            match cell_group_placement(group, &candidate, placeable) {
-                Ok(placement) => {
-                    proven = Some(placement);
-                    joined.push((ordinal, item));
-                }
-                Err(reason) => {
-                    fallbacks.push(CellGroupFallback {
-                        index: item.index,
-                        name: item.name.clone(),
-                        group: group.to_string(),
-                        reason,
-                    });
-                    rest.push((ordinal, item));
-                }
-            }
-        }
-        let Some(placement) = proven.filter(|_| joined.len() >= 2) else {
-            rest.extend(joined);
-            continue;
-        };
-        groups.push((
-            placement,
-            joined.into_iter().map(|(_, item)| item).collect(),
-        ));
-    }
-    rest.sort_by_key(|(ordinal, _)| *ordinal);
-    groups.extend(partition_check_items_by_placement(
-        rest.into_iter().map(|(_, item)| item).collect(),
-    ));
-    (groups, fallbacks)
-}
-
-/// Name each member that left its cell group on its lane and in the log.
-pub(super) fn report_cell_group_fallbacks(
-    batch: &PlannedCheckBatchRequest,
-    fallbacks: &[CellGroupFallback],
-) {
-    for fallback in fallbacks {
-        log::warn!(
-            "check {} left cell group {} for job {} and is placed on its own: {}",
-            fallback.name,
-            fallback.group,
-            batch.requesting_job_id,
-            fallback.reason
-        );
-        if let Some(board) = &batch.status_board {
-            board.transition(
-                fallback.index,
-                "pending",
-                Some(format!(
-                    "placed outside cell group {}: {}",
-                    fallback.group, fallback.reason
-                )),
-            );
-        }
-    }
-}
-
-/// The environment variable a cell group's lanes share a compile gate under
-/// (scripts/lib/cell-group-gate.ts).
-pub(super) const CELL_GROUP_GATE_ENV: &str = "CAIRN_CELL_GROUP_GATE";
-
-/// Whether any machine could take a placement: `None` when one could, else
-/// why not.
-pub(super) type GroupPlaceability<'a> =
-    &'a dyn Fn(Option<&ExecutorSelector>, &[String]) -> Option<String>;
-
-/// Give a cell group's lanes their compile gate: a token naming this tree and
-/// group, under which rust-lint's compile error stops the later lanes from
-/// compiling the same broken tree. The tree is the sealed commit, so a retry
-/// of the same tree may reuse the marker and a different tree never can.
-///
-/// It goes on each item, because an item's own environment is what its
-/// process is spawned with; the request's environment never reaches it.
-pub(super) fn gate_cell_group(
-    batch: &mut PlannedCheckBatchRequest,
-    placement: &CheckBatchPlacement,
-) {
-    if let Some(group) = &placement.cell_group {
-        let token = format!("{}:{group}", batch.sealed_commit);
-        for item in &mut batch.items {
-            item.env
-                .push((CELL_GROUP_GATE_ENV.to_string(), token.clone()));
-        }
-    }
-}
-
-pub(super) fn partition_check_items_by_placement(
-    items: Vec<PlannedCheckBatchItem>,
-) -> Vec<(CheckBatchPlacement, Vec<PlannedCheckBatchItem>)> {
-    let mut groups: Vec<(CheckBatchPlacement, Vec<PlannedCheckBatchItem>)> = Vec::new();
-    for item in items {
-        let placement = CheckBatchPlacement {
-            executor: item.executor.clone().filter(|value| !value.is_empty()),
-            verdict_platforms: item.verdict_platforms.clone(),
-            avoid: item.avoid_executor_ids.clone(),
-            cell_group: None,
-        };
-        if let Some((_, items)) = groups
-            .iter_mut()
-            .find(|(candidate, _)| candidate == &placement)
-        {
-            items.push(item);
-        } else {
-            groups.push((placement, vec![item]));
-        }
-    }
-    groups
-}
-
 /// The one set of machines a batch may not be placed on.
 ///
 /// A batch travels as one cell, so the whole of it goes to one machine. Where
 /// its items agree, this is a read. Where they disagree — one check suppressed
-/// on A, another on B — there is no single placement that satisfies both.
-/// Partitioned batches split before they reach here, on
-/// [`CheckBatchPlacement`]'s avoid set, so a disagreement surviving to this
-/// point belongs to a batch that CANNOT split: a write-cadence batch bound to
-/// one build slot, or a unified batch whose purpose key is a single standing
-/// answer that two submissions would replace rather than share.
+/// on A, another on B — there is no single placement that satisfies both. A
+/// verdict request carries one suite and so can never disagree with itself;
+/// a disagreement belongs to a lease, which CANNOT split because its items
+/// must share one cell's changes.
 ///
 /// For those, the honest statement is that no single machine can answer right
 /// now. It is charged to the head domain by its `Dispatch` shape, which is
@@ -1829,6 +1389,12 @@ pub(super) async fn submit_single_planned_check_batch(
 ) -> Result<PlannedCheckBatchOutcome, String> {
     // Configuration conflicts are deterministic caller errors and must surface
     // before any transient infrastructure preflight can obscure them.
+    if batch.mutation_policy == MutationPolicy::PureVerdict && batch.items.len() != 1 {
+        return Err(format!(
+            "a verdict request carries exactly one suite, not {}",
+            batch.items.len()
+        ));
+    }
     let (executor, verdict_platforms) = merge_batch_selector(&batch.items)?;
     // Unlike the two above, this is not a configuration error: it is a live
     // condition of the fleet, so it is reported as a substrate refusal per item
@@ -1968,43 +1534,25 @@ pub(super) async fn submit_single_planned_check_batch(
     }
     let submitted_at = std::time::Instant::now();
     let submitted = if mutation_policy == MutationPolicy::PureVerdict {
-        // The identities `submit_pure_verdict_batch` mints for its items.
-        let subscribers: Vec<(String, String)> = (0..items.len())
-            .map(|index| {
-                (
-                    format!("{}:check-{index}", request.request_id),
-                    format!("{}:check-{index}", request.attempt_id),
-                )
-            })
-            .collect();
+        let subscriber = crate::fleet::Fleet::check_subscriber(&request);
+        let item = items
+            .into_iter()
+            .next()
+            .expect("a verdict request was checked to carry one suite");
         let wait_batch = PlannedCheckBatchRequest {
             items: Vec::new(),
             status_board: None,
             ..batch.clone()
         };
         let board = batch.status_board.clone();
-        // A member the executor reports finished goes to the group's completion
-        // at once, so its verdict is recorded while its siblings still run. Only
-        // an executed verdict goes early, and only one no capacity retry could
-        // re-present; a refusal or a cancellation waits for its group, as does
-        // everything once the runner is stopping (see `left_running` below).
-        let early_completion = batch.on_group_complete.clone().map(|complete| {
-            let fleet = orch.fleet.clone();
-            complete_members_as_they_land(
-                complete,
-                indexed.clone(),
-                move || fleet.runner_stopping_since().is_some(),
-                submitted_at,
-            )
-        });
         // Built off-frame: the fleet's submission future is the bulk of every
-        // check-batch future above it, and held inline it is paid for again
+        // check-request future above it, and held inline it is paid for again
         // in each of their poll frames (see `cairn_platform::stack`).
         let submission = off_frame(|| {
-            orch.fleet.submit_pure_verdict_batch_streaming(
+            orch.fleet.submit_pure_verdict_check(
                 orch,
                 request.clone(),
-                items,
+                item,
                 batch.run_context,
                 // Only a board whose verdicts the engine owns takes the
                 // executor's per-item reports; any other pure-verdict board
@@ -2016,7 +1564,6 @@ pub(super) async fn submit_single_planned_check_batch(
                     .clone()
                     .filter(|board| board.engine_owns_verdicts() || board.is_observed()),
                 batch.purpose,
-                early_completion.as_deref(),
             )
         });
         match board {
@@ -2025,7 +1572,7 @@ pub(super) async fn submit_single_planned_check_batch(
                 narrate_dispatch(
                     submission,
                     wait,
-                    || batch_dispatch(&orch.fleet, &subscribers),
+                    || check_dispatch(&orch.fleet, &subscriber),
                     || {
                         patience.for_group(
                             orch,
@@ -2131,17 +1678,11 @@ pub(super) async fn submit_single_planned_check_batch(
                 }
             })
         });
-    let mut results = indexed
-        .into_iter()
-        .zip(submitted)
-        .map(|(index, delivery)| {
-            let result = match &left_running {
-                Some(attempt) => Err(CheckExecutionFailure::LeftRunning(attempt.clone())),
-                None => check_result_from_delivery(delivery),
-            };
-            (index, result)
-        })
-        .collect();
+    let result = match left_running {
+        Some(attempt) => Err(CheckExecutionFailure::LeftRunning(attempt)),
+        None => check_result_from_delivery(submitted),
+    };
+    let mut results = HashMap::from([(indexed[0], result)]);
     stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
     settle_unrecordable_delivery(orch, &request, &results).await;
     temporary_ref.retire();

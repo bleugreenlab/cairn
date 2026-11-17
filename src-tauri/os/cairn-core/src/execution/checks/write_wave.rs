@@ -1556,9 +1556,9 @@ pub(super) async fn run_write_checks_after_seal_inner(
                 let configured = checks
                     .get(&plan.name)
                     .expect("planned check must retain its configured definition");
-                submit_planned_check_batch(
+                submit_planned_check(
                     &orch,
-                    PlannedCheckBatchRequest {
+                    PlannedCheckRequest {
                         project_id: context.project_id.clone(),
                         repository,
                         store_dir,
@@ -1572,10 +1572,10 @@ pub(super) async fn run_write_checks_after_seal_inner(
                             execution_seq: context.exec_seq,
                             node_kind: context.job_name.clone(),
                         },
-                        affinity_key: Some(context.job_id.clone()),
+                        affinity_key: Some(check_affinity_key(&context.job_id, &plan.name)),
                         priority: CellPriority::WriteCheck,
                         env: cell_env,
-                        items: vec![PlannedCheckBatchItem {
+                        item: PlannedCheckBatchItem {
                             recording_plan: Some(CheckAdoptionRecordingPlan::new(
                                 plan,
                                 &crate::execution::cache::SealedCheckCoordinate::new(
@@ -1610,13 +1610,11 @@ pub(super) async fn run_write_checks_after_seal_inner(
                             infra_scopes: InfraScopes::head_only(&context.job_id, &sealed_commit),
                             avoid_executor_ids: Vec::new(),
                             resource_class: plan.resource_class,
-                        }],
+                        },
                         run_context: Some(context),
-                        mutation_policy: MutationPolicy::PureVerdict,
                         status_board: None,
-                        on_group_complete: None,
+                        on_complete: None,
                         purpose: None,
-                        cell_groups: Default::default(),
                         publication: None,
                     },
                 )
@@ -1752,7 +1750,8 @@ pub(super) fn split_write_wave(
 /// the caller always holds exactly one outcome per submitted index.
 ///
 /// `mutation_policy` is `AllowDelta` for the write cell, whose fix folds, and
-/// `PureVerdict` for the lanes a [`WriteWaveSplit`] spilled to other platforms.
+/// `PureVerdict` for the lanes a [`WriteWaveSplit`] spilled to other platforms,
+/// which are verdicts and so are each submitted as a request of their own.
 pub(super) async fn submit_write_check_batch_for(
     orch: &Orchestrator,
     batch: WriteCheckBatchRequest<'_>,
@@ -1835,38 +1834,83 @@ pub(super) async fn submit_write_check_batch_for(
     .await;
     let submitted = match repository {
         Ok((repository, store_dir)) => {
-            off_frame(|| {
-                submit_planned_check_batch(
-                    orch,
-                    PlannedCheckBatchRequest {
+            let owner = cairn_common::executor_protocol::CellOwnerRef {
+                project_id: run_context.project_id.clone(),
+                project_key: Some(run_context.project_key.clone()),
+                issue_number: run_context.issue_number,
+                job_id: Some(run_context.job_id.clone()),
+                execution_seq: run_context.exec_seq,
+                node_kind: run_context.job_name.clone(),
+            };
+            if mutation_policy == MutationPolicy::PureVerdict {
+                let requests = items.into_iter().map(|item| {
+                    let index = item.index;
+                    let request = PlannedCheckRequest {
                         project_id: run_context.project_id.clone(),
-                        repository,
-                        store_dir,
+                        repository: repository.clone(),
+                        store_dir: store_dir.clone(),
                         sealed_commit: sealed_commit.to_string(),
                         requesting_job_id: run_context.job_id.clone(),
-                        owner: cairn_common::executor_protocol::CellOwnerRef {
-                            project_id: run_context.project_id.clone(),
-                            project_key: Some(run_context.project_key.clone()),
-                            issue_number: run_context.issue_number,
-                            job_id: Some(run_context.job_id.clone()),
-                            execution_seq: run_context.exec_seq,
-                            node_kind: run_context.job_name.clone(),
-                        },
-                        affinity_key: Some(run_context.job_id.clone()),
+                        owner: owner.clone(),
+                        affinity_key: Some(check_affinity_key(&run_context.job_id, &item.name)),
                         priority: CellPriority::WriteCheck,
                         env: cell_env.to_vec(),
-                        items,
+                        item,
                         run_context: Some(run_context.clone()),
-                        mutation_policy,
-                        status_board,
-                        on_group_complete: None,
+                        status_board: status_board.as_ref().map(|board| board.for_lane(index)),
+                        on_complete: None,
                         purpose: None,
-                        cell_groups: Default::default(),
                         publication: None,
-                    },
-                )
-            })
-            .await
+                    };
+                    Box::pin(async move { (index, submit_planned_check(orch, request).await) })
+                });
+                let mut combined = PlannedCheckBatchOutcome {
+                    results: HashMap::new(),
+                    request: None,
+                    delta: None,
+                    store_dir: Some(store_dir.clone()),
+                };
+                for (index, submitted) in futures_util::future::join_all(requests).await {
+                    match submitted {
+                        Ok(outcome) => combined.results.extend(outcome.results),
+                        Err(error) => {
+                            combined.results.insert(
+                                index,
+                                Err(CheckExecutionFailure::Substrate(SubstrateFailure::new(
+                                    SubstrateFailureShape::Dispatch,
+                                    error,
+                                ))),
+                            );
+                        }
+                    }
+                }
+                Ok(combined)
+            } else {
+                off_frame(|| {
+                    submit_check_lease(
+                        orch,
+                        PlannedCheckBatchRequest {
+                            project_id: run_context.project_id.clone(),
+                            repository,
+                            store_dir,
+                            sealed_commit: sealed_commit.to_string(),
+                            requesting_job_id: run_context.job_id.clone(),
+                            owner,
+                            affinity_key: Some(run_context.job_id.clone()),
+                            priority: CellPriority::WriteCheck,
+                            env: cell_env.to_vec(),
+                            items,
+                            run_context: Some(run_context.clone()),
+                            mutation_policy,
+                            status_board,
+                            on_group_complete: None,
+                            purpose: None,
+                            publication: None,
+                        },
+                    )
+                })
+                .await
+            }
         }
         Err(error) => Ok(PlannedCheckBatchOutcome::failed(
             order.to_vec(),

@@ -2956,24 +2956,15 @@ mod tests {
         let (delivered, mut delivery_seen) = oneshot::channel();
         let submitting = orch.clone();
         let caller = tokio::spawn(async move {
-            let deliveries = submitting
+            let delivery = submitting
                 .fleet
-                .submit_pure_verdict_batch(&submitting, request, vec![item], None, None, None)
+                .submit_pure_verdict_check(&submitting, request, item, None, None, None)
                 .await;
-            let outcomes = format!(
-                "{:?}",
-                deliveries
-                    .iter()
-                    .map(|delivery| delivery.as_ref().map(|delivery| &delivery.outcome))
-                    .collect::<Vec<_>>()
-            );
+            let outcomes = format!("{:?}", delivery.as_ref().map(|delivery| &delivery.outcome));
             let _ = delivered.send(outcomes.clone());
-            assert!(
-                deliveries.iter().all(Result::is_ok),
-                "submission outcomes: {outcomes}"
-            );
+            assert!(delivery.is_ok(), "submission outcome: {outcomes}");
             std::future::pending::<()>().await;
-            drop(deliveries);
+            drop(delivery);
         });
         let entry_id = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -3088,14 +3079,7 @@ mod tests {
             let task = tokio::spawn(async move {
                 joining
                     .fleet
-                    .submit_pure_verdict_batch(
-                        &joining,
-                        request,
-                        vec![follower_item],
-                        None,
-                        None,
-                        None,
-                    )
+                    .submit_pure_verdict_check(&joining, request, follower_item, None, None, None)
                     .await
             });
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -3146,11 +3130,11 @@ mod tests {
                 .unwrap();
         }
         if let Some(follower) = follower {
-            let deliveries = tokio::time::timeout(Duration::from_secs(10), follower)
+            let delivery = tokio::time::timeout(Duration::from_secs(10), follower)
                 .await
                 .unwrap()
+                .unwrap()
                 .unwrap();
-            let delivery = deliveries.into_iter().next().unwrap().unwrap();
             orch.fleet
                 .record_check_claim_observation(&key, "rust-tests", "late-observation")
                 .await

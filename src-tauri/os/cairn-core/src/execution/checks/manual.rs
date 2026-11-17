@@ -535,7 +535,6 @@ pub(crate) async fn resolve_check_contract_at_commit(
                 extra_inputs,
                 unsupported,
                 budgets: _,
-                cell_groups: _,
             },
         defined_by_commit,
     } = load_checks_contract_at_commit_detailed(&repository, &commit)
@@ -1644,9 +1643,10 @@ pub(crate) async fn execute_check_contract(
             let attempts = submitted_attempts.clone();
             async move {
                 require_snapshot_command(&snapshot_command, &command)?;
-                let mut batch_outcome = submit_planned_check_batch(
+                let affinity_key = check_affinity_key(&job_id, &item_template.name);
+                let mut batch_outcome = submit_planned_check(
                     &orch,
-                    PlannedCheckBatchRequest {
+                    PlannedCheckRequest {
                         project_id: project_id.clone(),
                         repository,
                         store_dir,
@@ -1660,20 +1660,18 @@ pub(crate) async fn execute_check_contract(
                             execution_seq: None,
                             node_kind: Some(node_kind),
                         },
-                        affinity_key: Some(job_id),
+                        affinity_key: Some(affinity_key),
                         priority: CellPriority::ReviewCheck,
                         env: Vec::new(),
-                        items: vec![PlannedCheckBatchItem {
+                        item: PlannedCheckBatchItem {
                             command,
                             stream_id,
                             ..item_template
-                        }],
+                        },
                         run_context: None,
-                        mutation_policy: MutationPolicy::PureVerdict,
                         status_board: Some(status_board.clone()),
-                        on_group_complete: None,
+                        on_complete: None,
                         purpose,
-                        cell_groups: Default::default(),
                         publication: None,
                     },
                 )

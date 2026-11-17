@@ -204,7 +204,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
     let ao = orch.clone();
     let mut raw_a = tokio::spawn(async move {
         ao.fleet
-            .submit_pure_verdict_batch(&ao, request, vec![item], None, None, None)
+            .submit_pure_verdict_check(&ao, request, item, None, None, None)
             .await
     });
     let entry_id = loop {
@@ -266,7 +266,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
         let co = orch.clone();
         let task = tokio::spawn(async move {
             co.fleet
-                .submit_pure_verdict_batch(&co, request, vec![item], None, None, Some(key))
+                .submit_pure_verdict_check(&co, request, item, None, None, Some(key))
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
@@ -361,12 +361,10 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
             outcome: retained.clone(),
         },
     );
-    let mut deliveries = tokio::time::timeout(std::time::Duration::from_secs(20), raw_a)
+    let delivery = tokio::time::timeout(std::time::Duration::from_secs(20), raw_a)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(deliveries.len(), 1);
-    let delivery = deliveries.remove(0);
     assert!(
         delivery.is_ok(),
         "the physical A result must really be delivered"
@@ -489,8 +487,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
             .await
             .unwrap()
             .unwrap();
-    assert_eq!(cadence_delivery.len(), 1);
-    assert!(cadence_delivery[0].is_ok());
+    assert!(cadence_delivery.is_ok());
     drop(cadence_delivery);
     assert_no_release(&mut frames);
     db.execute("DROP TRIGGER cross_commit_crash", ())
@@ -603,7 +600,7 @@ fn assert_one_ack(frames: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutorMess
 async fn next_physical_frame(
     orch: &Orchestrator,
     frames: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutorMessage>,
-    submitting: &mut tokio::task::JoinHandle<Vec<crate::fleet::CoalescedDelivery>>,
+    submitting: &mut tokio::task::JoinHandle<crate::fleet::CoalescedDelivery>,
     stage: &str,
 ) -> ExecutorMessage {
     super::adoption_tests::next_submission_frame(

@@ -655,44 +655,47 @@ pub(super) fn batch_item(
 
 #[tokio::test]
 #[serial_test::serial(jj)]
-async fn cadence_joining_a_three_suite_manual_grant_survives_restart_and_acks_after_all_rows() {
-    shared_manual_batch(false, false, false, false, false).await;
+async fn cadence_joining_a_manual_grant_survives_restart_and_acks_after_every_disposition() {
+    shared_manual_grant(false, false, false, false, false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(jj)]
-async fn a_rejected_second_observation_retains_the_entire_batch_until_the_store_recovers() {
-    shared_manual_batch(true, false, false, false, false).await;
+async fn a_rejected_observation_retains_the_grant_until_the_store_recovers() {
+    shared_manual_grant(true, false, false, false, false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(jj)]
-async fn cadence_adoption_mixed_withdrawn_and_active_consumers_finishes_all_items() {
-    shared_manual_batch(false, true, false, false, false).await;
+async fn a_withdrawn_cadence_consumer_stays_terminal_while_its_active_sibling_is_adopted() {
+    shared_manual_grant(false, true, false, false, false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(jj)]
 async fn cadence_adoption_hash_mismatch_commits_loss_before_releasing_retained_result() {
-    shared_manual_batch(false, false, true, false, false).await;
+    shared_manual_grant(false, false, true, false, false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(jj)]
-async fn all_manual_consumers_withdrawn_before_result_keep_cancelled_receipts_when_cadence_adopts()
+async fn a_manual_consumer_withdrawn_before_result_keeps_its_cancelled_receipt_when_cadence_adopts()
 {
-    shared_manual_batch(false, false, false, true, false).await;
+    shared_manual_grant(false, false, false, true, false).await;
 }
 
 #[tokio::test]
 #[serial_test::serial(jj)]
 async fn cadence_adoption_delivered_receipt_retries_physical_commit_before_ack() {
-    shared_manual_batch(false, false, false, false, true).await;
+    shared_manual_grant(false, false, false, false, true).await;
 }
 
-async fn shared_manual_batch(
-    reject_second: bool,
-    withdrawn_first: bool,
+/// A manual check grant for `second`, joined by that suite's main cadence,
+/// left running across a runner restart and then adopted from the retained
+/// remote result.
+async fn shared_manual_grant(
+    reject_observation: bool,
+    withdrawn_sibling: bool,
     hash_mismatch: bool,
     cancelled_manual: bool,
     reject_finalization: bool,
@@ -705,12 +708,12 @@ async fn shared_manual_batch(
     init_project(&repo);
     std::fs::create_dir_all(repo.join(".cairn")).unwrap();
     std::fs::write(repo.join(".cairn/config.yaml"),
-        "checks:\n  first:\n    command: echo first\n    executor: {os: linux}\n    verdictPlatforms: [linux]\n    mainCadence:\n      platforms: [linux]\n      notify: testing\n  second:\n    command: echo second\n    executor: {os: linux}\n    verdictPlatforms: [linux]\n    mainCadence:\n      platforms: [linux]\n      notify: testing\n  third:\n    command: echo third {changedFiles}\n    fullCommand: echo third --all\n    executor: {os: linux}\n    verdictPlatforms: [linux]\n"
+        "checks:\n  second:\n    command: echo second\n    executor: {os: linux}\n    verdictPlatforms: [linux]\n    mainCadence:\n      platforms: [linux]\n      notify: testing\n"
     ).unwrap();
     git(&repo, &["add", "-A"]);
     git(
         &repo,
-        &["commit", "-q", "-m", "declare retained manual suites"],
+        &["commit", "-q", "-m", "declare retained manual suite"],
     );
     let commit = git_stdout(&repo, &["rev-parse", "HEAD"]);
     let local = Arc::new(
@@ -734,93 +737,47 @@ async fn shared_manual_batch(
     ).await.unwrap();
     let orch = boot(home.path(), local.clone()).await;
     let mut frames = orch.fleet.attach_reported_machine_for_test(REMOTE, &[]);
-    let suites = ["first", "second", "third"];
-    let mut contracts = Vec::new();
-    for name in suites {
-        contracts.push(
-            resolve_check_contract_at_commit(
-                &orch,
-                local.clone(),
-                CheckRunTarget {
-                    job_id: "manual-job".into(),
-                    project_id: "p".into(),
-                    project_key: "P".into(),
-                    repository_path: repo.to_string_lossy().into_owned(),
-                    attribution_target: "main".into(),
-                    attribution_commit: None,
-                },
-                commit.clone(),
-                name,
-                None,
-            )
-            .await
-            .expect("the original manual contract is resolved from the real sealed commit"),
-        );
-    }
-    let whole_third_input = contracts[2].context.input_hash.clone();
-    let selective_command = "echo third selected.rs";
-    contracts[2].plan.command = selective_command.into();
-    contracts[2].plan.scope = CheckScope::Partial;
-    let selected_input = check_result_key_for_executed_command(
-        &contracts[2].configured_check,
-        selective_command,
-        &InputSelector::from_globs(&["**".into()]),
-        None,
-        &contracts[2].context.tree_hash,
-        &check_platform_identity(),
-        check_toolchain_identity(),
-        CheckChange {
-            name: "third",
-            basis: contracts[2].change.basis(),
+    let contract = resolve_check_contract_at_commit(
+        &orch,
+        local.clone(),
+        CheckRunTarget {
+            job_id: "manual-job".into(),
+            project_id: "p".into(),
+            project_key: "P".into(),
+            repository_path: repo.to_string_lossy().into_owned(),
+            attribution_target: "main".into(),
+            attribution_commit: None,
         },
-    );
-    assert_ne!(selected_input, whole_third_input);
-    contracts[2].context.input_hash = selected_input.clone();
-    contracts[2].sealed_coordinate = crate::execution::cache::SealedCheckCoordinate::new(
-        &commit,
-        &commit,
-        &contracts[2].context.tree_hash,
-        &selected_input,
-    );
-    let hashes = contracts
-        .iter()
-        .map(|c| c.context.input_hash.as_str())
-        .collect::<Vec<_>>();
-    let handles = (0..3)
-        .map(|_| uuid::Uuid::new_v4().to_string())
-        .collect::<Vec<_>>();
-    let streams = handles
-        .iter()
-        .enumerate()
-        .map(|(i, handle)| format!("manual-check:run:handle={handle}:{i}"))
-        .collect::<Vec<_>>();
-    for handle in &handles {
-        local
-            .execute(
-                "INSERT INTO manual_check_handles(handle,project_id,created_at) VALUES(?1,'p',1)",
-                (handle.clone(),),
-            )
-            .await
-            .unwrap();
-    }
+        commit.clone(),
+        "second",
+        None,
+    )
+    .await
+    .expect("the original manual contract is resolved from the real sealed commit");
+    let input = contract.context.input_hash.clone();
+    let handle = uuid::Uuid::new_v4().to_string();
+    let stream = format!("manual-check:run:handle={handle}:0");
+    local
+        .execute(
+            "INSERT INTO manual_check_handles(handle,project_id,created_at) VALUES(?1,'p',1)",
+            (handle.clone(),),
+        )
+        .await
+        .unwrap();
     let mut physical = claim("running", "manual");
     physical.project_id = "p".into();
     physical.commit_sha = commit.clone();
-    physical.check_names = suites.iter().map(|s| s.to_string()).collect();
-    physical.input_hashes = hashes.iter().map(|s| s.to_string()).collect();
-    physical.consumer_ref = handles[0].clone();
-    physical.recording_plans = (0..3)
-        .map(|i| {
-            serde_json::to_value(CheckAdoptionRecordingPlan::new(
-                &contracts[i].plan,
-                &contracts[i].sealed_coordinate,
-                "manual-job",
-                &streams[i],
-                &[],
-            ))
-            .unwrap()
-        })
-        .collect();
+    physical.check_names = vec!["second".into()];
+    physical.input_hashes = vec![input.clone()];
+    physical.consumer_ref = handle.clone();
+    physical.recording_plans = vec![serde_json::to_value(CheckAdoptionRecordingPlan::new(
+        &contract.plan,
+        &contract.sealed_coordinate,
+        "manual-job",
+        &stream,
+        &[],
+    ))
+    .unwrap()];
     orch.fleet
         .register_check_claim((REQUEST.into(), ATTEMPT.into()), physical);
     let request = |id: &str, attempt: &str, job: &str| {
@@ -837,18 +794,13 @@ async fn shared_manual_batch(
         request
     };
     let manual_request = request(REQUEST, ATTEMPT, "manual-job");
-    let manual_items = (0..3)
-        .map(|i| {
-            let mut item = batch_item(suites[i], hashes[i], &streams[i]);
-            item.process.args = vec![contracts[i].plan.command.clone()];
-            item
-        })
-        .collect();
+    let mut manual_item = batch_item("second", &input, &stream);
+    manual_item.process.args = vec![contract.plan.command.clone()];
     let manual_orch = orch.clone();
     let mut manual = tokio::spawn(async move {
         manual_orch
             .fleet
-            .submit_pure_verdict_batch(&manual_orch, manual_request, manual_items, None, None, None)
+            .submit_pure_verdict_check(&manual_orch, manual_request, manual_item, None, None, None)
             .await
     });
     let entry_id = loop {
@@ -882,8 +834,8 @@ async fn shared_manual_batch(
         {
             assert_eq!(
                 batch.items.len(),
-                3,
-                "one physical grant contains all manual suites"
+                1,
+                "a check grant carries exactly its one suite"
             );
             break request;
         }
@@ -907,11 +859,11 @@ async fn shared_manual_batch(
     joined_template.project_id = "p".into();
     joined_template.commit_sha = commit.clone();
     joined_template.check_names = vec!["second".into()];
-    joined_template.input_hashes = vec![hashes[1].to_string()];
+    joined_template.input_hashes = vec![input.clone()];
     joined_template.consumer_ref = key.to_string();
     joined_template.recording_plans = vec![serde_json::to_value(CheckAdoptionRecordingPlan::new(
-        &contracts[1].plan,
-        &contracts[1].sealed_coordinate,
+        &contract.plan,
+        &contract.sealed_coordinate,
         "main:p",
         "main-cadence:p:second:linux",
         &[],
@@ -923,18 +875,14 @@ async fn shared_manual_batch(
     );
     let cadence_request = request("cadence-join", "cadence-attempt", "main:p");
     let cadence_orch = orch.clone();
-    let cadence_input = hashes[1].to_string();
+    let cadence_input = input.clone();
     let cadence = tokio::spawn(async move {
         cadence_orch
             .fleet
-            .submit_pure_verdict_batch(
+            .submit_pure_verdict_check(
                 &cadence_orch,
                 cadence_request,
-                vec![batch_item(
-                    "second",
-                    &cadence_input,
-                    "main-cadence:p:second:linux",
-                )],
+                batch_item("second", &cadence_input, "main-cadence:p:second:linux"),
                 None,
                 None,
                 Some(key),
@@ -961,19 +909,19 @@ async fn shared_manual_batch(
     })
     .await
     .expect("the late cadence join is durably attached to the existing physical grant");
-    if withdrawn_first {
+    // A second cadence consumer of the same suite on the same grant, standing
+    // in for one that will commit its observation and then withdraw.
+    let sibling_ref = "main_cadence:p:second:linux:withdrawn-sibling";
+    if withdrawn_sibling {
         claims::insert_waiter(
             &local,
             &claims::Waiter {
                 request_id: REQUEST.into(),
                 attempt_id: ATTEMPT.into(),
-                check_name: "first".into(),
+                check_name: "second".into(),
                 item_index: 0,
                 consumer: "main_cadence".into(),
-                consumer_ref: crate::fleet::purpose::PurposeKey::main_cadence(
-                    "p", "first", "linux",
-                )
-                .to_string(),
+                consumer_ref: sibling_ref.into(),
                 state: "running".into(),
                 observation_id: None,
                 evidence: None,
@@ -989,12 +937,12 @@ async fn shared_manual_batch(
             .into_iter()
             .filter(|w| w.consumer == "manual")
             .collect::<Vec<_>>();
-        assert_eq!(manuals.len(), 3);
+        assert_eq!(manuals.len(), 1);
         assert_eq!(
             orch.fleet
                 .cancel_job_requests("manual-job", crate::fleet::CancelCause::OperatorRetracted,),
-            3,
-            "ending the manual job detaches all three real subscribers, not the cadence joiner"
+            1,
+            "ending the manual job detaches its real subscriber, not the cadence joiner"
         );
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
@@ -1010,30 +958,28 @@ async fn shared_manual_batch(
             }
         })
         .await
-        .expect("detached manual consumers must commit cancellation before the result");
+        .expect("a detached manual consumer must commit cancellation before the result");
         // The caller has already received its cancellation response; replaying
         // the physical result must not overwrite that user-visible settlement.
-        for (index, handle) in handles.iter().enumerate() {
-            local.execute(
-                "UPDATE manual_check_handles SET response_json=?2,commit_sha=?3,tree_hash=?4,input_hash=?5
-                 WHERE handle=?1 AND observation_id IS NULL",
-                cairn_db::turso::params![
-                    handle.clone(), r#"{"cancelled":true}"#.to_string(), commit.clone(),
-                    contracts[index].context.tree_hash.clone(), hashes[index].to_string(),
-                ],
-            ).await.unwrap();
-        }
+        local.execute(
+            "UPDATE manual_check_handles SET response_json=?2,commit_sha=?3,tree_hash=?4,input_hash=?5
+             WHERE handle=?1 AND observation_id IS NULL",
+            cairn_db::turso::params![
+                handle.clone(), r#"{"cancelled":true}"#.to_string(), commit.clone(),
+                contract.context.tree_hash.clone(), input.clone(),
+            ],
+        ).await.unwrap();
         let before_result = claims::waiters(&local, REQUEST, ATTEMPT).await.unwrap();
         let manuals = before_result
             .iter()
             .filter(|w| w.consumer == "manual")
             .collect::<Vec<_>>();
-        assert_eq!(manuals.len(), 3);
+        assert_eq!(manuals.len(), 1);
         assert!(
             manuals
                 .iter()
                 .all(|w| w.state == "cancelled" && w.observation_id.is_none()),
-            "all manual consumers are already cancelled before recording: {manuals:?}"
+            "the manual consumer is already cancelled before recording: {manuals:?}"
         );
         assert!(before_result.iter().any(|w| w.consumer == "main_cadence"
             && matches!(w.state.as_str(), "running" | "awaiting_adoption" | "joined")));
@@ -1065,7 +1011,7 @@ async fn shared_manual_batch(
     // waits out the pool's busy timeout. Neither trigger can fire before the
     // driver below, since nothing records an observation or finalizes the
     // physical claim until then.
-    if reject_second {
+    if reject_observation {
         local.execute_script(
             "CREATE TRIGGER reject_second_observation BEFORE INSERT ON check_result_observations
              WHEN NEW.check_name='second' BEGIN
@@ -1086,20 +1032,10 @@ async fn shared_manual_batch(
     let mut retained = result(&restarted);
     if let CellOutcome::Completed { output, .. } = &mut retained.outcome {
         let specimen: Vec<ProcessBatchItemOutcome> = serde_json::from_str(output).unwrap();
-        let items = suites
-            .iter()
-            .map(|name| {
-                let mut item = specimen[0].clone();
-                item.header = (*name).into();
-                item.body = if *name == "third" {
-                    "CAIRN_CHECK_RESULT_JSON={\"schemaVersion\":1,\"parser\":\"nextest\",\"complete\":true,\"selection\":\"partial\",\"undeclaredSkips\":0,\"tests\":[{\"id\":\"fixture selected::passes\",\"status\":\"passed\",\"attempts\":1,\"retried\":false,\"flaky\":false}]}".into()
-                } else {
-                    format!("{name} passed remotely")
-                };
-                item
-            })
-            .collect::<Vec<_>>();
-        *output = serde_json::to_string(&items).unwrap();
+        let mut item = specimen[0].clone();
+        item.header = "second".into();
+        item.body = "second passed remotely".into();
+        *output = serde_json::to_string(&vec![item]).unwrap();
     }
     let retained_outcome = retained.outcome;
     restarted.fleet.handle_executor_message(
@@ -1115,9 +1051,11 @@ async fn shared_manual_batch(
         .fleet
         .apply_executor_snapshot(REMOTE, 1, Default::default(), Default::default());
     assert_no_release(&mut restarted_frames);
-    if withdrawn_first {
-        // Commit a real first-item observation, then withdraw that consumer.
-        // A second boot must not turn its terminal receipt back into an adopter.
+    let mut sibling_observation = None;
+    if withdrawn_sibling {
+        // Commit the grant's real observation, then withdraw the sibling
+        // consumer. A second boot must not turn its terminal receipt back into
+        // an adopter, while the still-active cadence consumer is delivered.
         let physical = claims::lookup(&local, REQUEST, ATTEMPT)
             .await
             .unwrap()
@@ -1126,16 +1064,14 @@ async fn shared_manual_batch(
             .await
             .unwrap();
         assert!(recorded.observation_id.is_some());
-        let first_purpose =
-            crate::fleet::purpose::PurposeKey::main_cadence("p", "first", "linux").to_string();
         restarted
             .fleet
             .withdraw_check_consumer(
                 &(REQUEST.into(), ATTEMPT.into()),
-                "first",
+                "second",
                 "main_cadence",
-                &first_purpose,
-                "first cadence consumer withdrew after its observation committed",
+                sibling_ref,
+                "sibling cadence consumer withdrew after its observation committed",
             )
             .await
             .unwrap();
@@ -1143,10 +1079,11 @@ async fn shared_manual_batch(
             .await
             .unwrap()
             .into_iter()
-            .find(|w| w.consumer == "main_cadence" && w.check_name == "first")
+            .find(|w| w.consumer_ref == sibling_ref)
             .unwrap();
         assert_eq!(withdrawn.state, "recorded_undelivered");
         assert_eq!(withdrawn.observation_id, recorded.observation_id);
+        sibling_observation = recorded.observation_id;
         assert_no_release(&mut restarted_frames);
         restarted.fleet.begin_runner_shutdown();
         let again = home.path().join("restarted-with-withdrawn-consumer");
@@ -1172,7 +1109,7 @@ async fn shared_manual_batch(
             .await
             .unwrap()
             .unwrap();
-        physical.input_hashes[1] = "corrupted-granted-cadence-input".into();
+        physical.input_hashes[0] = "corrupted-granted-cadence-input".into();
         let probes = Arc::new(AtomicUsize::new(0));
         let seen = probes.clone();
         let store = local.clone();
@@ -1245,15 +1182,15 @@ async fn shared_manual_batch(
                     AND state='delivered' AND observation_id IS NOT NULL").await?,
             ))
         }).unwrap();
-        assert_eq!((observations, cached, manual, cadence), (3, 3, 3, 1),
-            "ResultAck must follow the third observation/cache and every consumer's durable disposition");
+        assert_eq!((observations, cached, manual, cadence), (1, 1, 1, 1),
+            "ResultAck must follow the observation/cache and every consumer's durable disposition");
         if cancelled_manual {
             crate::storage::run_db_blocking(|| async {
                 assert_eq!(probe_db.query_opt(
                     "SELECT COUNT(*) FROM manual_check_handles WHERE project_id='p' AND response_json=?1",
                     (r#"{"cancelled":true}"#.to_string(),), |row| row.i64(0),
-                ).await.map_err(|e| e.to_string())?, Some(3),
-                    "adoption must preserve all original manual cancellation responses");
+                ).await.map_err(|e| e.to_string())?, Some(1),
+                    "adoption must preserve the original manual cancellation response");
                 let waiters = claims::waiters(&probe_db, REQUEST, ATTEMPT).await.map_err(|e| e.to_string())?;
                 for waiter in waiters.into_iter().filter(|w| w.consumer == "manual") {
                     assert_eq!(waiter.state, "cancelled");
@@ -1322,20 +1259,26 @@ async fn shared_manual_batch(
             .await
             .unwrap();
     }
-    if reject_second {
+    if reject_observation {
         let failure = tokio::time::timeout(std::time::Duration::from_secs(20), retries.recv())
             .await
-            .expect("the second observation insert must actually fail, not merely run slowly")
+            .expect("the observation insert must actually fail, not merely run slowly")
             .expect("the recording retry probe remains installed");
         assert!(
             failure.contains("fixture rejects second observation"),
             "{failure}"
         );
-        let rows = local.query_all(
-            "SELECT check_name FROM check_result_observations WHERE project_id='p' ORDER BY check_name",
-            (), |row| row.text(0),
-        ).await.unwrap();
-        assert_eq!(rows, vec!["first".to_string()]);
+        assert_eq!(
+            local
+                .query_opt(
+                    "SELECT COUNT(*) FROM check_result_observations WHERE project_id='p'",
+                    (),
+                    |row| row.i64(0)
+                )
+                .await
+                .unwrap(),
+            Some(0)
+        );
         assert!(
             !driver.is_finished(),
             "a temporary observation-store refusal is not adoption loss"
@@ -1357,18 +1300,21 @@ async fn shared_manual_batch(
     }
     tokio::time::timeout(std::time::Duration::from_secs(30), driver)
         .await
-        .expect("the same physical batch finishes after observation storage recovers")
+        .expect("the same physical grant finishes after observation storage recovers")
         .unwrap();
     assert_eq!(probes.load(Ordering::SeqCst), 1);
-    if withdrawn_first {
+    if withdrawn_sibling {
         let withdrawn = claims::waiters(&local, REQUEST, ATTEMPT)
             .await
             .unwrap()
             .into_iter()
-            .find(|w| w.consumer == "main_cadence" && w.check_name == "first")
+            .find(|w| w.consumer_ref == sibling_ref)
             .unwrap();
-        assert_eq!(withdrawn.state, "recorded_undelivered");
-        assert!(withdrawn.observation_id.is_some());
+        assert_eq!(
+            withdrawn.state, "recorded_undelivered",
+            "the withdrawn sibling's receipt stays terminal across the second boot"
+        );
+        assert_eq!(withdrawn.observation_id, sibling_observation);
         let outcomes = crate::execution::checks_main::last_outcomes(&restarted, "p");
         assert_eq!(
             outcomes
@@ -1376,41 +1322,22 @@ async fn shared_manual_batch(
                 .map(|o| o.check.as_str())
                 .collect::<Vec<_>>(),
             vec!["second"],
-            "only the active cadence suite reports; the withdrawn receipt stays terminal"
+            "the active cadence consumer reports once"
         );
     }
     let rows = local
         .query_all(
-            "SELECT check_name,COUNT(*) FROM check_result_observations WHERE project_id='p'
-         GROUP BY check_name ORDER BY check_name",
+            "SELECT check_name,input_hash FROM check_result_observations WHERE project_id='p'",
             (),
-            |row| Ok((row.text(0)?, row.i64(1)?)),
+            |row| Ok((row.text(0)?, row.text(1)?)),
         )
         .await
         .unwrap();
     assert_eq!(
         rows,
-        vec![
-            ("first".into(), 1),
-            ("second".into(), 1),
-            ("third".into(), 1)
-        ]
+        vec![("second".to_string(), input.clone())],
+        "the grant records exactly one observation, even when adopted across two boots"
     );
-    let selected = local.query_opt(
-        "SELECT selection,input_hash FROM check_result_observations WHERE project_id='p' AND check_name='third'",
-        (), |row| Ok((row.text(0)?, row.text(1)?)),
-    ).await.unwrap().unwrap();
-    assert_eq!(selected, ("partial".into(), selected_input));
-    assert!(
-        crate::execution::cache::get_check_result(local.clone(), "p", "third", &whole_third_input)
-            .unwrap()
-            .is_none(),
-        "a selected sibling must not satisfy the cadence's whole-suite coordinate"
-    );
-    let restored: CheckAdoptionRecordingPlan =
-        serde_json::from_value(physical.recording_plans[2].clone()).unwrap();
-    assert_eq!(restored.plan.scope, CheckScope::Partial);
-    assert_eq!(restored.plan.command, selective_command);
     let mut ack_count = 0;
     while let Ok(frame) = restarted_frames.try_recv() {
         match frame {
@@ -1418,7 +1345,7 @@ async fn shared_manual_batch(
             ExecutorMessage::Cancel { .. }
             | ExecutorMessage::Offer { .. }
             | ExecutorMessage::Granted { .. } => {
-                panic!("adoption must not cancel or dispatch another physical batch: {frame:?}")
+                panic!("adoption must not cancel or dispatch another physical request: {frame:?}")
             }
             _ => {}
         }
@@ -2013,18 +1940,17 @@ pub(super) async fn next_submission_frame(
     frames: &mut mpsc::UnboundedReceiver<ExecutorMessage>,
     identity: &(String, String),
     boundary: &str,
-    submission: &mut tokio::task::JoinHandle<Vec<crate::fleet::CoalescedDelivery>>,
+    submission: &mut tokio::task::JoinHandle<crate::fleet::CoalescedDelivery>,
 ) -> ExecutorMessage {
     let received = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         tokio::select! {
             frame = frames.recv() => frame.expect("remote fake link stays open"),
             result = submission => {
-                let outcomes = result.expect("submission task must not panic before a protocol frame")
-                    .into_iter().map(|item| match item {
-                        Ok(item) => format!("{:?}", item.outcome),
-                        Err(error) => format!("{error:?}"),
-                    }).collect::<Vec<_>>();
-                panic!("{boundary}: submission ended before the expected frame: {outcomes:?}");
+                let outcome = match result.expect("submission task must not panic before a protocol frame") {
+                    Ok(delivery) => format!("{:?}", delivery.outcome),
+                    Err(error) => format!("{error:?}"),
+                };
+                panic!("{boundary}: submission ended before the expected frame: {outcome}");
             }
         }
     }).await;

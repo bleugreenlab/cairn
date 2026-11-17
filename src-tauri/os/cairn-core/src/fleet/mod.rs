@@ -141,7 +141,6 @@ pub(crate) use colocated::{kernel_wait_diagnostic, NO_COLOCATED_EXECUTOR};
 pub(crate) use dispatch::verdict_disagreement;
 pub use dispatch::CancelOutcome;
 use dispatch::ItemSettlements;
-pub(crate) use dispatch::PureVerdictItemSink;
 #[cfg(test)]
 use dispatch::{
     account_of_claimed_attempt, batch_runs_javascript, cell_build_service_env, outcome_matches,

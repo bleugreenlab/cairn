@@ -59,11 +59,11 @@ use serde_json::Value;
 use crate::config::project_settings::CheckResourceClass;
 use crate::execution::cache::InfraScopes;
 use crate::execution::checks::{
-    submit_planned_check_batch, CheckExecutionFailure, PlannedCheckBatchItem,
-    PlannedCheckBatchOutcome, PlannedCheckBatchRequest,
+    submit_planned_check, CheckExecutionFailure, PlannedCheckBatchItem, PlannedCheckBatchOutcome,
+    PlannedCheckRequest,
 };
 use crate::execution::wire::CheckResourceIdentityInput;
-use crate::fleet::{CellPriority, KnownMachinePlatform, MutationPolicy};
+use crate::fleet::{CellPriority, KnownMachinePlatform};
 use crate::mcp::handlers::run::CheckExecResult;
 use crate::orchestrator::Orchestrator;
 use crate::security::RedactionPolicy;
@@ -569,12 +569,12 @@ async fn project_context(orch: &Orchestrator, project_id: &str) -> Result<Projec
     })
 }
 
-/// Places one leg's batch: production submits it to the fleet, a test answers
-/// it from a script.
+/// Places one leg's request: production submits it to the fleet, a test
+/// answers it from a script.
 pub(crate) trait LegPlacer: Send + Sync {
     fn place(
         &self,
-        batch: PlannedCheckBatchRequest,
+        request: PlannedCheckRequest,
     ) -> futures_util::future::BoxFuture<'_, Result<PlannedCheckBatchOutcome, String>>;
 }
 
@@ -583,9 +583,9 @@ struct FleetPlacer(Orchestrator);
 impl LegPlacer for FleetPlacer {
     fn place(
         &self,
-        batch: PlannedCheckBatchRequest,
+        request: PlannedCheckRequest,
     ) -> futures_util::future::BoxFuture<'_, Result<PlannedCheckBatchOutcome, String>> {
-        Box::pin(submit_planned_check_batch(&self.0, batch))
+        Box::pin(submit_planned_check(&self.0, request))
     }
 }
 
@@ -1258,7 +1258,7 @@ async fn place_leg(
     let owner_key = format!("publication:{}", publication.id);
     let outcome = actor
         .placer
-        .place(PlannedCheckBatchRequest {
+        .place(PlannedCheckRequest {
             project_id: context.project_id.clone(),
             repository: context.repository.clone(),
             store_dir: context.store_dir.clone(),
@@ -1275,7 +1275,7 @@ async fn place_leg(
             affinity_key: None,
             priority: CellPriority::ReviewCheck,
             env: Vec::new(),
-            items: vec![PlannedCheckBatchItem {
+            item: PlannedCheckBatchItem {
                 recording_plan: None,
                 index: 0,
                 name: name.clone(),
@@ -1301,12 +1301,10 @@ async fn place_leg(
                 resource_class: CheckResourceClass::Shared,
                 infra_scopes: InfraScopes::head_only(&owner_key, commit),
                 avoid_executor_ids: spec.avoid,
-            }],
-            cell_groups: Default::default(),
+            },
             run_context: None,
-            mutation_policy: MutationPolicy::PureVerdict,
             status_board: Some(board),
-            on_group_complete: None,
+            on_complete: None,
             purpose: None,
             publication: spec.custody,
         })
@@ -1603,14 +1601,14 @@ mod tests {
         impl LegPlacer for FakePlacer {
             fn place(
                 &self,
-                batch: PlannedCheckBatchRequest,
+                request: PlannedCheckRequest,
             ) -> futures_util::future::BoxFuture<'_, Result<PlannedCheckBatchOutcome, String>>
             {
-                let item = &batch.items[0];
+                let item = &request.item;
                 self.placed.lock().unwrap().push(Placed {
                     name: item.name.clone(),
                     command: item.command.clone(),
-                    custody: batch.publication,
+                    custody: request.publication,
                 });
                 let (exit, output) = (self.script)(&item.name);
                 Box::pin(async move {

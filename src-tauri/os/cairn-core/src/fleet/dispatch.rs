@@ -197,10 +197,8 @@ pub(crate) fn verdict_disagreement(early: &CellOutcome, last: &CellOutcome) -> V
     differing
 }
 
-/// What a caller of [`Fleet::submit_pure_verdict_batch_streaming`] is handed
-/// as each item's delivery lands, by the item's position in the batch.
-pub(crate) type PureVerdictItemSink =
-    dyn Fn(usize, &CoalescedDelivery) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync;
+/// What a check request's subscriber identity adds to its request identity.
+const CHECK_SUBSCRIBER_SUFFIX: &str = ":check";
 
 pub(super) fn scrub_cell_outcome(outcome: &mut CellOutcome) {
     use crate::security::{Crossing, DetectionReport, Sanitizer};
@@ -1142,8 +1140,8 @@ impl Fleet {
     /// a named machine since its claim, and whose run it is when it coalesced
     /// onto another request's.
     ///
-    /// `subscriber` is the public identity [`Self::submit_pure_verdict_batch`]
-    /// mints per item, `{request_id}:check-{index}`. `None` when no execution
+    /// `subscriber` is the identity [`Self::check_subscriber`] mints for a
+    /// check request. `None` when no execution
     /// is known for it, or the one it had is between leaving the queue and
     /// settling; a caller treats that as nothing new to say.
     ///
@@ -1156,8 +1154,8 @@ impl Fleet {
         let leader = self.coalesced_leader(subscriber)?;
         let own = subscriber
             .0
-            .rsplit_once(":check-")
-            .is_some_and(|(request_id, _)| request_id == leader.0);
+            .strip_suffix(CHECK_SUBSCRIBER_SUFFIX)
+            .is_some_and(|request_id| request_id == leader.0);
         let (phase, owner) = self.request_dispatch_state(&leader)?;
         Some(CheckDispatch {
             phase,
@@ -2314,52 +2312,33 @@ impl Fleet {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn submit_pure_verdict_batch(
-        &self,
-        orch: &Orchestrator,
-        request: CellRequest,
-        items: Vec<PureVerdictBatchItem>,
-        run_context: Option<crate::mcp::handlers::RunContext>,
-        check_status_board: Option<crate::execution::checks::CheckStatusBoard>,
-        purpose: Option<purpose::PurposeKey>,
-    ) -> Vec<CoalescedDelivery> {
-        self.submit_pure_verdict_batch_streaming(
-            orch,
-            request,
-            items,
-            run_context,
-            check_status_board,
-            purpose,
-            None,
+    /// The identity a check request's verdict is delivered under. The request
+    /// itself is the leader of any execution it opens; its subscriber is this,
+    /// so [`Self::check_dispatch_phase`] can tell its own run from one it
+    /// coalesced onto.
+    pub(crate) fn check_subscriber(request: &CellRequest) -> RequestIdentity {
+        (
+            format!("{}{CHECK_SUBSCRIBER_SUFFIX}", request.request_id),
+            format!("{}{CHECK_SUBSCRIBER_SUFFIX}", request.attempt_id),
         )
-        .await
     }
 
-    /// [`Self::submit_pure_verdict_batch`], handing each item's delivery to
-    /// `on_delivered` as it lands rather than only once every item has. An
-    /// item of a sequential batch lands when the executor reports it finished
-    /// ([`ItemSettlements`]), so a caller can act on a finished member while
-    /// its siblings still run.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn submit_pure_verdict_batch_streaming(
+    /// Ask for one check suite's verdict, coalescing onto an execution already
+    /// answering the same question when one exists. A check request is always
+    /// one suite: it is placed, priced and settled by itself.
+    pub(crate) async fn submit_pure_verdict_check(
         &self,
         orch: &Orchestrator,
         request: CellRequest,
-        items: Vec<PureVerdictBatchItem>,
+        item: PureVerdictBatchItem,
         run_context: Option<crate::mcp::handlers::RunContext>,
         check_status_board: Option<crate::execution::checks::CheckStatusBoard>,
         purpose: Option<purpose::PurposeKey>,
-        on_delivered: Option<&PureVerdictItemSink>,
-    ) -> Vec<CoalescedDelivery> {
+    ) -> CoalescedDelivery {
         if request.mutation_policy != MutationPolicy::PureVerdict {
-            let mut outcomes = Vec::with_capacity(items.len());
-            for _ in items {
-                outcomes.push(Err(CoalescedWaitError::refused(executor_unavailable(
-                    "coalesced batch submission requires pure-verdict mutation policy".into(),
-                ))));
-            }
-            return outcomes;
+            return Err(CoalescedWaitError::refused(executor_unavailable(
+                "a check verdict requires the pure-verdict mutation policy".into(),
+            )));
         }
         let leader = (request.request_id.clone(), request.attempt_id.clone());
         // The chokepoint. An item that names a purpose holds that purpose alone:
@@ -2397,11 +2376,7 @@ impl Fleet {
                     log::info!(
                         "purpose {key} is already held by {holder:?}; {leader:?} is stale and will not dispatch"
                     );
-                    let mut refused = Vec::with_capacity(items.len());
-                    for _ in &items {
-                        refused.push(Err(CoalescedWaitError::Cancelled(CancelCause::Superseded)));
-                    }
-                    return refused;
+                    return Err(CoalescedWaitError::Cancelled(CancelCause::Superseded));
                 }
             }
             admission_guard = Some(PurposeAdmissionGuard {
@@ -2417,11 +2392,7 @@ impl Fleet {
                     log::info!(
                         "purpose {key} moved on while {leader:?} waited to dispatch; it never ran"
                     );
-                    let mut refused = Vec::with_capacity(items.len());
-                    for _ in &items {
-                        refused.push(Err(CoalescedWaitError::Cancelled(CancelCause::Superseded)));
-                    }
-                    return refused;
+                    return Err(CoalescedWaitError::Cancelled(CancelCause::Superseded));
                 }
                 PurposeGate::Owed { outstanding } => {
                     // Refusing is the whole point. Dispatching here would
@@ -2435,13 +2406,9 @@ impl Fleet {
                     log::warn!("{diagnostic}");
                     self.purposes.lock().unwrap().finish(&leader);
                     self.purpose_quiesced.notify_waiters();
-                    let mut refused = Vec::with_capacity(items.len());
-                    for _ in &items {
-                        refused.push(Err(CoalescedWaitError::refused(executor_unavailable(
-                            diagnostic.clone(),
-                        ))));
-                    }
-                    return refused;
+                    return Err(CoalescedWaitError::refused(executor_unavailable(
+                        diagnostic,
+                    )));
                 }
             }
         }
@@ -2455,67 +2422,53 @@ impl Fleet {
         // The durable JOIN boundary and the recorder's final acknowledgement
         // share this gate; admitting a join cannot race ahead of its row.
         let adoption_admission = adoption_gate.lock().await;
-        let mut consumer_sources = Vec::new();
         let wait_horizon_unix_ms = request.wait_horizon_unix_ms;
-        let mut receivers = Vec::with_capacity(items.len());
-        let mut newly_claimed = Vec::new();
         let mut manual_publications = Vec::new();
         let mut keys = Vec::new();
         let demand = PlacementDemand::of(&request);
-        {
+        let subscriber = Self::check_subscriber(&request);
+        let manual_handle = crate::execution::checks::manual_check_handle(&item.process.stream_id)
+            .map(str::to_owned);
+        let check_name = item.result_identity.check_name.clone();
+        let (tx, rx) = oneshot::channel();
+        let (physical, newly_claimed) = {
             let mut registry = self.in_flight.lock().unwrap();
-            for (index, item) in items.into_iter().enumerate() {
-                let public_identity = (
-                    format!("{}:check-{index}", request.request_id),
-                    format!("{}:check-{index}", request.attempt_id),
-                );
-                let (tx, rx) = oneshot::channel();
-                let (key, opened) = registry.admit(
-                    item.result_identity.clone(),
-                    &demand,
-                    &leader,
-                    public_identity.clone(),
-                    CoalescedSubscriber {
-                        waiter: tx,
-                        priority: request.priority,
-                        requesting_job_id: request.requesting_job_id.clone(),
-                    },
-                );
-                if let Some(handle) =
-                    crate::execution::checks::manual_check_handle(&item.process.stream_id)
-                {
-                    let publication = &registry.by_key[&key].publication;
-                    manual_publications.push((handle.to_string(), publication.id().to_string()));
-                }
-                consumer_sources.push((
-                    public_identity.clone(),
-                    key.leader.clone(),
-                    item.result_identity.check_name.clone(),
-                    crate::execution::checks::manual_check_handle(&item.process.stream_id)
-                        .map(str::to_owned),
-                ));
-                if opened {
-                    keys.push(key);
-                    newly_claimed.push(item);
-                } else if let Some(board) = &check_status_board {
+            let (key, opened) = registry.admit(
+                item.result_identity.clone(),
+                &demand,
+                &leader,
+                subscriber.clone(),
+                CoalescedSubscriber {
+                    waiter: tx,
+                    priority: request.priority,
+                    requesting_job_id: request.requesting_job_id.clone(),
+                },
+            );
+            if let Some(handle) = &manual_handle {
+                let publication = &registry.by_key[&key].publication;
+                manual_publications.push((handle.clone(), publication.id().to_string()));
+            }
+            let physical = key.leader.clone();
+            if opened {
+                keys.push(key);
+                (physical, Some(item))
+            } else {
+                if let Some(board) = &check_status_board {
                     // Answered by an execution another leader opened, whose
-                    // per-item reports go to that leader. Say so, rather than
-                    // leave the lane reading as queued until the batch returns.
+                    // item reports go to that leader. Say so, rather than
+                    // leave the lane reading as queued until it returns.
                     if let Some(index) = check_index_from_stream_id(&item.process.stream_id) {
                         board.transition(index, "shared", None);
                     }
                 }
-                receivers.push((public_identity, rx));
+                (physical, None)
             }
-        }
-        let admission_subscribers: Vec<_> = receivers
-            .iter()
-            .map(|(identity, _)| CoalescedSubscriberDropGuard {
-                pool: self.clone(),
-                identity: identity.clone(),
-                armed: true,
-            })
-            .collect();
+        };
+        let admission_subscriber = CoalescedSubscriberDropGuard {
+            pool: self.clone(),
+            identity: subscriber.clone(),
+            armed: true,
+        };
         let mut admission_leader = CoalescedLeaderCompletionGuard {
             pool: self.clone(),
             leader: leader.clone(),
@@ -2525,76 +2478,61 @@ impl Fleet {
             armed: !keys.is_empty(),
         };
         if let Some(source) = &joining_metadata {
-            for (subscriber, physical, name, manual_handle) in consumer_sources {
-                let mut source = source.clone();
-                if source.consumer == "manual" {
-                    if let Some(handle) = manual_handle {
-                        source.consumer_ref = handle;
-                    }
-                }
-                self.track_check_consumer(subscriber, physical.clone(), &name, &source);
-                if let Err(error) = self
-                    .register_check_join_locked(&physical, &name, &source)
-                    .await
-                {
-                    let diagnostic = format!("persist configured check consumer JOIN: {error}");
-                    for (identity, _) in &receivers {
-                        self.detach_coalesced_subscriber(identity, None);
-                    }
-                    for key in &keys {
-                        self.complete_coalesced_for_leader(
-                            key,
-                            executor_unavailable(diagnostic.clone()),
-                        );
-                    }
-                    self.check_adoptions
-                        .lock()
-                        .unwrap()
-                        .templates
-                        .remove(&leader);
-                    return receivers
-                        .into_iter()
-                        .map(|_| {
-                            Err(CoalescedWaitError::refused(executor_unavailable(
-                                diagnostic.clone(),
-                            )))
-                        })
-                        .collect();
+            let mut source = source.clone();
+            if source.consumer == "manual" {
+                if let Some(handle) = manual_handle {
+                    source.consumer_ref = handle;
                 }
             }
+            self.track_check_consumer(subscriber.clone(), physical.clone(), &check_name, &source);
+            if let Err(error) = self
+                .register_check_join_locked(&physical, &check_name, &source)
+                .await
+            {
+                let diagnostic = format!("persist configured check consumer JOIN: {error}");
+                self.detach_coalesced_subscriber(&subscriber, None);
+                for key in &keys {
+                    self.complete_coalesced_for_leader(
+                        key,
+                        executor_unavailable(diagnostic.clone()),
+                    );
+                }
+                self.check_adoptions
+                    .lock()
+                    .unwrap()
+                    .templates
+                    .remove(&leader);
+                return Err(CoalescedWaitError::refused(executor_unavailable(
+                    diagnostic,
+                )));
+            }
         }
-        // Only newly opened items run in this physical grant. Joined items
-        // are recorded against their existing leader's claim instead.
+        // Only a newly opened execution runs in this physical grant. A joined
+        // check is recorded against its existing leader's claim instead.
         {
             let mut adoptions = self.check_adoptions.lock().unwrap();
-            if newly_claimed.is_empty() {
-                adoptions.templates.remove(&leader);
-            } else if let Some(template) = adoptions.templates.get_mut(&leader) {
-                let indices: Vec<_> = newly_claimed
-                    .iter()
-                    .filter_map(|item| {
-                        template
+            match &newly_claimed {
+                None => {
+                    adoptions.templates.remove(&leader);
+                }
+                Some(item) => {
+                    if let Some(template) = adoptions.templates.get_mut(&leader) {
+                        let position = template
                             .check_names
                             .iter()
                             .zip(&template.input_hashes)
                             .position(|(name, hash)| {
                                 name == &item.result_identity.check_name
                                     && hash == &item.result_identity.input_hash
-                            })
-                    })
-                    .collect();
-                template.recording_plans = indices
-                    .iter()
-                    .filter_map(|index| template.recording_plans.get(*index).cloned())
-                    .collect();
-                template.check_names = newly_claimed
-                    .iter()
-                    .map(|item| item.result_identity.check_name.clone())
-                    .collect();
-                template.input_hashes = newly_claimed
-                    .iter()
-                    .map(|item| item.result_identity.input_hash.clone())
-                    .collect();
+                            });
+                        template.recording_plans = position
+                            .and_then(|index| template.recording_plans.get(index).cloned())
+                            .into_iter()
+                            .collect();
+                        template.check_names = vec![item.result_identity.check_name.clone()];
+                        template.input_hashes = vec![item.result_identity.input_hash.clone()];
+                    }
+                }
             }
         }
         drop(adoption_admission);
@@ -2602,14 +2540,11 @@ impl Fleet {
         // wait for it. The publisher may already be committing its source; recovery
         // joins this identity even if we never receive its direct observation ID.
         if !manual_publications.is_empty() {
-            let mut subscribers: Vec<_> = receivers
-                .iter()
-                .map(|(identity, _)| CoalescedSubscriberDropGuard {
-                    pool: self.clone(),
-                    identity: identity.clone(),
-                    armed: true,
-                })
-                .collect();
+            let mut subscriber_guard = CoalescedSubscriberDropGuard {
+                pool: self.clone(),
+                identity: subscriber.clone(),
+                armed: true,
+            };
             let mut leader_guard = CoalescedLeaderCompletionGuard {
                 pool: self.clone(),
                 leader: leader.clone(),
@@ -2631,15 +2566,11 @@ impl Fleet {
                 .await
             }
             .await;
-            for subscriber in &mut subscribers {
-                subscriber.disarm();
-            }
+            subscriber_guard.disarm();
             leader_guard.disarm();
             if let Err(error) = registration {
                 let diagnostic = format!("persist manual check publication: {error}");
-                for (identity, _) in &receivers {
-                    self.detach_coalesced_subscriber(identity, None);
-                }
+                self.detach_coalesced_subscriber(&subscriber, None);
                 for key in &keys {
                     self.complete_coalesced_for_leader(
                         key,
@@ -2649,37 +2580,26 @@ impl Fleet {
                 if !keys.is_empty() {
                     self.cancelled_leaders.lock().unwrap().remove(&leader);
                 }
-                return receivers
-                    .into_iter()
-                    .map(|_| {
-                        Err(CoalescedWaitError::refused(executor_unavailable(
-                            diagnostic.clone(),
-                        )))
-                    })
-                    .collect();
+                return Err(CoalescedWaitError::refused(executor_unavailable(
+                    diagnostic,
+                )));
             }
         }
-        // An item whose every check joined an execution another leader opened
-        // has no leader of its own. Its subscriptions are its stake in the
-        // fleet, so retiring it has to end them, and their ending is its end.
-        if let (true, Some(key)) = (newly_claimed.is_empty(), &purpose) {
-            self.purpose_joiners.lock().unwrap().insert(
-                leader.clone(),
-                (
-                    key.clone(),
-                    receivers
-                        .iter()
-                        .map(|(identity, _)| identity.clone())
-                        .collect(),
-                ),
-            );
+        // A check that joined an execution another leader opened has no
+        // leader of its own. Its subscription is its stake in the fleet, so
+        // retiring it has to end it, and that ending is its end.
+        if let (true, Some(key)) = (newly_claimed.is_none(), &purpose) {
+            self.purpose_joiners
+                .lock()
+                .unwrap()
+                .insert(leader.clone(), (key.clone(), vec![subscriber.clone()]));
             // Displaced between the gate and this registration: the
             // retirement found nothing to detach, so do it here.
             if !self.purposes.lock().unwrap().is_live_holder(key, &leader) {
                 self.detach_purpose_joiner(&leader, CancelCause::Superseded);
             }
         }
-        if !newly_claimed.is_empty() {
+        if let Some(item) = newly_claimed {
             self.coalesced_leaders
                 .lock()
                 .unwrap()
@@ -2694,15 +2614,14 @@ impl Fleet {
             );
             let coalesced_output = output_guard::RelayedOutput::shared();
             let flushed_context = run_context.clone();
-            // Every claimed item settles from the executor's report of it as
-            // it finishes, so every batch names a context to report to. The
-            // executor sends its per-item reports only to a batch that does.
+            // The claimed check settles from the executor's report of it as
+            // it finishes, so every check names a context to report to. The
+            // executor sends its item reports only to a batch that does.
             let item_settlements = Arc::new(ItemSettlements {
                 leader: leader.clone(),
-                keys: newly_claimed
+                keys: keys
                     .iter()
-                    .zip(&keys)
-                    .map(|(item, key)| (item.process.stream_id.clone(), key.clone()))
+                    .map(|key| (item.process.stream_id.clone(), key.clone()))
                     .collect(),
                 settled: Mutex::new(HashMap::new()),
             });
@@ -2728,7 +2647,7 @@ impl Fleet {
                 Some(id)
             };
             let batch = Self::check_process_batch(
-                newly_claimed.into_iter().map(|item| item.process).collect(),
+                vec![item.process],
                 runner_context_id.clone(),
                 Self::check_batch_containment(&request),
                 Self::REVIEW_CHECK_SILENCE_BOUND_MS,
@@ -2894,30 +2813,14 @@ impl Fleet {
             });
         }
         admission_leader.disarm();
-        let mut landing: futures_util::stream::FuturesUnordered<_> = receivers
-            .into_iter()
-            .enumerate()
-            .map(|(position, (identity, rx))| {
-                let delivery = self.await_coalesced(identity, wait_horizon_unix_ms, rx);
-                async move { (position, delivery.await) }
-            })
-            .collect();
-        let mut landed: Vec<Option<CoalescedDelivery>> = (0..landing.len()).map(|_| None).collect();
-        while let Some((position, delivery)) = futures_util::StreamExt::next(&mut landing).await {
-            if let Some(sink) = on_delivered {
-                sink(position, &delivery).await;
-            }
-            landed[position] = Some(delivery);
-        }
-        let outcomes: Vec<CoalescedDelivery> = landed
-            .into_iter()
-            .map(|delivery| delivery.expect("every subscriber's wait returns a delivery"))
-            .collect();
-        // Still armed only for an item that led nothing: its subscriptions
-        // have ended, and with them its stake in the fleet.
+        let delivery = self
+            .await_coalesced(subscriber, wait_horizon_unix_ms, rx)
+            .await;
+        // Still armed only for a check that led nothing: its subscription has
+        // ended, and with it its stake in the fleet.
         drop(admission_guard);
-        drop(admission_subscribers);
-        outcomes
+        drop(admission_subscriber);
+        delivery
     }
 
     /// The confinement a batch runs under.

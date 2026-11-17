@@ -3316,17 +3316,14 @@ fn enqueue_entry(
         .expect("a fresh request identity enqueues")
 }
 
-/// A pure-verdict execution led by `leader`, with its own first item and
-/// one other request's item coalesced onto it, the identities
-/// `submit_pure_verdict_batch` mints.
+/// A pure-verdict execution led by `leader`, with its own check and one
+/// other request's check coalesced onto it, under the identities
+/// [`Fleet::check_subscriber`] mints.
 fn dispatched_check(pool: &Fleet, leader: &RequestIdentity) -> (RequestIdentity, RequestIdentity) {
-    let own = (
-        format!("{}:check-0", leader.0),
-        format!("{}:check-0", leader.1),
-    );
+    let own = (format!("{}:check", leader.0), format!("{}:check", leader.1));
     let joined = (
-        "other-request:check-2".to_string(),
-        "other-attempt:check-2".to_string(),
+        "other-request:check".to_string(),
+        "other-attempt:check".to_string(),
     );
     let subscriber = || {
         let (waiter, _) = oneshot::channel();
@@ -22978,16 +22975,16 @@ async fn a_shared_execution_outlives_the_runtime_of_the_wave_that_opened_it() {
             owner_id: request.project_id.clone(),
         };
         request.wait_horizon_unix_ms = unix_time_ms() + 60_000;
-        let items = vec![PureVerdictBatchItem {
+        let item = PureVerdictBatchItem {
             result_identity: result_identity(),
             process: cache_batch_item(Vec::new()),
-        }];
-        (request, items)
+        };
+        (request, item)
     };
 
     let (cancel_wave, wave_cancelled) = oneshot::channel::<()>();
     let wave_orch = orch.clone();
-    let (request, items) = check("wave");
+    let (request, item) = check("wave");
     let wave = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -22997,7 +22994,7 @@ async fn a_shared_execution_outlives_the_runtime_of_the_wave_that_opened_it() {
             tokio::select! {
                 _ = wave_orch
                     .fleet
-                    .submit_pure_verdict_batch(&wave_orch, request, items, None, None, None) => {
+                    .submit_pure_verdict_check(&wave_orch, request, item, None, None, None) => {
                     panic!("the wave is cancelled before its check settles")
                 }
                 _ = wave_cancelled => {}
@@ -23010,11 +23007,11 @@ async fn a_shared_execution_outlives_the_runtime_of_the_wave_that_opened_it() {
     };
 
     let follower_orch = orch.clone();
-    let (request, items) = check("follower");
+    let (request, item) = check("follower");
     let follower = tokio::spawn(async move {
         follower_orch
             .fleet
-            .submit_pure_verdict_batch(&follower_orch, request, items, None, None, None)
+            .submit_pure_verdict_check(&follower_orch, request, item, None, None, None)
             .await
     });
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -23099,473 +23096,18 @@ async fn a_shared_execution_outlives_the_runtime_of_the_wave_that_opened_it() {
         .unwrap();
     assert!(
         matches!(
-            delivered.as_slice(),
-            [Ok(CoalescedCellOutcome {
+            &delivered,
+            Ok(CoalescedCellOutcome {
                 outcome: CellOutcome::Completed {
                     exit_code: Some(0),
                     ..
                 },
                 ..
-            })]
+            })
         ),
         "the follower receives the machine's answer, not a vanished leader: {:?}",
-        delivered
-            .iter()
-            .map(|delivery| delivery.as_ref().map(|delivered| &delivered.outcome))
-            .collect::<Vec<_>>()
+        delivered.as_ref().map(|delivered| &delivered.outcome)
     );
-}
-
-/// cairn/4690. A review wave's members run in order in one cell. The
-/// executor reports each one's start and finish to the wave's engine-owned
-/// board, so while the batch is open a reader sees the member that is
-/// running, for how long, and the ones queued behind it. A finish is never a
-/// verdict: the member the executor stopped as silent exits non-zero, and
-/// its lane reads `finished` with that exit until the engine records it as
-/// the non-verdict it is. The stop itself reaches the engine with the
-/// member's outcome.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_review_waves_board_follows_its_members_one_at_a_time() {
-    use cairn_common::executor_protocol::{CommandStop, ProcessBatchItemOutcome, RunnerCallback};
-    let temp = tempfile::tempdir().unwrap();
-    let orch = test_orchestrator(temp.path()).await;
-    let (sender, mut executor) = mpsc::unbounded_channel();
-    let generation = orch.fleet.attach_executor(sender);
-    let names = ["fast-a", "silent", "fast-b"];
-    let plans: Vec<_> = names
-        .iter()
-        .map(|name| {
-            (
-                crate::execution::selection::CheckPlan {
-                    name: name.to_string(),
-                    applies: true,
-                    command: "true".into(),
-                    scope: crate::execution::selection::CheckScope::Full,
-                    resource_class: crate::config::project_settings::CheckResourceClass::Shared,
-                    verdict_environment_names: Vec::new(),
-                    verdict_platforms: Vec::new(),
-                    verdict_runtime: Vec::new(),
-                    verdict_executor_ids: None,
-                    config_error: None,
-                },
-                "input".to_string(),
-            )
-        })
-        .collect();
-    let board = crate::execution::checks::CheckStatusBoard::for_review_wave(&plans, || {});
-    let mut request = provenance_request();
-    request.request_id = "wave".into();
-    request.repository = RepositoryLocator::ScratchOnly {
-        owner_id: request.project_id.clone(),
-    };
-    request.wait_horizon_unix_ms = unix_time_ms() + 60_000;
-    let items: Vec<_> = names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| PureVerdictBatchItem {
-            result_identity: CheckResultIdentity::new("project", name, "input"),
-            process: ProcessBatchItem {
-                header: name.to_string(),
-                stream_id: format!("turn-checks:j-prod:check-{index}"),
-                ..cache_batch_item(Vec::new())
-            },
-        })
-        .collect();
-    let wave_orch = orch.clone();
-    let wave_board = board.clone();
-    let wave = tokio::spawn(async move {
-        wave_orch
-            .fleet
-            .submit_pure_verdict_batch(&wave_orch, request, items, None, Some(wave_board), None)
-            .await
-    });
-    let Some(ExecutorMessage::Offer { entry_id, .. }) = next_work_frame(&mut executor).await else {
-        panic!("the wave is offered");
-    };
-    orch.fleet.handle_executor_message(
-        COLOCATED_EXECUTOR_ID,
-        generation,
-        ExecutorMessage::Claim { entry_id },
-    );
-    let Some(ExecutorMessage::Granted {
-        request,
-        batch: Some(batch),
-        ..
-    }) = next_work_frame(&mut executor).await
-    else {
-        panic!("the wave is granted with its batch");
-    };
-    assert!(batch.sequential, "a wave's members run in order");
-    let context = batch
-        .runner_context_id
-        .clone()
-        .expect("a batch with a board names a context for its reports");
-    let states = || {
-        board
-            .snapshot()
-            .into_iter()
-            .map(|entry| entry.state)
-            .collect::<Vec<_>>()
-    };
-    let started = |index: usize| RunnerCallback::ProcessItemStarted {
-        runner_context_id: context.clone(),
-        stream_id: batch.items[index].stream_id.clone(),
-    };
-    let completed = |index: usize, exit: i32| RunnerCallback::ProcessItemCompleted {
-        runner_context_id: context.clone(),
-        stream_id: batch.items[index].stream_id.clone(),
-        succeeded: exit == 0,
-        exit_code: Some(exit),
-        timed_out: false,
-        duration_ms: 252_000,
-        result: None,
-    };
-
-    orch.fleet.handle_runner_callback(&orch, started(0)).await;
-    assert_eq!(states(), ["running", "pending", "pending"]);
-    orch.fleet
-        .handle_runner_callback(&orch, completed(0, 0))
-        .await;
-    orch.fleet.handle_runner_callback(&orch, started(1)).await;
-    assert_eq!(states(), ["finished", "running", "pending"]);
-    let snapshot = board.snapshot();
-    assert_eq!(
-        snapshot[0].annotation.as_deref(),
-        Some("finished in 4m 12s (exit 0); awaiting recording")
-    );
-    assert!(
-        snapshot[1].since_unix_ms.is_some(),
-        "the running member carries when it started"
-    );
-    // The executor stops the silent member; its leader exits non-zero.
-    orch.fleet
-        .handle_runner_callback(&orch, completed(1, 143))
-        .await;
-    orch.fleet.handle_runner_callback(&orch, started(2)).await;
-    assert_eq!(
-        states(),
-        ["finished", "finished", "running"],
-        "a stopped member's exit is not a verdict"
-    );
-    orch.fleet
-        .handle_runner_callback(&orch, completed(2, 0))
-        .await;
-
-    let outcome = |name: &str, exit: i32, stop: Option<CommandStop>| ProcessBatchItemOutcome {
-        header: name.into(),
-        body: "output".into(),
-        succeeded: exit == 0,
-        suspended: false,
-        images: Vec::new(),
-        exit_code: Some(exit),
-        timed_out: false,
-        started_at_unix_ms: 1,
-        finished_at_unix_ms: 2,
-        duration_ms: 1,
-        peak_rss_bytes: None,
-        peak_process: None,
-        cpu: None,
-        granted_units: None,
-        disk_delta_bytes: None,
-        sandbox_denials: Vec::new(),
-        tracked_modifications: None,
-        environment_fingerprint: String::new(),
-        verdict_platform: None,
-        verdict_arch: None,
-        toolchain_fingerprint: None,
-        verdict_environment_hash: None,
-        stop,
-        build_jobs: None,
-        unrecorded_cache_checkpoint: None,
-        build_job_processes: None,
-    };
-    let silent = CommandStop::Silent {
-        quiet_ms: 30 * 60 * 1_000,
-        last_output_unix_ms: None,
-        cpu_ms_in_window: Some(0),
-        storage_io_bytes_in_window: Some(0),
-        tree: Vec::new(),
-    };
-    let mut result = completed_for(&request, COLOCATED_EXECUTOR_ID, generation);
-    if let CellOutcome::Completed { output, .. } = &mut result {
-        *output = serde_json::to_string(&[
-            outcome("fast-a", 0, None),
-            outcome("silent", 143, Some(silent.clone())),
-            outcome("fast-b", 0, None),
-        ])
-        .unwrap();
-    }
-    orch.fleet.handle_executor_message(
-        COLOCATED_EXECUTOR_ID,
-        generation,
-        ExecutorMessage::Result {
-            request_id: request.request_id.clone(),
-            attempt_id: request.attempt_id.clone(),
-            outcome: result,
-        },
-    );
-    let delivered = tokio::time::timeout(Duration::from_secs(10), wave)
-        .await
-        .expect("the wave is answered")
-        .unwrap();
-    assert_eq!(delivered.len(), 3);
-    assert!(
-        delivered.iter().all(Result::is_ok),
-        "every member is answered by the one execution"
-    );
-    assert_eq!(
-        states(),
-        ["finished", "finished", "finished"],
-        "only the engine moves a lane past finished"
-    );
-    assert!(
-        !orch
-            .fleet
-            .runner_contexts
-            .lock()
-            .unwrap()
-            .contains_key(&context),
-        "the wave's callback context settles with its batch"
-    );
-}
-
-/// cairn/5893. A member the executor reports finished, with its result, is
-/// answered while the batch's later members still run, whether or not the
-/// batch has a board. The batch's own result then answers only the member no
-/// report reached: nothing is delivered twice, what a subscriber was given
-/// early agrees with the batch's result, and the leader still ends on the
-/// batch's own terminal outcome.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_finished_member_is_answered_before_its_batch_returns() {
-    use cairn_common::executor_protocol::{
-        ProcessBatchItemOutcome, ProcessItemResult, RunnerCallback,
-    };
-    let temp = tempfile::tempdir().unwrap();
-    let orch = test_orchestrator(temp.path()).await;
-    let (sender, mut executor) = mpsc::unbounded_channel();
-    let generation = orch.fleet.attach_executor(sender);
-    let names = ["fast-a", "slow", "fast-b"];
-    let mut request = provenance_request();
-    request.request_id = "wave".into();
-    request.repository = RepositoryLocator::ScratchOnly {
-        owner_id: request.project_id.clone(),
-    };
-    request.wait_horizon_unix_ms = unix_time_ms() + 60_000;
-    let items: Vec<_> = names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| PureVerdictBatchItem {
-            result_identity: CheckResultIdentity::new("project", name, "input"),
-            process: ProcessBatchItem {
-                header: name.to_string(),
-                stream_id: format!("turn-checks:j-prod:check-{index}"),
-                ..cache_batch_item(Vec::new())
-            },
-        })
-        .collect();
-    let (landed_tx, mut landed) = mpsc::unbounded_channel::<(usize, CoalescedDelivery)>();
-    let wave_orch = orch.clone();
-    let wave = tokio::spawn(async move {
-        let sink: Box<PureVerdictItemSink> =
-            Box::new(move |position, delivery: &CoalescedDelivery| {
-                let _ = landed_tx.send((position, delivery.clone()));
-                Box::pin(async {}) as futures_util::future::BoxFuture<'static, ()>
-            });
-        wave_orch
-            .fleet
-            .submit_pure_verdict_batch_streaming(
-                &wave_orch,
-                request,
-                items,
-                None,
-                None,
-                None,
-                Some(&*sink),
-            )
-            .await
-    });
-    let Some(ExecutorMessage::Offer { entry_id, .. }) = next_work_frame(&mut executor).await else {
-        panic!("the wave is offered");
-    };
-    orch.fleet.handle_executor_message(
-        COLOCATED_EXECUTOR_ID,
-        generation,
-        ExecutorMessage::Claim { entry_id },
-    );
-    let Some(ExecutorMessage::Granted {
-        request,
-        batch: Some(batch),
-        ..
-    }) = next_work_frame(&mut executor).await
-    else {
-        panic!("the wave is granted with its batch");
-    };
-    let context = batch
-        .runner_context_id
-        .clone()
-        .expect("a pure-verdict batch names a context for its members' reports, board or none");
-    let outcome = |name: &str, exit: i32| ProcessBatchItemOutcome {
-        header: name.into(),
-        body: format!("{name} output"),
-        succeeded: exit == 0,
-        suspended: false,
-        images: Vec::new(),
-        exit_code: Some(exit),
-        timed_out: false,
-        started_at_unix_ms: 1,
-        finished_at_unix_ms: 2,
-        duration_ms: 1,
-        peak_rss_bytes: None,
-        peak_process: None,
-        cpu: None,
-        granted_units: None,
-        disk_delta_bytes: None,
-        sandbox_denials: Vec::new(),
-        tracked_modifications: None,
-        environment_fingerprint: String::new(),
-        verdict_platform: None,
-        verdict_arch: None,
-        toolchain_fingerprint: None,
-        verdict_environment_hash: None,
-        stop: None,
-        build_jobs: None,
-        unrecorded_cache_checkpoint: None,
-        build_job_processes: None,
-    };
-    let mut batch_result = completed_for(&request, COLOCATED_EXECUTOR_ID, generation);
-    let CellOutcome::Completed { metadata, .. } = &batch_result else {
-        panic!("a completed batch");
-    };
-    let lane = metadata.clone();
-    let reported =
-        |index: usize, item: ProcessBatchItemOutcome| RunnerCallback::ProcessItemCompleted {
-            runner_context_id: context.clone(),
-            stream_id: batch.items[index].stream_id.clone(),
-            succeeded: item.succeeded,
-            exit_code: item.exit_code,
-            timed_out: false,
-            duration_ms: item.duration_ms,
-            result: Some(Box::new(ProcessItemResult {
-                metadata: lane.for_batch_item(&item),
-                outcome: item,
-            })),
-        };
-    async fn next_landing(
-        landed: &mut mpsc::UnboundedReceiver<(usize, CoalescedDelivery)>,
-    ) -> (usize, CoalescedDelivery) {
-        tokio::time::timeout(Duration::from_secs(10), landed.recv())
-            .await
-            .expect("a member lands")
-            .expect("the wave is open")
-    }
-
-    // fast-a finishes while slow runs.
-    orch.fleet
-        .handle_runner_callback(&orch, reported(0, outcome("fast-a", 0)))
-        .await;
-    let (position, early) = next_landing(&mut landed).await;
-    assert_eq!(position, 0);
-    assert!(!wave.is_finished(), "the batch is still open");
-    let early = early.expect("fast-a is answered");
-    let CellOutcome::Completed {
-        exit_code,
-        output,
-        metadata,
-        ..
-    } = &early.outcome
-    else {
-        panic!("fast-a is answered with its verdict");
-    };
-    assert_eq!((*exit_code, output.as_str()), (Some(0), "fast-a output"));
-    assert_eq!(metadata.executor_connection_generation, generation);
-    assert!(
-        !metadata.executor_id.is_empty(),
-        "the machine is stamped from the claim's link"
-    );
-    assert!(early.account.placement.is_some());
-    assert!(
-        orch.fleet
-            .coalesced_leaders
-            .lock()
-            .unwrap()
-            .contains(&(request.request_id.clone(), request.attempt_id.clone())),
-        "an early member does not end its leader"
-    );
-
-    // slow's report never arrives; fast-b's does.
-    orch.fleet
-        .handle_runner_callback(&orch, reported(2, outcome("fast-b", 0)))
-        .await;
-    assert_eq!(next_landing(&mut landed).await.0, 2);
-
-    // The batch's own result names all three.
-    if let CellOutcome::Completed { output, .. } = &mut batch_result {
-        *output = serde_json::to_string(&[
-            outcome("fast-a", 0),
-            outcome("slow", 1),
-            outcome("fast-b", 0),
-        ])
-        .unwrap();
-    }
-    orch.fleet.handle_executor_message(
-        COLOCATED_EXECUTOR_ID,
-        generation,
-        ExecutorMessage::Result {
-            request_id: request.request_id.clone(),
-            attempt_id: request.attempt_id.clone(),
-            outcome: batch_result,
-        },
-    );
-    assert_eq!(
-        next_landing(&mut landed).await.0,
-        1,
-        "the batch's result answers only the member no report reached"
-    );
-    let delivered = tokio::time::timeout(Duration::from_secs(10), wave)
-        .await
-        .expect("the wave is answered")
-        .unwrap();
-    assert!(
-        landed.recv().await.is_none(),
-        "no member lands a second time"
-    );
-    let exits: Vec<_> = delivered
-        .iter()
-        .map(|delivery| match delivery {
-            Ok(CoalescedCellOutcome {
-                outcome: CellOutcome::Completed { exit_code, .. },
-                ..
-            }) => *exit_code,
-            other => panic!(
-                "every member is answered by the one execution: {:?}",
-                other.as_ref().map(|d| &d.outcome)
-            ),
-        })
-        .collect();
-    assert_eq!(exits, [Some(0), Some(1), Some(0)]);
-    let mut at_end = early.outcome.clone();
-    if let CellOutcome::Completed { metadata, .. } = &mut at_end {
-        *metadata = lane.for_batch_item(&outcome("fast-a", 0));
-    }
-    assert!(
-        verdict_disagreement(&delivered[0].as_ref().unwrap().outcome, &at_end).is_empty(),
-        "what fast-a's subscriber was given is what the batch's result says"
-    );
-    assert!(
-        !orch
-            .fleet
-            .coalesced_leaders
-            .lock()
-            .unwrap()
-            .contains(&(request.request_id.clone(), request.attempt_id.clone())),
-        "the leader ends on the batch's own outcome"
-    );
-    assert!(!orch
-        .fleet
-        .runner_contexts
-        .lock()
-        .unwrap()
-        .contains_key(&context));
 }
 
 /// An early settlement and its batch's result are compared on what was

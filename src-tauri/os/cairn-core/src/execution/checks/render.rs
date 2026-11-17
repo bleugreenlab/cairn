@@ -351,26 +351,13 @@ impl DispatchNarrator {
     }
 }
 
-/// Where a pure-verdict batch's execution stands, from its items' subscriber
-/// identities. Items can coalesce onto different executions, so the batch
-/// reports its furthest-along one: running before placing before preparing,
-/// and its own run before one it joined.
-pub(super) fn batch_dispatch(
+/// Where a verdict request's execution stands, read by its subscriber
+/// identity: its own run, or the one it coalesced onto.
+pub(super) fn check_dispatch(
     fleet: &crate::fleet::Fleet,
-    subscribers: &[(String, String)],
+    subscriber: &(String, String),
 ) -> Option<crate::fleet::CheckDispatch> {
-    use crate::fleet::CheckDispatchPhase;
-    subscribers
-        .iter()
-        .filter_map(|subscriber| fleet.check_dispatch_phase(subscriber))
-        .max_by_key(|dispatch| {
-            let rank = match dispatch.phase {
-                CheckDispatchPhase::Running { .. } => 2,
-                CheckDispatchPhase::Placing { .. } => 1,
-                CheckDispatchPhase::Preparing { .. } => 0,
-            };
-            (rank, dispatch.joined.is_none())
-        })
+    fleet.check_dispatch_phase(subscriber)
 }
 
 /// Await `submission`, showing where its execution stands every
