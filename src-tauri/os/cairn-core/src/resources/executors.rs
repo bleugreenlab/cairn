@@ -3400,12 +3400,53 @@ fn retired_home_line(home: &RetiredHomeAccounting) -> String {
     )
 }
 
+/// The unmet lane floor beside the pressure line. A volume under it refuses
+/// that lane whatever its verdict reads, so the page says so, says when free
+/// space sits above the pressure line (where only the target rung reclaims for
+/// the lane), and says whether a pass has run (cairn/6430: bginf-sp1 read `Ok`
+/// at 66.5 GiB free while refusing every 88 GiB lane and reclaiming nothing).
+fn lane_floor_line(executor: &ExecutorInspection) -> Option<String> {
+    let disk = &executor.health.disk;
+    let lane = disk.lane_disk_floor?;
+    let machine = &executor.health.machine;
+    let free = match &machine.build_volume {
+        Some(build) => build.value(),
+        None => machine.volume.value(),
+    }
+    .map(|volume| volume.free_bytes)
+    .filter(|free| *free < lane.floor_bytes)?;
+    let pass = match disk.pressure.as_ref() {
+        None => "no pass has run".to_string(),
+        Some(pressure) => format!(
+            "the last pass, {}, was {:?}",
+            age(executor
+                .captured_at_unix_ms
+                .saturating_sub(pressure.at_unix_ms)),
+            pressure.outcome
+        ),
+    };
+    let band = if free > lane.pressure_line_bytes {
+        format!(
+            " and above the {} pressure line, so only idle build output is reclaimed for it",
+            bytes(lane.pressure_line_bytes)
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "- Lane floor: free {} is below the {} a {} lane needs{band}; {pass}\n",
+        bytes(free),
+        bytes(lane.floor_bytes),
+        lane.command_class.as_str(),
+    ))
+}
+
 /// The pressure tier's own account: what the last pass asked for, what each
 /// rung gave, whether that was enough, and which trees it left alone.
 fn render_storage_pressure(executor: &ExecutorInspection) -> String {
     let disk = &executor.health.disk;
     let captured = executor.captured_at_unix_ms;
-    let mut out = String::new();
+    let mut out = lane_floor_line(executor).unwrap_or_default();
     match disk.pressure.as_ref() {
         Some(pressure) => {
             let by_rung = |rung: StorageReclaimRung| {
@@ -7506,6 +7547,59 @@ mod storage_section_tests {
         assert!(
             rendered.contains("Last pressure pass: none since this executor started"),
             "{rendered}"
+        );
+    }
+
+    /// cairn/6430, bginf-sp1: free space between the configured pressure line
+    /// and a lane's floor refused every lane while the page read `Ok` and no
+    /// pass ran. The page names the gap, the pressure line it sits above, and
+    /// the pass.
+    #[test]
+    fn the_storage_section_names_a_volume_under_a_lanes_floor() {
+        use cairn_common::executor_protocol::{CellCommandClass, LaneDiskFloor};
+        let mut executor = tight_local();
+        executor.health.disk.pressure_free_bytes = 50 * GIB;
+        executor.health.disk.lane_disk_floor = Some(LaneDiskFloor {
+            command_class: CellCommandClass::CargoTest,
+            floor_bytes: 88 * GIB,
+            pressure_line_bytes: 50 * GIB,
+        });
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "- Lane floor: free 54.0 GiB is below the 88.0 GiB a cargoTest lane needs and above the 50.0 GiB pressure line, so only idle build output is reclaimed for it; no pass has run\n"
+            ),
+            "{rendered}"
+        );
+
+        executor.health.disk.pressure_free_bytes = 64 * GIB;
+        executor.health.disk.lane_disk_floor = Some(LaneDiskFloor {
+            command_class: CellCommandClass::CargoTest,
+            floor_bytes: 60 * GIB,
+            pressure_line_bytes: 64 * GIB,
+        });
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "- Lane floor: free 54.0 GiB is below the 60.0 GiB a cargoTest lane needs; no pass has run\n"
+            ),
+            "under the pressure line the policy's own ladder runs, so no band clause: {rendered}"
+        );
+
+        executor.health.disk.lane_disk_floor = Some(LaneDiskFloor {
+            command_class: CellCommandClass::CargoTest,
+            floor_bytes: 40 * GIB,
+            pressure_line_bytes: 30 * GIB,
+        });
+        assert!(
+            !render_executor(&executor).contains("Lane floor"),
+            "free space above the floor is no gap"
+        );
+
+        executor.health.disk.lane_disk_floor = None;
+        assert!(
+            !render_executor(&executor).contains("Lane floor"),
+            "an executor that reports no lane floor gets no sentence"
         );
     }
 

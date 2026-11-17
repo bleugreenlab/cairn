@@ -9450,6 +9450,18 @@ pub struct LearnedResourceEstimate {
 /// placement pass. It sends the same `ResourceReservation` in the same fields,
 /// computed from the same rows, so an older executor receives exactly what it
 /// received before and a runner talking to one gets nothing wrong.
+///
+/// cairn/6430 does not move the number. An executor that refuses or queues a
+/// lane for disk runs a pass over idle build output for it and reports the
+/// lane's unmet floor in a new optional `laneDiskFloor` on disk health, saying
+/// what the pass did in the refusal's existing `detail` and with the existing
+/// `inFlight` outlook. The floor arms the executor's own target rung only; the
+/// existing `pressureFreeBytes` keeps its meaning, the policy's line, so the
+/// `tight` verdict and the placement price a runner derives from it agree
+/// across executors old and new. `laneDiskFloor` is skipped when absent and
+/// ignored by an older runner, and a newer runner reading an older executor
+/// gets none and leaves the lane-floor sentence off its page. What a runner
+/// gets wrong talking to an older executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -19028,6 +19040,33 @@ pub struct CellTargetTrim {
     pub at_unix_ms: u64,
 }
 
+/// The disk floor of the most demanding lane class this machine refused or
+/// queued for disk and has not admitted since: the admission watermark plus
+/// that class's own disk growth, which is where a lane of it is refused.
+///
+/// A volume whose free space sits between the pressure line and this floor
+/// refuses that lane while the policy's ladder reclaims nothing for it. Such a
+/// floor arms the ladder's target rung alone, toward the floor (cairn/6430);
+/// it never moves the pressure line, which the status verdict, placement,
+/// catalog staging and retirement keep reading as the policy's.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneDiskFloor {
+    pub command_class: CellCommandClass,
+    pub floor_bytes: u64,
+    /// The pressure line as the policy sets it, the same figure as
+    /// [`DiskHealth::pressure_free_bytes`], carried so the floor reads alone.
+    pub pressure_line_bytes: u64,
+}
+
+impl LaneDiskFloor {
+    /// Whether the floor is above the pressure line, so free space between
+    /// the two arms the target rung where the policy's ladder would not.
+    pub fn above_pressure_line(&self) -> bool {
+        self.floor_bytes > self.pressure_line_bytes
+    }
+}
+
 /// Storage governance: the budget, the derived pressure verdict, and the
 /// janitor's state. The bytes themselves live on [`MachineTelemetry::volume`]
 /// and [`MachineTelemetry::disk_accounting`], with their own collection times.
@@ -19097,6 +19136,11 @@ pub struct DiskHealth {
     /// The same for `critical_free_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub critical_line_fraction_permille: Option<u32>,
+    /// The most demanding unmet lane disk floor, when this executor refused or
+    /// queued a lane for disk within the last hour and has not admitted one of
+    /// its class since. `None` otherwise and from a peer that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_disk_floor: Option<LaneDiskFloor>,
     /// The whole device under the build volume, or `None` when it could not
     /// be resolved (off Linux, or an unreadable mount table).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -19446,6 +19490,7 @@ impl Default for DiskHealth {
             pressure_free_bytes: 0,
             pressure_line_fraction_permille: None,
             critical_line_fraction_permille: None,
+            lane_disk_floor: None,
             device: None,
             pressure: None,
             quarantine_targets_stripped: Vec::new(),
@@ -30030,6 +30075,7 @@ mod tests {
             pressure_free_bytes: 64,
             pressure_line_fraction_permille: Some(100),
             critical_line_fraction_permille: None,
+            lane_disk_floor: None,
             device: Some(VolumeDevice {
                 name: "nvme0n1".into(),
                 model: Some("CT4000P3PSSD8".into()),
