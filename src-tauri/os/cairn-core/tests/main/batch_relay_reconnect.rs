@@ -15,6 +15,8 @@
 //!
 //! Like the other executor-cell suites these cannot run nested inside a Cairn
 //! worktree fence, and each records a declared skip there (skip-manifest.toml).
+//! The batch also spawns wrapped in a Seatbelt profile on macOS, so a process
+//! that cannot nest one records a declared skip as well.
 
 use crate::common;
 use crate::node_scratch_acceptance::{node, MACHINE_A};
@@ -23,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::task::JoinHandle;
 
 /// A batch that makes `reads` relayed `cairn read cairn:~` calls, the `i`th
 /// once the test writes `go-<i>`, leaving each call's status and body behind.
@@ -50,14 +54,31 @@ fn go(dir: &Path, read: usize) {
     std::fs::write(dir.join(format!("go-{read}")), "").unwrap();
 }
 
-/// The `read`th call's status and body, once it has answered.
-async fn answered(dir: &Path, read: usize) -> (String, String) {
+/// The `read`th call's status and body, once it has answered. A batch that
+/// ends first, having failed to start or died before the call, is reported by
+/// its own reply rather than as a call that went unanswered.
+async fn answered(dir: &Path, read: usize, batch: &mut JoinHandle<String>) -> (String, String) {
     let status = dir.join(format!("status-{read}"));
-    for _ in 0..1_200 {
-        if let Ok(code) = std::fs::read_to_string(&status) {
+    let settled = || {
+        std::fs::read_to_string(&status).ok().map(|code| {
             let body =
                 std::fs::read_to_string(dir.join(format!("body-{read}"))).unwrap_or_default();
-            return (code.trim().to_owned(), body);
+            (code.trim().to_owned(), body)
+        })
+    };
+    for _ in 0..1_200 {
+        if let Some(answer) = settled() {
+            return answer;
+        }
+        if batch.is_finished() {
+            // The batch may have written this status just before it ended.
+            if let Some(answer) = settled() {
+                return answer;
+            }
+            panic!(
+                "read {read} never ran: the batch ended first: {:?}",
+                batch.await
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -69,19 +90,23 @@ async fn answered(dir: &Path, read: usize) -> (String, String) {
 /// accepted at the end on the link it finished under.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_running_batch_keeps_its_relay_across_link_bounces() {
-    if common::skip_if_fenced("a_running_batch_keeps_its_relay_across_link_bounces") {
+    if common::skip_if_fenced("a_running_batch_keeps_its_relay_across_link_bounces")
+        || cairn_sandbox::skip_without_nested_sandbox(
+            "a_running_batch_keeps_its_relay_across_link_bounces",
+        )
+    {
         return;
     }
     let node = Arc::new(node().await);
     let dir = handshake_dir(&node);
-    let batch = tokio::spawn({
+    let mut batch = tokio::spawn({
         let node = node.clone();
         let command = reading_batch(&dir, 3);
         async move { node.shell("r-1", Some(MACHINE_A), &command).await }
     });
 
     go(&dir, 1);
-    let (status, body) = answered(&dir, 1).await;
+    let (status, body) = answered(&dir, 1, &mut batch).await;
     assert_eq!(status, "200", "before any bounce: {body}");
 
     for read in 2..=3 {
@@ -93,7 +118,7 @@ async fn a_running_batch_keeps_its_relay_across_link_bounces() {
             "a call in the gap waits for the reattach"
         );
         common::reannounce_link(node.orch(), MACHINE_A);
-        let (status, body) = answered(&dir, read).await;
+        let (status, body) = answered(&dir, read, &mut batch).await;
         assert_eq!(status, "200", "read {read}, on link {generation}: {body}");
     }
 
@@ -113,6 +138,8 @@ async fn a_running_batch_keeps_its_relay_across_link_bounces() {
 async fn a_batch_whose_executor_never_reattaches_is_told_its_relay_is_detached() {
     if common::skip_if_fenced(
         "a_batch_whose_executor_never_reattaches_is_told_its_relay_is_detached",
+    ) || cairn_sandbox::skip_without_nested_sandbox(
+        "a_batch_whose_executor_never_reattaches_is_told_its_relay_is_detached",
     ) {
         return;
     }
@@ -121,19 +148,19 @@ async fn a_batch_whose_executor_never_reattaches_is_told_its_relay_is_detached()
     common::RELAY_GAP_WAIT_MS.store(2_000, Ordering::Relaxed);
     let node = Arc::new(node().await);
     let dir = handshake_dir(&node);
-    let batch = tokio::spawn({
+    let mut batch = tokio::spawn({
         let node = node.clone();
         let command = reading_batch(&dir, 2);
         async move { node.shell("r-1", Some(MACHINE_A), &command).await }
     });
 
     go(&dir, 1);
-    let (status, body) = answered(&dir, 1).await;
+    let (status, body) = answered(&dir, 1, &mut batch).await;
     assert_eq!(status, "200", "before the bounce: {body}");
 
     common::drop_link(node.orch(), MACHINE_A);
     go(&dir, 2);
-    let (status, body) = answered(&dir, 2).await;
+    let (status, body) = answered(&dir, 2, &mut batch).await;
     assert_eq!(status, "503", "{body}");
     assert!(
         body.starts_with("relay detached by a link loss at ")
