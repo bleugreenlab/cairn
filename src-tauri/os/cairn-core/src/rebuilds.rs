@@ -290,6 +290,32 @@ fn identifier(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
+/// The phases `scripts/rebuild.ts` journals, in the order it runs them. Closed
+/// on purpose: a journal naming any other phase is refused, so the actor's list
+/// and this one are held together by
+/// `tests::the_actor_journals_exactly_the_phases_the_ledger_accepts`.
+const REBUILD_PHASES: &[&str] = &[
+    "free-space",
+    "tree-lock",
+    "fetch",
+    "preflight",
+    "dependencies",
+    "build",
+    "signature",
+    "voice-engine",
+    "executor-coverage",
+    "backup",
+    "stop-runner",
+    "quit-desktop",
+    "resume-previous",
+    "install",
+    "start-runner",
+    "verify-runner",
+    "desktop-adoption",
+    "voice-handoff",
+    "rollback",
+];
+
 fn validate_event(value: &Value, rebuild: &str) -> Result<(), &'static str> {
     if !value.is_object()
         || !value["event"].as_str().is_some_and(identifier)
@@ -303,29 +329,10 @@ fn validate_event(value: &Value, rebuild: &str) -> Result<(), &'static str> {
     let optional_text = |key: &str| value.get(key).is_none_or(Value::is_string);
     match value["type"].as_str() {
         Some("phase") => {
-            if !matches!(
-                value["name"].as_str(),
-                Some(
-                    "free-space"
-                        | "fetch"
-                        | "preflight"
-                        | "dependencies"
-                        | "build"
-                        | "signature"
-                        | "voice-engine"
-                        | "executor-coverage"
-                        | "backup"
-                        | "stop-runner"
-                        | "quit-desktop"
-                        | "resume-previous"
-                        | "install"
-                        | "start-runner"
-                        | "verify-runner"
-                        | "desktop-adoption"
-                        | "voice-handoff"
-                        | "rollback"
-                )
-            ) {
+            if !value["name"]
+                .as_str()
+                .is_some_and(|name| REBUILD_PHASES.contains(&name))
+            {
                 return Err("unexpected_phase");
             }
             if !value["name"].as_str().is_some_and(|s| !s.trim().is_empty())

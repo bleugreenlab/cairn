@@ -428,6 +428,58 @@ fn unexpected_phases_and_non_regular_files_are_refused() {
     );
 }
 
+/// The actor is the journal's only writer: every phase it names is a
+/// `journal.phase("…")` call or a `{ type: "phase", name: "…" }` append in
+/// `scripts/rebuild.ts`.
+#[test]
+fn the_actor_journals_exactly_the_phases_the_ledger_accepts() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../scripts/rebuild.ts");
+    let source = fs::read_to_string(&path).unwrap();
+    // A name the scan cannot read as a literal is a phase it cannot check.
+    let opaque =
+        regex::Regex::new(r#"journal\.phase\(\s*[^"\s]|type:\s*"phase",\s*name:\s*[^"\s]"#)
+            .unwrap();
+    let opaque: Vec<&str> = opaque.find_iter(&source).map(|m| m.as_str()).collect();
+    assert!(
+        opaque.is_empty(),
+        "scripts/rebuild.ts journals a phase whose name is not a string literal: {opaque:?}"
+    );
+    let literal =
+        regex::Regex::new(r#"journal\.phase\(\s*"([^"]+)"|type:\s*"phase",\s*name:\s*"([^"]+)""#)
+            .unwrap();
+    let emitted: std::collections::BTreeSet<&str> = literal
+        .captures_iter(&source)
+        .map(|c| c.get(1).or(c.get(2)).unwrap().as_str())
+        .collect();
+    assert!(
+        emitted.len() > 10,
+        "the scan found too few phases in scripts/rebuild.ts: {emitted:?}"
+    );
+
+    let refused: Vec<&str> = emitted
+        .iter()
+        .copied()
+        .filter(|name| {
+            let mut value = phase("r1", "e1");
+            value["name"] = json!(name);
+            validate_event(&value, "r1").is_err()
+        })
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "scripts/rebuild.ts journals phases the ledger refuses as unexpected_phase: {refused:?}"
+    );
+    let unemitted: Vec<&str> = REBUILD_PHASES
+        .iter()
+        .copied()
+        .filter(|name| !emitted.contains(name))
+        .collect();
+    assert!(
+        unemitted.is_empty(),
+        "the ledger accepts phases scripts/rebuild.ts no longer journals: {unemitted:?}"
+    );
+}
+
 #[test]
 fn owner_only_umask_modes_are_valid_but_special_modes_are_not() {
     let dir = root();
