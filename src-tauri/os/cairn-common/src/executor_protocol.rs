@@ -9488,6 +9488,14 @@ pub struct LearnedResourceEstimate {
 /// cairn/7318's removal of `ResolvedResourceProfile::item_durations` does not
 /// move the number: the field was the runner's own, never serialized, and no
 /// frame carried it.
+///
+/// cairn/6498 does not move the number. The runner clamps the
+/// `measuredPeakBytes` it stamps on a reservation to the machine's
+/// single-request cap (`memory_reservation_cap`), the clamp `memoryBytes`
+/// already had. It is the runner's own figure in a field that already
+/// exists, read by every executor as before, so a runner talking to an older
+/// executor gets nothing wrong: that executor charges the smaller figure the
+/// runner sent.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 174;
 
 /// The version `build.rs` derived from the paragraphs above

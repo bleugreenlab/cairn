@@ -344,14 +344,18 @@ async fn cold_compact_abandons_parked_wait_and_cancels_batch() {
     let resolution: serde_json::Value = serde_json::from_str(&resolution.unwrap()).unwrap();
     assert_eq!(resolution["outcome"], "abandoned");
     assert_eq!(resolution["cause"], "operator_compact");
+    // Compact asks the executor to cancel the batch, but the batch's process
+    // ends only when that lands: until the batch settles, the row holds its
+    // branch at the replay mutation boundary.
     assert_eq!(
-        count(
+        text(
             &db,
-            "SELECT COUNT(*) FROM run_batch_detached WHERE request_id = 'req-1'"
+            "SELECT state || '/' || holds_branch FROM run_batch_detached WHERE request_id = 'req-1'"
         )
-        .await,
-        0,
-        "Compact cancels session work rather than detaching it"
+        .await
+        .as_deref(),
+        Some("running/1"),
+        "the cancelled batch keeps holding its branch until it settles"
     );
     assert_eq!(
         count(

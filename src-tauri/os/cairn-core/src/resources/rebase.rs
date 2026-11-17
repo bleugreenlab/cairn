@@ -2954,6 +2954,7 @@ mod tests {
             request_id: "ba0e0085".to_string(),
             label: Some("rust-tests on main".to_string()),
             parked_at_ms: 130_000,
+            detached_because: None,
             progress: None,
         }))
     }

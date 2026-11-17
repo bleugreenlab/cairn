@@ -1550,6 +1550,13 @@ async fn complete_resolution_in_fact(
     Ok(())
 }
 
+/// Why a superseded wait left its batch a detached row.
+pub(crate) const SUPERSEDED_WHILE_RUNNING: &str = "its wait was abandoned while the batch ran";
+
+/// Why an operator Compact's abandoned wait left its batch a detached row.
+pub(crate) const COMPACTED_WHILE_RUNNING: &str =
+    "its session was compacted while the batch ran and its cancellation is not yet confirmed";
+
 /// Record the decision to abandon a suspension, reporting whether abandonment
 /// won the race against the row's own resolver.
 ///
@@ -1581,19 +1588,28 @@ async fn mark_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result<b
                     params![id, result, now],
                 )
                 .await?;
-            // Supersession ends only the wait: keep the batch's result and branch
-            // hold durable. Operator Compact instead cancels session-owned work,
-            // so it must not leave a detached row claiming the batch still runs.
-            if let (AbandonCause::Superseded, true, Some((job_id, run_id, condition))) =
-                (cause, marked > 0, row)
-            {
-                if let Ok(condition) = serde_json::from_str::<Condition>(&condition) {
+            // Abandoning ends only the wait, never the batch's hold. Supersession
+            // leaves the batch running, so it keeps the result durable too.
+            // Operator Compact has asked the fleet to cancel the batch, but its
+            // process ends only when that `Cancel` lands, and until then it can
+            // still commit to the old tip: a batch that can disturb the branch
+            // keeps holding it until its own settlement says it is over.
+            if let (true, Some((job_id, run_id, condition))) = (marked > 0, row) {
+                let condition = serde_json::from_str::<Condition>(&condition).ok();
+                let reason = match cause {
+                    AbandonCause::Superseded => Some(SUPERSEDED_WHILE_RUNNING),
+                    AbandonCause::OperatorCompact => condition
+                        .as_ref()
+                        .filter(|condition| condition.holds_branch())
+                        .map(|_| COMPACTED_WHILE_RUNNING),
+                };
+                if let (Some(condition), Some(reason)) = (condition, reason) {
                     super::run::detached::insert_converted(
                         c,
                         &job_id,
                         &run_id,
                         &condition,
-                        "its wait was abandoned while the batch ran",
+                        reason,
                         now,
                     )
                     .await?;
@@ -1741,6 +1757,66 @@ async fn cancel_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result
                 "UPDATE agent_waits SET state='cancelled',resolution_json=COALESCE(resolution_json,?2),resolved_at=COALESCE(resolved_at,?3) WHERE id=?1 AND state IN ('pending','resolving')",
                 params![id, result, now],
             ).await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Why a stop's cancelled wait left its batch a detached row.
+pub(crate) const STOPPED_WHILE_RUNNING: &str = "its run was stopped while the batch ran";
+
+/// Cancel every active wait of `run_id` for an external stop (an operator
+/// Stop, a provider change), in one write that first converts each run batch
+/// that holds its branch into a `running` detached row.
+///
+/// Cancelling the wait ends only the call's interest in the batch. Its process
+/// stops later, when the fleet's `Cancel` reaches its machine, and a provider
+/// change never sends one, so the batch runs on. Until it settles it may still
+/// commit to the old tip, so the detached row keeps the branch held at the
+/// mutation boundary and is settled by the batch's own resolver or, failing
+/// that, by the evidence [`super::run::detached::sweep_unreported`] requires.
+/// A batch that cannot disturb the branch is not converted: its cancelled wait
+/// is its whole record, as before.
+pub(crate) async fn cancel_run_waits_for_stop(db: &LocalDb, run_id: &str) -> Result<(), String> {
+    let run_id = run_id.to_string();
+    db.write(|c| {
+        let run_id = run_id.clone();
+        Box::pin(async move {
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut rows = c
+                .query(
+                    "SELECT job_id,condition_json FROM agent_waits WHERE run_id=?1 AND state IN ('pending','resolving')",
+                    params![run_id.clone()],
+                )
+                .await?;
+            let mut holding = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let job_id = row.text(0)?;
+                if let Ok(condition) = serde_json::from_str::<Condition>(&row.text(1)?) {
+                    if condition.holds_branch() {
+                        holding.push((job_id, condition));
+                    }
+                }
+            }
+            drop(rows);
+            for (job_id, condition) in &holding {
+                super::run::detached::insert_converted(
+                    c,
+                    job_id,
+                    &run_id,
+                    condition,
+                    STOPPED_WHILE_RUNNING,
+                    now,
+                )
+                .await?;
+            }
+            c.execute(
+                "UPDATE agent_waits SET state='cancelled', resolved_at=?2 WHERE run_id=?1 AND state IN ('pending','resolving')",
+                params![run_id, now],
+            )
+            .await?;
             Ok(())
         })
     })
@@ -4989,6 +5065,135 @@ mod tests {
             .unwrap();
         assert_eq!(identity.as_deref(), Some("same-batch"));
         assert_eq!(holds, 0, "a verdict-only batch never holds its branch");
+    }
+
+    /// The batch the mutation boundary sees on `agent/held`, as `job-1` reads it.
+    async fn boundary_hold(
+        orch: &Orchestrator,
+    ) -> Option<crate::orchestrator::base_advance::InflightRunBatch> {
+        crate::orchestrator::base_advance::inflight_run_batch_on_branch(
+            &orch.db.local,
+            "job-1",
+            "agent/held",
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn put_job_on_held_branch(orch: &Orchestrator) {
+        orch.db
+            .local
+            .execute("UPDATE jobs SET branch='agent/held' WHERE id='job-1'", ())
+            .await
+            .unwrap();
+    }
+
+    /// cairn/6205 at the boundary: a turn replacement abandons the wait of a
+    /// committing batch that is still running. The branch stays held, named as
+    /// a detached batch whose call no longer waits, until the batch settles;
+    /// only then is the boundary free to replay the branch under it.
+    #[tokio::test]
+    async fn an_abandoned_waits_running_batch_holds_its_branch_until_it_settles() {
+        let (orch, base, _) = durable_env().await;
+        put_job_on_held_branch(&orch).await;
+        let record = run_batch_record(&base, true);
+        insert(&orch.db.local, &record).await.unwrap();
+        let parked = boundary_hold(&orch).await.expect("the open wait holds it");
+        assert_eq!(parked.request_id, "request-1");
+        assert_eq!(parked.detached_because, None);
+
+        assert!(abandon(
+            &orch,
+            &orch.db.local,
+            &SuspendedCall::of(&record),
+            AbandonCause::Superseded
+        )
+        .await
+        .unwrap());
+        assert_eq!(wait_state(&orch).await, "cancelled");
+
+        let held = boundary_hold(&orch)
+            .await
+            .expect("an abandoned wait does not end its running batch's hold");
+        assert_eq!(held.request_id, "request-1");
+        assert_eq!(
+            held.detached_because.as_deref(),
+            Some(SUPERSEDED_WHILE_RUNNING)
+        );
+
+        super::super::run::detached::settle_answered_inline(
+            &orch,
+            &orch.db.local,
+            "request-1",
+            "passed",
+            "done",
+        )
+        .await;
+        assert_eq!(
+            boundary_hold(&orch).await,
+            None,
+            "the batch's settlement is what releases the branch"
+        );
+    }
+
+    /// An operator Stop or a provider change cancels the run's waits before
+    /// any batch process has ended (a provider change never ends it at all).
+    /// A batch that can disturb the branch keeps holding it until it settles;
+    /// one that cannot is not converted, and other waits simply end.
+    #[tokio::test]
+    async fn a_stop_keeps_a_running_batchs_branch_hold_until_it_settles() {
+        let (orch, base, _) = durable_env().await;
+        put_job_on_held_branch(&orch).await;
+        insert(&orch.db.local, &run_batch_record(&base, true))
+            .await
+            .unwrap();
+        let mut verdict_only = Record {
+            id: "wait-verdict".into(),
+            tool_use_id: "tool-verdict".into(),
+            ..run_batch_record(&base, false)
+        };
+        if let Condition::RunBatch {
+            request_id,
+            verdict_only: only,
+            ..
+        } = &mut verdict_only.condition
+        {
+            *request_id = "request-verdict".into();
+            *only = true;
+        }
+        insert(&orch.db.local, &verdict_only).await.unwrap();
+
+        cancel_run_waits_for_stop(&orch.db.local, "run-1")
+            .await
+            .unwrap();
+        assert_eq!(wait_state(&orch).await, "cancelled");
+        assert_eq!(active_wait_count(&orch).await, 0);
+
+        let held = boundary_hold(&orch)
+            .await
+            .expect("a stopped run's committing batch still holds its branch");
+        assert_eq!(held.request_id, "request-1");
+        assert_eq!(
+            held.detached_because.as_deref(),
+            Some(STOPPED_WHILE_RUNNING)
+        );
+        assert!(
+            super::super::run::detached::load(&orch.db.local, "request-verdict")
+                .await
+                .unwrap()
+                .is_none(),
+            "a verdict-only batch is not converted: it never held the branch"
+        );
+
+        super::super::run::detached::settle_answered_inline(
+            &orch,
+            &orch.db.local,
+            "request-1",
+            "cancelled",
+            "cancelled by the stop",
+        )
+        .await;
+        assert_eq!(boundary_hold(&orch).await, None);
     }
 
     /// A run batch has no waitFor condition to await; asking for one is a bug,
@@ -8922,9 +9127,10 @@ mod tests {
     }
 
     /// Supersession leaves the batch running, whereas Compact cancels session
-    /// work. Replaying either abandonment must answer once without resuming.
+    /// work; both keep a committing batch's row until it settles. Replaying
+    /// either abandonment must answer once without resuming.
     #[tokio::test]
-    async fn run_batch_abandonment_preserves_only_superseded_work() {
+    async fn run_batch_abandonment_keeps_the_batch_until_it_settles() {
         for cause in AbandonCause::ALL {
             let (orch, base, _) = durable_env().await;
             let record = run_batch_record(&base, true);
@@ -8970,7 +9176,14 @@ mod tests {
                     assert!(results[0].1.contains("keeps running"));
                 }
                 AbandonCause::OperatorCompact => {
-                    assert!(detached.is_none(), "Compact must not detach cancelled work");
+                    let detached = detached
+                        .expect("Compact's cancel is not the batch's death: it keeps the hold");
+                    assert_eq!(
+                        detached.state,
+                        super::super::run::detached::DetachedState::Running
+                    );
+                    assert!(detached.holds_branch);
+                    assert_eq!(detached.reason, COMPACTED_WHILE_RUNNING);
                     assert!(results[0].1.contains("operator_compact"));
                     assert!(results[0].1.contains("operator compacted"));
                     assert!(!results[0].1.contains("keeps running"));

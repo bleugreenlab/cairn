@@ -1222,6 +1222,12 @@ pub(crate) struct InflightRunBatch {
     /// When the batch parked its turn (Unix milliseconds). The batch itself
     /// started up to one synchronous window before that.
     pub(crate) parked_at_ms: i64,
+    /// Why no call waits for the batch any more, when it runs detached (its
+    /// wait was abandoned, its run stopped, its carrier could not park it).
+    /// `parked_at_ms` is then when it detached. The agent that stopped waiting
+    /// is exactly the one that no longer knows the batch holds its branch, so
+    /// the hold says so.
+    pub(crate) detached_because: Option<String>,
     /// Where the batch stands now, when this runner holds its task: the item
     /// running and for how long, or what it queues for. `None` for a batch
     /// this runner does not hold, and wherever the reader has no fleet to ask
@@ -1247,7 +1253,12 @@ impl InflightRunBatch {
             None => format!(" on job `{}`", self.job_id),
         };
         let parked = crate::clock::stamp_millis(self.parked_at_ms)
-            .map(|stamp| format!(", parked since {stamp}"))
+            .map(|stamp| match self.detached_because.as_deref() {
+                Some(reason) => format!(
+                    ", running detached since {stamp} because {reason}, so no call is waiting for it"
+                ),
+                None => format!(", parked since {stamp}"),
+            })
             .unwrap_or_default();
         let progress = self
             .progress
@@ -1311,6 +1322,7 @@ fn run_batch_from_wait(
             request_id,
             label,
             parked_at_ms: created_at,
+            detached_because: None,
             progress: None,
         }),
         _ => None,
@@ -1327,6 +1339,7 @@ fn run_batch_from_detached(
         request_id: row.text(1)?,
         label: row.opt_text(2)?,
         parked_at_ms: row.get::<i64>(3)?,
+        detached_because: row.opt_text(4)?,
         progress: None,
     })
 }
@@ -1366,8 +1379,9 @@ pub(crate) async fn inflight_run_batch_on_branch(
 /// unsettled, and only settlement releases it (cairn/6145 and cairn/6205): an
 /// open run-batch wait (`pending` or `resolving`), or a `run_batch_detached`
 /// row still `running` for a batch that can disturb the branch. A wait
-/// abandoned while its batch ran becomes such a detached row in the same
-/// write, so the agent losing interest never ends the hold. The source is
+/// abandoned while its batch ran, or cancelled by a stop of its run, becomes
+/// such a detached row in the same write, so the agent losing interest never
+/// ends the hold; the batch's settlement does. The source is
 /// these durable rows, not the in-memory fleet registry: the boundary
 /// revalidates inside the store-lock bracket that moves the bookmark, where a
 /// durable row can be read and the registry cannot, and the registry is
@@ -1394,7 +1408,7 @@ pub(crate) async fn inflight_run_batch_except(
           ORDER BY (w.job_id = ?3) DESC, w.created_at"
     );
     let detached_sql = format!(
-        "SELECT d.job_id, d.request_id, d.label, d.created_ms
+        "SELECT d.job_id, d.request_id, d.label, d.created_ms, d.reason
            FROM run_batch_detached d
            JOIN jobs j ON j.id = d.job_id
           WHERE j.project_id = ?1
@@ -4076,6 +4090,7 @@ mod tests {
             request_id: "ba0e0085".into(),
             label: Some("rust-tests on main".into()),
             parked_at_ms: 1_760_788_078_000,
+            detached_because: None,
             progress: None,
         }))
     }
@@ -4306,10 +4321,18 @@ mod tests {
                 request_id: "req-detached".into(),
                 label: Some("cargo test".into()),
                 parked_at_ms: 7,
+                detached_because: Some("its wait was abandoned while the batch ran".into()),
                 progress: None,
             })
         );
-        assert!(mutation_boundary_hold(&hold).contains("`req-detached`"));
+        let said = mutation_boundary_hold(&hold);
+        assert!(said.contains("`req-detached`"), "{said}");
+        assert!(
+            said.contains(
+                "because its wait was abandoned while the batch ran, so no call is waiting for it"
+            ),
+            "the hold tells the owner, who stopped waiting, why its batch still holds: {said}"
+        );
         assert!(
             inflight_run_batch_except(&db, "proj-1", "agent/overlap", None, None)
                 .await

@@ -6533,7 +6533,7 @@ impl ReservationPlan {
         }
         if self.batch_suites.is_empty() || self.parallel_width > 1 {
             resolved.process_evidence = self.process_evidence(&context).await;
-            resolved.charge_measured_peak();
+            resolved.charge_measured_peak(capabilities.memory_budget_bytes);
             let cpu_width = capabilities
                 .concurrency_capacity
                 .unwrap_or_else(|| u32::try_from(capabilities.logical_cores).unwrap_or(u32::MAX));
@@ -6680,7 +6680,7 @@ impl ReservationPlan {
                     context,
                 )
                 .await;
-                item.charge_measured_peak();
+                item.charge_measured_peak(memory_budget_bytes);
                 item.price_at_width(cpu_width, &member_prior, memory_budget_bytes);
                 process_evidence = Some(match process_evidence {
                     Some(held) => {

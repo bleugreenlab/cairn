@@ -391,9 +391,21 @@ impl ResolvedResourceProfile {
     /// The suite's test phase as measured on this machine rides beside it, so
     /// the executor can step a running lane down to it once the lane's own
     /// output shows that phase; without one the lane keeps this charge.
-    pub(super) fn charge_measured_peak(&mut self) {
-        self.reservation.measured_peak_bytes =
-            measured_peak_bytes(self.reservation.measured_peak_bytes, &self.process_evidence);
+    ///
+    /// Never above the machine's single-request cap
+    /// ([`memory_reservation_cap`]), the same clamp `memory_bytes` is held to.
+    /// Whether a larger process fits here at all is placement's process-fit
+    /// question, answered from `process_evidence`; a reservation carrying it
+    /// unclamped charged a 24 GiB Mac a borrowed 30.9 GiB, so that machine
+    /// refused everything until the command ended (cairn/6498).
+    pub(super) fn charge_measured_peak(&mut self, memory_budget_bytes: Option<u64>) {
+        self.reservation.measured_peak_bytes = measured_peak_bytes(
+            self.reservation.measured_peak_bytes,
+            &self.process_evidence,
+        )
+        .map(|peak| {
+            memory_budget_bytes.map_or(peak, |budget| peak.min(memory_reservation_cap(budget)))
+        });
         self.reservation.test_phase = self.process_evidence.test_phase;
         self.reservation.build_job_memory = self.process_evidence.build_job_memory;
     }
@@ -3743,7 +3755,7 @@ mod process_peak_tests {
                 }),
             });
             local.memory_fit = MemoryFit::of(Some(tree), Some(historical_budget));
-            local.charge_measured_peak();
+            local.charge_measured_peak(Some(historical_budget));
             local.price_at_width(32, &class_prior, Some(historical_budget));
             assert_eq!(local.memory_fit, MemoryFit::Holds);
             let price = local.rationale.build_jobs_price.unwrap();
@@ -5957,6 +5969,38 @@ mod tests {
         let prior = process_demand(9 * GIB, ProcessDemandBasis::ClassPrior { platform: None });
         assert_eq!(measured_peak_bytes(None, &prior), None);
         assert_eq!(measured_peak_bytes(None, &ProcessEvidence::default()), None);
+    }
+
+    /// A stamped peak never exceeds the machine (cairn/6498). On 11-08 a
+    /// 30.9 GiB rustc borrowed from Linux was stamped unclamped on a 24 GiB
+    /// Mac, which then refused everything while that command ran. The stamp
+    /// is held to the same cap as the reservation; a machine of unknown size
+    /// keeps the measurement.
+    #[tokio::test]
+    async fn a_stamped_peak_is_held_to_the_machines_cap() {
+        let mut resolved = ceiling_for_local_peak(
+            "resource-profile-stamped-peak-cap.db",
+            MIN_CONFIDENT_SAMPLES,
+            GIB,
+        )
+        .await;
+        let borrowed = process_demand(
+            30 * GIB,
+            ProcessDemandBasis::OtherPlatform {
+                platform: "linux".into(),
+            },
+        );
+        resolved.process_evidence = borrowed.clone();
+        resolved.reservation.measured_peak_bytes = None;
+        let mut unsized_machine = resolved.clone();
+        resolved.charge_measured_peak(Some(SPECIMEN_BUDGET));
+        assert_eq!(resolved.reservation.measured_peak_bytes, Some(SPECIMEN_CAP));
+        assert!(resolved.reservation.memory_charge_bytes() <= SPECIMEN_CAP);
+        unsized_machine.charge_measured_peak(None);
+        assert_eq!(
+            unsized_machine.reservation.measured_peak_bytes,
+            measured_peak_bytes(None, &borrowed)
+        );
     }
 
     /// cairn/5472's first specimen: bgsrv-ub had run the whole suite past the

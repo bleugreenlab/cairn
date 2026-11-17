@@ -47,6 +47,71 @@ async fn insert_project_job_run_turn(db: &LocalDb, turn_state: &str) {
     .unwrap();
 }
 
+/// cairn/6205 through the operator Stop entry point: the stop cancels the
+/// run's waits before any batch process has ended, so a batch that can write
+/// the branch is left a `running` detached row that holds it until the batch
+/// settles. A verdict-only batch never held the branch and is not converted.
+#[tokio::test]
+async fn stop_session_keeps_a_committing_batchs_branch_hold() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    insert_project_job_run_turn(&orch.db.local, "yielded").await;
+    for (id, condition) in [
+        (
+            "wait-commit",
+            r#"{"kind":"run_batch","request_id":"req-commit","commits":true}"#,
+        ),
+        (
+            "wait-verdict",
+            r#"{"kind":"run_batch","request_id":"req-verdict","commits":false,"verdict_only":true}"#,
+        ),
+    ] {
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO agent_waits(id, job_id, run_id, session_id, predecessor_turn_id, tool_use_id,
+                                         condition_json, state, created_at)
+                 VALUES (?1, 'job-1', 'run-1', 'session-1', 'turn-1', ?1, ?2, 'pending', 1)",
+                params![id, condition],
+            )
+            .await
+            .unwrap();
+    }
+
+    lifecycle::stop_session(&orch, "run-1").unwrap();
+
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &orch.db.local,
+            "SELECT COUNT(*) FROM agent_waits WHERE run_id = ?1 AND state IN ('pending', 'resolving')",
+            "run-1",
+        )
+        .await,
+        0,
+        "the stop ends every wait"
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT state || '/' || holds_branch FROM run_batch_detached WHERE request_id = ?1",
+            "req-commit",
+        )
+        .await
+        .as_deref(),
+        Some("running/1"),
+        "the committing batch still holds its branch"
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &orch.db.local,
+            "SELECT COUNT(*) FROM run_batch_detached WHERE request_id = ?1",
+            "req-verdict",
+        )
+        .await,
+        0,
+        "a verdict-only batch is not converted"
+    );
+}
+
 #[tokio::test]
 async fn stop_session_preserves_settled_resource_write_report_once() {
     let (_temp, orch) = common::test_orchestrator().await;

@@ -30,21 +30,13 @@ pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str, cancel_owned_
                 let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
                     .await
                     .map_err(|e| e.to_string())?;
-                db.write(|conn| {
-                    let run_id = run_id.clone();
-                    Box::pin(async move {
-                        conn.execute(
-                            "UPDATE agent_waits SET state='cancelled', resolved_at=?2 WHERE run_id=?1 AND state IN ('pending','resolving')",
-                            cairn_db::turso::params![run_id, chrono::Utc::now().timestamp_millis()],
-                        ).await?;
-                        Ok(())
-                    })
-                }).await.map_err(|e| e.to_string())
+                crate::mcp::handlers::durable_suspend::cancel_run_waits_for_stop(&db, &run_id).await
             }
         });
         match cancel_result {
-            // A cancelled run-batch wait no longer holds its branch: serve the
-            // explicit replay request it deferred, if nothing else holds it.
+            // A batch that can disturb the branch still holds it through the
+            // detached row the cancel wrote; any other hold the cancelled waits
+            // made is gone, so serve the replay request it deferred, if any.
             Ok(()) => {
                 crate::orchestrator::base_advance::on_branch_hold_released_for_run(orch, run_id)
             }

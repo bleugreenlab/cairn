@@ -15869,10 +15869,12 @@ pub(crate) mod host_batch_tests {
         assert!(!control.stop_placement.is_stopped());
     }
 
-    /// Supersession retains the identity of work still running, so a reissue
-    /// is refused. Compact cancels that work and must not leave a stale refusal.
+    /// Abandonment retains the identity of work still running, so a reissue is
+    /// refused. Compact cancels that work, but until its cancellation lands the
+    /// batch still runs in the residence, so the refusal holds there too and
+    /// ends with the batch's settlement.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_reissue_after_abandonment_is_refused_only_for_superseded_work() {
+    async fn a_reissue_after_abandonment_is_refused_until_the_batch_settles() {
         for compact in [false, true] {
             let orch = env().await;
             let payload = declared_payload();
@@ -15939,26 +15941,37 @@ pub(crate) mod host_batch_tests {
             }
             assert_eq!(
                 detached_state(&orch, "req-abandoned").await.as_deref(),
-                if compact { None } else { Some("running") }
+                Some("running"),
+                "compact: {compact}"
             );
             let mut reissue = call_request(payload);
             reissue.tool_use_id = Some("tool-2".into());
             assert_eq!(
                 reissue_refusal(&orch, &reissue).await,
-                if compact {
-                    None
-                } else {
-                    Some(detached::reissue_refusal_text(
-                        "req-abandoned",
-                        &detached::live_state(
-                            &orch,
-                            &detached::load(&orch.db.local, "req-abandoned")
-                                .await
-                                .unwrap()
-                                .unwrap(),
-                        ),
-                    ))
-                }
+                Some(detached::reissue_refusal_text(
+                    "req-abandoned",
+                    &detached::live_state(
+                        &orch,
+                        &detached::load(&orch.db.local, "req-abandoned")
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    ),
+                )),
+                "compact: {compact}"
+            );
+            detached::settle_answered_inline(
+                &orch,
+                &orch.db.local,
+                "req-abandoned",
+                "cancelled",
+                "cancelled",
+            )
+            .await;
+            assert_eq!(
+                reissue_refusal(&orch, &reissue).await,
+                None,
+                "a settled batch refuses nothing (compact: {compact})"
             );
         }
     }
