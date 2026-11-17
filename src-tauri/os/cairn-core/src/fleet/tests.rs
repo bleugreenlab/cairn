@@ -1076,6 +1076,7 @@ fn insert_bound_relay_context(pool: &Fleet) {
                 check_status_board: None,
                 run_batch_request_id: None,
                 live_checkout: false,
+                item_settlements: None,
                 executor_binding: Some(RunnerContextExecutorBinding {
                     executor_id: "executor-1".into(),
                     link: BatchLink::Bound(7),
@@ -1110,6 +1111,7 @@ async fn a_run_batch_item_report_marks_the_item_running_on_its_live_control() {
                 run_batch_request_id: Some(request_id.clone()),
                 live_checkout: false,
                 executor_binding: None,
+                item_settlements: None,
                 output: output_guard::RelayedOutput::shared(),
             },
         ),
@@ -1141,6 +1143,7 @@ async fn a_run_batch_item_report_marks_the_item_running_on_its_live_control() {
                 exit_code: Some(0),
                 timed_out: false,
                 duration_ms: 1_000,
+                result: None,
             },
         )
         .await;
@@ -22354,6 +22357,7 @@ fn revoking_a_runner_context_unregisters_its_capability() {
                 check_status_board: None,
                 run_batch_request_id: None,
                 live_checkout: false,
+                item_settlements: None,
                 executor_binding: Some(RunnerContextExecutorBinding {
                     executor_id: "executor-3824".into(),
                     link: BatchLink::Bound(1),
@@ -23219,6 +23223,7 @@ async fn a_review_waves_board_follows_its_members_one_at_a_time() {
         exit_code: Some(exit),
         timed_out: false,
         duration_ms: 252_000,
+        result: None,
     };
 
     orch.fleet.handle_runner_callback(&orch, started(0)).await;
@@ -23327,6 +23332,274 @@ async fn a_review_waves_board_follows_its_members_one_at_a_time() {
             .contains_key(&context),
         "the wave's callback context settles with its batch"
     );
+}
+
+/// cairn/5893. A member the executor reports finished, with its result, is
+/// answered while the batch's later members still run, whether or not the
+/// batch has a board. The batch's own result then answers only the member no
+/// report reached: nothing is delivered twice, what a subscriber was given
+/// early agrees with the batch's result, and the leader still ends on the
+/// batch's own terminal outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_member_is_answered_before_its_batch_returns() {
+    use cairn_common::executor_protocol::{
+        ProcessBatchItemOutcome, ProcessItemResult, RunnerCallback,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let orch = test_orchestrator(temp.path()).await;
+    let (sender, mut executor) = mpsc::unbounded_channel();
+    let generation = orch.fleet.attach_executor(sender);
+    let names = ["fast-a", "slow", "fast-b"];
+    let mut request = provenance_request();
+    request.request_id = "wave".into();
+    request.repository = RepositoryLocator::ScratchOnly {
+        owner_id: request.project_id.clone(),
+    };
+    request.wait_horizon_unix_ms = unix_time_ms() + 60_000;
+    let items: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| PureVerdictBatchItem {
+            result_identity: CheckResultIdentity::new("project", name, "input"),
+            process: ProcessBatchItem {
+                header: name.to_string(),
+                stream_id: format!("turn-checks:j-prod:check-{index}"),
+                ..cache_batch_item(Vec::new())
+            },
+        })
+        .collect();
+    let (landed_tx, mut landed) = mpsc::unbounded_channel::<(usize, CoalescedDelivery)>();
+    let wave_orch = orch.clone();
+    let wave = tokio::spawn(async move {
+        let sink: Box<PureVerdictItemSink> =
+            Box::new(move |position, delivery: &CoalescedDelivery| {
+                let _ = landed_tx.send((position, delivery.clone()));
+                Box::pin(async {}) as futures_util::future::BoxFuture<'static, ()>
+            });
+        wave_orch
+            .fleet
+            .submit_pure_verdict_batch_streaming(
+                &wave_orch,
+                request,
+                items,
+                None,
+                None,
+                None,
+                Some(&*sink),
+            )
+            .await
+    });
+    let Some(ExecutorMessage::Offer { entry_id, .. }) = next_work_frame(&mut executor).await else {
+        panic!("the wave is offered");
+    };
+    orch.fleet.handle_executor_message(
+        COLOCATED_EXECUTOR_ID,
+        generation,
+        ExecutorMessage::Claim { entry_id },
+    );
+    let Some(ExecutorMessage::Granted {
+        request,
+        batch: Some(batch),
+        ..
+    }) = next_work_frame(&mut executor).await
+    else {
+        panic!("the wave is granted with its batch");
+    };
+    let context = batch
+        .runner_context_id
+        .clone()
+        .expect("a pure-verdict batch names a context for its members' reports, board or none");
+    let outcome = |name: &str, exit: i32| ProcessBatchItemOutcome {
+        header: name.into(),
+        body: format!("{name} output"),
+        succeeded: exit == 0,
+        suspended: false,
+        images: Vec::new(),
+        exit_code: Some(exit),
+        timed_out: false,
+        started_at_unix_ms: 1,
+        finished_at_unix_ms: 2,
+        duration_ms: 1,
+        peak_rss_bytes: None,
+        peak_process: None,
+        cpu: None,
+        granted_units: None,
+        disk_delta_bytes: None,
+        sandbox_denials: Vec::new(),
+        tracked_modifications: None,
+        environment_fingerprint: String::new(),
+        verdict_platform: None,
+        verdict_arch: None,
+        toolchain_fingerprint: None,
+        verdict_environment_hash: None,
+        stop: None,
+        build_jobs: None,
+        unrecorded_cache_checkpoint: None,
+        build_job_processes: None,
+    };
+    let mut batch_result = completed_for(&request, COLOCATED_EXECUTOR_ID, generation);
+    let CellOutcome::Completed { metadata, .. } = &batch_result else {
+        panic!("a completed batch");
+    };
+    let lane = metadata.clone();
+    let reported =
+        |index: usize, item: ProcessBatchItemOutcome| RunnerCallback::ProcessItemCompleted {
+            runner_context_id: context.clone(),
+            stream_id: batch.items[index].stream_id.clone(),
+            succeeded: item.succeeded,
+            exit_code: item.exit_code,
+            timed_out: false,
+            duration_ms: item.duration_ms,
+            result: Some(Box::new(ProcessItemResult {
+                metadata: lane.for_batch_item(&item),
+                outcome: item,
+            })),
+        };
+    async fn next_landing(
+        landed: &mut mpsc::UnboundedReceiver<(usize, CoalescedDelivery)>,
+    ) -> (usize, CoalescedDelivery) {
+        tokio::time::timeout(Duration::from_secs(10), landed.recv())
+            .await
+            .expect("a member lands")
+            .expect("the wave is open")
+    }
+
+    // fast-a finishes while slow runs.
+    orch.fleet
+        .handle_runner_callback(&orch, reported(0, outcome("fast-a", 0)))
+        .await;
+    let (position, early) = next_landing(&mut landed).await;
+    assert_eq!(position, 0);
+    assert!(!wave.is_finished(), "the batch is still open");
+    let early = early.expect("fast-a is answered");
+    let CellOutcome::Completed {
+        exit_code,
+        output,
+        metadata,
+        ..
+    } = &early.outcome
+    else {
+        panic!("fast-a is answered with its verdict");
+    };
+    assert_eq!((*exit_code, output.as_str()), (Some(0), "fast-a output"));
+    assert_eq!(metadata.executor_connection_generation, generation);
+    assert!(
+        !metadata.executor_id.is_empty(),
+        "the machine is stamped from the claim's link"
+    );
+    assert!(early.account.placement.is_some());
+    assert!(
+        orch.fleet
+            .coalesced_leaders
+            .lock()
+            .unwrap()
+            .contains(&(request.request_id.clone(), request.attempt_id.clone())),
+        "an early member does not end its leader"
+    );
+
+    // slow's report never arrives; fast-b's does.
+    orch.fleet
+        .handle_runner_callback(&orch, reported(2, outcome("fast-b", 0)))
+        .await;
+    assert_eq!(next_landing(&mut landed).await.0, 2);
+
+    // The batch's own result names all three.
+    if let CellOutcome::Completed { output, .. } = &mut batch_result {
+        *output = serde_json::to_string(&[
+            outcome("fast-a", 0),
+            outcome("slow", 1),
+            outcome("fast-b", 0),
+        ])
+        .unwrap();
+    }
+    orch.fleet.handle_executor_message(
+        COLOCATED_EXECUTOR_ID,
+        generation,
+        ExecutorMessage::Result {
+            request_id: request.request_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            outcome: batch_result,
+        },
+    );
+    assert_eq!(
+        next_landing(&mut landed).await.0,
+        1,
+        "the batch's result answers only the member no report reached"
+    );
+    let delivered = tokio::time::timeout(Duration::from_secs(10), wave)
+        .await
+        .expect("the wave is answered")
+        .unwrap();
+    assert!(
+        landed.recv().await.is_none(),
+        "no member lands a second time"
+    );
+    let exits: Vec<_> = delivered
+        .iter()
+        .map(|delivery| match delivery {
+            Ok(CoalescedCellOutcome {
+                outcome: CellOutcome::Completed { exit_code, .. },
+                ..
+            }) => *exit_code,
+            other => panic!(
+                "every member is answered by the one execution: {:?}",
+                other.as_ref().map(|d| &d.outcome)
+            ),
+        })
+        .collect();
+    assert_eq!(exits, [Some(0), Some(1), Some(0)]);
+    let mut at_end = early.outcome.clone();
+    if let CellOutcome::Completed { metadata, .. } = &mut at_end {
+        *metadata = lane.for_batch_item(&outcome("fast-a", 0));
+    }
+    assert!(
+        verdict_disagreement(&delivered[0].as_ref().unwrap().outcome, &at_end).is_empty(),
+        "what fast-a's subscriber was given is what the batch's result says"
+    );
+    assert!(
+        !orch
+            .fleet
+            .coalesced_leaders
+            .lock()
+            .unwrap()
+            .contains(&(request.request_id.clone(), request.attempt_id.clone())),
+        "the leader ends on the batch's own outcome"
+    );
+    assert!(!orch
+        .fleet
+        .runner_contexts
+        .lock()
+        .unwrap()
+        .contains_key(&context));
+}
+
+/// An early settlement and its batch's result are compared on what was
+/// decided, never on what was measured: an early report reads the batch's
+/// test phase as far as it had got.
+#[test]
+fn an_early_settlement_is_checked_against_its_batch_on_the_verdict_alone() {
+    let request = provenance_request();
+    let early = completed_for(&request, COLOCATED_EXECUTOR_ID, 1);
+    let mut measured_apart = early.clone();
+    if let CellOutcome::Completed { metadata, .. } = &mut measured_apart {
+        metadata.duration_ms = Some(999);
+        metadata.peak_rss_bytes = Some(1 << 30);
+    }
+    assert!(verdict_disagreement(&early, &measured_apart).is_empty());
+    let mut red = early.clone();
+    if let CellOutcome::Completed {
+        exit_code, output, ..
+    } = &mut red
+    {
+        *exit_code = Some(1);
+        *output = "something else".into();
+    }
+    assert_eq!(verdict_disagreement(&early, &red), ["exit code", "output"]);
+    let cancelled = CellOutcome::Cancelled {
+        request_id: request.request_id.clone(),
+        attempt_id: request.attempt_id.clone(),
+    };
+    assert_eq!(verdict_disagreement(&early, &cancelled), ["outcome"]);
 }
 
 /// An agent's batch carries no command identities, and its items' kills

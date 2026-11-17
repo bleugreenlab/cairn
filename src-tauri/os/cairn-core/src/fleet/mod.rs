@@ -137,7 +137,11 @@ use colocated::require_colocated_population;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 use colocated::PendingTreeAdoptionResult;
 pub(crate) use colocated::{kernel_wait_diagnostic, NO_COLOCATED_EXECUTOR};
+#[cfg(test)]
+pub(crate) use dispatch::verdict_disagreement;
 pub use dispatch::CancelOutcome;
+use dispatch::ItemSettlements;
+pub(crate) use dispatch::PureVerdictItemSink;
 #[cfg(test)]
 use dispatch::{
     account_of_claimed_attempt, batch_runs_javascript, cell_build_service_env, outcome_matches,
@@ -635,6 +639,7 @@ pub(crate) enum PublicationRole {
     Published(Option<crate::execution::cache::RecordedCheckObservation>),
 }
 
+#[derive(Clone)]
 pub(crate) struct CoalescedCellOutcome {
     pub outcome: CellOutcome,
     pub publication: PublicationCoordination,

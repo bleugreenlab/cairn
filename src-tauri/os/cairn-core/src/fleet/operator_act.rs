@@ -119,6 +119,7 @@ impl Fleet {
                     run_batch_request_id: None,
                     live_checkout: false,
                     executor_binding: None,
+                    item_settlements: None,
                     output: output.clone(),
                 },
             ),

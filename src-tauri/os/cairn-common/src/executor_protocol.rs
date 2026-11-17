@@ -9469,7 +9469,22 @@ pub struct LearnedResourceEstimate {
 /// runtime and build-root fence. Nothing it sends or reads changes, and the
 /// floor's transitions reach the runner in the same machine samples as
 /// before, so a runner talking to an older executor gets nothing wrong.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 173;
+///
+/// Version 174 (cairn/5893) lets a review wave record each member's verdict
+/// as that member finishes, rather than when its slowest sibling does.
+/// [`RunnerCallback::ProcessItemCompleted`] gains an optional `result`
+/// ([`ProcessItemResult`]): for an item of a pure-verdict check lane, the
+/// executor sends the item's whole [`ProcessBatchItemOutcome`] and the
+/// command's metadata narrowed to it by [`CellExecutionMeta::for_batch_item`],
+/// and the runner settles that item's subscribers at once. The batch's own
+/// result is unchanged: it still settles every item no callback reached, and
+/// the runner checks it against what each callback delivered. [`MemoryJobBound`]
+/// loses `sharers`, as the cairn/7244 paragraph asked. What a runner gets wrong
+/// talking to an older executor: every member's verdict waits for the whole
+/// batch, which is the latency this version removes; an older runner talking
+/// to a newer executor ignores the result it is sent. The handshake refuses
+/// both pairings, as for every bump, so neither is kept.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 174;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -13682,13 +13697,6 @@ pub struct MemoryJobBound {
     /// room, this one included ([`BuildJobs::shared_by`]).
     #[serde(default = "one_item", skip_serializing_if = "is_one_item")]
     pub batch_items: u32,
-    /// Always 1, and read by nothing. Retained only so a protocol-173 runner,
-    /// which requires the key, still decodes the bound: since cairn/7244 spawn
-    /// divides the room by no count of lanes. Delete it at the next protocol
-    /// bump (named in the cairn/7244 paragraph above
-    /// [`EXECUTOR_PROTOCOL_VERSION`]).
-    #[serde(default = "one_item")]
-    pub sharers: u32,
     /// Where the reserve came from. A record from before it was kept reads as
     /// assumed, which every such record was.
     #[serde(default)]
@@ -13935,7 +13943,6 @@ impl MemoryJobBound {
             measured_at_unix_ms: memory.measured_at_unix_ms,
             per_job_reserve_bytes,
             batch_items: 1,
-            sharers: 1,
             reserve,
         }
     }
@@ -26351,7 +26358,30 @@ pub enum RunnerCallback {
         exit_code: Option<i32>,
         timed_out: bool,
         duration_ms: u64,
+        /// The item's whole result, sent for an item of a pure-verdict check
+        /// lane so the runner can settle that item's verdict while the batch's
+        /// later items still run. Absent for every other batch, whose items
+        /// the runner reads only from the batch's own result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<Box<ProcessItemResult>>,
     },
+}
+
+/// One finished item of a pure-verdict check batch: what the batch's own
+/// result will carry for it, sent as the item ends.
+///
+/// `metadata` is the command's metadata narrowed to the item by
+/// [`CellExecutionMeta::for_batch_item`], the derivation the runner applies to
+/// the batch's result, so an item settled early and one settled at the batch's
+/// end are described the same way. Its measurements are the item's own; the
+/// verdict-bearing fields (`exit_code`, `body`, `timed_out`, `stop`,
+/// `tracked_modifications`, `sandbox_denials`) are what the batch's result
+/// will repeat.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessItemResult {
+    pub outcome: ProcessBatchItemOutcome,
+    pub metadata: CellExecutionMeta,
 }
 
 impl RunnerCallback {
@@ -27246,6 +27276,47 @@ mod tests {
         });
         let bound: MemoryJobBound = serde_json::from_value(old).unwrap();
         assert_eq!(bound.reserve, JobMemoryReserve::Assumed);
+    }
+
+    #[test]
+    fn an_item_report_carries_its_result_only_when_it_has_one() {
+        let outcome: ProcessBatchItemOutcome = serde_json::from_value(serde_json::json!({
+            "header": "typecheck",
+            "body": "no errors",
+            "succeeded": true,
+            "suspended": false,
+            "exitCode": 0,
+            "startedAtUnixMs": 1,
+            "finishedAtUnixMs": 2,
+            "durationMs": 1
+        }))
+        .unwrap();
+        let metadata: CellExecutionMeta = serde_json::from_value(serde_json::json!({
+            "slotId": "cell",
+            "cellEpoch": 1,
+            "startedAtUnixMs": 1,
+            "finishedAtUnixMs": 2
+        }))
+        .unwrap();
+        let report = |result| RunnerCallback::ProcessItemCompleted {
+            runner_context_id: "context".into(),
+            stream_id: "turn-checks:job:check-0".into(),
+            succeeded: true,
+            exit_code: Some(0),
+            timed_out: false,
+            duration_ms: 1,
+            result,
+        };
+        let bare = serde_json::to_value(report(None)).unwrap();
+        assert!(bare.get("result").is_none(), "{bare}");
+        let full = report(Some(Box::new(ProcessItemResult { outcome, metadata })));
+        let wire = serde_json::to_value(&full).unwrap();
+        assert_eq!(wire["result"]["outcome"]["body"], "no errors");
+        assert_eq!(wire["result"]["metadata"]["slotId"], "cell");
+        assert_eq!(
+            serde_json::from_value::<RunnerCallback>(wire).unwrap(),
+            full
+        );
     }
 
     #[test]

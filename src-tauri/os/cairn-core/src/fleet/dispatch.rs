@@ -124,6 +124,84 @@ impl Drop for CoalescedLeaderCompletionGuard {
 /// chunk boundaries to reason about. The diagnostics are included because a
 /// spawn failure, a preparation timeout, or a storage error quotes the command
 /// and whatever it managed to print.
+/// Where a pure-verdict check batch's finished items settle before the batch
+/// returns.
+///
+/// Each item's stream names the coalesced execution it answers. What was
+/// settled early is kept until the batch's own result arrives, which then
+/// answers only the items no report reached and checks the rest against what
+/// their subscribers were already given.
+pub(super) struct ItemSettlements {
+    pub(super) leader: RequestIdentity,
+    pub(super) keys: HashMap<String, CoalescingKey>,
+    pub(super) settled: Mutex<HashMap<CoalescingKey, CellOutcome>>,
+}
+
+impl ItemSettlements {
+    /// The outcome `key` was settled with early, taken so the batch's end
+    /// handles each key once.
+    fn take(&self, key: &CoalescingKey) -> Option<CellOutcome> {
+        lock_through_poison(&self.settled).remove(key)
+    }
+}
+
+/// The verdict-bearing fields on which an item's early settlement and the
+/// batch's own result for it disagree; empty when they agree.
+///
+/// Measurements are left out on purpose: an early report reads the command's
+/// test phase as far as the batch had got, so its metadata can differ from
+/// the batch's in what was measured, never in what was decided.
+pub(crate) fn verdict_disagreement(early: &CellOutcome, last: &CellOutcome) -> Vec<&'static str> {
+    let (
+        CellOutcome::Completed {
+            exit_code,
+            output,
+            timed_out,
+            metadata,
+            sandbox_denials,
+            tracked_modifications,
+            ..
+        },
+        CellOutcome::Completed {
+            exit_code: last_exit_code,
+            output: last_output,
+            timed_out: last_timed_out,
+            metadata: last_metadata,
+            sandbox_denials: last_sandbox_denials,
+            tracked_modifications: last_tracked_modifications,
+            ..
+        },
+    ) = (early, last)
+    else {
+        return vec!["outcome"];
+    };
+    let mut differing = Vec::new();
+    if exit_code != last_exit_code {
+        differing.push("exit code");
+    }
+    if output != last_output {
+        differing.push("output");
+    }
+    if timed_out != last_timed_out {
+        differing.push("timed out");
+    }
+    if metadata.stop != last_metadata.stop {
+        differing.push("stop");
+    }
+    if sandbox_denials != last_sandbox_denials {
+        differing.push("sandbox denials");
+    }
+    if tracked_modifications != last_tracked_modifications {
+        differing.push("tracked modifications");
+    }
+    differing
+}
+
+/// What a caller of [`Fleet::submit_pure_verdict_batch_streaming`] is handed
+/// as each item's delivery lands, by the item's position in the batch.
+pub(crate) type PureVerdictItemSink =
+    dyn Fn(usize, &CoalescedDelivery) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync;
+
 pub(super) fn scrub_cell_outcome(outcome: &mut CellOutcome) {
     use crate::security::{Crossing, DetectionReport, Sanitizer};
 
@@ -1634,25 +1712,42 @@ impl Fleet {
         settlement: impl Into<LeaderSettlement>,
     ) -> bool {
         let settlement = settlement.into();
-        let execution = {
-            let mut registry = lock_through_poison(&self.in_flight);
-            let Some(execution) = registry.by_key.remove(key) else {
-                return false;
-            };
-            for identity in execution.subscribers.keys() {
-                registry.subscriber_keys.remove(identity);
-            }
-            execution
+        let Some(execution) = self.take_coalesced(key) else {
+            return false;
         };
-        let leader_still_active = lock_through_poison(&self.in_flight)
-            .by_key
-            .keys()
-            .any(|candidate| candidate.leader == key.leader);
-        if !leader_still_active {
-            lock_through_poison(&self.coalesced_leaders).remove(&key.leader);
+        let drained = self.release_drained_leader(&key.leader);
+        self.send_coalesced(execution, &settlement);
+        if drained {
+            self.leader_settled(&key.leader, &settlement);
         }
+        true
+    }
+
+    /// Deliver `settlement` to every subscriber of `key`, and nothing else: the
+    /// leader's own ending is [`Self::end_coalesced_leader_if_drained`]'s. False
+    /// when the key was already delivered, so no subscriber is answered twice.
+    fn deliver_coalesced(&self, key: &CoalescingKey, settlement: &LeaderSettlement) -> bool {
+        let Some(execution) = self.take_coalesced(key) else {
+            return false;
+        };
+        self.send_coalesced(execution, settlement);
+        true
+    }
+
+    /// Take `key`'s execution out of the registry, so exactly one settlement
+    /// ever answers its subscribers.
+    fn take_coalesced(&self, key: &CoalescingKey) -> Option<InFlightExecution> {
+        let mut registry = lock_through_poison(&self.in_flight);
+        let execution = registry.by_key.remove(key)?;
+        for identity in execution.subscribers.keys() {
+            registry.subscriber_keys.remove(identity);
+        }
+        Some(execution)
+    }
+
+    fn send_coalesced(&self, execution: InFlightExecution, settlement: &LeaderSettlement) {
         for (identity, subscriber) in execution.subscribers {
-            let delivery = match &settlement {
+            let delivery = match settlement {
                 LeaderSettlement::Settled { outcome, account } => Ok(CoalescedCellOutcome {
                     outcome: restamp_outcome(outcome, &identity),
                     publication: PublicationCoordination {
@@ -1668,12 +1763,112 @@ impl Fleet {
             };
             let _ = subscriber.waiter.send(delivery);
         }
-        if !leader_still_active
-            && matches!(&settlement, LeaderSettlement::Settled { account, .. } if account.left_running.is_none())
-        {
-            self.check_leader_completed(&key.leader);
+    }
+
+    /// Forget `leader` as a coalesced leader once none of its keys is left to
+    /// deliver, and say whether that was so.
+    fn release_drained_leader(&self, leader: &RequestIdentity) -> bool {
+        let leader_still_active = lock_through_poison(&self.in_flight)
+            .by_key
+            .keys()
+            .any(|candidate| candidate.leader == *leader);
+        if !leader_still_active {
+            lock_through_poison(&self.coalesced_leaders).remove(leader);
         }
-        true
+        !leader_still_active
+    }
+
+    fn leader_settled(&self, leader: &RequestIdentity, settlement: &LeaderSettlement) {
+        if matches!(settlement, LeaderSettlement::Settled { account, .. } if account.left_running.is_none())
+        {
+            self.check_leader_completed(leader);
+        }
+    }
+
+    /// End `leader` once none of its keys is left to deliver, for a leader
+    /// whose last keys were settled early ([`ItemSettlements`]) and so never
+    /// reached [`Self::complete_coalesced_for_leader`]. Its durable check claim
+    /// settles here, so this follows the leader's own terminal outcome.
+    fn end_coalesced_leader_if_drained(
+        &self,
+        leader: &RequestIdentity,
+        settlement: &LeaderSettlement,
+    ) {
+        if self.release_drained_leader(leader) {
+            self.leader_settled(leader, settlement);
+        }
+    }
+
+    /// Settle one finished item of a pure-verdict check batch from the
+    /// executor's report of it, before the batch returns.
+    ///
+    /// The item is described exactly as the batch's result will describe it:
+    /// the executor sends the metadata already narrowed to the item, and the
+    /// machine's identity is stamped from the claim's link as the result path
+    /// stamps it. A report the runner cannot place against a live claim is left
+    /// for the batch's result, which settles every item no report reached.
+    fn settle_item_early(
+        &self,
+        settlements: &ItemSettlements,
+        stream_id: &str,
+        result: cairn_common::executor_protocol::ProcessItemResult,
+    ) {
+        let Some(key) = settlements.keys.get(stream_id) else {
+            return;
+        };
+        let leader = &settlements.leader;
+        let Some((executor_id, generation)) = self.queue.binding_of(leader) else {
+            return;
+        };
+        let Some((canonical_id, device_id)) = self
+            .lock_connections()
+            .get(&executor_id)
+            .filter(|connection| connection.generation == generation)
+            .map(|connection| {
+                (
+                    connection.identity.executor_id.clone(),
+                    connection.identity.device_id.clone(),
+                )
+            })
+        else {
+            return;
+        };
+        let cairn_common::executor_protocol::ProcessItemResult {
+            outcome: item,
+            mut metadata,
+        } = result;
+        metadata.executor_id = canonical_id;
+        metadata.executor_device_id = device_id;
+        metadata.executor_connection_generation = generation;
+        let mut outcome = CellOutcome::Completed {
+            request_id: leader.0.clone(),
+            attempt_id: leader.1.clone(),
+            exit_code: item.exit_code,
+            output: item.body,
+            timed_out: item.timed_out,
+            metadata,
+            mutation_delta: None,
+            sandbox_denials: item.sandbox_denials,
+            tracked_modifications: item.tracked_modifications,
+            node_scratch: None,
+        };
+        scrub_cell_outcome(&mut outcome);
+        let account = CellAccount {
+            cancel_cause: None,
+            placement: Some(CellPlacement {
+                name: self.executor_name_for_text(&executor_id),
+                platform: self.executor_platform(&executor_id),
+                executor_id,
+                generation,
+            }),
+            left_running: None,
+        };
+        // Recorded before delivery, so the batch's result, however it races
+        // this report, finds the key either still open or already answered.
+        lock_through_poison(&settlements.settled).insert(key.clone(), outcome.clone());
+        if !self.deliver_coalesced(key, &LeaderSettlement::Settled { outcome, account }) {
+            lock_through_poison(&settlements.settled).remove(key);
+        }
     }
 
     /// Release one subscriber's interest in a coalesced execution.
@@ -2119,6 +2314,7 @@ impl Fleet {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn submit_pure_verdict_batch(
         &self,
         orch: &Orchestrator,
@@ -2127,6 +2323,34 @@ impl Fleet {
         run_context: Option<crate::mcp::handlers::RunContext>,
         check_status_board: Option<crate::execution::checks::CheckStatusBoard>,
         purpose: Option<purpose::PurposeKey>,
+    ) -> Vec<CoalescedDelivery> {
+        self.submit_pure_verdict_batch_streaming(
+            orch,
+            request,
+            items,
+            run_context,
+            check_status_board,
+            purpose,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::submit_pure_verdict_batch`], handing each item's delivery to
+    /// `on_delivered` as it lands rather than only once every item has. An
+    /// item of a sequential batch lands when the executor reports it finished
+    /// ([`ItemSettlements`]), so a caller can act on a finished member while
+    /// its siblings still run.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn submit_pure_verdict_batch_streaming(
+        &self,
+        orch: &Orchestrator,
+        request: CellRequest,
+        items: Vec<PureVerdictBatchItem>,
+        run_context: Option<crate::mcp::handlers::RunContext>,
+        check_status_board: Option<crate::execution::checks::CheckStatusBoard>,
+        purpose: Option<purpose::PurposeKey>,
+        on_delivered: Option<&PureVerdictItemSink>,
     ) -> Vec<CoalescedDelivery> {
         if request.mutation_policy != MutationPolicy::PureVerdict {
             let mut outcomes = Vec::with_capacity(items.len());
@@ -2470,31 +2694,39 @@ impl Fleet {
             );
             let coalesced_output = output_guard::RelayedOutput::shared();
             let flushed_context = run_context.clone();
-            // A context exists only for someone to call back to: a run that
-            // relays the batch's output, or a board that narrates its members.
-            // The executor sends its per-item start and completion reports only
-            // to a batch that names one.
-            let runner_context_id =
-                (run_context.is_some() || check_status_board.is_some()).then(|| {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    self.runner_contexts.lock().unwrap().insert(
-                        id.clone(),
-                        RunnerContextEntry::new(
-                            &id,
-                            &request.request_id,
-                            RunnerCallbackContext {
-                                request: None,
-                                run_context,
-                                check_status_board,
-                                run_batch_request_id: None,
-                                live_checkout: false,
-                                executor_binding: None,
-                                output: coalesced_output.clone(),
-                            },
-                        ),
-                    );
-                    id
-                });
+            // Every claimed item settles from the executor's report of it as
+            // it finishes, so every batch names a context to report to. The
+            // executor sends its per-item reports only to a batch that does.
+            let item_settlements = Arc::new(ItemSettlements {
+                leader: leader.clone(),
+                keys: newly_claimed
+                    .iter()
+                    .zip(&keys)
+                    .map(|(item, key)| (item.process.stream_id.clone(), key.clone()))
+                    .collect(),
+                settled: Mutex::new(HashMap::new()),
+            });
+            let runner_context_id = {
+                let id = uuid::Uuid::new_v4().to_string();
+                self.runner_contexts.lock().unwrap().insert(
+                    id.clone(),
+                    RunnerContextEntry::new(
+                        &id,
+                        &request.request_id,
+                        RunnerCallbackContext {
+                            request: None,
+                            run_context,
+                            check_status_board,
+                            run_batch_request_id: None,
+                            live_checkout: false,
+                            executor_binding: None,
+                            item_settlements: Some(item_settlements.clone()),
+                            output: coalesced_output.clone(),
+                        },
+                    ),
+                );
+                Some(id)
+            };
             let batch = Self::check_process_batch(
                 newly_claimed.into_iter().map(|item| item.process).collect(),
                 runner_context_id.clone(),
@@ -2549,6 +2781,32 @@ impl Fleet {
                 }
                 pool.cancelled_leaders.lock().unwrap().remove(&leader);
                 pool.settle_leader_purpose(&leader, abandoned_grant);
+                // An item the executor's report already settled is not answered
+                // again: its subscribers have their outcome. The batch's own
+                // result for it is only checked against what they were given.
+                let mut settled_early = 0_usize;
+                let settle_at_end = |key: &CoalescingKey, settlement: LeaderSettlement| {
+                    let Some(early) = item_settlements.take(key) else {
+                        pool.complete_coalesced_for_leader(key, settlement);
+                        return 0;
+                    };
+                    match &settlement {
+                        LeaderSettlement::Settled { outcome: last, .. } => {
+                            let differing = verdict_disagreement(&early, last);
+                            if !differing.is_empty() {
+                                log::warn!(
+                                    "check {} of request {} attempt {} was settled from its completion report, and the batch's result disagrees on {}; its subscribers keep the reported outcome",
+                                    key.result.check_name,
+                                    leader.0,
+                                    leader.1,
+                                    differing.join(", "),
+                                );
+                            }
+                        }
+                        LeaderSettlement::Vanished => {}
+                    }
+                    1
+                };
                 match &outcome {
                     CellOutcome::Completed {
                         output,
@@ -2563,7 +2821,7 @@ impl Fleet {
                         Ok(results) if results.len() == keys.len() => {
                             for (key, result) in keys.iter().zip(results) {
                                 let item_meta = metadata.for_batch_item(&result);
-                                pool.complete_coalesced_for_leader(
+                                settled_early += settle_at_end(
                                     key,
                                     settled(CellOutcome::Completed {
                                         request_id: leader.0.clone(),
@@ -2591,7 +2849,7 @@ impl Fleet {
                                 ),
                             };
                             for key in &keys {
-                                pool.complete_coalesced_for_leader(key, settled(failure.clone()));
+                                settled_early += settle_at_end(key, settled(failure.clone()));
                             }
                         }
                         Err(error) => {
@@ -2601,7 +2859,7 @@ impl Fleet {
                                 diagnostic: format!("decode typed check batch outcomes: {error}"),
                             };
                             for key in &keys {
-                                pool.complete_coalesced_for_leader(key, settled(failure.clone()));
+                                settled_early += settle_at_end(key, settled(failure.clone()));
                             }
                         }
                     },
@@ -2617,25 +2875,44 @@ impl Fleet {
                                     .into(),
                         };
                         for key in &keys {
-                            pool.complete_coalesced_for_leader(key, settled(failure.clone()));
+                            settled_early += settle_at_end(key, settled(failure.clone()));
                         }
                     }
                     _ => {
                         for key in &keys {
-                            pool.complete_coalesced_for_leader(key, settled(outcome.clone()));
+                            settled_early += settle_at_end(key, settled(outcome.clone()));
                         }
                     }
+                }
+                // Keys settled early never reach `complete_coalesced_for_leader`,
+                // so when they were the last ones the leader ends here, on its
+                // own terminal outcome.
+                if settled_early > 0 {
+                    pool.end_coalesced_leader_if_drained(&leader, &settled(outcome.clone()));
                 }
                 completion_guard.disarm();
             });
         }
         admission_leader.disarm();
-        let outcomes = futures_util::future::join_all(
-            receivers
-                .into_iter()
-                .map(|(identity, rx)| self.await_coalesced(identity, wait_horizon_unix_ms, rx)),
-        )
-        .await;
+        let mut landing: futures_util::stream::FuturesUnordered<_> = receivers
+            .into_iter()
+            .enumerate()
+            .map(|(position, (identity, rx))| {
+                let delivery = self.await_coalesced(identity, wait_horizon_unix_ms, rx);
+                async move { (position, delivery.await) }
+            })
+            .collect();
+        let mut landed: Vec<Option<CoalescedDelivery>> = (0..landing.len()).map(|_| None).collect();
+        while let Some((position, delivery)) = futures_util::StreamExt::next(&mut landing).await {
+            if let Some(sink) = on_delivered {
+                sink(position, &delivery).await;
+            }
+            landed[position] = Some(delivery);
+        }
+        let outcomes: Vec<CoalescedDelivery> = landed
+            .into_iter()
+            .map(|delivery| delivery.expect("every subscriber's wait returns a delivery"))
+            .collect();
         // Still armed only for an item that led nothing: its subscriptions
         // have ended, and with them its stake in the fleet.
         drop(admission_guard);
@@ -2695,6 +2972,7 @@ impl Fleet {
                     run_batch_request_id: Some(request.request_id.clone()),
                     live_checkout: runs_in_live_checkout(&request.repository),
                     executor_binding: None,
+                    item_settlements: None,
                     output: output.clone(),
                 },
             ),
@@ -2808,6 +3086,7 @@ impl Fleet {
                     run_batch_request_id: None,
                     live_checkout: false,
                     executor_binding: None,
+                    item_settlements: None,
                     output: output.clone(),
                 },
             ),
@@ -2958,8 +3237,14 @@ impl Fleet {
                 exit_code,
                 timed_out,
                 duration_ms,
+                result,
                 ..
             } => {
+                if let (Some(result), Some(settlements)) =
+                    (result, context.item_settlements.as_deref())
+                {
+                    self.settle_item_early(settlements, &stream_id, *result);
+                }
                 if let Some(board) = context
                     .check_status_board
                     .as_ref()

@@ -161,6 +161,8 @@ pub use manual::{
 };
 use manual::{uncached_retry_command, UNCACHED_RETRY_PREFIX};
 #[cfg(test)]
+use planning::complete_members_as_they_land;
+#[cfg(test)]
 use planning::{
     attribute_capacity_wait, capacity_retry_decision, collect_placement_group_results,
     describe_capacity_waits, gate_cell_group, key_review_tree_plans, merge_batch_avoid,
@@ -177,14 +179,14 @@ pub(crate) use planning::{
     run_planned_checks_with_board, submit_planned_check_batch, verify_review_tree, BranchAdvance,
     CheckPlacementQuestion, CheckRunCommit, InfraScopeInputs, ReviewTreeGateResult,
 };
+#[cfg(test)]
+pub(crate) use planning::{
+    complete_each_member_once, refuse_unplaceable_items, reserve_batch_items, run_planned_checks,
+    run_planned_checks_at_commit_with_coordinates,
+};
 use planning::{
     effective_verdict_environment_hash, holds_no_verdict, needs_execution, sealed_coordinates,
     slot_check_env, unmet_placement, GroupWait,
-};
-#[cfg(test)]
-pub(crate) use planning::{
-    refuse_unplaceable_items, reserve_batch_items, run_planned_checks,
-    run_planned_checks_at_commit_with_coordinates,
 };
 use render::{
     batch_dispatch, clock_utc, describe_ms, live_node_base, narrate_dispatch, summary_annotation,
@@ -1173,9 +1175,21 @@ pub(crate) struct PlannedCheckBatchItem {
 }
 
 pub(crate) type CheckGroupResults = HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>>;
+/// The members a completion failed to record durably. A completion wrapped by
+/// `complete_each_member_once` offers them again with the next call that
+/// carries them, rather than counting them answered.
+pub(crate) type CheckGroupUnrecorded = std::collections::HashSet<usize>;
 pub(crate) type CheckGroupCompletion = Arc<
-    dyn for<'a> Fn(&'a CheckGroupResults) -> futures_util::future::BoxFuture<'a, ()> + Send + Sync,
+    dyn for<'a> Fn(
+            &'a CheckGroupResults,
+        ) -> futures_util::future::BoxFuture<'a, CheckGroupUnrecorded>
+        + Send
+        + Sync,
 >;
+
+/// How a member's `not_recorded` reason begins when its observation row could
+/// not be written: a failure to persist, not a decision about the verdict.
+pub(crate) const OBSERVATION_WRITE_FAILED: &str = "the observation write failed: ";
 
 #[derive(Clone)]
 pub(crate) struct PlannedCheckBatchRequest {

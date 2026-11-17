@@ -424,7 +424,7 @@ async fn placement_capacity_retry_never_resubmits_or_rerecords_a_completed_sibli
                 recorded[index].fetch_add(1, Ordering::SeqCst);
                 completed.send(index).unwrap();
             }
-            Box::pin(std::future::ready(()))
+            Box::pin(std::future::ready(CheckGroupUnrecorded::new()))
         })
     };
     let groups = (0..2).map(|index| {
@@ -1434,6 +1434,187 @@ fn group_status_board_projects_a_held_groups_own_dispatch_phase() {
     assert_eq!(json["phase"], "dispatching");
     assert_eq!(json["dispatchPhase"], "queued");
     assert_eq!(json["sinceUnixMs"], 7);
+}
+
+/// cairn/5893. A member whose delivery lands as an executed verdict reaches
+/// its batch's completion at once, under its plan index; a member the wave
+/// could not judge yet waits for its group, as does everything once the runner
+/// is stopping. The group's final call then hands over only what is new.
+#[tokio::test]
+async fn a_landed_member_reaches_its_completion_at_once_and_only_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<(usize, bool)>>::new()));
+    let seen = calls.clone();
+    let inner: CheckGroupCompletion = Arc::new(move |results: &CheckGroupResults| {
+        let mut members: Vec<_> = results
+            .iter()
+            .map(|(index, result)| (*index, result.is_ok()))
+            .collect();
+        members.sort_unstable();
+        seen.lock().unwrap().push(members);
+        Box::pin(async { CheckGroupUnrecorded::new() })
+    });
+    let complete = complete_each_member_once(inner);
+    let stopping = Arc::new(AtomicBool::new(false));
+    let stop = stopping.clone();
+    let sink = complete_members_as_they_land(
+        complete.clone(),
+        vec![4, 7, 9],
+        move || stop.load(Ordering::SeqCst),
+        std::time::Instant::now(),
+    );
+    let identity = ("wave".to_string(), "attempt".to_string());
+    let delivered = |exit: i32| -> crate::fleet::CoalescedDelivery {
+        Ok(crate::fleet::CoalescedCellOutcome {
+            outcome: CellOutcome::Completed {
+                request_id: identity.0.clone(),
+                attempt_id: identity.1.clone(),
+                exit_code: Some(exit),
+                output: "output".into(),
+                timed_out: false,
+                metadata: serde_json::from_value(serde_json::json!({
+                    "slotId": "cell",
+                    "cellEpoch": 1,
+                    "startedAtUnixMs": 1,
+                    "finishedAtUnixMs": 2
+                }))
+                .unwrap(),
+                mutation_delta: None,
+                sandbox_denials: Vec::new(),
+                tracked_modifications: None,
+                node_scratch: None,
+            },
+            publication: crate::fleet::PublicationCoordination::for_request(identity.clone()),
+            account: crate::fleet::CellAccount::default(),
+        })
+    };
+
+    sink(0, &delivered(0)).await;
+    assert_eq!(*calls.lock().unwrap(), [vec![(4, true)]]);
+    sink(1, &Err(crate::fleet::CoalescedWaitError::LeaderVanished)).await;
+    stopping.store(true, Ordering::SeqCst);
+    sink(2, &delivered(1)).await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "a member with no verdict yet, or one landing as the runner stops, waits for its group"
+    );
+
+    let result = || {
+        Ok(crate::mcp::handlers::run::CheckExecResult {
+            exit_code: Some(0),
+            output: "output".into(),
+            timed_out: false,
+            duration_ms: Some(1),
+            provenance: None,
+            publication: None,
+        })
+    };
+    complete(&HashMap::from([
+        (4, result()),
+        (7, Err(CheckExecutionFailure::Process("vanished".into()))),
+        (9, result()),
+    ]))
+    .await;
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [vec![(4, true)], vec![(7, false), (9, true)]]
+    );
+}
+
+/// cairn/5893. A member its completion reports unrecorded is not answered:
+/// the next call carrying it offers it again, and once it is recorded it is
+/// not offered a third time.
+#[tokio::test]
+async fn a_member_reported_unrecorded_is_offered_again() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<usize>>::new()));
+    let seen = calls.clone();
+    let inner: CheckGroupCompletion = Arc::new(move |results: &CheckGroupResults| {
+        let mut members: Vec<_> = results.keys().copied().collect();
+        members.sort_unstable();
+        let first = {
+            let mut seen = seen.lock().unwrap();
+            seen.push(members);
+            seen.len() == 1
+        };
+        Box::pin(async move {
+            if first {
+                CheckGroupUnrecorded::from([4])
+            } else {
+                CheckGroupUnrecorded::new()
+            }
+        })
+    });
+    let complete = complete_each_member_once(inner);
+    let failure = || Err(CheckExecutionFailure::Process("exited".into()));
+    let members = || HashMap::from([(4, failure()), (7, failure())]);
+
+    assert_eq!(
+        complete(&HashMap::from([(4, failure())])).await,
+        CheckGroupUnrecorded::from([4])
+    );
+    complete(&members()).await;
+    complete(&members()).await;
+    assert_eq!(*calls.lock().unwrap(), [vec![4], vec![4, 7]]);
+}
+
+/// cairn/5893. A call dropped while its member is still being recorded claims
+/// nothing on that account: the recording runs on, and when it reports the
+/// member unrecorded the next call offers it again. A later call waits for the
+/// abandoned recording rather than racing it.
+#[tokio::test]
+async fn a_dropped_call_claims_only_what_its_recording_persisted() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<usize>>::new()));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (started, mut recording) = tokio::sync::mpsc::unbounded_channel();
+    let inner: CheckGroupCompletion = {
+        let calls = calls.clone();
+        let release = release.clone();
+        Arc::new(move |results: &CheckGroupResults| {
+            let mut members: Vec<_> = results.keys().copied().collect();
+            members.sort_unstable();
+            let first = {
+                let mut calls = calls.lock().unwrap();
+                calls.push(members);
+                calls.len() == 1
+            };
+            started.send(()).unwrap();
+            let release = release.clone();
+            Box::pin(async move {
+                if first {
+                    release.notified().await;
+                    CheckGroupUnrecorded::from([4])
+                } else {
+                    CheckGroupUnrecorded::new()
+                }
+            })
+        })
+    };
+    let complete = complete_each_member_once(inner);
+    let member = || HashMap::from([(4, Err(CheckExecutionFailure::Process("exited".into())))]);
+
+    let abandoned = tokio::spawn({
+        let complete = complete.clone();
+        async move { complete(&member()).await }
+    });
+    recording.recv().await.unwrap();
+    abandoned.abort();
+    assert!(abandoned.await.unwrap_err().is_cancelled());
+
+    let retry = tokio::spawn({
+        let complete = complete.clone();
+        async move { complete(&member()).await }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "a later call waits for the abandoned recording"
+    );
+    release.notify_one();
+    assert!(retry.await.unwrap().is_empty());
+    complete(&member()).await;
+    assert_eq!(*calls.lock().unwrap(), [vec![4], vec![4]]);
 }
 
 /// A `tree: impact` lane runs on the runner and never meets the fleet's

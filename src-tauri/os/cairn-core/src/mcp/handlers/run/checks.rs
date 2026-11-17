@@ -9,7 +9,7 @@ pub(crate) fn run_item_stream_id(tool_use_id: &str, index: usize) -> String {
 /// when the process produced no code (a signal kill OR a timeout); `timed_out`
 /// disambiguates the two so the runner can record a budget kill AS a timeout
 /// rather than an opaque crash. Combined stdout+stderr rides in `output`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct CheckExecResult {
     pub exit_code: Option<i32>,
     pub output: String,

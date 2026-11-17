@@ -63,6 +63,7 @@ async fn fence_orchestrator(with_process: bool) -> Orchestrator {
                 check_status_board: None,
                 run_batch_request_id: None,
                 live_checkout: false,
+                item_settlements: None,
                 executor_binding: Some(RunnerContextExecutorBinding {
                     executor_id: "executor-1".into(),
                     link: BatchLink::Bound(7),

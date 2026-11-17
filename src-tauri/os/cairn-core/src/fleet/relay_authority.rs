@@ -20,6 +20,9 @@ pub(super) struct RunnerCallbackContext {
     /// The only executor session allowed to exercise this short-lived capability.
     /// Populated after placement and before the process batch is submitted.
     pub(super) executor_binding: Option<RunnerContextExecutorBinding>,
+    /// For a pure-verdict check batch, where each finished item settles as the
+    /// executor reports it, before the batch returns.
+    pub(super) item_settlements: Option<Arc<ItemSettlements>>,
     /// Streaming scrubbers for this batch's relayed output, one per item stream.
     ///
     /// Shared with the submitting future, which drains them at the batch's
@@ -397,6 +400,7 @@ impl Fleet {
                     check_status_board: None,
                     run_batch_request_id: None,
                     live_checkout: false,
+                    item_settlements: None,
                     executor_binding: Some(RunnerContextExecutorBinding {
                         executor_id: executor_id.to_string(),
                         link: BatchLink::Bound(generation),

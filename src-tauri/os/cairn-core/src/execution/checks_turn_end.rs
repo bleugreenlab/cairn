@@ -3792,6 +3792,10 @@ impl Default for ReviewPersistenceSteps {
     }
 }
 
+/// How a member's `not_recorded` reason begins when the task recording its
+/// group failed before recording it.
+const PERSISTENCE_TASK_FAILED: &str = "review group persistence task failed: ";
+
 struct ReviewGroupRecorder {
     orch: Orchestrator,
     db: std::sync::Arc<LocalDb>,
@@ -3860,8 +3864,32 @@ impl ReviewGroupRecorder {
                         .record_completion_failure(&recovery_indices, &error.to_string())
                         .await;
                 }
+                recovery.unrecorded(&recovery_indices)
             })
         })
+    }
+
+    /// The members of `indices` whose recording failed to persist, so a later
+    /// completion may write them again. A member left unrecorded for any other
+    /// reason was decided, and offering it again would decide the same.
+    fn unrecorded(&self, indices: &[usize]) -> crate::execution::checks::CheckGroupUnrecorded {
+        let outcomes = self
+            .outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        indices
+            .iter()
+            .copied()
+            .filter(|index| {
+                outcomes.get(index).is_none_or(|outcome| {
+                    outcome.recorded.is_none()
+                        && outcome.not_recorded.as_deref().is_some_and(|reason| {
+                            reason.starts_with(crate::execution::checks::OBSERVATION_WRITE_FAILED)
+                                || reason.starts_with(PERSISTENCE_TASK_FAILED)
+                        })
+                })
+            })
+            .collect()
     }
 
     fn show_fault(&self, failure: &ReviewDurabilityError) {
@@ -3936,7 +3964,7 @@ impl ReviewGroupRecorder {
                 error: error.into(),
             })
             .await;
-            let reason = format!("review group persistence task failed: {error}");
+            let reason = format!("{PERSISTENCE_TASK_FAILED}{error}");
             self.board
                 .transition(index, "unverified", Some(reason.clone()));
             // A coordinator failure is never a verdict about the evaluated tree.
@@ -4051,11 +4079,9 @@ impl ReviewGroupRecorder {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(member_index, outcome.clone());
-            if let Some(error) = outcome
-                .not_recorded
-                .as_deref()
-                .and_then(|reason| reason.strip_prefix("the observation write failed: "))
-            {
+            if let Some(error) = outcome.not_recorded.as_deref().and_then(|reason| {
+                reason.strip_prefix(crate::execution::checks::OBSERVATION_WRITE_FAILED)
+            }) {
                 fault_tasks.push(self.start_fault(ReviewDurabilityError {
                     member: outcome.name.clone(),
                     step: "observation".into(),
@@ -6626,6 +6652,90 @@ pinBumps:
                 format!("original-head:original-definition:input-{name}")
             );
         }
+    }
+
+    /// cairn/5893. A member the executor reports finished is recorded alone,
+    /// while its siblings still run: its observation row exists before its
+    /// group completes. The group's own completion, which repeats it, records
+    /// only the members no early report reached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_member_recorded_as_it_finishes_is_not_recorded_again_with_its_group() {
+        let (recorder, _logs) = durability_group_fixture_with_names(
+            ReviewPersistenceSteps::default(),
+            &["fast-a", "slow", "fast-b"],
+        )
+        .await;
+        let complete = crate::execution::checks::complete_each_member_once(recorder.callback());
+        let member = || durability_group_result().remove(&1).unwrap();
+
+        complete(&std::collections::HashMap::from([(0, member())])).await;
+        assert_eq!(durability_group_observation_count(&recorder.db).await, 1);
+        {
+            let outcomes = recorder.outcomes.lock().unwrap();
+            assert_eq!(outcomes.keys().copied().collect::<Vec<_>>(), [0]);
+            assert!(outcomes[&0].recorded.is_some());
+        }
+        assert_eq!(recorder.board.snapshot()[1].state, "pending");
+
+        complete(&std::collections::HashMap::from([
+            (0, member()),
+            (1, member()),
+            (2, member()),
+        ]))
+        .await;
+        assert_eq!(durability_group_observation_count(&recorder.db).await, 3);
+        assert_eq!(recorder.outcomes.lock().unwrap().len(), 3);
+    }
+
+    /// cairn/5893. A member whose early recording fails to write is not
+    /// counted answered: its group's final call records it, once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_member_whose_early_write_failed_is_recorded_with_its_group() {
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let steps = ReviewPersistenceSteps {
+            observation: std::sync::Arc::new(move |db, observation| {
+                if observation.check_name == "fast-a"
+                    && !failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err("injected early observation failure".into());
+                }
+                crate::execution::cache::record_fresh_check_observation(db, observation)
+            }),
+            ..ReviewPersistenceSteps::default()
+        };
+        let (recorder, _logs) =
+            durability_group_fixture_with_names(steps, &["fast-a", "slow", "fast-b"]).await;
+        let complete = crate::execution::checks::complete_each_member_once(recorder.callback());
+        let member = || durability_group_result().remove(&1).unwrap();
+
+        let unrecorded = complete(&std::collections::HashMap::from([(0, member())])).await;
+        assert_eq!(unrecorded, std::collections::HashSet::from([0]));
+        assert_eq!(durability_group_observation_count(&recorder.db).await, 0);
+        assert!(recorder.outcomes.lock().unwrap()[&0]
+            .not_recorded
+            .as_deref()
+            .is_some_and(|reason| reason.contains("injected early observation failure")));
+
+        let unrecorded = complete(&std::collections::HashMap::from([
+            (0, member()),
+            (1, member()),
+            (2, member()),
+        ]))
+        .await;
+        assert!(unrecorded.is_empty());
+        assert_eq!(durability_group_observation_count(&recorder.db).await, 3);
+        let fast_a_rows = recorder
+            .db
+            .query_opt_text(
+                "SELECT CAST(count(*) AS TEXT) FROM check_result_observations
+                 WHERE check_name='fast-a'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fast_a_rows, "1");
+        assert!(recorder.outcomes.lock().unwrap()[&0].recorded.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

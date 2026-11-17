@@ -1021,6 +1021,10 @@ pub(super) async fn submit_admitted_check_batch(
     mut batch: PlannedCheckBatchRequest,
 ) -> Result<PlannedCheckBatchOutcome, String> {
     use crate::execution::impact_slice::{run_lanes, runner_globs};
+    batch.on_group_complete = batch
+        .on_group_complete
+        .take()
+        .map(complete_each_member_once);
     // `tree: impact` lanes the runner can answer never meet the fleet, so the
     // fleet's placeability says nothing about them; only cell lanes are asked.
     let (runner_items, mut cell_items): (Vec<_>, Vec<_>) = std::mem::take(&mut batch.items)
@@ -1173,19 +1177,8 @@ pub(super) enum CapacityRetry {
 /// has already exhausted that wait. The next commit or changed placement fact
 /// may re-arm the lane, but this ask must not restart the expired wait.
 pub(super) fn capacity_retry_decision(outcome: &PlannedCheckBatchOutcome) -> CapacityRetry {
-    let wholly_capacity = !outcome.results.is_empty()
-        && outcome.results.values().all(|result| {
-            matches!(
-                result,
-                Err(CheckExecutionFailure::Substrate(failure))
-                    if !failure.placement_refused && matches!(
-                        failure.shape(),
-                        SubstrateFailureShape::Capacity
-                            | SubstrateFailureShape::EnvironmentRetired
-                            | SubstrateFailureShape::CommandPreempted
-                    )
-            )
-        });
+    let wholly_capacity =
+        !outcome.results.is_empty() && outcome.results.values().all(awaits_capacity_retry);
     if wholly_capacity {
         CapacityRetry::Again {
             backoff: std::time::Duration::from_millis(CAPACITY_RETRY_BACKOFF_MS),
@@ -1193,6 +1186,110 @@ pub(super) fn capacity_retry_decision(outcome: &PlannedCheckBatchOutcome) -> Cap
     } else {
         CapacityRetry::Surface
     }
+}
+
+/// Whether one member's result is a transient refusal that a batch made only of
+/// such refusals presents again ([`capacity_retry_decision`]). A member whose
+/// result is not can never be re-presented, so it may be recorded the moment
+/// it lands.
+pub(super) fn awaits_capacity_retry(
+    result: &Result<CheckExecResult, CheckExecutionFailure>,
+) -> bool {
+    matches!(
+        result,
+        Err(CheckExecutionFailure::Substrate(failure))
+            if !failure.placement_refused && matches!(
+                failure.shape(),
+                SubstrateFailureShape::Capacity
+                    | SubstrateFailureShape::EnvironmentRetired
+                    | SubstrateFailureShape::CommandPreempted
+            )
+    )
+}
+
+/// `complete`, answering each member once: a member handed over as it
+/// finished is left out when its group completes. Every path that hands a
+/// result to a batch's completion shares the one wrapper the batch carries, so
+/// a group's final call records only what its members' early ones did not.
+///
+/// A member counts as answered only once its recording has returned without
+/// reporting it unrecorded, so a member whose early write failed is recorded
+/// by the next call that carries it: the group's final call at the latest.
+/// Calls run one at a time, so a group's final call waits for an early
+/// recording still in flight instead of racing it into a second row.
+///
+/// The recording, and the claim that follows it, run in a task of their own
+/// that holds the lock until the claim is made, so dropping a call changes
+/// nothing: its recording finishes, claims only what it persisted, and only
+/// then lets the next call look. A recording that panics claims nothing.
+pub(crate) fn complete_each_member_once(complete: CheckGroupCompletion) -> CheckGroupCompletion {
+    let answered = Arc::new(tokio::sync::Mutex::new(
+        std::collections::HashSet::<usize>::new(),
+    ));
+    Arc::new(move |results: &CheckGroupResults| {
+        let answered = answered.clone();
+        let complete = complete.clone();
+        Box::pin(async move {
+            let mut answered = answered.lock_owned().await;
+            let fresh: CheckGroupResults = results
+                .iter()
+                .filter(|(index, _)| !answered.contains(*index))
+                .map(|(index, result)| (*index, result.clone()))
+                .collect();
+            if fresh.is_empty() {
+                return crate::execution::checks::CheckGroupUnrecorded::new();
+            }
+            let members: crate::execution::checks::CheckGroupUnrecorded =
+                fresh.keys().copied().collect();
+            let recording = tokio::spawn(async move {
+                let unrecorded = complete(&fresh).await;
+                answered.extend(fresh.keys().filter(|index| !unrecorded.contains(*index)));
+                unrecorded
+            });
+            recording.await.unwrap_or(members)
+        })
+    })
+}
+
+/// The sink a pure-verdict batch hands the fleet, so each member reaches the
+/// group's completion as its delivery lands rather than with its slowest
+/// sibling. `indexed` maps a member's position in the batch to its plan index.
+///
+/// Only an executed verdict goes early, and only one no capacity retry could
+/// re-present; a refusal or a cancellation waits for its group, as does
+/// everything once the runner is stopping (the group then reads whether its
+/// lane was left running). The batch's completion answers each member once
+/// ([`complete_each_member_once`]), so the group's final call skips these.
+pub(super) fn complete_members_as_they_land(
+    complete: CheckGroupCompletion,
+    indexed: Vec<usize>,
+    runner_stopping: impl Fn() -> bool + Send + Sync + 'static,
+    submitted_at: std::time::Instant,
+) -> Box<crate::fleet::PureVerdictItemSink> {
+    Box::new(
+        move |position: usize, delivery: &crate::fleet::CoalescedDelivery| {
+            let early = match delivery {
+                Ok(delivered)
+                    if matches!(delivered.outcome, CellOutcome::Completed { .. })
+                        && !runner_stopping() =>
+                {
+                    let mut results: CheckGroupResults = HashMap::from([(
+                        indexed[position],
+                        check_result_from_delivery(Ok(delivered.clone())),
+                    )]);
+                    stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
+                    Some(results).filter(|results| !results.values().any(awaits_capacity_retry))
+                }
+                _ => None,
+            };
+            let complete = complete.clone();
+            Box::pin(async move {
+                if let Some(results) = early {
+                    complete(&results).await;
+                }
+            }) as futures_util::future::BoxFuture<'static, ()>
+        },
+    )
 }
 
 pub(super) struct PresentedBatch {
@@ -1886,11 +1983,25 @@ pub(super) async fn submit_single_planned_check_batch(
             ..batch.clone()
         };
         let board = batch.status_board.clone();
+        // A member the executor reports finished goes to the group's completion
+        // at once, so its verdict is recorded while its siblings still run. Only
+        // an executed verdict goes early, and only one no capacity retry could
+        // re-present; a refusal or a cancellation waits for its group, as does
+        // everything once the runner is stopping (see `left_running` below).
+        let early_completion = batch.on_group_complete.clone().map(|complete| {
+            let fleet = orch.fleet.clone();
+            complete_members_as_they_land(
+                complete,
+                indexed.clone(),
+                move || fleet.runner_stopping_since().is_some(),
+                submitted_at,
+            )
+        });
         // Built off-frame: the fleet's submission future is the bulk of every
         // check-batch future above it, and held inline it is paid for again
         // in each of their poll frames (see `cairn_platform::stack`).
         let submission = off_frame(|| {
-            orch.fleet.submit_pure_verdict_batch(
+            orch.fleet.submit_pure_verdict_batch_streaming(
                 orch,
                 request.clone(),
                 items,
@@ -1905,6 +2016,7 @@ pub(super) async fn submit_single_planned_check_batch(
                     .clone()
                     .filter(|board| board.engine_owns_verdicts() || board.is_observed()),
                 batch.purpose,
+                early_completion.as_deref(),
             )
         });
         match board {
@@ -3126,7 +3238,13 @@ where
                             }
                             Err(error) => {
                                 log::warn!("failed to record immutable check observation: {error}");
-                                (None, Some(format!("the observation write failed: {error}")))
+                                (
+                                    None,
+                                    Some(format!(
+                                        "{}{error}",
+                                        crate::execution::checks::OBSERVATION_WRITE_FAILED
+                                    )),
+                                )
                             }
                         };
                         // The legacy row is retained only for infrastructure retry/suppression diagnosis.

@@ -506,6 +506,7 @@ mod tests {
                 exit_code: Some(0),
                 timed_out: false,
                 duration_ms: 1,
+                result: None,
             },
         ];
         for callback in callbacks {
