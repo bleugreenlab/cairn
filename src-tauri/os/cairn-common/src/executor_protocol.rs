@@ -9599,6 +9599,18 @@ pub struct LearnedResourceEstimate {
 /// were, and a timeout there still drops the tool. What an older runner gets
 /// wrong talking to a newer executor: nothing; it ignores both fields, and the
 /// advertised set it reads is simply steadier.
+///
+/// cairn/7076 does not move the number. The memory budget follows a test
+/// lane's phase as cairn/6446's owed charge does: once the lane's output shows
+/// its test phase, the executor holds the lane's learned test-phase figure
+/// against its planning budget instead of the reservation it was admitted
+/// with, and gives back exactly what it holds when the lane ends. The
+/// executor's own bookkeeping decides it; what crosses the boundary is the
+/// figure it already sent, [`AnnouncedRoom::memory_budget`]'s `committed`
+/// and the snapshot's active reservation, now lower while lanes test, and a
+/// capacity decline's free text, which now names each holder and its phase.
+/// What a runner gets wrong talking to an older executor: nothing; that
+/// executor holds a lane's whole reservation to its end, as it always did.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 175;
 
 /// The version `build.rs` derived from the paragraphs above
