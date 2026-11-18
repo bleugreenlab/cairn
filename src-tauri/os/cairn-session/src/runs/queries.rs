@@ -596,6 +596,11 @@ pub struct ReconcileResult {
     /// alone left cached `idle` after their work ended. The caller settles them
     /// rather than re-deriving them; see the query that selects them.
     pub stranded_thread_task_ids: Vec<String>,
+    /// Node jobs a predecessor host claimed and never launched: claimed, but
+    /// with no turn and no run. The caller re-derives them, which writes them
+    /// back to Pending, and advances their executions so the DAG claims them
+    /// again; see the query that selects them.
+    pub never_launched_job_ids: Vec<String>,
     /// Every turn this sweep ended, for the work owed per turn once its writes
     /// have landed.
     pub settled_turns: Vec<SettledTurn>,
@@ -1992,6 +1997,63 @@ async fn reconcile_stale_runs_db(
                     stranded_thread_task_ids.push(job_id);
                 }
             }
+            drop(rows);
+
+            // A node job's launch is two steps the host cannot make atomic: DAG
+            // advancement claims it (`pending -> running`, stamping
+            // `started_at`) and commits, and only then does the host prepare its
+            // branch and insert its first run. A host that stops between the two
+            // leaves a claim with no turn and no run. The stale-run settlement
+            // above never sees it, because it starts from runs, and no later
+            // advancement claims it, because advancement claims only Pending
+            // jobs. Left alone it reads Running forever and holds a cap slot.
+            //
+            // `started_at` before this boot makes the claim a predecessor's: a
+            // claim stamped during this boot is a launch this host may still be
+            // preparing, and the in-memory launch claims cover the rest. A
+            // Pending job that was claimed once and never launched is the same
+            // fault one step later (a repair re-derived it and the advance it
+            // owed was lost), so it is selected too. A job parked on an active
+            // launch hold is not stranded: the hold owns its relaunch.
+            //
+            // Node jobs only. A node-less job has no DAG node to claim it, and
+            // every node-less launch path inserts its run as it creates the job.
+            // Single-table shape, as above.
+            let mut rows = conn
+                .query(
+                    &format!(
+                        "SELECT j.id
+                         FROM jobs j
+                         WHERE j.status IN ('running', 'pending')
+                           AND j.recipe_node_id IS NOT NULL
+                           AND NOT (CASE WHEN {} THEN 1 ELSE 0 END)
+                           AND j.started_at IS NOT NULL
+                           AND j.started_at < ?1
+                           AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.job_id = j.id)
+                           AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.job_id = j.id)
+                           AND NOT EXISTS (
+                               SELECT 1 FROM provider_limit_holds h
+                               WHERE h.job_id = j.id AND h.state = 'active'
+                           )
+                           AND EXISTS (
+                               SELECT 1 FROM executions e
+                               WHERE e.id = j.execution_id
+                                 AND e.status = 'running'
+                                 AND {}
+                           )",
+                        cairn_db::lineage::SESSION_JOB_SHAPE,
+                        cairn_db::live_execution_sql!()
+                    ),
+                    params![boot_at],
+                )
+                .await?;
+            let mut never_launched_job_ids = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let job_id = row.text(0)?;
+                if !claimed_job_ids.contains(&job_id) {
+                    never_launched_job_ids.push(job_id);
+                }
+            }
 
             Ok(ReconcileResult {
                 stale_run_count,
@@ -2000,6 +2062,7 @@ async fn reconcile_stale_runs_db(
                 orphaned_pending_count,
                 reproject_job_ids: reproject_job_ids.into_iter().collect(),
                 stranded_thread_task_ids,
+                never_launched_job_ids,
                 settled_turns: swept_turns,
             })
         })

@@ -20,8 +20,15 @@
 //! what the projection reads as `complete`. A caller that loses the guard
 //! returns having done nothing, so concurrent sweeps, a notifier batch racing
 //! the tick, and a manual release cannot start one execution twice. After the
-//! commit it emits and enqueues `AdvanceDag` — the same tail a fresh launch has
-//! — for the SAME execution row. A release never creates an execution.
+//! commit it emits and enqueues `AdvanceDag` for the SAME execution row,
+//! through the durable outbox so a restart cannot lose it. A release never
+//! creates an execution.
+//!
+//! The advance's claim (`pending -> running`) and the job's first run are two
+//! more commits with branch preparation between them. A host that stops in
+//! that gap leaves a claim with no turn and no run; boot reconciliation
+//! (`runs::queries::reconcile_stale_runs`) returns it to pending and advances
+//! the execution again.
 //!
 //! ## A burst is released in order, and never rate-limited
 //!
@@ -899,12 +906,21 @@ pub(crate) async fn announce_release(
     for change in crate::notify::job_db_changes_for_execution(db, execution_id, "insert").await {
         let _ = orch.services.emitter.emit("db-change", change);
     }
-    if let Some(tx) = orch.effect_tx.as_ref() {
-        let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
-            execution_id: execution_id.to_string(),
-            outbox_entry_id: None,
-            focus_admitted: true,
-        });
+    // Durable, because the release has already committed jobs that nothing
+    // else will claim: a host that stops before this advance runs replays it
+    // from the outbox at its next start.
+    if let Err(error) = crate::workflow_host::runtime(orch)
+        .enqueue_advance(execution_id, true)
+        .await
+    {
+        log::error!("Could not persist the advance of released execution {execution_id}: {error}");
+        if let Some(tx) = orch.effect_tx.as_ref() {
+            let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
+                execution_id: execution_id.to_string(),
+                outbox_entry_id: None,
+                focus_admitted: true,
+            });
+        }
     }
     if let Some(issue_id) = issue_id {
         orch.invalidate_sidebar_active_issues();
@@ -1721,6 +1737,106 @@ pub(crate) mod tests {
 
     pub(crate) fn now() -> i64 {
         NOW
+    }
+
+    /// A release whose node was claimed and never launched before the host
+    /// stopped: the claim committed `running`, the run was never inserted. Boot
+    /// reconciliation returns the job to pending and advances the execution
+    /// durably, and the DAG then claims the same job again. The execution stays
+    /// released throughout, so the queue does not count it twice.
+    #[tokio::test]
+    async fn a_claim_a_restart_cut_before_its_first_run_is_returned_to_pending_and_advanced() {
+        let mut env = env("gate-sweep-restart-claim.db").await;
+        file(&env, 2, merged_after(1)).await.unwrap();
+        resolve_issue(&env, 1, "merged").await;
+        let report = sweep_at(&env.orch, now()).await.unwrap();
+        let (execution_id, _, released_at, _) = execution(&env, 2).await;
+        assert_eq!(report.released, vec![execution_id.clone()]);
+        assert_eq!(advanced(&mut env), vec![execution_id.clone()]);
+        let pending_advances = format!(
+            "SELECT COUNT(*) FROM effect_outbox
+              WHERE kind = 'advance_dag' AND dedupe_key = '{execution_id}' AND state = 'pending'"
+        );
+        assert_eq!(
+            count(&env, &pending_advances).await,
+            1,
+            "the release's advance is durable, so a restart before it runs replays it"
+        );
+
+        // The advance claims the node and hands it back to be started; the
+        // host stops before it starts it, after the advance was acknowledged.
+        let claimed =
+            crate::execution::advancement::advance_execution_with_actions(&env.orch, &execution_id)
+                .await
+                .unwrap();
+        assert_eq!(claimed.len(), 1, "{claimed:?}");
+        let job_id = claimed[0].id.clone();
+        env.db
+            .execute("UPDATE effect_outbox SET state = 'done'", ())
+            .await
+            .unwrap();
+        let job_status = format!("SELECT status FROM jobs WHERE id = '{job_id}'");
+        let runs = format!("SELECT COUNT(*) FROM runs WHERE job_id = '{job_id}'");
+        assert_eq!(
+            env.db
+                .query_opt_text(&job_status, ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("running")
+        );
+        assert_eq!(count(&env, &runs).await, 0, "the claim has no run");
+
+        let mut env = restarted(env);
+        let boot_at = chrono::Utc::now().timestamp() + 1;
+        let boot = env.orch.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::runs::queries::reconcile_stale_runs(
+                &boot,
+                boot.services.emitter.as_ref(),
+                boot_at,
+            )
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            env.db
+                .query_opt_text(&job_status, ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("pending"),
+            "boot returns the never-launched claim to pending"
+        );
+        assert!(
+            advanced(&mut env).contains(&execution_id),
+            "boot advances the execution"
+        );
+        assert_eq!(
+            count(&env, &pending_advances).await,
+            1,
+            "through the outbox, so a second restart replays it"
+        );
+        let (_, status, still_released_at, _) = execution(&env, 2).await;
+        assert_eq!(
+            (status.as_str(), still_released_at),
+            ("running", released_at),
+            "the execution stays released: its slot was decided once"
+        );
+
+        let reclaimed =
+            crate::execution::advancement::advance_execution_with_actions(&env.orch, &execution_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            reclaimed
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![job_id.as_str()],
+            "the DAG claims the same job again, to start it"
+        );
     }
 
     /// Plan verification 2: held on creation, released in place on merge.

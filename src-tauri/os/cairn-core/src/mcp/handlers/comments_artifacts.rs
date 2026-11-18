@@ -878,7 +878,7 @@ pub(crate) async fn write_artifact_change(
             (job.execution_id.as_deref(), job.recipe_node_id.as_deref())
         {
             crate::workflow_host::runtime(orch)
-                .enqueue_advance(execution_id)
+                .enqueue_advance(execution_id, false)
                 .await?;
         }
     }

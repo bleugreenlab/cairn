@@ -2574,7 +2574,7 @@ fn publish_outcome(
         let runtime = runtime.clone();
         let execution_id = execution_id.to_owned();
         if let Err(error) =
-            run_advancement_db(async move { runtime.enqueue_advance(&execution_id).await })
+            run_advancement_db(async move { runtime.enqueue_advance(&execution_id, false).await })
         {
             log::error!("Failed to enqueue advance_dag outbox entry: {error}");
         }

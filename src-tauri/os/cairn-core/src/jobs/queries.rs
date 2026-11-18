@@ -160,6 +160,21 @@ pub(crate) fn pending_dispatch_description(pending: PendingDispatch<'_>) -> Stri
 pub(crate) const PREPARING_DESCRIPTION: &str =
     "preparing: claimed and setting up its branch and worktree; no run yet.";
 
+/// Whether a job with no run is a launch claim a predecessor host made: it
+/// reads `running` and was claimed before this host booted. A claim from this
+/// boot is a launch this host may still be preparing. A predecessor's can
+/// never produce a run, because the process that would have launched it is
+/// gone, so it is not active work, whatever its status says.
+pub(crate) fn claim_predates_boot(status: &str, started_at: Option<i64>, boot_at: i64) -> bool {
+    status == "running" && started_at.is_some_and(|claimed| claimed < boot_at)
+}
+
+/// What a predecessor's never-launched claim ([`claim_predates_boot`]) is, and
+/// the way out. Boot reconciliation returns such a claim to pending and
+/// advances its execution before agents can act, so a reader only meets one
+/// that recovery could not repair.
+pub(crate) const NEVER_LAUNCHED_DESCRIPTION: &str = "not launched: claimed to start before Cairn last restarted, and the restart cut its launch before any run existed. Startup recovery returns such a claim to pending and starts it; if it still reads this way, file a new execution on the issue to supersede it.";
+
 fn address_root_predicate(alias: &str) -> String {
     format!("({alias}.parent_job_id IS NULL OR {alias}.agent_config_id = 'workflow')")
 }

@@ -189,12 +189,18 @@ enum RecipientJob {
         run_id: String,
     },
     /// No run yet. `claimed` is a job advancement already claimed `running`
-    /// for a start that has not produced its run.
+    /// for a start that has not produced its run; `started_at` is when.
     Pending {
         job_id: String,
         claimed: bool,
+        started_at: Option<i64>,
         parent_segment: Option<String>,
         delegated: bool,
+    },
+    /// No run, and not waiting to start either: it settled (or was cancelled,
+    /// as a superseded execution's jobs are) without ever running.
+    NeverRan {
+        status: String,
     },
 }
 
@@ -261,7 +267,7 @@ async fn find_recipient_job(
                     conn.query(
                         "
                         SELECT j.id, r.id, j.status, p.uri_segment,
-                               j.parent_tool_use_id IS NOT NULL
+                               j.parent_tool_use_id IS NOT NULL, j.started_at
                         FROM jobs j
                         JOIN jobs p ON j.parent_job_id = p.id
                         LEFT JOIN runs r ON r.job_id = j.id
@@ -283,7 +289,7 @@ async fn find_recipient_job(
                     conn.query(
                         "
                         SELECT j.id, r.id, j.status, NULL,
-                               j.parent_tool_use_id IS NOT NULL
+                               j.parent_tool_use_id IS NOT NULL, j.started_at
                         FROM jobs j
                         LEFT JOIN runs r ON r.job_id = j.id
                         WHERE j.issue_id = ?1 AND j.execution_id = ?2
@@ -307,14 +313,15 @@ async fn find_recipient_job(
                         None if matches!(row.text(2)?.as_str(), "pending" | "running") => {
                             Ok(RecipientJob::Pending {
                                 claimed: row.text(2)? == "running",
+                                started_at: row.opt_i64(5)?,
                                 parent_segment: row.opt_text(3)?,
                                 delegated: row.i64(4)? != 0,
                                 job_id,
                             })
                         }
-                        None => Err(DbError::Internal(format!(
-                            "recipient job {job_id} has no run but is not pending"
-                        ))),
+                        None => Ok(RecipientJob::NeverRan {
+                            status: row.text(2)?,
+                        }),
                     }
                 })
                 .transpose()
@@ -649,12 +656,22 @@ async fn resolve_recipient(
             RecipientJob::Pending {
                 job_id,
                 claimed,
+                started_at,
                 parent_segment,
                 delegated,
             } => {
                 use crate::jobs::queries::PendingDispatch;
+                let status = if claimed { "running" } else { "pending" };
                 let condition = if let Some(wait) = orch.launch_admission_waits.get(&job_id) {
                     wait.describe()
+                } else if crate::jobs::queries::claim_predates_boot(
+                    status,
+                    started_at,
+                    orch.boot_at,
+                ) {
+                    crate::jobs::queries::NEVER_LAUNCHED_DESCRIPTION
+                        .trim_end_matches('.')
+                        .to_string()
                 } else if claimed {
                     crate::jobs::queries::PREPARING_DESCRIPTION
                         .trim_end_matches('.')
@@ -668,6 +685,11 @@ async fn resolve_recipient(
                     crate::jobs::queries::pending_dispatch_description(pending)
                 };
                 return Err(format!("{addressed_uri}: {condition}."));
+            }
+            RecipientJob::NeverRan { status } => {
+                return Err(format!(
+                    "{addressed_uri}: {status} without ever running, so there is no session to deliver to; address the issue's current execution instead, or file a new one."
+                ));
             }
         }
     };

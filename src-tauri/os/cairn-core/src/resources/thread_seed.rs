@@ -2193,7 +2193,14 @@ const CHILDREN_SQL: &str = "SELECT child.id, p.key, child.number, child.title, c
 /// and replaced jobs describe superseded work, not a live status or failure.
 /// CROSS JOIN keeps the child-driven order even with the current-attempt
 /// predicate; the execution lookup must use its covering facts, not its snapshot.
-const CHILD_NODES_SQL: &str = "SELECT child.id, COALESCE(j.node_name, j.uri_segment), j.status, j.id
+/// A node whose job reads `running` but has no run yet is projected as
+/// `not_launched`: it is claimed and nothing is executing it, whether its launch
+/// is still being prepared or a restart cut it off before any run existed.
+const CHILD_NODES_SQL: &str = "SELECT child.id, COALESCE(j.node_name, j.uri_segment),
+            CASE WHEN j.status = 'running'
+                       AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.job_id = j.id)
+                 THEN 'not_launched' ELSE j.status END,
+            j.id
        FROM issues child INDEXED BY idx_issues_parent_thread_id
        CROSS JOIN jobs j INDEXED BY idx_jobs_issue_id ON j.issue_id = child.id
        CROSS JOIN executions e INDEXED BY idx_executions_hold_facts ON e.id = j.execution_id
@@ -2572,6 +2579,8 @@ impl ChildStatus {
                         // whatever its job row says: it gets its own glyph.
                         let icon = if self.approvals.iter().any(|a| a.node == *name) {
                             "⏸"
+                        } else if status == "not_launched" {
+                            "○ not launched"
                         } else {
                             job_status_icon(status)
                         };
@@ -4152,6 +4161,8 @@ mod tests {
                VALUES ('job-open-review','e-open','i-open','p','running','review','review',3,3);
              INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
                VALUES ('run-open','job-open-build','i-open','running',1,1);
+             INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
+               VALUES ('run-open-review','job-open-review','i-open','running',3,3);
              INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at, github_pr_number)
                VALUES ('mr-open','job-open-build','p','i-open','Lease renewal backoff','feat/lease','main','open',10,10,892);
              INSERT INTO prompts(id, run_id, job_id, questions, created_at, background)
@@ -4554,6 +4565,34 @@ mod tests {
         );
     }
 
+    /// A node claimed `running` with no run is not active work: its launch is
+    /// still being prepared, or a restart cut it off before any run existed.
+    /// The census says it has not launched rather than drawing it running.
+    #[tokio::test]
+    async fn a_claimed_node_with_no_run_reads_as_not_launched() {
+        let db = thread_fixture("thread-seed-not-launched.db").await;
+        make_open_child_live(&db).await;
+        db.execute("DELETE FROM runs WHERE id = 'run-open-review'", ())
+            .await
+            .unwrap();
+
+        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
+        let child = children
+            .iter()
+            .find(|child| child.uri == OPEN_CHILD)
+            .unwrap();
+        assert_eq!(
+            child.nodes,
+            vec![
+                ("builder".into(), "complete".into()),
+                ("review".into(), "not_launched".into()),
+            ]
+        );
+        let line = child.detail_line(NOW);
+        assert!(line.contains("builder ✓ review ○ not launched"), "{line}");
+        assert!(!line.contains('◐'), "{line}");
+    }
+
     #[tokio::test]
     async fn the_census_reports_a_live_child_and_collapses_a_finished_one() {
         let db = thread_fixture("thread-seed-children.db").await;
@@ -4648,7 +4687,9 @@ mod tests {
                VALUES ('run-review-old','job-open-review','i-open','crashed',
                        'Superseded review failure',30,30);
              INSERT INTO jobs(id, execution_id, issue_id, project_id, status, recipe_node_id, uri_segment, node_name, created_at, updated_at)
-               VALUES ('job-review-retry','e-open','i-open','p','running','review-node','review-2','review',4,4);",
+               VALUES ('job-review-retry','e-open','i-open','p','running','review-node','review-2','review',4,4);
+             INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
+               VALUES ('run-review-retry','job-review-retry','i-open','live',40,40);",
         )
         .await
         .unwrap();

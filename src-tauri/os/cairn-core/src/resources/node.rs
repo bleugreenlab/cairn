@@ -321,15 +321,20 @@ fn append_optional_timestamp(output: &mut String, label: &str, timestamp: Option
 /// The summary's title and timestamps. A job held on its own pending work
 /// carries that hold beside its status icon and in a sentence beneath, because
 /// `running` alone reads exactly like a node mid-turn.
+/// `never_launched` marks a predecessor's launch claim that never produced a
+/// run (`jobs::queries::claim_predates_boot`): its status reads `running`, but
+/// nothing is running, so the header says so instead of drawing it active.
 fn render_job_summary_header(
     name: &str,
     status: &str,
     started_at: Option<i64>,
     completed_at: Option<i64>,
     hold: Option<&crate::messages::delivery::Hold>,
+    never_launched: bool,
 ) -> String {
     let icon = job_status_icon(status);
     let mut output = match (status, hold) {
+        _ if never_launched => format!("# {name} [? not launched]\n\n"),
         ("failed", _) => format!("# {name} [{icon} Failed]\n\n"),
         (_, Some(hold)) => format!("# {name} [{icon} {}]\n\n", hold.qualifier()),
         (_, None) => format!("# {name} [{icon}]\n\n"),
@@ -2513,12 +2518,23 @@ pub(super) async fn read_node(
     };
 
     let hold = crate::messages::delivery::describe_hold(db, &job.id).await;
+    let has_run = job.status == "running"
+        && crate::jobs::queries::latest_run_id_for_job(db, &job.id)
+            .await
+            .is_some();
+    let never_launched = !has_run
+        && crate::jobs::queries::claim_predates_boot(
+            &job.status,
+            job.started_at.map(i64::from),
+            orch.boot_at,
+        );
     let mut output = render_job_summary_header(
         node_name,
         &job.status,
         job.started_at.map(i64::from),
         job.completed_at.map(i64::from),
         hold.as_ref(),
+        never_launched,
     );
     push_missing_output(&mut output, db, &job.id).await;
     if let Some(reason) = failure_reason {
@@ -2557,13 +2573,14 @@ pub(super) async fn read_node(
         ));
         output.push_str("\n\n");
     }
-    if job.status == "running"
+    if never_launched {
+        output.push_str(crate::jobs::queries::NEVER_LAUNCHED_DESCRIPTION);
+        output.push_str("\n\n");
+    } else if job.status == "running"
+        && !has_run
         && launch.is_none()
         && preparation.is_none()
         && admission_wait.is_none()
-        && crate::jobs::queries::latest_run_id_for_job(db, &job.id)
-            .await
-            .is_none()
     {
         output.push_str(crate::jobs::queries::PREPARING_DESCRIPTION);
         output.push_str("\n\n");
@@ -3758,6 +3775,9 @@ pub(super) async fn read_task(
         task_job.started_at.map(i64::from),
         task_job.completed_at.map(i64::from),
         hold.as_ref(),
+        // A task's launch inserts its run as it creates the job, so a task
+        // has no claim-without-run gap for a restart to strand.
+        false,
     );
     push_placement_default(&mut output, db, &task_job.id).await;
     if let Some(wait) = admission_waits.get(&task_job.id) {
@@ -5308,7 +5328,8 @@ mod hold_header_tests {
             retry_not_before: Some(1_790_000_000),
             gate: None,
         };
-        let header = render_job_summary_header("builder", "running", None, None, Some(&limit));
+        let header =
+            render_job_summary_header("builder", "running", None, None, Some(&limit), false);
         assert!(
             header.starts_with(&format!("# builder [◐ {}]", limit.qualifier())),
             "{header}"
@@ -5328,7 +5349,8 @@ mod hold_header_tests {
             retry_not_before: Some(1_790_000_000),
             gate: Some(ProviderLimitGate::ToolInFlight),
         };
-        let header = render_job_summary_header("builder", "running", None, None, Some(&gated));
+        let header =
+            render_job_summary_header("builder", "running", None, None, Some(&gated), false);
         assert!(
             header.starts_with("# builder [◐ held: provider limit, needs continue]"),
             "{header}"
@@ -5345,16 +5367,25 @@ mod hold_header_tests {
             supersedable: true,
             notes: Vec::new(),
         };
-        let header = render_job_summary_header("builder", "running", None, None, Some(&wait));
+        let header =
+            render_job_summary_header("builder", "running", None, None, Some(&wait), false);
         assert!(
             header.starts_with("# builder [◐ waiting: waitFor: duration]"),
             "{header}"
         );
         assert!(header.contains("escalate:true"), "{header}");
 
-        let idle = render_job_summary_header("builder", "running", None, None, None);
+        let idle = render_job_summary_header("builder", "running", None, None, None, false);
         assert!(idle.starts_with("# builder [◐]\n"), "{idle}");
         assert!(!idle.contains("Not taking a turn"), "{idle}");
+
+        // A predecessor's claim that never launched is not drawn active.
+        let stranded = render_job_summary_header("builder", "running", Some(10), None, None, true);
+        assert!(
+            stranded.starts_with("# builder [? not launched]\n"),
+            "{stranded}"
+        );
+        assert!(!stranded.contains('◐'), "{stranded}");
     }
 }
 
@@ -5425,7 +5456,7 @@ mod failed_projection_tests {
 
     #[test]
     fn failed_projection_header_names_failed_even_without_error_evidence() {
-        let page = super::render_job_summary_header("builder", "failed", None, None, None);
+        let page = super::render_job_summary_header("builder", "failed", None, None, None, false);
         assert!(page.contains("[✗ Failed]"), "{page}");
     }
 }

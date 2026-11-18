@@ -97,6 +97,57 @@ pub fn reconcile_stale_runs(
                 log::warn!("Failed to re-derive job status for {job_id}: {error}");
             }
         }
+        relaunch_never_launched_jobs(orch, result.never_launched_job_ids, &swept);
+    }
+}
+
+/// Return the claims a predecessor host made and never launched to Pending,
+/// and advance their executions so the DAG claims them again.
+///
+/// The execution stays released. Its release already decided the queue's caps
+/// and spent its lane's turn, and a turnless job counts as in flight, so the
+/// execution has held its slot all along; un-releasing it would refund a turn it
+/// took. The relaunch goes through the ordinary launch admission, whose thread
+/// focus check excludes the job's own execution, so it fits wherever the claim
+/// it replaces fitted, and a cap lowered since then parks it on an ordinary
+/// launch hold the queue releases.
+///
+/// The re-derivation writes Pending because nothing on this host claims the
+/// job. The advance goes through the durable outbox, so a host that stops again
+/// before advancing replays it at its next start. `swept` holds the executions
+/// the reprojection above already re-derived.
+fn relaunch_never_launched_jobs(
+    orch: &crate::orchestrator::Orchestrator,
+    job_ids: Vec<String>,
+    swept: &std::collections::HashSet<String>,
+) {
+    let executions: std::collections::BTreeSet<String> = job_ids
+        .iter()
+        .filter_map(|job_id| execution_id_of(orch, job_id))
+        .collect();
+    for execution_id in executions {
+        if !swept.contains(&execution_id) {
+            if let Err(error) =
+                crate::execution::advancement::recompute_execution_jobs(orch, &execution_id)
+            {
+                log::warn!(
+                    "Could not return the never-launched jobs of execution {execution_id} to pending: {error}"
+                );
+                continue;
+            }
+        }
+        let runtime = crate::workflow_host::runtime(orch);
+        let advance = execution_id.clone();
+        match crate::execution::advancement::run_advancement_db(async move {
+            runtime.enqueue_advance(&advance, false).await
+        }) {
+            Ok(_) => log::info!(
+                "Returned execution {execution_id}'s never-launched claims to pending and advanced it"
+            ),
+            Err(error) => log::warn!(
+                "Could not advance execution {execution_id} after returning its never-launched claims to pending: {error}"
+            ),
+        }
     }
 }
 
