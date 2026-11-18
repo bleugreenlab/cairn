@@ -326,9 +326,7 @@ const NAMED_WRITERS: &[&str] = &[
     "rebase_then_fold_into(",
     "squash_branch_onto(",
     "publish_logical_head_exported(",
-    "publish_branch_to_origin(",
     "retire_bookmark_expecting(",
-    "ensure_bookmark_on_origin(",
     "repair_conflicted_branch_name(",
     "repair_conflicted_bookmark_name(",
     "collapse_divergent_bookmark(",
@@ -601,21 +599,21 @@ async fn take_origin_target(guard: JjStoreGuard) -> Result<(), String> {
     );
 
     let mentioned = r#"
-fn publish() {
+fn advance() {
     // branch_write_permit( is minted by the caller
-    crate::jj::publish_branch_to_origin(jj, store, branch);
+    crate::jj::set_bookmark_at(jj, store, branch, commit);
 }
 "#;
     assert_eq!(
         unadmitted_calls("sample.rs", mentioned),
-        vec!["sample.rs: publish_branch_to_origin(".to_string()],
+        vec!["sample.rs: set_bookmark_at(".to_string()],
         "a comment mentioning a permit is not one"
     );
 
     let permitted = r#"
-fn publish() {
+fn advance() {
     let _permit = guard.branch_write_permit(&db, &reservation, project, branch).await?;
-    crate::jj::publish_branch_to_origin(jj, store, branch);
+    crate::jj::set_bookmark_at(jj, store, branch, commit);
 }
 "#;
     assert!(unadmitted_calls("sample.rs", permitted).is_empty());

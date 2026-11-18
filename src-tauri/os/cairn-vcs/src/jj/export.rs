@@ -12,8 +12,8 @@
 //!    bookmark advances while the git ref freezes, so every later push carries a
 //!    stale ref — how a PR half-landed on a tree that was never pushed. Nothing
 //!    read that stderr, and nothing compared the resulting ref to the bookmark.
-//!    [`export_git_verified`] does both, and [`verified_publish_target`] puts
-//!    the check in front of every push.
+//!    [`export_git_verified`] does both, inside the store lock that covers
+//!    the export.
 //!
 //! This module READS the coupling between the store's git backend and the
 //! project checkout's `.git` in order to detect when it fails. It adds no new
@@ -819,133 +819,6 @@ pub(crate) fn export_bookmark_advance_guarded(
         ctx,
         &[(branch, commit.as_str())],
     )
-}
-
-/// The commit a push of `branch` is about to publish, with the backing git ref
-/// PROVEN to match it first.
-///
-/// This is the check that would have caught the half-landed PR: the tests ran on
-/// a tree the push never carried, because the git ref had frozen behind the
-/// bookmark and nothing compared them. Returns `None` when there is no bookmark
-/// to publish (the caller's push is then jj's own concern); refuses outright when
-/// the bookmark NAME is conflicted, since "the commit to publish" is not a
-/// single answer in that state and pushing would publish an arbitrary side.
-pub(crate) fn verified_publish_target(
-    jj: &JjEnv,
-    cwd: &Path,
-    branch: &str,
-) -> Result<Option<String>, String> {
-    // A push runs outside the store lock, so a publication can advance the
-    // bookmark while this verifies. What the push publishes is the bookmark as
-    // it stands afterwards; a verification of an earlier read proves nothing
-    // about that, so a read the bookmark has moved past is verified again.
-    const ATTEMPTS: usize = 3;
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        if bookmark_name_is_conflicted(jj, cwd, branch)? {
-            return Err(format!(
-                "refusing to push `{branch}`: its bookmark name is conflicted in the store, so the \
-                 commit to publish is ambiguous. Reconcile the bookmark against its remote first."
-            ));
-        }
-        // `Ok(None)` is the one benign answer: the bookmark is genuinely absent,
-        // so there is nothing to publish. A resolver FAILURE is propagated rather
-        // than read as absence, or a push would proceed unverified and skip its
-        // post-push origin confirmation on exactly the runs where the store
-        // cannot answer.
-        let Some(commit) = bookmark_commit_checked(jj, cwd, branch)? else {
-            return Ok(None);
-        };
-        let verified = export_git_verified(
-            jj,
-            cwd,
-            true,
-            &format!("publish `{branch}`: verify exported ref"),
-            &[(branch, commit.as_str())],
-        );
-        let now = bookmark_commit_checked(jj, cwd, branch)?;
-        if now.as_deref() == Some(commit.as_str()) {
-            verified?;
-            return Ok(Some(commit));
-        }
-        if attempt == ATTEMPTS {
-            verified?;
-            return Err(format!(
-                "refusing to push `{branch}`: its bookmark kept moving while the export was \
-                 verified (read {commit}, now {})",
-                now.as_deref().unwrap_or("<absent>")
-            ));
-        }
-        log::info!(
-            "publish `{branch}`: the bookmark moved from {commit} to {} during export \
-             verification; verifying the new tip",
-            now.as_deref().unwrap_or("<absent>")
-        );
-    }
-}
-
-/// Confirm origin's tip for `branch` equals `expected` after a push.
-///
-/// The push-side half of the same question: a push that reported success while
-/// origin gained no such branch is exactly the phantom-PR specimen.
-///
-/// Fails closed in every direction, including when the probe itself cannot run.
-/// This is a publication path, and "could not confirm" is not "confirmed" — a
-/// caller that treats an unverified publish as a successful one is back to
-/// trusting an exit code, which is the thing that produced a create-pr artifact
-/// for a pull request that did not exist. Note the probe follows a push that just
-/// succeeded over the same network to the same remote, so being unable to reach
-/// origin here is genuinely anomalous rather than routine.
-pub(crate) fn confirm_origin_tip(
-    jj: &JjEnv,
-    cwd: &Path,
-    branch: &str,
-    expected: &str,
-) -> Result<(), String> {
-    let Some(repo) = resolve_backing_checkout(cwd) else {
-        return Err(format!(
-            "cannot confirm the published tip of `{branch}`: no backing git checkout resolved for {}",
-            cwd.display()
-        ));
-    };
-    let git = ScopedGit(jj);
-    let output = git
-        .run(
-            &repo,
-            vec![
-                "ls-remote".to_string(),
-                "--heads".to_string(),
-                "origin".to_string(),
-                format!("refs/heads/{branch}"),
-            ],
-        )
-        .map_err(|error| {
-            format!(
-                "cannot confirm the published tip of `{branch}`: ls-remote failed to run: {error}"
-            )
-        })?;
-    if !output.success {
-        return Err(format!(
-            "cannot confirm the published tip of `{branch}`: ls-remote could not reach origin: {}",
-            output.stderr.trim()
-        ));
-    }
-    let actual = output
-        .stdout
-        .lines()
-        .find_map(|line| line.split_whitespace().next())
-        .map(str::to_string);
-    match actual {
-        Some(actual) if actual == expected => Ok(()),
-        Some(actual) => Err(format!(
-            "push of `{branch}` reported success but origin's tip is {actual}, not the {expected} \
-             that was published"
-        )),
-        None => Err(format!(
-            "push of `{branch}` reported success but origin has no `{branch}` branch"
-        )),
-    }
 }
 
 /// The canonical jj repository directory behind the store or workspace at

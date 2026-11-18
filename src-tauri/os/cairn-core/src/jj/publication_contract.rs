@@ -135,7 +135,8 @@ fn base_advance_publishes_nothing() {
         for push in [
             "publish_managed_branch(",
             "push_managed_branch",
-            "publish_branch_to_origin(",
+            "push_commit_expecting_unrecorded(",
+            "publish_landing_atomic_unrecorded(",
             "push_to_origin(",
         ] {
             assert!(

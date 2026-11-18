@@ -2856,18 +2856,12 @@ mod tests {
         let source = include_str!("actions.rs");
         let body = production_fn(source, "ensure_base_branch_on_origin");
         assert!(body.contains("publish_managed_branch("), "{body}");
-        assert!(!body.contains("ensure_bookmark_on_origin("), "{body}");
         // An absent base is decided from a pinned read before the funnel,
         // which refuses a branch the store does not hold.
         assert!(body.contains(".pin_settled_read(&store)"), "{body}");
         assert!(
             body.find("bookmark_commit_checked(&pinned") < body.find("publish_managed_branch("),
             "{body}"
-        );
-        let production = &source[..source.find("#[cfg(test)]\nmod tests").expect("tests")];
-        assert!(
-            !production.contains("crate::jj::ensure_bookmark_on_origin("),
-            "no raw base push remains in production"
         );
     }
 

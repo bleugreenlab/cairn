@@ -334,9 +334,8 @@ impl LandingPublication {
 /// What the store's local bookmark must hold for a send to proceed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalExpectation {
-    /// Already moved to the commit being published, with the backing git ref
-    /// proven to match (the composed, recording entry points); for a deletion,
-    /// already deleted.
+    /// Already moved to the commit being published (the composed, recording
+    /// entry points); for a deletion, already deleted.
     AtNew,
     /// Still at this commit: nothing local moves until origin accepts.
     At(String),
@@ -1424,48 +1423,42 @@ fn check_preconditions(
             }
             continue;
         };
-        match local {
-            // The bookmark is what the store believes it published; this also
-            // proves the backing git ref carries it (the export freeze check).
-            LocalExpectation::AtNew => {
-                let published = verified_publish_target(jj, store, &update.branch)?;
-                if published.as_deref() != Some(new) {
-                    return Err(format!(
-                        "the store bookmark `{}` is {}, not the {new} to publish",
-                        update.branch,
-                        published.as_deref().unwrap_or("<absent>"),
-                    ));
-                }
-            }
-            LocalExpectation::At(expected) => {
-                let targets = crate::local_bookmark_targets(store, &update.branch)?;
-                if targets.as_slice() != std::slice::from_ref(expected) {
-                    return Err(format!(
-                        "the store bookmark `{}` is {}, not the {expected} this publication was \
-                         prepared from",
-                        update.branch,
-                        if targets.is_empty() {
-                            "<absent>".to_string()
-                        } else {
-                            targets.join(" and ")
-                        }
-                    ));
-                }
-                run_git(
-                    jj,
-                    repo,
-                    &["cat-file", "-e", &format!("{new}^{{commit}}")],
-                    "git cat-file -e (leased push object)",
-                )
-                .map_err(|error| {
-                    format!(
-                        "`{}`: the commit {new} to publish is not in the backing repository: \
-                         {error}",
-                        update.branch
-                    )
-                })?;
-            }
+        // Read-only, like the rest of the send. The push names `new` by id, so
+        // the backing checkout's `refs/heads/<branch>` is never what is sent and
+        // its export is not this phase's to verify or repair; only the store's
+        // bookmark and the object itself are.
+        let expected = local_commit.map_or(new, String::as_str);
+        let targets = crate::local_bookmark_targets(store, &update.branch)?;
+        if targets.len() != 1 || targets[0] != expected {
+            let found = if targets.is_empty() {
+                "<absent>".to_string()
+            } else {
+                targets.join(" and ")
+            };
+            return Err(match local {
+                LocalExpectation::AtNew => format!(
+                    "the store bookmark `{}` is {found}, not the {new} to publish",
+                    update.branch
+                ),
+                LocalExpectation::At(_) => format!(
+                    "the store bookmark `{}` is {found}, not the {expected} this publication was \
+                     prepared from",
+                    update.branch
+                ),
+            });
         }
+        run_git(
+            jj,
+            repo,
+            &["cat-file", "-e", &format!("{new}^{{commit}}")],
+            "git cat-file -e (leased push object)",
+        )
+        .map_err(|error| {
+            format!(
+                "`{}`: the commit {new} to publish is not in the backing repository: {error}",
+                update.branch
+            )
+        })?;
         if let LeasedRefRole::Target(proof) = &update.role {
             let Some(remote) = update.expected_old.as_deref() else {
                 return Err(format!(
@@ -1694,7 +1687,7 @@ fn take_injected_verify_failure() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jj::testing::{git, git_stdout, init_project, jj_bin};
+    use crate::jj::testing::{git, git_stdout, init_project, jj_bin, push_bookmark_to_origin};
     use tempfile::TempDir;
 
     #[test]
@@ -1836,7 +1829,7 @@ mod tests {
         seal(&jj, &workspace, "second change", None).unwrap();
         export_bookmark_advance(&jj, &store, true, &source, "landing fixture").unwrap();
         let _ = track_bookmark(&jj, &store, &source);
-        push_store_bookmark(&jj, &store, &source).unwrap();
+        push_bookmark_to_origin(&jj, &store, &source);
         let _ = track_bookmark(&jj, &store, "main");
 
         let source_old = bookmark_commit(&jj, &store, &source).unwrap();

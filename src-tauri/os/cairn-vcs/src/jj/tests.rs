@@ -288,73 +288,6 @@ fn the_store_sweep_hides_only_what_nothing_references() {
 
 #[test]
 #[serial_test::serial(jj)]
-fn origin_presence_is_workspace_safe() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping origin_presence_is_workspace_safe: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let project = TempDir::new().unwrap();
-    let workspaces = TempDir::new().unwrap();
-    init_project(project.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("project");
-    ensure_project_store(&jj, &store, project.path()).unwrap();
-    let workspace = workspaces.path().join("builder");
-    add_workspace(&jj, &store, &workspace, "agent/origin-probe", "main", None).unwrap();
-    std::fs::write(workspace.join("unsealed.rs"), "unsealed\n").unwrap();
-    let commit_before = jj
-        .run(
-            &workspace,
-            &[
-                "log",
-                "-r",
-                "@",
-                "--no-graph",
-                "-T",
-                "commit_id ++ \"\\n\"",
-                "--ignore-working-copy",
-            ],
-            "capture working-copy commit before origin probe",
-        )
-        .unwrap();
-
-    assert_eq!(
-        discover_origin_presence(&jj, &workspace),
-        OriginPresence::Absent
-    );
-    let commit_after = jj
-        .run(
-            &workspace,
-            &[
-                "log",
-                "-r",
-                "@",
-                "--no-graph",
-                "-T",
-                "commit_id ++ \"\\n\"",
-                "--ignore-working-copy",
-            ],
-            "capture working-copy commit after origin probe",
-        )
-        .unwrap();
-    assert_eq!(commit_before, commit_after);
-    assert!(is_working_copy_dirty(&jj, &workspace).unwrap());
-
-    let origin = TempDir::new().unwrap();
-    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
-    git(
-        project.path(),
-        &["remote", "add", "origin", &origin.path().to_string_lossy()],
-    );
-    assert_eq!(
-        discover_origin_presence(&jj, &workspace),
-        OriginPresence::Present
-    );
-}
-
-#[test]
-#[serial_test::serial(jj)]
 #[cfg(unix)]
 fn malformed_post_commit_probe_restores_the_pre_seal_graph_and_bytes() {
     use std::os::unix::fs::PermissionsExt;
@@ -1195,146 +1128,6 @@ fn read_blobs_returns_sealed_tree_content_without_a_checkout() {
     );
 }
 
-/// A seal followed by `push_store_bookmark` lands the workspace's bookmark on a
-/// bare `origin` — the in-tree form of the bare-origin spike.
-#[test]
-#[serial_test::serial(jj)]
-fn push_store_bookmark_lands_bookmark_in_bare_origin() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping push_store_bookmark_lands_bookmark_in_bare_origin: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let origin = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-
-    // A bare origin, with the project checkout wired to push main there.
-    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
-    init_project(proj.path());
-    git(
-        proj.path(),
-        &["remote", "add", "origin", &origin.path().to_string_lossy()],
-    );
-    git(proj.path(), &["push", "-q", "origin", "main"]);
-
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let branch = "agent/CAIRN-9-builder-0";
-    let ws = wts.path().join("job");
-    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-    std::fs::write(ws.join("f.rs"), "x\n").unwrap();
-    seal(&jj, &ws, "agent work", None).unwrap();
-
-    push_store_bookmark(&jj, &store, branch).unwrap();
-
-    let refs = git_stdout(
-        origin.path(),
-        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
-    );
-    assert!(
-        refs.contains(branch),
-        "pushed bookmark {branch} must appear on origin: {refs}"
-    );
-}
-
-#[test]
-#[serial_test::serial(jj)]
-fn push_store_bookmark_reports_publication_failure() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping push_store_bookmark_reports_publication_failure: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let unavailable_origin = home.path().join("unavailable-origin");
-    git(
-        proj.path(),
-        &[
-            "remote",
-            "add",
-            "origin",
-            &unavailable_origin.to_string_lossy(),
-        ],
-    );
-
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-    let branch = "agent/CAIRN-2679-builder-1";
-    let ws = wts.path().join("job");
-    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-    std::fs::write(ws.join("f.rs"), "x\n").unwrap();
-    seal(&jj, &ws, "agent work", None).unwrap();
-
-    let error = push_store_bookmark(&jj, &store, branch).unwrap_err();
-    assert!(error.contains("jj git push"), "{error}");
-}
-
-/// `ensure_bookmark_on_origin` publishes a Coordinator integration-branch
-/// base that lives only as a bookmark in the shared store (the project
-/// checkout has no local ref for it), and no-ops cleanly when the bookmark
-/// does not exist.
-#[test]
-#[serial_test::serial(jj)]
-fn ensure_bookmark_on_origin_publishes_store_bookmark() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping ensure_bookmark_on_origin_publishes_store_bookmark: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let origin = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-
-    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
-    init_project(proj.path());
-    git(
-        proj.path(),
-        &["remote", "add", "origin", &origin.path().to_string_lossy()],
-    );
-    git(proj.path(), &["push", "-q", "origin", "main"]);
-
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let base = "agent/CAIRN-1940-coordinator-0";
-    // A nonexistent bookmark is a clean no-op (base not sealed yet).
-    ensure_bookmark_on_origin(&jj, &store, base).unwrap();
-    let before = git_stdout(
-        origin.path(),
-        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
-    );
-    assert!(
-        !before.contains(base),
-        "absent bookmark must not be created on origin: {before}"
-    );
-
-    // Seal an integration bookmark in the store, then publish it.
-    jj.run(
-        &store,
-        &["bookmark", "create", "-r", "main", base],
-        "bookmark create",
-    )
-    .unwrap();
-    ensure_bookmark_on_origin(&jj, &store, base).unwrap();
-    let after = git_stdout(
-        origin.path(),
-        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
-    );
-    assert!(
-        after.contains(base),
-        "published integration bookmark {base} must appear on origin: {after}"
-    );
-
-    // Idempotent: a second call is a no-op (already matches origin).
-    ensure_bookmark_on_origin(&jj, &store, base).unwrap();
-}
-
 /// The regression fence for the defect the three-way merge primitive exists to
 /// close, over a real store rather than in the abstract.
 ///
@@ -1924,7 +1717,7 @@ fn setup_wedged_hub(bin: &str) -> WedgedHub {
     let int = "agent/CAIRN-2241-coordinator-0";
     let ws_coord = wts.path().join("coord");
     add_workspace(&jj, &store, &ws_coord, int, "main", None).unwrap();
-    ensure_bookmark_on_origin(&jj, &store, int).unwrap();
+    push_bookmark_to_origin(&jj, &store, int);
     std::fs::write(ws_coord.join("shared.rs"), "hub-edit\n").unwrap();
     seal(&jj, &ws_coord, "hub edits shared", None).unwrap();
 
@@ -3759,97 +3552,6 @@ fn an_unrepairable_export_freeze_is_an_error_not_a_success() {
     );
 }
 
-/// "Which commit is this push publishing?" has no single answer while the
-/// bookmark name is conflicted, so the push is refused rather than allowed to
-/// publish an arbitrary side.
-#[test]
-#[serial_test::serial(jj)]
-fn publication_refuses_a_conflicted_bookmark() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping publication_refuses_a_conflicted_bookmark: jj not resolvable");
-        return;
-    };
-    let fx = setup_tracked_origin(&bin);
-    fold_local_main(&fx, "cairn fold: land child");
-    advance_origin_from(&fx, &fx.base, "gh.txt", "squash\n");
-    import_git(&fx.jj, &fx.store).unwrap();
-    assert!(bookmark_name_is_conflicted(&fx.jj, &fx.store, "main").unwrap());
-
-    let error = verified_publish_target(&fx.jj, &fx.store, "main")
-        .expect_err("a conflicted bookmark has no single commit to publish");
-
-    assert!(error.contains("conflicted"), "{error}");
-}
-
-/// The push-side half: a push that reports success while origin gained nothing —
-/// or gained something else — is the phantom-PR specimen, and it is caught by
-/// asking origin rather than trusting the exit code.
-#[test]
-#[serial_test::serial(jj)]
-fn origin_confirmation_catches_a_push_origin_did_not_record() {
-    let Some(bin) = jj_bin() else {
-        eprintln!(
-            "skipping origin_confirmation_catches_a_push_origin_did_not_record: jj not resolvable"
-        );
-        return;
-    };
-    let fx = setup_tracked_origin(&bin);
-    let branch = "agent/cairn-3189-builder-0";
-
-    // Nothing has been pushed yet: origin has no such branch.
-    let error = confirm_origin_tip(&fx.jj, &fx.store, branch, &fx.base)
-        .expect_err("origin has no such branch, which must not read as a successful publish");
-    assert!(error.contains("no `"), "{error}");
-
-    // Publish it, then confirm both the agreeing and the disagreeing verdicts.
-    create_bookmark_at(&fx.jj, &fx.store, branch, &fx.base).unwrap();
-    push_store_bookmark(&fx.jj, &fx.store, branch).unwrap();
-    confirm_origin_tip(&fx.jj, &fx.store, branch, &fx.base)
-        .expect("origin's tip matches what was published");
-
-    let squashed = advance_origin_from(&fx, &fx.base, "gh.txt", "other\n");
-    let error = confirm_origin_tip(&fx.jj, &fx.store, branch, &squashed)
-        .expect_err("origin's tip disagrees with the claimed publication");
-    assert!(error.contains(&squashed), "{error}");
-}
-
-/// The push-side verifier must not report "could not confirm" as "confirmed".
-///
-/// An unreachable origin means the publication is UNVERIFIED, and on a
-/// publication path that has to be an error — treating it as success is exactly
-/// the trust-the-exit-code reasoning that produced a create-pr artifact for a
-/// pull request that never existed.
-#[test]
-#[serial_test::serial(jj)]
-fn origin_confirmation_fails_closed_when_origin_is_unreachable() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping origin_confirmation_fails_closed_when_unreachable: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    init_project(proj.path());
-    let unreachable = home.path().join("no-such-origin");
-    git(
-        proj.path(),
-        &["remote", "add", "origin", &unreachable.to_string_lossy()],
-    );
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-    let head = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
-
-    let error = confirm_origin_tip(&jj, &store, "main", &head).expect_err(
-        "an unreachable origin leaves the publication unverified, which is not success",
-    );
-
-    assert!(
-        error.contains("cannot confirm"),
-        "the error must say the publication could not be confirmed: {error}"
-    );
-    assert!(error.contains("main"), "{error}");
-}
-
 /// The resolver keeps its three answers apart, which is what lets a caller that
 /// just moved a bookmark tell "there is nothing to publish" from "I cannot tell
 /// what to publish".
@@ -4965,7 +4667,7 @@ fn stale_publication_fixture() -> Option<StalePublicationFixture> {
     std::fs::write(workspace.join("published.rs"), "published\n").unwrap();
     seal(&jj, &workspace, "published frontier", None).unwrap();
     export_bookmark_advance(&jj, &store, true, &branch, "stale publication fixture").unwrap();
-    push_store_bookmark_classified(&jj, &store, &branch).unwrap();
+    push_bookmark_to_origin(&jj, &store, &branch);
     Some((
         home, project, origin, workspaces, jj, store, branch, workspace,
     ))
@@ -5003,7 +4705,7 @@ fn mint_unpublished_branch(jj: &JjEnv, store: &Path, workspaces: &Path, branch: 
 /// fetches and imports origin's copy — which jj records UNTRACKED.
 fn push_then_forget_then_reimport(jj: &JjEnv, store: &Path, branch: &str) {
     let snapshot = operation_id(jj, store).unwrap();
-    push_store_bookmark(jj, store, branch).unwrap();
+    push_bookmark_to_origin(jj, store, branch);
     jj.run(
         store,
         &["op", "restore", &snapshot, "--ignore-working-copy"],
@@ -5105,7 +4807,7 @@ fn a_base_advance_rebases_a_branch_whose_origin_copy_was_untracked() {
     assert!(branch_descends_from(&jj, &store, branch, &new_base));
     assert_eq!(origin_tracking(&jj, &store, branch), Some(true));
 
-    push_store_bookmark(&jj, &store, branch).unwrap();
+    push_bookmark_to_origin(&jj, &store, branch);
     assert_eq!(
         git_stdout(
             origin.path(),
@@ -5375,13 +5077,6 @@ async fn a_stale_export_expectation_never_rewinds_a_later_publication() {
     assert_eq!(
         git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{branch}")]),
         second
-    );
-    assert_eq!(
-        verified_publish_target(&jj, &store, branch)
-            .unwrap()
-            .as_deref(),
-        Some(second.as_str()),
-        "a push publishes the bookmark as it stands, not an earlier read"
     );
 }
 
@@ -5965,13 +5660,6 @@ fn child_merge_push_refused_without_target_flatten() {
         git_stdout(&checkout, &["rev-parse", &int_ref]),
         int_ref_before,
         "the integration git ref did not move onto the scaffolded fold"
-    );
-
-    // Nothing reached git, so there is nothing a push could publish either.
-    let err = push_store_bookmark(&hub.jj, &hub.store, hub.int).unwrap_err();
-    assert!(
-        err.to_lowercase().contains("conflict"),
-        "the push is refused for the conflicted ancestor: {err}"
     );
 }
 

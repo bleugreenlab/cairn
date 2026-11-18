@@ -16,8 +16,9 @@
 //! 3. **`origin`.** A push, required while a remote PR is open on the branch.
 //!
 //! [`publish_logical_head_exported`] joins rungs 1 and 2 into one operation, and
-//! is the ONLY sanctioned caller of `crate::publish_logical_*`.
-//! [`publish_branch_to_origin`] is rung 3. A publication that climbs only the
+//! is the ONLY sanctioned caller of `crate::publish_logical_*`. Rung 3 is the
+//! leased push (`super::leased_push`), which the host drives through its managed
+//! publication funnel. A publication that climbs only the
 //! first rung looks entirely successful — it reports a real commit on a real
 //! branch — while the git ref stays frozen at whatever it last held, so the
 //! failure is invisible until something downstream reads the stale tip.
@@ -28,9 +29,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use super::export::export_bookmark_advance;
-use super::merge::StoreBookmarkPushError;
 use super::packed_refs::{with_packed_refs_patience, PackedRefs};
-use super::reconcile::{discover_origin_presence, OriginPresence};
 use super::JjEnv;
 
 /// The description carried by an integration commit. The object is
@@ -241,50 +240,6 @@ fn land_logical_head(
     }
 }
 
-/// Push an exported branch bookmark to `origin` — the ladder's third rung.
-///
-/// Deliberately NOT run under the store lock: this is network I/O, and the
-/// bookmark it publishes is already durable in the store and in `refs/heads/*`.
-/// Addresses the SHARED STORE rather than a workspace, because agent processes
-/// live in scratch and own no jj workspace — a push routed through a workspace
-/// marker has nothing to read and silently publishes nothing.
-///
-/// A project with no `origin` has nothing to publish and is not a failure;
-/// anything else propagates.
-pub async fn publish_branch_to_origin(
-    jj: &JjEnv,
-    store: &Path,
-    branch: &str,
-) -> Result<(), StoreBookmarkPushError> {
-    let jj = jj.clone();
-    let store = store.to_path_buf();
-    let branch = branch.to_string();
-    tokio::task::spawn_blocking(move || {
-        match super::merge::push_store_bookmark_classified(&jj, &store, &branch) {
-            Ok(()) => Ok(()),
-            Err(error) => match discover_origin_presence(&jj, &store) {
-                OriginPresence::Absent => {
-                    log::info!("publish `{branch}`: no `origin` remote; nothing to publish");
-                    Ok(())
-                }
-                _ => Err(error),
-            },
-        }
-    })
-    .await
-    .map_err(|error| {
-        StoreBookmarkPushError::Failed(format!("origin publication worker failed: {error}"))
-    })?
-}
-
-/// The ladder is a contract between three call sites that cannot see each other.
-///
-/// Its rungs were split across modules once already, and the split was invisible
-/// precisely because each site looked complete on its own: the transaction
-/// reported a real commit, so nothing downstream had a reason to ask whether the
-/// branch ref moved. These are static guards over the sites' own source, in the
-/// idiom of `run`'s failure-opening guard — they cost nothing and they fail on
-/// the exact drift that produced the incident.
 /// What reconciling a sealed delta with the branch head it must land on found.
 ///
 /// A delta declares the commit it was built on as its parent, and the logical

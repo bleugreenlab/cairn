@@ -163,7 +163,7 @@ async fn setup_clean_merge(bin: &str) -> MergeFixture {
     let int = "agent/PROJ-1-coordinator-0";
     let ws_coord = wts.path().join("coord");
     crate::jj::add_workspace(&jj, &store, &ws_coord, int, "main", None).unwrap();
-    crate::jj::ensure_bookmark_on_origin(&jj, &store, int).unwrap();
+    crate::jj::tests::push_bookmark_to_origin(&jj, &store, int);
 
     // A child forked from `main` that edits shared.rs.
     let source = "agent/PROJ-2-builder-0";

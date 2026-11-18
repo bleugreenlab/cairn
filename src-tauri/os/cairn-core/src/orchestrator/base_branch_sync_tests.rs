@@ -795,7 +795,7 @@ async fn one_poll_pass_takes_an_outside_merge_into_a_parent_branch_and_a_demand_
     let parent_ws = workspaces.path().join("parent");
     crate::jj::add_workspace(&jj, &store, &parent_ws, PARENT, "main", None).unwrap();
     let parent_tip = seal(&parent_ws, PARENT, "parent.rs");
-    crate::jj::push_store_bookmark(&jj, &store, PARENT).unwrap();
+    crate::jj::tests::push_bookmark_to_origin(&jj, &store, PARENT);
     let child_ws = workspaces.path().join("child");
     crate::jj::add_workspace(&jj, &store, &child_ws, CHILD, PARENT, None).unwrap();
     let child_tip = seal(&child_ws, CHILD, "child.rs");
@@ -979,7 +979,7 @@ impl PublishedParent {
             _dirs: vec![origin, proj, workspaces],
         };
         let published = fixture.seal("parent.rs");
-        crate::jj::push_store_bookmark(&fixture.jj, &fixture.store, PARENT).unwrap();
+        crate::jj::tests::push_bookmark_to_origin(&fixture.jj, &fixture.store, PARENT);
         let child_ws = fixture._dirs[2].path().join("child");
         crate::jj::add_workspace(&fixture.jj, &fixture.store, &child_ws, CHILD, PARENT, None)
             .unwrap();

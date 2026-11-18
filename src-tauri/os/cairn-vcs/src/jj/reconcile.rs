@@ -14,8 +14,8 @@ fn record_failure(report: &mut ReconcileReport, branch: &str, error: String) {
 ///
 /// The caller MUST `continue` past `classify_reconciled_sibling` after this. That
 /// is load-bearing: the rebase was undone, so the branch is genuinely clean
-/// again, and classification would read it as `Clean`, publish it, and push it —
-/// silently reporting a successful reconcile for a branch that never moved.
+/// again, and classification would read it as `Clean`, silently reporting a
+/// successful reconcile for a branch that never moved.
 fn record_conflict(report: &mut ReconcileReport, branch: &str, diagnostic: ConflictDiagnostic) {
     let paths = diagnostic.conflicting_paths();
     if let Some(refusal) = &diagnostic.heal_refusal {
@@ -183,58 +183,6 @@ pub(crate) fn restore_operation_and_export(
     super::export_bookmark_advance(jj, store, true, branch, ctx)
 }
 
-/// Whether this project has an `origin` remote. Publication sites use absence as a
-/// successful nothing-to-publish result. If discovery fails, callers preserve the
-/// configured-origin failure signal rather than silently treating unreadable remote
-/// configuration as local-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OriginPresence {
-    Present,
-    Absent,
-    Unknown,
-}
-
-pub(crate) fn discover_origin_presence(jj: &JjEnv, repo: &Path) -> OriginPresence {
-    match jj.run(
-        repo,
-        &["git", "remote", "list", "--ignore-working-copy"],
-        "jj git remote list",
-    ) {
-        Ok(remotes)
-            if remotes.lines().any(|line| {
-                line.split_whitespace()
-                    .next()
-                    .is_some_and(|name| name == "origin")
-            }) =>
-        {
-            OriginPresence::Present
-        }
-        Ok(_) => OriginPresence::Absent,
-        Err(error) => {
-            log::warn!("jj reconcile: origin discovery failed; attempting publication conservatively: {error}");
-            OriginPresence::Unknown
-        }
-    }
-}
-
-pub(crate) fn publish_reconciled_bookmark(
-    jj: &JjEnv,
-    store: &Path,
-    branch: &str,
-    origin: OriginPresence,
-) -> Result<(), StoreBookmarkPushError> {
-    if origin == OriginPresence::Absent {
-        return Ok(());
-    }
-    push_store_bookmark_classified(jj, store, branch)
-}
-
-#[derive(Clone, Copy)]
-struct ReconcilePublication {
-    clean: bool,
-    healed: bool,
-}
-
 /// Where a branch this pass rebased stood immediately before the rebase, so a
 /// classification that cannot keep the rebased result can put it back.
 pub(crate) struct RebaseRollback {
@@ -397,18 +345,14 @@ pub(crate) fn record_unmoved_heal_refusal(
 /// healing the clean-tip / conflicted-intermediate case in place with
 /// [`heal_conflicted_ancestry`]. `dest_commit` is `None` only when the reconcile dest was unresolvable, in
 /// which case this falls back to the bare tip-conflict check (liveness over
-/// strictness). `publication.clean` advances a cleanly-rebased sibling's PR head
-/// when an `origin` remote is configured. A local-only project has nothing to publish and
-/// remains clean; failure to reach a configured origin is reported as blocking so
-/// the PR head cannot silently remain stale. A HEALED sibling always attempts
-/// publication because its commit ids changed. The caller holds the per-store lock,
+/// strictness). Nothing is published: a reconciled branch reaches origin only
+/// through the host's leased publication. The caller holds the per-store lock,
 /// so the heal cannot fork.
 fn classify_reconciled_sibling(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
     dest_commit: Option<&str>,
-    publication: ReconcilePublication,
     rollback: Option<&RebaseRollback>,
     report: &mut ReconcileReport,
 ) {
@@ -417,41 +361,13 @@ fn classify_reconciled_sibling(
         // No concrete dest to classify against: fall back to the tip-conflict check.
         None => match branch_has_conflict(jj, store, branch) {
             Ok(true) => report.conflicted.push(branch.to_string()),
-            Ok(false) => {
-                if publication.clean {
-                    if let Err(e) = publish_reconciled_bookmark(
-                        jj,
-                        store,
-                        branch,
-                        discover_origin_presence(jj, store),
-                    ) {
-                        log::warn!("jj reconcile: push rebased sibling {branch} failed: {e}");
-                        record_failure(report, branch, e.to_string());
-                        return;
-                    }
-                }
-                report.rebased_clean.push(branch.to_string());
-            }
+            Ok(false) => report.rebased_clean.push(branch.to_string()),
             Err(e) => {
                 log::warn!("jj reconcile: conflict check for {branch} failed: {e}");
                 record_failure(report, branch, e.to_string());
             }
         },
-        Some(FlattenState::Clean) => {
-            if publication.clean {
-                if let Err(e) = publish_reconciled_bookmark(
-                    jj,
-                    store,
-                    branch,
-                    discover_origin_presence(jj, store),
-                ) {
-                    log::warn!("jj reconcile: push rebased sibling {branch} failed: {e}");
-                    record_failure(report, branch, e.to_string());
-                    return;
-                }
-            }
-            report.rebased_clean.push(branch.to_string());
-        }
+        Some(FlattenState::Clean) => report.rebased_clean.push(branch.to_string()),
         // A genuinely-conflicted tip needs the agent to resolve markers; a
         // conflicted commit can never push, so it is stop-the-line.
         Some(FlattenState::TipConflicted) => report.conflicted.push(branch.to_string()),
@@ -465,20 +381,6 @@ fn classify_reconciled_sibling(
             let dest = dest_commit.expect("IntermediateOnly implies a concrete dest");
             match heal_conflicted_ancestry(jj, store, branch, dest) {
                 Ok(heal) => {
-                    // The heal rewrote commit ids, so the PR head must move even
-                    // when a plain clean rebase would have been skipped.
-                    if publication.healed {
-                        if let Err(e) = publish_reconciled_bookmark(
-                            jj,
-                            store,
-                            branch,
-                            discover_origin_presence(jj, store),
-                        ) {
-                            log::warn!("jj reconcile: push healed sibling {branch} failed: {e}");
-                            record_failure(report, branch, e.to_string());
-                            return;
-                        }
-                    }
                     log::info!(
                         "jj reconcile: healed {branch} in place ({} conflict-flagged commit(s) resolved, {} emptied commit(s) dropped)",
                         heal.healed.len(),
@@ -669,25 +571,8 @@ fn rebase_sibling(
 }
 
 /// Reconcile runner-owned sibling bookmarks onto the locally advanced integration
-/// tip. Graph advancement never reads, refreshes, or follows a workspace.
-pub fn reconcile_siblings(
-    jj: &JjEnv,
-    store: &Path,
-    integration_branch: &str,
-    siblings: &[String],
-) -> Result<ReconcileReport, String> {
-    reconcile_siblings_with_options(
-        jj,
-        store,
-        integration_branch,
-        siblings,
-        &ReconcileOptions {
-            publish: true,
-            ..ReconcileOptions::default()
-        },
-    )
-}
-
+/// tip. Graph advancement never reads, refreshes, or follows a workspace, and
+/// never publishes.
 pub fn reconcile_siblings_without_publication(
     jj: &JjEnv,
     store: &Path,
@@ -718,7 +603,6 @@ pub fn reconcile_resolved_sibling_without_publication(
         &siblings,
         &ReconcileOptions {
             resolution: Some((sibling.to_string(), resolution.clone())),
-            ..ReconcileOptions::default()
         },
     )
 }
@@ -726,8 +610,6 @@ pub fn reconcile_resolved_sibling_without_publication(
 /// How one reconcile pass treats its siblings.
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileOptions {
-    /// Publish each moved sibling to origin as part of the pass.
-    pub publish: bool,
     /// An explicitly requested committed resolution for one named sibling.
     pub resolution: Option<(String, ResolutionCarry)>,
 }
@@ -739,7 +621,6 @@ pub fn reconcile_siblings_with_options(
     siblings: &[String],
     options: &ReconcileOptions,
 ) -> Result<ReconcileReport, String> {
-    let publish = options.publish;
     let resolution = options
         .resolution
         .as_ref()
@@ -801,7 +682,6 @@ pub fn reconcile_siblings_with_options(
             integration_branch,
             branch,
             dest_commit.as_deref(),
-            publish,
             resolution,
             &mut report,
         );
@@ -814,24 +694,18 @@ pub fn reconcile_siblings_with_options(
     Ok(report)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one sibling's slice of the pass, carrying the pass's pinned coordinates"
-)]
 fn reconcile_one_sibling(
     jj: &JjEnv,
     store: &Path,
     integration_branch: &str,
     branch: &str,
     dest_commit: Option<&str>,
-    publish: bool,
     resolution: Option<(&str, &ResolutionCarry)>,
     report: &mut ReconcileReport,
 ) {
     let already_on_dest = dest_commit
         .map(|dest| branch_descends_from(jj, store, branch, dest))
         .unwrap_or(false);
-    let mut push_clean = !already_on_dest;
     let mut trivial_fast_forward = false;
     let mut rollback = None;
     let carry = resolution
@@ -847,7 +721,6 @@ fn reconcile_one_sibling(
                 record_failure(report, branch, error);
                 return;
             }
-            push_clean = false;
             trivial_fast_forward = true;
         } else {
             match rebase_sibling(jj, store, branch, integration_branch, carry, report) {
@@ -864,35 +737,21 @@ fn reconcile_one_sibling(
     }
 
     reached_step("reconcile: before classification");
-    classify_reconciled_sibling(
-        jj,
-        store,
-        branch,
-        dest_commit,
-        ReconcilePublication {
-            clean: push_clean && publish,
-            healed: publish,
-        },
+    classify_reconciled_sibling(jj, store, branch, dest_commit, rollback.as_ref(), report);
+    // Classification is part of the same locked transaction: expiry there must
+    // undo the rebase, not leave a moved branch reported as a failed retry.
+    if let (Some(rollback), Err(error)) = (
         rollback.as_ref(),
-        report,
-    );
-    // Automatic reconcile does not publish. Its later classification is still
-    // part of the same locked transaction: expiry there must undo the rebase,
-    // not leave a moved branch reported as a failed retry.
-    if !publish {
-        if let (Some(rollback), Err(error)) = (
-            rollback.as_ref(),
-            jj.check_operation_budget("jj reconcile classification"),
-        ) {
-            report.rebased_clean.retain(|name| name != branch);
-            report.conflicted.retain(|name| name != branch);
-            report.failed.retain(|failure| failure.branch != branch);
-            report.conflict_diagnostics.remove(branch);
-            record_failure(
-                report,
-                branch,
-                super::merge::roll_back_rebase(jj, store, branch, &rollback.pre_op, error),
-            );
-        }
+        jj.check_operation_budget("jj reconcile classification"),
+    ) {
+        report.rebased_clean.retain(|name| name != branch);
+        report.conflicted.retain(|name| name != branch);
+        report.failed.retain(|failure| failure.branch != branch);
+        report.conflict_diagnostics.remove(branch);
+        record_failure(
+            report,
+            branch,
+            super::merge::roll_back_rebase(jj, store, branch, &rollback.pre_op, error),
+        );
     }
 }

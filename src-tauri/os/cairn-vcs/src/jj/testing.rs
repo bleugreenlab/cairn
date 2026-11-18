@@ -233,6 +233,28 @@ pub fn git_stdout(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Put a store bookmark on `origin` for a fixture, with a plain `jj git push`.
+///
+/// Production never publishes this way: every send is the leased push, under
+/// the host's reservation and lock discipline. Fixtures only need the branch
+/// to exist on origin and be tracked, which is exactly what this records.
+pub fn push_bookmark_to_origin(jj: &JjEnv, store: &Path, branch: &str) {
+    jj.run(
+        store,
+        &[
+            "git",
+            "push",
+            "--remote",
+            "origin",
+            "--bookmark",
+            branch,
+            "--ignore-working-copy",
+        ],
+        "test fixture: push bookmark to origin",
+    )
+    .unwrap();
+}
+
 /// Rebase a branch WITHOUT the conflict guard, leaving the recorded conflict in
 /// place.
 ///

@@ -228,7 +228,7 @@ fn fold_into_bookmark(
 /// — which assumes Cairn's reconcile keeps the source on an integration tip — the
 /// default branch advances OUTSIDE the fold chain (another PR merged, or an
 /// external push), so the source is first rebased onto the current target tip,
-/// exactly as `reconcile_siblings` rebases siblings, then the target FFs to it.
+/// exactly as the sibling reconcile rebases siblings, then the target FFs to it.
 /// A recorded conflict returns a safe, actionable error and NEVER the
 /// `--allow-backwards` hint (which would move the default branch backward and
 /// clobber it). `dest` is the resolved live target tip (`<target>@origin` for a
@@ -432,87 +432,6 @@ pub fn track_own_remote_of_same_lineage(
         "jj: tracked `{branch}@origin` ({remote}); the local bookmark ({local}) carries its history"
     );
     Ok(true)
-}
-
-/// A verified store-bookmark push failure. The two remote-state refusals are
-/// recoverable by fetch-and-converge; every other failure keeps its original
-/// diagnostic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StoreBookmarkPushError {
-    /// jj's recorded view of `branch@origin` no longer matches origin.
-    StaleRemote(String),
-    /// `branch@origin` exists but is not tracked, so jj will not push over it.
-    UntrackedRemote(String),
-    Failed(String),
-}
-
-impl std::fmt::Display for StoreBookmarkPushError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::StaleRemote(error) | Self::UntrackedRemote(error) | Self::Failed(error) => {
-                formatter.write_str(error)
-            }
-        }
-    }
-}
-
-/// Push an already-advanced store bookmark to origin with `--ignore-working-copy`
-/// (the store's default `@` may be stale after a fold/rebase). Used to advance
-/// the integration tip after a fold, a cleanly-rebased sibling's PR head, and a
-/// managed branch's PR head; jj's remote-tracking model accepts a rewritten
-/// bookmark without a force-push.
-///
-/// The push is bracketed by verification: the backing git ref must equal the
-/// bookmark commit BEFORE the push (or the push carries a stale tree — the
-/// half-landed-PR mode), and origin's tip must equal it AFTER (or the push
-/// reported a success that origin did not record — the phantom-PR mode).
-pub(crate) fn push_store_bookmark_classified(
-    jj: &JjEnv,
-    store: &Path,
-    branch: &str,
-) -> Result<(), StoreBookmarkPushError> {
-    let published =
-        verified_publish_target(jj, store, branch).map_err(StoreBookmarkPushError::Failed)?;
-    if let Err(error) = jj.run_with_timeout(
-        store,
-        &[
-            "git",
-            "push",
-            "--ignore-working-copy",
-            "--remote",
-            "origin",
-            "--bookmark",
-            branch,
-        ],
-        "jj git push store bookmark",
-        JJ_NETWORK_TIMEOUT,
-    ) {
-        let lowered = error.to_ascii_lowercase();
-        return Err(
-            if lowered.contains("unexpectedly moved on the remote")
-                && lowered.contains("stale info")
-            {
-                StoreBookmarkPushError::StaleRemote(error)
-            } else if lowered.contains("non-tracking remote bookmark") {
-                StoreBookmarkPushError::UntrackedRemote(error)
-            } else {
-                StoreBookmarkPushError::Failed(error)
-            },
-        );
-    }
-    match published.as_deref() {
-        Some(published) => {
-            confirm_origin_tip(jj, store, branch, published).map_err(StoreBookmarkPushError::Failed)
-        }
-        None => Ok(()),
-    }
-}
-
-/// Unclassified form for merge publication paths that do not recover stale or
-/// untracked remotes themselves. Managed agent publication goes through
-/// `publish_managed_branch`, which does.
-pub fn push_store_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
-    push_store_bookmark_classified(jj, store, branch).map_err(|error| error.to_string())
 }
 
 /// Which of two very different situations a rolled-back rebase actually found.

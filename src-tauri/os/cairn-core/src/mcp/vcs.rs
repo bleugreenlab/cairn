@@ -10,8 +10,9 @@
 //! lives in scratch and owns no jj workspace, so a publication routed through a
 //! worktree resolves to the read-only [`NonWorktreeVcs`] and silently publishes
 //! nothing — which is exactly how commit after commit reported success while the
-//! branch stayed where it was. Publication addresses the shared store instead;
-//! see [`crate::jj::publish_branch_to_origin`].
+//! branch stayed where it was. Publication addresses the shared store instead,
+//! through the leased push that `publish_managed_branch` in
+//! `orchestrator/base_advance.rs` drives.
 
 use std::path::Path;
 use std::time::Duration;

@@ -2140,38 +2140,6 @@ fn recent_operation_ids(jj: &JjEnv, store: &Path) -> Vec<String> {
     .collect()
 }
 
-/// Publish a bookmark that already lives in the shared store to origin. Used to
-/// put a Coordinator integration-branch base on origin from the store, where it
-/// exists as a bookmark even though the project checkout carries no local ref
-/// for it (so the git `push origin <base>` the git path uses cannot find it).
-///
-/// No-op when the bookmark does not resolve in the store (base not sealed yet)
-/// or already matches origin (`jj git push` reports "Nothing changed"). jj 0.42
-/// auto-tracks a new bookmark on push, so no `--allow-new` is passed.
-pub fn ensure_bookmark_on_origin(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
-    if branch.is_empty() {
-        return Ok(());
-    }
-    let Some(published) = verified_publish_target(jj, store, branch)? else {
-        log::debug!("jj base bookmark {branch} absent from store; nothing to publish");
-        return Ok(());
-    };
-    jj.run(
-        store,
-        &[
-            "git",
-            "push",
-            "--remote",
-            "origin",
-            "--bookmark",
-            branch,
-            "--ignore-working-copy",
-        ],
-        "jj git push base bookmark",
-    )?;
-    confirm_origin_tip(jj, store, branch, &published)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

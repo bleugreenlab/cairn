@@ -169,7 +169,7 @@ pub(crate) fn add_workspace_with_marker_writer(
     // A Coordinator never seals (seal is the only other place a bookmark is
     // created), so without this its integration bookmark would never exist and a
     // child's `jj workspace add -r <integration-branch>` could not resolve the
-    // revision (it also leaves `ensure_bookmark_on_origin` nothing to publish).
+    // revision.
     // Create only if absent: `bookmark create` errors when the name already
     // exists and a retried job must not fail on that, while `bookmark set` is
     // wrong here because it refuses backwards/sideways moves.
