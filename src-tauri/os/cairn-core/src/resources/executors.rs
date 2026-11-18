@@ -9466,8 +9466,11 @@ mod tests {
             "{rendered}"
         );
 
+        // The probe's detail, as `cairn-sandbox` composes it on a machine
+        // whose only credential is a dormant runner's machine secret.
+        let machine_secret_only = "outer profile inherited: a confined process cannot apply a second profile (check-lane commands carry the non-relaxable operator credential floor, which also covers privileged rebuild state; this machine holds the machine secret mcp_auth_secret in /Users/dev/.cairn); nested Seatbelt in-bounds temp write refused (exit Some(71))";
         evidence.nested_sandbox_write_available = false;
-        evidence.nested_sandbox_write_detail = "outer profile inherited: a confined process cannot apply a second profile (this machine holds an operator credential, so its check-lane commands run under the operator credential floor)".into();
+        evidence.nested_sandbox_write_detail = machine_secret_only.into();
         evidence.nested_sandbox_write_context = Some(NestedSandboxProbeContext {
             launcher: SandboxLauncherClass::Unconfined,
             credential_floor_sha256: Some("ab".repeat(32)),
@@ -9475,10 +9478,12 @@ mod tests {
             fingerprint: Some("ef".repeat(32)),
             measured_at_unix_ms: 1_000_000 - 116_000,
         });
-        executor.health.advertisement.capabilities.sandbox = Some(evidence);
+        executor.health.advertisement.capabilities.sandbox = Some(evidence.clone());
         let rendered = render_executor(&executor);
         assert!(
-            rendered.contains("- Nested Seatbelt (check lanes): UNAVAILABLE — outer profile inherited: a confined process cannot apply a second profile"),
+            rendered.contains(&format!(
+                "- Nested Seatbelt (check lanes): UNAVAILABLE — {machine_secret_only}\n"
+            )),
             "{rendered}"
         );
         assert!(
@@ -9488,6 +9493,17 @@ mod tests {
         assert!(
             rendered
                 .contains("  - Fingerprint efefefefefef: the probe re-runs whenever it moves\n"),
+            "{rendered}"
+        );
+
+        let both_secrets = "outer profile inherited: a confined process cannot apply a second profile (check-lane commands carry the non-relaxable operator credential floor, which also covers privileged rebuild state; this machine holds the operator credential operator_auth_secret and the machine secret mcp_auth_secret in /Users/mitch/.cairn); nested Seatbelt in-bounds temp write refused (exit Some(71))";
+        evidence.nested_sandbox_write_detail = both_secrets.into();
+        executor.health.advertisement.capabilities.sandbox = Some(evidence);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(&format!(
+                "- Nested Seatbelt (check lanes): UNAVAILABLE — {both_secrets}\n"
+            )),
             "{rendered}"
         );
 

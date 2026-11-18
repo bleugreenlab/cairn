@@ -192,15 +192,6 @@ impl OperatorCredentialFloor {
             .collect()
     }
 
-    /// Whether any covered home holds an operator credential right now, or
-    /// this process cannot tell.
-    ///
-    /// A machine with none has nothing for the boundary to protect, which is
-    /// what lets work that must start its own sandbox run without one there
-    /// (see [`Confinement::for_branch_code`]). Every home this process was
-    /// told about is checked on its own, whether or not its name is in the
-    /// family; and a family this process cannot list counts as holding one,
-    /// because an unanswered question must not open the boundary.
     /// Whether this process could list the home family, which is what makes
     /// [`Self::holds_a_credential`] and the relocated-home rules an answer
     /// rather than a fail-closed assumption.
@@ -226,16 +217,36 @@ impl OperatorCredentialFloor {
         Ok(homes)
     }
 
+    /// Whether any covered home holds an operator credential right now, or
+    /// this process cannot tell.
+    ///
+    /// A machine with none has nothing for the boundary to protect, which is
+    /// what lets work that must start its own sandbox run without one there
+    /// (see [`Confinement::for_branch_code`]). Every home this process was
+    /// told about is checked on its own, whether or not its name is in the
+    /// family; and a family this process cannot list counts as holding one,
+    /// because an unanswered question must not open the boundary.
     pub fn holds_a_credential(&self) -> bool {
-        let has_credential =
-            |home: &PathBuf| CREDENTIAL_FILES.iter().any(|file| home.join(file).exists());
-        if self.named.iter().any(has_credential) {
-            return true;
+        self.held_credentials().trips_the_floor()
+    }
+
+    /// Which credential files, in which homes, make [`Self::holds_a_credential`]
+    /// true: the evidence behind that answer, so whoever has to act on it is
+    /// told which file to look at rather than only that one exists.
+    pub fn held_credentials(&self) -> HeldCredentials {
+        let mut held = HeldCredentials::default();
+        for home in &self.named {
+            held.record_home(home);
         }
         match self.family_members() {
-            Ok(members) => members.iter().chain(self.homes.iter()).any(has_credential),
-            Err(_) => true,
+            Ok(members) => {
+                for home in members.iter().chain(self.homes.iter()) {
+                    held.record_home(home);
+                }
+            }
+            Err(_) => held.unlistable_family = self.os_home.clone(),
         }
+        held
     }
 
     /// The operator credential a denied command was refused, judged from the
@@ -455,6 +466,81 @@ impl OperatorCredentialFloor {
             credentials.join(" "),
             home_nodes.join(" ")
         )
+    }
+}
+
+/// The credential files an [`OperatorCredentialFloor`] found, and whether it
+/// could look everywhere it covers. Paths only: nothing here reads a secret.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldCredentials {
+    /// Each credential file present, as `(home, file name)`, homes resolved
+    /// and in the order they were checked.
+    files: Vec<(PathBuf, &'static str)>,
+    /// The OS home whose `.cairn*` family could not be listed. The floor reads
+    /// that as holding a credential.
+    unlistable_family: Option<PathBuf>,
+}
+
+impl HeldCredentials {
+    fn record_home(&mut self, home: &Path) {
+        let resolved = resolve(home);
+        for file in CREDENTIAL_FILES {
+            let known = self
+                .files
+                .iter()
+                .any(|(seen, name)| *name == file && same_path(seen, &resolved));
+            if !known && home.join(file).exists() {
+                self.files.push((resolved.clone(), file));
+            }
+        }
+    }
+
+    /// Whether this puts the machine under the floor.
+    pub fn trips_the_floor(&self) -> bool {
+        !self.files.is_empty() || self.unlistable_family.is_some()
+    }
+
+    /// What tripped the floor, as a clause naming each file with its home
+    /// (`this machine holds the machine secret mcp_auth_secret in
+    /// /Users/dev/.cairn`), or `None` when nothing did.
+    pub fn describe(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        let mut homes: Vec<&Path> = Vec::new();
+        for (home, _) in &self.files {
+            if !homes.iter().any(|seen| same_path(seen, home)) {
+                homes.push(home);
+            }
+        }
+        let by_home: Vec<String> = homes
+            .iter()
+            .map(|home| {
+                let files: Vec<&str> = self
+                    .files
+                    .iter()
+                    .filter(|(seen, _)| same_path(seen, home))
+                    .map(|(_, file)| credential_label(file))
+                    .collect();
+                format!("{} in {}", files.join(" and "), home.display())
+            })
+            .collect();
+        if !by_home.is_empty() {
+            parts.push(format!("this machine holds {}", by_home.join("; ")));
+        }
+        if let Some(os_home) = &self.unlistable_family {
+            parts.push(format!(
+                "the Cairn homes in {} could not be listed, which the floor reads as holding a credential",
+                os_home.display()
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+}
+
+fn credential_label(file: &str) -> &'static str {
+    if file == OPERATOR_SECRET_FILE {
+        "the operator credential operator_auth_secret"
+    } else {
+        "the machine secret mcp_auth_secret"
     }
 }
 
@@ -1105,6 +1191,57 @@ mod tests {
         }
     }
 
+    /// The floor's yes says which file in which home: a dormant runner's
+    /// machine secret is not an operator credential, and the operator who
+    /// can remove it has to be told where it is.
+    #[test]
+    fn held_credentials_name_each_file_with_its_home() {
+        let os_home = tempfile::tempdir().unwrap();
+        let floor = floor_at(os_home.path());
+        assert_eq!(floor.held_credentials().describe(), None);
+
+        let dormant = os_home.path().join(".cairn");
+        std::fs::create_dir_all(&dormant).unwrap();
+        std::fs::write(dormant.join(MCP_SECRET_FILE), [0u8; 32]).unwrap();
+        let dormant = dormant.canonicalize().unwrap();
+        assert_eq!(
+            floor.held_credentials().describe().unwrap(),
+            format!(
+                "this machine holds the machine secret mcp_auth_secret in {}",
+                dormant.display()
+            )
+        );
+
+        std::fs::write(dormant.join(OPERATOR_SECRET_FILE), [0u8; 32]).unwrap();
+        let exec = os_home.path().join(".cairn-exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        std::fs::write(exec.join(MCP_SECRET_FILE), [0u8; 32]).unwrap();
+        // Named as well as listed: still one entry per file.
+        let floor =
+            OperatorCredentialFloor::discovered(Some(os_home.path().into()), [exec.clone()]);
+        let described = floor.held_credentials().describe().unwrap();
+        let exec = exec.canonicalize().unwrap();
+        assert!(
+            described.contains(&format!(
+                "the operator credential operator_auth_secret and the machine secret mcp_auth_secret in {}",
+                dormant.display()
+            )),
+            "{described}"
+        );
+        assert!(
+            described.contains(&format!(
+                "the machine secret mcp_auth_secret in {}",
+                exec.display()
+            )),
+            "{described}"
+        );
+        assert_eq!(
+            described.matches("mcp_auth_secret").count(),
+            2,
+            "{described}"
+        );
+    }
+
     #[test]
     fn a_denial_is_classified_by_the_path_a_tool_names() {
         let os_home = tempfile::tempdir().unwrap();
@@ -1250,6 +1387,7 @@ mod tests {
         let unknown = OperatorCredentialFloor::discovered(Some(os_home.path().into()), []);
         let (known_holds, unknown_holds) =
             (known.holds_a_credential(), unknown.holds_a_credential());
+        let unknown_described = unknown.held_credentials().describe();
         std::fs::set_permissions(os_home.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(known_holds, "the known own credential exists");
@@ -1261,6 +1399,12 @@ mod tests {
             // Root can list anything; elsewhere the listing failure itself
             // must fail closed even with no home named.
             assert!(unknown_holds, "an unlistable home fails closed");
+            let described = unknown_described.unwrap();
+            assert!(
+                described
+                    .contains("could not be listed, which the floor reads as holding a credential"),
+                "{described}"
+            );
         }
     }
 

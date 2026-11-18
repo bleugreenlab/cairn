@@ -14,6 +14,7 @@
 //! profile's bytes. Any of them moving re-probes, and an input that could not
 //! be read means no reuse at all.
 
+use crate::operator_credential::HeldCredentials;
 use crate::{
     Confinement, LaneNestedSandboxRecord, NestedSandboxWriteProbe, OperatorCredentialFloor,
 };
@@ -36,6 +37,9 @@ struct LaneContext {
     /// The credential floor's rules when the lane's outer profile carries them.
     credential_floor_rules: Option<String>,
     outer_profile: Option<String>,
+    /// The credential files that put this machine under the floor, so a
+    /// refusal names the file an operator would remove.
+    held_credentials: HeldCredentials,
     /// Whether every input above was read rather than assumed.
     fully_read: bool,
 }
@@ -55,17 +59,25 @@ impl LaneContext {
             confinement,
             credential_floor_rules,
             outer_profile,
+            held_credentials: floor.held_credentials(),
             fully_read: launcher != SandboxLauncherClass::Unknown && floor.family_is_listable(),
         }
     }
 
+    /// The held credentials are part of it because the refusal names them: a
+    /// secret removed or added leaves the rules' bytes unchanged, and reusing
+    /// the old measurement would keep naming a file that is gone.
     fn fingerprint(&self) -> Option<String> {
         self.fully_read.then(|| {
             sha256(&format!(
-                "launcher={:?}\u{1f}floor={}\u{1e}outer={}",
+                "launcher={:?}\u{1f}floor={}\u{1e}outer={}\u{1e}held={}",
                 self.launcher,
                 self.credential_floor_rules.as_deref().unwrap_or("none"),
                 self.outer_profile.as_deref().unwrap_or("none"),
+                self.held_credentials
+                    .describe()
+                    .as_deref()
+                    .unwrap_or("none"),
             ))
         })
     }
@@ -81,8 +93,11 @@ impl LaneContext {
                 probe.detail
             )
         } else if self.credential_floor_rules.is_some() {
+            let why = self.held_credentials.describe().unwrap_or_else(|| {
+                "no Cairn home here holds a credential file, so it is carried for privileged rebuild state alone".to_string()
+            });
             format!(
-                "{KERNEL_RULE} (check-lane commands carry the non-relaxable operator credential floor, including privileged rebuild state even before credentials exist); {}",
+                "{KERNEL_RULE} (check-lane commands carry the non-relaxable operator credential floor, which also covers privileged rebuild state; {why}); {}",
                 probe.detail
             )
         } else if self.outer_profile.is_some() {
@@ -229,6 +244,7 @@ mod tests {
             },
             credential_floor_rules: outer.map(|_| "(deny file-read-data ...)".to_string()),
             outer_profile: outer.map(str::to_string),
+            held_credentials: HeldCredentials::default(),
             fully_read: launcher != SandboxLauncherClass::Unknown,
         }
     }
@@ -342,6 +358,9 @@ mod tests {
         assert!(evidence
             .nested_sandbox_write_detail
             .contains("operator credential floor"));
+        assert!(evidence
+            .nested_sandbox_write_detail
+            .contains("no Cairn home here holds a credential file"));
         let recorded = evidence.nested_sandbox_write_context.unwrap();
         assert_eq!(
             recorded.outer_profile_sha256.as_deref(),
@@ -354,6 +373,38 @@ mod tests {
         assert!(evidence
             .nested_sandbox_write_detail
             .contains("this executor itself runs under an inherited Seatbelt profile"));
+    }
+
+    /// A refusal names the credential file that tripped the floor and its
+    /// home, and a change in which files are held is a new context.
+    #[test]
+    fn a_floor_refusal_names_the_credential_file_and_its_home() {
+        let os_home = tempfile::tempdir().unwrap();
+        let home = os_home.path().join(".cairn");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(cairn_common::auth::MCP_SECRET_FILE), [0u8; 32]).unwrap();
+        let floor = OperatorCredentialFloor::new(Some(os_home.path().into()), []);
+        let mut floored = context(SandboxLauncherClass::Unconfined, Some("(version 1) floor"));
+        floored.held_credentials = floor.held_credentials();
+        let (last, probes) = (Mutex::new(None), Cell::new(0));
+        let evidence = measure(&floored, &last, &probes, refused());
+        let expected = format!(
+            "this machine holds the machine secret mcp_auth_secret in {}",
+            home.canonicalize().unwrap().display()
+        );
+        assert!(
+            evidence.nested_sandbox_write_detail.contains(&expected),
+            "{}",
+            evidence.nested_sandbox_write_detail
+        );
+
+        std::fs::remove_file(home.join(cairn_common::auth::MCP_SECRET_FILE)).unwrap();
+        floored.held_credentials = floor.held_credentials();
+        let evidence = measure(&floored, &last, &probes, refused());
+        assert_eq!(probes.get(), 2, "a removed secret must re-probe");
+        assert!(!evidence
+            .nested_sandbox_write_detail
+            .contains("mcp_auth_secret"));
     }
 
     #[test]
@@ -389,6 +440,7 @@ mod tests {
             confinement: Confinement::CredentialFloor,
             credential_floor_rules: Some(rules),
             outer_profile: Confinement::CredentialFloor.seatbelt_profile(),
+            held_credentials: floor.held_credentials(),
             fully_read: true,
         };
         assert!(lane.outer_profile.is_some());
