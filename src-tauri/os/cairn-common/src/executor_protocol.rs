@@ -7136,6 +7136,12 @@ pub struct LearnedResourceEstimate {
 /// sends or reads one, so a runner talking to an older executor gets nothing
 /// wrong, and a journal row written before this decodes with a zero count.
 ///
+/// cairn/5860 does not move the number. An executor now drops a resident
+/// process's supervision handle before it sends that process's exited state,
+/// not after. The handle is the executor's own bookkeeping and never crosses
+/// the wire; the event, its fields and its order against the process's output
+/// are unchanged, so a runner talking to an older executor gets nothing wrong.
+///
 /// cairn/6262 does not move the number. The runner lowers a platform's
 /// learned largest process once enough completions built from nothing on
 /// newer source report less, reading facts every result already carries
