@@ -3042,6 +3042,7 @@ async fn a_class_suites_build_jobs_never_price_an_ad_hoc_compile() {
             &census,
             resource_profiles::CompletionKind::Succeeded,
             resource_profiles::MachineAdmission::default(),
+            resource_profiles::CompletedSource::default(),
         )
         .await;
     }
@@ -3122,6 +3123,7 @@ async fn a_class_suites_build_jobs_never_price_an_ad_hoc_compile() {
             ..resource_profiles::oom_killed_for_test(3 * GIB, None, 0, 2)
         },
         resource_profiles::CompletionKind::Succeeded,
+        resource_profiles::CompletedSource::default(),
     )
     .await;
     let measured = resolve(ProcessBatchItem {
@@ -8166,6 +8168,7 @@ async fn process_fit_fleet(
         },
         resource_profiles::CompletionKind::Succeeded,
         resource_profiles::MachineAdmission::default(),
+        resource_profiles::CompletedSource::default(),
     )
     .await;
     request.command_resource_identity = Some(identity);
@@ -8774,6 +8777,7 @@ async fn a_cold_compile_is_offered_the_small_machine_last_on_the_class_prior() {
                 },
                 resource_profiles::CompletionKind::Failed,
                 resource_profiles::MachineAdmission::default(),
+                resource_profiles::CompletedSource::default(),
             )
             .await;
         }
@@ -8895,6 +8899,7 @@ async fn a_cold_compile_is_offered_the_small_machine_last_on_the_class_prior() {
         },
         resource_profiles::CompletionKind::Failed,
         resource_profiles::MachineAdmission::default(),
+        resource_profiles::CompletedSource::default(),
     )
     .await;
     request.command_resource_identity = None;
@@ -9011,6 +9016,7 @@ async fn the_only_macos_machine_is_offered_a_suite_its_unnamed_peak_would_have_r
         },
         resource_profiles::CompletionKind::Succeeded,
         resource_profiles::MachineAdmission::default(),
+        resource_profiles::CompletedSource::default(),
     )
     .await;
     request.command_resource_identity = Some(identity);

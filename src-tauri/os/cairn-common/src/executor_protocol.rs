@@ -7136,6 +7136,17 @@ pub struct LearnedResourceEstimate {
 /// sends or reads one, so a runner talking to an older executor gets nothing
 /// wrong, and a journal row written before this decodes with a zero count.
 ///
+/// cairn/6262 does not move the number. The runner lowers a platform's
+/// learned largest process once enough completions built from nothing on
+/// newer source report less, reading facts every result already carries
+/// ([`CellExecutionMeta::warmth`], [`CellExecutionMeta::cell_origin`],
+/// [`CellExecutionMeta::build_job_processes`],
+/// [`CellExecutionMeta::test_phase`]) and dating the request's own
+/// `base_commit` from its own store. Nothing crosses the boundary that did
+/// not before; an older executor that states no warmth or origin builds
+/// nothing from nothing in the runner's eyes, so its results can raise a
+/// figure and never lower one.
+///
 /// cairn/7322 does not move the number. A check request becomes one durable
 /// runner-side row (`check_requests`) that the runner files, re-drives and
 /// adopts across its own restarts, and the fleet's coalesced-publication

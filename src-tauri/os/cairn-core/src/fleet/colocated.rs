@@ -937,6 +937,7 @@ impl Fleet {
                 true => resource_profiles::CompletionKind::Succeeded,
                 false => resource_profiles::CompletionKind::Failed,
             },
+            resource_profiles::CompletedSource::default(),
         )
         .await;
     }

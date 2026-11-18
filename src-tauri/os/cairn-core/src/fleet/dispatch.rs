@@ -245,6 +245,11 @@ pub(super) struct PreparedExecution {
     /// machine's paths. See [`cell_build_service_env`].
     pub(super) cell_client_env: Vec<(String, String)>,
     pub(super) placement_policy: ActivePlacementPolicy,
+    /// The runner's own store for the project, which dates the commit the
+    /// work ran for the learned largest process
+    /// ([`resource_profiles::source_committed_at`]). `None` for scratch work,
+    /// which runs no project source.
+    pub(super) source_store: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -3346,6 +3351,7 @@ impl Fleet {
                 },
                 object_plane: orch.object_plane.clone(),
                 db: orch.db.local.clone(),
+                source_store: None,
             });
         }
         let (local_repo_path, project_key) =
@@ -3404,6 +3410,10 @@ impl Fleet {
             },
             object_plane: orch.object_plane.clone(),
             db: orch.db.local.clone(),
+            source_store: Some(crate::jj::project_store_dir(
+                &orch.config_dir,
+                Path::new(project_path),
+            )),
         })
     }
 
@@ -3556,6 +3566,7 @@ impl Fleet {
             db,
             cell_client_env,
             placement_policy,
+            source_store,
         } = prepared;
         let mut request = request;
         if let Err(diagnostic) = require_colocated_population(&mut request, &executor_config) {
@@ -4052,6 +4063,16 @@ impl Fleet {
             ..
         } = &outcome
         {
+            // Dated once for every item: a batch runs one commit.
+            let committed_at_unix_ms = Box::pin(resource_profiles::source_committed_at(
+                source_store.as_deref(),
+                &admission_request.base_commit,
+            ))
+            .await;
+            let source = |began_on_the_cell| resource_profiles::CompletedSource {
+                committed_at_unix_ms,
+                began_on_the_cell,
+            };
             // The batch's shape decides, not whether its items carry
             // identities: an agent's batch has none, and its items' outcomes
             // (their own stops included) live only in the serialized output.
@@ -4092,6 +4113,7 @@ impl Fleet {
                     metadata,
                     kind,
                     self.machine_admission(&selected.executor_id, 0),
+                    source(true),
                 )
                 .await;
                 resource_profiles::observe_completed(
@@ -4100,6 +4122,7 @@ impl Fleet {
                     &profile_context,
                     metadata,
                     kind,
+                    source(true),
                 )
                 .await;
             } else if let Ok(items) = serde_json::from_str::<
@@ -4140,6 +4163,10 @@ impl Fleet {
                         0
                     },
                 );
+                // Only the first item of a batch that runs its items in turn
+                // began on the cell its warmth describes; any other began on
+                // what the items before or beside it built.
+                let began_on_the_cell = |index: usize| index == 0 && !batch_items_share_the_machine;
                 for (index, item) in items.iter().enumerate() {
                     if item.suspended {
                         continue;
@@ -4155,12 +4182,15 @@ impl Fleet {
                             &item.body,
                         ),
                         machine,
+                        source(began_on_the_cell(index)),
                     )
                     .await;
                 }
                 // Index-aligned with the items, so each item teaches only its
                 // own identity; an item with none teaches only its suite.
-                for (identity, item) in batch_profile_identities.iter().zip(items) {
+                for (index, (identity, item)) in
+                    batch_profile_identities.iter().zip(items).enumerate()
+                {
                     let Some(identity) = identity else {
                         continue;
                     };
@@ -4203,6 +4233,7 @@ impl Fleet {
                         &profile_context,
                         &item_meta,
                         kind,
+                        source(began_on_the_cell(index)),
                     )
                     .await;
                 }

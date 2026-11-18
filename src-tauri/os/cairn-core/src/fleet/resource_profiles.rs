@@ -3,13 +3,13 @@ use super::{ResourceReservation, ResourceReservationSource};
 use crate::storage::LocalDb;
 use cairn_common::executor_protocol::{
     BuildJobMemoryEvidence, BuildJobProcesses, BuildJobsPrice, CellCommandClass, CellExecutionMeta,
-    CommandResourceIdentity, CommandStop, ContentionEstimate, ContentionEvidence,
-    ContentionFallback, CrowdedKills, DurationEstimate, DurationEvidence, DurationFallback,
-    ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, JobWidthEvidence,
-    MeasurementQuality, MemoryCeiling, MemoryKill, MemoryKillCause, MemoryKillEvent,
-    ProcessDemandBasis, ReservationFallback, ReservationRationale, TestPhaseEvidence,
-    TestPhaseMeasurement, DURATION_PROFILE_STALE_AFTER_MS, DURATION_SAMPLE_WINDOW,
-    MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
+    CellProvenance, CellSeed, CommandResourceIdentity, CommandStop, ContentionEstimate,
+    ContentionEvidence, ContentionFallback, CrowdedKills, DurationEstimate, DurationEvidence,
+    DurationFallback, ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities,
+    JobWidthEvidence, MeasurementQuality, MemoryCeiling, MemoryKill, MemoryKillCause,
+    MemoryKillEvent, ProcessDemandBasis, ReservationFallback, ReservationRationale,
+    TestPhaseEvidence, TestPhaseMeasurement, DURATION_PROFILE_STALE_AFTER_MS,
+    DURATION_SAMPLE_WINDOW, MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
     MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_db::turso::params;
@@ -911,6 +911,11 @@ pub(super) fn ad_hoc_identity(
 /// What marks a suite keyed by command class rather than by a check's name.
 const CLASS_SUITE_PREFIX: &str = "class:";
 
+/// Whether `suite_key` names a command class rather than a configured check.
+fn is_class_suite(suite_key: &str) -> bool {
+    suite_display(suite_key).starts_with(CLASS_SUITE_PREFIX)
+}
+
 /// A suite key as a reader names it: without its project.
 fn suite_display(suite_key: &str) -> String {
     suite_key
@@ -975,8 +980,7 @@ pub(super) async fn resolve_process_demand(
         ),
         None => None,
     };
-    let class_suite =
-        suite_key.is_some_and(|key| suite_display(key).starts_with(CLASS_SUITE_PREFIX));
+    let class_suite = suite_key.is_some_and(is_class_suite);
     let measured_nowhere = own.is_empty() && own_elsewhere.is_none();
     let suite_applies = !class_suite || measured_nowhere;
     let kills_here = suite.as_ref().and_then(|suite| suite.kills_here.clone());
@@ -1496,13 +1500,17 @@ pub(super) fn same_machine_total(killed_at_total: u64, total_bytes: u64) -> bool
 ///
 /// Every completion with a suite teaches this, measured identity or not: an
 /// agent's batch carries no command identity, and its suite is the only
-/// place its evidence can live. The peak is rise-only, with no decay: warm
-/// runs say nothing about the cold compile, and one process's working set
-/// depends on the code, not on how busy the machine was. The kills are not: a
+/// place its evidence can live. The peak does not decay: warm runs say
+/// nothing about the cold compile, and one process's working set depends on
+/// the code, not on how busy the machine was. It falls only when the code
+/// did, as runs built from nothing on newer `source` show
+/// ([`PEAK_SUPERSEDED_AFTER`]); a class suite's never falls, since its runs
+/// are whichever commands of the class happened to run. The kills are not: a
 /// successful run of the suite here is the machine's later answer that it can
 /// hold it, and clears them. Compile-class work must also measure enough job
 /// processes to represent its width-dependent demand; a warm no-op cannot
 /// release its kill policy.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn observe_suite(
     db: Arc<LocalDb>,
     suite_key: Option<&str>,
@@ -1511,11 +1519,13 @@ pub(super) async fn observe_suite(
     metadata: &CellExecutionMeta,
     kind: CompletionKind,
     machine: MachineAdmission,
+    source: CompletedSource,
 ) {
     let Some(suite_key) = suite_key else { return };
     if kind == CompletionKind::SelectedNothing {
         return;
     }
+    let peak_source = PeakSource::of(metadata, kind, source);
     let mut peak = metadata
         .peak_process
         .as_ref()
@@ -1571,6 +1581,7 @@ pub(super) async fn observe_suite(
             .build_job_processes
             .filter(BuildJobProcesses::speaks_for_a_typical_job),
         width_sample(metadata),
+        peak_source,
     )
     .await;
 }
@@ -1704,6 +1715,9 @@ pub(super) async fn observe_suite_kill(
         None,
         None,
         None,
+        // A resident's kill dates no source and built nothing: its victim
+        // can raise the suite's figure and never lower it.
+        PeakSource::default(),
     )
     .await;
 }
@@ -1723,7 +1737,8 @@ const RESIDENT_KILL_IDENTITY_KEPT_MS: u64 = 2 * RESIDENT_KILL_LEARNING_HORIZON_M
 /// test phase raises the row's test-phase peak and per-test figure, and a
 /// build-job census its largest and typical job and its sample count, each
 /// figure independently and never lowering one: a warm run that rebuilt
-/// smaller crates says nothing about the cold compile's jobs.
+/// smaller crates says nothing about the cold compile's jobs. The largest
+/// process rises here too, and falls only through [`fold_process_peak`].
 #[allow(clippy::too_many_arguments)]
 async fn record_suite_evidence(
     db: Arc<LocalDb>,
@@ -1736,6 +1751,7 @@ async fn record_suite_evidence(
     test_phase: Option<TestPhaseMeasurement>,
     build_jobs: Option<BuildJobProcesses>,
     width: Option<WidthSample>,
+    peak_source: PeakSource,
 ) -> Result<(), String> {
     let _written = Writing::teaching(&db, super::profile_reads::suite_scopes(suite_key));
     if peak.is_none()
@@ -1890,11 +1906,447 @@ async fn record_suite_evidence(
                 .collect::<cairn_db::turso::Result<Vec<_>>>()?,
             )
             .await?;
+            if let Some((bytes, name)) = peak.filter(|_| !is_class_suite(&suite_key)) {
+                fold_process_peak(
+                    conn,
+                    PeakRows::Suite(&suite_key),
+                    &context,
+                    &peak_source.reading(bytes, name),
+                )
+                .await?;
+            }
             Ok(())
         })
     })
     .await
     .map_err(|error| error.to_string())
+}
+
+/// How many completions built from nothing must each report a smaller
+/// largest process than a platform's standing figure, on source newer than
+/// that figure was measured on, before the largest of what they reported
+/// replaces it (cairn/6262).
+///
+/// Five, from the fleet's own numbers. Machines of one platform agree on a
+/// cold compile's largest rustc to within about 3% (the cairn rust-tests
+/// suite read 28.0 to 29.0 GiB across four Linux machines on 2026-11-17), so
+/// the largest of five is the code's figure rather than one run's luck. The
+/// heaviest suite completes from nothing about twice a day on its busiest
+/// platform (19 such rust-tests runs on linux x86_64 in ten days), so a
+/// genuine shrink is believed within about three days.
+pub(super) const PEAK_SUPERSEDED_AFTER: u32 = 5;
+
+/// What the runner knows about the source a completion ran, for the
+/// supersession rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct CompletedSource {
+    /// The committer time of the commit the work ran, in milliseconds, read
+    /// from the runner's own store ([`source_committed_at`]). `None` where it
+    /// could not be dated, and an undated completion lowers nothing.
+    pub committed_at_unix_ms: Option<u64>,
+    /// Whether the command began on the cell its warmth describes. A batch
+    /// item after the first, or one running beside other items, began on
+    /// whatever they built, though it carries the batch's warmth.
+    pub began_on_the_cell: bool,
+}
+
+/// What one completion's largest process can say about the source it ran.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PeakSource {
+    tree_committed_at_unix_ms: Option<u64>,
+    built_from_nothing: bool,
+}
+
+impl PeakSource {
+    fn of(metadata: &CellExecutionMeta, kind: CompletionKind, source: CompletedSource) -> Self {
+        Self {
+            tree_committed_at_unix_ms: source.committed_at_unix_ms,
+            built_from_nothing: source.began_on_the_cell && built_from_nothing(metadata, kind),
+        }
+    }
+
+    fn reading(self, bytes: u64, name: Option<String>) -> PeakReading {
+        PeakReading {
+            bytes,
+            name,
+            tree_committed_at_unix_ms: self.tree_committed_at_unix_ms,
+            built_from_nothing: self.built_from_nothing,
+        }
+    }
+}
+
+/// Whether a completion compiled its whole work from nothing, so that its
+/// largest process is the largest its source holds: the executor says no
+/// retained cell had done this work class, the cell was not cloned from a
+/// sibling's build products, the compile ran to its end (the run succeeded,
+/// or its tests started), and it ran enough build jobs to be the work rather
+/// than a fragment of it, the bar a clean run clears to release kills.
+fn built_from_nothing(metadata: &CellExecutionMeta, kind: CompletionKind) -> bool {
+    let unprepared = matches!(
+        metadata.warmth,
+        Some(ExecutionWarmth::Cold | ExecutionWarmth::RepositoryOnly)
+    );
+    let cloned = matches!(
+        metadata
+            .cell_origin
+            .as_ref()
+            .map(|origin| &origin.provenance),
+        Some(CellProvenance::Seeded {
+            seed: CellSeed::Clone { .. }
+        })
+    );
+    let compiled_through = kind == CompletionKind::Succeeded || metadata.test_phase.is_some();
+    unprepared
+        && !cloned
+        && compiled_through
+        && metadata
+            .build_job_processes
+            .is_some_and(|jobs| jobs.speaks_for_a_typical_job())
+}
+
+/// One completion's largest process, as the supersession rule reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeakReading {
+    bytes: u64,
+    name: Option<String>,
+    tree_committed_at_unix_ms: Option<u64>,
+    built_from_nothing: bool,
+}
+
+/// A platform's largest process and its streak toward being superseded, read
+/// across the platform's rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PlatformPeak {
+    standing: Option<u64>,
+    /// The newest source the standing figure was measured on; `None` where
+    /// nothing that raised it was dated.
+    standing_tree_at: Option<u64>,
+    /// Completions built from nothing on newer source that reported less.
+    from_nothing: u32,
+    /// The largest process any completion on newer source reported since the
+    /// streak began, built from nothing or not.
+    lower: Option<(u64, Option<String>)>,
+    lower_tree_at: Option<u64>,
+}
+
+/// What one reading does to its platform's figure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeakStep {
+    /// It is the platform's largest: the streak starts over from its source.
+    Raised,
+    /// Smaller, on newer source: folded into the streak, counted toward
+    /// supersession only when built from nothing.
+    Lower { counts: bool },
+    /// It completed the streak: the platform's figure is now `bytes`, as of
+    /// the newest source the streak saw.
+    Superseded {
+        bytes: u64,
+        name: Option<String>,
+        tree_at: u64,
+    },
+    /// Smaller, on source no newer than the figure's, or undated: it says
+    /// nothing about whether the code shrank.
+    Unrelated,
+}
+
+impl PlatformPeak {
+    fn fold_row(
+        &mut self,
+        standing: Option<u64>,
+        standing_tree_at: Option<u64>,
+        from_nothing: u32,
+        lower: Option<(u64, Option<String>)>,
+        lower_tree_at: Option<u64>,
+    ) {
+        self.standing = self.standing.max(standing);
+        self.standing_tree_at = self.standing_tree_at.max(standing_tree_at);
+        self.from_nothing = self.from_nothing.saturating_add(from_nothing);
+        if let Some((bytes, name)) = lower {
+            if self.lower.as_ref().is_none_or(|(held, _)| bytes > *held) {
+                self.lower = Some((bytes, name));
+            }
+        }
+        self.lower_tree_at = self.lower_tree_at.max(lower_tree_at);
+    }
+
+    /// A reading at least the standing figure raises it, as it always has.
+    /// A smaller one speaks only for source newer than the figure's: an older
+    /// tree may simply predate whatever grew. A run built from nothing on
+    /// newer source counts; a warm one there can still raise the figure the
+    /// streak would settle on, since it may have rebuilt the largest unit,
+    /// but its silence about the units it did not rebuild proves nothing.
+    fn step(&self, reading: &PeakReading) -> PeakStep {
+        if self
+            .standing
+            .is_none_or(|standing| reading.bytes >= standing)
+        {
+            return PeakStep::Raised;
+        }
+        let Some(tree_at) = reading.tree_committed_at_unix_ms else {
+            return PeakStep::Unrelated;
+        };
+        if self
+            .standing_tree_at
+            .is_some_and(|standing| tree_at <= standing)
+        {
+            return PeakStep::Unrelated;
+        }
+        let counted = self.from_nothing + u32::from(reading.built_from_nothing);
+        if !reading.built_from_nothing || counted < PEAK_SUPERSEDED_AFTER {
+            return PeakStep::Lower {
+                counts: reading.built_from_nothing,
+            };
+        }
+        let (bytes, name) = match &self.lower {
+            Some((held, name)) if *held > reading.bytes => (*held, name.clone()),
+            _ => (reading.bytes, reading.name.clone()),
+        };
+        PeakStep::Superseded {
+            bytes,
+            name,
+            tree_at: self.lower_tree_at.map_or(tree_at, |at| at.max(tree_at)),
+        }
+    }
+}
+
+/// The rows one largest-process figure is kept in: a suite's, or a command
+/// identity's.
+#[derive(Clone, Copy)]
+enum PeakRows<'a> {
+    Suite(&'a str),
+    Identity(&'a CommandResourceIdentity),
+}
+
+impl PeakRows<'_> {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Suite(_) => "suite_memory_evidence",
+            Self::Identity(_) => "command_resource_profiles",
+        }
+    }
+
+    /// The predicate naming the platform's rows, and its parameters.
+    fn platform(self, context: &ProfileContext) -> (&'static str, Vec<cairn_db::turso::Value>) {
+        use cairn_db::turso::Value;
+        let platform = [
+            Value::Text(context.os.clone()),
+            Value::Text(context.arch.clone()),
+        ];
+        match self {
+            Self::Suite(key) => (
+                "suite_key=?1 AND os=?2 AND arch=?3",
+                [Value::Text(key.to_string())]
+                    .into_iter()
+                    .chain(platform)
+                    .collect(),
+            ),
+            Self::Identity(identity) => (
+                "command_identity=?1 AND os=?2 AND arch=?3 AND identity_version=?4",
+                [Value::Text(identity.key.clone())]
+                    .into_iter()
+                    .chain(platform)
+                    .chain([Value::Integer(i64::from(identity.version))])
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The predicate naming this machine context's row, and its parameters.
+    fn here(self, context: &ProfileContext) -> (String, Vec<cairn_db::turso::Value>) {
+        use cairn_db::turso::Value;
+        let (platform, mut values) = self.platform(context);
+        let next = values.len() + 1;
+        values.push(Value::Text(context.executor_class.clone()));
+        let here = match self {
+            Self::Suite(_) => format!("{platform} AND executor_class=?{next}"),
+            Self::Identity(_) => {
+                values.push(Value::Text(context.toolchain_fingerprint.clone()));
+                format!(
+                    "{platform} AND executor_class=?{next} AND toolchain_fingerprint=?{}",
+                    next + 1
+                )
+            }
+        };
+        (here, values)
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Self::Suite(key) => format!("suite {}", suite_display(key)),
+            Self::Identity(identity) => format!("command {}", identity.key),
+        }
+    }
+}
+
+/// Fold one completion's largest process into its platform's streak, in the
+/// write that already recorded it on this machine context's row (so a raise
+/// is already there), and supersede the platform's figure when the streak
+/// is complete: every row of the platform above the new figure is lowered to
+/// it, and every row's streak starts over.
+async fn fold_process_peak(
+    conn: &crate::storage::TrackedConnection,
+    rows: PeakRows<'_>,
+    context: &ProfileContext,
+    reading: &PeakReading,
+) -> crate::storage::DbResult<PeakStep> {
+    use cairn_db::turso::Value;
+    let table = rows.table();
+    let (platform, platform_values) = rows.platform(context);
+    let mut held = PlatformPeak::default();
+    {
+        let mut found = conn
+            .query(
+                format!(
+                    "SELECT upper_process_peak_bytes, peak_tree_committed_at_unix_ms,
+                            lower_from_nothing, lower_process_peak_bytes,
+                            lower_process_peak_name, lower_tree_committed_at_unix_ms
+                     FROM {table} WHERE {platform}"
+                ),
+                platform_values.clone(),
+            )
+            .await?;
+        let unsigned = |value: Option<i64>| value.map(|value| value.max(0) as u64);
+        while let Some(row) = found.next().await? {
+            held.fold_row(
+                unsigned(row.get::<Option<i64>>(0)?),
+                unsigned(row.get::<Option<i64>>(1)?),
+                u32::try_from(row.get::<i64>(2)?.max(0)).unwrap_or(u32::MAX),
+                unsigned(row.get::<Option<i64>>(3)?)
+                    .map(|bytes| (bytes, row.get::<Option<String>>(4).ok().flatten())),
+                unsigned(row.get::<Option<i64>>(5)?),
+            );
+        }
+    }
+    let step = held.step(reading);
+    let (here, here_values) = rows.here(context);
+    let at = |values: &Vec<Value>, offset: usize| values.len() + offset;
+    let restart = format!(
+        "UPDATE {table} SET lower_from_nothing = 0, lower_process_peak_bytes = NULL,
+             lower_process_peak_name = NULL, lower_tree_committed_at_unix_ms = NULL
+         WHERE {platform} AND (lower_from_nothing > 0 OR lower_process_peak_bytes IS NOT NULL)"
+    );
+    let stand_on = |tree_at: u64| {
+        let mut values = here_values.clone();
+        let sql = format!(
+            "UPDATE {table} SET peak_tree_committed_at_unix_ms =
+                 MAX(COALESCE(peak_tree_committed_at_unix_ms, 0), ?{})
+             WHERE {here}",
+            at(&values, 1)
+        );
+        values.push(Value::Integer(tree_at as i64));
+        (sql, values)
+    };
+    match &step {
+        PeakStep::Raised => {
+            conn.execute(restart.as_str(), platform_values.clone())
+                .await?;
+            if let Some(tree_at) = reading.tree_committed_at_unix_ms {
+                let (sql, values) = stand_on(tree_at);
+                conn.execute(sql.as_str(), values).await?;
+            }
+        }
+        PeakStep::Lower { counts } => {
+            let mut values = here_values.clone();
+            let (counted, bytes, name, tree) = (
+                at(&values, 1),
+                at(&values, 2),
+                at(&values, 3),
+                at(&values, 4),
+            );
+            let sql = format!(
+                "UPDATE {table} SET
+                     lower_from_nothing = lower_from_nothing + ?{counted},
+                     lower_process_peak_name = CASE
+                         WHEN lower_process_peak_bytes IS NULL OR ?{bytes} > lower_process_peak_bytes
+                         THEN ?{name} ELSE lower_process_peak_name END,
+                     lower_process_peak_bytes = MAX(COALESCE(lower_process_peak_bytes, 0), ?{bytes}),
+                     lower_tree_committed_at_unix_ms =
+                         MAX(COALESCE(lower_tree_committed_at_unix_ms, 0), ?{tree})
+                 WHERE {here}"
+            );
+            values.extend([
+                Value::Integer(i64::from(*counts)),
+                Value::Integer(reading.bytes as i64),
+                reading.name.clone().map_or(Value::Null, Value::Text),
+                Value::Integer(reading.tree_committed_at_unix_ms.unwrap_or(0) as i64),
+            ]);
+            conn.execute(sql.as_str(), values).await?;
+        }
+        PeakStep::Superseded {
+            bytes,
+            name,
+            tree_at,
+        } => {
+            let mut values = platform_values.clone();
+            let (to, named) = (at(&values, 1), at(&values, 2));
+            // A smaller figure keeps the standing one's name when its own
+            // runs named none: an unnamed peak reads as a tree's total, and
+            // a supersession must not turn a refusal into a mere price.
+            let sql = format!(
+                "UPDATE {table} SET upper_process_peak_bytes = ?{to},
+                     process_peak_name = COALESCE(?{named}, process_peak_name)
+                 WHERE {platform} AND upper_process_peak_bytes > ?{to}"
+            );
+            values.extend([
+                Value::Integer(*bytes as i64),
+                name.clone().map_or(Value::Null, Value::Text),
+            ]);
+            conn.execute(sql.as_str(), values).await?;
+            conn.execute(restart.as_str(), platform_values.clone())
+                .await?;
+            let (sql, values) = stand_on(*tree_at);
+            conn.execute(sql.as_str(), values).await?;
+            tracing::info!(
+                scope = %rows.describe(),
+                platform = %format!("{} {}", context.os, context.arch),
+                from_bytes = held.standing.unwrap_or(0),
+                to_bytes = *bytes,
+                after = PEAK_SUPERSEDED_AFTER,
+                "largest process superseded by runs built from nothing on newer source"
+            );
+        }
+        PeakStep::Unrelated => {}
+    }
+    Ok(step)
+}
+
+/// The committer time of `commit` in the runner's store for the project, in
+/// milliseconds. A commit's time never changes, so each is read from the
+/// store once; one the store cannot resolve is not remembered, since it may
+/// arrive there later.
+pub(super) async fn source_committed_at(
+    store: Option<&std::path::Path>,
+    commit: &str,
+) -> Option<u64> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    static DATED: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Default::default);
+    const MOST_REMEMBERED: usize = 4_096;
+    let store = store?;
+    let commit = commit.trim();
+    if commit.is_empty() {
+        return None;
+    }
+    let remembered = DATED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(commit)
+        .copied();
+    if remembered.is_some() {
+        return remembered;
+    }
+    let stamp = cairn_vcs::commit_stamp(store, commit, None).await.ok()?;
+    let at = u64::try_from(stamp.committed_at)
+        .ok()?
+        .saturating_mul(1_000);
+    let mut dated = DATED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if dated.len() >= MOST_REMEMBERED {
+        dated.clear();
+    }
+    dated.insert(commit.to_string(), at);
+    Some(at)
 }
 
 /// The conservative safety prior for a work class that has never been measured
@@ -2556,6 +3008,7 @@ pub(super) async fn observe_completed(
     context: &ProfileContext,
     metadata: &CellExecutionMeta,
     kind: CompletionKind,
+    source: CompletedSource,
 ) {
     let Some(identity) = identity else { return };
     // A no-op is the most frequent lane on every machine. Recorded, each one
@@ -2633,8 +3086,10 @@ pub(super) async fn observe_completed(
         },
         // The largest single process rises and never decays: a warm run
         // says nothing about the cold compile, and nothing beside a process
-        // inflates its working set.
+        // inflates its working set. It falls only when runs built from
+        // nothing on newer source show the code shrank.
         metadata.peak_process.as_ref(),
+        PeakSource::of(metadata, kind, source),
     )
     .await;
 }
@@ -3214,6 +3669,7 @@ async fn update_profile(
         false,
         PEAK_DECAY_DIVISOR,
         None,
+        PeakSource::default(),
     )
     .await
 }
@@ -3233,6 +3689,7 @@ async fn update_profile_with(
     held: bool,
     peak_decay_divisor: u64,
     peak_process: Option<&cairn_common::executor_protocol::PeakProcess>,
+    peak_source: PeakSource,
 ) -> Result<(), String> {
     let _written = Writing::teaching(&db, vec![super::profile_reads::identity_scope(identity)]);
     let identity = identity.clone();
@@ -3257,8 +3714,17 @@ async fn update_profile_with(
                      oom_alone_machine_bytes=CASE WHEN ?11 = 1 THEN NULL ELSE command_resource_profiles.oom_alone_machine_bytes END,
                      upper_process_peak_bytes=CASE WHEN ?13 IS NULL THEN command_resource_profiles.upper_process_peak_bytes WHEN command_resource_profiles.upper_process_peak_bytes IS NULL OR ?13 >= command_resource_profiles.upper_process_peak_bytes THEN ?13 ELSE command_resource_profiles.upper_process_peak_bytes END,
                      process_peak_name=CASE WHEN ?13 IS NOT NULL AND (command_resource_profiles.upper_process_peak_bytes IS NULL OR ?13 >= command_resource_profiles.upper_process_peak_bytes) THEN COALESCE(?14, command_resource_profiles.process_peak_name) ELSE command_resource_profiles.process_peak_name END"#,
-                params![identity.version as i64, identity.key, context.executor_class, context.os, context.arch, context.toolchain_fingerprint, finished as i64, memory.map(|value| value as i64), disk.map(|value| value as i64), duration.map(|value| value as i64), held as i64, peak_decay_divisor.max(1) as i64, process_bytes, process_name],
+                params![identity.version as i64, identity.key.clone(), context.executor_class.clone(), context.os.clone(), context.arch.clone(), context.toolchain_fingerprint.clone(), finished as i64, memory.map(|value| value as i64), disk.map(|value| value as i64), duration.map(|value| value as i64), held as i64, peak_decay_divisor.max(1) as i64, process_bytes, process_name.clone()],
             ).await?;
+            if let Some(bytes) = process_bytes {
+                fold_process_peak(
+                    conn,
+                    PeakRows::Identity(&identity),
+                    &context,
+                    &peak_source.reading(bytes as u64, process_name),
+                )
+                .await?;
+            }
             Ok(())
         })
     }).await.map_err(|error| error.to_string())
@@ -3319,6 +3785,7 @@ mod process_peak_tests {
             &here,
             &completed(8 * GIB, 1),
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         record_memory_kill(
@@ -3342,6 +3809,7 @@ mod process_peak_tests {
             &completed(12 * GIB, 1),
             CompletionKind::Succeeded,
             MachineAdmission::default(),
+            CompletedSource::default(),
         )
         .await;
 
@@ -3526,6 +3994,7 @@ mod process_peak_tests {
                 &run(jobs, tree),
                 CompletionKind::Succeeded,
                 MachineAdmission::default(),
+                CompletedSource::default(),
             )
             .await;
             if jobs == 1 {
@@ -3608,6 +4077,7 @@ mod process_peak_tests {
             &pinned,
             CompletionKind::Succeeded,
             MachineAdmission::default(),
+            CompletedSource::default(),
         )
         .await;
         let evidence = resolve_process_demand(
@@ -3661,6 +4131,7 @@ mod process_peak_tests {
             },
             CompletionKind::Succeeded,
             MachineAdmission::default(),
+            CompletedSource::default(),
         )
         .await;
         let spark = ProfileContext {
@@ -3836,6 +4307,7 @@ mod process_peak_tests {
                     &meta,
                     CompletionKind::Succeeded,
                     MachineAdmission::default(),
+                    CompletedSource::default(),
                 )
                 .await;
             }
@@ -3933,6 +4405,7 @@ mod process_peak_tests {
                 &meta,
                 CompletionKind::Succeeded,
                 MachineAdmission::default(),
+                CompletedSource::default(),
             )
             .await;
             observe_completed(
@@ -3941,6 +4414,7 @@ mod process_peak_tests {
                 &fedora,
                 &meta,
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -4004,6 +4478,7 @@ mod process_peak_tests {
             &completed(10 * GIB, 1),
             CompletionKind::Succeeded,
             MachineAdmission::default(),
+            CompletedSource::default(),
         )
         .await;
         let unseen = identity("rust-tests-b");
@@ -4098,6 +4573,7 @@ mod process_peak_tests {
             &completed(9 * GIB, 1),
             CompletionKind::Succeeded,
             MachineAdmission::default(),
+            CompletedSource::default(),
         )
         .await;
         let prior = resolve(compile.clone(), CellCommandClass::CargoCheck)
@@ -4124,6 +4600,7 @@ mod process_peak_tests {
                 &spark,
                 &completed(peak, 2),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -4135,6 +4612,7 @@ mod process_peak_tests {
             &completed(10 * GIB, 2),
             CompletionKind::Succeeded,
             MachineAdmission::default(),
+            CompletedSource::default(),
         )
         .await;
         let borrowed = resolve(compile.clone(), CellCommandClass::CargoCheck)
@@ -4162,6 +4640,7 @@ mod process_peak_tests {
             &completed(8 * GIB, 3),
             CompletionKind::Succeeded,
             MachineAdmission::default(),
+            CompletedSource::default(),
         )
         .await;
         let here = resolve(compile, CellCommandClass::CargoCheck)
@@ -4189,6 +4668,7 @@ mod process_peak_tests {
             &completed(10 * GIB, 1),
             CompletionKind::Failed,
             MachineAdmission::default(),
+            CompletedSource::default(),
         )
         .await;
         let stand_in = resolve_process_demand(
@@ -4238,6 +4718,7 @@ mod process_peak_tests {
             &fedora,
             &completed(GIB, 2),
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         assert_eq!(
@@ -4325,6 +4806,7 @@ mod process_peak_tests {
             &completed(30 * GIB, 1),
             CompletionKind::Failed,
             MachineAdmission::default(),
+            CompletedSource::default(),
         )
         .await;
         let mint =
@@ -4353,6 +4835,7 @@ mod process_peak_tests {
                     &fedora,
                     &completed(peak, 2),
                     CompletionKind::Succeeded,
+                    CompletedSource::default(),
                 )
                 .await;
             }
@@ -4402,6 +4885,7 @@ mod process_peak_tests {
             &completed(30 * GIB, 1),
             CompletionKind::Succeeded,
             MachineAdmission::default(),
+            CompletedSource::default(),
         )
         .await;
         let small = ad_hoc_identity(
@@ -4418,6 +4902,7 @@ mod process_peak_tests {
             &fedora,
             &completed(2 * GIB / 5, 2),
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         let demand = resolve_process_demand(
@@ -4465,6 +4950,7 @@ mod process_peak_tests {
                 &kill(3 * GIB, total, at),
                 CompletionKind::Failed,
                 MachineAdmission::default(),
+                CompletedSource::default(),
             )
             .await;
         }
@@ -4494,6 +4980,7 @@ mod process_peak_tests {
             &kill(GIB, 2 * total, 3),
             CompletionKind::Failed,
             MachineAdmission::default(),
+            CompletedSource::default(),
         )
         .await;
         let demand = resolve_process_demand(
@@ -4556,6 +5043,7 @@ mod process_peak_tests {
                         memory_brake,
                         batch_siblings: 0,
                     },
+                    CompletedSource::default(),
                 )
                 .await
             }
@@ -4677,6 +5165,7 @@ mod process_peak_tests {
                         &meta,
                         kind,
                         MachineAdmission::default(),
+                        CompletedSource::default(),
                     )
                     .await;
                 }
@@ -4728,6 +5217,7 @@ mod process_peak_tests {
                 memory_brake: true,
                 batch_siblings: 2,
             },
+            CompletedSource::default(),
         )
         .await;
         let kills = kills_on(db, "cairn/rust-tests", &ub).await.unwrap();
@@ -4755,6 +5245,7 @@ mod process_peak_tests {
                     memory_brake,
                     batch_siblings: 0,
                 },
+                CompletedSource::default(),
             )
             .await;
         }
@@ -4796,6 +5287,7 @@ mod process_peak_tests {
                     &rustc_killed(3 * GIB, 130_000_000_000, 0, at),
                     CompletionKind::Failed,
                     MachineAdmission::default(),
+                    CompletedSource::default(),
                 )
                 .await;
             }
@@ -4844,6 +5336,7 @@ mod process_peak_tests {
                 &unnamed,
                 CompletionKind::Succeeded,
                 MachineAdmission::default(),
+                CompletedSource::default(),
             )
             .await;
             observe_completed(
@@ -4852,6 +5345,7 @@ mod process_peak_tests {
                 &host,
                 &unnamed,
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
             let evidence = resolve_process_demand(
@@ -4870,6 +5364,416 @@ mod process_peak_tests {
                 Some(host.executor_class.as_str())
             );
         }
+    }
+
+    const DAY_MS: u64 = 86_400_000;
+
+    /// A completion that compiled its whole work in a fresh cell.
+    fn from_nothing(peak: u64, at: u64) -> CellExecutionMeta {
+        CellExecutionMeta {
+            warmth: Some(ExecutionWarmth::Cold),
+            build_job_processes: Some(BuildJobProcesses {
+                processes: 40,
+                largest_bytes: peak,
+                typical_bytes: GIB,
+            }),
+            ..completed(peak, at)
+        }
+    }
+
+    fn dated(committed_at_unix_ms: u64) -> CompletedSource {
+        CompletedSource {
+            committed_at_unix_ms: Some(committed_at_unix_ms),
+            began_on_the_cell: true,
+        }
+    }
+
+    /// Teach one completion to the suite and the identity, as dispatch does.
+    async fn learn(
+        db: &Arc<LocalDb>,
+        machine: &ProfileContext,
+        id: &CommandResourceIdentity,
+        meta: &CellExecutionMeta,
+        source: CompletedSource,
+    ) {
+        let suite = suite_key("cairn", Some(id), CellCommandClass::CargoTest);
+        observe_suite(
+            db.clone(),
+            suite.as_deref(),
+            CellCommandClass::CargoTest,
+            machine,
+            meta,
+            CompletionKind::Succeeded,
+            MachineAdmission::default(),
+            source,
+        )
+        .await;
+        observe_completed(
+            db.clone(),
+            Some(id),
+            machine,
+            meta,
+            CompletionKind::Succeeded,
+            source,
+        )
+        .await;
+    }
+
+    /// The single process placement judges `id` on, on `machine`.
+    async fn judged_on(
+        db: &Arc<LocalDb>,
+        machine: &ProfileContext,
+        id: &CommandResourceIdentity,
+    ) -> u64 {
+        let suite = suite_key("cairn", Some(id), CellCommandClass::CargoTest);
+        resolve_process_demand(
+            db.clone(),
+            Some(id),
+            suite.as_deref(),
+            CellCommandClass::CargoTest,
+            machine,
+        )
+        .await
+        .demand
+        .unwrap()
+        .peak_bytes
+    }
+
+    fn reading(bytes: u64, tree_at: Option<u64>, built_from_nothing: bool) -> PeakReading {
+        PeakReading {
+            bytes,
+            name: Some("rustc".into()),
+            tree_committed_at_unix_ms: tree_at,
+            built_from_nothing,
+        }
+    }
+
+    /// cairn/6262: the rule on its own. A reading at least the standing
+    /// figure raises it; a smaller one says nothing unless its source is
+    /// newer than the figure's; a warm one on newer source folds into the
+    /// streak without counting; the streak completes on the
+    /// `PEAK_SUPERSEDED_AFTER`th run built from nothing, at the largest
+    /// reading the streak saw.
+    #[test]
+    fn a_peak_is_superseded_only_by_enough_runs_built_from_nothing_on_newer_source() {
+        let held = PlatformPeak {
+            standing: Some(10 * GIB),
+            standing_tree_at: Some(DAY_MS),
+            ..PlatformPeak::default()
+        };
+        assert_eq!(held.step(&reading(10 * GIB, None, false)), PeakStep::Raised);
+        assert_eq!(
+            held.step(&reading(4 * GIB, None, true)),
+            PeakStep::Unrelated,
+            "an undated run says nothing about newer source"
+        );
+        assert_eq!(
+            held.step(&reading(4 * GIB, Some(DAY_MS), true)),
+            PeakStep::Unrelated,
+            "the figure's own source is not newer than itself"
+        );
+        assert_eq!(
+            held.step(&reading(4 * GIB, Some(2 * DAY_MS), false)),
+            PeakStep::Lower { counts: false }
+        );
+        assert_eq!(
+            held.step(&reading(4 * GIB, Some(2 * DAY_MS), true)),
+            PeakStep::Lower { counts: true }
+        );
+        let almost = PlatformPeak {
+            from_nothing: PEAK_SUPERSEDED_AFTER - 1,
+            lower: Some((5 * GIB, Some("rustc".into()))),
+            lower_tree_at: Some(3 * DAY_MS),
+            ..held.clone()
+        };
+        assert_eq!(
+            almost.step(&reading(4 * GIB, Some(2 * DAY_MS), false)),
+            PeakStep::Lower { counts: false },
+            "a warm run never completes the streak"
+        );
+        assert_eq!(
+            almost.step(&reading(4 * GIB, Some(2 * DAY_MS), true)),
+            PeakStep::Superseded {
+                bytes: 5 * GIB,
+                name: Some("rustc".into()),
+                tree_at: 3 * DAY_MS,
+            }
+        );
+        // An unknown standing source (a figure learned before sources were
+        // dated) is older than any dated one.
+        let undated = PlatformPeak {
+            standing_tree_at: None,
+            ..almost
+        };
+        assert!(matches!(
+            undated.step(&reading(4 * GIB, Some(1), true)),
+            PeakStep::Superseded { .. }
+        ));
+    }
+
+    /// What counts as built from nothing: a fresh, unprepared cell that ran
+    /// its compile to the end with enough build jobs, and only for a command
+    /// that began on that cell.
+    #[test]
+    fn only_a_whole_compile_on_a_fresh_cell_is_built_from_nothing() {
+        use cairn_common::executor_protocol::CellOrigin;
+        let cold = from_nothing(4 * GIB, 1);
+        let built = |meta: &CellExecutionMeta, kind, source| {
+            PeakSource::of(meta, kind, source).built_from_nothing
+        };
+        assert!(built(&cold, CompletionKind::Succeeded, dated(1)));
+        assert!(
+            !built(
+                &cold,
+                CompletionKind::Succeeded,
+                CompletedSource {
+                    began_on_the_cell: false,
+                    ..dated(1)
+                }
+            ),
+            "a later batch item began on what the first built"
+        );
+        assert!(
+            !built(&cold, CompletionKind::Failed, dated(1)),
+            "a failure before its tests may have stopped short of the largest unit"
+        );
+        let tested = CellExecutionMeta {
+            test_phase: Some(TestPhaseMeasurement {
+                entered_at_unix_ms: 1,
+                peak_bytes: GIB,
+                concurrent_tests: 1,
+            }),
+            ..cold.clone()
+        };
+        assert!(
+            built(&tested, CompletionKind::Failed, dated(1)),
+            "a lane whose tests failed compiled everything first"
+        );
+        let warm = CellExecutionMeta {
+            warmth: Some(ExecutionWarmth::PreparedWarmSlot),
+            ..cold.clone()
+        };
+        assert!(!built(&warm, CompletionKind::Succeeded, dated(1)));
+        let cloned = CellExecutionMeta {
+            cell_origin: Some(CellOrigin {
+                cell_id: "slot-7".into(),
+                provenance: CellProvenance::Seeded {
+                    seed: CellSeed::Clone {
+                        source_cell_id: "slot-3".into(),
+                        source_holder: None,
+                        source_commit: "abc".into(),
+                        distance: None,
+                        cloned_at_unix_ms: 0,
+                        clone_ms: 0,
+                    },
+                },
+                warmth: Some(ExecutionWarmth::Cold),
+            }),
+            ..cold.clone()
+        };
+        assert!(
+            !built(&cloned, CompletionKind::Succeeded, dated(1)),
+            "a clone carries its sibling's build products"
+        );
+        let fragment = CellExecutionMeta {
+            build_job_processes: Some(BuildJobProcesses {
+                processes: 3,
+                largest_bytes: GIB,
+                typical_bytes: GIB,
+            }),
+            ..cold
+        };
+        assert!(!built(&fragment, CompletionKind::Succeeded, dated(1)));
+    }
+
+    /// cairn/6262's acceptance: a suite whose largest process fell is offered
+    /// to a small machine again after enough runs built from nothing
+    /// elsewhere on its platform, with no manual write. bgsrv-ub's own row
+    /// keeps the old figure until then, and is lowered with the rest.
+    #[tokio::test]
+    async fn a_suite_whose_largest_process_fell_is_judged_on_the_new_figure() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-peak-superseded.db").await);
+        let (fedora, bbs, ub) = (
+            context("fedora:fedora"),
+            context("bbs:bbs"),
+            context("bgsrv-ub:bgsrv-ub"),
+        );
+        let id = identity("rust-tests-whole");
+        let big = 103 * GIB / 10;
+        learn(
+            &db,
+            &ub,
+            &id,
+            &completed(10 * GIB, 1),
+            CompletedSource::default(),
+        )
+        .await;
+        learn(&db, &fedora, &id, &from_nothing(big, 2), dated(DAY_MS)).await;
+        assert_eq!(judged_on(&db, &ub, &id).await, big);
+
+        // Older source that never had the large unit says nothing.
+        for at in 3..3 + u64::from(PEAK_SUPERSEDED_AFTER) {
+            learn(
+                &db,
+                &bbs,
+                &id,
+                &from_nothing(4 * GIB, at),
+                dated(DAY_MS / 2),
+            )
+            .await;
+        }
+        assert_eq!(judged_on(&db, &ub, &id).await, big);
+
+        // The split lands. Runs built from nothing on it report less; a warm
+        // one that happened to rebuild a larger unit raises the figure they
+        // settle on without counting toward it.
+        let after_split = [9 * GIB / 2, 24 * GIB / 5, 21 * GIB / 5, 23 * GIB / 5];
+        for (n, peak) in after_split.into_iter().enumerate() {
+            let machine = if n % 2 == 0 { &fedora } else { &bbs };
+            let at = 10 + n as u64;
+            learn(
+                &db,
+                machine,
+                &id,
+                &from_nothing(peak, at),
+                dated(2 * DAY_MS + at),
+            )
+            .await;
+        }
+        learn(
+            &db,
+            &bbs,
+            &id,
+            &completed(49 * GIB / 10, 20),
+            dated(2 * DAY_MS + 20),
+        )
+        .await;
+        assert_eq!(
+            judged_on(&db, &ub, &id).await,
+            big,
+            "one run short of the streak, the old figure stands"
+        );
+        learn(
+            &db,
+            &fedora,
+            &id,
+            &from_nothing(22 * GIB / 5, 21),
+            dated(2 * DAY_MS + 21),
+        )
+        .await;
+        assert_eq!(judged_on(&db, &ub, &id).await, 49 * GIB / 10);
+        assert_eq!(judged_on(&db, &fedora, &id).await, 49 * GIB / 10);
+
+        // Another platform's figure is its own.
+        let spark = ProfileContext {
+            arch: "aarch64".into(),
+            ..context("bginf-sp1:bginf-sp1")
+        };
+        learn(&db, &spark, &id, &from_nothing(big, 30), dated(DAY_MS)).await;
+        assert_eq!(judged_on(&db, &spark, &id).await, big);
+        assert_eq!(judged_on(&db, &ub, &id).await, 49 * GIB / 10);
+    }
+
+    /// A reading at least the standing figure restarts the streak, and the
+    /// next one must come from source newer than the reading that raised it.
+    #[tokio::test]
+    async fn a_raise_starts_the_streak_over_from_its_source() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-peak-raise-restarts.db").await);
+        let fedora = context("fedora:fedora");
+        let id = identity("rust-tests-raise");
+        learn(&db, &fedora, &id, &from_nothing(10 * GIB, 1), dated(DAY_MS)).await;
+        for at in 2..2 + u64::from(PEAK_SUPERSEDED_AFTER - 1) {
+            learn(
+                &db,
+                &fedora,
+                &id,
+                &from_nothing(4 * GIB, at),
+                dated(2 * DAY_MS),
+            )
+            .await;
+        }
+        learn(
+            &db,
+            &fedora,
+            &id,
+            &from_nothing(11 * GIB, 10),
+            dated(3 * DAY_MS),
+        )
+        .await;
+        learn(
+            &db,
+            &fedora,
+            &id,
+            &from_nothing(4 * GIB, 11),
+            dated(2 * DAY_MS),
+        )
+        .await;
+        assert_eq!(
+            judged_on(&db, &fedora, &id).await,
+            11 * GIB,
+            "the streak before the raise is gone, and older source than the raise's counts for nothing"
+        );
+        for at in 12..12 + u64::from(PEAK_SUPERSEDED_AFTER - 1) {
+            learn(
+                &db,
+                &fedora,
+                &id,
+                &from_nothing(4 * GIB, at),
+                dated(4 * DAY_MS),
+            )
+            .await;
+        }
+        assert_eq!(judged_on(&db, &fedora, &id).await, 11 * GIB);
+        learn(
+            &db,
+            &fedora,
+            &id,
+            &from_nothing(4 * GIB, 20),
+            dated(4 * DAY_MS),
+        )
+        .await;
+        assert_eq!(judged_on(&db, &fedora, &id).await, 4 * GIB);
+    }
+
+    /// A class suite's runs are whichever commands of the class ran, so a
+    /// run of a small one says nothing about the large one: its figure stays
+    /// rise-only.
+    #[tokio::test]
+    async fn a_class_suites_largest_process_never_falls() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-peak-class-suite.db").await);
+        let fedora = context("fedora:fedora");
+        let class = suite_key("cairn", None, CellCommandClass::CargoTest);
+        let observe = |meta: CellExecutionMeta, source| {
+            let (db, fedora, class) = (db.clone(), fedora.clone(), class.clone());
+            async move {
+                observe_suite(
+                    db,
+                    class.as_deref(),
+                    CellCommandClass::CargoTest,
+                    &fedora,
+                    &meta,
+                    CompletionKind::Succeeded,
+                    MachineAdmission::default(),
+                    source,
+                )
+                .await
+            }
+        };
+        observe(from_nothing(10 * GIB, 1), dated(DAY_MS)).await;
+        for at in 2..2 + u64::from(PEAK_SUPERSEDED_AFTER) {
+            observe(from_nothing(GIB, at), dated(2 * DAY_MS)).await;
+        }
+        let demand = resolve_process_demand(
+            db.clone(),
+            None,
+            class.as_deref(),
+            CellCommandClass::CargoTest,
+            &fedora,
+        )
+        .await
+        .demand
+        .unwrap();
+        assert_eq!(demand.peak_bytes, 10 * GIB);
     }
 }
 
@@ -5475,6 +6379,7 @@ mod tests {
             &context,
             &run(1, 16 * GIB, 100 * GIB),
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         assert_eq!(peak_after("full width").await, 16 * GIB);
@@ -5485,6 +6390,7 @@ mod tests {
             &context,
             &run(2, 8 * GIB, 10 * GIB),
             CompletionKind::Failed,
+            CompletedSource::default(),
         )
         .await;
         assert_eq!(
@@ -5500,6 +6406,7 @@ mod tests {
             &context,
             &run(3, 8 * GIB, 10 * GIB),
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         assert_eq!(
@@ -5514,6 +6421,7 @@ mod tests {
             &context,
             &run(4, 8 * GIB, 100 * GIB),
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         assert_eq!(
@@ -5660,6 +6568,7 @@ mod tests {
             &context,
             &metadata,
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         observe_completed(
@@ -5668,6 +6577,7 @@ mod tests {
             &context,
             &metadata,
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         let profile = load_profile(db.clone(), &identity, &context)
@@ -6122,6 +7032,7 @@ mod tests {
             &context,
             &killed,
             CompletionKind::Failed,
+            CompletedSource::default(),
         )
         .await;
 
@@ -6400,6 +7311,7 @@ mod tests {
                 &context,
                 &completion(Some(ExecutionWarmth::Cold), finished, 300_000),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
             observe_completed(
@@ -6408,6 +7320,7 @@ mod tests {
                 &context,
                 &completion(Some(ExecutionWarmth::PreparedWarmSlot), finished, 20_000),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -6461,6 +7374,7 @@ mod tests {
                 &here,
                 &completion(Some(ExecutionWarmth::Cold), finished, 50_000),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -6530,6 +7444,7 @@ mod tests {
                 &context,
                 &completion(Some(ExecutionWarmth::Cold), finished, 60_000),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -6539,6 +7454,7 @@ mod tests {
             &context,
             &completion(Some(ExecutionWarmth::Cold), 3, 2_400_000),
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         let with_outlier = predict(db.clone(), identity.clone(), context.clone()).await;
@@ -6557,6 +7473,7 @@ mod tests {
                 &context,
                 &completion(Some(ExecutionWarmth::Cold), finished, 55_000),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -6628,6 +7545,7 @@ mod tests {
                 &context,
                 &completion(Some(ExecutionWarmth::Cold), finished, 1_000),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -6657,6 +7575,7 @@ mod tests {
                 1_000,
             ),
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         let learned = resolve_duration(
@@ -6703,6 +7622,7 @@ mod tests {
                 &context,
                 &completion(None, finished, 42_000),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -6866,6 +7786,7 @@ mod tests {
                 &context,
                 &completion(Some(warmth), finished, 400_000),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -6883,6 +7804,7 @@ mod tests {
                 &context,
                 &failed,
                 CompletionKind::Failed,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -6935,6 +7857,7 @@ mod tests {
                 &context,
                 &completion(Some(warmth), finished, 400_000),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -6967,6 +7890,7 @@ mod tests {
                 &context,
                 &no_op,
                 CompletionKind::SelectedNothing,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -7004,6 +7928,7 @@ mod tests {
                 &context,
                 &completion(Some(warmth), finished, duration),
                 CompletionKind::classify(succeeded, &output),
+                CompletedSource::default(),
             )
             .await;
         }
@@ -7048,6 +7973,7 @@ mod tests {
                 &context,
                 &completion(Some(warmth), finished, 400_000),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -7059,6 +7985,7 @@ mod tests {
             &context,
             &under_load,
             CompletionKind::Failed,
+            CompletedSource::default(),
         )
         .await;
         for key in [context.executor_class.as_str(), "*"] {
@@ -7077,6 +8004,7 @@ mod tests {
             &context,
             &loaded(completion(Some(warmth), 5, 800_000)),
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         let machine = load_contention_profile(db, &context.executor_class, &load)
@@ -7125,6 +8053,7 @@ mod tests {
                     context,
                     &under_stall(completion(Some(warmth), finished, 10_000), 0, stall),
                     CompletionKind::Succeeded,
+                    CompletedSource::default(),
                 )
                 .await;
             }
@@ -7173,6 +8102,7 @@ mod tests {
             &measuring,
             &under_stall(completion(Some(warmth), 4, 20_000), 2, Some(230)),
             CompletionKind::Succeeded,
+            CompletedSource::default(),
         )
         .await;
         let load = ExecutionLoadContext {
@@ -7207,6 +8137,7 @@ mod tests {
                 &context,
                 &meta,
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }
@@ -7262,6 +8193,7 @@ mod tests {
                 &context,
                 &completion(Some(warmth), finished, 30_000),
                 CompletionKind::Succeeded,
+                CompletedSource::default(),
             )
             .await;
         }

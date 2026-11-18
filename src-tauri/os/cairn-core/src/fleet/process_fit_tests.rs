@@ -392,6 +392,7 @@ async fn an_aarch64_peak_refuses_a_cold_x86_identity_on_the_small_machine() {
         &linux("fedora:fedora", "x86_64"),
         &unnamed,
         resource_profiles::CompletionKind::Succeeded,
+        resource_profiles::CompletedSource::default(),
     )
     .await;
     resource_profiles::observe_completed(
@@ -400,6 +401,7 @@ async fn an_aarch64_peak_refuses_a_cold_x86_identity_on_the_small_machine() {
         &linux("bginf-sp1-device:bginf-sp1", "aarch64"),
         &rustc_completion(12 * GIB, 2),
         resource_profiles::CompletionKind::Succeeded,
+        resource_profiles::CompletedSource::default(),
     )
     .await;
     let evidence = evidence_on_ub(db, &id).await;
@@ -508,6 +510,7 @@ async fn the_class_prior_defers_the_small_machine() {
         &rustc_completion(KILLED_RUSTC, 1),
         resource_profiles::CompletionKind::Failed,
         resource_profiles::MachineAdmission::default(),
+        resource_profiles::CompletedSource::default(),
     )
     .await;
     let evidence = evidence_on_ub(db, &workspace_compile("workspace-compile:cold")).await;
@@ -583,6 +586,7 @@ async fn a_class_suites_peak_defers_an_unmeasured_command() {
             &rustc_completion(peak, 1),
             resource_profiles::CompletionKind::Failed,
             resource_profiles::MachineAdmission::default(),
+            resource_profiles::CompletedSource::default(),
         )
         .await;
         evidence.push(
@@ -642,6 +646,7 @@ async fn a_suite_killed_here_at_its_measured_size_is_refused_on_the_next_request
             &kill,
             resource_profiles::CompletionKind::Failed,
             resource_profiles::MachineAdmission::default(),
+            resource_profiles::CompletedSource::default(),
         )
         .await;
     }
