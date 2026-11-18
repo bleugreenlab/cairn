@@ -13,25 +13,47 @@
 //! background thread and the placement that missed prices the candidate as
 //! unmeasured, which ranks it but never gates it: both prices only break ties
 //! behind predicted time. The next pass, or the next placement for the same
-//! target, reads the answer. Candidates advertising the same warm roots share
-//! one entry, and every candidate for one request shares its target.
+//! target, reads the answer.
+//!
+//! A sync price is keyed by (repository, machine, target) and stamped with the
+//! revision of the machine's warm roots it was computed against, so a lookup
+//! hashes three short strings and compares one integer, never the roots. When
+//! the machine's roots move on, the previous price keeps being served while at
+//! most one refresh runs, and a refresh for the same key is not started again
+//! within [`REFRESH_INTERVAL`]. Roots only ever help, so the old price is an
+//! upper bound on what the machine lacks now; a placement can be a little
+//! stale in that direction, and only among candidates that tie on predicted
+//! time.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::ops::Deref;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use cairn_common::cache_distance::CacheDistance;
 
 use super::SyncCost;
 
-/// Entries kept per price. Keys are commit pairs, so a long-lived runner sees
-/// unboundedly many; the working set is the targets in flight times the roots
-/// and slot heads the fleet advertises.
-const PRICE_ENTRY_LIMIT: usize = 512;
+/// Distance entries kept. Keys are commit pairs, so a long-lived runner sees
+/// unboundedly many; the working set is the targets in flight times the slot
+/// heads the fleet advertises.
+const DISTANCE_ENTRY_LIMIT: usize = 512;
+
+/// Sync entries kept, one per (repository, machine, target). The working set is
+/// about 200 waiting targets times up to 16 priced machines, roughly 3,200;
+/// 4,096 holds it with headroom, and an entry is three short strings and a few
+/// integers, so the memo stays under a megabyte.
+const SYNC_ENTRY_LIMIT: usize = 4096;
+
+/// The least time between two walks for one (repository, machine, target). A
+/// machine whose roots change every few seconds is priced against the roots it
+/// had up to this long ago rather than keeping a git process running for it.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Computations of one price allowed to run at once. A miss past this bound
 /// schedules nothing and is asked again by the next pass, so a burst of new
@@ -44,10 +66,25 @@ type DistanceMeasure = dyn Fn(&Path, &str, &str) -> Option<CacheDistance> + Send
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct SyncKey {
     repository: String,
-    /// Sorted and deduplicated: the price depends on the set of roots, not on
-    /// the order a machine happened to advertise them in.
-    warm_roots: Vec<String>,
+    executor_id: String,
     target: String,
+}
+
+/// One machine's warm roots for one repository, as the sync price needs them:
+/// the sorted, deduplicated list (shared, never copied) and the revision of the
+/// machine's root set it was read at, which stands for the list in the memo.
+pub(super) struct WarmHaves<'a> {
+    pub(super) executor_id: &'a str,
+    pub(super) revision: u64,
+    pub(super) commits: Arc<[String]>,
+}
+
+impl Deref for WarmHaves<'_> {
+    type Target = [String];
+
+    fn deref(&self) -> &[String] {
+        &self.commits
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -82,35 +119,34 @@ impl PlacementPrices {
         measure: impl Fn(&Path, &str, &str) -> Option<CacheDistance> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            sync: RefinedCache::default(),
-            distance: RefinedCache::default(),
+            sync: RefinedCache::new(SYNC_ENTRY_LIMIT, REFRESH_INTERVAL),
+            distance: RefinedCache::new(DISTANCE_ENTRY_LIMIT, Duration::ZERO),
             walk: Arc::new(walk),
             measure: Arc::new(measure),
         }
     }
 
-    /// The bytes a machine holding `warm_roots` lacks to reach `target`, or
-    /// [`SyncCost::Unknown`] while that has not been priced yet.
+    /// The bytes a machine holding `haves` lacks to reach `target`, or
+    /// [`SyncCost::Unknown`] while that has not been priced yet. Once priced, a
+    /// change to the machine's roots keeps serving the earlier price while it
+    /// is refreshed.
     pub(super) fn sync_cost(
         &self,
         repository: &str,
-        warm_roots: &[String],
+        haves: &WarmHaves<'_>,
         target: &str,
     ) -> SyncCost {
-        let mut roots = warm_roots.to_vec();
-        roots.sort_unstable();
-        roots.dedup();
         let key = SyncKey {
             repository: repository.to_owned(),
-            warm_roots: roots,
+            executor_id: haves.executor_id.to_owned(),
             target: target.to_owned(),
         };
         let walk = Arc::clone(&self.walk);
-        let job = key.clone();
+        let roots = Arc::clone(&haves.commits);
+        let (repository, target) = (repository.to_owned(), target.to_owned());
         self.sync
-            .get_or_refine(key, move || {
-                walk(&job.repository, &job.target, &job.warm_roots)
-                    .map_or(SyncCost::Unknown, SyncCost::Known)
+            .get_or_refine(key, haves.revision, move || {
+                walk(&repository, &target, &roots).map_or(SyncCost::Unknown, SyncCost::Known)
             })
             .unwrap_or(SyncCost::Unknown)
     }
@@ -131,7 +167,7 @@ impl PlacementPrices {
         let measure = Arc::clone(&self.measure);
         let job = key.clone();
         self.distance
-            .get_or_refine(key, move || {
+            .get_or_refine(key, 0, move || {
                 measure(&job.repository, &job.head, &job.target)
             })
             .flatten()

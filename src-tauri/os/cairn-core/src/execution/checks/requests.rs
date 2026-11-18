@@ -919,8 +919,40 @@ fn clock(ms: i64) -> String {
         .unwrap_or_else(|| ms.to_string())
 }
 
+/// The longest a waiting request's stored diagnostic may go without a rewrite
+/// when nothing a reader acts on has changed. Every placement pass that
+/// re-rejects a waiting request reports a diagnostic whose text embeds the pass
+/// time, so left alone each request rewrites its row at the pass rate. While a
+/// request waits, its row's diagnostic can therefore be this stale.
+pub(crate) const PROGRESS_DIAGNOSTIC_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(20);
+
+/// What a reader of the row acts on: a change in any of these is written at
+/// once; a change in only the diagnostic text waits for the interval.
+#[derive(Clone, PartialEq, Eq)]
+struct ProgressKey {
+    state: Option<&'static str>,
+    executor: Option<String>,
+    held_by: Option<String>,
+    request_id: Option<String>,
+}
+
+impl ProgressKey {
+    /// A bare board state (`progress_state` of `None`) keeps the state the
+    /// request last reported, so it does not read as a state change.
+    fn of(update: &ManualCheckProgressUpdate, previous: Option<&ProgressKey>) -> Self {
+        ProgressKey {
+            state: progress_state(update).or(previous.and_then(|key| key.state)),
+            executor: update.executor.clone(),
+            held_by: update.held_by.clone(),
+            request_id: update.request_id.clone(),
+        }
+    }
+}
+
 /// One writer per request, in order, so progress writes never race each other
-/// or the settlement that follows them.
+/// or the settlement that follows them: the caller awaits the returned handle
+/// (it ends once every sender is dropped) before it settles.
 fn progress_writer(
     db: Arc<LocalDb>,
     id: String,
@@ -928,17 +960,80 @@ fn progress_writer(
     super::manual::ManualCheckProgress,
     tokio::task::JoinHandle<()>,
 ) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ManualCheckProgressUpdate>();
-    let writer = tokio::spawn(async move {
-        while let Some(update) = rx.recv().await {
+    coalescing_progress_writer(PROGRESS_DIAGNOSTIC_INTERVAL, move |update| {
+        let db = db.clone();
+        let id = id.clone();
+        async move {
             if let Err(error) = record_progress(&db, &id, &update).await {
                 log::warn!("check request {id}: progress not recorded: {error}");
+            }
+        }
+    })
+}
+
+/// The writer behind `progress_writer`, with the row write injected.
+///
+/// Updates go through a latest-only `watch` slot, so a slow store never builds
+/// a backlog of stale diagnostics: at most one update is pending per request.
+/// The pending update is written immediately when its `ProgressKey` differs
+/// from the last one written, and otherwise once `interval` has passed since
+/// the last write. A diagnostic still pending when the senders drop is
+/// discarded: `settle` writes the terminal answer and evidence itself.
+fn coalescing_progress_writer<W, F>(
+    interval: std::time::Duration,
+    write: W,
+) -> (
+    super::manual::ManualCheckProgress,
+    tokio::task::JoinHandle<()>,
+)
+where
+    W: Fn(ManualCheckProgressUpdate) -> F + Send + 'static,
+    F: std::future::Future<Output = ()> + Send,
+{
+    let (tx, mut rx) = tokio::sync::watch::channel::<Option<ManualCheckProgressUpdate>>(None);
+    let writer = tokio::spawn(async move {
+        let mut written: Option<(ProgressKey, tokio::time::Instant)> = None;
+        let mut pending: Option<ManualCheckProgressUpdate> = None;
+        loop {
+            let due = match (&pending, &written) {
+                (Some(_), Some((_, at))) => Some(*at + interval),
+                _ => None,
+            };
+            tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    if let Some(update) = rx.borrow_and_update().clone() {
+                        pending = Some(update);
+                    }
+                }
+                _ = async {
+                    match due {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+            }
+            let Some(update) = pending.take() else {
+                continue;
+            };
+            let key = ProgressKey::of(&update, written.as_ref().map(|(key, _)| key));
+            let due_now = match &written {
+                Some((last, at)) => *last != key || at.elapsed() >= interval,
+                None => true,
+            };
+            if due_now {
+                write(update).await;
+                written = Some((key, tokio::time::Instant::now()));
+            } else {
+                pending = Some(update);
             }
         }
     });
     (
         Arc::new(move |update| {
-            let _ = tx.send(update);
+            tx.send_replace(Some(update));
         }),
         writer,
     )
