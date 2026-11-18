@@ -1020,8 +1020,8 @@ fn launch_during_staged_install_waits_then_starts() {
     }
 }
 
-/// A network fault is retried inside the install: the launch waiting on it
-/// gets its CLI, and no error surfaces.
+/// A network fault is progress, not a terminal refusal: a launch arriving
+/// after the retries is told about the interruption and waits for its CLI.
 #[cfg(unix)]
 #[test]
 fn transient_failures_keep_waiters_waiting() {
@@ -1034,10 +1034,35 @@ fn transient_failures_keep_waiters_waiting() {
             FetchError::transient("error sending request: connection refused"),
             FetchError::transient("connection reset by peer"),
         ]);
+        let gate = fixture.served.gate();
         let managed = Arc::new(fixture.managed(&pin));
+        let installer = std::thread::spawn({
+            let managed = managed.clone();
+            move || managed.ensure()
+        });
+        gate.wait_for_a_download();
+
+        let told = AtomicUsize::new(0);
         let resolved = managed
-            .ensure_with(|progress| assert_eq!(progress.last_error, None), &|| true)
+            .ensure_with(
+                |progress| {
+                    told.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        progress.last_error.as_deref(),
+                        Some("connection reset by peer")
+                    );
+                    assert!(progress.waiting_message().contains(
+                        "The download was interrupted (connection reset by peer) and retries by itself."
+                    ));
+                    assert!(managed.installed().is_none());
+                    assert!(managed.state_guard().refused.is_none());
+                    gate.open();
+                },
+                &|| true,
+            )
             .expect("the install outlasts the network fault");
+        assert_eq!(told.load(Ordering::SeqCst), 1);
+        assert_eq!(resolved, installer.join().unwrap().unwrap());
         assert_eq!(resolved.version, "9.1.0");
         assert_eq!(fixture.served.count(), 3);
         assert!(managed.state_guard().refused.is_none());
