@@ -1677,6 +1677,30 @@ fn nudge_unobserved(
     let flushed = if let Some(run_id) = live_run_id.or_else(|| latest_run_for_job(&db, job_id)) {
         flush_on_idle(orch, &run_id)?
     } else {
+        // No run at all. A recipe node in that state has never been through
+        // its start: it has the session its job was created with, but not its
+        // branch. The resume funnel refuses it too; declining here leaves the
+        // message queued for its first turn and tells the sender why.
+        let unstarted = run_db_blocking({
+            let job_id = job_id.to_string();
+            let db = db.clone();
+            move || async move { crate::execution::jobs::unstarted_node_refusal(&db, &job_id).await }
+        });
+        match unstarted {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Ok(NudgeOutcome::Declined(
+                    "it has not started yet, so it has no branch of its own; the message stays \
+                     queued and reaches it once it has started"
+                        .into(),
+                ))
+            }
+            Err(error) => {
+                return Ok(NudgeOutcome::Declined(format!(
+                    "whether it has started could not be read ({error})"
+                )))
+            }
+        }
         crate::execution::jobs::continue_job_impl(
             pending_wake_cause(
                 &db,
@@ -2972,5 +2996,86 @@ mod tests {
         ] {
             assert_eq!(delivery_refusal(&db, job).await.unwrap(), expected, "{job}");
         }
+    }
+
+    /// cairn/7323: a builder released and then held at launch has a session
+    /// (minted with the job) but no run and no branch. A direct message to it
+    /// must not open a turn there: the nudge declines with the reason and the
+    /// funnel refuses outright, nothing is claimed, no run is minted, and the
+    /// job stays pending with its message queued for its first turn.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_message_to_a_builder_that_never_started_opens_no_turn() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('proj-1','default','Test Project','proj','/tmp/test-repo','main',1,1);
+             INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at)
+               VALUES ('issue-1','proj-1',7318,'Held','active','none',1,1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+               VALUES ('exec-1','build','issue-1','proj-1','running',1,1,'{\"branchTarget\":\"new\"}');
+             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, node_name, uri_segment,
+                               status, agent_config_id, branch, base_branch, created_at, updated_at)
+               VALUES ('job-held','exec-1','builder','issue-1','proj-1','Builder','builder',
+                       'pending','build',NULL,'main',1,1);
+             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES('sess-held','job-held','claude','open',1,1,1);
+             UPDATE jobs SET current_session_id='sess-held' WHERE id='job-held';",
+        )
+        .await
+        .unwrap();
+        crate::messages::queued::enqueue_async(&db, "job-held", "^", DeliveryUrgency::Queue)
+            .await
+            .unwrap();
+
+        let untouched = || async {
+            assert_eq!(
+                count(&db, "SELECT COUNT(*) FROM runs WHERE job_id='job-held'").await,
+                0,
+                "no run is minted for a node that never started"
+            );
+            assert_eq!(
+                count(&db, "SELECT COUNT(*) FROM turns WHERE job_id='job-held'").await,
+                0,
+                "no turn is opened on its base branch"
+            );
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT COUNT(*) FROM queued_messages WHERE job_id='job-held' AND delivered_at IS NULL"
+                )
+                .await,
+                1,
+                "the message stays queued for its first turn"
+            );
+            assert_eq!(
+                db.query_one("SELECT status FROM jobs WHERE id='job-held'", (), |row| row
+                    .text(0))
+                    .await
+                    .unwrap(),
+                "pending"
+            );
+        };
+
+        match nudge_job_for_urgency(&orch, "job-held", DeliveryUrgency::Queue).unwrap() {
+            NudgeOutcome::Declined(reason) => assert!(
+                reason.contains("not started") && reason.contains("stays queued"),
+                "{reason}"
+            ),
+            other => panic!("a never-started node must not be resumed: {other:?}"),
+        }
+        untouched().await;
+
+        let refused = crate::execution::jobs::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &orch,
+            "job-held",
+            None,
+            None,
+            None,
+        )
+        .expect_err("the funnel every resume shares refuses it too");
+        assert!(refused.contains("has not started yet"), "{refused}");
+        untouched().await;
     }
 }

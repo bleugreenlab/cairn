@@ -3216,6 +3216,14 @@ fn continue_job_launch_locked_inner(
     event.job_id = Some(job_id);
     event.emit();
 
+    // A recipe node's session exists from its creation, but its branch only
+    // from its start (`prepare_job`). A turn opened here for a node that never
+    // started would run on its base branch and commit there (cairn/7323).
+    // Refused before any delivery is claimed, so what is queued stays queued.
+    if let Some(refusal) = run_db_borrowed(super::unstarted_node_refusal(&owning_db, job_id))? {
+        return Err(refusal);
+    }
+
     // Keep admission through the write that makes this child active (released
     // below, once the slot is reserved). Refusal precedes delivery claims, so
     // an unstarted continuation spends no wakes.

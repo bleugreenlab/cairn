@@ -28,6 +28,7 @@ pub(crate) use decide::{DecideRequest, DecisionFailure, NamedDecision};
 pub(crate) mod base_branch_sync;
 pub(crate) mod complete;
 pub(crate) mod embed;
+pub(crate) mod unlanded_default;
 pub use decide::DecisionDiagnostic;
 pub mod device_presence;
 pub mod docs;

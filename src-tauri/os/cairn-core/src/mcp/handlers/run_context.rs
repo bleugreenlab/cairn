@@ -312,6 +312,29 @@ pub(crate) async fn commit_posture_refusal(
     if let Some(refusal) = crate::threads::commit_refusal_for_job(&db, &context.job_id).await {
         return Some(refusal);
     }
+    // A job with no branch of its own writes to its base branch, which is the
+    // project default for most work. Only an execution filed with `branch:
+    // base` declares that target; any other branchless job is refused here,
+    // before anything is written (cairn/7323). An unreadable posture refuses.
+    match crate::execution::jobs::branch_posture(&db, &context.job_id).await {
+        Ok(Some(posture)) => {
+            let node = crate::messages::delivery::node_uri_for_job(&db, &context.job_id)
+                .await
+                .unwrap_or_else(|| format!("job {}", context.job_id));
+            if let Some(refusal) = posture.commit_refusal(&node) {
+                return Some(refusal);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Some(format!(
+                "Refusing to commit: {error}. Whether this job has a branch of its own decides \
+                 whether the commit would land on the project's default branch, and a commit is \
+                 not taken on an unknown posture. Re-send the batch without commit_msg; reading, \
+                 running commands, and scratch files are unaffected."
+            ))
+        }
+    }
     // Early feedback only: a committing batch whose branch is already retired
     // is told so before it resolves a coordinate that cleanup may have removed
     // (which would otherwise answer as a lost or unresolvable branch). The
@@ -590,6 +613,46 @@ mod tests {
                 .await
                 .is_none(),
             "an ordinary issue job still commits"
+        );
+    }
+
+    /// cairn/7323: a node given a turn before its start has no branch, so its
+    /// commit would seal onto the base. Both verbs' gate refuses it by name; the
+    /// same job under a `branch: base` execution commits, by declaration.
+    #[tokio::test]
+    async fn a_run_whose_job_has_no_branch_is_refused_unless_its_execution_declared_base() {
+        let dbs = local_dbs().await;
+        seed_run(&dbs.local).await;
+        dbs.local
+            .execute(
+                "UPDATE jobs SET branch = NULL, base_branch = 'main', recipe_node_id = 'builder' WHERE id = 'j'",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let refusal = commit_posture_refusal(&dbs, &request_for_run("r"))
+            .await
+            .expect("a job with no branch may not commit");
+        assert!(
+            refusal.contains("cairn://p/prj/7/1/builder")
+                && refusal.contains("no branch of its own")
+                && refusal.contains("`main`"),
+            "the refusal names the node and where the commit would have landed: {refusal}"
+        );
+
+        dbs.local
+            .execute(
+                "UPDATE executions SET snapshot = '{\"branchTarget\":\"base\"}' WHERE id = 'e'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            commit_posture_refusal(&dbs, &request_for_run("r"))
+                .await
+                .is_none(),
+            "an execution filed with `branch: base` works on its base by declaration"
         );
     }
 

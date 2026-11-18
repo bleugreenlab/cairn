@@ -233,6 +233,8 @@ pub(crate) struct BaseBranchSyncRegistry {
     fetch_locks: Mutex<HashMap<PathBuf, Arc<TokioMutex<()>>>>,
     polls_in_flight: Mutex<HashSet<String>>,
     idle: Notify,
+    /// Default branches seen ahead of origin by commits no landing produced.
+    pub(crate) unlanded: Arc<crate::orchestrator::unlanded_default::Sightings>,
 }
 
 impl BaseBranchSyncRegistry {
@@ -1152,6 +1154,7 @@ fn read_ref(repo: &Path, refname: &str) -> Option<String> {
 /// one origin takes to answer, and each pass runs as its own task so a panic
 /// retires one pass rather than the loop.
 pub(crate) fn spawn_base_branch_poll(orch: &Orchestrator) {
+    crate::orchestrator::unlanded_default::register(orch);
     let orch = orch.clone();
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(BASE_BRANCH_POLL_INTERVAL);
@@ -1210,6 +1213,14 @@ pub(crate) async fn poll_once(orch: &Orchestrator) {
                 ),
             }
             poll_project(&orch, &project.id, Path::new(&project.repo_path), &branches).await;
+            crate::orchestrator::unlanded_default::check(
+                &orch,
+                &db,
+                &project.id,
+                Path::new(&project.repo_path),
+                &project.default_branch,
+            )
+            .await;
         });
     }
 }

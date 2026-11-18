@@ -34,6 +34,8 @@ use std::sync::Arc;
 
 mod admission_renewal;
 pub(crate) use admission_renewal::AdmissionRenewal;
+mod branch_posture;
+pub(crate) use branch_posture::{branch_posture, unstarted_node_refusal};
 mod calls;
 mod child_tasks;
 mod config_loading;

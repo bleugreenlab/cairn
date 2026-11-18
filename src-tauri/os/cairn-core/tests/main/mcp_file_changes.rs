@@ -3814,9 +3814,24 @@ async fn insert_preview_event(db: &LocalDb, input: serde_json::Value) {
         })
         .to_string();
         Box::pin(async move {
+            // The preview job has no branch of its own and works on its
+            // project's default branch, which a commit may only do when its
+            // execution declared `branch: base` (cairn/7323).
             conn.execute(
-                "INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
-                 VALUES ('job-preview', ?1, 'running', 'session-preview', 1, 1)",
+                "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+                 VALUES ('issue-preview', ?1, 1, 'Preview', 'active', 1, 1)",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+                 VALUES ('exec-preview', 'recipe', 'issue-preview', ?1, 'running', 1, 1, '{\"branchTarget\":\"base\"}')",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO jobs(id, execution_id, project_id, status, current_session_id, created_at, updated_at)
+                 VALUES ('job-preview', 'exec-preview', ?1, 'running', 'session-preview', 1, 1)",
                 params![project_id.as_str()],
             )
             .await?;
