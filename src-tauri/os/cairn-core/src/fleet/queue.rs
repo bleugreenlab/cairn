@@ -585,6 +585,10 @@ pub(crate) struct EntryDecline {
     pub(crate) backoff_ms: u64,
     /// `at_unix_ms + backoff_ms`: no offer to this machine before it.
     pub(crate) retry_after_unix_ms: u64,
+    /// The sequence of the room the machine had last announced when it
+    /// declined (cairn/7303): a refusal under one room is told apart from one
+    /// under the next. `None` from a machine that had announced none.
+    pub(crate) room_seq: Option<u64>,
     /// When the posted condition behind the reason was seen to change. A
     /// superseded decline no longer keeps the machine from being offered this
     /// entry once its backoff has run, but it is still the last thing that
@@ -1334,6 +1338,7 @@ impl ExecutionQueue {
                 condition,
                 backoff_ms,
                 retry_after_unix_ms: now_unix_ms.saturating_add(backoff_ms),
+                room_seq: None,
                 superseded_at_unix_ms: None,
             },
         );
@@ -1827,6 +1832,7 @@ impl ExecutionQueue {
                             condition: None,
                             backoff_ms: 0,
                             retry_after_unix_ms: 0,
+                            room_seq: None,
                             superseded_at_unix_ms: None,
                         },
                     );
@@ -2223,6 +2229,20 @@ impl ExecutionQueue {
                 }
             })
             .collect()
+    }
+
+    /// Stamp `executor_id`'s latest refusal of entry `id` with the sequence of
+    /// the room that machine had last announced (cairn/7303), so the account of
+    /// a queued request says which room it was refused under.
+    pub(crate) fn note_decline_room(&self, id: &str, executor_id: &str, room_seq: u64) {
+        let mut state = self.entries.lock().unwrap();
+        if let Some(decline) = state
+            .entries
+            .get_mut(id)
+            .and_then(|entry| entry.declined.get_mut(executor_id))
+        {
+            decline.room_seq = Some(room_seq);
+        }
     }
 
     /// What the live attempt of a request id is waiting on while no machine

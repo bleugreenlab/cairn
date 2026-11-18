@@ -385,6 +385,8 @@ impl Fleet {
             preparation_refusals: HashMap::new(),
             link_clock: Arc::default(),
             link_path: None,
+            // A link has no room until it announces one.
+            room: None,
         };
         // The facts a link opens with are judged from the moment it attached,
         // so a link whose facts never change still has a freeze to measure.

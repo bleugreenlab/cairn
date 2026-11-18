@@ -1989,24 +1989,10 @@ mod tests {
             "{body}"
         );
         observation.nested_sandbox_lane = None;
-        const GIB: u64 = 1 << 30;
-        observation.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(
-            8,
-            Some(cairn_common::executor_protocol::MemoryJobBound::assumed(
-                cairn_common::executor_protocol::SpawnMemory {
-                    available_bytes: 12 * GIB,
-                    owed_bytes: 0,
-                    owing: 0,
-                    measured_at_unix_ms: 0,
-                },
-                5 * GIB / 2,
-            )),
-        ));
+        observation.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(10));
         let body = render(&observation);
         assert!(
-            body.contains(
-                "- Build jobs: 4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job (assumed: no build job of this work measured here)\n"
-            ),
+            body.contains("- Build jobs: 10 build jobs, the compile slot's width\n"),
             "{body}"
         );
 

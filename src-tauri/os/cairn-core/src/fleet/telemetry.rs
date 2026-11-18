@@ -327,6 +327,7 @@ mod tests {
             captured_at_unix_ms: 0,
             connection_timeline: Vec::new(),
             project_eligibility: Vec::new(),
+            room: None,
         }
     }
 

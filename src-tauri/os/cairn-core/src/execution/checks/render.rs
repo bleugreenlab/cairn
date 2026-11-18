@@ -50,7 +50,7 @@ pub(super) fn decline_reason_words(
 /// One machine's decline in its own words, and, once the condition it posted
 /// has changed, that it is the last thing the machine said rather than what
 /// it says now.
-fn describe_decline(decline: &crate::fleet::CheckDispatchDecline) -> String {
+pub(crate) fn describe_decline(decline: &crate::fleet::CheckDispatchDecline) -> String {
     let reason = decline_reason_words(decline.reason);
     let mut words = match decline
         .detail
@@ -60,6 +60,9 @@ fn describe_decline(decline: &crate::fleet::CheckDispatchDecline) -> String {
         Some(detail) => format!("{reason}: {detail}"),
         None => reason.to_string(),
     };
+    if let Some(seq) = decline.room_seq {
+        words.push_str(&format!("; under its room #{seq}"));
+    }
     if let Some(superseded) = decline.superseded_at_unix_ms {
         words.push_str(&format!(
             "; its posted state changed at {}, offerable again from {}",
@@ -77,6 +80,24 @@ pub(super) fn describe_declines(declines: &[crate::fleet::CheckDispatchDecline])
         let named: Vec<String> = declines.iter().map(describe_decline).collect();
         format!("declined by {}", named.join(", "))
     })
+}
+
+/// What holds a queued request, as one sentence: what the latest placement
+/// pass did with each machine it named (or every machine's latest refusal),
+/// then the turns it waits behind. The one account of a queued request
+/// (cairn/6499): the check board writes it on a check request's row, and an
+/// executor's placement view renders it for any queued request.
+pub(crate) fn describe_queued_hold(
+    declines: &[crate::fleet::CheckDispatchDecline],
+    placement: Option<&crate::fleet::CheckPlacementPass>,
+    turn: Option<&String>,
+) -> Option<String> {
+    let candidates = match placement {
+        Some(pass) => Some(describe_placement_pass(pass, declines)),
+        None => describe_declines(declines),
+    };
+    let held: Vec<String> = [candidates, turn.cloned()].into_iter().flatten().collect();
+    (!held.is_empty()).then(|| held.join("; "))
 }
 
 /// What the latest placement pass did with every machine it named, so a wait
@@ -327,12 +348,7 @@ impl DispatchNarrator {
                 // Main's cadence turn is what holds a lane passed over behind
                 // it as surely as a decline is, and it is what the cadence
                 // lane itself waits for, so it is named beside the declines.
-                let candidates = match placement {
-                    Some(pass) => Some(describe_placement_pass(pass, declines)),
-                    None => describe_declines(declines),
-                };
-                let held: Vec<String> = [candidates, turn.clone()].into_iter().flatten().collect();
-                let held_by = (!held.is_empty()).then(|| held.join("; "));
+                let held_by = describe_queued_hold(declines, placement.as_ref(), turn.as_ref());
                 if let Some(declined) = &held_by {
                     diagnostic.push_str("; ");
                     diagnostic.push_str(declined);

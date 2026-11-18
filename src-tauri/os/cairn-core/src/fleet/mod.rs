@@ -215,10 +215,9 @@ use selection::{
     model_room_rejection, no_matching_executor_diagnostic, own_label_refusal,
     pipe_health_rejection, placement_prediction, placement_prediction_with_contention,
     placement_rejection_signature, price_host_stall, price_reliability, prior_predictions,
-    rank_candidates, rank_survey, repository_sync_cost, sequential_memory_envelope,
-    unpredicted_candidate, unresolved_rationale, wait_decision, warm_root_holds_commit,
-    CandidateSurvey, PlacementDraft, QueuePrices, ScoredCandidate, Selection, SurveyRankingContext,
-    RECENT_PLACEMENT_DECISIONS,
+    rank_candidates, rank_survey, repository_sync_cost, unpredicted_candidate,
+    unresolved_rationale, wait_decision, warm_root_holds_commit, CandidateSurvey, PlacementDraft,
+    QueuePrices, ScoredCandidate, Selection, SurveyRankingContext, RECENT_PLACEMENT_DECISIONS,
 };
 use selection::{
     candidate_rejection, deadline_evidence, declared_project_requirements_at,
@@ -485,6 +484,8 @@ pub(crate) struct CheckDispatchDecline {
     pub(crate) superseded_at_unix_ms: Option<u64>,
     /// No re-offer to this machine before this instant.
     pub(crate) retry_after_unix_ms: u64,
+    /// The room the machine had last announced when it declined.
+    pub(crate) room_seq: Option<u64>,
 }
 
 impl CheckDispatchDecline {
@@ -496,6 +497,7 @@ impl CheckDispatchDecline {
             at_unix_ms: decline.at_unix_ms,
             superseded_at_unix_ms: decline.superseded_at_unix_ms,
             retry_after_unix_ms: decline.retry_after_unix_ms,
+            room_seq: decline.room_seq,
         }
     }
 }
@@ -583,6 +585,7 @@ fn check_placement_pass(entry: &queue::QueueEntry) -> Option<CheckPlacementPass>
                         at_unix_ms: *declined_at_unix_ms,
                         superseded_at_unix_ms: None,
                         retry_after_unix_ms: *declined_at_unix_ms,
+                        room_seq: None,
                     }),
             ),
             PlacementRejectionReason::OutrankedBy { executor_name } => {
@@ -1907,6 +1910,10 @@ struct ExecutorConnectionState {
     /// The network path this connection took, when the runner's executor
     /// listener accepted it.
     link_path: Option<cairn_common::executor_protocol::ExecutorLinkPath>,
+    /// The room this link last announced (cairn/7303). Recorded and shown;
+    /// placement does not read it until the room-driven dispatcher replaces
+    /// the per-request loop. `None` until the link announces.
+    room: Option<Arc<cairn_common::executor_protocol::RoomAnnouncement>>,
 }
 
 impl ExecutorConnectionState {
@@ -2403,9 +2410,6 @@ impl Fleet {
 // their full module path, so moving a declaration renames its tests.
 #[cfg(test)]
 mod process_fit_tests;
-
-#[cfg(test)]
-mod sequential_memory_tests;
 
 /// The published artifact target a machine runs, from what it advertises.
 fn executor_artifact_target(entry: &ExecutorConnectionState) -> Option<&'static str> {

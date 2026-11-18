@@ -186,9 +186,12 @@ use render::{
     check_dispatch, clock_utc, describe_ms, live_node_base, narrate_dispatch, summary_annotation,
     tail, write_check_attributions,
 };
+pub(crate) use render::{
+    describe_decline, describe_queued_hold, format_check_summary, lane_breaker_sentence,
+    suppressed_check_message,
+};
 #[cfg(test)]
 use render::{describe_placement_pass, DispatchNarrator};
-pub(crate) use render::{format_check_summary, lane_breaker_sentence, suppressed_check_message};
 #[cfg(feature = "test-utils")]
 pub use write_wave::expire_write_check_wait_for_test;
 #[cfg(test)]

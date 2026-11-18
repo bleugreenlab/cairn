@@ -2627,7 +2627,13 @@ async fn render_resource_body(
                         }
                         (Some("placements"), _) => crate::resources::executors::render_placements(executor),
                         (Some("placement"), Some(request_id)) => {
-                            crate::resources::executors::read_placement(&orch.db.local, executor, request_id).await
+                            crate::resources::executors::read_placement(
+                                &orch.db.local,
+                                executor,
+                                request_id,
+                                orch.fleet.queued_request_account(request_id),
+                            )
+                            .await
                         }
                         // A machine whose link is up has no failed attach to
                         // account for. The runner keeps its account only while

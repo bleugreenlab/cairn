@@ -3539,17 +3539,18 @@ pub(super) fn executor_memory_bound(entry: &ExecutorConnectionState) -> Option<u
 }
 
 /// A planning ceiling is a preference; the unit's enforced bound is not.
-/// Ask the shared solver for the minimum admissible charge, not the wide modeled charge.
+/// Work whose figure, its learned memory at this machine's compile slot width
+/// (cairn/7303), is above the bound can never run under it. There is no
+/// narrower width to try: a compile runs at its slot's width or not at all.
 fn executor_bound_rejection(
     entry: &ExecutorConnectionState,
     demand: &ResourceReservation,
 ) -> Option<PlacementRejectionReason> {
     let bound_bytes = executor_memory_bound(entry)?;
-    let shortfall = demand.solve_memory_grant(1, bound_bytes, 0).err()?;
-    Some(PlacementRejectionReason::ExceedsExecutorMemoryBound {
-        charge_bytes: shortfall.minimum_charge_bytes,
+    let charge_bytes = demand.memory_charge_bytes();
+    (charge_bytes > bound_bytes).then_some(PlacementRejectionReason::ExceedsExecutorMemoryBound {
+        charge_bytes,
         bound_bytes,
-        width_measured: shortfall.width_measured,
     })
 }
 
@@ -6059,7 +6060,7 @@ pub(super) fn unresolved_rationale(stated: &ResourceReservation) -> ReservationR
         headroom_percent: 0,
         fallback: Some(ReservationFallback::CallerDeclared),
         memory_kill: None,
-        build_jobs_price: None,
+        slot_price: None,
         unreadable_memory: Vec::new(),
     }
 }
@@ -6436,11 +6437,14 @@ impl ReservationPlan {
 
     /// [`Self::resolve_for`]'s figures, read from the profile store.
     ///
-    /// A batch's figure is derived here and nowhere else: the heaviest
-    /// member's memory, disk and units, and for a sequential group the
-    /// envelope of its members' figures (`sequential_memory_envelope`). A
-    /// member's figure is its own context's, so a wave's figure is the same
-    /// whichever pass or placement path asks.
+    /// A compile's figure is its learned memory at this machine's compile
+    /// slot width ([`ResolvedResourceProfile::charge_measured_peak`]), priced
+    /// once, and it asks one slot's width of cores (cairn/7303). A batch's
+    /// figure is derived here and nowhere else: a sequential group runs one
+    /// member at a time at that one width, so it is its heaviest member's
+    /// figure; a parallel one is charged for its items at once. A member's
+    /// figure is its own context's, so a wave's figure is the same whichever
+    /// pass or placement path asks.
     async fn work_out_needs(
         &self,
         request: &CellRequest,
@@ -6449,6 +6453,15 @@ impl ReservationPlan {
         duration_context: resource_profiles::DurationContext,
     ) -> resource_profiles::ResolvedResourceProfile {
         let context = context.clone();
+        let slot_width = cairn_common::executor_protocol::CompileSlots::of(
+            capabilities.admission_concurrency_budget(),
+        )
+        .width;
+        // A compile asks at least one compile slot's width of cores, as the
+        // machine judges it (`Need::of`), so the reservation it is charged and
+        // releases is the one it was judged by. A compile that declared the
+        // whole machine (an exclusive check) keeps it.
+        let compile = self.command_class.is_compile_class();
         if !self.resolves {
             // A caller-stated reservation is not a caller-stated duration. The
             // prediction still comes from this machine's own history, because a
@@ -6456,14 +6469,15 @@ impl ReservationPlan {
             // about how fast any particular host is.
             //
             // Whether one process fits is the machine's size, which no
-            // caller's statement changes; nor is what this work's build jobs
-            // measured here, which sizes the jobs the executor grants.
+            // caller's statement changes.
             let process_evidence = self.process_evidence(&context).await;
             let mut reservation = self.stated.clone();
             if let Some(units) = self.declared_concurrency {
                 reservation.concurrency_units = clamp_declared_concurrency(units, capabilities);
             }
-            reservation.build_job_memory = process_evidence.build_job_memory;
+            if compile {
+                reservation.concurrency_units = reservation.concurrency_units.max(slot_width);
+            }
             return resource_profiles::ResolvedResourceProfile {
                 reservation,
                 learned_estimate: request.learned_estimate.clone(),
@@ -6482,7 +6496,6 @@ impl ReservationPlan {
         // observation, fell back because belowConfidenceFloor" (CAIRN-3345):
         // the learning it named cannot produce a concurrency number at all.
         let prior = resource_profiles::cold_start_prior(self.command_class, capabilities);
-        let class_prior = prior.clone();
         let mut resolved = if self.batch_suites.is_empty()
             || (self.parallel_width > 1 && self.known_batch_identities().next().is_none())
         {
@@ -6531,19 +6544,13 @@ impl ReservationPlan {
             resolved.reservation.concurrency_units = clamped;
             resolved.rationale.declared_concurrency_units = Some(clamped);
         }
+        if compile {
+            resolved.reservation.concurrency_units =
+                resolved.reservation.concurrency_units.max(slot_width);
+        }
         if self.batch_suites.is_empty() || self.parallel_width > 1 {
             resolved.process_evidence = self.process_evidence(&context).await;
-            resolved.charge_measured_peak(capabilities.memory_budget_bytes);
-            let cpu_width = capabilities
-                .concurrency_capacity
-                .unwrap_or_else(|| u32::try_from(capabilities.logical_cores).unwrap_or(u32::MAX));
-            if self.parallel_width == 1 {
-                resolved.price_at_width(cpu_width, &class_prior, capabilities.memory_budget_bytes);
-            } else if resolved.reservation.source == ResourceReservationSource::Unmeasured {
-                let fit = resolved.memory_fit;
-                resolved.price_at_width(cpu_width, &class_prior, capabilities.memory_budget_bytes);
-                resolved.memory_fit = fit;
-            }
+            resolved.charge_measured_peak(capabilities.memory_budget_bytes, slot_width);
         }
         resolved
     }
@@ -6642,10 +6649,10 @@ impl ReservationPlan {
         let mut memory_fits = Vec::with_capacity(self.batch_suites.len());
         let mut members = Vec::with_capacity(self.batch_suites.len());
         let mut process_evidence = None;
-        let cpu_width = capabilities
-            .concurrency_capacity
-            .unwrap_or_else(|| u32::try_from(capabilities.logical_cores).unwrap_or(u32::MAX))
-            .max(1);
+        let slot_width = cairn_common::executor_protocol::CompileSlots::of(
+            capabilities.admission_concurrency_budget(),
+        )
+        .width;
         for (identity, suite, class) in &self.batch_suites {
             if self.parallel_width > 1 && identity.is_none() {
                 continue;
@@ -6680,8 +6687,7 @@ impl ReservationPlan {
                     context,
                 )
                 .await;
-                item.charge_measured_peak(memory_budget_bytes);
-                item.price_at_width(cpu_width, &member_prior, memory_budget_bytes);
+                item.charge_measured_peak(memory_budget_bytes, slot_width);
                 process_evidence = Some(match process_evidence {
                     Some(held) => {
                         resource_profiles::ProcessEvidence::max(held, item.process_evidence.clone())
@@ -6718,26 +6724,30 @@ impl ReservationPlan {
         let mut memory_fit = resource_profiles::MemoryFit::of_batch(memory_fits);
         let mut evidence = process_evidence.unwrap_or_default();
         if self.parallel_width == 1 {
-            // Policy may raise a reduced live advertisement back to startup
-            // capacity after placement. Prove the envelope through the immutable
-            // hardware budget that bounds startup and every policy reapply.
-            let envelope_width = cairn_common::executor_protocol::admission_concurrency_budget(
-                capabilities.logical_cores,
-            );
-            reservation = sequential_memory_envelope(&members, envelope_width);
-            evidence.build_job_memory = reservation.build_job_memory;
-            evidence.build_jobs_elsewhere = None;
+            // One member runs at a time, at this machine's one slot width, so
+            // the group needs what its heaviest member needs: that member's
+            // figure is the group's, with the largest disk and units of any.
+            if let Some(heaviest) = members
+                .iter()
+                .max_by_key(|member| member.memory_charge_bytes())
+            {
+                reservation = ResourceReservation {
+                    disk_growth_bytes: reservation.disk_growth_bytes,
+                    concurrency_units: reservation.concurrency_units,
+                    ..heaviest.clone()
+                };
+            }
             // A later member may compile autonomously. Without re-admission a
-            // current member's test phase cannot release the future envelope.
+            // current member's test phase cannot release a later member's
+            // charge.
             if members.len() > 1 {
+                reservation.test_phase = None;
                 evidence.test_phase = None;
             }
-            if reservation.build_job_memory.is_none()
-                && memory_budget_bytes.is_some_and(|budget| {
-                    reservation.memory_charge_bytes()
-                        > resource_profiles::memory_reservation_cap(budget)
-                })
-                && !matches!(memory_fit, resource_profiles::MemoryFit::Exceeds(_))
+            if memory_budget_bytes.is_some_and(|budget| {
+                reservation.memory_charge_bytes()
+                    > resource_profiles::memory_reservation_cap(budget)
+            }) && !matches!(memory_fit, resource_profiles::MemoryFit::Exceeds(_))
             {
                 memory_fit = resource_profiles::MemoryFit::of(
                     Some(reservation.memory_charge_bytes()),
@@ -6759,64 +6769,6 @@ impl ReservationPlan {
             process_evidence: evidence,
         }
     }
-}
-
-/// One existing wire model may describe a sequential group only when an
-/// actual member dominates every other member over the entire grant range.
-/// Crossing curves retain their full-width envelope instead of synthesizing
-/// an unmeasured max-largest/max-typical process model.
-pub(super) fn sequential_memory_envelope(
-    members: &[ResourceReservation],
-    max_jobs: u32,
-) -> ResourceReservation {
-    if let [member] = members {
-        return member.clone();
-    }
-    let max_jobs = max_jobs.max(1);
-    let whole = members
-        .iter()
-        .map(ResourceReservation::memory_charge_bytes)
-        .max()
-        .unwrap_or(0);
-    let mut boundaries = vec![1, max_jobs];
-    for member in members {
-        if let Some(model) = member.build_job_memory {
-            let plateau = model.jobs_within(member.memory_charge_bytes());
-            boundaries.push(plateau.clamp(1, max_jobs));
-            boundaries.push(plateau.saturating_add(1).clamp(1, max_jobs));
-        }
-    }
-    let dominant = members.iter().find(|candidate| {
-        candidate.build_job_memory.is_some()
-            && candidate.source == ResourceReservationSource::Learned
-            && candidate.memory_charge_bytes() == whole
-            && boundaries.iter().all(|width| {
-                members.iter().all(|member| {
-                    candidate.memory_charge_at(Some(*width))
-                        >= member.memory_charge_at(Some(*width))
-                })
-            })
-    });
-    let mut reservation = dominant.cloned().unwrap_or_else(|| ResourceReservation {
-        memory_bytes: members
-            .iter()
-            .map(|member| member.memory_charge_at(Some(max_jobs)))
-            .max()
-            .unwrap_or(0),
-        ..ResourceReservation::default()
-    });
-    reservation.test_phase = None;
-    reservation.disk_growth_bytes = members
-        .iter()
-        .map(|member| member.disk_growth_bytes)
-        .max()
-        .unwrap_or(0);
-    reservation.concurrency_units = members
-        .iter()
-        .map(|member| member.concurrency_units)
-        .max()
-        .unwrap_or(1);
-    reservation
 }
 
 pub(super) fn selected_executor(entry: &ExecutorConnectionState) -> SelectedExecutor {

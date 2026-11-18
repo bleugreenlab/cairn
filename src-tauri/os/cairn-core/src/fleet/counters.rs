@@ -26,6 +26,7 @@ pub(crate) struct FleetCounters {
     refusals: AtomicU64,
     reservations: AtomicU64,
     needs_worked_out: AtomicU64,
+    announcements: AtomicU64,
     last_minute: Mutex<Option<CountedWindow>>,
 }
 
@@ -45,6 +46,8 @@ pub(crate) struct PlacementCounts {
     /// Times a queued request's needs on one machine were read from the
     /// profile store, rather than reused.
     pub(crate) needs_worked_out: u64,
+    /// Room frames received from the fleet (cairn/7303).
+    pub(crate) announcements: u64,
 }
 
 impl PlacementCounts {
@@ -60,6 +63,7 @@ impl PlacementCounts {
             needs_worked_out: self
                 .needs_worked_out
                 .saturating_sub(earlier.needs_worked_out),
+            announcements: self.announcements.saturating_sub(earlier.announcements),
         }
     }
 }
@@ -84,7 +88,7 @@ impl CountedWindow {
     pub(crate) fn sentence(&self) -> String {
         let counts = self.counts;
         format!(
-            "{} placement passes ({:.1}/s), {} fit evaluations ({:.1}/s), {} offers, {} refusals, {} reservations, {} needs worked out",
+            "{} placement passes ({:.1}/s), {} fit evaluations ({:.1}/s), {} offers, {} refusals, {} reservations, {} needs worked out, {} room announcements ({:.1}/s)",
             counts.placement_passes,
             self.per_second(counts.placement_passes),
             counts.fit_evaluations,
@@ -93,6 +97,8 @@ impl CountedWindow {
             counts.refusals,
             counts.reservations,
             counts.needs_worked_out,
+            counts.announcements,
+            self.per_second(counts.announcements),
         )
     }
 }
@@ -118,6 +124,11 @@ impl FleetCounters {
         self.refusals.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A machine announced its room.
+    pub(crate) fn announcement(&self) {
+        self.announcements.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// `count` needs were read from the profile store for a waiting request.
     pub(crate) fn needs_worked_out(&self, count: u64) {
         if count > 0 {
@@ -128,6 +139,7 @@ impl FleetCounters {
     pub(crate) fn totals(&self) -> PlacementCounts {
         PlacementCounts {
             needs_worked_out: self.needs_worked_out.load(Ordering::Relaxed),
+            announcements: self.announcements.load(Ordering::Relaxed),
             placement_passes: self.placement_passes.load(Ordering::Relaxed),
             fit_evaluations: self.fit_evaluations.load(Ordering::Relaxed),
             offers: self.offers.load(Ordering::Relaxed),
@@ -192,6 +204,7 @@ mod tests {
         counters.offer(false);
         counters.refusal();
         counters.needs_worked_out(3);
+        counters.announcement();
         let window = CountedWindow {
             ended_at_unix_ms: 0,
             window_ms: 2_000,
@@ -206,11 +219,12 @@ mod tests {
                 refusals: 1,
                 reservations: 1,
                 needs_worked_out: 3,
+                announcements: 1,
             }
         );
         assert_eq!(
             window.sentence(),
-            "2 placement passes (1.0/s), 14 fit evaluations (7.0/s), 2 offers, 1 refusals, 1 reservations, 3 needs worked out"
+            "2 placement passes (1.0/s), 14 fit evaluations (7.0/s), 2 offers, 1 refusals, 1 reservations, 3 needs worked out, 1 room announcements (0.5/s)"
         );
     }
 }

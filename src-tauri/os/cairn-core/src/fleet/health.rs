@@ -106,6 +106,37 @@ impl Fleet {
         })
     }
 
+    /// Hold the room an executor announced (cairn/7303): shown on its page,
+    /// and what the room-driven dispatcher will place by. A frame from a
+    /// replaced link, or one no newer than the room already held, changes
+    /// nothing.
+    pub fn record_room(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        seq: u64,
+        room: cairn_common::executor_protocol::AnnouncedRoom,
+    ) {
+        self.counters.announcement();
+        let mut connections = self.lock_connections();
+        let Some(entry) = connections
+            .get_mut(executor_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return;
+        };
+        if entry.room.as_ref().is_some_and(|held| held.seq >= seq) {
+            return;
+        }
+        entry.room = Some(Arc::new(
+            cairn_common::executor_protocol::RoomAnnouncement {
+                seq,
+                received_at_unix_ms: unix_time_ms(),
+                room,
+            },
+        ));
+    }
+
     /// Adopt a machine sample into this connection's posted health.
     ///
     /// Only the readings in it move. Cells, queues, reservations, and the rest
@@ -763,6 +794,7 @@ impl Fleet {
                     .map(|record| record.connection_timeline.iter().rev().cloned().collect())
                     .unwrap_or_default(),
                 project_eligibility: project_eligibility(entry, &known_projects),
+                room: entry.room.as_deref().cloned(),
             })
             .collect();
         values.sort_by(|a, b| a.name.cmp(&b.name));

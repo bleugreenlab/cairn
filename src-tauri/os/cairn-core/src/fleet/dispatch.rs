@@ -737,7 +737,7 @@ impl Fleet {
                 // long as a hold lasts. The first answer of a kind is the news;
                 // its repeats are folded into the entry's recorded decline and
                 // logged quietly.
-                match self.queue.decline(
+                let recorded = self.queue.decline(
                     &entry_id,
                     executor_id,
                     generation,
@@ -746,11 +746,23 @@ impl Fleet {
                     disk,
                     condition,
                     unix_time_ms(),
-                ) {
+                );
+                match recorded {
                     queue::DeclineRecord::Recorded { repeat: false } => log::info!("{line}"),
                     queue::DeclineRecord::Recorded { repeat: true } => log::debug!("{line}"),
                     queue::DeclineRecord::Stale => {
                         log::debug!("{line} (the entry had moved on; ignored)")
+                    }
+                }
+                if matches!(recorded, queue::DeclineRecord::Recorded { .. }) {
+                    let room_seq = self
+                        .lock_connections()
+                        .get(executor_id)
+                        .filter(|entry| entry.generation == generation)
+                        .and_then(|entry| entry.room.as_ref().map(|room| room.seq));
+                    if let Some(room_seq) = room_seq {
+                        self.queue
+                            .note_decline_room(&entry_id, executor_id, room_seq);
                     }
                 }
                 self.binding_changed.notify_waiters();
@@ -924,6 +936,11 @@ impl Fleet {
             // the CPU snapshot this frame replaced almost never did either.
             ExecutorMessage::MachineSampled { sample } => {
                 self.record_machine_sample(executor_id, generation, sample);
+                false
+            }
+            // Recorded and shown; nothing places by it yet (cairn/7303).
+            ExecutorMessage::Room { seq, room } => {
+                self.record_room(executor_id, generation, seq, room);
                 false
             }
             ExecutorMessage::InfrastructureDiagnostic { diagnostic } => {
@@ -1179,6 +1196,22 @@ impl Fleet {
     ) -> Option<CheckDispatchPhase> {
         self.request_dispatch_state(identity)
             .map(|(phase, _)| phase)
+    }
+
+    /// Why a request is still queued, from the queue entry that holds it
+    /// (cairn/6499): each machine's latest refusal in its own words with the
+    /// room it came under, what the latest placement pass did with each
+    /// machine it named, and the turns it waits behind. Answers for any queued
+    /// request, pinned or free to move. This is the one account of a queued
+    /// request: the check board, and through it a check request's durable
+    /// row, are written from this same phase. `None` once a machine has
+    /// claimed it or it has left the queue.
+    pub(crate) fn queued_request_account(&self, request_id: &str) -> Option<CheckDispatchPhase> {
+        let identity = self.queue.attempt_identity_of(request_id)?;
+        match self.request_dispatch_phase(&identity)? {
+            phase @ CheckDispatchPhase::Placing { .. } => Some(phase),
+            _ => None,
+        }
     }
 
     /// The phase of the execution queued as `identity`, with the owner its

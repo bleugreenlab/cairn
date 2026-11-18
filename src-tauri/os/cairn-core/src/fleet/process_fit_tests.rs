@@ -98,9 +98,8 @@ fn refuse(
         unattributed: None,
         unmeasured_compile: false,
         test_phase: None,
-        build_job_memory: None,
-        build_jobs_elsewhere: None,
         unreadable_memory: Vec::new(),
+        slot_tree: None,
     };
     match judge_process_evidence(
         &evidence,
@@ -224,9 +223,8 @@ fn an_unnamed_peak_is_waived_on_any_platform_with_its_arithmetic_shown() {
         }),
         unmeasured_compile: false,
         test_phase: None,
-        build_job_memory: None,
-        build_jobs_elsewhere: None,
         unreadable_memory: Vec::new(),
+        slot_tree: None,
     };
     let budget = Some(24 * GIB / 100 * 85);
     for kernel_kills in [false, true] {
@@ -260,9 +258,8 @@ fn a_named_misfit_is_waived_only_where_nothing_kills() {
         unattributed: None,
         unmeasured_compile: false,
         test_phase: None,
-        build_job_memory: None,
-        build_jobs_elsewhere: None,
         unreadable_memory: Vec::new(),
+        slot_tree: None,
     };
     let judge = |kernel_kills| {
         judge_process_evidence(
@@ -304,9 +301,8 @@ fn a_fitting_unnamed_peak_leaves_no_record() {
         }),
         unmeasured_compile: false,
         test_phase: None,
-        build_job_memory: None,
-        build_jobs_elsewhere: None,
         unreadable_memory: Vec::new(),
+        slot_tree: None,
     };
     assert_eq!(
         judge_process_evidence(

@@ -9366,19 +9366,19 @@ pub struct LearnedResourceEstimate {
 ///
 /// cairn/7244 does not move the number. Spawn sizes build jobs from
 /// admission's own room and solver, admission declines a lane below
-/// [`width_floor`] beside other compile-class work, and test threads are
-/// sized apart from the build jobs. On the wire, [`MemoryJobBound`] gains
+/// `width_floor` beside other compile-class work, and test threads are
+/// sized apart from the build jobs. On the wire, `MemoryJobBound` gains
 /// defaulted `owedBytes`, `owing` and `batchItems` and keeps `sharers`, now
 /// always 1 and read by nothing. [`BuildJobs`] gains an optional
 /// `testThreads`, and [`HostPressureCondition::MemoryAvailable`] an optional
-/// `widthFloor` ([`WidthFloorShortfall`]), whose `floorBytes` is then the
+/// `widthFloor` (`WidthFloorShortfall`), whose `floorBytes` is then the
 /// charge at the floor width. `BuildJobs` also gains an optional `narrowed`
-/// ([`SpawnNarrowing`]) and [`AdmissionHealth`] an optional
+/// (`SpawnNarrowing`) and [`AdmissionHealth`] an optional
 /// `floorNarrowingsLastDay`, both diagnostics an older runner ignores.
-/// [`BuildJobMemoryEvidence`] gains an optional `width`
-/// ([`JobWidthEvidence`]: the suite's tree measured at width on that machine),
+/// `BuildJobMemoryEvidence` gains an optional `width`
+/// (`JobWidthEvidence`: the suite's tree measured at width on that machine),
 /// which a runner sends with the job census; `MemoryAvailable` gains an
-/// optional `aloneBeside` ([`AloneHold`]) and [`WidthFloorShortfall`] an
+/// optional `aloneBeside` ([`AloneHold`]) and `WidthFloorShortfall` an
 /// optional `widestMeasuredJobs`. An executor that receives no `width` reads
 /// the work as measured at one job, so a wider grant runs alone and is
 /// charged no less than its whole charge: the conservative side. An older
@@ -9497,7 +9497,7 @@ pub struct LearnedResourceEstimate {
 /// command's metadata narrowed to it by [`CellExecutionMeta::for_batch_item`],
 /// and the runner settles that item's subscribers at once. The batch's own
 /// result is unchanged: it still settles every item no callback reached, and
-/// the runner checks it against what each callback delivered. [`MemoryJobBound`]
+/// the runner checks it against what each callback delivered. `MemoryJobBound`
 /// loses `sharers`, as the cairn/7244 paragraph asked. What a runner gets wrong
 /// talking to an older executor: every member's verdict waits for the whole
 /// batch, which is the latency this version removes; an older runner talking
@@ -9549,7 +9549,30 @@ pub struct LearnedResourceEstimate {
 /// changes. What a runner gets wrong talking to an older executor: nothing it
 /// decodes; that executor's first build after a build root is configured
 /// still fails with `build volume absent` until the directory is made by hand.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 174;
+///
+/// Version 175 (cairn/7332) runs compile-class work in fixed-width compile
+/// slots and has the executor announce its room (cairn/7303 step 3). The
+/// executor gains [`ExecutorMessage::Room`], carrying an [`AnnouncedRoom`],
+/// sent once a link is ready and after that on every material change, and
+/// decides every offer by [`fits`] over that same room, so the runner can
+/// read the machine's own rule over the machine's own figures. A compile is
+/// told exactly its slot's width ([`CompileSlots`]) and charged its whole
+/// figure, so the elastic-width wire goes: [`ResourceReservation`] loses
+/// `buildJobMemory` (and with it the per-job census and width evidence),
+/// [`BuildJobs`] loses `narrowed`, `heldToMeasured` and `memory`,
+/// `HostPressureCondition::MemoryAvailable` loses `widthFloor`,
+/// [`AloneReason`] loses `unlearnedWidth`, [`AdmissionHealth`] loses
+/// `floorNarrowingsLastDay`, and [`ReservationRationale`]'s
+/// `buildJobsPrice` becomes `slotPrice` ([`SlotPrice`]). What a runner gets
+/// wrong talking to an older executor: it hears no room, and the older
+/// executor sizes a compile's width by memory against figures the runner no
+/// longer sends, so it would run every compile at its whole charge and full
+/// elastic width. What an older runner gets wrong talking to a newer
+/// executor: it prices compiles at full width with the marginal model and
+/// sends no census, and cannot read a Room frame. The handshake refuses both
+/// pairings, as for every bump, and an executor refused this way updates
+/// itself to the runner's build.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 175;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -11642,110 +11665,6 @@ pub struct ResourceReservation {
     /// demand fails closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_phase: Option<TestPhaseEvidence>,
-    /// What one build job of this work has been measured to hold on this
-    /// machine, which sizes the build jobs the executor grants it at spawn.
-    /// `None` until a run here measured enough job processes: the executor
-    /// then assumes a fixed reserve per job and says so.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_job_memory: Option<BuildJobMemoryEvidence>,
-}
-
-/// What a suite's build jobs have been measured to hold in one machine
-/// context: rise-only high-water marks of [`BuildJobProcesses`] over the runs
-/// that measured enough job processes to say.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct BuildJobMemoryEvidence {
-    pub largest_bytes: u64,
-    pub typical_bytes: u64,
-    /// The runs that taught these figures.
-    pub samples: u32,
-    /// What this work's whole tree was measured to hold at the widths it ran
-    /// at here. `None` until a run here was measured at a known width, and
-    /// from a runner that predates it: the work is then measured at one job
-    /// only ([`Self::measured_width`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub width: Option<JobWidthEvidence>,
-}
-
-/// A suite's tree as measured at width on one machine, rise-only, each
-/// figure with the run it came from (cairn/7244).
-///
-/// The typical job is a median crate, taken with no regard to what ran
-/// beside it, and cannot stand for the several large rustc a wide compile
-/// holds at once: a 17-job rust-tests run on bbs held three at 11.3, 15.9 and
-/// 15.9 GiB together, and the 20-job tree on bginf-sp2 peaked at 54.7 GiB
-/// where `largest + 19 typical` priced about 30. These figures are the tree
-/// itself, at the jobs it was granted.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct JobWidthEvidence {
-    /// The most build jobs a measured run here was granted.
-    pub widest_jobs: u32,
-    /// The largest tree peak measured at `widest_jobs`.
-    pub widest_tree_bytes: u64,
-    /// The largest `(tree peak - largest job) / (jobs - 1)` of any run here
-    /// at two or more jobs: what each further job was measured to add.
-    #[serde(default)]
-    pub marginal_bytes: u64,
-    /// The jobs and tree peak of the run `marginal_bytes` came from.
-    #[serde(default)]
-    pub marginal_jobs: u32,
-    #[serde(default)]
-    pub marginal_tree_bytes: u64,
-}
-
-/// From this many build jobs a wide compile holds several large rustc at
-/// once, so a width from here up to the widest measured is charged no less
-/// than the tree measured at that widest width
-/// ([`ResourceReservation::compile_charge_bytes`]). Conservative on purpose:
-/// one tree peak per machine and suite cannot say how the tree grows between
-/// three jobs and the widest, so mid widths are over-charged rather than
-/// learned from a kill.
-pub const CO_RESIDENT_LARGE_JOBS: u32 = 3;
-
-impl BuildJobMemoryEvidence {
-    /// What this work holds at `jobs` build jobs: its largest job, and the
-    /// typical job for each further one. The one model both the jobs a
-    /// command is granted and the memory it is charged are read from, so a
-    /// grant's charge never exceeds the memory it was sized to fit.
-    ///
-    /// No headroom is added: each figure is already a rise-only high-water
-    /// mark of one process at its own peak, and a compile's jobs rarely peak
-    /// together, so the sum is itself an upper estimate of the tree.
-    pub fn bytes_at(&self, jobs: u32) -> u64 {
-        let further = u64::from(jobs.max(1) - 1);
-        self.largest_bytes
-            .saturating_add(further.saturating_mul(self.further_job_bytes()))
-    }
-
-    /// What each job beyond the largest is priced at: the typical job, or
-    /// what a further job was measured to add to the tree where that is more.
-    pub fn further_job_bytes(&self) -> u64 {
-        self.typical_bytes
-            .max(self.width.map_or(0, |width| width.marginal_bytes))
-    }
-
-    /// The widest grant a measured run here had, one where none was measured
-    /// at a known width. A wider grant is an unlearned width: it is made only
-    /// to a lane alone on the machine, and charged conservatively.
-    pub fn measured_width(&self) -> u32 {
-        self.width.map_or(1, |width| width.widest_jobs.max(1))
-    }
-
-    /// The most build jobs whose [`Self::bytes_at`] fits in `bytes`, never
-    /// below one: a machine that cannot hold the largest job beside nothing
-    /// is the single-process fit's question, not the width's.
-    pub fn jobs_within(&self, bytes: u64) -> u32 {
-        let further = bytes.saturating_sub(self.largest_bytes) / self.further_job_bytes().max(1);
-        u32::try_from(further).unwrap_or(u32::MAX).saturating_add(1)
-    }
-
-    /// Whether these figures can price a width at all: a run that measured
-    /// no job process teaches nothing a width could be read from.
-    pub fn is_usable(&self) -> bool {
-        self.largest_bytes > 0 && self.typical_bytes > 0 && self.samples > 0
-    }
 }
 
 /// A suite's test phase as measured on one machine: rise-only high-water
@@ -11768,6 +11687,18 @@ pub struct TestPhaseEvidence {
     pub bytes_per_concurrent_test: u64,
 }
 
+impl TestPhaseEvidence {
+    /// What the test phase holds running `concurrent_tests` tests at once: the
+    /// measured peak, or the per-test figure at that concurrency where that is
+    /// more, with measured headroom.
+    pub fn bytes_at(&self, concurrent_tests: u32) -> u64 {
+        let scaled = self
+            .bytes_per_concurrent_test
+            .saturating_mul(u64::from(concurrent_tests.max(1)));
+        with_measured_headroom(self.peak_bytes.max(scaled))
+    }
+}
+
 const fn default_concurrency_units() -> u32 {
     1
 }
@@ -11781,7 +11712,6 @@ impl Default for ResourceReservation {
             source: ResourceReservationSource::Unmeasured,
             measured_peak_bytes: None,
             test_phase: None,
-            build_job_memory: None,
         }
     }
 }
@@ -11793,77 +11723,7 @@ pub fn memory_reservation_cap(memory_budget_bytes: u64) -> u64 {
     memory_budget_bytes.saturating_mul(3) / 4
 }
 
-/// An in-process admission decision, not an executor wire message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryGrant {
-    pub jobs: Option<u32>,
-    pub charge_bytes: u64,
-}
-
-/// The minimum unclamped charge, including the caller's fixed floor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryGrantShortfall {
-    pub minimum_charge_bytes: u64,
-    /// Whether the minimum is one build job's charge from a usable job census.
-    /// Without one the whole measured tree is charged, which is missing width
-    /// evidence rather than a measured one-job excess.
-    pub width_measured: bool,
-}
-
 impl ResourceReservation {
-    /// The minimum available-memory floor standing headroom protects. This is
-    /// separate from its nominal budget charge, which remains `memory_bytes`.
-    pub fn headroom_memory_floor_bytes(&self) -> u64 {
-        self.solve_memory_grant(1, u64::MAX, admission_memory_floor(0))
-            .expect("an unbounded budget holds even a saturated memory charge")
-            .charge_bytes
-    }
-
-    /// Widest compile width whose actual charge fits, without clamping that
-    /// charge to the limit. Missing or empty process evidence keeps the whole charge;
-    /// a declared charge remains fixed. The caller supplies any non-scalable
-    /// floor (including admission headroom) independently of the process model.
-    pub fn solve_memory_grant(
-        &self,
-        max_jobs: u32,
-        limit_bytes: u64,
-        floor_bytes: u64,
-    ) -> Result<MemoryGrant, MemoryGrantShortfall> {
-        let widest = self
-            .build_job_memory
-            .filter(BuildJobMemoryEvidence::is_usable)
-            .and_then(|_| self.admission_build_jobs(max_jobs, None));
-        let charge = |jobs| self.memory_charge_at(jobs).max(floor_bytes);
-        let minimum_charge_bytes = charge(widest.map(|_| 1));
-        // jobs_within deliberately returns at least one even when one cannot
-        // fit. Feasibility must therefore be checked against the charge itself.
-        if minimum_charge_bytes > limit_bytes {
-            return Err(MemoryGrantShortfall {
-                minimum_charge_bytes,
-                width_measured: widest.is_some(),
-            });
-        }
-        let Some(mut high) = widest else {
-            return Ok(MemoryGrant {
-                jobs: None,
-                charge_bytes: minimum_charge_bytes,
-            });
-        };
-        let mut low = 1;
-        while low < high {
-            let middle = low + (high - low).div_ceil(2);
-            if charge(Some(middle)) <= limit_bytes {
-                low = middle;
-            } else {
-                high = middle - 1;
-            }
-        }
-        Ok(MemoryGrant {
-            jobs: Some(low),
-            charge_bytes: charge(Some(low)),
-        })
-    }
-
     /// Concurrency demand for a command that runs its own machine-wide job
     /// server and will fan out across every core it finds.
     ///
@@ -11877,83 +11737,12 @@ impl ResourceReservation {
 
     /// What a running command with this reservation is charged against
     /// memory: its reservation, or its measured peak where that is larger.
+    ///
+    /// For compile-class work this is the memory it was learned to hold at
+    /// its machine's compile slot width ([`CompileSlots`]), which is the only
+    /// width it ever runs at there, so no width prices it differently.
     pub fn memory_charge_bytes(&self) -> u64 {
         self.memory_bytes.max(self.measured_peak_bytes.unwrap_or(0))
-    }
-
-    /// What this work is charged compiling at `jobs` build jobs, from its build
-    /// jobs as measured on this machine ([`BuildJobMemoryEvidence::bytes_at`]),
-    /// or `None` where none were measured here, which keeps
-    /// [`Self::memory_charge_bytes`].
-    ///
-    /// A process tree's peak grows with the width the run that measured it was
-    /// granted, so a whole-suite peak taken at 32 jobs charged a lane granted
-    /// four as if it ran 32 (cairn/6263). Per-process figures do not depend on
-    /// the width, so they price any width. A learned reservation is this
-    /// machine's own measured tree, which no width it grants exceeds, so the
-    /// charge is never above it; any other reservation is a prior, and the
-    /// measured jobs replace it. A declared reservation is the caller's own
-    /// statement and stands.
-    ///
-    /// The width model is trusted only as far as this machine measured it
-    /// (cairn/7244). Up to [`CO_RESIDENT_LARGE_JOBS`] it prices the width. From
-    /// there to [`BuildJobMemoryEvidence::measured_width`] it is charged no less
-    /// than the tree measured at that widest width. Beyond it the width is
-    /// unlearned, granted only to a lane alone
-    /// ([`Self::runs_unlearned_width`]), and charged no less than the whole
-    /// charge. The whole charge is not a safe bound by itself, because it
-    /// decays across narrow runs, which is why an unlearned width must run alone.
-    pub fn compile_charge_bytes(&self, jobs: u32) -> Option<u64> {
-        let evidence = self.build_job_memory?;
-        if self.source == ResourceReservationSource::Declared {
-            return None;
-        }
-        let jobs = jobs.max(1);
-        let model = evidence.bytes_at(jobs);
-        Some(if jobs > evidence.measured_width() {
-            model.max(self.memory_charge_bytes())
-        } else if jobs >= CO_RESIDENT_LARGE_JOBS {
-            model.max(evidence.width.map_or(0, |width| width.widest_tree_bytes))
-        } else {
-            model
-        })
-    }
-
-    /// Whether a grant of `jobs` is wider than any this work was measured at
-    /// on this machine: a lane at such a width runs alone, and nothing
-    /// compile-class is admitted beside it until it ends ([`AloneHold`]).
-    /// Declared work and work with no usable job evidence never are.
-    pub fn runs_unlearned_width(&self, jobs: Option<u32>) -> bool {
-        self.source != ResourceReservationSource::Declared
-            && self
-                .build_job_memory
-                .filter(BuildJobMemoryEvidence::is_usable)
-                .zip(jobs)
-                .is_some_and(|(evidence, jobs)| jobs > evidence.measured_width())
-    }
-
-    /// The build jobs this work is priced at when it is admitted: `cpu_width`,
-    /// held to the jobs `memory_left` (available memory less what admitted
-    /// work owes) holds at its measured job sizes, so a lane that cannot run
-    /// wide is admitted narrow rather than refused at a width another machine
-    /// granted. `None` without build jobs measured on this machine, which
-    /// prices the work whole.
-    ///
-    /// The executor passes its elastic width; the runner, which cannot see
-    /// how the bulk budget is split, passes no width limit, so its forecast
-    /// is never narrower than the executor's answer and never refuses a
-    /// machine the executor would admit.
-    pub fn admission_build_jobs(&self, cpu_width: u32, memory_left: Option<u64>) -> Option<u32> {
-        let evidence = self.build_job_memory?;
-        let cpu_width = cpu_width.max(1);
-        Some(memory_left.map_or(cpu_width, |left| cpu_width.min(evidence.jobs_within(left))))
-    }
-
-    /// [`Self::compile_charge_bytes`] at `jobs` where the width is known,
-    /// else the whole charge.
-    pub fn memory_charge_at(&self, jobs: Option<u32>) -> u64 {
-        jobs.and_then(|jobs| self.compile_charge_bytes(jobs))
-            .unwrap_or_else(|| self.memory_charge_bytes())
     }
 
     /// What a lane of this work is charged once its test phase has been
@@ -11967,11 +11756,10 @@ impl ResourceReservation {
     /// their peaks, never averaged.
     pub fn test_phase_charge_bytes(&self, concurrent_tests: u32) -> Option<u64> {
         let evidence = self.test_phase?;
-        let scaled = evidence
-            .bytes_per_concurrent_test
-            .saturating_mul(u64::from(concurrent_tests.max(1)));
         Some(
-            with_measured_headroom(evidence.peak_bytes.max(scaled)).min(self.memory_charge_bytes()),
+            evidence
+                .bytes_at(concurrent_tests)
+                .min(self.memory_charge_bytes()),
         )
     }
 }
@@ -12061,7 +11849,7 @@ mod lane_charge_tests {
             since_unix_ms: 0,
             tests: 1_000,
         });
-        let eight = Some(BuildJobs::new(8, None));
+        let eight = Some(BuildJobs::new(8));
         assert_eq!(
             lane_memory_charge(&lane(), Some(LanePhase::Compile), eight),
             (31 * GIB, Some(ChargedPhase::Compile))
@@ -12074,7 +11862,7 @@ mod lane_charge_tests {
         // A wider lane is priced at its own concurrency, never above the
         // whole-suite charge.
         assert_eq!(
-            lane_memory_charge(&lane(), testing, Some(BuildJobs::new(16, None))).0,
+            lane_memory_charge(&lane(), testing, Some(BuildJobs::new(16))).0,
             10 * GIB
         );
         assert_eq!(
@@ -12096,330 +11884,26 @@ mod lane_charge_tests {
         assert_eq!(lane_memory_charge(&lane(), None, eight), (31 * GIB, None));
     }
 
-    /// The rust-tests lane above as this machine measured it: a 31 GiB whole
-    /// charge, a 20 GiB largest job (cairn-core's test rustc), 1 GiB typical
-    /// ones, and (where `width`) its tree measured at 28 GiB at eight jobs.
-    fn measured_jobs(source: ResourceReservationSource, width: bool) -> ResourceReservation {
-        ResourceReservation {
-            source,
-            build_job_memory: Some(BuildJobMemoryEvidence {
-                largest_bytes: 20 * GIB,
-                typical_bytes: GIB,
-                samples: 3,
-                width: width.then_some(JobWidthEvidence {
-                    widest_jobs: 8,
-                    widest_tree_bytes: 28 * GIB,
-                    marginal_bytes: GIB,
-                    marginal_jobs: 8,
-                    marginal_tree_bytes: 28 * GIB,
-                }),
-            }),
-            ..lane()
-        }
-    }
-
-    /// The width model prices a width only as far as this machine measured
-    /// it (cairn/7244). Two jobs are the model's. From three up to the widest
-    /// measured they are charged no less than the tree measured there, since
-    /// several large rustc are resident at once. Past it the width is
-    /// unlearned and charged no less than the whole charge. The whole charge
-    /// is no ceiling: a learned tree decays across narrow runs, and the wide
-    /// tree on bginf-sp2 was 54.7 GiB where the model said about 30.
+    /// A compile runs at its machine's one slot width, the width its figure
+    /// was learned at, so whatever build jobs it was told it is charged that
+    /// figure whole: nothing narrows or widens it after admission.
     #[test]
-    fn a_compile_is_charged_at_the_build_jobs_it_was_granted() {
-        let learned = measured_jobs(ResourceReservationSource::Learned, true);
-        let compiling = Some(LanePhase::Compile);
-        let jobs = |jobs| Some(BuildJobs::new(jobs, None));
-        assert_eq!(
-            lane_memory_charge(&learned, compiling, jobs(2)),
-            (21 * GIB, Some(ChargedPhase::Compile)),
-            "the largest job and one further one"
-        );
-        assert_eq!(
-            lane_memory_charge(&learned, None, jobs(2)),
-            (21 * GIB, None),
-            "a command that is not a phased lane is priced at its width too"
-        );
-        assert_eq!(
-            lane_memory_charge(&learned, compiling, jobs(4)).0,
-            28 * GIB,
-            "from three jobs, no less than the tree measured at the widest width"
-        );
-        assert_eq!(
-            lane_memory_charge(&learned, compiling, jobs(32)).0,
-            51 * GIB,
-            "past the measured width, the model or the whole charge, whichever is more"
-        );
-        assert_eq!(
-            lane_memory_charge(&learned, compiling, None).0,
-            31 * GIB,
-            "an unknown width keeps the whole charge"
-        );
-        assert_eq!(
-            lane_memory_charge(&lane(), compiling, jobs(4)).0,
-            31 * GIB,
-            "no build jobs measured here keeps the whole charge, fail-closed"
-        );
-        // Measured at one job only, every wider grant is unlearned.
-        let prior = measured_jobs(ResourceReservationSource::Unmeasured, false);
-        assert_eq!(lane_memory_charge(&prior, compiling, jobs(1)).0, 20 * GIB);
-        assert_eq!(lane_memory_charge(&prior, compiling, jobs(4)).0, 31 * GIB);
-        assert_eq!(lane_memory_charge(&prior, compiling, jobs(32)).0, 51 * GIB);
-        assert!(prior.runs_unlearned_width(Some(2)));
-        assert!(!learned.runs_unlearned_width(Some(8)));
-        assert!(learned.runs_unlearned_width(Some(9)));
-        // A caller's stated reservation stands.
-        let declared = measured_jobs(ResourceReservationSource::Declared, true);
-        assert_eq!(
-            lane_memory_charge(&declared, compiling, jobs(4)).0,
-            31 * GIB
-        );
-        // The test phase is priced by its own evidence, as before.
-        let testing = Some(LanePhase::Test {
-            since_unix_ms: 0,
-            tests: 1_000,
-        });
-        assert_eq!(lane_memory_charge(&learned, testing, jobs(8)).0, 5 * GIB);
-    }
-
-    #[test]
-    fn memory_grant_solver_fits_widest_unclamped_charge() {
-        // Historical wide-tree totals; per-process sizes here are synthetic,
-        // not a recovered census. The 2.5 GiB typical is an assumed fixture.
-        let ceiling = memory_reservation_cap(96_287_798_067);
-        assert_eq!(ceiling, 72_215_848_550);
-        assert_eq!(memory_reservation_cap(4), 3);
-        assert_eq!(memory_reservation_cap(3), 2);
-        for tree in [73_152_409_600, 72_489_070_720] {
-            for largest in [126 * GIB / 10, 147 * GIB / 10] {
-                let reservation = ResourceReservation {
-                    memory_bytes: tree,
-                    measured_peak_bytes: Some(tree),
-                    build_job_memory: Some(BuildJobMemoryEvidence {
-                        largest_bytes: largest,
-                        typical_bytes: 5 * GIB / 2,
-                        samples: 1,
-                        // Measured at 32 jobs with no tree above the model, so
-                        // the model alone prices every width the solver walks.
-                        width: Some(JobWidthEvidence {
-                            widest_jobs: 32,
-                            widest_tree_bytes: 0,
-                            marginal_bytes: 0,
-                            marginal_jobs: 32,
-                            marginal_tree_bytes: 0,
-                        }),
-                    }),
-                    ..measured_jobs(ResourceReservationSource::Learned, false)
-                };
-                let grant = reservation.solve_memory_grant(32, ceiling, 0).unwrap();
-                let jobs = grant.jobs.unwrap();
-                assert!(jobs < 32);
-                assert_eq!(grant.charge_bytes, reservation.memory_charge_at(Some(jobs)));
-                assert!(grant.charge_bytes <= ceiling);
-                assert!(reservation.memory_charge_at(Some(jobs + 1)) > ceiling);
-                assert_eq!(
-                    reservation
-                        .solve_memory_grant(32, grant.charge_bytes, 0)
-                        .unwrap(),
-                    grant
-                );
-                assert_eq!(
-                    reservation
-                        .solve_memory_grant(32, grant.charge_bytes - 1, 0)
-                        .unwrap()
-                        .jobs,
-                    Some(jobs - 1)
-                );
-                assert_eq!(
-                    reservation
-                        .solve_memory_grant(32, largest - 1, 0)
-                        .unwrap_err()
-                        .minimum_charge_bytes,
-                    largest
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn memory_grant_solver_preserves_unknown_declared_floors_and_saturation() {
-        let fixed = ResourceReservation {
-            memory_bytes: 100,
-            ..Default::default()
-        };
-        assert_eq!(
-            fixed.solve_memory_grant(u32::MAX, 100, 0).unwrap().jobs,
-            None
-        );
-        assert_eq!(
-            fixed
-                .solve_memory_grant(1, 99, 0)
-                .unwrap_err()
-                .minimum_charge_bytes,
-            100
-        );
-        let modeled = ResourceReservation {
-            memory_bytes: 100,
-            source: ResourceReservationSource::Unmeasured,
-            build_job_memory: Some(BuildJobMemoryEvidence {
-                largest_bytes: 10,
-                typical_bytes: 5,
-                samples: 1,
-                // Measured at every width solved below, so the model prices
-                // them and the floors are what is under test.
-                width: Some(JobWidthEvidence {
-                    widest_jobs: 20,
-                    widest_tree_bytes: 0,
-                    marginal_bytes: 0,
-                    marginal_jobs: 20,
-                    marginal_tree_bytes: 0,
-                }),
-            }),
-            ..Default::default()
-        };
-        assert_eq!(
-            modeled.solve_memory_grant(20, 25, 25).unwrap().jobs,
-            Some(4)
-        );
-        assert_eq!(
-            modeled
-                .solve_memory_grant(20, 24, 25)
-                .unwrap_err()
-                .minimum_charge_bytes,
-            25
-        );
-        assert_eq!(modeled.solve_memory_grant(0, 10, 0).unwrap().jobs, Some(1));
-        let declared = ResourceReservation {
-            source: ResourceReservationSource::Declared,
-            ..modeled.clone()
-        };
-        assert_eq!(
-            declared
-                .solve_memory_grant(20, 99, 0)
-                .unwrap_err()
-                .minimum_charge_bytes,
-            100
-        );
-        assert_eq!(
-            declared
-                .solve_memory_grant(20, 100, 0)
-                .unwrap()
-                .charge_bytes,
-            100
-        );
-        let saturated = ResourceReservation {
-            build_job_memory: Some(BuildJobMemoryEvidence {
-                largest_bytes: u64::MAX - 1,
-                typical_bytes: u64::MAX,
-                samples: 1,
-                width: None,
-            }),
-            ..modeled
-        };
-        assert_eq!(
-            saturated
-                .solve_memory_grant(u32::MAX, u64::MAX, 0)
-                .unwrap()
-                .jobs,
-            Some(u32::MAX)
-        );
-        assert_eq!(
-            saturated
-                .solve_memory_grant(u32::MAX, u64::MAX - 1, 0)
-                .unwrap()
-                .jobs,
-            Some(1)
-        );
-        for (largest_bytes, typical_bytes, samples) in [(0, 5, 1), (10, 0, 1), (10, 5, 0)] {
-            let empty = ResourceReservation {
-                memory_bytes: 100,
-                build_job_memory: Some(BuildJobMemoryEvidence {
-                    largest_bytes,
-                    typical_bytes,
-                    samples,
-                    width: None,
-                }),
-                ..saturated.clone()
-            };
+    fn a_compile_is_charged_its_whole_figure_at_any_build_jobs() {
+        for jobs in [None, Some(1), Some(8), Some(32)] {
             assert_eq!(
-                empty.solve_memory_grant(u32::MAX, 100, 0).unwrap(),
-                MemoryGrant {
-                    jobs: None,
-                    charge_bytes: 100
-                }
-            );
-            assert_eq!(
-                empty
-                    .solve_memory_grant(u32::MAX, 99, 0)
-                    .unwrap_err()
-                    .minimum_charge_bytes,
-                100
+                lane_memory_charge(&lane(), Some(LanePhase::Compile), jobs.map(BuildJobs::new)).0,
+                31 * GIB,
+                "{jobs:?}"
             );
         }
     }
 
-    #[test]
-    fn the_jobs_a_share_holds_are_the_widest_whose_charge_fits_it() {
-        let evidence = BuildJobMemoryEvidence {
-            largest_bytes: 20 * GIB,
-            typical_bytes: 3 * GIB / 2,
-            samples: 1,
-            width: None,
-        };
-        for jobs in 1..64 {
-            assert_eq!(evidence.jobs_within(evidence.bytes_at(jobs)), jobs);
-            if jobs > 1 {
-                assert_eq!(evidence.jobs_within(evidence.bytes_at(jobs) - 1), jobs - 1);
-            }
-        }
-        assert_eq!(evidence.jobs_within(0), 1, "never zero jobs");
-        assert_eq!(evidence.bytes_at(0), 20 * GIB, "zero jobs is read as one");
-        let lane = ResourceReservation {
-            build_job_memory: Some(evidence),
-            ..ResourceReservation::default()
-        };
-        let room = SpawnMemory {
-            available_bytes: 41 * GIB,
-            owed_bytes: 0,
-            owing: 0,
-            measured_at_unix_ms: 1,
-        };
-        let bound = MemoryJobBound::learned(room, &lane, 64).unwrap();
-        assert_eq!(bound.jobs, 15);
-        assert!(evidence.bytes_at(bound.jobs) <= 41 * GIB);
-        // What other lanes owe comes off the room once, and only once.
-        let owed = SpawnMemory {
-            owed_bytes: 6 * GIB,
-            owing: 2,
-            ..room
-        };
-        assert_eq!(
-            MemoryJobBound::learned(owed, &lane, 64).unwrap().jobs,
-            evidence.jobs_within(35 * GIB)
-        );
-    }
-
-    #[test]
-    fn the_floor_width_is_half_the_cpu_width_rounded_up() {
-        assert_eq!(
-            [0, 1, 2, 3, 5, 20].map(width_floor),
-            [1, 1, 1, 2, 3, 10],
-            "never zero, never above the width"
-        );
-    }
-
-    /// bginf-sp1's evidence: a 27.5 GiB largest compile job, 154 MiB typical
-    /// ones, and a test phase near 3.8 GiB at about 217 MiB a test.
+    /// bginf-sp1's evidence: a 31 GiB compile, and a test phase near 3.8 GiB
+    /// at about 217 MiB a test.
     fn sp1_lane() -> ResourceReservation {
         ResourceReservation {
             memory_bytes: 31 * GIB,
             source: ResourceReservationSource::Learned,
-            build_job_memory: Some(BuildJobMemoryEvidence {
-                largest_bytes: 55 * GIB / 2,
-                typical_bytes: 154 << 20,
-                samples: 4,
-                width: None,
-            }),
             test_phase: Some(TestPhaseEvidence {
                 peak_bytes: 38 * GIB / 10,
                 bytes_per_concurrent_test: 217 << 20,
@@ -12431,8 +11915,11 @@ mod lane_charge_tests {
     #[test]
     fn tests_run_as_wide_as_the_compile_charge_holds_not_as_the_build_jobs() {
         let lane = sp1_lane();
-        let narrow = BuildJobs::new(5, None);
-        let narrow = BuildJobs { jobs: 1, ..narrow }.with_test_threads(&lane);
+        let narrow = BuildJobs {
+            jobs: 1,
+            ..BuildJobs::new(5)
+        }
+        .with_test_threads(&lane);
         assert_eq!((narrow.jobs, narrow.test_threads()), (1, 5));
         assert!(narrow.describe().ends_with("; tests 5 at a time"));
 
@@ -12455,11 +11942,12 @@ mod lane_charge_tests {
             ..lane.clone()
         };
         let held = BuildJobs { jobs: 1, ..narrow }.with_test_threads(&heavy);
-        let compile = heavy.memory_charge_at(Some(1));
+        let compile = heavy.memory_charge_bytes();
         let threads = held.test_threads();
+        let phase = heavy.test_phase.unwrap();
         assert!(threads < 5, "{threads}");
-        assert!(heavy.test_phase_charge_bytes(threads).unwrap() <= compile);
-        assert!(heavy.test_phase_charge_bytes(threads + 1).unwrap() > compile);
+        assert!(phase.bytes_at(threads) <= compile);
+        assert!(phase.bytes_at(threads + 1) > compile);
 
         // The test-phase charge is priced at the threads that run, never
         // above the compile charge the lane steps down from.
@@ -12479,74 +11967,27 @@ mod lane_charge_tests {
             serde_json::from_value(serde_json::to_value(narrow).unwrap()).unwrap();
         assert_eq!(wire, narrow);
     }
-
-    /// cairn/6441's lockstep: lanes launched wide can each reach their largest
-    /// rustc at once. Each lane's compile charge holds a whole largest job, so
-    /// N lanes are charged at least N of them; launching wide weakens nothing.
-    #[test]
-    fn lanes_launched_wide_are_each_charged_a_whole_largest_job() {
-        let lane = sp1_lane();
-        let largest = lane.build_job_memory.unwrap().largest_bytes;
-        for width in [1, 5, 20] {
-            let jobs = BuildJobs::new(width, None).with_test_threads(&lane);
-            let charged: u64 = (0..4)
-                .map(|_| lane_memory_charge(&lane, Some(LanePhase::Compile), Some(jobs)).0)
-                .sum();
-            assert!(charged >= 4 * largest, "{width}: {charged}");
-        }
-    }
-
-    #[test]
-    fn a_launch_under_the_floor_is_marked_only_when_narrower_than_admitted() {
-        let narrow = BuildJobs {
-            jobs: 1,
-            ..BuildJobs::new(5, None)
-        };
-        // Admitted at 5, launched at 1: room or share shrank after admission.
-        let marked = narrow.marking_narrowing(Some(5));
-        assert_eq!(
-            marked.narrowed,
-            Some(SpawnNarrowing {
-                admitted_jobs: 5,
-                floor_jobs: 3
-            })
-        );
-        assert!(marked
-            .describe()
-            .contains("narrowed at spawn under the floor width of 3 (admitted at 5)"));
-        // Admitted at 1 (alone on the machine), launched at 1: not a narrowing.
-        assert_eq!(narrow.marking_narrowing(Some(1)).narrowed, None);
-        // Narrower than admitted but at or above the floor: not marked either.
-        let at_floor = BuildJobs {
-            jobs: 3,
-            ..BuildJobs::new(5, None)
-        };
-        assert_eq!(at_floor.marking_narrowing(Some(5)).narrowed, None);
-        assert_eq!(narrow.marking_narrowing(None).narrowed, None);
-    }
 }
 
 /// What admission charges a running command against memory, and the phase
 /// that charge belongs to (`None` for a command that is not a phased lane).
 ///
-/// One function over the three things a charge depends on: the phase, the
-/// width the command was granted, and its measured per-process peaks. A
-/// command compiling (or not a phased lane) is charged at the build jobs it
-/// was granted ([`ResourceReservation::compile_charge_bytes`]), so a lane
-/// held narrow on a small machine is priced narrow. A lane in its test phase
-/// is charged the learned test-phase figure at the tests it can run at once:
-/// the smaller of the test threads it was granted and the tests it started.
-/// Anything short of that evidence keeps the whole-suite charge.
+/// A command compiling (or not a phased lane) is charged its whole figure
+/// ([`ResourceReservation::memory_charge_bytes`]): a compile runs at its
+/// machine's one compile slot width ([`CompileSlots`]), the width that figure
+/// was learned at, so no width prices it differently. A lane in its test
+/// phase is charged the learned test-phase figure at the tests it can run at
+/// once: the smaller of the test threads it was granted and the tests it
+/// started. Anything short of that evidence keeps the whole-suite charge.
 pub fn lane_memory_charge(
     reservation: &ResourceReservation,
     phase: Option<LanePhase>,
     build_jobs: Option<BuildJobs>,
 ) -> (u64, Option<ChargedPhase>) {
     let whole = reservation.memory_charge_bytes();
-    let compiling = reservation.memory_charge_at(build_jobs.map(|jobs| jobs.jobs));
     match phase {
-        None => (compiling, None),
-        Some(LanePhase::Compile) => (compiling, Some(ChargedPhase::Compile)),
+        None => (whole, None),
+        Some(LanePhase::Compile) => (whole, Some(ChargedPhase::Compile)),
         Some(LanePhase::Test {
             since_unix_ms,
             tests,
@@ -13088,6 +12529,940 @@ pub struct DiskDecline {
     pub free_bytes: u64,
     pub floor_bytes: u64,
     pub outlook: DiskReliefOutlook,
+}
+
+/// How a machine runs compile-class work: `slots` compile slots, each `width`
+/// build jobs wide (cairn/7303).
+///
+/// A compile takes one slot or waits, and is told exactly the slot's width,
+/// so what a compile needs of a machine is one learned figure, not a curve
+/// over the widths it might be granted. Derived from the machine's
+/// concurrency budget and never configured: the executor calls [`Self::of`]
+/// on the units it admits against, the runner on the same units as the
+/// machine advertises them ([`ExecutorCapabilities::admission_concurrency_budget`]).
+///
+/// The slot is sized toward [`COMPILE_SLOT_JOBS`] from a cold
+/// `cargo check --workspace` measured at slot width against full width on
+/// shared machines: bginf-sp1 (20 cores, two slots of 10) lost nothing
+/// measurable, fedora (32 cores, four of 8) 12%, and only for a compile alone
+/// on an idle machine. The crate graph's critical path (cairn-core) dominates,
+/// which is why going wider barely helps, and beside other compiles the
+/// elastic width this replaced was already about this narrow.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompileSlots {
+    pub slots: u32,
+    pub width: u32,
+}
+
+/// The build jobs a compile slot is sized toward ([`CompileSlots`]).
+pub const COMPILE_SLOT_JOBS: u32 = 8;
+
+impl CompileSlots {
+    /// `max(1, units / 8)` slots, each `units / slots` build jobs wide.
+    pub const fn of(concurrency_units: u32) -> Self {
+        let units = if concurrency_units == 0 {
+            1
+        } else {
+            concurrency_units
+        };
+        let slots = units / COMPILE_SLOT_JOBS;
+        let slots = if slots == 0 { 1 } else { slots };
+        Self {
+            slots,
+            width: units / slots,
+        }
+    }
+
+    /// How many slots `free_cores` hold, never more than the machine has.
+    pub fn free(&self, free_cores: u64) -> u32 {
+        u32::try_from(free_cores / u64::from(self.width.max(1)))
+            .unwrap_or(u32::MAX)
+            .min(self.slots)
+    }
+}
+
+/// What one piece of work needs of a machine's [`AnnouncedRoom`], worked out
+/// from its reservation the same way wherever admission is decided
+/// ([`fits`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Need {
+    /// The available memory, less what admitted work still owes, that a
+    /// non-interactive admission must find: the work's whole charge
+    /// ([`ResourceReservation::memory_charge_bytes`]), or the reserve every
+    /// admission leaves ([`ADMISSION_MEMORY_FLOOR_BYTES`]) where that is more.
+    pub memory_bytes: u64,
+    /// What the work reserves against the machine's planning budget.
+    pub budget_memory_bytes: u64,
+    /// Concurrency units: what the reservation asks, and for compile-class
+    /// work never less than one compile slot's width. A compile that declared
+    /// the whole machine (an exclusive check) keeps it.
+    pub cores: u32,
+    /// The disk growth charged against the watermark: none for interactive
+    /// work in a cell it already has, which grows nothing predictable.
+    pub disk_bytes: u64,
+    pub compile: bool,
+    /// Someone is blocked on it (tenet 1323): it is held only by refusals,
+    /// provisioning, disk and host pressure, never by memory or capacity.
+    pub interactive: bool,
+    /// What the work asks of the fresh-pipe floor.
+    pub work: crate::pipe_health::PipeFloorWork,
+    /// Whether the work needs a cell on the machine's build volume.
+    pub needs_build_volume: bool,
+    /// The project whose provisioning hold this work would take, when it
+    /// provisions a cell.
+    pub provisions: Option<String>,
+}
+
+impl Need {
+    /// The need of work with `reservation`, on a machine with `slots`.
+    pub fn of(
+        reservation: &ResourceReservation,
+        class: CellCommandClass,
+        interactive: bool,
+        work: crate::pipe_health::PipeFloorWork,
+        needs_build_volume: bool,
+        provisions: Option<&str>,
+        slots: CompileSlots,
+    ) -> Self {
+        let compile = class.is_compile_class();
+        Self {
+            memory_bytes: admission_memory_floor(reservation.memory_charge_bytes()),
+            budget_memory_bytes: reservation.memory_bytes,
+            cores: if compile {
+                reservation.concurrency_units.max(slots.width)
+            } else {
+                reservation.concurrency_units
+            },
+            disk_bytes: if interactive && provisions.is_none() {
+                0
+            } else {
+                reservation.disk_growth_bytes
+            },
+            compile,
+            interactive,
+            work,
+            needs_build_volume,
+            provisions: provisions.map(str::to_string),
+        }
+    }
+}
+
+/// One figure a machine budgets: its limit, and what admitted work holds of it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Allowance {
+    pub limit: u64,
+    pub committed: u64,
+}
+
+impl Allowance {
+    pub fn free(&self) -> u64 {
+        self.limit.saturating_sub(self.committed)
+    }
+
+    fn holds(&self, need: u64) -> bool {
+        self.committed.saturating_add(need) <= self.limit
+    }
+}
+
+/// The machine's live memory as admission reads it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRoom {
+    pub available_bytes: u64,
+    /// What admitted work has yet to take (see [`OwingWork`]): the growth the
+    /// available reading has not seen yet.
+    pub owed_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl MemoryRoom {
+    /// Available memory less what admitted work still owes.
+    pub fn free_bytes(&self) -> u64 {
+        self.available_bytes.saturating_sub(self.owed_bytes)
+    }
+}
+
+/// The build volume as admission reads it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskRoom {
+    pub free_bytes: u64,
+    /// The free space admission always leaves.
+    pub watermark_bytes: u64,
+    /// The growth admitted work has declared and not yet made.
+    pub reserved_bytes: u64,
+    /// Set while the volume's free inodes are under their line: every create
+    /// on it is about to fail, however many bytes are free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inodes: Option<InodeShortfall>,
+}
+
+impl DiskRoom {
+    /// Free space above the watermark and what admitted work has reserved.
+    pub fn free_above_floor(&self) -> u64 {
+        self.free_bytes
+            .saturating_sub(self.watermark_bytes)
+            .saturating_sub(self.reserved_bytes)
+    }
+
+    /// Interactive work is checked against the bare watermark: it keeps its
+    /// priority until the machine is out of room, and not past that.
+    fn shortfall(&self, need: &Need) -> Option<HostPressureCondition> {
+        let reserved = if need.interactive {
+            0
+        } else {
+            self.reserved_bytes
+        };
+        let floor_bytes = self
+            .watermark_bytes
+            .saturating_add(reserved)
+            .saturating_add(need.disk_bytes);
+        if self.free_bytes < floor_bytes {
+            return Some(HostPressureCondition::DiskFree {
+                free_bytes: self.free_bytes,
+                floor_bytes,
+                inodes: None,
+            });
+        }
+        self.inodes
+            .clone()
+            .map(|inodes| HostPressureCondition::DiskFree {
+                free_bytes: self.free_bytes,
+                floor_bytes,
+                inodes: Some(inodes),
+            })
+    }
+}
+
+/// A lane that runs alone ([`AloneHold`]), and what it is charged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AloneRoom {
+    pub hold: AloneHold,
+    pub charge_bytes: u64,
+}
+
+/// A project provisioning a cell on this machine: work that would provision
+/// another for it waits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvisioningRoomHold {
+    pub project_id: String,
+    pub request_id: String,
+    pub since_unix_ms: u64,
+}
+
+/// Room this machine holds for an aged request (tenet 1444). The room it
+/// announces is net of the one it protects.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadroomRoomHold {
+    pub entry_id: String,
+    pub request_id: String,
+    pub memory_bytes: u64,
+    pub cores: u32,
+    pub disk_bytes: u64,
+    /// The senior hold, the one the announced figures are net of.
+    pub protected: bool,
+}
+
+/// Which work a [`RoomClosure`] closes the machine to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RoomScope {
+    Everything,
+    /// Work nobody is blocked on (tenet 1323).
+    NonInteractive,
+    /// Non-interactive compile-class work: the build-volume write brake
+    /// (tenet 1438).
+    NonInteractiveCompile,
+    /// An agent's own short command batch, which the fresh-pipe floor holds
+    /// only below its degraded line.
+    ShortCommands,
+    /// Everything else that starts a process, which the whole floor holds.
+    Processes,
+    /// Work that needs a cell on the build volume.
+    BuildVolume,
+}
+
+impl RoomScope {
+    pub fn covers(self, need: &Need) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::NonInteractive => !need.interactive,
+            Self::NonInteractiveCompile => !need.interactive && need.compile,
+            Self::ShortCommands => need.work == crate::pipe_health::PipeFloorWork::ShortCommand,
+            Self::Processes => need.work == crate::pipe_health::PipeFloorWork::Process,
+            Self::BuildVolume => need.needs_build_volume,
+        }
+    }
+}
+
+/// Something that leaves a machine no room for some work whatever its
+/// figures say: a drain, a missing build volume, a latched cleanup failure,
+/// a home volume under its floor, the fresh-pipe floor, or host pressure.
+///
+/// A closure with `conditions` is host pressure (a brake, the probe's
+/// reading); every one that covers a need is reported together, as one
+/// refusal. A closure without them is a refusal in its own words, checked
+/// before anything else.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomClosure {
+    pub scope: RoomScope,
+    pub reason: DeclineReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<DiskDecline>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<HostPressureCondition>,
+}
+
+impl RoomClosure {
+    fn is_pressure(&self) -> bool {
+        !self.conditions.is_empty()
+    }
+
+    /// What a change of this closure is judged by: its scope, its reason and
+    /// the kind of each condition, never a reading inside one, which moves
+    /// every sample while a brake holds.
+    fn material_key(
+        &self,
+    ) -> (
+        RoomScope,
+        DeclineReason,
+        Vec<std::mem::Discriminant<HostPressureCondition>>,
+    ) {
+        (
+            self.scope,
+            self.reason,
+            self.conditions.iter().map(std::mem::discriminant).collect(),
+        )
+    }
+}
+
+/// The memory a machine's room must move by, at least, before the change is
+/// announced: below it, a change is noise in the reading, not room.
+pub const ROOM_MEMORY_STEP_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The disk a machine's room must move by before the change is announced.
+pub const ROOM_DISK_STEP_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The least time between two announcements from one machine: changes inside
+/// it are coalesced into the next.
+pub const ROOM_ANNOUNCEMENT_INTERVAL_MS: u64 = 250;
+
+/// What a machine has room for right now (cairn/7303).
+///
+/// One value serves both ends of admission. The executor decides every offer
+/// by [`fits`] over the room it computes from its own ledger, and announces
+/// that room to the runner ([`ExecutorMessage::Room`]) whenever it changes
+/// materially ([`Self::differs_materially`]), so the runner judges by the
+/// machine's own rule over the machine's own figures and keeps no copy of
+/// either (tenet 834).
+///
+/// Room is three figures (memory, cores, disk) with the budgets and the
+/// closures that bound them. The figures are net of the senior standing
+/// headroom hold ([`HeadroomRoomHold`]); what the machine would have were
+/// every running job to end is [`Self::drained`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnouncedRoom {
+    pub slots: CompileSlots,
+    /// Concurrency units: the machine's budget and what admitted work holds.
+    pub cores: Allowance,
+    /// `None` while the executor holds no memory reading, which admits as it
+    /// always has: the reading is the live protection, not a precondition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryRoom>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_budget: Option<Allowance>,
+    /// `None` while the build volume's capacity is unread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<DiskRoom>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_budget: Option<Allowance>,
+    /// Pages admitted work holds that would return were all of it to end.
+    #[serde(default)]
+    pub reclaimable_memory_bytes: u64,
+    /// While a lane runs alone, no compile-class work fits beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alone: Option<AloneRoom>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provisioning: Vec<ProvisioningRoomHold>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holds: Vec<HeadroomRoomHold>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closures: Vec<RoomClosure>,
+}
+
+/// The figure [`fits`] found short, in the order it looks: a refusal, a
+/// provisioning hold, disk, host pressure, memory, then the budgets.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoomShort {
+    /// A refusal-stage closure that covers the work.
+    Closed(RoomClosure),
+    Provisioning(ProvisioningRoomHold),
+    /// [`HostPressureCondition::DiskFree`].
+    Disk(HostPressureCondition),
+    /// Every host-pressure condition that covers the work.
+    Pressure(Vec<HostPressureCondition>),
+    /// [`HostPressureCondition::MemoryAvailable`], with no `owing` list: who
+    /// owes is the executor's to name, and it does.
+    Memory(HostPressureCondition),
+    /// Concurrency units, or the memory or disk planning budget.
+    Capacity,
+}
+
+/// Whether work that needs `need` fits `room`: the one definition of
+/// admissible (tenet 834).
+// The shortfall carries the condition a refusal is rendered from, as every
+// admission verdict here does; it is returned once per offer, never stored.
+#[allow(clippy::result_large_err)]
+pub fn fits(room: &AnnouncedRoom, need: &Need) -> Result<(), RoomShort> {
+    if let Some(closure) = room
+        .closures
+        .iter()
+        .find(|closure| !closure.is_pressure() && closure.scope.covers(need))
+    {
+        return Err(RoomShort::Closed(closure.clone()));
+    }
+    if let Some(project) = &need.provisions {
+        if let Some(hold) = room
+            .provisioning
+            .iter()
+            .find(|hold| &hold.project_id == project)
+        {
+            return Err(RoomShort::Provisioning(hold.clone()));
+        }
+    }
+    if let Some(short) = room.disk.as_ref().and_then(|disk| disk.shortfall(need)) {
+        return Err(RoomShort::Disk(short));
+    }
+    let pressure: Vec<_> = room
+        .closures
+        .iter()
+        .filter(|closure| closure.is_pressure() && closure.scope.covers(need))
+        .flat_map(|closure| closure.conditions.iter().cloned())
+        .collect();
+    if !pressure.is_empty() {
+        return Err(RoomShort::Pressure(pressure));
+    }
+    if need.interactive {
+        return Ok(());
+    }
+    let memory_short = |floor_bytes: u64, alone_beside: Option<AloneHold>| {
+        RoomShort::Memory(HostPressureCondition::MemoryAvailable {
+            available_bytes: room.memory.map_or(0, |memory| memory.available_bytes),
+            floor_bytes,
+            owed_bytes: room.memory.map_or(0, |memory| memory.owed_bytes),
+            owing: Vec::new(),
+            total_bytes: room.memory.map(|memory| memory.total_bytes),
+            alone_beside,
+        })
+    };
+    if need.compile {
+        if let Some(alone) = &room.alone {
+            return Err(memory_short(
+                need.memory_bytes.saturating_add(alone.charge_bytes),
+                Some(alone.hold.clone()),
+            ));
+        }
+    }
+    if room
+        .memory
+        .is_some_and(|memory| memory.free_bytes() < need.memory_bytes)
+    {
+        return Err(memory_short(need.memory_bytes, None));
+    }
+    if !room.cores.holds(u64::from(need.cores))
+        || room
+            .memory_budget
+            .is_some_and(|budget| !budget.holds(need.budget_memory_bytes))
+        || room
+            .disk_budget
+            .is_some_and(|budget| !budget.holds(need.disk_bytes))
+    {
+        return Err(RoomShort::Capacity);
+    }
+    Ok(())
+}
+
+impl AnnouncedRoom {
+    /// The room this machine would have were every job it admitted to end:
+    /// nothing committed, nothing owed, and the pages its occupants hold
+    /// returned. Closures and provisioning stand, since they are not about
+    /// what is running. Whether aged work could ever fit here.
+    pub fn drained(&self) -> Self {
+        Self {
+            slots: self.slots,
+            cores: Allowance {
+                committed: 0,
+                ..self.cores
+            },
+            memory: self.memory.map(|memory| MemoryRoom {
+                available_bytes: memory
+                    .available_bytes
+                    .saturating_add(self.reclaimable_memory_bytes)
+                    .min(memory.total_bytes),
+                owed_bytes: 0,
+                total_bytes: memory.total_bytes,
+            }),
+            memory_budget: self.memory_budget.map(|budget| Allowance {
+                committed: 0,
+                ..budget
+            }),
+            disk: self.disk.clone().map(|disk| DiskRoom {
+                reserved_bytes: 0,
+                ..disk
+            }),
+            disk_budget: self.disk_budget.map(|budget| Allowance {
+                committed: 0,
+                ..budget
+            }),
+            reclaimable_memory_bytes: 0,
+            alone: None,
+            provisioning: self.provisioning.clone(),
+            holds: Vec::new(),
+            closures: self.closures.clone(),
+        }
+    }
+
+    /// Compile slots free: the slots the free cores hold.
+    pub fn free_slots(&self) -> u32 {
+        self.slots.free(self.cores.free())
+    }
+
+    /// Whether this room is news against `before`, the room last announced.
+    ///
+    /// Every budget, hold, closure and slot is compared exactly. The live
+    /// readings are not: memory free (and reclaimable) must move by
+    /// [`ROOM_MEMORY_STEP_BYTES`] or 2% of the machine, and disk above its
+    /// floor by [`ROOM_DISK_STEP_BYTES`], because the readings move every
+    /// sample and a sample that changes no room must cost nothing. A
+    /// closure's own readings are never compared, only its kind.
+    pub fn differs_materially(&self, before: &Self) -> bool {
+        let memory_moved = |left: u64, right: u64, total: u64| {
+            left.abs_diff(right) >= ROOM_MEMORY_STEP_BYTES.max(total / 50)
+        };
+        let memory = match (self.memory, before.memory) {
+            (Some(now), Some(then)) => {
+                memory_moved(now.free_bytes(), then.free_bytes(), now.total_bytes)
+                    || memory_moved(
+                        self.reclaimable_memory_bytes,
+                        before.reclaimable_memory_bytes,
+                        now.total_bytes,
+                    )
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        let disk = match (&self.disk, &before.disk) {
+            (Some(now), Some(then)) => {
+                now.watermark_bytes != then.watermark_bytes
+                    || now.reserved_bytes != then.reserved_bytes
+                    || now.inodes.is_some() != then.inodes.is_some()
+                    || now.free_above_floor().abs_diff(then.free_above_floor())
+                        >= ROOM_DISK_STEP_BYTES
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        let closures = |room: &Self| {
+            room.closures
+                .iter()
+                .map(RoomClosure::material_key)
+                .collect::<Vec<_>>()
+        };
+        memory
+            || disk
+            || self.slots != before.slots
+            || self.cores != before.cores
+            || self.memory_budget != before.memory_budget
+            || self.disk_budget != before.disk_budget
+            || self.alone != before.alone
+            || self.provisioning != before.provisioning
+            || self.holds != before.holds
+            || closures(self) != closures(before)
+    }
+}
+
+#[cfg(test)]
+mod room_tests {
+    use super::*;
+    use crate::pipe_health::PipeFloorWork;
+
+    const GIB: u64 = 1 << 30;
+
+    /// The slots the plan lists for the fleet, from each machine's budget.
+    #[test]
+    fn compile_slots_are_derived_from_the_concurrency_budget() {
+        let slots = |units| {
+            let CompileSlots { slots, width } = CompileSlots::of(units);
+            (slots, width)
+        };
+        // bbs, fedora
+        assert_eq!(slots(32), (4, 8));
+        // bginf-sp1, bginf-sp2
+        assert_eq!(slots(20), (2, 10));
+        // bgsrv-win
+        assert_eq!(slots(16), (2, 8));
+        // bgsrv-mac
+        assert_eq!(slots(12), (1, 12));
+        // bgsrv-ub, bgsrv-ub3
+        assert_eq!(slots(8), (1, 8));
+        // bgsrv-ub2
+        assert_eq!(slots(4), (1, 4));
+        // local: 16 cores less its interactive reserve is one slot of 14.
+        assert_eq!(slots(executor_cpu_budget(16, true)), (1, 14));
+        assert_eq!(slots(0), (1, 1), "never zero");
+        for units in 1..=256 {
+            let CompileSlots { slots, width } = CompileSlots::of(units);
+            assert!(slots * width <= units, "{units}");
+            assert!(width >= COMPILE_SLOT_JOBS.min(units), "{units}");
+        }
+        assert_eq!(CompileSlots::of(32).free(17), 2);
+        assert_eq!(CompileSlots::of(32).free(1_000), 4);
+    }
+
+    fn reservation(memory_bytes: u64) -> ResourceReservation {
+        ResourceReservation {
+            memory_bytes,
+            disk_growth_bytes: GIB,
+            concurrency_units: 32,
+            source: ResourceReservationSource::Learned,
+            ..ResourceReservation::default()
+        }
+    }
+
+    fn need(memory_bytes: u64, class: CellCommandClass, interactive: bool) -> Need {
+        Need::of(
+            &reservation(memory_bytes),
+            class,
+            interactive,
+            PipeFloorWork::Process,
+            true,
+            None,
+            CompileSlots::of(32),
+        )
+    }
+
+    /// fedora with nothing running: 125 GiB, 32 units, a roomy volume.
+    fn idle() -> AnnouncedRoom {
+        AnnouncedRoom {
+            slots: CompileSlots::of(32),
+            cores: Allowance {
+                limit: 32,
+                committed: 0,
+            },
+            memory: Some(MemoryRoom {
+                available_bytes: 120 * GIB,
+                owed_bytes: 0,
+                total_bytes: 125 * GIB,
+            }),
+            memory_budget: Some(Allowance {
+                limit: 106 * GIB,
+                committed: 0,
+            }),
+            disk: Some(DiskRoom {
+                free_bytes: 500 * GIB,
+                watermark_bytes: 50 * GIB,
+                reserved_bytes: 0,
+                inodes: None,
+            }),
+            disk_budget: None,
+            reclaimable_memory_bytes: 0,
+            alone: None,
+            provisioning: Vec::new(),
+            holds: Vec::new(),
+            closures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_compile_needs_one_slot_and_its_whole_figure() {
+        let mut slot_sized = reservation(30 * GIB);
+        slot_sized.concurrency_units = 1;
+        let compile = Need::of(
+            &slot_sized,
+            CellCommandClass::CargoTest,
+            false,
+            PipeFloorWork::Process,
+            true,
+            None,
+            CompileSlots::of(32),
+        );
+        assert_eq!(compile.cores, 8, "a compile asks at least one slot");
+        assert_eq!(
+            need(30 * GIB, CellCommandClass::CargoTest, false).cores,
+            32,
+            "a compile that declared the whole machine keeps it"
+        );
+        assert_eq!(compile.memory_bytes, 30 * GIB);
+        let small = need(GIB, CellCommandClass::Other, false);
+        assert_eq!(small.cores, 32, "other work asks what it asks");
+        assert_eq!(
+            small.memory_bytes, ADMISSION_MEMORY_FLOOR_BYTES,
+            "every admission leaves the floor"
+        );
+
+        // Four slots of eight: the fifth compile has no cores.
+        let mut room = idle();
+        assert_eq!(fits(&room, &compile), Ok(()));
+        room.cores.committed = 24;
+        assert_eq!(room.free_slots(), 1);
+        assert_eq!(fits(&room, &compile), Ok(()));
+        room.cores.committed = 25;
+        assert_eq!(room.free_slots(), 0);
+        assert_eq!(fits(&room, &compile), Err(RoomShort::Capacity));
+
+        // Memory is available less owed, against the whole figure.
+        let mut room = idle();
+        room.memory = Some(MemoryRoom {
+            available_bytes: 60 * GIB,
+            owed_bytes: 31 * GIB,
+            total_bytes: 125 * GIB,
+        });
+        assert!(matches!(
+            fits(&room, &compile),
+            Err(RoomShort::Memory(HostPressureCondition::MemoryAvailable {
+                floor_bytes,
+                owed_bytes,
+                ..
+            })) if floor_bytes == 30 * GIB && owed_bytes == 31 * GIB
+        ));
+        room.memory = room.memory.map(|memory| MemoryRoom {
+            owed_bytes: 30 * GIB,
+            ..memory
+        });
+        assert_eq!(fits(&room, &compile), Ok(()));
+        // No reading admits as it always has.
+        room.memory = None;
+        assert_eq!(fits(&room, &compile), Ok(()));
+    }
+
+    #[test]
+    fn refusals_come_before_provisioning_disk_pressure_memory_and_capacity() {
+        let compile = need(30 * GIB, CellCommandClass::CargoCheck, false);
+        let mut room = idle();
+        room.cores.committed = 32;
+        room.memory = None;
+        assert_eq!(fits(&room, &compile), Err(RoomShort::Capacity));
+
+        let stall = HostPressureCondition::MemoryStall {
+            full_avg10_millis: 300,
+            entry_millis: 200,
+            clear_millis: 100,
+            stalled_since_unix_ms: 1,
+            measured_at_unix_ms: 2,
+        };
+        room.closures.push(RoomClosure {
+            scope: RoomScope::NonInteractive,
+            reason: DeclineReason::Pressure,
+            detail: None,
+            disk: None,
+            conditions: vec![stall.clone()],
+        });
+        assert_eq!(
+            fits(&room, &compile),
+            Err(RoomShort::Pressure(vec![stall.clone()]))
+        );
+
+        room.disk = room.disk.map(|disk| DiskRoom {
+            free_bytes: 50 * GIB,
+            ..disk
+        });
+        assert!(matches!(
+            fits(&room, &compile),
+            Err(RoomShort::Disk(HostPressureCondition::DiskFree { floor_bytes, .. }))
+                if floor_bytes == 51 * GIB
+        ));
+
+        let provisioning = ProvisioningRoomHold {
+            project_id: "p".into(),
+            request_id: "r0".into(),
+            since_unix_ms: 1,
+        };
+        room.provisioning.push(provisioning.clone());
+        let provisions = Need {
+            provisions: Some("p".into()),
+            ..compile.clone()
+        };
+        assert_eq!(
+            fits(&room, &provisions),
+            Err(RoomShort::Provisioning(provisioning))
+        );
+
+        let drain = RoomClosure {
+            scope: RoomScope::NonInteractive,
+            reason: DeclineReason::Constraint,
+            detail: Some("this executor is draining".into()),
+            disk: None,
+            conditions: Vec::new(),
+        };
+        room.closures.push(drain.clone());
+        assert_eq!(fits(&room, &provisions), Err(RoomShort::Closed(drain)));
+    }
+
+    /// Tenet 1323: interactive work is held by refusals that cover it,
+    /// provisioning, the bare disk watermark and host pressure that covers
+    /// it, never by memory or capacity.
+    #[test]
+    fn interactive_work_is_held_only_by_what_covers_it() {
+        let interactive = need(30 * GIB, CellCommandClass::CargoCheck, true);
+        assert_eq!(interactive.disk_bytes, 0, "a cell it has grows nothing");
+        let mut room = idle();
+        room.cores.committed = 32;
+        room.memory = room.memory.map(|memory| MemoryRoom {
+            owed_bytes: memory.available_bytes,
+            ..memory
+        });
+        room.disk = room.disk.map(|disk| DiskRoom {
+            free_bytes: 51 * GIB,
+            reserved_bytes: 10 * GIB,
+            ..disk
+        });
+        room.closures.push(RoomClosure {
+            scope: RoomScope::NonInteractive,
+            reason: DeclineReason::Constraint,
+            detail: Some("this executor is draining".into()),
+            disk: None,
+            conditions: Vec::new(),
+        });
+        room.closures.push(RoomClosure {
+            scope: RoomScope::NonInteractiveCompile,
+            reason: DeclineReason::Pressure,
+            detail: None,
+            disk: None,
+            conditions: vec![HostPressureCondition::TelemetryBlind {
+                measurement: MachineMeasurement::Cpu,
+                measured_at_unix_ms: 1,
+                age_ms: 20_000,
+                blind_after_ms: 15_000,
+            }],
+        });
+        assert_eq!(fits(&room, &interactive), Ok(()));
+
+        let volume = RoomClosure {
+            scope: RoomScope::BuildVolume,
+            reason: DeclineReason::BuildVolumeAbsent,
+            detail: Some("absent".into()),
+            disk: None,
+            conditions: Vec::new(),
+        };
+        room.closures.push(volume.clone());
+        assert_eq!(fits(&room, &interactive), Err(RoomShort::Closed(volume)));
+    }
+
+    #[test]
+    fn a_lane_running_alone_holds_compiles_and_nothing_else() {
+        let mut room = idle();
+        room.alone = Some(AloneRoom {
+            hold: AloneHold {
+                request_id: "r1".into(),
+                reason: AloneReason::CommandSetsJobs,
+            },
+            charge_bytes: 20 * GIB,
+        });
+        assert!(matches!(
+            fits(&room, &need(10 * GIB, CellCommandClass::CargoClippy, false)),
+            Err(RoomShort::Memory(HostPressureCondition::MemoryAvailable {
+                floor_bytes,
+                alone_beside: Some(_),
+                ..
+            })) if floor_bytes == 30 * GIB
+        ));
+        let mut other = need(10 * GIB, CellCommandClass::Other, false);
+        other.cores = 1;
+        assert_eq!(fits(&room, &other), Ok(()));
+    }
+
+    #[test]
+    fn the_drained_room_is_capacity_with_every_running_job_ended() {
+        let mut room = idle();
+        room.cores.committed = 32;
+        room.memory = Some(MemoryRoom {
+            available_bytes: 10 * GIB,
+            owed_bytes: 40 * GIB,
+            total_bytes: 125 * GIB,
+        });
+        room.reclaimable_memory_bytes = 200 * GIB;
+        let compile = need(30 * GIB, CellCommandClass::CargoTest, false);
+        assert!(fits(&room, &compile).is_err());
+        let drained = room.drained();
+        assert_eq!(drained.memory.unwrap().available_bytes, 125 * GIB);
+        assert_eq!(drained.cores.committed, 0);
+        assert_eq!(fits(&drained, &compile), Ok(()));
+    }
+
+    #[test]
+    fn only_a_material_change_is_news() {
+        let room = idle();
+        assert!(!room.differs_materially(&room.clone()));
+        let mut moved = room.clone();
+        moved.memory = moved.memory.map(|memory| MemoryRoom {
+            available_bytes: memory.available_bytes - GIB,
+            ..memory
+        });
+        assert!(
+            !moved.differs_materially(&room),
+            "1 GiB of 125 is under 2% of the machine"
+        );
+        moved.memory = moved.memory.map(|memory| MemoryRoom {
+            available_bytes: memory.available_bytes - 2 * GIB,
+            ..memory
+        });
+        assert!(moved.differs_materially(&room), "3 GiB is news");
+
+        let mut claimed = room.clone();
+        claimed.cores.committed = 8;
+        assert!(claimed.differs_materially(&room), "a claim is news");
+
+        // A brake's readings move every sample; only its arrival is news.
+        let braked = |at| {
+            let mut room = idle();
+            room.closures.push(RoomClosure {
+                scope: RoomScope::NonInteractive,
+                reason: DeclineReason::Pressure,
+                detail: None,
+                disk: None,
+                conditions: vec![HostPressureCondition::MemoryStall {
+                    full_avg10_millis: 300,
+                    entry_millis: 200,
+                    clear_millis: 100,
+                    stalled_since_unix_ms: 1,
+                    measured_at_unix_ms: at,
+                }],
+            });
+            room
+        };
+        assert!(braked(1).differs_materially(&room));
+        assert!(!braked(2).differs_materially(&braked(1)));
+    }
+
+    #[test]
+    fn a_room_frame_round_trips() {
+        let mut room = idle();
+        room.holds.push(HeadroomRoomHold {
+            entry_id: "e1".into(),
+            request_id: "r1".into(),
+            memory_bytes: 30 * GIB,
+            cores: 8,
+            disk_bytes: GIB,
+            protected: true,
+        });
+        let frame = ExecutorMessage::Room { seq: 7, room };
+        let wire = serde_json::to_value(&frame).unwrap();
+        assert_eq!(wire["type"], "room");
+        assert_eq!(wire["room"]["slots"]["width"], 8);
+        assert_eq!(
+            serde_json::from_value::<ExecutorMessage>(wire).unwrap(),
+            frame
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -13675,35 +14050,26 @@ pub struct ExecutionAllocation {
     pub build_jobs: Option<BuildJobs>,
 }
 
-/// How many build jobs a command's cargo was told to run, how many tests its
-/// nextest was told to run at once, and what bounded those numbers.
+/// How many build jobs a command's cargo was told to run, and how many tests
+/// its nextest was told to run at once.
 ///
-/// Two bounds meet here. The CPU width is the command's share of the
-/// machine's bulk budget. The memory bound is how many jobs the memory left
-/// to the command as it started (available, less what other admitted work
-/// owes) could hold, so that one compile cannot fan out past what the host
-/// can hold: cargo defaults to one rustc per logical core, and on an 8-core,
-/// 12 GiB machine eight rustc processes at 1-8 GiB each exhaust it by
-/// themselves. Where memory is ample the memory bound exceeds the CPU width
-/// and changes nothing. Neither bound refuses work: the floor is one job, so a
-/// small machine builds slowly rather than dying.
-///
-/// The memory bound is admission's own model ([`MemoryJobBound::learned`]):
-/// the same solver, against the same available-less-owed room. It used to
-/// divide the raw reading by the compile-class commands running, which counted
-/// every other lane twice, once in the owed sum admission had already
-/// subtracted and once in the division, and held lanes admitted wide on a
-/// 20-core machine to one job each (cairn/7244).
+/// A compile runs in one of its machine's compile slots ([`CompileSlots`]) and
+/// is told exactly the slot's width. Nothing widens or narrows it after
+/// admission: the memory it was admitted against is the memory it was learned
+/// to hold at that width, so a grant sized again at spawn would only make that
+/// figure untrue (cairn/7303). The items of a parallel batch split their slot
+/// ([`Self::shared_by`]).
 ///
 /// This sizes only what the command left unset. A command, or a project
-/// script it runs, that states its own parallelism keeps it.
+/// script it runs, that states its own parallelism keeps it where it is no
+/// more than the slot, and is clamped to the slot where it is more.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildJobs {
-    /// What `CARGO_BUILD_JOBS` was set to where the command did not set it:
-    /// the smaller bound.
+    /// What `CARGO_BUILD_JOBS` was set to where the command did not set it.
     pub jobs: u32,
-    /// The command's share of the machine's bulk budget.
+    /// The width the command runs at: its compile slot's, or its share of the
+    /// slot for an item of a parallel batch.
     pub cpu_width: u32,
     /// What `NEXTEST_TEST_THREADS` and `RUST_TEST_THREADS` were set to where
     /// the command did not set them ([`Self::with_test_threads`]). `None` on a
@@ -13711,69 +14077,20 @@ pub struct BuildJobs {
     /// read it through [`Self::test_threads`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_threads: Option<u32>,
-    /// Present only when the command launched under [`width_floor`] of its
-    /// CPU width, narrower than admission committed: the room or the CPU
-    /// share shrank between admission and spawn. Admitted work launches
-    /// anyway (tenet 292); this names it so a rising count is seen. A lane
-    /// admitted narrow because it was alone launches at its admitted width
-    /// and is never marked.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub narrowed: Option<SpawnNarrowing>,
     /// The command set its own build parallelism: `CARGO_BUILD_JOBS` in its
     /// environment (clamped to `jobs`) or a `-j`/`--jobs` flag the executor
     /// could see (which nothing outside cargo can clamp). `jobs` is then not
-    /// provably the width it ran at, so no width is learned from the run, and
-    /// a visible flag holds the machine alone while it runs
+    /// provably the width it ran at, so its tree teaches nothing about the
+    /// slot, and a visible flag holds the machine alone while it runs
     /// ([`AloneReason::CommandSetsJobs`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_sets_jobs: Option<JobsSetBy>,
-    /// Set where the jobs were held to the widest width this work was
-    /// measured at here because other compile-class work was beside it: a
-    /// wider run must start alone, and the first that does teaches the width.
-    /// The executor page and the observation say so in words.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub held_to_measured: Option<u32>,
     /// Whether other compile-class work was admitted or running as the
     /// command spawned. Executor-local: it decides whether a build flag the
     /// executor cannot hold may launch ([`JobsSetBy::Flag`]), and never
     /// travels.
     #[serde(skip)]
     pub beside_company: bool,
-    /// `None` when the executor held no fresh memory reading as the command
-    /// started, so the CPU width stood alone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<MemoryJobBound>,
-}
-
-/// The build jobs the memory left to a command could hold as it started.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryJobBound {
-    /// The jobs the command's room holds, never below one. See
-    /// [`JobMemoryReserve`] for how.
-    pub jobs: u32,
-    pub available_bytes: u64,
-    /// What other admitted work owed the machine's memory as the command
-    /// started (its own admission excluded): the growth `available_bytes`
-    /// has not seen yet, which the command's room is net of. Zero on a
-    /// record from before it was kept.
-    #[serde(default)]
-    pub owed_bytes: u64,
-    /// How many admitted items owed it.
-    #[serde(default)]
-    pub owing: u32,
-    pub measured_at_unix_ms: u64,
-    /// What each job is reserved: the assumed figure, or the learned typical
-    /// job, beyond the learned largest one.
-    pub per_job_reserve_bytes: u64,
-    /// Items of one parallel batch running at once that split this command's
-    /// room, this one included ([`BuildJobs::shared_by`]).
-    #[serde(default = "one_item", skip_serializing_if = "is_one_item")]
-    pub batch_items: u32,
-    /// Where the reserve came from. A record from before it was kept reads as
-    /// assumed, which every such record was.
-    #[serde(default)]
-    pub reserve: JobMemoryReserve,
 }
 
 /// How a command set its own build parallelism ([`BuildJobs::command_sets_jobs`]).
@@ -13790,75 +14107,9 @@ pub enum JobsSetBy {
     Flag,
 }
 
-/// A spawn below the floor width that admission did not grant: the width it
-/// was admitted at, and the floor it launched under.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SpawnNarrowing {
-    pub admitted_jobs: u32,
-    pub floor_jobs: u32,
-}
-
-const fn one_item() -> u32 {
-    1
-}
-
-fn is_one_item(items: &u32) -> bool {
-    *items == 1
-}
-
-/// The memory a command starting now has to itself: what the machine has
-/// available, less what other admitted work still owes it. The room
-/// admission granted against, read again at spawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SpawnMemory {
-    pub available_bytes: u64,
-    pub owed_bytes: u64,
-    pub owing: u32,
-    pub measured_at_unix_ms: u64,
-}
-
-impl SpawnMemory {
-    pub fn room_bytes(&self) -> u64 {
-        self.available_bytes.saturating_sub(self.owed_bytes)
-    }
-}
-
-/// The narrowest build width a lane is admitted at beside other compile-class
-/// work: half its CPU width, rounded up, and at least one.
-///
-/// Measured on bginf-sp1 (20 cores, check_result_observations 11-08 to
-/// 11-15): rust-lint at two to nine jobs ran at about the speed it ran at ten
-/// or more (7.2 minutes median), and at one job 3.8 times slower (26.9);
-/// rust-tests partial took 74 minutes at one job against 14 at ten or more.
-/// Below half its width a lane gains the machine little and holds its slot
-/// for an hour, so it waits for owed memory to release instead
-/// (cairn/7244). A lane alone on the machine is never held to this: it runs
-/// at whatever width fits, which keeps a small machine making progress.
-pub fn width_floor(cpu_width: u32) -> u32 {
-    cpu_width.max(1).div_ceil(2)
-}
-
-/// Why a lane that fits at some width was declined anyway: it would run at
-/// `solved_jobs` of `cpu_width` beside other compile-class work, under the
-/// floor of `floor_jobs` ([`width_floor`]).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct WidthFloorShortfall {
-    pub solved_jobs: u32,
-    pub floor_jobs: u32,
-    pub cpu_width: u32,
-    /// Set where the grant was held to the widest width this work was
-    /// measured at here, which beside company it cannot exceed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub widest_measured_jobs: Option<u32>,
-}
-
 /// A lane that must run with no other compile-class work beside it until it
 /// ends, and why. Admission holds every compile-class request while one is
-/// admitted or running, so what the lane measures is its own tree and the
-/// machine is protected while that tree is unknown. One mechanism, which a
-/// guarded remeasurement (cairn/7242) can reuse by adding a reason.
+/// admitted or running ([`AnnouncedRoom::alone`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AloneHold {
@@ -13873,28 +14124,15 @@ pub struct AloneHold {
     rename_all_fields = "camelCase"
 )]
 pub enum AloneReason {
-    /// Granted `jobs`, wider than the widest this work was measured at here
-    /// ([`BuildJobMemoryEvidence::measured_width`]).
-    UnlearnedWidth {
-        jobs: u32,
-        widest_measured_jobs: u32,
-    },
     /// Running with a `-j`/`--jobs` flag of its own, which sets its fan-out
     /// past anything the ledger priced ([`BuildJobs::command_sets_jobs`]).
     CommandSetsJobs,
 }
 
 impl AloneHold {
-    /// `request r1 runs alone at 20 jobs, wider than the 1 measured here; compile-class work waits until it ends`
+    /// `request r1 runs alone: it sets its own build jobs, which nothing priced; compile-class work waits until it ends`
     pub fn describe(&self) -> String {
         match self.reason {
-            AloneReason::UnlearnedWidth {
-                jobs,
-                widest_measured_jobs,
-            } => format!(
-                "request {} runs alone at {jobs} jobs, wider than the {widest_measured_jobs} measured here; compile-class work waits until it ends",
-                self.request_id
-            ),
             AloneReason::CommandSetsJobs => format!(
                 "request {} runs alone: it sets its own build jobs, which nothing priced; compile-class work waits until it ends",
                 self.request_id
@@ -13903,261 +14141,46 @@ impl AloneHold {
     }
 }
 
-impl WidthFloorShortfall {
-    /// `would run at 1 of 5 jobs (floor 3); waiting for owed memory to release`
-    pub fn describe(&self) -> String {
-        let unmeasured = self
-            .widest_measured_jobs
-            .map(|widest| {
-                format!(
-                    " (no width above {widest} measured here, and an unmeasured width runs only alone)"
-                )
-            })
-            .unwrap_or_default();
-        format!(
-            "would run at {} of {} jobs (floor {}){unmeasured}; waiting for owed memory to release",
-            self.solved_jobs, self.cpu_width, self.floor_jobs
-        )
-    }
-}
-
-/// Where a command's per-job memory reserve came from.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum JobMemoryReserve {
-    /// Nothing about this work's build jobs was learned on this machine: each
-    /// job is assumed to need `per_job_reserve_bytes`, and the jobs are the
-    /// available memory over it.
-    #[default]
-    Assumed,
-    /// Learned from this work's own job processes on this machine
-    /// ([`BuildJobMemoryEvidence`]): the largest job is held first, at
-    /// `largest_bytes`, and each further job at the typical one
-    /// (`per_job_reserve_bytes`).
-    Learned { largest_bytes: u64, samples: u32 },
-}
-
-impl MemoryJobBound {
-    /// The jobs the command's room holds at an assumed `per_job_reserve_bytes`
-    /// a job, where nothing about this work's build jobs was learned here.
-    ///
-    /// Other lanes enter once, through what they owe: a compile that has
-    /// just started holds little of what it will peak at, and the owed sum is
-    /// that growth, so two compiles starting together cannot each claim all
-    /// of the headroom.
-    pub fn assumed(memory: SpawnMemory, per_job_reserve_bytes: u64) -> Self {
-        let jobs = u32::try_from(memory.room_bytes() / per_job_reserve_bytes.max(1))
-            .unwrap_or(u32::MAX)
-            .max(1);
-        Self::from_room(
-            memory,
-            jobs,
-            per_job_reserve_bytes,
-            JobMemoryReserve::Assumed,
-        )
-    }
-
-    /// The jobs the command's room holds at its learned job sizes, up to
-    /// `cpu_width`, as admission solved them
-    /// ([`ResourceReservation::solve_memory_grant`] against the room, with
-    /// admission's floor), so the width a lane launches at is the width it
-    /// was admitted at unless the room has since shrunk. A room that can no
-    /// longer hold one job still launches one: the work was admitted. `None`
-    /// where no usable build-job evidence was learned here.
-    ///
-    /// The jobs a past run used do not enter: both figures are single
-    /// processes' peaks, so a run held to one job teaches the same sizes as
-    /// one run wide, and its own narrowness cannot hold the next run narrow.
-    pub fn learned(
-        memory: SpawnMemory,
-        reservation: &ResourceReservation,
-        cpu_width: u32,
-    ) -> Option<Self> {
-        let evidence = reservation
-            .build_job_memory
-            .filter(BuildJobMemoryEvidence::is_usable)?;
-        let jobs = reservation
-            .solve_memory_grant(
-                cpu_width.max(1),
-                memory.room_bytes(),
-                admission_memory_floor(0),
-            )
-            .ok()
-            .and_then(|grant| grant.jobs)
-            .unwrap_or(1);
-        // The further-job figure, so a batch's items split by the same price
-        // the measured width sets.
-        Some(Self::from_room(
-            memory,
-            jobs,
-            evidence.further_job_bytes(),
-            JobMemoryReserve::Learned {
-                largest_bytes: evidence.largest_bytes,
-                samples: evidence.samples,
-            },
-        ))
-    }
-
-    fn from_room(
-        memory: SpawnMemory,
-        jobs: u32,
-        per_job_reserve_bytes: u64,
-        reserve: JobMemoryReserve,
-    ) -> Self {
-        Self {
-            jobs,
-            available_bytes: memory.available_bytes,
-            owed_bytes: memory.owed_bytes,
-            owing: memory.owing,
-            measured_at_unix_ms: memory.measured_at_unix_ms,
-            per_job_reserve_bytes,
-            batch_items: 1,
-            reserve,
-        }
-    }
-
-    /// The same room split among `items` items of one batch running at once:
-    /// each holds its own largest job, so each is sized from its share by the
-    /// per-process model ([`BuildJobMemoryEvidence::jobs_within`]).
-    fn shared_among(self, items: u32) -> Self {
-        let batch_items = self.batch_items.saturating_mul(items.max(1));
-        let room = self.available_bytes.saturating_sub(self.owed_bytes) / u64::from(batch_items);
-        let jobs = match self.reserve {
-            JobMemoryReserve::Assumed => u32::try_from(room / self.per_job_reserve_bytes.max(1))
-                .unwrap_or(u32::MAX)
-                .max(1),
-            JobMemoryReserve::Learned {
-                largest_bytes,
-                samples,
-            } => BuildJobMemoryEvidence {
-                largest_bytes,
-                typical_bytes: self.per_job_reserve_bytes,
-                samples,
-                width: None,
-            }
-            .jobs_within(room),
-        };
-        Self {
-            jobs,
-            batch_items,
-            ..self
-        }
-    }
-
-    /// The room the jobs were sized from, as the memory-bound sentence names
-    /// it: `90.0 GiB available less 62.0 GiB owed by 3 admitted items`.
-    fn describe_room(&self) -> String {
-        let mut out = format!("{} available", human_bytes(self.available_bytes));
-        if self.owed_bytes > 0 {
-            out.push_str(&format!(
-                " less {} owed by {} admitted {}",
-                human_bytes(self.owed_bytes),
-                self.owing,
-                if self.owing == 1 { "item" } else { "items" }
-            ));
-        }
-        if self.batch_items > 1 {
-            out.push_str(&format!(
-                ", shared by {} batch items running at once",
-                self.batch_items
-            ));
-        }
-        out
-    }
-
-    /// How the reserve divided the memory, as the memory-bound sentence ends.
-    fn describe_reserve(&self) -> String {
-        let per_job = human_bytes(self.per_job_reserve_bytes);
-        match self.reserve {
-            JobMemoryReserve::Assumed => {
-                format!("{per_job} per job (assumed: no build job of this work measured here)")
-            }
-            JobMemoryReserve::Learned {
-                largest_bytes,
-                samples,
-            } => format!(
-                "{} for the largest job and {per_job} per further job, learned from {samples} run{} here",
-                human_bytes(largest_bytes),
-                if samples == 1 { "" } else { "s" }
-            ),
-        }
-    }
-}
-
 impl BuildJobs {
-    pub fn new(cpu_width: u32, memory: Option<MemoryJobBound>) -> Self {
+    /// A command told `cpu_width` build jobs: its compile slot's width.
+    pub fn new(cpu_width: u32) -> Self {
         let cpu_width = cpu_width.max(1);
         Self {
-            jobs: memory.map_or(cpu_width, |memory| memory.jobs.min(cpu_width)),
+            jobs: cpu_width,
             cpu_width,
             test_threads: None,
-            narrowed: None,
             command_sets_jobs: None,
-            held_to_measured: None,
             beside_company: false,
-            memory,
         }
-    }
-
-    /// Marks a launch under the floor width narrower than its committed
-    /// `admitted_jobs` ([`Self::narrowed`]).
-    pub fn marking_narrowing(mut self, admitted_jobs: Option<u32>) -> Self {
-        let floor_jobs = width_floor(self.cpu_width);
-        self.narrowed = admitted_jobs
-            .filter(|admitted| self.jobs < *admitted && self.jobs < floor_jobs)
-            .map(|admitted_jobs| SpawnNarrowing {
-                admitted_jobs,
-                floor_jobs,
-            });
-        self
     }
 
     /// The tests the command's nextest runs at once: as many, up to the CPU
     /// width, as the learned test phase fits inside the compile charge the
-    /// lane already holds at its build jobs
-    /// ([`ResourceReservation::test_phase_charge_bytes`] against
-    /// [`ResourceReservation::memory_charge_at`]).
+    /// lane already holds ([`ResourceReservation::test_phase_charge_bytes`]
+    /// against [`ResourceReservation::memory_charge_bytes`]).
     ///
     /// A test thread is a whole test process, as a build job is a whole
     /// rustc, but a test's footprint is a fraction of a compile's: on
     /// bginf-sp1 the test phase peaked near 3.8 GiB at about 217 MiB a test,
-    /// against a 27.5 GiB largest compile job. Tying the tests to the build
-    /// jobs ran 6,720 tests one at a time on a lane memory had held to one
-    /// job (cairn/7244). Because the threads fit within what the lane is
-    /// already charged, its step down to the test-phase charge never owes the
-    /// machine more, and admission needs no second price. Without a measured
-    /// test phase the tests stay at the build jobs, as the unmeasured
-    /// test-phase charge stays whole: an unmeasured demand fails closed.
+    /// against a 27.5 GiB largest compile job. Because the threads fit within
+    /// what the lane is already charged, its step down to the test-phase
+    /// charge never owes the machine more, and admission needs no second
+    /// price. The threads are judged by the test phase's own figure, before
+    /// the cap that holds its charge to the whole one: the compile charge is
+    /// the whole one, so judged after that cap every width would fit. Without
+    /// a measured test phase the tests stay at the build jobs, as the
+    /// unmeasured test-phase charge stays whole: an unmeasured demand fails
+    /// closed.
     pub fn with_test_threads(mut self, reservation: &ResourceReservation) -> Self {
-        let compile = reservation.memory_charge_at(Some(self.jobs));
-        let threads = if reservation.test_phase.is_some() {
-            (1..=self.cpu_width)
+        let compile = reservation.memory_charge_bytes();
+        let threads = match reservation.test_phase {
+            Some(evidence) => (1..=self.cpu_width)
                 .rev()
-                .find(|threads| {
-                    reservation
-                        .test_phase_charge_bytes(*threads)
-                        .is_some_and(|charge| charge <= compile)
-                })
-                .unwrap_or(1)
-        } else {
-            self.jobs
+                .find(|threads| evidence.bytes_at(*threads) <= compile)
+                .unwrap_or(1),
+            None => self.jobs,
         };
         self.test_threads = Some(threads.max(1));
-        self
-    }
-
-    /// Never more build jobs than the lane was admitted at, where admission
-    /// committed a width. It caps the compile jobs only: the CPU width stays
-    /// the lane's share, which its test threads are sized against, so a lane
-    /// admitted narrow still runs its tests across its share.
-    pub fn held_to(mut self, admitted_jobs: Option<u32>) -> Self {
-        if let Some(admitted) = admitted_jobs {
-            self.jobs = self.jobs.min(admitted.max(1));
-        }
         self
     }
 
@@ -14169,80 +14192,41 @@ impl BuildJobs {
     }
 
     /// The same bounds for one of `items` batch items running at once, which
-    /// share the command's width, memory and test threads alike.
+    /// split the slot's width and test threads alike, never below one.
     pub fn shared_by(self, items: u32) -> Self {
         let items = items.max(1);
         if items == 1 {
             return self;
         }
-        let mut shared = Self::new(
-            self.cpu_width / items,
-            self.memory.map(|memory| memory.shared_among(items)),
-        )
-        // An item never builds wider than its part of the lane's own jobs,
-        // so splitting cannot widen a width admission committed.
-        .held_to(Some((self.jobs / items).max(1)));
+        let mut shared = Self::new(self.cpu_width / items);
+        shared.jobs = shared.jobs.min((self.jobs / items).max(1));
         shared.test_threads = self
             .test_threads
             .map(|threads| (threads / items).clamp(1, shared.cpu_width));
-        shared.narrowed = self.narrowed;
         shared.command_sets_jobs = self.command_sets_jobs;
         shared.beside_company = self.beside_company;
-        shared.held_to_measured = self.held_to_measured;
         shared
     }
 
-    /// Whether memory, rather than the CPU width, set the number.
-    pub fn memory_bound(&self) -> bool {
-        self.memory
-            .is_some_and(|memory| memory.jobs < self.cpu_width)
-    }
-
-    /// One line an operator can read without a second lookup, so a slow
-    /// compile on a small machine is explained where it is read.
+    /// One line an operator can read without a second lookup.
     pub fn describe(&self) -> String {
-        let jobs = match self.memory {
-            _ if self.held_to_measured.is_some_and(|measured| self.jobs <= measured) => format!(
-                "{} build job{} beside other compile work: this machine has measured this work only up to {} job{}, and a wider run must start alone; the first that does teaches the width",
+        let jobs = if self.jobs == self.cpu_width {
+            format!(
+                "{} build job{}, the compile slot's width",
+                self.jobs,
+                if self.jobs == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "{} build job{} of a width of {}",
                 self.jobs,
                 if self.jobs == 1 { "" } else { "s" },
-                self.held_to_measured.unwrap_or(1),
-                if self.held_to_measured == Some(1) { "" } else { "s" },
-            ),
-            Some(memory) if self.memory_bound() => format!(
-                "{} build jobs, held below the CPU width of {} by memory: {} at start / {}",
-                self.jobs,
-                self.cpu_width,
-                memory.describe_room(),
-                memory.describe_reserve(),
-            ),
-            _ if self.jobs < self.cpu_width => format!(
-                "{} build jobs, held below the CPU width of {} to the width it was admitted at",
-                self.jobs, self.cpu_width
-            ),
-            Some(memory) => format!(
-                "{} build jobs, the CPU width (memory allowed {})",
-                self.jobs, memory.jobs
-            ),
-            None => format!(
-                "{} build jobs, the CPU width (memory was not measured at start)",
-                self.jobs
-            ),
+                self.cpu_width
+            )
         };
-        let narrowed = self
-            .narrowed
-            .map(|narrowing| {
-                format!(
-                    "; narrowed at spawn under the floor width of {} (admitted at {})",
-                    narrowing.floor_jobs, narrowing.admitted_jobs
-                )
-            })
-            .unwrap_or_default();
         match self.test_threads {
-            Some(threads) if threads != self.jobs => {
-                format!("{jobs}{narrowed}; tests {threads} at a time")
-            }
-            _ => format!("{jobs}{narrowed}"),
+            Some(threads) if threads != self.jobs => format!("{jobs}; tests {threads} at a time"),
+            _ => jobs,
         }
     }
 }
@@ -14541,12 +14525,6 @@ pub enum HostPressureCondition {
         /// that predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         total_bytes: Option<u64>,
-        /// Present when the request would fit, but only below its floor width
-        /// beside other compile-class work ([`width_floor`]). `floor_bytes`
-        /// is then its charge at the floor width, so the decline is relieved
-        /// exactly when owed memory releases enough to run it there.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        width_floor: Option<WidthFloorShortfall>,
         /// Present when a compile-class request waits because a lane runs
         /// alone on the machine ([`AloneHold`]). `floor_bytes` then counts
         /// that lane's charge too, so the decline is relieved once it ends.
@@ -14690,34 +14668,26 @@ impl OwingWork {
 /// request's figure is its floor: its charge, or the reserve every admission
 /// leaves ([`ADMISSION_MEMORY_FLOOR_BYTES`]) when that is larger.
 ///
-/// A floor-width decline says so first: `memory short: would run at 1 of 5
-/// jobs (floor 3); waiting for owed memory to release; owed ...`, the
-/// request's figure then being its charge at the floor width.
+/// A compile held behind a lane that runs alone says so first: `memory short:
+/// request r1 runs alone: ...; owed ...`, the request's figure then counting
+/// that lane's charge too.
 pub fn describe_memory_short(
     available_bytes: u64,
     total_bytes: Option<u64>,
     owed_bytes: u64,
     owing: &[OwingWork],
     floor_bytes: u64,
-    width_floor: Option<&WidthFloorShortfall>,
     alone_beside: Option<&AloneHold>,
 ) -> String {
-    let mut out = match (width_floor, alone_beside) {
-        (_, Some(hold)) => format!(
+    let mut out = match alone_beside {
+        Some(hold) => format!(
             "memory short: {}; owed {} + {} for this request > available {}",
             hold.describe(),
             describe_gib(owed_bytes),
             describe_gib(floor_bytes),
             describe_gib(available_bytes),
         ),
-        (Some(shortfall), None) => format!(
-            "memory short: {}; owed {} + {} for this request at the floor width > available {}",
-            shortfall.describe(),
-            describe_gib(owed_bytes),
-            describe_gib(floor_bytes),
-            describe_gib(available_bytes),
-        ),
-        (None, None) => format!(
+        None => format!(
             "memory short: owed {} + {} for this request > available {}",
             describe_gib(owed_bytes),
             describe_gib(floor_bytes),
@@ -15518,7 +15488,6 @@ impl ResidencyFootprint {
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
             test_phase: None,
-            build_job_memory: None,
         }
     }
 }
@@ -16008,7 +15977,6 @@ impl CellOccupancy {
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
             test_phase: None,
-            build_job_memory: None,
         };
         for (key, process) in self.live_processes() {
             let fallback = ResourceReservation::default();
@@ -17062,12 +17030,6 @@ pub struct AdmissionHealth {
     /// The work behind `owed_memory_bytes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owing: Vec<OwingWork>,
-    /// Commands this executor launched under the floor width, narrower than
-    /// admission committed ([`BuildJobs::narrowed`]), in the last day of its
-    /// own run. A diagnostic, never a gate. `None` from an executor that
-    /// predates the count.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub floor_narrowings_last_day: Option<u32>,
     pub queued_reservation_bytes: u64,
     pub accepted_count: u64,
     pub rejected_count: u64,
@@ -20957,6 +20919,19 @@ pub struct ExecutorInspection {
     /// clauses placement applies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_eligibility: Vec<ProjectEligibility>,
+    /// The room this machine last announced ([`ExecutorMessage::Room`]), and
+    /// when. `None` until its link has announced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomAnnouncement>,
+}
+
+/// The room an executor last announced, as the runner holds it (cairn/7303).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomAnnouncement {
+    pub seq: u64,
+    pub received_at_unix_ms: u64,
+    pub room: AnnouncedRoom,
 }
 
 /// Whether one machine can prepare one project's cells, as placement decides.
@@ -21814,11 +21789,11 @@ pub struct ReservationRationale {
     /// victim floors the memory reservation whatever the profile says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_kill: Option<MemoryKill>,
-    /// The build jobs an unmeasured reservation was priced at on this
-    /// machine, when its suite's per-process figures set the memory number
-    /// rather than a prior or another machine's process tree.
+    /// The compile slot this work was priced at on this machine, when the
+    /// tree its suite was measured to hold at that slot's width set the
+    /// memory number ([`SlotPrice`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_jobs_price: Option<BuildJobsPrice>,
+    pub slot_price: Option<SlotPrice>,
 }
 
 /// A failed runner-side evidence query. This is diagnostic provenance, not
@@ -21840,19 +21815,14 @@ impl MemoryEvidenceFailure {
     }
 }
 
-/// A reservation priced at the width a machine grants: its largest build job
-/// and the typical one for each further job ([`BuildJobMemoryEvidence`]), at
-/// the jobs the machine's CPU width and memory cap allow.
+/// A compile priced at its machine's compile slot (cairn/7303): the tree its
+/// suite was measured to hold on this machine at `jobs` build jobs, the
+/// slot's width.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BuildJobsPrice {
+pub struct SlotPrice {
     pub jobs: u32,
-    pub largest_bytes: u64,
-    pub typical_bytes: u64,
-    /// The machine context (`device:executor`) the figures were measured in,
-    /// or `None` for this one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub measured_on: Option<String>,
+    pub tree_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -23741,16 +23711,10 @@ pub enum PlacementRejectionReason {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         killed_here: Option<MemoryKill>,
     },
-    /// The minimum admissible charge cannot fit the executor unit's physical
-    /// bound. Runner-only placement evidence, never sent to an executor.
-    ExceedsExecutorMemoryBound {
-        charge_bytes: u64,
-        bound_bytes: u64,
-        /// [`MemoryGrantShortfall::width_measured`]: false when no local job
-        /// census priced the work, so its whole tree was charged.
-        #[serde(default)]
-        width_measured: bool,
-    },
+    /// The work's charge, its learned memory at this machine's compile slot
+    /// width, cannot fit the executor unit's physical bound. Runner-only
+    /// placement evidence, never sent to an executor.
+    ExceedsExecutorMemoryBound { charge_bytes: u64, bound_bytes: u64 },
     /// The kernel killed this command for memory on this machine while nothing
     /// else of Cairn's ran there: the machine's own answer that it cannot run
     /// the command. Unlike [`Self::ExceedsMemoryCeiling`] this is never placed
@@ -24049,15 +24013,10 @@ impl PlacementRejectionReason {
             Self::ExceedsExecutorMemoryBound {
                 charge_bytes,
                 bound_bytes,
-                width_measured,
             } => {
                 let charge = *charge_bytes as f64 / (1u64 << 30) as f64;
                 let bound = *bound_bytes as f64 / (1u64 << 30) as f64;
-                if *width_measured {
-                    format!("minimum admissible charge {charge:.2} GiB at one build job exceeds executor cgroup memory.max {bound:.2} GiB")
-                } else {
-                    format!("no local job census; charged its whole measured tree of {charge:.2} GiB, above executor cgroup memory.max {bound:.2} GiB (missing width evidence, not a measured one-job excess)")
-                }
+                format!("charged {charge:.2} GiB, its learned memory at this machine's compile slot width, above executor cgroup memory.max {bound:.2} GiB")
             }
             Self::ExceedsMemoryCeiling {
                 estimate_bytes,
@@ -26184,6 +26143,16 @@ pub enum ExecutorMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disk: Option<DiskDecline>,
     },
+    /// Executor → runner: the room this machine has now ([`AnnouncedRoom`]).
+    /// Sent once a link is ready, and after that whenever the room changes
+    /// materially ([`AnnouncedRoom::differs_materially`]), at most once per
+    /// [`ROOM_ANNOUNCEMENT_INTERVAL_MS`]. `seq` rises across every
+    /// announcement this process makes, so a refusal recorded under one room
+    /// is told apart from one under the next.
+    Room {
+        seq: u64,
+        room: AnnouncedRoom,
+    },
     /// Runner → executor. The claim won; here is the work.
     ///
     /// This is the message that binds, and so the message that carries every
@@ -27301,109 +27270,6 @@ mod tests {
         assert_eq!(unread.delivered_units_millis, None);
     }
 
-    /// A cairn workspace compile run at one job on a 12 GiB machine: cargo,
-    /// a few build scripts, forty crates at 0.4-1.6 GiB, and cairn_core at
-    /// 8.2 GiB, each at the largest a census read it.
-    fn single_crate_dominated_compile() -> Vec<u64> {
-        const MIB: u64 = 1 << 20;
-        let mut peaks = vec![300 * MIB, 20 * MIB, 40 * MIB, 90 * MIB, 8_400 * MIB];
-        peaks.extend((0..40).map(|crate_index| 400 * MIB + crate_index * 30 * MIB));
-        peaks
-    }
-
-    #[test]
-    fn a_learned_reserve_is_not_narrowed_by_its_own_narrow_run() {
-        const GIB: u64 = 1 << 30;
-        let census = BuildJobProcesses::from_peaks(single_crate_dominated_compile()).unwrap();
-        // The shells under the floor are not jobs; cargo is one among many.
-        assert_eq!(census.processes, 42);
-        assert_eq!(census.largest_bytes, 8_400 << 20);
-        assert!(census.speaks_for_a_typical_job());
-        assert!(census.typical_bytes < GIB, "{}", census.typical_bytes);
-
-        // The ratio this replaces: the run's tree peak over the one job it
-        // ran is the largest crate, which holds the next run at one job.
-        let room = |available_bytes| SpawnMemory {
-            available_bytes,
-            owed_bytes: 0,
-            owing: 0,
-            measured_at_unix_ms: 1,
-        };
-        let available = 21 * GIB / 2;
-        let tree_peak_per_job = census.largest_bytes + GIB / 2;
-        assert_eq!(
-            MemoryJobBound::assumed(room(available), tree_peak_per_job).jobs,
-            1
-        );
-
-        // The learned reserve holds cairn_core first and fits typical crates
-        // beside it: more than one job, from a run that used one.
-        let evidence = BuildJobMemoryEvidence {
-            largest_bytes: census.largest_bytes,
-            typical_bytes: census.typical_bytes,
-            samples: 1,
-            width: None,
-        };
-        let lane = ResourceReservation {
-            build_job_memory: Some(evidence),
-            ..ResourceReservation::default()
-        };
-        let learned = MemoryJobBound::learned(room(available), &lane, 8).unwrap();
-        assert_eq!(learned.jobs, 3);
-        assert_eq!(
-            learned.reserve,
-            JobMemoryReserve::Learned {
-                largest_bytes: 8_400 << 20,
-                samples: 1
-            }
-        );
-        assert_eq!(learned.per_job_reserve_bytes, census.typical_bytes);
-        // Under the 2.5 GiB assumption the same machine would run four, and
-        // four rustc beside an 8.2 GiB cairn_core do not fit 10.5 GiB.
-        assert_eq!(
-            MemoryJobBound::assumed(room(available), 5 * GIB / 2).jobs,
-            4
-        );
-
-        // Where memory is ample the learned figures give the width back.
-        let ample = MemoryJobBound::learned(room(40 * GIB), &lane, 32).unwrap();
-        assert_eq!(ample.jobs, 32);
-        // A room below the largest job is still one job, never zero: the
-        // work was admitted, and launches.
-        assert_eq!(
-            MemoryJobBound::learned(room(4 * GIB), &lane, 8)
-                .unwrap()
-                .jobs,
-            1
-        );
-        // Items of one batch split the room before each holds its largest job.
-        let shared = BuildJobs::new(8, Some(learned)).shared_by(2);
-        assert_eq!(shared.memory.unwrap().jobs, 1);
-        assert_eq!(shared.memory.unwrap().batch_items, 2);
-        assert_eq!(shared.memory.unwrap().reserve, learned.reserve);
-
-        let held = BuildJobs::new(8, Some(learned));
-        assert_eq!(
-            held.describe(),
-            "3 build jobs, held below the CPU width of 8 by memory: 10.5 GiB available at start / 8.2 GiB for the largest job and 1000 MiB per further job, learned from 1 run here"
-        );
-        let wire: BuildJobs = serde_json::from_value(serde_json::to_value(held).unwrap()).unwrap();
-        assert_eq!(wire, held);
-    }
-
-    #[test]
-    fn a_bound_recorded_before_its_source_reads_as_assumed() {
-        let old = serde_json::json!({
-            "jobs": 4,
-            "availableBytes": 12_u64 << 30,
-            "measuredAtUnixMs": 1,
-            "perJobReserveBytes": 5_u64 << 29,
-            "sharers": 1
-        });
-        let bound: MemoryJobBound = serde_json::from_value(old).unwrap();
-        assert_eq!(bound.reserve, JobMemoryReserve::Assumed);
-    }
-
     #[test]
     fn an_item_report_carries_its_result_only_when_it_has_one() {
         let outcome: ProcessBatchItemOutcome = serde_json::from_value(serde_json::json!({
@@ -27475,71 +27341,32 @@ mod tests {
     }
 
     #[test]
-    fn build_jobs_name_the_bound_that_set_them() {
-        const GIB: u64 = 1 << 30;
-        let room = |available_bytes| SpawnMemory {
-            available_bytes,
-            owed_bytes: 0,
-            owing: 0,
-            measured_at_unix_ms: 1,
-        };
-        let held = BuildJobs::new(
-            8,
-            Some(MemoryJobBound::assumed(room(12 * GIB), 5 * GIB / 2)),
-        );
-        assert_eq!(held.jobs, 4);
-        assert_eq!(
-            held.describe(),
-            "4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job (assumed: no build job of this work measured here)"
-        );
-        let shared = held.shared_by(2);
-        assert_eq!((shared.cpu_width, shared.jobs), (4, 2));
-        assert!(
-            shared
-                .describe()
-                .contains("12.0 GiB available, shared by 2 batch items running at once at start"),
-            "{}",
-            shared.describe()
-        );
+    fn build_jobs_are_the_compile_slot_and_split_among_parallel_items() {
+        let slot = BuildJobs::new(8);
+        assert_eq!((slot.jobs, slot.cpu_width), (8, 8));
+        assert_eq!(slot.describe(), "8 build jobs, the compile slot's width");
+        let shared = slot.shared_by(2);
+        assert_eq!((shared.cpu_width, shared.jobs), (4, 4));
+        assert_eq!(slot.shared_by(16).jobs, 1, "never zero");
 
-        // The room is net of what other admitted work owes, and says so.
-        let owed = BuildJobs::new(
-            8,
-            Some(MemoryJobBound::assumed(
-                SpawnMemory {
-                    owed_bytes: 7 * GIB,
-                    owing: 3,
-                    ..room(12 * GIB)
-                },
-                5 * GIB / 2,
-            )),
-        );
-        assert_eq!(
-            owed.describe(),
-            "2 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available less 7.0 GiB owed by 3 admitted items at start / 2.5 GiB per job (assumed: no build job of this work measured here)"
-        );
-
-        let ample = BuildJobs::new(
-            32,
-            Some(MemoryJobBound::assumed(room(104 * GIB), 5 * GIB / 2)),
-        );
-        assert_eq!(
-            ample.describe(),
-            "32 build jobs, the CPU width (memory allowed 41)"
-        );
-        assert_eq!(
-            BuildJobs::new(8, None).describe(),
-            "8 build jobs, the CPU width (memory was not measured at start)"
-        );
+        // A record from an executor that sized jobs by memory still reads.
+        let older: BuildJobs = serde_json::from_value(serde_json::json!({
+            "jobs": 3,
+            "cpuWidth": 8,
+            "narrowed": { "admittedJobs": 5, "floorJobs": 3 },
+            "memory": { "jobs": 3, "availableBytes": 1, "measuredAtUnixMs": 1, "perJobReserveBytes": 1 }
+        }))
+        .unwrap();
+        assert_eq!((older.jobs, older.cpu_width), (3, 8));
 
         // The record round-trips, and an item's own jobs survive narrowing.
-        let wire: BuildJobs = serde_json::from_value(serde_json::to_value(held).unwrap()).unwrap();
-        assert_eq!(wire, held);
+        let wire: BuildJobs = serde_json::from_value(serde_json::to_value(slot).unwrap()).unwrap();
+        assert_eq!(wire, slot);
         let command = ExecutionAllocation::uncapped(8, NoCapReason::CapNotImplemented, None, 1)
-            .with_build_jobs(held);
+            .with_build_jobs(slot);
         assert_eq!(
             command.reobserved(None, None, None, 1).build_jobs,
-            Some(held)
+            Some(slot)
         );
         assert_eq!(
             command
@@ -28129,13 +27956,32 @@ mod tests {
             ExecutorMessage::NodeScratchDeleted {
                 scratch_id: "scratch".into(),
             },
+            ExecutorMessage::Room {
+                seq: 1,
+                room: AnnouncedRoom {
+                    slots: CompileSlots::of(20),
+                    cores: Allowance {
+                        limit: 20,
+                        committed: 10,
+                    },
+                    memory: None,
+                    memory_budget: None,
+                    disk: None,
+                    disk_budget: None,
+                    reclaimable_memory_bytes: 0,
+                    alone: None,
+                    provisioning: Vec::new(),
+                    holds: Vec::new(),
+                    closures: Vec::new(),
+                },
+            },
         ]
     }
 
     /// Every variant, by position. No wildcard arm, so a new variant does not
     /// compile here until it is counted, and `every_message_variant` is held
     /// to it by the tests below.
-    const MESSAGE_VARIANTS: usize = 58;
+    const MESSAGE_VARIANTS: usize = 59;
     fn message_variant_ordinal(message: &ExecutorMessage) -> usize {
         use ExecutorMessage::*;
         match message {
@@ -28197,6 +28043,7 @@ mod tests {
             InfrastructureDiagnostic { .. } => 55,
             ReleaseHeadroom { .. } => 56,
             HeadroomReleased { .. } => 57,
+            Room { .. } => 58,
         }
     }
 
@@ -28468,7 +28315,6 @@ mod tests {
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
             test_phase: None,
-            build_job_memory: None,
         };
         let process = |status: ResidentProcessStatus| ResidentProcess {
             generation: 1,
@@ -29007,7 +28853,6 @@ mod tests {
                     source: ResourceReservationSource::Learned,
                     measured_peak_bytes: None,
                     test_phase: None,
-                    build_job_memory: None,
                 },
                 reservation_rationale: ReservationRationale {
                     declared_concurrency_units: Some(1),
@@ -29021,7 +28866,7 @@ mod tests {
                     headroom_percent: 25,
                     fallback: None,
                     memory_kill: None,
-                    build_jobs_price: None,
+                    slot_price: None,
                     unreadable_memory: Vec::new(),
                 },
                 sync_cost: PlacementSyncCost::Known { bytes: 12_345 },
@@ -29113,7 +28958,6 @@ mod tests {
                 source: ResourceReservationSource::Unmeasured,
                 measured_peak_bytes: None,
                 test_phase: None,
-                build_job_memory: None,
             },
             learned_estimate: None,
             scratch_sync: None,
@@ -29667,7 +29511,6 @@ mod tests {
                 source: ResourceReservationSource::Declared,
                 measured_peak_bytes: None,
                 test_phase: None,
-                build_job_memory: None,
             }),
             live_usage: None,
             charge: None,
@@ -29885,7 +29728,6 @@ mod tests {
             source: ResourceReservationSource::Learned,
             measured_peak_bytes: None,
             test_phase: None,
-            build_job_memory: None,
         };
         let learned_estimate = LearnedResourceEstimate {
             sample_count: 5,
@@ -29943,7 +29785,6 @@ mod tests {
                         available_bytes: 1,
                         floor_bytes: 2,
                         owed_bytes: 3,
-                        width_floor: None,
                         alone_beside: None,
                         owing: vec![OwingWork {
                             subject: LiveUsageSubject::Command {
@@ -30663,7 +30504,6 @@ mod tests {
                     active_reservation: reservation.clone(),
                     owed_memory_bytes: Some(28),
                     owing: Vec::new(),
-                    floor_narrowings_last_day: None,
                     queued_reservation_bytes: 24,
                     accepted_count: 25,
                     rejected_count: 26,

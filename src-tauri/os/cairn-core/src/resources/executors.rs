@@ -1877,6 +1877,10 @@ pub(crate) fn render_executor_with_kills(
     }
     out.push('\n');
 
+    out.push_str(&render_room(
+        executor.room.as_ref(),
+        executor.captured_at_unix_ms,
+    ));
     out.push_str("## Admission\n");
     out.push_str(&pipe_floor_line(&executor_pipe_floor(
         &health.host,
@@ -1986,11 +1990,6 @@ pub(crate) fn render_executor_with_kills(
                         .join("; ")
                 )
             }
-        ));
-    }
-    if let Some(narrowings) = health.admission.floor_narrowings_last_day {
-        out.push_str(&format!(
-            "- Spawn narrowings under the floor width, last day: {narrowings}\n"
         ));
     }
     if health.queues.is_empty() {
@@ -3863,11 +3862,16 @@ struct JournaledScoring {
 }
 
 /// The single-decision view: the runner's recent window first, then the
-/// decision the queue journal persisted for the request.
+/// decision the queue journal persisted for the request. A request still
+/// queued is answered first from the queue's own account of it
+/// (`queued`, [`crate::fleet::Fleet::queued_request_account`]), whether or
+/// not any placement decision names this machine: a request pinned here and
+/// refused by it is never recorded as a decision (cairn/6499).
 pub(crate) async fn read_placement(
     db: &crate::storage::LocalDb,
     executor: &ExecutorInspection,
     request_id: &str,
+    queued: Option<crate::fleet::CheckDispatchPhase>,
 ) -> String {
     let in_window = executor
         .recent_placements
@@ -3878,7 +3882,65 @@ pub(crate) async fn read_placement(
     } else {
         Some(journaled_placement(db, request_id, &executor.health.identity.executor_id).await)
     };
-    render_placement(executor, request_id, journal.as_ref())
+    let Some(queued) = queued else {
+        return render_placement(executor, request_id, journal.as_ref());
+    };
+    let mut out = render_queued_account(executor, request_id, &queued);
+    let decided = in_window
+        || journal
+            .as_ref()
+            .is_some_and(|journal| journal.found.is_some());
+    if decided {
+        out.push_str("\n## The latest placement decision naming this machine\n\n");
+        out.push_str(&render_placement(executor, request_id, journal.as_ref()));
+    }
+    out
+}
+
+/// A queued request's account, read on one machine's page (cairn/6499):
+/// since when it has waited, what this machine last said of it and under
+/// which of its rooms, and the whole sentence of what holds it, the one the
+/// check board writes on a check request's row.
+pub(crate) fn render_queued_account(
+    executor: &ExecutorInspection,
+    request_id: &str,
+    queued: &crate::fleet::CheckDispatchPhase,
+) -> String {
+    let crate::fleet::CheckDispatchPhase::Placing {
+        since_unix_ms,
+        declines,
+        placement,
+        turn,
+    } = queued
+    else {
+        return String::new();
+    };
+    let mut out = format!(
+        "# Executor {} placement `{request_id}`\n\n- Queued and unclaimed since {}\n",
+        executor.name,
+        age(executor.captured_at_unix_ms.saturating_sub(*since_unix_ms))
+    );
+    match declines
+        .iter()
+        .find(|decline| decline.executor_name == executor.name)
+    {
+        Some(decline) => out.push_str(&format!(
+            "- Its latest refusal here, {}: {}\n",
+            age(executor
+                .captured_at_unix_ms
+                .saturating_sub(decline.at_unix_ms)),
+            crate::execution::checks::describe_decline(decline)
+        )),
+        None => out.push_str(&format!("- {} has not refused it\n", executor.name)),
+    }
+    out.push_str(&format!(
+        "- What holds it: {}\n",
+        crate::execution::checks::describe_queued_hold(declines, placement.as_ref(), turn.as_ref())
+            .unwrap_or_else(|| {
+                "nothing yet: no machine has refused it and no placement pass has run".into()
+            })
+    ));
+    out
 }
 
 /// The newest decision journaled for `request_id` that names `executor_id`,
@@ -4388,19 +4450,13 @@ fn describe_rationale(rationale: &ReservationRationale) -> String {
         })
         .unwrap_or_default();
     let priced = rationale
-        .build_jobs_price
+        .slot_price
         .as_ref()
         .map(|price| {
-            let source = price
-                .measured_on
-                .as_deref()
-                .map_or_else(|| "measured here".to_string(), |on| format!("measured on {on}"));
             format!(
-                "; memory priced at {} build jobs: the largest job at {} and {} more at {} each, {source}",
+                "; memory priced at its compile slot: the tree measured here at {} build jobs, {}",
                 price.jobs,
-                bytes(price.largest_bytes),
-                price.jobs.saturating_sub(1),
-                bytes(price.typical_bytes),
+                bytes(price.tree_bytes),
             )
         })
         .unwrap_or_default();
@@ -4440,7 +4496,7 @@ mod rationale_tests {
             fallback: (sample_count < MIN_CONFIDENT_RESERVATION_SAMPLES)
                 .then_some(ReservationFallback::BelowConfidenceFloor),
             memory_kill: None,
-            build_jobs_price: None,
+            slot_price: None,
             unreadable_memory: Vec::new(),
         }
     }
@@ -4491,23 +4547,75 @@ mod rationale_tests {
         );
     }
 
-    /// cairn/6263: a reservation priced at the width the machine grants says
-    /// so, with the figures and where they were measured, instead of reading
-    /// as a bare fleet prior.
+    /// cairn/6499: the account of a request pinned to a machine that refuses
+    /// it, read on that machine's page, carries the machine's refusal
+    /// verbatim and the room it came under; a request no machine has refused
+    /// says that instead of saying nothing.
     #[test]
-    fn a_width_priced_reservation_names_its_jobs_and_their_source() {
+    fn a_queued_requests_account_names_this_machines_refusal_and_its_room() {
+        let mut executor = super::tests::inspection("bgsrv-ub", false);
+        executor.captured_at_unix_ms = 60_000;
+        let refusal = "memory short: owed 6.5 GiB + 2.0 GiB for this request > available 6.4 GiB";
+        let refused = crate::fleet::CheckDispatchPhase::Placing {
+            since_unix_ms: 0,
+            declines: vec![crate::fleet::CheckDispatchDecline {
+                executor_name: "bgsrv-ub".into(),
+                reason: DeclineReason::Pressure,
+                detail: Some(refusal.into()),
+                at_unix_ms: 30_000,
+                superseded_at_unix_ms: None,
+                retry_after_unix_ms: 40_000,
+                room_seq: Some(41),
+            }],
+            placement: None,
+            turn: None,
+        };
+        let rendered = render_queued_account(&executor, "78a872da", &refused);
+        assert!(
+            rendered.contains("- Queued and unclaimed since 1m ago\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "- Its latest refusal here, 30s ago: bgsrv-ub (host pressure: {refusal}; under its room #41)\n"
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- What holds it: declined by bgsrv-ub (host pressure: "),
+            "{rendered}"
+        );
+        let unrefused = crate::fleet::CheckDispatchPhase::Placing {
+            since_unix_ms: 0,
+            declines: Vec::new(),
+            placement: None,
+            turn: None,
+        };
+        let rendered = render_queued_account(&executor, "78a872da", &unrefused);
+        assert!(
+            rendered.contains("- bgsrv-ub has not refused it\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- What holds it: nothing yet"),
+            "{rendered}"
+        );
+    }
+
+    /// A reservation priced at the machine's compile slot says so, with the
+    /// tree it was measured to hold there (cairn/7303), instead of reading as
+    /// a bare learned peak.
+    #[test]
+    fn a_slot_priced_reservation_names_its_slot_and_tree() {
         let mut priced = rationale(0, None);
-        priced.fallback = Some(ReservationFallback::FleetPrior);
-        priced.build_jobs_price = Some(cairn_common::executor_protocol::BuildJobsPrice {
-            jobs: 20,
-            largest_bytes: 12 << 30,
-            typical_bytes: 1 << 30,
-            measured_on: Some("fedora:fedora".into()),
+        priced.slot_price = Some(cairn_common::executor_protocol::SlotPrice {
+            jobs: 10,
+            tree_bytes: 40 << 30,
         });
         let rendered = describe_rationale(&priced);
         assert!(
             rendered.ends_with(
-                "; memory priced at 20 build jobs: the largest job at 12.0 GiB and 19 more at 1.0 GiB each, measured on fedora:fedora"
+                "; memory priced at its compile slot: the tree measured here at 10 build jobs, 40.0 GiB"
             ),
             "{rendered}"
         );
@@ -5122,6 +5230,106 @@ pub(crate) fn render_compile_cache_fitness(sentences: &[String]) -> String {
 
 /// What placing queued work has cost this runner: the last whole minute's
 /// growth, which is the rate a reader compares, and the totals since start.
+/// The room a machine last announced (cairn/7303): what its own admission
+/// decides by, in the figures it announced them, with what closes it to which
+/// work. Placement does not read it yet; the room-driven dispatcher will.
+pub(crate) fn render_room(
+    announced: Option<&cairn_common::executor_protocol::RoomAnnouncement>,
+    captured_at_unix_ms: u64,
+) -> String {
+    use cairn_common::executor_protocol::RoomScope;
+    let mut out = String::from("## Room\n");
+    let Some(announced) = announced else {
+        out.push_str("- Not announced: a machine announces its room once its link is ready\n\n");
+        return out;
+    };
+    let room = &announced.room;
+    out.push_str(&format!(
+        "- Announced: seq {}, {} ago\n",
+        announced.seq,
+        age(captured_at_unix_ms.saturating_sub(announced.received_at_unix_ms))
+    ));
+    out.push_str(&format!(
+        "- Compile slots: {} of {} free, each {} build jobs wide\n",
+        room.free_slots(),
+        room.slots.slots,
+        room.slots.width
+    ));
+    out.push_str(&format!(
+        "- Cores: {} of {} free\n",
+        room.cores.free(),
+        room.cores.limit
+    ));
+    out.push_str(&match room.memory {
+        Some(memory) => format!(
+            "- Memory: {} free ({} available less {} owed) of {}\n",
+            bytes(memory.free_bytes()),
+            bytes(memory.available_bytes),
+            bytes(memory.owed_bytes),
+            bytes(memory.total_bytes)
+        ),
+        None => "- Memory: no reading\n".to_string(),
+    });
+    if let Some(budget) = room.memory_budget {
+        out.push_str(&format!(
+            "- Memory budget: {} of {} free\n",
+            bytes(budget.free()),
+            bytes(budget.limit)
+        ));
+    }
+    out.push_str(&match &room.disk {
+        Some(disk) => format!(
+            "- Disk: {} free above the floor ({} free, {} floor, {} reserved){}\n",
+            bytes(disk.free_above_floor()),
+            bytes(disk.free_bytes),
+            bytes(disk.watermark_bytes),
+            bytes(disk.reserved_bytes),
+            disk.inodes
+                .as_ref()
+                .map(|inodes| format!("; {}", inodes.describe()))
+                .unwrap_or_default()
+        ),
+        None => "- Disk: not read\n".to_string(),
+    });
+    if let Some(alone) = &room.alone {
+        out.push_str(&format!("- Alone: {}\n", alone.hold.describe()));
+    }
+    for hold in &room.provisioning {
+        out.push_str(&format!(
+            "- Provisioning project {} for request {}\n",
+            hold.project_id, hold.request_id
+        ));
+    }
+    for hold in &room.holds {
+        out.push_str(&format!(
+            "- Holding headroom{} for request {} (entry {}): {} memory, {} cores, {} disk\n",
+            if hold.protected { ", protected," } else { "" },
+            hold.request_id,
+            hold.entry_id,
+            bytes(hold.memory_bytes),
+            hold.cores,
+            bytes(hold.disk_bytes)
+        ));
+    }
+    for closure in &room.closures {
+        let to = match closure.scope {
+            RoomScope::Everything => "all work",
+            RoomScope::NonInteractive => "non-interactive work",
+            RoomScope::NonInteractiveCompile => "non-interactive compiles",
+            RoomScope::ShortCommands => "short agent commands",
+            RoomScope::Processes => "new processes",
+            RoomScope::BuildVolume => "work that needs the build volume",
+        };
+        let why = closure
+            .detail
+            .clone()
+            .unwrap_or_else(|| format!("{} host-pressure condition(s)", closure.conditions.len()));
+        out.push_str(&format!("- Closed to {to}: {why}\n"));
+    }
+    out.push('\n');
+    out
+}
+
 pub(crate) fn render_placement_work(
     totals: crate::fleet::counters::PlacementCounts,
     last_minute: Option<crate::fleet::counters::CountedWindow>,
@@ -5139,13 +5347,14 @@ pub(crate) fn render_placement_work(
         }
     }
     out.push_str(&format!(
-        "- Since start: {} placement passes, {} fit evaluations, {} offers, {} refusals, {} reservations, {} needs worked out\n",
+        "- Since start: {} placement passes, {} fit evaluations, {} offers, {} refusals, {} reservations, {} needs worked out, {} room announcements\n",
         totals.placement_passes,
         totals.fit_evaluations,
         totals.offers,
         totals.refusals,
         totals.reservations,
-        totals.needs_worked_out
+        totals.needs_worked_out,
+        totals.announcements
     ));
     out
 }
@@ -9624,6 +9833,7 @@ mod tests {
             captured_at_unix_ms: CAPTURED_AT,
             connection_timeline: Vec::new(),
             project_eligibility: Vec::new(),
+            room: None,
         }
     }
 
@@ -13428,7 +13638,6 @@ mod tests {
                     source: ResourceReservationSource::Learned,
                     measured_peak_bytes: None,
                     test_phase: None,
-                    build_job_memory: None,
                 },
                 reservation_rationale: ReservationRationale {
                     declared_concurrency_units: Some(1),
@@ -13443,7 +13652,7 @@ mod tests {
                     headroom_percent: 25,
                     fallback: None,
                     memory_kill: None,
-                    build_jobs_price: None,
+                    slot_price: None,
                     unreadable_memory: Vec::new(),
                 },
                 sync_cost: PlacementSyncCost::Known { bytes: 12_345 },
@@ -13633,7 +13842,7 @@ mod tests {
             .unwrap();
         }
 
-        let rendered = read_placement(&db, &executor, "req-old").await;
+        let rendered = read_placement(&db, &executor, "req-old", None).await;
         assert!(
             rendered.contains("read from entry `entry-1` sequence 3, recorded 10m ago"),
             "{rendered}"
@@ -13645,7 +13854,7 @@ mod tests {
 
         let mut other = inspection("bglab-win", false);
         other.health.identity.executor_id = "executor-absent".into();
-        let refused = read_placement(&db, &other, "req-old").await;
+        let refused = read_placement(&db, &other, "req-old", None).await;
         assert!(
             refused.contains(
                 "in the runner's recent window or the queue journal; 1 journaled decision row(s)"
@@ -14271,8 +14480,7 @@ mod supervision_tests {
 mod running_now_tests {
     use super::render_running_now;
     use cairn_common::executor_protocol::{
-        BuildJobs, CellCommandClass, ExecutingCellRequest, FleetSnapshot, MemoryJobBound,
-        SpawnMemory,
+        BuildJobs, CellCommandClass, ExecutingCellRequest, FleetSnapshot,
     };
 
     const GIB: u64 = 1 << 30;
@@ -14332,27 +14540,13 @@ mod running_now_tests {
         assert!(rendered.contains("(commands exited "), "{rendered}");
     }
 
-    /// A compile held to four jobs on an eight-core machine says so where the
-    /// operator reads it, with the reading that held it.
+    /// A compile names its build jobs where the operator reads it: its
+    /// compile slot's width.
     #[test]
-    fn a_running_row_names_its_build_jobs_and_the_memory_that_held_them() {
-        let held = BuildJobs::new(
-            8,
-            Some(MemoryJobBound::assumed(
-                SpawnMemory {
-                    available_bytes: 12 * GIB,
-                    owed_bytes: 0,
-                    owing: 0,
-                    measured_at_unix_ms: 0,
-                },
-                5 * GIB / 2,
-            )),
-        );
-        let rendered = render_running_now(&running(Some(held)), None, 60_000);
+    fn a_running_row_names_its_build_jobs() {
+        let rendered = render_running_now(&running(Some(BuildJobs::new(8))), None, 60_000);
         assert!(
-            rendered.contains(
-                "usage not measured yet; 4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job (assumed: no build job of this work measured here)\n"
-            ),
+            rendered.contains("usage not measured yet; 8 build jobs, the compile slot's width\n"),
             "{rendered}"
         );
         // An executor that does not report build jobs leaves the row as it was.
@@ -14366,7 +14560,7 @@ mod running_now_tests {
     #[test]
     fn a_test_lane_names_its_phase_and_charge() {
         use cairn_common::executor_protocol::{LanePhase, ResourceReservation, TestPhaseEvidence};
-        let mut snapshot = running(Some(BuildJobs::new(8, None)));
+        let mut snapshot = running(Some(BuildJobs::new(8)));
         let lane = &mut snapshot.executing_requests[0];
         lane.resource_reservation = ResourceReservation {
             measured_peak_bytes: Some(31 * GIB),

@@ -1079,6 +1079,7 @@ async fn the_write_wave_board_feeds_its_dispatch_to_the_inline_wait() {
                 at_unix_ms: PARKED_AT + 1_000,
                 superseded_at_unix_ms: None,
                 retry_after_unix_ms: PARKED_AT + 2_000,
+                room_seq: None,
             }],
         },
         joined: None,
@@ -6483,7 +6484,6 @@ fn every_no_start_reason_keeps_its_own_condition_class() {
                     owed_bytes: 0,
                     owing: Vec::new(),
                     total_bytes: None,
-                    width_floor: None,
                     alone_beside: None,
                 }]),
             ),
@@ -6645,7 +6645,6 @@ fn a_deadlines_retry_eligibility_matches_the_fleets_own_capacity_verdict() {
                 owed_bytes: 0,
                 owing: Vec::new(),
                 total_bytes: None,
-                width_floor: None,
                 alone_beside: None,
             }]),
         ),
@@ -7081,6 +7080,7 @@ fn a_parked_check_names_the_machines_that_declined_it() {
                 at_unix_ms: PARKED_AT + 1_000,
                 superseded_at_unix_ms: None,
                 retry_after_unix_ms: PARKED_AT + 2_000,
+                room_seq: None,
             }],
         },
         joined: None,
@@ -7118,6 +7118,7 @@ fn a_parked_check_names_every_machine_of_its_latest_placement_pass() {
         at_unix_ms: PARKED_AT + 1_000,
         superseded_at_unix_ms,
         retry_after_unix_ms: PARKED_AT + 5_000,
+        room_seq: None,
     };
     let ceiling = |estimate_bytes| {
         CheckCandidateStatus::NotOffered(PlacementRejectionReason::ExceedsMemoryCeiling {

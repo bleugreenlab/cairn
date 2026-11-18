@@ -569,7 +569,6 @@ mod tests {
             owed_bytes: 0,
             owing: Vec::new(),
             total_bytes: None,
-            width_floor: None,
             alone_beside: None,
         }]))
         .is_capacity());
@@ -598,7 +597,6 @@ mod tests {
                 owed_bytes: 0,
                 owing: Vec::new(),
                 total_bytes: None,
-                width_floor: None,
                 alone_beside: None,
             },
             HostPressureCondition::DiskFree {

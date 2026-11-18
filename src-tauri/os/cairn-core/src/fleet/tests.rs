@@ -2954,7 +2954,8 @@ fn an_executor_without_containment_reporting_is_refused_in_its_own_terms() {
 #[tokio::test]
 async fn a_parallel_batch_is_charged_for_every_item_it_runs_at_once() {
     let db = Arc::new(crate::storage::migrated_test_db("parallel-batch-width.db").await);
-    let request = provenance_request();
+    let mut request = provenance_request();
+    request.command_class = CellCommandClass::Other;
     let batch = |sequential: bool, items: usize| ProcessBatch {
         files: Vec::new(),
         runtime_packages: Vec::new(),
@@ -3004,6 +3005,27 @@ async fn a_parallel_batch_is_charged_for_every_item_it_runs_at_once() {
         small.admission_concurrency_budget(),
         "a batch wider than the machine runs in waves rather than never fitting"
     );
+
+    // A compile takes one compile slot, whose width its items split, sequential
+    // or parallel (cairn/7303): 16 cores are two slots of eight.
+    let mut compile = provenance_request();
+    compile.command_class = CellCommandClass::CargoCheck;
+    for sequential in [true, false] {
+        let resolved = ReservationPlan::new(db.clone(), &compile, Some(&batch(sequential, 3)))
+            .resolve_for(
+                &compile,
+                "device",
+                "executor",
+                &capabilities_with_cores(16),
+                resource_profiles::DurationContext {
+                    class: compile.command_class,
+                    warmth: ExecutionWarmth::Cold,
+                    now_unix_ms: NOW,
+                },
+            )
+            .await;
+        assert_eq!(resolved.reservation.concurrency_units, 8, "{sequential}");
+    }
 }
 
 /// A minted identity is no licence to its class suite's build-job figures,
@@ -3092,10 +3114,9 @@ async fn a_class_suites_build_jobs_never_price_an_ad_hoc_compile() {
     let bound = 20 * GIB;
 
     let small = resolve(ad_hoc).await;
-    assert_eq!(small.reservation.build_job_memory, None);
-    assert_eq!(small.rationale.build_jobs_price, None);
+    assert_eq!(small.rationale.slot_price, None);
     assert!(
-        small.reservation.solve_memory_grant(1, bound, 0).is_ok(),
+        small.reservation.memory_charge_bytes() <= bound,
         "another command's 30 GiB job never refuses this one at the bound: {:?}",
         small.reservation
     );
@@ -3138,14 +3159,132 @@ async fn a_class_suites_build_jobs_never_price_an_ad_hoc_compile() {
     );
     let suite = resolve(configured).await;
     assert!(
-        suite.reservation.build_job_memory.is_some(),
-        "a configured suite's jobs are its own"
-    );
-    assert!(
-        suite.reservation.solve_memory_grant(1, bound, 0).is_err(),
-        "a configured suite's measured 30 GiB job is still refused at a 20 GiB bound: {:?}",
+        suite.reservation.memory_charge_bytes() > bound,
+        "a configured suite's measured 30 GiB process is still refused at a 20 GiB bound: {:?}",
         suite.reservation
     );
+}
+
+/// The why-rust specimen (cairn/7303; cairn://p/cairn/execution/task/why-rust):
+/// the combined Rust review wave on a bginf-sp2-sized machine, 20 cores in two
+/// compile slots of ten under a 105.5 GiB executor bound. Merging its members'
+/// per-job models once charged it 144.52 GiB, rust-lint's marginal from a
+/// two-job run times nineteen, above the bound, and the machine was excluded.
+/// Each member is now priced at the machine's slot width from the tree it
+/// reached there, and a sequential wave is its heaviest member: it fits, and
+/// asks one slot's cores.
+#[tokio::test]
+async fn the_combined_rust_wave_fits_a_bginf_sp2_sized_machine() {
+    use cairn_common::executor_protocol::{
+        BuildJobs, ExecutionAllocation, NoCapReason, PeakProcess, SlotPrice,
+    };
+    const GIB: u64 = 1 << 30;
+    let db = Arc::new(crate::storage::migrated_test_db("why-rust-wave.db").await);
+    let mut capabilities = capabilities_with_cores(20);
+    capabilities.memory_budget_bytes = Some(105 * GIB);
+    let context = ReservationPlan::context_for("device", "executor", &capabilities);
+    let mut request = provenance_request();
+    request.command_class = CellCommandClass::CargoTest;
+    // The largest process of each member as bginf-sp2's rows hold it, and
+    // the tree a cold run reached there at ten jobs.
+    let members = [
+        ("rust-lint", 16_739_962_880, 24 * GIB),
+        ("rust-tests", 29_816_995_840, 42 * GIB),
+        ("source-scans", 29_603_549_184, 38 * GIB),
+    ];
+    for (suite, largest, tree) in members {
+        resource_profiles::observe_suite(
+            db.clone(),
+            Some(&format!("{}/{suite}", request.project_id)),
+            CellCommandClass::CargoTest,
+            &context,
+            &CellExecutionMeta {
+                stop: None,
+                peak_process: Some(PeakProcess {
+                    bytes: largest,
+                    name: Some("rustc".into()),
+                }),
+                peak_rss_bytes: Some(tree),
+                warmth: Some(ExecutionWarmth::Cold),
+                allocation: Some(
+                    ExecutionAllocation::uncapped(10, NoCapReason::CapNotImplemented, None, 1)
+                        .with_build_jobs(BuildJobs::new(10)),
+                ),
+                ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
+            },
+            resource_profiles::CompletionKind::Succeeded,
+            resource_profiles::MachineAdmission::default(),
+            resource_profiles::CompletedSource::default(),
+        )
+        .await;
+    }
+    let item = |suite: &str| ProcessBatchItem {
+        command_resource_identity: Some(CommandResourceIdentity {
+            version: 1,
+            key: format!("{suite}:cold"),
+            suite: Some(suite.into()),
+        }),
+        ..cache_batch_item(Vec::new())
+    };
+    let wave = ProcessBatch {
+        files: Vec::new(),
+        runtime_packages: Vec::new(),
+        sequential: true,
+        stop_on_error: false,
+        sandbox_mode: ProcessSandboxMode::Unconfined,
+        timeout_bases: Vec::new(),
+        items: members.iter().map(|(suite, ..)| item(suite)).collect(),
+        runner_context_id: None,
+        execution_residency: None,
+        containment: None,
+        node_scratch: None,
+    };
+    let resolved = ReservationPlan::new(db, &request, Some(&wave))
+        .resolve_for(
+            &request,
+            "device",
+            "executor",
+            &capabilities,
+            resource_profiles::DurationContext {
+                class: CellCommandClass::CargoTest,
+                warmth: ExecutionWarmth::Cold,
+                now_unix_ms: NOW,
+            },
+        )
+        .await;
+    assert_eq!(
+        resolved.reservation.memory_charge_bytes(),
+        42 * GIB,
+        "the wave is its heaviest member at the slot width: {:?}",
+        resolved.reservation
+    );
+    assert_eq!(resolved.reservation.concurrency_units, 10, "one slot");
+    assert_eq!(
+        resolved.rationale.slot_price,
+        Some(SlotPrice {
+            jobs: 10,
+            tree_bytes: 42 * GIB
+        })
+    );
+
+    let bound = 105 * GIB + GIB / 2;
+    let (key, mut sp2) = fleet_entry("bginf-sp2", "linux", 0, &[]);
+    measured(&mut sp2, 0.01, 120 << 30, 500 << 30);
+    Arc::make_mut(&mut sp2.advertisement)
+        .capabilities
+        .service_bounds = Some(cairn_common::wire_vocabulary::ServiceBounds {
+        memory_max_bytes: Some(bound),
+        ..Default::default()
+    });
+    let draft = choose_executor_with(
+        &HashMap::from([(key.clone(), sp2)]),
+        &spillable_request(),
+        &HashMap::from([(key, resolved)]),
+        |_, _| SyncCost::Known(0),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(chosen(&draft).executor_id, "bginf-sp2");
 }
 
 /// A reservation has two independent halves, and the record must carry both.
@@ -3161,6 +3300,9 @@ async fn a_declared_concurrency_and_a_learned_lookup_are_both_on_the_record() {
     let db = Arc::new(crate::storage::migrated_test_db("reservation-provenance.db").await);
     let capabilities = capabilities_with_cores(16);
     let mut request = provenance_request();
+    // Not a compile, which asks at least one compile slot whatever it
+    // declares: this is about whose number the declared half is.
+    request.command_class = CellCommandClass::Other;
     request.resource_reservation = ResourceReservation {
         memory_bytes: 0,
         disk_growth_bytes: 0,
@@ -3168,7 +3310,6 @@ async fn a_declared_concurrency_and_a_learned_lookup_are_both_on_the_record() {
         source: ResourceReservationSource::Declared,
         measured_peak_bytes: None,
         test_phase: None,
-        build_job_memory: None,
     };
     let resolved = ReservationPlan::new(db.clone(), &request, None)
         .resolve_for(
@@ -3468,6 +3609,7 @@ fn check_dispatch_phase_reports_placing_with_the_latest_decline() {
                     at_unix_ms: 2_500,
                     superseded_at_unix_ms: None,
                     retry_after_unix_ms: 3_500,
+                    room_seq: None,
                 }],
             },
             joined: None,
@@ -3507,6 +3649,51 @@ fn check_dispatch_phase_reports_running_from_the_claim_and_who_a_joiner_joined()
     );
 }
 
+/// cairn/6499's specimen: a check lane pinned to one machine that refuses it
+/// every time. No placement decision names that machine, so its page had
+/// nothing to say and the requester read the lane as lost. The queue's own
+/// account answers by request id: the machine's refusal verbatim, under the
+/// room it came under, and gone once a machine claims it.
+#[test]
+fn a_queued_request_is_accounted_for_by_request_id_with_the_room_it_was_refused_under() {
+    let pool = Fleet::default();
+    let key = ("78a872da".to_string(), "attempt".to_string());
+    let entry = enqueue_owned_entry(&pool, &key);
+    let refusal = "memory short: owed 6.5 GiB + 2.0 GiB for this request > available 6.4 GiB";
+    assert!(pool.queue.offer(&entry, "bgsrv-ub", "bgsrv-ub", 3, 2_000));
+    pool.queue.decline(
+        &entry,
+        "bgsrv-ub",
+        3,
+        DeclineReason::Pressure,
+        Some(refusal.into()),
+        None,
+        None,
+        2_500,
+    );
+    pool.queue.note_decline_room(&entry, "bgsrv-ub", 41);
+    let Some(CheckDispatchPhase::Placing { declines, .. }) =
+        pool.queued_request_account("78a872da")
+    else {
+        panic!("a queued request is accounted for");
+    };
+    assert_eq!(declines.len(), 1);
+    assert_eq!(declines[0].executor_name, "bgsrv-ub");
+    assert_eq!(declines[0].detail.as_deref(), Some(refusal));
+    assert_eq!(declines[0].room_seq, Some(41));
+    assert_eq!(pool.queued_request_account("unknown"), None);
+    assert!(pool.queue.offer(&entry, "fedora", "fedora", 4, 3_000));
+    assert_eq!(
+        pool.queue.claim(&entry, "fedora", 4, 3_100),
+        queue::ClaimVerdict::Granted
+    );
+    assert_eq!(
+        pool.queued_request_account("78a872da"),
+        None,
+        "a claimed request is no longer queued"
+    );
+}
+
 /// A write-check batch is queued under its own request identity and never
 /// coalesced, so its phase is read by that identity: placing with each
 /// machine's decline while held, then running on the machine that claimed
@@ -3540,6 +3727,7 @@ fn request_dispatch_phase_reads_a_write_check_batch_by_its_own_identity() {
                 at_unix_ms: 2_500,
                 superseded_at_unix_ms: None,
                 retry_after_unix_ms: 3_500,
+                room_seq: None,
             }],
         })
     );
@@ -3647,6 +3835,7 @@ fn request_dispatch_phase_carries_every_candidate_of_the_latest_pass() {
         at_unix_ms: 2_500,
         superseded_at_unix_ms: None,
         retry_after_unix_ms: 3_500,
+        room_seq: None,
     };
     assert_eq!(declines, vec![fedora.clone()]);
     let candidate = |name: &str, status| CheckPlacementCandidate {
@@ -6453,6 +6642,7 @@ pub(super) fn fleet_entry_at(
             preparation_refusals: HashMap::new(),
             link_clock: Arc::default(),
             link_path: None,
+            room: None,
         },
     )
 }
@@ -7219,6 +7409,7 @@ fn an_immobile_request_waits_on_its_home_only_when_the_home_can_clear() {
                     condition: None,
                     backoff_ms: 0,
                     retry_after_unix_ms: 0,
+                    room_seq: None,
                     superseded_at_unix_ms: None,
                 },
             )]);
@@ -8592,6 +8783,7 @@ async fn a_hard_process_misfit_is_not_hidden_behind_a_decline_or_a_hold() {
                 condition: None,
                 backoff_ms: 0,
                 retry_after_unix_ms: 0,
+                room_seq: None,
                 superseded_at_unix_ms: None,
             },
         )])
@@ -9258,7 +9450,9 @@ async fn re_pricing_unchanged_requests_against_unchanged_machines_reads_nothing(
 /// compile on a 12.1 GiB machine now showing 2.5 GiB free. The re-armed
 /// lane is charged the kill, not the 2 GiB class prior that fit, so it goes
 /// to the machine that can take it, and the record says why with both
-/// numbers.
+/// numbers. The charge is the victim's own floor: a compile runs at its one
+/// slot width, so there is no per-job model to narrow it and no width pricing
+/// to raise it (cairn/7303).
 #[tokio::test]
 async fn a_command_killed_for_memory_is_not_placed_back_where_it_does_not_fit() {
     let available = 2_684_354_560;
@@ -9274,7 +9468,7 @@ async fn a_command_killed_for_memory_is_not_placed_back_where_it_does_not_fit() 
     assert_eq!(
         refused.reason,
         PlacementRejectionReason::InsufficientMemory {
-            required_bytes: 4_563_402_751,
+            required_bytes: 3_650_722_201,
             available_bytes: available,
         }
     );
@@ -9485,6 +9679,7 @@ async fn a_learned_peak_above_every_eligible_ceiling_places_a_probe_rather_than_
             condition: None,
             backoff_ms: 0,
             retry_after_unix_ms: 0,
+            room_seq: None,
             superseded_at_unix_ms: None,
         },
     )]);
@@ -11895,6 +12090,7 @@ fn a_machine_that_declined_this_entry_ranks_behind_one_that_has_not() {
             condition: None,
             backoff_ms: 0,
             retry_after_unix_ms: 0,
+            room_seq: None,
             superseded_at_unix_ms: Some(NOW - 1_000),
         },
     )]);
@@ -11941,6 +12137,7 @@ fn a_pinned_pressure_decline_parks_until_the_machine_posts_recovery() {
             condition: None,
             backoff_ms: 0,
             retry_after_unix_ms: 0,
+            room_seq: None,
             superseded_at_unix_ms: None,
         },
     )]);
@@ -12034,7 +12231,6 @@ fn a_posted_hold_is_read_against_the_reservation_resolved_for_that_machine() {
             source: ResourceReservationSource::Learned,
             measured_peak_bytes: None,
             test_phase: None,
-            build_job_memory: None,
         },
         learned_estimate: None,
         rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -13051,6 +13247,7 @@ fn a_refusal_names_each_machines_decline_not_the_staleness_read_when_it_is_compo
         condition: None,
         backoff_ms: 0,
         retry_after_unix_ms: 0,
+        room_seq: None,
         // Superseded and past backoff: neither decline keeps its machine
         // out of ranking, which is where the staleness is read.
         superseded_at_unix_ms: Some(at_unix_ms),
@@ -13165,11 +13362,10 @@ fn executor_unit_bound_is_hard_but_planning_ceiling_is_not() {
     let reason = PlacementRejectionReason::ExceedsExecutorMemoryBound {
         charge_bytes: CHARGE,
         bound_bytes: BOUND,
-        width_measured: false,
     };
     assert_eq!(
         reason.describe(),
-        "no local job census; charged its whole measured tree of 52.94 GiB, above executor cgroup memory.max 46.25 GiB (missing width evidence, not a measured one-job excess)"
+        "charged 52.94 GiB, its learned memory at this machine's compile slot width, above executor cgroup memory.max 46.25 GiB"
     );
     let reservations = HashMap::from([
         ("bbs".into(), demand.clone()),
@@ -13221,30 +13417,6 @@ fn executor_unit_bound_is_hard_but_planning_ceiling_is_not() {
         chosen(&choose(&missing, &spillable_request(), &reservations).unwrap()).executor_id,
         "bbs"
     );
-
-    let mut modeled = demand;
-    modeled.reservation.build_job_memory =
-        Some(cairn_common::executor_protocol::BuildJobMemoryEvidence {
-            largest_bytes: 8 << 30,
-            typical_bytes: 4 << 30,
-            samples: 1,
-            // Measured here out to 16 jobs, so each narrower width is priced
-            // by the job model rather than charged the whole as unlearned.
-            width: Some(cairn_common::executor_protocol::JobWidthEvidence {
-                widest_jobs: 16,
-                widest_tree_bytes: 0,
-                marginal_bytes: 0,
-                marginal_jobs: 0,
-                marginal_tree_bytes: 0,
-            }),
-        });
-    assert!(modeled.reservation.memory_charge_at(Some(16)) > BOUND);
-    let modeled = HashMap::from([("bbs".into(), modeled)]);
-    assert_eq!(
-        chosen(&choose(&only, &spillable_request(), &modeled).unwrap()).executor_id,
-        "bbs",
-        "a usable narrow modeled width must survive a wide charge above the bound"
-    );
 }
 
 /// Fit is the first ranking key, so a machine that measurably cannot hold the
@@ -13276,7 +13448,6 @@ fn resolved_demand_that_does_not_fit_loses_to_a_machine_that_holds_it() {
             source: ResourceReservationSource::Learned,
             measured_peak_bytes: None,
             test_phase: None,
-            build_job_memory: None,
         },
         learned_estimate: None,
         rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -13334,7 +13505,6 @@ fn an_all_memory_constrained_fleet_still_places_for_capacity_waiting() {
             source: ResourceReservationSource::Learned,
             measured_peak_bytes: None,
             test_phase: None,
-            build_job_memory: None,
         },
         learned_estimate: None,
         rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -13468,7 +13638,6 @@ fn the_volume_misfit_includes_the_machines_watermark() {
             source: ResourceReservationSource::Learned,
             measured_peak_bytes: None,
             test_phase: None,
-            build_job_memory: None,
         },
         learned_estimate: None,
         rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -15375,7 +15544,6 @@ fn snapshot_aggregates_lifetime_count_and_reservations_across_executors() {
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
             test_phase: None,
-            build_job_memory: None,
         },
     });
     let mut second = fleet_entry("second", "linux", 0, &[]).1;
@@ -15388,7 +15556,6 @@ fn snapshot_aggregates_lifetime_count_and_reservations_across_executors() {
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
             test_phase: None,
-            build_job_memory: None,
         },
     });
     pool.lock_connections()
@@ -26751,6 +26918,7 @@ async fn work_too_big_for_the_only_usable_machine_waits_for_a_capable_one_that_d
             condition: None,
             backoff_ms: 0,
             retry_after_unix_ms: 0,
+            room_seq: None,
             superseded_at_unix_ms: None,
         },
     )]);

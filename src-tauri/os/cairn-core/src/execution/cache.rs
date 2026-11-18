@@ -4186,19 +4186,10 @@ pub(crate) mod tests {
                 summary_ms: Some(144_635),
             }],
         });
-        const GIB: u64 = 1 << 30;
-        write.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(
-            8,
-            Some(cairn_common::executor_protocol::MemoryJobBound::assumed(
-                cairn_common::executor_protocol::SpawnMemory {
-                    available_bytes: 12 * GIB,
-                    owed_bytes: 0,
-                    owing: 0,
-                    measured_at_unix_ms: 90,
-                },
-                5 * GIB / 2,
-            )),
-        ));
+        write.build_jobs = Some(cairn_common::executor_protocol::BuildJobs {
+            jobs: 4,
+            ..cairn_common::executor_protocol::BuildJobs::new(8)
+        });
         record_fresh_check_observation(db.clone(), write.clone()).unwrap();
         record_fresh_check_observation(db.clone(), write.clone()).unwrap();
         let held_lanes = db
@@ -4238,7 +4229,7 @@ pub(crate) mod tests {
         assert_eq!(by_handle.cell_origin, write.cell_origin);
         assert_eq!(by_handle.build_jobs, write.build_jobs);
         let mut wider = write.clone();
-        wider.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(8, None));
+        wider.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(8));
         let error = record_fresh_check_observation(db.clone(), wider).unwrap_err();
         assert!(error.contains("different immutable fields"), "{error}");
         let mut moved_cell = write.clone();
