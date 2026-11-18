@@ -266,7 +266,8 @@ impl Fleet {
     /// failed to prepare, and answer only once that is durable — an error if
     /// the delete failed or the store's writer has stopped, since a repair
     /// that a restart would undo has not happened. Does not lift a MISSING
-    /// build-prerequisite verdict, which only a re-attach refreshes.
+    /// build-prerequisite verdict, which the executor's own re-check refreshes
+    /// (at each attach and every 30 minutes).
     pub(crate) async fn clear_preparation_refusals(&self, executor_id: &str) -> Result<(), String> {
         let barrier = {
             let mut connections = self.lock_connections();

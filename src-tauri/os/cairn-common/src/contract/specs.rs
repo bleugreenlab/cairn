@@ -89,7 +89,7 @@ pub(crate) const EXECUTOR_MACHINE_SERVICES: KeySpec = KeySpec::with_aliases(
 pub(crate) const EXECUTOR_REPAIRED: KeySpec = KeySpec::new(
     "repaired",
     KeyType::Bool,
-    "declare this machine repaired, re-arming every check infrastructure-suppressed on its environment and re-admitting it for projects it failed to prepare (a setup command not found); for a repair the executor's own attach probes cannot see. Does not lift a MISSING build-prerequisite verdict, which only a re-attach refreshes",
+    "declare this machine repaired, re-arming every check infrastructure-suppressed on its environment and re-admitting it for projects it failed to prepare (a setup command not found); for a repair the executor's own attach probes cannot see. Does not lift a MISSING build-prerequisite verdict, which the executor's own re-check refreshes (at each attach and every 30 minutes)",
 );
 pub(crate) const REBASE_RESOLUTION: KeySpec = KeySpec::new(
     "resolution",

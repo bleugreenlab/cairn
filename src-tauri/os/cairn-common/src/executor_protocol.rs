@@ -7121,6 +7121,14 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/7165 does not move the number. An executor re-runs its
+/// build-prerequisite script and its `rust` toolchain probe on every Ready
+/// and every tool-refresh interval instead of once per process, and sends
+/// each result in the [`ExecutorMessage::AdvertisementUpdated`] frame it
+/// already sent for the first one. No field or frame changes shape; a runner
+/// talking to an older executor gets the once-per-process verdict it always
+/// got, and an older runner reads the newer verdicts as ordinary updates.
+///
 /// cairn/7220 does not move the number. For work that cannot leave its home,
 /// only the home's own rejection row decides: it is waited on, or refused
 /// naming the home, and never another machine's row by id. A fresh-pipe floor
