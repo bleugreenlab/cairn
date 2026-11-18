@@ -133,6 +133,11 @@ pub enum SignalOutcome {
 /// still the group the recorded process leads: a group id is a pid, and a group
 /// whose leader has gone can be reused just as a pid can. A process that moved
 /// itself out of that group is still reached through its own pid.
+///
+/// Once the group signal is delivered, the leader is one of the processes it
+/// reached: a fatal signal can end it and let its parent reap it before the
+/// leader's own signal, which then finds no such pid. That is still this
+/// call's delivery, never [`SignalOutcome::Gone`].
 #[cfg(unix)]
 pub fn signal_verified(
     pid: u32,
@@ -153,8 +158,11 @@ pub fn signal_verified(
     let group = process_group_id.filter(|group| {
         *group == pid && unsafe { libc::getpgid(pid as libc::pid_t) } == *group as libc::pid_t
     });
+    let mut group_delivered = false;
     if let Some(group) = group {
-        if unsafe { libc::kill(-(group as libc::pid_t), signal) } != 0 {
+        if unsafe { libc::kill(-(group as libc::pid_t), signal) } == 0 {
+            group_delivered = true;
+        } else {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
                 return Err(format!("signal process group {group}: {error}"));
@@ -164,7 +172,11 @@ pub fn signal_verified(
     if unsafe { libc::kill(pid as libc::pid_t, signal) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(SignalOutcome::Gone);
+            return Ok(if group_delivered {
+                SignalOutcome::Delivered { group: true }
+            } else {
+                SignalOutcome::Gone
+            });
         }
         return Err(format!("signal pid {pid}: {error}"));
     }
@@ -736,6 +748,30 @@ mod tests {
                 "the group's sleep survived"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The group signal can kill the leader and its parent reap it before the
+    /// leader's own signal is sent. Whichever wins, the call delivered.
+    #[test]
+    fn a_leader_its_group_signal_killed_and_a_reaper_took_is_delivered_not_gone() {
+        use std::os::unix::process::CommandExt;
+        // Each round is a fresh race between the reaper thread and the
+        // leader's own signal; neither ordering may read as gone.
+        for _ in 0..32 {
+            let mut child = std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let token = process_start_token(pid).unwrap();
+            let reaper = std::thread::spawn(move || child.wait());
+            assert_eq!(
+                signal_verified(pid, &token, Some(pid), libc::SIGKILL).unwrap(),
+                SignalOutcome::Delivered { group: true }
+            );
+            reaper.join().unwrap().unwrap();
         }
     }
 
