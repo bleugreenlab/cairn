@@ -1514,7 +1514,10 @@ pub(crate) fn render_executor_with_kills(
         "- Toolchains: {}\n",
         list_or(&capabilities.toolchains, "none advertised")
     ));
-    out.push_str(&render_toolchain_probes(capabilities));
+    out.push_str(&render_toolchain_probes(
+        capabilities,
+        executor.captured_at_unix_ms,
+    ));
     out.push_str(&format!(
         "- GitHub: {}\n",
         github_credential_summary(capabilities, executor.captured_at_unix_ms)
@@ -6874,7 +6877,11 @@ fn bytes(value: u64) -> String {
 /// probed as and the failure that produced it.
 fn toolchain_summary(capabilities: &ExecutorCapabilities) -> String {
     if !capabilities.toolchains.is_empty() {
-        return capabilities.toolchains.join(", ");
+        let list = capabilities.toolchains.join(", ");
+        return match toolchain_gaps(capabilities) {
+            gaps if gaps.is_empty() => list,
+            gaps => format!("{list} ({})", gaps.join("; ")),
+        };
     }
     let Some(detection) = &capabilities.toolchain_detection else {
         return "none advertised".to_string();
@@ -6896,6 +6903,34 @@ fn toolchain_summary(capabilities: &ExecutorCapabilities) -> String {
         detection.account,
         failures.join("; ")
     )
+}
+
+/// The listing's note for each probe whose latest attempt measured nothing:
+/// a verified toolchain still advertised on an aging verdict, and one no probe
+/// has completed for, which is a gap rather than an absence.
+fn toolchain_gaps(capabilities: &ExecutorCapabilities) -> Vec<String> {
+    use cairn_common::executor_protocol::ToolchainProbeState;
+    let Some(detection) = &capabilities.toolchain_detection else {
+        return Vec::new();
+    };
+    detection
+        .probes
+        .iter()
+        .filter_map(|probe| {
+            let failure = probe.not_measured.as_ref()?;
+            Some(match probe.state() {
+                ToolchainProbeState::NotMeasured => {
+                    format!("{} not measured: {}", probe.toolchain, failure.cause)
+                }
+                state => format!(
+                    "{} held {}: latest probe {}",
+                    probe.toolchain,
+                    state.label(),
+                    failure.cause
+                ),
+            })
+        })
+        .collect()
 }
 
 /// One machine's build-prerequisite verdict for the fleet listing, or nothing
@@ -7489,7 +7524,15 @@ fn render_cli_build(capabilities: &ExecutorCapabilities) -> String {
     }
 }
 
-fn render_toolchain_probes(capabilities: &ExecutorCapabilities) -> String {
+/// Each probe in one of three states — verified, absent, not measured — with
+/// when its verdict was measured and, beside a verdict, the latest attempt
+/// that measured nothing. A held verdict is what keeps the toolchain
+/// advertised through a probe that timed out on a loaded host (cairn/6432).
+fn render_toolchain_probes(
+    capabilities: &ExecutorCapabilities,
+    captured_at_unix_ms: u64,
+) -> String {
+    use cairn_common::executor_protocol::ToolchainProbeState;
     let Some(detection) = &capabilities.toolchain_detection else {
         return "- Toolchain probes: not reported by this executor\n".to_string();
     };
@@ -7501,15 +7544,30 @@ fn render_toolchain_probes(capabilities: &ExecutorCapabilities) -> String {
         out.push_str("  - this executor probed for no toolchains\n");
         return out;
     }
+    let ago = |at: u64| age(captured_at_unix_ms.saturating_sub(at));
     for probe in &detection.probes {
+        let state = probe.state();
+        let measured = probe
+            .measured_at_unix_ms
+            .map(|at| format!(", measured {}", ago(at)))
+            .unwrap_or_default();
+        let latest = match (&probe.not_measured, state) {
+            (Some(failure), ToolchainProbeState::NotMeasured) => format!(
+                " ({}); no probe has completed, so this is a gap, not an absence",
+                ago(failure.at_unix_ms)
+            ),
+            (Some(failure), state) => format!(
+                "; the latest probe, {}, measured nothing ({}), so the {} verdict stands",
+                ago(failure.at_unix_ms),
+                failure.cause,
+                state.label()
+            ),
+            (None, _) => String::new(),
+        };
         out.push_str(&format!(
-            "  - {}: {} — `{}` at {} — {}\n",
+            "  - {}: {} — `{}` at {} — {}{measured}{latest}\n",
             probe.toolchain,
-            if probe.detected {
-                "detected"
-            } else {
-                "not detected"
-            },
+            state.label(),
             probe.command,
             probe.resolved_path.as_deref().unwrap_or("not on PATH"),
             probe.detail
@@ -9883,6 +9941,7 @@ mod tests {
                 resolved_path: None,
                 detail: "could not run: program not found".into(),
                 build_sha256: None,
+                ..Default::default()
             }],
         }
     }
@@ -9898,6 +9957,7 @@ mod tests {
                 resolved_path: Some("C:\\Users\\mitch\\.cargo\\bin\\cargo.exe".into()),
                 detail: "cargo 1.97.1 (c980f4866 2026-06-30)".into(),
                 build_sha256: None,
+                ..Default::default()
             }],
         }
     }
@@ -9913,6 +9973,7 @@ mod tests {
                 resolved_path: Some("/home/dev/.cairn-exec/bin/cairn".into()),
                 detail: detail.into(),
                 build_sha256: Some("7704f2fdbef1b931".into()),
+                ..Default::default()
             }],
         }
     }
@@ -10036,10 +10097,99 @@ mod tests {
         );
         assert!(
             rendered.contains(
-                "  - rust: detected — `cargo --version` at C:\\Users\\mitch\\.cargo\\bin\\cargo.exe — cargo 1.97.1 (c980f4866 2026-06-30)"
+                "  - rust: verified — `cargo --version` at C:\\Users\\mitch\\.cargo\\bin\\cargo.exe — cargo 1.97.1 (c980f4866 2026-06-30)"
             ),
             "{rendered}"
         );
+    }
+
+    fn npm_probe(
+        detected: bool,
+        detail: &str,
+        measured_at: Option<u64>,
+        timed_out_at: Option<u64>,
+    ) -> ToolchainProbe {
+        ToolchainProbe {
+            toolchain: "npm".into(),
+            command: "npm --version".into(),
+            detected,
+            resolved_path: Some("/home/dev/.cairn-exec/bin/npm".into()),
+            detail: detail.into(),
+            measured_at_unix_ms: measured_at,
+            not_measured: timed_out_at.map(|at_unix_ms| {
+                cairn_common::executor_protocol::ToolchainProbeUnmeasured {
+                    at_unix_ms,
+                    cause: "did not finish within 30s and was killed".into(),
+                }
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn npm_machine(probe: ToolchainProbe) -> ExecutorInspection {
+        let advertised = if probe.detected {
+            vec!["npm".to_string()]
+        } else {
+            Vec::new()
+        };
+        with_toolchains(
+            "bginf-sp1",
+            advertised,
+            Some(ToolchainDetection {
+                account: "dev".into(),
+                home: "/home/dev".into(),
+                probes: vec![probe],
+            }),
+        )
+    }
+
+    /// The bginf-sp1 specimen on the page: a verified npm whose latest probe
+    /// timed out stays advertised, with the timeout beside the verdict; a
+    /// measured absence reads absent; a probe that never completed reads not
+    /// measured. Three states, three words.
+    #[test]
+    fn the_machine_page_renders_three_toolchain_states() {
+        let held = npm_machine(npm_probe(
+            true,
+            "10.9.2 (manifest)",
+            Some(CAPTURED_AT - 900_000),
+            Some(CAPTURED_AT - 600_000),
+        ));
+        let page = render_executor(&held);
+        assert!(page.contains("- Toolchains: npm\n"), "{page}");
+        assert!(
+            page.contains("  - npm: verified — `npm --version` at /home/dev/.cairn-exec/bin/npm — 10.9.2 (manifest), measured 15m ago; the latest probe, 10m ago, measured nothing (did not finish within 30s and was killed), so the verified verdict stands\n"),
+            "{page}"
+        );
+        let listed = render_executors(&[held], &[], &[], None, CAPTURED_AT, false);
+        assert!(
+            listed.contains("- Toolchains: npm (npm held verified: latest probe did not finish within 30s and was killed)\n"),
+            "{listed}"
+        );
+
+        let absent = render_executor(&npm_machine(npm_probe(
+            false,
+            "could not run: No such file or directory",
+            Some(CAPTURED_AT - 60_000),
+            None,
+        )));
+        assert!(
+            absent.contains("  - npm: absent — `npm --version` at /home/dev/.cairn-exec/bin/npm — could not run: No such file or directory, measured 1m ago\n"),
+            "{absent}"
+        );
+
+        let never = npm_machine(npm_probe(
+            false,
+            "did not finish within 30s and was killed",
+            None,
+            Some(CAPTURED_AT - 5_000),
+        ));
+        let page = render_executor(&never);
+        assert!(
+            page.contains("  - npm: not measured — `npm --version` at /home/dev/.cairn-exec/bin/npm — did not finish within 30s and was killed (5s ago); no probe has completed, so this is a gap, not an absence\n"),
+            "{page}"
+        );
+        assert!(!page.contains("npm: absent"), "{page}");
     }
 
     /// A probe that resolved a program and still failed is the interesting case:
@@ -10058,6 +10208,7 @@ mod tests {
                 resolved_path: Some("C:\\Users\\other\\.cargo\\bin\\cargo.exe".into()),
                 detail: "exited 1: error: rustup could not choose a version of cargo to run".into(),
                 build_sha256: None,
+                ..Default::default()
             }],
         };
         let rendered = render_executor(&with_toolchains("bglab-win", Vec::new(), Some(detection)));
@@ -10286,6 +10437,7 @@ mod tests {
                         project_id: "cairn".into(),
                         missing: vec!["bun".into()],
                         advertised: Vec::new(),
+                        evidence: Vec::new(),
                     },
                     PlacementRejectionReason::BuildPrerequisitesMissing {
                         project_id: "cairn".into(),

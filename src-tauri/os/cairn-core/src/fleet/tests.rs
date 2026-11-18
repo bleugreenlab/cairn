@@ -25118,9 +25118,163 @@ fn probed(entry: &mut ExecutorConnectionState, bun_detected: bool) {
                 "could not run: No such file or directory".into()
             },
             build_sha256: None,
+            ..Default::default()
         }],
     });
     advertising(entry, if bun_detected { &["bun"] } else { &[] });
+}
+
+/// A machine whose only npm record is `probe`, advertising it exactly when the
+/// record is a verdict that it is there.
+fn npm_probed(
+    entry: &mut ExecutorConnectionState,
+    probe: cairn_common::executor_protocol::ToolchainProbe,
+) {
+    let advertised: &[&str] = if probe.detected { &["npm"] } else { &[] };
+    Arc::make_mut(&mut entry.advertisement)
+        .capabilities
+        .toolchain_detection = Some(cairn_common::executor_protocol::ToolchainDetection {
+        account: "dev".into(),
+        home: "/home/dev".into(),
+        probes: vec![probe],
+    });
+    advertising(entry, advertised);
+}
+
+fn npm_record(
+    detected: bool,
+    measured: bool,
+    timed_out: bool,
+) -> cairn_common::executor_protocol::ToolchainProbe {
+    let cause = "did not finish within 30s and was killed";
+    cairn_common::executor_protocol::ToolchainProbe {
+        toolchain: "npm".into(),
+        command: "npm --version".into(),
+        detected,
+        resolved_path: Some("/home/dev/.cairn-exec/bin/npm".into()),
+        detail: if detected {
+            "10.9.2 (manifest)".into()
+        } else if measured {
+            "exited 127: npm: not found".into()
+        } else {
+            cause.into()
+        },
+        measured_at_unix_ms: measured.then_some(NOW - 3_600_000),
+        not_measured: timed_out.then(|| {
+            cairn_common::executor_protocol::ToolchainProbeUnmeasured {
+                at_unix_ms: NOW - 600_000,
+                cause: cause.into(),
+            }
+        }),
+        ..Default::default()
+    }
+}
+
+/// The infra-stacks lane on bginf-sp1: a lane that names npm takes a machine
+/// whose npm is verified, and one whose npm was verified and whose latest
+/// probe timed out; it refuses one that measured npm absent, and one no probe
+/// has completed on, each refusal naming the state it acted on.
+#[test]
+fn a_lane_requiring_a_toolchain_reads_its_probe_state() {
+    let selector = ExecutorSelector {
+        os: Some("linux".into()),
+        required_toolchains: vec!["npm".into()],
+        ..ExecutorSelector::default()
+    };
+    let (_, mut entry) = fleet_entry("bginf-sp1", "linux", 0, &[]);
+
+    npm_probed(&mut entry, npm_record(true, true, false));
+    assert!(selector_shortfall(&entry, &selector).is_none());
+
+    npm_probed(&mut entry, npm_record(true, true, true));
+    assert!(
+        selector_shortfall(&entry, &selector).is_none(),
+        "a timeout after a verdict keeps the machine eligible"
+    );
+
+    npm_probed(&mut entry, npm_record(false, true, false));
+    let absent = selector_shortfall(&entry, &selector)
+        .expect("a measured absence refuses")
+        .describe();
+    assert_eq!(
+        absent,
+        "does not advertise npm (npm absent (`npm --version`: exited 127: npm: not found))"
+    );
+
+    npm_probed(&mut entry, npm_record(false, false, true));
+    let gap = selector_shortfall(&entry, &selector)
+        .expect("a lane that names npm needs it verified")
+        .describe();
+    assert!(
+        gap.starts_with("does not advertise npm (npm not measured since "),
+        "{gap}"
+    );
+    assert!(
+        gap.ends_with("(`npm --version` did not finish within 30s and was killed))"),
+        "{gap}"
+    );
+    assert!(!gap.contains("absent"), "{gap}");
+}
+
+/// The census names the state too, so a machine whose npm probe timed out
+/// reads as one in the unplaceable diagnostic rather than as a machine
+/// without npm.
+#[test]
+fn the_unplaceable_census_names_a_required_toolchains_probe_state() {
+    let fleet = Fleet::default();
+    let (id, mut entry) = fleet_entry("bginf-sp1", "linux", 0, &[]);
+    npm_probed(&mut entry, npm_record(false, false, true));
+    fleet.lock_connections().insert(id, entry);
+    // An attached colocated executor without npm, so the runner's own
+    // platform is not counted as reachable before its executor attaches,
+    // which on a Linux host would make any linux lane placeable.
+    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, std::env::consts::OS, 0, &[]);
+    local.colocated = true;
+    advertising(&mut local, &[]);
+    fleet.lock_connections().insert(local_id, local);
+    let selector = ExecutorSelector {
+        required_toolchains: vec!["npm".into()],
+        ..ExecutorSelector::default()
+    };
+    let reason = fleet
+        .unplaceable_reason(Some(&selector), &["linux".to_string()])
+        .expect("no machine has verified npm");
+    assert!(
+        reason.contains(
+            "bginf-sp1 (linux; no toolchains; does not advertise npm (npm not measured since "
+        ),
+        "{reason}"
+    );
+}
+
+/// Setup is the one consumer that learns from its own failure (tenet 951), so
+/// a setup toolchain no probe has completed on is a gap the machine stays
+/// eligible across; a measured absence still refuses, naming its evidence.
+#[test]
+fn a_setup_toolchain_that_was_never_measured_is_a_gap_not_a_refusal() {
+    let (_, mut entry) = fleet_entry("bginf-sp1", "linux", 0, &[]);
+    let mut request = spillable_request();
+    request.project_requirements = project_needs(&["npm"], &[]).into();
+
+    npm_probed(&mut entry, npm_record(false, false, true));
+    assert!(!matches!(
+        candidate_rejection(&entry, PlacementScope::of(&request), NOW),
+        Some(PlacementRejectionReason::PreparationToolchainMissing { .. })
+    ));
+
+    npm_probed(&mut entry, npm_record(true, true, true));
+    assert!(!matches!(
+        candidate_rejection(&entry, PlacementScope::of(&request), NOW),
+        Some(PlacementRejectionReason::PreparationToolchainMissing { .. })
+    ));
+
+    npm_probed(&mut entry, npm_record(false, true, false));
+    let refusal = candidate_rejection(&entry, PlacementScope::of(&request), NOW)
+        .expect("a measured absence refuses");
+    assert_eq!(
+        refusal.describe(),
+        "project setup for p requires npm; this machine advertises none (npm absent (`npm --version`: exited 127: npm: not found))"
+    );
 }
 
 #[test]
@@ -25181,6 +25335,7 @@ fn an_unselected_request_never_lands_where_the_project_setup_cannot_run() {
             project_id: "p".into(),
             missing: vec!["bun".into()],
             advertised: Vec::new(),
+            evidence: Vec::new(),
         }
     );
     assert_eq!(

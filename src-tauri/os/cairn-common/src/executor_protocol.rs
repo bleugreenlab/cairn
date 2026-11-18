@@ -9586,6 +9586,19 @@ pub struct LearnedResourceEstimate {
 /// sends no census, and cannot read a Room frame. The handshake refuses both
 /// pairings, as for every bump, and an executor refused this way updates
 /// itself to the runner's build.
+///
+/// cairn/6432 does not move the number. A toolchain probe that could not
+/// finish (a timeout, a SIGKILL, a spawn refused for want of resources) is no
+/// longer reported as the tool's absence: [`ToolchainProbe`] gains
+/// `measuredAtUnixMs` and `notMeasured`, both defaulted, and an executor keeps a
+/// verified toolchain advertised through attempts that measured nothing,
+/// recording the failure in `notMeasured` beside it. `PreparationToolchainMissing`
+/// gains a defaulted `evidence` list, which only the runner composes. What a
+/// runner gets wrong talking to an older executor: nothing new; that executor
+/// sends neither field, its records read as the two-valued verdicts they always
+/// were, and a timeout there still drops the tool. What an older runner gets
+/// wrong talking to a newer executor: nothing; it ignores both fields, and the
+/// advertised set it reads is simply steadier.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 175;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -10728,7 +10741,16 @@ pub struct ExecutorIdentity {
 /// evidence behind it cannot be checked. This carries the evidence so that
 /// "this machine has no Rust" is distinguishable from "the probe never worked",
 /// which are the same empty list without it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// A probe has three outcomes, not two ([`ToolchainProbeState`]): the tool
+/// answered (verified), the machine said it is not there (absent), or the probe
+/// itself could not finish (not measured). The third is a fact about the probe,
+/// never about the machine, so it never replaces an earlier verdict
+/// ([`ToolchainProbe::supersede`]); it rides beside it in
+/// [`ToolchainProbe::not_measured`]. An executor that predates the third state
+/// sends neither of its fields, and its record reads exactly as the two-valued
+/// one it always was.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolchainProbe {
     /// The toolchain this probe decides, spelled as a placement selector's
@@ -10751,6 +10773,141 @@ pub struct ToolchainProbe {
     /// the only identity that tells two of them apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_sha256: Option<String>,
+    /// When the verdict in `detected` and `detail` was measured. Absent from
+    /// an executor that predates it, and from a record no probe has yet
+    /// completed for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_at_unix_ms: Option<u64>,
+    /// The latest attempt, when it measured nothing: it timed out, was killed,
+    /// or could not be spawned for a reason that says nothing about the tool.
+    /// Beside a verdict it is news that the verdict is aging, not a new
+    /// verdict; with no verdict it is the whole record, and the toolchain is
+    /// not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_measured: Option<ToolchainProbeUnmeasured>,
+}
+
+/// A probe attempt that ended without measuring anything.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolchainProbeUnmeasured {
+    pub at_unix_ms: u64,
+    /// Why, in the probe's words: `did not finish within 30s and was killed`.
+    pub cause: String,
+}
+
+/// What a probe record says about its toolchain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolchainProbeState {
+    /// The tool answered. Held through later attempts that measured nothing.
+    Verified,
+    /// The machine said the tool is not there, or not usable: not on PATH, or
+    /// it ran and failed.
+    Absent,
+    /// No attempt has completed, so nothing is known either way. Tenet 302:
+    /// never-measured is a gap, not a zero.
+    NotMeasured,
+}
+
+impl ToolchainProbeState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Absent => "absent",
+            Self::NotMeasured => "not measured",
+        }
+    }
+}
+
+impl ToolchainProbe {
+    pub fn state(&self) -> ToolchainProbeState {
+        if self.detected {
+            ToolchainProbeState::Verified
+        } else if self.not_measured.is_some() && self.measured_at_unix_ms.is_none() {
+            ToolchainProbeState::NotMeasured
+        } else {
+            ToolchainProbeState::Absent
+        }
+    }
+
+    /// The record that follows `prior` once `fresh` is in.
+    ///
+    /// A fresh verdict, either way, replaces whatever came before. A fresh
+    /// attempt that measured nothing does not: the prior verdict stands, with
+    /// the failed attempt recorded beside it, because a probe that could not
+    /// finish on a saturated host has learned nothing about the tool. Only
+    /// when there is no prior verdict does the failure become the record.
+    pub fn supersede(prior: Option<&ToolchainProbe>, fresh: ToolchainProbe) -> ToolchainProbe {
+        if fresh.state() != ToolchainProbeState::NotMeasured {
+            return fresh;
+        }
+        match prior {
+            Some(prior) if prior.state() != ToolchainProbeState::NotMeasured => ToolchainProbe {
+                not_measured: fresh.not_measured,
+                ..prior.clone()
+            },
+            _ => fresh,
+        }
+    }
+}
+
+/// Why a toolchain a machine was asked for is not in its advertised set, in
+/// the state its probe record is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnadvertisedToolchain<'a> {
+    /// The probe measured it absent.
+    Absent(&'a ToolchainProbe),
+    /// No probe of it has completed.
+    NotMeasured(&'a ToolchainProbe),
+    /// The executor reported no probe of it at all.
+    Unreported,
+}
+
+impl UnadvertisedToolchain<'_> {
+    /// The clause a refusal names the toolchain's state with, or `None` when
+    /// the executor gave no evidence beyond its advertised list.
+    pub fn describe(&self, toolchain: &str) -> Option<String> {
+        match self {
+            Self::Absent(probe) => Some(format!(
+                "{toolchain} absent (`{}`: {})",
+                probe.command, probe.detail
+            )),
+            Self::NotMeasured(probe) => {
+                let failure = probe.not_measured.as_ref()?;
+                Some(format!(
+                    "{toolchain} not measured since {} (`{}` {})",
+                    describe_age(failure.at_unix_ms),
+                    probe.command,
+                    failure.cause
+                ))
+            }
+            Self::Unreported => None,
+        }
+    }
+}
+
+impl ExecutorCapabilities {
+    /// Why `toolchain` is not advertised here, or `None` when it is.
+    pub fn unadvertised_toolchain(&self, toolchain: &str) -> Option<UnadvertisedToolchain<'_>> {
+        if self
+            .toolchains
+            .iter()
+            .any(|advertised| advertised == toolchain)
+        {
+            return None;
+        }
+        let probe = self
+            .toolchain_detection
+            .as_ref()
+            .and_then(|detection| detection.probes.iter().find(|p| p.toolchain == toolchain));
+        Some(match probe {
+            Some(probe) if probe.state() == ToolchainProbeState::NotMeasured => {
+                UnadvertisedToolchain::NotMeasured(probe)
+            }
+            Some(probe) => UnadvertisedToolchain::Absent(probe),
+            None => UnadvertisedToolchain::Unreported,
+        })
+    }
 }
 
 /// The evidence behind an executor's advertised toolchain set.
@@ -10772,7 +10929,9 @@ pub struct ToolchainDetection {
 }
 
 impl ToolchainDetection {
-    /// The toolchain names to advertise: exactly those a probe confirmed.
+    /// The toolchain names to advertise: exactly those a probe confirmed,
+    /// including one whose latest attempt measured nothing after it was
+    /// verified ([`ToolchainProbe::supersede`]).
     ///
     /// Deriving the advertised set from the probes rather than assembling it
     /// separately is what keeps the claim and its evidence from disagreeing.
@@ -23897,6 +24056,11 @@ pub enum PlacementRejectionReason {
         project_id: String,
         missing: Vec<String>,
         advertised: Vec<String>,
+        /// Each missing toolchain's probe state, where the machine gave one
+        /// ([`UnadvertisedToolchain::describe`]). Absent from a record made
+        /// before it existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        evidence: Vec<String>,
     },
     /// The project requires [`ProjectCapability::GithubCredential`] (declared,
     /// or learned from a fetch that failed for want of one) and this machine
@@ -24160,13 +24324,19 @@ impl PlacementRejectionReason {
                 project_id,
                 missing,
                 advertised,
+                evidence,
             } => format!(
-                "project setup for {project_id} requires {}; this machine advertises {}",
+                "project setup for {project_id} requires {}; this machine advertises {}{}",
                 missing.join(", "),
                 if advertised.is_empty() {
                     "none".to_string()
                 } else {
                     advertised.join(", ")
+                },
+                if evidence.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", evidence.join("; "))
                 }
             ),
             Self::PreparationRefused {
@@ -29308,6 +29478,147 @@ mod tests {
         };
         let error = no_edge.validate().unwrap_err();
         assert!(error.contains("at least one edge"), "{error}");
+    }
+
+    fn npm_probe(detected: bool, detail: &str, measured_at: Option<u64>) -> ToolchainProbe {
+        ToolchainProbe {
+            toolchain: "npm".into(),
+            command: "npm --version".into(),
+            detected,
+            resolved_path: Some("/home/dev/.cairn-exec/bin/npm".into()),
+            detail: detail.into(),
+            measured_at_unix_ms: measured_at,
+            ..ToolchainProbe::default()
+        }
+    }
+
+    fn timed_out(at_unix_ms: u64) -> ToolchainProbe {
+        let cause = "did not finish within 30s and was killed";
+        ToolchainProbe {
+            not_measured: Some(ToolchainProbeUnmeasured {
+                at_unix_ms,
+                cause: cause.into(),
+            }),
+            ..npm_probe(false, cause, None)
+        }
+    }
+
+    /// The bginf-sp1 specimen: a verified npm whose next probe timed out under
+    /// load stays verified and advertised, with the timeout beside it; a
+    /// measured absence replaces it; and a probe that never completed is not
+    /// measured rather than absent.
+    #[test]
+    fn a_probe_that_measured_nothing_never_replaces_a_verdict() {
+        let verified = npm_probe(true, "10.9.2 (manifest)", Some(1_000));
+        let held = ToolchainProbe::supersede(Some(&verified), timed_out(2_000));
+        assert_eq!(held.state(), ToolchainProbeState::Verified);
+        assert_eq!(held.detail, "10.9.2 (manifest)");
+        assert_eq!(held.measured_at_unix_ms, Some(1_000));
+        assert_eq!(held.not_measured.as_ref().unwrap().at_unix_ms, 2_000);
+        let detection = ToolchainDetection {
+            account: "dev".into(),
+            home: "/home/dev".into(),
+            probes: vec![held.clone()],
+        };
+        assert_eq!(detection.advertised(), vec!["npm".to_string()]);
+
+        // A held verdict is still a verdict: a second timeout keeps it, and
+        // the record says when the latest attempt failed.
+        let still = ToolchainProbe::supersede(Some(&held), timed_out(3_000));
+        assert_eq!(still.state(), ToolchainProbeState::Verified);
+        assert_eq!(still.not_measured.unwrap().at_unix_ms, 3_000);
+
+        let absent = npm_probe(
+            false,
+            "could not run: No such file or directory",
+            Some(4_000),
+        );
+        let replaced = ToolchainProbe::supersede(Some(&held), absent.clone());
+        assert_eq!(replaced, absent);
+        assert_eq!(replaced.state(), ToolchainProbeState::Absent);
+
+        let never = ToolchainProbe::supersede(None, timed_out(5_000));
+        assert_eq!(never.state(), ToolchainProbeState::NotMeasured);
+        assert_eq!(
+            ToolchainProbe::supersede(Some(&never), timed_out(6_000))
+                .not_measured
+                .unwrap()
+                .at_unix_ms,
+            6_000
+        );
+        let recovered = npm_probe(true, "10.9.2 (manifest)", Some(7_000));
+        assert_eq!(
+            ToolchainProbe::supersede(Some(&never), recovered.clone()),
+            recovered
+        );
+    }
+
+    /// Tenet 1368: an older executor's probe, which carries neither new field,
+    /// decodes into the two-valued verdict it always was, and a newer record
+    /// carries both fields only when it has them.
+    #[test]
+    fn the_third_state_is_additive_on_the_wire() {
+        let legacy: ToolchainProbe = serde_json::from_value(serde_json::json!({
+            "toolchain": "npm",
+            "command": "npm --version",
+            "detected": false,
+            "detail": "did not finish within 30s and was killed"
+        }))
+        .unwrap();
+        assert_eq!(legacy.state(), ToolchainProbeState::Absent);
+        let encoded = serde_json::to_value(npm_probe(true, "10.9.2", None)).unwrap();
+        assert!(encoded.get("notMeasured").is_none(), "{encoded}");
+        assert!(encoded.get("measuredAtUnixMs").is_none(), "{encoded}");
+        let held =
+            ToolchainProbe::supersede(Some(&npm_probe(true, "10.9.2", Some(1))), timed_out(2));
+        let round_tripped: ToolchainProbe =
+            serde_json::from_value(serde_json::to_value(&held).unwrap()).unwrap();
+        assert_eq!(round_tripped, held);
+    }
+
+    /// A refusal names which state it acted on, so "npm missing" can no
+    /// longer stand for a probe that timed out.
+    #[test]
+    fn an_unadvertised_toolchain_is_described_in_its_probe_state() {
+        let mut capabilities: ExecutorCapabilities = serde_json::from_value(serde_json::json!({
+            "os": "linux",
+            "arch": "x86_64",
+            "logicalCores": 1,
+            "toolchains": ["bun"]
+        }))
+        .unwrap();
+        assert_eq!(capabilities.unadvertised_toolchain("bun"), None);
+        assert_eq!(
+            capabilities.unadvertised_toolchain("npm"),
+            Some(UnadvertisedToolchain::Unreported)
+        );
+        assert_eq!(UnadvertisedToolchain::Unreported.describe("npm"), None);
+        capabilities.toolchain_detection = Some(ToolchainDetection {
+            account: "dev".into(),
+            home: "/home/dev".into(),
+            probes: vec![timed_out(0)],
+        });
+        let gap = capabilities.unadvertised_toolchain("npm").unwrap();
+        assert!(matches!(gap, UnadvertisedToolchain::NotMeasured(_)));
+        let described = gap.describe("npm").unwrap();
+        assert!(
+            described.starts_with("npm not measured since "),
+            "{described}"
+        );
+        assert!(
+            described.ends_with("(`npm --version` did not finish within 30s and was killed)"),
+            "{described}"
+        );
+        capabilities.toolchain_detection.as_mut().unwrap().probes =
+            vec![npm_probe(false, "exited 127: npm: not found", Some(1))];
+        assert_eq!(
+            capabilities
+                .unadvertised_toolchain("npm")
+                .unwrap()
+                .describe("npm")
+                .unwrap(),
+            "npm absent (`npm --version`: exited 127: npm: not found)"
+        );
     }
 
     /// Refusals are built from this, so it has to name what was asked for in

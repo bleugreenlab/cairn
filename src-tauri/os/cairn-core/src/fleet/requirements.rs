@@ -395,21 +395,37 @@ pub(super) fn projects_serve(projects_served: &[String], project_id: &str) -> bo
 
 /// The toolchains a project's setup invokes that this machine does not
 /// advertise, as a rejection, or `None` when it advertises them all.
+///
+/// A toolchain no probe has finished measuring is not missing: setup is what
+/// needs it, and a setup that then fails for want of it is learned as a
+/// [`PlacementRejectionReason::PreparationRefused`] with its evidence (tenet
+/// 951). Refusing on a probe that timed out would turn a slow host into an
+/// absent tool (tenet 302).
 pub(super) fn setup_toolchain_deficiency(
     capabilities: &ExecutorCapabilities,
     project_id: &str,
     requirements: &ProjectPlacementRequirements,
 ) -> Option<PlacementRejectionReason> {
-    let missing: Vec<String> = requirements
-        .setup_toolchains
-        .iter()
-        .filter(|required| !capabilities.toolchains.contains(required))
-        .cloned()
-        .collect();
+    let mut missing = Vec::new();
+    let mut evidence = Vec::new();
+    for required in &requirements.setup_toolchains {
+        let Some(gap) = capabilities.unadvertised_toolchain(required) else {
+            continue;
+        };
+        if matches!(
+            gap,
+            cairn_common::executor_protocol::UnadvertisedToolchain::NotMeasured(_)
+        ) {
+            continue;
+        }
+        missing.push(required.clone());
+        evidence.extend(gap.describe(required));
+    }
     (!missing.is_empty()).then(|| PlacementRejectionReason::PreparationToolchainMissing {
         project_id: project_id.to_string(),
         missing,
         advertised: capabilities.toolchains.clone(),
+        evidence,
     })
 }
 
@@ -674,8 +690,13 @@ pub(super) enum SelectorShortfall {
     Platform {
         wanted: String,
     },
+    /// Required toolchains the machine does not advertise, and the probe state
+    /// of each where the machine reported one. A lane that names a toolchain
+    /// needs it verified, so a probe that never completed refuses too, but
+    /// says so rather than reading as an absence.
     Toolchains {
         missing: Vec<String>,
+        states: Vec<String>,
     },
     /// The sentence [`nested_sandbox_shortfall`] states.
     NestedSandbox(String),
@@ -701,7 +722,14 @@ impl SelectorShortfall {
     pub(super) fn describe(&self) -> String {
         match self {
             Self::Name { wanted } | Self::Platform { wanted } => format!("not {wanted}"),
-            Self::Toolchains { missing } => format!("does not advertise {}", missing.join(", ")),
+            Self::Toolchains { missing, states } if states.is_empty() => {
+                format!("does not advertise {}", missing.join(", "))
+            }
+            Self::Toolchains { missing, states } => format!(
+                "does not advertise {} ({})",
+                missing.join(", "),
+                states.join("; ")
+            ),
             Self::NestedSandbox(sentence) => sentence.clone(),
             Self::Containment(edge) => format!("containment: {edge}"),
             Self::PageCallProgram(sentence) => sentence.clone(),
@@ -744,19 +772,16 @@ pub(super) fn selector_shortfall(
             wanted: wanted.to_string(),
         });
     }
-    let missing: Vec<String> = selector
-        .required_toolchains
-        .iter()
-        .filter(|required| {
-            !capabilities
-                .toolchains
-                .iter()
-                .any(|available| available == *required)
-        })
-        .cloned()
-        .collect();
+    let mut missing = Vec::new();
+    let mut states = Vec::new();
+    for required in &selector.required_toolchains {
+        if let Some(gap) = capabilities.unadvertised_toolchain(required) {
+            missing.push(required.clone());
+            states.extend(gap.describe(required));
+        }
+    }
     if !missing.is_empty() {
-        return Some(SelectorShortfall::Toolchains { missing });
+        return Some(SelectorShortfall::Toolchains { missing, states });
     }
     let unreported = |capability| SelectorShortfall::Unreported {
         capability,

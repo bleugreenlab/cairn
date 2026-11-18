@@ -613,7 +613,9 @@ impl Fleet {
         // A containment or page-call requirement is invisible in a machine's
         // OS and toolchains, so each machine then also says which edge or
         // program it failed: the line an operator needs to know which machine
-        // to fix.
+        // to fix. So is the state of a required toolchain's probe: a machine
+        // whose probe could not finish lacks it in a different way from one
+        // that measured it absent.
         let measured_requirement = selector.filter(|selector| {
             selector.containment.is_some() || !selector.page_call_programs.is_empty()
         });
@@ -623,8 +625,15 @@ impl Fleet {
                 let capabilities = &entry.advertisement.capabilities;
                 let mut toolchains = capabilities.toolchains.clone();
                 toolchains.sort();
-                let shortfall = measured_requirement
+                let shortfall = selector
                     .and_then(|selector| selector_shortfall(entry, selector))
+                    .filter(|shortfall| {
+                        measured_requirement.is_some()
+                            || matches!(
+                                shortfall,
+                                SelectorShortfall::Toolchains { states, .. } if !states.is_empty()
+                            )
+                    })
                     .map(|shortfall| format!("; {}", shortfall.describe()))
                     .unwrap_or_default();
                 format!(
