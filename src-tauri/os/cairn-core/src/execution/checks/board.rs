@@ -170,6 +170,17 @@ impl CheckStatusBoard {
         board
     }
 
+    /// The board a write wave publishes while it runs. Like a review wave's,
+    /// its verdicts belong to the check engine, which records each lane as its
+    /// own request settles, so a request's per-item completion marks a lane
+    /// `finished` rather than `passed` or `failed`. `notify` hears every
+    /// snapshot with the whole wave's phase ([`Self::wave_phase`]).
+    pub(super) fn for_write_wave(plans: &[(CheckPlan, String)], notify: CheckStatusNotify) -> Self {
+        let mut board = Self::new(plans, notify);
+        board.engine_owned = true;
+        board
+    }
+
     pub(crate) fn engine_owns_verdicts(&self) -> bool {
         self.engine_owned
     }
@@ -298,19 +309,42 @@ impl CheckStatusBoard {
             .all(|entry| matches!(entry.state.as_str(), "passed" | "failed" | "unverified"))
     }
 
+    /// Where the board's requests stand together: the furthest along of every
+    /// lane's own phase, and of the shared phase while a lane that has no
+    /// request yet is still unanswered. Running outranks queued, which outranks
+    /// being prepared, so one lane parked behind a hold never hides another
+    /// that a machine is running.
+    pub(super) fn wave_phase(&self) -> CheckPhaseStatus {
+        // Entries are copied out before `lanes` is taken: `request_is_recorded`
+        // takes the two the other way round.
+        let entries = self.snapshot();
+        let lanes = self.lanes.lock().unwrap();
+        if lanes.is_empty() {
+            return self.phase.lock().unwrap().clone();
+        }
+        let shared_pending = entries.iter().any(|entry| {
+            !lanes.contains_key(&entry.index)
+                && !matches!(entry.state.as_str(), "passed" | "failed" | "unverified")
+        });
+        let shared = shared_pending.then(|| self.phase.lock().unwrap().clone());
+        let rank = |phase: &CheckPhaseStatus| match phase.phase.as_deref() {
+            Some("running") => 3,
+            Some("queued") => 2,
+            Some(_) => 1,
+            None => 0,
+        };
+        let mut furthest = CheckPhaseStatus::default();
+        for phase in lanes.values().cloned().chain(shared) {
+            if rank(&phase) > rank(&furthest) {
+                furthest = phase;
+            }
+        }
+        furthest
+    }
+
     pub(super) fn emit(&self) {
         let entries = self.entries.lock().unwrap().clone();
-        let phase = match self.lane {
-            Some(lane) => self
-                .lanes
-                .lock()
-                .unwrap()
-                .get(&lane)
-                .cloned()
-                .unwrap_or_default(),
-            None => self.phase.lock().unwrap().clone(),
-        };
-        (self.notify)(entries, phase);
+        (self.notify)(entries, self.wave_phase());
     }
 
     pub(super) fn emit_initial(&self) {
@@ -376,9 +410,76 @@ impl CheckStatusBoard {
     }
 
     /// Show a phase [`DispatchNarrator`] rendered, machine and time included.
-    pub(super) fn show_phase(&self, status: CheckPhaseStatus) {
+    pub(crate) fn show_phase(&self, status: CheckPhaseStatus) {
         self.update_phase(None, |phase| *phase = status);
         self.emit();
+    }
+}
+
+/// The status boards of a job's write waves in flight, so `/checks` reads each
+/// write lane from its own request rather than calling every lane `running`
+/// because some wave is. Runtime-only.
+#[derive(Default)]
+pub(crate) struct WriteWaveBoards {
+    next: std::sync::atomic::AtomicU64,
+    boards: std::sync::Mutex<HashMap<String, Vec<(u64, CheckStatusBoard)>>>,
+}
+
+impl WriteWaveBoards {
+    /// Publish `board` for `job_id` until the returned handle drops.
+    pub(crate) fn publish(
+        self: &Arc<Self>,
+        job_id: &str,
+        board: &CheckStatusBoard,
+    ) -> PublishedWriteWaveBoard {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.boards
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(job_id.to_string())
+            .or_default()
+            .push((id, board.clone()));
+        PublishedWriteWaveBoard {
+            boards: self.clone(),
+            job_id: job_id.to_string(),
+            id,
+        }
+    }
+
+    /// The board of the job's newest write wave in flight that plans `name`.
+    pub(crate) fn lane(&self, job_id: &str, name: &str) -> Option<CheckStatusBoard> {
+        self.boards
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(job_id)?
+            .iter()
+            .rev()
+            .map(|(_, board)| board)
+            .find(|board| board.snapshot().iter().any(|entry| entry.name == name))
+            .cloned()
+    }
+}
+
+/// A write wave's board, published until this drops.
+pub(crate) struct PublishedWriteWaveBoard {
+    boards: Arc<WriteWaveBoards>,
+    job_id: String,
+    id: u64,
+}
+
+impl Drop for PublishedWriteWaveBoard {
+    fn drop(&mut self) {
+        let mut boards = self
+            .boards
+            .boards
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(published) = boards.get_mut(&self.job_id) {
+            published.retain(|(id, _)| *id != self.id);
+            if published.is_empty() {
+                boards.remove(&self.job_id);
+            }
+        }
     }
 }
 

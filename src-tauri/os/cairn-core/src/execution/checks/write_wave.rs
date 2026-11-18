@@ -1,7 +1,17 @@
 use super::*;
 
-pub(super) fn format_fixed_batch_summary(summary: &str, commit: &str, paths: &[String]) -> String {
-    let short = commit.get(..12).unwrap_or(commit);
+/// A wave's summary with its folds attributed once, at wave level: each
+/// fixer's fold is its own commit, and the files are every fold's together.
+pub(super) fn format_fixed_batch_summary(
+    summary: &str,
+    commits: &[String],
+    paths: &[String],
+) -> String {
+    let short = commits
+        .iter()
+        .map(|commit| commit.get(..12).unwrap_or(commit))
+        .collect::<Vec<_>>()
+        .join(", ");
     let verdicts = summary.strip_prefix("Checks: ").unwrap_or(summary);
     format!(
         "Checks: ✓ write-check fixes (fixed, {short}; {} file{}) · {verdicts}",
@@ -25,54 +35,21 @@ pub(super) fn delta_patch_excerpt(repo: &Path, delta: &crate::fleet::MutationDel
         .unwrap_or_else(|| "(delta patch unavailable)".into())
 }
 
-/// The write cadence's SUBMISSION order: declared fixers first, then every
-/// other check in plan order.
+/// Whether a fold is fully explained by the declared fixer that produced it.
 ///
-/// This ordering is the whole mechanism behind the one-execution-per-commit
-/// contract. Write-cadence checks share ONE slot working tree and run
-/// sequentially inside it under `MutationPolicy::AllowDelta`, which takes no
-/// per-item snapshot (`after_item` is wired only for the pure-verdict lane), so
-/// each check observes every write the checks before it made. Running the
-/// declared fixers first therefore makes every later check a verdict on the tree
-/// that will actually land, and the fix folds into the sealed commit without
-/// re-running anything.
+/// A fold carries its fixer's verdict onto the folded tree only because that
+/// fixer produced the tree. A folded path outside every given fixer's INPUT
+/// SET means the fixer rewrote something it never declared, so its verdict
+/// cannot be keyed to the landed tree and must be re-verified. Uncertainty (an
+/// uncompilable glob, or no fixer at all) resolves to NOT attributed: that
+/// costs one extra verification run, never a verdict recorded against a tree
+/// it never saw.
 ///
-/// Only submission order changes. Plan indices — and with them the status board,
-/// the per-check output streams, and the rendered summary — stay in plan order.
-pub(super) fn fixer_first_submission_order(
-    keyed: &[(CheckPlan, String)],
-    checks: &HashMap<String, CheckCommand>,
-    indices: &[usize],
-) -> Vec<usize> {
-    let mut ordered = indices.to_vec();
-    ordered.sort_by_key(|index| {
-        let fixes = checks
-            .get(&keyed[*index].0.name)
-            .is_some_and(|check| check.fixes);
-        (!fixes, *index)
-    });
-    ordered
-}
-
-/// Whether a folded fix is fully explained by the declared fixers that ran.
-///
-/// The wave's verdicts describe the post-fix tree only because the fixers ran
-/// first. A fixed path that no declared fixer's INPUT SET covers means some other
-/// check rewrote the tree mid-wave, and whatever ran before it validated a tree
-/// that never landed — so those verdicts cannot be keyed to the landed tree and
-/// must be re-verified. Uncertainty (an uncompilable glob, or no declared fixer
-/// at all) resolves to NOT attributed: that costs one extra verification batch,
-/// never a verdict recorded against a tree it never saw.
-///
-/// The combined delta is the only mutation evidence a folding batch produces —
-/// the executor attributes dirt per item only on the pure-verdict lane, which
-/// reverts after each item and so cannot fold. Attribution therefore rests on
-/// the same declaration the result cache already rests on: an undeclared check
-/// that rewrites paths INSIDE a declared fixer's input set is indistinguishable
-/// from the fixer's own output, and the wave would trust it. Closing that would
-/// take observe-only per-item dirt reporting in the executor (CAIRN-3155);
-/// until then the declared inputs and `fixes` are the trust boundary, as
-/// everywhere else.
+/// The fold is the only mutation evidence a fixer's request produces, so
+/// attribution rests on the same declaration the result cache already rests
+/// on: the declared inputs and `fixes` are the trust boundary, as everywhere
+/// else. A check that does not declare `fixes` is a pure verdict: whatever it
+/// writes is discarded and reported (`tracked_modifications`), never folded.
 pub(super) fn fix_is_attributed_to_declared_fixers(
     paths: &[String],
     fixers: &[&InputSelector],
@@ -83,81 +60,40 @@ pub(super) fn fix_is_attributed_to_declared_fixers(
             .all(|path| fixers.iter().any(|fixer| fixer.matches(path)))
 }
 
-/// Whether a check's batch verdict still describes the tree a fix landed.
+/// Whether a lane's verdict still describes the tree one fixer's fold landed.
 ///
 /// Two independent proofs, either of which suffices:
 ///
-/// - the fix left the check's impact-filtered inputs untouched, so its cache key
-///   is unchanged — the same argument the result cache itself rests on; or
-/// - the check ran after every mutation the wave folded. Ordering supplies that:
-///   [`fixer_first_submission_order`] puts the declared fixers first, so a
-///   NON-fixer observes all of them, and the LAST declared fixer observes all
-///   the fixers before it plus its own output.
+/// - the fold left the lane's impact-filtered inputs untouched, so its cache
+///   key is unchanged — the same argument the result cache itself rests on; or
+/// - the lane is the fixer whose output this fold is (`produced_fold`), and the
+///   fold is attributed to it. Producing this tree is what it just did, and
+///   re-checking it against that is precisely the redundant second run this
+///   rule exists to delete.
 ///
-/// The last qualifier is the whole reason `superseded_by_later_fixer` exists. A
-/// wave may declare several fixers, and they run in plan order among themselves,
-/// so an EARLIER fixer never sees a later one's output — Prettier passes, then
-/// `eslint --fix` rewrites the same file, and Prettier's green verdict would be
-/// keyed to a tree it never checked. Impact globs cannot separate the two: their
-/// paths overlap by construction, which is exactly why they are both fixers. So
-/// every fixer but the last is re-verified whenever the fold moved its key.
+/// Every other verdict in hand, an earlier fixer's included, was about the
+/// tree before this fold, so it carries only on an unchanged key. That is why
+/// an earlier fixer never carries a later one's rewrite: Prettier passes, then
+/// `eslint --fix` rewrites the same file and folds, and Prettier's key moved.
 ///
-/// A fixer's own output is not an invalidation of its own verdict: producing
-/// this tree is what it just did, and re-checking it against that is precisely
-/// the redundant second wave this rule exists to delete.
+/// `fix_landed_on_tested_base` is false when the branch advanced while the
+/// fixer ran and the fold merged onto the newer head. The folded commit then
+/// carries code the fixer never executed, so only an unchanged key carries.
 ///
-/// `fix_landed_on_tested_base` is false when the branch advanced while the wave
-/// ran and the fix was merged onto the newer head. The fixed commit then carries
-/// code no check in the wave executed, so only an unchanged input key carries.
-///
-/// The ordering proof covers the TREE only. A base-relative check ran after the
-/// fixers but was handed the change of the commit the wave was planned at, so
-/// it carries across a fold only when its key, which names that change, did
-/// not move. A base-subtracting check is the same: it was handed the base
-/// finding set the wave was planned with, which its key names.
+/// The fixer proof covers the TREE only. A base-relative check was handed the
+/// change of the commit it was planned at, so it carries across a fold only
+/// when its key, which names that change, did not move. A base-subtracting
+/// check is the same: it was handed the base finding set its key names.
 pub(super) fn verdict_survives_fix(
     fix_landed_on_tested_base: bool,
-    executed: bool,
+    produced_fold: bool,
     fix_attributed: bool,
-    superseded_by_later_fixer: bool,
     key_before: &str,
     key_after: &str,
     base_relative: bool,
 ) -> bool {
     key_before == key_after
-        || (!base_relative
-            && fix_landed_on_tested_base
-            && fix_attributed
-            && executed
-            && !superseded_by_later_fixer)
-}
-
-/// The submitted plan indices whose declared fix a LATER declared fixer could
-/// have overwritten — every fixer in the wave except the last one to run.
-///
-/// `order` is the wave's submission order, so the fixers form its prefix and the
-/// last of them is the one that observed all the others. A non-fixer is never
-/// here: it runs after the whole fixer prefix.
-pub(super) fn fixers_superseded_by_a_later_fixer(
-    keyed: &[(CheckPlan, String)],
-    checks: &HashMap<String, CheckCommand>,
-    order: &[usize],
-) -> BTreeSet<usize> {
-    let submitted_fixers: Vec<usize> = order
-        .iter()
-        .copied()
-        .filter(|index| {
-            checks
-                .get(&keyed[*index].0.name)
-                .is_some_and(|check| check.fixes)
-        })
-        .collect();
-    submitted_fixers
-        .iter()
-        .rev()
-        .skip(1)
-        .copied()
-        .collect::<BTreeSet<usize>>()
+        || (!base_relative && fix_landed_on_tested_base && fix_attributed && produced_fold)
 }
 
 pub(super) fn split_write_check_batch_outcome(
@@ -1079,13 +1015,17 @@ pub(super) async fn run_write_checks_after_seal_inner(
         "write-cadence checks must be defined by the commit they evaluate"
     );
 
+    // Kept for re-keying onto each fixer's fold: the fold lands in the same
+    // repository, and its change is read against the same base.
+    let repository_path = logical.repository_path.clone();
+    let planning_base = live_base.unwrap_or_else(|| logical.default_commit_id.clone());
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let planning = WriteWavePlanning {
         jj: jj.clone(),
-        repository: logical.repository_path,
+        repository: repository_path.clone(),
         object_repository: object_repository.clone(),
         head: logical.commit_id,
-        base: live_base.unwrap_or(logical.default_commit_id),
+        base: planning_base.clone(),
         contract: ChecksContract {
             checks: checks.clone(),
             extra_inputs: extra_inputs.clone(),
@@ -1119,11 +1059,6 @@ pub(super) async fn run_write_checks_after_seal_inner(
     // does log stayed silent, so the stall was invisible in the logs for days.
     // Expect tens of milliseconds; seconds here means something in planning has
     // started scaling with history again.
-    //
-    // (The batch these plans feed submits under `MutationPolicy::AllowDelta`, not
-    // a pure-verdict lease — the write cadence is the cadence that folds
-    // formatter fixes back into the commit. The old wording of this line claimed
-    // otherwise and sent this investigation's first pass chasing slot admission.)
     log::info!(
         "when:write checks: planned {} check(s) in {}ms; cache-filtering before submission",
         keyed.len(),
@@ -1188,7 +1123,11 @@ pub(super) async fn run_write_checks_after_seal_inner(
         },
         progress,
     );
-    let status_board = CheckStatusBoard::new(&keyed, status_notify);
+    let status_board = CheckStatusBoard::for_write_wave(&keyed, status_notify);
+    // `/checks` reads each write lane from its own request while the wave runs.
+    let _published_board = orch
+        .write_wave_boards
+        .publish(&run_context.job_id, &status_board);
     status_board.set_phase(
         (!miss_indices.is_empty()).then_some("dispatching"),
         (!miss_indices.is_empty()).then_some("dispatching checks"),
@@ -1212,9 +1151,6 @@ pub(super) async fn run_write_checks_after_seal_inner(
         }
     }
 
-    // The write cell runs on this runner's colocated machine; a lane whose
-    // platforms exclude it leaves the cell rather than waiting on a machine
-    // that can never answer it.
     let split = split_write_wave(
         &keyed,
         &checks,
@@ -1224,203 +1160,196 @@ pub(super) async fn run_write_checks_after_seal_inner(
             .fleet
             .executor_name_for_text(crate::fleet::COLOCATED_EXECUTOR_ID),
     );
-    let batch_outcome = if split.cell.is_empty() {
-        None
-    } else {
-        Some(
-            submit_write_check_batch_for(
+    // What each lane already has, by plan index, before the verdicts run: a
+    // fixer's own run, and a fixer the write cell cannot run, which is a
+    // lane-configuration error whose sentence names the config line to change.
+    let mut ran: HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>> = split
+        .refused
+        .iter()
+        .map(|(index, refusal)| {
+            (
+                *index,
+                Err(CheckExecutionFailure::NotPlaceable(refusal.clone())),
+            )
+        })
+        .collect();
+    let requests = match resolve_check_repository(
+        orch,
+        &run_context.project_id,
+        &run_context.job_id,
+        repo_root,
+    )
+    .await
+    {
+        Ok((repository, store_dir)) => Some(Arc::new(WriteWaveRequests {
+            run_context: run_context.clone(),
+            repository,
+            store_dir,
+            checks: checks.clone(),
+            timeouts: timeouts.clone(),
+            defined_by_commit: defined_by_commit.clone(),
+            cell_env: cell_env.clone(),
+            tool_use_id: tool_use_id.to_string(),
+            board: status_board.clone(),
+        })),
+        Err(error) => {
+            for index in split.fixers.iter().chain(&split.verifiers) {
+                ran.insert(
+                    *index,
+                    Err(CheckExecutionFailure::substrate(
+                        SubstrateFailureShape::Dispatch,
+                        error.clone(),
+                    )),
+                );
+            }
+            None
+        }
+    };
+
+    // 1. The declared fixers, chained. Each is its own change-returning
+    // request on the commit the previous fixer's fold landed, so it sees every
+    // rewrite before it, and its own rewrite lands as a commit of its own
+    // before the next fixer runs. The verdicts wait for the chain, so every one
+    // of them is about the tree that lands, and each check runs once.
+    let mut keyed = keyed;
+    let mut tree_hash = tree_hash;
+    let mut commit = sealed_commit.clone();
+    let mut folds: Vec<crate::mcp::handlers::run::PublishedSlotDelta> = Vec::new();
+    // Lanes whose answer in hand describes a tree a later fold replaced.
+    let mut stale: BTreeSet<usize> = BTreeSet::new();
+    let mut answered_elsewhere: Vec<ClaimedElsewhere> = Vec::new();
+    if let Some(requests) = requests.as_ref() {
+        for (position, &index) in split.fixers.iter().enumerate() {
+            let fixer = keyed[index].0.name.clone();
+            status_board.set_phase(
+                Some("dispatching"),
+                Some("running fixers"),
+                Some(format!(
+                    "waiting for {fixer} to fold its fix before the verdicts run"
+                )),
+            );
+            let request = requests.request(
+                index,
+                &LaneAt {
+                    commit: &commit,
+                    tree_hash: &tree_hash,
+                    keyed: &keyed,
+                    process_env: &process_env,
+                },
+                keyed[index].0.command.clone(),
+                crate::mcp::handlers::run::check_stream_id(tool_use_id, index),
+            );
+            let FixerOutcome {
+                result,
+                delta,
+                cell,
+            } = fixer_outcome(index, submit_planned_fix(orch, request).await);
+            ran.insert(index, result);
+            let Some(delta) = delta else {
+                continue;
+            };
+            let Some((request, store_dir)) = cell else {
+                return Some(
+                    "Checks: \u{2717} write-check fold (the slot publication context was lost)"
+                        .into(),
+                );
+            };
+            let published = match fold_fixer_delta(
                 orch,
-                WriteCheckBatchRequest {
+                FixerFold {
                     run_context,
                     repo_root,
+                    cwd,
+                    request: &request,
+                    store_dir: &store_dir,
+                    delta: &delta,
+                    fixer: &fixer,
+                },
+            )
+            .await
+            {
+                Ok(published) => published,
+                Err(summary) => return Some(summary),
+            };
+            let rekeyed = rekey_wave_onto_fix(
+                orch,
+                FoldRekey {
+                    run_context,
                     checks: &checks,
                     extra_inputs: &extra_inputs,
                     keyed: &keyed,
-                    order: &fixer_first_submission_order(&keyed, &checks, &split.cell),
-                    timeouts: &timeouts,
-                    sealed_commit: &sealed_commit,
-                    tree_hash: &tree_hash,
-                    defined_by_commit: &defined_by_commit,
                     cell_env: &cell_env,
-                    process_env: &process_env,
-                    tool_use_id,
-                    status_board: Some(status_board.clone()),
+                    repository: &repository_path,
+                    object_repository: &object_repository,
+                    base: &planning_base,
+                    folded_by: index,
                 },
-                MutationPolicy::AllowDelta,
+                &published,
+                &mut claims,
             )
-            .await,
-        )
-    };
-    let (mut batched_results, delta, request, store_dir) = match batch_outcome {
-        Some(outcome) => (
-            outcome.results,
-            outcome.delta,
-            outcome.request,
-            outcome.store_dir,
-        ),
-        None => (HashMap::new(), None, None, None),
-    };
-
-    // A fix lands as its own commit on the branch, and every verdict this wave
-    // records has to describe the tree that landed. The wave does not re-run to
-    // get there. The declared fixers ran FIRST inside the shared slot, so the
-    // checks after them already validated the fixed tree; re-keying carries
-    // their verdicts onto it. Only a check the fix demonstrably invalidated runs
-    // again, in one bounded verification batch that never folds.
-    let mut keyed = keyed;
-    let mut tree_hash = tree_hash;
-    let mut fixed = None;
-    let mut answered_elsewhere: Vec<ClaimedElsewhere> = Vec::new();
-    if let Some(delta) = delta {
-        let (Some(request), Some(store_dir)) = (request.as_ref(), store_dir.as_ref()) else {
-            return Some(
-                "Checks: \u{2717} write-check fold (the slot publication context was lost)".into(),
-            );
-        };
-        let author = PublicationIdentity::new("Cairn checks", "checks@cairn.local");
-        let branch = {
-            let db =
-                match crate::execution::routing::owning_db_for_job(&orch.db, &run_context.job_id)
-                    .await
-                {
-                    Ok(db) => db,
-                    Err(error) => {
-                        return Some(format!(
-                            "Checks: \u{2717} write-check fold (resolve owning database: {error})"
-                        ))
-                    }
-                };
-            let job_id = run_context.job_id.clone();
-            match db
-                .query_text("SELECT branch FROM jobs WHERE id = ?1", (job_id,))
-                .await
-            {
-                Ok(Some(branch)) => branch,
-                Ok(None) => {
-                    return Some(
-                        "Checks: \u{2717} write-check fold (logical branch is absent)".into(),
-                    )
-                }
+            .await;
+            let rekeyed = match rekeyed {
+                Ok(rekeyed) => rekeyed,
                 Err(error) => {
+                    let patch = delta_patch_excerpt(repo_root, &delta);
                     return Some(format!(
-                        "Checks: \u{2717} write-check fold (resolve logical branch: {error})"
-                    ))
+                        "Checks: \u{2717} write-check fold ({error})\n```diff\n{patch}\n```"
+                    ));
                 }
-            }
-        };
-        let published = crate::mcp::handlers::run::publish_and_seal_slot_delta(
-            orch,
-            store_dir,
-            request,
-            &delta,
-            &branch,
-            "fix: apply write-check changes",
-            Some(&author),
-        )
-        .await;
-        let published = match published {
-            Ok(Some(published)) => published,
-            Ok(None) => {
-                return Some(
-                    "Checks: \u{22EF} superseded — the branch advanced before this wave's fix landed. \
-                     The stale fix was discarded without changing the branch or recording verdicts. \
-                     Read cairn:~/checks for the branch's current verdicts."
-                        .into(),
-                );
-            }
-            Err(error) => {
-                let patch = delta_patch_excerpt(repo_root, &delta);
-                return Some(format!(
-                    "Checks: \u{2717} write-check fold ({error})\n```diff\n{patch}\n```"
-                ));
-            }
-        };
-        log::info!(
-            "write checks published fix commit {} for {} path(s), patch_bytes={}",
-            published.commit,
-            published.paths.len(),
-            published.patch.len()
-        );
-        let _ = orch.services.emitter.emit(
-            "worktree-changed",
-            serde_json::json!({"path": cwd, "source": "write-check-fix"}),
-        );
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "check_result_cache", "action": "invalidate"}),
-        );
-        debug_assert!(published.landed_on_tested_base);
-        let rekeyed = rekey_wave_onto_fix(
-            orch,
-            WriteCheckBatchRequest {
-                run_context,
-                repo_root,
-                checks: &checks,
-                extra_inputs: &extra_inputs,
-                keyed: &keyed,
-                order: &split.cell,
-                timeouts: &timeouts,
-                sealed_commit: &sealed_commit,
-                tree_hash: &tree_hash,
-                defined_by_commit: &defined_by_commit,
-                cell_env: &cell_env,
-                process_env: &process_env,
-                tool_use_id,
-                status_board: Some(status_board.clone()),
-            },
-            cwd,
-            &published,
-            &split.spilled,
-            &mut claims,
-        )
-        .await;
-        let rekeyed = match rekeyed {
-            Ok(rekeyed) => rekeyed,
-            Err(error) => {
-                let patch = delta_patch_excerpt(repo_root, &delta);
-                return Some(format!(
-                    "Checks: \u{2717} write-check fold ({error})\n```diff\n{patch}\n```"
-                ));
-            }
-        };
-        // Verification that dirties the tree AGAIN is never folded. With the
-        // recursion gone this is what bounds the fix loop: a wave publishes at
-        // most one fix commit and reports the second mutation instead of chasing
-        // it.
-        if let Some(delta) = rekeyed.non_convergent {
-            let patch = delta_patch_excerpt(repo_root, &delta);
-            return Some(format!(
-                "Checks: \u{2717} write-check batch (non-convergent: verification mutated again)\n```diff\n{patch}\n```"
-            ));
+            };
+            // The fixers after this one and every verdict run on the fold, and
+            // a refusal is about no tree, so only an answer already in hand can
+            // have gone stale.
+            let unanswered: BTreeSet<usize> = split.fixers[position + 1..]
+                .iter()
+                .chain(&split.verifiers)
+                .chain(split.refused.iter().map(|(lane, _)| lane))
+                .copied()
+                .collect();
+            stale.extend(
+                rekeyed
+                    .invalidated
+                    .into_iter()
+                    .filter(|lane| !unanswered.contains(lane)),
+            );
+            keyed = rekeyed.keyed;
+            tree_hash = rekeyed.tree_hash;
+            process_env = rekeyed.process_env;
+            commit = published.commit.clone();
+            claims.claim(
+                split.fixers[position + 1..]
+                    .iter()
+                    .map(|lane| lane_key(&run_context.project_id, &keyed[*lane])),
+                &commit,
+            );
+            folds.push(published);
         }
-        keyed = rekeyed.keyed;
-        tree_hash = rekeyed.tree_hash;
-        // Every lane from here on (the spilled ones, an uncached retry) runs at
-        // the fixed commit, so it carries that commit's change.
-        process_env = rekeyed.process_env;
-        batched_results.extend(rekeyed.results);
-        answered_elsewhere.extend(rekeyed.answered_elsewhere);
-        fixed = Some(published);
     }
-    let observation_commit = fixed
-        .as_ref()
-        .map(|published| published.commit.as_str())
-        .unwrap_or(sealed_commit.as_str());
-    // Spilled lanes run only now, after the cell and any fold, at the commit
-    // this wave lands and keyed on that tree. Running them beside the cell would
-    // key a verdict to a tree a fix then replaced; ordering them after it makes
-    // that impossible by construction rather than by timing.
-    //
-    // After a fold they are keyed to the fixed commit, which the planning-time
-    // cache filter never saw, and on a moved head the head's own wave is
-    // usually verifying them already: they get the fold's hand-off too.
-    let spilled = if fixed.is_some() && !split.spilled.is_empty() {
+    let observation_commit = commit;
+
+    // 2. After a fold every lane still to answer is keyed to the commit the
+    // chain ended at, which the planning-time cache filter never saw, and on a
+    // moved head that head's own wave is usually verifying the same lanes at
+    // the same keys: wait for those, and run only what is still a miss.
+    let mut rerun_fixers = Vec::new();
+    if !folds.is_empty() {
+        for lane in &stale {
+            ran.remove(lane);
+        }
+        let candidates: Vec<usize> = split
+            .verifiers
+            .iter()
+            .chain(&stale)
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let (left, answered) = lanes_left_to_run(
             orch.db.local.clone(),
             &mut claims,
             &run_context.project_id,
             &keyed,
-            &split.spilled,
+            &candidates,
             &process_env,
             FOLD_HANDOFF_WAIT,
         )
@@ -1428,75 +1357,98 @@ pub(super) async fn run_write_checks_after_seal_inner(
         answered_elsewhere.extend(answered);
         claims.claim(
             left.iter()
-                .map(|index| lane_key(&run_context.project_id, &keyed[*index])),
-            observation_commit,
+                .map(|lane| lane_key(&run_context.project_id, &keyed[*lane])),
+            &observation_commit,
         );
-        left
-    } else {
-        split.spilled.clone()
-    };
-    if !spilled.is_empty() {
+        rerun_fixers = left
+            .into_iter()
+            .filter(|lane| {
+                stale.contains(lane)
+                    && checks
+                        .get(&keyed[*lane].0.name)
+                        .is_some_and(|check| check.fixes)
+            })
+            .collect();
+    }
+
+    // 3. A fixer whose answer a later fold made stale runs once more, on the
+    // tree that landed. A rewrite then is never folded: a wave folds each
+    // fixer at most once, which is what bounds the fix loop, and a second
+    // rewrite is reported as non-convergent instead of chased.
+    if let (false, Some(requests)) = (rerun_fixers.is_empty(), requests.as_ref()) {
         log::info!(
-            "when:write checks: {} lane(s) declare platforms the write cell is not on; running them verdict-only at {observation_commit}: {:?}",
-            spilled.len(),
-            spilled
+            "when:write checks: a later fold invalidated {:?}; re-running them against {observation_commit}",
+            rerun_fixers
                 .iter()
-                .map(|index| keyed[*index].0.name.as_str())
+                .map(|lane| keyed[*lane].0.name.as_str())
                 .collect::<Vec<_>>()
         );
-        let spilled = submit_write_check_batch_for(
-            orch,
-            WriteCheckBatchRequest {
-                run_context,
-                repo_root,
-                checks: &checks,
-                extra_inputs: &extra_inputs,
-                keyed: &keyed,
-                order: &spilled,
-                timeouts: &timeouts,
-                sealed_commit: observation_commit,
-                tree_hash: &tree_hash,
-                defined_by_commit: &defined_by_commit,
-                cell_env: &cell_env,
-                process_env: &process_env,
-                tool_use_id,
-                status_board: Some(status_board.clone()),
-            },
-            MutationPolicy::PureVerdict,
-        )
+        let at = LaneAt {
+            commit: &observation_commit,
+            tree_hash: &tree_hash,
+            keyed: &keyed,
+            process_env: &process_env,
+        };
+        let reruns = futures_util::future::join_all(rerun_fixers.iter().map(|&index| {
+            let request = requests.request(
+                index,
+                &at,
+                keyed[index].0.command.clone(),
+                crate::mcp::handlers::run::check_stream_id(tool_use_id, index),
+            );
+            async move {
+                (
+                    index,
+                    fixer_outcome(index, submit_planned_fix(orch, request).await),
+                )
+            }
+        }))
         .await;
-        batched_results.extend(spilled.results);
+        let mut rewrote = Vec::new();
+        for (index, FixerOutcome { result, delta, .. }) in reruns {
+            ran.insert(index, result);
+            if let Some(delta) = delta {
+                rewrote.push((index, delta));
+            }
+        }
+        if !rewrote.is_empty() {
+            let names = rewrote
+                .iter()
+                .map(|(index, _)| keyed[*index].0.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let patches = rewrote
+                .iter()
+                .map(|(_, delta)| delta_patch_excerpt(repo_root, delta))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some(format!(
+                "Checks: \u{2717} write-check fix (non-convergent: {names} rewrote the tree again after the fold)\n```diff\n{patches}\n```"
+            ));
+        }
     }
-    // A fixer the write cell cannot run is a lane-configuration error: nothing
-    // ran, and the sentence names the config line to change.
-    for (index, refusal) in &split.refused {
-        batched_results.insert(
-            *index,
-            Err(CheckExecutionFailure::NotPlaceable(refusal.clone())),
+    if !split.fixers.is_empty() {
+        status_board.set_phase(
+            Some("dispatching"),
+            Some("dispatching checks"),
+            Some("preparing check requests".to_string()),
         );
     }
-    let batched_results = Arc::new(std::sync::Mutex::new(batched_results));
-    let retry_orch = orch.clone();
-    let retry_context = run_context.clone();
-    let retry_keyed = keyed.clone();
-    let retry_checks = checks.clone();
-    let retry_timeouts = timeouts.clone();
-    let retry_commit = observation_commit.to_string();
-    let retry_tree_hash = tree_hash.clone();
-    let retry_defined_by = defined_by_commit.clone();
-    let retry_cell_env = cell_env.clone();
-    let retry_process_env = process_env.clone();
-    let retry_repository = resolve_check_repository(
-        orch,
-        &run_context.project_id,
-        &run_context.job_id,
-        repo_root,
-    )
-    .await
-    .ok();
+
+    // 4. The verdicts, all at once: each lane is its own pure-verdict request
+    // placed by its own selector and platforms, and each is recorded the moment
+    // its own request settles. A verdict is reproducible from the commit
+    // alone, so what a check that does not declare `fixes` writes is discarded
+    // and reported with its result, never folded.
+    let ran = Arc::new(std::sync::Mutex::new(ran));
+    let lane_orch = orch.clone();
+    let lane_commit = observation_commit.clone();
+    let lane_tree = tree_hash.clone();
+    let lane_keyed = Arc::new(keyed.clone());
+    let lane_env = Arc::new(process_env.clone());
     let sealed_coordinates = sealed_coordinates(
         CheckRunCommit {
-            evaluated: observation_commit,
+            evaluated: &observation_commit,
             defined_by: &defined_by_commit,
         },
         &tree_hash,
@@ -1506,130 +1458,70 @@ pub(super) async fn run_write_checks_after_seal_inner(
         orch.db.local.clone(),
         &run_context.project_id,
         CheckRunCommit {
-            evaluated: observation_commit,
+            evaluated: &observation_commit,
             defined_by: &defined_by_commit,
         },
         &tree_hash,
         run_context.job_id.as_str(),
         &keyed,
         &sealed_coordinates,
-        &head_infra_scopes(keyed.len(), run_context.job_id.as_str(), observation_commit),
+        &head_infra_scopes(
+            keyed.len(),
+            run_context.job_id.as_str(),
+            &observation_commit,
+        ),
         tool_use_id,
-        CheckExecMode::Shared,
+        CheckExecMode::Isolated,
         Some(orch),
         Some(status_board),
         &process_env,
         false,
         move |index, command, stream_id| {
-            let batched_results = batched_results.clone();
-            let orch = retry_orch.clone();
-            let context = retry_context.clone();
-            let keyed = retry_keyed.clone();
-            let checks = retry_checks.clone();
-            let timeouts = retry_timeouts.clone();
-            let sealed_commit = retry_commit.clone();
-            let tree_hash = retry_tree_hash.clone();
-            let defined_by_commit = retry_defined_by.clone();
-            let cell_env = retry_cell_env.clone();
-            let process_env = retry_process_env.clone();
-            let repository = retry_repository.clone();
+            let ran = ran.clone();
+            let orch = lane_orch.clone();
+            let requests = requests.clone();
+            let commit = lane_commit.clone();
+            let tree_hash = lane_tree.clone();
+            let keyed = lane_keyed.clone();
+            let process_env = lane_env.clone();
             async move {
+                // A fixer's answer (or a refusal) is already in hand. An
+                // uncached retry always runs afresh, as a verdict.
                 if !command.starts_with(UNCACHED_RETRY_PREFIX) {
-                    return batched_results
-                        .lock()
-                        .unwrap()
-                        .remove(&index)
-                        .unwrap_or_else(|| {
-                            Err(CheckExecutionFailure::substrate(
-                                SubstrateFailureShape::Result,
-                                format!("missing batched outcome for plan index {index}"),
-                            ))
-                        });
+                    if let Some(result) = ran.lock().unwrap().remove(&index) {
+                        return result;
+                    }
                 }
-                let Some((repository, store_dir)) = repository else {
+                let Some(requests) = requests else {
                     return Err(CheckExecutionFailure::substrate(
                         SubstrateFailureShape::Dispatch,
-                        "could not resolve repository for uncached check retry",
+                        "could not resolve repository for the write check",
                     ));
                 };
-                let plan = &keyed[index].0;
-                let configured = checks
-                    .get(&plan.name)
-                    .expect("planned check must retain its configured definition");
-                submit_planned_check(
-                    &orch,
-                    PlannedCheckRequest {
-                        project_id: context.project_id.clone(),
-                        repository,
-                        store_dir,
-                        sealed_commit: sealed_commit.clone(),
-                        requesting_job_id: context.job_id.clone(),
-                        owner: cairn_common::executor_protocol::CellOwnerRef {
-                            project_id: context.project_id.clone(),
-                            project_key: Some(context.project_key.clone()),
-                            issue_number: context.issue_number,
-                            job_id: Some(context.job_id.clone()),
-                            execution_seq: context.exec_seq,
-                            node_kind: context.job_name.clone(),
-                        },
-                        affinity_key: Some(check_affinity_key(&context.job_id, &plan.name)),
-                        priority: CellPriority::WriteCheck,
-                        env: cell_env,
-                        item: PlannedCheckBatchItem {
-                            recording_plan: Some(CheckAdoptionRecordingPlan::new(
-                                plan,
-                                &crate::execution::cache::SealedCheckCoordinate::new(
-                                    &sealed_commit,
-                                    &defined_by_commit,
-                                    &tree_hash,
-                                    &keyed[index].1,
-                                ),
-                                &context.job_id,
-                                &stream_id,
-                                &process_env,
-                            )),
-                            index,
-                            name: plan.name.clone(),
-                            input_hash: keyed[index].1.clone(),
-                            resource_identity: CheckResourceIdentityInput::Configured {
-                                name: plan.name.clone(),
-                                check: configured.clone(),
-                            },
-                            command,
-                            stream_id,
-                            env: process_env,
-                            verdict_environment_names: plan.verdict_environment_names.clone(),
-                            timeout_ms: timeouts[index].into(),
-                            executor: configured.executor.clone(),
-                            verdict_platforms: crate::execution::check_identity::verdict_platforms(
-                                configured,
-                            ),
-                            // A write check runs in the job's own build slot,
-                            // which is one environment reached by one machine:
-                            // there is no fleet of candidates to bound it by.
-                            infra_scopes: InfraScopes::head_only(&context.job_id, &sealed_commit),
-                            avoid_executor_ids: Vec::new(),
-                            resource_class: plan.resource_class,
-                        },
-                        run_context: Some(context),
-                        status_board: None,
-                        on_complete: None,
-                        purpose: None,
-                        publication: None,
+                let request = requests.request(
+                    index,
+                    &LaneAt {
+                        commit: &commit,
+                        tree_hash: &tree_hash,
+                        keyed: &keyed,
+                        process_env: &process_env,
                     },
-                )
-                .await
-                .map_err(|error| {
-                    CheckExecutionFailure::substrate(SubstrateFailureShape::Dispatch, error)
-                })?
-                .results
-                .remove(&index)
-                .ok_or_else(|| {
-                    CheckExecutionFailure::substrate(
-                        SubstrateFailureShape::Result,
-                        format!("missing uncached retry outcome for plan index {index}"),
-                    )
-                })?
+                    command,
+                    stream_id,
+                );
+                submit_planned_check(&orch, request)
+                    .await
+                    .map_err(|error| {
+                        CheckExecutionFailure::substrate(SubstrateFailureShape::Dispatch, error)
+                    })?
+                    .results
+                    .remove(&index)
+                    .ok_or_else(|| {
+                        CheckExecutionFailure::substrate(
+                            SubstrateFailureShape::Result,
+                            format!("missing write-check outcome for plan index {index}"),
+                        )
+                    })?
             }
         },
         move |_checks| {},
@@ -1654,58 +1546,136 @@ pub(super) async fn run_write_checks_after_seal_inner(
         Some(line) => format!("{summary}\n{line}"),
         None => summary,
     };
-    // The fix is attributed ONCE, at batch level: it is the wave's combined
-    // delta, not any single check's, so no per-check annotation can honestly
-    // claim it.
-    Some(match fixed {
-        Some(published) => {
-            format_fixed_batch_summary(&summary, &published.commit, &published.paths)
-        }
-        None => summary,
-    })
+    // The fixes are attributed once, at wave level: each fold is its own
+    // commit, named there, and the per-check verdicts stay verdicts.
+    if folds.is_empty() {
+        return Some(summary);
+    }
+    let commits: Vec<String> = folds.iter().map(|fold| fold.commit.clone()).collect();
+    let paths: Vec<String> = folds
+        .iter()
+        .flat_map(|fold| fold.paths.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Some(format_fixed_batch_summary(&summary, &commits, &paths))
 }
 
-/// Everything one build-slot submission of write-cadence checks needs. The
-/// fields are the wave's shared identity; `order` is the only per-submission
-/// part, and it carries the plan indices to run in the order to run them.
-pub(super) struct WriteCheckBatchRequest<'a> {
-    pub(super) run_context: &'a RunContext,
-    pub(super) repo_root: &'a Path,
-    pub(super) checks: &'a HashMap<String, CheckCommand>,
-    /// Node-level extra inputs, carried so the post-fix re-key can resolve every
-    /// selector afresh against the tree the fix actually landed.
-    pub(super) extra_inputs: &'a HashMap<String, Vec<String>>,
-    pub(super) keyed: &'a [(CheckPlan, String)],
-    pub(super) order: &'a [usize],
-    pub(super) timeouts: &'a [u32],
-    pub(super) sealed_commit: &'a str,
-    pub(super) tree_hash: &'a str,
-    pub(super) defined_by_commit: &'a str,
+/// What every request one write wave submits shares. Each lane is its own
+/// request for one suite, keyed by job and suite so it returns to the cell its
+/// own last run left, and reporting on its own lane of the wave's board.
+pub(super) struct WriteWaveRequests {
+    pub(super) run_context: RunContext,
+    pub(super) repository: String,
+    pub(super) store_dir: PathBuf,
+    pub(super) checks: HashMap<String, CheckCommand>,
+    pub(super) timeouts: Vec<u32>,
+    pub(super) defined_by_commit: String,
     /// The build slot's environment: the cell request's, without the transport.
-    pub(super) cell_env: &'a [(String, String)],
-    /// Each check process's environment: `cell_env` plus the change transport,
-    /// built by [`write_check_transport_env`].
-    pub(super) process_env: &'a [(String, String)],
-    pub(super) tool_use_id: &'a str,
-    pub(super) status_board: Option<CheckStatusBoard>,
+    pub(super) cell_env: Vec<(String, String)>,
+    pub(super) tool_use_id: String,
+    pub(super) board: CheckStatusBoard,
 }
 
-/// How a write-cadence wave's cache misses split by where each may run.
+/// The commit one lane's request runs at: that commit's tree, every plan's key
+/// on it, and each process's environment there, which is the slot's plus the
+/// transport of that commit's own change ([`write_check_transport_env`]).
+pub(super) struct LaneAt<'a> {
+    pub(super) commit: &'a str,
+    pub(super) tree_hash: &'a str,
+    pub(super) keyed: &'a [(CheckPlan, String)],
+    pub(super) process_env: &'a [(String, String)],
+}
+
+impl WriteWaveRequests {
+    /// Lane `index`'s request at `at`. Whether it asks for a verdict or runs a
+    /// fixer is the submission's choice ([`submit_planned_check`] or
+    /// [`submit_planned_fix`]), never the request's shape.
+    pub(super) fn request(
+        &self,
+        index: usize,
+        at: &LaneAt<'_>,
+        command: String,
+        stream_id: String,
+    ) -> PlannedCheckRequest {
+        let (plan, input_hash) = &at.keyed[index];
+        let configured = self
+            .checks
+            .get(&plan.name)
+            .expect("planned check must retain its configured definition");
+        let context = &self.run_context;
+        PlannedCheckRequest {
+            project_id: context.project_id.clone(),
+            repository: self.repository.clone(),
+            store_dir: self.store_dir.clone(),
+            sealed_commit: at.commit.to_string(),
+            requesting_job_id: context.job_id.clone(),
+            owner: cairn_common::executor_protocol::CellOwnerRef {
+                project_id: context.project_id.clone(),
+                project_key: Some(context.project_key.clone()),
+                issue_number: context.issue_number,
+                job_id: Some(context.job_id.clone()),
+                execution_seq: context.exec_seq,
+                node_kind: context.job_name.clone(),
+            },
+            affinity_key: Some(check_affinity_key(&context.job_id, &plan.name)),
+            priority: CellPriority::WriteCheck,
+            env: self.cell_env.clone(),
+            item: PlannedCheckBatchItem {
+                recording_plan: Some(CheckAdoptionRecordingPlan::new(
+                    plan,
+                    &crate::execution::cache::SealedCheckCoordinate::new(
+                        at.commit,
+                        &self.defined_by_commit,
+                        at.tree_hash,
+                        input_hash,
+                    ),
+                    &context.job_id,
+                    &self.tool_use_id,
+                    at.process_env,
+                )),
+                index,
+                name: plan.name.clone(),
+                input_hash: input_hash.clone(),
+                resource_identity: CheckResourceIdentityInput::Configured {
+                    name: plan.name.clone(),
+                    check: configured.clone(),
+                },
+                command,
+                stream_id,
+                env: at.process_env.to_vec(),
+                verdict_environment_names: plan.verdict_environment_names.clone(),
+                timeout_ms: self.timeouts[index].into(),
+                executor: configured.executor.clone(),
+                verdict_platforms: crate::execution::check_identity::verdict_platforms(configured),
+                resource_class: plan.resource_class,
+                // A write check is bounded by the head it runs on, not by a
+                // fleet of candidate environments.
+                infra_scopes: InfraScopes::head_only(&context.job_id, at.commit),
+                avoid_executor_ids: Vec::new(),
+            },
+            run_context: Some(context.clone()),
+            status_board: Some(self.board.for_lane(index)),
+            on_complete: None,
+            purpose: None,
+            publication: None,
+        }
+    }
+}
+
+/// How a write wave's cache misses divide by what kind of request each is.
 ///
-/// The write cell is the job's colocated checkout, the one place a fix can fold
-/// back into the commit, so its mobility is pinned. A lane whose
-/// `verdictPlatforms` exclude the write cell's platform can never be answered
-/// there, and a request naming a platform is answered only by a run on that
-/// platform. Such a lane leaves the cell as a verdict-only lane placed on a
-/// matching machine, unless it is a declared fixer, whose delta can fold only
-/// from the write cell.
+/// A declared fixer (`fixes: true`) returns its changes to fold into the
+/// branch, and a fold publishes only from the write cell, so a fixer whose
+/// `verdictPlatforms` exclude the write cell's platform is refused with the
+/// config line to change. Every other check is a verdict, reproducible from
+/// the commit alone, placed by its own selector and platforms.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct WriteWaveSplit {
-    /// Run in the write cell, which may fold a fix.
-    pub(super) cell: Vec<usize>,
-    /// Run verdict-only on a machine their own platforms admit, at the commit
-    /// the wave lands, after the cell (and any fold) is done.
-    pub(super) spilled: Vec<usize>,
+    /// Declared fixers, in plan order: the order they chain in.
+    pub(super) fixers: Vec<usize>,
+    /// Verdicts, run concurrently once every fixer has folded.
+    pub(super) verifiers: Vec<usize>,
     /// Declared fixers the write cell cannot run, with the sentence saying why.
     pub(super) refused: Vec<(usize, String)>,
 }
@@ -1720,8 +1690,8 @@ pub(super) fn split_write_wave(
     let mut split = WriteWaveSplit::default();
     for &index in misses {
         let name = &keyed[index].0.name;
-        let Some(check) = checks.get(name) else {
-            split.cell.push(index);
+        let Some(check) = checks.get(name).filter(|check| check.fixes) else {
+            split.verifiers.push(index);
             continue;
         };
         let platforms = crate::execution::check_identity::verdict_platforms(check);
@@ -1729,8 +1699,8 @@ pub(super) fn split_write_wave(
             .iter()
             .any(|platform| platform.eq_ignore_ascii_case(write_cell_platform))
         {
-            split.cell.push(index);
-        } else if check.fixes {
+            split.fixers.push(index);
+        } else {
             split.refused.push((
                 index,
                 format!(
@@ -1738,212 +1708,142 @@ pub(super) fn split_write_wave(
                     platforms.join(", ")
                 ),
             ));
-        } else {
-            split.spilled.push(index);
         }
     }
     split
 }
 
-/// Submit one build-slot batch for the given cache-MISS plan indices, in the
-/// given execution order. Every failure mode resolves to per-index failures, so
-/// the caller always holds exactly one outcome per submitted index.
-///
-/// `mutation_policy` is `AllowDelta` for the write cell, whose fix folds, and
-/// `PureVerdict` for the lanes a [`WriteWaveSplit`] spilled to other platforms,
-/// which are verdicts and so are each submitted as a request of their own.
-pub(super) async fn submit_write_check_batch_for(
-    orch: &Orchestrator,
-    batch: WriteCheckBatchRequest<'_>,
-    mutation_policy: MutationPolicy,
-) -> PlannedCheckBatchOutcome {
-    let WriteCheckBatchRequest {
-        run_context,
-        repo_root,
-        checks,
-        extra_inputs: _,
-        keyed,
-        order,
-        timeouts,
-        sealed_commit,
-        tree_hash,
-        defined_by_commit,
-        cell_env,
-        process_env,
-        tool_use_id,
-        status_board,
-    } = batch;
-    let items: Vec<PlannedCheckBatchItem> = order
-        .iter()
-        .map(|index| PlannedCheckBatchItem {
-            recording_plan: Some(CheckAdoptionRecordingPlan::new(
-                &keyed[*index].0,
-                &crate::execution::cache::SealedCheckCoordinate::new(
-                    sealed_commit,
-                    defined_by_commit,
-                    tree_hash,
-                    &keyed[*index].1,
-                ),
-                &run_context.job_id,
-                tool_use_id,
-                process_env,
-            )),
-            index: *index,
-            name: keyed[*index].0.name.clone(),
-            input_hash: keyed[*index].1.clone(),
-            resource_identity: CheckResourceIdentityInput::Configured {
-                name: keyed[*index].0.name.clone(),
-                check: checks
-                    .get(&keyed[*index].0.name)
-                    .expect("planned check must retain its configured definition")
-                    .clone(),
-            },
-            command: keyed[*index].0.command.clone(),
-            stream_id: crate::mcp::handlers::run::check_stream_id(tool_use_id, *index),
-            env: process_env.to_vec(),
-            verdict_environment_names: keyed[*index].0.verdict_environment_names.clone(),
-            timeout_ms: timeouts[*index].into(),
-            executor: checks
-                .get(&keyed[*index].0.name)
-                .and_then(|check| check.executor.clone()),
-            verdict_platforms: checks
-                .get(&keyed[*index].0.name)
-                .map(crate::execution::check_identity::verdict_platforms)
-                .unwrap_or_default(),
-            resource_class: keyed[*index].0.resource_class,
-            // A write check runs in the job's own build slot, which is one
-            // environment reached by one machine: there is no fleet of
-            // candidates to bound it by.
-            infra_scopes: InfraScopes::head_only(&run_context.job_id, sealed_commit),
-            avoid_executor_ids: Vec::new(),
-        })
-        .collect();
-    if let Some(board) = status_board.as_ref() {
-        board.set_phase(
-            Some("provisioning"),
-            Some("preparing build slot"),
-            Some("resolving build slot".into()),
-        );
-    }
-    let repository = resolve_check_repository(
-        orch,
-        &run_context.project_id,
-        &run_context.job_id,
-        repo_root,
-    )
-    .await;
-    let submitted = match repository {
-        Ok((repository, store_dir)) => {
-            let owner = cairn_common::executor_protocol::CellOwnerRef {
-                project_id: run_context.project_id.clone(),
-                project_key: Some(run_context.project_key.clone()),
-                issue_number: run_context.issue_number,
-                job_id: Some(run_context.job_id.clone()),
-                execution_seq: run_context.exec_seq,
-                node_kind: run_context.job_name.clone(),
-            };
-            if mutation_policy == MutationPolicy::PureVerdict {
-                let requests = items.into_iter().map(|item| {
-                    let index = item.index;
-                    let request = PlannedCheckRequest {
-                        project_id: run_context.project_id.clone(),
-                        repository: repository.clone(),
-                        store_dir: store_dir.clone(),
-                        sealed_commit: sealed_commit.to_string(),
-                        requesting_job_id: run_context.job_id.clone(),
-                        owner: owner.clone(),
-                        affinity_key: Some(check_affinity_key(&run_context.job_id, &item.name)),
-                        priority: CellPriority::WriteCheck,
-                        env: cell_env.to_vec(),
-                        item,
-                        run_context: Some(run_context.clone()),
-                        status_board: status_board.as_ref().map(|board| board.for_lane(index)),
-                        on_complete: None,
-                        purpose: None,
-                        publication: None,
-                    };
-                    Box::pin(async move { (index, submit_planned_check(orch, request).await) })
-                });
-                let mut combined = PlannedCheckBatchOutcome {
-                    results: HashMap::new(),
-                    request: None,
-                    delta: None,
-                    store_dir: Some(store_dir.clone()),
-                };
-                for (index, submitted) in futures_util::future::join_all(requests).await {
-                    match submitted {
-                        Ok(outcome) => combined.results.extend(outcome.results),
-                        Err(error) => {
-                            combined.results.insert(
-                                index,
-                                Err(CheckExecutionFailure::Substrate(SubstrateFailure::new(
-                                    SubstrateFailureShape::Dispatch,
-                                    error,
-                                ))),
-                            );
-                        }
-                    }
-                }
-                Ok(combined)
-            } else {
-                off_frame(|| {
-                    submit_check_lease(
-                        orch,
-                        PlannedCheckBatchRequest {
-                            project_id: run_context.project_id.clone(),
-                            repository,
-                            store_dir,
-                            sealed_commit: sealed_commit.to_string(),
-                            requesting_job_id: run_context.job_id.clone(),
-                            owner,
-                            affinity_key: Some(run_context.job_id.clone()),
-                            priority: CellPriority::WriteCheck,
-                            env: cell_env.to_vec(),
-                            items,
-                            run_context: Some(run_context.clone()),
-                            mutation_policy,
-                            status_board,
-                            on_group_complete: None,
-                            purpose: None,
-                            publication: None,
-                        },
-                    )
-                })
-                .await
-            }
-        }
-        Err(error) => Ok(PlannedCheckBatchOutcome::failed(
-            order.to_vec(),
-            SubstrateFailure::new(SubstrateFailureShape::Dispatch, error),
-        )),
-    };
+/// One fixer request's answer.
+pub(super) struct FixerOutcome {
+    /// The lane's result.
+    pub(super) result: Result<CheckExecResult, CheckExecutionFailure>,
+    /// The rewrite it returned, if it changed tracked files.
+    pub(super) delta: Option<crate::fleet::MutationDelta>,
+    /// The cell request and store that rewrite is published from.
+    pub(super) cell: Option<(CellRequest, PathBuf)>,
+}
+
+pub(super) fn fixer_outcome(
+    index: usize,
+    submitted: Result<PlannedCheckBatchOutcome, String>,
+) -> FixerOutcome {
     match submitted {
-        Ok(outcome) => outcome,
-        Err(error) => PlannedCheckBatchOutcome::failed(
-            order.to_vec(),
-            SubstrateFailure::new(SubstrateFailureShape::Dispatch, error),
-        ),
+        Ok(mut outcome) => FixerOutcome {
+            result: outcome.results.remove(&index).unwrap_or_else(|| {
+                Err(CheckExecutionFailure::substrate(
+                    SubstrateFailureShape::Result,
+                    format!("missing fixer outcome for plan index {index}"),
+                ))
+            }),
+            delta: outcome.delta,
+            cell: outcome.request.zip(outcome.store_dir),
+        },
+        Err(error) => FixerOutcome {
+            result: Err(CheckExecutionFailure::substrate(
+                SubstrateFailureShape::Dispatch,
+                error,
+            )),
+            delta: None,
+            cell: None,
+        },
     }
 }
 
-/// A write-check wave re-keyed onto the tree its fix actually landed.
+/// One fixer's delta, and where it is published from.
+pub(super) struct FixerFold<'a> {
+    pub(super) run_context: &'a RunContext,
+    pub(super) repo_root: &'a Path,
+    pub(super) cwd: &'a str,
+    pub(super) request: &'a CellRequest,
+    pub(super) store_dir: &'a Path,
+    pub(super) delta: &'a crate::fleet::MutationDelta,
+    pub(super) fixer: &'a str,
+}
+
+/// Publish one fixer's delta as a commit of its own on the job's branch.
+/// `Err` is the summary the wave returns instead, when it cannot land.
+pub(super) async fn fold_fixer_delta(
+    orch: &Orchestrator,
+    fold: FixerFold<'_>,
+) -> Result<crate::mcp::handlers::run::PublishedSlotDelta, String> {
+    let author = PublicationIdentity::new("Cairn checks", "checks@cairn.local");
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &fold.run_context.job_id)
+        .await
+        .map_err(|error| {
+            format!("Checks: \u{2717} write-check fold (resolve owning database: {error})")
+        })?;
+    let job_id = fold.run_context.job_id.clone();
+    let branch = match db
+        .query_text("SELECT branch FROM jobs WHERE id = ?1", (job_id,))
+        .await
+    {
+        Ok(Some(branch)) => branch,
+        Ok(None) => {
+            return Err("Checks: \u{2717} write-check fold (logical branch is absent)".into())
+        }
+        Err(error) => {
+            return Err(format!(
+                "Checks: \u{2717} write-check fold (resolve logical branch: {error})"
+            ))
+        }
+    };
+    let published = crate::mcp::handlers::run::publish_and_seal_slot_delta(
+        orch,
+        fold.store_dir,
+        fold.request,
+        fold.delta,
+        &branch,
+        &format!("fix: apply {} write-check changes", fold.fixer),
+        Some(&author),
+    )
+    .await;
+    let published = match published {
+        Ok(Some(published)) => published,
+        Ok(None) => {
+            return Err(
+                "Checks: \u{22EF} superseded — the branch advanced before this wave's fix landed. \
+                 The stale fix was discarded without changing the branch or recording verdicts. \
+                 Read cairn:~/checks for the branch's current verdicts."
+                    .into(),
+            );
+        }
+        Err(error) => {
+            let patch = delta_patch_excerpt(fold.repo_root, fold.delta);
+            return Err(format!(
+                "Checks: \u{2717} write-check fold ({error})\n```diff\n{patch}\n```"
+            ));
+        }
+    };
+    log::info!(
+        "write checks published {}'s fix commit {} for {} path(s), patch_bytes={}",
+        fold.fixer,
+        published.commit,
+        published.paths.len(),
+        published.patch.len()
+    );
+    let _ = orch.services.emitter.emit(
+        "worktree-changed",
+        serde_json::json!({"path": fold.cwd, "source": "write-check-fix"}),
+    );
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "check_result_cache", "action": "invalidate"}),
+    );
+    Ok(published)
+}
+
+/// A write wave re-keyed onto the commit one fixer's fold landed.
 pub(super) struct FixedWave {
-    /// The wave's plans paired with their cache key on the POST-fix tree. A
-    /// re-verified check also carries its re-planned command.
+    /// The wave's plans paired with their cache key on the folded tree. A lane
+    /// the fold invalidated also carries its re-planned command.
     pub(super) keyed: Vec<(CheckPlan, String)>,
-    /// Whole-tree hash of the post-fix commit, re-stamped onto every row.
+    /// Whole-tree hash of the folded commit, re-stamped onto every row.
     pub(super) tree_hash: String,
-    /// Outcomes from the re-verification batch, by plan index. They replace the
-    /// pre-fix outcome for those checks; every other index keeps its original.
-    pub(super) results: HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>>,
-    /// Set when re-verification dirtied the tree AGAIN. Never folded.
-    pub(super) non_convergent: Option<crate::fleet::MutationDelta>,
-    /// Each check process's environment at the fixed commit: the slot's, plus
-    /// the transport of the fixed commit's own change.
+    /// The plan indices whose verdict the fold invalidated.
+    pub(super) invalidated: Vec<usize>,
+    /// Each check process's environment at the folded commit: the slot's, plus
+    /// the transport of the folded commit's own change.
     pub(super) process_env: Vec<(String, String)>,
-    /// Invalidated lanes another wave verified at the same input key, whose
-    /// verdicts the fold reuses instead of running them again.
-    pub(super) answered_elsewhere: Vec<ClaimedElsewhere>,
 }
 
 /// How long a fold waits for another write wave to record a lane it is
@@ -2074,9 +1974,8 @@ pub(super) struct FixReplanning {
     pub(super) extra_inputs: HashMap<String, Vec<String>>,
     pub(super) plans: Vec<CheckPlan>,
     pub(super) keys_before: Vec<String>,
-    pub(super) executed: BTreeSet<usize>,
-    pub(super) superseded: BTreeSet<usize>,
-    pub(super) fixer_names: Vec<String>,
+    /// The plan index of the fixer whose output the fold is.
+    pub(super) folded_by: usize,
     pub(super) fixed_paths: Vec<String>,
     pub(super) fix_landed_on_tested_base: bool,
     pub(super) db: Arc<LocalDb>,
@@ -2099,9 +1998,7 @@ pub(super) fn replan_onto_fix(planning: FixReplanning) -> Result<Replan, String>
         extra_inputs,
         plans,
         keys_before,
-        executed,
-        superseded,
-        fixer_names,
+        folded_by,
         fixed_paths,
         fix_landed_on_tested_base,
         db,
@@ -2119,15 +2016,14 @@ pub(super) fn replan_onto_fix(planning: FixReplanning) -> Result<Replan, String>
     };
     let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
     let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
-    // Attribution is a property of the whole wave: the fix is the slot's
-    // combined delta, so the question is whether the declared fixers that ran
-    // can account for every path in it. It is asked against the FIXED tree's
-    // inputs, which is the tree the verdicts are being keyed to.
-    let fixers: Vec<&InputSelector> = fixer_names
-        .iter()
-        .map(|name| inputs.for_check(name))
-        .collect();
-    let attributed = fix_is_attributed_to_declared_fixers(&fixed_paths, &fixers);
+    // Attribution is a property of the fold: the question is whether the
+    // fixer that produced it can account for every path in it. It is asked
+    // against the FOLDED tree's inputs, which is the tree the verdicts are
+    // being keyed to.
+    let attributed = fix_is_attributed_to_declared_fixers(
+        &fixed_paths,
+        &[inputs.for_check(&plans[folded_by].name)],
+    );
     // The fixed commit's own change. When the fix landed on a head that moved
     // while the wave ran, it differs from the change the wave was planned with,
     // and every key and lane from here on is about it.
@@ -2168,9 +2064,8 @@ pub(super) fn replan_onto_fix(planning: FixReplanning) -> Result<Replan, String>
         );
         if verdict_survives_fix(
             fix_landed_on_tested_base,
-            executed.contains(&index),
+            index == folded_by,
             attributed,
-            superseded.contains(&index),
             &keys_before[index],
             &key_after,
             is_base_relative(&plan.name, check)
@@ -2190,153 +2085,75 @@ pub(super) fn replan_onto_fix(planning: FixReplanning) -> Result<Replan, String>
     Ok((rekeyed, invalidated, tree_hash, transport))
 }
 
-/// Re-key a wave onto the commit its fix landed, re-verifying exactly the checks
-/// whose verdict the fix invalidated.
+/// The wave as one fixer's fold finds it.
+pub(super) struct FoldRekey<'a> {
+    pub(super) run_context: &'a RunContext,
+    pub(super) checks: &'a HashMap<String, CheckCommand>,
+    /// Node-level extra inputs, so every selector resolves afresh against the
+    /// tree the fold actually landed.
+    pub(super) extra_inputs: &'a HashMap<String, Vec<String>>,
+    /// Every plan with its key on the tree before the fold.
+    pub(super) keyed: &'a [(CheckPlan, String)],
+    pub(super) cell_env: &'a [(String, String)],
+    pub(super) repository: &'a Path,
+    pub(super) object_repository: &'a Path,
+    /// The base the wave was planned against, when the node's live base
+    /// cannot be read.
+    pub(super) base: &'a str,
+    pub(super) folded_by: usize,
+}
+
+/// Re-key a wave onto the commit one fixer's fold landed, naming the lanes
+/// whose verdict the fold invalidated. Nothing is run here: the fixers still to
+/// chain and every verdict run on the folded commit anyway, and the caller
+/// re-verifies whatever answer in hand went stale.
 ///
-/// Survival is decided per check by [`verdict_survives_fix`]. In the ordinary
-/// case — a declared formatter rewriting files inside its own `impact` — every
-/// verdict survives and no second batch is submitted at all; the wave costs one
-/// slot admission and one execution per check. A fix that no declared fixer
-/// explains, or a check that was answered from the cache before the fix touched
-/// its inputs, falls back to running that check once against the fixed commit.
+/// Survival is decided per lane by [`verdict_survives_fix`]. In the ordinary
+/// case, a declared formatter rewriting files inside its own `impact`, its own
+/// verdict survives and nothing else has answered yet, so the fold costs no
+/// further run.
 ///
-/// Planning is bound to `fix.commit`, the commit the fix was published as,
+/// Planning is bound to `fix.commit`, the commit the fold was published as,
 /// never to whatever the branch head is by the time this runs: a detached wave
 /// can outlive several later commits.
 pub(super) async fn rekey_wave_onto_fix(
     orch: &Orchestrator,
-    wave: WriteCheckBatchRequest<'_>,
-    cwd: &str,
+    fold: FoldRekey<'_>,
     fix: &crate::mcp::handlers::run::PublishedSlotDelta,
-    deferred: &[usize],
     claims: &mut WaveClaims,
 ) -> Result<FixedWave, String> {
-    let fixed_paths = fix.paths.as_slice();
-    let fixed_commit = fix.commit.as_str();
-    let fix_landed_on_tested_base = fix.landed_on_tested_base;
-    let logical = crate::mcp::handlers::branch::resolve_current_for_read(
-        orch,
-        &crate::mcp::types::McpCallbackRequest {
-            run_id: Some(wave.run_context.run_id.clone()),
-            cwd: cwd.to_string(),
-            ..Default::default()
-        },
-    )
-    .await
-    .map_err(|error| format!("resolve the fixed commit: {error}"))?;
-    let live_base = live_node_base(orch, &wave.run_context.job_id).await;
-
-    // Fixers run in plan order among themselves, so only the last one observed
-    // the whole fold. Every earlier fixer whose key the fold moved is re-verified.
-    let superseded = fixers_superseded_by_a_later_fixer(wave.keyed, wave.checks, wave.order);
-
-    let executed: BTreeSet<usize> = wave.order.iter().copied().collect();
-    let plans: Vec<CheckPlan> = wave.keyed.iter().map(|(plan, _)| plan.clone()).collect();
-    let keys_before: Vec<String> = wave.keyed.iter().map(|(_, key)| key.clone()).collect();
-    let checks = wave.checks.clone();
-    let extra_inputs = wave.extra_inputs.clone();
-    let fixer_names: Vec<String> = wave
-        .order
-        .iter()
-        .map(|index| wave.keyed[*index].0.name.clone())
-        .filter(|name| wave.checks.get(name).is_some_and(|check| check.fixes))
-        .collect();
-    let head = fixed_commit.to_string();
+    let live_base = live_node_base(orch, &fold.run_context.job_id).await;
     let planning = FixReplanning {
         jj: crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
-        repository: logical.repository_path.clone(),
-        object_repository: logical.object_repository_path.clone(),
-        base: live_base.unwrap_or(logical.default_commit_id),
-        head: head.clone(),
-        checks,
-        extra_inputs,
-        plans,
-        keys_before,
-        executed,
-        superseded,
-        fixer_names,
-        fixed_paths: fixed_paths.to_vec(),
-        fix_landed_on_tested_base,
+        repository: fold.repository.to_path_buf(),
+        object_repository: fold.object_repository.to_path_buf(),
+        base: live_base.unwrap_or_else(|| fold.base.to_string()),
+        head: fix.commit.clone(),
+        checks: fold.checks.clone(),
+        extra_inputs: fold.extra_inputs.clone(),
+        plans: fold.keyed.iter().map(|(plan, _)| plan.clone()).collect(),
+        keys_before: fold.keyed.iter().map(|(_, key)| key.clone()).collect(),
+        folded_by: fold.folded_by,
+        fixed_paths: fix.paths.clone(),
+        fix_landed_on_tested_base: fix.landed_on_tested_base,
         db: orch.db.local.clone(),
-        project_id: wave.run_context.project_id.clone(),
+        project_id: fold.run_context.project_id.clone(),
     };
-    let (rekeyed, invalidated, tree_hash, transport) =
+    let (keyed, invalidated, tree_hash, transport) =
         tokio::task::spawn_blocking(move || replan_onto_fix(planning))
             .await
             .map_err(|error| format!("join the post-fix planning unit: {error}"))??;
-    let process_env = write_check_transport_env(wave.cell_env, transport);
-
-    let project_id = wave.run_context.project_id.as_str();
-    // The keys these lanes were planned under will never be recorded now, so no
-    // other fold should wait on them.
+    // The keys these lanes were planned under will never be recorded now, so
+    // no other fold should wait on them.
     claims.release(
         invalidated
             .iter()
-            .map(|index| lane_key(project_id, &wave.keyed[*index])),
+            .map(|index| lane_key(&fold.run_context.project_id, &fold.keyed[*index])),
     );
-    // An invalidated verdict may still be answerable from the cache on the FIXED
-    // tree, including from another wave verifying the same key right now (the
-    // moved head's own wave, usually); only a genuine miss needs the slot. A
-    // deferred lane is never re-verified here: it has not run yet, it runs at
-    // the fixed commit once this returns, and the write cell is the one place it
-    // cannot run.
-    let candidates: Vec<usize> = invalidated
-        .into_iter()
-        .filter(|index| !deferred.contains(index))
-        .collect();
-    let (misses, answered_elsewhere) = lanes_left_to_run(
-        orch.db.local.clone(),
-        claims,
-        project_id,
-        &rekeyed,
-        &candidates,
-        &process_env,
-        FOLD_HANDOFF_WAIT,
-    )
-    .await;
-    claims.claim(
-        misses
-            .iter()
-            .map(|index| lane_key(project_id, &rekeyed[*index])),
-        &head,
-    );
-    if misses.is_empty() {
-        return Ok(FixedWave {
-            keyed: rekeyed,
-            tree_hash,
-            results: HashMap::new(),
-            non_convergent: None,
-            process_env,
-            answered_elsewhere,
-        });
-    }
-    log::info!(
-        "when:write checks: fix invalidated {} verdict(s), re-verifying {:?} against {head}",
-        misses.len(),
-        misses
-            .iter()
-            .map(|index| rekeyed[*index].0.name.as_str())
-            .collect::<Vec<_>>()
-    );
-    let outcome = submit_write_check_batch_for(
-        orch,
-        WriteCheckBatchRequest {
-            keyed: &rekeyed,
-            order: &fixer_first_submission_order(&rekeyed, wave.checks, &misses),
-            sealed_commit: &head,
-            tree_hash: &tree_hash,
-            process_env: &process_env,
-            ..wave
-        },
-        MutationPolicy::AllowDelta,
-    )
-    .await;
     Ok(FixedWave {
-        keyed: rekeyed,
+        keyed,
         tree_hash,
-        results: outcome.results,
-        non_convergent: outcome.delta,
-        process_env,
-        answered_elsewhere,
+        invalidated,
+        process_env: write_check_transport_env(fold.cell_env, transport),
     })
 }

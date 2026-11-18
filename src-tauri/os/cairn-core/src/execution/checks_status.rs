@@ -2048,19 +2048,23 @@ fn assemble_statuses(
                 return status;
             }
 
-            // Placement groups run independently. The board supplies each
-            // lane's own group, so another group's runner or dispatch report
-            // cannot become its blocker or machine. Before publication every
-            // review lane is pending; write waves have no per-lane board here.
-            let progress = (cadence.review && check.when == CheckWhen::Review && !not_applicable)
-                .then(|| {
-                    wave_board.and_then(|board| {
-                        grouped_lane_progress(board, &name, request_ids.get(&name))
-                    })
-                })
+            // Every lane is its own request. The board supplies that request's
+            // state, so a sibling's runner or dispatch report cannot become its
+            // blocker or machine. A review lane reads the turn's board; a write
+            // lane reads the newest write wave in flight that plans it. Before
+            // its board is published every lane is pending, never `running`:
+            // a wave in flight says nothing about whether a machine has a lane.
+            let write_board = (cadence.write && check.when == CheckWhen::Write && !not_applicable)
+                .then(|| orch.write_wave_boards.lane(job_id, &name))
                 .flatten();
-            let started = (cadence.write && check.when == CheckWhen::Write && !not_applicable)
-                || progress.as_ref().is_some_and(LaneProgress::is_started);
+            let lane_board = match check.when {
+                CheckWhen::Review if cadence.review && !not_applicable => wave_board,
+                CheckWhen::Write => write_board.as_ref(),
+                _ => None,
+            };
+            let progress = lane_board
+                .and_then(|board| grouped_lane_progress(board, &name, request_ids.get(&name)));
+            let started = progress.as_ref().is_some_and(LaneProgress::is_started);
 
             let state = match lane_evidence(false, not_applicable, started) {
                 LaneEvidence::NotApplicable => NodeCheckState::NotApplicable,
@@ -2073,7 +2077,10 @@ fn assemble_statuses(
                 read_turn_end_log_tail(orch, job_id, &name)
             });
 
-            let executor = wave_board.and_then(|board| board.lane_phase(&name).executor);
+            let executor = write_board
+                .as_ref()
+                .or(wave_board)
+                .and_then(|board| board.lane_phase(&name).executor);
             let notice = main_only.then(|| main_only_notice(&name));
             NodeCheckStatus {
                 observation_id: None,
@@ -5786,6 +5793,116 @@ mod complete_input_projection_tests {
                 "the waiter must still demand current evidence"
             );
         }
+    }
+
+    /// cairn/4971's write half. A write wave in flight no longer makes every
+    /// applicable write lane `running`: each lane reads its own request,
+    /// queued with its hold cause while a machine has not taken it, running
+    /// with its machine once one has, and pending before its wave publishes.
+    #[tokio::test]
+    async fn a_write_lane_reads_its_own_request_not_the_cadence() {
+        use crate::execution::checks::{CheckPhaseStatus, CheckStatusBoard};
+        let mut f = Fixture::new("fmt").await;
+        f.checks = HashMap::from([
+            (
+                "fmt".to_string(),
+                serde_yaml::from_str("command: cargo fmt\nwhen: write\n").unwrap(),
+            ),
+            (
+                "lint".to_string(),
+                serde_yaml::from_str("command: cargo clippy\nwhen: write\n").unwrap(),
+            ),
+        ]);
+        let applicable = HashSet::from(["fmt".to_string(), "lint".to_string()]);
+        let assemble = |f: &Fixture| {
+            assemble_statuses(
+                &f.orch,
+                "job-a",
+                &f.checks,
+                LaneVerdicts::default(),
+                Some(&applicable),
+                &HashMap::new(),
+                WaveCadence::writing_for_test(),
+                None,
+            )
+        };
+        for lane in assemble(&f) {
+            assert_eq!(
+                lane.state,
+                NodeCheckState::Pending,
+                "{} has no request yet, so it is not running",
+                lane.name
+            );
+        }
+
+        let plans: Vec<(crate::execution::selection::CheckPlan, String)> = ["fmt", "lint"]
+            .into_iter()
+            .map(|name| {
+                let configured = &f.checks[name];
+                (
+                    crate::execution::selection::CheckPlan {
+                        name: name.to_string(),
+                        applies: true,
+                        command: configured.command.clone(),
+                        scope: crate::execution::selection::CheckScope::Full,
+                        resource_class: crate::config::project_settings::CheckResourceClass::Shared,
+                        verdict_environment_names: Vec::new(),
+                        verdict_executor_ids: None,
+                        config_error: None,
+                        verdict_platforms: Vec::new(),
+                        verdict_runtime: crate::execution::check_identity::expected_verdict_runtime(
+                            configured, TOOLS,
+                        ),
+                    },
+                    "input".to_string(),
+                )
+            })
+            .collect();
+        let board = CheckStatusBoard::for_review_wave(&plans, || {});
+        let published = f.orch.write_wave_boards.publish("job-a", &board);
+        let fmt = board.for_lane(0);
+        let lint = board.for_lane(1);
+        let mut queued = CheckPhaseStatus::default();
+        queued.phase = Some("queued".into());
+        queued.diagnostic = Some("local declined: cpu 97%".into());
+        queued.since_unix_ms = Some(7);
+        fmt.show_phase(queued);
+        let mut running = CheckPhaseStatus::default();
+        running.phase = Some("running".into());
+        running.executor = Some("fedora".into());
+        running.since_unix_ms = Some(9);
+        lint.show_phase(running);
+        lint.transition(1, "running", None);
+
+        let lanes = assemble(&f);
+        let lane = |name: &str| lanes.iter().find(|lane| lane.name == name).unwrap();
+        assert_eq!(
+            lane("fmt").state,
+            NodeCheckState::Pending,
+            "queued for capacity is not running"
+        );
+        match &lane("fmt").progress {
+            Some(LaneProgress::Dispatching {
+                dispatch_phase,
+                diagnostic,
+                ..
+            }) => {
+                assert_eq!(dispatch_phase, "queued");
+                assert_eq!(diagnostic.as_deref(), Some("local declined: cpu 97%"));
+            }
+            other => panic!("fmt reads its own hold: {other:?}"),
+        }
+        assert_eq!(lane("fmt").executor, None);
+        assert_eq!(lane("lint").state, NodeCheckState::Running);
+        assert_eq!(lane("lint").executor.as_deref(), Some("fedora"));
+
+        drop(published);
+        assert!(
+            assemble(&f)
+                .iter()
+                .all(|lane| lane.state == NodeCheckState::Pending),
+            "a finished wave's board is withdrawn"
+        );
     }
 
     /// No branch wave runs a main-only check, so with no row on the head its

@@ -361,20 +361,21 @@ async fn a_fix_landing_on_a_moved_head_re_verifies_with_that_heads_change() {
         .unwrap()
         .contract
         .checks;
-    let order: Vec<usize> = (0..wave.keyed.len()).collect();
     let replanning = FixReplanning {
         jj: jj.clone(),
         repository: coordinates.clone(),
         object_repository: repo.clone(),
         base: base.clone(),
         head: fixed.clone(),
-        superseded: fixers_superseded_by_a_later_fixer(&wave.keyed, &checks, &order),
         checks,
         extra_inputs: HashMap::new(),
         plans: wave.keyed.iter().map(|(plan, _)| plan.clone()).collect(),
         keys_before: wave.keyed.iter().map(|(_, key)| key.clone()).collect(),
-        executed: order.iter().copied().collect(),
-        fixer_names: vec!["fmt".to_string()],
+        folded_by: wave
+            .keyed
+            .iter()
+            .position(|(plan, _)| plan.name == "fmt")
+            .unwrap(),
         fixed_paths: vec!["src/lib.rs".to_string()],
         fix_landed_on_tested_base: false,
         db: db.clone(),

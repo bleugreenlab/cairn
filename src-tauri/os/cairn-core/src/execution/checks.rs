@@ -30,28 +30,31 @@
 //! process machinery directly (not `run_one`), so a sandbox-blocked syscall
 //! surfaces as a failed exit rather than an interactive fence prompt.
 //!
-//! ## Concurrency, ordering, and the fold
+//! ## Requests, ordering, and the fold
 //!
-//! The affected cache-MISS checks run SEQUENTIALLY inside ONE `AllowDelta` cell
-//! lease materialized at the just-sealed commit. Cache hits are resolved before
-//! admission, so an all-hit cadence acquires no slot. The committing run's
-//! affinity key prefers its warm slot while each check retains its own cache
-//! identity, result, timing, output stream, and provenance.
+//! Every affected cache-MISS check is its own request for one suite, keyed
+//! `{job}:{suite}` ([`check_affinity_key`]) so it returns to the cell its own
+//! last run left. Cache hits are resolved before admission, so an all-hit
+//! cadence acquires no cell.
 //!
-//! The lease takes no per-item snapshot, so the checks share one mutable
-//! checkout and each observes what the checks before it wrote. That is what
-//! makes the write cadence the cadence that FOLDS a formatter's fix back into
-//! the commit that produced it, and it is why submission order is not plan
-//! order: checks declared `fixes: true` are submitted FIRST
-//! ([`fixer_first_submission_order`]), so every other check in the wave already
-//! validates the tree the fix produces. The wave then publishes that fix as one
-//! commit, re-keys its verdicts onto the tree that landed, and re-runs nothing —
-//! each check executes at most once per commit. Only a verdict the fix
-//! demonstrably invalidated ([`verdict_survives_fix`]) is re-verified, in one
-//! bounded batch that never folds again. Fixers run in plan order among
-//! themselves, so an earlier fixer cannot see a later one's rewrite and only the
-//! LAST fixer's own verdict is carried across the fold
-//! ([`fixers_superseded_by_a_later_fixer`]).
+//! Checks declared `fixes: true` run FIRST, chained in plan order: each is a
+//! change-returning request ([`submit_planned_fix`]) on the commit the previous
+//! fixer's fold landed, so it sees every rewrite before it. A fixer's delta is
+//! published as a commit of its own before the next fixer runs, and the wave
+//! re-keys onto that commit (`rekey_wave_onto_fix`).
+//!
+//! Every other check is a verdict, reproducible from the commit alone. Once
+//! the chain ends, the verdicts are submitted concurrently as pure-verdict
+//! requests ([`submit_planned_check`]) on the commit it ended at, so each is
+//! about the tree that lands and each is recorded the moment its own request
+//! settles. What a verdict writes to the tree is discarded and reported with
+//! its result, never folded: only a declared fixer's rewrite lands.
+//!
+//! Each check executes at most once per commit. Only an answer a later fold
+//! demonstrably invalidated ([`verdict_survives_fix`]) runs again: an earlier
+//! fixer whose inputs a later fixer rewrote, or a lane answered from the cache
+//! before a fold touched its inputs. A fixer's re-run never folds; a second
+//! rewrite is reported as non-convergent.
 //!
 //! ## Cache key
 //!
@@ -116,7 +119,7 @@ mod write_wave;
 #[cfg(test)]
 use board::wave_progress;
 use board::{check_phase_status, wave_status_notify, WaveProgress, WaveStage};
-pub(crate) use board::{BatchProgress, CheckPhaseStatus, CheckStatusBoard};
+pub(crate) use board::{BatchProgress, CheckPhaseStatus, CheckStatusBoard, WriteWaveBoards};
 pub use failure::CheckFailureKind;
 use failure::{
     active_build_service_failure, append_sandbox_denial_evidence,
@@ -170,8 +173,9 @@ pub(crate) use planning::{
     cancel_stale_review_on_branch_advance, cancel_stale_review_on_branch_advance_except,
     execute_job_verdict, head_infra_scopes, jobs_sharing_branch, plan_infra_scopes,
     record_suppressed_check, review_placement_occupancy, run_planned_checks_selected,
-    run_planned_checks_with_board, submit_check_lease, submit_planned_check, verify_review_tree,
-    BranchAdvance, CheckPlacementQuestion, CheckRunCommit, InfraScopeInputs, ReviewTreeGateResult,
+    run_planned_checks_with_board, submit_planned_check, submit_planned_fix,
+    submit_regeneration_lease, verify_review_tree, BranchAdvance, CheckPlacementQuestion,
+    CheckRunCommit, InfraScopeInputs, ReviewTreeGateResult,
 };
 #[cfg(test)]
 pub(crate) use planning::{
@@ -197,13 +201,13 @@ pub use write_wave::expire_write_check_wait_for_test;
 #[cfg(test)]
 use write_wave::{
     await_write_check_wave, claim_offered_outcome, classify_expired_wait,
-    fix_is_attributed_to_declared_fixers, fixer_first_submission_order,
-    fixers_superseded_by_a_later_fixer, format_answered_elsewhere, format_fixed_batch_summary,
+    fix_is_attributed_to_declared_fixers, format_answered_elsewhere, format_fixed_batch_summary,
     hand_off_wave_outcome, lane_key, lanes_left_to_run, late_write_check_message,
     pending_wave_reason, pending_write_checks_summary, plan_write_wave, replan_onto_fix,
     run_write_checks_after_seal_inner, split_write_wave, verdict_survives_fix, FixReplanning,
-    InlineWaitBounds, InlineWaitOutcome, OfferedOutcome, PendingWave, WriteChecksInFlightGuard,
-    WriteWavePlanning, WriteWaveSplit, WRITE_CHECK_INLINE_WAIT,
+    InlineWaitBounds, InlineWaitOutcome, LaneAt, OfferedOutcome, PendingWave,
+    WriteChecksInFlightGuard, WriteWavePlanning, WriteWaveRequests, WriteWaveSplit,
+    WRITE_CHECK_INLINE_WAIT,
 };
 pub(crate) use write_wave::{run_write_checks_after_seal, WriteCheckTarget};
 use write_wave::{split_write_check_batch_outcome, stamp_substrate_elapsed};
@@ -1188,13 +1192,14 @@ pub(crate) type CheckGroupCompletion = Arc<
 /// not be written: a failure to persist, not a decision about the verdict.
 pub(crate) const OBSERVATION_WRITE_FAILED: &str = "the observation write failed: ";
 
-/// One check suite, on one revision, asked of the fleet for a verdict.
+/// One check suite, on one revision, asked of the fleet.
 ///
-/// A verdict request carries exactly one suite, so it is placed, priced and
+/// A check request carries exactly one suite, so it is placed, priced and
 /// recorded by itself: no caller can compose two suites into one cell, and a
 /// suite's verdict lands when its own request settles rather than with a
 /// slower sibling's. Callers that want several verdicts submit several
-/// requests concurrently.
+/// requests concurrently. [`submit_planned_check`] asks for a verdict;
+/// [`submit_planned_fix`] runs a declared fixer whose changes come back.
 #[derive(Clone)]
 pub(crate) struct PlannedCheckRequest {
     pub project_id: String,
@@ -1221,7 +1226,7 @@ pub(crate) struct PlannedCheckRequest {
 }
 
 impl PlannedCheckRequest {
-    fn into_batch(self) -> PlannedCheckBatchRequest {
+    fn into_batch(self, mutation_policy: MutationPolicy) -> PlannedCheckBatchRequest {
         PlannedCheckBatchRequest {
             project_id: self.project_id,
             repository: self.repository,
@@ -1234,7 +1239,7 @@ impl PlannedCheckRequest {
             env: self.env,
             items: vec![self.item],
             run_context: self.run_context,
-            mutation_policy: MutationPolicy::PureVerdict,
+            mutation_policy,
             status_board: self.status_board,
             on_group_complete: self.on_complete,
             purpose: self.purpose,
@@ -1250,10 +1255,13 @@ pub(crate) fn check_affinity_key(job_id: &str, suite: &str) -> String {
     format!("{job_id}:{suite}")
 }
 
-/// The carrier every submission is planned through. Built directly only for
-/// a change-returning lease ([`MutationPolicy::AllowDelta`]), whose items run
-/// in order in one cell because a later command must see what an earlier one
-/// wrote. A verdict is asked for with a [`PlannedCheckRequest`].
+/// The carrier every submission is planned through. Every check suite is
+/// asked for as a [`PlannedCheckRequest`], which becomes a one-item carrier.
+/// Built directly only for base-advance regeneration
+/// ([`submit_regeneration_lease`]): its 'regenerate' and 'regenerate check'
+/// commands run in order in one cell ([`MutationPolicy::AllowDelta`]) because
+/// the second must see what the first wrote, and their combined changes come
+/// back. No check caller composes two suites into one of these.
 #[derive(Clone)]
 pub(crate) struct PlannedCheckBatchRequest {
     pub project_id: String,
@@ -2987,6 +2995,11 @@ mod manual_transport_tests;
 
 #[cfg(test)]
 mod write_wave_target_tests;
+
+/// The write cadence end to end: fixers chain as requests, every verdict is a
+/// request of its own recorded as it settles.
+#[cfg(test)]
+mod write_wave_requests_tests;
 
 /// A base-relative check's verdict is a function of its tree AND the change it
 /// was measured against, so its key names both.

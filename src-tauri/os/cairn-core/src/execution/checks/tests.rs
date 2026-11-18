@@ -4923,7 +4923,7 @@ fn fixed_summary_attributes_a_combined_delta_once_at_batch_level() {
     let summary = "Checks: ✓ rust-fmt (2.1s) · ✓ migrations (cached)";
     let rendered = format_fixed_batch_summary(
         summary,
-        "1234567890abcdef",
+        &["1234567890abcdef".into()],
         &["src/lib.rs".into(), "src/main.rs".into()],
     );
     assert_eq!(
@@ -4931,9 +4931,20 @@ fn fixed_summary_attributes_a_combined_delta_once_at_batch_level() {
         "Checks: ✓ write-check fixes (fixed, 1234567890ab; 2 files) · ✓ rust-fmt (2.1s) · ✓ migrations (cached)"
     );
     assert!(!rendered.contains("migrations (fixed"));
+    // Two fixers that both rewrote fold as two commits, each named.
+    let rendered = format_fixed_batch_summary(
+        summary,
+        &["1234567890abcdef".into(), "fedcba0987654321".into()],
+        &["src/lib.rs".into()],
+    );
+    assert!(
+        rendered
+            .starts_with("Checks: ✓ write-check fixes (fixed, 1234567890ab, fedcba098765; 1 file)"),
+        "{rendered}"
+    );
 }
 
-// --- one wave per commit: fixers first, then re-key, never re-run --------
+// --- one wave per commit: fixers chain, then re-key, never re-run --------
 
 /// A declared fixer — the formatter shape this contract exists for.
 fn fixing_check(command: &str, impact: Option<&[&str]>) -> CheckCommand {
@@ -4988,30 +4999,12 @@ fn write_wave() -> (HashMap<String, CheckCommand>, Vec<(CheckPlan, String)>) {
     (checks, keyed)
 }
 
+/// #435 and cairn/7333: declared fixers chain in plan order and every other
+/// check is a verdict of its own, whatever platforms it names, because a
+/// verdict request is placed by its own platforms. Only a declared fixer the
+/// write cell cannot run is refused, because its fix folds only from there.
 #[test]
-fn a_declared_fixer_is_submitted_before_the_checks_that_read_its_output() {
-    let (checks, keyed) = write_wave();
-    let order = fixer_first_submission_order(&keyed, &checks, &[0, 1, 2, 3]);
-    let names: Vec<&str> = order.iter().map(|i| keyed[*i].0.name.as_str()).collect();
-    assert_eq!(
-        names,
-        vec!["rust-fmt", "api", "lockfile", "migrations"],
-        "the fixer runs first; every other check keeps plan order"
-    );
-    // Indices themselves are untouched, so the status board, the per-check
-    // output streams, and the rendered summary all stay in plan order.
-    let mut covered = order.clone();
-    covered.sort_unstable();
-    assert_eq!(covered, vec![0, 1, 2, 3]);
-}
-
-/// #435: a lane declaring only a platform the write cell is not on leaves
-/// the cell as a verdict-only lane instead of waiting on a machine that can
-/// never answer it. A lane that admits the cell's platform stays, and a
-/// declared fixer the cell cannot run is refused, because its fix can fold
-/// only from the write cell.
-#[test]
-fn a_write_wave_splits_by_the_write_cell_platform() {
+fn a_write_wave_splits_fixers_from_verdicts_and_refuses_a_fixer_off_the_write_cell() {
     let (mut checks, keyed) = write_wave();
     let here = crate::execution::check_identity::gating_platform();
     let elsewhere = if here == "linux" { "macos" } else { "linux" };
@@ -5021,21 +5014,19 @@ fn a_write_wave_splits_by_the_write_cell_platform() {
 
     let split = split_write_wave(&keyed, &checks, &[0, 1, 2, 3], here, "bgsrv-mac");
     assert_eq!(
-        split.cell,
-        vec![1, 2, 3],
-        "undeclared and admitting lanes stay"
+        split,
+        WriteWaveSplit {
+            fixers: vec![3],
+            verifiers: vec![0, 1, 2],
+            refused: Vec::new(),
+        },
+        "the fixer chains; every other lane is a verdict, the off-cell one included"
     );
-    assert_eq!(
-        split.spilled,
-        vec![0],
-        "the lane naming only another platform leaves"
-    );
-    assert!(split.refused.is_empty());
 
     checks.get_mut("rust-fmt").unwrap().verdict_platforms = Some(vec![elsewhere.to_string()]);
     let split = split_write_wave(&keyed, &checks, &[0, 1, 2, 3], here, "bgsrv-mac");
-    assert_eq!(split.cell, vec![1, 2]);
-    assert_eq!(split.spilled, vec![0]);
+    assert!(split.fixers.is_empty());
+    assert_eq!(split.verifiers, vec![0, 1, 2]);
     let [(index, refusal)] = split.refused.as_slice() else {
         panic!("the excluded fixer is refused: {:?}", split.refused);
     };
@@ -5052,26 +5043,121 @@ fn a_write_wave_splits_by_the_write_cell_platform() {
     assert_eq!(
         split,
         WriteWaveSplit {
-            cell: vec![1],
+            verifiers: vec![1],
             ..WriteWaveSplit::default()
         }
     );
+
+    // Several declared fixers chain in plan order.
+    checks.get_mut("rust-fmt").unwrap().verdict_platforms = None;
+    checks.get_mut("api").unwrap().fixes = true;
+    checks.get_mut("api").unwrap().verdict_platforms = None;
+    let split = split_write_wave(&keyed, &checks, &[3, 0, 1], here, "bgsrv-mac");
+    assert_eq!(split.fixers, vec![3, 0], "the misses' order is the chain's");
+    assert_eq!(split.verifiers, vec![1]);
 }
 
+/// cairn/5005: write checks pinned to different machines can always run.
+/// Each lane is its own one-suite request carrying its own selector and its
+/// own affinity key, so there is no shared cell whose items must agree on one
+/// machine.
 #[test]
-fn submission_order_is_plan_order_when_nothing_declares_a_fix() {
-    let (mut checks, keyed) = write_wave();
-    checks.get_mut("rust-fmt").unwrap().fixes = false;
+fn write_checks_pinned_to_different_machines_are_separate_requests() {
+    let pinned = |machine: &str| -> CheckCommand {
+        serde_yaml::from_str(&format!(
+            "command: echo {machine}\nwhen: write\nexecutor:\n  name: {machine}\n"
+        ))
+        .unwrap()
+    };
+    let checks = HashMap::from([
+        ("cargo-test".to_string(), pinned("bbs")),
+        ("translate".to_string(), pinned("local")),
+    ]);
+    let keyed: Vec<(CheckPlan, String)> = ["cargo-test", "translate"]
+        .into_iter()
+        .map(|name| (plan(name, &checks[name].command), format!("key-{name}")))
+        .collect();
+    let here = crate::execution::check_identity::gating_platform();
+    let split = split_write_wave(&keyed, &checks, &[0, 1], here, "local");
+    assert_eq!(split.verifiers, vec![0, 1]);
+    let requests = WriteWaveRequests {
+        run_context: RunContext {
+            run_id: "run".into(),
+            job_id: "job".into(),
+            exec_seq: Some(1),
+            issue_id: None,
+            issue_number: None,
+            thread_id: None,
+            project_id: "project".into(),
+            project_key: "p".into(),
+            job_name: Some("builder".into()),
+            agent_config_id: None,
+        },
+        repository: "/repo".into(),
+        store_dir: PathBuf::from("/store"),
+        checks: checks.clone(),
+        timeouts: vec![600_000; 2],
+        defined_by_commit: "sealed".into(),
+        cell_env: Vec::new(),
+        tool_use_id: "tool".into(),
+        board: CheckStatusBoard::for_review_wave(&keyed, || {}),
+    };
+    let at = LaneAt {
+        commit: "sealed",
+        tree_hash: "tree",
+        keyed: &keyed,
+        process_env: &[],
+    };
+    let built: Vec<PlannedCheckRequest> = split
+        .verifiers
+        .iter()
+        .map(|&index| {
+            requests.request(
+                index,
+                &at,
+                keyed[index].0.command.clone(),
+                format!("stream-{index}"),
+            )
+        })
+        .collect();
+    let machines: Vec<Option<String>> = built
+        .iter()
+        .map(|request| {
+            request
+                .item
+                .executor
+                .as_ref()
+                .and_then(|selector| selector.name.clone())
+        })
+        .collect();
+    assert_eq!(machines, [Some("bbs".into()), Some("local".into())]);
+    let keys: Vec<Option<String>> = built
+        .iter()
+        .map(|request| request.affinity_key.clone())
+        .collect();
     assert_eq!(
-        fixer_first_submission_order(&keyed, &checks, &[0, 1, 2, 3]),
-        vec![0, 1, 2, 3],
-        "a wave with no declared fixer must submit exactly as it did before"
+        keys,
+        [Some("job:cargo-test".into()), Some("job:translate".into())],
+        "each suite returns to its own warm cell"
     );
+    for request in &built {
+        assert_eq!(request.sealed_commit, "sealed");
+        assert_eq!(
+            merge_batch_executor(std::slice::from_ref(&request.item))
+                .expect("one suite's selector cannot conflict with itself")
+                .and_then(|selector| selector.name),
+            request
+                .item
+                .executor
+                .as_ref()
+                .and_then(|selector| selector.name.clone())
+        );
+    }
 }
 
 #[test]
-fn a_declared_fixers_fix_re_verifies_nothing_and_never_re_runs_the_fixer() {
-    let (checks, keyed) = write_wave();
+fn a_fixers_own_fold_carries_its_verdict_and_never_re_runs_it() {
+    let (checks, _) = write_wave();
     let fixed = vec![
         "src-tauri/os/a.rs".to_string(),
         "src-tauri/os/b.rs".to_string(),
@@ -5079,47 +5165,33 @@ fn a_declared_fixers_fix_re_verifies_nothing_and_never_re_runs_the_fixer() {
     let resolved = [selector(&checks["rust-fmt"])];
     let fixers: Vec<&InputSelector> = resolved.iter().collect();
     assert!(fix_is_attributed_to_declared_fixers(&fixed, &fixers));
-    // The fix changed every Rust-impacted check's inputs, so every key moves.
-    // Each verdict still describes the tree that landed: the fixer ran first
-    // inside the shared slot, so the rest of the wave already validated its
-    // output — and the fixer's own verdict is a verdict on the tree it just
-    // produced. Nothing here executes twice.
-    for (plan, key_before) in &keyed {
-        let key_after = format!("key-after-{}", plan.name);
-        assert!(
-            verdict_survives_fix(true, true, true, false, key_before, &key_after, false),
-            "{} must not run again against a fix it already saw",
-            plan.name
-        );
-    }
+    // The fold moved the fixer's own key. Its verdict is about the tree it
+    // just produced, so it carries; the verdicts have not run yet, and run on
+    // the folded commit, so nothing executes twice.
+    assert!(
+        verdict_survives_fix(true, true, true, "key-before", "key-after", false),
+        "rust-fmt must not run again against a fix it produced"
+    );
 }
 
 #[test]
 fn a_verdict_the_fix_invalidated_is_re_verified_rather_than_re_keyed() {
-    // Answered from the cache BEFORE the fix: it never saw the fixed tree, so
-    // its verdict cannot be keyed onto it. Re-verifying is the only honest
+    // Answered from the cache BEFORE the fold: it never saw the folded tree,
+    // so its verdict cannot be keyed onto it. Re-verifying is the only honest
     // answer; re-keying it would be exactly the false green this forbids.
     assert!(!verdict_survives_fix(
-        true, false, true, false, "before", "after", false
+        true, false, true, "before", "after", false
     ));
-    // Unless the fix left its inputs alone — the same argument the result
+    // Unless the fold left its inputs alone — the same argument the result
     // cache itself rests on.
     assert!(verdict_survives_fix(
-        true, false, true, false, "same", "same", false
+        true, false, true, "same", "same", false
     ));
-    // An unattributed fix invalidates even a check that ran: something else
-    // rewrote the tree mid-wave and nothing proves this check saw it.
+    // An unattributed fold invalidates even the fixer that produced it: it
+    // rewrote something it never declared, and nothing proves its verdict
+    // covers that.
     assert!(!verdict_survives_fix(
-        true, true, false, false, "before", "after", false
-    ));
-    // A fixer another fixer ran after cannot carry: it never saw the output
-    // that landed, however well the fold is attributed.
-    assert!(!verdict_survives_fix(
-        true, true, true, true, "before", "after", false
-    ));
-    // Unless the later fixer left its inputs alone.
-    assert!(verdict_survives_fix(
-        true, true, true, true, "same", "same", false
+        true, true, false, "before", "after", false
     ));
 }
 
@@ -5133,20 +5205,18 @@ fn a_fix_merged_onto_a_newer_head_carries_no_executed_verdict() {
         false,
         true,
         true,
-        false,
         "a-tree",
         "b-plus-fix",
         false
     ));
     assert!(verdict_survives_fix(
-        false, true, true, false, "same", "same", false
+        false, true, true, "same", "same", false
     ));
     // The same pass carries when the fix landed on the tree it ran against.
     assert!(verdict_survives_fix(
         true,
         true,
         true,
-        false,
         "a-tree",
         "a-plus-fix",
         false
@@ -5160,15 +5230,13 @@ fn a_fix_outside_every_declared_fixers_impact_is_not_attributed() {
         &["src-tauri/os/a.rs".to_string()],
         &[&selector(&fmt)]
     ));
-    // A lockfile the formatter cannot have written: some undeclared check
-    // mutated the tree, so the wave falls back to re-verification.
+    // A lockfile the formatter cannot have written: it rewrote something it
+    // never declared, so the wave falls back to re-verification.
     assert!(!fix_is_attributed_to_declared_fixers(
         &["src-tauri/Cargo.lock".to_string()],
         &[&selector(&fmt)]
     ));
-    // A wave with no declared fixer can attribute nothing, so an un-migrated
-    // config keeps re-verifying rather than recording verdicts about a tree
-    // no check ran against.
+    // No fixer can attribute nothing.
     assert!(!fix_is_attributed_to_declared_fixers(
         &["src-tauri/os/a.rs".to_string()],
         &[]
@@ -5183,10 +5251,9 @@ fn a_fix_outside_every_declared_fixers_impact_is_not_attributed() {
 
 #[test]
 fn an_earlier_fixer_never_carries_a_later_fixers_rewrite() {
-    // The wave the single-fixer tests cannot reach: Prettier, then
-    // `eslint --fix`. Both are declared fixers over the same files, so
-    // ESLint can rewrite a file Prettier already passed. Prettier ran first
-    // and never saw that rewrite.
+    // Prettier, then `eslint --fix`, both declared fixers over the same
+    // files, so ESLint can rewrite a file Prettier already passed. They chain
+    // in plan order, and Prettier ran on the tree before ESLint's fold.
     let checks = HashMap::from([
         (
             "prettier".to_string(),
@@ -5210,98 +5277,43 @@ fn an_earlier_fixer_never_carries_a_later_fixers_rewrite() {
         (plan("eslint", "bunx eslint --fix src/"), "e".to_string()),
         (plan("typecheck", "bunx tsc --noEmit"), "t".to_string()),
     ];
-    let order = fixer_first_submission_order(&keyed, &checks, &[0, 1, 2]);
-    assert_eq!(
-        order,
-        vec![0, 1, 2],
-        "both fixers precede the verdict check"
-    );
+    let here = crate::execution::check_identity::gating_platform();
+    let split = split_write_wave(&keyed, &checks, &[0, 1, 2], here, "bgsrv-mac");
+    assert_eq!(split.fixers, vec![0, 1], "both fixers chain, in plan order");
+    assert_eq!(split.verifiers, vec![2], "the verdict waits for the chain");
 
-    let superseded = fixers_superseded_by_a_later_fixer(&keyed, &checks, &order);
-    assert!(
-        superseded.contains(&0),
-        "prettier ran before eslint, so eslint's rewrite is behind its back"
-    );
-    assert!(
-        !superseded.contains(&1),
-        "eslint is the last fixer: it observed prettier's output and its own"
-    );
-    assert!(
-        !superseded.contains(&2),
-        "a non-fixer runs after the whole fixer prefix"
-    );
-
-    // The fold is attributed — every path is inside a declared fixer's impact
-    // — and prettier did execute. Attribution alone must NOT carry it.
+    // ESLint's fold is attributed to ESLint, and Prettier did execute.
+    // Neither carries Prettier's green onto a tree ESLint rewrote.
     let fixed = vec!["src/app.ts".to_string()];
-    let resolved = [selector(&checks["prettier"]), selector(&checks["eslint"])];
-    let fixers: Vec<&InputSelector> = resolved.iter().collect();
-    assert!(fix_is_attributed_to_declared_fixers(&fixed, &fixers));
+    let eslint = selector(&checks["eslint"]);
+    assert!(fix_is_attributed_to_declared_fixers(&fixed, &[&eslint]));
     assert!(
-        !verdict_survives_fix(
-            true,
-            true,
-            true,
-            superseded.contains(&0),
-            "p",
-            "p-after",
-            false
-        ),
+        !verdict_survives_fix(true, false, true, "p", "p-after", false),
         "a green prettier verdict must not be keyed to a tree eslint rewrote"
     );
-    // The other two are proven by ordering and carry as before.
-    assert!(verdict_survives_fix(
-        true,
-        true,
-        true,
-        superseded.contains(&1),
-        "e",
-        "e-after",
-        false
-    ));
-    assert!(verdict_survives_fix(
-        true,
-        true,
-        true,
-        superseded.contains(&2),
-        "t",
-        "t-after",
-        false
-    ));
-}
-
-#[test]
-fn a_lone_fixer_is_never_superseded() {
-    // The repository's own wave, and the reason supersession is scoped to
-    // fixer-after-fixer: with one declared fixer there is nothing behind it,
-    // so rust-fmt still carries its verdict and never re-runs.
-    let (checks, keyed) = write_wave();
-    let order = fixer_first_submission_order(&keyed, &checks, &[0, 1, 2, 3]);
     assert!(
-        fixers_superseded_by_a_later_fixer(&keyed, &checks, &order).is_empty(),
-        "a single-fixer wave keeps the one-execution-per-commit contract intact"
+        verdict_survives_fix(true, true, true, "e", "e-after", false),
+        "eslint produced the fold, so its own verdict carries"
     );
 }
 
 #[test]
 fn a_fixer_that_keeps_rewriting_the_tree_terminates() {
-    // Termination is structural now that nothing recurses. A wave publishes
-    // at most ONE fix commit, and the fixer's verdict survives that fix, so
-    // the wave never asks it for a second one. A further mutation can only
-    // come from the bounded verification batch, whose delta is reported as
-    // non-convergent and never folded (`FixedWave::non_convergent`).
+    // Termination is structural: a wave folds each fixer at most once, and a
+    // fixer's verdict survives its own fold, so the wave never asks it for a
+    // second one. A further rewrite can only come from re-running a fixer a
+    // LATER fold made stale, and that rewrite is reported as non-convergent
+    // and never folded.
     let checks = HashMap::from([(
         "fmt".to_string(),
         fixing_check("rewrite-forever", Some(&["**/*.rs"])),
     )]);
-    let keyed = vec![(plan("fmt", "rewrite-forever"), "key-before".to_string())];
-    assert_eq!(fixer_first_submission_order(&keyed, &checks, &[0]), vec![0]);
     assert!(fix_is_attributed_to_declared_fixers(
         &["a.rs".to_string()],
         &[&selector(&checks["fmt"])]
     ));
     assert!(
-        verdict_survives_fix(true, true, true, false, "key-before", "key-after", false),
+        verdict_survives_fix(true, true, true, "key-before", "key-after", false),
         "re-checking a fixer against its own output is the loop this removes"
     );
 }

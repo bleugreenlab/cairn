@@ -60,7 +60,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::project_settings::{CheckResourceClass, LandingRegenerateRule};
 use crate::execution::cache::InfraScopes;
 use crate::execution::checks::{
-    submit_check_lease, CheckExecutionFailure, PlannedCheckBatchItem, PlannedCheckBatchRequest,
+    submit_regeneration_lease, CheckExecutionFailure, PlannedCheckBatchItem,
+    PlannedCheckBatchRequest,
 };
 use crate::execution::wire::CheckResourceIdentityInput;
 use crate::fleet::{CellPriority, MutationPolicy};
@@ -1737,7 +1738,7 @@ async fn run_in_fleet(orch: &Orchestrator, job: &RegenerationJob) -> BatchOutcom
         infra_scopes: InfraScopes::head_only(&requester, &head),
         avoid_executor_ids: Vec::new(),
     };
-    let submitted = submit_check_lease(
+    let submitted = submit_regeneration_lease(
         orch,
         PlannedCheckBatchRequest {
             project_id: row.project_id.clone(),

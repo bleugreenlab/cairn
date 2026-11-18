@@ -1008,17 +1008,31 @@ impl GroupWait {
 }
 
 /// Ask the fleet for one suite's verdict. The request is placed and priced by
-/// itself; a caller wanting several suites submits several requests.
+/// itself; a caller wanting several suites submits several requests. A
+/// verdict is reproducible from the commit alone, so whatever the command
+/// writes to the tree is discarded and reported, never returned.
 pub(crate) async fn submit_planned_check(
     orch: &Orchestrator,
     request: PlannedCheckRequest,
 ) -> Result<PlannedCheckBatchOutcome, String> {
-    submit_admitted_check_batch(orch, request.into_batch()).await
+    submit_admitted_check_batch(orch, request.into_batch(MutationPolicy::PureVerdict)).await
 }
 
-/// Run a change-returning lease: its items in order in one cell, whose
-/// changes come back with the results. A verdict is never a lease.
-pub(crate) async fn submit_check_lease(
+/// Run one declared fixer suite (`fixes: true`) in a cell whose changes come
+/// back with its result, for the caller to fold into the branch. Like a
+/// verdict it carries exactly one suite: fixers that must see each other's
+/// output are chained as separate requests, never shared in one cell.
+pub(crate) async fn submit_planned_fix(
+    orch: &Orchestrator,
+    request: PlannedCheckRequest,
+) -> Result<PlannedCheckBatchOutcome, String> {
+    submit_admitted_check_batch(orch, request.into_batch(MutationPolicy::AllowDelta)).await
+}
+
+/// Run base-advance regeneration's lease: its commands in order in one cell,
+/// whose combined changes come back with the results. The only submission
+/// that carries more than one command; a check suite is never a lease.
+pub(crate) async fn submit_regeneration_lease(
     orch: &Orchestrator,
     lease: PlannedCheckBatchRequest,
 ) -> Result<PlannedCheckBatchOutcome, String> {
