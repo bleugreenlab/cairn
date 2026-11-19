@@ -51,6 +51,114 @@ async fn resolve_project_and_issue(
     resolved.ok_or_else(|| format!("Issue {}/{} not found", key, number))
 }
 
+/// Refuse filing an execution on issue `number` when the issue is merged or
+/// closed, before anything is written.
+///
+/// Resolution is [`cairn_db::resolved_issue_sql!`], the clause the gate
+/// sweep's release predicate excludes by, so an execution this refuses is one
+/// release would never start, and one it lets through is not excluded for its
+/// issue. Without it the filing answered `Queued` (or `Started`) for work that
+/// can never run, and the author learned so only from the census's
+/// `won't start` later. An issue that does not exist is left to the filing's
+/// own lookup to report.
+pub(crate) async fn refuse_filing_on_resolved_issue(
+    orch: &Orchestrator,
+    project_key: &str,
+    number: i32,
+) -> Result<(), String> {
+    let owning_db = orch.db.for_project(project_key).await;
+    let key = cairn_uri::canonical_project(project_key);
+    let resolved = owning_db
+        .read(|conn| {
+            let key = key.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        concat!(
+                            "SELECT resolved_issue.id, resolved_issue.merged_at IS NOT NULL
+                               FROM issues resolved_issue
+                               JOIN projects p ON p.id = resolved_issue.project_id
+                              WHERE p.key = ?1 AND resolved_issue.number = ?2 AND ",
+                            cairn_db::resolved_issue_sql!()
+                        ),
+                        params![key.as_str(), number],
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok::<_, DbError>(None);
+                };
+                let (issue_id, merged) = (row.text(0)?, row.i64(1)? != 0);
+                // The newest node that minted a branch: the head a successor
+                // on a new issue would want to start from.
+                let mut heads = conn
+                    .query(
+                        "SELECT e.seq, j.uri_segment, j.branch
+                           FROM jobs j JOIN executions e ON e.id = j.execution_id
+                          WHERE j.issue_id = ?1 AND j.parent_job_id IS NULL
+                            AND j.branch IS NOT NULL AND j.branch != ''
+                          ORDER BY e.seq DESC, j.created_at DESC LIMIT 1",
+                        params![issue_id.as_str()],
+                    )
+                    .await?;
+                let head = match heads.next().await? {
+                    Some(row) => Some((row.opt_i64(0)?, row.opt_text(1)?, row.text(2)?)),
+                    None => None,
+                };
+                Ok(Some((merged, head)))
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some((merged, head)) = resolved else {
+        return Ok(());
+    };
+    let head = head.map(|(seq, segment, branch)| {
+        let node = match (seq, segment) {
+            (Some(seq), Some(segment)) => format!(
+                " (node {})",
+                cairn_uri::build_node_uri(&key, number, seq as i32, &segment)
+            ),
+            _ => String::new(),
+        };
+        format!("branch `{branch}`{node}")
+    });
+    Err(resolved_issue_refusal(
+        &key,
+        number,
+        merged,
+        head.as_deref(),
+    ))
+}
+
+/// The refusal for a filing on a resolved issue: what is wrong, why it would
+/// never start, and the route that does work. `continuity:` adopts only heads
+/// from earlier executions of the SAME issue (`execution::continuity`), and the
+/// issue-create `execution` object takes no `continuity`, so the old head
+/// travels in the new issue's description.
+fn resolved_issue_refusal(key: &str, number: i32, merged: bool, head: Option<&str>) -> String {
+    let resolution = if merged { "merged" } else { "closed" };
+    let issue_uri = cairn_uri::build_issue_uri(key, number);
+    let start = match head {
+        Some(head) => format!("Start from its head: {head}."),
+        None => "Start from its head: <node URI, branch or commit>.".to_string(),
+    };
+    format!(
+        "{key}/{number} is {resolution}: an execution filed on it would never start, because \
+         the gate sweep releases no execution on a merged or closed issue, and filing one does \
+         not reopen it.\n\
+         To carry the work on, file it on a new issue that names this one's head. \
+         `continuity:` adopts only heads from earlier executions of the same issue, so the \
+         head goes in the new issue's description for its agent to start from:\n  \
+         write({{changes:[{{target:\"cairn://p/{key}/issues\",mode:\"append\",payload:{{\
+         title:\"... (continues {key}/{number})\",description:\"Continues {issue_uri}. \
+         {start}\",execution:true}}}}]}})\n\
+         Evidence-only work goes on a new issue the same way, with its PR node removed in the \
+         execution object: execution:{{overrides:{{without:[\"<PR node>\"]}}}}. On {key}/{number} \
+         itself that would never start either.\n\
+         Nothing was filed."
+    )
+}
+
 /// What an execution create files besides its launch options: the recipe it
 /// resolved and why, and who filed it with what, for the reply and the
 /// resolution record.

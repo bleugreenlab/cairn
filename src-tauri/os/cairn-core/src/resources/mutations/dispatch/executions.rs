@@ -115,6 +115,12 @@ pub(super) async fn dispatch(
                 item.payload.as_ref().and_then(|p| p.get("place")),
                 "payload.place",
             )?;
+            // Before adoption, resolution or any write, and on a preview too:
+            // the release predicate never starts an execution on a merged or
+            // closed issue, so accepting one would be a false `Queued`.
+            executions::refuse_filing_on_resolved_issue(orch, project, *number)
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
             // A same-project thread filing work on an issue that hangs from
             // nothing adopts it, so the issue's attention (its plan gates, its
             // reviews, its failure) reaches the thread that asked for it, and

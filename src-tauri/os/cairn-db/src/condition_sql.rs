@@ -10,13 +10,31 @@
 //! agree on which held executions are still waiting to start, so that
 //! predicate lives here too.
 
+/// True when issue `resolved_issue` is resolved: merged or closed. This is the
+/// ONE definition of the issue half of execution liveness. [`live_execution_sql!`]
+/// (and so the gate sweep's [`awaiting_release_sql!`]) excludes an execution on
+/// such an issue, and filing an execution refuses such an issue, so release and
+/// filing cannot disagree about which issues take no new work. It reads the
+/// resolution timestamps, not `status`. Expects an `issues` row aliased
+/// `resolved_issue`.
+#[macro_export]
+macro_rules! resolved_issue_sql {
+    () => {
+        "(resolved_issue.merged_at IS NOT NULL OR resolved_issue.closed_at IS NOT NULL)"
+    };
+}
+
 /// True when execution `e` can still act: not superseded by a newer attempt,
-/// and its issue (if any) not resolved. Expects an `executions` row aliased
-/// `e`.
+/// and its issue (if any) not resolved ([`resolved_issue_sql!`]). Expects an
+/// `executions` row aliased `e`.
 #[macro_export]
 macro_rules! live_execution_sql {
     () => {
-        "e.lifecycle != 'superseded' AND NOT EXISTS (SELECT 1 FROM issues resolved_issue WHERE resolved_issue.id = e.issue_id AND (resolved_issue.merged_at IS NOT NULL OR resolved_issue.closed_at IS NOT NULL))"
+        concat!(
+            "e.lifecycle != 'superseded' AND NOT EXISTS (SELECT 1 FROM issues resolved_issue WHERE resolved_issue.id = e.issue_id AND ",
+            $crate::resolved_issue_sql!(),
+            ")"
+        )
     };
 }
 

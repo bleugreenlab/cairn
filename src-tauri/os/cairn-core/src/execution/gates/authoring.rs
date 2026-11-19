@@ -422,11 +422,15 @@ async fn hold_state_conn(
 ) -> DbResult<HoldState> {
     let mut rows = conn
         .query(
-            "SELECT e.released_at, e.lifecycle = 'superseded',
-                    EXISTS (SELECT 1 FROM execution_gates WHERE execution_id = ?1),
-                    EXISTS (SELECT 1 FROM issues i WHERE i.id = e.issue_id
-                              AND (i.merged_at IS NOT NULL OR i.closed_at IS NOT NULL))
-               FROM executions e WHERE e.id = ?1",
+            concat!(
+                "SELECT e.released_at, e.lifecycle = 'superseded',
+                        EXISTS (SELECT 1 FROM execution_gates WHERE execution_id = ?1),
+                        EXISTS (SELECT 1 FROM issues resolved_issue
+                                 WHERE resolved_issue.id = e.issue_id AND ",
+                cairn_db::resolved_issue_sql!(),
+                ")
+                   FROM executions e WHERE e.id = ?1"
+            ),
             cairn_db::turso::params![execution_id],
         )
         .await?;
