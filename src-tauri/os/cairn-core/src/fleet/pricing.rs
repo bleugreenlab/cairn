@@ -27,8 +27,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::ops::Deref;
 use std::io::{BufRead, BufReader};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -189,38 +189,37 @@ impl PlacementPrices {
 }
 
 /// A bounded memo whose misses are filled in the background.
+///
+/// Each value carries the revision of the inputs it was computed from. A
+/// lookup at a different revision still returns the held value, and schedules
+/// a recomputation unless the held one was started less than `refresh` ago.
 struct RefinedCache<K, V> {
     shared: Arc<Shared<K, V>>,
+    refresh: Duration,
 }
 
 struct Shared<K, V> {
     state: Mutex<State<K, V>>,
     settled: Condvar,
     started: AtomicU64,
+    limit: usize,
 }
 
 struct State<K, V> {
-    /// Each value with the tick it was last read or written at; the smallest
-    /// tick is evicted first.
-    entries: HashMap<K, (V, u64)>,
+    entries: HashMap<K, Entry<V>>,
     pending: HashSet<K>,
     tick: u64,
 }
 
-impl<K, V> Default for RefinedCache<K, V> {
-    fn default() -> Self {
-        Self {
-            shared: Arc::new(Shared {
-                state: Mutex::new(State {
-                    entries: HashMap::new(),
-                    pending: HashSet::new(),
-                    tick: 0,
-                }),
-                settled: Condvar::new(),
-                started: AtomicU64::new(0),
-            }),
-        }
-    }
+struct Entry<V> {
+    value: V,
+    /// The revision of the inputs `value` was computed from.
+    revision: u64,
+    /// When the computation that produced `value` started.
+    computed_at: Instant,
+    /// The tick this entry was last read or written at; the smallest is
+    /// evicted first.
+    used: u64,
 }
 
 impl<K, V> Shared<K, V> {
@@ -234,37 +233,69 @@ where
     K: Clone + Eq + Hash + Send + 'static,
     V: Clone + Send + 'static,
 {
-    /// The cached value, or `None` after scheduling `compute` to fill it.
-    fn get_or_refine(&self, key: K, compute: impl FnOnce() -> V + Send + 'static) -> Option<V> {
+    fn new(limit: usize, refresh: Duration) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State {
+                    entries: HashMap::new(),
+                    pending: HashSet::new(),
+                    tick: 0,
+                }),
+                settled: Condvar::new(),
+                started: AtomicU64::new(0),
+                limit,
+            }),
+            refresh,
+        }
+    }
+
+    /// The value held for `key`, or `None` when nothing is held yet. A miss,
+    /// or a held value computed at another revision and due a refresh,
+    /// schedules `compute` to fill it at `revision`.
+    fn get_or_refine(
+        &self,
+        key: K,
+        revision: u64,
+        compute: impl FnOnce() -> V + Send + 'static,
+    ) -> Option<V> {
         let mut state = self.shared.lock();
         state.tick += 1;
         let tick = state.tick;
-        if let Some((value, used)) = state.entries.get_mut(&key) {
-            *used = tick;
-            return Some(value.clone());
-        }
+        let held = match state.entries.get_mut(&key) {
+            Some(entry) => {
+                entry.used = tick;
+                if entry.revision == revision || entry.computed_at.elapsed() < self.refresh {
+                    return Some(entry.value.clone());
+                }
+                Some(entry.value.clone())
+            }
+            None => None,
+        };
         if state.pending.contains(&key) || state.pending.len() >= REFINEMENTS_IN_FLIGHT_LIMIT {
-            return None;
+            return held;
         }
         state.pending.insert(key.clone());
         drop(state);
         self.shared.started.fetch_add(1, Ordering::Relaxed);
         let pending = Pending {
             shared: Arc::clone(&self.shared),
-            key: key.clone(),
+            key,
         };
+        let computed_at = Instant::now();
         let spawned = std::thread::Builder::new()
             .name("cairn-placement-price".into())
             .spawn(move || {
                 let value = compute();
-                pending.shared.insert(pending.key.clone(), value);
+                pending
+                    .shared
+                    .insert(pending.key.clone(), revision, computed_at, value);
             });
         if let Err(error) = spawned {
             // The closure, and the pending marker it owned, were dropped with
             // the failed spawn, so the next pass asks again.
             tracing::warn!(%error, "placement price refinement could not start a thread");
         }
-        None
+        held
     }
 
     #[cfg(test)]
@@ -291,21 +322,29 @@ where
 }
 
 impl<K: Clone + Eq + Hash, V> Shared<K, V> {
-    fn insert(&self, key: K, value: V) {
+    fn insert(&self, key: K, revision: u64, computed_at: Instant, value: V) {
         let mut state = self.lock();
         state.tick += 1;
         let tick = state.tick;
-        if !state.entries.contains_key(&key) && state.entries.len() >= PRICE_ENTRY_LIMIT {
+        if !state.entries.contains_key(&key) && state.entries.len() >= self.limit {
             let oldest = state
                 .entries
                 .iter()
-                .min_by_key(|(_, (_, used))| *used)
+                .min_by_key(|(_, entry)| entry.used)
                 .map(|(key, _)| key.clone());
             if let Some(oldest) = oldest {
                 state.entries.remove(&oldest);
             }
         }
-        state.entries.insert(key, (value, tick));
+        state.entries.insert(
+            key,
+            Entry {
+                value,
+                revision,
+                computed_at,
+                used: tick,
+            },
+        );
     }
 }
 
@@ -441,10 +480,18 @@ mod tests {
         (prices, walks, measures)
     }
 
+    fn haves<'a>(executor_id: &'a str, revision: u64, commits: &[&str]) -> WarmHaves<'a> {
+        WarmHaves {
+            executor_id,
+            revision,
+            commits: commits.iter().map(|commit| (*commit).to_owned()).collect(),
+        }
+    }
+
     #[test]
     fn an_unpriced_pair_is_unknown_now_and_known_once_refined() {
         let (prices, walks, _) = counting();
-        let roots = vec!["w".to_owned()];
+        let roots = haves("m", 1, &["w"]);
         assert_eq!(prices.sync_cost("/repo", &roots, "t"), SyncCost::Unknown);
         prices.settle();
         assert_eq!(prices.sync_cost("/repo", &roots, "t"), SyncCost::Known(200));
@@ -452,17 +499,44 @@ mod tests {
     }
 
     #[test]
-    fn the_same_root_set_in_any_order_is_one_price() {
-        let (prices, walks, _) = counting();
-        let forward = vec!["a".to_owned(), "b".to_owned()];
-        let backward = vec!["b".to_owned(), "a".to_owned(), "a".to_owned()];
-        prices.sync_cost("/repo", &forward, "t");
+    fn moved_roots_serve_the_old_price_while_one_refresh_runs() {
+        let (mut prices, walks, _) = counting();
+        prices.sync = RefinedCache::new(SYNC_ENTRY_LIMIT, Duration::ZERO);
+        prices.sync_cost("/repo", &haves("m", 1, &["a"]), "t");
         prices.settle();
-        assert_eq!(
-            prices.sync_cost("/repo", &backward, "t"),
-            SyncCost::Known(300)
-        );
+
+        let moved = haves("m", 2, &["a", "b"]);
+        assert_eq!(prices.sync_cost("/repo", &moved, "t"), SyncCost::Known(200));
+        prices.settle();
+        assert_eq!(walks.load(Ordering::SeqCst), 2);
+        for _ in 0..3 {
+            assert_eq!(prices.sync_cost("/repo", &moved, "t"), SyncCost::Known(300));
+        }
+        assert_eq!(walks.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn moved_roots_are_not_walked_again_within_the_refresh_interval() {
+        let (prices, walks, _) = counting();
+        prices.sync_cost("/repo", &haves("m", 1, &["a"]), "t");
+        prices.settle();
+        for revision in 2..5 {
+            assert_eq!(
+                prices.sync_cost("/repo", &haves("m", revision, &["a", "b"]), "t"),
+                SyncCost::Known(200)
+            );
+            prices.settle();
+        }
         assert_eq!(walks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn each_machine_is_priced_on_its_own() {
+        let (prices, walks, _) = counting();
+        prices.sync_cost("/repo", &haves("m", 1, &["a"]), "t");
+        prices.sync_cost("/repo", &haves("n", 1, &["a"]), "t");
+        prices.settle();
+        assert_eq!(walks.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -477,7 +551,10 @@ mod tests {
             |_, _, _| None,
         );
         for _ in 0..3 {
-            assert_eq!(prices.sync_cost("/repo", &[], "t"), SyncCost::Unknown);
+            assert_eq!(
+                prices.sync_cost("/repo", &haves("m", 0, &[]), "t"),
+                SyncCost::Unknown
+            );
             prices.settle();
         }
         assert_eq!(walks.load(Ordering::SeqCst), 1);
@@ -516,7 +593,10 @@ mod tests {
             |_, _, _| None,
         );
         for target in ["a", "b", "c", "d"] {
-            assert_eq!(prices.sync_cost("/repo", &[], target), SyncCost::Unknown);
+            assert_eq!(
+                prices.sync_cost("/repo", &haves("m", 0, &[]), target),
+                SyncCost::Unknown
+            );
         }
         assert_eq!(
             prices.computations_started(),
@@ -530,23 +610,27 @@ mod tests {
 
     #[test]
     fn the_cache_is_bounded_and_evicts_the_least_recently_used() {
-        let cache: RefinedCache<usize, usize> = RefinedCache::default();
-        for key in 0..PRICE_ENTRY_LIMIT {
-            cache.shared.insert(key, key);
+        const LIMIT: usize = 8;
+        let cache: RefinedCache<usize, usize> = RefinedCache::new(LIMIT, Duration::ZERO);
+        for key in 0..LIMIT {
+            cache.shared.insert(key, 0, Instant::now(), key);
         }
         // Reading the first entry makes the second the oldest.
-        assert_eq!(cache.get_or_refine(0, || unreachable!()), Some(0));
-        cache.shared.insert(PRICE_ENTRY_LIMIT, PRICE_ENTRY_LIMIT);
-        assert_eq!(cache.shared.lock().entries.len(), PRICE_ENTRY_LIMIT);
+        assert_eq!(cache.get_or_refine(0, 0, || unreachable!()), Some(0));
+        cache.shared.insert(LIMIT, 0, Instant::now(), LIMIT);
+        assert_eq!(cache.shared.lock().entries.len(), LIMIT);
         assert!(cache.contains(&0));
         assert!(!cache.contains(&1));
-        assert!(cache.contains(&PRICE_ENTRY_LIMIT));
+        assert!(cache.contains(&LIMIT));
     }
 
     #[test]
     fn a_panicking_computation_releases_its_key() {
         let prices = PlacementPrices::with(|_, _, _| panic!("walk failed"), |_, _, _| None);
-        assert_eq!(prices.sync_cost("/repo", &[], "t"), SyncCost::Unknown);
+        assert_eq!(
+            prices.sync_cost("/repo", &haves("m", 0, &[]), "t"),
+            SyncCost::Unknown
+        );
         prices.settle();
         assert!(prices.sync.shared.lock().pending.is_empty());
     }

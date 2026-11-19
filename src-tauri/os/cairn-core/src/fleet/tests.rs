@@ -20746,14 +20746,15 @@ fn a_priced_target_is_placed_again_without_starting_git() {
     place_priced(&pool, &request);
     pool.placement_prices.settle();
     let started = pool.placement_prices.computations_started();
-    assert_eq!(started, 2);
+    // A sync price per machine, and one distance for the slot head they share.
+    assert_eq!(started, 3);
 
     for _ in 0..5 {
         place_priced(&pool, &request);
     }
     pool.placement_prices.settle();
     assert_eq!(pool.placement_prices.computations_started(), started);
-    assert_eq!(walks.lock().unwrap().len(), 1);
+    assert_eq!(walks.lock().unwrap().len(), 2);
     assert_eq!(measures.lock().unwrap().len(), 1);
 
     // A new target is new pairs: priced once more, then never again.
@@ -20762,7 +20763,7 @@ fn a_priced_target_is_placed_again_without_starting_git() {
     place_priced(&pool, &next);
     pool.placement_prices.settle();
     place_priced(&pool, &next);
-    assert_eq!(pool.placement_prices.computations_started(), started + 2);
+    assert_eq!(pool.placement_prices.computations_started(), started + 3);
 }
 
 #[test]

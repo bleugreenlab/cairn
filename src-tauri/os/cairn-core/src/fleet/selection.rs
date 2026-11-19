@@ -6093,7 +6093,7 @@ pub(super) fn sync_cost_key(cost: SyncCost) -> (bool, u64) {
 pub(super) fn repository_sync_cost(
     request: &CellRequest,
     entry: &ExecutorConnectionState,
-    price: impl FnOnce(&str, &[String], &str) -> SyncCost,
+    price: impl FnOnce(&str, &pricing::WarmHaves<'_>, &str) -> SyncCost,
 ) -> SyncCost {
     if entry.colocated {
         return SyncCost::Known(0);
@@ -6107,11 +6107,12 @@ pub(super) fn repository_sync_cost(
     let Some(repository_path) = request.repository.colocated_path() else {
         return SyncCost::Unknown;
     };
-    price(
-        repository_path,
-        entry.warm_roots.commits(&repository),
-        &request.base_commit,
-    )
+    let haves = pricing::WarmHaves {
+        executor_id: &entry.identity.executor_id,
+        revision: entry.warm_roots.revision(),
+        commits: entry.warm_roots.commits(&repository),
+    };
+    price(repository_path, &haves, &request.base_commit)
 }
 
 pub(super) fn aggregate_batch_learned_estimates(
