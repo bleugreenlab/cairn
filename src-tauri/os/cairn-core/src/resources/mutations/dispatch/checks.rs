@@ -178,6 +178,18 @@ async fn file(
         Writer::Run { job_id, home } => (home.clone(), Some(job_id.clone())),
     };
     if dry_run {
+        // The write refuses this in `requests::accepted_revision` once it reads
+        // the subject's head; a preview reads no head, and the reserved thread
+        // coordinate already says there is none, so it refuses in the same words
+        // rather than promise a filing the write will not make.
+        if payload.revision.is_none()
+            && matches!(
+                cairn_uri::NodeAddress::new(number, exec_seq, node_id),
+                cairn_uri::NodeAddress::Thread { .. }
+            )
+        {
+            return Err(fail(requests::THREAD_REQUEST_NEEDS_A_REVISION.to_string()));
+        }
         return Ok(Some(format!(
             "Would file {} check request(s) ({}) on behalf of {requester_ref}",
             suites.len(),

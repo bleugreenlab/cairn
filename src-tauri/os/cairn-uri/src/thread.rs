@@ -76,15 +76,17 @@ pub fn retired_surface(resource: &CairnResource) -> Option<String> {
 /// Why a branch-shaped sub-resource has no meaning under a thread.
 ///
 /// A thread session is commit-fenced by construction: it has no branch and no
-/// PR, so `diff`, `changed`, `rebase`, and the session's own `checks` are not
-/// merely unimplemented there — they name something that does not exist. Saying
-/// so is a better answer than the silent coercion into an artifact of that name
-/// this replaced.
-fn branchless_refusal(name: &str, segment: &str) -> String {
+/// PR, so `diff`, `changed`, and `rebase`, which describe a branch's contents,
+/// are not merely unimplemented there — they name something that does not
+/// exist. Saying so is a better answer than the silent coercion into an
+/// artifact of that name this replaced.
+fn branchless_refusal(project: &str, name: &str, segment: &str) -> String {
     format!(
         "A thread session has no branch, so '{segment}' does not apply to thread '{name}'. \
-         Branch-shaped resources (diff, changed, rebase, and a session's own checks) belong to \
-         an execution node working on an issue."
+         Branch-shaped resources (diff, changed, rebase) belong to an execution node working \
+         on an issue. To judge a revision from a thread, file a check request naming it: \
+         append {{suite, revision}} to {}/checks.",
+        crate::build_thread_uri(project, name)
     )
 }
 
@@ -223,11 +225,9 @@ pub fn delegate_thread_descendant(resource: CairnResource) -> Result<CairnResour
 
         // Branch-shaped, and a thread has no branch. Refused with the reason at
         // both levels rather than silently becoming an artifact of that name.
-        ["diff"] | ["changed"] | ["checks"] | ["rebase"] => {
-            return Err(branchless_refusal(&name, segments[0]))
-        }
-        ["task", _, segment @ ("diff" | "changed" | "rebase")] => {
-            return Err(branchless_refusal(&name, segment))
+        [segment @ ("diff" | "changed" | "rebase")]
+        | ["task", _, segment @ ("diff" | "changed" | "rebase")] => {
+            return Err(branchless_refusal(&project, &name, segment))
         }
 
         // ---- Session level ----
@@ -249,6 +249,12 @@ pub fn delegate_thread_descendant(resource: CairnResource) -> Result<CairnResour
         // so it is the same reading position across every session.
         ["feed"] => at_thread!(HomeFeed, task_name: None),
         ["tasks"] => at_thread!(NodeTasks),
+        // A session's `checks` is the session job's, as a node's is its job's:
+        // the check requests it filed, and the door it files them through. A
+        // request names its own revision, so it needs no branch from its filer;
+        // what a thread cannot do is leave the revision out, and filing refuses
+        // that (`requests::accepted_revision`), not the address.
+        ["checks"] => at_thread!(NodeChecks),
         ["calls"] => at_thread!(NodeCalls),
         // A thread agent's `run` hands back `cairn:~/batches/<id>` like any
         // node's does, so the handle has to resolve from a thread too.

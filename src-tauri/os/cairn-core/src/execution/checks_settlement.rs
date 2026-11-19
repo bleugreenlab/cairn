@@ -569,7 +569,10 @@ pub(crate) fn checks_coords(reference: &str, home: Option<&str>) -> Result<Check
         }
         _ => canonical.to_string(),
     };
-    let (project, number, exec_seq, node_id, task_name) = match parse_uri(&canonical) {
+    // A thread's checks is its job's, reached through the one thread mapping.
+    let resolved = parse_uri(&canonical)
+        .and_then(|resource| cairn_uri::delegate_thread_descendant(resource).ok());
+    let (project, number, exec_seq, node_id, task_name) = match resolved {
         Some(CairnResource::NodeChecks {
             project,
             number,

@@ -52,7 +52,7 @@ const FILE_CHECK_REQUEST: MutationSpec = MutationSpec {
         KeySpec::new(
             "revision",
             KeyType::Str,
-            "a branch name, commit id or node URI; omitted: this node's own head",
+            "a branch name, commit id or node URI; omitted: this node's own head (required from a thread, which has none)",
         ),
         KeySpec::new(
             "executor",

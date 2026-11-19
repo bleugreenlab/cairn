@@ -1038,3 +1038,248 @@ fn a_filed_request_places_one_lane_and_survives_a_restart_before_its_grant() {
         assert_eq!(count("SELECT COUNT(*) FROM run_batch_detached").await, 0);
     });
 }
+
+// --- filed from a thread -------------------------------------------------------
+
+const THREAD: &str = "design-review";
+const THREAD_HOME: &str = "cairn://p/proj/design-review";
+const THREAD_RUN: &str = "run-thread";
+
+/// A thread with a live session run, the writer every `cairn:~/` write from
+/// that session (and `cairn check run` in its batches) is attributed to.
+fn thread_rows_sql() -> String {
+    format!(
+        "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at)
+           VALUES('th','p','{THREAD}','active','none',1,1);
+         INSERT INTO jobs(id,project_id,thread_id,node_name,status,uri_segment,created_at,updated_at)
+           VALUES('job-thread','p','th','Thread','running','thread',1,1);
+         INSERT INTO runs(id,project_id,job_id,status,created_at,updated_at)
+           VALUES('{THREAD_RUN}','p','job-thread','live',1,1);"
+    )
+}
+
+/// A write as the thread's session run, through the write handler: the path
+/// an agent's `write` and the CLI's filing both take.
+async fn write_as_thread(orch: &Orchestrator, payload: serde_json::Value) -> String {
+    thread_write(orch, payload, false).await
+}
+
+async fn thread_write(orch: &Orchestrator, payload: serde_json::Value, preview: bool) -> String {
+    let request = crate::mcp::types::McpCallbackRequest {
+        answer_bound_ms: None,
+        thread_id: None,
+        cwd: String::new(),
+        run_id: Some(THREAD_RUN.into()),
+        tool: "write".into(),
+        payload: serde_json::json!({ "changes": [{
+            "target": "cairn:~/checks", "mode": "append", "payload": payload
+        }], "preview": preview }),
+        tool_use_id: None,
+        origin: None,
+    };
+    crate::mcp::handlers::write::handle_write(orch, &request).await
+}
+
+async fn read_uri(orch: &Orchestrator, uri: &str) -> String {
+    let request = crate::mcp::types::McpCallbackRequest {
+        answer_bound_ms: None,
+        thread_id: None,
+        cwd: String::new(),
+        run_id: None,
+        tool: "read_issue_resource".into(),
+        payload: serde_json::json!({ "uri": uri }),
+        tool_use_id: None,
+        origin: None,
+    };
+    crate::mcp::handlers::issue_resources::handle_read_issue_resource(orch, &request).await
+}
+
+/// A thread owns no branch, so a request from one that names no revision has
+/// nothing to judge. It is refused at filing, with the way through, and no
+/// row is written for a driver to fail later. Its preview refuses in the same
+/// words rather than say it would file what the write refuses.
+#[tokio::test]
+async fn a_threads_request_without_a_revision_is_refused_before_anything_is_filed() {
+    let (_root, orch) = row_fixture().await;
+    orch.db
+        .local
+        .execute_script(thread_rows_sql())
+        .await
+        .unwrap();
+
+    let previewed = thread_write(&orch, serde_json::json!({ "suite": "rust-tests" }), true).await;
+    // The reply is JSON, so the refusal's quotes arrive escaped; its opening
+    // sentence has none.
+    let refusal = THREAD_REQUEST_NEEDS_A_REVISION
+        .split_once(':')
+        .map_or(THREAD_REQUEST_NEEDS_A_REVISION, |(head, _)| head);
+    assert!(
+        previewed.contains("a thread has no branch of its own")
+            && previewed.contains(refusal)
+            && !previewed.contains("Would file"),
+        "{previewed}"
+    );
+
+    let refused = write_as_thread(&orch, serde_json::json!({ "suite": "rust-tests" })).await;
+
+    assert!(
+        refused.contains("a thread has no branch of its own") && refused.contains(refusal),
+        "{refused}"
+    );
+    let filed = orch
+        .db
+        .local
+        .query_opt("SELECT COUNT(*) FROM check_requests", (), |row| row.i64(0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(filed, 0, "a revisionless thread request filed a row");
+}
+
+/// A thread files a check request through its own `cairn:~/checks` exactly as
+/// a node does: the row names the thread's home as its requester and the
+/// revision it was given, the lane runs to a verdict, and the verdict is in
+/// the project ledger for that revision, where anyone can cite it. The
+/// thread's checks read shows the request and offers the revision as
+/// required.
+#[test]
+#[serial_test::serial(jj)]
+fn a_threads_request_records_a_verdict_in_the_ledger() {
+    use crate::execution::checks::write_check_stack_headroom::{commit, passed_batch};
+    use crate::jj::tests::{init_project, jj_bin};
+    use cairn_common::executor_protocol::ExecutorMessage;
+    let Some(bin) = jj_bin() else {
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let repo = project.path().to_path_buf();
+    init_project(&repo);
+    commit(
+        &repo,
+        &[(
+            ".cairn/config.yaml",
+            "checks:\n  unit:\n    command: echo ok\n    when: review\n",
+        )],
+        "declare unit",
+    );
+    crate::stack_headroom::within_budget("thread check request", move || async move {
+        let config_dir = home.path().to_path_buf();
+        let local = Arc::new(
+            crate::storage::LocalDb::open_migrated_for_test(config_dir.join("checks.db"))
+                .await
+                .unwrap(),
+        );
+        local
+            .execute_script(format!(
+                "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('ws','w',1,1);
+                 INSERT INTO projects(id,workspace_id,name,key,repo_path,default_branch,created_at,updated_at)
+                   VALUES('p','ws','P','proj','{}','main',1,1);
+                 {}",
+                repo.to_string_lossy(),
+                thread_rows_sql()
+            ))
+            .await
+            .unwrap();
+        let search = Arc::new(
+            crate::storage::SearchIndex::open_or_create(config_dir.join("search")).unwrap(),
+        );
+        let orch = Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(local.clone(), search)),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            config_dir.clone(),
+        )
+        .jj_binary_path(bin.clone())
+        .build();
+        let (sender, mut machine) = tokio::sync::mpsc::unbounded_channel();
+        let generation = orch.fleet.attach_executor(sender);
+        let fleet = orch.fleet.clone();
+        let executor = tokio::spawn(async move {
+            let entry_id = loop {
+                match machine.recv().await {
+                    Some(ExecutorMessage::Offer { entry_id, .. }) => break entry_id,
+                    Some(_) => continue,
+                    None => panic!("the thread's request is offered to a machine"),
+                }
+            };
+            fleet.handle_executor_message(
+                crate::fleet::COLOCATED_EXECUTOR_ID,
+                generation,
+                ExecutorMessage::Claim { entry_id },
+            );
+            let (request, batch) = loop {
+                match machine.recv().await {
+                    Some(ExecutorMessage::Granted {
+                        request,
+                        batch: Some(batch),
+                        ..
+                    }) => break (request, batch),
+                    Some(_) => continue,
+                    None => panic!("the claimed request is granted"),
+                }
+            };
+            let outcome = passed_batch(&request, &batch.items[0].header, generation);
+            fleet.handle_executor_message(
+                crate::fleet::COLOCATED_EXECUTOR_ID,
+                generation,
+                ExecutorMessage::Result {
+                    request_id: request.request_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    outcome,
+                },
+            );
+        });
+
+        let reply = write_as_thread(
+            &orch,
+            serde_json::json!({ "suite": "unit", "revision": "main" }),
+        )
+        .await;
+        let rows: Vec<CheckRequestRow> = local
+            .query_all(
+                format!("SELECT {ROW_COLUMNS} FROM check_requests"),
+                (),
+                CheckRequestRow::from_row,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "one suite, one request: {reply}");
+        let filed = &rows[0];
+        assert_eq!(filed.requester_ref, THREAD_HOME, "{reply}");
+        assert_eq!(filed.requester_job_id.as_deref(), Some("job-thread"));
+        assert_eq!(filed.revision_spec.as_deref(), Some("main"));
+
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                let mut settled = subscribe_settlements();
+                let row = load_request(&local, "p", &filed.id).await.unwrap().unwrap();
+                if !row.is_open() {
+                    return;
+                }
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), settled.changed())
+                        .await;
+            }
+        })
+        .await
+        .expect("the thread's request settles");
+        executor.await.unwrap();
+        let recorded = load_request(&local, "p", &filed.id).await.unwrap().unwrap();
+        assert_eq!(recorded.state, "recorded", "{:?}", recorded.evidence);
+        assert!(recorded.observation_id.is_some(), "its ledger observation");
+
+        let ledger = read_uri(&orch, "cairn://p/proj/check-results/main?suite=unit").await;
+        assert!(
+            ledger.contains("passed"),
+            "the verdict is citable at the revision it named: {ledger}"
+        );
+
+        let own = read_uri(&orch, &format!("{THREAD_HOME}/checks")).await;
+        assert!(own.contains("no turn-end checks run"), "{own}");
+        assert!(own.contains("[unit]") && own.contains("on main"), "{own}");
+        assert!(
+            own.contains("a thread has no branch of its own"),
+            "the filing action offers revision as required: {own}"
+        );
+    });
+}

@@ -1041,6 +1041,12 @@ pub(super) async fn read_node_checks(
     };
     let uri = build_node_checks_uri(project_key, number, exec_seq, node_name);
     let mut out = format!("# Checks \u{2014} {node_name}\n\n`{uri}`\n");
+    if let cairn_uri::NodeAddress::Thread { name } =
+        cairn_uri::NodeAddress::new(number, exec_seq, node_name)
+    {
+        out.push_str(&thread_checks_body(orch, project_key, name, &job.id).await);
+        return out;
+    }
     match crate::execution::checks_turn_end::render_turn_end_checks_section(orch, &job.id).await {
         Some(section) => {
             out.push('\n');
@@ -1056,6 +1062,33 @@ pub(super) async fn read_node_checks(
         super::check_requests::requested_section(orch, project_key, &job.id).await
     {
         out.push_str(&requested);
+    }
+    out
+}
+
+/// A thread session's checks: only the requests it filed. A thread has no
+/// branch, so no turn-end wave ever judges it and there are no lanes of its
+/// own to show; what it has recorded lives in the project ledger under the
+/// revision each request named.
+async fn thread_checks_body(
+    orch: &crate::orchestrator::Orchestrator,
+    project_key: &str,
+    thread: &str,
+    job_id: &str,
+) -> String {
+    let ledger = cairn_uri::build_project_check_results_uri(project_key, "<revision>");
+    let mut out = format!(
+        "\nThread '{thread}' has no branch, so no turn-end checks run for it. It files check \
+         requests that name a revision, and each records into the project ledger at `{ledger}` \
+         (for example `{}`).\n",
+        cairn_uri::build_project_check_results_uri(project_key, "main")
+    );
+    match super::check_requests::requested_section(orch, project_key, job_id).await {
+        Some(requested) => out.push_str(&requested),
+        None => out.push_str(
+            "\nNo check requests filed yet. File one with \
+             write({changes:[{target:\"cairn:~/checks\",mode:\"append\",payload:{suite:\"<suite>\",revision:\"main\"}}]}).\n",
+        ),
     }
     out
 }

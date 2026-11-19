@@ -1441,6 +1441,23 @@ pub(crate) async fn produce_cairn_resource(
                 spec.actions.clear();
             }
         }
+        // A thread session's check request has no head of its own to fall
+        // back on, so the revision its filing refuses to go without is offered
+        // as required, not optional.
+        if matches!(
+            &resource,
+            CairnResource::NodeChecks { number, exec_seq, node_id, .. }
+                if matches!(
+                    cairn_uri::NodeAddress::new(*number, *exec_seq, node_id),
+                    cairn_uri::NodeAddress::Thread { .. }
+                )
+        ) {
+            if let Some(spec) = spec.as_mut() {
+                for action in &mut spec.actions {
+                    require_thread_check_revision(action);
+                }
+            }
+        }
         let block = spec.as_ref().map(render_affordance).unwrap_or_default();
         (!block.is_empty()).then_some(Affordance {
             kind: SegmentKind::Resource,
@@ -5612,4 +5629,16 @@ mod transcript_grep_tests {
             "the error follows turn 1 under its own heading: {body}"
         );
     }
+}
+
+/// Move `revision` from optional to required on a thread session's filing
+/// action, restating it for a filer with no branch.
+fn require_thread_check_revision(action: &mut cairn_common::read::ActionSpec) {
+    let Some(index) = action.optional.iter().position(|key| key.key == "revision") else {
+        return;
+    };
+    let mut revision = action.optional.remove(index);
+    revision.note =
+        "a branch name (`main`), commit id or node URI; a thread has no branch of its own".into();
+    action.required.push(revision);
 }

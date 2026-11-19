@@ -129,7 +129,6 @@ fn branch_shaped_segments_are_refused_with_a_reason() {
     for path in [
         "diff",
         "changed",
-        "checks",
         "rebase",
         "task/probe/diff",
         "task/probe/changed",
@@ -138,20 +137,29 @@ fn branch_shaped_segments_are_refused_with_a_reason() {
         let error = delegate(path).expect_err("branch-shaped segments are refused");
         assert!(error.contains("no branch"), "{path}: {error}");
         assert!(error.contains("design-review"), "{path}: {error}");
+        assert!(
+            error.contains("cairn://p/cairn/design-review/checks"),
+            "the refusal names the door that does judge a revision from a thread: {error}"
+        );
     }
 }
 
-/// A task's `checks` is the task job's own read-only resource, not a
-/// branch-shaped one.
+/// A thread's `checks` is its job's, at both levels, not a branch-shaped
+/// resource.
 ///
 /// `diff`, `changed`, and `rebase` describe a branch's CONTENTS and cannot
-/// be answered without one; a job's turn-end verdicts are job-shaped, so a
-/// thread's task addresses them exactly as a node's task does and the
-/// read-only contract is what answers a mutation. Refusing it as
-/// branch-shaped advertised a mutation the contract does not offer
-/// (CAIRN-3874).
+/// be answered without one. A check request names its own revision, so the
+/// session files through the same `NodeChecks` a node does, at the reserved
+/// thread coordinate, and a task through `TaskChecks` (CAIRN-3874). Refusing
+/// the session's as branch-shaped left a thread no way to record a verdict
+/// anyone else could cite.
 #[test]
-fn a_thread_tasks_checks_is_the_task_jobs_read_only_resource() {
+fn a_threads_checks_is_its_jobs_at_both_levels() {
+    assert!(matches!(
+        delegate("checks").expect("a session's checks delegates"),
+        CairnResource::NodeChecks { number: 0, exec_seq: 0, ref node_id, .. }
+            if node_id == "design-review"
+    ));
     assert!(matches!(
         delegate("task/probe/checks").expect("a task's checks delegates"),
         CairnResource::TaskChecks { number: 0, exec_seq: 0, ref node_id, ref task_name, .. }
@@ -173,15 +181,14 @@ fn a_thread_addresses_every_resource_a_node_does() {
     // Branch-shaped, and deliberately refused rather than mapped: a thread
     // has no branch. This is an assertion carrying its reason, not a silent
     // exemption — `branch_shaped_segments_are_refused_with_a_reason` pins it.
-    // `checks` is refused for the SESSION, whose own turn-end verdicts are
-    // what a thread has no branch to produce, and mapped for a TASK, whose
-    // verdicts belong to the task job like every other task-level segment.
+    // `checks` is mapped at both levels: a check request names its own
+    // revision, so it is job-shaped, not branch-shaped.
     for (node_prefix, thread_prefix, level, refused) in [
         (
             "cairn://p/cairn/1/1/builder",
             "cairn://p/cairn/design-review",
             "node",
-            &["diff", "changed", "checks", "rebase"][..],
+            &["diff", "changed", "rebase"][..],
         ),
         (
             "cairn://p/cairn/1/1/builder/task/probe",

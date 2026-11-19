@@ -465,22 +465,38 @@ pub(crate) async fn file_check_request(
 /// captured exactly. A request on its own head is about the head it was filed
 /// at, so neither its first driver nor a re-drive after a restart judges a
 /// head that moved on since.
+///
+/// A thread's jobs own no branch, so a request on one of them that names no
+/// revision names nothing to judge. That is refused here, before any row
+/// exists, rather than accepted and failed by the driver.
 pub(crate) async fn accepted_revision(
     orch: &Orchestrator,
     subject_job_id: &str,
     revision: Option<&str>,
 ) -> Result<ManualCheckRevision, String> {
+    use crate::execution::cache::JobLogicalHeadError;
     match revision {
         Some(branch) => super::classify_manual_check_revision(orch, subject_job_id, branch).await,
         None => match crate::execution::cache::resolve_job_logical_head(orch, subject_job_id).await
         {
             Ok(head) => super::classify_manual_check_revision(orch, subject_job_id, &head).await,
-            // A head that cannot be read here (a thread session) is refused by
-            // the driver, in the requester's own words.
+            Err(JobLogicalHeadError::Branchless {
+                thread_owned: true, ..
+            }) => Err(THREAD_REQUEST_NEEDS_A_REVISION.to_string()),
+            // Any other unreadable head is the driver's to report, which it
+            // does against the head it then finds.
             Err(_) => Ok(ManualCheckRevision::OwnHead),
         },
     }
 }
+
+/// Why a check request from a thread that names no revision is refused.
+pub(crate) const THREAD_REQUEST_NEEDS_A_REVISION: &str = "Nothing was filed: a thread has no \
+     branch of its own, so a check request filed from one has no head to judge and must name \
+     the revision it is about. Add revision to the payload, a branch name (`main`), a commit id, \
+     or a node URI (`cairn://p/PROJECT/ISSUE/EXEC/NODE`): \
+     {suite:\"<suite>\", revision:\"main\"}. From a shell: \
+     `cairn check run <suite> --branch <revision>`.";
 
 /// What an accepted request is about, as far as acceptance can tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
