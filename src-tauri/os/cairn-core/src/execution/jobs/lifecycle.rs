@@ -10104,17 +10104,12 @@ mod tests {
     async fn a_failed_last_request_lookup_still_launches_and_warns() {
         crate::test_support::capture_log(super::CONTINUATION_LOG_TARGET);
         let (orch, db) = failed_over_node("failed-last-request", true).await;
-        // The lookup attributes the request through this column; without it the
-        // query itself fails.
-        db.exclusive(|conn| {
-            Box::pin(async move {
-                conn.execute("ALTER TABLE runs DROP COLUMN account_id", ())
-                    .await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
+        // The lookup attributes the request through its run's account; one that
+        // is not text cannot be decoded, so the lookup fails while the schema
+        // the launch's own event writes need stays whole.
+        db.execute("UPDATE runs SET account_id = X'00' WHERE id = 'r1'", ())
+            .await
+            .unwrap();
         super::continue_job_impl(
             crate::execution::jobs::WakeCause::Addressed,
             &orch,

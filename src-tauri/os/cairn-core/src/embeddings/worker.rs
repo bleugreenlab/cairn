@@ -258,10 +258,7 @@ async fn process_batch(
                                             );
                                         }
                                         Ok(event_db) => {
-                                            let session_id = position
-                                                .as_ref()
-                                                .map(|meta| meta.session_id.as_str());
-                                            let (issue_id, thread_id) =
+                                            let (session_id, issue_id, thread_id) =
                                                 match queries::skyline_scope_for_event_async(
                                                     &event_db, event_id,
                                                 )
@@ -274,7 +271,7 @@ async fn process_batch(
                                                         event_id,
                                                         e
                                                     );
-                                                        (None, None)
+                                                        (None, None, None)
                                                     }
                                                 };
                                             let _ = emitter.emit(
@@ -658,7 +655,7 @@ mod tests {
         persist_event_vibe_for_event(
             &dbs,
             event_id,
-            Some("sess-team"),
+            None,
             "#123456",
             0.25,
             0.75,
@@ -678,5 +675,11 @@ mod tests {
         };
         assert_eq!(count(team.clone()).await, 1);
         assert_eq!(count(local.clone()).await, 0);
+        // Finalized-stream jobs carry no position. Their stored session must
+        // still scope the invalidation to this skyline rather than every pane.
+        let scope = queries::skyline_scope_for_event_async(&team, event_id)
+            .await
+            .unwrap();
+        assert_eq!(scope, (Some("sess-team".to_string()), None, None));
     }
 }

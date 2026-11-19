@@ -169,6 +169,9 @@ const EXPORT_KEYED: &[(&str, &str)] = &[("project_routes", "project_key = ?1")];
 /// A manifest entry named here is dropped from the plan, so the sweep keeps it
 /// while the export does not.
 const EXPORT_EXCLUDED: &[(&str, &str)] = &[
+    ("session_skyline_cache", "derived skyline data stamped with the source database clock; rebuild from imported events and vibes"),
+    ("session_skyline_watermarks", "database-local event/vibe summaries and ABA tombstones; destination inserts maintain their own summaries"),
+    ("skyline_vibe_mutations", "database-local vibe mutation journal including deletion tombstones; destination vibe inserts maintain their own journal"),
     ("requests", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
     ("request_requesters", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
     ("request_waiting", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
@@ -1413,6 +1416,25 @@ impl EventWriter {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn skyline_clock_state_never_travels_with_a_project() {
+        let plan = export_plan().unwrap();
+        for table in [
+            "session_skyline_cache",
+            "session_skyline_watermarks",
+            "skyline_vibe_mutations",
+        ] {
+            assert!(!plan.iter().any(|entry| entry.table == table), "{table}");
+            assert!(EXPORT_EXCLUDED.iter().any(|(name, _)| *name == table));
+        }
+        for table in ["session_skyline_watermarks", "skyline_vibe_mutations"] {
+            assert!(
+                !COPY_ORDER.iter().any(|entry| entry.table == table),
+                "{table}"
+            );
+        }
+    }
 
     fn no_op_hook() -> impl FnMut() -> PageHookFuture + Send {
         || -> PageHookFuture { Box::pin(async {}) }

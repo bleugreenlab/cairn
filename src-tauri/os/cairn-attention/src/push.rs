@@ -1151,8 +1151,17 @@ pub async fn revert_delivery(db: &LocalDb, carrying_event_id: &str) -> DbResult<
                     params![event_id.as_str()],
                 )
                 .await? as usize;
-            conn.execute("DELETE FROM events WHERE id=?1", params![event_id.as_str()])
+            let previous =
+                cairn_db::storage::skyline_watermarks::snapshot_event(conn, &event_id).await?;
+            let removed = conn
+                .execute("DELETE FROM events WHERE id=?1", params![event_id.as_str()])
                 .await?;
+            if removed > 0 {
+                if let Some(previous) = previous {
+                    cairn_db::storage::skyline_watermarks::record_event_delete(conn, &previous)
+                        .await?;
+                }
+            }
             Ok(restored)
         })
     })
@@ -1212,11 +1221,35 @@ pub async fn revert_turn_deliveries_conn(
             params![turn_id],
         )
         .await? as usize;
+    let mut snapshots = Vec::new();
+    {
+        let mut rows = conn
+            .query(
+                "SELECT id FROM events WHERE turn_id = ?1 AND event_type = 'attention:briefing'",
+                params![turn_id],
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.text(0)?);
+        }
+        drop(rows);
+        for id in ids {
+            if let Some(snapshot) =
+                cairn_db::storage::skyline_watermarks::snapshot_event(conn, &id).await?
+            {
+                snapshots.push(snapshot);
+            }
+        }
+    }
     conn.execute(
         "DELETE FROM events WHERE turn_id = ?1 AND event_type = 'attention:briefing'",
         params![turn_id],
     )
     .await?;
+    for snapshot in snapshots {
+        cairn_db::storage::skyline_watermarks::record_event_delete(conn, &snapshot).await?;
+    }
     Ok(restored)
 }
 
@@ -3303,6 +3336,16 @@ mod tests {
               VALUES('prompt-q','run-1','sess2','turn-q',2,1,'user','{}',1);
             ",
         )
+        .await
+        .unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                for id in ["brief-q", "prompt-q"] {
+                    cairn_db::storage::skyline_watermarks::record_event_insert(conn, id).await?;
+                }
+                Ok(())
+            })
+        })
         .await
         .unwrap();
         let id = tell(db, "watcher").await;

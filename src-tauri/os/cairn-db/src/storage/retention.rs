@@ -224,6 +224,8 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     // Evicted with its execution but not packed: a rebuildable cache, as every
     // history pack's manifest states.
     tiered("session_skyline_cache").budget(768),
+    keep("session_skyline_watermarks", "persistent session mutation identity, including deletion tombstones"),
+    keep("skyline_vibe_mutations", "last vibe mutation per session/event, including deletion tombstones"),
     keep(
         "execution_history",
         "pointers: an execution's base/tip and its range pack's hash; the pack lives in the archive",

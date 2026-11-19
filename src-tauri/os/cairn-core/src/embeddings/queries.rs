@@ -32,11 +32,9 @@ pub struct EventVibeRecord {
     pub friction: f32,
     pub model: String,
     pub created_at: i64,
-    /// Monotonic per-write sequence over the whole `event_vibes` table, assigned
-    /// on both insert and replacement. This is the only sound "did this color
-    /// move" signal: `created_at` is epoch seconds and a batch of vibes lands
-    /// inside one of them, so it cannot separate a replacement from the write
-    /// that preceded it (CAIRN-4710).
+    /// Row revision assigned from the local embedding-write index edge.
+    /// This records surviving color writes, not removal history. Skyline cache
+    /// invalidation uses the session-local mutation revisions and tombstones.
     pub revision: i64,
 }
 
@@ -217,18 +215,24 @@ async fn upsert_event_vibe_conn(
     friction: f32,
     model: &str,
 ) -> DbResult<()> {
+    let old_session = {
+        let mut rows = conn
+            .query(
+                "SELECT session_id FROM event_vibes WHERE event_id = ?1",
+                params![event_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => row.opt_text(0)?,
+            None => None,
+        }
+    };
     let now = chrono::Utc::now().timestamp();
-    // Two things here are load-bearing rather than stylistic (CAIRN-4710).
+    // Preserve row identity with an upsert. The row revision comes from the
+    // surviving index edge; the session-local mutation metadata below separately
+    // records every skyline change, including deletion and ownership moves.
     //
-    // An UPSERT rather than INSERT OR REPLACE: `revision` must end up strictly
-    // greater than every revision in the table so a reader comparing the newest
-    // one can tell that a color moved. INSERT OR REPLACE deletes the conflicting
-    // row first, so when that row held the maximum, deriving "newest + 1" over
-    // what remains hands back the number just freed and the watermark stands
-    // still. ON CONFLICT DO UPDATE never removes the row, so the subquery sees
-    // it and the assigned revision clears it.
-    //
-    // And `ORDER BY revision DESC LIMIT 1` rather than `MAX(revision)`: the
+    // `ORDER BY revision DESC LIMIT 1` rather than `MAX(revision)`: the
     // embed worker persists a batch one row at a time, so this subquery runs
     // once per vibe. `MAX(indexed_col)` walks the index in this engine instead
     // of seeking its edge, which would make a batch of M vibes against N
@@ -259,27 +263,56 @@ async fn upsert_event_vibe_conn(
         ],
     )
     .await?;
+    let new_session = {
+        let mut rows = conn
+            .query(
+                "SELECT session_id FROM event_vibes WHERE event_id = ?1",
+                params![event_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => row.opt_text(0)?,
+            None => None,
+        }
+    };
+    if old_session == new_session {
+        if let Some(session) = new_session.as_deref() {
+            cairn_db::storage::skyline_watermarks::record_vibe_change(conn, session, event_id, 0)
+                .await?;
+        }
+    } else {
+        if let Some(session) = old_session.as_deref() {
+            cairn_db::storage::skyline_watermarks::record_vibe_change(conn, session, event_id, -1)
+                .await?;
+        }
+        if let Some(session) = new_session.as_deref() {
+            cairn_db::storage::skyline_watermarks::record_vibe_change(conn, session, event_id, 1)
+                .await?;
+        }
+    }
     Ok(())
 }
 
-/// Resolve which skyline owner an event belongs to, as `(issue_id, thread_id)`.
+/// Resolve a persisted vibe\'s skyline scope as `(session_id, issue_id, thread_id)`.
 ///
-/// Both are read in one query because a vibe emit must scope to exactly one
+/// These are read together because a vibe emit must scope to exactly one
 /// owner: an issue job carries `issue_id`, a thread's session or spawned task
 /// carries `thread_id`, and reading them separately could describe a job that
-/// never existed. Resolving neither is normal for a run recorded before its job
-/// was attached, and degrades to the broad invalidation roots.
+/// never existed. Session scope comes from the persisted vibe, not optional
+/// position metadata: finalized-stream embed jobs need not carry a position.
+/// Missing owners still degrade to the corresponding broad invalidation roots.
 pub(crate) async fn skyline_scope_for_event_async(
     db: &LocalDb,
     event_id: &str,
-) -> DbResult<(Option<String>, Option<String>)> {
+) -> DbResult<(Option<String>, Option<String>, Option<String>)> {
     let event_id = event_id.to_string();
     db.read(move |conn| {
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT r.issue_id, j.thread_id
+                    "SELECT ev.session_id, r.issue_id, j.thread_id
                      FROM events e
+                     INNER JOIN event_vibes ev ON ev.event_id = e.id
                      INNER JOIN runs r ON r.id = e.run_id
                      LEFT JOIN jobs j ON j.id = r.job_id
                      WHERE e.id = ?1
@@ -288,8 +321,8 @@ pub(crate) async fn skyline_scope_for_event_async(
                 )
                 .await?;
             match rows.next().await? {
-                Some(row) => Ok((row.opt_text(0)?, row.opt_text(1)?)),
-                None => Ok((None, None)),
+                Some(row) => Ok((row.opt_text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
+                None => Ok((None, None, None)),
             }
         })
     })

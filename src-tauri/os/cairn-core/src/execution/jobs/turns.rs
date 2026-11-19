@@ -53,6 +53,30 @@ mod codex_goal_admission_tests {
         .unwrap()
     }
 
+    /// Session `s`'s maintained (event_count, event_revision) beside the count
+    /// of its stored events.
+    async fn watermark_and_stored(db: &LocalDb) -> ((i64, i64), i64) {
+        let watermark = db
+            .query_opt(
+                "SELECT event_count, event_revision FROM session_skyline_watermarks WHERE session_id='s'",
+                (),
+                |row| Ok((row.i64(0)?, row.i64(1)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap_or((0, 0));
+        let stored = db
+            .query_opt(
+                "SELECT COUNT(*) FROM events WHERE session_id='s'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        (watermark, stored)
+    }
+
     #[test]
     fn a_rejection_names_every_identity_field_that_disagrees_and_only_those() {
         let launch = ["s", "j", "r"];
@@ -233,6 +257,11 @@ mod codex_goal_admission_tests {
         };
         assert_ne!(successor, "t0");
         assert_eq!(event_count(&db, "system:codex_goal_turn_started").await, 1);
+        let (admitted_watermark, stored) = watermark_and_stored(&db).await;
+        assert_eq!(
+            admitted_watermark.0, stored,
+            "the marker is counted once, by the insert that stored it"
+        );
         assert_eq!(
             admit_codex_goal_turn(
                 &orch,
@@ -246,6 +275,11 @@ mod codex_goal_admission_tests {
             .unwrap(),
             CodexGoalTurnAdmission::Admitted(successor),
             "a repeated notification for the same provider turn mints no second successor"
+        );
+        assert_eq!(
+            watermark_and_stored(&db).await,
+            (admitted_watermark, stored),
+            "a repeated notification stores and counts nothing"
         );
     }
 
@@ -1668,6 +1702,27 @@ pub(crate) fn admit_codex_goal_turn(
                         new_turn_id
                     };
                     let now = chrono::Utc::now().timestamp() as i32;
+                    let data = {
+                        use cairn_session::agent_process::stream::TranscriptJson;
+                        crate::agent_process::stream::TranscriptEvent {
+                            event_type: "system:codex_goal_turn_started".to_string(),
+                            session_id: Some(session_id.clone()),
+                            parent_tool_use_id: None,
+                            content: None,
+                            thinking: None,
+                            tool_name: None,
+                            tool_input: None,
+                            tool_uses: None,
+                            tool_use_id: None,
+                            tool_result: None,
+                            is_error: false,
+                            thinking_ms: None,
+                            queued_message_id: None,
+                            raw: Some(serde_json::json!({"providerTurnId": provider_turn_id})),
+                        }
+                        .observed()
+                        .to_event_json()
+                    };
                     crate::transcripts::stream_store::insert_event_conn(
                         conn,
                         &crate::transcripts::stream_store::EventInsert {
@@ -1677,8 +1732,7 @@ pub(crate) fn admit_codex_goal_turn(
                             timestamp: now,
                             selected_model: None,
                             event_type: "system:codex_goal_turn_started".to_string(),
-                            data: serde_json::json!({"providerTurnId": provider_turn_id})
-                                .to_string(),
+                            data,
                             parent_tool_use_id: None,
                             created_at: now,
                             input_tokens: None,

@@ -2206,7 +2206,7 @@ mod tests {
                 format!("t{n}"),
             ),
             (
-                format!("SELECT json_extract(data,'$.providerTurnId') FROM events WHERE run_id='r{n}' AND event_type='system:codex_goal_turn_started'"),
+                format!("SELECT json_extract(data,'$.raw.providerTurnId') FROM events WHERE run_id='r{n}' AND event_type='system:codex_goal_turn_started'"),
                 format!("provider-r{n}"),
             ),
             (format!("SELECT state FROM turns WHERE id='t{n}'"), "running".to_string()),

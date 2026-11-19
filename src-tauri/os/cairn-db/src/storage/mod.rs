@@ -36,6 +36,7 @@ pub mod render;
 pub mod requests;
 pub mod route_feedback;
 pub mod served_api;
+pub mod skyline_watermarks;
 pub mod usage_readings;
 
 /// Normalized team identifier. Defined here (rather than reaching up into

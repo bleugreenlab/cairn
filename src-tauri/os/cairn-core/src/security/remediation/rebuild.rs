@@ -101,8 +101,7 @@ pub async fn rebuild_derived(db: &LocalDb, records: &[AffectedRecord]) -> Rebuil
     // will read through the gate is the withholding notice.
     let mut embeddings_cleared = 0;
     for event_id in &event_ids {
-        embeddings_cleared +=
-            drop_rows(db, "DELETE FROM event_vibes WHERE event_id = ?1", event_id).await;
+        embeddings_cleared += drop_vibe(db, event_id).await;
         embeddings_cleared += drop_rows(
             db,
             "DELETE FROM turn_embeddings WHERE turn_id IN \
@@ -137,6 +136,27 @@ async fn drop_rows(db: &LocalDb, sql: &str, key: &str) -> usize {
         Ok(count) => count as usize,
         Err(error) => {
             log::warn!("disclosure response could not clear a derived row for {key}: {error}");
+            0
+        }
+    }
+}
+
+/// Drop one event's vibe and record the removal against the session that owned
+/// it, in the same transaction, so the skyline's vibe count stays exact. Never
+/// fails, for the same reason as [`drop_rows`].
+async fn drop_vibe(db: &LocalDb, event_id: &str) -> usize {
+    let result = db
+        .write(|conn| {
+            let event_id = event_id.to_owned();
+            Box::pin(async move {
+                cairn_db::storage::skyline_watermarks::delete_vibe(conn, &event_id).await
+            })
+        })
+        .await;
+    match result {
+        Ok(count) => count as usize,
+        Err(error) => {
+            log::warn!("disclosure response could not clear a derived row for {event_id}: {error}");
             0
         }
     }

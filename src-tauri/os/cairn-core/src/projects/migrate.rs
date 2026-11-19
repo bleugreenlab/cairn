@@ -1,4 +1,8 @@
 use cairn_common::ids::rekey_to_team;
+use cairn_db::storage::skyline_watermarks::{
+    record_event_insert, record_event_rewrite, record_vibe_change, snapshot_event,
+    EventMutationSnapshot,
+};
 use cairn_db::turso::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -330,6 +334,30 @@ struct DeferredReferenceUpdate {
     value: String,
 }
 
+/// The jobs a project owns: its own, and any job reached through one of its
+/// issues or executions, all of which the project's deletion cascades to.
+macro_rules! project_jobs_where {
+    () => {
+        "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"
+    };
+}
+
+/// The runs a project owns: every run a cascade from the project, its issues,
+/// or its jobs would remove. The run's children (turns, events, vibes, read
+/// tokens, prompts) are selected through this one set, so no run leaves by a
+/// cascade that drops children the manifest never copied or counted.
+macro_rules! project_runs {
+    () => {
+        concat!(
+            "SELECT id FROM runs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE ",
+            project_jobs_where!(),
+            ")"
+        )
+    };
+}
+
+const PROJECT_EVENTS_WHERE: &str = concat!("run_id IN (", project_runs!(), ")");
+
 // One ownership manifest serves move-to-team, project deletion, and project
 // export (`super::export`, which reads each entry's sweep predicate as the
 // answer to "which of this table's rows does the project own"). Entries are
@@ -373,7 +401,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("recipe_option_sets", "project_id = ?1"),
     spec("recipe_resolutions", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("execution_agent_edits", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
-    spec("jobs", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
+    spec("jobs", project_jobs_where!()),
     owned("feed_cursors", &[owner(OwnerSet::Threads, "(home_kind = 'thread' AND home_id IN {ids})"), owner(OwnerSet::Jobs, "(home_kind = 'job' AND home_id IN {ids})")]),
     spec("turn_end_check_attempts", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("artifact_content", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
@@ -387,14 +415,16 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("repl_exchanges", "project_id = ?1 OR repl_id IN (SELECT id FROM job_repls WHERE project_id = ?1 OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("job_terminals", "project_id = ?1 OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
     spec("memories", "project_id = ?1 OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
-    spec("runs", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
+    spec("runs", concat!("id IN (", project_runs!(), ")")),
     owned("codex_watchdog_leases", &[owner(OwnerSet::Runs, "run_id IN {ids}"), owner(OwnerSet::Runs, "successor_run_id IN {ids}")]),
     owned("codex_watchdog_lifecycle", &[owner(OwnerSet::Runs, "run_id IN {ids}"), owner(OwnerSet::Runs, "successor_run_id IN {ids}")]),
-    spec("turns", "run_id IN (SELECT id FROM runs WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
+    spec("turns", concat!("run_id IN (", project_runs!(), ") OR job_id IN (SELECT id FROM jobs WHERE ", project_jobs_where!(), ")")),
     spec("provider_limit_holds", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))) OR run_id IN (SELECT id FROM runs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
-    spec("events", "run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
-    spec("prompts", "run_id IN (SELECT id FROM runs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)))) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)))"),
-    spec("permission_requests", "run_id IN (SELECT id FROM runs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)))) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)))"),
+    // Swept through the counted seams in `sweep_shared_half`, which keep the
+    // skyline watermarks exact in the transaction that removes the rows.
+    spec("events", PROJECT_EVENTS_WHERE),
+    spec("prompts", concat!("run_id IN (", project_runs!(), ") OR job_id IN (SELECT id FROM jobs WHERE ", project_jobs_where!(), ")")),
+    spec("permission_requests", concat!("run_id IN (", project_runs!(), ") OR job_id IN (SELECT id FROM jobs WHERE ", project_jobs_where!(), ")")),
     // Messages to the operator before their delivery rows, which this sweep
     // reaches in reverse: a row of kind `operator` belongs to the project its
     // message does, whichever job sent it.
@@ -420,7 +450,11 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("run_batch_adopted_outcomes", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     delete_only("run_batch_detached", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     delete_only("agent_waits", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR run_id IN (SELECT id FROM runs WHERE project_id = ?1) OR session_id IN (SELECT id FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
-    spec("session_skyline_cache", "session_id IN (SELECT id FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
+    // Cache revisions belong to the source database clock. Destination event
+    // and vibe inserts build fresh summaries; never copy the cache or the
+    // FK-free watermark/journal tables. Source tombstones must survive sweeps
+    // so a later reuse of a session id cannot match an earlier watermark.
+    delete_only("session_skyline_cache", "session_id IN (SELECT id FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR chat_id IN (SELECT id FROM runs WHERE project_id = ?1))"),
     spec("resource_surfacings", "session_id IN (SELECT id FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("execution_trigger_sources", "source_job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR triggered_execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("merge_requests", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
@@ -436,8 +470,8 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("attention_pushes", "recipient IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("delivery_receipts", "project_id = ?1 OR (recipient_kind = 'thread' AND recipient_id IN (SELECT id FROM threads WHERE project_id = ?1)) OR (recipient_kind = 'job' AND recipient_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("attention_read_cursors", "recipient IN (SELECT id FROM jobs WHERE project_id = ?1) OR source IN (SELECT id FROM jobs WHERE project_id = ?1)"),
-    spec("event_read_tokens", "event_id IN (SELECT id FROM events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),
-    spec("event_vibes", "event_id IN (SELECT id FROM events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),
+    spec("event_read_tokens", concat!("event_id IN (SELECT id FROM events WHERE run_id IN (", project_runs!(), "))")),
+    spec("event_vibes", concat!("event_id IN (SELECT id FROM events WHERE run_id IN (", project_runs!(), "))")),
     // A direct's recipients come before the message: deletion walks this list
     // in reverse, and the `messages` predicate finds a project's directs
     // through their recipient rows, so those rows must outlive the sweep of
@@ -871,9 +905,10 @@ async fn copy_archived_objects(
         .collect();
     let segments: BTreeSet<String> = source
         .query_all(
-            "SELECT data FROM events
-             WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1)
-               AND storage_mode = 'gitcoord' AND content_commit IS NULL",
+            format!(
+                "SELECT data FROM events WHERE ({PROJECT_EVENTS_WHERE})
+                   AND storage_mode = 'gitcoord' AND content_commit IS NULL"
+            ),
             (project_id.to_string(),),
             |row| row.text(0),
         )
@@ -1052,10 +1087,16 @@ async fn insert_rows(
         .map(|idx| format!("?{idx}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!(
-        "INSERT OR REPLACE INTO {table} ({}) VALUES ({placeholders})",
-        columns.join(", ")
-    );
+    let counted_key = counted_copy_key(table);
+    let primary_key = primary_key_columns(db, table).await?;
+    if let Some(key) = counted_key {
+        if primary_key != [key] {
+            return Err(MoveProjectError::Internal(format!(
+                "{table} primary key is {primary_key:?}, not the counted key {key}"
+            )));
+        }
+    }
+    let sql = copy_insert_sql(table, columns, &primary_key, &placeholders);
     let columns = columns.to_vec();
     let team_id = team_id.to_string();
     let id_columns = id_columns.clone();
@@ -1137,15 +1178,185 @@ async fn insert_rows(
                         }
                     }
                 }
+                let counted = match counted_key {
+                    Some(key) => {
+                        let key_value = columns
+                            .iter()
+                            .position(|column| column == key)
+                            .and_then(|idx| match &values[idx] {
+                                Value::Text(value) => Some(value.clone()),
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                DbError::Internal(format!("{table}.{key} is not copied text"))
+                            })?;
+                        if table == "event_vibes" {
+                            // The source's table-wide revision is another
+                            // database's clock; take the next one here.
+                            if let Some(idx) = columns.iter().position(|c| c == "revision") {
+                                values[idx] = Value::Integer(next_vibe_revision(conn).await?);
+                            }
+                        }
+                        let prior = copied_prior(conn, table, &key_value).await?;
+                        Some((key_value, prior))
+                    }
+                    None => None,
+                };
                 conn.execute(&sql, values.clone())
                     .await
                     .map_err(|error| DbError::Internal(format!("copying {table}: {error}")))?;
+                if let Some((key_value, prior)) = counted {
+                    record_copied_row(conn, &key_value, prior).await?;
+                }
             }
             Ok(deferred_updates)
         })
     })
     .await
     .map_err(MoveProjectError::Db)
+}
+
+/// The copy statement for one table.
+///
+/// A retried move finds rows an earlier attempt already copied, so the copy
+/// upserts on the primary key and keeps each row's identity. It never uses
+/// `INSERT OR REPLACE`: that deletes the conflicting row, and deleting a
+/// parent (a project, issue, job or run) cascades through its already copied
+/// events without the removal reaching the skyline counters, which the
+/// recopy then counts a second time. A conflict on any other unique index
+/// fails the copy instead of deleting an unrelated row. A table without a
+/// declared primary key takes a plain insert.
+fn copy_insert_sql(
+    table: &str,
+    columns: &[String],
+    primary_key: &[String],
+    placeholders: &str,
+) -> String {
+    let insert = format!(
+        "INSERT INTO {table} ({}) VALUES ({placeholders})",
+        columns.join(", ")
+    );
+    if primary_key.is_empty() {
+        return insert;
+    }
+    let updates = columns
+        .iter()
+        .filter(|column| !primary_key.contains(column))
+        .map(|column| format!("{column} = excluded.{column}"))
+        .collect::<Vec<_>>();
+    let conflict = primary_key.join(", ");
+    if updates.is_empty() {
+        format!("{insert} ON CONFLICT({conflict}) DO NOTHING")
+    } else {
+        format!(
+            "{insert} ON CONFLICT({conflict}) DO UPDATE SET {}",
+            updates.join(", ")
+        )
+    }
+}
+
+/// The declared primary key of `table` in `db`, in key order.
+async fn primary_key_columns(db: &LocalDb, table: &str) -> Result<Vec<String>, DbError> {
+    let mut keyed = db
+        .query_all(format!("PRAGMA table_info({table})"), (), |row| {
+            Ok((row.i64(5)?, row.text(1)?))
+        })
+        .await?
+        .into_iter()
+        .filter(|(position, _)| *position > 0)
+        .collect::<Vec<_>>();
+    keyed.sort_unstable();
+    Ok(keyed.into_iter().map(|(_, column)| column).collect())
+}
+
+/// Copied tables whose destination rows feed the skyline watermarks, with the
+/// primary key each actual write is recorded under.
+fn counted_copy_key(table: &str) -> Option<&'static str> {
+    match table {
+        "events" => Some("id"),
+        "event_vibes" => Some("event_id"),
+        _ => None,
+    }
+}
+
+/// The destination row a counted copy is about to write over, if any.
+enum CopiedPrior {
+    Event(Option<EventMutationSnapshot>),
+    /// `None` when no vibe row exists; the inner value is its owning session.
+    Vibe(Option<Option<String>>),
+}
+
+async fn copied_prior(
+    conn: &cairn_db::storage::TrackedConnection,
+    table: &str,
+    key: &str,
+) -> Result<CopiedPrior, DbError> {
+    Ok(match table {
+        "events" => CopiedPrior::Event(snapshot_event(conn, key).await?),
+        _ => CopiedPrior::Vibe(vibe_owner(conn, key).await?),
+    })
+}
+
+async fn vibe_owner(
+    conn: &cairn_db::storage::TrackedConnection,
+    event_id: &str,
+) -> Result<Option<Option<String>>, DbError> {
+    let mut rows = conn
+        .query(
+            "SELECT session_id FROM event_vibes WHERE event_id = ?1",
+            [event_id],
+        )
+        .await?;
+    let owner = match rows.next().await? {
+        Some(row) => Some(row.opt_text(0)?),
+        None => None,
+    };
+    Ok(owner)
+}
+
+async fn next_vibe_revision(conn: &cairn_db::storage::TrackedConnection) -> Result<i64, DbError> {
+    let mut rows = conn
+        .query(
+            "SELECT COALESCE((SELECT revision FROM event_vibes ORDER BY revision DESC LIMIT 1), 0) + 1",
+            (),
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => row.i64(0),
+        None => Ok(1),
+    }
+}
+
+/// Record a counted copy after its row was actually written, against the
+/// session ownership the destination row now holds.
+async fn record_copied_row(
+    conn: &cairn_db::storage::TrackedConnection,
+    key: &str,
+    prior: CopiedPrior,
+) -> Result<(), DbError> {
+    match prior {
+        CopiedPrior::Event(None) => record_event_insert(conn, key).await,
+        CopiedPrior::Event(Some(previous)) => {
+            record_event_rewrite(conn, key, previous.session_id.as_deref()).await
+        }
+        CopiedPrior::Vibe(prior) => {
+            let owner = vibe_owner(conn, key).await?.flatten();
+            match (prior, owner) {
+                (Some(Some(old)), Some(new)) if old == new => {
+                    record_vibe_change(conn, &new, key, 0).await
+                }
+                (prior, owner) => {
+                    if let Some(Some(old)) = prior {
+                        record_vibe_change(conn, &old, key, -1).await?;
+                    }
+                    if let Some(new) = owner {
+                        record_vibe_change(conn, &new, key, 1).await?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 fn deferred_reference_columns(table: &'static str) -> &'static [&'static str] {
@@ -1450,14 +1661,22 @@ async fn sweep_shared_half(
         if spec.lineage()? != TableLineage::Shared {
             continue;
         }
-        let sql = format!(
-            "DELETE FROM {} WHERE {}",
-            spec.table,
-            spec.local_where_sql()
-        );
-        conn.execute(&sql, (project_id,))
-            .await
-            .map_err(|error| DbError::Internal(format!("sweeping {}: {error}", spec.table)))?;
+        let where_sql = spec.local_where_sql();
+        let bound = || vec![Value::Text(project_id.to_string())];
+        let swept = match spec.table {
+            "events" => crate::jobs::cleanup::delete_counted_events(conn, &where_sql, bound())
+                .await
+                .map(drop),
+            "event_vibes" => crate::jobs::cleanup::delete_counted_vibes(conn, &where_sql, bound())
+                .await
+                .map(drop),
+            table => conn
+                .execute(&format!("DELETE FROM {table} WHERE {where_sql}"), bound())
+                .await
+                .map(drop)
+                .map_err(DbError::from),
+        };
+        swept.map_err(|error| DbError::Internal(format!("sweeping {}: {error}", spec.table)))?;
     }
     conn.execute("DELETE FROM projects WHERE id = ?1", (project_id,))
         .await
@@ -1789,6 +2008,32 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn copy_upserts_on_the_primary_key_and_never_replaces() {
+        let columns = ["a", "b", "c"].map(String::from);
+        assert_eq!(
+            copy_insert_sql("t", &columns, &["a".into(), "b".into()], "?1, ?2, ?3"),
+            "INSERT INTO t (a, b, c) VALUES (?1, ?2, ?3) ON CONFLICT(a, b) DO UPDATE SET c = excluded.c"
+        );
+        assert_eq!(
+            copy_insert_sql("t", &columns[..1], &["a".into()], "?1"),
+            "INSERT INTO t (a) VALUES (?1) ON CONFLICT(a) DO NOTHING"
+        );
+        assert_eq!(
+            copy_insert_sql("t", &columns[..1], &[], "?1"),
+            "INSERT INTO t (a) VALUES (?1)"
+        );
+    }
+
+    #[test]
+    fn skyline_cache_is_swept_but_never_copied() {
+        let cache = COPY_ORDER
+            .iter()
+            .find(|entry| entry.table == "session_skyline_cache")
+            .unwrap();
+        assert!(cache.copy_where_sql.is_none());
+    }
+
+    #[test]
     fn channel_key_manifest_lists_uri_addressed_tables_explicitly() {
         // The schema cannot distinguish a project URI in `target_uri` from any
         // other string, so this part of the manifest is necessarily maintained
@@ -1840,11 +2085,87 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(binding_ref.strip_suffix(":0"), Some("prompt-delete"));
 
+        // `run-issue-only` has no project_id: its events once left only by the
+        // runs cascade, which no counter sees.
+        const SESSION: &str = "8b0f6c1e-5d2a-4c3b-9f7e-1a2b3c4d5e6f";
+        db.execute_batch(&format!(
+            r#"
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+              VALUES ('event-project-run', 'run-delete', '{SESSION}', 1, 1, 'text', '{{}}', 1),
+                     ('event-issue-run', 'run-issue-only', '{SESSION}', 2, 2, 'text', '{{}}', 2);
+            INSERT INTO event_vibes(event_id, session_id, css_color, phase, friction, model, created_at, revision)
+              VALUES ('event-issue-run', '{SESSION}', '#fff', 0.5, 0.5, 'm', 1, 7);
+            "#
+        ))
+        .await
+        .unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                record_event_insert(conn, "event-project-run").await?;
+                record_event_insert(conn, "event-issue-run").await?;
+                record_vibe_change(conn, SESSION, "event-issue-run", 1).await
+            })
+        })
+        .await
+        .unwrap();
+        let watermark = |db: Arc<LocalDb>| async move {
+            db.query_all(
+                "SELECT event_count, vibe_count FROM session_skyline_watermarks WHERE session_id = ?1",
+                (SESSION.to_string(),),
+                |row| Ok((row.i64(0)?, row.i64(1)?)),
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(watermark(db.clone()).await, [(2, 1)]);
+
+        // Copying onto rows that already exist (a retried move) rewrites them
+        // in place. Recopying the parent run must not cascade its events away
+        // uncounted, and the vibe takes this database's next revision rather
+        // than the source's.
+        let columns = table_columns(&db).await.unwrap();
+        for (table, where_sql, bound) in [
+            ("runs", "?1 IS NOT NULL", "any"),
+            ("events", "session_id = ?1", SESSION),
+            ("event_vibes", "session_id = ?1", SESSION),
+        ] {
+            let rows = load_rows(&db, table, where_sql, bound, &columns[table])
+                .await
+                .unwrap();
+            insert_rows(&db, table, &columns[table], rows, &HashSet::new(), "team")
+                .await
+                .unwrap();
+        }
+        assert_eq!(count_rows(&db, "events").await, 2);
+        assert_eq!(watermark(db.clone()).await, [(2, 1)]);
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT revision FROM event_vibes WHERE event_id = 'event-issue-run'",
+                ()
+            )
+            .await
+            .unwrap(),
+            Some(8)
+        );
+
         let search = Arc::new(SearchIndex::open_or_create(tempdir().unwrap().keep()).unwrap());
         let dbs = DbState::new(db.clone(), search);
         crate::projects::crud::delete_routed(&dbs, "project-delete")
             .await
             .unwrap();
+
+        assert_eq!(count_rows(&db, "events").await, 0);
+        // The summary row and the vibe's journal entry survive as tombstones.
+        assert_eq!(watermark(db.clone()).await, [(0, 0)]);
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM skyline_vibe_mutations WHERE session_id = ?1 AND event_id = 'event-issue-run'",
+                (SESSION.to_string(),)
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
 
         for table in [
             "discord_surface",

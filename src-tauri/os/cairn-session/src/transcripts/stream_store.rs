@@ -259,6 +259,7 @@ async fn insert_event_at_conn(
         )
         .await?;
     if count > 0 {
+        cairn_db::storage::skyline_watermarks::record_event_insert(conn, &event.id).await?;
         // Per-event analytics rollup maintenance (Tier A token/cost + Tier B
         // tool invocations) rides this same insert transaction, gated on a NEW
         // row landing so a duplicate-id re-insert never double-counts. This is

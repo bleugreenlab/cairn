@@ -2566,6 +2566,8 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("runs", TableScope::ProjectScoped),
     ("search_outbox", TableScope::ProjectScoped),
     ("session_skyline_cache", TableScope::ProjectScoped),
+    ("session_skyline_watermarks", TableScope::ProjectScoped),
+    ("skyline_vibe_mutations", TableScope::ProjectScoped),
     ("sessions", TableScope::ProjectScoped),
     ("skill_configs", TableScope::ProjectScoped),
     ("camps", TableScope::ProjectScoped),
@@ -3687,17 +3689,20 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     },
     RekeyTableManifest {
         table: "session_skyline_cache",
-        id_columns: &["session_id"],
+        id_columns: &[],
     },
     RekeyTableManifest {
+        table: "session_skyline_watermarks",
+        id_columns: &[],
+    },
+    RekeyTableManifest {
+        table: "skyline_vibe_mutations",
+        id_columns: &["event_id"],
+    },
+    // Provider session identities are bare UUIDs, not routable entity IDs.
+    RekeyTableManifest {
         table: "sessions",
-        id_columns: &[
-            "id",
-            "job_id",
-            "chat_id",
-            "replaced_by_id",
-            "parent_session_id",
-        ],
+        id_columns: &["job_id", "chat_id"],
     },
     RekeyTableManifest {
         table: "skill_configs",
@@ -3809,6 +3814,48 @@ mod tests {
         let mut expected = scoped.clone();
         expected.insert("execution_history");
         assert_eq!(manifest, expected);
+    }
+
+    #[test]
+    fn session_ids_remain_bare_through_project_rekey() {
+        let session = "123e4567-e89b-42d3-a456-426614174000";
+        let team = "Team123";
+        let moved = |table: &str, column: &str| {
+            let entry = PROJECT_REKEY_MANIFEST
+                .iter()
+                .find(|entry| entry.table == table)
+                .unwrap();
+            if entry.id_columns.contains(&column) {
+                cairn_common::ids::rekey_to_team(session, team).unwrap()
+            } else {
+                session.to_owned()
+            }
+        };
+        for (table, column) in [
+            ("sessions", "id"),
+            ("sessions", "replaced_by_id"),
+            ("sessions", "parent_session_id"),
+            ("events", "session_id"),
+            ("event_vibes", "session_id"),
+            ("runs", "session_id"),
+            ("turns", "session_id"),
+            ("session_skyline_cache", "session_id"),
+            ("session_skyline_watermarks", "session_id"),
+            ("skyline_vibe_mutations", "session_id"),
+        ] {
+            assert_eq!(moved(table, column), session, "{table}.{column}");
+        }
+        for (table, column) in [
+            ("sessions", "job_id"),
+            ("sessions", "chat_id"),
+            ("skyline_vibe_mutations", "event_id"),
+        ] {
+            assert_eq!(
+                moved(table, column),
+                format!("{team}~{session}"),
+                "{table}.{column}"
+            );
+        }
     }
 
     /// The name half of every `version_name` entry `MigrationRunner::run` reports.

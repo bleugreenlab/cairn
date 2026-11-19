@@ -136,22 +136,46 @@ async fn write_event_updates(db: &LocalDb, updates: Vec<EventUpdate>) -> Result<
                         Some(blob) => cairn_db::turso::Value::Blob(blob.clone()),
                         None => cairn_db::turso::Value::Null,
                     };
-                    conn.execute(
-                        "UPDATE events SET storage_mode = ?1, content_commit = ?2,
+                    let rewritten = conn
+                        .execute(
+                            "UPDATE events SET storage_mode = ?1, content_commit = ?2,
                              content_render_sha = ?3, data = ?4, data_blob = ?5, codec = ?6,
                              content_change_id = NULL
                          WHERE id = ?7 AND (storage_mode IS NULL OR storage_mode = 'full')",
-                        (
-                            cols.storage_mode.as_deref(),
-                            cols.content_commit.as_deref(),
-                            cols.content_render_sha.as_deref(),
-                            cols.data.as_str(),
-                            blob_value,
-                            cols.codec.as_deref(),
-                            id.as_str(),
-                        ),
-                    )
-                    .await?;
+                            (
+                                cols.storage_mode.as_deref(),
+                                cols.content_commit.as_deref(),
+                                cols.content_render_sha.as_deref(),
+                                cols.data.as_str(),
+                                blob_value,
+                                cols.codec.as_deref(),
+                                id.as_str(),
+                            ),
+                        )
+                        .await?;
+                    // The decoded content is meant to be unchanged, but skyline
+                    // bars read `data`, so an actual rewrite conservatively resets
+                    // the session's cached skyline. Session and ordering are
+                    // untouched, so the count and ordering edge stay as they are.
+                    if rewritten > 0 {
+                        let mut rows = conn
+                            .query(
+                                "SELECT session_id FROM events WHERE id = ?1",
+                                (id.as_str(),),
+                            )
+                            .await?;
+                        let session = match rows.next().await? {
+                            Some(row) => row.opt_text(0)?,
+                            None => None,
+                        };
+                        drop(rows);
+                        if let Some(session) = session.as_deref() {
+                            cairn_db::storage::skyline_watermarks::record_event_change(
+                                conn, session, 0, true,
+                            )
+                            .await?;
+                        }
+                    }
                 }
                 Ok(())
             })

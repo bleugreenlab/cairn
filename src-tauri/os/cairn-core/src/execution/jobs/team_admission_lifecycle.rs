@@ -790,6 +790,13 @@ mod tests {
         )
         .await
         .unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                cairn_db::storage::skyline_watermarks::record_event_insert(conn, "brief").await
+            })
+        })
+        .await
+        .unwrap();
         let (push_id, _) = attention::push(
             &db,
             "job-1",
