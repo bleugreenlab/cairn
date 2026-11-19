@@ -101,16 +101,6 @@ kind = "deliberate"
 issue = "cairn://p/cairn/5866"
 reason = "REFERENCE_DUE_SQL is defined only by a test, the reference the keyed scheduler query is compared against."
 
-# SELECT COUNT(*) FROM delegated_packets WHERE parent_job_id = ?1 AND status NOT I
-[[allow]]
-file = "os/cairn-core/src/messages/delivery.rs"
-rule = "wide-scan"
-table = "delegated_packets"
-statement = "6aa0bc16f2d369a2"
-kind = "debt"
-issue = "cairn://p/cairn/6127"
-reason = "The dependency-wait hold counts packets by a parent_job_id that leads no index."
-
 # SELECT id, data FROM artifacts
 [[allow]]
 file = "os/cairn-core/src/security/remediation/inventory.rs"

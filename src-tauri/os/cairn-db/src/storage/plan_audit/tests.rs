@@ -66,6 +66,34 @@ async fn inline_pack_remaining_probe_does_not_walk_wide_history() {
     assert!(subjects(&before).contains(&"wide-scan on execution_history".to_string()));
 }
 
+#[tokio::test]
+async fn dependency_wait_packet_count_seeks_unfinished_parent_in_both_lineages() {
+    for (_temp, db) in [private_db().await, team_db().await] {
+        let sql = "SELECT COUNT(*) FROM delegated_packets WHERE parent_job_id = ?1
+                   AND status NOT IN ('completed', 'failed', 'cancelled')";
+        let (listing, classified) = audit(&db, sql, WIDE_ROW_TABLES).await;
+        assert!(classified.findings.is_empty(), "{}", listing.render());
+        assert!(
+            listing.instrs().any(|instr| instr.opcode == "SeekGE"),
+            "{}",
+            listing.render()
+        );
+        assert!(
+            !listing.instrs().any(|instr| {
+                instr.opcode == "Column" && instr.comment.contains("delegated_packets.status")
+            }),
+            "{}",
+            listing.render()
+        );
+
+        db.execute_batch("DROP INDEX idx_delegated_packets_pending_parent")
+            .await
+            .unwrap();
+        let (_, before) = audit(&db, sql, WIDE_ROW_TABLES).await;
+        assert!(subjects(&before).contains(&"wide-scan on delegated_packets".to_string()));
+    }
+}
+
 fn subjects(classified: &Classified) -> Vec<String> {
     classified.findings.iter().map(Finding::subject).collect()
 }
