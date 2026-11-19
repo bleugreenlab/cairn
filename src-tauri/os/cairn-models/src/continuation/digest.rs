@@ -206,9 +206,16 @@ pub fn render_digest(
 ) -> String {
     let mut out = String::new();
     let mut previous_local_date = first_local_date(transcript, clock);
+    let numbered = host_numbers_turns(transcript);
     for index in turn_window(transcript.turns.len(), opts) {
         let turn = &transcript.turns[index];
-        out.push_str(&turn_heading(turn, index, clock, &mut previous_local_date));
+        out.push_str(&turn_heading(
+            turn,
+            index,
+            numbered,
+            clock,
+            &mut previous_local_date,
+        ));
         render_turn(&mut out, turn, tools, opts);
     }
     out
@@ -242,18 +249,31 @@ fn first_local_date(transcript: &Transcript, clock: &HostClock) -> Option<chrono
         .and_then(|at| clock.local_date(at))
 }
 
+/// Whether the host numbers its turns. When it does, an unnumbered block is
+/// history outside any turn, and its position is no turn's number.
+fn host_numbers_turns(transcript: &Transcript) -> bool {
+    transcript.turns.iter().any(|turn| turn.number.is_some())
+}
+
 /// One turn's `\n## Turn …` heading, advancing `previous_local_date` to the day
 /// it stamps. Only headings that actually render may advance it, so a projection
 /// that skips turns still dates the next one it shows correctly.
+///
+/// An unnumbered turn is labelled by its position, unless the host numbers
+/// turns (`numbered`): then the position would collide with a real turn's
+/// number, so the block reads `## Outside a turn`.
 fn turn_heading(
     turn: &Turn,
     index: usize,
+    numbered: bool,
     clock: &HostClock,
     previous_local_date: &mut Option<chrono::NaiveDate>,
 ) -> String {
-    let label = turn
-        .number
-        .map_or_else(|| (index + 1).to_string(), |number| number.to_string());
+    let label = match turn.number {
+        Some(number) => format!("Turn {number}"),
+        None if numbered => "Outside a turn".to_string(),
+        None => format!("Turn {}", index + 1),
+    };
     match turn.started_at {
         Some(at) => {
             let time = clock
@@ -263,9 +283,9 @@ fn turn_heading(
                     stamp
                 })
                 .unwrap_or_default();
-            format!("\n## Turn {} · {}\n", label, time)
+            format!("\n## {} · {}\n", label, time)
         }
-        None => format!("\n## Turn {}\n", label),
+        None => format!("\n## {}\n", label),
     }
 }
 
@@ -315,6 +335,7 @@ pub fn render_digest_matches<E>(
 ) -> Result<DigestMatches, E> {
     let mut result = DigestMatches::default();
     let mut previous_local_date = first_local_date(transcript, clock);
+    let numbered = host_numbers_turns(transcript);
     for index in turn_window(transcript.turns.len(), opts) {
         let turn = &transcript.turns[index];
         let mut section = String::new();
@@ -356,9 +377,13 @@ pub fn render_digest_matches<E>(
             section.push_str(&blocks);
         }
         if !section.is_empty() {
-            result
-                .body
-                .push_str(&turn_heading(turn, index, clock, &mut previous_local_date));
+            result.body.push_str(&turn_heading(
+                turn,
+                index,
+                numbered,
+                clock,
+                &mut previous_local_date,
+            ));
             result.body.push_str(&section);
         }
     }

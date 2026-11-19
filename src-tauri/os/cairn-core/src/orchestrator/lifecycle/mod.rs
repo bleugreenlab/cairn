@@ -44,6 +44,7 @@ pub(crate) use backend_turn::{
 pub use crate::workflow_host::rearm_failed_resolutions_on_startup;
 pub(crate) use child_stall::{render_stall_push_body, sweep_stalled_children};
 pub(crate) use child_unresumed::{render_unresumed_push_body, sweep_unresumed_children};
+pub(crate) use common::live_turn_id_for_run;
 pub(crate) use common::set_exit_reason;
 pub(crate) use finalize::{
     current_session_closed, finalize_run_for_operator_compact, finalize_run_for_recovery,

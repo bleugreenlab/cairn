@@ -18,7 +18,7 @@ It drops trailing commas.
 · Glob **/*.rs
 **Assistant:** Tests fail on trailing commas.
 
-## Turn 2 · 14:33 PST
+## Outside a turn · 14:33 PST
 · [automatic resume — no operator message]
 **Assistant:** assistant narrative line 1 explaining the next step in detail
 assistant narrative line 2 explaining the next step in detail

@@ -20,7 +20,8 @@ pub struct Transcript {
 /// in answer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Turn {
-    /// The turn's addressable label. `None` renders the turn's position.
+    /// The turn's addressable label. `None` renders the turn's position, or,
+    /// when other turns of the transcript are numbered, `Outside a turn`.
     pub number: Option<i64>,
     /// Where the turn can be read in full. Truncation trailers cite it as
     /// `[+N lines → {link}]`; without one they read `[+N lines]`.

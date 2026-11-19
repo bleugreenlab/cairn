@@ -1916,6 +1916,28 @@ mod claude_and_owned_completion {
         assert_eq!(diagnostic_count(&orch).await, 1);
     }
 
+    /// The Claude Result-failure diagnostic is recorded in the turn it ended, so
+    /// `/chat/turn/N` holds the cause rather than only the prompt.
+    #[tokio::test]
+    async fn claude_failure_diagnostic_is_stamped_with_its_turn() {
+        let db = test_db().await;
+        seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
+        let orch = test_orchestrator(db);
+        register_warm_process(&orch, "run-child", Some("j-child"));
+        orch.process_state.begin_turn("run-child", "child-turn");
+        claude(&orch, "run-child", error(), normal_context());
+        assert_eq!(
+            scalar_text(
+                &orch,
+                "SELECT turn_id FROM events WHERE event_type='system:error' AND run_id=?1",
+                "run-child"
+            )
+            .await
+            .as_deref(),
+            Some("child-turn")
+        );
+    }
+
     #[tokio::test]
     /// A provider-depleted Result is settled as an interrupted turn instead; see
     /// `provider_depleted_claude_turn_is_interrupted_not_completed`.

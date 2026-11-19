@@ -2020,7 +2020,13 @@ async fn advance_channel_cursor(
     Ok(())
 }
 
-/// Insert a synthetic system:error event for display in the transcript
+/// Insert a synthetic system:error event for display in the transcript.
+///
+/// The event belongs to the turn the run is failing while that turn is still
+/// live, so `/chat/turn/N` holds the cause beside the prompt it answered. A
+/// failure with no live turn (a launch before any turn was admitted, or a warm
+/// run failing to admit its next one) stays turn-less, and the digest renders
+/// it in sequence position rather than inside a turn that already finished.
 pub fn insert_error_event(
     orch: &Orchestrator,
     run_id: &str,
@@ -2028,6 +2034,7 @@ pub fn insert_error_event(
     error_message: &str,
 ) {
     let now = chrono::Utc::now().timestamp() as i32;
+    let turn_id = crate::orchestrator::lifecycle::live_turn_id_for_run(orch, run_id);
     let event_id = ids::mint_child(run_id);
     let run_id_owned = run_id.to_string();
     let session_id_owned = session_id.map(|s| s.to_string());
@@ -2066,6 +2073,7 @@ pub fn insert_error_event(
                 let run_id = run_id.clone();
                 let session_id = session_id.clone();
                 let data = data.clone();
+                let turn_id = turn_id.clone();
                 Box::pin(async move {
                     crate::transcripts::stream_store::insert_event_conn(
                         conn,
@@ -2084,7 +2092,7 @@ pub fn insert_error_event(
                             cache_create_tokens: None,
                             output_tokens: None,
                             thinking_tokens: None,
-                            turn_id: None,
+                            turn_id,
                             cost_usd: None,
                         },
                     )

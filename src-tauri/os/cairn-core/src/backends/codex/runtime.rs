@@ -1766,6 +1766,74 @@ mod tests {
         );
     }
 
+    /// A Codex turn refused by the provider holds only its prompt and the cause.
+    /// The cause is stamped with the failing turn, so the digest, the turn read,
+    /// the Markdown raw stream and a transcript grep all show it; before, only
+    /// `chat/raw?format=json` did, and the turn read as having nothing to say.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_turns_cause_reads_in_the_digest_the_turn_and_markdown_raw() {
+        use crate::mcp::types::McpCallbackRequest;
+        use crate::resources::produce_cairn_resource;
+
+        const NODE: &str = "cairn://p/p/1/1/planner";
+        const REFUSAL: &str =
+            "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.";
+        let (db, orch) = persistent_codex_turn(
+            "codex-refused-model-transcript",
+            "INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at) VALUES('i','p',1,'I','active','active','none',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('e','recipe','i','p','running',1,1);
+             UPDATE jobs SET execution_id='e', issue_id='i', uri_segment='planner' WHERE id='j';",
+        )
+        .await;
+        db.execute(
+            "INSERT INTO events(id,run_id,session_id,sequence,timestamp,event_type,data,created_at,turn_id) VALUES('ev-prompt','r','s',1,1,'user',?1,1,'t')",
+            (json!({"content": "Plan the change."}).to_string(),),
+        )
+        .await
+        .unwrap();
+        read_notifications(&orch, &db, vec![provider_error(REFUSAL)]);
+
+        assert_eq!(
+            text(
+                &db,
+                "SELECT turn_id FROM events WHERE event_type='system:error'"
+            )
+            .await
+            .as_deref(),
+            Some("t"),
+            "the cause belongs to the turn it failed"
+        );
+        let request = McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: String::new(),
+            run_id: None,
+            tool: "read".to_string(),
+            payload: json!({}),
+            tool_use_id: None,
+            origin: None,
+        };
+        for surface in ["chat", "chat/turn/1", "chat/raw"] {
+            let read = produce_cairn_resource(&orch, &request, &format!("{NODE}/{surface}")).await;
+            assert!(
+                read.content.contains(REFUSAL),
+                "{surface}: {}",
+                read.content
+            );
+        }
+        for surface in ["chat", "chat/turn/1"] {
+            let found =
+                produce_cairn_resource(&orch, &request, &format!("{NODE}/{surface}?grep=ChatGPT"))
+                    .await;
+            assert_eq!(found.match_count, Some(1), "{surface}: {}", found.content);
+            assert!(
+                found.content.contains("  error:\n"),
+                "{surface} labels the field: {}",
+                found.content
+            );
+        }
+    }
+
     /// The post-tool shape the issue first suspected: Codex ends a turn normally
     /// with no assistant item after a tool result. That is a completed turn on a
     /// live process, never a crash.

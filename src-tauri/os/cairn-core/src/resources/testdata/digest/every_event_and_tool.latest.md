@@ -17,7 +17,7 @@ Full turn: cairn://p/cairn/1666/1/builder/chat/turn/N · raw stream: cairn://p/c
 · write todos — Updated 2 todos [committed abcdef0]
 ✗ write src/broken.rs — anchor not found: @@ +x
 
-## Turn 2 · 14:33 PST
+## Outside a turn · 14:33 PST
 · [automatic resume — no operator message]
 **Assistant:** assistant narrative line 1 explaining the next step in detail
 assistant narrative line 2 explaining the next step in detail

@@ -57,6 +57,10 @@ pub(crate) const LAUNCH_LABEL: &str = "**Launch prompt:** ";
 /// the raw stream.
 pub(crate) const LAUNCH_MARKER_LINE: &str = "· [launch prompt — the task this node was given]";
 
+/// The speaker label full-fidelity projections give a `system:error` event: the
+/// host's record of why a turn failed, not something any participant said.
+pub(crate) const ERROR_LABEL: &str = "**System error:** ";
+
 /// Format transcript rows into markdown without truncation.
 ///
 /// Intended for reuse in places where we need a faithful text rendering of the
@@ -136,6 +140,15 @@ pub(crate) fn format_transcript_full(events: &[TranscriptRow]) -> String {
                 if let Some(content) = event_data.get("content").and_then(|c| c.as_str()) {
                     if !content.is_empty() {
                         transcript.push_str(LAUNCH_LABEL);
+                        transcript.push_str(content);
+                        transcript.push_str("\n\n");
+                    }
+                }
+            }
+            "system:error" => {
+                if let Some(content) = event_data.get("content").and_then(|c| c.as_str()) {
+                    if !content.is_empty() {
+                        transcript.push_str(ERROR_LABEL);
                         transcript.push_str(content);
                         transcript.push_str("\n\n");
                     }

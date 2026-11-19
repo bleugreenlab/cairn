@@ -5297,7 +5297,7 @@ mod transcript_grep_tests {
     use crate::db::DbState;
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, SearchIndex};
+    use crate::storage::{LocalDb, RowExt, SearchIndex};
     use std::sync::Arc;
 
     const NODE: &str = "cairn://p/prj/2/1/builder";
@@ -5470,6 +5470,14 @@ mod transcript_grep_tests {
             absent.content
         );
 
+        assert!(
+            absent
+                .content
+                .contains("other system events (status, prompts, notices)"),
+            "errors are searched, so the footer no longer lists them: {}",
+            absent.content
+        );
+
         let missing =
             produce_cairn_resource(&orch, &request, &format!("{NODE}/chat/turn/9?grep=run")).await;
         assert_eq!(missing.match_count, None, "{}", missing.content);
@@ -5477,6 +5485,131 @@ mod transcript_grep_tests {
             missing.content.contains("Turn 9 not found"),
             "{}",
             missing.content
+        );
+    }
+
+    /// A launch that failed before its run admitted any turn records a
+    /// turn-less error. The digest still shows it, in sequence position: ahead of
+    /// the later run's turn 1, not dropped and not folded into that turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turnless_launch_error_renders_in_sequence_position() {
+        const CAUSE: &str = "Failed to start Claude: spawn refused by fixture";
+        let orch = orch().await;
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO runs (id, job_id, issue_id, session_id, created_at, updated_at) VALUES ('run-0','j','i','sess',0,0)",
+                (),
+            )
+            .await
+            .unwrap();
+        let writer = orch.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::orchestrator::session::insert_error_event(&writer, "run-0", Some("sess"), CAUSE);
+        })
+        .await
+        .unwrap();
+        // `insert_error_event` timestamps with the wall clock; place the event at
+        // its run's launch so chat order is the order the runs happened in.
+        orch.db
+            .local
+            .execute(
+                "UPDATE events SET created_at=0, timestamp=0 WHERE run_id='run-0'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt(
+                    "SELECT COUNT(*) FROM events WHERE run_id='run-0' AND event_type='system:error' AND turn_id IS NULL",
+                    (),
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap(),
+            Some(1),
+            "no turn was admitted, so none is stamped"
+        );
+
+        let digest = produce_cairn_resource(&orch, &request(), &format!("{NODE}/chat")).await;
+        let body = &digest.content;
+        let error = body
+            .find(CAUSE)
+            .unwrap_or_else(|| panic!("the turn-less error renders: {body}"));
+        assert_eq!(
+            body.matches("## Turn 1").count(),
+            1,
+            "the turn-less block claims no turn's number: {body}"
+        );
+        let outside = body
+            .find("## Outside a turn")
+            .unwrap_or_else(|| panic!("the turn-less block says what it is: {body}"));
+        let turn = body
+            .find("## Turn 1")
+            .unwrap_or_else(|| panic!("turn 1 renders: {body}"));
+        assert!(outside < error, "the error is under its heading: {body}");
+        assert!(
+            error < turn,
+            "the error precedes the later run's turn: {body}"
+        );
+    }
+
+    /// A warm run outlives its turns. When its next turn fails to enter Cairn's
+    /// lifecycle (cairn/6190's specimen), the completed previous turn is not the
+    /// failing one: the error stays turn-less and renders after that turn, never
+    /// inside it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_warm_runs_admission_failure_is_not_stamped_onto_its_completed_turn() {
+        const CAUSE: &str =
+            "Codex native goal turn p2 could not enter Cairn's turn lifecycle: fixture refusal";
+        let orch = orch().await;
+        orch.db
+            .local
+            .execute("UPDATE turns SET state='complete' WHERE id='turn-1'", ())
+            .await
+            .unwrap();
+        let writer = orch.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::orchestrator::session::insert_error_event(&writer, "run", Some("sess"), CAUSE);
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt(
+                    "SELECT COUNT(*) FROM events WHERE event_type='system:error' AND turn_id IS NULL",
+                    (),
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap(),
+            Some(1),
+            "the completed turn is not the one that failed"
+        );
+
+        let turn = produce_cairn_resource(&orch, &request(), &format!("{NODE}/chat/turn/1")).await;
+        assert!(
+            !turn.content.contains(CAUSE),
+            "turn 1 shows no failure that isn't its own: {}",
+            turn.content
+        );
+        let digest = produce_cairn_resource(&orch, &request(), &format!("{NODE}/chat")).await;
+        let body = &digest.content;
+        let turn = body
+            .find("## Turn 1")
+            .unwrap_or_else(|| panic!("turn 1 renders: {body}"));
+        let outside = body
+            .find("## Outside a turn")
+            .unwrap_or_else(|| panic!("the turn-less block says what it is: {body}"));
+        let error = body
+            .find(CAUSE)
+            .unwrap_or_else(|| panic!("the error renders: {body}"));
+        assert!(
+            turn < outside && outside < error,
+            "the error follows turn 1 under its own heading: {body}"
         );
     }
 }

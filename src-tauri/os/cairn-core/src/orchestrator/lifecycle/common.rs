@@ -387,6 +387,25 @@ pub(super) fn active_turn_id_for_run(orch: &Orchestrator, run_id: &str) -> Optio
         .or_else(|| current_turn_id_for_run(orch, run_id))
 }
 
+/// The turn a run is serving right now: the process's live turn, else the run's
+/// newest turn while it is still `running` (a failure path that reads before the
+/// turn is settled). A warm run outlives its turns, so a finished turn is never
+/// the answer: a failure to admit the next turn belongs to no turn yet.
+pub(crate) fn live_turn_id_for_run(orch: &Orchestrator, run_id: &str) -> Option<String> {
+    orch.process_state.get_current_turn_id(run_id).or_else(|| {
+        blocking_text_lookup(
+            orch,
+            run_id,
+            "SELECT id
+             FROM turns
+             WHERE run_id = ?1 AND state = 'running'
+             ORDER BY sequence DESC
+             LIMIT 1",
+            TextColumn::Optional,
+        )
+    })
+}
+
 pub(super) fn host_shutdown_in_progress(orch: &Orchestrator, run_id: &str) -> bool {
     blocking_text_lookup(
         orch,

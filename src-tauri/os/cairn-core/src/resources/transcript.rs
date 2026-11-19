@@ -1319,7 +1319,10 @@ fn format_transcript_digest(
 }
 
 /// One rendered turn of a transcript: the events sharing a `turn_id`, with any
-/// turn-less events folded into the block they follow.
+/// turn-less events folded into the block they follow. A turn-less
+/// `system:error` is the exception: it is the host's record of a failure that
+/// belonged to no turn (a warm run failing to admit its next one), so it opens
+/// a turn-less block rather than reading as the finished turn's own failure.
 ///
 /// This grouping is the job's single chronological turn sequence, and a block's
 /// index in it is the coordinate the `/chat?offset=&limit=` re-read address
@@ -1334,7 +1337,12 @@ pub(super) fn group_turn_blocks(events: &[EventRow]) -> Vec<TurnBlock<'_>> {
     let mut blocks: Vec<TurnBlock> = Vec::new();
     for event in events {
         let key = event.turn_id.as_deref();
+        let outside_a_turn = key.is_none() && event.event_type == "system:error";
         match blocks.last_mut() {
+            Some(block) if outside_a_turn && block.turn_id.is_some() => blocks.push(TurnBlock {
+                turn_id: None,
+                events: vec![event],
+            }),
             Some(block) if key.is_none() || block.turn_id == key => block.events.push(event),
             _ => blocks.push(TurnBlock {
                 turn_id: key,
@@ -1459,8 +1467,8 @@ pub(super) fn grep_transcript_content(
     )?;
     let body = if found.matches == 0 {
         format!(
-            "{} in message text, tool inputs, or tool results.\n\
-             Not searched: system events (status, prompts, notices, errors) and the bodies \
+            "{} in message text, tool inputs, tool results, or errors.\n\
+             Not searched: other system events (status, prompts, notices) and the bodies \
              of prior-context seeds; {raw_uri}?format=json carries every event.",
             grep_no_matches_body(&payload.pattern)
         )
@@ -1620,6 +1628,13 @@ fn entries_for_event(
                 body.then(|| format!("{}{content}", crate::transcripts::LAUNCH_LABEL)),
             )
         }
+        // Why a turn failed, often the only thing a failed-to-start turn holds
+        // beyond its prompt. Turn-less errors fold into the block they follow
+        // (or open one), so they render in sequence position either way.
+        "system:error" => match content_of(&data) {
+            "" => Vec::new(),
+            content => vec![Entry::Error(content.to_string())],
+        },
         kind @ ("system:session_boundary" | "system:compact_boundary") => marker(
             None,
             None,
