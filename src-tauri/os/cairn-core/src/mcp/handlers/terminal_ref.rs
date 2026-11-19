@@ -1,8 +1,7 @@
-//! What a terminal `ref` names, for the two surfaces that wait on a terminal.
+//! Shared terminal address and owner resolution for reads, waits, and wakes.
 //!
-//! `run {waitFor:{kind:"terminal"}}` and a `kind:"terminal"` wake subscription
-//! take one `ref` vocabulary and must agree on what it means, so both resolve it
-//! here. The scope written in the ref is the scope searched, and nothing falls
+//! Reads, `run {waitFor:{kind:"terminal"}}`, and `kind:"terminal"` wake
+//! subscriptions must agree on the terminal a canonical address names. The scope written in the ref is the scope searched, and nothing falls
 //! back to another: a project terminal URI names a project-owned row, a node or
 //! task terminal URI names that job's row, and only the caller-relative forms
 //! (`cairn:~/terminal/<slug>` and a bare slug) name the caller's own terminals.
@@ -100,7 +99,7 @@ pub(crate) async fn resolve_terminal_ref(
     }
 
     let unrecognized = || format!("`{reference}` is not a terminal ref; use {TERMINAL_REF_FORMS}");
-    let resource = uri::parse_uri(&canonical).ok_or_else(unrecognized)?;
+    let resource = terminal_resource(&canonical).ok_or_else(unrecognized)?;
     let (project, slug) = match &resource {
         CairnResource::NodeTerminal { project, slug, .. }
         | CairnResource::TaskTerminal { project, slug, .. }
@@ -130,27 +129,32 @@ fn slug_of<'a>(reference: &str, slug: &'a str) -> Result<&'a str, String> {
     Ok(slug)
 }
 
-async fn owner_of(db: &LocalDb, resource: &CairnResource) -> Result<TerminalOwner, String> {
-    let address = resource.to_uri();
+/// Parse every terminal address recognized by reads, including thread descendants.
+pub(crate) fn terminal_resource(address: &str) -> Option<CairnResource> {
+    let resource = uri::delegate_thread_descendant(uri::parse_uri(address)?).ok()?;
     match resource {
+        CairnResource::NodeTerminal { .. }
+        | CairnResource::TaskTerminal { .. }
+        | CairnResource::ProjectTerminal { .. } => Some(resource),
+        _ => None,
+    }
+}
+
+/// Resolve the owner identically for reads, waits, and wake subscriptions.
+/// An absent owner is distinct from a database failure, so reads can retain
+/// their scope-specific not-found diagnostics.
+pub(crate) async fn terminal_owner(
+    db: &LocalDb,
+    resource: &CairnResource,
+) -> DbResult<Option<TerminalOwner>> {
+    let (project, number, exec_seq, node_id, task_name) = match resource {
         CairnResource::NodeTerminal {
             project,
             number,
             exec_seq,
             node_id,
             ..
-        } => crate::jobs::queries::job_id_for_node_coordinate(
-            db, project, *number, *exec_seq, node_id, None,
-        )
-        .await
-        .map_err(|error| error.to_string())?
-        .map(|job_id| TerminalOwner::Job { job_id })
-        .ok_or_else(|| {
-            format!(
-                "No node owns the terminal {address}. {}",
-                crate::resources::node_job_not_found_message(project, *number, *exec_seq, node_id)
-            )
-        }),
+        } => (project, *number, *exec_seq, node_id, None),
         CairnResource::TaskTerminal {
             project,
             number,
@@ -158,25 +162,63 @@ async fn owner_of(db: &LocalDb, resource: &CairnResource) -> Result<TerminalOwne
             node_id,
             task_name,
             ..
-        } => crate::jobs::queries::job_id_for_node_coordinate(
-            db,
+        } => (
             project,
             *number,
             *exec_seq,
             node_id,
-            Some(task_name),
-        )
+            Some(task_name.as_str()),
+        ),
+        CairnResource::ProjectTerminal { project, .. } => {
+            return Ok(project_id_for_key(db, project)
+                .await?
+                .map(|project_id| TerminalOwner::Project { project_id }));
+        }
+        _ => {
+            return Err(crate::storage::DbError::Row(format!(
+                "{} is not a terminal URI",
+                resource.to_uri()
+            )))
+        }
+    };
+    Ok(crate::jobs::queries::job_id_for_node_coordinate(
+        db, project, number, exec_seq, node_id, task_name,
+    )
+    .await?
+    .map(|job_id| TerminalOwner::Job { job_id }))
+}
+
+pub(crate) async fn owner_of(
+    db: &LocalDb,
+    resource: &CairnResource,
+) -> Result<TerminalOwner, String> {
+    terminal_owner(db, resource)
         .await
         .map_err(|error| error.to_string())?
-        .map(|job_id| TerminalOwner::Job { job_id })
-        .ok_or_else(|| format!("No task owns the terminal {address}")),
-        CairnResource::ProjectTerminal { project, .. } => project_id_for_key(db, project)
-            .await
-            .map_err(|error| error.to_string())?
-            .map(|project_id| TerminalOwner::Project { project_id })
-            .ok_or_else(|| format!("No project `{project}` owns the terminal {address}")),
-        _ => Err(format!("{address} is not a terminal URI")),
-    }
+        .ok_or_else(|| {
+            let address = resource.to_uri();
+            match resource {
+                CairnResource::NodeTerminal {
+                    project,
+                    number,
+                    exec_seq,
+                    node_id,
+                    ..
+                } => format!(
+                    "No node owns the terminal {address}. {}",
+                    crate::resources::node_job_not_found_message(
+                        project, *number, *exec_seq, node_id
+                    )
+                ),
+                CairnResource::TaskTerminal { .. } => {
+                    format!("No task owns the terminal {address}")
+                }
+                CairnResource::ProjectTerminal { project, .. } => {
+                    format!("No project `{project}` owns the terminal {address}")
+                }
+                _ => format!("{address} is not a terminal URI"),
+            }
+        })
 }
 
 async fn project_id_for_key(db: &LocalDb, project_key: &str) -> DbResult<Option<String>> {
@@ -198,7 +240,7 @@ async fn project_id_for_key(db: &LocalDb, project_key: &str) -> DbResult<Option<
 
 /// The slugs one owner holds, for a refusal that shows what the searched scope
 /// does contain.
-async fn owner_slugs(db: &LocalDb, owner: &TerminalOwner) -> DbResult<Vec<String>> {
+pub(crate) async fn owner_slugs(db: &LocalDb, owner: &TerminalOwner) -> DbResult<Vec<String>> {
     let owner = owner.clone();
     db.read(|conn| {
         let owner = owner.clone();

@@ -75,7 +75,7 @@ fn reconciled_exit_urgency(
 /// `Thread` path and names a terminal only once delegated, so a bare parse would
 /// see no terminal there at all.
 fn terminal_resource_from_uri(uri: &str) -> Option<(CairnResource, String)> {
-    let resource = cairn_uri::delegate_thread_descendant(cairn_uri::parse_uri(uri)?).ok()?;
+    let resource = super::terminal_ref::terminal_resource(uri)?;
     let slug = match &resource {
         CairnResource::NodeTerminal { slug, .. }
         | CairnResource::TaskTerminal { slug, .. }

@@ -535,12 +535,7 @@ async fn produce_resource_segment(
     // same map the dispatchers use. Matching a raw `Thread` path here meant this
     // router carried its own copy of the thread-path vocabulary, and it knew
     // only the session-level shape.
-    let terminal_resource = matches!(
-        parse_uri(&identity).map(cairn_uri::delegate_thread_descendant),
-        Some(Ok(CairnResource::NodeTerminal { .. }
-            | CairnResource::TaskTerminal { .. }
-            | CairnResource::ProjectTerminal { .. }))
-    );
+    let terminal_resource = super::super::terminal_ref::terminal_resource(&identity).is_some();
     if terminal_resource {
         return produce_terminal_segment(orch, request, read_cursors, target, &resolved_target)
             .await;

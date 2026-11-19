@@ -1885,6 +1885,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_parent_waits_on_its_tasks_terminal_for_output_and_exit() {
+        let orch = test_orchestrator().await;
+        let db = &orch.db.local;
+        db.execute_script(
+            "INSERT INTO jobs (id,execution_id,issue_id,project_id,parent_job_id,uri_segment,status,created_at,updated_at)
+             VALUES ('child','e','i','p','job-1','install-managed','running',1,1);
+             INSERT INTO threads (id,project_id,name,created_at,updated_at) VALUES ('thread','p','design',1,1);
+             INSERT INTO jobs (id,project_id,thread_id,uri_segment,status,created_at,updated_at)
+             VALUES ('thread-job','p','thread','thread','running',1,1);
+             INSERT INTO jobs (id,project_id,parent_job_id,uri_segment,status,created_at,updated_at)
+             VALUES ('thread-task','p','thread-job','probe','running',1,1);
+             INSERT INTO job_terminals (id,job_id,session_id,command,status,created_at,slug,output_tail)
+             VALUES ('parent-term','job-1','parent-session','test','exited',1,'install','parent-only');
+             INSERT INTO job_terminals (id,job_id,session_id,command,status,created_at,slug,output_tail)
+             VALUES ('child-term','child','child-session','test','running',1,'install','child ready');
+             INSERT INTO job_terminals (id,job_id,session_id,command,status,created_at,slug,output_tail)
+             VALUES ('thread-term','thread-job','thread-session','test','running',1,'install','child ready');
+             INSERT INTO job_terminals (id,job_id,session_id,command,status,created_at,slug,output_tail)
+             VALUES ('thread-task-term','thread-task','thread-task-session','test','running',1,'install','child ready');",
+        ).await.unwrap();
+
+        for uri in [
+            "cairn://p/prj/1/1/builder/task/install-managed/terminal/install",
+            "cairn://p/prj/design/terminal/install",
+            "cairn://p/prj/design/task/probe/terminal/install",
+        ] {
+            let request = McpCallbackRequest {
+                run_id: Some("run-1".into()),
+                payload: serde_json::json!({"uri":uri}),
+                ..Default::default()
+            };
+            let cursors = std::sync::Mutex::new(std::collections::HashMap::new());
+            let read =
+                super::super::resources::handle_read_resource(&orch, &request, &cursors).await;
+            let read: serde_json::Value = serde_json::from_str(&read).unwrap();
+            assert_eq!(read["status"], "running", "{read}");
+            assert!(
+                !read["output"].as_str().unwrap().contains("parent-only"),
+                "{read}"
+            );
+
+            let mut conditions = Vec::new();
+            for (on, phrase) in [
+                (TerminalWaitEvent::Output, Some("child ready".to_string())),
+                (TerminalWaitEvent::Exit, None),
+            ] {
+                let wait = WaitFor::Terminal {
+                    kind: super::super::run::TerminalWaitKind::Terminal,
+                    reference: uri.into(),
+                    on,
+                    phrase,
+                };
+                let (condition, deadline) = normalize(&orch, &request, db, "job-1", &wait, 0)
+                    .await
+                    .unwrap();
+                assert!(deadline.is_none());
+                conditions.push(condition);
+            }
+            let output = trigger(orch.clone(), db.clone(), record(conditions.remove(0), None))
+                .await
+                .unwrap();
+            let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(output["outcome"], "matched", "{output}");
+            assert_eq!(output["terminal"], uri);
+
+            let exit = conditions.remove(0);
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    trigger(orch.clone(), db.clone(), record(exit.clone(), None)),
+                )
+                .await
+                .is_err(),
+                "the parent's exited same-slug terminal must not satisfy the wait"
+            );
+
+            let target = super::super::terminal_ref::terminal_resource(uri).unwrap();
+            let TerminalOwner::Job { job_id } = super::super::terminal_ref::owner_of(db, &target)
+                .await
+                .unwrap()
+            else {
+                panic!("expected a job terminal");
+            };
+            db.execute(
+                "UPDATE job_terminals SET status='exited',exit_code=7,exited_at=50 WHERE job_id=?1",
+                (job_id.as_str(),),
+            )
+            .await
+            .unwrap();
+            let result = trigger(orch.clone(), db.clone(), record(exit, None))
+                .await
+                .unwrap();
+            let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(result["outcome"], "exited", "{result}");
+            assert_eq!(result["exitCode"], 7);
+            assert_eq!(result["terminal"], uri);
+
+            let read =
+                super::super::resources::handle_read_resource(&orch, &request, &cursors).await;
+            let read: serde_json::Value = serde_json::from_str(&read).unwrap();
+            assert_eq!(read["status"], "exited", "{read}");
+            assert_eq!(read["exit_code"], 7, "{read}");
+            assert!(
+                read["output"].as_str().unwrap().contains("child ready"),
+                "{read}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn missing_terminal_fails_before_any_durable_wait_exists() {
         let orch = test_orchestrator().await;
         let error = trigger(

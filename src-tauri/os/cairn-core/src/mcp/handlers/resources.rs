@@ -12,7 +12,7 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::query::split_target_query;
 use cairn_db::turso::params;
-use cairn_uri::{parse_uri, CairnResource};
+use cairn_uri::CairnResource;
 
 /// Type alias for read cursor state: session_id -> bytes_read
 /// Uses per-terminal cursor so reads "consume" output regardless of which run is reading.
@@ -431,73 +431,33 @@ async fn lookup_terminal_info(
     db: &LocalDb,
     parsed: &ParsedTerminalUri,
 ) -> DbResult<Option<TerminalInfo>> {
-    let project_key = parsed.project_key.clone();
+    let resource = super::terminal_ref::terminal_resource(&parsed.anchor_uri)
+        .ok_or_else(|| crate::storage::DbError::Row(terminal_shape_error(&parsed.anchor_uri)))?;
+    let Some(owner) = super::terminal_ref::terminal_owner(db, &resource).await? else {
+        return Ok(None);
+    };
     let slug = parsed.slug.clone();
-    let issue_number = parsed.issue_number;
-    let exec_seq = parsed.exec_seq;
-    let node_id = parsed.node_id.clone();
-    let task_name = parsed.task_name.clone();
-
     db.read(|conn| {
-        let project_key = project_key.clone();
+        let owner = owner.clone();
         let slug = slug.clone();
-        let node_id = node_id.clone();
-        let task_name = task_name.clone();
         Box::pin(async move {
-            let row = if node_id.is_none() {
-                let lookup_key = cairn_uri::canonical_project(project_key);
-                let mut rows = conn
-                    .query(
-                        "
-                        SELECT jt.session_id, jt.status, jt.exit_code, jt.created_at, jt.exited_at, jt.output_tail, jt.job_id, jt.exit_reason,
-                               jt.lost_at, jt.restart_policy
-                        FROM job_terminals jt
-                        JOIN projects p ON jt.project_id = p.id
-                        WHERE p.key = ?1
-                          AND jt.job_id IS NULL
-                          AND jt.slug = ?2
-                        LIMIT 1
-                        ",
-                        params![lookup_key.as_str(), slug.as_str()],
-                    )
-                    .await?;
-                rows.next().await?
-            } else {
-                let (Some(issue_number), Some(exec_seq), Some(node_id)) =
-                    (issue_number, exec_seq, node_id.as_deref())
-                else {
-                    return Ok(None);
-                };
-                // Owner-aware through the shared resolver: the reserved thread
-                // coordinate resolves to the session (or its task) job here
-                // exactly as an issue coordinate resolves to a node job.
-                let job_id = crate::jobs::queries::job_id_for_node_coordinate_conn(
-                    conn,
-                    &project_key,
-                    issue_number,
-                    exec_seq,
-                    node_id,
-                    task_name.as_deref(),
+            let (scope, id) = match &owner {
+                super::terminal_ref::TerminalOwner::Job { job_id } => ("job_id = ?1", job_id),
+                super::terminal_ref::TerminalOwner::Project { project_id } => {
+                    ("project_id = ?1 AND job_id IS NULL", project_id)
+                }
+            };
+            let mut rows = conn
+                .query(
+                    format!(
+                        "SELECT session_id, status, exit_code, created_at, exited_at, output_tail,
+                                job_id, exit_reason, lost_at, restart_policy
+                         FROM job_terminals WHERE {scope} AND slug = ?2 LIMIT 1"
+                    ),
+                    params![id.as_str(), slug.as_str()],
                 )
                 .await?;
-                let Some(job_id) = job_id else {
-                    return Ok(None);
-                };
-                let mut rows = conn
-                    .query(
-                        "
-                        SELECT session_id, status, exit_code, created_at, exited_at, output_tail, job_id, exit_reason,
-                               lost_at, restart_policy
-                        FROM job_terminals
-                        WHERE job_id = ?1 AND slug = ?2
-                        LIMIT 1
-                        ",
-                        params![job_id.as_str(), slug.as_str()],
-                    )
-                    .await?;
-                rows.next().await?
-            };
-
+            let row = rows.next().await?;
             row.map(|row| {
                 Ok(TerminalInfo {
                     session_id: row.text(0)?,
@@ -525,73 +485,12 @@ async fn list_terminal_slugs_in_scope(
     db: &LocalDb,
     parsed: &ParsedTerminalUri,
 ) -> DbResult<Vec<String>> {
-    let project_key = parsed.project_key.clone();
-    let issue_number = parsed.issue_number;
-    let exec_seq = parsed.exec_seq;
-    let node_id = parsed.node_id.clone();
-    let task_name = parsed.task_name.clone();
-
-    db.read(|conn| {
-        let project_key = project_key.clone();
-        let node_id = node_id.clone();
-        let task_name = task_name.clone();
-        Box::pin(async move {
-            let mut rows = if node_id.is_none() {
-                let lookup_key = cairn_uri::canonical_project(project_key);
-                conn.query(
-                    "
-                    SELECT jt.slug
-                    FROM job_terminals jt
-                    JOIN projects p ON jt.project_id = p.id
-                    WHERE p.key = ?1 AND jt.job_id IS NULL AND jt.slug IS NOT NULL
-                    ORDER BY jt.slug
-                    ",
-                    params![lookup_key.as_str()],
-                )
-                .await?
-            } else {
-                let job_id = {
-                    let (Some(issue_number), Some(exec_seq), Some(node_id)) =
-                        (issue_number, exec_seq, node_id.as_deref())
-                    else {
-                        return Ok(Vec::new());
-                    };
-                    // The same owner-aware resolver the lookup uses, so the
-                    // slug list a not-found message offers is scoped to the
-                    // very job the read looked in.
-                    crate::jobs::queries::job_id_for_node_coordinate_conn(
-                        conn,
-                        &project_key,
-                        issue_number,
-                        exec_seq,
-                        node_id,
-                        task_name.as_deref(),
-                    )
-                    .await?
-                };
-                let Some(job_id) = job_id else {
-                    return Ok(Vec::new());
-                };
-                conn.query(
-                    "
-                    SELECT slug
-                    FROM job_terminals
-                    WHERE job_id = ?1 AND slug IS NOT NULL
-                    ORDER BY slug
-                    ",
-                    params![job_id.as_str()],
-                )
-                .await?
-            };
-
-            let mut slugs = Vec::new();
-            while let Some(row) = rows.next().await? {
-                slugs.push(row.text(0)?);
-            }
-            Ok(slugs)
-        })
-    })
-    .await
+    let resource = super::terminal_ref::terminal_resource(&parsed.anchor_uri)
+        .ok_or_else(|| crate::storage::DbError::Row(terminal_shape_error(&parsed.anchor_uri)))?;
+    let Some(owner) = super::terminal_ref::terminal_owner(db, &resource).await? else {
+        return Ok(Vec::new());
+    };
+    super::terminal_ref::owner_slugs(db, &owner).await
 }
 
 /// Parsed terminal URI components
@@ -601,7 +500,6 @@ struct ParsedTerminalUri {
     issue_number: Option<i32>,
     exec_seq: Option<i32>,
     node_id: Option<String>,
-    task_name: Option<String>,
     slug: String,
     /// `?new=true`: incremental cursor read instead of the idempotent full buffer.
     new: bool,
@@ -710,9 +608,7 @@ fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
     // terminal route carried its own thread-path interpreter, which knew only
     // the session-level `terminal/<slug>` shape — so a thread TASK could create
     // a terminal (the write path resolves it) and then not read it back.
-    let resource = parse_uri(&split.identity)
-        .map(cairn_uri::delegate_thread_descendant)
-        .transpose()?
+    let resource = super::terminal_ref::terminal_resource(&split.identity)
         .ok_or_else(|| terminal_shape_error(&split.identity))?;
     let anchor_uri = resource.to_uri();
     match resource {
@@ -727,7 +623,6 @@ fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
             issue_number: Some(number),
             exec_seq: Some(exec_seq),
             node_id: Some(node_id),
-            task_name: None,
             slug,
             new,
             annotations_suppressed,
@@ -738,14 +633,13 @@ fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
             number,
             exec_seq,
             node_id,
-            task_name,
             slug,
+            ..
         } => Ok(ParsedTerminalUri {
             project_key: project,
             issue_number: Some(number),
             exec_seq: Some(exec_seq),
             node_id: Some(node_id),
-            task_name: Some(task_name),
             slug,
             new,
             annotations_suppressed,
@@ -756,7 +650,6 @@ fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
             issue_number: None,
             exec_seq: None,
             node_id: None,
-            task_name: None,
             slug,
             new,
             annotations_suppressed,
@@ -1049,6 +942,7 @@ fn strip_ansi_sequences(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_uri::parse_uri;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
@@ -1120,7 +1014,6 @@ mod tests {
         let session = parse_terminal_uri("cairn://p/thr/design-review/terminal/dev").unwrap();
         assert_eq!(session.slug, "dev");
         assert_eq!(session.node_id.as_deref(), Some("design-review"));
-        assert_eq!(session.task_name, None);
         assert_eq!((session.issue_number, session.exec_seq), (Some(0), Some(0)));
         assert_eq!(
             session.anchor_uri, "cairn://p/thr/design-review/terminal/dev",
@@ -1131,7 +1024,6 @@ mod tests {
             parse_terminal_uri("cairn://p/thr/design-review/task/probe/terminal/build").unwrap();
         assert_eq!(task.slug, "build");
         assert_eq!(task.node_id.as_deref(), Some("design-review"));
-        assert_eq!(task.task_name.as_deref(), Some("probe"));
         assert_eq!(
             task.anchor_uri,
             "cairn://p/thr/design-review/task/probe/terminal/build"
@@ -1157,7 +1049,10 @@ mod tests {
             .expect("task terminal URI should parse");
         assert_eq!(parsed.project_key, "cairn");
         assert_eq!(parsed.node_id.as_deref(), Some("builder"));
-        assert_eq!(parsed.task_name.as_deref(), Some("Explore"));
+        assert_eq!(
+            parsed.anchor_uri,
+            "cairn://p/cairn/1/1/builder/task/Explore/terminal/ci"
+        );
         assert_eq!(parsed.slug, "ci");
         assert!(
             task_terminal_hint("cairn://p/cairn/1/1/builder/task/Explore/terminal/ci").is_none()
