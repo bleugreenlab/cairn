@@ -940,6 +940,7 @@ impl OrchestratorBuilder {
             sidebar_active_issues_rebuild_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             admission_lock: admission_lock.clone(),
             launch_admission_waits: Arc::default(),
+            held_work_memo: Arc::default(),
             sweep_pulse: Arc::new(crate::execution::gates::pulse::SweepPulse::new(
                 admission_lock,
             )),
@@ -1977,6 +1978,10 @@ pub struct Orchestrator {
     /// Dispatched launches admission refused, while they are re-driven; see
     /// `orchestrator::wakes::launch_admission`.
     pub(crate) launch_admission_waits: Arc<crate::orchestrator::wakes::LaunchAdmissionWaits>,
+    /// Thread-bound holds the last pass over held work refused, so the next
+    /// pass skips those whose thread has not changed; see
+    /// `orchestrator::wakes::provider_limits`.
+    pub(crate) held_work_memo: Arc<crate::orchestrator::wakes::HeldWorkMemo>,
     /// The gate sweep loop's liveness and each held execution's last
     /// evaluation; see `execution::gates::pulse`.
     pub sweep_pulse: Arc<crate::execution::gates::pulse::SweepPulse>,

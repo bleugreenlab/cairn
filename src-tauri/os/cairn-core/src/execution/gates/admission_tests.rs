@@ -297,7 +297,28 @@ async fn thread_world(name: &str) -> (Env, std::sync::Arc<RecordedStarts>) {
 /// a PR.
 async fn pending_builder(env: &Env, number: i32) {
     super::capacity::tests::add_started(env, number, Some("th"), "pending").await;
-    let snapshot = json!({
+    env.db
+        .execute(
+            "UPDATE executions SET snapshot = ?1 WHERE id = ?2",
+            (
+                builder_snapshot(&format!("si{number}")).to_string(),
+                format!("se{number}"),
+            ),
+        )
+        .await
+        .unwrap();
+    env.db
+        .execute(
+            "UPDATE jobs SET recipe_node_id = 'builder' WHERE id = ?1",
+            (format!("sj{number}"),),
+        )
+        .await
+        .unwrap();
+}
+
+/// An execution snapshot whose `builder` node feeds a PR node.
+fn builder_snapshot(issue_id: &str) -> Value {
+    json!({
         "recipe": {"id": "recipe", "name": "Recipe", "trigger": "manual",
             "nodes": [
                 {"id":"trigger","name":"Trigger","nodeType":"trigger","position":{"x":0,"y":0}},
@@ -311,23 +332,9 @@ async fn pending_builder(env: &Env, number: i32) {
                  "targetNodeId":"pr","targetHandle":"context-in"}
             ]},
         "agents": {}, "skills": {}, "tools": {},
-        "triggerContext": {"issueId": format!("si{number}"), "projectId": "p", "triggerType": "manual"},
+        "triggerContext": {"issueId": issue_id, "projectId": "p", "triggerType": "manual"},
         "delegatedPackets": [], "createdAt": 1
-    });
-    env.db
-        .execute(
-            "UPDATE executions SET snapshot = ?1 WHERE id = ?2",
-            (snapshot.to_string(), format!("se{number}")),
-        )
-        .await
-        .unwrap();
-    env.db
-        .execute(
-            "UPDATE jobs SET recipe_node_id = 'builder' WHERE id = ?1",
-            (format!("sj{number}"),),
-        )
-        .await
-        .unwrap();
+    })
 }
 
 /// The host's DAG-launch seam for a system re-entry, as the event loop calls
@@ -503,7 +510,7 @@ async fn an_open_pr_bound_hold_releases_on_the_pass_after_a_merge_without_a_hint
                 Ok((
                     super::open_prs::children_conn(conn, "th").await?,
                     cairn_workflow::inputs::node_ships_a_pr_conn(conn, "builder", "se102").await?,
-                    super::open_prs::launch_refusal_conn(conn, "sj102", 2).await?,
+                    super::open_prs::launch_refusal_conn(conn, "sj102", 2, None).await?,
                 ))
             })
         })
@@ -575,4 +582,203 @@ async fn an_open_pr_bound_hold_releases_on_the_pass_after_a_merge_without_a_hint
     assert_eq!(starts.started(), vec!["sj102".to_string()]);
     through(5).await;
     assert_eq!(starts.started().len(), 1, "released once");
+}
+
+// -- one pass over held work --------------------------------------------------
+
+/// Hold job `job` on its thread's open-PR bound, as the launch seam arms it.
+async fn held_on_open_prs(
+    db: &crate::storage::LocalDb,
+    job: &str,
+) -> crate::orchestrator::wakes::ProviderLimitHold {
+    crate::orchestrator::wakes::arm_thread_hold(
+        db,
+        job,
+        crate::orchestrator::wakes::HoldKind::Launch,
+        "thread_open_prs",
+        "Waiting for the thread's open PRs.".into(),
+        String::new(),
+        super::sweep::tests::now(),
+    )
+    .await
+    .unwrap()
+}
+
+fn caps_and_bound(env: &Env, fleet: usize, children: i32, open_prs: i32) {
+    env.orch
+        .update_settings(crate::models::UpdateSettings {
+            max_concurrent_executions: Some(fleet as i32),
+            max_open_children_per_thread: Some(children),
+            max_open_prs_per_thread: Some(open_prs),
+            ..Default::default()
+        })
+        .unwrap();
+}
+
+async fn in_progress(env: &Env) -> usize {
+    super::capacity::fleet_load(&env.orch)
+        .await
+        .unwrap()
+        .in_progress
+}
+
+/// A team job id, routed to the `teamgate` replica `attach_team` opens.
+fn team_job(n: i32) -> String {
+    format!("teamgate~00000000-0000-4000-8000-{n:012}")
+}
+
+/// Thread `tz` in the team replica: child 0 has an open PR, and children
+/// 1..=`count` each have a pending PR-producing builder.
+async fn team_builders(team: &crate::storage::LocalDb, count: i32) {
+    let snapshot = builder_snapshot("tc0").to_string();
+    let mut script = "INSERT INTO threads(id, project_id, name, created_at, updated_at)
+           VALUES('tz', 'tp', 'team-thread', 1, 1);"
+        .to_string();
+    for n in 0..=count {
+        let status = if n == 0 { "complete" } else { "pending" };
+        script.push_str(&format!(
+            "INSERT INTO issues(id, project_id, number, title, status, progress, attention,
+                                parent_thread_id, created_at, updated_at)
+               VALUES('tc{n}', 'tp', {number}, 'Team {n}', 'active', 'active', 'none', 'tz', 1, 1);
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+               VALUES('te{n}', 'recipe', 'tc{n}', 'tp', 'running', 1, 1, '{snapshot}');
+             INSERT INTO jobs(id, execution_id, recipe_node_id, project_id, issue_id, node_name,
+                              status, created_at, updated_at)
+               VALUES('{job}', 'te{n}', 'builder', 'tp', 'tc{n}', 'builder', '{status}', 1, 1);",
+            number = 100 + n,
+            job = team_job(n),
+        ));
+    }
+    script.push_str(&format!(
+        "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
+                                    target_branch, status, opened_at, updated_at)
+           VALUES('tmr0', '{job}', 'tp', 'tc0', 'PR', 'b0', 'main', 'open', 1, 1);",
+        job = team_job(0)
+    ));
+    team.execute_script(script).await.unwrap();
+}
+
+/// The acceptance bound for the orchestrator's hold-resolution cost: fifty
+/// thread holds across two threads and two databases cost one fleet scan per
+/// database in a pass, not one per hold. The team thread's holds are refused
+/// by its open-PR bound and never reach the fleet; the private thread's pass
+/// their bound and all meet a full fleet, decided against one count. A second
+/// pass with nothing changed does not decide the bound holds again.
+#[tokio::test]
+async fn a_pass_over_fifty_thread_holds_counts_the_fleet_once_per_database() {
+    use super::sweep::tests::{attach_team, now};
+    let (env, starts) = thread_world("hold-pass-one-count.db").await;
+    let team = attach_team(&env, "hold-pass-one-count-team.db").await;
+    team_builders(&team, 25).await;
+    for n in 1..=25 {
+        held_on_open_prs(&team, &team_job(n)).await;
+    }
+    for number in 200..225 {
+        pending_builder(&env, number).await;
+        held_on_open_prs(&env.db, &format!("sj{number}")).await;
+    }
+    let full = in_progress(&env).await;
+    caps_and_bound(&env, full, 50, 1);
+
+    let scans = super::capacity::fleet_scans_on_this_thread();
+    let report = crate::orchestrator::wakes::resolve_thread_holds(&env.orch, now())
+        .await
+        .unwrap();
+    assert_eq!(report.considered, 50, "{report:?}");
+    assert_eq!(report.released, 0, "{report:?}");
+    assert_eq!(report.fleet_snapshots, 1, "{report:?}");
+    assert_eq!(
+        super::capacity::fleet_scans_on_this_thread() - scans,
+        2,
+        "one fleet scan for each of the two databases"
+    );
+    assert!(starts.started().is_empty());
+    let bound = count(
+        &env,
+        "SELECT COUNT(*) FROM provider_limit_holds WHERE state = 'active'",
+    )
+    .await;
+    assert_eq!(bound, 25, "the private thread's holds still wait");
+
+    let scans = super::capacity::fleet_scans_on_this_thread();
+    let again = crate::orchestrator::wakes::resolve_thread_holds(&env.orch, now())
+        .await
+        .unwrap();
+    assert_eq!(again.considered, 50, "{again:?}");
+    assert_eq!(
+        again.skipped_unchanged, 25,
+        "the bound holds' thread has not changed: {again:?}"
+    );
+    assert_eq!(again.fleet_snapshots, 1, "{again:?}");
+    assert_eq!(super::capacity::fleet_scans_on_this_thread() - scans, 2);
+}
+
+/// The cost change keeps the release rule: with one free fleet slot and three
+/// releasable holds, one pass releases exactly the first in queue order, and
+/// its release counts before the other two are decided.
+#[tokio::test]
+async fn one_free_slot_releases_only_the_first_of_three_holds_in_one_pass() {
+    use super::sweep::tests::now;
+    let (env, starts) = thread_world("hold-pass-one-slot.db").await;
+    let mut holds = Vec::new();
+    for number in [300, 301, 302] {
+        pending_builder(&env, number).await;
+        holds.push(held_on_open_prs(&env.db, &format!("sj{number}")).await);
+    }
+    let free_one = in_progress(&env).await + 1;
+    caps_and_bound(&env, free_one, 50, 10);
+
+    let report = crate::orchestrator::wakes::resolve_thread_holds(&env.orch, now())
+        .await
+        .unwrap();
+    assert_eq!(starts.started(), vec!["sj300".to_string()]);
+    assert_eq!(report.released, 1, "{report:?}");
+    assert_eq!(report.fleet_snapshots, 1, "{report:?}");
+    assert_eq!(hold_state(&env, &holds[0].id).await, "resolved");
+    assert_eq!(hold_state(&env, &holds[1].id).await, "active");
+    assert_eq!(hold_state(&env, &holds[2].id).await, "active");
+}
+
+/// A hold its thread's open-PR bound refuses is answered by that bound alone:
+/// neither a pass nor a supply change counts the fleet for it.
+#[tokio::test]
+async fn a_hold_refused_by_its_open_pr_bound_takes_no_fleet_count() {
+    use super::capacity::tests::add_started;
+    use super::sweep::tests::now;
+    let (env, starts) = thread_world("hold-pass-bound-no-count.db").await;
+    caps_and_bound(&env, 50, 10, 1);
+    add_started(&env, 100, Some("th"), "complete").await;
+    env.db
+        .execute_script(
+            "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
+                                        target_branch, status, opened_at, updated_at)
+               VALUES('smr100', 'sj100', 'p', 'si100', 'PR', 'b100', 'main', 'open', 1, 1);",
+        )
+        .await
+        .unwrap();
+    pending_builder(&env, 102).await;
+    let hold = held_on_open_prs(&env.db, "sj102").await;
+
+    let scans = super::capacity::fleet_scans_on_this_thread();
+    let report = crate::orchestrator::wakes::resolve_thread_holds(&env.orch, now())
+        .await
+        .unwrap();
+    assert!(
+        !crate::orchestrator::wakes::release_on_supply_change(&env.orch, &hold, now())
+            .await
+            .unwrap()
+    );
+    assert_eq!(report.fleet_snapshots, 0, "{report:?}");
+    assert_eq!(super::capacity::fleet_scans_on_this_thread(), scans);
+    assert_eq!(hold_state(&env, &hold.id).await, "active");
+    assert!(starts.started().is_empty());
+    let reason = env
+        .db
+        .query_opt_text(
+            "SELECT observed_text FROM provider_limit_holds WHERE id = ?1",
+            (hold.id.clone(),),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reason.as_deref(), Some("harness has 1/1 open PRs: 100"));
 }

@@ -425,6 +425,16 @@ impl AdmissionLock {
         self.acquisitions[site.index()].load(Ordering::Relaxed)
     }
 
+    /// How many times any site has taken the lock. Read while holding it, the
+    /// count includes every admission decided before this one, so a caller can
+    /// tell whether anyone else admitted work since it last held the lock.
+    pub fn total_acquisitions(&self) -> u64 {
+        self.acquisitions
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
+    }
+
     #[cfg(test)]
     pub(crate) fn set_wait_bound(&self, bound: Duration) {
         self.wait_bound_ms.store(millis(bound), Ordering::Relaxed);
@@ -493,13 +503,13 @@ pub(crate) fn carry_queue_facts(fact: &str, prior: Option<&str>, hold: &Capacity
 // ---------------------------------------------------------------------------
 
 /// Agent work in flight is the one activity rule used by both caps.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Activity {
     InFlight,
     Parked(ParkCause),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ParkCause {
     Stopped,
     Operator,
@@ -666,6 +676,7 @@ pub(crate) enum ActivityScope<'a> {
     Issue(&'a str),
 }
 
+#[derive(Debug, Clone, Hash)]
 pub(crate) struct ActivityJobRow {
     pub execution_id: String,
     pub job_id: String,
@@ -734,7 +745,10 @@ pub async fn fleet_load(orch: &Orchestrator) -> Result<FleetLoad, String> {
 }
 
 /// Whether work held for want of supply on `execution_id` may run now that
-/// supply can serve it, decided under the [`AdmissionLock`] the caller holds.
+/// supply can serve it, decided under the [`AdmissionLock`] the caller holds,
+/// against `working`, a [`fleet_working`] count taken under that lock. A pass
+/// deciding many holds counts the fleet once and adds each release to the
+/// count itself, rather than counting again per hold.
 ///
 /// It fits when its execution already counts (another of its jobs is
 /// working), since running it takes no further slot. Otherwise it needs a free
@@ -743,13 +757,13 @@ pub async fn fleet_load(orch: &Orchestrator) -> Result<FleetLoad, String> {
 /// on its node, so it also waits behind any execution of its own lane queued
 /// for a fleet slot, keeping the order the lane's owner set; a resume or yield
 /// hold is interrupted work and does not.
-pub async fn held_work_fits(
+pub(crate) async fn held_work_fits(
     orch: &Orchestrator,
     db: &LocalDb,
+    working: &FleetWorking,
     execution_id: &str,
     behind_its_lane: bool,
 ) -> Result<bool, String> {
-    let working = fleet_working(orch).await?;
     if working.contains_key(execution_id) {
         return Ok(true);
     }
@@ -795,13 +809,31 @@ const LANE_QUEUED_SQL: &str = concat!(
     " FROM executions e LEFT JOIN issues i ON i.id = e.issue_id WHERE e.id = ?1))"
 );
 
-/// Every execution in progress on this runner's fleet, and whether one of its
-/// working jobs is still waiting for a machine.
-async fn fleet_working(orch: &Orchestrator) -> Result<HashMap<String, bool>, String> {
+/// Every execution in progress on this runner's fleet, keyed by id, and whether
+/// one of its working jobs is still waiting for a machine.
+pub(crate) type FleetWorking = HashMap<String, bool>;
+
+thread_local! {
+    static FLEET_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many per-database fleet scans this thread has run. A scan reads every
+/// working job of a database, so a test reads this around a pass to prove what
+/// the pass cost; per thread, so parallel tests do not see each other's.
+#[cfg(test)]
+pub(crate) fn fleet_scans_on_this_thread() -> u64 {
+    FLEET_SCANS.with(std::cell::Cell::get)
+}
+
+/// Count the fleet: one [`FLEET_JOBS_SQL`] scan of every open database. This
+/// is the expensive read behind both caps' fleet half, so a caller deciding
+/// many things at once counts once and carries the result.
+pub(crate) async fn fleet_working(orch: &Orchestrator) -> Result<FleetWorking, String> {
     let device = orch.anon_device_manager.device_id();
     let waiting_jobs = orch.fleet.jobs_waiting_for_a_machine();
-    let mut working: HashMap<String, bool> = HashMap::new();
+    let mut working: FleetWorking = HashMap::new();
     for db in orch.db.all_dbs().await {
+        FLEET_SCANS.with(|scans| scans.set(scans.get() + 1));
         let device = device.clone();
         let rows = db
             .read(move |conn| {
@@ -867,6 +899,35 @@ pub(crate) async fn active_thread_children_conn(
     Ok(active.into_iter().collect())
 }
 
+/// What a thread's two bounds read about the thread itself: its children with
+/// open PRs (the open-PR bound) and its jobs with agent work in flight (the
+/// focus cap). A hold-resolution pass reads these once per thread and shares
+/// them across every hold of that thread; what is particular to one hold (its
+/// issue, its node, its place in the re-entry band) is still read per hold.
+#[derive(Debug, Clone, Hash)]
+pub struct ThreadFacts {
+    pub(crate) thread_id: String,
+    pub(crate) open_prs: Vec<(i64, String)>,
+    pub(crate) in_flight: Vec<ActivityJobRow>,
+}
+
+pub(crate) async fn thread_facts_conn(
+    conn: &crate::storage::TrackedConnection,
+    thread_id: &str,
+) -> DbResult<ThreadFacts> {
+    let open_prs = super::open_prs::children_conn(conn, thread_id).await?;
+    let in_flight = activity_job_rows_conn(conn, ActivityScope::Thread(thread_id))
+        .await?
+        .into_iter()
+        .filter(|row| row.activity == Activity::InFlight)
+        .collect();
+    Ok(ThreadFacts {
+        thread_id: thread_id.to_string(),
+        open_prs,
+        in_flight,
+    })
+}
+
 pub(crate) async fn thread_reentries_conn(
     conn: &crate::storage::TrackedConnection,
     thread_id: &str,
@@ -896,13 +957,16 @@ pub(crate) async fn thread_reentries_conn(
 /// Admission for a system re-entry. Caller holds the process admission lock.
 /// An already active issue takes no additional focus slot. Holds are a FIFO
 /// band ahead of fresh work, with an id tie-break for simultaneous arrivals.
+/// `known` is the thread's facts as a pass already read them; it is used only
+/// when it is the facts of this execution's thread, and read afresh otherwise.
 pub(crate) async fn focus_admits(
     orch: &Orchestrator,
     db: &LocalDb,
     execution_id: &str,
     hold_id: Option<&str>,
+    known: Option<Arc<ThreadFacts>>,
 ) -> Result<bool, String> {
-    focus_admits_inner(orch, db, execution_id, hold_id, None).await
+    focus_admits_inner(orch, db, execution_id, hold_id, None, known).await
 }
 
 /// A DAG launch has already been claimed as running before it reaches the
@@ -914,8 +978,9 @@ pub(crate) async fn focus_admits_launch(
     execution_id: &str,
     job_id: &str,
     hold_id: Option<&str>,
+    known: Option<Arc<ThreadFacts>>,
 ) -> Result<bool, String> {
-    focus_admits_inner(orch, db, execution_id, hold_id, Some(job_id)).await
+    focus_admits_inner(orch, db, execution_id, hold_id, Some(job_id), known).await
 }
 
 async fn focus_admits_inner(
@@ -924,14 +989,19 @@ async fn focus_admits_inner(
     execution_id: &str,
     hold_id: Option<&str>,
     exclude_job: Option<&str>,
+    known: Option<Arc<ThreadFacts>>,
 ) -> Result<bool, String> {
     let execution_id = execution_id.to_string();
     let hold_id = hold_id.map(str::to_string);
     let exclude_job = exclude_job.map(str::to_string);
     let limit = orch.get_settings().max_open_children_per_thread.max(1) as usize;
     db.read(move |conn| {
-        let (execution_id, hold_id, exclude_job) =
-            (execution_id.clone(), hold_id.clone(), exclude_job.clone());
+        let (execution_id, hold_id, exclude_job, known) = (
+            execution_id.clone(),
+            hold_id.clone(),
+            exclude_job.clone(),
+            known.clone(),
+        );
         Box::pin(async move {
             let mut rows = conn
                 .query(
@@ -957,10 +1027,17 @@ async fn focus_admits_inner(
             let Some(thread) = thread_of_issue_conn(conn, &issue_id).await? else {
                 return Ok(true);
             };
-            let active: HashSet<String> =
-                activity_job_rows_conn(conn, ActivityScope::Thread(&thread.thread_id))
-                    .await?
-                    .into_iter()
+            let rows = match known
+                .as_deref()
+                .filter(|facts| facts.thread_id == thread.thread_id)
+            {
+                Some(facts) => facts.in_flight.clone(),
+                None => {
+                    activity_job_rows_conn(conn, ActivityScope::Thread(&thread.thread_id)).await?
+                }
+            };
+            let active: HashSet<String> = rows
+                .into_iter()
                     .filter(|row| {
                         Some(row.job_id.as_str()) != exclude_job.as_deref()
                             && !(exclude_job.is_some() && row.execution_id == execution_id && !row.has_turn)
@@ -2649,9 +2726,16 @@ pub(crate) mod tests {
     }
 
     async fn fits(env: &Env, number: i32, behind_its_lane: bool) -> bool {
-        held_work_fits(&env.orch, &env.db, &format!("se{number}"), behind_its_lane)
-            .await
-            .unwrap()
+        let working = fleet_working(&env.orch).await.unwrap();
+        held_work_fits(
+            &env.orch,
+            &env.db,
+            &working,
+            &format!("se{number}"),
+            behind_its_lane,
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -3906,7 +3990,7 @@ pub(crate) mod tests {
                VALUES('descendant105','se105','p','si105','review','pending',1,1);"
         ).await.unwrap();
         assert!(
-            !focus_admits_launch(&env.orch, &env.db, "se105", "sj105", None)
+            !focus_admits_launch(&env.orch, &env.db, "se105", "sj105", None, None)
                 .await
                 .unwrap()
         );
@@ -3920,7 +4004,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            focus_admits_launch(&env.orch, &env.db, "se105", "sj105", None)
+            focus_admits_launch(&env.orch, &env.db, "se105", "sj105", None, None)
                 .await
                 .unwrap()
         );

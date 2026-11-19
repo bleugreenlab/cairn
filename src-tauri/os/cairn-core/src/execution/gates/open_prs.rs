@@ -31,10 +31,13 @@ pub async fn children_conn(
 /// an exemption. Resolving a hold repeats this read rather than latching it.
 /// This bounds launches against already-open PRs, not reserved future PRs:
 /// builders admitted below the bound can later publish enough PRs to exceed it.
+/// `known` is the thread's facts as a pass already read them; its open-PR
+/// children stand in for a fresh read only when it is this job's thread.
 pub async fn launch_refusal_conn(
     conn: &TrackedConnection,
     job_id: &str,
     bound: i32,
+    known: Option<&super::capacity::ThreadFacts>,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
         .query(
@@ -54,7 +57,10 @@ pub async fn launch_refusal_conn(
     let node_id = row.opt_text(3)?;
     let execution_id = row.opt_text(4)?;
     drop(rows);
-    let children = children_conn(conn, &thread_id).await?;
+    let children = match known.filter(|facts| facts.thread_id == thread_id) {
+        Some(facts) => facts.open_prs.clone(),
+        None => children_conn(conn, &thread_id).await?,
+    };
     if children.iter().any(|(_, id)| id == &issue_id) || children.len() < bound.max(1) as usize {
         return Ok(None);
     }
@@ -119,7 +125,7 @@ mod tests {
 
     async fn refusal(db: &LocalDb, job: &str) -> Option<String> {
         let job = job.to_owned();
-        db.read(move |conn| Box::pin(async move { launch_refusal_conn(conn, &job, 2).await }))
+        db.read(move |conn| Box::pin(async move { launch_refusal_conn(conn, &job, 2, None).await }))
             .await
             .unwrap()
     }

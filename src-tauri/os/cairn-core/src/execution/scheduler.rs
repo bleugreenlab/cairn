@@ -476,7 +476,11 @@ async fn run_scheduler_loop(orch: Orchestrator) {
                 // then its first usage reading), so they settle first and
                 // are answered once.
                 tokio::time::sleep(SUPPLY_CHANGE_DEBOUNCE).await;
-                release_holds_on_supply_change(&orch).await;
+                crate::orchestrator::wakes::release_holds_on_supply_change(
+                    &orch,
+                    Utc::now().timestamp(),
+                )
+                .await;
                 true
             }
         };
@@ -511,39 +515,6 @@ async fn run_scheduler_loop(orch: Orchestrator) {
 /// How long a burst of credential-store writes settles before held work asks
 /// whether it changed anything.
 const SUPPLY_CHANGE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Ask every hold not gated on the operator whether the accounts as they now
-/// stand can serve its work, and release those they can. A hold that still
-/// cannot run re-arms and stays held. Releases go through the hold's own path
-/// (a launch hold to advancement and admission), so a burst queues behind the
-/// fleet cap rather than launching at once. No jitter: a supply change has no
-/// shared instant to spread.
-async fn release_holds_on_supply_change(orch: &Orchestrator) {
-    let now = Utc::now().timestamp();
-    let mut holds = Vec::new();
-    for db in orch.db.all_dbs().await {
-        if let Err(error) =
-            crate::orchestrator::wakes::supersede_orphaned_provider_limit_holds(&db, now).await
-        {
-            log::error!("Failed to retire orphaned provider limit holds: {error}");
-        }
-        match crate::orchestrator::wakes::load_active_provider_limit_holds(&db).await {
-            Ok(loaded) => holds.extend(loaded),
-            Err(error) => log::error!("Failed to load provider limit holds: {error}"),
-        }
-    }
-    sort_oldest_first(&mut holds);
-    for hold in holds.iter().filter(|hold| hold.releasable()) {
-        if let Err(error) =
-            crate::orchestrator::wakes::release_on_supply_change(orch, hold, now).await
-        {
-            log::error!(
-                "Failed to release hold '{}' on a supply change: {error}",
-                hold.id
-            );
-        }
-    }
-}
 
 /// Holds are asked oldest first, across every database, so when a free fleet
 /// slot can take only some of them the longest-held work goes first.

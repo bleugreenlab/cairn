@@ -14,6 +14,9 @@ use cairn_db::turso::{params, Row};
 use cairn_models::supply::CapacityRefusal;
 use serde::{Deserialize, Serialize};
 
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use crate::execution::gates::capacity::{fleet_working, held_work_fits, FleetWorking, ThreadFacts};
 use crate::execution::jobs::ResumeContext;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -125,13 +128,7 @@ impl ProviderLimitHold {
     /// spread, so it is due as declared. With no declared reset the hold
     /// re-checks [`SUPPLY_RECHECK_SECS`] after it last learned anything.
     pub fn next_due_at(&self) -> Option<i64> {
-        if self.state != "active"
-            || self.resume_gate.is_some()
-            || matches!(
-                self.boundary_source.as_str(),
-                "thread_focus" | "thread_open_prs"
-            )
-        {
+        if self.state != "active" || self.resume_gate.is_some() || self.is_thread_bound() {
             return None;
         }
         // A switch to another account, or a wait for a fleet slot, has no
@@ -158,6 +155,15 @@ impl ProviderLimitHold {
     /// Whether a change to the accounts may release this hold now.
     pub fn releasable(&self) -> bool {
         self.state == "active" && self.resume_gate.is_none()
+    }
+
+    /// Whether this hold waits on its thread's bound (focus or open PRs)
+    /// rather than on supply or a fleet slot.
+    pub fn is_thread_bound(&self) -> bool {
+        matches!(
+            self.boundary_source.as_str(),
+            "thread_focus" | "thread_open_prs"
+        )
     }
 }
 
@@ -540,6 +546,20 @@ pub async fn thread_job_refusal(
     hold_id: Option<&str>,
     focus_admitted: bool,
 ) -> Result<Option<(&'static str, String)>, String> {
+    thread_refusal(orch, db, job_id, kind, hold_id, focus_admitted, None).await
+}
+
+/// [`thread_job_refusal`] over the thread's facts as a pass already read them
+/// (`known`), when they are this job's thread's; read afresh otherwise.
+async fn thread_refusal(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_id: &str,
+    kind: HoldKind,
+    hold_id: Option<&str>,
+    focus_admitted: bool,
+    known: Option<std::sync::Arc<ThreadFacts>>,
+) -> Result<Option<(&'static str, String)>, String> {
     if !owns_held_job(orch, db, job_id).await? {
         return Err("This execution belongs to another runner; resume it there.".into());
     }
@@ -556,11 +576,19 @@ pub async fn thread_job_refusal(
     if kind == HoldKind::Launch {
         let job = job_id.to_string();
         let bound = orch.get_settings().max_open_prs_per_thread;
+        let facts = known.clone();
         let reason = db
             .read(move |conn| {
                 let job = job.clone();
+                let facts = facts.clone();
                 Box::pin(async move {
-                    crate::execution::gates::open_prs::launch_refusal_conn(conn, &job, bound).await
+                    crate::execution::gates::open_prs::launch_refusal_conn(
+                        conn,
+                        &job,
+                        bound,
+                        facts.as_deref(),
+                    )
+                    .await
                 })
             })
             .await
@@ -573,11 +601,12 @@ pub async fn thread_job_refusal(
         true
     } else if kind == HoldKind::Launch {
         crate::execution::gates::capacity::focus_admits_launch(
-            orch, db, &execution, job_id, hold_id,
+            orch, db, &execution, job_id, hold_id, known,
         )
         .await?
     } else {
-        crate::execution::gates::capacity::focus_admits(orch, db, &execution, hold_id).await?
+        crate::execution::gates::capacity::focus_admits(orch, db, &execution, hold_id, known)
+            .await?
     };
     if !focus_fits {
         return Ok(Some((
@@ -631,30 +660,301 @@ pub async fn arm_thread_hold(
 
 /// A gate pass is also the boot and periodic backstop for no-timer holds.
 /// Resolve oldest first before the same pass considers never-started work.
-pub async fn resolve_thread_holds(orch: &Orchestrator, now: i64) -> Result<(), String> {
-    let mut holds = Vec::new();
+pub async fn resolve_thread_holds(orch: &Orchestrator, now: i64) -> Result<HoldPassReport, String> {
+    let mut held = Vec::new();
     for db in orch.db.all_dbs().await {
         recover_undriven_thread_resumes(orch, &db, now).await?;
         supersede_orphaned_provider_limit_holds(&db, now).await?;
-        holds.extend(
+        held.extend(
             load_active_provider_limit_holds(&db)
                 .await?
                 .into_iter()
-                .filter(|h| {
-                    matches!(
-                        h.boundary_source.as_str(),
-                        "thread_focus" | "thread_open_prs"
-                    )
-                }),
+                .filter(ProviderLimitHold::is_thread_bound)
+                .map(|hold| (db.clone(), hold)),
         );
     }
-    holds.sort_by(|a, b| (a.queue_order(), &a.id).cmp(&(b.queue_order(), &b.id)));
-    for hold in holds {
-        if let Err(error) = resolve(orch, &hold, now, Trigger::SupplyChanged).await {
-            log::error!("Thread hold {} could not release: {error}", hold.id);
+    Ok(decide_held_work(orch, held, now).await)
+}
+
+/// Ask every hold not gated on the operator whether the accounts as they now
+/// stand can serve its work, and release those they can. A hold that still
+/// cannot run re-arms and stays held. Releases go through the hold's own path
+/// (a launch hold to advancement and admission), so a burst queues behind the
+/// fleet cap rather than launching at once. No jitter: a supply change has no
+/// shared instant to spread.
+pub async fn release_holds_on_supply_change(orch: &Orchestrator, now: i64) -> HoldPassReport {
+    let mut held = Vec::new();
+    for db in orch.db.all_dbs().await {
+        if let Err(error) = supersede_orphaned_provider_limit_holds(&db, now).await {
+            log::error!("Failed to retire orphaned provider limit holds: {error}");
+        }
+        match load_active_provider_limit_holds(&db).await {
+            Ok(loaded) => held.extend(
+                loaded
+                    .into_iter()
+                    .filter(ProviderLimitHold::releasable)
+                    .map(|hold| (db.clone(), hold)),
+            ),
+            Err(error) => log::error!("Failed to load provider limit holds: {error}"),
         }
     }
-    Ok(())
+    decide_held_work(orch, held, now).await
+}
+
+/// How long a thread-bound hold refused on unchanged thread facts goes without
+/// being decided again. The backstop for anything a thread's fingerprint does
+/// not capture (an operator override on the execution, a band hold's job
+/// changing state).
+pub const THREAD_HOLD_BACKSTOP_SECS: i64 = 60;
+
+/// Thread-bound holds the last pass refused on their thread's bound: the
+/// fingerprint of the thread facts that refused each, and when. Process memory
+/// only, so a restart decides every hold afresh.
+#[derive(Default)]
+pub struct HeldWorkMemo(std::sync::Mutex<HashMap<String, (u64, i64)>>);
+
+impl HeldWorkMemo {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, i64)>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// What one pass over held work did: the line that makes its cost one grep.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HoldPassReport {
+    /// Holds the pass looked at.
+    pub considered: usize,
+    /// Thread-bound holds not decided again because nothing their thread's
+    /// bound reads had changed since they were last refused.
+    pub skipped_unchanged: usize,
+    /// Fleet counts the pass took: 0 when no hold reached the fleet cap, 1
+    /// otherwise, plus one per admission another site made mid-pass.
+    pub fleet_snapshots: usize,
+    pub released: usize,
+}
+
+/// A pass's fleet count, taken under the admission lock and good for as long
+/// as every acquisition since was this pass's own: `admissions` is the lock's
+/// total acquisition count as of this pass's latest acquisition.
+struct FleetSnapshot {
+    working: FleetWorking,
+    admissions: u64,
+}
+
+/// The state one pass carries from hold to hold.
+#[derive(Default)]
+struct HoldPass {
+    fleet: Option<FleetSnapshot>,
+    report: HoldPassReport,
+}
+
+impl HoldPass {
+    /// Note that this pass has just taken the admission lock. If anyone else
+    /// took it since the count was taken, they may have admitted work the
+    /// count does not hold, so it is dropped and taken again when next needed.
+    fn admitted(&mut self, orch: &Orchestrator) {
+        let seen = orch.admission_lock.total_acquisitions();
+        if let Some(snapshot) = &mut self.fleet {
+            if snapshot.admissions + 1 == seen {
+                snapshot.admissions = seen;
+            } else {
+                self.fleet = None;
+            }
+        }
+    }
+
+    /// The fleet as this pass counts it. Call only under the admission lock.
+    async fn fleet(&mut self, orch: &Orchestrator) -> Result<&FleetWorking, String> {
+        let snapshot = match self.fleet.take() {
+            Some(snapshot) => snapshot,
+            None => {
+                let working = fleet_working(orch).await?;
+                self.report.fleet_snapshots += 1;
+                FleetSnapshot {
+                    working,
+                    admissions: orch.admission_lock.total_acquisitions(),
+                }
+            }
+        };
+        Ok(&self.fleet.insert(snapshot).working)
+    }
+
+    /// A released hold's execution counts from now on, so it counts before the
+    /// next hold is decided.
+    fn counted(&mut self, execution: Option<String>) {
+        if let (Some(snapshot), Some(execution)) = (&mut self.fleet, execution) {
+            snapshot.working.entry(execution).or_insert(false);
+        }
+    }
+}
+
+/// A thread as a pass keys it: the address of the database it lives in, and
+/// its id.
+type ThreadKey = (usize, String);
+
+/// What a pass knows about one hold's thread: its key, its facts, and the
+/// fingerprint of everything its bound reads.
+type HoldThread = (ThreadKey, std::sync::Arc<ThreadFacts>, u64);
+
+/// Decide `held` as one pass, in release order (queue key, then id): resumed
+/// work ahead of never-started work, each release counting before the next
+/// decision. The pass reads each thread's bound facts once, counts the fleet
+/// once, and does not decide again a thread-bound hold its thread's facts
+/// refused last time when those facts have not changed, for at most
+/// [`THREAD_HOLD_BACKSTOP_SECS`].
+async fn decide_held_work(
+    orch: &Orchestrator,
+    mut held: Vec<(std::sync::Arc<LocalDb>, ProviderLimitHold)>,
+    now: i64,
+) -> HoldPassReport {
+    let started = std::time::Instant::now();
+    held.sort_by(|(_, a), (_, b)| (a.queue_order(), &a.id).cmp(&(b.queue_order(), &b.id)));
+    let threads = thread_facts_by_hold(orch, &held)
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!("Held work pass reads each hold's thread afresh: {error}");
+            HashMap::new()
+        });
+    let prior = orch.held_work_memo.lock().clone();
+    let mut refused = HashMap::new();
+    let mut released_in: HashSet<ThreadKey> = HashSet::new();
+    let mut pass = HoldPass::default();
+    for (_, hold) in &held {
+        pass.report.considered += 1;
+        let thread = threads
+            .get(&hold.id)
+            .filter(|(key, ..)| !released_in.contains(key));
+        if let (Some((_, _, fingerprint)), Some((seen, at))) = (thread, prior.get(&hold.id)) {
+            if hold.is_thread_bound()
+                && fingerprint == seen
+                && now.saturating_sub(*at) < THREAD_HOLD_BACKSTOP_SECS
+            {
+                pass.report.skipped_unchanged += 1;
+                refused.insert(hold.id.clone(), (*seen, *at));
+                continue;
+            }
+        }
+        let known = thread.map(|(_, facts, _)| facts.clone());
+        match resolve(orch, hold, now, Trigger::SupplyChanged, &mut pass, known).await {
+            Ok(Decision::ThreadBound) => {
+                if let Some((_, _, fingerprint)) = thread {
+                    refused.insert(hold.id.clone(), (*fingerprint, now));
+                }
+            }
+            Ok(Decision::Released) => {
+                pass.report.released += 1;
+                if let Some((key, ..)) = threads.get(&hold.id) {
+                    released_in.insert(key.clone());
+                }
+            }
+            Ok(Decision::Kept) => {}
+            Err(error) => log::error!("Hold {} could not release: {error}", hold.id),
+        }
+    }
+    *orch.held_work_memo.lock() = refused;
+    log::debug!(
+        "held work pass holds={} skipped_unchanged={} fleet_snapshots={} released={} duration_ms={}",
+        pass.report.considered,
+        pass.report.skipped_unchanged,
+        pass.report.fleet_snapshots,
+        pass.report.released,
+        started.elapsed().as_millis()
+    );
+    pass.report
+}
+
+/// Each thread-bound hold's thread, read once per thread: one query per
+/// database maps holds to threads, then one read per thread takes its facts.
+/// A thread's fingerprint covers what its bound reads: those facts, the two
+/// bound settings, and the identity and place of every thread-bound hold on it
+/// (the re-entry band). A hold whose issue has no thread has no entry.
+async fn thread_facts_by_hold(
+    orch: &Orchestrator,
+    held: &[(std::sync::Arc<LocalDb>, ProviderLimitHold)],
+) -> Result<HashMap<String, HoldThread>, String> {
+    use std::hash::{Hash, Hasher};
+    let settings = orch.get_settings();
+    let bounds = (
+        settings.max_open_prs_per_thread,
+        settings.max_open_children_per_thread,
+    );
+    let holds: HashMap<&str, &ProviderLimitHold> = held
+        .iter()
+        .map(|(_, hold)| (hold.id.as_str(), hold))
+        .collect();
+    let mut dbs: Vec<&std::sync::Arc<LocalDb>> = Vec::new();
+    for (db, hold) in held {
+        if hold.is_thread_bound() && !dbs.iter().any(|known| std::sync::Arc::ptr_eq(known, db)) {
+            dbs.push(db);
+        }
+    }
+    // Per thread: its holds as (id, open issue), in a stable order.
+    let mut members: BTreeMap<ThreadKey, Vec<(String, bool)>> = BTreeMap::new();
+    let mut by_thread: HashMap<ThreadKey, std::sync::Arc<LocalDb>> = HashMap::new();
+    for db in dbs {
+        let address = std::sync::Arc::as_ptr(db) as usize;
+        let rows = db
+            .query_all(
+                "SELECT h.id, i.parent_thread_id, (i.merged_at IS NULL AND i.closed_at IS NULL)
+                   FROM provider_limit_holds h JOIN jobs j ON j.id = h.job_id
+                   LEFT JOIN executions e ON e.id = j.execution_id
+                   JOIN issues i ON i.id = COALESCE(j.issue_id, e.issue_id)
+                  WHERE h.state = 'active' AND h.boundary_source IN ('thread_focus', 'thread_open_prs')
+                    AND i.parent_thread_id IS NOT NULL",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.i64(2)? != 0)),
+            )
+            .await
+            .map_err(|error| format!("failed to map holds to threads: {error}"))?;
+        for (hold, thread, open) in rows {
+            if !holds.contains_key(hold.as_str()) {
+                continue;
+            }
+            let key = (address, thread);
+            by_thread.entry(key.clone()).or_insert_with(|| db.clone());
+            members.entry(key).or_default().push((hold, open));
+        }
+    }
+    let mut out = HashMap::new();
+    for (key, mut thread_holds) in members {
+        let Some(db) = by_thread.get(&key) else {
+            continue;
+        };
+        let thread_id = key.1.clone();
+        let facts = db
+            .read(move |conn| {
+                let thread_id = thread_id.clone();
+                Box::pin(async move {
+                    crate::execution::gates::capacity::thread_facts_conn(conn, &thread_id).await
+                })
+            })
+            .await
+            .map_err(|error| format!("failed to read thread {}: {error}", key.1))?;
+        thread_holds.sort();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        facts.hash(&mut hasher);
+        bounds.hash(&mut hasher);
+        for (id, open) in &thread_holds {
+            let hold = holds[id.as_str()];
+            (
+                id,
+                open,
+                hold.queue_order(),
+                hold.kind.as_str(),
+                &hold.boundary_source,
+                hold.updated_at,
+            )
+                .hash(&mut hasher);
+        }
+        let fingerprint = hasher.finish();
+        let facts = std::sync::Arc::new(facts);
+        for (id, _) in thread_holds {
+            out.insert(id, (key.clone(), facts.clone(), fingerprint));
+        }
+    }
+    Ok(out)
 }
 
 /// A process can end after claiming a hold but before reserving a successor.
@@ -1214,10 +1514,7 @@ async fn restore_resume_claim_conn(
             params![
                 active_id,
                 hold.resume_json.as_deref(),
-                matches!(
-                    hold.boundary_source.as_str(),
-                    "thread_focus" | "thread_open_prs"
-                ),
+                hold.is_thread_bound(),
                 hold.boundary_source.as_str(),
                 hold.queue_key
                     .unwrap_or_else(|| hold.created_at.saturating_mul(1_000_000)),
@@ -1418,10 +1715,7 @@ async fn rearm(
     );
     let id = hold.id.clone();
     let supply = hold.kind.is_supply();
-    let thread_boundary = matches!(
-        hold.boundary_source.as_str(),
-        "thread_focus" | "thread_open_prs"
-    );
+    let thread_boundary = hold.is_thread_bound();
     db.write(move |conn| {
         let id = id.clone();
         let account = account.clone();
@@ -1577,7 +1871,16 @@ pub async fn resolve_provider_limit_hold(
     hold: &ProviderLimitHold,
     now: i64,
 ) -> Result<bool, String> {
-    resolve(orch, hold, now, Trigger::Timer).await
+    resolve(
+        orch,
+        hold,
+        now,
+        Trigger::Timer,
+        &mut HoldPass::default(),
+        None,
+    )
+    .await
+    .map(|decision| decision == Decision::Released)
 }
 
 /// Ask a hold, whatever its clock says, whether the accounts as they now stand
@@ -1588,7 +1891,16 @@ pub async fn release_on_supply_change(
     hold: &ProviderLimitHold,
     now: i64,
 ) -> Result<bool, String> {
-    resolve(orch, hold, now, Trigger::SupplyChanged).await
+    resolve(
+        orch,
+        hold,
+        now,
+        Trigger::SupplyChanged,
+        &mut HoldPass::default(),
+        None,
+    )
+    .await
+    .map(|decision| decision == Decision::Released)
 }
 
 /// Operator-authorized Start now, with the same hold claim as automatic
@@ -1611,11 +1923,7 @@ pub async fn start_now_thread_hold(
         if !owns_held_job(orch, &db, &hold.job_id).await? {
             return Ok(false);
         }
-        if !matches!(
-            hold.boundary_source.as_str(),
-            "thread_focus" | "thread_open_prs"
-        ) || !hold.releasable()
-        {
+        if !hold.is_thread_bound() || !hold.releasable() {
             return Ok(false);
         }
         let guard = orch
@@ -1652,24 +1960,42 @@ pub async fn start_now_thread_hold(
     Ok(false)
 }
 
+/// What deciding one hold came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Released,
+    /// Refused by its thread's bound, read before anything else was asked.
+    ThreadBound,
+    /// Still held for any other reason, or not this runner's to decide.
+    Kept,
+}
+
+/// Decide one hold. A thread-bound hold asks its thread's bound first, from
+/// `known` when the pass read its thread: that is the question that refuses it
+/// almost every time, and it needs neither a supply probe nor a fleet count.
+/// Only work the thread would admit goes on to supply, then to the fleet cap
+/// under the admission lock, where the thread's bound is asked again afresh
+/// before anything is released.
 async fn resolve(
     orch: &Orchestrator,
     hold: &ProviderLimitHold,
     now: i64,
     trigger: Trigger,
-) -> Result<bool, String> {
+    pass: &mut HoldPass,
+    known: Option<std::sync::Arc<ThreadFacts>>,
+) -> Result<Decision, String> {
     let db = crate::execution::routing::owning_db_for_job(&orch.db, &hold.job_id)
         .await
         .map_err(|error| error.to_string())?;
     if !owns_held_job(orch, &db, &hold.job_id).await? {
-        return Ok(false);
+        return Ok(Decision::Kept);
     }
     let ready = match trigger {
         Trigger::Timer => hold.due_at(now).is_some(),
         Trigger::SupplyChanged | Trigger::Operator => hold.releasable(),
     };
     if !ready {
-        return Ok(false);
+        return Ok(Decision::Kept);
     }
     if crate::execution::canonical::job_refusal(&db, &hold.job_id).is_some() {
         let id = hold.id.clone();
@@ -1679,20 +2005,38 @@ async fn resolve(
         })
         .await
         .map_err(|error| error.to_string())?;
-        return Ok(false);
+        return Ok(Decision::Kept);
     }
-    if !hold_can_launch(orch, &db, hold, now).await? {
-        return Ok(false);
-    }
-    // Supply can serve it; the fleet cap decides whether it runs now. The
-    // admission lock serialises this with every other cap decision, and the
-    // release below happens under it, so each released hold counts before
-    // the next is decided.
     let addressed = hold
         .resume_json
         .as_deref()
         .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
         .is_some_and(|v| v.get("cause").and_then(|c| c.as_str()) == Some("addressed"));
+    if hold.is_thread_bound() {
+        // Refusing reads no count that a refusal could overrun, so it needs no
+        // lock; a stale read here only sends work on to the check under it.
+        if let Some((boundary, reason)) = thread_refusal(
+            orch,
+            &db,
+            &hold.job_id,
+            hold.kind,
+            Some(&hold.id),
+            addressed,
+            known,
+        )
+        .await?
+        {
+            keep_thread_bound(&db, hold, boundary, reason, now).await?;
+            return Ok(Decision::ThreadBound);
+        }
+    }
+    if !hold_can_launch(orch, &db, hold, now).await? {
+        return Ok(Decision::Kept);
+    }
+    // Supply can serve it; the fleet cap decides whether it runs now. The
+    // admission lock serialises this with every other cap decision, and the
+    // release below happens under it, so each released hold counts before
+    // the next is decided.
     let guard = match orch
         .admission_lock
         .acquire(
@@ -1705,12 +2049,27 @@ async fn resolve(
         Err(busy) => {
             log::info!("Hold {} waits for the admission lock: {busy:?}", hold.id);
             wait_for_fleet_slot(&db, hold, now).await?;
-            return Ok(false);
+            return Ok(Decision::Kept);
         }
     };
-    if !addressed && !held_work_fits(orch, &db, hold).await? {
-        wait_for_fleet_slot(&db, hold, now).await?;
-        return Ok(false);
+    pass.admitted(orch);
+    let execution = db
+        .query_opt(
+            "SELECT execution_id FROM jobs WHERE id = ?1",
+            (hold.job_id.clone(),),
+            |row| row.opt_text(0),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .flatten();
+    // Work outside an execution (a thread's own session) never counts.
+    if let (false, Some(execution)) = (addressed, execution.as_deref()) {
+        let behind_its_lane = hold.kind == HoldKind::Launch && !hold.is_thread_bound();
+        let working = pass.fleet(orch).await?;
+        if !held_work_fits(orch, &db, working, execution, behind_its_lane).await? {
+            wait_for_fleet_slot(&db, hold, now).await?;
+            return Ok(Decision::Kept);
+        }
     }
     if let Some((boundary, reason)) = thread_job_refusal(
         orch,
@@ -1722,50 +2081,44 @@ async fn resolve(
     )
     .await?
     {
-        let id = hold.id.clone();
-        db.write(move |conn| {let id=id.clone();let reason=reason.clone();Box::pin(async move {
-            conn.execute("UPDATE provider_limit_holds SET boundary_source=?1,retry_not_before=NULL,observed_text=?2,updated_at=?3,queue_key=COALESCE(queue_key,MAX(?5,COALESCE((SELECT MAX(COALESCE(h.queue_key,h.created_at*1000000)) FROM provider_limit_holds h WHERE h.state='active' AND h.boundary_source IN ('thread_focus','thread_open_prs') AND h.id<>?4),0)+1)) WHERE id=?4 AND state='active'",params![boundary,reason,now,id.as_str(),now.saturating_mul(1_000_000)]).await?;
-            Ok(())
-        })}).await.map_err(|e|e.to_string())?;
-        return Ok(false);
+        keep_thread_bound(&db, hold, boundary, reason, now).await?;
+        return Ok(Decision::Kept);
     }
-    match hold.kind {
-        HoldKind::Yield => resolve_yield(orch, &db, hold, now, trigger, guard, None).await,
+    let released = match hold.kind {
+        HoldKind::Yield => resolve_yield(orch, &db, hold, now, trigger, guard, None).await?,
         HoldKind::Launch | HoldKind::Resume => {
-            resolve_supply_hold(orch, &db, hold, now, trigger, guard, None).await
+            resolve_supply_hold(orch, &db, hold, now, trigger, guard, None).await?
         }
+    };
+    if !released {
+        return Ok(Decision::Kept);
     }
+    pass.counted(execution);
+    Ok(Decision::Released)
 }
 
-async fn held_work_fits(
-    orch: &Orchestrator,
+/// Record that a hold waits on its thread's bound, and why, giving it a place
+/// in the thread's line if it has none. A hold that already says exactly this
+/// is left untouched, so a refusal repeated pass after pass writes nothing.
+async fn keep_thread_bound(
     db: &LocalDb,
     hold: &ProviderLimitHold,
-) -> Result<bool, String> {
-    let execution = db
-        .query_opt(
-            "SELECT execution_id FROM jobs WHERE id = ?1",
-            (hold.job_id.clone(),),
-            |row| row.opt_text(0),
-        )
-        .await
-        .map_err(|error| error.to_string())?
-        .flatten();
-    // Work outside an execution (a thread's own session) never counts.
-    let Some(execution) = execution else {
-        return Ok(true);
-    };
-    crate::execution::gates::capacity::held_work_fits(
-        orch,
-        db,
-        &execution,
-        hold.kind == HoldKind::Launch
-            && !matches!(
-                hold.boundary_source.as_str(),
-                "thread_focus" | "thread_open_prs"
-            ),
-    )
-    .await
+    boundary: &'static str,
+    reason: String,
+    now: i64,
+) -> Result<(), String> {
+    if hold.boundary_source == boundary
+        && hold.observed_text.as_deref() == Some(reason.as_str())
+        && hold.retry_not_before.is_none()
+        && hold.queue_key.is_some()
+    {
+        return Ok(());
+    }
+    let id = hold.id.clone();
+    db.write(move |conn| {let id=id.clone();let reason=reason.clone();Box::pin(async move {
+        conn.execute("UPDATE provider_limit_holds SET boundary_source=?1,retry_not_before=NULL,observed_text=?2,updated_at=?3,queue_key=COALESCE(queue_key,MAX(?5,COALESCE((SELECT MAX(COALESCE(h.queue_key,h.created_at*1000000)) FROM provider_limit_holds h WHERE h.state='active' AND h.boundary_source IN ('thread_focus','thread_open_prs') AND h.id<>?4),0)+1)) WHERE id=?4 AND state='active'",params![boundary,reason,now,id.as_str(),now.saturating_mul(1_000_000)]).await?;
+        Ok(())
+    })}).await.map_err(|e|e.to_string())
 }
 
 /// Keep a hold whose work supply can serve again held until a fleet slot is
@@ -1775,10 +2128,7 @@ async fn wait_for_fleet_slot(
     hold: &ProviderLimitHold,
     now: i64,
 ) -> Result<(), String> {
-    if matches!(
-        hold.boundary_source.as_str(),
-        "thread_focus" | "thread_open_prs"
-    ) {
+    if hold.is_thread_bound() {
         // Preserve the re-entry band's identity while a fleet slot is busy.
         // The periodic/boot pass, not a per-hold timer, retries this hold.
         return Ok(());
