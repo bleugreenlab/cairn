@@ -12,7 +12,8 @@ use crate::agent_process::stream::TranscriptEvent;
 use crate::messages::queued::QueuedMessage;
 use crate::messages::side_channel::SideChannelNotice;
 use crate::orchestrator::Orchestrator;
-use crate::storage::{run_db_blocking, DbError, DbResult, LocalDb, RowExt};
+use crate::storage::{run_db_blocking, DbResult, LocalDb};
+use crate::transcripts::stream_store::{insert_event_conn, EventInsert};
 use cairn_common::ids;
 use cairn_db::turso::params;
 use cairn_session::agent_process::stream::TranscriptJson;
@@ -312,31 +313,47 @@ pub(crate) async fn insert_session_boundary_conn(
     };
     let data = event.observed().to_event_json();
     let now = chrono::Utc::now().timestamp() as i32;
-    let event_id = ids::mint_child(run_id);
-    let sequence = next_event_sequence(conn, run_id).await?;
-    conn.execute(
-        "
-        INSERT INTO events (
-            id, run_id, session_id, sequence, timestamp, event_type,
-            data, parent_tool_use_id, created_at, input_tokens,
-            cache_read_tokens, cache_create_tokens, output_tokens, turn_id
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, NULL, NULL, NULL, ?9)
-        ",
-        params![
-            event_id.as_str(),
-            run_id,
-            session_id,
-            sequence,
-            now,
-            "system:session_boundary",
-            data.as_str(),
-            now,
-            turn_id
-        ],
-    )
-    .await?;
+    let event = quiet_event(
+        &ids::mint_child(run_id),
+        run_id,
+        session_id,
+        "system:session_boundary",
+        data,
+        now,
+        turn_id,
+    );
+    insert_event_conn(conn, &event).await?;
     Ok(())
+}
+
+/// A transcript event Cairn writes itself: no tokens, cost, or parent tool use.
+fn quiet_event(
+    event_id: &str,
+    run_id: &str,
+    session_id: Option<&str>,
+    event_type: &str,
+    data: String,
+    now: i32,
+    turn_id: Option<&str>,
+) -> EventInsert {
+    EventInsert {
+        id: event_id.to_string(),
+        run_id: run_id.to_string(),
+        session_id: session_id.map(str::to_string),
+        timestamp: now,
+        selected_model: None,
+        event_type: event_type.to_string(),
+        data,
+        parent_tool_use_id: None,
+        created_at: now,
+        input_tokens: None,
+        cache_read_tokens: None,
+        cache_create_tokens: None,
+        output_tokens: None,
+        thinking_tokens: None,
+        turn_id: turn_id.map(str::to_string),
+        cost_usd: None,
+    }
 }
 
 /// Insert a general quiet system message with structured metadata.
@@ -576,51 +593,27 @@ fn insert_system_event_sync(
     data: &str,
     now: i32,
     turn_id: Option<&str>,
-) -> Result<i32, String> {
+) -> Result<(), String> {
     let db_for_emit = db.clone();
     let run_id_for_emit = run_id.to_string();
     let session_id_for_emit = session_id.map(str::to_string);
 
-    let event_id = event_id.to_string();
-    let run_id = run_id.to_string();
-    let session_id = session_id.map(str::to_string);
-    let event_type = event_type.to_string();
-    let data = data.to_string();
-    let turn_id = turn_id.map(str::to_string);
-
-    let sequence = run_db_blocking(move || async move {
+    let event = quiet_event(
+        event_id,
+        run_id,
+        session_id,
+        event_type,
+        data.to_string(),
+        now,
+        turn_id,
+    );
+    let db = Arc::clone(db);
+    run_db_blocking(move || async move {
         db.write(|conn| {
-            let event_id = event_id.clone();
-            let run_id = run_id.clone();
-            let session_id = session_id.clone();
-            let event_type = event_type.clone();
-            let data = data.clone();
-            let turn_id = turn_id.clone();
+            let event = event.clone();
             Box::pin(async move {
-                let sequence = next_event_sequence(conn, &run_id).await?;
-                conn.execute(
-                    "
-                    INSERT INTO events (
-                        id, run_id, session_id, sequence, timestamp, event_type,
-                        data, parent_tool_use_id, created_at, input_tokens,
-                        cache_read_tokens, cache_create_tokens, output_tokens, turn_id
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, NULL, NULL, NULL, ?9)
-                    ",
-                    params![
-                        event_id.as_str(),
-                        run_id.as_str(),
-                        session_id.as_deref(),
-                        sequence,
-                        now,
-                        event_type.as_str(),
-                        data.as_str(),
-                        now,
-                        turn_id.as_deref()
-                    ],
-                )
-                .await?;
-                Ok(sequence)
+                insert_event_conn(conn, &event).await?;
+                Ok(())
             })
         })
         .await
@@ -640,7 +633,7 @@ fn insert_system_event_sync(
             "insert",
         ),
     );
-    Ok(sequence)
+    Ok(())
 }
 
 /// Insert a `user`-typed event (used for delivered queued user messages).
@@ -652,7 +645,7 @@ async fn insert_user_event(
     session_id: Option<&str>,
     data: &str,
     now: i32,
-) -> DbResult<i32> {
+) -> DbResult<()> {
     insert_system_event(
         db,
         emitter,
@@ -678,60 +671,36 @@ async fn insert_system_event(
     data: &str,
     now: i32,
     push_ids: &[String],
-) -> DbResult<i32> {
+) -> DbResult<()> {
     let db_for_emit = db.clone();
     let run_id_for_emit = run_id.to_string();
     let session_id_for_emit = session_id.map(str::to_string);
 
-    let event_id = event_id.to_string();
-    let run_id = run_id.to_string();
-    let session_id = session_id.map(str::to_string);
-    let event_type = event_type.to_string();
-    let data = data.to_string();
+    let event = quiet_event(
+        event_id,
+        run_id,
+        session_id,
+        event_type,
+        data.to_string(),
+        now,
+        None,
+    );
     let push_ids = push_ids.to_vec();
 
-    let sequence = db
-        .write(|conn| {
-            let event_id = event_id.clone();
-            let run_id = run_id.clone();
-            let session_id = session_id.clone();
-            let event_type = event_type.clone();
-            let data = data.clone();
-            let push_ids = push_ids.clone();
-            Box::pin(async move {
-                let sequence = next_event_sequence(conn, &run_id).await?;
-                conn.execute(
-                    "
-                INSERT INTO events (
-                    id, run_id, session_id, sequence, timestamp, event_type,
-                    data, parent_tool_use_id, created_at, input_tokens,
-                    cache_read_tokens, cache_create_tokens, output_tokens, turn_id
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, NULL, NULL, NULL, NULL)
-                ",
-                    params![
-                        event_id.as_str(),
-                        run_id.as_str(),
-                        session_id.as_deref(),
-                        sequence,
-                        now,
-                        event_type.as_str(),
-                        data.as_str(),
-                        now
-                    ],
-                )
+    db.write(|conn| {
+        let event = event.clone();
+        let push_ids = push_ids.clone();
+        Box::pin(async move {
+            insert_event_conn(conn, &event).await?;
+            // CAIRN-1881: when this event carries attention pushes, stamp each
+            // delivered by it inside the same transaction as the INSERT. Roll
+            // back together → the push redelivers.
+            crate::orchestrator::attention_push::stamp_delivered_conn(conn, &push_ids, &event.id)
                 .await?;
-                // CAIRN-1881: when this event carries attention pushes, stamp each
-                // delivered by it inside the same transaction as the INSERT. Roll
-                // back together → the push redelivers.
-                crate::orchestrator::attention_push::stamp_delivered_conn(
-                    conn, &push_ids, &event_id,
-                )
-                .await?;
-                Ok(sequence)
-            })
+            Ok(())
         })
-        .await?;
+    })
+    .await?;
 
     // Emit the scoped `events` db-change AFTER the write transaction commits
     // (never inside it). The live chat transcript's incremental delta cache is
@@ -747,24 +716,7 @@ async fn insert_system_event(
             "insert",
         ),
     );
-    Ok(sequence)
-}
-
-async fn next_event_sequence(
-    conn: &cairn_db::storage::TrackedConnection,
-    run_id: &str,
-) -> DbResult<i32> {
-    let mut rows = conn
-        .query(
-            "SELECT MAX(sequence) FROM events WHERE run_id = ?1",
-            params![run_id],
-        )
-        .await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or_else(|| DbError::Row("missing event sequence".to_string()))?;
-    Ok(row.opt_i64(0)?.unwrap_or(-1) as i32 + 1)
+    Ok(())
 }
 
 /// Look up `(session_id, run_id)` for the calling run. Useful for the dispatch

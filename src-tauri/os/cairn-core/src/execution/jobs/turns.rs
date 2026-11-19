@@ -1668,21 +1668,27 @@ pub(crate) fn admit_codex_goal_turn(
                         new_turn_id
                     };
                     let now = chrono::Utc::now().timestamp() as i32;
-                    let mut sequences = conn
-                        .query(
-                            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE run_id = ?1",
-                            (run_id.as_str(),),
-                        )
-                        .await?;
-                    let sequence = sequences.next().await?.unwrap().i64(0)?;
-                    conn.execute(
-                        "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at, turn_id)
-                         VALUES(?1, ?2, ?3, ?4, ?5, 'system:codex_goal_turn_started', ?6, ?5, ?7)",
-                        params![
-                            marker_id.as_str(), run_id.as_str(), session_id.as_str(), sequence,
-                            now, serde_json::json!({"providerTurnId": provider_turn_id}).to_string(),
-                            turn_id.as_str()
-                        ],
+                    crate::transcripts::stream_store::insert_event_conn(
+                        conn,
+                        &crate::transcripts::stream_store::EventInsert {
+                            id: marker_id.clone(),
+                            run_id: run_id.clone(),
+                            session_id: Some(session_id.clone()),
+                            timestamp: now,
+                            selected_model: None,
+                            event_type: "system:codex_goal_turn_started".to_string(),
+                            data: serde_json::json!({"providerTurnId": provider_turn_id})
+                                .to_string(),
+                            parent_tool_use_id: None,
+                            created_at: now,
+                            input_tokens: None,
+                            cache_read_tokens: None,
+                            cache_create_tokens: None,
+                            output_tokens: None,
+                            thinking_tokens: None,
+                            turn_id: Some(turn_id.clone()),
+                            cost_usd: None,
+                        },
                     )
                     .await?;
                     conn.execute(

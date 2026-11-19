@@ -608,6 +608,50 @@ mod tests {
         assert!(persist_reference(&reopened, conflicting).await.is_err());
     }
 
+    /// A chat already open on a session reads new rows through a forward delta
+    /// keyed on `session_id`; a card or notice stored without one never arrives.
+    #[tokio::test]
+    async fn out_of_band_events_reach_an_open_sessions_next_forward_delta() {
+        use cairn_db::storage::events::history::{EventFilter, HistoryReader};
+        let (_temp, db) = test_db().await;
+        insert_run(&db, "run-1").await;
+        let orch = orchestrator_for_delivery(db.clone());
+        let notice = |content: &str| {
+            crate::messages::transcript::insert_system_message_sync(
+                &orch,
+                "run-1",
+                None,
+                None,
+                content,
+                json!({"kind": "supply_hold_resolved"}),
+            )
+            .unwrap()
+        };
+        notice("before the chat opened");
+        let mut reader = HistoryReader::new(&db);
+        let cursor = reader
+            .session_max_rowid("session-1")
+            .await
+            .unwrap()
+            .expect("the open chat holds a position in its session");
+
+        persist_reference(&db, reference_event(&intent("reference"), "run-1"))
+            .await
+            .unwrap();
+        notice("An account can serve this node again, so it resumes now.");
+
+        let delta = reader
+            .session_events_after("session-1", None, cursor, EventFilter::default())
+            .await
+            .unwrap();
+        let types: Vec<&str> = delta
+            .rows
+            .iter()
+            .map(|row| row.event.event_type.as_str())
+            .collect();
+        assert_eq!(types, ["request_reference", "system:message"]);
+    }
+
     #[tokio::test]
     async fn parentless_request_attention_is_durable_and_not_rearmed_by_ack_retry() {
         let (_temp, db) = test_db().await;

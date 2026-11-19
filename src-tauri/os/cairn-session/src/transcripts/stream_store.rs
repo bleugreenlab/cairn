@@ -194,6 +194,17 @@ async fn insert_event_at_conn(
     // `event_account_sql`.
     let stamps_account =
         cairn_analytics::queries::stamps_account(&event.event_type, event.cost_usd);
+    // An open chat follows its session through forward deltas selected by
+    // `session_id`, so a row stored without one is skipped by every live reader
+    // and appears only after a cold reload. Writers outside the provider stream
+    // (request cards, system notices, synthetic errors) rarely hold the session,
+    // so it comes from the run. A run that never got a session, such as a launch
+    // that failed first, has no session reader to miss the row, so its events
+    // still land, read by run.
+    let session_id = match &event.session_id {
+        Some(session_id) => Some(session_id.clone()),
+        None => run_session_id_conn(conn, &event.run_id).await?,
+    };
     // Shutdown removes the process handle before its reader necessarily drains
     // stdout. The durable run-local turn, never the job's successor, still owns
     // those late frames and synthetic diagnostics.
@@ -227,7 +238,7 @@ async fn insert_event_at_conn(
             params![
                 event.id.as_str(),
                 event.run_id.as_str(),
-                event.session_id.as_deref(),
+                session_id.as_deref(),
                 sequence,
                 event.timestamp,
                 event.event_type.as_str(),
@@ -311,6 +322,16 @@ async fn insert_event_at_conn(
         }
     }
     Ok(count)
+}
+
+async fn run_session_id_conn(conn: &TrackedConnection, run_id: &str) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query("SELECT session_id FROM runs WHERE id = ?1", params![run_id])
+        .await?;
+    match rows.next().await? {
+        Some(row) => row.opt_text(0),
+        None => Ok(None),
+    }
 }
 
 fn presence_ts_ms(created_at_secs: i64) -> i64 {
@@ -1429,6 +1450,47 @@ mod tests {
             .unwrap()
             .flatten();
         assert_eq!(child, None);
+    }
+
+    #[tokio::test]
+    async fn an_event_without_a_session_takes_its_runs_session() {
+        let (_temp, db) = test_db().await;
+        insert_run_with_session(&db, "run-1", "session-from-run").await;
+        insert_run_with_session(&db, "sessionless", "unused").await;
+        db.execute(
+            "UPDATE runs SET session_id = NULL WHERE id = 'sessionless'",
+            (),
+        )
+        .await
+        .unwrap();
+
+        for (id, run_id, session_id) in [
+            ("out-of-band", "run-1", None),
+            ("explicit", "run-1", Some("session-explicit")),
+            ("launch-error", "sessionless", None),
+        ] {
+            let mut event = test_event(id, run_id);
+            event.session_id = session_id.map(str::to_string);
+            assert!(insert_event(db.clone(), event).unwrap());
+        }
+
+        let stored = db
+            .query_all("SELECT id, session_id FROM events ORDER BY id", (), |row| {
+                Ok((row.text(0)?, row.opt_text(1)?))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored,
+            [
+                ("explicit".to_string(), Some("session-explicit".to_string())),
+                ("launch-error".to_string(), None),
+                (
+                    "out-of-band".to_string(),
+                    Some("session-from-run".to_string())
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
