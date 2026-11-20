@@ -892,3 +892,158 @@ async fn a_hold_refused_by_its_open_pr_bound_takes_no_fleet_count() {
         .unwrap();
     assert_eq!(reason.as_deref(), Some("harness has 1/1 open PRs: 100"));
 }
+
+// -- Start means start (cairn/7364) ------------------------------------------
+
+/// A thread at its open-PR bound of 1, with child 102's PR-producing builder
+/// pending: the shape cairn/7339, 7360 and 7362 were held in.
+async fn at_the_open_pr_bound(name: &str) -> (Env, std::sync::Arc<RecordedStarts>) {
+    use super::capacity::tests::add_started;
+    let (env, starts) = thread_world(name).await;
+    caps_and_bound(&env, 50, 10, 1);
+    add_started(&env, 100, Some("th"), "complete").await;
+    env.db
+        .execute_script(
+            "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
+                                        target_branch, status, opened_at, updated_at)
+               VALUES('smr100', 'sj100', 'p', 'si100', 'PR', 'b100', 'main', 'open', 1, 1);",
+        )
+        .await
+        .unwrap();
+    pending_builder(&env, 102).await;
+    (env, starts)
+}
+
+async fn release_record(env: &Env, execution: &str) -> Value {
+    let json = env
+        .db
+        .query_opt_text(
+            "SELECT release_override_json FROM executions WHERE id = ?1",
+            (execution.to_string(),),
+        )
+        .await
+        .unwrap()
+        .expect("the start is recorded");
+    serde_json::from_str(&json).unwrap()
+}
+
+/// cairn/7360 and 7362: the operator's Start released the execution past the
+/// fleet cap, and its root builder was then dispatched as a system launch,
+/// which armed a `thread_open_prs` hold. Admission reads the operator's start
+/// on the execution: the never-run builder launches, nothing is held, and the
+/// start records the bound it skipped beside the fleet cap. A job that has run
+/// before is not covered by that start and is held as ever.
+#[tokio::test]
+async fn an_operator_started_builder_launches_past_its_threads_open_pr_bound() {
+    let (env, _starts) = at_the_open_pr_bound("operator-start-past-bound.db").await;
+    env.db
+        .execute(
+            "UPDATE executions SET release_override_json = ?1 WHERE id = 'se102'",
+            (
+                json!({"principal": "operator", "at": 1, "operator": true, "skipped": ["fleet"]})
+                    .to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let admitted = crate::orchestrator::wakes::admit_thread_launch(
+        &env.orch,
+        "sj102",
+        crate::execution::jobs::WakeCause::System,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(admitted.is_some(), "the operator's start is not held");
+    drop(admitted);
+    assert!(
+        crate::orchestrator::wakes::load_active_provider_limit_holds(&env.db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        release_record(&env, "se102").await["skipped"],
+        json!(["fleet", "open_prs"])
+    );
+
+    env.db
+        .execute_script(
+            "INSERT INTO runs(id, project_id, job_id, issue_id, status, created_at, updated_at)
+               VALUES('sr102', 'p', 'sj102', 'si102', 'exited', 1, 1);",
+        )
+        .await
+        .unwrap();
+    let hold = launch_is_held(&env, "sj102").await;
+    assert_eq!(hold.boundary_source, "thread_open_prs");
+}
+
+/// The operator's Start on a started execution whose builder its thread's
+/// open-PR bound holds releases it in one call: the hold resolves, the builder
+/// is handed to a runner, the start records the bound it skipped, and the
+/// system re-dispatch a refused launch gets is not held again.
+#[tokio::test]
+async fn start_now_on_a_job_held_execution_launches_its_builder_in_one_call() {
+    let (env, starts) = at_the_open_pr_bound("start-now-job-held.db").await;
+    let hold = launch_is_held(&env, "sj102").await;
+
+    let census = env
+        .db
+        .read(|conn| {
+            Box::pin(async move {
+                super::census::census_for_executions_conn(conn, &["se102".to_string()]).await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        census["se102"].job_held.as_deref(),
+        Some("harness has 1/1 open PRs: 100"),
+        "the issue page sees the held job, and offers Start now for it"
+    );
+
+    let outcome = super::start_now::start_now_within(
+        &env.orch,
+        "se102",
+        json!("operator"),
+        super::sweep::CapSkipAuthority::Operator,
+        Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome,
+        super::start_now::StartOutcome::Starting,
+        "the recording runner starts no process, so no run reports"
+    );
+    assert_eq!(hold_state(&env, &hold.id).await, "resolved");
+    assert_eq!(starts.started(), vec!["sj102".to_string()]);
+    let record = release_record(&env, "se102").await;
+    assert_eq!(record["operator"], json!(true));
+    assert_eq!(record["skipped"], json!(["open_prs"]));
+
+    let redispatched = crate::orchestrator::wakes::admit_thread_launch(
+        &env.orch,
+        "sj102",
+        crate::execution::jobs::WakeCause::System,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(redispatched.is_some(), "not held again by the bound");
+    drop(redispatched);
+
+    let again = super::start_now::start_now_within(
+        &env.orch,
+        "se102",
+        json!("operator"),
+        super::sweep::CapSkipAuthority::Operator,
+        Duration::ZERO,
+    )
+    .await;
+    assert_eq!(
+        again.unwrap(),
+        super::start_now::StartOutcome::AlreadyStarted
+    );
+}

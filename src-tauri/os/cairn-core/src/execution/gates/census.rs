@@ -355,7 +355,33 @@ pub fn census_with(
         gates: entries,
         release_override,
         evaluated_at: None,
+        job_held: None,
     })
+}
+
+/// The census of a started execution whose job its thread's bound holds:
+/// `census` when it has one, otherwise a bare one, carrying the hold's words
+/// as its summary so the job-held line never reads as running.
+fn with_job_held(census: Option<ExecutionGateCensus>, reason: String) -> ExecutionGateCensus {
+    let summary = format!("started, but a job is held: {reason}");
+    match census {
+        Some(census) => ExecutionGateCensus {
+            summary,
+            job_held: Some(reason),
+            ..census
+        },
+        None => ExecutionGateCensus {
+            held: false,
+            wont_start: None,
+            queued: false,
+            summary,
+            detail: None,
+            gates: Vec::new(),
+            release_override: None,
+            evaluated_at: None,
+            job_held: Some(reason),
+        },
+    }
 }
 
 /// Why a gated, unreleased execution that is no longer live can never start.
@@ -453,7 +479,17 @@ fn summarize(
 
 /// `, skipping the fleet and thread caps`: what a Start now skipped.
 pub(crate) fn skipped_phrase(skipped: &[String]) -> String {
-    match skipped {
+    // `open_prs` is the open-PR bound; `thread_focus` and `thread_open_prs`
+    // are what earlier starts of a held job recorded.
+    let words: Vec<&str> = skipped
+        .iter()
+        .map(|label| match label.as_str() {
+            "open_prs" | "thread_open_prs" => "open-PR",
+            "thread_focus" => "thread",
+            other => other,
+        })
+        .collect();
+    match words.as_slice() {
         [] => String::new(),
         [one] => format!(", skipping the {one} cap"),
         many => format!(", skipping the {} caps", many.join(" and ")),
@@ -644,8 +680,9 @@ pub(super) fn executions_census_sql(n: usize) -> String {
     ))
 }
 
-/// The census of each execution in `execution_ids` that has one. Two queries
-/// per [`IN_LIST_CHUNK`] executions, however many a list shows.
+/// The census of each execution in `execution_ids` that has one, a started
+/// execution whose job its thread's bound holds included. Three queries per
+/// [`IN_LIST_CHUNK`] executions, however many a list shows.
 pub async fn census_for_executions_conn(
     conn: &crate::storage::TrackedConnection,
     execution_ids: &[String],
@@ -659,6 +696,11 @@ pub async fn census_for_executions_conn(
                 .into_iter()
                 .map(|(row, census)| (row.id, census)),
         );
+        for (execution, reason) in super::open_prs::thread_held_executions_conn(conn, chunk).await?
+        {
+            let census = with_job_held(out.remove(&execution), reason);
+            out.insert(execution, census);
+        }
     }
     Ok(out)
 }

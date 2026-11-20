@@ -82,39 +82,116 @@ pub async fn launch_refusal_conn(
     )))
 }
 
+/// What a Start now records it skipped when it releases a hold on `boundary`:
+/// the same labels a released execution's capacity rows record (`fleet`,
+/// `thread`), with `open_prs` for the open-PR bound.
+pub fn skipped_label(boundary: &str) -> Option<&'static str> {
+    match boundary {
+        "thread_open_prs" => Some("open_prs"),
+        "thread_focus" => Some("thread"),
+        "fleet_slot" => Some("fleet"),
+        _ => None,
+    }
+}
+
+/// One live thread-policy hold on a job: its id, the job, what it says, and the
+/// bound (`thread_open_prs` or `thread_focus`) that holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadHold {
+    pub id: String,
+    pub job_id: String,
+    pub reason: String,
+    pub boundary: String,
+}
+
+/// The predicate shared by [`thread_holds`] and [`thread_held_executions_conn`]:
+/// a live thread hold that still owns its job, on a live execution of an
+/// unresolved issue. Expects `supply_hold`, `j`, `e` and `i`.
+macro_rules! live_thread_hold_sql {
+    () => {
+        concat!(
+            "supply_hold.boundary_source IN ('thread_focus','thread_open_prs')
+               AND i.merged_at IS NULL AND i.closed_at IS NULL AND ",
+            cairn_db::live_execution_sql!(),
+            " AND ",
+            cairn_db::reentry_hold_owns_job_sql!()
+        )
+    };
+}
+
 /// Live thread-policy holds on an execution (or one hold id), in release order.
 /// Used by Start now without confusing job holds with unreleased gate rows.
 pub async fn thread_holds(
     db: &crate::storage::LocalDb,
     execution_or_hold: &str,
-) -> DbResult<Vec<(String, String)>> {
+) -> DbResult<Vec<ThreadHold>> {
     let id = execution_or_hold.to_owned();
     db.read(move |conn| {
         Box::pin(async move {
             let mut rows = conn
                 .query(
                     concat!(
-            "SELECT supply_hold.id, COALESCE(supply_hold.observed_text, supply_hold.boundary_source)
-             FROM provider_limit_holds supply_hold JOIN jobs j ON j.id=supply_hold.job_id
-             JOIN executions e ON e.id=j.execution_id JOIN issues i ON i.id=e.issue_id
-             WHERE (e.id=?1 OR supply_hold.id=?1)
-               AND supply_hold.boundary_source IN ('thread_focus','thread_open_prs')
-               AND i.merged_at IS NULL AND i.closed_at IS NULL AND ",
-            cairn_db::live_execution_sql!(), " AND ",
-            cairn_db::reentry_hold_owns_job_sql!(),
-            " ORDER BY COALESCE(supply_hold.queue_key,supply_hold.created_at*1000000), supply_hold.id"
-        ),
+                        "SELECT supply_hold.id,
+                                COALESCE(supply_hold.observed_text, supply_hold.boundary_source),
+                                supply_hold.boundary_source, supply_hold.job_id
+                           FROM provider_limit_holds supply_hold JOIN jobs j ON j.id=supply_hold.job_id
+                           JOIN executions e ON e.id=j.execution_id JOIN issues i ON i.id=e.issue_id
+                          WHERE (e.id=?1 OR supply_hold.id=?1) AND ",
+                        live_thread_hold_sql!(),
+                        " ORDER BY COALESCE(supply_hold.queue_key,supply_hold.created_at*1000000), supply_hold.id"
+                    ),
                     params![id],
                 )
                 .await?;
             let mut holds = Vec::new();
             while let Some(row) = rows.next().await? {
-                holds.push((row.text(0)?, row.text(1)?));
+                holds.push(ThreadHold {
+                    id: row.text(0)?,
+                    reason: row.text(1)?,
+                    boundary: row.text(2)?,
+                    job_id: row.text(3)?,
+                });
             }
             Ok(holds)
         })
     })
     .await
+}
+
+/// Which of `execution_ids` have a job held by a live thread hold, and what the
+/// first such hold (in release order) says: the released executions whose work
+/// still waits, which the issue page offers a Start now for. The caller keeps
+/// `execution_ids` within [`cairn_db::sql::IN_LIST_CHUNK`].
+pub async fn thread_held_executions_conn(
+    conn: &TrackedConnection,
+    execution_ids: &[String],
+) -> DbResult<std::collections::HashMap<String, String>> {
+    use cairn_db::storage::QueryConn;
+
+    let mut held = std::collections::HashMap::new();
+    if execution_ids.is_empty() {
+        return Ok(held);
+    }
+    let placeholders = cairn_db::sql::placeholders(execution_ids.len());
+    let sql = format!(
+        "SELECT e.id, COALESCE(supply_hold.observed_text, supply_hold.boundary_source)
+           FROM jobs j JOIN provider_limit_holds supply_hold ON supply_hold.job_id = j.id
+           JOIN executions e ON e.id = j.execution_id JOIN issues i ON i.id = e.issue_id
+          WHERE j.execution_id IN ({placeholders}) AND supply_hold.state = 'active' AND {}
+          ORDER BY COALESCE(supply_hold.queue_key, supply_hold.created_at*1000000), supply_hold.id",
+        live_thread_hold_sql!()
+    );
+    let bound = execution_ids
+        .iter()
+        .map(|id| cairn_db::turso::Value::Text(id.clone()))
+        .collect::<Vec<_>>();
+    let mut rows = conn.query_rows(&sql, bound).await?;
+    while let Some(row) = rows.next().await? {
+        let execution = row.text(0)?;
+        let reason = row.text(1)?;
+        held.entry(execution).or_insert(reason);
+    }
+    Ok(held)
 }
 
 #[cfg(test)]
@@ -218,7 +295,28 @@ mod tests {
                VALUES('hold3','j3','claude','thread_open_prs','PR bound','launch',1,1);"
         ).await.unwrap();
         let holds = thread_holds(&db, "e3").await.unwrap();
-        assert_eq!(holds, vec![("hold3".into(), "PR bound".into())]);
+        assert_eq!(
+            holds,
+            vec![ThreadHold {
+                id: "hold3".into(),
+                job_id: "j3".into(),
+                reason: "PR bound".into(),
+                boundary: "thread_open_prs".into(),
+            }]
+        );
+        let ids = vec!["e3".to_string(), "e1".to_string()];
+        let held = db
+            .read(move |conn| {
+                let ids = ids.clone();
+                Box::pin(async move { thread_held_executions_conn(conn, &ids).await })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            held,
+            std::collections::HashMap::from([("e3".to_string(), "PR bound".to_string())]),
+            "only the execution whose job a live thread hold owns is job-held"
+        );
         assert_eq!(thread_holds(&db, "hold3").await.unwrap(), holds);
         db.execute_script("UPDATE jobs SET status='running' WHERE id='j3';")
             .await

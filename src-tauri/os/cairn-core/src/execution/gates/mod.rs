@@ -19,5 +19,6 @@ pub mod reorder;
 pub mod rotation;
 #[cfg(test)]
 mod rotation_tests;
+pub mod start_now;
 pub mod sweep;
 pub mod vocabulary;

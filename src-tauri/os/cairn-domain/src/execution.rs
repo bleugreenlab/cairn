@@ -369,6 +369,11 @@ pub struct ExecutionGateCensus {
     /// absent after a restart until the first pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluated_at: Option<i64>,
+    /// Present when the execution has started but one of its jobs is held by
+    /// its thread's bound (open PRs or focus): what that hold says. The
+    /// operator's Start now releases it like any other cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_held: Option<String>,
 }
 
 /// A gated, unreleased execution as an issue-level surface lists it: waiting

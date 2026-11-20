@@ -345,7 +345,7 @@ fn hold_start_for_reservation(
 /// [`crate::orchestrator::wakes::arm_supply_hold`]). The refused launch still
 /// returns its error; whichever seam would then fail the start finds the hold
 /// and records the run instead ([`mark_job_start_failed`]).
-fn hold_refused_launch(
+pub(crate) fn hold_refused_launch(
     owning_db: &Arc<LocalDb>,
     job_id: &str,
     kind: crate::orchestrator::wakes::HoldKind,

@@ -429,7 +429,7 @@ async fn start_now_request(
     if !job_holds.is_empty() {
         let reasons = job_holds
             .iter()
-            .map(|(_, reason)| reason.as_str())
+            .map(|hold| hold.reason.as_str())
             .collect::<Vec<_>>();
         authority
             .summary

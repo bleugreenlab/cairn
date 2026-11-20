@@ -520,6 +520,9 @@ pub async fn admit_thread_launch(
         if let Some((boundary, reason)) =
             thread_job_refusal(orch, &db, job_id, HoldKind::Launch, None, focus_admitted).await?
         {
+            if skip_bound_for_operator_start(&db, job_id, boundary).await? {
+                return Ok(Some(guard));
+            }
             arm_thread_hold(
                 &db,
                 job_id,
@@ -534,6 +537,78 @@ pub async fn admit_thread_launch(
         }
     }
     Ok(Some(guard))
+}
+
+/// Whether a launch the thread's `boundary` would hold is one the operator
+/// started, and so is never held (tenet 1456): its execution's release records
+/// the operator's Start now (or a start under the operator's grant), and the
+/// job has never run. When it is, the bound is added to that record's
+/// `skipped`, so the start names every cap that actually held the work.
+///
+/// The release is read here, at admission, rather than carried on the
+/// dispatch: an operator's start reaches this seam through a durable advance
+/// and possibly a restart, and every dispatch along the way says `System`.
+async fn skip_bound_for_operator_start(
+    db: &LocalDb,
+    job_id: &str,
+    boundary: &'static str,
+) -> Result<bool, String> {
+    let job = job_id.to_string();
+    db.write(move |conn| {
+        let job = job.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT e.id, e.release_override_json,
+                            EXISTS (SELECT 1 FROM runs r WHERE r.job_id = j.id)
+                       FROM jobs j JOIN executions e ON e.id = j.execution_id
+                      WHERE j.id = ?1",
+                    params![job.as_str()],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(false);
+            };
+            let execution = row.text(0)?;
+            let release = row.opt_text(1)?;
+            let has_run = row.i64(2)? != 0;
+            drop(rows);
+            let Some(mut record) = release
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            else {
+                return Ok(false);
+            };
+            let operator_started = record.get("operator").and_then(|v| v.as_bool()) == Some(true)
+                || record
+                    .get("granted")
+                    .is_some_and(|granted| !granted.is_null());
+            if !operator_started || has_run {
+                return Ok(false);
+            }
+            let Some(label) = crate::execution::gates::open_prs::skipped_label(boundary) else {
+                return Ok(true);
+            };
+            let skipped = record.as_object_mut().map(|object| {
+                object
+                    .entry("skipped")
+                    .or_insert_with(|| serde_json::json!([]))
+            });
+            if let Some(serde_json::Value::Array(skipped)) = skipped {
+                if !skipped.iter().any(|known| known.as_str() == Some(label)) {
+                    skipped.push(serde_json::Value::from(label));
+                    conn.execute(
+                        "UPDATE executions SET release_override_json = ?2 WHERE id = ?1",
+                        params![execution.as_str(), record.to_string()],
+                    )
+                    .await?;
+                }
+            }
+            Ok(true)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Check thread policy while the caller holds the admission lock. Returning

@@ -669,7 +669,6 @@ pub(crate) async fn patch_execution_gates(
             }
         }
         GatePatch::StartNow => {
-            use crate::execution::gates::sweep;
             if dry_run {
                 return Ok(format!(
                     "Would start {label} now, past every cap (asks the operator unless this \
@@ -686,74 +685,36 @@ pub(crate) async fn patch_execution_gates(
             .await?;
             let principal = acting_principal(orch, request).await;
             let thread = granted.thread.clone();
-            if !job_holds.is_empty() {
-                let record = serde_json::json!({
-                    "principal": principal, "at": orch.services.clock.now(), "operator": false,
-                    "granted": {"thread": granted.thread, "decision": granted.decision},
-                    "skipped": ["thread_focus", "thread_open_prs"]
-                });
-                let mut started = false;
-                for (hold, _) in &job_holds {
-                    started |= crate::orchestrator::wakes::start_now_thread_hold(
-                        orch,
-                        hold,
-                        record.clone(),
-                    )
-                    .await?;
-                }
-                return if started {
-                    Ok(format!("Started held jobs on {label} now under the operator's grant. Recorded as an override by {thread}."))
-                } else {
-                    Err(format!(
-                        "{label}'s job holds were released by someone else first"
-                    ))
-                };
-            }
-            let outcome = sweep::release(
+            let outcome = crate::execution::gates::start_now::start_now(
                 orch,
                 &execution_id,
-                sweep::ReleaseCause::Override {
-                    principal,
-                    scope: sweep::OverrideScope::Everything {
-                        by: sweep::CapSkipAuthority::Granted {
-                            thread: granted.thread,
-                            decision: granted.decision,
-                        },
-                    },
+                principal,
+                crate::execution::gates::sweep::CapSkipAuthority::Granted {
+                    thread: granted.thread,
+                    decision: granted.decision,
                 },
             )
             .await?;
-            match outcome {
-                sweep::ReleaseOutcome::Released => {
-                    let ids = vec![execution_id.clone()];
-                    let census = owning_db
-                        .read(move |conn| {
-                            let ids = ids.clone();
-                            Box::pin(async move {
-                                crate::execution::gates::census::census_for_executions_conn(
-                                    conn, &ids,
-                                )
-                                .await
-                            })
-                        })
-                        .await
-                        .ok()
-                        .and_then(|mut found| found.remove(&execution_id));
-                    let line = census
-                        .map(|census| format!(": {}", census.summary))
-                        .unwrap_or_default();
-                    Ok(format!(
-                        "Started {label} now under the operator's grant{line}. Recorded as an \
-                         override by {thread}."
-                    ))
-                }
-                sweep::ReleaseOutcome::NotHeld => Err(format!(
-                    "{label} was released by someone else first; it is already running"
-                )),
-                sweep::ReleaseOutcome::HeldByCap(_) => Err(format!(
-                    "a granted start of {label} was held by a cap it should have skipped"
-                )),
-            }
+            // The census line names the caps the start skipped, which the
+            // launch sentence does not.
+            let ids = vec![execution_id.clone()];
+            let census = owning_db
+                .read(move |conn| {
+                    let ids = ids.clone();
+                    Box::pin(async move {
+                        crate::execution::gates::census::census_for_executions_conn(conn, &ids)
+                            .await
+                    })
+                })
+                .await
+                .ok()
+                .and_then(|mut found| found.remove(&execution_id))
+                .map(|census| census.summary)
+                .unwrap_or_else(|| format!("started now by {thread} under the operator's grant"));
+            Ok(format!(
+                "{} It was {census}. Recorded as an override by {thread}.",
+                outcome.sentence(&label)
+            ))
         }
         GatePatch::Replace(clauses) => {
             let gates = crate::execution::gates::authoring::canonical_predicates(
