@@ -1646,6 +1646,14 @@ async fn abandon(
 /// Everything after the decision is recorded, and therefore also what startup
 /// runs to finish an abandonment a restart interrupted. It never creates a
 /// successor and never resumes the run.
+///
+/// Every abandonment ends here, so this is where an abandoned run batch's wait
+/// releases its branch hold. The batch's detached row usually holds the branch
+/// on past this, and its own ending releases it; but a batch that settled
+/// while the abandonment was unfinished found this wait still holding and
+/// released nothing, leaving this cancellation the last hold to end. The
+/// release rechecks every hold and serves a request at most once, so a
+/// redundant one is harmless.
 async fn finish_abandonment(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -1653,7 +1661,14 @@ async fn finish_abandonment(
     cause: AbandonCause,
 ) -> Result<(), String> {
     deliver_abandonment(orch, db, call, cause).await;
-    cancel_abandoned(db, &call.id, cause).await
+    let cancelled = cancel_abandoned(db, &call.id, cause).await;
+    if matches!(
+        call.condition,
+        Some(Condition::RunBatch { host: false, .. })
+    ) {
+        crate::orchestrator::base_advance::on_branch_hold_released_for_run(orch, &call.run_id);
+    }
+    cancelled
 }
 
 /// Write the terminal state a resolution earned but never recorded.
@@ -4060,42 +4075,69 @@ mod tests {
     /// the batch ran, and the replay deferred behind the hold is served at that
     /// answer rather than at the next start. The queued request's resolution is
     /// unreadable, so serving it closes it with no store to replay in.
+    /// Queue an explicit replay of job-1's branch, as one a run batch's hold
+    /// deferred. Its resolution is unreadable, so serving it closes it with no
+    /// store to replay in.
+    async fn queue_deferred_replay(orch: &Orchestrator) {
+        let db = &orch.db.local;
+        let repo = orch.config_dir.join("repo");
+        let store = crate::jj::project_store_dir(&orch.config_dir, &repo);
+        std::fs::create_dir_all(&store).unwrap();
+        db.execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='p'",
+            (repo.to_string_lossy().into_owned(),),
+        )
+        .await
+        .unwrap();
+        db.execute("UPDATE jobs SET branch='agent/held' WHERE id='job-1'", ())
+            .await
+            .unwrap();
+        let request = crate::orchestrator::conflict_session::queue_replay_request(
+            db,
+            "p",
+            &store,
+            "main",
+            "0000",
+            "agent/held",
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE jj_reconcile_items SET replay_resolution='unreadable' WHERE replay_request_id=?1",
+            (request.id.clone(),),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn deferred_replays(db: &LocalDb) -> usize {
+        crate::orchestrator::conflict_session::list_pending_replay_requests(db)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// Wait, without a restart, for the deferred replay to be served.
+    async fn await_deferred_replay_served(db: &LocalDb, exit: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while deferred_replays(db).await > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{exit} never served the replay deferred behind the batch"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_held_batchs_answer_serves_the_replay_deferred_behind_it() {
         for transferred in [false, true] {
             let (orch, base, _) = durable_env().await;
             let db = &orch.db.local;
-            let repo = orch.config_dir.join("repo");
-            let store = crate::jj::project_store_dir(&orch.config_dir, &repo);
-            std::fs::create_dir_all(&store).unwrap();
-            db.execute(
-                "UPDATE projects SET repo_path=?1 WHERE id='p'",
-                (repo.to_string_lossy().into_owned(),),
-            )
-            .await
-            .unwrap();
-            db.execute("UPDATE jobs SET branch='agent/held' WHERE id='job-1'", ())
-                .await
-                .unwrap();
-            let request = crate::orchestrator::conflict_session::queue_replay_request(
-                db,
-                "p",
-                &store,
-                "main",
-                "0000",
-                "agent/held",
-                None,
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-            db.execute(
-                "UPDATE jj_reconcile_items SET replay_resolution='unreadable' WHERE replay_request_id=?1",
-                (request.id.clone(),),
-            )
-            .await
-            .unwrap();
+            queue_deferred_replay(&orch).await;
             let held = run_batch_record(&base, true);
             assert!(held.condition.holds_branch());
             insert_as(db, &held, Establish::Hold).await.unwrap();
@@ -4113,19 +4155,103 @@ mod tests {
                 deliver_held_inline(&orch, db, &held).await.unwrap(),
                 expected
             );
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !crate::orchestrator::conflict_session::list_pending_replay_requests(db)
-                .await
-                .unwrap()
-                .is_empty()
-            {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the answer's release never served the deferred replay (transferred: {transferred})"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            await_deferred_replay_served(db, &format!("the answer (transferred: {transferred})"))
+                .await;
+        }
+    }
+
+    /// The callers that finish an abandoned wait.
+    #[derive(Clone, Copy, Debug)]
+    enum AbandonmentExit {
+        OperatorCompact,
+        StartupRedrive,
+        Supersede,
+    }
+
+    /// Abandoning a run batch's wait moves its branch hold onto a `running`
+    /// detached row, whose ending releases it. When the batch settles while
+    /// the abandonment is still unfinished, that release finds the abandoned
+    /// wait still holding and serves nothing, so the wait's own cancellation
+    /// is the last hold to end, and it must release the branch. Each exit that
+    /// finishes an abandonment serves the deferred replay, without a restart.
+    async fn finishing_an_abandonment_serves_the_deferred_replay(exit: AbandonmentExit) {
+        let (orch, base, _) = durable_env().await;
+        let db = &orch.db.local;
+        queue_deferred_replay(&orch).await;
+        let held = run_batch_record(&base, true);
+        insert(db, &held).await.unwrap();
+        // The decision is recorded and finishing it was interrupted: a cancel
+        // that failed, or a host that died before it.
+        let first = match exit {
+            AbandonmentExit::OperatorCompact => AbandonCause::Superseded,
+            AbandonmentExit::StartupRedrive | AbandonmentExit::Supersede => {
+                AbandonCause::OperatorCompact
+            }
+        };
+        assert!(mark_abandoned(db, &held.id, first).await.unwrap());
+        // Its batch then settled. Its detached row's release ran while the
+        // abandoned wait still held the branch, so it served nothing.
+        db.execute(
+            "UPDATE run_batch_detached SET state='settled', settled_ms=1 WHERE request_id='request-1' AND state='running'",
+            (),
+        )
+        .await
+        .unwrap();
+        let holder = || async {
+            crate::orchestrator::base_advance::inflight_run_batch_on_branch(
+                db,
+                "job-1",
+                "agent/held",
+            )
+            .await
+            .unwrap()
+        };
+        assert!(
+            holder().await.is_some(),
+            "the abandoned wait is the one hold left"
+        );
+        assert_eq!(deferred_replays(db).await, 1);
+
+        match exit {
+            AbandonmentExit::OperatorCompact => assert_eq!(
+                abandon_job_waits_for_operator_compact(&orch, db, "job-1")
+                    .await
+                    .unwrap(),
+                1
+            ),
+            AbandonmentExit::StartupRedrive => reconcile(&orch).await,
+            AbandonmentExit::Supersede => {
+                let next = Record {
+                    id: "next-wait".into(),
+                    turn_id: "next-turn".into(),
+                    tool_use_id: "next-call".into(),
+                    ..base.clone()
+                };
+                supersede_abandoned(&orch, db, &next).await.unwrap();
             }
         }
+
+        await_deferred_replay_served(db, &format!("{exit:?}")).await;
+        assert_eq!(ownership_snapshot(db, &held.id).await.state, "cancelled");
+        assert!(
+            holder().await.is_none(),
+            "nothing holds the branch once the abandonment is finished"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_operator_compact_that_finishes_an_abandonment_serves_the_deferred_replay() {
+        finishing_an_abandonment_serves_the_deferred_replay(AbandonmentExit::OperatorCompact).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_startup_redrive_of_an_abandonment_serves_the_deferred_replay() {
+        finishing_an_abandonment_serves_the_deferred_replay(AbandonmentExit::StartupRedrive).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_supersession_that_finishes_an_abandonment_serves_the_deferred_replay() {
+        finishing_an_abandonment_serves_the_deferred_replay(AbandonmentExit::Supersede).await;
     }
 
     #[tokio::test]

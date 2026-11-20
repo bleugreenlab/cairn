@@ -1118,8 +1118,9 @@ impl Drop for ServingClaim {
     }
 }
 
-/// The one seam a released branch hold calls: a run batch's wait resolved or
-/// was cancelled by a Stop, or was settled because its node cannot resume.
+/// The one seam a released branch hold calls: a run batch's wait resolved,
+/// was abandoned, or was cancelled by a Stop, or was settled because its node
+/// cannot resume; or a detached batch ended.
 ///
 /// Spawned, so it never runs inside the releasing batch's guard, reservation
 /// or permit; it takes its own through normal preparation. It finds the job's
