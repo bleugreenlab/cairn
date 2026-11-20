@@ -1,8 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+// Tokio's clock, so the schedule, every deadline the router keeps and the
+// tests that drive them all agree on one clock and paused time is honoured.
+use tokio::time::Instant;
 
 use cairn_db::sql::placeholders;
 use cairn_db::turso::{params, Value};
@@ -27,10 +31,27 @@ use crate::{
     storage::{LocalDb, RowExt},
 };
 
-const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+/// The longest a router sleeps with nothing announced and nothing due.
+///
+/// A sweep runs when an input it reads moves or when something it owes falls
+/// due; this is the net under both. A safety-net sweep runs every step exactly
+/// as an unconditional sweep would, so a write site that forgets to announce
+/// itself costs at most this long, and says so in the log. Equal to
+/// [`GATE_SOURCE_RECONCILE`], so the gate sources' own horizon is reached by it.
+const SWEEP_SAFETY_NET: Duration = Duration::from_secs(60);
+/// The pace of the paths that retry with no backoff of their own: a send held
+/// back while the provider is unavailable, a domain action that failed and
+/// released its lease, a cleanup that failed, and presence the provider infers
+/// without announcing. It is the cadence these paths had when every sweep ran
+/// on a five-second timer, kept rather than changed here.
+const UNPACED_RETRY: Duration = Duration::from_secs(5);
+/// How long a domain-action lease is held. A lease another router holds is
+/// retried once it can have expired.
+const ACTION_LEASE: Duration = Duration::from_secs(60);
 const BACKLOG_SEAL_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// One sweep DELIVERS at most this many gates, so a burst of new asks cannot
-/// monopolize the outbound path; the rest go out on the next tick.
+/// monopolize the outbound path; a sweep that stops here with work left is
+/// due again at once, so the rest go out after the floor.
 ///
 /// It is deliberately not a bound on the query. A claimed gate still matches the
 /// loaders' predicates forever -- an unanswered prompt stays unanswered once its
@@ -41,12 +62,13 @@ const BACKLOG_SEAL_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const SWEEP_LIMIT: usize = 100;
 /// The minimum rest between two sweeps, whatever woke them.
 ///
-/// The timer alone cannot spin once its missed ticks coalesce, but a presence
-/// change is an external event: a beacon that flaps, or any future wake source,
-/// would otherwise be able to drive sweeps as fast as they complete. A floor
-/// well under the cadence costs a live wake almost nothing and makes "this loop
-/// cannot become a busy loop" a property of the schedule rather than a property
-/// of every caller that might one day notify it.
+/// The safety net alone cannot spin once its missed ticks coalesce, but every
+/// other wake is an external event: a beacon that flaps, a burst of ledger
+/// writes, a deadline that keeps falling due, would otherwise be able to drive
+/// sweeps as fast as they complete. A floor well under any deadline costs a
+/// live wake almost nothing and makes "this loop cannot become a busy loop" a
+/// property of the schedule rather than a property of every caller that might
+/// one day notify it.
 const SWEEP_FLOOR: Duration = Duration::from_secs(1);
 const ATTENTION_GRACE: Duration = Duration::from_secs(3 * 60);
 const RETRY_BASE: Duration = Duration::from_secs(5);
@@ -358,31 +380,41 @@ fn routed_gate_target(uri: &str) -> Option<String> {
 }
 
 /// Why a sweep is running. It rides in the sweep's log line because a
-/// recurrence has to be legible without a profiler: a loop running hot on the
-/// timer is a slow sweep, and one running hot on presence is a wake source that
-/// has started flapping, and those have different fixes.
+/// recurrence has to be legible without a profiler: a loop running hot on its
+/// signal or its gate inputs is a write source that has started flapping, one
+/// running hot on deadlines is a retry that is not backing off, and those have
+/// different fixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SweepReason {
-    Timer,
-    Presence,
+    /// [`SWEEP_SAFETY_NET`] elapsed: every step runs.
+    SafetyNet,
+    /// The router's own wake: a ledger announcement, a presence change, or one
+    /// of its own tasks changing what it owes.
+    Signal,
+    /// A gate source's input tables advanced.
+    GateInputs,
+    /// Something the router owes fell due.
+    Deadline,
 }
 
 impl SweepReason {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Timer => "timer",
-            Self::Presence => "presence",
+            Self::SafetyNet => "safety-net",
+            Self::Signal => "signal",
+            Self::GateInputs => "gate-inputs",
+            Self::Deadline => "deadline",
         }
     }
 }
 
-/// The sweep loop's clock.
+/// The sweep loop's clock: it sleeps until an input moves, a deadline falls
+/// due, or the safety net elapses, then rests the floor.
 ///
-/// A sweep polls everything there is, so its cadence is a floor on REST, not a
-/// schedule to catch up to. `tokio::time::interval` defaults to
-/// `MissedTickBehavior::Burst`, which means precisely the opposite: a sweep that
-/// overruns its period leaves a deadline ready for every period it covered, so a
-/// twenty-second sweep on a five-second cadence is followed by four more sweeps
+/// The safety net's period is a floor on REST, not a schedule to catch up to.
+/// `tokio::time::interval` defaults to `MissedTickBehavior::Burst`, which means
+/// precisely the opposite: a sweep that overruns its period leaves a deadline
+/// ready for every period it covered, so it is followed by one sweep per period
 /// with no sleep between them. Under the load that made the sweep slow in the
 /// first place that condition never clears, and each provider's loop becomes a
 /// permanently ready worker — which is what a rebuilt runner sitting at 500% CPU
@@ -394,27 +426,54 @@ impl SweepReason {
 /// immediately by the next one; under overload that is the case that matters,
 /// and rest is what overload needs.
 struct SweepSchedule {
-    interval: tokio::time::Interval,
-    /// Tokio's clock, not the standard one, so the floor honors paused time and
-    /// the overload behavior is testable without sleeping through it.
-    finished: Option<tokio::time::Instant>,
+    safety_net: tokio::time::Interval,
+    signal: Arc<tokio::sync::Notify>,
+    /// `None` once the generations' sender is gone, so a closed channel cannot
+    /// read as a wake that is always ready.
+    gate_inputs: Option<tokio::sync::watch::Receiver<()>>,
+    finished: Option<Instant>,
 }
 
 impl SweepSchedule {
-    fn new() -> Self {
-        let mut interval = tokio::time::interval(SWEEP_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    fn new(
+        signal: Arc<tokio::sync::Notify>,
+        gate_inputs: tokio::sync::watch::Receiver<()>,
+    ) -> Self {
+        let mut safety_net = tokio::time::interval(SWEEP_SAFETY_NET);
+        safety_net.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         Self {
-            interval,
+            safety_net,
+            signal,
+            gate_inputs: Some(gate_inputs),
             finished: None,
         }
     }
 
-    /// Waits for the next sweep and reports what woke it.
-    async fn next(&mut self) -> SweepReason {
+    /// Waits for the next sweep and reports what woke it. `due` is when the
+    /// previous sweep said it next owes something.
+    async fn next(&mut self, due: Option<Instant>) -> SweepReason {
+        let gate_inputs = async {
+            match self.gate_inputs.as_mut() {
+                Some(inputs) => inputs.changed().await.is_ok(),
+                None => std::future::pending().await,
+            }
+        };
+        let deadline = async {
+            match due {
+                Some(due) => tokio::time::sleep_until(due).await,
+                None => std::future::pending().await,
+            }
+        };
         let reason = tokio::select! {
-            _ = self.interval.tick() => SweepReason::Timer,
-            _ = super::wait_for_presence_change() => SweepReason::Presence,
+            _ = self.safety_net.tick() => SweepReason::SafetyNet,
+            _ = self.signal.notified() => SweepReason::Signal,
+            open = gate_inputs => {
+                if !open {
+                    self.gate_inputs = None;
+                }
+                SweepReason::GateInputs
+            }
+            _ = deadline => SweepReason::Deadline,
         };
         if let Some(finished) = self.finished {
             tokio::time::sleep_until(finished + SWEEP_FLOOR).await;
@@ -425,7 +484,194 @@ impl SweepSchedule {
     /// Records that a sweep has finished, which is what the floor is measured
     /// from. A sweep's own duration is never charged against the floor.
     fn finished(&mut self) {
-        self.finished = Some(tokio::time::Instant::now());
+        self.finished = Some(Instant::now());
+    }
+}
+
+/// What one sweep is to do, decided before it reads anything.
+///
+/// Each step runs only when one of its inputs was announced since the last
+/// sweep or something it owes is due. A `full` sweep runs every step regardless
+/// — the safety net, the first sweep of a session, and every caller of
+/// [`ChannelRouter::sweep`] — which is what bounds a write that announced
+/// nothing.
+#[derive(Debug, Clone, Copy)]
+struct SweepPlan {
+    full: bool,
+    /// A full sweep that is not the session's first: work it finds that no
+    /// announcement or deadline accounted for is reported, because a write site
+    /// that forgets to announce itself is otherwise a silent minute of delay.
+    reportable: bool,
+    now: Instant,
+    presence_moved: bool,
+    binding_moved: bool,
+    outbound_moved: bool,
+    ask_action_moved: bool,
+    /// The last message pass stopped at [`SWEEP_LIMIT`] with rows left, which
+    /// are `pending` and so have no retry schedule to fall due.
+    message_backlog: bool,
+}
+
+impl SweepPlan {
+    fn due(&self, at: Option<Instant>) -> bool {
+        at.is_some_and(|at| at <= self.now)
+    }
+}
+
+/// What one router owes between sweeps, beyond the in-memory sets it already
+/// keeps (deferred asks, unsent gates, held routes).
+#[derive(Default)]
+struct SweepState {
+    /// The announcement epochs the last sweep satisfied, recorded before it
+    /// read anything.
+    epochs: Option<super::WakeEpochs>,
+    /// The earliest retry of an agent or operator message.
+    message_retry_at: Option<Instant>,
+    /// The message pass left rows for the next sweep.
+    message_backlog: bool,
+    /// The earliest retry of a pending route whose send was held back. A route
+    /// is never in the live gate set, so its debt cannot live in `unsent`,
+    /// which is pruned against that set; it is recovery that resends it.
+    route_retry_at: Option<Instant>,
+    /// When a domain action is next worth leasing: a failure's retry, or a
+    /// lease another router holds running out.
+    action_retry_at: Option<Instant>,
+    /// When a failed cleanup is retried.
+    cleanup_retry_at: Option<Instant>,
+    /// When presence may have changed with nothing to announce it.
+    presence_recheck_at: Option<Instant>,
+    /// When a gate source that lagged its inputs may be replaced.
+    source_due_at: Option<Instant>,
+    /// The last sweep stopped at [`SWEEP_LIMIT`] with work left.
+    backlog: bool,
+    /// The live set the close pass last compared against.
+    close_live: Option<HashSet<String>>,
+    /// The close pass is owed whatever the live set says: a question went out
+    /// since it last ran, or it was skipped on an incomplete snapshot.
+    close_owed: bool,
+    /// The read-receipt query last found nothing unread, and no operator
+    /// message has been sent since.
+    receipts_clean: bool,
+}
+
+fn earliest(slot: &mut Option<Instant>, at: Instant) {
+    if slot.is_none_or(|current| at < current) {
+        *slot = Some(at);
+    }
+}
+
+tokio::task_local! {
+    /// What the current sweep acted on, by row or gate. Task-local so that
+    /// only the sweep task records, and a route submission delivered by the
+    /// inbox task concurrently is never mistaken for safety-net work.
+    static SWEEP_ACTS: std::cell::RefCell<Vec<String>>;
+}
+
+fn record_act(what: impl FnOnce() -> String) {
+    let _ = SWEEP_ACTS.try_with(|acts| acts.borrow_mut().push(what()));
+}
+
+fn take_acts() -> Vec<String> {
+    SWEEP_ACTS
+        .try_with(|acts| std::mem::take(&mut *acts.borrow_mut()))
+        .unwrap_or_default()
+}
+
+/// Per-step timings for one sweep, logged at debug.
+struct SweepTrace {
+    last: Instant,
+    steps: Vec<(&'static str, Duration)>,
+}
+
+impl SweepTrace {
+    fn new() -> Self {
+        Self {
+            last: Instant::now(),
+            steps: Vec::new(),
+        }
+    }
+
+    fn step(&mut self, name: &'static str) {
+        let now = Instant::now();
+        self.steps
+            .push((name, now.saturating_duration_since(self.last)));
+        self.last = now;
+    }
+
+    fn add(&mut self, name: &'static str, spent: Duration) {
+        match self.steps.iter_mut().find(|(step, _)| *step == name) {
+            Some((_, total)) => *total += spent,
+            None => self.steps.push((name, spent)),
+        }
+    }
+
+    fn summary(&self) -> String {
+        self.steps
+            .iter()
+            .map(|(name, spent)| format!("{name}_ms={}", spent.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// How often one router writes its sweep summary at info.
+const SWEEP_TALLY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// One router's sweeps over the current hour: how many, what woke them, how
+/// many ran every step, and the time spent in each step. Written at info once
+/// the hour closes, so the production log carries the sweep rate and its cost
+/// without a line per sweep.
+struct SweepTally {
+    started: Instant,
+    sweeps: u64,
+    full: u64,
+    reasons: std::collections::BTreeMap<&'static str, u64>,
+    steps: std::collections::BTreeMap<&'static str, Duration>,
+}
+
+impl SweepTally {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            sweeps: 0,
+            full: 0,
+            reasons: Default::default(),
+            steps: Default::default(),
+        }
+    }
+
+    /// Counts one sweep, returning the summary when it closes the interval.
+    fn record(&mut self, reason: SweepReason, full: bool, trace: &SweepTrace) -> Option<String> {
+        self.sweeps += 1;
+        self.full += u64::from(full);
+        *self.reasons.entry(reason.as_str()).or_default() += 1;
+        for (step, spent) in &trace.steps {
+            *self.steps.entry(*step).or_default() += *spent;
+        }
+        let elapsed = self.started.elapsed();
+        if elapsed < SWEEP_TALLY_INTERVAL {
+            return None;
+        }
+        let reasons = self
+            .reasons
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let steps = self
+            .steps
+            .iter()
+            .map(|(step, spent)| format!("{step}_ms={}", spent.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let summary = format!(
+            "window_s={} sweeps={} full={} reasons={reasons} {steps}",
+            elapsed.as_secs(),
+            self.sweeps,
+            self.full
+        );
+        *self = Self::new();
+        Some(summary)
     }
 }
 
@@ -530,13 +776,18 @@ impl Gate {
     }
 
     fn delivery_key(&self, provider: &str, default_conversation: &str) -> String {
-        format!(
-            "{provider}\u{0}{}\u{0}{}\u{0}{}",
+        delivery_key(
+            provider,
             self.conversation.as_deref().unwrap_or(default_conversation),
             self.kind,
-            self.binding_ref
+            &self.binding_ref,
         )
     }
+}
+
+/// One rendering's identity: a gate's, or the ledger row that records it.
+fn delivery_key(provider: &str, conversation: &str, kind: &str, binding_ref: &str) -> String {
+    format!("{provider}\u{0}{conversation}\u{0}{kind}\u{0}{binding_ref}")
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -561,6 +812,23 @@ struct DeferredAttention {
     id: String,
     gate: Gate,
     deadline: Instant,
+}
+
+/// A gate a sweep offers to [`ChannelRouter::deliver_or_defer`].
+struct Offer {
+    gate: Gate,
+    /// Whether something announced or scheduled this offer. Only a full sweep
+    /// offers a gate that nothing did, and delivering one is reported.
+    announced: bool,
+}
+
+/// The instant a wall-clock time in epoch milliseconds falls at, or now if it
+/// has passed. Ledger schedules are wall-clock; the router waits on tokio's.
+fn instant_at_epoch_ms(at_ms: i64) -> Instant {
+    let wait = at_ms
+        .saturating_sub(chrono::Utc::now().timestamp_millis())
+        .max(0) as u64;
+    Instant::now() + Duration::from_millis(wait)
 }
 
 /// What a route submission's gate is keyed and sent under.
@@ -658,7 +926,10 @@ impl ClaimSet {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Equality is over every field, `held_since` included: a holder going away
+/// changes where an ask may go, so a load that differs only there is a
+/// different gate set and must be routed again.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Gate {
     kind: &'static str,
     initiated_by: OutboundInitiator,
@@ -702,8 +973,9 @@ struct Gate {
 /// stale only once its inputs have moved AND it is older than this floor, or
 /// than its own last computation if that took longer, which keeps a slow
 /// recompute on a starved host to at most half of one worker -- the rule
-/// `CadencedCache` applies to the sidebar rollups. Two seconds of staleness
-/// sits inside the five-second sweep.
+/// `CadencedCache` applies to the sidebar rollups. A router that reads a
+/// source still held back by the floor sets a deadline for when it may be
+/// replaced, so the advance is served late rather than lost.
 const GATE_SOURCE_FLOOR: Duration = Duration::from_secs(2);
 
 /// A gate source older than this is recomputed whatever its inputs say.
@@ -856,8 +1128,16 @@ async fn shared_gates(
     // Deciding and advancing under one lock is the point: N providers observing
     // the same advance must produce ONE recomputation, where N unconditional
     // invalidations would each reject the readers already computing.
+    // The snapshot being replaced, so an equal load can republish its gates
+    // under the same allocation: routing is keyed by that identity, and a
+    // recompute that found nothing new must not cost every router a re-route.
+    let previous = Mutex::new(None);
     let reason = gate_sources().invalidate_stale_because(&key, |snapshot| {
-        gate_source_staleness(snapshot, observed, now)
+        let reason = gate_source_staleness(snapshot, observed, now);
+        if reason.is_some() {
+            *previous.lock().expect("previous gate source poisoned") = Some(snapshot.gates.clone());
+        }
+        reason
     });
     let failure = Mutex::new(None);
     let snapshot = gate_sources()
@@ -877,18 +1157,35 @@ async fn shared_gates(
             match load_source_gates(db, kind).await {
                 Ok((gates, backlog, expired)) => {
                     let duration = started.elapsed();
+                    let previous = previous
+                        .lock()
+                        .expect("previous gate source poisoned")
+                        .clone();
+                    let (gates, changed) = match previous {
+                        Some(previous) if *previous == gates => (previous, false),
+                        _ => (Arc::new(gates), true),
+                    };
                     log::info!(
-                        "channel gate source kind={} reason={} generation={generation} backlog={backlog} gates={} expired={expired} duration_ms={}",
+                        "channel gate source kind={} reason={} generation={generation} changed={changed} backlog={backlog} gates={} expired={expired} duration_ms={}",
                         kind.as_str(),
                         reason.unwrap_or("unattributed"),
                         gates.len(),
                         duration.as_millis()
                     );
+                    // Nothing announced an input, yet the gates moved: a write
+                    // to one of this kind's input tables emitted no frame, and
+                    // every router waited out the horizon to see it.
+                    if changed && reason == Some("reconcile-horizon") {
+                        log::warn!(
+                            "channel safety net found a changed {} gate source with no announced input; a write to one of its input tables emitted no db-change frame",
+                            kind.as_str()
+                        );
+                    }
                     Some(GateSourceSnapshot {
                         generation,
                         computed_at: tokio::time::Instant::now(),
                         duration,
-                        gates: Arc::new(gates),
+                        gates,
                         backlog,
                         expired,
                     })
@@ -912,21 +1209,19 @@ async fn shared_gates(
 /// One router's routing of the gate sources, for one database.
 ///
 /// Routing is a function of the source snapshots and the binding ledger, so it
-/// is keyed by exactly those: the identity of each source's published gates
-/// (one allocation per computation, held here so it cannot be reused) and the
-/// ledger's binding generation.
-#[derive(Default)]
+/// is keyed by exactly those: the identity of each source's published gates and
+/// of the router's binding index. Both keep their allocation across a reload
+/// that found nothing new, so identity changes exactly when content does. The
+/// snapshot holds both, so neither allocation can be freed and reused.
 struct GateSnapshot {
     sources: Vec<Arc<Vec<Gate>>>,
-    binding_generation: String,
-    initialized: bool,
+    bindings: Arc<ledger::BindingIndex>,
     routed: Vec<Gate>,
 }
 
 impl GateSnapshot {
-    fn routes(&self, sources: &[Arc<Vec<Gate>>], binding_generation: &str) -> bool {
-        self.initialized
-            && self.binding_generation == binding_generation
+    fn routes(&self, sources: &[Arc<Vec<Gate>>], bindings: &Arc<ledger::BindingIndex>) -> bool {
+        Arc::ptr_eq(&self.bindings, bindings)
             && self.sources.len() == sources.len()
             && self
                 .sources
@@ -956,7 +1251,11 @@ pub struct ChannelRouter {
     /// recompute, up to the reconcile horizon, instead of its own backoff. Each
     /// sweep that offers one of these reads its ledger row, and a final state
     /// (sent, resolved, expired, or out of attempts) removes it.
-    unsent: Mutex<HashSet<String>>,
+    ///
+    /// Each carries when its row is next worth offering: its scheduled retry,
+    /// or [`UNPACED_RETRY`] for a send held back by an unavailable provider or
+    /// by another sweep's attempt. A sweep that is not full offers it only then.
+    unsent: Mutex<HashMap<String, Instant>>,
     /// Keyed by binding ref, so a fact re-submitted while its surface is still
     /// being created waits once.
     held_routes: Mutex<HashMap<String, HeldRoute>>,
@@ -966,6 +1265,18 @@ pub struct ChannelRouter {
     /// Operator messages whose receipt lookup failure was already logged, so a
     /// standing failure logs once per message rather than every poll.
     receipt_failures_logged: Mutex<HashSet<String>>,
+    /// This router's registration for ledger and presence announcements.
+    wake: super::RouterWake,
+    /// The provider's bindings as of the binding epoch they were read at.
+    bindings: Mutex<Option<(u64, Arc<ledger::BindingIndex>)>>,
+    sweep_state: Mutex<SweepState>,
+    sweep_tally: Mutex<SweepTally>,
+    /// Every sweep's reason, for tests that drive the real loop.
+    #[cfg(test)]
+    sweep_log: Mutex<Vec<SweepReason>>,
+    /// What the safety net reported finding unannounced.
+    #[cfg(test)]
+    unannounced: Mutex<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1033,6 +1344,7 @@ impl ChannelRouter {
         route: MessageClassPolicy,
         inbound_capabilities: ChannelInboundCapabilities,
     ) -> Self {
+        let wake = super::RouterWake::register(&orch.db.local, provider_id);
         Self {
             orch,
             provider,
@@ -1043,11 +1355,70 @@ impl ChannelRouter {
             claims: ClaimSet::default(),
             deferred_attention: Mutex::new(HashMap::new()),
             gate_snapshots: Mutex::new(HashMap::new()),
-            unsent: Mutex::new(HashSet::new()),
+            unsent: Mutex::new(HashMap::new()),
             held_routes: Mutex::new(HashMap::new()),
             receipts_polled_at: Mutex::new(None),
             receipt_failures_logged: Mutex::new(HashSet::new()),
+            wake,
+            bindings: Mutex::new(None),
+            sweep_state: Mutex::new(SweepState::default()),
+            sweep_tally: Mutex::new(SweepTally::new()),
+            #[cfg(test)]
+            sweep_log: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            unannounced: Mutex::new(Vec::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn note_unannounced(&self, what: String) {
+        self.unannounced
+            .lock()
+            .expect("unannounced log poisoned")
+            .push(what);
+    }
+
+    #[cfg(not(test))]
+    fn note_unannounced(&self, _what: String) {}
+
+    fn state(&self) -> std::sync::MutexGuard<'_, SweepState> {
+        self.sweep_state.lock().expect("sweep state poisoned")
+    }
+
+    /// The provider's binding index, read once per announced binding change.
+    ///
+    /// `reload` reads it regardless, which is what a full sweep does to bound a
+    /// binding write that announced nothing. A reload equal to what is held
+    /// keeps the held allocation, so routing keyed by its identity stands.
+    /// The second value says whether a held index was REPLACED.
+    async fn binding_index(
+        &self,
+        reload: bool,
+    ) -> Result<(Arc<ledger::BindingIndex>, bool), String> {
+        // Read before the load: a write landing during it leaves the epoch
+        // ahead of what this records, and the next call reads again.
+        let epoch = self.wake.epochs().binding;
+        if !reload {
+            let held = self
+                .bindings
+                .lock()
+                .expect("binding index poisoned")
+                .as_ref()
+                .filter(|(seen, _)| *seen == epoch)
+                .map(|(_, index)| index.clone());
+            if let Some(index) = held {
+                return Ok((index, false));
+            }
+        }
+        let fresh = ledger::binding_index(self.ledger(), self.provider_id).await?;
+        let mut slot = self.bindings.lock().expect("binding index poisoned");
+        let (index, replaced) = match slot.as_ref() {
+            Some((_, held)) if **held == fresh => (held.clone(), false),
+            Some(_) => (Arc::new(fresh), true),
+            None => (Arc::new(fresh), false),
+        };
+        *slot = Some((epoch, index.clone()));
+        Ok((index, replaced))
     }
 
     #[cfg(test)]
@@ -1134,7 +1505,13 @@ impl ChannelRouter {
         match intent.status.as_str() {
             "pending" => {
                 let json = serde_json::to_string(&submission).map_err(|error| error.to_string())?;
-                ledger::set_pending_route_submission(self.ledger(), &intent.id, &json).await?;
+                ledger::set_pending_route_submission(
+                    self.ledger(),
+                    self.provider_id,
+                    &intent.id,
+                    &json,
+                )
+                .await?;
                 Ok(())
             }
             "sent" => {
@@ -1204,14 +1581,10 @@ impl ChannelRouter {
         target: &str,
     ) -> Result<Option<String>, String> {
         let guild = self.discord_guild()?;
-        Ok(ledger::list_eligible_bindings(
-            self.ledger(),
-            self.provider_id,
-            target,
-            super::bindings::MESSAGE_CLASS_NOTIFY,
-        )
-        .await?
-        .into_iter()
+        let (bindings, _) = self.binding_index(false).await?;
+        Ok(bindings
+            .eligible(target, super::bindings::MESSAGE_CLASS_NOTIFY)?
+            .into_iter()
         .filter(|binding| {
             binding.binding_kind == super::bindings::BindingKind::Structural.as_str()
         })
@@ -1242,6 +1615,7 @@ impl ChannelRouter {
         for (binding_ref, route) in held {
             let failure = match self.route_gate_conversation(&route.submission).await {
                 Ok(RouteConversation::Deliver(_)) => {
+                    record_act(|| format!("held route {binding_ref}"));
                     if let Err(error) = self.submit_route(route.submission, presence, now).await {
                         log::warn!("held route {binding_ref} could not be submitted: {error}");
                     }
@@ -1263,6 +1637,7 @@ impl ChannelRouter {
             };
             match failure {
                 Some(reason) => {
+                    record_act(|| format!("held route {binding_ref}"));
                     if let Err(error) = crate::routes::record_channel_outcome(
                         &self.orch,
                         &route.submission,
@@ -1321,15 +1696,25 @@ impl ChannelRouter {
         .await
     }
 
+    #[cfg(test)]
     async fn recover_pending_routes(
         &self,
         presence: OperatorPresence,
         now: Instant,
     ) -> Result<(), String> {
-        for record in ledger::list_unresolved(self.ledger(), self.provider_id).await? {
-            if record.kind != "route" || record.status != "pending" {
-                continue;
-            }
+        let pending = ledger::list_pending_routes(self.ledger(), self.provider_id).await?;
+        self.recover_routes(pending, presence, now).await
+    }
+
+    /// Offer every pending route in `pending` again, deferring each for what is
+    /// left of its attention grace.
+    async fn recover_routes(
+        &self,
+        pending: Vec<ledger::OutboundRecord>,
+        presence: OperatorPresence,
+        now: Instant,
+    ) -> Result<(), String> {
+        for record in pending {
             let json = record.options_json.as_deref().ok_or_else(|| {
                 format!(
                     "pending route intent {} has no durable submission",
@@ -1556,6 +1941,9 @@ impl ChannelRouter {
         let mut delivered = 0;
         for record in due {
             if delivered == SWEEP_LIMIT {
+                let mut state = self.state();
+                state.backlog = true;
+                state.message_backlog = true;
                 break;
             }
             let id = record.id.clone();
@@ -1564,6 +1952,17 @@ impl ChannelRouter {
                 Ok(false) => {}
                 Err(error) => log::warn!("channel agent message {id} delivery failed: {error}"),
             }
+        }
+        // What this pass left waiting on its backoff is due no earlier than
+        // the earliest schedule. A failure during the pass is already in
+        // there; one held back by an unavailable provider was set lower by
+        // `send_claimed` and is kept.
+        let retry = ledger::next_message_retry_at(self.ledger(), self.provider_id, MAX_ATTEMPTS)
+            .await?
+            .map(instant_at_epoch_ms);
+        let mut state = self.state();
+        if let Some(retry) = retry {
+            earliest(&mut state.message_retry_at, retry);
         }
         Ok(())
     }
@@ -2254,33 +2653,230 @@ impl ChannelRouter {
         }
     }
 
+    /// One sweep of every step, whatever moved: what the safety net runs.
     pub async fn sweep(&self) {
+        self.sweep_for(SweepReason::SafetyNet).await;
+    }
+
+    /// One sweep for `reason`. Returns when the router next owes something,
+    /// which is the deadline its schedule sleeps to.
+    async fn sweep_for(&self, reason: SweepReason) -> Option<Instant> {
         if self.destination.trim().is_empty() {
-            return;
+            return None;
         }
-        if let Err(error) = self.sweep_live_gates().await {
+        SWEEP_ACTS
+            .scope(
+                std::cell::RefCell::new(Vec::new()),
+                self.sweep_steps(reason),
+            )
+            .await
+    }
+
+    /// What this sweep is to do. The epochs are recorded here, before any
+    /// step reads, so a write that lands mid-sweep is still ahead of them and
+    /// earns the next sweep.
+    fn plan(&self, reason: SweepReason) -> SweepPlan {
+        let epochs = self.wake.epochs();
+        let now = Instant::now();
+        let mut state = self.state();
+        let previous = state.epochs.replace(epochs);
+        let moved = |field: fn(&super::WakeEpochs) -> u64| {
+            previous.is_none_or(|previous| field(&previous) != field(&epochs))
+        };
+        let recheck = state.presence_recheck_at.is_some_and(|at| at <= now);
+        state.backlog = false;
+        let message_backlog = std::mem::take(&mut state.message_backlog);
+        SweepPlan {
+            full: reason == SweepReason::SafetyNet || previous.is_none(),
+            reportable: reason == SweepReason::SafetyNet && previous.is_some(),
+            now,
+            presence_moved: moved(|epochs| epochs.presence) || recheck,
+            binding_moved: moved(|epochs| epochs.binding),
+            outbound_moved: moved(|epochs| epochs.outbound),
+            ask_action_moved: moved(|epochs| epochs.ask_action),
+            message_backlog,
+        }
+    }
+
+    async fn sweep_steps(&self, reason: SweepReason) -> Option<Instant> {
+        #[cfg(test)]
+        self.sweep_log
+            .lock()
+            .expect("sweep log poisoned")
+            .push(reason);
+        let plan = self.plan(reason);
+        let mut trace = SweepTrace::new();
+        if let Err(error) = self.sweep_live_gates_with(&plan, &mut trace).await {
             log::warn!("channel gate sweep failed: {error}");
         }
-        if let Err(error) = self.deliver_pending_agent_messages().await {
-            log::warn!("channel agent message sweep failed: {error}");
+
+        let announced =
+            plan.outbound_moved || plan.message_backlog || plan.due(self.state().message_retry_at);
+        if plan.full || announced {
+            self.state().message_retry_at = None;
+            take_acts();
+            if let Err(error) = self.deliver_pending_agent_messages().await {
+                log::warn!("channel agent message sweep failed: {error}");
+            }
+            self.report_unannounced(&plan, "agent_messages", announced);
+            trace.step("agent_messages");
         }
-        if let Err(error) = self.sweep_pending_domain_actions().await {
-            log::warn!("channel ask domain-action sweep failed: {error}");
+
+        let announced = plan.ask_action_moved || plan.due(self.state().action_retry_at);
+        if plan.full || announced {
+            self.state().action_retry_at = None;
+            take_acts();
+            // Type-erased: the domain resolvers this reaches make the sweep's
+            // future deep enough that proving the spawned task `Send` overflows
+            // the trait solver's recursion limit. A boxed `dyn` proves it here.
+            let actions: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>,
+            > = Box::pin(self.sweep_pending_domain_actions());
+            if let Err(error) = actions.await {
+                log::warn!("channel ask domain-action sweep failed: {error}");
+            }
+            self.report_unannounced(&plan, "domain_actions", announced);
+            trace.step("domain_actions");
         }
-        if let Err(error) = self.sweep_pending_cleanup().await {
-            log::warn!("channel ask cleanup sweep failed: {error}");
+
+        let announced = plan.outbound_moved || plan.due(self.state().cleanup_retry_at);
+        if plan.full || announced {
+            self.state().cleanup_retry_at = None;
+            take_acts();
+            if let Err(error) = self.sweep_pending_cleanup().await {
+                log::warn!("channel ask cleanup sweep failed: {error}");
+            }
+            self.report_unannounced(&plan, "cleanup", announced);
+            trace.step("cleanup");
         }
-        if let Err(error) = self.sweep_operator_receipts().await {
+
+        if let Err(error) = self.sweep_operator_receipts(plan.full).await {
             log::warn!("channel operator receipt sweep failed: {error}");
         }
+        trace.step("receipts");
+        let due = self.next_due();
+        log::debug!(
+            "channel sweep trace provider={} reason={} full={} {}",
+            self.provider_id,
+            reason.as_str(),
+            plan.full,
+            trace.summary()
+        );
+        if let Some(summary) = self
+            .sweep_tally
+            .lock()
+            .expect("sweep tally poisoned")
+            .record(reason, plan.full, &trace)
+        {
+            log::info!(
+                "channel sweep steps provider={} {summary}",
+                self.provider_id
+            );
+        }
+        due
+    }
+
+    /// Reports what a full sweep did in a step no announcement or deadline
+    /// would have run. That is a write site that forgot to announce itself, and
+    /// the only thing that otherwise reveals one is a minute of unexplained
+    /// delay.
+    fn report_unannounced(&self, plan: &SweepPlan, step: &'static str, announced: bool) {
+        let acts = take_acts();
+        if plan.reportable && !announced && !acts.is_empty() {
+            log::warn!(
+                "channel safety net caught work nothing announced provider={} step={step} acted_on={}",
+                self.provider_id,
+                acts.join(", ")
+            );
+            self.note_unannounced(format!("{step}: {}", acts.join(", ")));
+        }
+    }
+
+    /// The earliest thing this router owes, from the state it already holds.
+    /// Also decides when presence must be looked at again with nothing to
+    /// announce a change, which matters only while presence-aware work waits.
+    fn next_due(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let mut due = None;
+        let mut presence_work = false;
+        {
+            let deferred = self
+                .deferred_attention
+                .lock()
+                .expect("deferred attention set poisoned");
+            for attention in deferred.values() {
+                earliest(&mut due, attention.deadline);
+            }
+            presence_work |= !deferred.is_empty();
+        }
+        for at in self
+            .unsent
+            .lock()
+            .expect("unsent delivery set poisoned")
+            .values()
+        {
+            earliest(&mut due, *at);
+        }
+        {
+            let held = self.held_routes.lock().expect("held route set poisoned");
+            for route in held.values() {
+                earliest(&mut due, route.deadline);
+            }
+            presence_work |= !held.is_empty();
+        }
+        let polled_at = *self
+            .receipts_polled_at
+            .lock()
+            .expect("receipt poll lock poisoned");
+        let mut state = self.state();
+        for at in [
+            state.message_retry_at,
+            state.route_retry_at,
+            state.action_retry_at,
+            state.cleanup_retry_at,
+            state.source_due_at,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            earliest(&mut due, at);
+        }
+        if state.backlog {
+            earliest(&mut due, now);
+        }
+        if self.provider_id == "imessage" && !state.receipts_clean {
+            earliest(
+                &mut due,
+                polled_at.map_or(now, |at| at + RECEIPT_POLL_INTERVAL),
+            );
+        }
+        state.presence_recheck_at = if presence_work {
+            match super::presence_transition() {
+                super::PresenceTransition::Announced => None,
+                super::PresenceTransition::After(remaining) => Some(now + remaining),
+                super::PresenceTransition::Unannounced => Some(now + UNPACED_RETRY),
+            }
+        } else {
+            None
+        };
+        if let Some(at) = state.presence_recheck_at {
+            earliest(&mut due, at);
+        }
+        due
     }
 
     /// Ask the provider for read receipts on the operator messages it sent in
     /// the last three days that are still unread, at most once per
     /// [`RECEIPT_POLL_INTERVAL`] and only while there are some. A failed
     /// lookup is inert: it touches no delivery state and logs once per message.
-    async fn sweep_operator_receipts(&self) -> Result<(), String> {
+    ///
+    /// Once the query finds nothing unread it is not asked again until this
+    /// router sends an operator message (or a full sweep looks anyway).
+    async fn sweep_operator_receipts(&self, full: bool) -> Result<(), String> {
         if self.provider_id != "imessage" {
+            return Ok(());
+        }
+        if self.state().receipts_clean && !full {
             return Ok(());
         }
         if self
@@ -2293,6 +2889,7 @@ impl ChannelRouter {
         }
         let since = chrono::Utc::now().timestamp_millis() - RECEIPT_WINDOW_MS;
         let unread = ledger::unread_operator_sends(self.ledger(), self.provider_id, since).await?;
+        self.state().receipts_clean = unread.is_empty();
         if unread.is_empty() {
             return Ok(());
         }
@@ -2325,7 +2922,7 @@ impl ChannelRouter {
     }
 
     async fn sweep_pending_domain_actions(&self) -> Result<(), String> {
-        const ACTION_LEASE_MS: i64 = 60_000;
+        let lease_ms = ACTION_LEASE.as_millis() as i64;
         for (action_ref, kind) in ledger::pending_ask_actions(self.ledger()).await? {
             let answers = match ledger::answers_for_action(self.ledger(), &action_ref).await {
                 Ok(answers) => answers,
@@ -2339,11 +2936,20 @@ impl ChannelRouter {
             }
             let now = chrono::Utc::now().timestamp_millis();
             let Some(lease) =
-                ledger::try_lease_ask_action(self.ledger(), &action_ref, now, ACTION_LEASE_MS)
-                    .await?
+                ledger::try_lease_ask_action(self.ledger(), &action_ref, now, lease_ms).await?
             else {
+                // Another worker holds it. An abandoned lease is this router's
+                // to take when it runs out, so that is when to look again; a
+                // lease that cannot be read is assumed freshly taken.
+                let expires = ledger::ask_action_lease_until(self.ledger(), &action_ref)
+                    .await?
+                    .map(instant_at_epoch_ms)
+                    .unwrap_or_else(|| Instant::now() + ACTION_LEASE)
+                    .max(Instant::now() + SWEEP_FLOOR);
+                earliest(&mut self.state().action_retry_at, expires);
                 continue;
             };
+            record_act(|| format!("{kind} action {action_ref}"));
 
             // Read before the effect runs: parking a refusal withdraws the
             // winning answer, and the conversation that sent it still has to be
@@ -2433,6 +3039,10 @@ impl ChannelRouter {
                         }
                         ledger::AskActionFailure::Retryable => {
                             log::warn!("channel domain action {action_ref} will retry: {error}");
+                            earliest(
+                                &mut self.state().action_retry_at,
+                                Instant::now() + UNPACED_RETRY,
+                            );
                         }
                         // Another worker owns this attempt's outcome; saying
                         // anything here would be a second voice on one event.
@@ -2478,6 +3088,7 @@ impl ChannelRouter {
                         .map(str::to_owned)
                 })
                 .unwrap_or_else(|| "✓ answered in another conversation".to_string());
+            record_act(|| format!("cleanup {}", record.id));
             let multi_select = self.question_is_multi_select(&record).await?;
             match cleanup_claimed_question(
                 self.ledger(),
@@ -2494,21 +3105,58 @@ impl ChannelRouter {
                 Err(error) => {
                     ledger::record_cleanup_failure(self.ledger(), &record.id, &error).await?;
                     log::warn!("channel cleanup deferred for {}: {error}", record.id);
+                    earliest(
+                        &mut self.state().cleanup_retry_at,
+                        Instant::now() + UNPACED_RETRY,
+                    );
                 }
             }
         }
         Ok(())
     }
 
+    /// Every gate step, whatever moved.
+    #[cfg(test)]
     async fn sweep_live_gates(&self) -> Result<(), String> {
-        let mut gates = Vec::new();
+        let plan = SweepPlan {
+            full: true,
+            reportable: false,
+            now: Instant::now(),
+            presence_moved: true,
+            binding_moved: true,
+            outbound_moved: true,
+            ask_action_moved: true,
+            message_backlog: true,
+        };
+        self.sweep_live_gates_with(&plan, &mut SweepTrace::new())
+            .await
+    }
+
+    async fn sweep_live_gates_with(
+        &self,
+        plan: &SweepPlan,
+        trace: &mut SweepTrace,
+    ) -> Result<(), String> {
+        let (bindings, replaced) = self.binding_index(plan.full).await?;
+        if replaced && plan.reportable && !plan.binding_moved {
+            log::warn!(
+                "channel safety net found a changed binding index with no announcement provider={}; a write to channel_conversation_binding bypassed the ledger's announcing functions",
+                self.provider_id
+            );
+            self.note_unannounced("bindings".to_string());
+        }
+        trace.step("bindings");
+        let mut offers = Vec::new();
         let mut snapshot_complete = true;
         let mut live_gates = Vec::new();
-        let binding_generation = ledger::binding_generation(self.ledger()).await?;
+        let mut source_due_at = None;
         for db in self.orch.db.all_dbs().await {
-            match self.load_routed_gates(&db, &binding_generation).await {
-                Ok((mut db_gates, mut db_live)) => {
-                    gates.append(&mut db_gates);
+            match self
+                .load_routed_gates(&db, &bindings, plan, &mut source_due_at, trace)
+                .await
+            {
+                Ok((mut db_offers, mut db_live)) => {
+                    offers.append(&mut db_offers);
                     live_gates.append(&mut db_live);
                 }
                 Err(error) => {
@@ -2517,6 +3165,7 @@ impl ChannelRouter {
                 }
             }
         }
+        self.state().source_due_at = source_due_at;
         let live: HashSet<_> = live_gates
             .iter()
             .map(|gate| gate.delivery_key(self.provider_id, &self.destination))
@@ -2529,33 +3178,90 @@ impl ChannelRouter {
             self.unsent
                 .lock()
                 .expect("unsent delivery set poisoned")
-                .retain(|key| live.contains(key));
+                .retain(|key, _| live.contains(key));
         }
-        // Held and pending routes are presence-aware work outside `gates`, so
-        // they need the operator's real presence as much as a live ask does.
-        let route_work = !self
-            .held_routes
+
+        // A held route waits for its Discord surface: a binding landing, a
+        // presence change, or its own deadline is what can move it.
+        let (held_work, held_due) = {
+            let held = self.held_routes.lock().expect("held route set poisoned");
+            (
+                !held.is_empty(),
+                held.values().map(|route| route.deadline).min(),
+            )
+        };
+        let held_announced = plan.binding_moved || plan.presence_moved || plan.due(held_due);
+        let retry_held = held_work && (plan.full || held_announced);
+        // A pending route is recovered when one is written, when presence
+        // moves, or when a deferred one's grace runs out.
+        let route_grace_due = self
+            .deferred_attention
             .lock()
-            .expect("held route set poisoned")
-            .is_empty()
-            || ledger::has_pending_route(self.ledger(), self.provider_id).await?;
-        let presence = if route_work || gates.iter().any(Gate::is_presence_aware) {
+            .expect("deferred attention set poisoned")
+            .values()
+            .any(|attention| attention.gate.kind == "route" && attention.deadline <= plan.now);
+        let route_retry_due = plan.due(self.state().route_retry_at);
+        let recovery_announced =
+            plan.outbound_moved || plan.presence_moved || route_grace_due || route_retry_due;
+        let pending_routes = if plan.full || recovery_announced {
+            // Recovery re-offers every pending route, so it settles every held
+            // retry; one that is held back again sets it anew.
+            self.state().route_retry_at = None;
+            Some(ledger::list_pending_routes(self.ledger(), self.provider_id).await?)
+        } else {
+            None
+        };
+        // Held and pending routes are presence-aware work outside the gates,
+        // so they need the operator's real presence as much as a live ask does.
+        // Nothing presence-aware being offered means presence is not asked,
+        // which for iMessage is an executor round trip.
+        let presence = if retry_held
+            || pending_routes
+                .as_ref()
+                .is_some_and(|routes| !routes.is_empty())
+            || offers
+                .iter()
+                .any(|offer: &Offer| offer.gate.is_presence_aware())
+        {
             super::operator_presence(Some(self.provider.as_ref())).await
         } else {
             OperatorPresence::Away
         };
+        trace.step("presence");
         let now = Instant::now();
-        self.retry_held_routes(presence, now).await;
-        self.recover_pending_routes(presence, now).await?;
+        if retry_held {
+            take_acts();
+            self.retry_held_routes(presence, now).await;
+            self.report_unannounced(plan, "held_routes", held_announced);
+        }
+        if let Some(pending_routes) = pending_routes {
+            take_acts();
+            self.recover_routes(pending_routes, presence, now).await?;
+            self.report_unannounced(plan, "route_recovery", recovery_announced);
+            trace.step("route_recovery");
+        }
         let mut delivered = 0;
-        for gate in gates {
+        for offer in offers {
             if delivered == SWEEP_LIMIT {
+                self.state().backlog = true;
                 break;
             }
-            if self.deliver_or_defer(gate, presence, now).await? {
+            let unannounced = (!offer.announced)
+                .then(|| offer.gate.delivery_key(self.provider_id, &self.destination));
+            if self.deliver_or_defer(offer.gate, presence, now).await? {
                 delivered += 1;
+                if let Some(key) = unannounced.filter(|_| plan.reportable) {
+                    let key = key.replace('\u{0}', " ");
+                    log::warn!(
+                        "channel safety net delivered a gate nothing announced or scheduled provider={} delivery={key}",
+                        self.provider_id,
+                    );
+                    self.note_unannounced(format!("deliver: {key}"));
+                }
             }
         }
+        take_acts();
+        trace.step("deliver");
         let cancelled = cancel_resolved_attention(
             &mut self
                 .deferred_attention
@@ -2572,23 +3278,59 @@ impl ChannelRouter {
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await?;
-            } else if delivered < SWEEP_LIMIT
-                && self
-                    .send_claimed(attention.id, attention.gate, false)
-                    .await?
+            } else if delivered >= SWEEP_LIMIT {
+                self.state().backlog = true;
+            } else if self
+                .send_claimed(attention.id, attention.gate, false)
+                .await?
             {
                 delivered += 1;
             }
         }
-        if snapshot_complete {
-            for record in ledger::list_unresolved(self.ledger(), self.provider_id).await? {
-                if record.kind == "question"
-                    && record.status == "sent"
-                    && !live.contains(&record.binding_ref)
-                {
-                    self.finish_question(&record, "✓ question closed in Cairn")
-                        .await?;
-                }
+        // The close pass retracts sent questions whose gate has left the live
+        // set, so it has something to do only when that set moved, when a
+        // question went out since it last looked, or when it last could not
+        // look because a database failed to load.
+        let close = {
+            let mut state = self.state();
+            if !snapshot_complete {
+                state.close_owed = true;
+                false
+            } else if plan.full || state.close_owed || state.close_live.as_ref() != Some(&live) {
+                state.close_owed = false;
+                state.close_live = Some(live.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if close {
+            if let Err(error) = self.close_departed_questions(&live).await {
+                self.state().close_owed = true;
+                return Err(error);
+            }
+            trace.step("close_pass");
+        }
+        Ok(())
+    }
+
+    /// Retract every sent question whose rendering is no longer live.
+    ///
+    /// Compared by delivery key, the identity `live` is built from: a bare
+    /// binding ref never equals one, which is how every sent question used to
+    /// be retracted on the sweep after it went out.
+    async fn close_departed_questions(&self, live: &HashSet<String>) -> Result<(), String> {
+        for record in ledger::list_sent_questions(self.ledger(), self.provider_id).await? {
+            let key = delivery_key(
+                self.provider_id,
+                &record.conversation,
+                &record.kind,
+                &record.binding_ref,
+            );
+            if !live.contains(&key) {
+                record_act(|| format!("close question {}", record.id));
+                self.finish_question(&record, "✓ question closed in Cairn")
+                    .await?;
             }
         }
         Ok(())
@@ -2607,7 +3349,12 @@ impl ChannelRouter {
     /// Withholding never strands an ask. It stays answerable in-app, its
     /// watcher's push is the delivery, and if that watcher dies or the operator
     /// mutes the child the very next sweep finds it unheld and sends it.
-    async fn route_gates(&self, db: &LocalDb, gates: Vec<Gate>) -> Result<Vec<Gate>, String> {
+    async fn route_gates(
+        &self,
+        db: &LocalDb,
+        bindings: &ledger::BindingIndex,
+        gates: Vec<Gate>,
+    ) -> Result<Vec<Gate>, String> {
         // By ASK, not by rendering. One prompt carrying three questions produces
         // three gates under one key, and that is one thing being held from the
         // operator, not three.
@@ -2636,13 +3383,7 @@ impl ChannelRouter {
                 }
                 continue;
             };
-            let bindings = ledger::list_eligible_bindings(
-                self.ledger(),
-                self.provider_id,
-                target_uri,
-                gate.message_class(),
-            )
-            .await?;
+            let bindings = bindings.eligible(target_uri, gate.message_class())?;
             if bindings.is_empty() {
                 if self.provider_id == "discord" {
                     self.ensure_discord_surface(db, target_uri).await?;
@@ -2679,16 +3420,27 @@ impl ChannelRouter {
         Ok(routed)
     }
 
-    /// Returns `(work, live)`: `work` contains gates whose sources changed and
-    /// need routing now; `live` is the complete cached identity set used for cleanup.
-    /// A source that has not been recomputed is the same allocation it was, so
-    /// the safety tick is query-free at idle while preserving a full live set for
-    /// fencing and resolution cleanup.
+    /// Returns `(work, live)`: `work` is the gates to offer this sweep; `live`
+    /// is the complete cached identity set used for cleanup. A source that has
+    /// not been recomputed is the same allocation it was, so an idle sweep is
+    /// query-free while preserving a full live set for fencing and resolution
+    /// cleanup.
+    ///
+    /// A gate already claimed is offered again only when something it waits on
+    /// is due: a deferred ask's presence or grace, an unsent one's retry. A full
+    /// sweep offers every one, marking those nothing accounted for.
+    ///
+    /// A source still held back by [`GATE_SOURCE_FLOOR`] behind its inputs
+    /// sets `source_due_at`, so the advance it has not yet served is not lost.
     async fn load_routed_gates(
         &self,
         db: &LocalDb,
-        binding_generation: &str,
-    ) -> Result<(Vec<Gate>, Vec<Gate>), String> {
+        bindings: &Arc<ledger::BindingIndex>,
+        plan: &SweepPlan,
+        source_due_at: &mut Option<Instant>,
+        trace: &mut SweepTrace,
+    ) -> Result<(Vec<Offer>, Vec<Gate>), String> {
+        let started = Instant::now();
         let path = db.path().to_path_buf();
         let mut kinds = Vec::new();
         if self.route.question {
@@ -2705,8 +3457,16 @@ impl ChannelRouter {
         // reconcile horizon.
         let mut sources = Vec::with_capacity(kinds.len());
         for kind in kinds {
-            sources.push((kind, shared_gates(db, &self.orch.gate_inputs, kind).await?));
+            let snapshot = shared_gates(db, &self.orch.gate_inputs, kind).await?;
+            if snapshot.generation != self.orch.gate_inputs.generation(kind) {
+                earliest(
+                    source_due_at,
+                    snapshot.computed_at + GATE_SOURCE_FLOOR.max(snapshot.duration),
+                );
+            }
+            sources.push((kind, snapshot));
         }
+        trace.add("sources", started.elapsed());
         let source_gates: Vec<Arc<Vec<Gate>>> = sources
             .iter()
             .map(|(_, snapshot)| snapshot.gates.clone())
@@ -2716,7 +3476,7 @@ impl ChannelRouter {
             .lock()
             .expect("gate snapshot cache poisoned")
             .get(&path)
-            .filter(|snapshot| snapshot.routes(&source_gates, binding_generation))
+            .filter(|snapshot| snapshot.routes(&source_gates, bindings))
         {
             let deferred = self
                 .deferred_attention
@@ -2726,11 +3486,21 @@ impl ChannelRouter {
             let work = snapshot
                 .routed
                 .iter()
-                .filter(|gate| {
+                .filter_map(|gate| {
                     let key = gate.delivery_key(self.provider_id, &self.destination);
-                    !self.claims.holds(&key) || deferred.contains_key(&key) || unsent.contains(&key)
+                    let announced = if !self.claims.holds(&key) {
+                        true
+                    } else if let Some(attention) = deferred.get(&key) {
+                        plan.presence_moved || attention.deadline <= plan.now
+                    } else {
+                        // Claimed and owing nothing: not this sweep's work.
+                        *unsent.get(&key)? <= plan.now
+                    };
+                    (plan.full || announced).then(|| Offer {
+                        gate: gate.clone(),
+                        announced,
+                    })
                 })
-                .cloned()
                 .collect();
             return Ok((work, snapshot.routed.clone()));
         }
@@ -2748,7 +3518,8 @@ impl ChannelRouter {
             }
             gates.extend(snapshot.gates.iter().cloned());
         }
-        let routed = self.route_gates(db, gates).await?;
+        let routed = self.route_gates(db, bindings, gates).await?;
+        trace.add("routing", started.elapsed());
         // `backlog` is the undelivered review rows this refresh read. It is here
         // next to the duration because the pair is the diagnostic: this refresh
         // costs what the BACKLOG costs, and a duration that grows while the
@@ -2768,12 +3539,41 @@ impl ChannelRouter {
                 path,
                 GateSnapshot {
                     sources: source_gates,
-                    binding_generation: binding_generation.to_string(),
-                    initialized: true,
+                    bindings: bindings.clone(),
                     routed: routed.clone(),
                 },
             );
-        Ok((routed.clone(), routed))
+        let work = routed
+            .iter()
+            .cloned()
+            .map(|gate| Offer {
+                gate,
+                announced: true,
+            })
+            .collect();
+        Ok((work, routed))
+    }
+
+    /// The gates this router routes for `db` right now, with its bindings read
+    /// afresh: the live set a full sweep would see.
+    #[cfg(test)]
+    async fn routed_now(&self, db: &LocalDb) -> Vec<Gate> {
+        let (bindings, _) = self.binding_index(true).await.unwrap();
+        let plan = SweepPlan {
+            full: true,
+            reportable: false,
+            now: Instant::now(),
+            presence_moved: true,
+            binding_moved: true,
+            outbound_moved: true,
+            ask_action_moved: true,
+            message_backlog: true,
+        };
+        let (_, live) = self
+            .load_routed_gates(db, &bindings, &plan, &mut None, &mut SweepTrace::new())
+            .await
+            .unwrap();
+        live
     }
 
     /// Ensure the structural Discord surface for an issue or thread target exists
@@ -2927,16 +3727,23 @@ impl ChannelRouter {
                 {
                     self.send_claimed(record.id, gate, true).await
                 }
+                // Waiting out its backoff. A failure with no schedule is an
+                // ambiguous outcome that is deliberately never re-sent, so it
+                // owes nothing.
                 "failed" if record.attempts < MAX_ATTEMPTS => {
-                    self.mark_unsent(delivery_key, true);
+                    self.owe(
+                        gate.kind,
+                        delivery_key,
+                        record.next_attempt_at.map(instant_at_epoch_ms),
+                    );
                     Ok(false)
                 }
                 "expired" => {
-                    self.mark_unsent(delivery_key, false);
+                    self.owe(gate.kind, delivery_key, None);
                     Ok(true)
                 }
                 _ => {
-                    self.mark_unsent(delivery_key, false);
+                    self.owe(gate.kind, delivery_key, None);
                     Ok(false)
                 }
             };
@@ -2961,13 +3768,31 @@ impl ChannelRouter {
         self.send_claimed(id, gate, false).await
     }
 
-    /// Record whether a claimed delivery still owes a send (see `unsent`).
-    fn mark_unsent(&self, delivery_key: String, owed: bool) {
+    /// Record whether a claimed delivery still owes a send, and when it is
+    /// next worth offering. A gate's debt lives in `unsent`; an agent or
+    /// operator message is offered from its ledger row instead, so its debt is
+    /// only the time its sweep next runs.
+    fn owe(&self, kind: &str, delivery_key: String, at: Option<Instant>) {
+        if matches!(kind, agent_message::KIND | operator_message::KIND) {
+            if let Some(at) = at {
+                earliest(&mut self.state().message_retry_at, at);
+            }
+            return;
+        }
+        if kind == "route" {
+            if let Some(at) = at {
+                earliest(&mut self.state().route_retry_at, at);
+            }
+            return;
+        }
         let mut unsent = self.unsent.lock().expect("unsent delivery set poisoned");
-        if owed {
-            unsent.insert(delivery_key);
-        } else {
-            unsent.remove(&delivery_key);
+        match at {
+            Some(at) => {
+                unsent.insert(delivery_key, at);
+            }
+            None => {
+                unsent.remove(&delivery_key);
+            }
         }
     }
 
@@ -2975,14 +3800,17 @@ impl ChannelRouter {
     /// bounds sends rather than gates examined.
     async fn send_claimed(&self, id: String, gate: Gate, retry: bool) -> Result<bool, String> {
         let delivery_key = gate.delivery_key(self.provider_id, &self.destination);
+        let kind = gate.kind;
         // An outage spends nothing: an unavailable provider is never called, so a
         // message cannot exhaust its attempts unseen while the provider is down.
         // A degraded provider is running and is called, and its failures spend.
+        // Nothing announces the provider coming back, so it is looked at again
+        // on the unpaced cadence.
         if matches!(
             self.provider.health(),
             super::ChannelHealth::Unavailable { .. }
         ) {
-            self.mark_unsent(delivery_key, true);
+            self.owe(kind, delivery_key, Some(Instant::now() + UNPACED_RETRY));
             return Ok(false);
         }
         let now = chrono::Utc::now().timestamp_millis();
@@ -2994,9 +3822,10 @@ impl ChannelRouter {
         if !claimed {
             // Another sweep holds the attempt, or the row has moved on. The next
             // offer reads the row and settles it either way.
-            self.mark_unsent(delivery_key, true);
+            self.owe(kind, delivery_key, Some(Instant::now() + UNPACED_RETRY));
             return Ok(false);
         }
+        record_act(|| format!("{kind} {}", gate.binding_ref));
         let options_json = match &gate.ask {
             OutboundAsk::Question { options, .. } => Some(
                 serde_json::to_string(
@@ -3037,7 +3866,16 @@ impl ChannelRouter {
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await?;
-                self.mark_unsent(delivery_key, false);
+                self.owe(kind, delivery_key, None);
+                let mut state = self.state();
+                if kind == "question" {
+                    // A question on the wire is what the close pass retracts.
+                    state.close_owed = true;
+                }
+                if kind == operator_message::KIND {
+                    // And an operator message is what read receipts are for.
+                    state.receipts_clean = false;
+                }
             }
             Err(error) => {
                 log::warn!(
@@ -3071,7 +3909,12 @@ impl ChannelRouter {
                         message.conversation,
                     );
                 }
-                self.mark_unsent(delivery_key, attempt < MAX_ATTEMPTS);
+                let retry_at = Instant::now() + backoff;
+                self.owe(
+                    kind,
+                    delivery_key,
+                    (attempt < MAX_ATTEMPTS).then_some(retry_at),
+                );
                 return Ok(false);
             }
         }
@@ -3898,6 +4741,10 @@ pub fn spawn(
                     }
                 }
             }
+            // A submission can leave a deadline the sweep has not seen: a
+            // route deferred for the operator's attention, a held Discord
+            // route, a failed send's retry. One cheap sweep picks it up.
+            route_router.wake.signal();
         }
     });
     let sweep = router.clone();
@@ -3916,21 +4763,7 @@ pub fn spawn(
             tokio::time::sleep(BACKLOG_SEAL_RETRY_INTERVAL).await;
         }
         super::set_router_blocker(provider_id, None);
-        let mut schedule = SweepSchedule::new();
-        loop {
-            let reason = schedule.next().await;
-            let started = Instant::now();
-            sweep.sweep().await;
-            schedule.finished();
-            // A sweep's duration next to what woke it is the pair that makes a
-            // recurrence diagnosable from the log alone: whether the cadence is
-            // being outrun, and by which provider.
-            log::info!(
-                "channel sweep provider={provider_id} reason={} duration_ms={}",
-                reason.as_str(),
-                started.elapsed().as_millis()
-            );
-        }
+        run_sweeps(&sweep).await;
     });
     let inbound = router.clone();
     let inbound_task = tokio::spawn(async move {
@@ -3942,6 +4775,29 @@ pub fn spawn(
         }
     });
     vec![sweep_task, inbound_task, route_task]
+}
+
+/// The sweep task's loop: sleep until something is announced or falls due, or
+/// the safety net elapses; sweep; rest the floor. Never returns.
+async fn run_sweeps(router: &ChannelRouter) {
+    let mut schedule =
+        SweepSchedule::new(router.wake.notify(), router.orch.gate_inputs.subscribe());
+    let mut due = None;
+    loop {
+        let reason = schedule.next(due).await;
+        let started = Instant::now();
+        due = router.sweep_for(reason).await;
+        schedule.finished();
+        // A sweep's duration next to what woke it is the pair that makes a
+        // recurrence diagnosable from the log alone: whether the loop is being
+        // driven hard, by which provider, and by what.
+        log::info!(
+            "channel sweep provider={} reason={} duration_ms={}",
+            router.provider_id,
+            reason.as_str(),
+            started.elapsed().as_millis()
+        );
+    }
 }
 
 /// Every question gate currently open, newest first. Deliberately unlimited: a
@@ -4814,13 +5670,10 @@ mod tests {
         tokio::time::advance(GATE_SOURCE_FLOOR).await;
     }
 
-    async fn operator_carries_the_node_question(
-        router: &ChannelRouter,
-        db: &LocalDb,
-        generation: &str,
-    ) -> bool {
-        let (routed, _) = router.load_routed_gates(db, generation).await.unwrap();
-        routed
+    async fn operator_carries_the_node_question(router: &ChannelRouter, db: &LocalDb) -> bool {
+        router
+            .routed_now(db)
+            .await
             .iter()
             .any(|gate| gate.ask_key.as_deref() == Some(NODE_QUESTION_KEY))
     }
@@ -4838,14 +5691,14 @@ mod tests {
         let (router, _provider) = test_router(orch);
 
         assert!(
-            operator_carries_the_node_question(&router, &db, "g0").await,
+            operator_carries_the_node_question(&router, &db).await,
             "an orphan issue's ask has no agent answerable for it"
         );
 
         let push_id = tell_watcher(&db, "watcher").await;
         announce(&router, "attention_pushes").await;
         assert!(
-            !operator_carries_the_node_question(&router, &db, "g1").await,
+            !operator_carries_the_node_question(&router, &db).await,
             "a live watcher was told, so its in-app attention IS the delivery"
         );
 
@@ -4857,7 +5710,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !operator_carries_the_node_question(&router, &db, "g2").await,
+            !operator_carries_the_node_question(&router, &db).await,
             "draining a push does not release the ask"
         );
 
@@ -4866,7 +5719,7 @@ mod tests {
             .unwrap();
         announce(&router, "jobs").await;
         assert!(
-            operator_carries_the_node_question(&router, &db, "g3").await,
+            operator_carries_the_node_question(&router, &db).await,
             "a watcher that finished without answering must not strand the ask"
         );
     }
@@ -4920,33 +5773,31 @@ mod tests {
             },
             ChannelInboundCapabilities::default(),
         );
-        let carries = |generation: &'static str| {
+        let carries = || {
             let router = &router;
             let db = &db;
             async move {
-                let (routed, _) = router.load_routed_gates(db, generation).await.unwrap();
-                routed
+                router
+                    .routed_now(db)
+                    .await
                     .iter()
                     .any(|gate| gate.ask_key.as_deref() == Some(REVIEW))
             }
         };
 
-        assert!(!carries("g0").await, "a live watcher holds the review");
+        assert!(!carries().await, "a live watcher holds the review");
 
         crate::orchestrator::attention_push::stamp_delivered(&db, &[push_id], "ev-1")
             .await
             .unwrap();
-        assert!(
-            !carries("g1").await,
-            "draining it does not release it either"
-        );
+        assert!(!carries().await, "draining it does not release it either");
 
         db.execute("UPDATE jobs SET status='complete' WHERE id='watcher'", ())
             .await
             .unwrap();
         announce(&router, "jobs").await;
         assert!(
-            carries("g2").await,
+            carries().await,
             "a review whose watcher died unresolved must still reach the operator"
         );
     }
@@ -5018,7 +5869,7 @@ mod tests {
         let (router, _provider) = test_router(orch);
 
         tell_watcher(&db, "watcher").await;
-        assert!(!operator_carries_the_node_question(&router, &db, "g0").await);
+        assert!(!operator_carries_the_node_question(&router, &db).await);
 
         db.execute(
             "INSERT INTO wake_subscriptions
@@ -5030,7 +5881,7 @@ mod tests {
         .unwrap();
         announce(&router, "wake_subscriptions").await;
         assert!(
-            operator_carries_the_node_question(&router, &db, "g1").await,
+            operator_carries_the_node_question(&router, &db).await,
             "the mute is read live, so it releases an ask raised before it"
         );
     }
@@ -5048,7 +5899,7 @@ mod tests {
 
         let (imessage, _provider) = test_router(orch.clone());
         assert!(
-            !operator_carries_the_node_question(&imessage, &db, "g0").await,
+            !operator_carries_the_node_question(&imessage, &db).await,
             "the operator's pocket is spared an ask a live agent holds"
         );
 
@@ -5072,7 +5923,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (routed, _) = discord.load_routed_gates(&db, "g0").await.unwrap();
+        let routed = discord.routed_now(&db).await;
         let carried: Vec<_> = routed
             .iter()
             .filter(|gate| gate.ask_key.as_deref() == Some(NODE_QUESTION_KEY))
@@ -5360,7 +6211,7 @@ mod tests {
             .unwrap();
         let delivered = sent().await;
         for _ in 0..4 {
-            tokio::time::advance(SWEEP_INTERVAL).await;
+            tokio::time::advance(UNPACED_RETRY).await;
             sweep().await;
         }
         assert!(db.mutation_generation() > global);
@@ -5372,7 +6223,7 @@ mod tests {
 
         // (b) A review raised through its production caller.
         crate::orchestrator::lifecycle::evaluate_review_readiness(&orch, "issue-201").await;
-        tokio::time::advance(SWEEP_INTERVAL).await;
+        tokio::time::advance(UNPACED_RETRY).await;
         sweep().await;
         assert_eq!(
             computes(),
@@ -5471,98 +6322,1171 @@ mod tests {
         );
     }
 
-    /// A sweep that overruns its cadence is followed by ONE sweep, not by one
-    /// for every deadline it covered.
+    /// The hourly summary closes once an hour has passed, counts every sweep
+    /// in it by reason, and starts the next hour empty.
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_summary_closes_once_an_hour() {
+        let mut tally = SweepTally::new();
+        let mut trace = SweepTrace::new();
+        trace.add("deliver", Duration::from_millis(3));
+        assert!(tally.record(SweepReason::SafetyNet, true, &trace).is_none());
+        tokio::time::advance(SWEEP_TALLY_INTERVAL).await;
+        let summary = tally
+            .record(SweepReason::Deadline, false, &trace)
+            .expect("the hour closed");
+        assert!(summary.contains("sweeps=2 full=1"), "{summary}");
+        assert!(
+            summary.contains("reasons=deadline=1,safety-net=1"),
+            "{summary}"
+        );
+        assert!(summary.contains("deliver_ms=6"), "{summary}");
+        assert!(tally.record(SweepReason::Signal, false, &trace).is_none());
+    }
+
+    /// A schedule with its own wake and its own gate inputs, so no other test's
+    /// announcements reach it.
+    fn isolated_schedule() -> (
+        SweepSchedule,
+        Arc<tokio::sync::Notify>,
+        GateInputGenerations,
+    ) {
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let inputs = GateInputGenerations::default();
+        let schedule = SweepSchedule::new(signal.clone(), inputs.subscribe());
+        (schedule, signal, inputs)
+    }
+
+    /// A sweep that overruns the safety net is followed by ONE sweep, not by
+    /// one for every period it covered.
     ///
     /// This is the difference between a slow sweep and a saturated core. With
-    /// tokio's default `Burst`, a twenty-second sweep on a five-second cadence
-    /// leaves four deadlines ready at once, so the loop runs four more sweeps
-    /// back to back with no sleep at all — and while the condition that made the
-    /// sweep slow persists, it never sleeps again. Three enabled providers is
-    /// then three permanently ready workers, which is what a rebuilt runner
-    /// sitting at 500% CPU was (CAIRN-4208).
+    /// tokio's default `Burst`, a sweep four periods long leaves four deadlines
+    /// ready at once, so the loop runs four more sweeps back to back with no
+    /// sleep at all — and while the condition that made the sweep slow
+    /// persists, it never sleeps again. Three enabled providers is then three
+    /// permanently ready workers, which is what a rebuilt runner sitting at
+    /// 500% CPU was (CAIRN-4208).
     ///
     /// Paused time is what makes this assertable: the property is about WHEN the
     /// loop is allowed to run, so it is measured on the clock rather than
     /// inferred from a duration.
-    /// The presence wake is process-global, so a permit some other test left
-    /// behind arrives here as a spurious wake. Draining it is part of arranging
-    /// a schedule test, not incidental cleanup.
-    async fn drain_presence_wakes() {
-        while tokio::time::timeout(
-            Duration::from_millis(1),
-            super::super::wait_for_presence_change(),
-        )
-        .await
-        .is_ok()
-        {}
-    }
-
     #[tokio::test(start_paused = true)]
-    #[serial_test::serial(operator_presence)]
-    async fn a_sweep_that_overruns_its_cadence_is_followed_by_one_sweep() {
-        drain_presence_wakes().await;
-        let mut schedule = SweepSchedule::new();
-        assert_eq!(schedule.next().await, SweepReason::Timer);
+    async fn a_sweep_that_overruns_the_safety_net_is_followed_by_one_sweep() {
+        let (mut schedule, _signal, _inputs) = isolated_schedule();
+        assert_eq!(schedule.next(None).await, SweepReason::SafetyNet);
 
-        // A sweep four cadences long.
-        tokio::time::advance(SWEEP_INTERVAL * 4).await;
-        let overran = tokio::time::Instant::now();
+        // A sweep four periods long.
+        tokio::time::advance(SWEEP_SAFETY_NET * 4).await;
+        let overran = Instant::now();
         schedule.finished();
 
         let mut starts = Vec::new();
         for _ in 0..3 {
-            assert_eq!(schedule.next().await, SweepReason::Timer);
+            assert_eq!(schedule.next(None).await, SweepReason::SafetyNet);
             starts.push(overran.elapsed());
             schedule.finished();
         }
 
         assert!(
             starts[0] <= SWEEP_FLOOR,
-            "the missed deadlines coalesce into one sweep, which runs now: {starts:?}"
+            "the missed periods coalesce into one sweep, which runs now: {starts:?}"
         );
         assert!(
-            starts[1] >= SWEEP_INTERVAL && starts[2] >= SWEEP_INTERVAL * 2,
-            "and the loop returns to its cadence rather than working off a \
-             backlog of deadlines: under Burst these are three sweeps with no \
+            starts[1] >= SWEEP_SAFETY_NET && starts[2] >= SWEEP_SAFETY_NET * 2,
+            "and the loop returns to its period rather than working off a \
+             backlog of them: under Burst these are three sweeps with no \
              sleep between them: {starts:?}"
         );
     }
 
-    /// A presence change is an external event, so the floor holds for it too: a
-    /// wake source that flaps can advance a sweep, but it cannot spin the loop.
+    /// Every wake but the safety net is an external event, so the floor holds
+    /// for each: a source that flaps can advance a sweep, but it cannot spin the
+    /// loop, and a burst of announcements is one sweep, not one per announcement.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_wakes_buys_one_sweep_each_and_cannot_spin() {
+        let (mut schedule, signal, inputs) = isolated_schedule();
+        assert_eq!(schedule.next(None).await, SweepReason::SafetyNet);
+        schedule.finished();
+
+        for _ in 0..4 {
+            signal.notify_one();
+            inputs.note_table("prompts");
+        }
+        let mut woke = Vec::new();
+        for _ in 0..2 {
+            let started = Instant::now();
+            woke.push(schedule.next(None).await);
+            assert!(
+                started.elapsed() >= SWEEP_FLOOR,
+                "a live wake still rests the floor"
+            );
+            schedule.finished();
+        }
+        woke.sort_by_key(|reason| reason.as_str());
+        assert_eq!(
+            woke,
+            vec![SweepReason::GateInputs, SweepReason::Signal],
+            "four of each wake are one sweep each"
+        );
+
+        // A deadline that is already due rests the floor too, which is what
+        // keeps a sweep that keeps leaving work behind to one a second.
+        let started = Instant::now();
+        assert_eq!(
+            schedule.next(Some(Instant::now())).await,
+            SweepReason::Deadline
+        );
+        assert!(started.elapsed() >= SWEEP_FLOOR);
+        schedule.finished();
+
+        // And with nothing announced or due the loop sleeps out the net.
+        let started = Instant::now();
+        assert_eq!(schedule.next(None).await, SweepReason::SafetyNet);
+        assert!(started.elapsed() >= SWEEP_SAFETY_NET - SWEEP_FLOOR * 4);
+    }
+
+    // ── The real loop under paused time ──
+
+    fn spawn_sweeps(router: &Arc<ChannelRouter>) -> tokio::task::JoinHandle<()> {
+        let router = router.clone();
+        tokio::spawn(async move { run_sweeps(&router).await })
+    }
+
+    impl ChannelRouter {
+        fn sweeps(&self) -> Vec<SweepReason> {
+            self.sweep_log.lock().unwrap().clone()
+        }
+    }
+
+    /// Lets the loop run until it sleeps again. Paused time auto-advances only
+    /// when nothing is runnable, so a short sleep settles the sweep in flight.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    /// Advances paused time in small steps until `done`, failing past `within`.
+    async fn within(what: &str, within: Duration, mut done: impl FnMut() -> bool) -> Duration {
+        let started = Instant::now();
+        while !done() {
+            assert!(
+                started.elapsed() <= within,
+                "{what} did not happen within {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        started.elapsed()
+    }
+
+    fn question_sends(provider: &RecordingProvider, prompt: &str) -> usize {
+        provider
+            .sends
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(
+                |ask| matches!(ask, OutboundAsk::Question { prompt_id, .. } if prompt_id == prompt),
+            )
+            .count()
+    }
+
+    /// An idle router reads nothing between safety nets. It used to sweep every
+    /// five seconds whether or not anything had moved: eleven of those periods
+    /// now pass with no sweep, no gate-source compute and no statement at all,
+    /// and the safety net still runs once a minute.
     #[tokio::test(start_paused = true)]
     #[serial_test::serial(operator_presence)]
-    async fn a_burst_of_presence_changes_buys_one_sweep_and_cannot_spin() {
-        use crate::channels::OperatorPresenceMode;
+    async fn an_idle_router_reads_nothing_until_the_safety_net() {
+        let (orch, db) = route_test_orchestrator("channel-router-idle-loop.db").await;
+        seed_run(&db).await;
+        let (router, _provider) = test_router(orch);
+        let router = Arc::new(router);
+        let source = gate_source_key(&db, GateKind::Question);
+        let computes = || {
+            gate_source_computes()
+                .lock()
+                .unwrap()
+                .get(&source)
+                .copied()
+                .unwrap_or(0)
+        };
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        assert_eq!(router.sweeps(), vec![SweepReason::SafetyNet]);
+        let (statements, computed) = (db.statement_count(), computes());
 
-        drain_presence_wakes().await;
-        let mut schedule = SweepSchedule::new();
-        assert_eq!(schedule.next().await, SweepReason::Timer);
-        schedule.finished();
-
-        for mode in [
-            OperatorPresenceMode::Idle,
-            OperatorPresenceMode::Active,
-            OperatorPresenceMode::Auto,
-            OperatorPresenceMode::Idle,
-        ] {
-            super::super::set_operator_presence_mode(mode);
-        }
-        let started = tokio::time::Instant::now();
-        assert_eq!(schedule.next().await, SweepReason::Presence);
-        assert!(
-            started.elapsed() >= SWEEP_FLOOR,
-            "a live wake still rests the floor"
+        tokio::time::sleep(Duration::from_secs(55)).await;
+        assert_eq!(router.sweeps().len(), 1, "{:?}", router.sweeps());
+        assert_eq!(
+            db.statement_count(),
+            statements,
+            "an idle router issues no statement"
         );
-        schedule.finished();
+        assert_eq!(computes(), computed);
 
-        // The changes that arrived while the first sweep ran are one wake, not
-        // four: what follows is the ordinary cadence.
-        let started = tokio::time::Instant::now();
-        assert_eq!(schedule.next().await, SweepReason::Timer);
-        assert!(started.elapsed() >= SWEEP_FLOOR);
-        super::super::set_operator_presence_mode(OperatorPresenceMode::Auto);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(
+            router.sweeps(),
+            vec![SweepReason::SafetyNet, SweepReason::SafetyNet],
+            "the safety net still sweeps once a minute"
+        );
+        looping.abort();
+    }
+
+    /// A question raised just after a source was computed waits out only the
+    /// gate-source floor: the advance wakes the router, the source is still
+    /// inside its floor, and the router sets a deadline for when it may be
+    /// replaced rather than dropping the advance.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_new_question_is_delivered_within_the_gate_source_floor() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        let (orch, db) = route_test_orchestrator("channel-router-question-wake.db").await;
+        seed_run(&db).await;
+        let (router, provider) = test_router(orch);
+        let router = Arc::new(router);
+        let looping = spawn_sweeps(&router);
+        settle().await;
+
+        seed_prompt(&db, "prompt-1", 100).await;
+        router.orch.notifier.emit_change("prompts");
+        let waited = within(
+            "the question's delivery",
+            SWEEP_FLOOR.max(GATE_SOURCE_FLOOR) + SWEEP_FLOOR,
+            || question_sends(&provider, "prompt-1") == 1,
+        )
+        .await;
+        assert!(waited >= GATE_SOURCE_FLOOR - SWEEP_FLOOR, "{waited:?}");
+        let sweeps = router.sweeps();
+        assert!(sweeps.contains(&SweepReason::GateInputs), "{sweeps:?}");
+        assert!(sweeps.contains(&SweepReason::Deadline), "{sweeps:?}");
+        assert_eq!(
+            sweeps
+                .iter()
+                .filter(|reason| **reason == SweepReason::SafetyNet)
+                .count(),
+            1
+        );
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+        looping.abort();
+    }
+
+    /// An agent message and a route left pending each wake their router through
+    /// the ledger write that records them, within the floor.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn ledger_writes_wake_their_router_within_the_floor() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        let (orch, db) = route_test_orchestrator("channel-router-ledger-wake.db").await;
+        let provider = Arc::new(RecordingProvider::new());
+        let router = Arc::new(agent_message_router(orch, provider.clone(), "discord"));
+        let looping = spawn_sweeps(&router);
+        settle().await;
+
+        let id = enqueue_agent_message(&db, "discord:1/2", "cairn://p/cairn/general").await;
+        let sent = |db: Arc<LocalDb>, id: String| async move {
+            ledger::get_by_id(&db, &id).await.unwrap().unwrap().status == "sent"
+        };
+        let started = Instant::now();
+        while !sent(db.clone(), id.clone()).await {
+            assert!(started.elapsed() <= SWEEP_FLOOR * 2, "the message waited");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let mut submission = route_submission("pending-route");
+        submission.destination = Some("discord:1/7".parse().unwrap());
+        ledger::insert_intent(
+            &db,
+            &ledger::NewOutbound {
+                id: "route-row",
+                channel: "discord",
+                kind: "route",
+                binding_ref: &submission.binding_ref,
+                conversation: "discord:1/7",
+                job_id: None,
+                rendered_text: "notify",
+                rendering: "text",
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        ledger::set_pending_route_submission(
+            &db,
+            "discord",
+            "route-row",
+            &serde_json::to_string(&submission).unwrap(),
+        )
+        .await
+        .unwrap();
+        let started = Instant::now();
+        while !sent(db.clone(), "route-row".into()).await {
+            assert!(started.elapsed() <= SWEEP_FLOOR * 2, "the route waited");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            router
+                .sweeps()
+                .iter()
+                .filter(|reason| **reason == SweepReason::SafetyNet)
+                .count(),
+            1,
+            "neither waited for the safety net"
+        );
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+        looping.abort();
+    }
+
+    /// Tenet 1054: a deferred ask ends on presence or on its deadline, and both
+    /// now wake the router. Presence first: the operator leaving sends it
+    /// within the floor, long before its grace.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_deferred_ask_goes_out_when_the_operator_leaves() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+        set_operator_presence_mode(OperatorPresenceMode::Active);
+        let (orch, db) = route_test_orchestrator("channel-router-presence-wake.db").await;
+        seed_run(&db).await;
+        seed_prompt(&db, "prompt-1", 100).await;
+        let (router, provider) = test_router(orch);
+        let router = Arc::new(router);
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        assert_eq!(
+            question_sends(&provider, "prompt-1"),
+            0,
+            "present, so deferred"
+        );
+        assert_eq!(router.deferred_attention.lock().unwrap().len(), 1);
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        within("the deferred ask", SWEEP_FLOOR * 2, || {
+            question_sends(&provider, "prompt-1") == 1
+        })
+        .await;
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+        looping.abort();
+    }
+
+    /// And the deadline: with the operator present throughout, the ask goes
+    /// out when its grace runs out, woken by that deadline.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_deferred_ask_goes_out_at_its_grace_deadline() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+        set_operator_presence_mode(OperatorPresenceMode::Active);
+        let (orch, db) = route_test_orchestrator("channel-router-grace-wake.db").await;
+        seed_run(&db).await;
+        let (router, provider) = test_router(orch);
+        let router = Arc::new(router);
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        // Off the safety net's grid, so the deadline is what sends it.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        seed_prompt(&db, "prompt-1", 100).await;
+        router.orch.notifier.emit_change("prompts");
+        let raised = Instant::now();
+        tokio::time::sleep(ATTENTION_GRACE - Duration::from_secs(1)).await;
+        assert_eq!(question_sends(&provider, "prompt-1"), 0);
+        within(
+            "the ask at its deadline",
+            GATE_SOURCE_FLOOR + SWEEP_FLOOR * 3,
+            || question_sends(&provider, "prompt-1") == 1,
+        )
+        .await;
+        assert!(raised.elapsed() >= ATTENTION_GRACE);
+        assert_eq!(router.sweeps().last(), Some(&SweepReason::Deadline));
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+        looping.abort();
+    }
+
+    /// A send held back by an unavailable provider keeps the pace it had on the
+    /// old five-second timer: nothing announces the provider coming back, so
+    /// the router looks again on [`UNPACED_RETRY`] while it owes the send, and
+    /// not at all once it does not.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn an_unavailable_provider_is_retried_on_the_unpaced_cadence() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        let (orch, db) = route_test_orchestrator("channel-router-unavailable-pace.db").await;
+        seed_run(&db).await;
+        seed_prompt(&db, "prompt-1", 100).await;
+        let router = Arc::new(ChannelRouter::new_for_provider(
+            orch,
+            Arc::new(UnavailableProvider {
+                sends: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            "imessage",
+            "+15551234567".into(),
+            MessageClassPolicy {
+                question: true,
+                permission: false,
+                notify: false,
+            },
+            ChannelInboundCapabilities::default(),
+        ));
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        tokio::time::sleep(UNPACED_RETRY * 4 + Duration::from_millis(500)).await;
+        let sweeps = router.sweeps();
+        assert_eq!(
+            sweeps
+                .iter()
+                .filter(|reason| **reason == SweepReason::Deadline)
+                .count(),
+            4,
+            "{sweeps:?}"
+        );
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+        looping.abort();
+    }
+
+    /// Tenets 894 and 895: an ask withheld because a live watcher holds it goes
+    /// to the operator once that watcher dies or is muted, and neither waits for
+    /// the safety net. The holder's change is a frame on a gate-source input,
+    /// which wakes the router; the recompute finds `held_since` cleared, which
+    /// makes the gate set unequal and routing run again.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_held_ask_is_released_without_the_safety_net() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        let bound = GATE_SOURCE_FLOOR + SWEEP_FLOOR * 2;
+        for release in ["terminal", "muted"] {
+            let (orch, db) =
+                route_test_orchestrator(&format!("channel-router-held-release-{release}.db")).await;
+            seed_ask_shapes(&db).await;
+            tell_watcher(&db, "watcher").await;
+            let (router, provider) = test_router(orch);
+            let router = Arc::new(router);
+            let looping = spawn_sweeps(&router);
+            settle().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            assert_eq!(question_sends(&provider, "node-prompt"), 0, "held");
+
+            match release {
+                "terminal" => {
+                    db.execute("UPDATE jobs SET status='complete' WHERE id='watcher'", ())
+                        .await
+                        .unwrap();
+                    router.orch.notifier.emit_change("jobs");
+                }
+                _ => {
+                    db.execute(
+                        "INSERT INTO wake_subscriptions
+                           (id, job_id, source_kind, source_ref, state, created_by, created_at, updated_at)
+                         VALUES('sub','watcher','issue','cairn://p/proj/2','muted','agent',1,1)",
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                    router.orch.notifier.emit_change("wake_subscriptions");
+                }
+            }
+            within(&format!("release by {release}"), bound, || {
+                question_sends(&provider, "node-prompt") == 1
+            })
+            .await;
+            assert_eq!(
+                router
+                    .sweeps()
+                    .iter()
+                    .filter(|reason| **reason == SweepReason::SafetyNet)
+                    .count(),
+                1,
+                "{release}: released without the safety net"
+            );
+            looping.abort();
+        }
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+    }
+
+    /// A recompute that finds what was already published republishes the same
+    /// allocation, so routing, keyed by its identity, does not run again. A
+    /// change to `held_since` alone is a change.
+    #[tokio::test(start_paused = true)]
+    async fn an_equal_recompute_keeps_its_gates_and_a_holder_change_does_not() {
+        let db = migrated_test_db("channel-router-equal-recompute.db").await;
+        let inputs = GateInputGenerations::default();
+        seed_ask_shapes(&db).await;
+        let first = shared_gates(&db, &inputs, GateKind::Question)
+            .await
+            .unwrap();
+
+        inputs.note_table("prompts");
+        tokio::time::advance(GATE_SOURCE_FLOOR).await;
+        let equal = shared_gates(&db, &inputs, GateKind::Question)
+            .await
+            .unwrap();
+        assert_ne!(equal.generation, first.generation, "it was recomputed");
+        assert!(
+            Arc::ptr_eq(&equal.gates, &first.gates),
+            "and kept its gates"
+        );
+
+        tell_watcher(&db, "watcher").await;
+        inputs.note_table("attention_pushes");
+        tokio::time::advance(GATE_SOURCE_FLOOR).await;
+        let held = shared_gates(&db, &inputs, GateKind::Question)
+            .await
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&held.gates, &first.gates),
+            "a holder appearing is a different gate set"
+        );
+        assert!(held.gates.iter().any(|gate| gate.held_since.is_some()));
+    }
+
+    /// An announcement is made after its write commits: a router woken by it
+    /// reads the row the write made.
+    #[tokio::test]
+    async fn a_woken_router_reads_the_write_that_woke_it() {
+        let db = Arc::new(migrated_test_db("channel-router-announce-after-commit.db").await);
+        let wake = super::super::RouterWake::register(&db, "discord");
+        let notify = wake.notify();
+        let reader = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                notify.notified().await;
+                ledger::list_due_deliveries(
+                    &db,
+                    "discord",
+                    agent_message::KIND,
+                    i64::MAX,
+                    MAX_ATTEMPTS,
+                )
+                .await
+                .unwrap()
+                .len()
+            })
+        };
+        enqueue_agent_message(&db, "discord:1/2", "cairn://p/cairn/general").await;
+        assert_eq!(reader.await.unwrap(), 1);
+    }
+
+    /// A sweep records the epochs it satisfies before it reads, so a write
+    /// landing while it runs leaves them behind and is swept next time.
+    #[tokio::test]
+    async fn a_write_during_a_sweep_earns_the_next_sweep() {
+        let (orch, db) = route_test_orchestrator("channel-router-epoch-before-read.db").await;
+        let provider = Arc::new(RecordingProvider::new());
+        let router = agent_message_router(orch, provider, "discord");
+        router.plan(SweepReason::SafetyNet);
+        let during = router.plan(SweepReason::Signal);
+        assert!(!during.outbound_moved);
+        // The write lands after the sweep planned and before it would finish.
+        enqueue_agent_message(&db, "discord:1/2", "cairn://p/cairn/general").await;
+        let next = router.plan(SweepReason::Signal);
+        assert!(next.outbound_moved, "the write is the next sweep's work");
+        assert!(!router.plan(SweepReason::Signal).outbound_moved);
+    }
+
+    /// A write that announces nothing is still delivered, by the safety net, and
+    /// the safety net says what it caught, which is how such a site is found.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn the_safety_net_delivers_and_reports_an_unannounced_write() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        let (orch, db) = route_test_orchestrator("channel-router-unannounced.db").await;
+        let provider = Arc::new(RecordingProvider::new());
+        let router = Arc::new(agent_message_router(orch, provider.clone(), "discord"));
+        let looping = spawn_sweeps(&router);
+        settle().await;
+
+        // Written beside the ledger's functions, so nothing announces it.
+        db.execute(
+            "INSERT INTO channel_outbound (id, channel, kind, binding_ref, conversation, rendered_text, rendering, status, created_at)
+             VALUES ('quiet', 'discord', ?1, ?2, 'discord:1/2', 'hello', 'text', 'pending', 1)",
+            params![
+                agent_message::KIND,
+                agent_message::binding_ref("quiet", "cairn://p/cairn/general")
+            ],
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(provider.deliveries.lock().unwrap().is_empty());
+        assert!(router.unannounced.lock().unwrap().is_empty());
+
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert_eq!(provider.deliveries.lock().unwrap().len(), 1);
+        let caught = router.unannounced.lock().unwrap().clone();
+        assert!(
+            caught
+                .iter()
+                .any(|line| line.starts_with("agent_messages:")),
+            "{caught:?}"
+        );
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+        looping.abort();
+    }
+
+    fn safety_nets(router: &ChannelRouter) -> usize {
+        router
+            .sweeps()
+            .iter()
+            .filter(|reason| **reason == SweepReason::SafetyNet)
+            .count()
+    }
+
+    async fn status_of(db: &LocalDb, id: &str) -> String {
+        ledger::get_by_id(db, id).await.unwrap().unwrap().status
+    }
+
+    /// Polls a ledger row under paused time until it reaches `want`.
+    async fn row_reaches(db: &LocalDb, id: &str, want: &str, within: Duration) -> Duration {
+        let started = Instant::now();
+        while status_of(db, id).await != want {
+            assert!(
+                started.elapsed() <= within,
+                "{id} did not reach {want} within {within:?}: {}",
+                status_of(db, id).await
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        started.elapsed()
+    }
+
+    /// Fails its first send and its first cleanup, then succeeds; can be made
+    /// unavailable.
+    #[derive(Default)]
+    struct FlakyProvider {
+        sends: std::sync::atomic::AtomicUsize,
+        cleanups: std::sync::atomic::AtomicUsize,
+        receipt_polls: std::sync::atomic::AtomicUsize,
+        unavailable: std::sync::atomic::AtomicBool,
+        fail_first: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelProvider for FlakyProvider {
+        fn capabilities(&self) -> crate::channels::ChannelCapabilities {
+            crate::channels::ChannelCapabilities::default()
+        }
+
+        async fn send(
+            &self,
+            _message: &OutboundMessage,
+        ) -> Result<crate::channels::SentIds, String> {
+            let attempt = self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_first && attempt == 0 {
+                return Err("transient send failure".into());
+            }
+            Ok(crate::channels::SentIds {
+                primary_guid: format!("guid-{attempt}"),
+                caption_guid: None,
+            })
+        }
+
+        fn subscribe(&self) -> tokio::sync::mpsc::Receiver<InboundEvent> {
+            tokio::sync::mpsc::channel(1).1
+        }
+
+        fn health(&self) -> crate::channels::ChannelHealth {
+            if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+                crate::channels::ChannelHealth::Unavailable {
+                    reason: "bridge down".into(),
+                }
+            } else {
+                crate::channels::ChannelHealth::Ready
+            }
+        }
+
+        async fn cleanup_question(&self, _message: &ResolvedQuestionMessage) -> Result<(), String> {
+            let attempt = self
+                .cleanups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_first && attempt == 0 {
+                return Err("transient cleanup failure".into());
+            }
+            Ok(())
+        }
+
+        async fn read_receipts(&self, _guids: &[String]) -> Result<Vec<(String, i64)>, String> {
+            self.receipt_polls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    fn flaky(fail_first: bool) -> Arc<FlakyProvider> {
+        Arc::new(FlakyProvider {
+            fail_first,
+            ..Default::default()
+        })
+    }
+
+    fn imessage_router(
+        orch: Orchestrator,
+        provider: Arc<dyn ChannelProvider>,
+    ) -> Arc<ChannelRouter> {
+        Arc::new(ChannelRouter::new_for_provider(
+            orch,
+            provider,
+            "imessage",
+            "+15551234567".into(),
+            MessageClassPolicy {
+                question: true,
+                permission: false,
+                notify: false,
+            },
+            ChannelInboundCapabilities::default(),
+        ))
+    }
+
+    /// A pending route held back by an unavailable provider is resent on its
+    /// own retry deadline once the provider recovers, not at the safety net.
+    /// Its debt cannot ride the gates' `unsent` set, which is pruned against a
+    /// live set no route is ever in.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_held_back_route_is_resent_on_its_retry_once_the_provider_recovers() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        let (orch, db) = route_test_orchestrator("channel-router-route-retry-loop.db").await;
+        let provider = flaky(false);
+        provider
+            .unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let router = Arc::new(agent_message_router(orch, provider.clone(), "discord"));
+        let looping = spawn_sweeps(&router);
+        settle().await;
+
+        let mut submission = route_submission("held-back");
+        submission.destination = Some("discord:1/7".parse().unwrap());
+        ledger::insert_intent(
+            &db,
+            &ledger::NewOutbound {
+                id: "route-row",
+                channel: "discord",
+                kind: "route",
+                binding_ref: &submission.binding_ref,
+                conversation: "discord:1/7",
+                job_id: None,
+                rendered_text: "notify",
+                rendering: "text",
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        ledger::set_pending_route_submission(
+            &db,
+            "discord",
+            "route-row",
+            &serde_json::to_string(&submission).unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(SWEEP_FLOOR * 2).await;
+        assert_eq!(status_of(&db, "route-row").await, "pending", "held back");
+
+        // The provider comes back. Nothing announces that.
+        provider
+            .unavailable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        row_reaches(&db, "route-row", "sent", UNPACED_RETRY + SWEEP_FLOOR).await;
+        assert_eq!(safety_nets(&router), 1, "{:?}", router.sweeps());
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+        looping.abort();
+    }
+
+    /// A message backlog larger than one pass drains a pass per floor. The
+    /// rows left over are `pending`, so no retry schedule wakes the next pass;
+    /// the pass that stopped at the limit carries the continuation itself.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_message_backlog_drains_a_pass_per_floor() {
+        let (orch, db) = route_test_orchestrator("channel-router-message-backlog.db").await;
+        let provider = Arc::new(RecordingProvider::new());
+        let router = Arc::new(agent_message_router(orch, provider.clone(), "discord"));
+        for _ in 0..(SWEEP_LIMIT * 2 + 50) {
+            enqueue_agent_message(&db, "discord:1/2", "cairn://p/cairn/general").await;
+        }
+        // Started after the writes, so the only announcement-free path to the
+        // rest of the backlog is the continuation.
+        let looping = spawn_sweeps(&router);
+        within("the backlog to drain", SWEEP_FLOOR * 4, || {
+            provider.deliveries.lock().unwrap().len() == SWEEP_LIMIT * 2 + 50
+        })
+        .await;
+        assert_eq!(safety_nets(&router), 1, "{:?}", router.sweeps());
+        looping.abort();
+    }
+
+    /// A failed message is retried on its backoff deadline. The ledger's
+    /// schedule is wall-clock, which paused time does not move, so the test
+    /// makes the row due by hand (announcing nothing) and the router's own
+    /// deadline is what must find it.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_failed_message_is_retried_on_its_backoff_deadline() {
+        let (orch, db) = route_test_orchestrator("channel-router-message-backoff.db").await;
+        let provider = flaky(true);
+        let router = Arc::new(agent_message_router(orch, provider.clone(), "discord"));
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        let id = enqueue_agent_message(&db, "discord:1/2", "cairn://p/cairn/general").await;
+        row_reaches(&db, &id, "failed", SWEEP_FLOOR * 2).await;
+        db.execute(
+            "UPDATE channel_outbound SET next_attempt_at = 0 WHERE id = ?1",
+            params![id.clone()],
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(RETRY_BASE - SWEEP_FLOOR * 2).await;
+        assert_eq!(status_of(&db, &id).await, "failed", "inside its backoff");
+        row_reaches(&db, &id, "sent", SWEEP_FLOOR * 3).await;
+        assert_eq!(safety_nets(&router), 1, "{:?}", router.sweeps());
+        looping.abort();
+    }
+
+    /// The same for a gate: a failed question is offered again on its own
+    /// backoff deadline from the router's unsent set.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_failed_gate_is_retried_on_its_backoff_deadline() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        let (orch, db) = route_test_orchestrator("channel-router-gate-backoff.db").await;
+        seed_run(&db).await;
+        seed_prompt(&db, "prompt-1", 100).await;
+        let provider = flaky(true);
+        let router = imessage_router(orch, provider.clone());
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        assert_eq!(provider.sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+        db.execute("UPDATE channel_outbound SET next_attempt_at = 0", ())
+            .await
+            .unwrap();
+        tokio::time::sleep(RETRY_BASE - SWEEP_FLOOR * 2).await;
+        assert_eq!(provider.sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+        within("the gate's retry", SWEEP_FLOOR * 3, || {
+            provider.sends.load(std::sync::atomic::Ordering::SeqCst) == 2
+        })
+        .await;
+        assert_eq!(safety_nets(&router), 1, "{:?}", router.sweeps());
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+        looping.abort();
+    }
+
+    /// A failed cleanup is retried on the unpaced cadence, not at the net.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_failed_cleanup_is_retried_on_the_unpaced_cadence() {
+        let (orch, db) = route_test_orchestrator("channel-router-cleanup-retry.db").await;
+        let provider = flaky(true);
+        let router = imessage_router(orch, provider.clone());
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        ledger::insert_intent(
+            &db,
+            &ledger::NewOutbound {
+                id: "q-row",
+                channel: "imessage",
+                kind: "question",
+                binding_ref: "gone-prompt:0",
+                conversation: "+15551234567",
+                job_id: None,
+                rendered_text: "Which?",
+                rendering: "poll",
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        ledger::mark_sent(&db, "q-row", "guid-q", None, None, 2)
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE channel_outbound SET status = 'cleanup_pending', options_json = '{\"receipt\":\"done\"}' WHERE id = 'q-row'",
+            (),
+        )
+        .await
+        .unwrap();
+        crate::channels::announce_outbound_all(&db);
+        within("the first cleanup", SWEEP_FLOOR * 2, || {
+            provider.cleanups.load(std::sync::atomic::Ordering::SeqCst) == 1
+        })
+        .await;
+        row_reaches(&db, "q-row", "resolved", UNPACED_RETRY + SWEEP_FLOOR).await;
+        assert_eq!(safety_nets(&router), 1, "{:?}", router.sweeps());
+        looping.abort();
+    }
+
+    /// A domain action that failed is retried on the unpaced cadence. Its
+    /// prompt is gone, so every attempt fails retryably.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_failed_domain_action_is_retried_on_the_unpaced_cadence() {
+        let (orch, db) = route_test_orchestrator("channel-router-action-retry.db").await;
+        let router = imessage_router(orch, flaky(false));
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        ledger::claim_ask_resolution(
+            &db,
+            "gone-prompt",
+            "[\"Ship\"]",
+            cairn_common::identity::AppearanceTransport::ChannelReply,
+            Some("imessage"),
+            Some("+15551234567"),
+            Some("operator"),
+            "question",
+            "gone-prompt",
+            1,
+        )
+        .await
+        .unwrap();
+        let attempts = || async {
+            db.query_opt_i64(
+                "SELECT attempt_count FROM channel_ask_action WHERE action_ref = 'gone-prompt'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap_or(0)
+        };
+        tokio::time::sleep(SWEEP_FLOOR).await;
+        assert_eq!(attempts().await, 1, "the claim's announcement ran it once");
+        tokio::time::sleep(UNPACED_RETRY * 2 + SWEEP_FLOOR).await;
+        assert_eq!(attempts().await, 3, "then once per unpaced retry");
+        assert_eq!(safety_nets(&router), 1, "{:?}", router.sweeps());
+        looping.abort();
+    }
+
+    /// A domain action whose lease another worker holds is looked at again
+    /// when THAT lease runs out, not a whole lease length after this router
+    /// noticed it. The lease here is half spent, so its expiry falls before
+    /// the next safety net, and only its deadline can explain the attempt.
+    /// The lease is wall-clock, which paused time does not move, so the test
+    /// lets it run out by hand, announcing nothing.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_lease_held_elsewhere_is_retaken_when_it_runs_out() {
+        let (orch, db) = route_test_orchestrator("channel-router-lease-expiry.db").await;
+        let router = imessage_router(orch, flaky(false));
+        ledger::claim_ask_resolution(
+            &db,
+            "gone-prompt",
+            "[\"Ship\"]",
+            cairn_common::identity::AppearanceTransport::ChannelReply,
+            Some("imessage"),
+            Some("+15551234567"),
+            Some("operator"),
+            "question",
+            "gone-prompt",
+            1,
+        )
+        .await
+        .unwrap();
+        let remaining = ACTION_LEASE / 2;
+        db.execute(
+            "UPDATE channel_ask_action SET lease_token = 'elsewhere', lease_until = ?1 WHERE action_ref = 'gone-prompt'",
+            params![chrono::Utc::now().timestamp_millis() + remaining.as_millis() as i64],
+        )
+        .await
+        .unwrap();
+        let attempts = || async {
+            db.query_opt_i64(
+                "SELECT attempt_count FROM channel_ask_action WHERE action_ref = 'gone-prompt'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap_or(0)
+        };
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        assert_eq!(attempts().await, 0, "held elsewhere");
+        db.execute(
+            "UPDATE channel_ask_action SET lease_until = 0 WHERE action_ref = 'gone-prompt'",
+            (),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(remaining - SWEEP_FLOOR).await;
+        assert_eq!(attempts().await, 0, "not before the lease runs out");
+        tokio::time::sleep(SWEEP_FLOOR * 3).await;
+        assert_eq!(attempts().await, 1, "taken when it ran out");
+        assert_eq!(safety_nets(&router), 1, "{:?}", router.sweeps());
+        looping.abort();
+    }
+
+    /// Desktop activity ageing to away announces nothing, so a router holding
+    /// a deferred ask looks at presence again when the last sample ages out,
+    /// and sends the ask then rather than at its grace deadline.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_deferred_ask_goes_out_when_desktop_activity_ages_to_away() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+        let (orch, db) = route_test_orchestrator("channel-router-presence-ageing.db").await;
+        seed_run(&db).await;
+        let (router, provider) = test_router(orch);
+        let router = Arc::new(router);
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        // Off the safety net's grid.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        crate::channels::report_desktop_presence(0, false);
+        let sampled = Instant::now();
+        seed_prompt(&db, "prompt-1", 100).await;
+        router.orch.notifier.emit_change("prompts");
+        tokio::time::sleep(GATE_SOURCE_FLOOR + SWEEP_FLOOR).await;
+        assert_eq!(
+            router.deferred_attention.lock().unwrap().len(),
+            1,
+            "present"
+        );
+
+        let timeout = Duration::from_secs(60);
+        tokio::time::sleep(timeout - sampled.elapsed() - SWEEP_FLOOR).await;
+        assert_eq!(question_sends(&provider, "prompt-1"), 0);
+        within("the ask once activity aged out", SWEEP_FLOOR * 3, || {
+            question_sends(&provider, "prompt-1") == 1
+        })
+        .await;
+        assert!(sampled.elapsed() < ATTENTION_GRACE);
+        assert_eq!(router.sweeps().last(), Some(&SweepReason::Deadline));
+        crate::channels::clear_desktop_presence();
+        looping.abort();
+    }
+
+    /// A held Discord route that never gets its surface fails at its own
+    /// `SURFACE_WAIT` deadline, woken by it.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_held_route_fails_at_its_surface_wait_deadline() {
+        let (orch, db) = route_test_orchestrator("channel-router-held-expiry.db").await;
+        seed_route_subject_issue(&db, 42, "active").await;
+        let (router, _provider) = guild_discord_router(orch);
+        let router = Arc::new(router);
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        // Off the safety net's grid, so the deadline is what fails it.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        router
+            .submit_route(
+                undirected_route_submission("expires", "detailUri", "cairn://p/cairn/42"),
+                OperatorPresence::Away,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        // What the inbox task does after each submission.
+        router.wake.signal();
+        tokio::time::sleep(SURFACE_WAIT - Duration::from_secs(1)).await;
+        assert_eq!(router.held_routes.lock().unwrap().len(), 1);
+        within("the held route's expiry", SWEEP_FLOOR * 3, || {
+            router.held_routes.lock().unwrap().is_empty()
+        })
+        .await;
+        assert_eq!(router.sweeps().last(), Some(&SweepReason::Deadline));
+        assert_eq!(route_firing_for(&db, "expires").await.status, "failed");
+        looping.abort();
+    }
+
+    /// Read receipts are polled every two minutes while an operator message is
+    /// unread, not on every sweep, and not at all once nothing is unread.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn receipts_are_polled_on_their_interval_only_while_something_is_unread() {
+        let (orch, db) = route_test_orchestrator("channel-router-receipt-poll.db").await;
+        ledger::insert_intent(
+            &db,
+            &ledger::NewOutbound {
+                id: "op-row",
+                channel: "imessage",
+                kind: operator_message::KIND,
+                binding_ref: "operator:op-row",
+                conversation: "+15551234567",
+                job_id: None,
+                rendered_text: "hello",
+                rendering: "text",
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        ledger::mark_sent(
+            &db,
+            "op-row",
+            "guid-op",
+            None,
+            None,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap();
+        let provider = flaky(false);
+        let router = imessage_router(orch, provider.clone());
+        let polls = || {
+            provider
+                .receipt_polls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let looping = spawn_sweeps(&router);
+        settle().await;
+        assert_eq!(polls(), 1);
+        tokio::time::sleep(RECEIPT_POLL_INTERVAL - Duration::from_secs(1)).await;
+        assert_eq!(polls(), 1, "the safety net in between did not poll");
+        within("the second poll", SWEEP_FLOOR * 3, || polls() == 2).await;
+
+        db.execute(
+            "UPDATE channel_outbound SET read_at = 1 WHERE id = 'op-row'",
+            (),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(RECEIPT_POLL_INTERVAL * 2).await;
+        assert_eq!(polls(), 2, "nothing unread, nothing asked");
+        looping.abort();
+    }
+
+    /// A question still open stays on the wire. The close pass compared each
+    /// sent row's bare binding ref against a set of delivery keys, which never
+    /// matched, so every sent question was retracted as closed on the sweep
+    /// after it went out.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_sent_question_still_open_is_not_retracted() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        let (orch, db) = route_test_orchestrator("channel-router-open-question-stays.db").await;
+        seed_run(&db).await;
+        seed_prompt(&db, "prompt-1", 100).await;
+        let (router, provider) = test_router(orch);
+        router.sweep().await;
+        router.sweep().await;
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+
+        assert_eq!(question_sends(&provider, "prompt-1"), 1);
+        assert_eq!(
+            provider.cleanups.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the open question was not retracted"
+        );
+        let sent = ledger::list_sent_questions(&db, "imessage").await.unwrap();
+        assert_eq!(sent.len(), 1);
+
+        // Answered in Cairn, it leaves the live set and is retracted.
+        db.execute(
+            "UPDATE prompts SET response = '{}' WHERE id = 'prompt-1'",
+            (),
+        )
+        .await
+        .unwrap();
+        router.orch.notifier.emit_change("prompts");
+        tokio::time::sleep(GATE_SOURCE_FLOOR).await;
+        router.sweep().await;
+        assert!(ledger::list_sent_questions(&db, "imessage")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// Every enabled provider sweeps on its own five-second loop, but what the
@@ -6842,9 +8766,14 @@ mod tests {
         )
         .await
         .unwrap();
-        ledger::set_pending_route_submission(db, id, &serde_json::to_string(&submission).unwrap())
-            .await
-            .unwrap();
+        ledger::set_pending_route_submission(
+            db,
+            "discord",
+            id,
+            &serde_json::to_string(&submission).unwrap(),
+        )
+        .await
+        .unwrap();
         submission
     }
 
@@ -8476,7 +10405,7 @@ mod tests {
         assert_eq!(computes(), 1);
 
         // Inside the backoff: offered, read, and left alone.
-        tokio::time::advance(SWEEP_INTERVAL).await;
+        tokio::time::advance(UNPACED_RETRY).await;
         router.sweep_live_gates().await.unwrap();
         assert_eq!(attempts().await, 2);
 
@@ -8484,7 +10413,7 @@ mod tests {
         db.execute("UPDATE channel_outbound SET next_attempt_at = 0", ())
             .await
             .unwrap();
-        tokio::time::advance(SWEEP_INTERVAL).await;
+        tokio::time::advance(UNPACED_RETRY).await;
         router.sweep_live_gates().await.unwrap();
         set_operator_presence_mode(OperatorPresenceMode::Auto);
 
@@ -8552,7 +10481,7 @@ mod tests {
             .await
             .unwrap();
         router.gate_snapshots.lock().unwrap().remove(local.path());
-        tokio::time::advance(SWEEP_INTERVAL).await;
+        tokio::time::advance(UNPACED_RETRY).await;
         router.sweep_live_gates().await.unwrap();
         set_operator_presence_mode(OperatorPresenceMode::Auto);
 
@@ -10021,6 +11950,7 @@ mod tests {
                 .unwrap();
                 ledger::set_pending_route_submission(
                     &db,
+                    "discord",
                     id,
                     &serde_json::to_string(&submission).unwrap(),
                 )

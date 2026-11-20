@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 use tokio::sync::mpsc;
 
@@ -23,7 +26,8 @@ static DISCORD_ADMISSION_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
 static DISCORD_SURFACE_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
 static OPERATOR_PRESENCE_STATE: OnceLock<Mutex<OperatorPresenceState>> = OnceLock::new();
 static DESKTOP_ACTIVITY_STATE: OnceLock<Mutex<DesktopActivityState>> = OnceLock::new();
-static OPERATOR_PRESENCE_CHANGED: OnceLock<tokio::sync::Notify> = OnceLock::new();
+static PRESENCE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static LEDGER_SIGNALS: OnceLock<Mutex<HashMap<u64, Arc<LedgerSignals>>>> = OnceLock::new();
 static ROUTE_SUBMISSIONS: OnceLock<
     Mutex<HashMap<&'static str, mpsc::UnboundedSender<router::RouterSubmission>>>,
 > = OnceLock::new();
@@ -157,6 +161,187 @@ pub fn wake_discord_surfaces() {
     DISCORD_SURFACE_WAKE
         .get_or_init(tokio::sync::Notify::new)
         .notify_one();
+}
+
+// ── Router wakes ──
+//
+// A router sweeps when something it reads has moved or when something it owes
+// falls due, and otherwise sleeps out a slow safety net. These are the
+// "something moved" half for the channel ledger: each write a sweep must act on
+// bumps an epoch and wakes the routers that read it, and a woken router
+// compares epochs to learn which of its steps are dirty.
+//
+// Two rules make that safe. An announcement is made only after the write has
+// committed, so the router it wakes reads the new row rather than consuming the
+// wake on the old one. And a router records the epochs it is about to satisfy
+// BEFORE it reads, so a write landing mid-sweep leaves the epoch ahead of what
+// the router recorded and earns one more sweep.
+//
+// Everything here is in-process and keyed by the ledger database's handle
+// instance, which is what both the writers and the routers hold. A writer in
+// another process would reach the routers only through the gate-input frames
+// and, failing those, the safety net.
+
+/// One ledger database's announcement state.
+#[derive(Default)]
+struct LedgerSignals {
+    binding: AtomicU64,
+    ask_action: AtomicU64,
+    /// Outbound work every channel owes, such as cleanup fanned out from one
+    /// resolution; a router's outbound epoch is this plus its own channel's.
+    outbound_all: AtomicU64,
+    outbound: Mutex<HashMap<String, u64>>,
+    routers: Mutex<HashMap<&'static str, Arc<tokio::sync::Notify>>>,
+}
+
+impl LedgerSignals {
+    fn wake_all(&self) {
+        for notify in self
+            .routers
+            .lock()
+            .expect("router wake registry poisoned")
+            .values()
+        {
+            notify.notify_one();
+        }
+    }
+
+    fn wake(&self, provider: &str) {
+        if let Some(notify) = self
+            .routers
+            .lock()
+            .expect("router wake registry poisoned")
+            .get(provider)
+        {
+            notify.notify_one();
+        }
+    }
+}
+
+fn ledger_signals(db: &crate::storage::LocalDb) -> Arc<LedgerSignals> {
+    LEDGER_SIGNALS
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("ledger signal registry poisoned")
+        .entry(db.instance())
+        .or_default()
+        .clone()
+}
+
+/// A committed write to `channel_conversation_binding` on this ledger.
+pub(crate) fn announce_binding_change(db: &crate::storage::LocalDb) {
+    let signals = ledger_signals(db);
+    signals.binding.fetch_add(1, Ordering::AcqRel);
+    signals.wake_all();
+}
+
+/// Committed outbound work `channel`'s sweep owes: a pending message or route.
+pub(crate) fn announce_outbound(db: &crate::storage::LocalDb, channel: &str) {
+    let signals = ledger_signals(db);
+    *signals
+        .outbound
+        .lock()
+        .expect("outbound epoch poisoned")
+        .entry(channel.to_string())
+        .or_default() += 1;
+    signals.wake(channel);
+}
+
+/// Committed outbound work any channel may owe.
+pub(crate) fn announce_outbound_all(db: &crate::storage::LocalDb) {
+    let signals = ledger_signals(db);
+    signals.outbound_all.fetch_add(1, Ordering::AcqRel);
+    signals.wake_all();
+}
+
+/// A committed claim on an ask's domain action. `channel_ask_action` is not
+/// channel-scoped, so every router on the ledger may be the one to run it.
+pub(crate) fn announce_ask_action(db: &crate::storage::LocalDb) {
+    let signals = ledger_signals(db);
+    signals.ask_action.fetch_add(1, Ordering::AcqRel);
+    signals.wake_all();
+}
+
+/// Operator presence is process state, so its change reaches every router on
+/// every ledger.
+fn announce_presence_change() {
+    PRESENCE_EPOCH.fetch_add(1, Ordering::AcqRel);
+    let all = LEDGER_SIGNALS
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("ledger signal registry poisoned")
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for signals in all {
+        signals.wake_all();
+    }
+}
+
+/// The announcement epochs one router reads, as of one instant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct WakeEpochs {
+    pub(super) presence: u64,
+    pub(super) binding: u64,
+    pub(super) outbound: u64,
+    pub(super) ask_action: u64,
+}
+
+/// One router's registration: its own wake, which every announcement it reads
+/// notifies, and the epochs that say which announcement it was.
+///
+/// The wake is the router's own `Notify`, with exactly one waiter, so
+/// `notify_one`'s stored permit means an announcement made while the router is
+/// mid-sweep is kept for its next wait rather than lost. A single process-wide
+/// `Notify` cannot do this for several routers: `notify_one` wakes one of them.
+pub(super) struct RouterWake {
+    signals: Arc<LedgerSignals>,
+    provider: &'static str,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl RouterWake {
+    /// Registers `provider`'s router on `db`, replacing any earlier registration.
+    pub(super) fn register(db: &crate::storage::LocalDb, provider: &'static str) -> Self {
+        let signals = ledger_signals(db);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        signals
+            .routers
+            .lock()
+            .expect("router wake registry poisoned")
+            .insert(provider, notify.clone());
+        Self {
+            signals,
+            provider,
+            notify,
+        }
+    }
+
+    pub(super) fn epochs(&self) -> WakeEpochs {
+        let own = self
+            .signals
+            .outbound
+            .lock()
+            .expect("outbound epoch poisoned")
+            .get(self.provider)
+            .copied()
+            .unwrap_or_default();
+        WakeEpochs {
+            presence: PRESENCE_EPOCH.load(Ordering::Acquire),
+            binding: self.signals.binding.load(Ordering::Acquire),
+            outbound: own.wrapping_add(self.signals.outbound_all.load(Ordering::Acquire)),
+            ask_action: self.signals.ask_action.load(Ordering::Acquire),
+        }
+    }
+
+    pub(super) fn notify(&self) -> Arc<tokio::sync::Notify> {
+        self.notify.clone()
+    }
+
+    /// Wakes this router alone: its own tasks changed what it owes.
+    pub(super) fn signal(&self) {
+        self.notify.notify_one();
+    }
 }
 
 pub async fn ensure_discord_thread_surface(
@@ -589,9 +774,13 @@ struct DesktopActivityState {
     last_sample: Option<DesktopPresenceSample>,
 }
 
+/// The clock desktop presence ages on: tokio's, so the router's presence
+/// deadline and the ageing it waits for agree, and both honour paused time.
+type PresenceClock = tokio::time::Instant;
+
 #[derive(Debug, Clone, Copy)]
 struct DesktopPresenceSample {
-    sampled_at: Instant,
+    sampled_at: PresenceClock,
     idle_seconds: u64,
     locked: bool,
 }
@@ -610,7 +799,7 @@ fn desktop_activity_state() -> &'static Mutex<DesktopActivityState> {
 /// permanently ready, which doubles the sweep rate at idle and removes the sleep
 /// entirely once a sweep runs longer than its own cadence (CAIRN-4208).
 pub fn report_desktop_presence(idle_seconds: u64, locked: bool) {
-    let now = Instant::now();
+    let now = PresenceClock::now();
     let changed = {
         let mut state = desktop_activity_state()
             .lock()
@@ -626,15 +815,66 @@ pub fn report_desktop_presence(idle_seconds: u64, locked: bool) {
         before != desktop_inferred_presence(state.last_sample, now)
     };
     if changed {
-        OPERATOR_PRESENCE_CHANGED
-            .get_or_init(tokio::sync::Notify::new)
-            .notify_one();
+        announce_presence_change();
+    }
+}
+
+/// Forgets the desktop's last activity sample, which is process state a test
+/// that reports one must not leave behind.
+#[cfg(test)]
+pub(crate) fn clear_desktop_presence() {
+    desktop_activity_state()
+        .lock()
+        .expect("desktop activity state lock poisoned")
+        .last_sample = None;
+}
+
+/// When resolved presence can next change with no event to announce it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PresenceTransition {
+    /// Only an announced event changes it: a pinned mode, a locked screen, or
+    /// desktop activity that has already aged to away.
+    Announced,
+    /// The last desktop sample ages from present to away after this long.
+    After(Duration),
+    /// Presence comes from the provider's own fallback, which announces
+    /// nothing, so a caller that depends on it has to look again.
+    Unannounced,
+}
+
+/// The time-driven half of presence. [`resolve_presence`] adds nothing to it:
+/// a pinned mode holds until it is set again, which announces.
+pub(super) fn presence_transition() -> PresenceTransition {
+    let mode = presence_state()
+        .lock()
+        .expect("operator presence state lock poisoned")
+        .mode;
+    let sample = desktop_activity_state()
+        .lock()
+        .expect("desktop activity state lock poisoned")
+        .last_sample;
+    let Some(sample) = sample else {
+        return match mode {
+            OperatorPresenceMode::Auto => PresenceTransition::Unannounced,
+            OperatorPresenceMode::Active | OperatorPresenceMode::Idle => {
+                PresenceTransition::Announced
+            }
+        };
+    };
+    if mode != OperatorPresenceMode::Auto || sample.locked {
+        return PresenceTransition::Announced;
+    }
+    let effective_idle = Duration::from_secs(sample.idle_seconds)
+        .saturating_add(PresenceClock::now().saturating_duration_since(sample.sampled_at));
+    match DESKTOP_ACTIVITY_TIMEOUT.checked_sub(effective_idle) {
+        Some(remaining) if !remaining.is_zero() => PresenceTransition::After(remaining),
+        _ => PresenceTransition::Announced,
     }
 }
 
 fn desktop_inferred_presence(
     sample: Option<DesktopPresenceSample>,
-    now: Instant,
+    now: PresenceClock,
 ) -> Option<(OperatorPresence, bool)> {
     sample.map(|sample| {
         let sample_age = now.saturating_duration_since(sample.sampled_at);
@@ -864,16 +1104,8 @@ pub fn set_operator_presence_mode(mode: OperatorPresenceMode) {
         .lock()
         .expect("operator presence state lock poisoned");
     state.mode = mode;
-    OPERATOR_PRESENCE_CHANGED
-        .get_or_init(tokio::sync::Notify::new)
-        .notify_one();
-}
-
-pub(super) async fn wait_for_presence_change() {
-    OPERATOR_PRESENCE_CHANGED
-        .get_or_init(tokio::sync::Notify::new)
-        .notified()
-        .await;
+    drop(state);
+    announce_presence_change();
 }
 
 pub async fn operator_presence(provider: Option<&dyn ChannelProvider>) -> OperatorPresence {
@@ -886,7 +1118,7 @@ pub async fn operator_presence(provider: Option<&dyn ChannelProvider>) -> Operat
             .lock()
             .expect("desktop activity state lock poisoned")
             .last_sample,
-        Instant::now(),
+        PresenceClock::now(),
     );
     let channel_fallback = match desktop_inferred {
         Some(_) => OperatorPresence::Away,
@@ -1702,12 +1934,77 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(operator_presence)]
     async fn presence_change_is_retained_until_the_router_waits() {
+        let db = crate::storage::migrated_test_db("channel-presence-wake-retained.db").await;
+        let wake = RouterWake::register(&db, "imessage");
         set_operator_presence_mode(OperatorPresenceMode::Idle);
-        tokio::time::timeout(Duration::from_millis(50), wait_for_presence_change())
+        tokio::time::timeout(Duration::from_millis(50), wake.notify().notified())
             .await
             .expect("a presence change emitted before the wait must retain a wake permit");
         set_operator_presence_mode(OperatorPresenceMode::Auto);
-        wait_for_presence_change().await;
+        wake.notify().notified().await;
+    }
+
+    /// A presence change wakes EVERY router. The wake used to be one
+    /// process-wide `Notify` signalled with `notify_one`, which three provider
+    /// loops all waited on, so a change woke one provider and left the others
+    /// to their timers.
+    #[tokio::test]
+    #[serial_test::serial(operator_presence)]
+    async fn a_presence_change_reaches_every_router() {
+        let db = crate::storage::migrated_test_db("channel-presence-wake-fanout.db").await;
+        let other = crate::storage::migrated_test_db("channel-presence-wake-fanout-2.db").await;
+        let routers = [
+            RouterWake::register(&db, "imessage"),
+            RouterWake::register(&db, "discord"),
+            RouterWake::register(&other, "telegram"),
+        ];
+        let before = routers[0].epochs().presence;
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        for router in &routers {
+            tokio::time::timeout(Duration::from_millis(50), router.notify().notified())
+                .await
+                .unwrap_or_else(|_| panic!("{} was not woken", router.provider));
+            assert!(router.epochs().presence > before);
+        }
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+    }
+
+    /// A ledger announcement wakes only the routers that read it: the outbound
+    /// epoch is per channel, and nothing crosses to another ledger. Serialized
+    /// with the presence tests because a presence change wakes every router.
+    #[tokio::test]
+    #[serial_test::serial(operator_presence)]
+    async fn ledger_announcements_wake_only_the_routers_that_read_them() {
+        let db = crate::storage::migrated_test_db("channel-ledger-wake-scope.db").await;
+        let other = crate::storage::migrated_test_db("channel-ledger-wake-scope-2.db").await;
+        let imessage = RouterWake::register(&db, "imessage");
+        let discord = RouterWake::register(&db, "discord");
+        let elsewhere = RouterWake::register(&other, "imessage");
+        let woken = |wake: &RouterWake| {
+            let notify = wake.notify();
+            async move {
+                tokio::time::timeout(Duration::from_millis(20), notify.notified())
+                    .await
+                    .is_ok()
+            }
+        };
+
+        let before = (imessage.epochs(), discord.epochs());
+        announce_outbound(&db, "imessage");
+        assert!(woken(&imessage).await);
+        assert!(!woken(&discord).await);
+        assert!(!woken(&elsewhere).await);
+        assert_ne!(imessage.epochs().outbound, before.0.outbound);
+        assert_eq!(discord.epochs().outbound, before.1.outbound);
+
+        announce_binding_change(&db);
+        assert!(woken(&imessage).await && woken(&discord).await);
+        assert!(!woken(&elsewhere).await);
+        assert_ne!(discord.epochs().binding, before.1.binding);
+
+        announce_outbound_all(&db);
+        assert!(woken(&imessage).await && woken(&discord).await);
+        assert_ne!(discord.epochs().outbound, before.1.outbound);
     }
 
     #[tokio::test]
@@ -1779,7 +2076,7 @@ mod tests {
 
     #[test]
     fn desktop_activity_expires_after_the_presence_window() {
-        let start = Instant::now();
+        let start = PresenceClock::now();
         assert_eq!(desktop_inferred_presence(None, start), None);
         let sample = DesktopPresenceSample {
             sampled_at: start,

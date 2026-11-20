@@ -523,7 +523,8 @@ mod tests {
     }
 
     /// Line-numbered production lines: every `#[cfg(test)]` item (a test module
-    /// above all) is dropped, so a test may build any frame it likes.
+    /// above all) is dropped, so a test may build any frame it likes. So is a
+    /// `#[cfg(all(test, ...))]` item, which is compiled only under test too.
     fn production_lines(source: &str) -> Vec<(usize, &str)> {
         let mut kept = Vec::new();
         let mut state = LexState::default();
@@ -540,7 +541,9 @@ mod tests {
                 continue;
             }
             let trimmed = line.trim();
-            if starts_in_code && trimmed.starts_with("#[cfg(test)]") {
+            if starts_in_code
+                && (trimmed.starts_with("#[cfg(test)]") || trimmed.starts_with("#[cfg(all(test,"))
+            {
                 pending_test_item = true;
                 continue;
             }
@@ -670,6 +673,55 @@ mod tests {
         assert!(
             stale.is_empty(),
             "UNSCOPED_SWEEPS entries no longer match a site: {stale:?}"
+        );
+    }
+
+    /// Every write to `channel_conversation_binding` goes through the channel
+    /// ledger's functions, because they are what announce it to the routers.
+    /// A router reads its bindings once per announced change, so a write made
+    /// beside them would reach routing only at the next safety-net sweep.
+    #[test]
+    fn only_the_channel_ledger_writes_bindings() {
+        const ALLOWED: &[&str] = &["os/cairn-core/src/channels/ledger.rs"];
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let os = manifest
+            .parent()
+            .expect("cairn-core lives under src-tauri/os");
+        let src_tauri = os.parent().expect("src-tauri/os lives under src-tauri");
+        let mut files = Vec::new();
+        rust_sources(&manifest.join("src"), &mut files);
+        rust_sources(&src_tauri.join("cairn-transport/src"), &mut files);
+        assert!(
+            files.len() > 100,
+            "the scan found only {} files",
+            files.len()
+        );
+        let mut violations = Vec::new();
+        for file in &files {
+            let relative = file
+                .strip_prefix(src_tauri)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if ALLOWED.contains(&relative.as_str()) {
+                continue;
+            }
+            let source = std::fs::read_to_string(file).expect("read source");
+            for (number, line) in production_lines(&source) {
+                if line.contains("channel_conversation_binding")
+                    && ["INSERT", "UPDATE ", "DELETE FROM"]
+                        .iter()
+                        .any(|verb| line.contains(verb))
+                {
+                    violations.push(format!("{relative}:{number}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "write channel_conversation_binding through channels::ledger \
+             (bind_target, unbind_target, set_message_class), which announce it:\n{}",
+            violations.join("\n")
         );
     }
 

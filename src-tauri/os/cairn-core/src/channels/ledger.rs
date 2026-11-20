@@ -218,6 +218,17 @@ pub async fn pending_ask_actions(db: &LocalDb) -> Result<Vec<(String, String)>, 
     ).await.map_err(|error| error.to_string())
 }
 
+/// When the lease on an action runs out, in epoch milliseconds, or `None` when
+/// nothing holds it.
+pub async fn ask_action_lease_until(db: &LocalDb, action_ref: &str) -> Result<Option<i64>, String> {
+    db.query_opt_i64(
+        "SELECT lease_until FROM channel_ask_action WHERE action_ref = ?1",
+        (action_ref.to_string(),),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 pub async fn answers_for_action(
     db: &LocalDb,
     action_ref: &str,
@@ -455,10 +466,17 @@ pub async fn set_message_class(
             !class,
         )
     };
-    db.execute(sql, params![provider.to_string(), conversation, uri, mask])
+    let changed = db
+        .execute(sql, params![provider.to_string(), conversation, uri, mask])
         .await
-        .map(|changed| changed == 1)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?
+        == 1;
+    // A mask that did not move is still announced: `changed` counts matched
+    // rows, and an announcement only costs the routers one cheap reload.
+    if changed {
+        super::announce_binding_change(db);
+    }
+    Ok(changed)
 }
 
 /// Why an ambient binding's classes never change: the CHECK pins them to agent
@@ -596,18 +614,26 @@ pub async fn begin_delivery(db: &LocalDb, id: &str, now: i64) -> Result<bool, St
     .map_err(|error| error.to_string())
 }
 
+/// Makes a pending route recoverable, and wakes `channel`'s router: a route left
+/// pending owes a delivery its sweep has to schedule.
 pub async fn set_pending_route_submission(
     db: &LocalDb,
+    channel: &str,
     id: &str,
     submission_json: &str,
 ) -> Result<bool, String> {
-    db.execute(
-        "UPDATE channel_outbound SET options_json = ?2 WHERE id = ?1 AND kind = 'route' AND status = 'pending'",
-        params![id.to_string(), submission_json.to_string()],
-    )
-    .await
-    .map(|changed| changed == 1)
-    .map_err(|error| error.to_string())
+    let changed = db
+        .execute(
+            "UPDATE channel_outbound SET options_json = ?2 WHERE id = ?1 AND kind = 'route' AND status = 'pending'",
+            params![id.to_string(), submission_json.to_string()],
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        == 1;
+    if changed {
+        super::announce_outbound(db, channel);
+    }
+    Ok(changed)
 }
 
 pub async fn is_bound(
@@ -675,22 +701,27 @@ pub async fn bind_target(
 ) -> Result<bool, String> {
     let conversation = super::bindings::canonical_conversation(provider, conversation)?;
     let uri = canonical_binding_target(uri, binding_kind)?;
-    db.execute(
-        "INSERT OR IGNORE INTO channel_conversation_binding
-          (provider, conversation, target_uri, binding_kind, message_classes, bound_at)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            provider.to_string(),
-            conversation,
-            uri,
-            binding_kind.as_str(),
-            message_classes.max(0),
-            bound_at
-        ],
-    )
-    .await
-    .map(|changed| changed == 1)
-    .map_err(|error| error.to_string())
+    let inserted = db
+        .execute(
+            "INSERT OR IGNORE INTO channel_conversation_binding
+              (provider, conversation, target_uri, binding_kind, message_classes, bound_at)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                provider.to_string(),
+                conversation,
+                uri,
+                binding_kind.as_str(),
+                message_classes.max(0),
+                bound_at
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        == 1;
+    if inserted {
+        super::announce_binding_change(db);
+    }
+    Ok(inserted)
 }
 
 pub async fn unbind_target(
@@ -702,20 +733,25 @@ pub async fn unbind_target(
 ) -> Result<bool, String> {
     let conversation = super::bindings::canonical_conversation(provider, conversation)?;
     let uri = canonical_persisted_target(uri)?;
-    db.execute(
-        "DELETE FROM channel_conversation_binding
-          WHERE provider = ?1 AND conversation = ?2 AND target_uri = ?3
-            AND (?4 IS NULL OR binding_kind = ?4)",
-        params![
-            provider.to_string(),
-            conversation,
-            uri,
-            binding_kind.map(str::to_string)
-        ],
-    )
-    .await
-    .map(|changed| changed == 1)
-    .map_err(|error| error.to_string())
+    let removed = db
+        .execute(
+            "DELETE FROM channel_conversation_binding
+              WHERE provider = ?1 AND conversation = ?2 AND target_uri = ?3
+                AND (?4 IS NULL OR binding_kind = ?4)",
+            params![
+                provider.to_string(),
+                conversation,
+                uri,
+                binding_kind.map(str::to_string)
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        == 1;
+    if removed {
+        super::announce_binding_change(db);
+    }
+    Ok(removed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -725,55 +761,83 @@ pub struct EligibleBinding {
     pub binding_kind: String,
 }
 
-/// Enumerate every conversation whose binding carries `message_class` for the
-/// canonical target. Each result becomes an independent outbound rendering.
-/// Stable projection generation for fields that affect gate routing. This is one
-/// small private-ledger query per channel sweep, independent of project count;
-/// unrelated private database writes leave the value unchanged.
-pub async fn binding_generation(db: &LocalDb) -> Result<String, String> {
-    db.query_opt_text(
-        "SELECT group_concat(encoded, char(30)) FROM (
-           SELECT provider || char(31) || conversation || char(31) || target_uri || char(31) ||
-                  binding_kind || char(31) || message_classes AS encoded
-             FROM channel_conversation_binding
-            ORDER BY provider, conversation, target_uri, binding_kind
-         )",
-        (),
-    )
-    .await
-    .map(|value| value.unwrap_or_default())
-    .map_err(|error| error.to_string())
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexedBinding {
+    conversation: String,
+    binding_kind: String,
+    message_classes: i64,
 }
 
-pub async fn list_eligible_bindings(
-    db: &LocalDb,
-    provider: &str,
-    target_uri: &str,
-    message_class: i64,
-) -> Result<Vec<EligibleBinding>, String> {
-    let target_uri = canonical_persisted_target(target_uri)?;
-    if message_class <= 0 || message_class & !super::bindings::MESSAGE_CLASSES_ALL != 0 {
-        return Err(format!(
-            "invalid channel message class bit: {message_class}"
-        ));
-    }
-    db.query_all(
-        "SELECT conversation, target_uri, binding_kind
-           FROM channel_conversation_binding
-          WHERE provider = ?1 AND target_uri = ?2
-            AND (message_classes & ?3) != 0
-          ORDER BY conversation, binding_kind",
-        params![provider.to_string(), target_uri, message_class],
-        |row| {
-            Ok(EligibleBinding {
-                conversation: row.text(0)?,
-                target_uri: row.text(1)?,
-                binding_kind: row.text(2)?,
+/// Every binding one provider holds, grouped by canonical target.
+///
+/// Routing asks "which conversations carry this class for this target" once per
+/// gate, which as one query per gate walked the provider's whole binding table
+/// each time (Turso plans the lookup on the primary key's provider prefix rather
+/// than on the target index). The table changes only when a binding is written,
+/// and every such write is announced ([`super::announce_binding_change`]), so a
+/// router reads it once per change and answers each gate from memory.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BindingIndex {
+    by_target: std::collections::HashMap<String, Vec<IndexedBinding>>,
+}
+
+impl BindingIndex {
+    /// Every conversation whose binding carries `message_class` for the
+    /// canonical target, ordered by conversation then binding kind. Each result
+    /// becomes an independent outbound rendering.
+    pub fn eligible(
+        &self,
+        target_uri: &str,
+        message_class: i64,
+    ) -> Result<Vec<EligibleBinding>, String> {
+        let target_uri = canonical_persisted_target(target_uri)?;
+        if message_class <= 0 || message_class & !super::bindings::MESSAGE_CLASSES_ALL != 0 {
+            return Err(format!(
+                "invalid channel message class bit: {message_class}"
+            ));
+        }
+        Ok(self
+            .by_target
+            .get(&target_uri)
+            .into_iter()
+            .flatten()
+            .filter(|binding| binding.message_classes & message_class != 0)
+            .map(|binding| EligibleBinding {
+                conversation: binding.conversation.clone(),
+                target_uri: target_uri.clone(),
+                binding_kind: binding.binding_kind.clone(),
             })
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())
+            .collect())
+    }
+}
+
+/// One provider's bindings as a [`BindingIndex`]: one read of its rows.
+pub async fn binding_index(db: &LocalDb, provider: &str) -> Result<BindingIndex, String> {
+    let rows = db
+        .query_all(
+            "SELECT target_uri, conversation, binding_kind, message_classes
+               FROM channel_conversation_binding
+              WHERE provider = ?1
+              ORDER BY target_uri, conversation, binding_kind",
+            (provider.to_string(),),
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    IndexedBinding {
+                        conversation: row.text(1)?,
+                        binding_kind: row.text(2)?,
+                        message_classes: row.i64(3)?,
+                    },
+                ))
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut index = BindingIndex::default();
+    for (target, binding) in rows {
+        index.by_target.entry(target).or_default().push(binding);
+    }
+    Ok(index)
 }
 
 /// Claims an inbound answer against a still-sent rendering. This legacy rendering
@@ -985,13 +1049,28 @@ async fn write_intent(
         rendering: intent.rendering,
         created_at: intent.created_at,
     };
-    db.execute(
+    let inserted = db.execute(
         "INSERT OR IGNORE INTO channel_outbound (id, channel, kind, binding_ref, conversation, job_id, rendered_text, rendering, status, created_at, resolved_at, reply_to, reply_to_guid) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CASE WHEN ?9 = 'expired' THEN ?10 END, ?11, ?12)",
         params![intent.id, intent.channel, intent.kind, binding_ref, intent.conversation, intent.job_id, intent.rendered_text, intent.rendering, status, intent.created_at, reply.map(|reply| reply.to), reply.and_then(|reply| reply.guid)],
     )
     .await
     .map(|changed| changed == 1)
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    // Only a message the sweep delivers is announced. A gate's own claim is
+    // written by the router that is delivering it in the same breath, so waking
+    // that router again would only buy it a sweep with nothing to do.
+    if inserted && status == "pending" && is_swept_message_kind(intent.kind) {
+        super::announce_outbound(db, intent.channel);
+    }
+    Ok(inserted)
+}
+
+/// The outbound kinds `deliver_pending_agent_messages` owes a delivery.
+fn is_swept_message_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        super::agent_message::KIND | super::operator_message::KIND
+    )
 }
 
 pub async fn get_by_conversation_binding(
@@ -1063,15 +1142,51 @@ pub async fn list_due_deliveries(
     .map_err(|error| error.to_string())
 }
 
-/// Whether any route intent on this channel is still owed a delivery.
-pub async fn has_pending_route(db: &LocalDb, channel: &str) -> Result<bool, String> {
+/// When the earliest scheduled retry of a swept message on this channel falls
+/// due, in epoch milliseconds, or `None` when no message is waiting on one.
+pub async fn next_message_retry_at(
+    db: &LocalDb,
+    channel: &str,
+    max_attempts: i64,
+) -> Result<Option<i64>, String> {
     db.query_opt_i64(
-        "SELECT EXISTS(SELECT 1 FROM channel_outbound WHERE channel = ?1 AND kind = 'route' AND status = 'pending')",
-        params![channel.to_string()],
+        "SELECT MIN(next_attempt_at) FROM channel_outbound
+          WHERE channel = ?1 AND kind IN (?2, ?3) AND status = 'failed'
+            AND attempts < ?4 AND next_attempt_at IS NOT NULL",
+        params![
+            channel.to_string(),
+            super::agent_message::KIND,
+            super::operator_message::KIND,
+            max_attempts
+        ],
     )
     .await
-    .map(|exists| exists == Some(1))
     .map_err(|error| error.to_string())
+}
+
+/// The route intents on this channel still owed a delivery, oldest first.
+pub async fn list_pending_routes(
+    db: &LocalDb,
+    channel: &str,
+) -> Result<Vec<OutboundRecord>, String> {
+    db.query_all(
+        format!("SELECT {OUTBOUND_COLUMNS} FROM channel_outbound WHERE channel = ?1 AND kind = 'route' AND status = 'pending' ORDER BY created_at"),
+        params![channel.to_string()],
+        OutboundRecord::from_row,
+    ).await.map_err(|error| error.to_string())
+}
+
+/// The questions this channel has on the wire, oldest first: the renderings the
+/// close pass retracts once their gate leaves the live set.
+pub async fn list_sent_questions(
+    db: &LocalDb,
+    channel: &str,
+) -> Result<Vec<OutboundRecord>, String> {
+    db.query_all(
+        format!("SELECT {OUTBOUND_COLUMNS} FROM channel_outbound WHERE channel = ?1 AND kind = 'question' AND status = 'sent' ORDER BY created_at"),
+        params![channel.to_string()],
+        OutboundRecord::from_row,
+    ).await.map_err(|error| error.to_string())
 }
 
 pub async fn list_unresolved(db: &LocalDb, channel: &str) -> Result<Vec<OutboundRecord>, String> {
@@ -1214,6 +1329,10 @@ pub async fn claim_ask_resolution(
             Ok(inserted)
         })
     }).await.map_err(|error| error.to_string())? == 1;
+    // After the claim commits, so the router it wakes can lease what it reads.
+    if inserted {
+        super::announce_ask_action(db);
+    }
     let resolution = db.query_opt(
         "SELECT resolution_id, binding_ref, action_ref, kind, answer, winner_provider, winner_conversation, winner_surface, winner_actor, domain_resolved_at IS NOT NULL FROM channel_ask_resolution WHERE binding_ref = ?1",
         (binding_ref,),
@@ -1248,7 +1367,7 @@ pub async fn finalize_ask_resolution(
 ) -> Result<u64, String> {
     let action_ref = cairn_uri::canonicalize_uri_identity(action_ref);
     let options = serde_json::json!({ "receipt": receipt }).to_string();
-    db.write(move |conn| {
+    let cleanup = db.write(move |conn| {
         let action_ref = action_ref.clone();
         let options = options.clone();
         Box::pin(async move {
@@ -1267,7 +1386,12 @@ pub async fn finalize_ask_resolution(
             ).await?;
             Ok(changed)
         })
-    }).await.map_err(|error| error.to_string())
+    }).await.map_err(|error| error.to_string())?;
+    // The renderings now owe a cleanup on whichever channels carried them.
+    if cleanup > 0 {
+        super::announce_outbound_all(db);
+    }
+    Ok(cleanup)
 }
 
 pub async fn list_cleanup_pending(
@@ -2201,14 +2325,11 @@ mod tests {
         ] {
             // An attention gate's target is a thread or an issue; a project root
             // is never one, so no gate can reach the ambient row.
+            let index = binding_index(&db, "discord").await.unwrap();
+            assert!(index.eligible("cairn://p/cairn", class).is_err());
             assert!(
-                list_eligible_bindings(&db, "discord", "cairn://p/cairn", class)
-                    .await
-                    .is_err()
-            );
-            assert!(
-                list_eligible_bindings(&db, "discord", "cairn://p/cairn/general", class)
-                    .await
+                index
+                    .eligible("cairn://p/cairn/general", class)
                     .unwrap()
                     .iter()
                     .all(|binding| binding.binding_kind != "ambient"),
@@ -3260,23 +3381,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["cairn://p/cairn/2"]
         );
-        assert!(list_eligible_bindings(
-            &db,
-            "telegram",
-            "cairn://p/cairn/2",
-            MESSAGE_CLASS_QUESTION
-        )
-        .await
-        .unwrap()
-        .is_empty());
-        assert!(list_eligible_bindings(
-            &db,
-            "telegram",
-            "cairn://p/cairn/2",
-            MESSAGE_CLASS_AGENT_TEXT
-        )
-        .await
-        .is_err());
+        let index = binding_index(&db, "telegram").await.unwrap();
+        assert!(index
+            .eligible("cairn://p/cairn/2", MESSAGE_CLASS_QUESTION)
+            .unwrap()
+            .is_empty());
+        assert!(index
+            .eligible("cairn://p/cairn/2", MESSAGE_CLASS_AGENT_TEXT)
+            .is_err());
     }
 
     /// The operator's toggle moves exactly one bit and refuses a mask or a
@@ -3386,31 +3498,38 @@ mod tests {
         .await
         .unwrap());
 
+        let index = binding_index(&db, "discord").await.unwrap();
         assert_eq!(
-            list_eligible_bindings(
-                &db,
-                "discord",
-                target,
-                super::super::bindings::MESSAGE_CLASS_QUESTION,
-            )
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|binding| binding.conversation)
-            .collect::<Vec<_>>(),
+            index
+                .eligible(target, super::super::bindings::MESSAGE_CLASS_QUESTION)
+                .unwrap()
+                .into_iter()
+                .map(|binding| binding.conversation)
+                .collect::<Vec<_>>(),
             vec!["discord:42/7"]
         );
+        // Ordered by conversation then kind whatever order the rows were
+        // written in, which is the order a gate's renderings go out in.
         assert_eq!(
-            list_eligible_bindings(
-                &db,
-                "discord",
-                target,
-                super::super::bindings::MESSAGE_CLASS_NOTIFY,
+            index
+                .eligible(target, super::super::bindings::MESSAGE_CLASS_NOTIFY)
+                .unwrap()
+                .into_iter()
+                .map(|binding| binding.conversation)
+                .collect::<Vec<_>>(),
+            vec!["discord:42/7", "discord:42/8"]
+        );
+        assert!(index
+            .eligible(
+                "cairn://p/cairn/4008",
+                super::super::bindings::MESSAGE_CLASS_NOTIFY
             )
-            .await
             .unwrap()
-            .len(),
-            2
+            .is_empty());
+        assert_eq!(
+            binding_index(&db, "discord").await.unwrap(),
+            index,
+            "an unchanged table reloads to an equal index, so a router keeps its routing"
         );
     }
 

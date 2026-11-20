@@ -230,6 +230,9 @@ pub async fn insert(
 ) -> Result<(), String> {
     let message = message.clone();
     let delivery = delivery.cloned();
+    let channel = delivery
+        .as_ref()
+        .map(|delivery| delivery.channel.to_string());
     db.write(move |conn| {
         let message = message.clone();
         let delivery = delivery.clone();
@@ -284,7 +287,11 @@ pub async fn insert(
         })
     })
     .await
-    .map_err(|error| format!("failed to record the message: {error}"))
+    .map_err(|error| format!("failed to record the message: {error}"))?;
+    if let Some(channel) = channel {
+        crate::channels::announce_outbound(db, &channel);
+    }
+    Ok(())
 }
 
 pub async fn get(db: &LocalDb, id: &str) -> Result<Option<Message>, String> {

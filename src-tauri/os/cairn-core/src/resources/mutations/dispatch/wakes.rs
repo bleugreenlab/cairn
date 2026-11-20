@@ -181,6 +181,7 @@ pub(super) async fn dispatch(
                     )
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
+                    announce_subscription_change(orch);
                     format!(
                         "Subscribed wake {} {}",
                         sub.source_kind,
@@ -281,6 +282,7 @@ pub(super) async fn dispatch(
                         )
                         .await
                         .map_err(|error| build_failure(index, item, error))?;
+                        announce_subscription_change(orch);
                         format!(
                             "Muted wake {} {}",
                             sub.source_kind,
@@ -395,6 +397,7 @@ pub(super) async fn dispatch(
                     )
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
+                    announce_subscription_change(orch);
                     format!("Unmuted {count} wake subscription(s)")
                 }
             }
@@ -501,6 +504,7 @@ pub(super) async fn dispatch(
                     )
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
+                    announce_subscription_change(orch);
                     format!("Unsubscribed {count} wake subscription(s)")
                 }
             }
@@ -1189,4 +1193,12 @@ async fn subscribe_terminal_output_wake(
             "Subscribed to terminal '{slug}' output for phrase \"{phrase}\"; end your turn to resume when it next prints, across restarts ({uri})"
         )),
     }
+}
+
+/// A subscription's state is part of who holds an ask: muting or unsubscribing
+/// a watcher hands its outstanding asks back to the operator, and the channel
+/// gate sources learn of it only through this frame. Without it a mute waited
+/// out the gate sources' reconcile horizon.
+fn announce_subscription_change(orch: &Orchestrator) {
+    orch.notifier.emit_change("wake_subscriptions");
 }

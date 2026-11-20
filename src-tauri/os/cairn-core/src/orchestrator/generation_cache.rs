@@ -343,9 +343,38 @@ const REVIEW_GATE_INPUT_TABLES: &[&str] = &[
 /// Unscoped on purpose. Advancing is free and work happens only on the next
 /// read, so there is nothing to save by placing a frame against a project, and
 /// a counter that can only over-invalidate cannot serve a stale gate.
-#[derive(Default)]
+///
+/// An advance also wakes every channel router through [`Self::subscribe`]:
+/// the routers sleep until something they read moves, and these counters are
+/// how a gate source's inputs say they did.
 pub(crate) struct GateInputGenerations {
     generations: [AtomicU64; 3],
+    advanced: tokio::sync::watch::Sender<()>,
+    tally: Mutex<GateInputTally>,
+}
+
+/// Advances per (table, kind) over the current minute, written at info when
+/// the minute closes (only minutes with an advance write anything). This is the evidence for narrowing which writes advance
+/// which kind: it names the tables that actually drive each source's
+/// recomputes.
+struct GateInputTally {
+    started: Instant,
+    counts: std::collections::BTreeMap<(String, &'static str), u64>,
+}
+
+const GATE_INPUT_TALLY_INTERVAL: Duration = Duration::from_secs(60);
+
+impl Default for GateInputGenerations {
+    fn default() -> Self {
+        Self {
+            generations: Default::default(),
+            advanced: tokio::sync::watch::channel(()).0,
+            tally: Mutex::new(GateInputTally {
+                started: Instant::now(),
+                counts: Default::default(),
+            }),
+        }
+    }
 }
 
 impl GateInputGenerations {
@@ -353,24 +382,53 @@ impl GateInputGenerations {
         self.generations[kind.index()].load(Ordering::Acquire)
     }
 
+    /// A receiver that is marked changed by every advance after this call.
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.advanced.subscribe()
+    }
+
     /// A committed write to `table` moves every kind that reads it.
     pub(crate) fn note_table(&self, table: &str) {
+        let mut moved = false;
         for kind in GateKind::ALL {
             if kind.input_tables().contains(&table) {
-                self.advance(kind);
+                self.advance(table, kind);
+                moved = true;
             }
+        }
+        if moved {
+            self.advanced.send_replace(());
         }
     }
 
     /// A team pull applies remote rows of any table at once.
     pub(crate) fn note_all(&self) {
         for kind in GateKind::ALL {
-            self.advance(kind);
+            self.advance("team_sync", kind);
         }
+        self.advanced.send_replace(());
     }
 
-    fn advance(&self, kind: GateKind) {
+    fn advance(&self, table: &str, kind: GateKind) {
         self.generations[kind.index()].fetch_add(1, Ordering::AcqRel);
+        let Ok(mut tally) = self.tally.lock() else {
+            return;
+        };
+        *tally
+            .counts
+            .entry((table.to_string(), kind.as_str()))
+            .or_default() += 1;
+        if tally.started.elapsed() >= GATE_INPUT_TALLY_INTERVAL {
+            let summary = tally
+                .counts
+                .iter()
+                .map(|((table, kind), count)| format!("{table}:{kind}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            log::info!("channel gate input advances {summary}");
+            tally.counts.clear();
+            tally.started = Instant::now();
+        }
     }
 }
 
@@ -3132,6 +3190,21 @@ mod tests {
             (true, true, true),
             "a team pull can have moved any table"
         );
+    }
+
+    /// The routers wake on an advance, and only on one: a frame for a table no
+    /// gate source reads leaves them asleep.
+    #[test]
+    fn a_gate_input_advance_wakes_its_subscribers() {
+        let inputs = GateInputGenerations::default();
+        let mut woken = inputs.subscribe();
+        inputs.note_table("events");
+        assert!(!woken.has_changed().unwrap());
+        inputs.note_table("prompts");
+        assert!(woken.has_changed().unwrap());
+        woken.mark_unchanged();
+        inputs.note_all();
+        assert!(woken.has_changed().unwrap());
     }
 
     /// A scoped input change touches only its own project.
