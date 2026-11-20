@@ -30,12 +30,34 @@
 //! ## One pass for live and history
 //!
 //! Because there is one construction there is one code path: [`embed_pending`]
-//! takes the newest turns that have ended and carry no vector yet, and embeds
-//! them. Run from the worker's timer it is the live path; run repeatedly it
-//! walks history recent-first. It is idempotent, resumable, and self-healing —
-//! a turn missed by a failed pass is simply still pending on the next one.
+//! takes turns that have ended and carry no vector yet, and embeds them. Live
+//! and history differ only in where a pass looks, and both look through cursors
+//! over `turns` in arrival (rowid) order, recorded in `embedding_state` so a
+//! restart resumes rather than rescans:
+//!
+//! - The **forward** walk ([`Scope::Live`]) reads the turns that arrived since
+//!   its head, so a turn becomes searchable within a loop of ending.
+//! - The **backward** walk ([`Scope::History`]) starts where the forward walk
+//!   began and reads history newest-first, once per embedding space, then
+//!   stops.
+//! - A turn either walk passes before it can be settled — still running, or its
+//!   call or write failed — joins the **open set**, which the forward walk
+//!   re-reads every pass. A turn that outlives a newer one is therefore picked
+//!   up when it ends, without rescanning history to find it.
+//!
+//! Rowids are allocated at insert but become visible at commit, so a turn can
+//! appear below one that is already visible. The forward walk therefore never
+//! moves its head over a turn younger than [`VISIBILITY_GRACE_SECS`]: it
+//! re-reads those every pass until they are old enough that every turn
+//! allocated before them has committed.
+//!
+//! Every turn behind a cursor is settled, outside the consent scope, or open,
+//! so a pass reads at most [`WALK_WINDOW`] rows plus the open set: what it costs
+//! follows the work it finds, not the size of history. A switch of embedding
+//! space clears the cursors in the transaction that purges the old vectors
+//! ([`SpaceKeeper::reconcile`]), and the walks start over.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -89,18 +111,17 @@ pub(crate) const REJECTED_PAUSE_SECS: u64 = 300;
 /// `dims` marking a turn whose prose could not be established — an archived
 /// event that did not reconstruct.
 ///
-/// It has to be a ROW, not just a counter in the pass summary. A deferred turn
-/// is still pending, and the walk is newest-first, so it is by construction
-/// newer than everything not yet reached: left unmarked it reappears at the
-/// head of every subsequent page, and once enough accumulate the page is
-/// entirely deferred, the sweep re-forms it every couple of seconds forever and
-/// never reaches the rest of history. That is precisely the poison-batch
-/// hazard [`EMBED_BATCH_CHARS`] exists to prevent, arriving by another door.
+/// It has to be a ROW, not just a counter in the pass summary. The walks move
+/// past every turn they read, so an unreadable turn left unmarked would be
+/// lost behind the cursor; held in the open set instead it would be re-read
+/// every loop, when its blobs arrive, if ever, on the timescale of archival
+/// restores. The marker settles it as far as the walks are concerned and hands
+/// it to [`Scope::Deferred`], which retries every marked turn on the slow
+/// cadence.
 ///
 /// Distinct from the `dims = 0` tombstone because it means the opposite thing:
-/// a tombstone is a settled answer, this is an unsettled one, and
-/// [`Scope::Deferred`] retries it on the slow cadence. Both are excluded from
-/// retrieval by `dims > 0`.
+/// a tombstone is a settled answer, this is an unsettled one. Both are excluded
+/// from retrieval by `dims > 0`.
 ///
 /// The marker is written once, when the turn is first found unreadable. A
 /// retry that still cannot read it writes nothing: the retry walks a cursor
@@ -108,16 +129,36 @@ pub(crate) const REJECTED_PAUSE_SECS: u64 = 300;
 /// on, and a pass that embeds nothing leaves no trace.
 const DEFERRED_DIMS: i32 = -1;
 
-/// How often a caught-up sweep re-examines all of history.
+/// How often the deferred turns are retried, after the first retry at start
+/// and after a switch.
+const DEFERRED_RETRY_SECS: u64 = 1800;
+
+/// Rows one walk step reads from `turns`, at most. With [`OPEN_REVISIT`] it
+/// bounds what a pass costs however much history exists; a first walk over a
+/// large history is many cheap passes on the backlog cadence, not one long one.
+pub(crate) const WALK_WINDOW: usize = 1024;
+
+/// Open turns re-read per pass, at most. The open set holds the turns running
+/// now plus the odd failed write, so this is a guard, not a working limit: any
+/// beyond it wait for a later pass. A turn re-read and kept moves to the back,
+/// so the set rotates and none waits behind the ones that never settle.
+const OPEN_REVISIT: usize = 256;
+
+/// How long a turn may run and still be held open. A turn running this long
+/// is orphaned in practice (a crash mid-turn leaves its row `running`, and
+/// nothing ends it), so it leaves the open set rather than being re-read for
+/// the life of the install. One that does end later stays without a vector.
+const OPEN_HORIZON_SECS: i64 = 24 * 60 * 60;
+
+/// How young a turn must be for the forward head to stop short of it.
 ///
-/// The history scan is an anti-join over every turn, so a pass that finds
-/// nothing still costs one index probe per turn ever recorded. Running that
-/// once a minute forever would make idle cost grow with the size of history
-/// rather than with the work there is to do. It cannot be dropped entirely: a
-/// turn that was still running when the sweep passed its position becomes
-/// eligible later without ever crossing the live boundary, so only a full scan
-/// finds it. This is the bound on how long such a turn waits.
-const HISTORY_RECONCILE_SECS: u64 = 1800;
+/// `turns` writes run as concurrent MVCC transactions, which take a rowid when
+/// they insert and become visible when they commit, so a turn can become
+/// visible below the head after a newer one moved it there. Turns created
+/// within this long are re-read each pass instead of passed. Their cost is the
+/// turns that arrived in the last minute, and it closes the gap for every
+/// transaction that inserts a turn and commits within this long.
+const VISIBILITY_GRACE_SECS: i64 = 60;
 
 /// Event types whose prose describes what a turn was ABOUT.
 ///
@@ -164,6 +205,9 @@ pub struct SweepSummary {
     /// The last turn the pass considered, in its scope's order: where a
     /// [`Scope::Deferred`] walk resumes.
     pub last_turn: Option<String>,
+    /// Rows the pass read from `turns` to choose its work: the measure of
+    /// what choosing cost, bounded by [`WALK_WINDOW`] plus [`OPEN_REVISIT`].
+    pub examined: usize,
 }
 
 /// Why a sweep pass stopped short.
@@ -207,7 +251,7 @@ enum PassFailure {
 /// Two independent questions decide a pass, and conflating them strands turns:
 ///
 /// - **Consent.** Uploading transcripts that predate this install is
-///   irreversible, so [`Scope::All`] requires consent: a connected account,
+///   irreversible, so [`ALL`] requires consent: a connected account,
 ///   or an embedding model the operator chose
 ///   (`Orchestrator::history_consented`). A turn this
 ///   install watched happen is different in kind: the embed worker already puts
@@ -215,28 +259,30 @@ enum PassFailure {
 ///   vibe colors exist when logged out, so persisting the vector changes what
 ///   is KEPT, not what is sent.
 /// - **Correctness.** A turn can miss the pass that reaches it — still running
-///   at the time, unreadable, or its write failed — and the fast pass only
-///   looks above the newest embedded turn, so such a turn falls permanently
-///   below the floor. Recovering it means re-scanning from this install's own
-///   boundary, which is not a history upload and needs no account.
+///   at the time, unreadable, or its call or write failed. The walks keep such
+///   a turn in their open set, or behind a deferral marker when it could not
+///   be read, rather than counting on a later rescan to find it. Recovering it
+///   is not a history upload and needs no account: it is a turn this install
+///   already walked past.
+///
+/// `floor` is the walks' answer to the first question: `None` with consent,
+/// so every turn is in scope, and otherwise this install's participation
+/// boundary, below which a turn is passed over. Gaining consent restarts the
+/// backward walk so that the turns it passed over are reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
-    /// Un-embedded turns created at or after `since`, newest first.
-    ///
-    /// The fast pass floors this at the newest embedded turn; the reconcile
-    /// pass floors it at this install's participation boundary, which is what
-    /// recovers a turn stranded below the fast floor.
-    Since(i64),
-    /// Every un-embedded turn, including transcripts predating this install.
-    /// Requires consent.
-    All,
+    /// The forward walk: turns that arrived since its head, then the open set.
+    Live { floor: Option<i64> },
+    /// The backward walk: history newest-first from where it last stopped,
+    /// once per embedding space.
+    History { floor: Option<i64> },
     /// Turns an earlier pass could not read, retried. They carry a marker row
-    /// so they stay OUT of the scopes above; see [`DEFERRED_DIMS`].
+    /// so the walks treat them as settled; see [`DEFERRED_DIMS`].
     ///
     /// `since` floors the retry at this install's boundary when no account is
     /// connected. A turn is deferred because an archived event would not
     /// reconstruct, and archival is what makes a turn old, so this population
-    /// is overwhelmingly pre-boundary — the very transcripts [`Scope::All`] is
+    /// is overwhelmingly pre-boundary — the very transcripts [`ALL`] is
     /// gated to protect. Like every other scope, it has to answer both
     /// questions above, not just the correctness one.
     ///
@@ -257,9 +303,11 @@ pub enum Scope {
 /// must not stall the live coloring and position folding the worker owes each
 /// incoming event.
 ///
-/// The loop is self-pacing: while history remains it comes straight back for
-/// another pass, and once it is caught up it settles onto the idle cadence,
-/// which is also the freshness bound for newly ended turns.
+/// The loop is self-pacing: while the backward walk has history left, or a
+/// pass filled its page, it comes straight back for another pass, and once it
+/// is caught up it settles onto the idle cadence, which is also the freshness
+/// bound for newly ended turns. A caught-up loop reads the rows that arrived
+/// since the last one and the open set, and nothing else.
 /// `consented` is `Orchestrator::history_consented`: a connected account or
 /// an explicitly chosen model, never merely a usable gateway token. Every
 /// install registers an anonymous device token, so a token alone says
@@ -280,16 +328,17 @@ pub fn spawn_turn_embedding_sweep(
         let db = keeper.db().clone();
         let embedder = keeper.embedder().clone();
         let embedder = embedder.as_ref();
-        let mut last_reconcile = std::time::Instant::now();
-        let mut catching_up = true;
+        // When the deferred retry last ran: `None` runs it on the next loop.
+        let mut last_retry: Option<std::time::Instant> = None;
         // Where the deferred retry resumes; held here, never written.
         let mut deferred_after: Option<String> = None;
         // The turn the last refusal was logged for.
         let mut refused: Option<String> = None;
         loop {
             match keeper.reconcile(Trigger::Sweep).await {
+                // The walks were reset by the switch itself.
                 Ok(Reconciled::Switched) => {
-                    catching_up = true;
+                    last_retry = None;
                     deferred_after = None;
                     refused = None;
                 }
@@ -313,60 +362,42 @@ pub fn spawn_turn_embedding_sweep(
                 tokio::time::sleep(Duration::from_secs(BOUNDARY_RETRY_SECS)).await;
                 continue;
             };
-            let Some(key) = embedder.active(Corpus::Turns) else {
+            if embedder.active(Corpus::Turns).is_none() {
                 tokio::time::sleep(Duration::from_secs(SWEEP_IDLE_SECS)).await;
                 continue;
-            };
+            }
+            // Asked once, so every pass of a loop answers it the same way.
+            let floor = (!consented()).then_some(boundary);
 
-            // Fast pass: the newest edge, so a turn that just ended becomes
-            // searchable promptly, ahead of anything still being walked.
-            let live_floor = live_boundary(&db, &key, boundary).await;
-            let mut wait =
-                match run_pass(&db, embedder, Scope::Since(live_floor), &mut refused).await {
-                    Ok(summary) if summary.remaining => SWEEP_BACKLOG_PAUSE_SECS,
-                    Ok(_) => SWEEP_IDLE_SECS,
-                    Err(failure) => failure_wait(embedder, failure),
-                };
-
-            // Wider pass, on a slower cadence: an anti-join whose cost tracks
-            // how much history exists rather than how much work there is, so a
-            // caught-up pass finding nothing must not pay it every minute.
-            let due = catching_up
-                || last_reconcile.elapsed()
-                    >= std::time::Duration::from_secs(HISTORY_RECONCILE_SECS);
-            if due {
-                last_reconcile = std::time::Instant::now();
-                // With an account this subsumes reconciliation. Without one it
-                // narrows to this install's own region — which still has to be
-                // reconciled, or a turn that missed its pass is stranded
-                // forever on exactly the installs the consent split protects.
-                let scope = if consented() {
-                    Scope::All
-                } else {
-                    Scope::Since(boundary)
-                };
+            let mut backlog = false;
+            let mut failed: Option<u64> = None;
+            // Forward first, so a turn that just ended becomes searchable
+            // ahead of anything the backward walk is still reaching.
+            for scope in [Scope::Live { floor }, Scope::History { floor }] {
                 match run_pass(&db, embedder, scope, &mut refused).await {
-                    Ok(summary) => {
-                        catching_up = summary.remaining;
-                        if summary.remaining {
-                            wait = SWEEP_BACKLOG_PAUSE_SECS;
-                        }
+                    Ok(summary) => backlog |= summary.remaining,
+                    Err(failure) => {
+                        failed = Some(failed.unwrap_or(0).max(failure_wait(embedder, failure)))
                     }
-                    Err(failure) => wait = failure_wait(embedder, failure),
                 }
-                // Retry whatever could not be read before. Bounded and out of
-                // the way: these carry marker rows, so they never crowd the
-                // pages above.
-                //
-                // Floored by the same consent decision as the pass above, and
-                // not merely for symmetry: a turn is deferred because an
-                // archived event would not reconstruct, and archival is what
-                // makes a turn old, so the deferred population is overwhelmingly
-                // PRE-boundary. Unfloored, disconnecting an account would leave
-                // this quietly retrying uploads of exactly the transcripts the
-                // gate exists to protect.
+            }
+
+            // Retry whatever could not be read before. Bounded and out of
+            // the way: these carry marker rows, so the walks pass over them.
+            //
+            // Floored by the same consent decision as the walks, and not
+            // merely for symmetry: a turn is deferred because an archived
+            // event would not reconstruct, and archival is what makes a turn
+            // old, so the deferred population is overwhelmingly PRE-boundary.
+            // Unfloored, disconnecting an account would leave this quietly
+            // retrying uploads of exactly the transcripts the gate exists to
+            // protect.
+            let retry_due = last_retry
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(DEFERRED_RETRY_SECS));
+            if retry_due {
+                last_retry = Some(std::time::Instant::now());
                 let deferred = Scope::Deferred {
-                    since: (!consented()).then_some(boundary),
+                    since: floor,
                     after: deferred_after.clone(),
                 };
                 match run_pass(&db, embedder, deferred, &mut refused).await {
@@ -374,10 +405,17 @@ pub fn spawn_turn_embedding_sweep(
                     Ok(summary) => {
                         deferred_after = summary.remaining.then_some(summary.last_turn).flatten();
                     }
-                    Err(failure) => wait = wait.max(failure_wait(embedder, failure)),
+                    Err(failure) => {
+                        failed = Some(failed.unwrap_or(0).max(failure_wait(embedder, failure)))
+                    }
                 }
             }
 
+            let wait = failed.unwrap_or(if backlog {
+                SWEEP_BACKLOG_PAUSE_SECS
+            } else {
+                SWEEP_IDLE_SECS
+            });
             tokio::time::sleep(Duration::from_secs(wait)).await;
         }
     });
@@ -535,30 +573,6 @@ async fn run_pass(
     }
 }
 
-/// The floor for the fast pass: the newest turn already settled in the
-/// active space (`key`: a vector of its model, or a model-independent
-/// marker), or the install boundary when nothing has been yet.
-///
-/// This one DOES flatten a read error into its fallback, and the difference
-/// from [`install_boundary`] is the fallback, not the pattern. Falling back to
-/// the install boundary only widens this pass within the install's own region,
-/// where the wider reconcile pass is already permitted to go — it costs a
-/// larger scan, never a broader upload. Nothing here is persisted either, so a
-/// bad value lasts one loop.
-async fn live_boundary(db: &LocalDb, key: &VectorKey, started_at: i64) -> i64 {
-    db.query_one(
-        "SELECT MAX(t.created_at) FROM turn_embeddings te
-           JOIN turns t ON t.id = te.turn_id
-          WHERE te.dims <= 0 OR te.model = ?1",
-        params![key.model.clone()],
-        |row| row.opt_i64(0),
-    )
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(started_at)
-}
-
 /// Embed the newest turns in `scope` that have ended and have no vector yet.
 ///
 /// Returns `Ok(None)` when embedding is not configured on this device: nothing
@@ -569,6 +583,10 @@ async fn live_boundary(db: &LocalDb, key: &VectorKey, started_at: i64) -> i64 {
 /// vectors are already written, and every turn not reached stays pending. That
 /// is the point: a tombstone must mean "swept successfully, no prose found"
 /// and nothing else, because nothing ever clears one.
+///
+/// A walk pass records where it got to however it ends, once its turns have
+/// been read: every turn it chose and did not settle joins the open set, so
+/// moving the cursor past it loses nothing.
 pub async fn embed_pending(
     db: &LocalDb,
     embedder: &dyn Embed,
@@ -594,34 +612,101 @@ pub async fn embed_pending(
         return Ok(None);
     };
     let retrying = matches!(scope, Scope::Deferred { .. });
-    let pending = load_pending_turns(db, scope, &key, limit)
-        .await
-        .map_err(|error| SweepError::Storage(format!("loading pending turns: {error}")))?;
-    if pending.is_empty() {
-        return Ok(Some(SweepSummary::default()));
+    let loading = |error: crate::storage::DbError| {
+        SweepError::Storage(format!("loading pending turns: {error}"))
+    };
+    let (pending, walk, mut summary) = match scope {
+        Scope::Deferred { since, after } => {
+            let pending = load_deferred_turns(db, since, after, limit)
+                .await
+                .map_err(loading)?;
+            let summary = SweepSummary {
+                remaining: pending.len() == limit,
+                examined: pending.len(),
+                ..SweepSummary::default()
+            };
+            (pending, None, summary)
+        }
+        Scope::Live { floor } | Scope::History { floor } => {
+            let direction = if matches!(scope, Scope::Live { .. }) {
+                Direction::Forward
+            } else {
+                Direction::Backward
+            };
+            let plan = plan_walk(db, &key, direction, floor, limit, unix_now())
+                .await
+                .map_err(loading)?;
+            let summary = SweepSummary {
+                remaining: plan.remaining,
+                examined: plan.examined,
+                ..SweepSummary::default()
+            };
+            (plan.pending, Some((plan.epoch, plan.next)), summary)
+        }
+    };
+    summary.last_turn = pending.last().map(|turn| turn.turn_id.clone());
+
+    let mut settled = HashSet::new();
+    let outcome = settle(
+        db,
+        embedder,
+        &key.model,
+        &pending,
+        retrying,
+        &mut summary,
+        &mut settled,
+    )
+    .await;
+
+    if let Some((epoch, mut next)) = walk {
+        for turn in &pending {
+            if !settled.contains(&turn.turn_id) {
+                next.keep_open(&turn.turn_id);
+            }
+        }
+        // A failure to record costs a re-read, never a turn: the next pass
+        // starts from wherever the walk was last recorded.
+        if let Err(error) = commit_walk(db, epoch, &next).await {
+            let error = SweepError::Storage(format!("recording the walk: {error}"));
+            outcome?;
+            return Err(error);
+        }
     }
 
+    Ok(outcome?.then_some(summary))
+}
+
+/// Settle `pending`: embed the turns that carry prose, tombstone those that
+/// carry none, and mark those whose prose could not be read. Every turn that
+/// now holds a row in the active space is added to `settled`.
+///
+/// `Ok(false)` means embedding was switched off mid-pass, and the turns not
+/// reached were left as they were.
+async fn settle(
+    db: &LocalDb,
+    embedder: &dyn Embed,
+    model: &str,
+    pending: &[PendingTurn],
+    retrying: bool,
+    summary: &mut SweepSummary,
+    settled: &mut HashSet<String>,
+) -> Result<bool, SweepError> {
+    if pending.is_empty() {
+        return Ok(true);
+    }
     // A read failure here must NOT reach the tombstone path below. Reporting
     // "these turns have no text" when the truth is "I could not tell you" would
     // erase a page of history from the corpus permanently, and the only trace
     // would be a log line.
-    let prose = load_turn_texts(db, &pending)
+    let prose = load_turn_texts(db, pending)
         .await
         .map_err(|error| SweepError::Storage(format!("loading turn text: {error}")))?;
-    let mut summary = SweepSummary {
-        remaining: pending.len() == limit,
-        last_turn: pending.last().map(|turn| turn.turn_id.clone()),
-        ..SweepSummary::default()
-    };
-    // Rows that carry no vector are labelled with the model they were swept
-    // for, like every other row.
-    let model = key.model;
 
     let mut texts: HashMap<String, String> = HashMap::new();
     let mut with_text: Vec<PendingTurn> = Vec::new();
     let mut empty: Vec<PendingTurn> = Vec::new();
     let mut deferred: Vec<PendingTurn> = Vec::new();
-    for turn in pending {
+    for turn in pending.iter().cloned() {
         match prose.get(&turn.turn_id) {
             Some(found) if !found.text.is_empty() => {
                 texts.insert(turn.turn_id.clone(), found.text.clone());
@@ -635,35 +720,38 @@ pub async fn embed_pending(
         }
     }
 
-    // Marking a deferral is what lets the sweep move past it. Counting it
-    // would leave the turn at the head of every future page. A turn reached
-    // through its marker already carries one, and rewriting it would record a
-    // write for a pass that embedded nothing.
+    // Marking a deferral is what hands the turn to the slow retry. A turn
+    // reached through its marker already carries one, and rewriting it would
+    // record a write for a pass that embedded nothing.
     for turn in &deferred {
         if retrying {
             summary.deferred += 1;
             continue;
         }
-        if let Err(error) = upsert_turn_vector(db, turn, &[], &model, DEFERRED_DIMS).await {
+        // Rows that carry no vector are labelled with the model they were
+        // swept for, like every other row.
+        if let Err(error) = upsert_turn_vector(db, turn, &[], model, DEFERRED_DIMS).await {
             log::warn!(
                 "turn embeddings: deferral for {} failed: {error}",
                 turn.turn_id
             );
         } else {
             summary.deferred += 1;
+            settled.insert(turn.turn_id.clone());
         }
     }
 
     // A turn of pure tool results has nothing to embed. Record that fact so the
     // turn is not reconsidered by every future pass.
     for turn in &empty {
-        if let Err(error) = upsert_turn_vector(db, turn, &[], &model, 0).await {
+        if let Err(error) = upsert_turn_vector(db, turn, &[], model, 0).await {
             log::warn!(
                 "turn embeddings: tombstone for {} failed: {error}",
                 turn.turn_id
             );
         } else {
             summary.tombstoned += 1;
+            settled.insert(turn.turn_id.clone());
         }
     }
 
@@ -688,7 +776,10 @@ pub async fn embed_pending(
                     )
                     .await
                     {
-                        Ok(()) => summary.embedded += 1,
+                        Ok(()) => {
+                            summary.embedded += 1;
+                            settled.insert(turn.turn_id.clone());
+                        }
                         Err(error) => log::warn!(
                             "turn embeddings: upsert for {} failed: {error}",
                             turn.turn_id
@@ -699,7 +790,7 @@ pub async fn embed_pending(
             // Embedding was switched off mid-pass: leave every remaining turn
             // pending and say so, rather than tombstoning turns we simply
             // could not reach.
-            Err(EmbedFailure::Unconfigured) => return Ok(None),
+            Err(EmbedFailure::Unconfigured) => return Ok(false),
             Err(EmbedFailure::Rejected(reason)) => {
                 return Err(SweepError::Refused {
                     turn_id: chunk[0].turn_id.clone(),
@@ -710,7 +801,7 @@ pub async fn embed_pending(
         }
     }
 
-    Ok(Some(summary))
+    Ok(true)
 }
 
 /// Split turns into gateway calls bounded by BOTH count and total characters.
@@ -748,84 +839,402 @@ fn batches<'a>(
 /// in flight across a switch, and the turn is embedded again over it.
 const SETTLED: &str = "te.dims <= 0 OR (te.model = ?1 AND (?2 IS NULL OR te.dims = ?2))";
 
-/// The newest ended turns carrying no vector in `key`'s space.
-///
-/// A turn still `pending` or `running` is excluded because it can still gain
-/// events; every other state is terminal (a resumption opens a SUCCESSOR turn,
-/// it does not reopen this one). Newest first, so a workspace's useful history
-/// becomes searchable before its archaeology.
-async fn load_pending_turns(
-    db: &LocalDb,
-    scope: Scope,
-    key: &VectorKey,
-    limit: usize,
-) -> DbResult<Vec<PendingTurn>> {
-    let model = key.model.clone();
-    let dims = key.dims.map(i64::from);
-    let row_to_turn = |row: &cairn_db::turso::Row| {
-        Ok(PendingTurn {
-            turn_id: row.text(0)?,
-            session_id: row.text(1)?,
-            job_id: row.opt_text(2)?,
-            project_id: row.opt_text(3)?,
-            sequence: row.i64(4)? as i32,
-        })
-    };
-    const COLUMNS: &str =
-        "SELECT t.id, t.session_id, COALESCE(t.job_id, r.job_id), r.project_id, t.sequence
-           FROM turns t
-           LEFT JOIN runs r ON r.id = t.run_id";
-    // A turn settled in the space — vector, tombstone, or deferral — is out of
-    // these scopes. That exclusion is what stops a deferral from re-forming
-    // the same page forever.
-    let pending = format!(
-        "WHERE t.state NOT IN ('pending', 'running')
-            AND NOT EXISTS (SELECT 1 FROM turn_embeddings te
-                             WHERE te.turn_id = t.id AND ({SETTLED}))"
-    );
-    match scope {
-        // Bounded by the index range, so its cost tracks how many turns have
-        // happened since the floor, not how much history exists.
-        Scope::Since(since) => {
-            db.query_all(
-                format!(
-                    "{COLUMNS} {pending} AND t.created_at >= ?3 \
-                     ORDER BY t.created_at DESC LIMIT ?4"
-                ),
-                params![model, dims, since, limit as i64],
-                row_to_turn,
-            )
-            .await
-        }
-        Scope::All => {
-            db.query_all(
-                format!("{COLUMNS} {pending} ORDER BY t.created_at DESC LIMIT ?3"),
-                params![model, dims, limit as i64],
-                row_to_turn,
-            )
-            .await
-        }
-        // In turn-id order from the caller's cursor, so retries rotate through
-        // every unreadable turn rather than hammering the same page, without
-        // writing anything to remember where they got to.
-        Scope::Deferred { since, after } => {
-            db.query_all(
-                format!(
-                    "{COLUMNS} JOIN turn_embeddings te ON te.turn_id = t.id \
-                     WHERE te.dims = ?1 AND t.created_at >= ?2 AND te.turn_id > ?3 \
-                     ORDER BY te.turn_id ASC LIMIT ?4"
-                ),
-                params![
-                    DEFERRED_DIMS as i64,
-                    since.unwrap_or(i64::MIN),
-                    after.unwrap_or_default(),
-                    limit as i64
-                ],
-                row_to_turn,
-            )
-            .await
+/// Which way a walk step moves through `turns`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// Up from the head: the turns that arrived since.
+    Forward,
+    /// Down from the tail: history, newest first, so a workspace's useful
+    /// history becomes searchable before its archaeology.
+    Backward,
+}
+
+/// Where the walks stand in the recorded space, as `embedding_state` keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WalkState {
+    /// The highest rowid the forward walk has read; `None` until a walk has
+    /// started in this space.
+    head: Option<i64>,
+    /// The backward walk reads rowids below this; `0` once it has reached the
+    /// oldest turn.
+    tail: Option<i64>,
+    /// Turns behind a cursor that were not settled when it passed them.
+    open: Vec<String>,
+    /// Whether every pass so far had history consent.
+    consented: bool,
+    /// Bumped by every reset; a record carrying an older one is discarded.
+    epoch: i64,
+}
+
+impl WalkState {
+    fn keep_open(&mut self, turn_id: &str) {
+        if !self.open.iter().any(|open| open == turn_id) {
+            self.open.push(turn_id.to_string());
         }
     }
+}
+
+/// One walk step's choice of work, and the state to record once it is done.
+struct WalkPlan {
+    pending: Vec<PendingTurn>,
+    next: WalkState,
+    /// The epoch the state was read at.
+    epoch: i64,
+    examined: usize,
+    remaining: bool,
+}
+
+/// A row of `turns` as a walk reads it.
+struct WalkRow {
+    rowid: i64,
+    turn: PendingTurn,
+    /// `pending` or `running`: it can still gain events, so embedding it now
+    /// would capture half a thought. Every other state is terminal.
+    in_flight: bool,
+    created_at: i64,
+    /// Holds a row in the active space: a vector, a tombstone or a deferral.
+    settled: bool,
+}
+
+/// The columns a walk reads, filtered and ordered by `filter`. Binds `?1`
+/// and `?2` for [`SETTLED`]; `filter` binds from `?3`.
+fn walk_sql(filter: &str) -> String {
+    format!(
+        "SELECT t.rowid, t.id, t.session_id, COALESCE(t.job_id, r.job_id), r.project_id,
+                t.sequence, t.state IN ('pending', 'running'), t.created_at,
+                EXISTS (SELECT 1 FROM turn_embeddings te
+                         WHERE te.turn_id = t.id AND ({SETTLED}))
+           FROM turns t
+           LEFT JOIN runs r ON r.id = t.run_id
+          {filter}"
+    )
+}
+
+/// A forward step: the rowid seek above the head.
+const FORWARD: &str = "WHERE t.rowid > ?3 ORDER BY t.rowid ASC LIMIT ?4";
+
+/// A backward step: the rowid seek below the tail.
+const BACKWARD: &str = "WHERE t.rowid < ?3 ORDER BY t.rowid DESC LIMIT ?4";
+
+fn walk_row(row: &cairn_db::turso::Row) -> DbResult<WalkRow> {
+    Ok(WalkRow {
+        rowid: row.i64(0)?,
+        turn: PendingTurn {
+            turn_id: row.text(1)?,
+            session_id: row.text(2)?,
+            job_id: row.opt_text(3)?,
+            project_id: row.opt_text(4)?,
+            sequence: row.i64(5)? as i32,
+        },
+        in_flight: row.i64(6)? != 0,
+        created_at: row.i64(7)?,
+        settled: row.i64(8)? != 0,
+    })
+}
+
+fn space_params(key: &VectorKey) -> Vec<Value> {
+    vec![
+        Value::Text(key.model.clone()),
+        key.dims
+            .map_or(Value::Null, |dims| Value::Integer(i64::from(dims))),
+    ]
+}
+
+async fn load_walk(db: &LocalDb) -> DbResult<WalkState> {
+    db.query_one(
+        "SELECT turn_walk_head, turn_walk_tail, turn_walk_open, turn_walk_consented,
+                turn_walk_epoch
+           FROM embedding_state WHERE id = 1",
+        (),
+        |row| {
+            let open = row.text(2)?;
+            Ok(WalkState {
+                head: row.opt_i64(0)?,
+                tail: row.opt_i64(1)?,
+                // Written only by `commit_walk`, so this does not fail; were
+                // it to, the open turns are found again by the next walk of
+                // the space rather than never.
+                open: serde_json::from_str(&open).unwrap_or_default(),
+                consented: row.i64(3)? != 0,
+                epoch: row.i64(4)?,
+            })
+        },
+    )
+    .await
+}
+
+/// Record `next`, unless the walks were reset since `epoch` was read.
+async fn commit_walk(db: &LocalDb, epoch: i64, next: &WalkState) -> DbResult<()> {
+    let open = serde_json::to_string(&next.open).unwrap_or_else(|_| "[]".to_string());
+    db.execute(
+        "UPDATE embedding_state
+            SET turn_walk_head = ?1, turn_walk_tail = ?2, turn_walk_open = ?3,
+                turn_walk_consented = ?4
+          WHERE id = 1 AND turn_walk_epoch = ?5",
+        params![next.head, next.tail, open, i64::from(next.consented), epoch],
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The state a pass walks from: started if no walk has been, restarted below
+/// the head if consent was gained since the last pass, and with the head
+/// lowered if the turns it stood on are gone.
+///
+/// A new walk's forward cursor starts at the newest turn older than
+/// [`VISIBILITY_GRACE_SECS`] and its backward cursor just above it, so between
+/// them they cover every turn exactly once. Nothing is written here; the pass
+/// records the state when it is done, and one that fails first simply starts
+/// again.
+async fn begin_walk(
+    db: &LocalDb,
+    mut state: WalkState,
+    consented: bool,
+    now: i64,
+) -> DbResult<WalkState> {
+    if let Some(head) = state.head {
+        // The newest turns were deleted. After a restart the rowid allocator
+        // seeds from the largest rowid left, so new turns would reuse rowids
+        // at or below the head and the forward walk would never read them.
+        // Seen before they climb back to the head, lowering it reaches them;
+        // turns inserted between a restart and the first pass can still land
+        // there unseen.
+        let newest = db
+            .query_one("SELECT COALESCE(MAX(rowid), 0) FROM turns", (), |row| {
+                row.i64(0)
+            })
+            .await?;
+        if newest < head {
+            state.head = Some(settled_head(db, now).await?);
+        }
+    }
+    if state.head.is_none() {
+        let head = settled_head(db, now).await?;
+        state.head = Some(head);
+        state.tail = Some(head + 1);
+        state.open.clear();
+        state.consented = consented;
+    } else if consented && !state.consented {
+        // The walk passed over pre-boundary turns without consent. Walking
+        // history again reaches them; everything it already settled is a
+        // probe each.
+        state.tail = state.head.map(|head| head + 1);
+        state.consented = true;
+    } else if !consented {
+        state.consented = false;
+    }
+    Ok(state)
+}
+
+/// The clock in the seconds `created_at` holds.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
+}
+
+/// The newest rowid a head may stand on: that of the newest turn created
+/// before the grace period, or `0`. Reads down from the top of `turns` only as
+/// far as the turns created within it.
+async fn settled_head(db: &LocalDb, now: i64) -> DbResult<i64> {
+    db.query_one(
+        "SELECT COALESCE((SELECT rowid FROM turns WHERE created_at <= ?1
+                           ORDER BY rowid DESC LIMIT 1), 0)",
+        params![now - VISIBILITY_GRACE_SECS],
+        |row| row.i64(0),
+    )
+    .await
+}
+
+/// Choose one walk step's turns: at most `limit` ended turns without a row in
+/// `key`'s space, reading at most [`WALK_WINDOW`] rows, plus (forward) up to
+/// [`OPEN_REVISIT`] open turns.
+///
+/// `floor` is the consent floor; see [`Scope`]. A turn below it is passed over
+/// without being recorded anywhere, which is what gaining consent restarts the
+/// backward walk for. `now` is the clock, in the seconds `created_at` holds.
+async fn plan_walk(
+    db: &LocalDb,
+    key: &VectorKey,
+    direction: Direction,
+    floor: Option<i64>,
+    limit: usize,
+    now: i64,
+) -> DbResult<WalkPlan> {
+    let loaded = load_walk(db).await?;
+    let epoch = loaded.epoch;
+    let mut next = begin_walk(db, loaded, floor.is_none(), now).await?;
+    let in_scope = |created_at: i64| floor.is_none_or(|floor| created_at >= floor);
+    let orphaned = |created_at: i64| created_at < now - OPEN_HORIZON_SECS;
+    // Carried apart from `next.open` so the turns this step newly passes are
+    // not read a second time below.
+    let carried = match direction {
+        Direction::Forward => std::mem::take(&mut next.open),
+        Direction::Backward => Vec::new(),
+    };
+    let mut plan = WalkPlan {
+        pending: Vec::new(),
+        next,
+        epoch,
+        examined: 0,
+        remaining: false,
+    };
+
+    let cursor = match direction {
+        Direction::Forward => plan.next.head,
+        Direction::Backward => plan.next.tail.filter(|tail| *tail > 0),
+    };
+    if let Some(cursor) = cursor {
+        let filter = match direction {
+            Direction::Forward => FORWARD,
+            Direction::Backward => BACKWARD,
+        };
+        let mut values = space_params(key);
+        values.extend([Value::Integer(cursor), Value::Integer(WALK_WINDOW as i64)]);
+        let rows = db.query_all(walk_sql(filter), values, walk_row).await?;
+        plan.examined += rows.len();
+        let window_full = rows.len() == WALK_WINDOW;
+
+        let mut stopped = false;
+        // Whether the cursor still moves: the forward head stops at the first
+        // young turn, and every row from there is read again next pass.
+        let mut passing = true;
+        for row in rows {
+            if plan.pending.len() == limit {
+                stopped = true;
+                break;
+            }
+            match direction {
+                Direction::Forward => {
+                    passing &= row.created_at <= now - VISIBILITY_GRACE_SECS;
+                    if passing {
+                        plan.next.head = Some(row.rowid);
+                    }
+                }
+                Direction::Backward => plan.next.tail = Some(row.rowid),
+            }
+            if row.settled || !in_scope(row.created_at) {
+                continue;
+            }
+            if row.in_flight {
+                // Not yet passed, it is read again anyway.
+                if passing && !orphaned(row.created_at) {
+                    plan.next.keep_open(&row.turn.turn_id);
+                }
+                continue;
+            }
+            plan.pending.push(row.turn);
+        }
+        // A window the head stopped inside is read again from the young turn
+        // on, so there is no more to come back for until they age.
+        plan.remaining = stopped || (window_full && passing);
+        if direction == Direction::Backward && !plan.remaining {
+            plan.next.tail = Some(0);
+        }
+    }
+
+    if !carried.is_empty() {
+        let (revisit, later) = carried.split_at(carried.len().min(OPEN_REVISIT));
+        let placeholders = (0..revisit.len())
+            .map(|index| format!("?{}", index + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut values = space_params(key);
+        values.extend(revisit.iter().map(|id| Value::Text(id.clone())));
+        let rows = db
+            .query_all(
+                walk_sql(&format!("WHERE t.id IN ({placeholders})")),
+                values,
+                walk_row,
+            )
+            .await?;
+        plan.examined += rows.len();
+        let mut found: HashMap<String, WalkRow> = rows
+            .into_iter()
+            .map(|row| (row.turn.turn_id.clone(), row))
+            .collect();
+        // A young turn the window just read is already chosen.
+        let chosen: HashSet<String> = plan
+            .pending
+            .iter()
+            .map(|turn| turn.turn_id.clone())
+            .collect();
+        let mut kept = Vec::new();
+        for turn_id in revisit {
+            // A turn packed away or deleted has nothing left to embed.
+            let Some(row) = found.remove(turn_id) else {
+                continue;
+            };
+            // Out of scope, consent was lost since it was opened. Gaining it
+            // again restarts the backward walk, which reaches it.
+            if row.settled || !in_scope(row.created_at) || chosen.contains(turn_id) {
+                continue;
+            }
+            if row.in_flight {
+                if orphaned(row.created_at) {
+                    log::debug!(
+                        "turn embeddings: {turn_id} has run past the horizon; no longer held open"
+                    );
+                } else {
+                    kept.push(turn_id);
+                }
+                continue;
+            }
+            if plan.pending.len() == limit {
+                kept.push(turn_id);
+                plan.remaining = true;
+                continue;
+            }
+            plan.pending.push(row.turn);
+        }
+        for turn_id in later.iter().chain(kept) {
+            plan.next.keep_open(turn_id);
+        }
+    }
+    Ok(plan)
+}
+
+/// Deferred turns from just past `after` in turn-id order, floored at
+/// `since`. Seeks `idx_turn_embeddings_deferred`, which holds only the
+/// markers, so a page costs its own rows rather than the index up to them.
+async fn load_deferred_turns(
+    db: &LocalDb,
+    since: Option<i64>,
+    after: Option<String>,
+    limit: usize,
+) -> DbResult<Vec<PendingTurn>> {
+    db.query_all(
+        deferred_sql(),
+        params![
+            since.unwrap_or(i64::MIN),
+            after.unwrap_or_default(),
+            limit as i64
+        ],
+        |row| {
+            Ok(PendingTurn {
+                turn_id: row.text(0)?,
+                session_id: row.text(1)?,
+                job_id: row.opt_text(2)?,
+                project_id: row.opt_text(3)?,
+                sequence: row.i64(4)? as i32,
+            })
+        },
+    )
+    .await
+}
+
+/// The deferred page's statement. The marker value is a literal, not a bound
+/// parameter, because a partial index is only chosen for a term that matches
+/// its predicate as written.
+fn deferred_sql() -> String {
+    format!(
+        "SELECT t.id, t.session_id, COALESCE(t.job_id, r.job_id), r.project_id, t.sequence
+           FROM turn_embeddings te INDEXED BY idx_turn_embeddings_deferred
+           JOIN turns t ON t.id = te.turn_id
+           LEFT JOIN runs r ON r.id = t.run_id
+          WHERE te.dims = {DEFERRED_DIMS} AND t.created_at >= ?1 AND te.turn_id > ?2
+          ORDER BY te.turn_id ASC LIMIT ?3"
+    )
 }
 
 /// Assemble each turn's embeddable text from its content events.
@@ -1556,8 +1965,45 @@ mod tests {
         }
     }
 
+    /// The backward walk with consent: every turn, newest first.
+    const ALL: Scope = Scope::History { floor: None };
+
+    /// The turns a pass in `scope` would take, without taking them.
+    async fn load_pending_turns(
+        db: &LocalDb,
+        scope: Scope,
+        key: &VectorKey,
+        limit: usize,
+    ) -> DbResult<Vec<PendingTurn>> {
+        match scope {
+            Scope::Deferred { since, after } => load_deferred_turns(db, since, after, limit).await,
+            Scope::Live { floor } => {
+                Ok(
+                    plan_walk(db, key, Direction::Forward, floor, limit, unix_now())
+                        .await?
+                        .pending,
+                )
+            }
+            Scope::History { floor } => {
+                Ok(
+                    plan_walk(db, key, Direction::Backward, floor, limit, unix_now())
+                        .await?
+                        .pending,
+                )
+            }
+        }
+    }
+
     async fn pending(db: &LocalDb, scope: Scope, limit: usize) -> DbResult<Vec<PendingTurn>> {
         load_pending_turns(db, scope, &cohere_any(), limit).await
+    }
+
+    /// One pass that must succeed and find embedding configured.
+    async fn pass(db: &LocalDb, embedder: &dyn Embed, scope: Scope) -> SweepSummary {
+        embed_pending(db, embedder, scope, SWEEP_LIMIT)
+            .await
+            .unwrap()
+            .expect("embedding is configured")
     }
 
     async fn seed_project(db: &LocalDb) {
@@ -1581,6 +2027,24 @@ mod tests {
         created_at: i64,
         events: &[(&str, &str)],
     ) {
+        seed_turn_row(db, turn_id, None, state, created_at, events).await;
+    }
+
+    /// [`seed_turn`] at a chosen rowid: a turn whose rowid was allocated
+    /// before a turn that became visible first.
+    async fn seed_turn_at(db: &LocalDb, turn_id: &str, rowid: i64, created_at: i64) {
+        let events = [("assistant", "prose")];
+        seed_turn_row(db, turn_id, Some(rowid), "complete", created_at, &events).await;
+    }
+
+    async fn seed_turn_row(
+        db: &LocalDb,
+        turn_id: &str,
+        rowid: Option<i64>,
+        state: &str,
+        created_at: i64,
+        events: &[(&str, &str)],
+    ) {
         let run_id = format!("run-{turn_id}");
         let session_id = format!("session-{turn_id}");
         db.execute(
@@ -1591,14 +2055,16 @@ mod tests {
         .await
         .unwrap();
         db.execute(
-            "INSERT INTO turns(id, session_id, run_id, sequence, state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5)",
+            "INSERT INTO turns(rowid, id, session_id, run_id, sequence, state, created_at,
+                               updated_at)
+             VALUES (?6, ?1, ?2, ?3, 1, ?4, ?5, ?5)",
             params![
                 turn_id,
                 session_id.as_str(),
                 run_id.as_str(),
                 state,
-                created_at
+                created_at,
+                rowid
             ],
         )
         .await
@@ -1651,7 +2117,7 @@ mod tests {
         .await
         .unwrap();
 
-        let pending = pending(&db, Scope::All, 10).await.unwrap();
+        let pending = pending(&db, ALL, 10).await.unwrap();
         let ids: Vec<&str> = pending.iter().map(|turn| turn.turn_id.as_str()).collect();
         assert_eq!(ids, vec!["turn-new", "turn-old"]);
         assert_eq!(pending[0].project_id.as_deref(), Some("project-1"));
@@ -1672,7 +2138,7 @@ mod tests {
         .await;
 
         assert_eq!(pending_count(&db, &cohere_any()).await.unwrap(), 1);
-        let summary = embed_pending(&db, &tokened_client(), Scope::All, 10)
+        let summary = embed_pending(&db, &tokened_client(), ALL, 10)
             .await
             .unwrap()
             .expect("a turn with no text needs no gateway call");
@@ -1704,7 +2170,7 @@ mod tests {
         // stay pending so it is picked up once a token exists — recording it as
         // empty would lose it permanently.
         assert_eq!(
-            embed_pending(&db, &tokenless_client(), Scope::All, 10)
+            embed_pending(&db, &tokenless_client(), ALL, 10)
                 .await
                 .unwrap(),
             None
@@ -1722,13 +2188,15 @@ mod tests {
         // An install with no connected account never walks back through
         // transcripts that predate it; only turns it watched happen are in
         // scope. Uploading history is the one part that cannot be undone.
-        let live = pending(&db, Scope::Since(200), 10).await.unwrap();
+        let live = pending(&db, Scope::History { floor: Some(200) }, 10)
+            .await
+            .unwrap();
         assert_eq!(
             live.iter().map(|t| t.turn_id.as_str()).collect::<Vec<_>>(),
             vec!["turn-new"]
         );
 
-        let all = pending(&db, Scope::All, 10).await.unwrap();
+        let all = pending(&db, ALL, 10).await.unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -1837,7 +2305,7 @@ mod tests {
         .await
         .unwrap();
 
-        let summary = embed_pending(&db, &tokened_client(), Scope::All, 10)
+        let summary = embed_pending(&db, &tokened_client(), ALL, 10)
             .await
             .unwrap()
             .expect("the pass itself succeeds");
@@ -1884,7 +2352,7 @@ mod tests {
         )
         .await;
 
-        let summary = embed_pending(&db, &tokened_client(), Scope::All, 10)
+        let summary = embed_pending(&db, &tokened_client(), ALL, 10)
             .await
             .unwrap()
             .expect("the pass itself succeeds");
@@ -1923,23 +2391,10 @@ mod tests {
     async fn a_deferred_turn_does_not_block_the_sweep_from_reaching_older_ones() {
         let db = migrated_db().await;
         seed_project(&db).await;
-        // The newest turn is unreadable. Because the walk is newest-first, an
-        // unmarked deferral would head every subsequent page forever — fill
-        // the page with them and the sweep never reaches anything else.
-        seed_turn(
-            &db,
-            "turn-unreadable",
-            "complete",
-            300,
-            &[("assistant", "")],
-        )
-        .await;
-        db.execute(
-            "UPDATE events SET storage_mode = 'zstd' WHERE turn_id = 'turn-unreadable'",
-            (),
-        )
-        .await
-        .unwrap();
+        // The newest turn is unreadable. The walk is newest-first, so a
+        // deferral that stayed in its page would head every subsequent one
+        // forever — fill the page with them and the sweep never reaches
+        // anything else.
         seed_turn(
             &db,
             "turn-older",
@@ -1948,9 +2403,10 @@ mod tests {
             &[("tool_result", "bulk")],
         )
         .await;
+        seed_unreadable(&db, "turn-unreadable", 300).await;
 
         // One pass, page size one: it can only reach the unreadable turn.
-        let first = embed_pending(&db, &tokened_client(), Scope::All, 1)
+        let first = embed_pending(&db, &tokened_client(), ALL, 1)
             .await
             .unwrap()
             .unwrap();
@@ -1958,7 +2414,7 @@ mod tests {
 
         // The next pass must get PAST it. This is the claim that matters: the
         // deferral left the page rather than re-forming it.
-        let second = embed_pending(&db, &tokened_client(), Scope::All, 1)
+        let second = embed_pending(&db, &tokened_client(), ALL, 1)
             .await
             .unwrap()
             .unwrap();
@@ -1967,18 +2423,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_turn_stranded_below_the_live_floor_is_recovered_without_an_account() {
+    async fn a_turn_still_running_when_the_walk_passes_it_is_embedded_once_it_ends() {
         let db = migrated_db().await;
         seed_project(&db).await;
-        // The long turn was still running when the sweep reached its position,
-        // so a shorter, newer turn was embedded first and the live floor moved
-        // past it. In Cairn this is ordinary: a node's turn is routinely
-        // outlived by the sub-agent turns it spawned.
+        // The long turn was still running when the walk reached it, and a
+        // shorter, newer turn ended first. In Cairn this is ordinary: a node's
+        // turn is routinely outlived by the sub-agent turns it spawned.
         seed_turn(
             &db,
             "turn-long",
-            "complete",
-            100,
+            "running",
+            // Recent: a turn running past the horizon is let go as orphaned.
+            unix_now() - 7200,
             &[("assistant", "substance")],
         )
         .await;
@@ -1986,45 +2442,34 @@ mod tests {
             &db,
             "turn-short",
             "complete",
-            300,
+            unix_now() - 3600,
             &[("assistant", "brief")],
         )
         .await;
-        upsert_turn_vector(
-            &db,
-            &PendingTurn {
-                turn_id: "turn-short".to_string(),
-                session_id: "session-turn-short".to_string(),
-                job_id: None,
-                project_id: Some("project-1".to_string()),
-                sequence: 1,
-            },
-            &vector::to_bytes(&[1.0]),
-            "cohere-embed-v4",
-            1,
+        let embedder = tokened_client();
+        // No account: recovering it must not need one, or an install that
+        // never signed in would lose its longest turns permanently.
+        let floor = Some(0);
+
+        let walked = pass(&db, &embedder, Scope::History { floor }).await;
+        assert_eq!(walked.embedded, 1);
+        assert!(!walked.remaining, "the history walk is done");
+        // Nothing rescans history now. The forward walk re-reads only the open
+        // turn, for as long as it runs.
+        let waiting = pass(&db, &embedder, Scope::Live { floor }).await;
+        assert_eq!((waiting.embedded, waiting.examined), (0, 1));
+
+        db.execute(
+            "UPDATE turns SET state = 'complete' WHERE id = 'turn-long'",
+            (),
         )
         .await
         .unwrap();
-
-        // The fast pass cannot see it: that is the strand.
-        let live_floor = live_boundary(&db, &cohere_any(), 0).await;
-        assert_eq!(live_floor, 300);
-        assert!(pending(&db, Scope::Since(live_floor), 10)
-            .await
-            .unwrap()
-            .is_empty());
-
-        // Reconciling from the install's own boundary recovers it, and that
-        // scope is NOT account-gated — otherwise an install that never signed
-        // in would lose its longest turns permanently.
-        let recovered = pending(&db, Scope::Since(0), 10).await.unwrap();
-        assert_eq!(
-            recovered
-                .iter()
-                .map(|t| t.turn_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["turn-long"]
-        );
+        let ended = pass(&db, &embedder, Scope::Live { floor }).await;
+        assert_eq!(ended.embedded, 1);
+        assert_eq!(pending_count(&db, &cohere_any()).await.unwrap(), 0);
+        let idle = pass(&db, &embedder, Scope::Live { floor }).await;
+        assert_eq!(idle.examined, 0, "settled, it leaves the open set");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2173,24 +2618,37 @@ mod tests {
         );
     }
 
-    /// The settled test reads `model` and `dims`, which sit after the vector
-    /// blob; from the table that walks overflow pages for every turn probed.
-    /// The covering index keeps the probe off the row.
+    /// A walk step seeks `turns` by rowid from its cursor, and its settled
+    /// test reads `model` and `dims`, which sit after the vector blob: from the
+    /// table that walks overflow pages for every turn probed, so the covering
+    /// index keeps the probe off the row. The deferred page seeks the index
+    /// that holds only the markers.
     #[tokio::test(flavor = "current_thread")]
-    async fn the_settled_probe_and_progress_counts_read_only_the_space_index() {
+    async fn a_walk_step_seeks_by_rowid_and_probes_only_the_space_index() {
         let db = migrated_db().await;
-        let key = || vec![Value::Text("cohere-embed-v4".into()), Value::Integer(1536)];
-        let pending = plan(
+        for filter in [FORWARD, BACKWARD] {
+            let mut values = space_params(&cohere_any());
+            values.extend([Value::Integer(10), Value::Integer(WALK_WINDOW as i64)]);
+            let walk = plan(&db, &walk_sql(filter), values).await;
+            assert!(
+                walk.contains("INTEGER PRIMARY KEY") && walk.contains("idx_turn_embeddings_space"),
+                "{walk}"
+            );
+        }
+        let deferred = plan(
             &db,
-            &format!(
-                "SELECT t.id FROM turns t WHERE t.state NOT IN ('pending', 'running')
-                   AND NOT EXISTS (SELECT 1 FROM turn_embeddings te
-                                    WHERE te.turn_id = t.id AND ({SETTLED}))"
-            ),
-            key(),
+            &deferred_sql(),
+            vec![
+                Value::Integer(0),
+                Value::Text(String::new()),
+                Value::Integer(64),
+            ],
         )
         .await;
-        assert!(pending.contains("idx_turn_embeddings_space"), "{pending}");
+        assert!(
+            deferred.contains("idx_turn_embeddings_deferred"),
+            "{deferred}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2216,7 +2674,7 @@ mod tests {
             .collect();
         assert_eq!(read, ["turn-new"]);
         assert_eq!(
-            load_pending_turns(&db, Scope::All, &m2, 10)
+            load_pending_turns(&db, ALL, &m2, 10)
                 .await
                 .unwrap()
                 .into_iter()
@@ -2256,7 +2714,7 @@ mod tests {
         let embedder = tokened_client();
         embedder.script(vec![Some(EmbedFailure::Rejected("too long".into()))]);
         assert_eq!(
-            embed_pending(&db, &embedder, Scope::All, 10).await,
+            embed_pending(&db, &embedder, ALL, 10).await,
             Err(SweepError::Refused {
                 turn_id: "turn-poison".into(),
                 reason: "too long".into()
@@ -2264,9 +2722,11 @@ mod tests {
         );
         assert_eq!(pending_count(&db, &cohere_any()).await.unwrap(), 1);
 
+        // The walk moved on and holds the refused turn open, so the forward
+        // walk is what tries it again.
         let mut refused = None;
         embedder.script(vec![Some(EmbedFailure::Rejected("too long".into()))]);
-        let failure = run_pass(&db, &embedder, Scope::All, &mut refused)
+        let failure = run_pass(&db, &embedder, Scope::Live { floor: None }, &mut refused)
             .await
             .unwrap_err();
         assert_eq!(failure, PassFailure::Refused);
@@ -2292,7 +2752,7 @@ mod tests {
         assert_eq!((before.embedded, before.eligible), (0, 6));
 
         // One page of two, then the rest: the counts follow each call.
-        embed_pending(&db, &embedder, Scope::All, 2).await.unwrap();
+        embed_pending(&db, &embedder, ALL, 2).await.unwrap();
         let after_one = turn_progress(&db, &key, None).await.unwrap();
         // The newest two are the unreadable turn (deferred) and the tool turn
         // (tombstoned): neither is eligible.
@@ -2300,10 +2760,10 @@ mod tests {
             (after_one.embedded, after_one.eligible, after_one.deferred),
             (0, 4, 1)
         );
-        embed_pending(&db, &embedder, Scope::All, 2).await.unwrap();
+        embed_pending(&db, &embedder, ALL, 2).await.unwrap();
         let after_two = turn_progress(&db, &key, None).await.unwrap();
         assert_eq!((after_two.embedded, after_two.eligible), (2, 4));
-        embed_pending(&db, &embedder, Scope::All, 10).await.unwrap();
+        embed_pending(&db, &embedder, ALL, 10).await.unwrap();
         let done = turn_progress(&db, &key, None).await.unwrap();
         assert_eq!((done.embedded, done.eligible, done.deferred), (4, 4, 1));
 
@@ -2327,9 +2787,7 @@ mod tests {
         let embedder = tokened_client();
         embedder.set_paused(true);
 
-        let error = embed_pending(&db, &embedder, Scope::All, 10)
-            .await
-            .unwrap_err();
+        let error = embed_pending(&db, &embedder, ALL, 10).await.unwrap_err();
         assert!(
             matches!(error, SweepError::Embedding(EmbedFailure::Paused { .. })),
             "{error:?}"
@@ -2360,7 +2818,7 @@ mod tests {
         let embedder = tokened_client();
         embedder.script(vec![None, Some(EmbedFailure::Failed("HTTP 500".into()))]);
 
-        let error = embed_pending(&db, &embedder, Scope::All, SWEEP_LIMIT)
+        let error = embed_pending(&db, &embedder, ALL, SWEEP_LIMIT)
             .await
             .unwrap_err();
         assert_eq!(
@@ -2398,7 +2856,7 @@ mod tests {
             seed_unreadable(&db, turn_id, 100 + index as i64).await;
         }
         let embedder = tokened_client();
-        let first = embed_pending(&db, &embedder, Scope::All, 10)
+        let first = embed_pending(&db, &embedder, ALL, 10)
             .await
             .unwrap()
             .unwrap();
@@ -2471,7 +2929,7 @@ mod tests {
             seed_unreadable(&db, turn_id, 100 + index as i64).await;
         }
         let embedder = tokened_client();
-        embed_pending(&db, &embedder, Scope::All, 10)
+        embed_pending(&db, &embedder, ALL, 10)
             .await
             .unwrap()
             .unwrap();
@@ -2498,5 +2956,288 @@ mod tests {
                 vec![ids[0].clone(), ids[1].clone()],
             ]
         );
+    }
+
+    /// Seed `count` ended turns in bulk, created from `created_at` up, each
+    /// tombstoned when `settled`.
+    async fn seed_bulk(db: &LocalDb, prefix: &str, count: usize, created_at: i64, settled: bool) {
+        let ids: Vec<usize> = (0..count).collect();
+        for chunk in ids.chunks(500) {
+            let turns = chunk
+                .iter()
+                .map(|index| {
+                    let at = created_at + *index as i64;
+                    format!("('{prefix}-{index}', 's-{prefix}-{index}', 1, 'complete', {at}, {at})")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut sql = format!(
+                "INSERT INTO turns(id, session_id, sequence, state, created_at, updated_at)
+                 VALUES {turns};"
+            );
+            if settled {
+                let rows = chunk
+                    .iter()
+                    .map(|index| {
+                        format!("('{prefix}-{index}', 's-{prefix}-{index}', 1, X'', 'cohere-embed-v4', 0, 1, 1)")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                sql.push_str(&format!(
+                    "INSERT INTO turn_embeddings(turn_id, session_id, sequence, embedding, model,
+                                                 dims, created_at, updated_at)
+                     VALUES {rows};"
+                ));
+            }
+            db.execute_script(sql).await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_reads_a_bounded_window_whatever_the_size_of_history() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        let embedder = tokened_client();
+        // An install without consent, boundary at 1000. Below it, a backlog
+        // the sweep may never take: the shape of the one that never drained.
+        // Above it, a history several windows deep, all of it settled.
+        let floor = Some(1000);
+        let (held, history) = (300, 3 * WALK_WINDOW + 100);
+        seed_bulk(&db, "held", held, 100, false).await;
+        seed_bulk(&db, "done", history, 1000, true).await;
+
+        // The first walk over it: a window per pass, never the whole table.
+        let mut passes = 0;
+        loop {
+            let summary = pass(&db, &embedder, Scope::History { floor }).await;
+            assert!(summary.examined <= WALK_WINDOW, "{summary:?}");
+            assert_eq!(summary.embedded + summary.tombstoned + summary.deferred, 0);
+            passes += 1;
+            if !summary.remaining {
+                break;
+            }
+        }
+        assert_eq!(passes, (held + history).div_ceil(WALK_WINDOW));
+
+        // Caught up, with the backlog still there: the sweep idles, and an
+        // idle pass reads nothing at all. The cursors are re-read from the
+        // database by every pass, as after a restart.
+        for _ in 0..3 {
+            for scope in [Scope::Live { floor }, Scope::History { floor }] {
+                let summary = pass(&db, &embedder, scope.clone()).await;
+                assert_eq!(
+                    (summary.examined, summary.remaining),
+                    (0, false),
+                    "{scope:?}"
+                );
+            }
+        }
+        assert_eq!(
+            pending_count(&db, &cohere_any()).await.unwrap(),
+            held as i64
+        );
+
+        // New turns cost what they are: three that ended and one still running.
+        // An hour old: past the visibility grace, within the open horizon.
+        let at = unix_now() - 3600;
+        for (index, turn) in ["new-a", "new-b", "new-c"].into_iter().enumerate() {
+            let created_at = at + index as i64;
+            seed_turn(&db, turn, "complete", created_at, &[("assistant", "prose")]).await;
+        }
+        seed_turn(
+            &db,
+            "new-live",
+            "running",
+            at + 3,
+            &[("assistant", "prose")],
+        )
+        .await;
+        let arrived = pass(&db, &embedder, Scope::Live { floor }).await;
+        assert_eq!((arrived.examined, arrived.embedded), (4, 3));
+        let open = pass(&db, &embedder, Scope::Live { floor }).await;
+        assert_eq!((open.examined, open.embedded), (1, 0), "only the open turn");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_model_switch_restarts_the_walk() {
+        use crate::embeddings::space::tests::keeper;
+
+        let db = std::sync::Arc::new(migrated_db().await);
+        seed_project(&db).await;
+        seed_turn(&db, "turn-a", "complete", 100, &[("assistant", "a")]).await;
+        seed_turn(&db, "turn-b", "complete", 200, &[("assistant", "b")]).await;
+        let stub = std::sync::Arc::new(StubEmbed::new("m1", 4));
+        let (keeper, _worker) = keeper(db.clone(), stub.clone());
+        keeper.reconcile(Trigger::Startup).await.unwrap();
+
+        assert_eq!(pass(&db, stub.as_ref(), ALL).await.embedded, 2);
+        assert_eq!(pass(&db, stub.as_ref(), ALL).await.examined, 0, "walked");
+        let before_switch = load_walk(&db).await.unwrap();
+
+        stub.set_space("cairn", "m2", 4);
+        assert_eq!(
+            keeper.reconcile(Trigger::Sweep).await.unwrap(),
+            Reconciled::Switched
+        );
+        // A pass that read the state before the switch cannot put its
+        // cursors back over the reset.
+        commit_walk(&db, before_switch.epoch, &before_switch)
+            .await
+            .unwrap();
+        assert_eq!(load_walk(&db).await.unwrap().head, None);
+
+        assert_eq!(pass(&db, stub.as_ref(), ALL).await.embedded, 2);
+        assert_eq!(
+            count_rows(
+                &db,
+                "SELECT COUNT(*) FROM turn_embeddings WHERE model = 'm2'"
+            )
+            .await,
+            2
+        );
+    }
+
+    async fn rowid_of(db: &LocalDb, turn_id: &str) -> i64 {
+        db.query_one(
+            "SELECT rowid FROM turns WHERE id = ?1",
+            params![turn_id],
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_turn_that_becomes_visible_below_a_newer_one_is_still_reached() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        seed_turn(&db, "turn-old", "complete", 100, &[("assistant", "a")]).await;
+        let embedder = tokened_client();
+        assert_eq!(pass(&db, &embedder, ALL).await.embedded, 1);
+        let head = load_walk(&db).await.unwrap().head.unwrap();
+
+        // Two turns insert concurrently. The first takes the lower rowid but
+        // commits after the second, so a pass between the commits sees only
+        // the higher one.
+        let now = unix_now();
+        seed_turn_at(&db, "turn-second", head + 2, now).await;
+        let between = pass(&db, &embedder, Scope::Live { floor: None }).await;
+        assert_eq!(between.embedded, 1);
+        assert_eq!(
+            load_walk(&db).await.unwrap().head,
+            Some(head),
+            "the head stops short of a young turn"
+        );
+
+        seed_turn_at(&db, "turn-first", head + 1, now).await;
+        let after = pass(&db, &embedder, Scope::Live { floor: None }).await;
+        assert_eq!((after.embedded, after.examined), (1, 2));
+        assert_eq!(pending_count(&db, &cohere_any()).await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rowid_reused_below_the_head_is_still_reached() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        seed_turn(&db, "turn-a", "complete", 100, &[("assistant", "a")]).await;
+        seed_turn(&db, "turn-b", "complete", 200, &[("assistant", "b")]).await;
+        let embedder = tokened_client();
+        assert_eq!(pass(&db, &embedder, ALL).await.embedded, 2);
+        let reused = rowid_of(&db, "turn-b").await;
+
+        // The newest turn is deleted, and after a restart the allocator hands
+        // its rowid out again.
+        db.execute_script(
+            "DELETE FROM events WHERE turn_id = 'turn-b';
+             DELETE FROM turn_embeddings WHERE turn_id = 'turn-b';
+             DELETE FROM turns WHERE id = 'turn-b';",
+        )
+        .await
+        .unwrap();
+        pass(&db, &embedder, Scope::Live { floor: None }).await;
+        assert_eq!(
+            load_walk(&db).await.unwrap().head,
+            Some(rowid_of(&db, "turn-a").await)
+        );
+        seed_turn_at(&db, "turn-c", reused, 300).await;
+        let reached = pass(&db, &embedder, Scope::Live { floor: None }).await;
+        assert_eq!(reached.embedded, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_open_set_lets_go_of_orphans_and_of_turns_consent_no_longer_covers() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        let now = unix_now();
+        // Left `running` by a crash months ago; nothing will ever end it.
+        seed_turn(&db, "turn-orphan", "running", 100, &[("assistant", "a")]).await;
+        seed_turn(
+            &db,
+            "turn-live",
+            "running",
+            now - 600,
+            &[("assistant", "b")],
+        )
+        .await;
+        let embedder = tokened_client();
+
+        pass(&db, &embedder, ALL).await;
+        assert_eq!(load_walk(&db).await.unwrap().open, vec!["turn-live"]);
+        let held = pass(&db, &embedder, Scope::Live { floor: None }).await;
+        assert_eq!(held.examined, 1);
+
+        // Consent is lost, and the open turn predates the boundary.
+        let floor = Some(now);
+        pass(&db, &embedder, Scope::Live { floor }).await;
+        assert!(load_walk(&db).await.unwrap().open.is_empty());
+        let idle = pass(&db, &embedder, Scope::Live { floor }).await;
+        assert_eq!(idle.examined, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_open_set_rotates_so_none_waits_behind_turns_that_never_settle() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        let embedder = tokened_client();
+        let count = OPEN_REVISIT + 44;
+        seed_bulk(&db, "open", count, unix_now() - 3600, false).await;
+        db.execute("UPDATE turns SET state = 'running'", ())
+            .await
+            .unwrap();
+        // The backward walk opens them newest first, so `open-0` is last.
+        pass(&db, &embedder, ALL).await;
+        assert_eq!(load_walk(&db).await.unwrap().open.len(), count);
+        // A revisit that finds them all still running.
+        pass(&db, &embedder, Scope::Live { floor: None }).await;
+
+        db.execute("UPDATE turns SET state = 'complete'", ())
+            .await
+            .unwrap();
+        pass(&db, &embedder, Scope::Live { floor: None }).await;
+        assert_eq!(
+            count_rows(
+                &db,
+                "SELECT COUNT(*) FROM turn_embeddings WHERE turn_id = 'open-0'"
+            )
+            .await,
+            1,
+            "the turns past the first revisit come next"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gaining_consent_walks_the_history_it_passed_over() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        seed_turn(&db, "turn-old", "complete", 100, &[("assistant", "a")]).await;
+        seed_turn(&db, "turn-new", "complete", 500, &[("assistant", "b")]).await;
+        let embedder = tokened_client();
+
+        let without = pass(&db, &embedder, Scope::History { floor: Some(300) }).await;
+        assert_eq!((without.embedded, without.remaining), (1, false));
+
+        let with = pass(&db, &embedder, ALL).await;
+        assert_eq!(with.embedded, 1, "the pre-boundary turn is reached");
+        assert_eq!(pending_count(&db, &cohere_any()).await.unwrap(), 0);
     }
 }

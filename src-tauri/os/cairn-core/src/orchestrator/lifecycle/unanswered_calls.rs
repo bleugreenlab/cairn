@@ -517,6 +517,22 @@ async fn recorded_calls(
     .await
 }
 
+/// The tool names of the calls `turn_id` of `run_id` has issued and not yet had
+/// answered, in transcript order: what the turn is doing between its tool
+/// boundaries. Empty while it is generating.
+pub(crate) async fn open_call_names(
+    db: &LocalDb,
+    run_id: &str,
+    turn_id: &str,
+) -> DbResult<Vec<String>> {
+    let (calls, completed) = recorded_calls(db, run_id, turn_id).await?;
+    Ok(calls
+        .into_iter()
+        .filter(|call| !completed.contains(&call.tool.id))
+        .map(|call| normalized_tool_name(&call.tool.name).to_string())
+        .collect())
+}
+
 async fn user_stop_results(
     orch: &Orchestrator,
     db: &LocalDb,

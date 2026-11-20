@@ -193,9 +193,14 @@ async fn purge_and_record(db: &LocalDb, space: &EmbedSpace) -> DbResult<Purged> 
                 params![model.as_str()],
             )
             .await?;
+            // The turn walks start over in the new space. Clearing them here,
+            // with the purge, means no pass can see the new space with the old
+            // space's cursors; the epoch discards a pass already in flight.
             conn.execute(
                 "UPDATE embedding_state
-                    SET provider = ?1, model = ?2, turn_dims = ?3, resource_dims = ?4
+                    SET provider = ?1, model = ?2, turn_dims = ?3, resource_dims = ?4,
+                        turn_walk_head = NULL, turn_walk_tail = NULL,
+                        turn_walk_open = '[]', turn_walk_epoch = turn_walk_epoch + 1
                   WHERE id = 1",
                 params![provider.as_str(), model.as_str(), turn_dims, resource_dims],
             )

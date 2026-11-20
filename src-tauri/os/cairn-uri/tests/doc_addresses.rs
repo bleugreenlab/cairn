@@ -2,8 +2,7 @@
 //! descriptions teach is one the grammar parses.
 //!
 //! Agents copy addresses out of these texts verbatim, so an address that names
-//! nothing in the grammar becomes an `Invalid resource URI` the moment it is
-//! followed. Templates are not addresses and are skipped by the few rules in
+//! nothing in the grammar becomes a refusal the moment it is followed. Templates are not addresses and are skipped by the few rules in
 //! [`is_template`]; a line that says an address is invalid is a counterexample,
 //! not a teaching, and is skipped too. `docs/plans/**` records proposals,
 //! legacy shapes included, and is not scanned.

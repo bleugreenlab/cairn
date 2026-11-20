@@ -790,9 +790,7 @@ async fn node_less_required_artifact_conn(
     let packet_artifact = match execution_id {
         Some(execution_id) => {
             crate::delegated_packets::find_by_result_job(conn, &execution_id, job_id)
-                .await
-                .ok()
-                .flatten()
+                .await?
                 .map(|packet| packet.output_contract.artifact_name())
         }
         None => None,
@@ -1854,7 +1852,8 @@ async fn execution_placement_conn(
     }
 }
 
-/// Terminalize a node-less delegated child job (an ephemeral call or a workflow)
+/// Terminalize a node-less delegated child job (an ephemeral call, a workflow,
+/// or a packet-less `create_child_task` sub-agent such as a cross-node task)
 /// directly from its turn + artifact facts.
 ///
 /// The execution sweep ([`recompute_execution_jobs_conn`]) only reduces jobs
@@ -1882,8 +1881,7 @@ pub async fn reduce_delegated_child_job_conn(
     let row = {
         let mut rows = conn
             .query(
-                "SELECT recipe_node_id, parent_job_id, status, execution_id, \
-                 agent_config_id, output_contract
+                "SELECT recipe_node_id, parent_job_id, status, execution_id, agent_config_id
                  FROM jobs WHERE id = ?1",
                 (job_id,),
             )
@@ -1897,19 +1895,11 @@ pub async fn reduce_delegated_child_job_conn(
                     r.text(2)?,
                     r.opt_text(3)?,
                     r.opt_text(4)?,
-                    r.opt_text(5)?,
                 ))
             })
             .transpose()?
     };
-    let Some((
-        recipe_node_id,
-        parent_job_id,
-        status_str,
-        execution_id,
-        agent_config_id,
-        output_contract_json,
-    )) = row
+    let Some((recipe_node_id, parent_job_id, status_str, execution_id, agent_config_id)) = row
     else {
         return Ok(None);
     };
@@ -1936,44 +1926,36 @@ pub async fn reduce_delegated_child_job_conn(
         return Ok(None);
     }
 
-    // Reduce only a child that IS the result target of a pre-materialized
-    // delegated packet (an ephemeral call or a workflow) — the exact set whose
-    // resume gate keys on this job's status. A packet-less node-less child (a
-    // `create_child_task` sub-agent) is left alone: it persists no output
-    // contract yet is still owed a fixed `result` artifact, so reducing it off an
-    // absent contract would derive `Complete` even when it never wrote `result`.
-    // Reading the required artifact name from the packet's own contract keeps the
-    // completion gate from ever drifting from the artifact the child must produce.
-    let Some(execution_id) = execution_id else {
+    // The artifact this job owes, from the contract that owns it: a packet's
+    // result target owes its packet's artifact, a packet-less child (a
+    // `create_child_task` sub-agent) owes the fixed `result`, and a standalone
+    // workflow owes its own persisted contract's artifact. The completion gate
+    // below requires that artifact, so a child that never wrote it derives
+    // Blocked, which this reducer never writes.
+    let Some(required_name) = node_less_required_artifact_conn(conn, job_id).await? else {
         return Ok(None);
-    };
-    // Resolve the required artifact name from the contract that owns it. A
-    // delegated child reads it off its pre-materialized packet (whose resume gate
-    // keys on this job's status); a standalone workflow reads it off its OWN
-    // persisted `output_contract`, since it carries no packet (no caller to
-    // resume). A packet-less node-less CHILD (a `create_child_task` sub-agent) is
-    // still left alone: it persists no contract yet is owed a fixed `result`, so
-    // reducing it off an absent contract would wrongly derive `Complete`.
-    let required_name = if is_standalone_workflow {
-        let Some(json) = output_contract_json else {
-            return Ok(None);
-        };
-        let contract: crate::models::DelegatedOutputContract =
-            serde_json::from_str(&json).map_err(|e| DbError::internal(e.to_string()))?;
-        contract.artifact_name()
-    } else {
-        let Some(packet) =
-            crate::delegated_packets::find_by_result_job(conn, &execution_id, job_id).await?
-        else {
-            return Ok(None);
-        };
-        packet.output_contract.artifact_name()
     };
     let requires_output = true;
     let artifact_present = artifact_fact(conn, job_id, Some(&required_name))
         .await?
         .is_some();
     let turn = turn_facts(conn, job_id).await?;
+    // Only an ephemeral call completes without a turn, and every call is its
+    // packet's result target. Any other turn-less child has no outcome to read
+    // yet, so it stays as it is.
+    if turn.work_state.is_none() && !is_standalone_workflow {
+        let is_packet_result = match execution_id.as_deref() {
+            Some(execution_id) => {
+                crate::delegated_packets::find_by_result_job(conn, execution_id, job_id)
+                    .await?
+                    .is_some()
+            }
+            None => false,
+        };
+        if !is_packet_result {
+            return Ok(None);
+        }
+    }
     let output_abandoned = output_abandoned_fact(conn, job_id).await?;
     // A node-less ephemeral CALL establishes no DB turn (unlike a workflow or a
     // task, which both run a real turn), so its completion cannot be read from
@@ -2038,9 +2020,9 @@ pub async fn reduce_delegated_child_job_conn(
     // caller's turn-end sweep instead; a standalone workflow has no caller, so
     // without this its anchor issue/execution would stay `running` forever after
     // the node terminalizes.
-    if is_standalone_workflow {
-        recompute_execution_status_conn(conn, &execution_id).await?;
-        if let Some(issue_id) = execution_issue_id_conn(conn, &execution_id).await? {
+    if let (true, Some(execution_id)) = (is_standalone_workflow, execution_id.as_deref()) {
+        recompute_execution_status_conn(conn, execution_id).await?;
+        if let Some(issue_id) = execution_issue_id_conn(conn, execution_id).await? {
             recompute_issue_status_conn(conn, &issue_id).await?;
         }
     }
@@ -2181,16 +2163,29 @@ pub async fn heal_stuck_delegated_children(runtime: &WorkflowRuntime) {
             .read(|conn| {
                 Box::pin(async move {
                     // Scope to the genuine hang: a node-less child whose latest
-                    // run is terminal AND whose parent is durably suspended on
-                    // the resume gate — its `current_turn_id` is either the
-                    // yielded dependency anchor (current shape) or a pending
-                    // successor written by an older build. This
-                    // deliberately excludes children whose caller already moved on
-                    // (e.g. a fast call resolved inline, parent `running` with no
-                    // pending successor), which need no wake.
+                    // run is terminal and either
+                    // - whose parent is durably suspended on the resume gate —
+                    //   its `current_turn_id` is the yielded dependency anchor
+                    //   (current shape) or a pending successor written by an
+                    //   older build; or
+                    // - that is packet-less (a `create_child_task` sub-agent):
+                    //   nobody waits on it, but with its run over no later turn
+                    //   end will ever settle it.
+                    // This deliberately excludes a packet-backed child whose
+                    // caller already moved on (e.g. a fast call resolved inline),
+                    // which needs no wake.
                     let mut rows = conn
                         .query(
-                            "SELECT j.id FROM jobs j
+                            "SELECT j.id, j.execution_id, EXISTS (
+                                   SELECT 1 FROM jobs pj
+                                   JOIN turns pt ON pt.id = pj.current_turn_id
+                                   WHERE pj.id = j.parent_job_id
+                                     AND (
+                                       (pt.state = 'yielded' AND pt.yield_reason = 'dependency_wait')
+                                       OR (pt.state = 'pending' AND pt.start_reason = 'dependency_unblock')
+                                     )
+                               )
+                             FROM jobs j
                              WHERE j.parent_job_id IS NOT NULL
                                AND j.recipe_node_id IS NULL
                                AND j.status IN ('running', 'pending', 'blocked')
@@ -2203,22 +2198,32 @@ pub async fn heal_stuck_delegated_children(runtime: &WorkflowRuntime) {
                                          WHERE job_id = j.id
                                          ORDER BY created_at DESC, rowid DESC LIMIT 1
                                      )
-                               )
-                               AND EXISTS (
-                                   SELECT 1 FROM jobs pj
-                                   JOIN turns pt ON pt.id = pj.current_turn_id
-                                   WHERE pj.id = j.parent_job_id
-                                     AND (
-                                       (pt.state = 'yielded' AND pt.yield_reason = 'dependency_wait')
-                                       OR (pt.state = 'pending' AND pt.start_reason = 'dependency_unblock')
-                                     )
                                )",
                             (),
                         )
                         .await?;
-                    let mut out = Vec::new();
+                    let mut candidates = Vec::new();
                     while let Some(row) = rows.next().await? {
-                        out.push(row.text(0)?);
+                        candidates.push((row.text(0)?, row.opt_text(1)?, row.i64(2)? != 0));
+                    }
+                    drop(rows);
+                    let mut out = Vec::new();
+                    for (job_id, execution_id, parent_parked) in candidates {
+                        let packet_less = match execution_id.as_deref() {
+                            Some(execution_id) => {
+                                crate::delegated_packets::find_by_result_job(
+                                    conn,
+                                    execution_id,
+                                    &job_id,
+                                )
+                                .await?
+                                .is_none()
+                            }
+                            None => true,
+                        };
+                        if parent_parked || packet_less {
+                            out.push(job_id);
+                        }
                     }
                     Ok(out)
                 })

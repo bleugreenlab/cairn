@@ -90,6 +90,7 @@ use super::rotation::{
     mint_turn, newest_turn_conn, note_turn, read_lane_turns_conn, release_order, Entry, LaneTurns,
     SHARED_LANE,
 };
+use crate::execution::jobs::liveness::{liveness, Liveness, ProcessReading, WorkObserver};
 use crate::models::{CapacityHold, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
@@ -515,6 +516,14 @@ pub(crate) enum Activity {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ParkCause {
     Stopped,
+    /// Its turn reads pending or running, but this host holds no process for
+    /// it and no launch: only a run row that still reads live, last updated
+    /// at this time. Unknown is not alive, so it takes no slot.
+    LivenessUnknown(i64),
+    /// A `pending` job with no turn in an execution that has already run
+    /// turns: a downstream node whose predecessors have not all finished,
+    /// which advancement has not claimed for launch.
+    AwaitingPredecessors,
     Operator,
     Supply,
     Dependencies,
@@ -533,20 +542,59 @@ pub(crate) struct ParkedWait {
     pub any_in_flight_wait: bool,
 }
 
+/// What this host observed of one job's work beside its rows
+/// ([`crate::execution::jobs::liveness`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorkEvidence {
+    /// A launch for the job is claimed or durably admitted.
+    pub launch_in_flight: bool,
+    pub process: ProcessReading,
+    /// The last update of its newest run that still reads live.
+    pub live_run_since: Option<i64>,
+    /// For a job with no turn: whether something owns its way to a launch
+    /// ([`WorkObserver::placed_for_launch`]).
+    pub placed_for_launch: bool,
+}
+
 /// Shared by fleet and focus admission. Unknown waits are not counted and are
 /// logged by the row reader. Yield reasons are exhaustive, so a new reason
-/// requires an explicit decision here. A dead process whose turn still says
-/// running counts until boot recovery or the liveness census corrects it.
+/// requires an explicit decision here.
+///
+/// A turn's state is a label, so a pending or running turn is work only when
+/// this host can see it: a process serving the job, or a launch for it in
+/// flight. A dead process behind a running turn, or one whose liveness is
+/// unknown, holds no slot; neither is resumed from here, since what to do
+/// with stopped work is the operator's call.
 pub(crate) fn job_activity(
     turn_state: Option<&str>,
     yield_reason: Option<&str>,
     wait: &ParkedWait,
+    evidence: &WorkEvidence,
 ) -> Result<Activity, String> {
+    // A launch reserves its execution from admission, before its turn or its
+    // process is visible, whatever the job's previous turn ended as.
+    if evidence.launch_in_flight {
+        return Ok(Activity::InFlight);
+    }
     match turn_state {
         Some("interrupted" | "cancelled" | "failed" | "complete") => {
             return Ok(Activity::Parked(ParkCause::Stopped));
         }
-        None | Some("pending" | "running") => return Ok(Activity::InFlight),
+        // A job placed and not yet launched has no turn until its launch
+        // prepares one. While something owns its way there (its release's
+        // owed advance, or this boot's claim) it holds its slot, so a burst of
+        // releases cannot overrun the fleet before what it released is
+        // launched. A turnless job nothing owns (a pending node behind
+        // predecessors, a predecessor host's claim, a failed launch) holds none.
+        None if evidence.placed_for_launch => return Ok(Activity::InFlight),
+        None => return Ok(Activity::Parked(ParkCause::AwaitingPredecessors)),
+        Some("pending" | "running") => {
+            return Ok(match liveness(&evidence.process, evidence.live_run_since) {
+                Liveness::Alive { .. } | Liveness::Busy => Activity::InFlight,
+                Liveness::Dead => Activity::Parked(ParkCause::Stopped),
+                Liveness::Unknown { since } => Activity::Parked(ParkCause::LivenessUnknown(since)),
+            });
+        }
         Some("yielded") => {}
         Some(other) => return Err(format!("turn:{other}")),
     }
@@ -617,10 +665,12 @@ pub fn unclassified_yield_counts() -> BTreeMap<String, u64> {
         .unwrap_or_default()
 }
 
-/// Both scopes select identical job/turn/wait facts. Only scope membership
-/// differs: a runner's executions versus a thread's open direct children.
+/// Every scope selects identical job/turn/wait/run facts. Only scope
+/// membership differs: a runner's executions, a thread's open direct
+/// children, one issue, or one job.
 macro_rules! activity_job_columns_sql {
     () => {
+        concat!(
         "SELECT e.id, j.id, e.issue_id, t.state, t.yield_reason,
             (SELECT json_extract(aw.condition_json, '$.kind') FROM agent_waits aw
               WHERE aw.job_id = j.id AND aw.state IN ('pending', 'resolving')
@@ -636,7 +686,20 @@ macro_rules! activity_job_columns_sql {
                 AND (json_extract(aw.condition_json, '$.kind') IN ('terminal', 'run_batch', 'mcp_continuation')
                      OR (json_extract(aw.condition_json, '$.kind') = 'duration'
                          AND aw.deadline_ms - aw.created_at BETWEEN 0 AND 300000))),
-            i.number "
+            i.number, j.current_session_id, t.run_id, ",
+        crate::execution::jobs::liveness::live_run_id_sql!(),
+        ", ",
+        crate::execution::jobs::liveness::live_run_since_sql!(),
+        ", j.status, j.started_at,
+            j.started_at IS NOT NULL AND EXISTS (SELECT 1 FROM runs ended_run
+              WHERE ended_run.job_id = j.id
+                AND ended_run.status NOT IN ('starting', 'live')
+                AND ended_run.updated_at >= j.started_at),
+            NOT EXISTS (SELECT 1 FROM jobs started_job
+              WHERE started_job.execution_id = j.execution_id
+                AND started_job.current_turn_id IS NOT NULL),
+            j.created_at "
+        )
     };
 }
 
@@ -673,10 +736,22 @@ macro_rules! focus_jobs_sql {
 pub(super) const THREAD_JOBS_SQL: &str = focus_jobs_sql!("i.parent_thread_id = ?1");
 const ISSUE_JOBS_SQL: &str = focus_jobs_sql!("i.id = ?1");
 
+/// One job's activity, whether or not it may hold a slot: what a surface
+/// describing that job reads, so it says what the caps would count.
+pub(super) const JOB_ACTIVITY_SQL: &str = concat!(
+    activity_job_columns_sql!(),
+    "FROM jobs j
+       LEFT JOIN executions e ON e.id = j.execution_id
+       LEFT JOIN issues i ON i.id = e.issue_id
+       LEFT JOIN turns t ON t.id = j.current_turn_id
+      WHERE j.id = ?1"
+);
+
 pub(crate) enum ActivityScope<'a> {
     Device(&'a str),
     Thread(&'a str),
     Issue(&'a str),
+    Job(&'a str),
 }
 
 #[derive(Debug, Clone, Hash)]
@@ -690,40 +765,73 @@ pub(crate) struct ActivityJobRow {
 }
 
 /// The common reader also records unknown kinds, irrespective of which cap
-/// encountered them. UI standings can retain the named parked cause.
+/// encountered them. UI standings can retain the named parked cause. Every
+/// row is classified against `observer`, one observation for the whole read.
 pub(crate) async fn activity_job_rows_conn(
     conn: &crate::storage::TrackedConnection,
     scope: ActivityScope<'_>,
+    observer: &WorkObserver,
 ) -> DbResult<Vec<ActivityJobRow>> {
     let (sql, scope) = match scope {
         ActivityScope::Device(device) => (FLEET_JOBS_SQL, device),
         ActivityScope::Thread(thread) => (THREAD_JOBS_SQL, thread),
         ActivityScope::Issue(issue) => (ISSUE_JOBS_SQL, issue),
+        ActivityScope::Job(job) => (JOB_ACTIVITY_SQL, job),
     };
     let mut rows = conn.query(sql, params![scope]).await?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await? {
+        let job_id = row.text(1)?;
+        let turn_state = row.opt_text(3)?;
         let wait = ParkedWait {
             kind: row.opt_text(5)?,
             deadline_ms: row.opt_i64(6)?,
             created_at_ms: row.opt_i64(7)?,
             any_in_flight_wait: row.i64(8)? != 0,
         };
+        let (session, turn_run, live_run) =
+            (row.opt_text(10)?, row.opt_text(11)?, row.opt_text(12)?);
+        let runs = [turn_run.as_deref(), live_run.as_deref()];
+        let launch_in_flight = observer.launch_in_flight(&job_id, &runs);
+        // Only a pending or running turn's standing rests on a process, so
+        // only those consult the registry.
+        let process =
+            if !launch_in_flight && matches!(turn_state.as_deref(), Some("pending" | "running")) {
+                observer.process(session.as_deref(), &runs)
+            } else {
+                ProcessReading::Absent
+            };
+        let evidence = WorkEvidence {
+            launch_in_flight,
+            process,
+            live_run_since: row.opt_i64(13)?,
+            placed_for_launch: turn_state.is_none()
+                && observer.placed_for_launch(
+                    &row.text(14)?,
+                    row.opt_i64(15)?,
+                    row.i64(16)? != 0,
+                    row.opt_text(0)?.as_deref().unwrap_or_default(),
+                    row.i64(17)? != 0,
+                    row.opt_i64(18)?,
+                ),
+        };
         let activity = job_activity(
-            row.opt_text(3)?.as_deref(),
+            turn_state.as_deref(),
             row.opt_text(4)?.as_deref(),
             &wait,
+            &evidence,
         )
         .unwrap_or_else(|reason| {
             note_unclassified(&reason);
             Activity::Parked(ParkCause::Unclassified(reason))
         });
         out.push(ActivityJobRow {
-            execution_id: row.text(0)?,
-            job_id: row.text(1)?,
+            // A job outside any execution is described, never counted.
+            execution_id: row.opt_text(0)?.unwrap_or_default(),
+            job_id,
             issue_id: row.opt_text(2)?,
             number: row.opt_i64(9)?,
-            has_turn: row.opt_text(3)?.is_some(),
+            has_turn: turn_state.is_some(),
             activity,
         });
     }
@@ -741,10 +849,14 @@ pub struct FleetLoad {
 /// Count executions in progress across every open database.
 pub async fn fleet_load(orch: &Orchestrator) -> Result<FleetLoad, String> {
     let working = fleet_working(orch).await?;
-    Ok(FleetLoad {
+    Ok(load_of(&working))
+}
+
+fn load_of(working: &FleetWorking) -> FleetLoad {
+    FleetLoad {
         in_progress: working.len(),
         waiting_for_machine: working.values().filter(|placing| **placing).count(),
-    })
+    }
 }
 
 /// Whether work held for want of supply on `execution_id` may run now that
@@ -830,19 +942,30 @@ pub(crate) fn fleet_scans_on_this_thread() -> u64 {
 
 /// Count the fleet: one [`FLEET_JOBS_SQL`] scan of every open database. This
 /// is the expensive read behind both caps' fleet half, so a caller deciding
-/// many things at once counts once and carries the result.
+/// many things at once counts once and carries the result. The count is of
+/// work this host can observe, read once for the whole count
+/// ([`WorkObserver::read`]: one admission read of this host's database).
 pub(crate) async fn fleet_working(orch: &Orchestrator) -> Result<FleetWorking, String> {
+    let observer = WorkObserver::read(orch).await?;
+    fleet_working_observed(orch, &observer).await
+}
+
+async fn fleet_working_observed(
+    orch: &Orchestrator,
+    observer: &WorkObserver,
+) -> Result<FleetWorking, String> {
     let device = orch.anon_device_manager.device_id();
     let waiting_jobs = orch.fleet.jobs_waiting_for_a_machine();
     let mut working: FleetWorking = HashMap::new();
     for db in orch.db.all_dbs().await {
         FLEET_SCANS.with(|scans| scans.set(scans.get() + 1));
         let device = device.clone();
+        let observer = observer.clone();
         let rows = db
             .read(move |conn| {
-                let device = device.clone();
+                let (device, observer) = (device.clone(), observer.clone());
                 Box::pin(async move {
-                    activity_job_rows_conn(conn, ActivityScope::Device(&device)).await
+                    activity_job_rows_conn(conn, ActivityScope::Device(&device), &observer).await
                 })
             })
             .await
@@ -889,8 +1012,9 @@ async fn thread_of_issue_conn(
 pub(crate) async fn active_thread_children_conn(
     conn: &crate::storage::TrackedConnection,
     thread_id: &str,
+    observer: &WorkObserver,
 ) -> DbResult<Vec<(i64, String)>> {
-    let rows = activity_job_rows_conn(conn, ActivityScope::Thread(thread_id)).await?;
+    let rows = activity_job_rows_conn(conn, ActivityScope::Thread(thread_id), observer).await?;
     let mut active = BTreeMap::new();
     for row in rows {
         if row.activity == Activity::InFlight {
@@ -917,9 +1041,10 @@ pub struct ThreadFacts {
 pub(crate) async fn thread_facts_conn(
     conn: &crate::storage::TrackedConnection,
     thread_id: &str,
+    observer: &WorkObserver,
 ) -> DbResult<ThreadFacts> {
     let open_prs = super::open_prs::children_conn(conn, thread_id).await?;
-    let in_flight = activity_job_rows_conn(conn, ActivityScope::Thread(thread_id))
+    let in_flight = activity_job_rows_conn(conn, ActivityScope::Thread(thread_id), observer)
         .await?
         .into_iter()
         .filter(|row| row.activity == Activity::InFlight)
@@ -994,16 +1119,53 @@ async fn focus_admits_inner(
     exclude_job: Option<&str>,
     known: Option<Arc<ThreadFacts>>,
 ) -> Result<bool, String> {
+    let limit = orch.get_settings().max_open_children_per_thread.max(1) as usize;
+    // An observation is read only when this decision must count the thread's
+    // jobs itself: a pass deciding many holds carries the thread's facts, so it
+    // reads none per hold. The decision says when it needs one (`None`), and is
+    // taken again with it.
+    let mut observer: Option<WorkObserver> = None;
+    loop {
+        let decided = focus_decision(
+            db,
+            execution_id,
+            hold_id,
+            exclude_job,
+            known.clone(),
+            observer.clone(),
+            limit,
+        )
+        .await
+        .map_err(|error| format!("failed to decide thread focus: {error}"))?;
+        match decided {
+            Some(admits) => return Ok(admits),
+            None if observer.is_none() => observer = Some(WorkObserver::read(orch).await?),
+            None => return Err("thread focus needed an observation twice".to_string()),
+        }
+    }
+}
+
+/// [`focus_admits_inner`]'s one read: `None` when it must count the thread's
+/// jobs and was given no observation to count them against.
+async fn focus_decision(
+    db: &LocalDb,
+    execution_id: &str,
+    hold_id: Option<&str>,
+    exclude_job: Option<&str>,
+    known: Option<Arc<ThreadFacts>>,
+    observer: Option<WorkObserver>,
+    limit: usize,
+) -> DbResult<Option<bool>> {
     let execution_id = execution_id.to_string();
     let hold_id = hold_id.map(str::to_string);
     let exclude_job = exclude_job.map(str::to_string);
-    let limit = orch.get_settings().max_open_children_per_thread.max(1) as usize;
     db.read(move |conn| {
-        let (execution_id, hold_id, exclude_job, known) = (
+        let (execution_id, hold_id, exclude_job, known, observer) = (
             execution_id.clone(),
             hold_id.clone(),
             exclude_job.clone(),
             known.clone(),
+            observer.clone(),
         );
         Box::pin(async move {
             let mut rows = conn
@@ -1016,28 +1178,32 @@ async fn focus_admits_inner(
                 )
                 .await?;
             let Some(row) = rows.next().await? else {
-                return Ok(true);
+                return Ok(Some(true));
             };
             let issue_id = row.opt_text(0)?;
             let operator_started = row.i64(1)? != 0;
             drop(rows);
             if operator_started {
-                return Ok(true);
+                return Ok(Some(true));
             }
             let Some(issue_id) = issue_id else {
-                return Ok(true);
+                return Ok(Some(true));
             };
             let Some(thread) = thread_of_issue_conn(conn, &issue_id).await? else {
-                return Ok(true);
+                return Ok(Some(true));
             };
-            let rows = match known
-                .as_deref()
-                .filter(|facts| facts.thread_id == thread.thread_id)
-            {
-                Some(facts) => facts.in_flight.clone(),
-                None => {
-                    activity_job_rows_conn(conn, ActivityScope::Thread(&thread.thread_id)).await?
+            let rows = match (
+                known
+                    .as_deref()
+                    .filter(|facts| facts.thread_id == thread.thread_id),
+                observer.as_ref(),
+            ) {
+                (Some(facts), _) => facts.in_flight.clone(),
+                (None, Some(observer)) => {
+                    activity_job_rows_conn(conn, ActivityScope::Thread(&thread.thread_id), observer)
+                        .await?
                 }
+                (None, None) => return Ok(None),
             };
             let active: HashSet<String> = rows
                 .into_iter()
@@ -1049,10 +1215,10 @@ async fn focus_admits_inner(
                     .filter_map(|row| row.issue_id)
                     .collect();
             if active.contains(&issue_id) {
-                return Ok(true);
+                return Ok(Some(true));
             }
             if active.len() >= limit {
-                return Ok(false);
+                return Ok(Some(false));
             }
             let mut rows = conn
                 .query(
@@ -1074,13 +1240,12 @@ async fn focus_admits_inner(
                 )
                 .await?;
             match rows.next().await? {
-                Some(row) => Ok(row.i64(0)? == 0),
-                None => Ok(true),
+                Some(row) => Ok(Some(row.i64(0)? == 0)),
+                None => Ok(Some(true)),
             }
         })
     })
     .await
-    .map_err(|error| format!("failed to decide thread focus: {error}"))
 }
 
 /// Every unsatisfied capacity row in one database, with what the queue needs
@@ -1190,6 +1355,7 @@ async fn starts_facts_conn(
     conn: &crate::storage::TrackedConnection,
     wanted: &[WantedStart],
     mut known: HashSet<String>,
+    observer: &WorkObserver,
 ) -> DbResult<StartsFacts> {
     let executions: Vec<&str> = wanted
         .iter()
@@ -1254,7 +1420,7 @@ async fn starts_facts_conn(
         if known.insert(thread.thread_id.clone()) {
             facts.children.push(ThreadChildren {
                 thread_id: thread.thread_id.clone(),
-                active: active_thread_children_conn(conn, &thread.thread_id).await?,
+                active: active_thread_children_conn(conn, &thread.thread_id, observer).await?,
                 reentries: thread_reentries_conn(conn, &thread.thread_id).await?,
             });
         }
@@ -1430,10 +1596,12 @@ impl QueueSnapshot {
         let reading = |error: crate::storage::DbError| format!("failed to read the queue: {error}");
         let settings = orch.get_settings();
         let device = orch.anon_device_manager.device_id();
+        // One observation for the fleet count and every thread's children.
+        let observer = WorkObserver::read(orch).await?;
         let mut snapshot = Self {
             fleet_limit: settings.max_concurrent_executions.max(1) as usize,
             thread_limit: settings.max_open_children_per_thread.max(1) as usize,
-            load: fleet_load(orch).await?,
+            load: load_of(&fleet_working_observed(orch, &observer).await?),
             stored: HashMap::new(),
             fleet_line: HashMap::new(),
             thread_lines: HashMap::new(),
@@ -1479,6 +1647,7 @@ impl QueueSnapshot {
         }
         for (db, wanted) in groups {
             let known: HashSet<String> = snapshot.active_children.keys().cloned().collect();
+            let observer = observer.clone();
             let StartsFacts {
                 devices,
                 issues,
@@ -1487,8 +1656,11 @@ impl QueueSnapshot {
                 turns,
             } = db
                 .read(move |conn| {
-                    let (wanted, known) = (wanted.clone(), known.clone());
-                    Box::pin(async move { starts_facts_conn(conn, &wanted, known).await })
+                    let (wanted, known, observer) =
+                        (wanted.clone(), known.clone(), observer.clone());
+                    Box::pin(
+                        async move { starts_facts_conn(conn, &wanted, known, &observer).await },
+                    )
                 })
                 .await
                 .map_err(reading)?;
@@ -1934,9 +2106,10 @@ pub(crate) async fn decide_with_thread(
     let mut snapshot = QueueSnapshot::load(orch, std::slice::from_ref(&start)).await?;
     if !snapshot.issues.contains_key(issue_id) {
         let (issue, thread) = (issue_id.to_string(), thread_id.to_string());
+        let observer = WorkObserver::read(orch).await?;
         let read = db
             .read(move |conn| {
-                let (issue, thread) = (issue.clone(), thread.clone());
+                let (issue, thread, observer) = (issue.clone(), thread.clone(), observer.clone());
                 Box::pin(async move {
                     let mut rows = conn.query(
                     "SELECT t.name,i.number FROM threads t,issues i WHERE t.id=?1 AND i.id=?2",
@@ -1951,8 +2124,9 @@ pub(crate) async fn decide_with_thread(
                         number: row.i64(1)?,
                     };
                     drop(rows);
-                    let mut active = active_thread_children_conn(conn, &thread).await?;
-                    let own = activity_job_rows_conn(conn, ActivityScope::Issue(&issue)).await?;
+                    let mut active = active_thread_children_conn(conn, &thread, &observer).await?;
+                    let own = activity_job_rows_conn(conn, ActivityScope::Issue(&issue), &observer)
+                        .await?;
                     if own.iter().any(|row| row.activity == Activity::InFlight)
                         && !active.iter().any(|(_, id)| id == &issue)
                     {
@@ -2480,15 +2654,19 @@ pub(crate) mod tests {
             ).await.unwrap();
         }
         if parallel {
-            env.db.execute_script(
-                "INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id,
-                                  node_name, status, created_at, updated_at)
-                   VALUES('capacity-parallel','se100','parallel','si100','p','parallel','running',1,1);
+            env.db
+                .execute_script(
+                    "INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id,
+                                  node_name, status, started_at, created_at, updated_at)
+                   VALUES('capacity-parallel','se100','parallel','si100','p','parallel','running',
+                          CAST(strftime('%s', 'now') AS INTEGER),1,1);
                  INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason,
                                    created_at, updated_at)
                    VALUES('capacity-parallel-turn','parallel-session','capacity-parallel',1,
-                          'running','initial',1,1);"
-            ).await.unwrap();
+                          'running','initial',1,1);",
+                )
+                .await
+                .unwrap();
         }
     }
 
@@ -2514,8 +2692,10 @@ pub(crate) mod tests {
             let env = env("failed-capacity-settlement.db").await;
             let baseline = fleet(&env).await;
             seed_failed_capacity_dag(&env, with_planner, false).await;
-            assert_eq!(fleet(&env).await, baseline + 1);
-            assert_eq!(open_children(&env, 100).await, vec![100]);
+            // Its pending nodes wait on a predecessor that failed, so they hold
+            // no slot even before settlement marks them failed.
+            assert_eq!(fleet(&env).await, baseline);
+            assert!(open_children(&env, 100).await.is_empty());
             settle_failed_capacity_dag(&env).await;
             assert_eq!(fleet(&env).await, baseline);
             assert!(open_children(&env, 100).await.is_empty());
@@ -2577,8 +2757,10 @@ pub(crate) mod tests {
             .execute_script("UPDATE jobs SET status='failed' WHERE id='sj100';")
             .await
             .unwrap();
-        assert_eq!(fleet(&env).await, baseline + 1);
-        assert_eq!(open_children(&env, 100).await, vec![100]);
+        // Pending nodes behind the failed one are not placed, so they hold no
+        // slot before healing either.
+        assert_eq!(fleet(&env).await, baseline);
+        assert!(open_children(&env, 100).await.is_empty());
         for pass in 0..2 {
             let outcome = env
                 .db
@@ -2650,8 +2832,9 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    /// An issue with a started execution whose one job `sj{number}` has
-    /// `status`: what the fleet and the thread see as work already under way.
+    /// An issue with an execution started this boot whose one job `sj{number}`
+    /// has `status`: what the fleet and the thread see as work already under
+    /// way, or, while it has no turn, on its way to a launch.
     pub(crate) async fn add_started(env: &Env, number: i32, thread: Option<&str>, status: &str) {
         add_issue(env, number, thread).await;
         env.db
@@ -2660,8 +2843,11 @@ pub(crate) mod tests {
                  INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                    VALUES('se{number}', 'recipe', 'si{number}', 'p', 'running', 1, 1);
                  INSERT INTO jobs(id, execution_id, project_id, issue_id, node_name, status,
-                                  created_at, updated_at)
-                   VALUES('sj{number}', 'se{number}', 'p', 'si{number}', 'builder', '{status}', 1, 1);"
+                                  started_at, created_at, updated_at)
+                   VALUES('sj{number}', 'se{number}', 'p', 'si{number}', 'builder', '{status}',
+                          CASE WHEN '{status}' = 'running'
+                               THEN CAST(strftime('%s', 'now') AS INTEGER) END,
+                          CAST(strftime('%s', 'now') AS INTEGER), 1);"
             ))
             .await
             .unwrap();
@@ -2685,6 +2871,21 @@ pub(crate) mod tests {
                  UPDATE jobs SET current_turn_id = 'st{number}' WHERE id = 'sj{number}';"
             ))
             .await
+            .unwrap();
+    }
+
+    /// Register a process serving job `sj{number}`'s session on its run, as a
+    /// launched turn has: the evidence that makes a running turn work.
+    pub(crate) fn serving(env: &Env, number: i32) {
+        env.orch
+            .process_state
+            .register_process(
+                format!("sr{number}"),
+                crate::agent_process::process::RunHandle::test_handle(
+                    Some(&format!("ss{number}")),
+                    Some(&format!("sj{number}")),
+                ),
+            )
             .unwrap();
     }
 
@@ -2721,18 +2922,21 @@ pub(crate) mod tests {
 
     async fn open_children(env: &Env, issue_number: i32) -> Vec<i64> {
         let issue_id = format!("si{issue_number}");
+        let observer = WorkObserver::read(&env.orch).await.unwrap();
         env.db
             .read(move |conn| {
-                let issue_id = issue_id.clone();
+                let (issue_id, observer) = (issue_id.clone(), observer.clone());
                 Box::pin(async move {
                     let Some(thread) = thread_of_issue_conn(conn, &issue_id).await? else {
                         return Ok(Vec::new());
                     };
-                    Ok(active_thread_children_conn(conn, &thread.thread_id)
-                        .await?
-                        .into_iter()
-                        .map(|(number, _)| number)
-                        .collect())
+                    Ok(
+                        active_thread_children_conn(conn, &thread.thread_id, &observer)
+                            .await?
+                            .into_iter()
+                            .map(|(number, _)| number)
+                            .collect(),
+                    )
                 })
             })
             .await
@@ -3302,6 +3506,8 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+        serving(&env, 103);
+        serving(&env, 104);
         assert_eq!(fleet(&env).await, 8);
         sweep_at(&env.orch, now()).await.unwrap();
         for number in [103, 104] {
@@ -3961,6 +4167,10 @@ pub(crate) mod tests {
                 }
             } else {
                 turn(&env, number, state, reason).await;
+                // A pending or running turn is work when a process serves it.
+                if matches!(state, "pending" | "running") {
+                    serving(&env, number);
+                }
             }
             if counted {
                 expected.push(i64::from(number));
@@ -4035,8 +4245,9 @@ pub(crate) mod tests {
         env.db
             .execute_script(
                 "INSERT INTO jobs(id,execution_id,project_id,issue_id,node_name,status,
-                              parent_job_id,created_at,updated_at)
-               VALUES('task106','se106','p','si106','task','running','sj106',1,1);",
+                              parent_job_id,started_at,created_at,updated_at)
+               VALUES('task106','se106','p','si106','task','running','sj106',
+                      CAST(strftime('%s', 'now') AS INTEGER),1,1);",
             )
             .await
             .unwrap();
@@ -4044,7 +4255,11 @@ pub(crate) mod tests {
         assert_eq!(fleet(&env).await, expected.len());
         assert_eq!(open_children(&env, 106).await, expected);
 
-        for (scope, sql) in [("fleet", FLEET_JOBS_SQL), ("thread", THREAD_JOBS_SQL)] {
+        for (scope, sql) in [
+            ("fleet", FLEET_JOBS_SQL),
+            ("thread", THREAD_JOBS_SQL),
+            ("job", JOB_ACTIVITY_SQL),
+        ] {
             let sql = format!("EXPLAIN QUERY PLAN {sql}");
             let plan = env
                 .db
@@ -4058,9 +4273,16 @@ pub(crate) mod tests {
                         "SCAN j",
                         "SCAN t",
                         "SCAN aw",
+                        "SCAN e",
+                        "SCAN i",
+                        "SCAN live_run",
+                        "SCAN ended_run",
+                        "SCAN thread_host_job",
                         "SCAN jobs",
                         "SCAN turns",
-                        "SCAN agent_waits"
+                        "SCAN agent_waits",
+                        "SCAN executions",
+                        "SCAN runs"
                     ]
                     .iter()
                     .any(|scan| detail == scan || detail.starts_with(&format!("{scan} "))),
@@ -4068,6 +4290,26 @@ pub(crate) mod tests {
                 );
             }
         }
+        // The observation's owed-advance read seeks the outbox by kind.
+        let plan = env
+            .db
+            .query_all(
+                format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    crate::execution::jobs::liveness::ADVANCING_EXECUTIONS_SQL
+                ),
+                (),
+                |row| row.text(3),
+            )
+            .await
+            .unwrap();
+        println!("owed advances query plan:\n{}", plan.join("\n"));
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.starts_with("SCAN effect_outbox")
+                    || detail.contains("USING COVERING INDEX")),
+            "{plan:?}"
+        );
     }
 
     #[tokio::test]
@@ -4136,6 +4378,7 @@ pub(crate) mod tests {
         // Actual work on another node of the same execution does count.
         add_started(&env, 106, Some("th"), "running").await;
         turn(&env, 106, "running", None).await;
+        serving(&env, 106);
         env.db
             .execute_script(
                 "UPDATE jobs SET execution_id='se105',issue_id='si105' WHERE id='sj106';",
@@ -4337,6 +4580,7 @@ pub(crate) mod tests {
         impl<T: ?Sized> NotDefault<()> for T {}
         impl<T: Default> NotDefault<u8> for T {}
         let _ = <crate::execution::jobs::WakeCause as NotDefault<_>>::witness;
+        let none = WorkEvidence::default();
         use TurnYieldReason::*;
         let all = [
             UserInput,
@@ -4352,7 +4596,7 @@ pub(crate) mod tests {
                 ..ParkedWait::default()
             };
             assert!(
-                job_activity(Some("yielded"), Some(&reason.to_string()), &wait).is_ok(),
+                job_activity(Some("yielded"), Some(&reason.to_string()), &wait, &none).is_ok(),
                 "{reason} is unclassified"
             );
         }
@@ -4368,7 +4612,7 @@ pub(crate) mod tests {
                 ..ParkedWait::default()
             };
             assert!(
-                job_activity(Some("yielded"), Some("wait"), &wait).is_ok(),
+                job_activity(Some("yielded"), Some("wait"), &wait, &none).is_ok(),
                 "wait:{kind}"
             );
         }
@@ -4378,7 +4622,8 @@ pub(crate) mod tests {
             &ParkedWait {
                 kind: Some("something_new".to_string()),
                 ..ParkedWait::default()
-            }
+            },
+            &none,
         )
         .is_err());
         assert_eq!(
@@ -4389,7 +4634,8 @@ pub(crate) mod tests {
                     kind: Some("duration".to_string()),
                     any_in_flight_wait: true,
                     ..ParkedWait::default()
-                }
+                },
+                &none,
             ),
             Ok(Activity::InFlight),
             "a newer duration wait does not hide a parked run batch beside it"
@@ -4397,13 +4643,93 @@ pub(crate) mod tests {
         assert!(job_activity(
             Some("yielded"),
             Some("a_new_reason"),
-            &ParkedWait::default()
+            &ParkedWait::default(),
+            &none,
         )
         .is_err());
+    }
+
+    /// A pending or running turn is work only on evidence; a terminal head is
+    /// stopped unless a launch has claimed the job again; a job with no turn
+    /// yet keeps the slot it was placed in.
+    #[test]
+    fn a_turn_label_counts_only_on_evidence() {
+        let wait = ParkedWait::default();
+        let with = |launch_in_flight, process, live_run_since| WorkEvidence {
+            launch_in_flight,
+            process,
+            live_run_since,
+            placed_for_launch: false,
+        };
+        let serving = with(false, ProcessReading::Serving, None);
+        let warm = with(false, ProcessReading::Warm { run_id: "r".into() }, None);
+        let unreadable = with(false, ProcessReading::Unreadable, None);
+        let dead = with(false, ProcessReading::Absent, None);
+        let unknown = with(false, ProcessReading::Absent, Some(7));
+        let launching = with(true, ProcessReading::Absent, Some(7));
+        for state in ["pending", "running"] {
+            for evidence in [&serving, &warm, &unreadable, &launching] {
+                assert_eq!(
+                    job_activity(Some(state), None, &wait, evidence),
+                    Ok(Activity::InFlight),
+                    "{state} {evidence:?}"
+                );
+            }
+            assert_eq!(
+                job_activity(Some(state), None, &wait, &dead),
+                Ok(Activity::Parked(ParkCause::Stopped)),
+                "{state}: dead"
+            );
+            assert_eq!(
+                job_activity(Some(state), None, &wait, &unknown),
+                Ok(Activity::Parked(ParkCause::LivenessUnknown(7))),
+                "{state}: a live run row alone is unknown, and unknown is not alive"
+            );
+        }
+        for state in ["interrupted", "cancelled", "failed", "complete"] {
+            assert_eq!(
+                job_activity(Some(state), None, &wait, &warm),
+                Ok(Activity::Parked(ParkCause::Stopped)),
+                "{state}: an idle warm process behind a stopped turn is not work"
+            );
+            assert_eq!(
+                job_activity(Some(state), None, &wait, &launching),
+                Ok(Activity::InFlight),
+                "{state}: a launch in flight reserves the slot"
+            );
+        }
+        let placed = WorkEvidence {
+            placed_for_launch: true,
+            ..dead.clone()
+        };
         assert_eq!(
-            job_activity(Some("running"), None, &ParkedWait::default()),
-            Ok(Activity::InFlight)
+            job_activity(None, None, &wait, &placed),
+            Ok(Activity::InFlight),
+            "a placed job keeps its slot until its launch prepares a turn"
         );
+        assert_eq!(
+            job_activity(None, None, &wait, &dead),
+            Ok(Activity::Parked(ParkCause::AwaitingPredecessors)),
+            "a pending node behind predecessors that ran is not placed"
+        );
+        assert_eq!(
+            job_activity(None, None, &wait, &launching),
+            Ok(Activity::InFlight),
+            "unless a launch for it is in flight"
+        );
+        // Machine waits count whatever the process: a parked process is
+        // released while its batch or terminal runs.
+        for kind in ["run_batch", "terminal", "mcp_continuation"] {
+            let wait = ParkedWait {
+                kind: Some(kind.to_string()),
+                ..ParkedWait::default()
+            };
+            assert_eq!(
+                job_activity(Some("yielded"), Some("wait"), &wait, &dead),
+                Ok(Activity::InFlight),
+                "{kind}"
+            );
+        }
     }
 
     /// The caps gate starts only. Placement and per-machine admission must
@@ -4608,6 +4934,360 @@ pub(crate) mod tests {
         assert_eq!(
             decode_hold(THREAD_FOCUS_FACT, &encode_hold(&thread)),
             Some(thread)
+        );
+    }
+
+    // -- a slot is held by work, not by a label (cairn/6265) ----------------
+
+    /// With one slot free, issue 100's placed job takes it and issue 1 queues
+    /// behind it for a fleet slot. Returns the fleet count before issue 100
+    /// and the queued execution.
+    async fn queued_behind_100(env: &Env) -> (usize, String) {
+        let baseline = fleet(env).await;
+        caps(env, baseline as i32 + 1, 50);
+        add_started(env, 100, None, "running").await;
+        assert_eq!(
+            fleet(env).await,
+            baseline + 1,
+            "a placed job holds its slot"
+        );
+        file(env, 1, json!([])).await.unwrap();
+        assert!(is_held(env, 1).await, "queued for a fleet slot");
+        (baseline, execution(env, 1).await.0)
+    }
+
+    /// Job `sj100`'s head turn is `state`, ended for `end_reason`, on a run
+    /// that reads `run_status`, while the job's own label still reads
+    /// `running`: the shape a slot took when held by work that had stopped.
+    async fn head_of_100(env: &Env, state: &str, end_reason: Option<&str>, run_status: &str) {
+        turn(env, 100, state, None).await;
+        let reason = end_reason.map_or("NULL".to_string(), |reason| format!("'{reason}'"));
+        let ended = if matches!(state, "pending" | "running") {
+            "NULL"
+        } else {
+            "2"
+        };
+        env.db
+            .execute_script(format!(
+                "UPDATE turns SET end_reason = {reason}, started_at = 1, ended_at = {ended}
+                  WHERE id = 'st100';
+                 UPDATE runs SET status = '{run_status}', updated_at = 2 WHERE id = 'sr100';
+                 UPDATE jobs SET current_session_id = 'ss100' WHERE id = 'sj100';"
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// Everything durable about job `sj100` that a read or a sweep could
+    /// rewrite, resume or relaunch.
+    async fn durable_100(env: &Env) -> (String, String, String) {
+        env.db
+            .query_one(
+                "SELECT (SELECT status FROM jobs WHERE id = 'sj100'),
+                        (SELECT GROUP_CONCAT(id || ':' || state, ',') FROM turns WHERE job_id = 'sj100'),
+                        (SELECT GROUP_CONCAT(id || ':' || status, ',') FROM runs WHERE job_id = 'sj100')",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A job that reads `running` while nothing runs it holds no slot, and the
+    /// ordinary sweep releases the next queued execution into it. Nothing is
+    /// resumed, relaunched or relabelled by the reads: the operator owns that.
+    #[tokio::test]
+    async fn a_job_whose_work_stopped_frees_its_slot_and_the_queue_releases_into_it() {
+        for (name, state, end_reason, run_status) in [
+            ("interrupted", "interrupted", Some("crash"), "crashed"),
+            // A queued turn cancelled before it started, not a claimed successor.
+            ("orphaned", "cancelled", Some("orphaned_pending"), "exited"),
+            ("failed", "failed", Some("provider_failure"), "crashed"),
+            // A turn that still reads running, with no process and no live run.
+            ("dead", "running", None, "exited"),
+            // ... and with a run row that still reads live: unknown, not alive.
+            ("unknown", "running", None, "live"),
+        ] {
+            let mut env = env(&format!("cap-stopped-{name}.db")).await;
+            let (baseline, queued) = queued_behind_100(&env).await;
+            advanced(&mut env);
+            head_of_100(&env, state, end_reason, run_status).await;
+            let before = durable_100(&env).await;
+            assert_eq!(
+                fleet(&env).await,
+                baseline,
+                "{name}: work that stopped holds no slot"
+            );
+            let report = sweep_at(&env.orch, now()).await.unwrap();
+            assert_eq!(report.released, vec![queued.clone()], "{name}");
+            assert!(jobs_of(&env, &queued).await > 0, "{name}: released");
+            assert_eq!(
+                advanced(&mut env),
+                vec![queued.clone()],
+                "{name}: only the released execution advances"
+            );
+            assert_eq!(
+                durable_100(&env).await,
+                before,
+                "{name}: nothing resumed, relaunched or relabelled the stopped job"
+            );
+            assert_eq!(
+                count(
+                    &env,
+                    "SELECT COUNT(*) FROM effect_outbox
+                      WHERE dedupe_key IN ('se100', 'sj100') OR payload_json LIKE '%sj100%'"
+                )
+                .await,
+                0,
+                "{name}: nothing was scheduled for it"
+            );
+        }
+    }
+
+    /// The fleet, the focus cap and the thread's census read one job the same
+    /// way: unknown liveness is named unknown and counted by neither cap, and
+    /// the same job served by a process is running and counted by both.
+    #[tokio::test]
+    async fn the_caps_and_the_census_agree_on_unknown_and_live_work() {
+        use crate::execution::gates::census::{focus_standings_conn, FocusStanding};
+        let env = env("cap-surfaces-agree.db").await;
+        let baseline = fleet(&env).await;
+        add_thread(&env, "th", "harness").await;
+        add_started(&env, 100, Some("th"), "running").await;
+        head_of_100(&env, "running", None, "live").await;
+        let standing = |env: &Env| {
+            let db = env.db.clone();
+            let orch = env.orch.clone();
+            async move {
+                let observer = WorkObserver::read(&orch).await.unwrap();
+                db.read(move |conn| {
+                    let observer = observer.clone();
+                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
+                })
+                .await
+                .unwrap()
+                .remove("si100")
+            }
+        };
+        let before = durable_100(&env).await;
+        assert_eq!(fleet(&env).await, baseline, "unknown holds no fleet slot");
+        assert!(
+            open_children(&env, 100).await.is_empty(),
+            "nor a focus slot"
+        );
+        assert_eq!(
+            standing(&env).await,
+            Some(FocusStanding::Unknown { since: 2 }),
+            "the census names it unknown, not running"
+        );
+        assert_eq!(durable_100(&env).await, before, "reading changed nothing");
+
+        serving(&env, 100);
+        assert_eq!(fleet(&env).await, baseline + 1);
+        assert_eq!(open_children(&env, 100).await, vec![100]);
+        assert_eq!(standing(&env).await, Some(FocusStanding::Running));
+    }
+
+    /// Work this host can see keeps its slot: a process serving or parked
+    /// warm behind a running turn, a launch claimed before its process or its
+    /// turn is visible, a launch durably queued in admission, and the
+    /// machine-using waits, which need no process at all.
+    #[tokio::test]
+    async fn observable_work_keeps_its_slot() {
+        use crate::agent_process::process::RunHandle;
+        let env = env("cap-observable-work.db").await;
+        let baseline = fleet(&env).await;
+
+        // A running turn on a registered process.
+        add_started(&env, 100, None, "running").await;
+        head_of_100(&env, "running", None, "live").await;
+        env.orch
+            .process_state
+            .register_process(
+                "sr100".into(),
+                RunHandle::test_handle(Some("ss100"), Some("sj100")),
+            )
+            .unwrap();
+        assert_eq!(fleet(&env).await, baseline + 1, "a serving process");
+        assert!(env.orch.process_state.transition_to_warm("sr100"));
+        assert_eq!(fleet(&env).await, baseline + 1, "a warm process");
+        env.orch
+            .process_state
+            .processes
+            .lock()
+            .unwrap()
+            .remove("sr100");
+        assert_eq!(fleet(&env).await, baseline, "its process is gone");
+
+        // A launch claimed behind a stopped head, before any successor turn
+        // or process exists, holds the slot until the claim is let go.
+        env.db
+            .execute_script(
+                "UPDATE turns SET state = 'interrupted', ended_at = 2 WHERE id = 'st100';",
+            )
+            .await
+            .unwrap();
+        let claim = env.orch.claim_job_launch("sj100", "sr100-next");
+        assert_eq!(fleet(&env).await, baseline + 1, "a claimed launch");
+        drop(claim);
+        assert_eq!(fleet(&env).await, baseline, "the launch let go");
+
+        // A pending successor whose launch is durably queued in admission:
+        // the claim was handed to the admission row.
+        env.db
+            .execute_script(
+                "INSERT INTO turns(id, session_id, job_id, sequence, predecessor_id, state,
+                                   start_reason, created_at, updated_at)
+                   VALUES('st100b', 'ss100', 'sj100', 2, 'st100', 'pending', 'retry', 3, 3);
+                 UPDATE jobs SET current_turn_id = 'st100b' WHERE id = 'sj100';
+                 INSERT INTO runs(id, project_id, job_id, issue_id, status, session_id,
+                                  created_at, updated_at)
+                   VALUES('sr100b', 'p', 'sj100', 'si100', 'starting', 'ss100', 3, 3);
+                 INSERT INTO runtime_admission_requests(request_id, workspace_key,
+                     resource_lane, launch_key, claim_json, priority, enqueue_seq, state,
+                     lease_owner, lease_generation, lease_expires_at, created_at, updated_at)
+                   VALUES('req100', 'private-runtime', 'lane', 'ordinary:sr100b', '{}', 0, 1,
+                          'queued', NULL, 0, NULL, 3, 3);
+                 INSERT INTO prepared_ordinary_launches(request_id, job_id, run_id, session_id,
+                     turn_id, execution_id, prompt, reason,
+                     session_start_json, model, agent_config_json, runtime_capability_json,
+                     created_at)
+                   VALUES('req100', 'sj100', 'sr100b', 'ss100', 'st100b', 'se100', '',
+                          'retry', '{}', 'm', '{}', '{}', 3);",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet(&env).await,
+            baseline + 1,
+            "a launch queued in admission"
+        );
+        env.db
+            .execute(
+                "UPDATE runtime_admission_requests SET state = 'cancelled' WHERE request_id = 'req100'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet(&env).await,
+            baseline,
+            "a withdrawn launch whose run still reads starting is unknown, not a launch"
+        );
+
+        // A review pending behind its stopped builder, with nothing launching
+        // it, holds no slot either: the witness bcmd/19's shape. Freshly
+        // released, with no turn anywhere in its execution, it holds one.
+        env.db
+            .execute_script(
+                "UPDATE turns SET state = 'interrupted', ended_at = 4 WHERE id = 'st100b';
+                 UPDATE runs SET status = 'crashed' WHERE id = 'sr100b';
+                 INSERT INTO jobs(id, execution_id, project_id, issue_id, node_name, status,
+                                  created_at, updated_at)
+                   VALUES('review100', 'se100', 'p', 'si100', 'review', 'pending', 1, 1);",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet(&env).await,
+            baseline,
+            "a pending node behind a stopped predecessor"
+        );
+        add_started(&env, 103, None, "pending").await;
+        assert_eq!(
+            fleet(&env).await,
+            baseline + 1,
+            "started this boot: its first advance is this process's to carry"
+        );
+        env.db
+            .execute("UPDATE jobs SET created_at = 1 WHERE id = 'sj103'", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet(&env).await,
+            baseline,
+            "a pending job from an earlier boot that nothing will advance"
+        );
+        // Its release's advance owns it until advancement claims it.
+        env.db
+            .execute_script(
+                "INSERT INTO effect_outbox(id, kind, dedupe_key, payload_json, state, created_at,
+                                           updated_at)
+                   VALUES('advance103', 'advance_dag', 'se103', '{}', 'pending', 5, 5);",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet(&env).await,
+            baseline + 1,
+            "a just-released job keeps its slot while its advance is owed"
+        );
+        // The advance claims it running this boot and marks its entry done:
+        // still owned, by the claim's launch.
+        env.db
+            .execute_script(format!(
+                "UPDATE jobs SET status = 'running', started_at = {claimed} WHERE id = 'sj103';
+                 UPDATE effect_outbox SET state = 'done' WHERE id = 'advance103';",
+                claimed = env.orch.boot_at + 1
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet(&env).await,
+            baseline + 1,
+            "this boot's claim, on its way to a launch"
+        );
+        // Its launch failed before any turn: nothing owns it any longer.
+        env.db
+            .execute_script(format!(
+                "INSERT INTO runs(id, project_id, job_id, issue_id, status, created_at, updated_at)
+                   VALUES('sr103', 'p', 'sj103', 'si103', 'crashed', {at}, {at});",
+                at = env.orch.boot_at + 2
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet(&env).await,
+            baseline,
+            "a launch that ended without a turn"
+        );
+        // A claim with no recorded time is no evidence of this boot's launch.
+        env.db
+            .execute_script(
+                "DELETE FROM runs WHERE id = 'sr103';
+                 UPDATE jobs SET started_at = NULL WHERE id = 'sj103';",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet(&env).await,
+            baseline,
+            "a running label with no claim time"
+        );
+        // A predecessor host's claim never launches.
+        env.db
+            .execute_script(format!(
+                "DELETE FROM runs WHERE id = 'sr103';
+                 UPDATE jobs SET started_at = {before} WHERE id = 'sj103';",
+                before = env.orch.boot_at - 1
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fleet(&env).await, baseline, "a claim from before this boot");
+        env.db
+            .execute("UPDATE jobs SET status = 'complete' WHERE id = 'sj103'", ())
+            .await
+            .unwrap();
+
+        // Machine-using waits count with no process behind them.
+        for (number, kind) in [(101, "run_batch"), (102, "terminal")] {
+            add_started(&env, number, None, "running").await;
+            park_on(&env, number, json!({ "kind": kind })).await;
+        }
+        assert_eq!(
+            fleet(&env).await,
+            baseline + 2,
+            "run_batch and terminal waits"
         );
     }
 }

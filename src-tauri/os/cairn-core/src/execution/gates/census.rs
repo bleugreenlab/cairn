@@ -1545,6 +1545,12 @@ pub(crate) enum FocusStanding {
         reason: String,
     },
     Stopped,
+    /// Its turn reads running, but this host holds no process for it: only a
+    /// run row still reads live, last updated at `since`. Neither running nor
+    /// known to be dead, so it holds no slot and nothing resumes it.
+    Unknown {
+        since: i64,
+    },
     /// Held by a gated hold that only the operator's Continue or Start now
     /// releases. It is out of the band, so it has no place in line.
     NeedsOperator {
@@ -1561,6 +1567,10 @@ impl FocusStanding {
         match self {
             Self::Running => "Running".into(),
             Self::Stopped => "Stopped".into(),
+            Self::Unknown { since } => format!(
+                "Unknown · reads running with no process on this host · its run last updated {} ago",
+                crate::clock::format_elapsed(now.saturating_sub(*since).max(0))
+            ),
             Self::Queued {
                 reentry,
                 place,
@@ -1592,7 +1602,7 @@ impl FocusStanding {
             Self::Queued { .. } => 2,
             Self::HeldForPrs { .. } => 3,
             Self::Parked { .. } => 4,
-            Self::Stopped | Self::NeedsOperator { .. } => 5,
+            Self::Stopped | Self::Unknown { .. } | Self::NeedsOperator { .. } => 5,
         }
     }
 }
@@ -1613,10 +1623,12 @@ fn gate_phrase(gate: &str, attempts: i64) -> String {
 
 /// One batched projection for queue, overview and seed. Listing membership still
 /// comes from the open-child predicate; activity is read through the caps' sole
-/// classifier. A running task outranks every wait on its parent.
+/// classifier, against `observer`, so a child reads running exactly when the
+/// focus cap would count it. A running task outranks every wait on its parent.
 pub(crate) async fn focus_standings_conn(
     conn: &crate::storage::TrackedConnection,
     thread_id: &str,
+    observer: &crate::execution::jobs::liveness::WorkObserver,
 ) -> DbResult<HashMap<String, FocusStanding>> {
     use super::capacity::{activity_job_rows_conn, Activity, ActivityScope, ParkCause};
     use cairn_db::turso::params;
@@ -1873,7 +1885,7 @@ pub(crate) async fn focus_standings_conn(
     }
     drop(operators);
 
-    for row in activity_job_rows_conn(conn, ActivityScope::Thread(thread_id)).await? {
+    for row in activity_job_rows_conn(conn, ActivityScope::Thread(thread_id), observer).await? {
         let Some(id) = row.issue_id else { continue };
         if row.activity == Activity::InFlight {
             standings.insert(id, FocusStanding::Running);
@@ -1910,7 +1922,9 @@ pub(crate) async fn focus_standings_conn(
                     }
                     FocusStanding::Stopped
                 }
-                ParkCause::Operator => continue,
+                ParkCause::LivenessUnknown(since) => FocusStanding::Unknown { since },
+                // Its predecessors' own rows say where the child stands.
+                ParkCause::Operator | ParkCause::AwaitingPredecessors => continue,
                 ParkCause::Supply => FocusStanding::Parked {
                     cause: FocusParkCause::Other("held (supply)".into()),
                 },

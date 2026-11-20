@@ -4,7 +4,7 @@ use crate::mcp::types::{ChangeItem, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
 use cairn_db::turso::params;
-use cairn_uri::{parse_uri, CairnResource};
+use cairn_uri::{classify_uri, CairnResource};
 use sha2::{Digest, Sha256};
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -77,8 +77,9 @@ pub(crate) async fn hash_resource_target(
     let target =
         super::super::common::resolve_home_relative_resource_uri(&orch.db, request, &item.target)
             .await?;
-    let resource =
-        parse_uri(&target).ok_or_else(|| format!("Unrecognized URI format: {}", item.target))?;
+    let resource = classify_uri(&target).map_err(|refusal| {
+        crate::mcp::handlers::resources::unparsed_uri_refusal(&target, &refusal)
+    })?;
     if let Some(hash) = hash_skill_target(orch, request, item, &resource).await? {
         return Ok(hash);
     }

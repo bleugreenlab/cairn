@@ -1030,6 +1030,7 @@ fn register_codex_process_aborting_on_interrupt(
                 },
                 CodexTurnContext {
                     failure_disposition: TurnFailureDisposition::Unhandled,
+                    fatal_cause: None,
                 },
             );
             // The specimen's job was a builder node: once its turn settled,

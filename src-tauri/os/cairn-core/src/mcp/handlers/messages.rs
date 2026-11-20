@@ -1059,13 +1059,15 @@ pub async fn send_direct_message(
     // Nudge only when the effective wake still wakes an idle recipient. A muted
     // source was downgraded to `Passive` and rides along on the recipient's next
     // run. `nudge_for_direct_message` is the shared resume ladder: an idle
-    // recipient resumes and drains the push; an `interrupt` on an active
-    // recipient stops the turn so the turn-end flush delivers it; a non-interrupt
-    // active recipient is left for the event-boundary push drain; an `interrupt`
-    // to a recipient parked only on `waitFor` ends that wait; any other
-    // self-suspended recipient is held and the direct rides along when its own
-    // work resolves. The message row and push are durable either way, so the
-    // send succeeds and the reply says which of these happened.
+    // recipient resumes and drains the push; an active recipient in a tool call
+    // is left for the event-boundary push drain, at any urgency; an `interrupt`
+    // to an active recipient that is only generating interrupts the turn without
+    // cancelling its work, so the turn-end flush delivers it; an `interrupt` to a
+    // recipient parked on `waitFor` calls and `run` batches ends the waits and
+    // detaches the batches; any other self-suspended recipient is held and the
+    // direct rides along when its own work resolves. The message row and push
+    // are durable either way, so the send succeeds and the reply says which of
+    // these happened.
     let from = sender_uri.unwrap_or_else(|| sender_name.clone());
     let outcomes: Vec<(String, Option<Result<delivery::NudgeOutcome, String>>)> = planned
         .iter()
@@ -1155,6 +1157,18 @@ fn recipient_outcome(wake: Option<Result<delivery::NudgeOutcome, String>>) -> St
         Some(Ok(NudgeOutcome::Interrupted)) => {
             "Its turn was interrupted and it is resuming with your message.".to_string()
         }
+        Some(Ok(NudgeOutcome::Steered { calls })) if calls.is_empty() => {
+            "It is in the middle of its own work; it reads your message at its next tool \
+             boundary, and nothing it has running was cancelled. If it never gets there, \
+             stop the node with action:\"stop\"."
+                .to_string()
+        }
+        Some(Ok(NudgeOutcome::Steered { calls })) => format!(
+            "It is in the middle of a tool call ({}); it reads your message when that call \
+             returns, and nothing it has running was cancelled. If the call never returns, \
+             stop the node with action:\"stop\".",
+            calls.join(", ")
+        ),
         Some(Ok(NudgeOutcome::Resumed)) => {
             "A turn was dispatched for it, carrying your message.".to_string()
         }
@@ -1206,6 +1220,12 @@ mod reply_tests {
                     notes: Vec::new(),
                 }))),
                 "It has not started a turn: it is parked on its own `waitFor: duration`",
+            ),
+            (
+                Some(Ok(NudgeOutcome::Steered {
+                    calls: vec!["run".into()],
+                })),
+                "It is in the middle of a tool call (run); it reads your message when that call returns, and nothing it has running was cancelled.",
             ),
             (
                 Some(Ok(NudgeOutcome::Refused(DeliveryRefusal::Cancelled))),

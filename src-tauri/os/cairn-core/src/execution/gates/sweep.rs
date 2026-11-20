@@ -1649,6 +1649,13 @@ pub(crate) mod tests {
         }
         db.execute_script(&seed).await.unwrap();
         let (orch, effects) = orchestrator_over(temp.path(), "search", db.clone());
+        // The coordinator was claimed by this orchestrator's own boot.
+        db.execute(
+            "UPDATE jobs SET started_at = ?1 WHERE id = 'coord'",
+            (orch.boot_at,),
+        )
+        .await
+        .unwrap();
         Env {
             _temp: temp,
             orch,

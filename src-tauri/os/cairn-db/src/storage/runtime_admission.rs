@@ -1557,18 +1557,28 @@ pub fn launch_run_id(launch_key: &str) -> Option<&str> {
 /// match a call row, because team authority rows exist only for ordinary
 /// launches.
 pub async fn pending_launch_run_ids(db: &LocalDb) -> DbResult<HashSet<String>> {
-    let keys = db
-        .query_all(
+    db.read(|conn| Box::pin(async move { pending_launch_run_ids_conn(conn).await }))
+        .await
+}
+
+/// [`pending_launch_run_ids`] on a connection the caller already holds, so a
+/// reader taking several facts at once checks out one connection for all.
+pub async fn pending_launch_run_ids_conn(
+    conn: &crate::storage::TrackedConnection,
+) -> DbResult<HashSet<String>> {
+    let mut rows = conn
+        .query(
             format!("SELECT r.launch_key FROM runtime_admission_requests r WHERE r.state IN ('queued','leased','starting') AND {AWAITING_LAUNCH} AND (EXISTS (SELECT 1 FROM prepared_ordinary_launches p WHERE p.request_id=r.request_id) OR EXISTS (SELECT 1 FROM prepared_runtime_calls c WHERE c.request_id=r.request_id))"),
             (),
-            |row| row.text(0),
         )
         .await?;
-    Ok(keys
-        .iter()
-        .filter_map(|key| launch_run_id(key))
-        .map(str::to_string)
-        .collect())
+    let mut runs = HashSet::new();
+    while let Some(row) = rows.next().await? {
+        if let Some(run) = launch_run_id(&row.text(0)?) {
+            runs.insert(run.to_string());
+        }
+    }
+    Ok(runs)
 }
 
 /// A launch waiting on this session prevents rotation even after its in-memory

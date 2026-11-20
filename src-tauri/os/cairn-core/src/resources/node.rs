@@ -331,21 +331,142 @@ fn render_job_summary_header(
     completed_at: Option<i64>,
     hold: Option<&crate::messages::delivery::Hold>,
     never_launched: bool,
+    stopped: Option<&StoppedWork>,
 ) -> String {
     let icon = job_status_icon(status);
-    let mut output = match (status, hold) {
+    let mut output = match (status, hold, stopped) {
         _ if never_launched => format!("# {name} [? not launched]\n\n"),
-        ("failed", _) => format!("# {name} [{icon} Failed]\n\n"),
-        (_, Some(hold)) => format!("# {name} [{icon} {}]\n\n", hold.qualifier()),
-        (_, None) => format!("# {name} [{icon}]\n\n"),
+        ("failed", _, _) => format!("# {name} [{icon} Failed]\n\n"),
+        (_, Some(hold), _) => format!("# {name} [{icon} {}]\n\n", hold.qualifier()),
+        (_, None, Some(stopped)) => format!("# {name} [{}]\n\n", stopped.label()),
+        (_, None, None) => format!("# {name} [{icon}]\n\n"),
     };
     append_optional_timestamp(&mut output, "Started", started_at);
     append_optional_timestamp(&mut output, "Completed", completed_at);
     output.push('\n');
     if let Some(hold) = hold {
         output.push_str(&format!("Not taking a turn: {}.\n\n", hold.render()));
+    } else if let Some(stopped) = stopped {
+        output.push_str(&stopped.render(chrono::Utc::now().timestamp()));
     }
     output
+}
+
+/// A job whose label reads `running` while this host can see nothing running
+/// it, read through the caps' own classifier so the summary says what the fleet
+/// counts. Nothing resumes it: the operator does, or closes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoppedWork {
+    /// Its last turn ended, or it reads running with no process and no live
+    /// run, and no launch is claimed or queued for it.
+    Stopped {
+        turn_state: String,
+        end_reason: Option<String>,
+        since: i64,
+    },
+    /// Its turn reads running and a run row still reads live, but this host
+    /// holds no process for it, last updated at `since`.
+    Unknown { since: i64 },
+}
+
+impl StoppedWork {
+    /// From the job's label, its activity and its head turn (state, end
+    /// reason, when it last moved). A complete head on a running job is the gap
+    /// before its flush or follow-up, not a stop.
+    fn read(
+        status: &str,
+        activity: Option<&crate::execution::gates::capacity::Activity>,
+        head: Option<(String, Option<String>, i64)>,
+    ) -> Option<Self> {
+        use crate::execution::gates::capacity::{Activity, ParkCause};
+        if status != "running" {
+            return None;
+        }
+        match activity? {
+            Activity::Parked(ParkCause::LivenessUnknown(since)) => {
+                Some(Self::Unknown { since: *since })
+            }
+            Activity::Parked(ParkCause::Stopped) => {
+                let (turn_state, end_reason, since) = head?;
+                (turn_state != "complete").then_some(Self::Stopped {
+                    turn_state,
+                    end_reason,
+                    since,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Stopped { .. } => "■ Stopped",
+            Self::Unknown { .. } => "? Unknown",
+        }
+    }
+
+    fn render(&self, now: i64) -> String {
+        let ago = |since: i64| crate::clock::format_elapsed(now.saturating_sub(since).max(0));
+        const OWNER: &str = "It holds no fleet slot and nothing will resume it on its own: \
+                             send it a message to resume it, or close it.";
+        match self {
+            Self::Stopped {
+                turn_state,
+                end_reason,
+                since,
+            } => {
+                let how = match (turn_state.as_str(), end_reason) {
+                    ("pending" | "running", _) => format!(
+                        "its turn reads `{turn_state}`, but this host holds no process or launch \
+                         for it and no run of it reads live (last moved {} ago)",
+                        ago(*since)
+                    ),
+                    (_, Some(reason)) => format!(
+                        "its last turn ended `{turn_state}` (`{reason}`) {} ago",
+                        ago(*since)
+                    ),
+                    (_, None) => format!("its last turn ended `{turn_state}` {} ago", ago(*since)),
+                };
+                format!("Stopped: {how}. {OWNER}\n\n")
+            }
+            Self::Unknown { since } => format!(
+                "Unknown: its turn reads running and its run still reads live (last updated {} \
+                 ago), but this host holds no process for it, so whether its provider is alive \
+                 is unknown and Cairn will not launch a second one beside it. {OWNER}\n\n",
+                ago(*since)
+            ),
+        }
+    }
+}
+
+/// The job's activity as the caps read it, and its head turn's state, end
+/// reason and last movement. Best-effort: a summary without the reading falls
+/// back to the job's label.
+async fn load_work_standing(
+    conn: &TrackedConnection,
+    job_id: &str,
+    observer: &crate::execution::jobs::liveness::WorkObserver,
+) -> WorkStanding {
+    use crate::execution::gates::capacity::{activity_job_rows_conn, ActivityScope};
+    let activity = activity_job_rows_conn(conn, ActivityScope::Job(job_id), observer)
+        .await
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .map(|row| row.activity);
+    let head = async {
+        let mut rows = conn
+            .query(
+                "SELECT t.state, t.end_reason, COALESCE(t.ended_at, t.updated_at)
+                   FROM jobs j JOIN turns t ON t.id = j.current_turn_id WHERE j.id = ?1",
+                (job_id,),
+            )
+            .await
+            .ok()?;
+        let row = rows.next().await.ok().flatten()?;
+        Some((row.text(0).ok()?, row.opt_text(1).ok()?, row.i64(2).ok()?))
+    }
+    .await;
+    (activity, head)
 }
 
 /// The sentence beneath a node's header when its turn ended without the output
@@ -2423,7 +2544,15 @@ struct JobSummaryRows {
     activity: Option<NodeActivity>,
     named_artifacts: Vec<ResourceArtifact>,
     pr: Option<NodePrRow>,
+    work: WorkStanding,
 }
+
+/// A job's activity as the caps read it, and its head turn's state, end
+/// reason and last movement.
+type WorkStanding = (
+    Option<crate::execution::gates::capacity::Activity>,
+    Option<(String, Option<String>, i64)>,
+);
 
 /// The `merge_requests` row a node summary reports on.
 struct NodePrRow {
@@ -2486,7 +2615,12 @@ pub(super) async fn read_node(
     let routed_db = orch.db.for_project(project_key).await;
     let db = &*routed_db;
     let (key, segment) = (project_key.to_owned(), node_name.to_owned());
+    let observer = match crate::execution::jobs::liveness::WorkObserver::read(orch).await {
+        Ok(observer) => observer,
+        Err(error) => return format!("Failed to read node '{node_name}': {error}"),
+    };
     let read = read_resource(db, move |conn| {
+        let observer = observer.clone();
         Box::pin(async move {
             let (_, issue_id) = resolve_issue_id(conn, &key, number).await?;
             // Find job by node name (looks up name in execution snapshot)
@@ -2510,6 +2644,11 @@ pub(super) async fn read_node(
             } else {
                 None
             };
+            let work = if job.status == "running" {
+                load_work_standing(conn, &job.id, &observer).await
+            } else {
+                (None, None)
+            };
             Ok(NodeSummaryRows::Job(Box::new(JobSummaryRows {
                 job,
                 failure_reason,
@@ -2517,6 +2656,7 @@ pub(super) async fn read_node(
                 activity,
                 named_artifacts,
                 pr,
+                work,
             })))
         })
     });
@@ -2527,6 +2667,7 @@ pub(super) async fn read_node(
         activity,
         named_artifacts,
         pr,
+        work,
     } = match read.await {
         Ok(NodeSummaryRows::Job(rows)) => *rows,
         Ok(NodeSummaryRows::Action(action_run)) => {
@@ -2561,6 +2702,18 @@ pub(super) async fn read_node(
             job.started_at.map(i64::from),
             orch.boot_at,
         );
+    let admission_wait = orch.launch_admission_waits.get(&job.id);
+    // A launch waiting for a session slot has a run and no process, which reads
+    // like a hang unless the summary says where it is in line and why.
+    let launch = crate::execution::jobs::describe_job_launch(orch, &job.id).await;
+    // Branch preparation queues for the project store before any run exists,
+    // so without this line a new job reads as stalled for as long as it waits.
+    let preparation = orch.branch_preparation_wait(&job.id);
+    // Whatever holds or launches the job owns it, so it is not stopped work.
+    let stopped =
+        (hold.is_none() && admission_wait.is_none() && launch.is_none() && preparation.is_none())
+            .then(|| StoppedWork::read(&job.status, work.0.as_ref(), work.1))
+            .flatten();
     let mut output = render_job_summary_header(
         node_name,
         &job.status,
@@ -2568,13 +2721,13 @@ pub(super) async fn read_node(
         job.completed_at.map(i64::from),
         hold.as_ref(),
         never_launched,
+        stopped.as_ref(),
     );
     push_missing_output(&mut output, db, &job.id).await;
     if let Some(reason) = failure_reason {
         output.push_str(&format!("Failure: {reason}\n\n"));
     }
     push_placement_default(&mut output, db, &job.id).await;
-    let admission_wait = orch.launch_admission_waits.get(&job.id);
     if let Some(wait) = admission_wait.as_ref() {
         output.push_str(&wait.describe());
         output.push_str(".\n\n");
@@ -2588,16 +2741,10 @@ pub(super) async fn read_node(
         output.push_str(&crate::jobs::queries::pending_dispatch_description(pending));
         output.push_str(".\n\n");
     }
-    // A launch waiting for a session slot has a run and no process, which reads
-    // like a hang unless the summary says where it is in line and why.
-    let launch = crate::execution::jobs::describe_job_launch(orch, &job.id).await;
     if let Some(launch) = launch.as_deref() {
         output.push_str(launch);
         output.push('\n');
     }
-    // Branch preparation queues for the project store before any run exists,
-    // so without this line a new job reads as stalled for as long as it waits.
-    let preparation = orch.branch_preparation_wait(&job.id);
     if let Some((status, position, since_ms)) = preparation.as_ref() {
         output.push_str(&crate::orchestrator::describe_preparation_wait(
             status,
@@ -3766,16 +3913,20 @@ pub(super) async fn read_node_artifact(
 
 /// Read a sub-agent task job's base summary — the task analogue of `read_node`.
 /// `admission_waits` says what a task whose launch admission refused is
-/// waiting on.
+/// waiting on; `observer` is what its standing is read against, so a task
+/// whose work stopped reads stopped or unknown exactly as a node does.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn read_task(
     db: &LocalDb,
     admission_waits: &crate::orchestrator::wakes::LaunchAdmissionWaits,
+    observer: &crate::execution::jobs::liveness::WorkObserver,
     project_key: &str,
     number: i32,
     exec_seq: i32,
     node_name: &str,
     task_name: &str,
 ) -> String {
+    let observer = observer.clone();
     let read = read_task_rows(
         db,
         project_key,
@@ -3783,7 +3934,8 @@ pub(super) async fn read_task(
         exec_seq,
         node_name,
         task_name,
-        |conn, parent_job, task_job| {
+        move |conn, parent_job, task_job| {
+            let observer = observer.clone();
             Box::pin(async move {
                 let parent_segment =
                     if task_job.status == "pending" && task_job.started_at.is_none() {
@@ -3792,16 +3944,36 @@ pub(super) async fn read_task(
                         None
                     };
                 let artifact = get_direct_artifact_for_job(conn, &task_job.id).await;
-                (parent_segment, artifact)
+                let work = if task_job.status == "running" {
+                    load_work_standing(conn, &task_job.id, &observer).await
+                } else {
+                    (None, None)
+                };
+                // The address a failed task's parent is handed must say why,
+                // exactly as an issue node's page does.
+                let failure_reason = if task_job.status == "failed" {
+                    cairn_attention::delivery::job_failure_reason_conn(conn, &task_job.id)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                (parent_segment, artifact, work, failure_reason)
             })
         },
     );
-    let (_, task_job, (parent_segment, artifact)) = match read.await {
+    let (_, task_job, (parent_segment, artifact, work, failure_reason)) = match read.await {
         Ok(read) => read,
         Err(error) => return error,
     };
 
     let hold = crate::messages::delivery::describe_hold(db, &task_job.id).await;
+    let admission_wait = admission_waits.get(&task_job.id);
+    // Whatever holds or admits the task owns it, so it is not stopped work.
+    let stopped = (hold.is_none() && admission_wait.is_none())
+        .then(|| StoppedWork::read(&task_job.status, work.0.as_ref(), work.1))
+        .flatten();
     let mut output = render_job_summary_header(
         task_name,
         &task_job.status,
@@ -3811,9 +3983,13 @@ pub(super) async fn read_task(
         // A task's launch inserts its run as it creates the job, so a task
         // has no claim-without-run gap for a restart to strand.
         false,
+        stopped.as_ref(),
     );
+    if let Some(reason) = failure_reason {
+        output.push_str(&format!("Failure: {reason}\n\n"));
+    }
     push_placement_default(&mut output, db, &task_job.id).await;
-    if let Some(wait) = admission_waits.get(&task_job.id) {
+    if let Some(wait) = admission_wait.as_ref() {
         output.push_str(&wait.describe());
         output.push_str(".\n\n");
     } else if let Some(parent_segment) = parent_segment {
@@ -5362,7 +5538,7 @@ mod hold_header_tests {
             gate: None,
         };
         let header =
-            render_job_summary_header("builder", "running", None, None, Some(&limit), false);
+            render_job_summary_header("builder", "running", None, None, Some(&limit), false, None);
         assert!(
             header.starts_with(&format!("# builder [◐ {}]", limit.qualifier())),
             "{header}"
@@ -5383,7 +5559,7 @@ mod hold_header_tests {
             gate: Some(ProviderLimitGate::ToolInFlight),
         };
         let header =
-            render_job_summary_header("builder", "running", None, None, Some(&gated), false);
+            render_job_summary_header("builder", "running", None, None, Some(&gated), false, None);
         assert!(
             header.starts_with("# builder [◐ held: provider limit, needs continue]"),
             "{header}"
@@ -5401,24 +5577,194 @@ mod hold_header_tests {
             notes: Vec::new(),
         };
         let header =
-            render_job_summary_header("builder", "running", None, None, Some(&wait), false);
+            render_job_summary_header("builder", "running", None, None, Some(&wait), false, None);
         assert!(
             header.starts_with("# builder [◐ waiting: waitFor: duration]"),
             "{header}"
         );
         assert!(header.contains("escalate:true"), "{header}");
 
-        let idle = render_job_summary_header("builder", "running", None, None, None, false);
+        let idle = render_job_summary_header("builder", "running", None, None, None, false, None);
         assert!(idle.starts_with("# builder [◐]\n"), "{idle}");
         assert!(!idle.contains("Not taking a turn"), "{idle}");
 
         // A predecessor's claim that never launched is not drawn active.
-        let stranded = render_job_summary_header("builder", "running", Some(10), None, None, true);
+        let stranded =
+            render_job_summary_header("builder", "running", Some(10), None, None, true, None);
         assert!(
             stranded.starts_with("# builder [? not launched]\n"),
             "{stranded}"
         );
         assert!(!stranded.contains('◐'), "{stranded}");
+    }
+}
+
+#[cfg(test)]
+mod stopped_work_tests {
+    use crate::storage::RowExt;
+
+    async fn durable(env: &crate::execution::gates::sweep::tests::Env) -> (String, String) {
+        env.db
+            .query_one(
+                "SELECT (SELECT status FROM jobs WHERE id = 'coord'),
+                        (SELECT GROUP_CONCAT(id || ':' || state) FROM turns WHERE job_id = 'coord')",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A node whose label reads running says what the fleet counts: stopped
+    /// behind an ended turn, stopped with no process and no live run, unknown
+    /// with only a live run row, and running only with a process. Reading it
+    /// relabels and resumes nothing.
+    #[tokio::test]
+    async fn a_running_label_reads_as_the_work_this_host_can_see() {
+        let env = crate::execution::gates::sweep::tests::env("node-stopped-work.db").await;
+        let page = || super::read_node(&env.orch, "prj", 9, 1, "coordinator", false);
+        env.db
+            .execute_script(
+                "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+                   VALUES('sess', 'coord', 'open', 1, 1);
+                 INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason,
+                                   end_reason, started_at, ended_at, created_at, updated_at)
+                   VALUES('t-coord', 'sess', 'run-coord', 'coord', 1, 'interrupted', 'initial',
+                          'crash', 1, 2, 1, 2);
+                 UPDATE jobs SET current_turn_id = 't-coord' WHERE id = 'coord';
+                 UPDATE runs SET status = 'crashed', session_id = 'sess' WHERE id = 'run-coord';",
+            )
+            .await
+            .unwrap();
+        let before = durable(&env).await;
+        let stopped = page().await;
+        assert!(stopped.contains("# coordinator [■ Stopped]"), "{stopped}");
+        assert!(
+            stopped.contains("its last turn ended `interrupted` (`crash`)"),
+            "{stopped}"
+        );
+        assert!(
+            stopped.contains("send it a message to resume it"),
+            "{stopped}"
+        );
+        assert!(!stopped.contains('◐'), "{stopped}");
+
+        env.db
+            .execute_script("UPDATE turns SET state = 'running', end_reason = NULL, ended_at = NULL WHERE id = 't-coord';")
+            .await
+            .unwrap();
+        let dead = page().await;
+        assert!(dead.contains("# coordinator [■ Stopped]"), "{dead}");
+        assert!(dead.contains("its turn reads `running`"), "{dead}");
+
+        env.db
+            .execute_script(
+                "UPDATE runs SET status = 'live', updated_at = 5 WHERE id = 'run-coord';",
+            )
+            .await
+            .unwrap();
+        let unknown = page().await;
+        assert!(unknown.contains("# coordinator [? Unknown]"), "{unknown}");
+        assert!(
+            unknown.contains("Cairn will not launch a second one beside it"),
+            "{unknown}"
+        );
+
+        env.orch
+            .process_state
+            .register_process(
+                "run-coord".into(),
+                crate::agent_process::process::RunHandle::test_handle(Some("sess"), Some("coord")),
+            )
+            .unwrap();
+        let live = page().await;
+        assert!(live.contains("# coordinator [◐]"), "{live}");
+        assert!(
+            !live.contains("Stopped") && !live.contains("Unknown"),
+            "{live}"
+        );
+
+        let (status, turns) = durable(&env).await;
+        assert_eq!(status, before.0, "no read relabelled the job");
+        assert_eq!(turns, "t-coord:running", "no read added or ended a turn");
+    }
+
+    /// A delegated task reads its standing the way a node does.
+    #[tokio::test]
+    async fn a_running_task_reads_as_the_work_this_host_can_see() {
+        let env = crate::execution::gates::sweep::tests::env("task-stopped-work.db").await;
+        env.db
+            .execute_script(
+                "INSERT INTO jobs(id, execution_id, parent_job_id, project_id, issue_id, node_name,
+                                  uri_segment, status, current_session_id, created_at, updated_at)
+                   VALUES('scout', 'ep', 'coord', 'p', 'ip', 'Scout', 'scout', 'running',
+                          'scout-sess', 1, 1);
+                 INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+                   VALUES('scout-sess', 'scout', 'open', 1, 1);
+                 INSERT INTO runs(id, project_id, job_id, issue_id, session_id, status,
+                                  created_at, updated_at)
+                   VALUES('scout-run', 'p', 'scout', 'ip', 'scout-sess', 'crashed', 1, 2);
+                 INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason,
+                                   end_reason, started_at, ended_at, created_at, updated_at)
+                   VALUES('scout-turn', 'scout-sess', 'scout-run', 'scout', 1, 'interrupted',
+                          'initial', 'crash', 1, 2, 1, 2);
+                 UPDATE jobs SET current_turn_id = 'scout-turn' WHERE id = 'scout';",
+            )
+            .await
+            .unwrap();
+        let read = || async {
+            let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                .await
+                .unwrap();
+            super::read_task(
+                &env.db,
+                &env.orch.launch_admission_waits,
+                &observer,
+                "prj",
+                9,
+                1,
+                "coordinator",
+                "scout",
+            )
+            .await
+        };
+        let stopped = read().await;
+        assert!(stopped.contains("# scout [■ Stopped]"), "{stopped}");
+        assert!(
+            stopped.contains("its last turn ended `interrupted` (`crash`)"),
+            "{stopped}"
+        );
+
+        env.db
+            .execute_script(
+                "UPDATE turns SET state = 'running', end_reason = NULL, ended_at = NULL
+                  WHERE id = 'scout-turn';
+                 UPDATE runs SET status = 'live', updated_at = 5 WHERE id = 'scout-run';",
+            )
+            .await
+            .unwrap();
+        let unknown = read().await;
+        assert!(unknown.contains("# scout [? Unknown]"), "{unknown}");
+
+        env.orch.process_state.processes.lock().unwrap().register(
+            "scout-run".into(),
+            crate::agent_process::process::RunHandle::test_handle(
+                Some("scout-sess"),
+                Some("scout"),
+            ),
+        );
+        let live = read().await;
+        assert!(live.contains("# scout [◐]"), "{live}");
+        let status = env
+            .db
+            .query_opt_text("SELECT status FROM jobs WHERE id = 'scout'", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            status.as_deref(),
+            Some("running"),
+            "no read relabelled the task"
+        );
     }
 }
 
@@ -5489,7 +5835,8 @@ mod failed_projection_tests {
 
     #[test]
     fn failed_projection_header_names_failed_even_without_error_evidence() {
-        let page = super::render_job_summary_header("builder", "failed", None, None, None, false);
+        let page =
+            super::render_job_summary_header("builder", "failed", None, None, None, false, None);
         assert!(page.contains("[✗ Failed]"), "{page}");
     }
 }

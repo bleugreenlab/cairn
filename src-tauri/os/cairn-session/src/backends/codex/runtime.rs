@@ -29,7 +29,10 @@ pub trait CodexHost: Send + Sync {
     /// when it never asked. Called once per terminal notification.
     fn take_interrupt_cause(&self, provider_turn_id: &str) -> Option<InterruptCause>;
     fn artifact_handoff(&self);
-    fn watchdog_arm_failed(&self) -> Result<(), String>;
+    /// Terminalize the run whose provider turn could not enter Cairn's
+    /// ownership. `evidence` says why, already reported through [`Self::error`];
+    /// the host keeps it as the run's failure cause.
+    fn watchdog_arm_failed(&self, evidence: &str) -> Result<(), String>;
     fn recover_watchdog(
         &self,
         identity: &crate::runs::watchdog_ledger::WatchdogIdentity,
@@ -646,6 +649,25 @@ fn turn_id_or_cached(
         .or_else(|| current_turn_id.lock().ok().and_then(|guard| guard.clone()))
 }
 
+/// Whether a terminal notification names a provider turn other than the one
+/// this reader is serving. Such a notification arrives late, after Cairn
+/// settled that turn some other way (a recovery, an interrupt) and the run went
+/// on to a newer turn, so it may neither end the newer turn nor give the run
+/// its cause. A notification naming no turn belongs to the current one.
+pub(crate) fn names_a_superseded_turn(
+    notification_turn_id: Option<&str>,
+    current_turn_id: &Arc<Mutex<Option<String>>>,
+) -> bool {
+    let Some(named) = notification_turn_id else {
+        return false;
+    };
+    current_turn_id
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .is_some_and(|current| current != named)
+}
+
 pub(crate) fn clear_provider_turn_if_current(
     completed_turn_id: Option<&str>,
     current_turn_id: &Arc<Mutex<Option<String>>>,
@@ -1114,7 +1136,7 @@ impl CodexRuntime {
                                     );
                                     log::error!("{evidence}");
                                     host.host.error(&evidence);
-                                    let _ = host.host.watchdog_arm_failed();
+                                    let _ = host.host.watchdog_arm_failed(&evidence);
                                     break;
                                 }
                             }
@@ -1125,7 +1147,8 @@ impl CodexRuntime {
                             );
                             log::error!("{evidence} (run {run_id})");
                             host.host.error(&evidence);
-                            if let Err(terminalize_error) = host.host.watchdog_arm_failed() {
+                            if let Err(terminalize_error) = host.host.watchdog_arm_failed(&evidence)
+                            {
                                 log::error!(
                                     "Failed to terminalize unowned Codex provider turn {turn_id} for run {run_id}: {terminalize_error}"
                                 );
@@ -1457,6 +1480,14 @@ impl CodexRuntime {
                         );
                         continue;
                     }
+                    if names_a_superseded_turn(turn_id, &current_turn_id) {
+                        log::info!(
+                            "Ignoring late turn/completed for superseded Codex turn {:?} on run {}",
+                            turn_id,
+                            run_id
+                        );
+                        continue;
+                    }
                     // Publish provider terminality before finalization. Recovery
                     // may be waiting for this exact notification while the
                     // finalizer performs database and orchestration work.
@@ -1541,6 +1572,10 @@ impl CodexRuntime {
                         ),
                         CodexTurnContext {
                             failure_disposition,
+                            // A provider status names no cause. A fatal error
+                            // reported before it already ended this turn and
+                            // carried its own.
+                            fatal_cause: None,
                         },
                     );
                     // A pooled call is a single one-shot turn: its turn/completed
@@ -1566,6 +1601,14 @@ impl CodexRuntime {
                         log::info!(
                             "Observed abort for deferred Codex goal turn {:?}; predecessor remains authoritative",
                             aborted_provider_turn_id
+                        );
+                        continue;
+                    }
+                    if names_a_superseded_turn(turn_id, &current_turn_id) {
+                        log::info!(
+                            "Ignoring late turn/aborted for superseded Codex turn {:?} on run {}",
+                            turn_id,
+                            run_id
                         );
                         continue;
                     }
@@ -1613,6 +1656,7 @@ impl CodexRuntime {
                         ),
                         CodexTurnContext {
                             failure_disposition: TurnFailureDisposition::Unhandled,
+                            fatal_cause: None,
                         },
                     );
                     if let Some(turn_id) = aborted_provider_turn_id.as_deref() {
@@ -1658,6 +1702,15 @@ impl CodexRuntime {
                             }
                         }
                     } else {
+                        if names_a_superseded_turn(turn_id, &current_turn_id) {
+                            log::info!(
+                                "Ignoring late fatal error for superseded Codex turn {:?} on run {}: {}",
+                                turn_id,
+                                run_id,
+                                message
+                            );
+                            continue;
+                        }
                         let already_terminalized = error_provider_turn_id
                             .as_ref()
                             .and_then(|turn_id| provider_turn_failures.get(turn_id))
@@ -1691,7 +1744,8 @@ impl CodexRuntime {
                             &mut streaming_state,
                             session_id.as_deref(),
                         );
-                        host.host.error(&format!("Codex error: {}", message));
+                        let fatal_cause = format!("Codex error: {}", message);
+                        host.host.error(&fatal_cause);
                         if let Some(turn_id) = error_provider_turn_id.as_deref() {
                             // The turn is over; a cause recorded for it has
                             // nothing left to attribute.
@@ -1706,6 +1760,7 @@ impl CodexRuntime {
                             ),
                             CodexTurnContext {
                                 failure_disposition: TurnFailureDisposition::DiagnosticRecorded,
+                                fatal_cause: Some(fatal_cause),
                             },
                         );
                         if let Some(turn_id) = error_provider_turn_id {

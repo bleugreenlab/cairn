@@ -1901,8 +1901,17 @@ pub(crate) mod tests {
             Some("the operator")
         );
 
-        let read =
-            crate::resources::read_thread_queue(&w.env.db, "prj", "alpha", now() + 720, 4).await;
+        let read = crate::resources::read_thread_queue(
+            &w.env.db,
+            "prj",
+            "alpha",
+            now() + 720,
+            4,
+            &crate::execution::jobs::liveness::WorkObserver::read(&w.env.orch)
+                .await
+                .unwrap(),
+        )
+        .await;
         let lines: Vec<&str> = read
             .lines()
             .filter(|line| line.starts_with(char::is_numeric))
@@ -2249,7 +2258,17 @@ pub(crate) mod tests {
             .map(|held| held.execution_id)
             .collect();
         assert_eq!(view[0], w.a3, "the queue page");
-        let read = crate::resources::read_thread_queue(&w.env.db, "prj", "alpha", now(), 4).await;
+        let read = crate::resources::read_thread_queue(
+            &w.env.db,
+            "prj",
+            "alpha",
+            now(),
+            4,
+            &crate::execution::jobs::liveness::WorkObserver::read(&w.env.orch)
+                .await
+                .unwrap(),
+        )
+        .await;
         assert!(read.contains("\n1. [203](cairn://p/prj/203)"), "{read}");
 
         // The fleet fills again and the focus cap frees: the dormant fleet

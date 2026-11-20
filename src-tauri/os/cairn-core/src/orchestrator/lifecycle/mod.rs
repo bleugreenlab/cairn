@@ -47,10 +47,10 @@ pub(crate) use child_unresumed::{render_unresumed_push_body, sweep_unresumed_chi
 pub(crate) use common::live_turn_id_for_run;
 pub(crate) use common::set_exit_reason;
 pub(crate) use finalize::{
-    current_session_closed, finalize_run_for_operator_compact, finalize_run_for_recovery,
-    interrupt_run_for_provider_depletion, memory_review_turn_ended, record_run_failure_if_active,
-    release_and_stop_process, settle_provider_turn_failure, stop_processes_for_sessions,
-    LAUNCH_ATTACH_FAILED_EXIT_REASON,
+    current_session_closed, fail_run_with_cause, finalize_run_for_operator_compact,
+    finalize_run_for_recovery, interrupt_run_for_provider_depletion, memory_review_turn_ended,
+    record_run_cause_if_active, record_run_failure_if_active, release_and_stop_process,
+    settle_provider_turn_failure, stop_processes_for_sessions, LAUNCH_ATTACH_FAILED_EXIT_REASON,
 };
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state, warm_provider_held_run};
 #[cfg(test)]
@@ -71,9 +71,9 @@ pub(crate) use stop::{
     PROVIDER_SILENCE_RECOVERY_EXIT_REASON, WATCHDOG_ARM_FAILED_EXIT_REASON,
 };
 pub use stop::{
-    kill_session, kill_session_with_reason, live_run_id_for_job, operator_stop_job,
-    operator_stop_run, stop_active_turn_for_run, stop_agents_for_host_shutdown, stop_call,
-    stop_job, stop_session, stop_workflow, suspend_run_for_durable_wait,
+    interrupt_turn_for_message, kill_session, kill_session_with_reason, live_run_id_for_job,
+    operator_stop_job, operator_stop_run, stop_active_turn_for_run, stop_agents_for_host_shutdown,
+    stop_call, stop_job, stop_session, stop_workflow, suspend_run_for_durable_wait,
     suspend_run_for_durable_wait_after_handoff, suspend_run_for_durable_wait_after_handoff_then,
     HostShutdownStops, ParkSlots, TerminalPolicy, RUNNER_SHUTDOWN_EXIT_REASON,
     SUSPEND_HANDOFF_GRACE,
@@ -84,8 +84,8 @@ pub(crate) use unanswered_calls::{
     LostCallAnswer, USER_STOP_TOOL_RESULT,
 };
 pub(crate) use unanswered_calls::{
-    lost_calls_note, settle_calls_cut_off_by_process_end, settle_unanswered_calls, InterruptCause,
-    HOST_RESTART_REASON, PROCESS_LOST_REASON,
+    lost_calls_note, open_call_names, settle_calls_cut_off_by_process_end, settle_unanswered_calls,
+    InterruptCause, HOST_RESTART_REASON, PROCESS_LOST_REASON,
 };
 pub(crate) use unowned_running::{render_unowned_push_body, sweep_unowned_running};
 pub(crate) use watchdog_recovery::notify_watchdog_successor_started;

@@ -1245,12 +1245,10 @@ async fn startup_heal_recovers_stuck_nodeless_child_and_resumes_parent() {
     assert_eq!(turn_state(&orch, "succ").await, "complete");
 }
 
-/// Regression: the node-less reducer must NOT touch a packet-less child — a
-/// `create_child_task` sub-agent has `parent_job_id` set and `recipe_node_id`
-/// NULL just like a call/workflow, but persists no output contract and has no
-/// pre-materialized delegated packet, while still being owed a `result`
-/// artifact. Reducing it off its absent contract would derive `Complete` even
-/// though it never wrote `result`. It must stay `running`.
+/// A packet-less child — a `create_child_task` sub-agent, with `parent_job_id`
+/// set and `recipe_node_id` NULL like a call/workflow but no output contract and
+/// no delegated packet — is owed the fixed `result` artifact. A completed turn
+/// that never wrote it must not complete the job: it stays `running`.
 #[tokio::test]
 async fn reduce_leaves_packetless_child_task_untouched() {
     let empty_snapshot = serde_json::json!({
@@ -1293,6 +1291,178 @@ async fn reduce_leaves_packetless_child_task_untouched() {
             .as_deref(),
         Some("running"),
         "a child task that never wrote its result must not be marked complete",
+    );
+}
+
+/// A sub-agent task that wrote its `result`, ended that turn, and was woken
+/// again (a sibling's message, a resolved wait): its head is a later
+/// `follow_up` turn still running on a live warm run. `recipe_node_id` chooses
+/// the shape: `None` is a packet-less `create_child_task` child (every
+/// cross-node task), `Some` the `delegated-*-agent` node a self-route task gets.
+async fn seed_child_task_woken_after_its_result(
+    db: &LocalDb,
+    snapshot: String,
+    recipe_node_id: Option<&'static str>,
+) {
+    db.write(move |conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-warm','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-warm','w-warm','P','prj','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-warm','p-warm',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-warm','recipe','i-warm','p-warm','running',1,1,?1)", (snapshot.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, created_at, updated_at) VALUES ('j-parent','e-warm','i-warm','p-warm','running',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, parent_job_id, issue_id, project_id, status, agent_config_id, model, created_at, updated_at) VALUES ('j-child','e-warm',?1,'j-parent','i-warm','p-warm','running','Build','gpt-6.1-sol',1,1)", (recipe_node_id,)).await?;
+                conn.execute("INSERT INTO runs (id, job_id, status, created_at, updated_at) VALUES ('run-child','j-child','live',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, end_reason, start_reason, created_at, updated_at) VALUES ('handoff-turn','s-child','run-child','j-child',1,'complete','artifact_handoff','initial',1,1)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-result','j-child','result',0,'{\"summary\":\"s\"}',1,'result',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, run_id, job_id, sequence, predecessor_id, state, start_reason, created_at, updated_at) VALUES ('woken-turn','s-child','run-child','j-child',2,'handoff-turn','running','follow_up',2,2)", ()).await?;
+                conn.execute("UPDATE jobs SET current_turn_id='woken-turn' WHERE id='j-child'", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+}
+
+fn packetless_snapshot() -> String {
+    serde_json::json!({
+        "recipe": {"id": "r", "name": "R", "description": null, "trigger": "manual", "nodes": [], "edges": []},
+        "agents": {},
+        "skills": {},
+        "triggerContext": {"issueId": "i-warm", "projectId": "p-warm", "triggerType": "manual"},
+        "delegatedPackets": [],
+        "createdAt": 0
+    })
+    .to_string()
+}
+
+/// cairn/6467: a cross-node task (packet-less, node-less) that wrote `result`,
+/// was woken again, and ended that turn on the warm path settles `complete` at
+/// that turn end, once. Before the fix the node-less reducer required a
+/// delegated packet, so the job stayed `running` until its issue resolved.
+#[tokio::test]
+async fn packetless_task_woken_after_its_result_settles_at_turn_end() {
+    let db = test_db().await;
+    seed_child_task_woken_after_its_result(&db, packetless_snapshot(), None).await;
+    let orch = test_orchestrator(db);
+    register_warm_process(&orch, "run-child", Some("j-child"));
+    orch.process_state
+        .set_current_turn_id("run-child", Some("woken-turn"));
+
+    assert!(transition_to_warm_state(&orch, "run-child", None));
+
+    assert_eq!(turn_state(&orch, "woken-turn").await, "complete");
+    assert_eq!(
+        scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "j-child")
+            .await
+            .as_deref(),
+        Some("complete"),
+    );
+    assert!(
+        crate::execution::advancement::reduce_delegated_child_job(&orch, "j-child")
+            .unwrap()
+            .is_none(),
+        "a settled task is not settled again"
+    );
+}
+
+/// Control for the test above: the same woken-after-result shape on a
+/// self-route task, whose `delegated-*-agent` recipe node the execution sweep
+/// derives, settles at the same turn end.
+#[tokio::test]
+async fn node_backed_task_woken_after_its_result_settles_at_turn_end() {
+    let db = test_db().await;
+    seed_child_task_woken_after_its_result(&db, running_child_snapshot(), Some("child-node")).await;
+    let orch = test_orchestrator(db);
+    register_warm_process(&orch, "run-child", Some("j-child"));
+    orch.process_state
+        .set_current_turn_id("run-child", Some("woken-turn"));
+
+    assert!(transition_to_warm_state(&orch, "run-child", None));
+
+    assert_eq!(turn_state(&orch, "woken-turn").await, "complete");
+    assert_eq!(
+        scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "j-child")
+            .await
+            .as_deref(),
+        Some("complete"),
+    );
+}
+
+/// A packet-less task an earlier build stranded — result written, turn
+/// complete, run exited, job still `running`, parent not parked on it — is
+/// settled by the startup heal, since no later turn end will come. A
+/// packet-backed child whose parent is not parked (a turn-less child of a
+/// caller that moved on) is not the heal's to touch.
+#[tokio::test]
+async fn startup_heal_settles_a_stranded_packetless_task_only() {
+    let db = test_db().await;
+    db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-warm','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-warm','w-warm','P','prj','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-warm','p-warm',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-warm','recipe','i-warm','p-warm','running',1,1,?1)", (completed_nodeless_child_snapshot("running").as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, created_at, updated_at) VALUES ('j-parent','e-warm','i-warm','p-warm','running',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, agent_config_id, created_at, updated_at) VALUES ('j-task','e-warm','j-parent','i-warm','p-warm','running','Investigate',1,1)", ()).await?;
+                conn.execute("INSERT INTO runs (id, job_id, status, created_at, updated_at) VALUES ('run-task','j-task','exited',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('task-turn','s-task','run-task','j-task',1,'complete','initial',1,1)", ()).await?;
+                conn.execute("UPDATE jobs SET current_turn_id='task-turn' WHERE id='j-task'", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-task','j-task','result',0,'{\"summary\":\"s\"}',1,'result',1,1)", ()).await?;
+                // The snapshot's packet names this child: packet-backed, its
+                // run crashed before any turn, and its caller is not parked.
+                conn.execute("INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, agent_config_id, created_at, updated_at) VALUES ('j-child','e-warm','j-parent','i-warm','p-warm','running','Explore',1,1)", ()).await?;
+                conn.execute("INSERT INTO runs (id, job_id, status, created_at, updated_at) VALUES ('run-child','j-child','crashed',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+    let orch = test_orchestrator(db);
+
+    crate::execution::advancement::heal_stuck_delegated_children(&orch).await;
+
+    assert_eq!(
+        scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "j-task")
+            .await
+            .as_deref(),
+        Some("complete"),
+    );
+    assert_eq!(
+        scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "j-child")
+            .await
+            .as_deref(),
+        Some("running"),
+    );
+}
+
+/// Only a packet-backed ephemeral call completes without a turn. A packet-less
+/// node-less child that has run no turn has no outcome to read: its terminal
+/// run must not fail it for the `result` it was never asked for yet.
+#[tokio::test]
+async fn reduce_leaves_a_turnless_packetless_child_untouched() {
+    let db = test_db().await;
+    db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-warm','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-warm','w-warm','P','prj','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-warm','p-warm',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-warm','recipe','i-warm','p-warm','running',1,1,?1)", (packetless_snapshot().as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, created_at, updated_at) VALUES ('j-parent','e-warm','i-warm','p-warm','running',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, agent_config_id, created_at, updated_at) VALUES ('j-child','e-warm','j-parent','i-warm','p-warm','running','Build',1,1)", ()).await?;
+                conn.execute("INSERT INTO runs (id, job_id, status, created_at, updated_at) VALUES ('run-child','j-child','exited',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+    let orch = test_orchestrator(db);
+
+    assert!(
+        crate::execution::advancement::reduce_delegated_child_job(&orch, "j-child")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "j-child")
+            .await
+            .as_deref(),
+        Some("running"),
     );
 }
 
@@ -1470,6 +1640,7 @@ mod backend_turn {
                 } else {
                     TurnFailureDisposition::Unhandled
                 },
+                fatal_cause: None,
             },
         );
     }
@@ -1729,6 +1900,7 @@ mod backend_turn {
             },
             CodexTurnContext {
                 failure_disposition: TurnFailureDisposition::DiagnosticRecorded,
+                fatal_cause: None,
             },
         );
         assert_eq!(turn_state(&orch, "child-turn").await, "failed");
@@ -1750,6 +1922,137 @@ mod backend_turn {
             0,
             "missing usage must not manufacture an extra error result"
         );
+    }
+
+    /// A Codex completion of `run_id` that failed with `disposition` and the
+    /// reader's `cause`.
+    fn fail_with(
+        orch: &Orchestrator,
+        run_id: &str,
+        disposition: TurnFailureDisposition,
+        cause: Option<&str>,
+    ) {
+        apply_codex_turn_completion(
+            orch,
+            &orch.db.local,
+            &orch.services.emitter,
+            run_id,
+            None,
+            SessionTurnCompletion {
+                outcome: SessionTurnOutcome::Failed {
+                    status: "error".into(),
+                },
+                usage: TokenCounts::default(),
+                session_lifetime: SessionLifetime::Persistent,
+            },
+            CodexTurnContext {
+                failure_disposition: disposition,
+                fatal_cause: cause.map(str::to_string),
+            },
+        );
+    }
+
+    async fn run_cause(orch: &Orchestrator, run_id: &str) -> Option<String> {
+        scalar_text(orch, "SELECT error_message FROM runs WHERE id=?1", run_id).await
+    }
+
+    /// The reader's fatal cause is the failed child run's recorded cause, in
+    /// place by the time the parent is resumed, and the stable exit reason
+    /// stays apart from it.
+    #[tokio::test]
+    async fn a_fatal_cause_is_recorded_on_the_failed_child_run_and_its_parent_resumes() {
+        let db = test_db().await;
+        seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
+        let orch = test_orchestrator(db);
+        register_warm_process(&orch, "run-child", Some("j-child"));
+        orch.process_state
+            .set_current_turn_id("run-child", Some("child-turn"));
+        fail_with(
+            &orch,
+            "run-child",
+            TurnFailureDisposition::DiagnosticRecorded,
+            Some("Codex error: refresh_token_reused (401)"),
+        );
+        assert_eq!(
+            run_cause(&orch, "run-child").await.as_deref(),
+            Some("Codex error: refresh_token_reused (401)")
+        );
+        assert_eq!(
+            scalar_text(
+                &orch,
+                "SELECT exit_reason FROM runs WHERE id=?1",
+                "run-child"
+            )
+            .await
+            .as_deref(),
+            Some("turn_failed")
+        );
+        assert_eq!(turn_state(&orch, "child-turn").await, "failed");
+        assert_eq!(turn_state(&orch, "succ").await, "complete");
+
+        // A repeated terminal callback, with another cause, changes nothing.
+        fail_with(
+            &orch,
+            "run-child",
+            TurnFailureDisposition::DiagnosticRecorded,
+            Some("Codex error: a later, different failure"),
+        );
+        assert_eq!(
+            run_cause(&orch, "run-child").await.as_deref(),
+            Some("Codex error: refresh_token_reused (401)")
+        );
+    }
+
+    /// A provider status is not a cause, and a failure another path already
+    /// owns (a capacity retry) records nothing over that path's state.
+    #[tokio::test]
+    async fn a_bare_status_or_an_already_handled_failure_records_no_cause() {
+        for disposition in [
+            TurnFailureDisposition::Unhandled,
+            TurnFailureDisposition::AlreadyHandled,
+        ] {
+            let db = test_db().await;
+            seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
+            let orch = test_orchestrator(db);
+            register_warm_process(&orch, "run-child", Some("j-child"));
+            orch.process_state
+                .set_current_turn_id("run-child", Some("child-turn"));
+            let cause = (disposition == TurnFailureDisposition::AlreadyHandled)
+                .then_some("Codex error: owned by the retry");
+            fail_with(&orch, "run-child", disposition, cause);
+            assert_eq!(run_cause(&orch, "run-child").await, None, "{disposition:?}");
+            assert_eq!(
+                turn_state(&orch, "child-turn").await,
+                if cause.is_some() { "running" } else { "failed" },
+                "{disposition:?}"
+            );
+        }
+    }
+
+    /// A transient error followed by a completed turn is not a failure, and
+    /// records no run cause: only the terminal decision does.
+    #[tokio::test]
+    async fn a_transient_error_then_success_records_no_run_cause() {
+        let db = test_db().await;
+        seed_top_level_run(&db, "r", "j", "t", "none").await;
+        let orch = test_orchestrator(db);
+        register_warm_process(&orch, "r", Some("j"));
+        orch.process_state.set_current_turn_id("r", Some("t"));
+        crate::orchestrator::session::insert_error_event(
+            &orch,
+            "r",
+            None,
+            "Codex error: stream disconnected, retrying",
+        );
+        complete(
+            &orch,
+            "r",
+            SessionTurnOutcome::Completed,
+            SessionLifetime::Persistent,
+            false,
+        );
+        assert_eq!(run_cause(&orch, "r").await, None);
+        assert_eq!(turn_state(&orch, "t").await, "complete");
     }
 
     #[tokio::test]
@@ -1787,6 +2090,7 @@ mod backend_turn {
                 },
                 CodexTurnContext {
                     failure_disposition: TurnFailureDisposition::AlreadyHandled,
+                    fatal_cause: None,
                 },
             );
             assert_eq!(result_count(&orch).await, expected);

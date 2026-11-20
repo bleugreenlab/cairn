@@ -3822,7 +3822,7 @@ fn settle_active_run_as_crashed(
     match crate::orchestrator::lifecycle::record_run_failure_if_active(
         orch,
         run_id,
-        exit_reason,
+        Some(exit_reason),
         error_message,
     ) {
         Ok(owned) => owned,

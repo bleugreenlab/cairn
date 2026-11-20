@@ -34,6 +34,7 @@ use cairn_tokenize::{count, Family};
 
 use std::collections::{HashMap, HashSet};
 
+use crate::execution::jobs::liveness::WorkObserver;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use crate::tenets::{TenetOrigin, TenetStatus, TenetView};
 use crate::threads::compaction::{self, ChildMark, EntrySource, TocEntry};
@@ -173,14 +174,23 @@ pub(crate) async fn compose_thread_seed(
     job_id: &str,
     now: i64,
 ) -> Result<ThreadSeed, String> {
-    compose_thread_seed_with_policy(db, job_id, now, SeedPolicy::default()).await
+    compose_thread_seed_with_policy(
+        db,
+        job_id,
+        now,
+        SeedPolicy::default(),
+        &WorkObserver::nothing(),
+    )
+    .await
 }
 
+/// `observer` is what the children's census reads their standings against.
 pub(crate) async fn compose_thread_seed_with_policy(
     db: &LocalDb,
     job_id: &str,
     now: i64,
     policy: SeedPolicy,
+    observer: &WorkObserver,
 ) -> Result<ThreadSeed, String> {
     // No connection is held across the transcript load or the composition
     // below: either would keep a transaction open for as long as a long
@@ -216,7 +226,7 @@ pub(crate) async fn compose_thread_seed_with_policy(
         })
     })
     .await?;
-    let children = load_children(db, thread_id.as_deref())
+    let children = load_children(db, thread_id.as_deref(), observer)
         .await
         .map_err(|error| format!("Failed to resolve this thread's children: {error}"))?;
     // The camps this thread takes part in ride with the store census: both are
@@ -2696,8 +2706,9 @@ pub(super) async fn assert_focus_text(
     db: &LocalDb,
     thread_id: &str,
     expected: &HashMap<String, crate::execution::gates::census::FocusStanding>,
+    observer: &WorkObserver,
 ) {
-    let children = load_children(db, Some(thread_id)).await.unwrap();
+    let children = load_children(db, Some(thread_id), observer).await.unwrap();
     let now = chrono::Utc::now().timestamp();
     for (id, standing) in expected {
         let number = id.strip_prefix("ci").unwrap();
@@ -2732,7 +2743,11 @@ pub(super) async fn assert_focus_text(
 /// staleness this block exists to remove. Enriching them is best-effort — a
 /// facet that cannot be read is left off the line, which is what the renderer
 /// does for a facet that simply does not exist.
-async fn load_children(db: &LocalDb, thread_id: Option<&str>) -> Result<Vec<ChildStatus>, String> {
+async fn load_children(
+    db: &LocalDb,
+    thread_id: Option<&str>,
+    observer: &WorkObserver,
+) -> Result<Vec<ChildStatus>, String> {
     let Some(thread_id) = thread_id else {
         return Ok(Vec::new());
     };
@@ -2781,9 +2796,11 @@ async fn load_children(db: &LocalDb, thread_id: Option<&str>) -> Result<Vec<Chil
         });
     }
     let standing_thread = thread_id.to_owned();
+    let observer = observer.clone();
     let standings = read_resource(db, move |conn| {
+        let (standing_thread, observer) = (standing_thread.clone(), observer.clone());
         Box::pin(async move {
-            crate::execution::gates::census::focus_standings_conn(conn, &standing_thread)
+            crate::execution::gates::census::focus_standings_conn(conn, &standing_thread, &observer)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -4123,6 +4140,7 @@ mod tests {
                 budget_tokens: 600,
                 inline_eras: 3,
             },
+            &WorkObserver::nothing(),
         )
         .await
         .unwrap();
@@ -4157,12 +4175,12 @@ mod tests {
                VALUES ('job-open-stale','e-open-old','i-open','p','failed','builder','builder',1,1);
              INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
                VALUES ('job-open-build','e-open','i-open','p','complete','builder','builder',2,2);
-             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
-               VALUES ('job-open-review','e-open','i-open','p','running','review','review',3,3);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, started_at, created_at, updated_at)
+               VALUES ('job-open-review','e-open','i-open','p','running','review','review',3,3,3);
              INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
                VALUES ('run-open','job-open-build','i-open','running',1,1);
              INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
-               VALUES ('run-open-review','job-open-review','i-open','running',3,3);
+               VALUES ('run-open-review','job-open-review','i-open','starting',3,3);
              INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at, github_pr_number)
                VALUES ('mr-open','job-open-build','p','i-open','Lease renewal backoff','feat/lease','main','open',10,10,892);
              INSERT INTO prompts(id, run_id, job_id, questions, created_at, background)
@@ -4273,8 +4291,8 @@ mod tests {
                VALUES ('i-plan','p',23,'Plan the backoff','active','none',1,1,(SELECT thread_id FROM jobs WHERE id = 'job-thread'));
              INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                VALUES ('e-plan','plan','i-plan','p','running',1,1);
-             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
-               VALUES ('job-planner','e-plan','i-plan','p','running','planner','Planner',1,1);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, started_at, created_at, updated_at)
+               VALUES ('job-planner','e-plan','i-plan','p','running','planner','Planner',1,1,1);
              INSERT INTO artifacts(id, job_id, artifact_type, data, version, output_name, confirmed, created_at, updated_at)
                VALUES ('a-plan','job-planner','plan','{{}}',1,'plan',0,{written},{written});"
         ))
@@ -4576,7 +4594,9 @@ mod tests {
             .await
             .unwrap();
 
-        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id), &WorkObserver::nothing())
+            .await
+            .unwrap();
         let child = children
             .iter()
             .find(|child| child.uri == OPEN_CHILD)
@@ -4669,7 +4689,9 @@ mod tests {
             "stale attempt leaked: {}",
             seed.content
         );
-        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id), &WorkObserver::nothing())
+            .await
+            .unwrap();
         let collapsed = collapsed_census(&children, "cairn://p/prj/platform", usize::MAX);
         assert!(
             collapsed.contains("review Failed: Review backend refused the session"),
@@ -4686,15 +4708,17 @@ mod tests {
              INSERT INTO runs(id, job_id, issue_id, status, error_message, created_at, updated_at)
                VALUES ('run-review-old','job-open-review','i-open','crashed',
                        'Superseded review failure',30,30);
-             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, recipe_node_id, uri_segment, node_name, created_at, updated_at)
-               VALUES ('job-review-retry','e-open','i-open','p','running','review-node','review-2','review',4,4);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, recipe_node_id, uri_segment, node_name, started_at, created_at, updated_at)
+               VALUES ('job-review-retry','e-open','i-open','p','running','review-node','review-2','review',4,4,4);
              INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
                VALUES ('run-review-retry','job-review-retry','i-open','live',40,40);",
         )
         .await
         .unwrap();
 
-        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id), &WorkObserver::nothing())
+            .await
+            .unwrap();
         let child = children
             .iter()
             .find(|child| child.uri == OPEN_CHILD)
@@ -4721,7 +4745,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id), &WorkObserver::nothing())
+            .await
+            .unwrap();
         let child = children
             .iter()
             .find(|child| child.uri == OPEN_CHILD)
@@ -4737,7 +4763,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id), &WorkObserver::nothing())
+            .await
+            .unwrap();
         let child = children
             .iter()
             .find(|child| child.uri == OPEN_CHILD)
@@ -4778,10 +4806,10 @@ mod tests {
                    VALUES ('{issue}','p',{number},'Lease renewal backoff for executor {number}, with the retry curve still unsettled','active','none',1,1,(SELECT thread_id FROM jobs WHERE id = 'job-thread'));
                  INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                    VALUES ('e-{issue}','build','{issue}','p','running',1,1);
-                 INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
-                   VALUES ('job-{issue}','e-{issue}','{issue}','p','running','builder','builder',1,1);
+                 INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, started_at, created_at, updated_at)
+                   VALUES ('job-{issue}','e-{issue}','{issue}','p','running','builder','builder',1,1,1);
                  INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
-                   VALUES ('run-{issue}','job-{issue}','{issue}','running',1,1);
+                   VALUES ('run-{issue}','job-{issue}','{issue}','starting',1,1);
                  INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at, github_pr_number)
                    VALUES ('mr-{issue}','job-{issue}','p','{issue}','Lease renewal backoff','feat/lease','main','open',10,10,{number});
                  INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
@@ -4809,9 +4837,10 @@ mod tests {
             budget_tokens: 1_500,
             inline_eras: 3,
         };
-        let seed = compose_thread_seed_with_policy(&db, THREAD_JOB, NOW, policy)
-            .await
-            .unwrap();
+        let seed =
+            compose_thread_seed_with_policy(&db, THREAD_JOB, NOW, policy, &WorkObserver::nothing())
+                .await
+                .unwrap();
         let body = body_below_record(&seed.content);
 
         // Measured the way production measures, not by a bytes-over-four guess.
@@ -4843,6 +4872,7 @@ mod tests {
                 budget_tokens: 100_000,
                 inline_eras: 3,
             },
+            &WorkObserver::nothing(),
         )
         .await
         .unwrap();
@@ -4882,9 +4912,10 @@ mod tests {
             budget_tokens: 800,
             inline_eras: 3,
         };
-        let seed = compose_thread_seed_with_policy(&db, THREAD_JOB, NOW, policy)
-            .await
-            .unwrap();
+        let seed =
+            compose_thread_seed_with_policy(&db, THREAD_JOB, NOW, policy, &WorkObserver::nothing())
+                .await
+                .unwrap();
         let body = body_below_record(&seed.content);
 
         assert!(
@@ -4932,6 +4963,7 @@ mod tests {
                     budget_tokens: budget,
                     inline_eras: 3,
                 },
+                &WorkObserver::nothing(),
             )
             .await
             .unwrap();
@@ -5028,6 +5060,7 @@ mod tests {
                 budget_tokens: 300,
                 inline_eras: 3,
             },
+            &WorkObserver::nothing(),
         )
         .await
         .unwrap();
@@ -6045,10 +6078,16 @@ mod tests {
             ) -> (std::time::Duration, usize) {
                 let started = std::time::Instant::now();
                 let seed_bytes = if thread {
-                    compose_thread_seed_with_policy(db, &job.id, now, SeedPolicy::default())
-                        .await
-                        .map(|seed| seed.content.len())
-                        .unwrap()
+                    compose_thread_seed_with_policy(
+                        db,
+                        &job.id,
+                        now,
+                        SeedPolicy::default(),
+                        &WorkObserver::nothing(),
+                    )
+                    .await
+                    .map(|seed| seed.content.len())
+                    .unwrap()
                 } else {
                     compose_node_seed(db, job, SeedPolicy::default().budget_tokens)
                         .await
@@ -6166,7 +6205,9 @@ mod tests {
         .await
         .unwrap();
 
-        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id), &WorkObserver::nothing())
+            .await
+            .unwrap();
         let child = children
             .iter()
             .find(|child| child.uri == OPEN_CHILD)
@@ -6245,7 +6286,9 @@ mod tests {
         .await
         .unwrap();
 
-        let children = load_children(&db, Some(&db.thread_id)).await.unwrap();
+        let children = load_children(&db, Some(&db.thread_id), &WorkObserver::nothing())
+            .await
+            .unwrap();
         let rendered = render_children(&children, NOW);
         let at = |uri: &str| {
             rendered
@@ -6268,7 +6311,10 @@ mod tests {
     #[tokio::test]
     async fn a_job_outside_any_thread_has_an_empty_census() {
         let db = thread_fixture("thread-seed-no-thread.db").await;
-        assert!(load_children(&db, None).await.unwrap().is_empty());
+        assert!(load_children(&db, None, &WorkObserver::nothing())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// What the children census costs on a real history: the whole census as
@@ -6314,7 +6360,9 @@ mod tests {
             .await
             .unwrap();
             let node = started.elapsed();
-            let children = load_children(db, thread_id.as_deref()).await.unwrap();
+            let children = load_children(db, thread_id.as_deref(), &WorkObserver::nothing())
+                .await
+                .unwrap();
             println!(
                 "census: node read {node:?}; {} children in {:?} total",
                 children.len(),

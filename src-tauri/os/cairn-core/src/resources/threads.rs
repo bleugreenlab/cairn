@@ -4,6 +4,7 @@
 //! it onto the node-family resource that answers for it.
 
 use super::common::{lookup_project_by_key, read_resource};
+use crate::execution::jobs::liveness::WorkObserver;
 use cairn_db::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
 
@@ -26,18 +27,22 @@ pub(super) async fn resolve_thread_id(
     })).await.map_err(|error| format!("Failed to resolve thread: {error}"))
 }
 
-/// Canonical text queue; callers supply the workspace focus bound.
+/// Canonical text queue; callers supply the workspace focus bound and the
+/// observation its children's standings are read against.
 pub(crate) async fn read_thread_queue(
     db: &LocalDb,
     project_key: &str,
     thread: &str,
     now: i64,
     limit: i64,
+    observer: &WorkObserver,
 ) -> String {
     let project_key = project_key.to_owned();
     let thread = thread.to_owned();
+    let observer = observer.clone();
     read_resource(db, move |conn| {
-        let (project_key, thread) = (project_key.clone(), thread.clone());
+        let (project_key, thread, observer) =
+            (project_key.clone(), thread.clone(), observer.clone());
         Box::pin(async move {
             let project = match lookup_project_by_key(conn, &project_key).await {
                 Ok(project) => project,
@@ -59,7 +64,7 @@ pub(crate) async fn read_thread_queue(
                     Ok(queue) => queue,
                     Err(error) => return Ok(format!("Failed to load {thread}'s queue: {error}")),
                 };
-            let standings = crate::execution::gates::census::focus_standings_conn(conn, &thread_id).await.map_err(|e| e.to_string())?;
+            let standings = crate::execution::gates::census::focus_standings_conn(conn, &thread_id, &observer).await.map_err(|e| e.to_string())?;
             let mut rows = conn.query("SELECT id, number, title FROM issues WHERE parent_thread_id = ?1 ORDER BY number", params![thread_id.as_str()]).await.map_err(|e| e.to_string())?;
             let mut listed = Vec::new();
             while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
@@ -238,11 +243,14 @@ pub(super) async fn read_thread(
     name: &str,
     path: &[String],
     default_open_children: i64,
+    observer: &WorkObserver,
 ) -> String {
     let project_key = project_key.to_owned();
     let name = name.to_owned();
     let path = path.to_vec();
+    let observer = observer.clone();
     read_resource(db, move |conn| {
+        let observer = observer.clone();
         Box::pin(async move {
             let project_key = project_key.as_str();
             let name = name.as_str();
@@ -364,7 +372,7 @@ pub(super) async fn read_thread(
             .unwrap_or_default();
 
             out.push_str("\n## Children\n\n");
-            let standings = crate::execution::gates::census::focus_standings_conn(conn, &id).await.map_err(|e| e.to_string())?;
+            let standings = crate::execution::gates::census::focus_standings_conn(conn, &id, &observer).await.map_err(|e| e.to_string())?;
             let limit = default_open_children.max(1);
             if !listed.is_empty() {
                 let running = standings.values().filter(|s| s.tier() == 0).count();
@@ -431,7 +439,17 @@ mod children_tests {
             )
             .await
             .unwrap();
-        let page = super::read_thread(&env.db, "prj", "harness", &[], 4).await;
+        let page = super::read_thread(
+            &env.db,
+            "prj",
+            "harness",
+            &[],
+            4,
+            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                .await
+                .unwrap(),
+        )
+        .await;
         assert!(page.contains("Running 0/4"), "{page}");
         assert!(page.contains("Failed"), "{page}");
         assert!(page.contains("Launch refused"), "{page}");
@@ -459,8 +477,9 @@ mod children_tests {
                 "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                    VALUES('ce{number}', 'recipe', 'ci{number}', 'p', 'running', 1, 1);
                  INSERT INTO jobs(id, execution_id, project_id, issue_id, node_name, status,
-                                  created_at, updated_at)
-                   VALUES('cj{number}', 'ce{number}', 'p', 'ci{number}', 'builder', 'running', 1, 1);"
+                                  started_at, created_at, updated_at)
+                   VALUES('cj{number}', 'ce{number}', 'p', 'ci{number}', 'builder', 'running',
+                          CAST(strftime('%s', 'now') AS INTEGER), 1, 1);"
             ));
         }
         env.db.execute_script(&seed).await.unwrap();
@@ -470,13 +489,31 @@ mod children_tests {
             .await
             .unwrap();
 
-        let page = super::read_thread(&env.db, "prj", "harness", &[], 4).await;
+        let page = super::read_thread(
+            &env.db,
+            "prj",
+            "harness",
+            &[],
+            4,
+            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                .await
+                .unwrap(),
+        )
+        .await;
         use crate::execution::gates::census::{
             focus_standings_conn, FocusParkCause, FocusStanding,
         };
         let standing = env
             .db
-            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .read({
+                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                    .await
+                    .unwrap();
+                move |conn| {
+                    let observer = observer.clone();
+                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
+                }
+            })
             .await
             .unwrap();
         for n in 100..104 {
@@ -514,7 +551,15 @@ mod children_tests {
         ).await.unwrap();
         let standing = env
             .db
-            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .read({
+                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                    .await
+                    .unwrap();
+                move |conn| {
+                    let observer = observer.clone();
+                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
+                }
+            })
             .await
             .unwrap();
         assert_eq!(standing.get("ci100"), Some(&FocusStanding::Stopped));
@@ -540,7 +585,15 @@ mod children_tests {
         ).await.unwrap();
         let standing = env
             .db
-            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .read({
+                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                    .await
+                    .unwrap();
+                move |conn| {
+                    let observer = observer.clone();
+                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
+                }
+            })
             .await
             .unwrap();
         assert!(matches!(
@@ -566,7 +619,15 @@ mod children_tests {
         ).await.unwrap();
         let standing = env
             .db
-            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .read({
+                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                    .await
+                    .unwrap();
+                move |conn| {
+                    let observer = observer.clone();
+                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
+                }
+            })
             .await
             .unwrap();
         assert!(
@@ -581,9 +642,9 @@ mod children_tests {
              INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
              VALUES('ce106','recipe','ci106','p','running',1,1),
                    ('ce107','recipe','ci107','p','running',1,1);
-             INSERT INTO jobs(id,execution_id,project_id,issue_id,node_name,status,created_at,updated_at)
-             VALUES('cj106','ce106','p','ci106','builder','running',1,1),
-                   ('cj107','ce107','p','ci107','builder','running',1,1);
+             INSERT INTO jobs(id,execution_id,project_id,issue_id,node_name,status,started_at,created_at,updated_at)
+             VALUES('cj106','ce106','p','ci106','builder','running',CAST(strftime('%s','now') AS INTEGER),1,1),
+                   ('cj107','ce107','p','ci107','builder','running',CAST(strftime('%s','now') AS INTEGER),1,1);
              INSERT INTO sessions(id,job_id,status,backend_id,created_at,updated_at)
              VALUES('cs107','cj107','open','backend',1,1);
              INSERT INTO runs(id,project_id,job_id,issue_id,status,session_id,created_at,updated_at)
@@ -594,12 +655,30 @@ mod children_tests {
         ).await.unwrap();
         let standing = env
             .db
-            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .read({
+                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                    .await
+                    .unwrap();
+                move |conn| {
+                    let observer = observer.clone();
+                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
+                }
+            })
             .await
             .unwrap();
         assert_eq!(standing.get("ci106"), Some(&FocusStanding::Running));
         assert_eq!(standing.get("ci107"), Some(&FocusStanding::Stopped));
-        let queue = super::read_thread_queue(&env.db, "prj", "harness", 1000, 4).await;
+        let queue = super::read_thread_queue(
+            &env.db,
+            "prj",
+            "harness",
+            1000,
+            4,
+            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                .await
+                .unwrap(),
+        )
+        .await;
         let sections = [
             ("Running", vec![106]),
             ("Queued", vec![100, 105]),
@@ -630,7 +709,17 @@ mod children_tests {
             queue.find("cairn://p/prj/100)").unwrap() < queue.find("cairn://p/prj/105)").unwrap(),
             "{queue}"
         );
-        let overview = super::read_thread(&env.db, "prj", "harness", &[], 4).await;
+        let overview = super::read_thread(
+            &env.db,
+            "prj",
+            "harness",
+            &[],
+            4,
+            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                .await
+                .unwrap(),
+        )
+        .await;
         assert!(
             overview.contains("Running 1/4 · queued 3 · parked 2"),
             "{overview}"
@@ -644,7 +733,15 @@ mod children_tests {
             let canonical = state.line(chrono::Utc::now().timestamp());
             assert!(line.contains(&canonical), "{line}");
         }
-        super::super::thread_seed::assert_focus_text(&env.db, "th", &standing).await;
+        super::super::thread_seed::assert_focus_text(
+            &env.db,
+            "th",
+            &standing,
+            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                .await
+                .unwrap(),
+        )
+        .await;
 
         // Three failed launches gate the re-entry: it leaves the band and
         // reads as stopped, needing the operator, with no place in line.
@@ -656,7 +753,15 @@ mod children_tests {
             .unwrap();
         let standing = env
             .db
-            .read(|conn| Box::pin(async move { focus_standings_conn(conn, "th").await }))
+            .read({
+                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                    .await
+                    .unwrap();
+                move |conn| {
+                    let observer = observer.clone();
+                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
+                }
+            })
             .await
             .unwrap();
         assert!(
@@ -664,7 +769,17 @@ mod children_tests {
             "{:?}",
             standing.get("ci100")
         );
-        let queue = super::read_thread_queue(&env.db, "prj", "harness", 1000, 4).await;
+        let queue = super::read_thread_queue(
+            &env.db,
+            "prj",
+            "harness",
+            1000,
+            4,
+            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
+                .await
+                .unwrap(),
+        )
+        .await;
         let stopped = queue
             .split("## Stopped\n\n")
             .nth(1)
@@ -718,7 +833,15 @@ mod tests {
             "the stored epoch must not reach the surface: {collection}"
         );
 
-        let overview = read_thread(&db, "thr", "design-review", &[], 4).await;
+        let overview = read_thread(
+            &db,
+            "thr",
+            "design-review",
+            &[],
+            4,
+            &WorkObserver::nothing(),
+        )
+        .await;
         // A thread's heading is its one identifier, the same string its URI
         // carries and its pane header shows.
         assert!(overview.contains("# design-review"));
@@ -743,7 +866,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let overview = read_thread(&db, "thr", "design-review", &[], 4).await;
+        let overview = read_thread(
+            &db,
+            "thr",
+            "design-review",
+            &[],
+            4,
+            &WorkObserver::nothing(),
+        )
+        .await;
         assert!(
             overview.contains("· Operator has read through #4, 2h ago\n"),
             "{overview}"
@@ -782,7 +913,15 @@ mod tests {
             "a closed thread is not offered as somewhere to address: {collection}"
         );
 
-        let overview = read_thread(&db, "thr", "retired-topic", &[], 4).await;
+        let overview = read_thread(
+            &db,
+            "thr",
+            "retired-topic",
+            &[],
+            4,
+            &WorkObserver::nothing(),
+        )
+        .await;
         assert!(overview.contains("# retired-topic"));
         assert!(overview.contains("Status: closed"));
         assert!(
@@ -921,6 +1060,7 @@ mod tests {
         let task = super::super::node::read_task(
             &db,
             &Default::default(),
+            &WorkObserver::nothing(),
             "thr",
             0,
             0,
@@ -988,7 +1128,15 @@ mod tests {
             "a read must never mint a thread's session job"
         );
 
-        let overview = read_thread(&db, "thr", "design-review", &[], 4).await;
+        let overview = read_thread(
+            &db,
+            "thr",
+            "design-review",
+            &[],
+            4,
+            &WorkObserver::nothing(),
+        )
+        .await;
         assert!(overview.contains("Live session: not started"), "{overview}");
     }
 

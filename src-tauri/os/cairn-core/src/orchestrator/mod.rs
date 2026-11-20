@@ -926,6 +926,8 @@ impl OrchestratorBuilder {
             executor: Arc::new(OnceLock::new()),
             mcp_gateway: Arc::new(OnceLock::new()),
             model_catalog: self.model_catalog,
+            settings_memo: Arc::default(),
+            models_memo: Arc::default(),
             claude_alias_cache: Arc::new(generation_cache::GenerationCache::new(
                 "Claude alias observations",
             )),
@@ -976,6 +978,7 @@ impl OrchestratorBuilder {
             ),
             write_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             lane_claims: Arc::new(Default::default()),
+            late_write_checks: Arc::new(Default::default()),
             write_wave_boards: Arc::new(Default::default()),
             node_check_status_cache: Arc::new(
                 crate::execution::checks_status::NodeCheckStatusCache::default(),
@@ -1773,6 +1776,9 @@ pub struct Orchestrator {
     /// The write-check lanes being verified right now, by input key, so a fix
     /// fold onto a moved head reuses the head's own verdicts. Runtime-only.
     pub(crate) lane_claims: Arc<crate::execution::lane_claims::LaneClaims>,
+    /// Each job's write waves in planning order, so a late summary a newer
+    /// wave superseded is folded into that wave's own. Runtime-only.
+    pub(crate) late_write_checks: Arc<crate::execution::late_write_checks::LateWriteChecks>,
     /// The status boards of the write waves in flight, by job, so `/checks`
     /// reads each write lane from its own request. Runtime-only.
     pub(crate) write_wave_boards: Arc<crate::execution::checks::WriteWaveBoards>,
@@ -1940,6 +1946,15 @@ pub struct Orchestrator {
 
     /// Cached provider model catalog loaded at startup and refreshed on demand.
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
+    /// The workspace settings, until `settings.yaml` changes. See
+    /// [`Self::get_settings`].
+    settings_memo: Arc<cairn_config::file_memo::FileMemo<(), crate::models::Settings>>,
+    /// The pools and ladder each project checkout selects within (`None`: the
+    /// workspace's), until a file they derive from changes. See
+    /// [`Self::effective_models`].
+    pub(crate) models_memo: Arc<
+        cairn_config::file_memo::FileMemo<Option<PathBuf>, cairn_config::allotment::ModelsConfig>,
+    >,
     /// Whether [`Self::refresh_model_catalog`] rediscovers anything. Always on
     /// outside test builds. Test builds default it off, because a full refresh
     /// is the one discovery nobody asked for by name: it fires from

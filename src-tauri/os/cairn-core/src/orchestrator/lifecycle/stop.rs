@@ -19,6 +19,31 @@ pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str, cancel_owned_
     // a self-suspend — was the latent defect behind never-resumed durable waits
     // (CAIRN-2970).
     if cancel_owned_waits {
+        cancel_owned_waits_for_stop(orch, run_id);
+    } else {
+        // A durable self-suspend already yielded its turn with the actual cause.
+        // The provider interrupt only parks the process; it must not relabel the
+        // turn as an operator `user_stop`. External Stop takes the path below.
+        return;
+    }
+    settle_active_turn(orch, run_id);
+}
+
+/// End the run's live turn as a warm stop, answering its still-open calls.
+fn settle_active_turn(orch: &Orchestrator, run_id: &str) {
+    let Some(turn_id) = active_turn_id_for_run(orch, run_id) else {
+        return;
+    };
+
+    if let Err(error) = settle_live_turn(orch, Some(run_id), &turn_id, TurnSettlement::UserStop) {
+        log::warn!("Failed to stop turn {turn_id} for run {run_id}: {error}");
+    }
+}
+
+/// An external stop's claim on the run's own work: its resource writes stop at
+/// their next item, and its durable waits are cancelled.
+fn cancel_owned_waits_for_stop(orch: &Orchestrator, run_id: &str) {
+    {
         // Ask each resource write the run is applying to stop before its next
         // item, before the turn's pending results are settled. Only an
         // external stop: a self-suspend's own write is the call that suspends.
@@ -42,18 +67,6 @@ pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str, cancel_owned_
             }
             Err(error) => log::warn!("Failed to cancel owned wait for run {run_id}: {error}"),
         }
-    } else {
-        // A durable self-suspend already yielded its turn with the actual cause.
-        // The provider interrupt only parks the process; it must not relabel the
-        // turn as an operator `user_stop`. External Stop takes the path below.
-        return;
-    }
-    let Some(turn_id) = active_turn_id_for_run(orch, run_id) else {
-        return;
-    };
-
-    if let Err(error) = settle_live_turn(orch, Some(run_id), &turn_id, TurnSettlement::UserStop) {
-        log::warn!("Failed to stop turn {turn_id} for run {run_id}: {error}");
     }
 }
 
@@ -212,9 +225,10 @@ struct ParkSlot {
 #[derive(Default)]
 pub struct ParkSlots(Mutex<HashMap<String, ParkSlot>>);
 
-#[cfg(test)]
 impl ParkSlots {
-    /// Whether any suspension has armed a park for `run_id`.
+    /// Whether a suspension has armed a park for `run_id` that has not yet
+    /// happened: the run's turn has yielded, but its process is still within
+    /// the handoff grace.
     pub(crate) fn armed(&self, run_id: &str) -> bool {
         self.0.lock().unwrap().contains_key(run_id)
     }
@@ -352,7 +366,18 @@ fn arm_coalesced_park(
         // Retire the slot BEFORE broadcasting, so a suspension arriving
         // afterwards opens its own rather than waiting on a signal already sent.
         retire_park_slot(&orch, &run_id, generation);
+        let parked_ok = parked.is_ok();
         let _ = done.send(parked);
+        // An escalated message that reached the turn while it was in the call
+        // that just parked it was left for that call's return, and a park is
+        // not a return. Deliver it now that the park is the last thing that
+        // happened to the predecessor (tenet 1439).
+        if parked_ok {
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::messages::delivery::steer_park_for_waiting_escalation(&orch, &run_id)
+            })
+            .await;
+        }
     });
     parked
 }
@@ -609,9 +634,10 @@ fn is_workflow_child_run(orch: &Orchestrator, run_id: &str) -> bool {
 
 /// The operator pressed Stop on a run. A user interrupt suppresses autonomous
 /// successors, so the job's goal is turned off before the turn is interrupted
-/// and stays off until the operator turns it back on. Internal stops (an
-/// interrupting message, a model switch, closing an issue) go through
-/// [`stop_session`] and leave the operator's choice alone.
+/// and stays off until the operator turns it back on. Internal stops (a model
+/// switch, closing an issue) go through [`stop_session`] and leave the
+/// operator's choice alone; an agent's escalated message never stops a session
+/// ([`interrupt_turn_for_message`]).
 pub fn operator_stop_run(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
     let job_id = job_id_for_run(orch, run_id);
     if let Some(job_id) = &job_id {
@@ -660,6 +686,15 @@ pub fn stop_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
 
     // Stop the requested run
     stop_session_internal(orch, run_id, StopReason::OperatorStop)
+}
+
+/// Interrupt a run's turn so an agent's escalated message lands now, leaving
+/// everything the job started running (tenet 1439). Used only for a turn that
+/// is generating rather than in a tool call: a turn in a tool call is steered
+/// at its next tool boundary instead (`messages::delivery`). Unlike
+/// [`stop_session`] it does not cascade to child runs.
+pub fn interrupt_turn_for_message(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
+    stop_session_internal(orch, run_id, StopReason::Message)
 }
 
 /// Job-level stop for a suspended/waiting job that has no live run attached.
@@ -833,12 +868,19 @@ pub(crate) enum StopReason {
     /// A system-owned park preserves inline siblings and warm state even when
     /// interrupt delivery fails. Only this condition may release its pause.
     Park(GoalPauseOwner),
+    /// An agent's escalated message to a turn that is only generating (tenet
+    /// 1439). The turn ends as a warm stop so the message lands now, and nothing
+    /// the job started is touched: no batch is cancelled at its machine, no
+    /// inline command or terminal is killed, no durable wait or check request
+    /// is withdrawn, no child run is stopped, and a failed interrupt never falls
+    /// back to a hard kill.
+    Message,
 }
 
 impl StopReason {
     fn pause_intent(&self) -> PauseIntent {
         PauseIntent::Stake(match self {
-            Self::OperatorStop => GoalPause::Interrupted,
+            Self::OperatorStop | Self::Message => GoalPause::Interrupted,
             Self::Park(owner) => GoalPause::Owned(owner.clone()),
         })
     }
@@ -849,7 +891,9 @@ impl StopReason {
 
     fn interrupt_cause(&self) -> cairn_models::interface::session::InterruptCause {
         match self {
-            Self::OperatorStop => cairn_models::interface::session::InterruptCause::OperatorStop,
+            Self::OperatorStop | Self::Message => {
+                cairn_models::interface::session::InterruptCause::OperatorStop
+            }
             Self::Park(_) => cairn_models::interface::session::InterruptCause::DurablePark,
         }
     }
@@ -880,13 +924,16 @@ fn stop_session_with_pause_intent(
     reason: StopReason,
     intent: PauseIntent,
 ) -> Result<(), String> {
-    let cancel_owned_waits = reason.is_operator_stop();
-    if cancel_owned_waits {
-        if let Some(job_id) = job_id_for_run(orch, run_id) {
-            cancel_provider_holds(orch, &job_id)?;
+    match &reason {
+        StopReason::OperatorStop => {
+            if let Some(job_id) = job_id_for_run(orch, run_id) {
+                cancel_provider_holds(orch, &job_id)?;
+            }
+            stop_active_turn_for_run(orch, run_id, true);
         }
+        StopReason::Message => settle_active_turn(orch, run_id),
+        StopReason::Park(_) => stop_active_turn_for_run(orch, run_id, false),
     }
-    stop_active_turn_for_run(orch, run_id, cancel_owned_waits);
 
     // Send interrupt via the backend-aware stdin handler. For Codex this pauses
     // the native goal under the same stdin lock before sending `turn/interrupt`,
@@ -911,7 +958,7 @@ fn stop_session_with_pause_intent(
             return kill_session_with_reason(orch, run_id, "user_stop", TerminalPolicy::Finalize);
         } else {
             log::warn!(
-                "Failed to send interrupt to run {}; preserving warm durable-wait state: {}",
+                "Failed to send interrupt to run {}; preserving its warm state and its work: {}",
                 run_id,
                 e
             );

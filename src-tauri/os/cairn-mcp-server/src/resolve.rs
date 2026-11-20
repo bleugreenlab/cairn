@@ -1,7 +1,8 @@
 //! Cairn URI resolution and display-relativization for the MCP verbs: home/base
 //! shorthand expansion and target validation.
 use cairn_common::query::split_target_query;
-use cairn_uri::parse_uri as parse_cairn_uri;
+use cairn_common::uri_refusal::refusal_message;
+use cairn_uri::UriGrammar;
 
 use crate::schemas::ChangeInput;
 use crate::server::CairnMcpServer;
@@ -40,6 +41,16 @@ impl CairnMcpServer {
     /// the shorthand raw keeps that resolution current when a thread is renamed and
     /// also lets one pooled `cairn-cmd` serve call threads with different homes.
     fn resolve_target_with(&self, target: &str) -> Result<ResolvedTarget, String> {
+        self.resolve_target_against(target, UriGrammar::current())
+    }
+
+    /// [`Self::resolve_target_with`] against a given grammar, so a test can stand
+    /// in for a runner older than the address it is handed.
+    fn resolve_target_against(
+        &self,
+        target: &str,
+        grammar: &UriGrammar,
+    ) -> Result<ResolvedTarget, String> {
         if target == "cairn:~"
             || target.starts_with(CAIRN_HOME_PREFIX)
             || target.starts_with(CAIRN_PROJECT_PREFIX)
@@ -47,8 +58,8 @@ impl CairnMcpServer {
             return Ok(ResolvedTarget::CairnUri(target.to_string()));
         }
         if target.starts_with(CAIRN_URI_PREFIX) {
-            if parse_cairn_uri(target).is_none() {
-                return Err(format!("Invalid cairn resource URI: {}", target));
+            if let Err(refusal) = grammar.classify(target) {
+                return Err(refusal_message(target, &refusal));
             }
             return Ok(ResolvedTarget::CairnUri(target.to_string()));
         }
@@ -152,6 +163,71 @@ mod tests {
             .resolve_target("src/main.rs")
             .unwrap_err()
             .contains("expected cairn://... or file:..."));
+    }
+
+    #[test]
+    fn a_garbled_cairn_target_is_refused_naming_its_fault() {
+        let mcp = test_server();
+        assert_eq!(
+            mcp.resolve_target("cairn://posts//1").unwrap_err(),
+            "Malformed cairn address `cairn://posts//1`: segment 2 is empty (a doubled or \
+             trailing `/`)."
+        );
+    }
+
+    /// The specimen: a launcher newer than its runner asks for
+    /// `cairn://dev/launch-ticket`. The runner says it lacks the family and
+    /// who it is, not that the address is garbled.
+    #[test]
+    fn a_family_this_runner_lacks_is_refused_as_skew_naming_the_build() {
+        let mcp = test_server();
+        let older = UriGrammar::without(|resource| {
+            matches!(
+                resource,
+                cairn_uri::CairnResource::Dev
+                    | cairn_uri::CairnResource::DevDb
+                    | cairn_uri::CairnResource::DevPid
+                    | cairn_uri::CairnResource::DevLaunchTicket
+            )
+        });
+        let message = mcp
+            .resolve_target_against("cairn://dev/launch-ticket", &older)
+            .unwrap_err();
+        assert!(
+            message.starts_with(&format!(
+                "This runner ({}) has no `cairn://dev` resource.",
+                cairn_common::uri_refusal::runner_identity()
+            )),
+            "{message}"
+        );
+        assert!(message.contains("rebuild or update it"), "{message}");
+        assert!(message.contains("Known families: "), "{message}");
+        assert!(message.contains("models"), "{message}");
+
+        // The same address against this build resolves.
+        assert!(mcp.resolve_target("cairn://dev/launch-ticket").is_ok());
+    }
+
+    #[test]
+    fn a_near_miss_cairn_target_suggests_the_nearest_family() {
+        let mcp = test_server();
+        let message = mcp
+            .rewrite_change_targets(&ChangeInput {
+                changes: Some(vec![ChangeItemInput {
+                    target: Some("cairn://modles/catalog".into()),
+                    mode: Some("patch".into()),
+                    payload: None,
+                }]),
+                commit_msg: None,
+                preview: None,
+                atomic: None,
+                conflict_markers_reason: None,
+            })
+            .unwrap_err();
+        assert!(
+            message.contains("has no `cairn://modles` resource. Did you mean `cairn://models`?"),
+            "{message}"
+        );
     }
 
     #[test]

@@ -4,16 +4,22 @@
 //!
 //! Nothing here probes a provider. Usage comes from what the book already
 //! holds and the credential store's recorded health, so a preview costs a
-//! settings read and a catalog build, not a network round trip.
+//! catalog build, not a network round trip, and the settings and project
+//! overlay are parsed again only when their files change.
 
 use cairn_config::library::LibraryRoots;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use cairn_config::allotment::{
     model_ref, parse_allotment, AllotmentEntry, Band, LevelSource, ModelsConfig, PoolKind,
 };
-use cairn_config::project_settings::{convert_project_tiers, load_project_settings_read_only};
-use cairn_config::settings::{convert_settings_tiers, load_settings_file};
+use cairn_config::project_settings::{
+    convert_project_tiers, get_project_config_path, load_project_settings_read_only,
+};
+use cairn_config::settings::{
+    convert_settings_tiers, get_settings_path, load_settings_file, RETIRED_GRID_FILE,
+};
 use cairn_db::storage::run_db_blocking;
 use cairn_models::interface::{Catalog, CatalogProvider, ModelScope, Models};
 use cairn_models::supply::SupplyInputs;
@@ -410,7 +416,24 @@ impl Orchestrator {
     /// A workspace or project whose tier grid has not been converted yet is
     /// converted here in memory, the same conversion the one-time migration
     /// writes, so a preview never reads an empty ladder.
+    ///
+    /// Every launch, held-launch probe and preview asks this, so the answer is
+    /// kept per checkout until `settings.yaml`, the retired tier grid or the
+    /// project's `.cairn/config.yaml` changes on disk.
     pub fn effective_models(&self, project_id: Option<&str>) -> Result<ModelsConfig, String> {
+        let project_path = project_id.map(|id| self.project_path(id)).transpose()?;
+        let mut files = vec![
+            get_settings_path(&self.config_dir),
+            self.config_dir.join(RETIRED_GRID_FILE),
+        ];
+        files.extend(project_path.as_deref().map(get_project_config_path));
+        self.models_memo.get(project_path.clone(), &files, || {
+            self.read_effective_models(project_path.as_deref())
+        })
+    }
+
+    /// [`Self::effective_models`] read from the files themselves.
+    fn read_effective_models(&self, project_path: Option<&Path>) -> Result<ModelsConfig, String> {
         let settings = self.get_settings();
         // Until the one-time conversion has written `models` (it runs at
         // startup), the file's tier grid is converted here the same way.
@@ -419,8 +442,8 @@ impl Orchestrator {
             Some(models) => models.clone(),
             None => convert_settings_tiers(&workspace_file(), &settings.enabled_providers).models,
         };
-        if let Some(project_id) = project_id {
-            let file = load_project_settings_read_only(&self.project_path(project_id)?);
+        if let Some(project_path) = project_path {
+            let file = load_project_settings_read_only(project_path);
             let overlay = match &file.models {
                 Some(overlay) => Some(overlay.clone()),
                 None => convert_project_tiers(
@@ -1517,6 +1540,96 @@ mod tests {
         // Startup reads the project and leaves its file as written.
         orch.migrate_models().unwrap();
         assert_eq!(std::fs::read_to_string(&config).unwrap(), written);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn effective_models_rereads_only_after_a_file_changes() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        std::fs::write(
+            orch.config_dir.join("settings.yaml"),
+            "enabledProviders: [claude, codex]\ntiers: [sm, md, lg, xl]\nbackends:\n  claude:\n    xl: {model: fable}\n",
+        )
+        .unwrap();
+        orch.migrate_models().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".cairn")).unwrap();
+        let config = repo.path().join(".cairn/config.yaml");
+        let settings = orch.config_dir.join("settings.yaml");
+        // Written files are trusted only once they are a moment old, so each
+        // write is dated an hour back.
+        let settle = |path: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+                .unwrap();
+        };
+        std::fs::write(&config, "backends:\n  claude:\n    xl: {model: opus}\n").unwrap();
+        settle(&config);
+        settle(&settings);
+        settle(&orch.config_dir.join(RETIRED_GRID_FILE));
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('p', 'default', 'P', 'p', ?1, 1, 1)",
+                cairn_db::turso::params![repo.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        let xl = |models: &ModelsConfig| -> Vec<String> {
+            models
+                .expand(
+                    &[AllotmentEntry::Pool("xl".into())],
+                    &cairn_config::allotment::unplaced,
+                )
+                .unwrap()
+                .candidates
+                .iter()
+                .map(|candidate| model_ref(&candidate.model))
+                .collect()
+        };
+        let fills = || orch.models_memo.fills();
+
+        let start = fills();
+        let first = orch.effective_models(Some("p")).unwrap();
+        assert_eq!(orch.effective_models(Some("p")).unwrap(), first);
+        assert_eq!(xl(&first), ["claude/opus"]);
+        assert_eq!(
+            fills(),
+            start + 1,
+            "an unchanged checkout is not read again"
+        );
+
+        // The project's overlay changes on disk, with no settings write.
+        std::fs::write(&config, "backends:\n  claude:\n    xl: {model: sonnet}\n").unwrap();
+        settle(&config);
+        let edited = orch.effective_models(Some("p")).unwrap();
+        assert_eq!(xl(&edited), ["claude/sonnet"]);
+        assert_eq!(fills(), start + 2);
+
+        // The workspace's ladder changes, with no project write.
+        let mut workspace = orch.get_settings().models.unwrap();
+        workspace.default_models = vec![AllotmentEntry::Pool("xl".into())];
+        cairn_config::settings::mutate_workspace_settings(&orch.config_dir, "test", |root| {
+            root.insert("models".into(), serde_yaml::to_value(&workspace).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        // Until it settles, the fresh file is read on every call.
+        for _ in 0..2 {
+            let fresh = orch.effective_models(Some("p")).unwrap();
+            assert_eq!(fresh.default_models, workspace.default_models);
+        }
+        assert_eq!(fills(), start + 4);
+        settle(&settings);
+        for _ in 0..2 {
+            let settled = orch.effective_models(Some("p")).unwrap();
+            assert_eq!(settled.default_models, workspace.default_models);
+            assert_eq!(xl(&settled), ["claude/sonnet"]);
+        }
+        assert_eq!(fills(), start + 5);
     }
 
     #[tokio::test(flavor = "multi_thread")]

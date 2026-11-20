@@ -647,6 +647,7 @@ async fn a_task_cut_off_by_its_provider_is_still_asked_for_its_return() {
             CodexTurnContext {
                 failure_disposition:
                     cairn_session::agent_process::completion::TurnFailureDisposition::Unhandled,
+                fatal_cause: None,
             },
         );
     })
@@ -1171,6 +1172,7 @@ async fn complete_codex_child_turn(orch: &Orchestrator) {
             cairn_session::agent_process::completion::CodexTurnContext {
                 failure_disposition:
                     cairn_session::agent_process::completion::TurnFailureDisposition::Unhandled,
+                fatal_cause: None,
             },
         );
     })
@@ -1290,6 +1292,158 @@ async fn codex_task_turns_all_run_on_a_live_run_and_the_returning_one_settles_it
     assert_eq!(run_status(&orch, "run-child").await, "live");
     assert!(orch.process_state.is_warm("run-child"));
     assert_eq!(fleet_slots_held(&orch, &child).await, 0);
+}
+
+/// The sgpd/42 failure as the Codex reader reports it: a fatal error ends the
+/// task's turn, and the reader hands the host its cause.
+const FATAL: &str = "Codex error: unexpected status 401 Unauthorized: refresh_token_reused; \
+                     reconnect with connect_codex_auth";
+
+/// The text a resumed parent reads in its spawning call's result, which the
+/// write that spawned the task wraps in its envelope.
+fn blocking_text(delivered: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(delivered)
+        .ok()
+        .and_then(|envelope| envelope["blocking"]["text"].as_str().map(str::to_string))
+        .unwrap_or_else(|| delivered.to_string())
+}
+
+async fn fail_codex_child_turn(orch: &Orchestrator, cause: Option<&'static str>) {
+    on_blocking_thread(orch, move |orch| {
+        crate::orchestrator::lifecycle::apply_codex_turn_completion(
+            orch,
+            &orch.db.local,
+            &orch.services.emitter,
+            "run-child",
+            Some("session-child"),
+            crate::agent_process::completion::SessionTurnCompletion {
+                outcome: crate::agent_process::completion::SessionTurnOutcome::Failed {
+                    status: "error".into(),
+                },
+                usage: crate::agent_process::stream::TokenCounts::default(),
+                session_lifetime: crate::agent_process::completion::SessionLifetime::Persistent,
+            },
+            cairn_session::agent_process::completion::CodexTurnContext {
+                failure_disposition:
+                    cairn_session::agent_process::completion::TurnFailureDisposition::DiagnosticRecorded,
+                fatal_cause: cause.map(str::to_string),
+            },
+        );
+    })
+    .await;
+}
+
+/// cairn/6099: a Codex task that dies on a known fatal error. Its parent,
+/// parked on the durable wait, is resumed with that error and the task's
+/// address, as an error result, exactly once however often the end replays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_task_that_dies_on_a_fatal_error_tells_its_parent_why_and_where() {
+    let (orch, child, _requests) = spawn_and_park("return-followup-codex-fatal.db").await;
+    open_codex_child_turn(&orch, &child).await;
+    fail_codex_child_turn(&orch, Some(FATAL)).await;
+
+    assert_eq!(job_status(&orch, &child).await, "failed");
+    assert_eq!(
+        text(
+            &orch,
+            "SELECT error_message FROM runs WHERE id = 'run-child'"
+        )
+        .await
+        .as_deref(),
+        Some(FATAL)
+    );
+    await_successor(&orch).await;
+    let delivered = delivered_tool_result(&orch)
+        .await
+        .expect("the parent is told the task failed");
+    assert!(
+        blocking_text(&delivered).starts_with(&format!(
+            "Task 'map the fleet' failed.\n\nIt stopped on this error: {FATAL}\n\nRead it at \
+             cairn://p/prj/7/1/builder/task/"
+        )),
+        "{delivered}"
+    );
+    assert!(!delivered.contains("encountered an error"), "{delivered}");
+    assert_eq!(
+        count(
+            &orch,
+            "SELECT COUNT(*) FROM events WHERE run_id='run-parent' AND event_type='tool_result' \
+             AND json_extract(data,'$.toolUseId')='tool-write' AND json_extract(data,'$.isError')",
+        )
+        .await,
+        1,
+        "the spawning call's result is an error"
+    );
+    assert_eq!(
+        reprompts(&orch, &child).await,
+        0,
+        "a failure is not re-prompted"
+    );
+
+    // A repeated terminal callback with another cause, and replayed
+    // finalization, neither replace the cause nor deliver again.
+    fail_codex_child_turn(&orch, Some("Codex error: a later failure")).await;
+    on_blocking_thread(&orch, |orch| {
+        finalize_run(orch, "run-child", RunStatus::Crashed);
+        finalize_run(orch, "run-child", RunStatus::Crashed);
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        text(
+            &orch,
+            "SELECT error_message FROM runs WHERE id = 'run-child'"
+        )
+        .await
+        .as_deref(),
+        Some(FATAL)
+    );
+    assert_eq!(successor_count(&orch).await, 1, "the parent resumes once");
+    assert_eq!(tool_results_on_the_spawning_call(&orch).await, 1);
+}
+
+/// A failure with no known cause still reaches the parent, generically, with
+/// the task's address.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_task_that_fails_without_a_known_cause_keeps_the_generic_report() {
+    let (orch, child, _requests) = spawn_and_park("return-followup-codex-causeless.db").await;
+    open_codex_child_turn(&orch, &child).await;
+    fail_codex_child_turn(&orch, None).await;
+    assert_eq!(job_status(&orch, &child).await, "failed");
+    await_successor(&orch).await;
+    let delivered = delivered_tool_result(&orch).await.expect("the failure");
+    assert!(
+        delivered.contains("The agent encountered an error.")
+            && delivered.contains("Read it at cairn://p/prj/7/1/builder/task/"),
+        "{delivered}"
+    );
+}
+
+/// The inline wait renders through the same report: the blocking call itself
+/// returns the cause and the task's address.
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_wait_reports_a_failed_codex_tasks_cause_and_home() {
+    let (orch, _executor) = parent_fixture("return-followup-inline-fatal.db").await;
+    let budget = Duration::from_secs(20);
+    let spawn_orch = orch.clone();
+    let spawning = tokio::spawn(async move {
+        spawn(&spawn_orch, &[explore_payload("map the fleet")], budget).await
+    });
+    let child = created_child(&orch).await;
+    open_codex_child_turn(&orch, &child).await;
+    fail_codex_child_turn(&orch, Some(FATAL)).await;
+
+    let response = spawning
+        .await
+        .unwrap()
+        .response
+        .expect("blocking text")
+        .result;
+    assert!(
+        response.contains(&format!("It stopped on this error: {FATAL}"))
+            && response.contains("Read it at cairn://p/prj/7/1/builder/task/"),
+        "{response}"
+    );
 }
 
 /// Every resume edge firing for one settled child still delivers once.

@@ -64,7 +64,7 @@ pub(crate) const CHANNEL_MESSAGE_REPLY_TO: KeySpec = KeySpec::new(
 pub(crate) const ESCALATE: KeySpec = KeySpec::new(
     "escalate",
     KeyType::Bool,
-    "urgency interrupt: interrupt each recipient's active turn, and wake it even through a mute",
+    "urgency interrupt: wake each recipient now, even through a mute, at its next tool boundary (a turn that is only generating is interrupted; a call parked on a `run` batch answers with the batch's cairn:~/batches/<id> handle); never cancels the recipient's running batches, terminals or tasks",
 );
 pub(crate) const MESSAGE_URGENCY: KeySpec = KeySpec::new(
     "urgency",

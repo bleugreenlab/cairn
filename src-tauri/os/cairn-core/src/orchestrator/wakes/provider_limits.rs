@@ -993,16 +993,24 @@ async fn thread_facts_by_hold(
         }
     }
     let mut out = HashMap::new();
+    // One observation of this host's work for every thread the pass reads.
+    let observer = match members.is_empty() {
+        true => None,
+        false => Some(crate::execution::jobs::liveness::WorkObserver::read(orch).await?),
+    };
     for (key, mut thread_holds) in members {
-        let Some(db) = by_thread.get(&key) else {
+        let (Some(db), Some(observer)) = (by_thread.get(&key), observer.clone()) else {
             continue;
         };
         let thread_id = key.1.clone();
         let facts = db
             .read(move |conn| {
-                let thread_id = thread_id.clone();
+                let (thread_id, observer) = (thread_id.clone(), observer.clone());
                 Box::pin(async move {
-                    crate::execution::gates::capacity::thread_facts_conn(conn, &thread_id).await
+                    crate::execution::gates::capacity::thread_facts_conn(
+                        conn, &thread_id, &observer,
+                    )
+                    .await
                 })
             })
             .await
@@ -1269,19 +1277,10 @@ pub async fn settle_supply_held_start(
     Ok(true)
 }
 
-/// Retire every active hold that no longer owns what it was armed for. A yield
-/// hold owns its provider-yielded head, and once an operator continues past it
-/// there is nothing left to resolve. A launch hold owns a pending job, which an
-/// operator's start, a cancel, or a resolution moves on. A resume hold owns the
-/// head it rests on, which a later continue replaces. A timed hold would learn
-/// this when it came due, but a gated hold never comes due.
-pub async fn supersede_orphaned_provider_limit_holds(
-    db: &LocalDb,
-    now: i64,
-) -> Result<u64, String> {
-    db.execute(
-        "UPDATE provider_limit_holds SET state='superseded', updated_at=?1
-         WHERE state='active' AND (
+/// An active `provider_limit_holds` row that no longer owns what it was armed
+/// for. The supersession's read probe and its write both use this one
+/// predicate, so they cannot disagree about what is orphaned.
+const ORPHANED_HOLD: &str = "state='active' AND (
            EXISTS (SELECT 1 FROM jobs j
              LEFT JOIN executions e ON e.id=j.execution_id
              LEFT JOIN issues i ON i.id=COALESCE(j.issue_id,e.issue_id)
@@ -1297,7 +1296,38 @@ pub async fn supersede_orphaned_provider_limit_holds(
               SELECT 1 FROM jobs j WHERE j.id=provider_limit_holds.job_id AND j.status='pending'))
            OR (kind='resume' AND NOT EXISTS (
               SELECT 1 FROM jobs j WHERE j.id=provider_limit_holds.job_id
-                AND j.current_turn_id=provider_limit_holds.turn_id AND j.status<>'cancelled')))",
+                AND j.current_turn_id=provider_limit_holds.turn_id AND j.status<>'cancelled')))";
+
+/// Retire every active hold that no longer owns what it was armed for. A yield
+/// hold owns its provider-yielded head, and once an operator continues past it
+/// there is nothing left to resolve. A launch hold owns a pending job, which an
+/// operator's start, a cancel, or a resolution moves on. A resume hold owns the
+/// head it rests on, which a later continue replaces. A timed hold would learn
+/// this when it came due, but a gated hold never comes due.
+///
+/// Every gate pass and scheduler tick asks this of every database, and the
+/// answer is almost always none, so it is asked on the read path first and the
+/// writer is taken only when something is orphaned. The update re-evaluates
+/// the predicate under the write; a hold orphaned after the probe is retired
+/// by the next pass.
+pub async fn supersede_orphaned_provider_limit_holds(
+    db: &LocalDb,
+    now: i64,
+) -> Result<u64, String> {
+    let orphaned = db
+        .query_opt_i64(
+            format!("SELECT 1 FROM provider_limit_holds WHERE {ORPHANED_HOLD} LIMIT 1"),
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if orphaned.is_none() {
+        return Ok(0);
+    }
+    db.execute(
+        format!(
+            "UPDATE provider_limit_holds SET state='superseded', updated_at=?1 WHERE {ORPHANED_HOLD}"
+        ),
         params![now],
     )
     .await

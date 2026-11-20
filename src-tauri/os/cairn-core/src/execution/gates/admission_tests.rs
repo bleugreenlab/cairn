@@ -226,9 +226,11 @@ async fn quiet_pass(env: &Env, depth: i32) -> PassCost {
         Some(0),
         "{depth} holds that did not change cost no write under the lock"
     );
-    // Outside the lock, the hold pass's supersession of orphaned supply holds
-    // is one write a database, whatever the queue holds.
-    assert_eq!(env.db.write_transaction_count() - wrote, 1);
+    assert_eq!(
+        env.db.write_transaction_count() - wrote,
+        0,
+        "with no hold orphaned, the pass takes no write outside the lock either"
+    );
     cost
 }
 
@@ -259,7 +261,8 @@ async fn a_quiet_pass_takes_the_lock_once_and_writes_nothing() {
 }
 
 /// At the depth production reached on 11-06, one pass decides every held
-/// execution under the lock in seven statements: the fleet count, the
+/// execution under the lock in nine statements: the work observation (this
+/// host's pending launch admissions and owed advances), the fleet count, the
 /// capacity rows with their lanes' turns and the newest turn, and the starts'
 /// devices, issues and lanes' turns. Before the starts' facts were read as
 /// bound lists, this pass took 754.
@@ -268,8 +271,8 @@ async fn a_pass_over_150_held_executions_reads_a_bounded_amount_under_the_lock()
     let env = queue_in_lanes("admission-pass-150.db", 150).await;
     let cost = quiet_pass(&env, 150).await;
     assert!(
-        cost.under_lock <= 7,
-        "150 held executions are decided in at most 7 statements under the lock: {cost:?}"
+        cost.under_lock <= 9,
+        "150 held executions are decided in at most 9 statements under the lock: {cost:?}"
     );
 }
 
@@ -509,6 +512,7 @@ async fn a_confirmed_builder_reentry_precedes_an_older_fresh_filing_and_releases
         )
         .await
         .unwrap();
+    super::capacity::tests::serving(&env, 100);
 
     add_issue(&env, 103, Some("th")).await;
     let filed = file(&env, 103, json!([])).await.unwrap();
@@ -891,6 +895,43 @@ async fn a_hold_refused_by_its_open_pr_bound_takes_no_fleet_count() {
         .await
         .unwrap();
     assert_eq!(reason.as_deref(), Some("harness has 1/1 open PRs: 100"));
+}
+
+/// Active holds that still own their jobs cost a pass no write: the orphan
+/// check is a read. Once one hold's job is cancelled and the other's launch
+/// has started, the same pass supersedes both in exactly one write.
+#[tokio::test]
+async fn a_pass_writes_only_when_a_hold_is_orphaned() {
+    use super::sweep::tests::now;
+    let (env, _starts) = at_the_open_pr_bound("hold-pass-orphans.db").await;
+    pending_builder(&env, 103).await;
+    let cancelled = held_on_open_prs(&env.db, "sj102").await;
+    let started = held_on_open_prs(&env.db, "sj103").await;
+    let pass = || async {
+        let wrote = env.db.write_transaction_count();
+        crate::orchestrator::wakes::resolve_thread_holds(&env.orch, now())
+            .await
+            .unwrap();
+        env.db.write_transaction_count() - wrote
+    };
+    // The first pass records each hold's refusal as its bound words it.
+    pass().await;
+
+    assert_eq!(pass().await, 0, "two held launches that own their jobs");
+    assert_eq!(hold_state(&env, &cancelled.id).await, "active");
+    assert_eq!(hold_state(&env, &started.id).await, "active");
+
+    env.db
+        .execute_script(
+            "UPDATE jobs SET status = 'cancelled' WHERE id = 'sj102';
+             UPDATE jobs SET status = 'running' WHERE id = 'sj103';",
+        )
+        .await
+        .unwrap();
+    assert_eq!(pass().await, 1, "both orphans retire in one write");
+    assert_eq!(hold_state(&env, &cancelled.id).await, "superseded");
+    assert_eq!(hold_state(&env, &started.id).await, "superseded");
+    assert_eq!(pass().await, 0, "and nothing is left to retire");
 }
 
 // -- Start means start (cairn/7364) ------------------------------------------

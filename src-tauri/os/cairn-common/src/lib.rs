@@ -54,6 +54,7 @@ pub mod test_seal;
 pub mod token_meter;
 pub mod toolchain_path;
 pub mod toolchain_requirements;
+pub mod uri_refusal;
 pub mod volume;
 pub mod wire_vocabulary;
 pub mod write_contract;

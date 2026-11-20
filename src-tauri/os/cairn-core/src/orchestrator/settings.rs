@@ -30,9 +30,18 @@ fn validate_telegram_channel_update(
 }
 
 impl Orchestrator {
-    /// Get current settings from file.
+    /// The workspace settings in `settings.yaml`, read and parsed again only
+    /// when the file has changed since the last read.
     pub fn get_settings(&self) -> Settings {
-        settings::load_settings(&self.config_dir)
+        let path = settings::get_settings_path(&self.config_dir);
+        self.settings_memo
+            .get((), &[path], || {
+                settings::load_settings_snapshot(&self.config_dir)
+            })
+            .unwrap_or_else(|error| {
+                log::info!("Using default settings: {error}");
+                settings::SettingsFile::default().to_settings()
+            })
     }
 
     /// The providers this workspace has installed, in catalog order.

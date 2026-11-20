@@ -13,6 +13,7 @@ pub use cairn_domain::allotment;
 pub mod build_services;
 pub mod contextual_packages;
 pub mod drain;
+pub mod file_memo;
 pub mod fleet;
 pub mod inference;
 pub mod legacy_presets;

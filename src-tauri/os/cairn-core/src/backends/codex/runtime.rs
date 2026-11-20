@@ -728,7 +728,14 @@ impl CodexHost for CodexReaderHost {
             None,
         );
     }
-    fn watchdog_arm_failed(&self) -> Result<(), String> {
+    fn watchdog_arm_failed(&self, evidence: &str) -> Result<(), String> {
+        // The exit reason stays the stable category; the evidence is the
+        // prose a waiting parent reads, kept before the kill finalizes.
+        crate::orchestrator::lifecycle::record_run_cause_if_active(
+            &self.session.orch,
+            &self.session.run_id,
+            evidence,
+        );
         crate::orchestrator::lifecycle::kill_session_with_reason(
             &self.session.orch,
             &self.session.run_id,
@@ -753,18 +760,25 @@ impl CodexHost for CodexReaderHost {
             self.session.session_id.as_deref(),
         )
     }
-    fn complete(&self, completion: SessionTurnCompletion, context: CodexTurnContext) {
+    fn complete(&self, completion: SessionTurnCompletion, mut context: CodexTurnContext) {
         // Codex reports a turn that ran out of tokens in its own words (a
         // routing or auth error) and drops the reason Cairn gave it, so the
-        // run is told that reason beside Codex's. A failure another path
-        // already took over (a capacity retry) is not this turn's to explain.
-        if matches!(completion.outcome, SessionTurnOutcome::Failed { .. })
-            && context.failure_disposition != TurnFailureDisposition::AlreadyHandled
-        {
-            if let Some(notice) = self.standing_token_refusal() {
-                self.error(&notice);
+        // run is told that reason beside Codex's, and it is the cause a
+        // waiting parent hears: Cairn's account-scoped refusal explains the
+        // failure, where Codex's "unauthorized" does not. A failure another
+        // path already took over (a capacity retry) is not this turn's to
+        // explain, and only a failed turn has a cause.
+        let failed = matches!(completion.outcome, SessionTurnOutcome::Failed { .. })
+            && context.failure_disposition != TurnFailureDisposition::AlreadyHandled;
+        context.fatal_cause = if failed {
+            let refusal = self.standing_token_refusal();
+            if let Some(notice) = refusal.as_deref() {
+                self.error(notice);
             }
-        }
+            refusal.or(context.fatal_cause)
+        } else {
+            None
+        };
         apply_codex_turn_completion(
             &self.session.orch,
             &self.session.run_db,
@@ -978,7 +992,8 @@ mod tests {
         db.execute_script(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
-             INSERT INTO jobs(id,project_id,status,node_name,created_at,updated_at) VALUES('j','p','running','builder',1,1);
+             INSERT INTO jobs(id,project_id,status,node_name,created_at,updated_at) VALUES('jp','p','running','builder',1,1);
+             INSERT INTO jobs(id,project_id,status,node_name,parent_job_id,created_at,updated_at) VALUES('j','p','running','review','jp',1,1);
              INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at) VALUES('s','j','codex','native-thread','open',1,1,1);
              INSERT INTO runs(id,project_id,job_id,status,session_id,created_at,updated_at) VALUES('r','p','j','live','s',1,1);
              INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('t','s','r','j',1,'running','initial',1,1);
@@ -1069,6 +1084,37 @@ mod tests {
         assert!(
             errors.iter().all(|error| !error.contains("at-1")),
             "{errors:?}"
+        );
+
+        // The task fails, and the cause its parent is told is Cairn's
+        // account-scoped refusal, not Codex's opaque "unauthorized".
+        let notice = format!(
+            "Cairn refused this Codex session's request for fresh ChatGPT tokens: {refusal}"
+        );
+        let cause = db
+            .query_opt_text("SELECT error_message FROM runs WHERE id='r'", ())
+            .await
+            .unwrap()
+            .expect("the failed task run keeps its cause");
+        assert_eq!(
+            Some(cause.as_str()),
+            crate::security::sanitize::failure_cause(&notice).as_deref()
+        );
+        assert!(!cause.contains("workspace routing discovery"), "{cause}");
+        assert!(!cause.contains("at-1"), "{cause}");
+        assert_eq!(
+            db.query_opt_text("SELECT state FROM turns WHERE id='t'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            db.query_opt_text("SELECT exit_reason FROM runs WHERE id='r'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("turn_failed")
         );
     }
 
@@ -1169,6 +1215,18 @@ mod tests {
                     .unwrap()
                     .as_deref(),
                 Some(crate::orchestrator::lifecycle::WATCHDOG_ARM_FAILED_EXIT_REASON)
+            );
+            // The refusal is the run's recorded cause, so the parent of a
+            // refused task is told it rather than a generic error.
+            let cause = db
+                .query_opt_text("SELECT error_message FROM runs WHERE id='r'", ())
+                .await
+                .unwrap()
+                .expect("the refused run keeps its cause");
+            assert!(cause.contains(expected), "{cause}");
+            assert!(
+                cause.starts_with("Codex native goal turn p1 could not enter Cairn's turn lifecycle"),
+                "{cause}"
             );
             assert_eq!(
                 db.query_opt_i64(
@@ -1484,6 +1542,60 @@ mod tests {
     }
 
     const CAPACITY: &str = "Selected model is at capacity. Please try a different model.";
+
+    /// A run reused warm serves a newer provider turn (`p1`) when the terminal
+    /// callbacks of an earlier one (`p0`), which Cairn already settled, arrive
+    /// late. They name `p0`, so they neither end the delegated task's current
+    /// turn nor record `p0`'s cause against the run; the same fatal error
+    /// naming `p1` still fails it with its cause.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_terminal_callback_for_a_superseded_turn_leaves_the_run_and_its_cause_alone() {
+        let stale = |turn: &str| {
+            vec![
+                json!({"method": "error", "params": {
+                    "turnId": turn,
+                    "error": {"message": "refresh_token_reused"},
+                    "willRetry": false,
+                }}),
+                json!({"method": "turn/completed", "params": {"turn": {"id": turn, "status": "failed"}}}),
+                json!({"method": "turn/aborted", "params": {"turnId": turn, "reason": "interrupted"}}),
+            ]
+        };
+        let (db, orch) = persistent_codex_turn(
+            "codex-superseded-terminal",
+            "UPDATE jobs SET parent_job_id='pj' WHERE id='j';",
+        )
+        .await;
+        read_notifications(&orch, &db, stale("p0"));
+        assert_eq!(
+            text(
+                &db,
+                "SELECT status || '/' || COALESCE(error_message,'none') FROM runs WHERE id='r'"
+            )
+            .await
+            .as_deref(),
+            Some("live/none"),
+            "a superseded turn's callbacks neither end the run nor give it a cause"
+        );
+        assert_eq!(turn_row(&db).await.as_deref(), Some("running/"));
+
+        let (db, orch) = persistent_codex_turn(
+            "codex-current-terminal",
+            "UPDATE jobs SET parent_job_id='pj' WHERE id='j';",
+        )
+        .await;
+        read_notifications(&orch, &db, stale("p1"));
+        assert_eq!(
+            text(
+                &db,
+                "SELECT status || '/' || COALESCE(error_message,'none') FROM runs WHERE id='r'"
+            )
+            .await
+            .as_deref(),
+            Some("crashed/Codex error: refresh_token_reused"),
+            "the current turn's fatal error fails the task with its cause"
+        );
+    }
 
     /// cairn/6189's specimen: a recipe planner's turn reads a tool result, then
     /// the provider refuses the next sampling for capacity, without retrying. The

@@ -89,7 +89,14 @@ async fn main() {
     let started = std::time::Instant::now();
     let mut embedded = 0usize;
     while embedded < budget {
-        match embed_pending(&db, embedder.as_ref(), Scope::All, SWEEP_LIMIT).await {
+        match embed_pending(
+            &db,
+            embedder.as_ref(),
+            Scope::History { floor: None },
+            SWEEP_LIMIT,
+        )
+        .await
+        {
             Ok(Some(summary)) => {
                 embedded += summary.embedded + summary.tombstoned;
                 if !summary.remaining {

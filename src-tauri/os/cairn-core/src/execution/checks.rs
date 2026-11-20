@@ -205,7 +205,7 @@ use write_wave::{
     hand_off_wave_outcome, lane_key, lanes_left_to_run, late_write_check_message,
     pending_wave_reason, pending_write_checks_summary, plan_write_wave, replan_onto_fix,
     run_write_checks_after_seal_inner, split_write_wave, verdict_survives_fix, FixReplanning,
-    InlineWaitBounds, InlineWaitOutcome, LaneAt, OfferedOutcome, PendingWave,
+    InlineWaitBounds, InlineWaitOutcome, LaneAt, LateWave, OfferedOutcome, PendingWave,
     WriteChecksInFlightGuard, WriteWavePlanning, WriteWaveRequests, WriteWaveSplit,
     WRITE_CHECK_INLINE_WAIT,
 };
@@ -3000,6 +3000,11 @@ mod write_wave_target_tests;
 /// request of its own recorded as it settles.
 #[cfg(test)]
 mod write_wave_requests_tests;
+
+/// A late write-check summary per wave, named, once, and never for a wave a
+/// newer one superseded.
+#[cfg(test)]
+mod late_delivery_tests;
 
 /// A base-relative check's verdict is a function of its tree AND the change it
 /// was measured against, so its key names both.

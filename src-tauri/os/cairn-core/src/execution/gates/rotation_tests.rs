@@ -383,6 +383,15 @@ async fn rotation_survives_a_restart() {
 
     let env = restarted(env);
     caps(&env, 6, 50);
+    // Startup recovery returns a claim the restart cut off to pending and
+    // advances it again, so the fleet's work is this boot's claims once more.
+    env.db
+        .execute(
+            "UPDATE jobs SET started_at = ?1 WHERE status = 'running' AND current_turn_id IS NULL",
+            (env.orch.boot_at,),
+        )
+        .await
+        .unwrap();
     let older = count(
         &env,
         &format!(

@@ -451,6 +451,7 @@ async fn fixers_chain_as_requests_and_each_verdict_is_its_own_request_recorded_a
     let (progress, progress_seen) = tokio::sync::watch::channel(WaveProgress::default());
     let wave_orch = orch.clone();
     let claims = orch.lane_claims.open_wave(JOB);
+    let ticket = orch.late_write_checks.open(JOB, "tool-use");
     let ceiling = Duration::from_secs(600);
     let guard = WriteChecksInFlightGuard::new(&orch, JOB);
     let wave = tokio::spawn(async move {
@@ -466,10 +467,10 @@ async fn fixers_chain_as_requests_and_each_verdict_is_its_own_request_recorded_a
                     &wave_orch,
                     Some(&run_context),
                     &repo_path,
-                    "tool-use",
                     Some(&sealed_resolution),
                     progress,
                     claims,
+                    &ticket,
                 )
                 .await
             },

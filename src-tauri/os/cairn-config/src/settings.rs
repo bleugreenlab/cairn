@@ -1089,9 +1089,8 @@ pub fn get_settings_path(config_dir: &std::path::Path) -> PathBuf {
 /// (`commit_and_maybe_push`) and is also edited by hand, so a save hook would
 /// miss the changes that arrive from outside this process. One `stat` is cheap
 /// next to reading and YAML-parsing the whole file.
-pub fn settings_file_stamp(config_dir: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
-    let metadata = std::fs::metadata(get_settings_path(config_dir)).ok()?;
-    Some((metadata.modified().ok()?, metadata.len()))
+pub fn settings_file_stamp(config_dir: &std::path::Path) -> Option<crate::file_memo::FileStamp> {
+    crate::file_memo::FileStamp::of(&get_settings_path(config_dir))
 }
 
 const WORKSPACE_HEADER: &str = "# Cairn Workspace Settings";

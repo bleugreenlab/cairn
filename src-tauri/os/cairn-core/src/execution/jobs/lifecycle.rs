@@ -6013,8 +6013,11 @@ fn compose_thread_seed_blocking(
     let job_id = job.id.clone();
     let now = orch.services.clock.now();
     let policy = seed_policy_for_job(orch, owning_db, job);
+    let orch = orch.clone();
     run_db(async move {
-        crate::resources::compose_thread_seed_with_policy(&db, &job_id, now, policy).await
+        let observer = crate::execution::jobs::liveness::WorkObserver::read(&orch).await?;
+        crate::resources::compose_thread_seed_with_policy(&db, &job_id, now, policy, &observer)
+            .await
     })
 }
 

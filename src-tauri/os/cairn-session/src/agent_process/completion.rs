@@ -90,4 +90,10 @@ pub enum TurnFailureDisposition {
 
 pub struct CodexTurnContext {
     pub failure_disposition: TurnFailureDisposition,
+    /// The reader's own explanation of why this turn failed, when it knows one:
+    /// the provider's fatal error, as reported for this completion and no
+    /// other. `None` when the turn did not fail on a known cause, including a
+    /// retryable or informational error, which is never a terminal cause. The
+    /// host decides whether it becomes the run's recorded failure.
+    pub fatal_cause: Option<String>,
 }

@@ -1506,8 +1506,19 @@ async fn a_wave_that_fails_after_answering_pending_delivers_its_outcome() {
         .expect("the late outcome must be delivered")
         .unwrap();
     assert_eq!(late, fold_failure);
-    let message = late_write_check_message(&late);
+    let message = late_write_check_message(
+        &LateWave {
+            commit: Some("0123456789abcdef0123456789abcdef01234567"),
+            wave_id: "toolu_fold",
+            superseded: None,
+        },
+        &late,
+    );
     assert!(message.contains("conflict in src/a.rs"), "{message}");
+    assert!(
+        message.contains("commit 0123456789ab (wave toolu_fold)"),
+        "{message}"
+    );
     assert!(message.contains("cairn:~/checks"), "{message}");
 }
 

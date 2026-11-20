@@ -9,7 +9,7 @@ use crate::storage::RowExt;
 use cairn_common::query::{split_target_query, QueryParam};
 use cairn_common::read::{ImageBlock, NaturalUnit, ReadSegment, SegmentKind, SegmentMeta};
 use cairn_db::turso::params;
-use cairn_uri::{build_issue_uri, parse_uri, CairnResource};
+use cairn_uri::{build_issue_uri, classify_uri, CairnResource};
 use serde::Serialize;
 
 /// Size threshold for eliding glob content previews (250KB)
@@ -1267,9 +1267,14 @@ pub async fn handle_read_file(orch: &Orchestrator, request: &McpCallbackRequest)
     };
 
     if split.identity.starts_with("cairn://") {
-        let resource = match parse_uri(&split.identity) {
-            Some(resource) => resource,
-            None => return format!("Invalid cairn resource URI: {}", split.identity),
+        let resource = match classify_uri(&split.identity) {
+            Ok(resource) => resource,
+            Err(refusal) => {
+                return crate::mcp::handlers::resources::unparsed_uri_refusal(
+                    &split.identity,
+                    &refusal,
+                )
+            }
         };
         let resource_request = McpCallbackRequest {
             answer_bound_ms: None,

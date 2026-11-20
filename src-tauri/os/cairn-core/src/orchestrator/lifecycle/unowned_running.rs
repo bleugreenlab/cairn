@@ -74,18 +74,7 @@ pub(crate) const UNOWNED_GRACE_SECS: i64 = 30;
 /// capacity retry takes, counted on the same retry chain.
 pub(crate) const CONTINUATION_BUDGET: u32 = 3;
 
-/// Whether the provider behind a job's session is alive, as this host can tell.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Liveness {
-    /// This host holds the session's process, parked warm between turns.
-    Alive { run_id: String },
-    /// This host holds the session's process and it is serving something.
-    Busy,
-    /// No process, and no run of the job claims to be live.
-    Dead,
-    /// No process, yet a run row still reads live; `since` is its last update.
-    Unknown { since: i64 },
-}
+pub(crate) use crate::execution::jobs::liveness::Liveness;
 
 /// The job's latest work turn and what has been tried since it ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,34 +310,6 @@ async fn episode(db: &LocalDb, job_id: &str) -> Result<Option<Episode>, String> 
     }))
 }
 
-async fn liveness(
-    processes: &ProcessState,
-    db: &LocalDb,
-    job_id: &str,
-    session_id: &str,
-) -> Result<Liveness, String> {
-    if let Some(run_id) = processes.find_process_by_session(session_id) {
-        return Ok(if processes.is_warm(&run_id) {
-            Liveness::Alive { run_id }
-        } else {
-            Liveness::Busy
-        });
-    }
-    let since = db
-        .query_opt(
-            "SELECT MAX(updated_at) FROM runs WHERE job_id = ?1 AND status IN ('starting', 'live')",
-            (job_id.to_string(),),
-            |row| row.opt_i64(0),
-        )
-        .await
-        .map_err(|error| format!("unowned-running sweep failed to read runs: {error}"))?
-        .flatten();
-    Ok(match since {
-        Some(since) => Liveness::Unknown { since },
-        None => Liveness::Dead,
-    })
-}
-
 /// Every job in `db` in this module's shape whose decision is not `Leave`.
 /// `claimed` is the set of jobs with a launch reservation in flight.
 pub(crate) async fn unowned_jobs(
@@ -385,7 +346,10 @@ pub(crate) async fn unowned_jobs(
         if !episode.is_unfinished_failure() {
             continue;
         }
-        let liveness = liveness(processes, db, &job_id, &session_id).await?;
+        let liveness =
+            crate::execution::jobs::liveness::read_liveness(processes, db, &job_id, &session_id)
+                .await
+                .map_err(|error| format!("unowned-running sweep: {error}"))?;
         let decision = decide(&episode, &liveness, claimed.contains(&job_id), now);
         if decision == Decision::Leave {
             continue;

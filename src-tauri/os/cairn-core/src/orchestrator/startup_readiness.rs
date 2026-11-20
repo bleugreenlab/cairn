@@ -149,17 +149,22 @@ mod tests {
     }
 
     /// `source` without its top-level inline test modules. Each
-    /// `#[cfg(test)] mod x {` block is dropped through its closing brace, which
-    /// rustfmt places alone at column 0; production code between and after such
-    /// blocks is kept.
+    /// `#[cfg(test)] mod x {` block, of any visibility, is dropped through its
+    /// closing brace, which rustfmt places alone at column 0; production code
+    /// between and after such blocks is kept.
     fn strip_test_modules(source: &str) -> String {
+        let opens_module = |line: &str| {
+            let line = ["pub(crate) ", "pub(super) ", "pub "]
+                .iter()
+                .find_map(|visibility| line.strip_prefix(visibility))
+                .unwrap_or(line);
+            line.starts_with("mod ") && line.trim_end().ends_with('{')
+        };
         let mut kept = String::new();
         let mut lines = source.lines().peekable();
         while let Some(line) = lines.next() {
-            let opens_test_module = line == "#[cfg(test)]"
-                && lines
-                    .peek()
-                    .is_some_and(|next| next.starts_with("mod ") && next.trim_end().ends_with('{'));
+            let opens_test_module =
+                line == "#[cfg(test)]" && lines.peek().is_some_and(|next| opens_module(next));
             if opens_test_module {
                 for skipped in lines.by_ref() {
                     if skipped == "}" {

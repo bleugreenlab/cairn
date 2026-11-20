@@ -419,6 +419,7 @@ struct HeadTurnRow {
     id: String,
     state: String,
     yield_reason: Option<String>,
+    run_id: Option<String>,
 }
 
 impl HeadTurnRow {
@@ -450,7 +451,7 @@ async fn head_turn_row(db: &LocalDb, job_id: &str) -> Result<Option<HeadTurnRow>
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT t.id, t.state, t.yield_reason
+                    "SELECT t.id, t.state, t.yield_reason, t.run_id
                      FROM jobs j
                      LEFT JOIN turns current ON current.id = j.current_turn_id
                      JOIN turns t ON t.id = COALESCE(
@@ -473,6 +474,7 @@ async fn head_turn_row(db: &LocalDb, job_id: &str) -> Result<Option<HeadTurnRow>
                 id: row.text(0)?,
                 state: row.text(1)?,
                 yield_reason: row.opt_text(2)?,
+                run_id: row.opt_text(3)?,
             }))
         })
     })
@@ -558,7 +560,7 @@ impl Hold {
                 supersedable: true,
                 notes,
             } => format!(
-                "it is parked on its own {}; it reads this when that wait resolves or the operator resumes it, and a message sent with escalate:true ends the wait and wakes it now{}",
+                "it is parked on its own {}; it reads this when that wait resolves or the operator resumes it, and a message sent with escalate:true wakes it now, leaving any batch it waits on running{}",
                 Self::calls(labels),
                 Self::notes(notes)
             ),
@@ -794,6 +796,7 @@ pub(crate) async fn describe_hold(db: &LocalDb, job_id: &str) -> Option<Hold> {
 struct SelfSuspension {
     reason: crate::models::TurnYieldReason,
     turn_id: String,
+    run_id: Option<String>,
 }
 
 fn self_suspension_sync(db: &LocalDb, job_id: &str) -> Option<SelfSuspension> {
@@ -805,8 +808,29 @@ fn self_suspension_sync(db: &LocalDb, job_id: &str) -> Option<SelfSuspension> {
             Some(SelfSuspension {
                 reason: row.self_suspend_reason()?,
                 turn_id: row.id,
+                run_id: row.run_id,
             })
         })
+}
+
+/// The tool names of the calls the job's head turn has issued and not yet had
+/// answered. Empty while it is generating, and when they cannot be read: a
+/// steer that misreads a tool call as generation interrupts the turn, which
+/// still cancels none of its work.
+fn open_calls_of_head_turn_sync(db: &LocalDb, job_id: &str) -> Vec<String> {
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        let Some(row) = head_turn_row(db, &job_id).await? else {
+            return Ok(Vec::new());
+        };
+        let Some(run_id) = row.run_id else {
+            return Ok(Vec::new());
+        };
+        crate::orchestrator::lifecycle::open_call_names(db, &run_id, &row.id)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .unwrap_or_default()
 }
 
 /// [`head_turn`] for the non-async flush-on-idle resume gate. Fails open to
@@ -1526,6 +1550,11 @@ pub enum NudgeOutcome {
     QueuedForActiveTurn,
     /// The job's active turn was stopped, and it resumes with the content.
     Interrupted,
+    /// An escalated direct message reached a turn in the middle of its own
+    /// calls (`calls`, by tool name or wait label). It is delivered when they
+    /// return, at the turn's next tool boundary; a call that parks instead
+    /// returns early with its batch's handle. Nothing was cancelled.
+    Steered { calls: Vec<String> },
     /// A continuation was dispatched; it takes the content as it starts.
     Resumed,
     /// An escalated direct message ended the job's `waitFor` park, and it is
@@ -1539,11 +1568,13 @@ pub enum NudgeOutcome {
 
 /// Nudge a job after a pending row has been durably persisted according to the
 /// delivery urgency ladder. Passive never wakes. Queue/steer wake idle jobs.
-/// Interrupt on an active recipient uses the same semantics as manually queueing
-/// a message and pressing Stop: stop the active turn and let the normal idle
-/// flush claim the already-persisted row and resume exactly once. Idle interrupt
-/// recipients still resume immediately. A self-suspended recipient is held, and
-/// the outcome says what holds it.
+/// Interrupt on an active recipient steers (tenet 1439): a turn in a tool call
+/// is left to read the row at that call's return, and a turn that is only
+/// generating is interrupted without cancelling any of its work
+/// ([`crate::orchestrator::lifecycle::interrupt_turn_for_message`]), after which
+/// the normal idle flush claims the already-persisted row and resumes exactly
+/// once. Idle interrupt recipients still resume immediately. A self-suspended
+/// recipient is held, and the outcome says what holds it.
 pub fn nudge_job_for_urgency(
     orch: &Orchestrator,
     job_id: &str,
@@ -1552,11 +1583,29 @@ pub fn nudge_job_for_urgency(
     nudge(orch, job_id, urgency, None)
 }
 
-/// [`nudge_job_for_urgency`] for an agent's direct message, which adds one
-/// rung: an escalated (`interrupt`) message to a job parked only on its own
-/// `waitFor` calls ends those waits and resumes it with the message. A
-/// `waitFor` only observes something, so ending it loses nothing. Every other
-/// self-suspension still holds, and operator input never comes through here.
+/// [`nudge_job_for_urgency`] for a direct message, where an escalated
+/// (`interrupt`) message steers rather than stops (tenet 1439). It reaches the
+/// recipient at its next tool boundary and never cancels the recipient's work:
+///
+/// - A turn in the middle of a tool call is left running, and the message is
+///   delivered when that call returns.
+/// - A turn that is only generating is interrupted
+///   ([`crate::orchestrator::lifecycle::interrupt_turn_for_message`]), which
+///   cancels no batch, terminal, inline command, wait, or child run.
+/// - A turn parked on its own `waitFor` calls and routed `run` batches resumes
+///   with the message: each `waitFor` ends, and each batch's call is answered
+///   with its `cairn:~/batches/<id>` handle while the batch runs on detached
+///   and reports to the job as a notice
+///   ([`crate::mcp::handlers::durable_suspend::steer_parked_waits`]). A turn
+///   that parks after the message arrived is steered the same way once its
+///   park lands ([`steer_park_for_waiting_escalation`]).
+///
+/// The first two rungs are every sender's (a system wake or an operator's
+/// queued follow-up at `interrupt` steers the same way); ending a parked
+/// turn's waits is a direct message's alone. Every other self-suspension
+/// still holds, and the operator's Stop does not come through here.
+///
+/// [`steer_park_for_waiting_escalation`]: crate::messages::delivery::steer_park_for_waiting_escalation
 pub(crate) fn nudge_for_direct_message(
     orch: &Orchestrator,
     job_id: &str,
@@ -1641,10 +1690,19 @@ fn nudge_unobserved(
     if urgency == DeliveryUrgency::Interrupt && head_active {
         let run_id =
             live_run_id.ok_or_else(|| "no live process holds the active turn".to_string())?;
-        crate::orchestrator::lifecycle::stop_session(orch, &run_id)?;
+        // Content at `interrupt` steers, whoever sent it (tenets 1439, 1421): a
+        // turn in a tool call reads it when the call returns, and only a turn
+        // that is generating is interrupted, without touching its work. A
+        // message to deliver is not evidence about any batch, so no sender's
+        // interrupt cancels one; ending a node's work is Stop's job alone.
+        let calls = open_calls_of_head_turn_sync(&db, job_id);
+        if !calls.is_empty() {
+            return Ok(NudgeOutcome::Steered { calls });
+        }
+        crate::orchestrator::lifecycle::interrupt_turn_for_message(orch, &run_id)?;
 
         // The backend abort acknowledgement remains the fast path, but it is not
-        // the owner: stop_session has already made the turn terminal and the run
+        // the owner: the interrupt has already made the turn terminal and the run
         // idle synchronously, so this idempotent flush guarantees the queued row
         // is claimed even when the backend never acknowledges the interrupt.
         // A concurrent acknowledgement-driven flush either wins the claim or
@@ -1658,9 +1716,31 @@ fn nudge_unobserved(
         if let Some(SelfSuspension {
             reason: crate::models::TurnYieldReason::Wait,
             turn_id,
+            run_id,
         }) = self_suspension_sync(&db, job_id)
         {
-            if let Some(labels) = crate::mcp::handlers::durable_suspend::supersede_timed_waits(
+            // The turn has yielded but its process has not parked yet. Resuming
+            // now would race the park, which must be the last thing that
+            // happens to the predecessor (CAIRN-2970); the park's own completion
+            // delivers the message instead.
+            if run_id
+                .as_deref()
+                .is_some_and(|run_id| orch.park_slots.armed(run_id))
+            {
+                let calls = run_db_blocking({
+                    let (db, job_id, turn_id) = (db.clone(), job_id.to_string(), turn_id.clone());
+                    move || async move {
+                        crate::mcp::handlers::durable_suspend::parked_waits_of_turn(
+                            &db, &job_id, &turn_id,
+                        )
+                        .await
+                    }
+                })
+                .map(|waits| waits.labels)
+                .unwrap_or_default();
+                return Ok(NudgeOutcome::Steered { calls });
+            }
+            if let Some(labels) = crate::mcp::handlers::durable_suspend::steer_parked_waits(
                 orch, &db, job_id, &turn_id, message,
             )? {
                 log::info!(
@@ -1737,6 +1817,122 @@ fn nudge_unobserved(
             NudgeOutcome::Declined("its run does not resolve to a job".into())
         }
     })
+}
+
+/// Deliver an escalated direct message that reached `run_id`'s turn while it
+/// was in the call that has just parked it (tenet 1439).
+///
+/// The nudge that carried the message left it for that call's return, and a
+/// park is not a return: the turn now waits on its own work, which would hold
+/// the message until the work ended. So once the park has landed, the turn is
+/// steered exactly as an escalation to an already-parked turn is. A park with
+/// no escalated message waiting for its job does nothing.
+pub(crate) fn steer_park_for_waiting_escalation(orch: &Orchestrator, run_id: &str) {
+    let found = run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            let db = owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let Some(job_id) = db
+                .query_opt_text("SELECT job_id FROM runs WHERE id = ?1", (run_id.clone(),))
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                return Ok(None);
+            };
+            Ok(waiting_escalation(&db, &job_id)
+                .await?
+                .map(|message| (job_id, message)))
+        }
+    });
+    let (job_id, message) = match found {
+        Ok(Some(found)) => found,
+        Ok(None) => return,
+        Err(error) => {
+            log::warn!("could not look for an escalation waiting on run {run_id}'s park: {error}");
+            return;
+        }
+    };
+    match nudge_for_direct_message(orch, &job_id, DeliveryUrgency::Interrupt, &message) {
+        Ok(outcome) => log::info!(
+            "escalated direct {} waiting on job {}'s park: {outcome:?}",
+            message.message_id,
+            &job_id[..job_id.len().min(8)]
+        ),
+        Err(error) => log::warn!(
+            "escalated direct {} waiting on job {}'s park was not delivered: {error}",
+            message.message_id,
+            &job_id[..job_id.len().min(8)]
+        ),
+    }
+}
+
+/// The oldest escalated direct message still undelivered to `job_id`, as the
+/// wait it ends names it: its sender's home when the sender is an agent, else
+/// the sender's name.
+async fn waiting_escalation(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<DirectMessageRef>, String> {
+    let job_id = job_id.to_string();
+    let found = db
+        .read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT key FROM attention_pushes
+                         WHERE recipient = ?1 AND wake = 'interrupt' AND key LIKE 'direct:%'
+                           AND delivered_event_id IS NULL AND retired_at IS NULL
+                         ORDER BY created_at, rowid",
+                        params![job_id.as_str()],
+                    )
+                    .await?;
+                let mut keys = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    keys.push(row.text(0)?);
+                }
+                drop(rows);
+                for key in keys {
+                    let Some(message_id) =
+                        crate::orchestrator::attention_push::direct_message_id_from_key(&key)
+                    else {
+                        continue;
+                    };
+                    let mut rows = conn
+                        .query(
+                            "SELECT m.sender_name, r.job_id FROM messages m
+                             LEFT JOIN runs r ON r.id = m.sender_run_id
+                             WHERE m.id = ?1",
+                            params![message_id],
+                        )
+                        .await?;
+                    if let Some(row) = rows.next().await? {
+                        return Ok(Some((
+                            message_id.to_string(),
+                            row.text(0)?,
+                            row.opt_text(1)?,
+                        )));
+                    }
+                }
+                Ok(None)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some((message_id, sender_name, sender_job)) = found else {
+        return Ok(None);
+    };
+    let home = match sender_job {
+        Some(job) => node_uri_for_job(db, &job).await,
+        None => None,
+    };
+    Ok(Some(DirectMessageRef {
+        from: home.unwrap_or(sender_name),
+        message_id,
+    }))
 }
 
 #[cfg(test)]
@@ -2254,6 +2450,204 @@ mod tests {
             from: "cairn://p/proj/42/1/coordinator".into(),
             message_id: "msg-1".into(),
         }
+    }
+
+    /// A turn in the middle of a `run` call: its assistant event issued the
+    /// call, and nothing has answered it.
+    async fn seed_open_run_call(db: &LocalDb) {
+        db.execute(
+            "INSERT INTO events(id, run_id, session_id, turn_id, sequence, timestamp, event_type, data, created_at)
+             VALUES ('ev-call', 'run-1', 'sess', 't-head', 1, 1, 'assistant',
+                     '{\"eventType\":\"assistant\",\"isError\":false,\"toolUses\":[{\"id\":\"toolu-run\",\"name\":\"mcp__cairn__run\",\"input\":{\"commands\":[{\"command\":\"cargo nextest run\"}]}}]}', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A machine attached to the fleet with one of `job-1`'s batches claimed,
+    /// and the frames it is sent from here on.
+    fn claim_a_batch_for_job(
+        orch: &Orchestrator,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<cairn_common::executor_protocol::ExecutorMessage>
+    {
+        let (executor_tx, mut executor_rx) = tokio::sync::mpsc::unbounded_channel();
+        let generation = orch.fleet.attach_executor(executor_tx);
+        // The receiver is dropped with the test; the claim itself is the batch.
+        std::mem::forget(
+            orch.fleet
+                .claim_job_command_for_test("req-1", "job-1", generation),
+        );
+        while executor_rx.try_recv().is_ok() {}
+        executor_rx
+    }
+
+    /// The requests the machine was told to cancel: what its executor records
+    /// as "canceled by requester".
+    fn cancelled_requests(
+        frames: &mut tokio::sync::mpsc::UnboundedReceiver<
+            cairn_common::executor_protocol::ExecutorMessage,
+        >,
+    ) -> Vec<String> {
+        let mut cancelled = Vec::new();
+        while let Ok(frame) = frames.try_recv() {
+            if let cairn_common::executor_protocol::ExecutorMessage::Cancel { request_id, .. } =
+                frame
+            {
+                cancelled.push(request_id);
+            }
+        }
+        cancelled
+    }
+
+    async fn head_state(db: &LocalDb) -> String {
+        db.query_one("SELECT state FROM turns WHERE id = 't-head'", (), |row| {
+            row.text(0)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Tenet 1439, the cairn://posts/668 specimen: an agent escalates to a task
+    /// whose turn is in a long `run` call. The batch must not be cancelled at
+    /// its machine, and the turn keeps its call. Written against APIs `main`
+    /// already has, so the same text shows the stop-based escalate failing it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_escalate_to_a_turn_in_a_run_call_leaves_its_batch_running() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_run(&db, "run-1", "job-1").await;
+        set_head_turn(&db, "job-1", "running", None).await;
+        seed_open_run_call(&db).await;
+        let mut frames = claim_a_batch_for_job(&orch);
+
+        let outcome =
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &escalation());
+
+        assert_eq!(
+            cancelled_requests(&mut frames),
+            Vec::<String>::new(),
+            "no batch is canceled by requester ({outcome:?})"
+        );
+        assert!(
+            orch.fleet.claimed_executor_of("req-1").is_some(),
+            "the batch is still held by its machine"
+        );
+        assert_eq!(head_state(&db).await, "running", "the turn keeps its call");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM events WHERE event_type = 'tool_result'"
+            )
+            .await,
+            0,
+            "the open call is not answered with a stop"
+        );
+    }
+
+    /// One interrupt path: a system direct at `interrupt` urgency (a route
+    /// receipt, a wake) to a turn in a `run` call cancels no batch either.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_system_direct_at_interrupt_to_a_turn_in_a_run_call_cancels_no_batch() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_run(&db, "run-1", "job-1").await;
+        set_head_turn(&db, "job-1", "running", None).await;
+        seed_open_run_call(&db).await;
+        let mut frames = claim_a_batch_for_job(&orch);
+
+        queue_system_direct(
+            &orch,
+            "run-1",
+            "the plan changed",
+            DeliveryUrgency::Interrupt,
+        )
+        .unwrap();
+
+        assert_eq!(cancelled_requests(&mut frames), Vec::<String>::new());
+        assert!(orch.fleet.claimed_executor_of("req-1").is_some());
+        assert_eq!(head_state(&db).await, "running");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM events WHERE event_type = 'tool_result'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            nudge_job_for_urgency(&orch, "job-1", DeliveryUrgency::Interrupt).unwrap(),
+            NudgeOutcome::Steered {
+                calls: vec!["run".into()]
+            }
+        );
+    }
+
+    /// The sender learns the message waits for the call, and the push stays
+    /// pending for the tool-boundary drain to carry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_escalate_to_a_turn_in_a_tool_call_is_steered_to_its_next_boundary() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_run(&db, "run-1", "job-1").await;
+        set_head_turn(&db, "job-1", "running", None).await;
+        seed_open_run_call(&db).await;
+
+        assert_eq!(
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &escalation())
+                .unwrap(),
+            NudgeOutcome::Steered {
+                calls: vec!["run".into()]
+            }
+        );
+        assert_eq!(head_state(&db).await, "running");
+    }
+
+    /// A turn that is only generating is still interrupted at once, and the
+    /// interrupt cancels none of the job's batches.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_escalate_to_a_generating_turn_interrupts_it_and_cancels_nothing() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_run(&db, "run-1", "job-1").await;
+        set_head_turn(&db, "job-1", "running", None).await;
+        let mut frames = claim_a_batch_for_job(&orch);
+
+        assert_eq!(
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &escalation())
+                .unwrap(),
+            NudgeOutcome::Interrupted
+        );
+        assert_eq!(head_state(&db).await, "interrupted");
+        assert_eq!(cancelled_requests(&mut frames), Vec::<String>::new());
+        assert!(orch.fleet.claimed_executor_of("req-1").is_some());
+    }
+
+    /// Out of scope for tenet 1439, and asserted as it stands: the operator's
+    /// Stop still answers the open call as a stop, interrupts the turn, and
+    /// tells the machine to cancel the job's batches. (Operator Compact's
+    /// cancel is asserted in `tests/main/operator_compact.rs`.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn operator_stop_still_cancels_the_jobs_batches() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_run(&db, "run-1", "job-1").await;
+        set_head_turn(&db, "job-1", "running", None).await;
+        seed_open_run_call(&db).await;
+        let mut frames = claim_a_batch_for_job(&orch);
+
+        crate::orchestrator::lifecycle::operator_stop_run(&orch, "run-1").unwrap();
+
+        assert_eq!(cancelled_requests(&mut frames), vec!["req-1".to_string()]);
+        assert_eq!(head_state(&db).await, "interrupted");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM events WHERE event_type = 'tool_result' AND data LIKE '%interrupted by user stop%'"
+            )
+            .await,
+            1
+        );
     }
 
     /// Only a pure `waitFor` park yields to an escalated message. Every other

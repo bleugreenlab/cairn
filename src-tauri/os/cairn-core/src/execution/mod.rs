@@ -43,6 +43,7 @@ pub mod inputs;
 pub mod jobs;
 pub(crate) mod lane_breaker;
 pub(crate) mod lane_claims;
+pub(crate) mod late_write_checks;
 pub(crate) mod launch_preview;
 pub(crate) mod lint_baseline;
 pub(super) mod main_incidents_store;

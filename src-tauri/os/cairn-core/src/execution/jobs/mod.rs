@@ -42,6 +42,7 @@ mod config_loading;
 mod goal_intent;
 mod inputs;
 mod lifecycle;
+pub(crate) mod liveness;
 mod node_selection;
 pub(crate) use node_selection::{pinned, probe_launch_supply};
 mod ordinary_admission;

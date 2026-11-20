@@ -27,7 +27,8 @@ use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
 use cairn_common::protocol::{stamp_callback_origin, CallbackRequest, MODEL_FACING_ORIGIN};
 use cairn_common::read::{ReadBatchEnvelope, RunBatchEnvelope};
-use cairn_uri::{parse_uri as parse_cairn_uri, CairnResource};
+use cairn_common::uri_refusal::{refusal_data, refusal_message};
+use cairn_uri::{classify_uri, CairnResource};
 
 use crate::heartbeat::{with_heartbeat, HEARTBEAT_INTERVAL};
 use crate::output::{
@@ -558,8 +559,8 @@ impl ServerHandler for CairnMcpServer {
         // Determine which callback to use based on URI scheme
         let tool_name = if uri.starts_with("cairn://") {
             // Parse cairn:// URI to determine resource type
-            match parse_cairn_uri(uri) {
-                Some(resource) => {
+            match classify_uri(uri) {
+                Ok(resource) => {
                     match resource {
                         // Terminal resources use read_resource
                         CairnResource::NodeTerminal { .. }
@@ -568,10 +569,10 @@ impl ServerHandler for CairnMcpServer {
                         _ => "read_issue_resource",
                     }
                 }
-                None => {
+                Err(refusal) => {
                     return Err(rmcp::ErrorData::invalid_request(
-                        format!("Invalid cairn resource URI: {}", uri),
-                        None,
+                        refusal_message(uri, &refusal),
+                        Some(refusal_data(&refusal)),
                     ));
                 }
             }

@@ -1068,6 +1068,18 @@ async fn cold_process_spawn_refusal_restores_the_held_head() {
 
 /// One parked child beside one running child at focus=1. No notifier or
 /// background gate loop is installed: every recovery below gets no hint.
+/// The busy child's turn is served by a live process on this host: what makes
+/// a running turn work the focus cap counts, rather than a label.
+fn busy_child_serving(orch: &Orchestrator) {
+    orch.process_state.processes.lock().unwrap().register(
+        "busy-run".to_string(),
+        cairn_core::internal::agent_process::process::RunHandle::test_handle(
+            Some("busy-session"),
+            Some("busy-job"),
+        ),
+    );
+}
+
 async fn focus_fixture() -> (TempDir, Arc<LocalDb>, Orchestrator, RecordedProcesses) {
     let (temp, db, orch, recorder) = fixture().await;
     orch.update_settings(cairn_core::models::UpdateSettings {
@@ -1087,6 +1099,7 @@ async fn focus_fixture() -> (TempDir, Arc<LocalDb>, Orchestrator, RecordedProces
         INSERT INTO sessions(id,job_id,backend,status,created_at,updated_at) VALUES('busy-session','busy-job','claude','open',1,1);
         INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('busy-turn','busy-session','busy-job',1,'running','initial',1,1);
         UPDATE jobs SET current_turn_id='busy-turn',current_session_id='busy-session' WHERE id='busy-job';").await.unwrap();
+    busy_child_serving(&orch);
     (temp, db, orch, recorder)
 }
 
@@ -1117,6 +1130,8 @@ async fn focus_resume_survives_boot_and_periodic_pass_without_a_hint_and_deliver
     );
     drop(orch);
     let (orch, recorder) = orchestrator(&temp, db.clone());
+    // The busy child is still observably working after the boot.
+    busy_child_serving(&orch);
     // Boot pass: still full. It must neither launch nor lose the durable input.
     cairn_core::internal::execution::gates::sweep::sweep(&orch)
         .await
@@ -1487,6 +1502,7 @@ async fn a_launch_failed_reentry_leaves_the_band_and_blocks_no_later_work() {
     )
     .await
     .unwrap();
+    busy_child_serving(&orch);
     let error = continue_job_impl(
         WakeCause::System,
         &orch,
@@ -1801,6 +1817,7 @@ async fn a_crash_between_focus_claim_and_launch_is_recovered_with_its_place() {
         }
 
         let (orch, recorder) = orchestrator(&temp, db.clone());
+        busy_child_serving(&orch);
         cairn_core::internal::execution::gates::sweep::sweep(&orch)
             .await
             .unwrap();
@@ -1879,6 +1896,14 @@ pub(super) async fn saturate_ingress_focus(
     db.execute_script("INSERT INTO sessions(id,job_id,backend,status,created_at,updated_at) VALUES('ingress-busy','ingress-busy','claude','open',1,1);
       INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('ingress-busy','ingress-busy','ingress-busy',1,'running','initial',1,1);
       UPDATE jobs SET status='running',current_session_id='ingress-busy',current_turn_id='ingress-busy' WHERE id='ingress-busy';").await.unwrap();
+    // The occupant's turn is served by a live process, so it is work.
+    orch.process_state.processes.lock().unwrap().register(
+        "ingress-busy-run".to_string(),
+        cairn_core::internal::agent_process::process::RunHandle::test_handle(
+            Some("ingress-busy"),
+            Some("ingress-busy"),
+        ),
+    );
 }
 
 /// Remove the original occupant: only the addressed recipient can now fill focus.

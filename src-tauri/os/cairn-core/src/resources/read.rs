@@ -1278,16 +1278,12 @@ pub(crate) async fn produce_cairn_resource(
             Err(error) => return RenderedResource::line(error, None, None, None),
         };
 
-    let resource = match parse_uri(&identity) {
-        Some(r) => r,
-        None => {
-            return RenderedResource::line(
-                crate::mcp::handlers::resources::resource_uri_hint(&identity)
-                    .unwrap_or_else(|| format!("Invalid resource URI: {}", uri)),
-                None,
-                None,
-                None,
-            )
+    let resource = match cairn_uri::classify_uri(&identity) {
+        Ok(r) => r,
+        Err(refusal) => {
+            return RenderedResource::failed(crate::mcp::handlers::resources::unparsed_uri_refusal(
+                &identity, &refusal,
+            ))
         }
     };
 
@@ -2808,14 +2804,21 @@ async fn render_resource_body(
             name,
             path,
         } => {
-            let mut overview = super::threads::read_thread(
-                db,
-                &project,
-                &name,
-                &path,
-                i64::from(orch.get_settings().max_open_children_per_thread),
-            )
-            .await;
+            let mut overview =
+                match crate::execution::jobs::liveness::WorkObserver::read(orch).await {
+                    Ok(observer) => {
+                        super::threads::read_thread(
+                            db,
+                            &project,
+                            &name,
+                            &path,
+                            i64::from(orch.get_settings().max_open_children_per_thread),
+                            &observer,
+                        )
+                        .await
+                    }
+                    Err(error) => format!("Failed to read thread '{name}': {error}"),
+                };
             if path.is_empty() {
                 overview.push_str(
                     &super::vcs::branch_summaries(
@@ -2833,14 +2836,20 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("thread queue", &params) {
                 error
             } else {
-                super::threads::read_thread_queue(
-                    db,
-                    &project,
-                    &thread,
-                    orch.services.clock.now(),
-                    i64::from(orch.get_settings().max_open_children_per_thread),
-                )
-                .await
+                match crate::execution::jobs::liveness::WorkObserver::read(orch).await {
+                    Ok(observer) => {
+                        super::threads::read_thread_queue(
+                            db,
+                            &project,
+                            &thread,
+                            orch.services.clock.now(),
+                            i64::from(orch.get_settings().max_open_children_per_thread),
+                            &observer,
+                        )
+                        .await
+                    }
+                    Err(error) => format!("Failed to load {thread}'s queue: {error}"),
+                }
             }
         }
         CairnResource::ProjectCheckResults { project, revision } => {
@@ -2985,16 +2994,22 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("task", &params) {
                 error
             } else {
-                read_task(
-                    db,
-                    &orch.launch_admission_waits,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    &task_name,
-                )
-                .await
+                match crate::execution::jobs::liveness::WorkObserver::read(orch).await {
+                    Ok(observer) => {
+                        read_task(
+                            db,
+                            &orch.launch_admission_waits,
+                            &observer,
+                            &project,
+                            number,
+                            exec_seq,
+                            &node_id,
+                            &task_name,
+                        )
+                        .await
+                    }
+                    Err(error) => format!("Failed to read task '{task_name}': {error}"),
+                }
             }
         }
         CairnResource::NodeChat {
@@ -4554,6 +4569,74 @@ mod tests {
         assert_eq!(
             render_sql_value(Value::Blob(vec![0, 1, 2, 10, 255, 254, 253, 252, 251])),
             "<blob 9 bytes hex=0001020afffefdfc>"
+        );
+    }
+
+    /// An address the grammar refuses fails the read with the grammar's own
+    /// account: garbled, or naming something this runner does not have (which
+    /// names the runner, the known families and the nearest one). A retired
+    /// address's named replacement still wins.
+    #[tokio::test]
+    async fn an_unparsed_address_fails_the_read_saying_why() {
+        let local = crate::storage::LocalDb::open_migrated_for_test(
+            tempfile::tempdir().unwrap().keep().join("refusals.db"),
+        )
+        .await
+        .unwrap();
+        let search = Arc::new(
+            crate::storage::SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep())
+                .unwrap(),
+        );
+        let orch = crate::orchestrator::OrchestratorBuilder::new(
+            Arc::new(crate::db::DbState::new(Arc::new(local), search)),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        let request = read_request();
+
+        let garbled = produce_cairn_resource(&orch, &request, "cairn://posts//1").await;
+        assert!(garbled.failed, "{}", garbled.content);
+        assert_eq!(
+            garbled.content,
+            "Malformed cairn address `cairn://posts//1`: segment 2 is empty (a doubled or \
+             trailing `/`)."
+        );
+
+        let unknown = produce_cairn_resource(&orch, &request, "cairn://launchpad/ticket").await;
+        assert!(unknown.failed, "{}", unknown.content);
+        assert!(
+            unknown.content.starts_with(&format!(
+                "This runner ({}) has no `cairn://launchpad` resource. If the address came \
+                 from a newer client",
+                cairn_common::uri_refusal::runner_identity()
+            )),
+            "{}",
+            unknown.content
+        );
+        assert!(
+            unknown.content.contains("Known families: ") && unknown.content.contains("dev"),
+            "{}",
+            unknown.content
+        );
+
+        let near_miss = produce_cairn_resource(&orch, &request, "cairn://modles?limit=5").await;
+        assert!(near_miss.failed, "{}", near_miss.content);
+        assert!(
+            near_miss
+                .content
+                .contains("has no `cairn://modles` resource. Did you mean `cairn://models`?"),
+            "{}",
+            near_miss.content
+        );
+
+        let retired = produce_cairn_resource(&orch, &request, "cairn://inference/recipes").await;
+        assert!(
+            retired
+                .content
+                .starts_with("Inference recipes are now called profiles"),
+            "{}",
+            retired.content
         );
     }
 

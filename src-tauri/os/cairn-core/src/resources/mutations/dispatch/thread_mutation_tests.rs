@@ -816,7 +816,17 @@ async fn an_unknown_status_is_refused_and_changes_nothing() {
 }
 
 async fn thread_overview(orch: &Orchestrator) -> String {
-    crate::resources::threads::read_thread(&orch.db.local, "prj", "roadmap", &[], 3).await
+    crate::resources::threads::read_thread(
+        &orch.db.local,
+        "prj",
+        "roadmap",
+        &[],
+        3,
+        &crate::execution::jobs::liveness::WorkObserver::read(orch)
+            .await
+            .unwrap(),
+    )
+    .await
 }
 
 /// A thread's placement default (cairn/5920): the patch echoes the line, the

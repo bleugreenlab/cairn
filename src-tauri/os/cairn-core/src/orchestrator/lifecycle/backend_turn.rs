@@ -121,8 +121,9 @@ pub(crate) fn apply_codex_turn_completion(
                 return;
             }
             // A genuine turn failure: finalize task-aware so a delegated child
-            // fails terminally (its parent resumes) rather than stranding it.
-            super::fail_run(orch, run_id, "turn_failed");
+            // fails terminally (its parent resumes) rather than stranding it,
+            // told why when the reader or host knew.
+            super::fail_run_with_cause(orch, run_id, "turn_failed", context.fatal_cause.as_deref());
         }
     }
 }

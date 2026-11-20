@@ -922,8 +922,8 @@ pub(crate) async fn insert_child_job_session_run(
 /// child would otherwise be classed a tracking host. It is established BEFORE
 /// any row exists, so a child whose agent cannot be snapshotted is refused with
 /// nothing left behind. That ordering matters beyond tidiness: a packet-less
-/// child's status has no reducer, so a child created and then failed here would
-/// sit `running` forever.
+/// child's status is reduced only from a turn it ran, so a child created and
+/// then failed here, before any turn, would sit `running` forever.
 pub(crate) async fn insert_child_with_agent_snapshot(
     orch: &Orchestrator,
     db: Arc<LocalDb>,

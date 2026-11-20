@@ -82,6 +82,15 @@ pub(crate) fn thread_db_hint(uri: &str) -> Option<String> {
     )
 }
 
+/// The refusal for a `cairn://` address the grammar does not accept: a retired
+/// address's named replacement when there is one, otherwise the grammar's own
+/// account of whether the address is garbled or names something this runner
+/// does not have.
+pub(crate) fn unparsed_uri_refusal(uri: &str, refusal: &cairn_uri::UriRefusal) -> String {
+    resource_uri_hint(uri)
+        .unwrap_or_else(|| cairn_common::uri_refusal::refusal_message(uri, refusal))
+}
+
 pub(crate) fn resource_uri_hint(uri: &str) -> Option<String> {
     thread_db_hint(uri)
         .or_else(|| task_terminal_hint(uri))

@@ -228,6 +228,7 @@ fn a_write_check_submission_fits_in_half_a_default_stack() {
         let (progress, progress_seen) = tokio::sync::watch::channel(WaveProgress::default());
         let wave_orch = orch.clone();
         let claims = orch.lane_claims.open_wave("job");
+        let ticket = orch.late_write_checks.open("job", "tool-use");
         let ceiling = std::time::Duration::from_secs(600);
         let summary = await_write_check_wave(
             WriteChecksInFlightGuard::new(&orch, "job"),
@@ -241,10 +242,10 @@ fn a_write_check_submission_fits_in_half_a_default_stack() {
                     &wave_orch,
                     Some(&run_context),
                     &repo_path,
-                    "tool-use",
                     Some(&sealed_resolution),
                     progress,
                     claims,
+                    &ticket,
                 )
                 .await
             },

@@ -649,8 +649,9 @@ fn maybe_kill_completed_call_child(orch: &Orchestrator, run_id: &str) {
     });
 }
 
-/// Terminalize a node-less delegated child (an ephemeral call or a workflow)
-/// whose status the execution sweep can't derive, so the `try_resume_delegated_parent`
+/// Terminalize a node-less delegated child (an ephemeral call, a workflow, or a
+/// packet-less cross-node task) whose status the execution sweep can't derive,
+/// so the `try_resume_delegated_parent`
 /// that follows resolves its packet and wakes the suspended caller in this same
 /// finalize pass.
 ///
@@ -769,6 +770,22 @@ pub(super) fn run_fails_terminally(orch: &Orchestrator, run_id: &str) -> bool {
 /// process death) keep calling `finalize_run(Crashed)` directly and stay
 /// resumable regardless of task-vs-job.
 pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
+    fail_run_with_cause(orch, run_id, reason, None);
+}
+
+/// [`fail_run`] for a failure whose cause the caller knows. `reason` stays the
+/// stable exit reason; `cause` is the prose a parent is told, kept on the run
+/// by [`record_run_cause_if_active`] before the run is finalized, so the parent
+/// that finalization resumes reads it. `None` keeps the generic report.
+pub(crate) fn fail_run_with_cause(
+    orch: &Orchestrator,
+    run_id: &str,
+    reason: &str,
+    cause: Option<&str>,
+) {
+    if let Some(cause) = cause {
+        record_run_cause_if_active(orch, run_id, cause);
+    }
     if !run_fails_terminally(orch, run_id) {
         // Top-level agent job: keep the resumable-interrupt behavior unchanged.
         finalize_run(orch, run_id, RunStatus::Crashed);
@@ -803,17 +820,20 @@ pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
 
 /// Record why a still-active run failed, only if it is still active.
 ///
-/// Returns whether the run was `Starting`/`Live` and now carries the cause. A
-/// run another path already settled (a kill, the reaper, a user stop) keeps
-/// the cause that path wrote; the caller then must not finalize it again.
+/// Returns whether the run was `Starting`/`Live` and so is this caller's to
+/// settle. A run another path already settled (a kill, the reaper, a user
+/// stop) keeps the cause that path wrote; the caller then must not finalize it
+/// again. The first cause recorded on a run is its cause: a later one, a
+/// repeated terminal callback or another owner's, never replaces it. `None`
+/// for `exit_reason` leaves the exit reason to the caller's own finalization.
 pub(crate) fn record_run_failure_if_active(
     orch: &Orchestrator,
     run_id: &str,
-    exit_reason: &str,
+    exit_reason: Option<&str>,
     error_message: &str,
 ) -> Result<bool, String> {
     let run_id = run_id.to_string();
-    let exit_reason = exit_reason.to_string();
+    let exit_reason = exit_reason.map(str::to_string);
     let error_message = error_message.to_string();
     run_db_blocking({
         let dbs = orch.db.clone();
@@ -829,13 +849,13 @@ pub(crate) fn record_run_failure_if_active(
                     let changed = conn
                         .execute(
                             "UPDATE runs
-                             SET exit_reason = ?1,
-                                 error_message = ?2,
+                             SET exit_reason = COALESCE(?1, exit_reason),
+                                 error_message = COALESCE(error_message, ?2),
                                  updated_at = ?3
                              WHERE id = ?4
                                AND status IN (?5, ?6)",
                             (
-                                exit_reason.as_str(),
+                                exit_reason.as_deref(),
                                 error_message.as_str(),
                                 chrono::Utc::now().timestamp(),
                                 run_id.as_str(),
@@ -851,6 +871,20 @@ pub(crate) fn record_run_failure_if_active(
             .map_err(|e| e.to_string())
         }
     })
+}
+
+/// Keep `cause` as the reason a still-active run is failing, before anything
+/// settles on its failure. The cause is made safe first
+/// ([`crate::security::sanitize::failure_cause`]): it reaches another agent's
+/// prompt. Written through [`record_run_failure_if_active`], so a run another
+/// owner already settled, or one that already carries a cause, keeps its own.
+pub(crate) fn record_run_cause_if_active(orch: &Orchestrator, run_id: &str, cause: &str) {
+    let Some(cause) = crate::security::sanitize::failure_cause(cause) else {
+        return;
+    };
+    if let Err(error) = record_run_failure_if_active(orch, run_id, None, &cause) {
+        log::warn!("Failed to record the failure cause of run {run_id}: {error}");
+    }
 }
 
 /// Settle a turn that ended because its provider account is depleted.

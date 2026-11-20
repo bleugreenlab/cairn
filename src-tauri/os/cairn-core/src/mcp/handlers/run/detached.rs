@@ -1793,6 +1793,97 @@ mod tests {
         }
     }
 
+    /// A detached batch's ending, settled with its answer or written lost,
+    /// serves the replay deferred behind its branch hold, and only once no
+    /// other batch still holds the branch: the first of two endings leaves the
+    /// request queued, the second serves it. The queued request's resolution
+    /// is unreadable, so serving it closes it with no store to replay in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_detached_batchs_ending_serves_the_replay_once_no_other_hold_remains() {
+        for settled_first in [true, false] {
+            let orch = orch_with_job().await;
+            let db: &LocalDb = &orch.db.local;
+            let repo = orch.config_dir.join("repo");
+            let store = crate::jj::project_store_dir(&orch.config_dir, &repo);
+            std::fs::create_dir_all(&store).unwrap();
+            db.execute(
+                "UPDATE projects SET repo_path=?1 WHERE id='p'",
+                (repo.to_string_lossy().into_owned(),),
+            )
+            .await
+            .unwrap();
+            db.execute("UPDATE jobs SET branch='agent/held' WHERE id='job'", ())
+                .await
+                .unwrap();
+            let request = crate::orchestrator::conflict_session::queue_replay_request(
+                db,
+                "p",
+                &store,
+                "main",
+                "0000",
+                "agent/held",
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "UPDATE jj_reconcile_items SET replay_resolution='unreadable' WHERE replay_request_id=?1",
+                (request.id.clone(),),
+            )
+            .await
+            .unwrap();
+            insert(db, &running("req-settled")).await.unwrap();
+            insert(db, &running("req-lost")).await.unwrap();
+            let pending = || async {
+                crate::orchestrator::conflict_session::list_pending_replay_requests(db)
+                    .await
+                    .unwrap()
+                    .len()
+            };
+            let end_one = |settled: bool| {
+                let orch = orch.clone();
+                async move {
+                    let db: &LocalDb = &orch.db.local;
+                    if settled {
+                        assert!(
+                            settle_and_deliver(&orch, db, "req-settled", "succeeded", "ok").await
+                        );
+                    } else {
+                        assert!(mark_lost(
+                            &orch,
+                            db,
+                            "req-lost",
+                            "its machine's enrolment is gone"
+                        )
+                        .await
+                        .unwrap()
+                        .is_some());
+                    }
+                }
+            };
+
+            end_one(settled_first).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(
+                pending().await,
+                1,
+                "a release while another batch holds the branch must leave the replay queued (settled first: {settled_first})"
+            );
+
+            end_one(!settled_first).await;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while pending().await > 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the last hold's release never served the deferred replay (settled first: {settled_first})"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+
     /// cairn/6991: a loss and an adoption arbitrate in the store. A batch
     /// whose result was adopted (its driver may be publishing it) is never
     /// written lost, by the sweep or by a cancel, however the reads that

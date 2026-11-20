@@ -674,6 +674,7 @@ pub(crate) fn note_wake(job_id: &str, outcome: &Result<NudgeOutcome, String>) {
             Ok(NudgeOutcome::Refused(_)) => "refused",
             Ok(NudgeOutcome::QueuedForActiveTurn) => "queued_for_active_turn",
             Ok(NudgeOutcome::Interrupted) => "interrupted",
+            Ok(NudgeOutcome::Steered { .. }) => "steered",
             Ok(NudgeOutcome::Resumed) => "resume_dispatched",
             Ok(NudgeOutcome::SupersededWait { .. }) => "superseded_wait",
             Ok(NudgeOutcome::Held(_)) => "held",

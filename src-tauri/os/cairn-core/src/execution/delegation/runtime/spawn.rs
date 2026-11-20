@@ -2338,7 +2338,69 @@ pub(super) mod unstarted_child_tests {
                 && reason.contains("this launch waited 30 s"),
             "{reason}"
         );
+        // cairn/6099 comment 1: the parent is told that reason, as Cairn's
+        // failure rather than the task's.
+        assert!(
+            delivered.contains("infrastructure failure, not a failure of the task's own work")
+                && delivered.contains("its launch was never admitted: 1 attempts were refused")
+                && delivered.contains("Read it at cairn://p/prj/7/1/builder/task/"),
+            "{delivered}"
+        );
         assert!(orch.launch_admission_waits.get(&child).is_none());
+    }
+
+    /// A background task's parent is pushed only its task's address, so that
+    /// address must say why the task failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_background_tasks_pushed_address_reads_its_failure_reason() {
+        let (orch, _executor) = parent_fixture("background-failure-address.db").await;
+        let outcome = spawn_background(&orch, "map the fleet").await;
+        let task = &outcome.spawned[0];
+        let task_uri = task.task_uri.clone().expect("the task's address");
+        orch.launch_admission_waits.set_backoff(Vec::new());
+        crate::orchestrator::wakes::redrive_refused_launch(
+            &orch,
+            &task.job_id,
+            "launch admission was busy: this launch waited 30 s while another admission held it",
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let push = loop {
+            let pushes =
+                crate::orchestrator::attention_push::list_pending(&orch.db.local, "j-parent")
+                    .await
+                    .unwrap();
+            if let Some(push) = pushes
+                .into_iter()
+                .find(|push| push.key.starts_with("tasks:"))
+            {
+                break push;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the spawner was never told its background task settled"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(push.content_ref, task_uri);
+
+        let request = crate::mcp::types::McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: "/tmp".to_string(),
+            run_id: None,
+            tool: "read".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+            origin: None,
+        };
+        let page = crate::resources::read_cairn_resource(&orch, &request, &push.content_ref).await;
+        assert!(page.contains("Failed"), "{page}");
+        assert!(
+            page.lines().any(|line| line.starts_with("Failure: ")
+                && line.contains("its launch was never admitted")),
+            "{page}"
+        );
     }
 
     /// Advancement's DAG reduction waits for the execution snapshot lock that

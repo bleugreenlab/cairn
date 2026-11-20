@@ -38,7 +38,7 @@ pub(crate) use settings::workspace_settings_authority;
 
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_uri::{parse_uri, CairnResource};
+use cairn_uri::{classify_uri, CairnResource};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResourceTargetHash {
@@ -254,9 +254,8 @@ pub(super) async fn target_resource_for_request(
         Some((resolved, _)) => resolved,
         None => target,
     };
-    let resource = parse_uri(&target).ok_or_else(|| {
-        crate::mcp::handlers::resources::resource_uri_hint(&target)
-            .unwrap_or_else(|| format!("Unrecognized URI format: {}", item.target))
+    let resource = classify_uri(&target).map_err(|refusal| {
+        crate::mcp::handlers::resources::unparsed_uri_refusal(&target, &refusal)
     })?;
     cairn_uri::delegate_thread_descendant(resource)
 }

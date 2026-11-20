@@ -463,12 +463,15 @@ pub(crate) async fn run_write_checks_after_seal(
     // Opened before the wave is spawned, so a fold that finds the branch moved
     // to this commit sees the wave planning from the moment the commit landed.
     let claims = orch.lane_claims.open_wave(&run_context.job_id);
+    let ticket = Arc::new(
+        orch.late_write_checks
+            .open(&run_context.job_id, tool_use_id),
+    );
+    let wave_ticket = ticket.clone();
     let late_orch = orch.clone();
     let late_run_id = run_context.run_id.clone();
-    let late_job_id = run_context.job_id.clone();
     let wave_orch = orch.clone();
     let cwd = cwd.to_string();
-    let tool_use_id = tool_use_id.to_string();
     let sealed_resolution = target.sealed_resolution();
     let (progress, progress_seen) = tokio::sync::watch::channel(WaveProgress::default());
     await_write_check_wave(
@@ -480,16 +483,14 @@ pub(crate) async fn run_write_checks_after_seal(
                 &wave_orch,
                 Some(&run_context),
                 &cwd,
-                &tool_use_id,
                 sealed_resolution.as_ref(),
                 progress,
                 claims,
+                &wave_ticket,
             )
             .await
         },
-        move |summary| {
-            deliver_late_write_check_summary(late_orch, late_run_id, late_job_id, summary)
-        },
+        move |summary| deliver_late_write_check_summary(late_orch, late_run_id, ticket, summary),
     )
     .await
 }
@@ -808,14 +809,35 @@ pub(super) fn settled_wave_summary(
 /// next turn boundary; a pass rides along passively. A superseded node is never
 /// woken (the turn-end cadence's resurrection fence, CAIRN-4665): its message is
 /// still written, passively, so the outcome stays readable.
+///
+/// A wave a newer wave of the same job has superseded sends nothing; the newer
+/// wave's summary names it instead ([`crate::execution::late_write_checks`]).
+/// Each wave is delivered at most once, keyed by its recipient and the call
+/// that started it, so a repeated hand-off cannot write a second copy.
 pub(super) async fn deliver_late_write_check_summary(
     orch: Orchestrator,
     run_id: String,
-    job_id: String,
+    ticket: Arc<crate::execution::late_write_checks::WaveTicket>,
     summary: String,
 ) {
+    use crate::execution::late_write_checks::LateDisposition;
     use crate::messages::queued::DeliveryUrgency;
-    let mut urgency = if summary.contains('\u{2717}') {
+    let job_id = ticket.job_id().to_string();
+    let superseded = match ticket.settle_late() {
+        LateDisposition::Superseded => {
+            log::info!(
+                "late write-check summary for job {job_id}, wave {}, commit {}: a newer wave superseded it; folded into that wave's summary",
+                ticket.wave_id(),
+                ticket.commit().unwrap_or("unplanned"),
+            );
+            return;
+        }
+        LateDisposition::Deliver(superseded) => superseded,
+    };
+    let folded_failure = superseded
+        .as_ref()
+        .is_some_and(|superseded| !superseded.failures.is_empty());
+    let mut urgency = if summary.contains('\u{2717}') || folded_failure {
         DeliveryUrgency::Queue
     } else {
         DeliveryUrgency::Passive
@@ -831,9 +853,17 @@ pub(super) async fn deliver_late_write_check_summary(
             urgency = DeliveryUrgency::Passive;
         }
     }
-    let content = late_write_check_message(&summary);
+    let content = late_write_check_message(
+        &LateWave {
+            commit: ticket.commit(),
+            wave_id: ticket.wave_id(),
+            superseded: superseded.as_ref(),
+        },
+        &summary,
+    );
+    let key = late_write_check_key(&job_id, ticket.wave_id());
     let delivered = tokio::task::spawn_blocking(move || {
-        crate::messages::delivery::queue_system_direct(&orch, &run_id, &content, urgency)
+        crate::messages::delivery::queue_system_direct_once(&orch, &run_id, &content, urgency, &key)
     })
     .await;
     match delivered {
@@ -847,10 +877,74 @@ pub(super) async fn deliver_late_write_check_summary(
     }
 }
 
-pub(super) fn late_write_check_message(summary: &str) -> String {
+/// The wave a late summary reports on.
+pub(super) struct LateWave<'a> {
+    /// The commit it evaluated, or `None` when it ended before planning.
+    pub(super) commit: Option<&'a str>,
+    /// The committing call that started it.
+    pub(super) wave_id: &'a str,
+    /// The earlier waves this summary stands in for.
+    pub(super) superseded: Option<&'a crate::execution::late_write_checks::SupersededWaves>,
+}
+
+/// The one delivery a wave's late summary may make. The recipient is part of
+/// the key, so no other job's delivery can ever answer for it.
+pub(super) fn late_write_check_key(job_id: &str, wave_id: &str) -> String {
+    format!("write-checks:{job_id}:{wave_id}")
+}
+
+pub(super) fn late_write_check_message(wave: &LateWave<'_>, summary: &str) -> String {
+    let subject = match wave.commit {
+        Some(commit) => format!(
+            "commit {}",
+            crate::execution::late_write_checks::short_commit(commit)
+        ),
+        None => "an earlier commit".to_string(),
+    };
+    let folded = wave
+        .superseded
+        .map(|superseded| {
+            let unnamed = superseded.total - superseded.commits.len();
+            let mut commits = superseded.commits.join(", ");
+            if unnamed > 0 {
+                if !commits.is_empty() {
+                    commits.push_str(", ");
+                }
+                commits.push_str(&format!("{unnamed} more"));
+            }
+            let waves = if superseded.total == 1 {
+                "1 earlier pending wave".to_string()
+            } else {
+                format!("{} earlier pending waves", superseded.total)
+            };
+            let failures = if superseded.failures.is_empty() {
+                String::new()
+            } else {
+                let named = superseded
+                    .failures
+                    .iter()
+                    .map(|failure| {
+                        format!(
+                            "{}: {} failed",
+                            failure.commit.as_deref().unwrap_or("unplanned"),
+                            failure.lane
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!(
+                    " No newer wave has recorded a verdict on these failures from them: {named}."
+                )
+            };
+            format!(
+                "\n\nThis summary supersedes {waves} (commits {commits}); their own summaries are not sent.{failures}"
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "[Write checks] The when:write checks that were still pending when an earlier commit of yours \
-         returned have finished.\n\n{summary}\n\nCurrent verdicts for the branch: cairn:~/checks"
+        "[Write checks] The when:write checks for {subject} (wave {}) have finished; that commit's \
+         call had returned pending.\n\n{summary}{folded}\n\nCurrent verdicts for the branch: cairn:~/checks",
+        wave.wave_id
     )
 }
 
@@ -944,13 +1038,15 @@ pub(super) async fn run_write_checks_after_seal_inner(
     orch: &Orchestrator,
     run_context: Option<&RunContext>,
     cwd: &str,
-    tool_use_id: &str,
     sealed_resolution: Option<&crate::mcp::handlers::branch::BranchResolution>,
     progress: tokio::sync::watch::Sender<WaveProgress>,
     // Held until this function returns, which is after every verdict the wave
     // records has been recorded.
     mut claims: WaveClaims,
+    // Its wave id is the committing call's tool_use_id.
+    ticket: &crate::execution::late_write_checks::WaveTicket,
 ) -> Option<String> {
+    let tool_use_id = ticket.wave_id();
     // No run context ⇒ no run id to stream against and no job to anchor the diff.
     let run_context = run_context?;
     let owning_db = crate::execution::routing::owning_db_for_job(&orch.db, &run_context.job_id)
@@ -1050,6 +1146,7 @@ pub(super) async fn run_write_checks_after_seal_inner(
             return Some(write_check_planning_infrastructure_failure(&error));
         }
     };
+    ticket.planned(&sealed_commit);
 
     // The planning unit above is synchronous and sits on the critical path of
     // every source-touching commit, between the sealed commit and the agent
@@ -1537,6 +1634,17 @@ pub(super) async fn run_write_checks_after_seal_inner(
         serde_json::json!({"table": "check_result_cache", "action": "update"}),
     );
 
+    ticket.recorded(results.iter().filter_map(|outcome| {
+        use crate::execution::late_write_checks::LaneVerdict;
+        let verdict = if outcome.passed {
+            LaneVerdict::Passed
+        } else if outcome.is_genuine_failure() {
+            LaneVerdict::Failed
+        } else {
+            return None;
+        };
+        Some((outcome.name.as_str(), verdict))
+    }));
     if results.is_empty() {
         return None;
     }

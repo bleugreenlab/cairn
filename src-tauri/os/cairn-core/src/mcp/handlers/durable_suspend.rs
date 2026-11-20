@@ -158,6 +158,10 @@ pub(crate) enum RelinquishOutcome {
 /// wait. The inner wait answers the call; this row answers nothing.
 pub(crate) const TRANSFERRED_OUTCOME: &str = r#"{"outcome":"transferred_to_inner_wait"}"#;
 
+/// The transfer is not where a run batch's branch hold ends: the batch keeps
+/// running behind its item's permission, and a withdrawn permission hands this
+/// row back. The hold is released when the batch answers, through
+/// [`deliver_held_inline`] or a park's [`resolve`].
 pub(crate) async fn relinquish_to_inner_wait(
     conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
@@ -201,8 +205,8 @@ pub(crate) async fn was_cancelled(db: &LocalDb, id: &str) -> bool {
 /// Whether a trigger polling for this suspension's condition should keep going.
 ///
 /// A trigger loses its row in two ways: a Stop cancels it, or something else
-/// resolves it first (an escalated message superseding a `waitFor`, see
-/// [`supersede_timed_waits`]). Either way nothing it finds can be delivered, so
+/// resolves it first (an escalated message ending a `waitFor`, see
+/// [`steer_parked_waits`]). Either way nothing it finds can be delivered, so
 /// a polling loop stands down rather than watching a resolved row until its
 /// condition happens to hit. No row at all is the inline phase, before the
 /// durable row exists, and an unreadable row reads as pending: the trigger then
@@ -229,8 +233,9 @@ async fn wait_row_state(db: &LocalDb, id: &str) -> Option<String> {
 pub(crate) struct ParkedWaits {
     /// Each active call's [`Condition::label`], in creation order.
     pub(crate) labels: Vec<String>,
-    /// Whether an escalated message may end these waits: every active call is a
-    /// parked `waitFor`, and at least one of them is still pending.
+    /// Whether an escalated message may steer this park: every active call is
+    /// a parked `waitFor` or routed `run` batch, and at least one of them is
+    /// still pending ([`steer_parked_waits`]).
     pub(crate) supersedable: bool,
     /// What a reader should know about when a call resolves at the latest, such
     /// as the deadline of a recovering terminal a wait is parked on.
@@ -260,15 +265,61 @@ async fn active_waits_of_turn(
     Ok(found)
 }
 
-/// Whether these active calls are a pure `waitFor` park an escalated message
-/// may end. A `run` batch or an MCP continuation is work in flight whose result
-/// would be lost, and a held row is a call still answering on its own socket,
-/// so any of them alongside keeps the whole turn held.
-fn timed_waits_only(waits: &[(Record, String, bool)]) -> bool {
+/// Who is ending a parked turn's calls early, which decides which calls it may
+/// end and what each is answered with.
+#[derive(Clone)]
+enum ParkClaim {
+    /// Evidence about a `waitFor`'s own subject (a restarting terminal's
+    /// notice): only `waitFor` calls end, each answered with `result`.
+    TimedWaits { result: String },
+    /// An escalated direct message (tenet 1439): `waitFor` calls end, and
+    /// routed `run` batches detach ([`Condition::is_steerable`]).
+    Escalation(crate::messages::delivery::DirectMessageRef),
+}
+
+impl ParkClaim {
+    fn may_end(&self, condition: &Condition) -> bool {
+        match self {
+            Self::TimedWaits { .. } => condition.is_wait_for(),
+            Self::Escalation(_) => condition.is_steerable(),
+        }
+    }
+
+    fn result_for(&self, condition: &Condition) -> String {
+        match (self, condition) {
+            (Self::TimedWaits { result }, _) => result.clone(),
+            (Self::Escalation(message), Condition::RunBatch { request_id, .. }) => {
+                detached_by_message_result(message, request_id)
+            }
+            (Self::Escalation(message), _) => superseded_by_message_result(message),
+        }
+    }
+
+    /// Whether these active calls are a park this claim may end: every one is
+    /// a call it may end, none is held (a held row is a call still answering on
+    /// its own socket), and at least one is still pending. Any other call
+    /// alongside keeps the whole turn held, since resuming would leave its
+    /// result owed to a turn the agent has left.
+    fn may_end_all(&self, waits: &[(Record, String, bool)]) -> bool {
+        only_calls_that(waits, |condition| self.may_end(condition))
+    }
+}
+
+/// Whether every active call is unheld and passes `may_end`, and at least one
+/// is still pending.
+fn only_calls_that(waits: &[(Record, String, bool)], may_end: impl Fn(&Condition) -> bool) -> bool {
     waits
         .iter()
-        .all(|(record, _, held)| record.condition.is_wait_for() && !held)
+        .all(|(record, _, held)| may_end(&record.condition) && !held)
         && waits.iter().any(|(_, state, _)| state == "pending")
+}
+
+/// Whether these active calls are a park an escalated message may steer: each
+/// is a `waitFor`, which only observes something, or a routed `run` batch,
+/// which runs on detached and reports to its handle. An MCP continuation, an
+/// operator request, or a host batch has no detached form, so it holds.
+fn steerable_waits_only(waits: &[(Record, String, bool)]) -> bool {
+    only_calls_that(waits, Condition::is_steerable)
 }
 
 /// What the parked turn `turn_id` of `job_id` is waiting for.
@@ -299,7 +350,7 @@ pub(crate) async fn parked_waits_of_turn(
             .iter()
             .map(|(record, _, _)| record.condition.label())
             .collect(),
-        supersedable: timed_waits_only(&waits),
+        supersedable: steerable_waits_only(&waits),
         notes,
     })
 }
@@ -317,47 +368,90 @@ pub(crate) fn superseded_by_message_result(
     .to_string()
 }
 
-/// End a pure `waitFor` park early for an escalated direct message.
+/// The outcome a `run` call answered early for an escalated message records.
+const DETACHED_FOR_MESSAGE_OUTCOME: &str = "detached_for_message";
+
+/// Why a steered wait left its batch a detached row.
+pub(crate) const STEERED_WHILE_RUNNING: &str =
+    "its call was answered early to deliver an escalated message while the batch ran";
+
+/// The result a parked `run` call returns when an escalated message steers its
+/// turn: the batch keeps running, and its result reaches the job as a notice.
+pub(crate) fn detached_by_message_result(
+    message: &crate::messages::delivery::DirectMessageRef,
+    request_id: &str,
+) -> String {
+    let handle = super::run::detached::handle_uri(request_id);
+    serde_json::json!({
+        "outcome": DETACHED_FOR_MESSAGE_OUTCOME,
+        "from": message.from,
+        "messageId": message.message_id,
+        "batch": handle,
+        "note": format!(
+            "This call answered early so an escalated message could reach you. Its batch keeps running and nothing was cancelled. Cairn delivers its result to this job as a notice, and `{handle}` shows where it stands now. Do not re-run it; cancel it there if the message means you no longer need it."
+        ),
+    })
+    .to_string()
+}
+
+/// Whether a stored resolution is a `run` call answered early for a message,
+/// whose batch's own result goes to its detached row rather than to this wait.
+fn is_detached_for_message(resolution: Option<&str>) -> bool {
+    resolution
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .is_some_and(|value| {
+            value.get("outcome").and_then(serde_json::Value::as_str)
+                == Some(DETACHED_FOR_MESSAGE_OUTCOME)
+        })
+}
+
+/// Steer a parked turn for an escalated direct message (tenet 1439): resume it
+/// with the message without cancelling anything.
 ///
 /// A `waitFor` only observes something, so ending it loses nothing: the agent
-/// resumes with the message and can wait again. Anything else parked in the
-/// same turn is work in flight, and then nothing is superseded.
+/// resumes with the message and can wait again. A routed `run` batch keeps
+/// running: its call is answered with [`detached_by_message_result`], and in
+/// the same write the batch becomes a `running` detached row, which its own
+/// resolver settles and reports to the job as a notice when it finishes (the
+/// cairn/6145 path). Anything else parked in the same turn has no such form,
+/// and then nothing is steered.
 ///
 /// The decision and the claim are one write. Every eligible row moves
-/// `pending -> resolving` carrying [`superseded_by_message_result`], exactly the
-/// first-writer-wins transition any resolver takes, so a trigger that fires
-/// later loses the race harmlessly and a resolver that got there first leaves
-/// nothing eligible. The resume itself is the ordinary owner's path
+/// `pending -> resolving` carrying its result, exactly the first-writer-wins
+/// transition any resolver takes, so a trigger or batch that finishes later
+/// loses the race harmlessly and a resolver that got there first leaves nothing
+/// eligible. The resume itself is the ordinary owner's path
 /// ([`drive_resolution`] replaying the claimed rows): it answers each call,
 /// elects one resumer, settles any native goal pause, and starts the successor
 /// turn that drains the pending `direct:` pushes.
 ///
-/// Returns the superseded calls' labels, or `None` when the park is not a pure
-/// `waitFor` park. The resume runs on the ambient runtime; with none, the
+/// Returns the steered calls' labels, or `None` when the park is not one an
+/// escalation may steer. The resume runs on the ambient runtime; with none, the
 /// claimed rows are re-driven by the periodic sweep of stale `resolving` rows.
-pub(crate) fn supersede_timed_waits(
+pub(crate) fn steer_parked_waits(
     orch: &Orchestrator,
     db: &Arc<LocalDb>,
     job_id: &str,
     turn_id: &str,
     message: &crate::messages::delivery::DirectMessageRef,
 ) -> Result<Option<Vec<String>>, String> {
-    let result = superseded_by_message_result(message);
     let claimed = crate::storage::run_db_blocking({
-        let (db, job_id, turn_id, result) = (
+        let (db, job_id, turn_id, message) = (
             db.clone(),
             job_id.to_string(),
             turn_id.to_string(),
-            result.clone(),
+            message.clone(),
         );
-        move || async move { claim_timed_waits(&db, &job_id, &turn_id, &result).await }
+        move || async move {
+            claim_parked_waits(&db, &job_id, &turn_id, &ParkClaim::Escalation(message)).await
+        }
     })?;
     let Some(records) = claimed else {
         return Ok(None);
     };
     let labels = records
         .iter()
-        .map(|record| record.condition.label())
+        .map(|(record, _)| record.condition.label())
         .collect();
     match tokio::runtime::Handle::try_current() {
         Ok(runtime) => {
@@ -365,7 +459,7 @@ pub(crate) fn supersede_timed_waits(
             runtime.spawn(async move {
                 // In order, so every sibling but the last stands down and the
                 // last one out drives the turn's single resume.
-                for record in records {
+                for (record, result) in records {
                     drive_resolution(&orch, &db, &record, &result, true).await;
                 }
             });
@@ -377,20 +471,23 @@ pub(crate) fn supersede_timed_waits(
     Ok(Some(labels))
 }
 
-/// The claim half of [`supersede_timed_waits`]: decide and transition in one
-/// write, so no resolver can land between the eligibility read and the claim.
-async fn claim_timed_waits(
+/// The claim half of [`steer_parked_waits`] and [`supersede_terminal_waits`]:
+/// decide and transition in one write, so no resolver can land between the
+/// eligibility read and the claim, and a batch's wait never ends without its
+/// detached row. Returns each claimed call with the result it was answered
+/// with.
+async fn claim_parked_waits(
     db: &LocalDb,
     job_id: &str,
     turn_id: &str,
-    result: &str,
-) -> Result<Option<Vec<Record>>, String> {
-    let (job_id, turn_id, result) = (job_id.to_string(), turn_id.to_string(), result.to_string());
+    claim: &ParkClaim,
+) -> Result<Option<Vec<(Record, String)>>, String> {
+    let (job_id, turn_id, claim) = (job_id.to_string(), turn_id.to_string(), claim.clone());
     db.write(|c| {
-        let (job_id, turn_id, result) = (job_id.clone(), turn_id.clone(), result.clone());
+        let (job_id, turn_id, claim) = (job_id.clone(), turn_id.clone(), claim.clone());
         Box::pin(async move {
             let waits = active_waits_of_turn(c, &job_id, &turn_id).await?;
-            if waits.is_empty() || !timed_waits_only(&waits) {
+            if waits.is_empty() || !claim.may_end_all(&waits) {
                 return Ok(None);
             }
             let now = chrono::Utc::now().timestamp_millis();
@@ -399,15 +496,27 @@ async fn claim_timed_waits(
                 if state != "pending" {
                     continue;
                 }
+                let result = claim.result_for(&record.condition);
                 let changed = c
                     .execute(
                         "UPDATE agent_waits SET state='resolving',resolution_json=?2,resolving_at=?3,resume_cause='addressed' WHERE id=?1 AND state='pending'",
                         params![record.id.as_str(), result.as_str(), now],
                     )
                     .await?;
-                if changed > 0 {
-                    claimed.push(record);
+                if changed == 0 {
+                    continue;
                 }
+                // A no-op for every condition but a run batch.
+                super::run::detached::insert_converted(
+                    c,
+                    &record.job_id,
+                    &record.run_id,
+                    &record.condition,
+                    STEERED_WHILE_RUNNING,
+                    now,
+                )
+                .await?;
+                claimed.push((record, result));
             }
             Ok((!claimed.is_empty()).then_some(claimed))
         })
@@ -450,9 +559,9 @@ impl CyclingTerminal<'_> {
 ///
 /// A notice about the terminal is evidence about the wait itself, so ending
 /// the wait loses nothing: the agent resumes with `result` as the wait's own
-/// answer and can wait again. The rule [`supersede_timed_waits`] keeps holds
-/// here too: a turn that also has a `run` batch or an MCP continuation in
-/// flight is never resumed early, and the notice then reaches it as a message.
+/// answer and can wait again. Only a pure `waitFor` park is ended: a turn that
+/// also has a `run` batch or an MCP continuation in flight is never resumed
+/// early, and the notice then reaches it as a message.
 /// The claim is the same atomic `pending -> resolving` write, so a wait
 /// already resolved (by an earlier notice, or by the terminal itself) is never
 /// touched again.
@@ -485,15 +594,18 @@ pub(crate) async fn supersede_terminal_waits(
     }
     let mut labels = Vec::new();
     for turn_id in turns {
-        let Some(records) = claim_timed_waits(db, job_id, &turn_id, result).await? else {
+        let claim = ParkClaim::TimedWaits {
+            result: result.to_string(),
+        };
+        let Some(records) = claim_parked_waits(db, job_id, &turn_id, &claim).await? else {
             continue;
         };
-        labels.extend(records.iter().map(|record| record.condition.label()));
-        let (orch, db, result) = (orch.clone(), db.clone(), result.to_string());
+        labels.extend(records.iter().map(|(record, _)| record.condition.label()));
+        let (orch, db) = (orch.clone(), db.clone());
         tokio::spawn(async move {
             // In order, so every sibling but the last stands down and the
             // last one out drives the turn's single resume.
-            for record in records {
+            for (record, result) in records {
                 drive_resolution(&orch, &db, &record, &result, true).await;
             }
         });
@@ -580,6 +692,14 @@ impl Condition {
             } => !host && (*commits || !verdict_only),
             _ => false,
         }
+    }
+
+    /// Whether an escalated message may answer this call early and resume its
+    /// turn without cancelling anything: a `waitFor`, or a run batch on a
+    /// machine, which runs on detached. A host batch's items are interrupted
+    /// when nobody waits on them, so it holds.
+    pub(crate) fn is_steerable(&self) -> bool {
+        self.is_wait_for() || matches!(self, Condition::RunBatch { host: false, .. })
     }
 
     /// Whether this is a `waitFor` condition, which only observes something,
@@ -1033,10 +1153,25 @@ pub(crate) const DELIVERED_INLINE_OUTCOME: &str = r#"{"outcome":"delivered_inlin
 /// leaves the host: the row resolves with no stored result and no successor,
 /// and the reconciler (which selects only pending and resolving rows) never
 /// wakes for it.
+///
+/// Only a batch that has answered is delivered, so its branch hold ends here
+/// whichever way the row went: resolved now, or already retired by a stop or by
+/// an item's permission that took the call over while the batch kept running.
+/// The replay deferred behind the hold is served from here. A row still held
+/// becomes a park, and that park's resolution releases the hold instead.
 pub(crate) async fn deliver_held_inline(
+    orch: &Orchestrator,
     db: &LocalDb,
     record: &Record,
 ) -> Result<HeldDelivery, String> {
+    let delivery = settle_held_inline(db, record).await?;
+    if delivery != HeldDelivery::TurnYielded && record.condition.holds_branch() {
+        crate::orchestrator::base_advance::on_branch_hold_released(orch, &record.job_id);
+    }
+    Ok(delivery)
+}
+
+async fn settle_held_inline(db: &LocalDb, record: &Record) -> Result<HeldDelivery, String> {
     let (id, turn_id) = (record.id.clone(), record.turn_id.clone());
     db.write(|c| {
         let (id, turn_id) = (id.clone(), turn_id.clone());
@@ -2209,15 +2344,19 @@ async fn divert_to_job(
                 params![id.clone()],
             ).await?;
             let Some(row) = rows.next().await? else {
-                return Ok(false);
+                return Ok(None);
             };
             let state = row.text(0)?;
             let resolution = row.opt_text(1)?;
             let successor = row.opt_text(2)?;
             drop(rows);
             if state != "resolving" || successor.is_some() || is_abandonment(resolution.as_deref()) {
-                return Ok(false);
+                return Ok(None);
             }
+            // A call answered early for a message already made its batch a
+            // detached row, which the batch's own result settles; this
+            // resolution is that answer, not the batch's.
+            let steered = is_detached_for_message(resolution.as_deref());
             let now = chrono::Utc::now().timestamp_millis();
             super::run::detached::insert_converted(
                 c,
@@ -2233,20 +2372,20 @@ async fn divert_to_job(
                 params![id, now],
             )
             .await?;
-            Ok(true)
+            Ok(Some(steered))
         })
     })
     .await
     .map_err(|e| e.to_string())?;
-    if !diverted {
+    let Some(steered) = diverted else {
         return Ok(());
-    }
+    };
     log::info!(
         "run batch suspension {} resolved after its turn ended; its result goes to job {} as a notice",
         r.id,
         r.job_id
     );
-    if replay {
+    if replay && !steered {
         super::run::detached::settle_and_deliver(
             orch,
             db,
@@ -3914,6 +4053,79 @@ mod tests {
             Box::pin(async move { relinquish_to_inner_wait(conn, &run_id, &tool_use_id).await })
         })
         .await
+    }
+
+    /// A held batch's branch hold ends when the batch answers, whether its row
+    /// is delivered then or was already handed to an item's permission while
+    /// the batch ran, and the replay deferred behind the hold is served at that
+    /// answer rather than at the next start. The queued request's resolution is
+    /// unreadable, so serving it closes it with no store to replay in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_batchs_answer_serves_the_replay_deferred_behind_it() {
+        for transferred in [false, true] {
+            let (orch, base, _) = durable_env().await;
+            let db = &orch.db.local;
+            let repo = orch.config_dir.join("repo");
+            let store = crate::jj::project_store_dir(&orch.config_dir, &repo);
+            std::fs::create_dir_all(&store).unwrap();
+            db.execute(
+                "UPDATE projects SET repo_path=?1 WHERE id='p'",
+                (repo.to_string_lossy().into_owned(),),
+            )
+            .await
+            .unwrap();
+            db.execute("UPDATE jobs SET branch='agent/held' WHERE id='job-1'", ())
+                .await
+                .unwrap();
+            let request = crate::orchestrator::conflict_session::queue_replay_request(
+                db,
+                "p",
+                &store,
+                "main",
+                "0000",
+                "agent/held",
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "UPDATE jj_reconcile_items SET replay_resolution='unreadable' WHERE replay_request_id=?1",
+                (request.id.clone(),),
+            )
+            .await
+            .unwrap();
+            let held = run_batch_record(&base, true);
+            assert!(held.condition.holds_branch());
+            insert_as(db, &held, Establish::Hold).await.unwrap();
+            let expected = if transferred {
+                assert_eq!(
+                    relinquish(db, &held).await.unwrap(),
+                    RelinquishOutcome::Transferred
+                );
+                HeldDelivery::Gone
+            } else {
+                HeldDelivery::Delivered
+            };
+
+            assert_eq!(
+                deliver_held_inline(&orch, db, &held).await.unwrap(),
+                expected
+            );
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !crate::orchestrator::conflict_session::list_pending_replay_requests(db)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the answer's release never served the deferred replay (transferred: {transferred})"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
     }
 
     #[tokio::test]
@@ -7341,6 +7553,16 @@ mod tests {
                 INSERT INTO sessions(id,job_id,backend,status,created_at,updated_at) VALUES('busy-session','busy-job','claude','open',1,1);
                 INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('busy-turn','busy-session','busy-job',1,'running','initial',1,1);
                 UPDATE jobs SET current_turn_id='busy-turn',current_session_id='busy-session' WHERE id='busy-job';").await.unwrap();
+            // The busy child's turn is served by a process, so it is work.
+            orch.process_state
+                .register_process(
+                    "busy-run".into(),
+                    crate::agent_process::process::RunHandle::test_handle(
+                        Some("busy-session"),
+                        Some("busy-job"),
+                    ),
+                )
+                .unwrap();
             insert(db, &record).await.unwrap();
             register_warm(&orch);
             resolve(&orch, db, &record, ELAPSED, false).await.unwrap();
@@ -8726,8 +8948,12 @@ mod tests {
                     .local
                     .read(|conn| {
                         Box::pin(async move {
-                            let rows =
-                                activity_job_rows_conn(conn, ActivityScope::Issue("i")).await?;
+                            let rows = activity_job_rows_conn(
+                                conn,
+                                ActivityScope::Issue("i"),
+                                &crate::execution::jobs::liveness::WorkObserver::nothing(),
+                            )
+                            .await?;
                             assert_eq!(rows.len(), 1);
                             Ok(rows.into_iter().next().unwrap().activity)
                         })
@@ -9895,31 +10121,101 @@ mod tests {
         assert!(!direct_push_delivered(&orch).await);
     }
 
+    /// Tenet 1439: an escalation to a turn parked on a routed `run` batch
+    /// resumes it with the message and leaves the batch running. The call is
+    /// answered with the batch's handle, the batch becomes a running detached
+    /// row in the same write, and when the batch finishes its own resolver
+    /// settles that row instead of answering the call a second time.
     #[tokio::test]
-    async fn an_escalated_direct_holds_for_a_run_park_alone_or_beside_a_waitfor() {
+    async fn an_escalated_direct_detaches_a_parked_run_and_its_result_still_reaches_the_job() {
+        let (orch, base, _) = durable_env().await;
+        let record = Record {
+            condition: run_batch_condition(true, Some("cargo test")),
+            deadline: None,
+            ..base
+        };
+        insert(&orch.db.local, &record).await.unwrap();
+        register_warm(&orch);
+        let message = seed_direct(&orch, "interrupt").await;
+
+        assert_eq!(
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &message).unwrap(),
+            NudgeOutcome::SupersededWait {
+                labels: vec!["run: cargo test".into()]
+            }
+        );
+        await_wait_state(&orch, "wait-1", "resolved").await;
+        assert_eq!(wait_resolved_turns(&orch).await.len(), 1, "one resume");
+        let results = tool_results(&orch).await;
+        assert_eq!(results.len(), 1, "the run call is answered once");
+        for expected in [
+            "detached_for_message",
+            "msg-1",
+            "cairn:~/batches/request-1",
+            "nothing was cancelled",
+        ] {
+            assert!(
+                results[0].1.contains(expected),
+                "{expected}: {}",
+                results[0].1
+            );
+        }
+        assert!(
+            direct_push_delivered(&orch).await,
+            "the resume delivers the message itself"
+        );
+        let detached = super::super::run::detached::load(&orch.db.local, "request-1")
+            .await
+            .unwrap()
+            .expect("the batch keeps a durable record of its own");
+        assert_eq!(
+            detached.state,
+            super::super::run::detached::DetachedState::Running
+        );
+        assert_eq!(detached.reason, STEERED_WHILE_RUNNING);
+        assert!(detached.holds_branch, "a committing batch keeps its hold");
+
+        // The batch finishes: its resolver finds the wait already answered and
+        // hands the result to the detached row, which reaches the job.
+        resolve(&orch, &orch.db.local, &record, "batch passed", false)
+            .await
+            .unwrap();
+        assert_eq!(tool_result_count(&orch).await, 1, "no second answer");
+        assert_eq!(
+            wait_resolved_turns(&orch).await.len(),
+            1,
+            "no second resume"
+        );
+        assert!(
+            super::super::run::detached::settle_and_deliver(
+                &orch,
+                &orch.db.local,
+                "request-1",
+                "passed",
+                "batch passed",
+            )
+            .await
+        );
+        let settled = super::super::run::detached::load(&orch.db.local, "request-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settled.state,
+            super::super::run::detached::DetachedState::Settled
+        );
+        assert_eq!(settled.verdict.as_deref(), Some("passed"));
+    }
+
+    /// A `waitFor` beside a routed batch ends with it, in one resume; a host
+    /// batch has no detached form, so a turn parked on one still holds.
+    #[tokio::test]
+    async fn an_escalated_direct_steers_a_waitfor_beside_a_run_and_holds_for_a_host_batch() {
         let batch_of = |base: &Record| Record {
             condition: run_batch_condition(false, Some("cargo test")),
             deadline: None,
             ..base.clone()
         };
-
-        // A run batch alone is work in flight.
-        let (orch, base, _) = durable_env().await;
-        insert(&orch.db.local, &batch_of(&base)).await.unwrap();
-        register_warm(&orch);
-        let message = seed_direct(&orch, "interrupt").await;
-        assert_eq!(
-            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &message).unwrap(),
-            NudgeOutcome::Held(Hold::Wait {
-                labels: vec!["run: cargo test".into()],
-                supersedable: false,
-                notes: Vec::new(),
-            })
-        );
-        assert_eq!(wait_state(&orch).await, "pending");
-
-        // A waitFor parked beside one is not ended either: ending it would
-        // resume the turn while the batch's result is still owed.
         let (orch, base, _) = durable_env().await;
         insert(&orch.db.local, &ten_minute_wait(base.clone()))
             .await
@@ -9929,22 +10225,97 @@ mod tests {
             .unwrap();
         register_warm(&orch);
         let message = seed_direct(&orch, "interrupt").await;
-        let outcome =
-            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &message).unwrap();
-        let NudgeOutcome::Held(hold) = outcome else {
-            panic!("a turn with a run in flight must hold: {outcome:?}");
-        };
         assert_eq!(
-            hold,
-            Hold::Wait {
-                labels: vec!["waitFor: duration".into(), "run: cargo test".into()],
-                supersedable: false,
-                notes: Vec::new(),
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &message).unwrap(),
+            NudgeOutcome::SupersededWait {
+                labels: vec!["waitFor: duration".into(), "run: cargo test".into()]
             }
         );
-        assert!(hold.render().contains("`run: cargo test`"));
-        assert_eq!(active_wait_count(&orch).await, 2);
+        eventually_resolved_turns(&orch, 1).await;
+        assert_eq!(tool_result_count(&orch).await, 2, "each call answered once");
+        assert_eq!(active_wait_count(&orch).await, 0);
+
+        let (orch, base, _) = durable_env().await;
+        let host = Record {
+            condition: Condition::RunBatch {
+                request_id: "request-1".into(),
+                commits: false,
+                label: Some("slow".into()),
+                host: true,
+                identity: None,
+                verdict_only: false,
+                settlement: None,
+            },
+            deadline: None,
+            ..base
+        };
+        insert(&orch.db.local, &host).await.unwrap();
+        register_warm(&orch);
+        let message = seed_direct(&orch, "interrupt").await;
+        assert_eq!(
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &message).unwrap(),
+            NudgeOutcome::Held(Hold::Wait {
+                labels: vec!["run: slow".into()],
+                supersedable: false,
+                notes: Vec::new(),
+            })
+        );
+        assert_eq!(wait_state(&orch).await, "pending");
         assert!(wait_resolved_turns(&orch).await.is_empty());
+    }
+
+    /// An escalation that reached the turn while it was in the call that then
+    /// parked was left for that call's return. A park is not a return, so the
+    /// park's completion delivers it, exactly as an escalation to an
+    /// already-parked turn would be.
+    #[tokio::test]
+    async fn an_escalation_waiting_when_a_run_parks_is_delivered_once_the_park_lands() {
+        let (orch, base, _) = durable_env().await;
+        let record = Record {
+            condition: run_batch_condition(false, Some("cargo test")),
+            deadline: None,
+            ..base
+        };
+        insert(&orch.db.local, &record).await.unwrap();
+        register_warm(&orch);
+        seed_direct(&orch, "interrupt").await;
+
+        crate::messages::delivery::steer_park_for_waiting_escalation(&orch, "run-1");
+        await_wait_state(&orch, "wait-1", "resolved").await;
+        let results = tool_results(&orch).await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].1.contains("detached_for_message") && results[0].1.contains("coordinator"),
+            "{}",
+            results[0].1
+        );
+        assert!(direct_push_delivered(&orch).await);
+
+        // Nothing escalated waits for the next park, so it is left alone.
+        let (orch, base, _) = durable_env().await;
+        insert(&orch.db.local, &run_batch_record(&base, false))
+            .await
+            .unwrap();
+        register_warm(&orch);
+        seed_direct(&orch, "steer").await;
+        crate::messages::delivery::steer_park_for_waiting_escalation(&orch, "run-1");
+        assert_eq!(wait_state(&orch).await, "pending");
+        assert!(!direct_push_delivered(&orch).await);
+    }
+
+    async fn eventually_resolved_turns(orch: &Orchestrator, expected: usize) {
+        for _ in 0..200 {
+            if wait_resolved_turns(orch).await.len() == expected
+                && active_wait_count(orch).await == 0
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!(
+            "expected {expected} resumed turn(s), found {:?}",
+            wait_resolved_turns(orch).await
+        );
     }
 
     #[tokio::test]

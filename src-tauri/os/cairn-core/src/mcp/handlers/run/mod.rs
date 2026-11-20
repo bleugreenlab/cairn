@@ -10091,11 +10091,16 @@ const HELD_DELIVERY_RETRY: std::time::Duration = std::time::Duration::from_secs(
 /// Record a held call's inline answer again after a failed attempt, so its
 /// row never stays pending behind a call that answered: a restart would
 /// otherwise resume the turn with a result the agent already has.
-fn retry_held_delivery(held: HeldCall) {
+fn retry_held_delivery(orch: &Orchestrator, held: HeldCall) {
+    let orch = orch.clone();
     tokio::spawn(async move {
         tokio::time::sleep(HELD_DELIVERY_RETRY).await;
-        if let Err(error) =
-            crate::mcp::handlers::durable_suspend::deliver_held_inline(&held.db, &held.record).await
+        if let Err(error) = crate::mcp::handlers::durable_suspend::deliver_held_inline(
+            &orch,
+            &held.db,
+            &held.record,
+        )
+        .await
         {
             log::warn!(
                 "held run batch {} still could not record its inline answer: {error}",
@@ -10246,8 +10251,8 @@ impl CallAnswer {
         // On its own task, so a delivery that outlives the answer deadline
         // still lands instead of being dropped mid-write.
         let delivery = tokio::spawn({
-            let (db, record) = (held.db.clone(), held.record.clone());
-            async move { durable_suspend::deliver_held_inline(&db, &record).await }
+            let (orch, db, record) = (self.orch.clone(), held.db.clone(), held.record.clone());
+            async move { durable_suspend::deliver_held_inline(&orch, &db, &record).await }
         });
         let delivered = tokio::time::timeout_at(self.deadlines.answer, delivery).await;
         match delivered {
@@ -10279,6 +10284,14 @@ impl CallAnswer {
                             "held run batch {} could not park its answer: {error}",
                             held.record.id
                         );
+                        // Something else settled the row first, and the batch
+                        // has answered, so its branch hold is over.
+                        if held.record.condition.holds_branch() {
+                            crate::orchestrator::base_advance::on_branch_hold_released(
+                                &self.orch,
+                                &held.record.job_id,
+                            );
+                        }
                         self.finish(AnswerOutcome::Held, answer.envelope)
                     }
                 }
@@ -10287,9 +10300,11 @@ impl CallAnswer {
                 // An item's permission may have taken the record over and be
                 // about to hand it back; settle it then, so a restart never
                 // finds it pending.
+                let orch = self.orch.clone();
                 tokio::spawn(async move {
                     durable_suspend::await_inner_wait_release(&held.db, &held.record).await;
-                    let _ = durable_suspend::deliver_held_inline(&held.db, &held.record).await;
+                    let _ =
+                        durable_suspend::deliver_held_inline(&orch, &held.db, &held.record).await;
                 });
                 self.finish(AnswerOutcome::Held, answer.envelope)
             }
@@ -10298,7 +10313,7 @@ impl CallAnswer {
                     "held run batch {} could not record its inline answer: {error}",
                     held.record.id
                 );
-                retry_held_delivery(held);
+                retry_held_delivery(&self.orch, held);
                 self.finish(AnswerOutcome::Held, answer.envelope)
             }
             Ok(Err(error)) => {
@@ -10306,7 +10321,7 @@ impl CallAnswer {
                     "held run batch {} could not record its inline answer: its task failed ({error})",
                     held.record.id
                 );
-                retry_held_delivery(held);
+                retry_held_delivery(&self.orch, held);
                 self.finish(AnswerOutcome::Held, answer.envelope)
             }
             Err(_) => {

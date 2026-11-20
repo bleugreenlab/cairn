@@ -16,6 +16,8 @@
 //!   in the app ([`Surface`]); the frontend owns the routes.
 //! - `build`: the `build_*` constructors and `to_uri()`.
 //! - `parse`: [`parse_uri`].
+//! - `refusal`: [`classify_uri`], why `parse_uri` refused an address: garbled,
+//!   or well formed but naming something this build does not have.
 //! - `thread`: [`delegate_thread_descendant`], the one reader of thread
 //!   sub-paths.
 //! - `scan`: finding the cairn:// URIs written into free text, by handing
@@ -35,6 +37,7 @@ mod kind;
 mod label;
 mod parse;
 pub mod percent;
+mod refusal;
 mod relative;
 pub mod samples;
 mod scan;
@@ -48,6 +51,7 @@ pub use executor_name::normalize_executor_name;
 pub use kind::ResourceKind;
 pub use label::LabelContext;
 pub use parse::*;
+pub use refusal::{classify_uri, MalformedUri, UnknownSegment, UriGrammar, UriRefusal};
 pub use relative::*;
 pub use scan::*;
 pub use surface::Surface;
