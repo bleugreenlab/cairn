@@ -430,9 +430,9 @@ fn pinned_statements() -> Vec<(&'static str, String, usize)> {
             1,
         ),
         (
-            "RUNNER_DEVICE_SQL",
-            super::capacity::RUNNER_DEVICE_SQL.to_string(),
-            1,
+            "runner_devices_sql",
+            super::capacity::runner_devices_sql(3),
+            3,
         ),
         ("HELD_EXECUTIONS_SQL", HELD_EXECUTIONS_SQL.to_string(), 0),
         (
@@ -509,6 +509,56 @@ async fn held_reads_never_read_an_execution_row() {
             "idx_executions_issue_seq",
             "AUTOMATIC",
         ] {
+            assert!(
+                !plan.iter().any(|line| line.contains(forbidden)),
+                "{label}: names `{forbidden}`: {plan:#?}"
+            );
+        }
+    }
+}
+
+/// The queue read's bound-list statements, which run under the admission lock
+/// for every start and lane of a pass, seek each table by key: the starts'
+/// issues and their threads, the place refresh's issue threads, and the lanes'
+/// turns. None scans, so the read stays constant in what it touches per
+/// start however large the tables are (cairn/5894, cairn/5925, cairn/6325).
+#[tokio::test]
+async fn the_queue_reads_seek_issues_threads_and_lanes_by_key() {
+    let db = crate::storage::migrated_test_db("held-reads-start-lists.db").await;
+    for (label, sql, sought) in [
+        (
+            "start issues",
+            super::capacity::start_issues_sql(3),
+            &["SEARCH i ", "SEARCH t "][..],
+        ),
+        (
+            "issue threads",
+            super::capacity::issue_threads_sql(3),
+            &["SEARCH issues "][..],
+        ),
+        (
+            "lane turns",
+            super::rotation::lane_turns_sql(3),
+            &["SEARCH queue_lane_turns "][..],
+        ),
+        (
+            "runner devices",
+            super::capacity::runner_devices_sql(3),
+            &[
+                "SEARCH g ",
+                "SEARCH e USING COVERING INDEX idx_executions_hold_facts (id=?)",
+            ][..],
+        ),
+    ] {
+        let plan = plan(&db, &sql, 3).await;
+        eprintln!("{label}: {plan:?}");
+        for step in sought {
+            assert!(
+                plan.iter().any(|line| line.starts_with(step)),
+                "{label}: `{step}` by key: {plan:#?}"
+            );
+        }
+        for forbidden in ["SCAN", "AUTOMATIC", "sqlite_autoindex_executions_1"] {
             assert!(
                 !plan.iter().any(|line| line.contains(forbidden)),
                 "{label}: names `{forbidden}`: {plan:#?}"
@@ -1129,15 +1179,14 @@ async fn rewritten_held_reads_return_what_they_returned() {
             true,
         ));
     }
-    for execution in &all_executions {
-        cases.push((
-            format!("runner device {execution:?}"),
-            super::capacity::RUNNER_DEVICE_SQL.into(),
-            unhinted(super::capacity::RUNNER_DEVICE_SQL),
-            vec![execution.clone()],
-            true,
-        ));
-    }
+    let runner_devices = super::capacity::runner_devices_sql(all_executions.len());
+    cases.push((
+        "runner devices".into(),
+        runner_devices.clone(),
+        unhinted(&runner_devices),
+        all_executions.clone(),
+        false,
+    ));
 
     let mut results = std::collections::HashMap::new();
     for (label, rewritten, reference, bound, ordered) in cases {

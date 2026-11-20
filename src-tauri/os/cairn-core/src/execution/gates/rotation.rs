@@ -50,7 +50,7 @@ use std::collections::{BTreeMap, HashMap};
 use cairn_db::turso::params;
 use cairn_workflow::gates::store::QUEUE_KEY_SCALE;
 
-use crate::storage::DbResult;
+use crate::storage::{DbResult, RowExt};
 
 /// The lane of top-level issues and issue-less executions.
 pub(crate) const SHARED_LANE: &str = "shared";
@@ -62,8 +62,13 @@ pub(crate) const LANE_OF_ISSUE_SQL: &str = concat!(
     " FROM issues i WHERE i.id = ?1"
 );
 
-/// One lane's stamp, by primary key.
-pub(crate) const LANE_TURN_SQL: &str = "SELECT turn FROM queue_lane_turns WHERE lane = ?1";
+/// `n` lanes' stamps, by primary key.
+pub(crate) fn lane_turns_sql(n: usize) -> String {
+    format!(
+        "SELECT lane, turn FROM queue_lane_turns WHERE lane IN ({})",
+        cairn_db::sql::placeholders(n)
+    )
+}
 
 /// The newest stamp in this database. Ordered down to it rather than read as
 /// `MAX(turn)`, which Turso answers by walking the whole index.
@@ -213,18 +218,28 @@ pub(crate) async fn record_turn_conn(
     Ok(())
 }
 
-/// The stamps this database holds for `lanes`, one primary-key search each,
-/// merged into `turns`.
+/// The stamps this database holds for `lanes`, merged into `turns`: one
+/// primary-key search per lane, in one statement per
+/// [`cairn_db::sql::IN_LIST_CHUNK`] lanes, so a queue read under the admission
+/// lock costs the same however many lanes its queue spans.
 pub(crate) async fn read_lane_turns_conn<'a>(
     conn: &crate::storage::TrackedConnection,
     lanes: impl IntoIterator<Item = &'a str>,
     turns: &mut LaneTurns,
 ) -> DbResult<()> {
-    for lane in lanes {
-        if let Some(turn) =
-            crate::storage::query_opt_i64_conn(conn, LANE_TURN_SQL, params![lane]).await?
-        {
-            note_turn(turns, lane, turn);
+    let lanes: Vec<&str> = lanes
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for chunk in lanes.chunks(cairn_db::sql::IN_LIST_CHUNK) {
+        let bound: Vec<cairn_db::turso::Value> = chunk
+            .iter()
+            .map(|lane| cairn_db::turso::Value::Text((*lane).to_string()))
+            .collect();
+        let mut rows = conn.query(&lane_turns_sql(chunk.len()), bound).await?;
+        while let Some(row) = rows.next().await? {
+            note_turn(turns, &row.text(0)?, row.i64(1)?);
         }
     }
     Ok(())
@@ -240,7 +255,6 @@ pub(crate) async fn newest_turn_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::RowExt;
 
     fn entry<'a>(id: &'a str, lane: &'a str, key: i64) -> Entry<'a> {
         Entry {
@@ -393,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn the_turn_statements_seek_and_never_name_executions() {
         let db = crate::storage::migrated_test_db("rotation-turn-plans.db").await;
-        let lane = plan(&db, LANE_TURN_SQL, 1).await;
+        let lane = plan(&db, &lane_turns_sql(3), 3).await;
         assert!(
             lane.iter().any(
                 |line| line.starts_with("SEARCH queue_lane_turns") && line.contains("(lane=?)")
@@ -438,7 +452,7 @@ mod tests {
             );
         }
         for sql in [
-            LANE_TURN_SQL,
+            lane_turns_sql(3).as_str(),
             NEWEST_TURN_SQL,
             UPDATE_TURN_SQL,
             INSERT_TURN_SQL,

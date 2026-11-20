@@ -61,8 +61,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use cairn_db::turso::params;
 use cairn_workflow::gates::store::{
-    latch_foreclosure_conn, list_gates_conn, list_held_executions_conn,
-    list_waiting_gate_predicates_conn, record_outcome_conn, release_execution_conn, HeldExecution,
+    latch_foreclosure_conn, list_gates_conn, list_gates_for_executions_conn,
+    list_held_executions_conn, list_waiting_gate_predicates_conn, record_outcome_conn,
+    release_execution_conn, HeldExecution,
 };
 use tokio::sync::mpsc;
 
@@ -193,6 +194,14 @@ pub struct SweepReport {
     /// it; `None` when the pass took no lock.
     pub lock_wait_ms: Option<u64>,
     pub lock_held_ms: Option<u64>,
+    /// Statements issued on every open database while the pass held the
+    /// lock: in a test, where nothing else runs, the pass's own.
+    #[cfg(test)]
+    pub lock_statements: Option<usize>,
+    /// Write transactions on every open database while the pass held the
+    /// lock.
+    #[cfg(test)]
+    pub lock_writes: Option<usize>,
     /// Authored gates resolved this pass, by fact and outcome (`satisfied`,
     /// `refuted`, `no_evidence`, `foreclosed`).
     pub clauses: BTreeMap<(String, &'static str), usize>,
@@ -225,19 +234,19 @@ pub(crate) async fn sweep_with(
     let mut held = Vec::new();
     for (db_index, db) in orch.db.all_dbs().await.into_iter().enumerate() {
         let listed = db
-            .read(|conn| Box::pin(async move { list_held_executions_conn(conn).await }))
+            .read(|conn| Box::pin(async move { held_with_gates_conn(conn).await }))
             .await
             .map_err(|error| format!("failed to list held executions: {error}"))?;
         held.extend(
             listed
                 .into_iter()
-                .map(|execution| (db_index, db.clone(), execution)),
+                .map(|(execution, gates)| (db_index, db.clone(), execution, gates)),
         );
     }
     // Capacity keys never tie. An execution with no capacity row yet (one
     // that waits on its own `after:` gates) keys on the second it was filed,
     // so a burst filed at one instant ties and keeps its issue order.
-    held.sort_by(|(a_db, _, a), (b_db, _, b)| {
+    held.sort_by(|(a_db, _, a, _), (b_db, _, b, _)| {
         (
             a.queue_key,
             a_db,
@@ -258,17 +267,17 @@ pub(crate) async fn sweep_with(
     report.evaluated = held.len();
     let held_ids: HashSet<String> = held
         .iter()
-        .map(|(_, _, execution)| execution.execution_id.clone())
+        .map(|(_, _, execution, _)| execution.execution_id.clone())
         .collect();
     // Evaluate, without the admission lock: resolve each execution's authored
     // gates and record what they say. One whose authored gates all allow it
     // is a candidate; whether the queue's caps let it start is the release
     // phase's to decide.
     let mut candidates = Vec::new();
-    for (_, db, execution) in held {
+    for (_, db, execution, gates) in held {
         // One execution whose evidence cannot be read must not hold up the
         // rest of the burst behind it.
-        match resolve_held(orch, &db, vocabulary, &execution, now).await {
+        match resolve_gates(orch, &db, vocabulary, &execution, &gates, now).await {
             Ok(resolved) => {
                 orch.sweep_pulse
                     .note_evaluated(&execution.execution_id, now);
@@ -308,6 +317,22 @@ pub(crate) async fn sweep_with(
 
 fn millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Statements and write transactions issued on every open database so far,
+/// read around the lock to count what a pass does while holding it.
+#[cfg(test)]
+async fn issued(orch: &Orchestrator) -> (usize, usize) {
+    orch.db
+        .all_dbs()
+        .await
+        .iter()
+        .fold((0, 0), |(statements, writes), db| {
+            (
+                statements + db.statement_count(),
+                writes + db.write_transaction_count(),
+            )
+        })
 }
 
 /// A held execution whose authored gates all allow it to start this pass.
@@ -366,6 +391,8 @@ async fn release_candidates(
         }
     };
     report.lock_wait_ms = Some(millis(guard.waited()));
+    #[cfg(test)]
+    let issued_at_acquire = issued(orch).await;
     let starts: Vec<Start<'_>> = candidates
         .iter()
         .map(|candidate| Start {
@@ -439,6 +466,12 @@ async fn release_candidates(
         }
     }
     report.lock_held_ms = Some(millis(guard.held()));
+    #[cfg(test)]
+    {
+        let (statements, writes) = issued(orch).await;
+        report.lock_statements = Some(statements - issued_at_acquire.0);
+        report.lock_writes = Some(writes - issued_at_acquire.1);
+    }
     drop(guard);
 
     let mut announced = HashSet::new();
@@ -531,15 +564,26 @@ async fn evaluate_held(
     evaluate_gates(orch, db, vocabulary, execution, &gates, now).await
 }
 
-async fn resolve_held(
-    orch: &Orchestrator,
-    db: &Arc<LocalDb>,
-    vocabulary: &GateVocabulary,
-    execution: &HeldExecution,
-    now: i64,
-) -> Result<Resolved, String> {
-    let gates = gates_of(db, &execution.execution_id).await?;
-    resolve_gates(orch, db, vocabulary, execution, &gates, now).await
+/// Every held execution in one database, each with its gates in authored
+/// order: one listing and one gate read (per `IN_LIST_CHUNK` executions) for
+/// the pass, however many are held. A gate patched after this read is decided
+/// against the gates as stored by `release_conn`, as for any stale list.
+async fn held_with_gates_conn(
+    conn: &crate::storage::TrackedConnection,
+) -> DbResult<Vec<(HeldExecution, Vec<ExecutionGate>)>> {
+    let held = list_held_executions_conn(conn).await?;
+    let ids: Vec<String> = held
+        .iter()
+        .map(|execution| execution.execution_id.clone())
+        .collect();
+    let mut gates = list_gates_for_executions_conn(conn, &ids).await?;
+    Ok(held
+        .into_iter()
+        .map(|execution| {
+            let listed = gates.remove(&execution.execution_id).unwrap_or_default();
+            (execution, listed)
+        })
+        .collect())
 }
 
 /// Resolve `gates` — the list as this evaluation READ it, which a concurrent

@@ -163,6 +163,116 @@ async fn queue_of(name: &str, depth: i32) -> Env {
     env
 }
 
+/// [`queue_of`], with each held execution in a lane of its own (a parent
+/// issue apiece): the most lanes a queue of `depth` can have, so a read per
+/// lane would show as one per held execution.
+async fn queue_in_lanes(name: &str, depth: i32) -> Env {
+    let env = queue_of(name, depth).await;
+    let mut seed = String::new();
+    for number in 100..100 + depth {
+        seed.push_str(&format!(
+            "INSERT INTO issues(id, project_id, number, title, status, progress, attention,
+                                created_at, updated_at)
+               VALUES('lane{number}', 'p', {parent}, 'Lane {number}', 'active', 'active',
+                      'none', 1, 1);
+             UPDATE issues SET parent_issue_id = 'lane{number}' WHERE id = 'i{number}';",
+            parent = number + 1000
+        ));
+    }
+    env.db.execute_script(&seed).await.unwrap();
+    super::sweep::sweep(&env.orch).await.unwrap();
+    env
+}
+
+/// What one pass over a held queue cost, on the test's one database.
+#[derive(Debug, Clone, Copy)]
+struct PassCost {
+    /// Read transactions over the whole pass.
+    reads: usize,
+    /// Statements over the whole pass.
+    statements: usize,
+    /// Statements while the pass held the admission lock.
+    under_lock: usize,
+}
+
+/// One pass over a queue nothing changed: every held execution is a
+/// candidate its cap still holds as stored. It takes the lock once, releases
+/// nothing and writes nothing under it.
+async fn quiet_pass(env: &Env, depth: i32) -> PassCost {
+    let lock = &env.orch.admission_lock;
+    let (passes, reads, statements, wrote) = (
+        lock.acquisitions(AdmissionSite::SweepPass),
+        env.db.read_transaction_count(),
+        env.db.statement_count(),
+        env.db.write_transaction_count(),
+    );
+    let report = super::sweep::sweep(&env.orch).await.unwrap();
+    let cost = PassCost {
+        reads: env.db.read_transaction_count() - reads,
+        statements: env.db.statement_count() - statements,
+        under_lock: report.lock_statements.expect("the pass took the lock"),
+    };
+    eprintln!("quiet pass at depth {depth}: {cost:?}");
+    assert!(report.released.is_empty(), "{report:?}");
+    assert_eq!(report.candidates, depth as usize, "{report:?}");
+    assert_eq!(report.held_by_cap, depth as usize, "{report:?}");
+    assert_eq!(
+        lock.acquisitions(AdmissionSite::SweepPass) - passes,
+        1,
+        "one acquisition for the whole pass"
+    );
+    assert_eq!(
+        report.lock_writes,
+        Some(0),
+        "{depth} holds that did not change cost no write under the lock"
+    );
+    // Outside the lock, the hold pass's supersession of orphaned supply holds
+    // is one write a database, whatever the queue holds.
+    assert_eq!(env.db.write_transaction_count() - wrote, 1);
+    cost
+}
+
+/// A quiet pass takes the lock once and writes nothing, and what it reads
+/// does not grow with the queue: the held executions' gates are listed
+/// together, and under the lock every start's facts are read together, so
+/// fifty more held executions, each in a lane of its own, cost no more read
+/// transactions and no more statements under the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quiet_pass_takes_the_lock_once_and_writes_nothing() {
+    let mut costs = Vec::new();
+    for depth in [10, 60] {
+        let env = queue_in_lanes(&format!("admission-pass-{depth}.db"), depth).await;
+        costs.push(quiet_pass(&env, depth).await);
+    }
+    assert_eq!(
+        costs[1].reads, costs[0].reads,
+        "fifty more held executions cost no more read transactions: {costs:?}"
+    );
+    assert_eq!(
+        costs[1].under_lock, costs[0].under_lock,
+        "fifty more held executions cost no more statements under the lock: {costs:?}"
+    );
+    assert_eq!(
+        costs[1].statements, costs[0].statements,
+        "nor any more statements over the whole pass: {costs:?}"
+    );
+}
+
+/// At the depth production reached on 11-06, one pass decides every held
+/// execution under the lock in seven statements: the fleet count, the
+/// capacity rows with their lanes' turns and the newest turn, and the starts'
+/// devices, issues and lanes' turns. Before the starts' facts were read as
+/// bound lists, this pass took 754.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_over_150_held_executions_reads_a_bounded_amount_under_the_lock() {
+    let env = queue_in_lanes("admission-pass-150.db", 150).await;
+    let cost = quiet_pass(&env, 150).await;
+    assert!(
+        cost.under_lock <= 7,
+        "150 held executions are decided in at most 7 statements under the lock: {cost:?}"
+    );
+}
+
 /// A held filing takes the lock once and decides once: the reply comes from
 /// that decision, not from evaluating the execution again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

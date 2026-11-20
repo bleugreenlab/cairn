@@ -68,7 +68,9 @@
 //! The lock is cheap to hold and never waited on forever. A decision is one
 //! read of the queue ([`QueueSnapshot`]) and a pure function over it, so a
 //! sweep pass decides every candidate under ONE acquisition, in the queue's
-//! order, and writes only what changed. Display values (counts and places in line)
+//! order, and writes only what changed. The read is a fixed number of
+//! statements however deep the queue: what it reads per start or per lane is
+//! bound as one list, and only a thread costs statements of its own. Display values (counts and places in line)
 //! are rewritten after the pass, outside the lock. An acquisition that waits
 //! past [`ADMISSION_WAIT_BOUND`] names the holder and fails retryably.
 
@@ -77,15 +79,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use cairn_db::turso::params;
+use cairn_db::sql::{placeholders, IN_LIST_CHUNK};
+use cairn_db::turso::{params, Value as SqlValue};
 use cairn_workflow::gates::store::{
     list_blocking_capacity_gates_conn, set_gate_detail_conn, CAPACITY_GATE_SEQ_BASE,
 };
 use tracing::Instrument;
 
 use super::rotation::{
-    lane_of_issue_conn, mint_turn, newest_turn_conn, note_turn, read_lane_turns_conn,
-    release_order, Entry, LaneTurns, SHARED_LANE,
+    mint_turn, newest_turn_conn, note_turn, read_lane_turns_conn, release_order, Entry, LaneTurns,
+    SHARED_LANE,
 };
 use crate::models::{CapacityHold, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
@@ -1105,10 +1108,162 @@ pub(super) const CAPACITY_ROWS_SQL: &str = concat!(
     cairn_db::capacity_gate_sql!()
 );
 
-/// The device a wanted start's execution runs on, through the index that
-/// carries it rather than the execution's row.
-pub(super) const RUNNER_DEVICE_SQL: &str =
-    "SELECT runner_device_id FROM executions INDEXED BY idx_executions_hold_facts WHERE id = ?1";
+/// The devices `n` wanted starts' executions run on, through the index that
+/// carries them rather than the executions' rows, once per gate row.
+///
+/// It starts from the starts' gates and reaches each execution by an
+/// equality, because Turso plans a bound list on the forced
+/// `idx_executions_hold_facts` itself as a walk of the whole index. A start's
+/// execution is a held one, which its gate rows hold; one with none would read
+/// as running on no device, which counts it toward this device's fleet, the
+/// conservative side of the cap.
+pub(super) fn runner_devices_sql(n: usize) -> String {
+    format!(
+        "SELECT g.execution_id, e.runner_device_id
+           FROM execution_gates g
+           JOIN executions e INDEXED BY idx_executions_hold_facts ON e.id = g.execution_id
+          WHERE g.execution_id IN ({})",
+        placeholders(n)
+    )
+}
+
+/// `n` wanted starts' issues by key: each one's lane, and the thread it is a
+/// child of (`t.id` is NULL for an issue with no thread).
+pub(super) fn start_issues_sql(n: usize) -> String {
+    format!(
+        concat!(
+            "SELECT i.id, ",
+            cairn_db::queue_lane_sql!(),
+            ", t.id, t.name, i.number
+               FROM issues i LEFT JOIN threads t ON t.id = i.parent_thread_id
+              WHERE i.id IN ({})"
+        ),
+        placeholders(n)
+    )
+}
+
+/// The thread each of `n` issues is a child of, by key.
+pub(super) fn issue_threads_sql(n: usize) -> String {
+    format!(
+        "SELECT id, parent_thread_id FROM issues WHERE id IN ({})",
+        placeholders(n)
+    )
+}
+
+fn bound_texts<'a>(values: impl IntoIterator<Item = &'a str>) -> Vec<SqlValue> {
+    values
+        .into_iter()
+        .map(|value| SqlValue::Text(value.to_string()))
+        .collect()
+}
+
+/// What a queue read needs about the starts it decides, in one database.
+#[derive(Default)]
+struct StartsFacts {
+    /// Each start's execution, with the device it runs on (`None` when the
+    /// execution names none, or is not found).
+    devices: Vec<(String, Option<String>)>,
+    /// Each start's issue, with the thread it is a child of.
+    issues: Vec<(String, IssueThread)>,
+    /// Each thread first met here.
+    children: Vec<ThreadChildren>,
+    /// Each start's issue, with its lane.
+    lanes: Vec<(String, String)>,
+    /// Those lanes' turns.
+    turns: LaneTurns,
+}
+
+/// A thread's active children and re-entries, read the first time a queue
+/// read meets the thread.
+struct ThreadChildren {
+    thread_id: String,
+    active: Vec<(i64, String)>,
+    reentries: usize,
+}
+
+/// Read [`StartsFacts`] for `wanted`. Every per-start fact is one bound list
+/// a statement (per [`IN_LIST_CHUNK`] starts), so the read costs the same for
+/// one start as for a whole queue under the admission lock. Only a thread met
+/// for the first time (not in `known`) costs statements of its own: its active
+/// children and re-entries.
+async fn starts_facts_conn(
+    conn: &crate::storage::TrackedConnection,
+    wanted: &[WantedStart],
+    mut known: HashSet<String>,
+) -> DbResult<StartsFacts> {
+    let executions: Vec<&str> = wanted
+        .iter()
+        .filter_map(|(execution_id, _)| execution_id.as_deref())
+        .collect();
+    let mut runners: HashMap<String, Option<String>> = HashMap::new();
+    for chunk in executions.chunks(IN_LIST_CHUNK) {
+        let mut rows = conn
+            .query(
+                &runner_devices_sql(chunk.len()),
+                bound_texts(chunk.iter().copied()),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            runners.insert(row.text(0)?, row.opt_text(1)?);
+        }
+    }
+    let issue_ids: Vec<&str> = wanted
+        .iter()
+        .filter_map(|(_, issue_id)| issue_id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut found: HashMap<String, (String, Option<IssueThread>)> = HashMap::new();
+    for chunk in issue_ids.chunks(IN_LIST_CHUNK) {
+        let mut rows = conn
+            .query(
+                &start_issues_sql(chunk.len()),
+                bound_texts(chunk.iter().copied()),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let thread = match row.opt_text(2)? {
+                Some(thread_id) => Some(IssueThread {
+                    thread_id,
+                    thread_name: row.text(3)?,
+                    number: row.i64(4)?,
+                }),
+                None => None,
+            };
+            found.insert(row.text(0)?, (row.text(1)?, thread));
+        }
+    }
+
+    let mut facts = StartsFacts::default();
+    for execution_id in executions {
+        let runner = runners.get(execution_id).cloned().flatten();
+        facts.devices.push((execution_id.to_string(), runner));
+    }
+    for issue_id in wanted
+        .iter()
+        .filter_map(|(_, issue_id)| issue_id.as_deref())
+    {
+        // An issue this database does not hold is in the shared lane, on no
+        // thread.
+        let (lane, thread) = found
+            .get(issue_id)
+            .cloned()
+            .unwrap_or_else(|| (SHARED_LANE.to_string(), None));
+        facts.lanes.push((issue_id.to_string(), lane));
+        let Some(thread) = thread else { continue };
+        if known.insert(thread.thread_id.clone()) {
+            facts.children.push(ThreadChildren {
+                thread_id: thread.thread_id.clone(),
+                active: active_thread_children_conn(conn, &thread.thread_id).await?,
+                reentries: thread_reentries_conn(conn, &thread.thread_id).await?,
+            });
+        }
+        facts.issues.push((issue_id.to_string(), thread));
+    }
+    let lanes: Vec<String> = facts.lanes.iter().map(|(_, lane)| lane.clone()).collect();
+    read_lane_turns_conn(conn, lanes.iter().map(String::as_str), &mut facts.turns).await?;
+    Ok(facts)
+}
 
 struct CapacityRow {
     execution_id: String,
@@ -1306,7 +1461,8 @@ impl QueueSnapshot {
         }
 
         // Each database the starts live in: one read for their devices,
-        // their issues' threads, and those threads' active children and re-entries.
+        // their issues' lanes, threads and lane turns, and those threads'
+        // active children and re-entries ([`starts_facts_conn`]).
         let mut groups: Vec<(&LocalDb, Vec<WantedStart>)> = Vec::new();
         for start in starts {
             let wanted = (
@@ -1323,41 +1479,16 @@ impl QueueSnapshot {
         }
         for (db, wanted) in groups {
             let known: HashSet<String> = snapshot.active_children.keys().cloned().collect();
-            let (devices, issues, children, lanes, turns) = db
+            let StartsFacts {
+                devices,
+                issues,
+                children,
+                lanes,
+                turns,
+            } = db
                 .read(move |conn| {
-                    let (wanted, mut known) = (wanted.clone(), known.clone());
-                    Box::pin(async move {
-                        let (mut devices, mut issues, mut children, mut lanes) =
-                            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                        let mut turns = LaneTurns::new();
-                        for (execution_id, issue_id) in &wanted {
-                            if let Some(execution_id) = execution_id {
-                                let runner = crate::storage::query_opt_text_conn(
-                                    conn,
-                                    RUNNER_DEVICE_SQL,
-                                    params![execution_id.as_str()],
-                                )
-                                .await?;
-                                devices.push((execution_id.clone(), runner));
-                            }
-                            let Some(issue_id) = issue_id else { continue };
-                            let lane = lane_of_issue_conn(conn, Some(issue_id)).await?;
-                            read_lane_turns_conn(conn, [lane.as_str()], &mut turns).await?;
-                            lanes.push((issue_id.clone(), lane));
-                            let Some(thread) = thread_of_issue_conn(conn, issue_id).await? else {
-                                continue;
-                            };
-                            if known.insert(thread.thread_id.clone()) {
-                                children.push((
-                                    thread.thread_id.clone(),
-                                    active_thread_children_conn(conn, &thread.thread_id).await?,
-                                    thread_reentries_conn(conn, &thread.thread_id).await?,
-                                ));
-                            }
-                            issues.push((issue_id.clone(), thread));
-                        }
-                        Ok((devices, issues, children, lanes, turns))
-                    })
+                    let (wanted, known) = (wanted.clone(), known.clone());
+                    Box::pin(async move { starts_facts_conn(conn, &wanted, known).await })
                 })
                 .await
                 .map_err(reading)?;
@@ -1368,7 +1499,12 @@ impl QueueSnapshot {
                 snapshot.on_device.insert(execution_id, on_device);
             }
             snapshot.issues.extend(issues);
-            for (thread_id, active, reentries) in children {
+            for ThreadChildren {
+                thread_id,
+                active,
+                reentries,
+            } in children
+            {
                 snapshot.active_children.insert(thread_id.clone(), active);
                 snapshot.reentries.insert(thread_id, reentries);
             }
@@ -1884,19 +2020,22 @@ pub(crate) async fn refresh_places(
             .read(|conn| {
                 Box::pin(async move {
                     let gates = list_blocking_capacity_gates_conn(conn).await?;
-                    let mut threads = HashMap::new();
-                    for gate in &gates {
-                        if let Some(issue_id) = gate.issue_id.as_deref() {
-                            if threads.contains_key(issue_id) {
-                                continue;
-                            }
-                            let thread = crate::storage::query_opt_text_conn(
-                                conn,
-                                "SELECT parent_thread_id FROM issues WHERE id = ?1",
-                                params![issue_id],
+                    let issues: Vec<&str> = gates
+                        .iter()
+                        .filter_map(|gate| gate.issue_id.as_deref())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    let mut threads: HashMap<String, Option<String>> = HashMap::new();
+                    for chunk in issues.chunks(IN_LIST_CHUNK) {
+                        let mut rows = conn
+                            .query(
+                                &issue_threads_sql(chunk.len()),
+                                bound_texts(chunk.iter().copied()),
                             )
                             .await?;
-                            threads.insert(issue_id.to_string(), thread);
+                        while let Some(row) = rows.next().await? {
+                            threads.insert(row.text(0)?, row.opt_text(1)?);
                         }
                     }
                     Ok((gates, threads))
