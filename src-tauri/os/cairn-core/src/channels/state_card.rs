@@ -291,35 +291,25 @@ pub async fn reconcile_discord_cards(
     // Discovery only creates cards, and `ensure` ignores one that exists, so a
     // job that already has a card in a conversation has nothing to discover
     // there; keeping its card current is the due pass's work.
-    let carded = carded_jobs(ledger_db, "discord").await?;
-    for binding in super::ledger::list_active_bindings(ledger_db)
-        .await?
-        .into_iter()
-        .filter(|binding| binding.provider == "discord")
-    {
-        let Some((project_key, issue_number)) = issue_target(&binding.target_uri) else {
+    let held = held_project_keys(project_db).await?;
+    let bindings = super::ledger::list_active_bindings(ledger_db).await?;
+    let bound = held_issue_bindings(&bindings, &held);
+    let jobs = bound_issue_jobs(project_db, &bound).await?;
+    let carded = if jobs.is_empty() {
+        HashMap::new()
+    } else {
+        carded_jobs(ledger_db, "discord").await?
+    };
+    for (binding, project_key, issue_number) in bound {
+        let Some(job_ids) = jobs.get(&(project_key.to_ascii_lowercase(), issue_number)) else {
             continue;
         };
-        let job_ids = project_db
-            .query_all(
-                "SELECT j.id FROM jobs j
-                 JOIN issues i ON i.id=j.issue_id
-                 JOIN projects p ON p.id=i.project_id
-                 WHERE i.number=?1 AND lower(p.key)=lower(?2)
-                   AND j.parent_job_id IS NULL
-                   AND j.status <> 'pending' AND j.uri_segment IS NOT NULL
-                 ORDER BY j.created_at",
-                params![issue_number, project_key],
-                |row| row.text(0),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
         let already_carded = carded.get(&binding.conversation);
         for job_id in job_ids {
-            if already_carded.is_some_and(|jobs| jobs.contains(&job_id)) {
+            if already_carded.is_some_and(|jobs| jobs.contains(job_id)) {
                 continue;
             }
-            let Some(state) = derive_agent_state(project_db, &job_id).await? else {
+            let Some(state) = derive_agent_state(project_db, job_id).await? else {
                 continue;
             };
             ensure(
@@ -330,7 +320,7 @@ pub async fn reconcile_discord_cards(
                     subject_uri: &state.subject_uri,
                     target_uri: &binding.target_uri,
                     project_key,
-                    job_id: &job_id,
+                    job_id,
                     created_at: now,
                 },
             )
@@ -339,6 +329,9 @@ pub async fn reconcile_discord_cards(
     }
 
     for record in list_due(ledger_db, "discord", now, RECONCILE_BATCH).await? {
+        if !held.contains(&record.project_key.to_ascii_lowercase()) {
+            continue;
+        }
         let Some(state) = derive_agent_state(project_db, &record.job_id).await? else {
             continue;
         };
@@ -462,6 +455,80 @@ async fn reconcile_one(
         .await?;
     }
     Ok(())
+}
+
+/// The lowercased keys of the projects this database holds. The ledger is
+/// shared by every project database the loop visits, and a binding or card
+/// whose project is not among these has no jobs here to read.
+async fn held_project_keys(db: &LocalDb) -> Result<HashSet<String>, String> {
+    db.query_all("SELECT lower(key) FROM projects", (), |row| row.text(0))
+        .await
+        .map(|keys| keys.into_iter().collect())
+        .map_err(|error| error.to_string())
+}
+
+/// The active Discord bindings to an issue of a project in `held`, in ledger
+/// order, with the project key and issue number their target names.
+fn held_issue_bindings<'a>(
+    bindings: &'a [super::ledger::ActiveBinding],
+    held: &HashSet<String>,
+) -> Vec<(&'a super::ledger::ActiveBinding, &'a str, i64)> {
+    bindings
+        .iter()
+        .filter(|binding| binding.provider == "discord")
+        .filter_map(|binding| {
+            let (project_key, issue_number) = issue_target(&binding.target_uri)?;
+            held.contains(&project_key.to_ascii_lowercase()).then_some((
+                binding,
+                project_key,
+                issue_number,
+            ))
+        })
+        .collect()
+}
+
+/// Every cardable job on the bound issues, in one statement however many
+/// bindings there are, keyed by lowercased project key and issue number and in
+/// creation order. The statement filters keys and numbers independently, so
+/// pairs no binding names are dropped here rather than in SQL.
+async fn bound_issue_jobs(
+    db: &LocalDb,
+    bound: &[(&super::ledger::ActiveBinding, &str, i64)],
+) -> Result<HashMap<(String, i64), Vec<String>>, String> {
+    if bound.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let wanted: HashSet<(String, i64)> = bound
+        .iter()
+        .map(|(_, key, number)| (key.to_ascii_lowercase(), *number))
+        .collect();
+    let keys: HashSet<&str> = wanted.iter().map(|(key, _)| key.as_str()).collect();
+    let numbers: HashSet<i64> = wanted.iter().map(|(_, number)| *number).collect();
+    let keys = serde_json::to_string(&keys).map_err(|error| error.to_string())?;
+    let numbers = serde_json::to_string(&numbers).map_err(|error| error.to_string())?;
+    let rows = db
+        .query_all(
+            "SELECT lower(p.key), i.number, j.id FROM jobs j
+             JOIN issues i ON i.id=j.issue_id
+             JOIN projects p ON p.id=i.project_id
+             WHERE i.number IN (SELECT value FROM json_each(?1))
+               AND lower(p.key) IN (SELECT value FROM json_each(?2))
+               AND j.parent_job_id IS NULL
+               AND j.status <> 'pending' AND j.uri_segment IS NOT NULL
+             ORDER BY j.created_at, j.id",
+            params![numbers, keys],
+            |row| Ok((row.text(0)?, row.i64(1)?, row.text(2)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut jobs: HashMap<(String, i64), Vec<String>> = HashMap::new();
+    for (key, number, job_id) in rows {
+        let issue = (key, number);
+        if wanted.contains(&issue) {
+            jobs.entry(issue).or_default().push(job_id);
+        }
+    }
+    Ok(jobs)
 }
 
 fn issue_target(target: &str) -> Option<(&str, i64)> {
@@ -1087,6 +1154,95 @@ mod tests {
             ["j"],
             "once carded, a live job is derived only by the due pass"
         );
+    }
+
+    /// Bindings across two projects in two databases, every job already
+    /// carded: an idle pass costs the same few statements per database however
+    /// many bindings the ledger holds, and derives nothing.
+    #[tokio::test]
+    async fn an_idle_discovery_pass_costs_a_constant_number_of_statements() {
+        let ledger = crate::storage::migrated_test_db("state-card-idle-ledger.db").await;
+        let team = crate::storage::migrated_test_db("state-card-idle-team.db").await;
+        let mut ledger_rows = String::new();
+        for (db, key) in [(&ledger, "cairn"), (&team, "team")] {
+            let mut rows = format!(
+                "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+                 INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','{key}','{key}','/tmp/{key}',1,1);"
+            );
+            for n in 1..=150 {
+                rows.push_str(&format!(
+                    "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i{n}','p',{n},'Card','active',1,1);
+                     INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('e{n}','build','i{n}','p','completed',1,1);
+                     INSERT INTO jobs(id,execution_id,issue_id,project_id,status,uri_segment,node_name,started_at,completed_at,created_at,updated_at) VALUES('j{key}{n}','e{n}','i{n}','p','complete','builder','Builder',1,2,1,1);"
+                ));
+                ledger_rows.push_str(&format!(
+                    "INSERT INTO channel_conversation_binding(provider,conversation,target_uri,binding_kind,message_classes,bound_at) VALUES('discord','discord:1/{key}{n}','cairn://p/{key}/{n}','structural',7,1);
+                     INSERT INTO channel_state_card(provider,conversation,subject_uri,target_uri,project_key,job_id,status,created_at,updated_at) VALUES('discord','discord:1/{key}{n}','cairn://p/{key}/{n}/1/builder','cairn://p/{key}/{n}','{key}','j{key}{n}','settled',1,1);"
+                ));
+            }
+            db.execute_batch(&rows).await.unwrap();
+        }
+        ledger.execute_batch(&ledger_rows).await.unwrap();
+        let provider = RecordingProvider::default();
+        take_derived_jobs();
+
+        for db in [&ledger, &team] {
+            let before = ledger.statement_count() + team.statement_count();
+            reconcile_discord_cards(db, &ledger, &provider, 10)
+                .await
+                .unwrap();
+            let statements = ledger.statement_count() + team.statement_count() - before;
+            assert!(
+                statements <= 5,
+                "an idle pass issued {statements} statements for 300 bindings"
+            );
+        }
+        assert!(
+            take_derived_jobs().is_empty(),
+            "carded jobs are never derived"
+        );
+        assert_eq!(*provider.posts.lock().unwrap(), 0);
+        assert_eq!(
+            ledger
+                .query_one("SELECT COUNT(*) FROM channel_state_card", (), |row| row
+                    .i64(0))
+                .await
+                .unwrap(),
+            300
+        );
+    }
+
+    /// A binding whose project lives in another database is discovered only
+    /// in that database, and its card is derived only there.
+    #[tokio::test]
+    async fn a_binding_is_discovered_only_in_the_database_holding_its_project() {
+        let ledger = seeded_reconcile_db("state-card-held-ledger.db").await;
+        let other = crate::storage::migrated_test_db("state-card-held-other.db").await;
+        other
+            .execute_script(
+                "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+                 INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','Other','other','/tmp/other',1,1);",
+            )
+            .await
+            .unwrap();
+        let provider = RecordingProvider::default();
+        take_derived_jobs();
+
+        reconcile_discord_cards(&other, &ledger, &provider, 10)
+            .await
+            .unwrap();
+        assert!(take_derived_jobs().is_empty());
+        reconcile_discord_cards(&ledger, &ledger, &provider, 10)
+            .await
+            .unwrap();
+        assert_eq!(take_derived_jobs(), ["j", "j"]);
+        assert_eq!(*provider.posts.lock().unwrap(), 1);
+
+        // The live card is due again, but the other database cannot hold it.
+        reconcile_discord_cards(&other, &ledger, &provider, 20)
+            .await
+            .unwrap();
+        assert!(take_derived_jobs().is_empty());
     }
 
     fn take_derived_jobs() -> Vec<String> {
