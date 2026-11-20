@@ -361,7 +361,8 @@ impl ServiceHost for LeaseHost {
                         });
                         return;
                     }
-                    ResidentProcessEventKind::State { .. } => {}
+                    ResidentProcessEventKind::State { .. }
+                    | ResidentProcessEventKind::OutputEnded { .. } => {}
                 }
             }
             let _ = sender.send(HostEvent::Exited {

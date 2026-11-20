@@ -287,6 +287,7 @@ async fn same_slug_terminal_in_another_job_does_not_cross_wake() {
         Some(1),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -301,10 +302,18 @@ async fn same_slug_terminal_in_another_job_does_not_cross_wake() {
     );
 
     // The real terminal's exit delivers and consumes the one-shot subscription.
-    let mine =
-        wakes::route_terminal_exit_async(&orch, "run-1", &uri_a, Some(0), Some(1), None, None)
-            .await
-            .unwrap();
+    let mine = wakes::route_terminal_exit_async(
+        &orch,
+        "run-1",
+        &uri_a,
+        Some(0),
+        Some(1),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(mine, wakes::WakeRouteAction::Delivered);
     assert!(
         !wakes::list_subscriptions_for_job(&db, "job-1")
@@ -357,10 +366,18 @@ async fn output_phrase_subscription_is_woken_by_exit_before_phrase() {
         .unwrap();
 
     // The terminal dies (nonzero) before ever printing "ready".
-    let action =
-        wakes::route_terminal_exit_async(&orch, "run-1", uri, Some(1), Some(2), Some("boom"), None)
-            .await
-            .unwrap();
+    let action = wakes::route_terminal_exit_async(
+        &orch,
+        "run-1",
+        uri,
+        Some(1),
+        Some(2),
+        Some("boom"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         action,
         wakes::WakeRouteAction::Delivered,

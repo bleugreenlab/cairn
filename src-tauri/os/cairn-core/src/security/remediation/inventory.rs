@@ -650,19 +650,24 @@ pub fn scan_process_logs(
     out
 }
 
-/// Scan every job's persisted terminal scrollback.
+/// Scan every persisted terminal scrollback: the retained captures beside the
+/// scratch root (`<cairn_home>/terminal-output`, see `crate::terminal_output`)
+/// and any scratch log a terminal from before retained capture left behind.
 pub fn scan_terminal_logs(
     snapshot: &Arc<RegistrySnapshot>,
     secret: &SecretId,
     scratch_root: &Path,
 ) -> Vec<AffectedRecord> {
-    let Ok(jobs) = std::fs::read_dir(scratch_root) else {
-        return Vec::new();
-    };
+    let mut dirs = Vec::new();
+    if let Some(home) = scratch_root.parent() {
+        dirs.push(home.join("terminal-output"));
+    }
+    if let Ok(jobs) = std::fs::read_dir(scratch_root) {
+        dirs.extend(jobs.flatten().map(|job| job.path().join("terminals")));
+    }
     let mut out = Vec::new();
-    for job in jobs.flatten() {
-        let terminals = job.path().join("terminals");
-        let Ok(logs) = std::fs::read_dir(&terminals) else {
+    for dir in dirs {
+        let Ok(logs) = std::fs::read_dir(&dir) else {
             continue;
         };
         for log in logs.flatten() {

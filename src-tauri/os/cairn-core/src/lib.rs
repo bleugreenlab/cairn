@@ -59,6 +59,7 @@ pub mod sessions;
 pub use cairn_symbols::symbols;
 pub mod tenets;
 pub mod terminal_host;
+pub mod terminal_output;
 pub mod threads;
 pub mod todos;
 pub mod token_meters;

@@ -2313,6 +2313,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "node_scratches",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // A retained terminal capture names a file in this runner's Cairn home,
+    // which a team replica does not have.
+    (
+        "terminal_outputs",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     (
         "node_scratch_replicas",
         TableScope::Private(PrivateReason::RunnerTransient),

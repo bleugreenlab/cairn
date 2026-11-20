@@ -192,7 +192,8 @@ pub enum SinkKind {
     TerminalTail,
     /// The rotated JSONL logs and the runner's stderr file.
     ProcessLog,
-    /// A terminal's persisted scrollback under the job scratch directory.
+    /// A terminal's retained capture under `<cairn_home>/terminal-output`, or
+    /// a scratch log from before retained capture.
     TerminalLog,
     /// `message_stream_chunks` — the accumulator a streamed message is built
     /// from. Redundant once its event exists.

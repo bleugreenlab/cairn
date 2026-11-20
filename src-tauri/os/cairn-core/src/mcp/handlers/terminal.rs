@@ -115,6 +115,10 @@ pub(crate) async fn reconcile_terminal_exit_wake(
         row.exited_at
             .map(|exited| terminal_runtime_secs(row.created_at, Some(exited), row.lost_at, 0))
     });
+    let retained = match row.as_ref() {
+        Some(row) => retained_notice(orch, row.terminal_id.as_deref(), None).await,
+        None => retained_notice(orch, None, Some(uri)).await,
+    };
     crate::orchestrator::wakes::route_terminal_exit_at(
         orch,
         &slug,
@@ -123,10 +127,35 @@ pub(crate) async fn reconcile_terminal_exit_wake(
         runtime_secs,
         row.as_ref().and_then(|row| row.output_tail.as_deref()),
         reconciled_terminal_reason(row.as_ref()),
+        retained.as_ref(),
         reconciled_exit_urgency(row.as_ref(), chrono::Utc::now().timestamp()),
     )
     .await?;
     Ok(true)
+}
+
+/// The retained record an exit notification names: the one the terminal row
+/// `terminal_id` captures into, or, for a terminal whose row is already gone,
+/// the newest record created under its `terminal_uri`. `None` for a terminal
+/// from before retained capture.
+async fn retained_notice(
+    orch: &Orchestrator,
+    terminal_id: Option<&str>,
+    terminal_uri: Option<&str>,
+) -> Option<crate::terminal_output::RetainedNotice> {
+    let db = &orch.db.local;
+    let record = match (terminal_id, terminal_uri) {
+        (Some(terminal_id), _) => crate::terminal_output::load_for_terminal(db, terminal_id).await,
+        (None, Some(uri)) => crate::terminal_output::load_newest_for_uri(db, uri).await,
+        (None, None) => Ok(None),
+    };
+    match record {
+        Ok(record) => record.as_ref().map(Into::into),
+        Err(error) => {
+            tracing::warn!(%error, "could not load a terminal's retained output record");
+            None
+        }
+    }
 }
 
 /// How long a terminal ran, as its exit wake and a read state it: to its exit,
@@ -323,23 +352,52 @@ async fn rollback_terminal_creation(
 
     let session_id_owned = session_id.to_string();
     if rollback == CreationRollback::DeleteRow {
-        if let Err(error) = orch
+        // The capture record goes with the row: nothing ran that anyone was
+        // told to read.
+        match orch
             .db
             .local
             .write(|conn| {
                 let session_id = session_id_owned.clone();
                 Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT o.id FROM job_terminals t
+                               JOIN terminal_outputs o ON o.terminal_id = t.id
+                              WHERE t.session_id = ?1",
+                            (session_id.as_str(),),
+                        )
+                        .await?;
+                    let mut outputs = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        outputs.push(row.text(0)?);
+                    }
+                    drop(rows);
+                    for output_id in &outputs {
+                        conn.execute(
+                            "DELETE FROM terminal_outputs WHERE id = ?1",
+                            (output_id.as_str(),),
+                        )
+                        .await?;
+                    }
                     conn.execute(
                         "DELETE FROM job_terminals WHERE session_id = ?1",
                         (session_id.as_str(),),
                     )
                     .await?;
-                    Ok(())
+                    Ok(outputs)
                 })
             })
             .await
         {
-            tracing::warn!(%session_id, %error, "failed to remove terminal row during creation rollback");
+            Ok(outputs) => {
+                for output_id in outputs {
+                    crate::terminal_output::remove_capture_file(&output_id);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "failed to remove terminal row during creation rollback");
+            }
         }
     }
 
@@ -625,6 +683,7 @@ async fn settle_terminal_as_lost(
         .await
         .map_err(|error| error.to_string())?;
     if settled {
+        finalize_lost_capture(orch, &expected_row, &reason).await;
         let _ = orch.services.emitter.emit(
             "db-change",
             serde_json::json!({"table": "job_terminals", "action": "update"}),
@@ -632,6 +691,32 @@ async fn settle_terminal_as_lost(
     }
     reconcile_terminal_exit_wake(orch, terminal_uri).await?;
     Ok(settled)
+}
+
+/// Finalize the capture of a terminal Cairn settled as lost. No exit arrived
+/// through its live stream, so the capture is recorded as incomplete; what was
+/// delivered before the loss stays readable. A capture the ordinary finalizer
+/// already ended is left as it is.
+async fn finalize_lost_capture(orch: &Orchestrator, terminal_id: &str, reason: &str) {
+    let db = &orch.db.local;
+    let record = match crate::terminal_output::load_for_terminal(db, terminal_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%terminal_id, %error, "could not load a lost terminal's capture");
+            return;
+        }
+    };
+    let end = crate::terminal_output::CaptureEnd {
+        exit_code: None,
+        exit_reason: Some(reason.to_string()),
+        summary: None,
+    };
+    if let Err(error) =
+        crate::terminal_output::finalize(db, &record.id, end, chrono::Utc::now().timestamp()).await
+    {
+        tracing::warn!(%terminal_id, %error, "could not finalize a lost terminal's capture");
+    }
 }
 
 /// Settle the recovering terminal row `terminal_id` as lost, for `reason`.
@@ -1207,8 +1292,55 @@ async fn readopt_terminal_process(
     if readopted == 0 {
         return Ok(None);
     }
+    // The same terminal continues, so its capture does too, with the gap the
+    // runner's absence may have left stated on the record.
+    let output_id = match crate::terminal_output::load_for_terminal(&orch.db.local, &row.id).await {
+        Ok(Some(record)) => {
+            if let Err(error) = crate::terminal_output::note_gap(
+                &orch.db.local,
+                &record.id,
+                crate::terminal_output::READOPT_GAP_NOTE,
+            )
+            .await
+            {
+                tracing::warn!(%session_id, %error, "could not note a re-adopted terminal's capture gap");
+            }
+            Some(record.id)
+        }
+        Ok(None) => {
+            let capture = new_capture(&resource, &target);
+            match crate::terminal_output::attach(&orch.db.local, &row.id, &capture).await {
+                Ok(output_id) => {
+                    if let Some(job_id) = target.job_id.as_deref() {
+                        crate::terminal_output::adopt_legacy_capture(
+                            &orch.db.local,
+                            job_id,
+                            &target.slug,
+                            &output_id,
+                        )
+                        .await;
+                    }
+                    Some(output_id)
+                }
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "could not attach a capture to a re-adopted terminal");
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "could not load a re-adopted terminal's capture");
+            None
+        }
+    };
     ensure_lifetime_subscription(orch);
-    let parts = TerminalSessionParts::new(&target, &fence, &session_id, generation);
+    let parts = TerminalSessionParts::new(
+        &target,
+        &fence,
+        &session_id,
+        generation,
+        output_id.as_deref(),
+    );
     insert_terminal_session(orch, &session_id, &parts)?;
     spawn_terminal_heartbeat(orch, &session_id, &fence);
     install_terminal_event_handler(
@@ -1219,6 +1351,7 @@ async fn readopt_terminal_process(
         &fence,
         &parts,
         &row.command,
+        crate::terminal_output::StreamLedger::mid_stream(),
     )
     .await?;
     announce_in_terminal(orch, &session_id, READOPTED_NOTICE);
@@ -2437,6 +2570,22 @@ async fn ensure_terminal_slug_available(
     .await
 }
 
+/// What a terminal created under `resource` captures into.
+fn new_capture(
+    resource: &CairnResource,
+    target: &TerminalResourceTarget,
+) -> crate::terminal_output::NewCapture {
+    crate::terminal_output::NewCapture {
+        terminal_uri: resource.to_uri(),
+        slug: target.slug.clone(),
+        job_id: target.job_id.clone(),
+        project_id: target.project_id.clone(),
+        basis: crate::terminal_output::ExpiryBasis::for_resource(resource),
+    }
+}
+
+/// Insert the terminal's row and attach its capture record in one write,
+/// returning the record's id.
 async fn insert_terminal_resource(
     db: &LocalDb,
     target: &TerminalResourceTarget,
@@ -2444,7 +2593,9 @@ async fn insert_terminal_resource(
     command: &str,
     title: Option<&str>,
     description: Option<&str>,
-) -> DbResult<()> {
+    capture: &crate::terminal_output::NewCapture,
+) -> DbResult<String> {
+    let capture = capture.clone();
     let title = title.map(ToOwned::to_owned);
     let job_id = target.job_id.clone();
     let project_id = target.project_id.clone();
@@ -2472,6 +2623,7 @@ async fn insert_terminal_resource(
         let description = description.clone();
         let lease = lease.clone();
         let selector = selector.clone();
+        let capture = capture.clone();
         let holder_key = lease.as_ref().map(|fence| fence.holder.storage_key());
         Box::pin(async move {
             let now = chrono::Utc::now().timestamp() as i32;
@@ -2545,7 +2697,14 @@ async fn insert_terminal_resource(
                 ],
             )
             .await?;
-            Ok(())
+            crate::terminal_output::attach_in(
+                conn,
+                id.as_str(),
+                replaces.as_deref(),
+                &capture,
+                i64::from(now),
+            )
+            .await
         })
     })
     .await
@@ -2664,6 +2823,8 @@ pub(crate) struct TerminalWakeRow {
     /// When Cairn lost sight of the terminal's process, if it is or was in
     /// recovery: where its run clock stops.
     pub lost_at: Option<i64>,
+    /// The row's id, which its retained capture record is found by.
+    pub terminal_id: Option<String>,
 }
 
 /// Look up the terminal one owner holds under `slug`, for a wake subscription or
@@ -2684,7 +2845,7 @@ pub(crate) async fn lookup_terminal_for_wake(
                 TerminalOwner::Job { job_id } => {
                     conn.query(
                         "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
-                                exit_reason, lost_at
+                                exit_reason, lost_at, id
                          FROM job_terminals WHERE job_id = ?1 AND slug = ?2 LIMIT 1",
                         params![job_id.as_str(), slug.as_str()],
                     )
@@ -2693,7 +2854,7 @@ pub(crate) async fn lookup_terminal_for_wake(
                 TerminalOwner::Project { project_id } => {
                     conn.query(
                         "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
-                                exit_reason, lost_at
+                                exit_reason, lost_at, id
                          FROM job_terminals
                          WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2 LIMIT 1",
                         params![project_id.as_str(), slug.as_str()],
@@ -2733,7 +2894,7 @@ async fn lookup_terminal_for_wake_by_session_id(
             let mut rows = conn
                 .query(
                     "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
-                            exit_reason, lost_at
+                            exit_reason, lost_at, id
                      FROM job_terminals WHERE session_id = ?1 LIMIT 1",
                     params![session_id.as_str()],
                 )
@@ -2759,6 +2920,7 @@ async fn terminal_wake_row_from_rows(
         session_id: row.opt_text(5)?,
         exit_reason: row.opt_text(6)?,
         lost_at: row.opt_i64(7)?,
+        terminal_id: row.opt_text(8)?,
     }))
 }
 
@@ -2811,6 +2973,7 @@ pub(crate) async fn subscribe_terminal_exit_wake_once(
         let runtime_secs = exit_row.exited_at.map(|exited| {
             terminal_runtime_secs(exit_row.created_at, Some(exited), exit_row.lost_at, 0)
         });
+        let retained = retained_notice(orch, exit_row.terminal_id.as_deref(), None).await;
         crate::orchestrator::wakes::route_terminal_exit_async(
             orch,
             slug,
@@ -2819,6 +2982,7 @@ pub(crate) async fn subscribe_terminal_exit_wake_once(
             runtime_secs,
             exit_row.output_tail.as_deref(),
             exit_row.exit_reason.as_deref(),
+            retained.as_ref(),
         )
         .await?;
         Ok(TerminalWakeSubscriptionOutcome::ExitAlreadyQueued)
@@ -2876,6 +3040,7 @@ pub(crate) async fn subscribe_terminal_output_wake_once(
         let runtime_secs = exit_row.exited_at.map(|exited| {
             terminal_runtime_secs(exit_row.created_at, Some(exited), exit_row.lost_at, 0)
         });
+        let retained = retained_notice(orch, exit_row.terminal_id.as_deref(), None).await;
         crate::orchestrator::wakes::route_terminal_exit_async(
             orch,
             slug,
@@ -2884,6 +3049,7 @@ pub(crate) async fn subscribe_terminal_output_wake_once(
             runtime_secs,
             exit_row.output_tail.as_deref(),
             exit_row.exit_reason.as_deref(),
+            retained.as_ref(),
         )
         .await?;
         return Ok(TerminalWakeSubscriptionOutcome::ExitAlreadyQueued);
@@ -3270,6 +3436,25 @@ fn finalize_terminal_session(
 ) -> bool {
     let output_tail = capture_output_tail(buffer);
 
+    // Persist the capture before recording the exit. The handler that calls
+    // this tees each delivered chunk before it handles the process's next
+    // event, so every chunk delivered ahead of the exit is already on disk;
+    // what the record states about the capture must be settled before anyone
+    // is told to read it.
+    let record = match block_on_background_db(finalize_session_capture(
+        orch.db.local.clone(),
+        session_id.to_string(),
+        live_capture(orch, session_id),
+        exit_code,
+        exit_reason.map(ToOwned::to_owned),
+    )) {
+        Ok(record) => record,
+        Err(error) => {
+            log::warn!("failed to finalize the capture of {process_ref}: {error}");
+            None
+        }
+    };
+
     let context = match block_on_background_db(mark_terminal_exited_and_load_context(
         orch.db.local.clone(),
         session_id.to_string(),
@@ -3278,20 +3463,21 @@ fn finalize_terminal_session(
         output_tail.clone(),
         exit_reason.map(ToOwned::to_owned),
     )) {
-        Ok(Some(context)) => context,
-        // No running row matched: another path already finalized (or the row is
-        // gone). Stay idempotent — drop the dead session and return without a
-        // second pty-exit/wake/injection.
-        Ok(None) => {
-            remove_pty_session(&orch.pty_state, session_id);
-            return false;
-        }
+        Ok(context) => context,
         Err(error) => {
             log::warn!("failed to mark terminal exited for {process_ref}: {error}");
-            remove_pty_session(&orch.pty_state, session_id);
-            return false;
+            None
         }
     };
+    // Neither the row nor the capture transitioned: another path already
+    // finalized. Stay idempotent — drop the dead session and return without a
+    // second pty-exit/wake/injection. A capture that transitioned while its row
+    // was already gone (released by teardown before the exit arrived) is still
+    // an exit its subscriber is owed.
+    if context.is_none() && record.is_none() {
+        remove_pty_session(&orch.pty_state, session_id);
+        return false;
+    }
 
     let _ = orch.services.emitter.emit(
         "pty-exit",
@@ -3308,8 +3494,13 @@ fn finalize_terminal_session(
     );
 
     let runtime_secs = context
-        .created_at
+        .as_ref()
+        .and_then(|context| context.created_at)
+        .or_else(|| record.as_ref().map(|record| record.created_at))
         .map(|created| (chrono::Utc::now().timestamp() - created).max(0));
+    let retained = record
+        .as_ref()
+        .map(crate::terminal_output::RetainedNotice::from);
 
     if let Err(error) = crate::orchestrator::wakes::route_terminal_exit(
         orch,
@@ -3319,11 +3510,12 @@ fn finalize_terminal_session(
         runtime_secs,
         output_tail.as_deref(),
         exit_reason,
+        retained.as_ref(),
     ) {
         log::warn!("failed to route terminal-exit wake for {process_ref}: {error}");
     }
 
-    if let Some((injection_session_id, code)) = context.injection {
+    if let Some((injection_session_id, code)) = context.and_then(|context| context.injection) {
         send_terminal_exit_context(
             orch,
             &injection_session_id,
@@ -3338,6 +3530,50 @@ fn finalize_terminal_session(
     // session (buffer/exit were passed in). Drop it from the live map.
     remove_pty_session(&orch.pty_state, session_id);
     true
+}
+
+/// The live capture of `session_id`: its record id and what it holds, flushed.
+/// `None` when the session or its capture is not attached to this runner.
+fn live_capture(
+    orch: &Orchestrator,
+    session_id: &str,
+) -> Option<(String, crate::terminal_output::CaptureSummary)> {
+    let session = orch
+        .pty_state
+        .sessions
+        .lock()
+        .ok()?
+        .get(session_id)?
+        .clone();
+    let log = session.lock().ok()?.output_log.clone()?;
+    let mut guard = log.lock().ok()?;
+    let log = guard.as_mut()?;
+    log.flush();
+    Some((log.output_id().to_string(), log.summary()))
+}
+
+/// Finalize the record `session_id` captures into: from its live capture when
+/// attached, otherwise found through its row and marked incomplete.
+async fn finalize_session_capture(
+    db: Arc<LocalDb>,
+    session_id: String,
+    live: Option<(String, crate::terminal_output::CaptureSummary)>,
+    exit_code: Option<i32>,
+    exit_reason: Option<String>,
+) -> DbResult<Option<crate::terminal_output::OutputRecord>> {
+    let (output_id, summary) = match live {
+        Some((output_id, summary)) => (output_id, Some(summary)),
+        None => match crate::terminal_output::load_for_session(&db, &session_id).await? {
+            Some(record) => (record.id, None),
+            None => return Ok(None),
+        },
+    };
+    let end = crate::terminal_output::CaptureEnd {
+        exit_code,
+        exit_reason,
+        summary,
+    };
+    crate::terminal_output::finalize(&db, &output_id, end, chrono::Utc::now().timestamp()).await
 }
 
 /// Stop an executor-hosted terminal from a synchronous lifecycle path. The
@@ -3692,23 +3928,25 @@ struct TerminalSessionParts {
     output_buffer: Arc<Mutex<VecDeque<u8>>>,
     last_output_at: Arc<Mutex<SystemTime>>,
     output_watchers: Arc<Mutex<Vec<crate::services::TerminalOutputWatcher>>>,
-    terminal_log: Arc<Mutex<Option<crate::scratch::TerminalLog>>>,
+    terminal_log: Arc<Mutex<Option<crate::terminal_output::TerminalLog>>>,
 }
 
 impl TerminalSessionParts {
+    /// `output_id` is the retained record the session captures into. A new
+    /// terminal passes `None` and opens its capture once the record exists.
     fn new(
-        target: &TerminalResourceTarget,
+        _target: &TerminalResourceTarget,
         fence: &ResidencyFence,
         session_id: &str,
         process_generation: u64,
+        output_id: Option<&str>,
     ) -> Self {
         let output_buffer = Arc::new(Mutex::new(VecDeque::new()));
         let last_output_at = Arc::new(Mutex::new(SystemTime::now()));
         let output_watchers = Arc::new(Mutex::new(Vec::new()));
-        let terminal_log =
-            Arc::new(Mutex::new(target.job_id.as_deref().and_then(|job| {
-                crate::scratch::TerminalLog::open(job, &target.slug)
-            })));
+        let terminal_log = Arc::new(Mutex::new(
+            output_id.map(crate::terminal_output::TerminalLog::open),
+        ));
         let session = Arc::new(Mutex::new(PtySession {
             master: None,
             writer: None,
@@ -3797,6 +4035,7 @@ fn spawn_terminal_heartbeat(orch: &Orchestrator, session_id: &str, fence: &Resid
 /// transcript, its output wakes, and its end: recovery for an involuntary
 /// death its restart policy allows, finalization for every other.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn install_terminal_event_handler(
     orch: &Orchestrator,
     resource: &CairnResource,
@@ -3805,6 +4044,7 @@ async fn install_terminal_event_handler(
     fence: &ResidencyFence,
     parts: &TerminalSessionParts,
     command: &str,
+    stream: crate::terminal_output::StreamLedger,
 ) -> Result<(), String> {
     let detail_uri = resource.to_uri();
     if let Ok(persisted) =
@@ -3835,6 +4075,11 @@ async fn install_terminal_event_handler(
     let event_process_ref = resource_slug(resource);
     let event_uri = detail_uri.clone();
     let event_policy = target.restart_policy;
+    let event_stream = Mutex::new(stream);
+    // Read while the executor holding the terminal is attached: whether a
+    // missing end at the exit means lost output or only that this executor
+    // never reports one.
+    let reports_end = orch.fleet.reports_resident_output_end(&fence.holder);
     let handler = Arc::new(move |event: ResidentProcessEvent| {
         if event.incarnation_id != event_fence.incarnation_id
             || event.cell_epoch != event_fence.cell_epoch
@@ -3850,7 +4095,16 @@ async fn install_terminal_event_handler(
             return;
         }
         match event.event {
-            ResidentProcessEventKind::Output { data, .. } => {
+            ResidentProcessEventKind::Output { sequence, data, .. } => {
+                // A tail the runner's scrubber released at exit is numbered
+                // apart from the executor's chunks and is never a repeat.
+                let fresh = crate::fleet::output_guard::is_released_tail(sequence)
+                    || event_stream
+                        .lock()
+                        .map_or(true, |mut stream| stream.accept(sequence));
+                if !fresh || data.is_empty() {
+                    return;
+                }
                 let text = String::from_utf8_lossy(&data).into_owned();
                 emit_terminal_data(
                     &*event_orch.services.emitter,
@@ -3964,6 +4218,15 @@ async fn install_terminal_event_handler(
                     handlers.remove(&(event_fence.holder.storage_key(), event_sid.clone()));
                 }
                 event_orch.pty_state.forget_terminal_restart(&event_uri);
+                let verdict = event_stream
+                    .lock()
+                    .ok()
+                    .map(|stream| stream.verdict(reports_end, executor_lost));
+                if let (Some(verdict), Ok(mut log)) = (verdict, event_log.lock()) {
+                    if let Some(log) = log.as_mut() {
+                        log.settle_stream(verdict);
+                    }
+                }
                 finalize_terminal_session(
                     &event_orch,
                     &event_sid,
@@ -3989,7 +4252,20 @@ async fn install_terminal_event_handler(
                     }
                 });
             }
-            _ => {}
+            ResidentProcessEventKind::OutputEnded {
+                sequence,
+                still_open,
+            } => {
+                let end = if still_open {
+                    crate::terminal_output::StreamEnd::StillOpen
+                } else {
+                    crate::terminal_output::StreamEnd::Closed
+                };
+                if let Ok(mut stream) = event_stream.lock() {
+                    stream.end(sequence, end);
+                }
+            }
+            ResidentProcessEventKind::State { .. } => {}
         }
     });
     orch.pty_state
@@ -4034,7 +4310,7 @@ async fn spawn_terminal_session(
     ensure_lifetime_subscription(orch);
 
     let session_id = ids::mint_session_id().into_string();
-    let parts = TerminalSessionParts::new(&target, &fence, &session_id, 0);
+    let parts = TerminalSessionParts::new(&target, &fence, &session_id, 0, None);
     let session = parts.session.clone();
     if let Err(error) = insert_terminal_session(orch, &session_id, &parts) {
         rollback_terminal_creation(orch, &session_id, &fence, rollback).await;
@@ -4057,18 +4333,40 @@ async fn spawn_terminal_session(
     // The durable binding must predate handler registration and StartProcess.
     // An executor may emit Exited before StartProcess returns; the finalizer
     // therefore needs a running row to transition before any event can arrive.
-    if let Err(error) = insert_terminal_resource(
+    let capture = new_capture(&resource, &target);
+    let output_id = match insert_terminal_resource(
         &orch.db.local,
         &target,
         &session_id,
         &command,
         title.as_deref(),
         description.as_deref(),
+        &capture,
     )
     .await
     {
-        rollback_terminal_creation(orch, &session_id, &fence, rollback).await;
-        return Err(format!("Database error: {error}"));
+        Ok(output_id) => output_id,
+        Err(error) => {
+            rollback_terminal_creation(orch, &session_id, &fence, rollback).await;
+            return Err(format!("Database error: {error}"));
+        }
+    };
+    // A recovery restart of a terminal from before retained capture takes its
+    // scratch log along, since it is the same terminal continuing.
+    if let (Some(_), Some(job_id)) = (target.replaces.as_ref(), target.job_id.as_deref()) {
+        crate::terminal_output::adopt_legacy_capture(
+            &orch.db.local,
+            job_id,
+            &target.slug,
+            &output_id,
+        )
+        .await;
+    }
+    // The capture opens only once its record exists, so a start refused before
+    // this point leaves no file behind. No event reaches the session before the
+    // handler below is installed, so nothing delivered goes uncaptured.
+    if let Ok(mut log) = parts.terminal_log.lock() {
+        *log = Some(crate::terminal_output::TerminalLog::open(&output_id));
     }
     spawn_terminal_heartbeat(orch, &session_id, &fence);
     if let Err(error) = install_terminal_event_handler(
@@ -4079,6 +4377,7 @@ async fn spawn_terminal_session(
         &fence,
         &parts,
         &command,
+        crate::terminal_output::StreamLedger::from_first_chunk(),
     )
     .await
     {
@@ -4351,7 +4650,7 @@ fn emit_terminal_data(
     session_id: &str,
     data: &str,
     buffer: &Arc<Mutex<VecDeque<u8>>>,
-    log: &Arc<Mutex<Option<crate::scratch::TerminalLog>>>,
+    log: &Arc<Mutex<Option<crate::terminal_output::TerminalLog>>>,
 ) {
     let _ = emitter.emit(
         "pty-data",
@@ -4367,11 +4666,10 @@ fn emit_terminal_data(
             buf_guard.pop_front();
         }
     }
-    // Tee the same bytes the ring buffer received to the persisted log, so a
+    // Tee the same bytes the ring buffer received to the retained capture, so a
     // post-exit read shows exactly what a live read displayed — including
     // synthetic Cairn messages (fence denials, restart notices), not just raw PTY
-    // output. No-op when the terminal has no log (project terminal, or the file
-    // could not be opened).
+    // output. A capture that could not be opened records why instead.
     if let Ok(mut guard) = log.lock() {
         if let Some(terminal_log) = guard.as_mut() {
             terminal_log.append(data.as_bytes());
@@ -7439,6 +7737,7 @@ mod terminal_finalize_tests {
             session_id: Some("silent".to_string()),
             exit_reason: None,
             lost_at: None,
+            terminal_id: None,
         };
         assert_eq!(reconciled_terminal_reason(Some(&silent_exit)), None);
         let lost = TerminalWakeRow {
@@ -7450,6 +7749,7 @@ mod terminal_finalize_tests {
             session_id: Some("lost".to_string()),
             exit_reason: Some("lost: no executor re-advertised it".to_string()),
             lost_at: Some(2),
+            terminal_id: None,
         };
         assert_eq!(
             reconciled_terminal_reason(Some(&lost)),
@@ -7563,7 +7863,8 @@ mod terminal_finalize_tests {
         for round in 0..100 {
             let slug = format!("race-{round}");
             let (target, _) = test_terminal_target(&slug);
-            let (rt, db_ref, target_ref) = (&runtime, &db, &target);
+            let capture = new_capture(&node_terminal_resource(&slug), &target);
+            let (rt, db_ref, target_ref, capture_ref) = (&runtime, &db, &target, &capture);
             let created: Vec<String> = crate::storage::race_on_threads(["a", "b"].map(|who| {
                 let session = format!("{slug}-{who}");
                 move || {
@@ -7574,8 +7875,9 @@ mod terminal_finalize_tests {
                         "sleep 100",
                         None,
                         None,
+                        capture_ref,
                     ))
-                    .map(|()| session)
+                    .map(|_| session)
                 }
             }))
             .into_iter()
@@ -7894,6 +8196,7 @@ mod terminal_finalize_tests {
             session_id: None,
             exit_reason: None,
             lost_at: None,
+            terminal_id: None,
         };
         assert_eq!(
             reconciled_exit_urgency(Some(&exited(STALE_TERMINAL_EXIT_SECS)), now),
@@ -8299,12 +8602,12 @@ mod terminal_finalize_tests {
         use crate::services::testing::CapturingEmitter;
         use std::collections::VecDeque;
 
-        let job_id = format!("test-{}", uuid::Uuid::new_v4());
+        let output_id = crate::terminal_output::mint_output_id();
         let emitter = CapturingEmitter::new();
         let buffer = Arc::new(Mutex::new(VecDeque::new()));
-        let log = Arc::new(Mutex::new(crate::scratch::TerminalLog::open(
-            &job_id, "dev",
-        )));
+        let log = Arc::new(Mutex::new(Some(crate::terminal_output::TerminalLog::open(
+            &output_id,
+        ))));
 
         let denial = "\r\nDenied by agent fence policy (fence: deny): touch /etc/x\r\n";
         emit_terminal_data(&emitter, "sess", denial, &buffer, &log);
@@ -8317,14 +8620,13 @@ mod terminal_finalize_tests {
         // Landed in the ring buffer (and hence `output_tail`)...
         let buffered: Vec<u8> = buffer.lock().unwrap().iter().copied().collect();
         assert!(String::from_utf8_lossy(&buffered).contains("Denied by agent fence policy"));
-        // ...and in the persisted log, so a post-exit read still shows it.
-        let logged = std::fs::read(crate::scratch::terminal_log_path(&job_id, "dev")).unwrap();
+        // ...and in the retained capture, so a post-exit read still shows it.
+        let logged = crate::terminal_output::read_capture(&output_id).unwrap();
         assert!(
             String::from_utf8_lossy(&logged).contains("Denied by agent fence policy"),
-            "synthetic fence message must persist to the log"
+            "synthetic fence message must persist to the capture"
         );
-
-        crate::scratch::remove_job_scratch_dir(&job_id);
+        crate::terminal_output::remove_capture_file(&output_id);
     }
 
     /// The disposition of an involuntarily stopped terminal, stated as one rule.
@@ -8527,10 +8829,29 @@ mod terminal_finalize_tests {
     }
 
     impl StatefulExecutor {
+        /// An executor that ends each resident PTY's output, as every current
+        /// executor does.
         fn attach(orch: &Orchestrator, cell: PersistentCellState) -> Self {
+            Self::attach_reporting(orch, cell, true)
+        }
+
+        /// An executor built before the output end, which never sends one.
+        fn attach_predating_output_end(orch: &Orchestrator, cell: PersistentCellState) -> Self {
+            Self::attach_reporting(orch, cell, false)
+        }
+
+        fn attach_reporting(
+            orch: &Orchestrator,
+            cell: PersistentCellState,
+            ends_output: bool,
+        ) -> Self {
             let pool: Arc<Fleet> = orch.fleet.clone();
             let (sender, mut receiver) = mpsc::unbounded_channel();
-            let generation = pool.attach_executor(sender);
+            let generation = if ends_output {
+                pool.attach_executor_ending_output(sender)
+            } else {
+                pool.attach_executor(sender)
+            };
             let cell = Arc::new(Mutex::new(cell));
             let state = cell.clone();
             let task = tokio::spawn(async move {
@@ -9135,10 +9456,6 @@ mod terminal_finalize_tests {
         let (watch, fence) = test_terminal_target("watch-7082");
         let (mut proof, _) = test_terminal_target("proof-7082");
         proof.restart_policy = RestartPolicy::Never;
-        // Cleared before the spawn opens its append handle: unlinking an open
-        // log afterwards would leave its writes on a file nothing can read.
-        let log_path = crate::scratch::terminal_log_path("j", "proof-7082");
-        let _ = std::fs::remove_file(&log_path);
         let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
         let watch_session = spawn_node_terminal(&orch, watch, "bun test --watch").await;
         let proof_session = spawn_node_terminal(&orch, proof, "./prove --world shared").await;
@@ -9176,12 +9493,24 @@ mod terminal_finalize_tests {
             proof.session_id, proof_session,
             "nothing was started for it"
         );
-        let logged = std::fs::read_to_string(&log_path).unwrap_or_default();
+        // Its last output is kept in its retained record, which says the
+        // capture is incomplete: the process was lost, not seen to exit.
+        let record = crate::terminal_output::load_newest_for_uri(
+            &orch.db.local,
+            &cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "proof-7082"),
+        )
+        .await
+        .unwrap()
+        .expect("the proof terminal has a retained record");
+        assert_eq!(record.capture, "incomplete");
+        assert_eq!(record.exit_reason.as_deref(), proof.exit_reason.as_deref());
+        let logged =
+            String::from_utf8(crate::terminal_output::read_capture(&record.id).unwrap_or_default())
+                .unwrap();
         assert!(
             logged.contains("round 3 of 5 proved"),
             "its last output is kept: {logged:?}"
         );
-        let _ = std::fs::remove_file(&log_path);
 
         let watch = recovery_state(&orch.db.local, "watch-7082").await;
         assert_eq!(watch.status, "running");
@@ -9201,6 +9530,668 @@ mod terminal_finalize_tests {
             "only the auto terminal's restart started a process: {:?}",
             processes.keys()
         );
+    }
+
+    /// bug sink #544: teardown released a terminal's row while its process was
+    /// still stopping. The exit that arrives afterwards still finalizes the
+    /// capture, with what was delivered before it, and the record outlives the
+    /// row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exit_after_teardown_released_the_row_still_finalizes_its_capture() {
+        let db = crate::storage::migrated_test_db("term_late_exit_capture.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("headless-green");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session = spawn_node_terminal(&orch, target, "cargo test").await;
+        executor.post();
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "headless-green");
+        assert!(announce_in_terminal(
+            &orch,
+            &session,
+            "Compiling cairn-core\r\n"
+        ));
+        assert!(announce_in_terminal(
+            &orch,
+            &session,
+            "test result: FAILED. 3 failed\r\n"
+        ));
+
+        orch.db
+            .local
+            .execute("DELETE FROM job_terminals WHERE job_id = 'j'", ())
+            .await
+            .unwrap();
+        let (late_orch, late_session, late_uri) = (orch.clone(), session.clone(), uri.clone());
+        let finalized = tokio::task::spawn_blocking(move || {
+            finalize_terminal_session(
+                &late_orch,
+                &late_session,
+                Some(100),
+                &Arc::new(Mutex::new(VecDeque::new())),
+                "cargo test",
+                Some("j".into()),
+                "headless-green",
+                &late_uri,
+                None,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            finalized,
+            "the capture transitioned although its row is gone"
+        );
+
+        let record = crate::terminal_output::load_newest_for_uri(&orch.db.local, &uri)
+            .await
+            .unwrap()
+            .expect("the record outlives the row");
+        assert_eq!(record.capture, "complete");
+        assert_eq!(record.exit_code, Some(100));
+        let captured =
+            String::from_utf8(crate::terminal_output::read_capture(&record.id).unwrap()).unwrap();
+        assert!(captured.contains("test result: FAILED"), "{captured:?}");
+        executor.task.abort();
+    }
+
+    /// One resident event for terminal `session`, sent the way an executor
+    /// sends it: through the fleet's ingest, which checks the link and the
+    /// fence, runs the scrubber, and dispatches to the terminal's handler.
+    fn deliver(
+        orch: &Orchestrator,
+        link: u64,
+        fence: &ResidencyFence,
+        session: &str,
+        process_generation: u64,
+        event: ResidentProcessEventKind,
+    ) {
+        orch.fleet.handle_executor_message(
+            "colocated",
+            link,
+            ExecutorMessage::ResidentProcessEvent {
+                event: ResidentProcessEvent {
+                    holder: fence.holder.clone(),
+                    incarnation_id: fence.incarnation_id.clone(),
+                    cell_epoch: fence.cell_epoch,
+                    process_key: session.to_string(),
+                    process_generation,
+                    event,
+                },
+            },
+        );
+    }
+
+    fn pty_chunk(sequence: u64, text: &str) -> ResidentProcessEventKind {
+        ResidentProcessEventKind::Output {
+            sequence,
+            stream: cairn_common::executor_protocol::ResidentProcessStream::Pty,
+            data: text.as_bytes().to_vec(),
+        }
+    }
+
+    fn pty_end(sequence: u64) -> ResidentProcessEventKind {
+        ResidentProcessEventKind::OutputEnded {
+            sequence,
+            still_open: false,
+        }
+    }
+
+    fn pty_exit(exit_code: i32) -> ResidentProcessEventKind {
+        ResidentProcessEventKind::State {
+            status: ResidentProcessStatus::Exited {
+                finished_at_unix_ms: 2,
+                exit_code: Some(exit_code),
+                restartable: true,
+                executor_lost: false,
+            },
+        }
+    }
+
+    fn process_generation(executor: &StatefulExecutor, session: &str) -> u64 {
+        executor.cell.lock().unwrap().occupancy.processes[session].generation
+    }
+
+    /// The newest record under `uri` once its capture has settled.
+    async fn settled_capture(
+        orch: &Orchestrator,
+        uri: &str,
+    ) -> crate::terminal_output::OutputRecord {
+        for _ in 0..100 {
+            if let Some(record) = crate::terminal_output::load_newest_for_uri(&orch.db.local, uri)
+                .await
+                .unwrap()
+            {
+                if !record.is_capturing() {
+                    return record;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the capture under {uri} never settled");
+    }
+
+    fn captured_text(record: &crate::terminal_output::OutputRecord) -> String {
+        String::from_utf8_lossy(&crate::terminal_output::read_capture(&record.id).unwrap())
+            .into_owned()
+    }
+
+    /// What an agent reads at `uri`, as JSON.
+    async fn read_as_agent(orch: &Orchestrator, uri: &str) -> serde_json::Value {
+        let request = crate::mcp::types::McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: "/tmp".to_string(),
+            run_id: None,
+            tool: "read_resource".to_string(),
+            payload: serde_json::json!({ "uri": uri }),
+            tool_use_id: None,
+            origin: None,
+        };
+        let cursors = Mutex::new(std::collections::HashMap::new());
+        let raw = super::super::resources::handle_read_resource(orch, &request, &cursors).await;
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// An exit that reaches the runner without the stream's end may have
+    /// overtaken the final output, so the capture never claims to be complete,
+    /// and a chunk that straggles in after the exit changes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exit_that_overtakes_the_end_of_output_is_never_recorded_complete() {
+        let db = crate::storage::migrated_test_db("term_overtaken_exit.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("overtaken");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session = spawn_node_terminal(&orch, target, "cargo test").await;
+        executor.post();
+        let generation = process_generation(&executor, &session);
+        let link = executor.generation;
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "overtaken");
+
+        deliver(
+            &orch,
+            link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(1, "Compiling\r\n"),
+        );
+        deliver(&orch, link, &fence, &session, generation, pty_exit(0));
+        deliver(
+            &orch,
+            link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(2, "STRAGGLER\r\n"),
+        );
+
+        let record = settled_capture(&orch, &uri).await;
+        assert_eq!(record.capture, "incomplete");
+        assert!(
+            record
+                .capture_note
+                .as_deref()
+                .is_some_and(|note| note.contains("without the end of the output")),
+            "{:?}",
+            record.capture_note
+        );
+        let captured = captured_text(&record);
+        assert!(captured.contains("Compiling"), "{captured:?}");
+        assert!(!captured.contains("STRAGGLER"), "{captured:?}");
+    }
+
+    /// The control for the output end. An executor built before it never sends
+    /// one, so its missing end proves nothing: the capture's completeness is
+    /// not reported, and it is never recorded `incomplete` for that alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_executor_predating_the_output_end_leaves_completeness_unreported() {
+        let db = crate::storage::migrated_test_db("term_unreported_end.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("older");
+        let executor = StatefulExecutor::attach_predating_output_end(&orch, pre_start_cell(&fence));
+        let session = spawn_node_terminal(&orch, target, "cargo test").await;
+        executor.post();
+        let generation = process_generation(&executor, &session);
+        let link = executor.generation;
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "older");
+
+        deliver(
+            &orch,
+            link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(1, "OLDER_SENTINEL\r\n"),
+        );
+        deliver(&orch, link, &fence, &session, generation, pty_exit(0));
+
+        let record = settled_capture(&orch, &uri).await;
+        assert_eq!(record.capture, "unreported", "{:?}", record.capture_note);
+        assert_eq!(record.capture_note, None);
+        assert_eq!(
+            record.disclosure().as_deref(),
+            Some(crate::terminal_output::UNREPORTED_NOTE)
+        );
+        assert!(captured_text(&record).contains("OLDER_SENTINEL"));
+        let read = read_as_agent(&orch, &record.retained_uri()).await;
+        let output = read["output"].as_str().unwrap();
+        assert!(output.contains("completeness not reported"), "{output}");
+        assert!(!output.contains("capture complete"), "{output}");
+    }
+
+    /// An exit the executor announced at its drain bound, with the terminal
+    /// still held open, carries that cause by name, not the overtaking one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exit_at_the_drain_bound_names_the_output_still_open() {
+        let db = crate::storage::migrated_test_db("term_drain_bound.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("held-open");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session = spawn_node_terminal(&orch, target, "cargo test &").await;
+        executor.post();
+        let generation = process_generation(&executor, &session);
+        let link = executor.generation;
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "held-open");
+
+        deliver(
+            &orch,
+            link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(1, "BACKGROUNDED\r\n"),
+        );
+        deliver(
+            &orch,
+            link,
+            &fence,
+            &session,
+            generation,
+            ResidentProcessEventKind::OutputEnded {
+                sequence: 1,
+                still_open: true,
+            },
+        );
+        deliver(&orch, link, &fence, &session, generation, pty_exit(0));
+
+        let record = settled_capture(&orch, &uri).await;
+        assert_eq!(record.capture, "incomplete");
+        let note = record.capture_note.unwrap_or_default();
+        assert!(
+            note.contains("still open at the executor's drain bound"),
+            "{note}"
+        );
+        assert!(!note.contains("overtaken"), "{note}");
+        assert!(!note.contains("never arrived"), "{note}");
+    }
+
+    /// bug sink #544 end to end. A merge resolves the issue while a test
+    /// terminal is running. The resolution teardown stops it, and the stop's
+    /// reply comes back ahead of the final output and the exit, as it can on a
+    /// real link where replies and process events travel on separate queues.
+    /// Teardown then deletes the row and the scratch. The final output and exit
+    /// that arrive afterwards still land in the retained record, and the URI
+    /// the exit notification names reads the final sentinel.
+    ///
+    /// The subscriber is a node on another, still-active issue: a resolved
+    /// issue's own nodes are not woken, by the attention layer's design.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merge_teardown_of_a_live_terminal_keeps_its_final_output_at_the_notified_uri() {
+        let db = crate::storage::migrated_test_db("term_merge_teardown_live.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        orch.db
+            .local
+            .execute_script(
+                "
+                INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i2','p',8,'Waiting','active','active','none',1,1);
+                INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES('e2','rec','i2','p','running',1,1);
+                INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id, node_name, uri_segment, branch, status, current_session_id, created_at, updated_at) VALUES('j2','e2','builder','i2','p','builder','builder','agent/waiting','running','s2',1,1);
+                INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at) VALUES('s2','j2','claude','open',1,1,1);
+                INSERT INTO runs(id, project_id, issue_id, job_id, session_id, status, created_at, updated_at) VALUES('r2','p','i2','j2','s2','live',1,1);
+                INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, started_at, updated_at) VALUES('t2','s2','r2','j2',1,'running','initial',1,1,1);
+                UPDATE jobs SET current_turn_id = 't2' WHERE id = 'j2';
+                ",
+            )
+            .await
+            .unwrap();
+        let (target, fence) = test_terminal_target("headless-green");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session = spawn_node_terminal(&orch, target, "cargo test").await;
+        executor.post();
+        let generation = process_generation(&executor, &session);
+        let link = executor.generation;
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "headless-green");
+        crate::orchestrator::wakes::subscribe_one_shot(
+            &orch.db.local,
+            "j2",
+            "process",
+            Some(&uri),
+            Some(&[crate::orchestrator::wakes::FACT_KIND_TERMINAL_EXIT.to_string()]),
+            "agent",
+        )
+        .await
+        .unwrap();
+        deliver(
+            &orch,
+            link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(1, "EARLY_SENTINEL Compiling cairn-core\r\n"),
+        );
+
+        orch.db
+            .local
+            .execute(
+                "UPDATE issues SET status = 'merged', completed_at = 1000 WHERE id = 'i'",
+                (),
+            )
+            .await
+            .unwrap();
+        crate::execution::teardown::cleanup_issue_jobs(
+            &orch,
+            crate::execution::teardown::TeardownScope::Issue("i".into()),
+            crate::execution::teardown::TeardownReason::Merged,
+        )
+        .await
+        .unwrap();
+        let rows: i64 = orch
+            .db
+            .local
+            .query_opt(
+                "SELECT COUNT(*) FROM job_terminals WHERE job_id = 'j'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rows, 0, "teardown released the terminal's rows");
+
+        deliver(
+            &orch,
+            link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(2, "test result: FAILED. 3 failed\r\nFINAL_SENTINEL\r\n"),
+        );
+        deliver(&orch, link, &fence, &session, generation, pty_end(2));
+        deliver(&orch, link, &fence, &session, generation, pty_exit(100));
+
+        let record = settled_capture(&orch, &uri).await;
+        assert_eq!(record.capture, "complete", "{:?}", record.capture_note);
+        assert_eq!(record.exit_code, Some(100));
+        assert_eq!(record.resolved_at, Some(1000));
+        let exited_at = record.exited_at.unwrap();
+        assert_eq!(
+            record.expires_at,
+            Some(exited_at.max(1000) + crate::terminal_output::RETENTION_SECS)
+        );
+
+        let notices: Vec<String> = orch
+            .db
+            .local
+            .query_all(
+                "SELECT content FROM messages WHERE channel_type='direct' AND id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'r2')",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        let notice = notices
+            .iter()
+            .find(|content| content.contains("headless-green"))
+            .unwrap_or_else(|| panic!("the exit was notified: {notices:?}"));
+        let retained = record.retained_uri();
+        assert!(notice.contains(&retained), "{notice}");
+        assert!(notice.contains("retained output"), "{notice}");
+
+        let read = read_as_agent(&orch, &retained).await;
+        let output = read["output"].as_str().unwrap();
+        assert!(output.contains("EARLY_SENTINEL"), "{output}");
+        assert!(output.contains("FINAL_SENTINEL"), "{output}");
+        assert!(output.contains("capture complete"), "{output}");
+    }
+
+    /// An executor drops what a terminal writes while its link is down. After
+    /// the link comes back, the chunk numbers jump, so the capture says how
+    /// many chunks never arrived instead of claiming to be complete, and
+    /// nothing the old link still carried is taken from it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunks_lost_while_the_link_was_down_make_the_capture_incomplete() {
+        let db = crate::storage::migrated_test_db("term_link_gap.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("flaky");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session = spawn_node_terminal(&orch, target, "cargo test").await;
+        executor.post();
+        let generation = process_generation(&executor, &session);
+        let old_link = executor.generation;
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "flaky");
+        deliver(
+            &orch,
+            old_link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(1, "FIRST\r\n"),
+        );
+
+        let cell = executor.cell.lock().unwrap().clone();
+        drop(executor);
+        let executor = StatefulExecutor::attach(&orch, cell);
+        let link = executor.generation;
+        assert_ne!(link, old_link, "the link reconnected");
+        deliver(
+            &orch,
+            old_link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(2, "STALE\r\n"),
+        );
+        deliver(
+            &orch,
+            link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(4, "LAST_SENTINEL\r\n"),
+        );
+        deliver(&orch, link, &fence, &session, generation, pty_end(4));
+        deliver(&orch, link, &fence, &session, generation, pty_exit(0));
+
+        let record = settled_capture(&orch, &uri).await;
+        assert_eq!(record.capture, "incomplete");
+        assert!(
+            record.capture_note.as_deref().is_some_and(
+                |note| note.contains("2 output chunks from the executor never arrived")
+            ),
+            "{:?}",
+            record.capture_note
+        );
+        let captured = captured_text(&record);
+        assert!(
+            captured.contains("FIRST") && captured.contains("LAST_SENTINEL"),
+            "{captured:?}"
+        );
+        assert!(!captured.contains("STALE"), "{captured:?}");
+    }
+
+    /// A chunk, an end or an exit delivered twice is captured and settled once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn events_delivered_twice_are_captured_once() {
+        let db = crate::storage::migrated_test_db("term_duplicate_events.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("echoed");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session = spawn_node_terminal(&orch, target, "cargo test").await;
+        executor.post();
+        let generation = process_generation(&executor, &session);
+        let link = executor.generation;
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "echoed");
+
+        for _ in 0..2 {
+            deliver(
+                &orch,
+                link,
+                &fence,
+                &session,
+                generation,
+                pty_chunk(1, "ONCE_SENTINEL\r\n"),
+            );
+        }
+        for _ in 0..2 {
+            deliver(&orch, link, &fence, &session, generation, pty_end(1));
+        }
+        deliver(&orch, link, &fence, &session, generation, pty_exit(0));
+        let record = settled_capture(&orch, &uri).await;
+        deliver(&orch, link, &fence, &session, generation, pty_exit(1));
+
+        assert_eq!(record.capture, "complete", "{:?}", record.capture_note);
+        assert_eq!(captured_text(&record).matches("ONCE_SENTINEL").count(), 1);
+        let after = crate::terminal_output::load(&orch.db.local, &record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.exit_code,
+            Some(0),
+            "the repeated exit settled nothing"
+        );
+        assert_eq!(after.exited_at, record.exited_at);
+    }
+
+    /// A capture the disk refused is never recorded complete, whatever the
+    /// stream says.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_capture_the_disk_refused_is_never_recorded_complete() {
+        let db = crate::storage::migrated_test_db("term_refused_capture.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("diskfull");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session = spawn_node_terminal(&orch, target, "cargo test").await;
+        executor.post();
+        let generation = process_generation(&executor, &session);
+        let link = executor.generation;
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "diskfull");
+
+        // The capture's file becomes a directory, so reopening it fails the way
+        // a full or read-only volume would.
+        let (output_id, _) = live_capture(&orch, &session).unwrap();
+        let path = crate::terminal_output::output_log_path(&output_id);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let log = orch.pty_state.sessions.lock().unwrap()[&session]
+            .lock()
+            .unwrap()
+            .output_log
+            .clone()
+            .unwrap();
+        *log.lock().unwrap() = Some(crate::terminal_output::TerminalLog::open(&output_id));
+
+        deliver(
+            &orch,
+            link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(1, "UNWRITTEN\r\n"),
+        );
+        deliver(&orch, link, &fence, &session, generation, pty_end(1));
+        deliver(&orch, link, &fence, &session, generation, pty_exit(0));
+
+        let record = settled_capture(&orch, &uri).await;
+        std::fs::remove_dir_all(&path).unwrap();
+        assert_eq!(record.capture, "incomplete");
+        assert!(
+            record
+                .capture_note
+                .as_deref()
+                .is_some_and(|note| note.contains("could not open")),
+            "{:?}",
+            record.capture_note
+        );
+    }
+
+    /// verification 3 across a restart. A terminal the executor kept running
+    /// while the runner was away is re-adopted under the record it had, and its
+    /// exit afterwards finalizes that same record: the URI from before the
+    /// restart reads the output from both sides of it. The capture says it may
+    /// have a gap, since the runner heard nothing while it was down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_re_adopted_after_a_runner_restart_keeps_one_record_through_its_exit() {
+        let db = crate::storage::migrated_test_db("term_readopt_retained.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (mut target, fence) = test_terminal_target("survivor");
+        target.restart_policy = RestartPolicy::Never;
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session = spawn_node_terminal(&orch, target, "cargo test").await;
+        executor.post();
+        let generation = process_generation(&executor, &session);
+        let link = executor.generation;
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "survivor");
+        deliver(
+            &orch,
+            link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(1, "BEFORE_RESTART\r\n"),
+        );
+        let before = crate::terminal_output::load_newest_for_uri(&orch.db.local, &uri)
+            .await
+            .unwrap()
+            .unwrap();
+
+        restart_the_runner(&orch).await;
+        assert_eq!(
+            crate::terminal_host::reconcile_terminal_lifecycle_with(&orch, false)
+                .await
+                .unwrap(),
+            1
+        );
+        let adopted = recovery_state(&orch.db.local, "survivor").await;
+        assert_eq!(adopted.status, "running");
+        assert_eq!(adopted.session_id, session, "the same process, re-adopted");
+
+        deliver(
+            &orch,
+            link,
+            &fence,
+            &session,
+            generation,
+            pty_chunk(7, "AFTER_RESTART FINAL_SENTINEL\r\n"),
+        );
+        deliver(&orch, link, &fence, &session, generation, pty_end(7));
+        deliver(&orch, link, &fence, &session, generation, pty_exit(3));
+
+        let record = settled_capture(&orch, &uri).await;
+        assert_eq!(record.id, before.id, "one record across the restart");
+        assert_eq!(record.exit_code, Some(3));
+        assert_eq!(record.capture, "incomplete");
+        assert!(
+            record
+                .capture_note
+                .as_deref()
+                .is_some_and(|note| note == crate::terminal_output::READOPT_GAP_NOTE),
+            "only the re-adoption gap, since the stream ended unbroken: {:?}",
+            record.capture_note
+        );
+        let read = read_as_agent(&orch, &before.retained_uri()).await;
+        let output = read["output"].as_str().unwrap();
+        assert!(output.contains("BEFORE_RESTART"), "{output}");
+        assert!(output.contains("FINAL_SENTINEL"), "{output}");
     }
 
     /// `never` forbids a replay, never a survivor. A `restart: never` terminal

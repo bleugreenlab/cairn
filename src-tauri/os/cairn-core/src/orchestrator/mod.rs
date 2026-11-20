@@ -3299,6 +3299,18 @@ impl Orchestrator {
         } else {
             log::info!("retention pass: {report}");
         }
+        // Retained terminal output names files as well as rows, so its rule is
+        // pruned here rather than by the row evictor: file first, then row.
+        match crate::terminal_output::prune(&self.db.local, chrono::Utc::now().timestamp()).await {
+            Ok(pruned) if pruned.failed > 0 => {
+                log::warn!("retained terminal output prune: {pruned:?}");
+            }
+            Ok(pruned) if pruned.deleted > 0 => {
+                log::info!("retained terminal output prune: {pruned:?}");
+            }
+            Ok(_) => {}
+            Err(error) => log::warn!("retained terminal output prune failed: {error}"),
+        }
         // The pass as a row, so its figures are one query rather than a log
         // search: `runner_events` where `kind = 'retention_pass'`.
         {
@@ -4988,6 +5000,7 @@ mod tests {
                     publish_isolation: None,
                     machine_services: Vec::new(),
                     credential_floor_service_residents: false,
+                    resident_output_end: false,
                     service_bounds: None,
                 },
                 current_load: 0,

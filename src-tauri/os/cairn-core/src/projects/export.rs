@@ -207,6 +207,10 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
         "a node scratch's authority row describes a Git store on this runner and replicas on this runner's executors; neither travels with an export, and the scratch ends with its node",
     ),
     (
+        "terminal_outputs",
+        "a retained terminal capture's record names a file in this runner's Cairn home that an export does not carry, and it expires seven days after its terminal exits and its issue resolves; deleting the project expires it at once",
+    ),
+    (
         "operator_notification_dismissals",
         "one operator's closes in their notification center on this install, keyed by derived entry keys; it describes the operator, not the project, and an entry with no dismissal is simply open again",
     ),

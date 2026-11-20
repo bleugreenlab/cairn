@@ -139,6 +139,10 @@ pub(crate) async fn handle_read_resource(
 
     let consume = parsed.new;
 
+    if let Some(output_id) = parsed.output.clone() {
+        return read_retained_output(orch, &parsed, &output_id).await;
+    }
+
     let info = match lookup_terminal_info(&orch.db.local, &parsed).await {
         Ok(Some(info)) => info,
         Ok(None) => {
@@ -161,14 +165,28 @@ pub(crate) async fn handle_read_resource(
         }
     };
 
-    // A job-scoped agent terminal tees its full output to this scratch log; a
-    // project terminal (job_id None) has none. Post-exit reads prefer it over the
-    // truncated `output_tail`, and the banner exposes its path so an agent can
-    // grep it directly as a `file:` target.
-    let log_path = info
-        .job_id
-        .as_deref()
-        .map(|job_id| crate::scratch::terminal_log_path(job_id, &parsed.slug));
+    // Every terminal tees its output into a retained capture. Post-exit reads
+    // serve it over the truncated `output_tail`, and the banner names its
+    // retained URI, which stays readable after this terminal is replaced or
+    // released. A terminal from before retained capture has its scratch log
+    // instead, whose path the banner shows while it exists.
+    let record = crate::terminal_output::load_for_terminal(&orch.db.local, &info.terminal_id)
+        .await
+        .ok()
+        .flatten();
+    let (log_path, banner_log_path) = match record.as_ref() {
+        Some(record) => (
+            Some(crate::terminal_output::output_log_path(&record.id)),
+            None,
+        ),
+        None => {
+            let legacy = info
+                .job_id
+                .as_deref()
+                .map(|job_id| crate::scratch::legacy_terminal_log_path(job_id, &parsed.slug));
+            (legacy.clone(), legacy)
+        }
+    };
 
     let (output, new_bytes, total_bytes, idle_secs) = get_buffer_content(
         orch,
@@ -194,6 +212,7 @@ pub(crate) async fn handle_read_resource(
         lost_at: info.lost_at,
         settles_at,
         restart_never: info.restart_policy == "never",
+        retained: record.as_ref().map(retained_clause),
     };
 
     let machine = (info.status == "running")
@@ -207,7 +226,7 @@ pub(crate) async fn handle_read_resource(
         runtime_secs,
         idle_secs,
         total_bytes,
-        log_path.as_deref(),
+        banner_log_path.as_deref(),
         machine.as_deref(),
         &lifecycle,
     );
@@ -270,6 +289,117 @@ async fn thread_without_session_reason(db: &LocalDb, parsed: &ParsedTerminalUri)
     })
 }
 
+/// How a banner names a terminal's retained record.
+fn retained_clause(record: &crate::terminal_output::OutputRecord) -> String {
+    let mut clause = format!(
+        "retained output: {} ({})",
+        record.retained_uri(),
+        record.retention_clause()
+    );
+    if let Some(disclosure) = record.disclosure() {
+        clause.push_str(&format!(", {disclosure}"));
+    }
+    clause
+}
+
+/// Whether two terminal URIs name the same terminal once normalized, so a
+/// thread terminal matches whichever of its spellings each side used.
+fn same_terminal(a: &str, b: &str) -> bool {
+    let canonical = |uri: &str| {
+        super::terminal_ref::terminal_resource(uri)
+            .map(|resource| resource.to_uri())
+            .unwrap_or_else(|| uri.to_string())
+    };
+    canonical(a) == canonical(b)
+}
+
+/// Read one retained capture, `<terminal URI>?output=<id>`.
+///
+/// The id answers only under the terminal it was captured for: a record whose
+/// owner is another terminal is reported as absent, exactly as an expired one
+/// is, and the read never falls back to whatever terminal holds the slug now.
+/// Nothing live is needed: no session, executor, job or scratch.
+async fn read_retained_output(
+    orch: &Orchestrator,
+    parsed: &ParsedTerminalUri,
+    output_id: &str,
+) -> String {
+    if parsed.new {
+        return terminal_error_json(
+            "`new` reads a live terminal incrementally and does not combine with `output`; \
+             read the retained output whole, with `offset`/`limit` or `grep` to narrow it."
+                .to_string(),
+        );
+    }
+    let record = match crate::terminal_output::load(&orch.db.local, output_id).await {
+        Ok(record) => record,
+        Err(error) => {
+            return terminal_error_json(format!(
+                "Failed to look up retained output {output_id}: {error}"
+            ))
+        }
+    };
+    let Some(record) =
+        record.filter(|record| same_terminal(&record.terminal_uri, &parsed.anchor_uri))
+    else {
+        return terminal_error_json(format!(
+            "No retained output {output_id} for {}. Retained output is kept for 7 days after \
+             the later of its terminal's exit and its issue's resolution, so it may have \
+             expired; an id is only readable under the terminal it was captured for.",
+            parsed.anchor_uri
+        ));
+    };
+    let (output, total_bytes) = match crate::terminal_output::read_capture(&record.id) {
+        Some(raw) => {
+            let text = strip_ansi_sequences(&String::from_utf8_lossy(&raw));
+            let len = text.len();
+            (text, len)
+        }
+        None => ("(no output was captured)".to_string(), 0),
+    };
+    let runtime_secs = record
+        .exited_at
+        .map(|exited| (exited - record.created_at).max(0));
+    let status = if record.is_capturing() {
+        "running"
+    } else {
+        "exited"
+    };
+    let mut parts = vec![format!("retained output {}", record.id)];
+    if record.is_capturing() {
+        parts.push("still capturing".to_string());
+    } else {
+        match (record.exit_code, record.exit_reason.as_deref()) {
+            (Some(code), _) => parts.push(format!("exited code {code}")),
+            (None, Some(reason)) => parts.push(format!("ended: {reason}")),
+            (None, None) => parts.push("exit code unknown".to_string()),
+        }
+    }
+    if let Some(runtime) = runtime_secs {
+        parts.push(format!("ran {}", fmt_duration(runtime)));
+    }
+    parts.push(record.retention_clause());
+    match (record.capture.as_str(), record.disclosure()) {
+        ("complete", None) => parts.push("capture complete".to_string()),
+        (_, Some(disclosure)) => parts.push(disclosure),
+        _ => {}
+    }
+    let banner = format!("[terminal {}: {}]", record.slug, parts.join(", "));
+    serde_json::to_string(&TerminalReadResult {
+        output: format!("{banner}\n\n{output}"),
+        status: status.to_string(),
+        exit_code: record.exit_code,
+        exit_reason: record.exit_reason.clone(),
+        new_bytes: total_bytes,
+        total_bytes,
+        runtime_secs,
+        idle_secs: None,
+        settles_at: None,
+        lost_at: None,
+    })
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
 fn terminal_error_json(message: String) -> String {
     serde_json::to_string(&TerminalReadResult {
         output: message,
@@ -302,6 +432,8 @@ struct BannerLifecycle {
     settles_at: Option<i64>,
     /// The terminal carries `restart: never`. The default is not shown.
     restart_never: bool,
+    /// How the terminal's retained record is named, when it has one.
+    retained: Option<String>,
 }
 
 fn describe_unix_clock(unix_secs: i64) -> String {
@@ -374,9 +506,11 @@ fn format_status_banner(
     if lifecycle.restart_never {
         parts.push("restart: never".to_string());
     }
-    // Surface the persisted log path only when the file actually exists, so a
-    // non-teed terminal (project terminal, or a desktop node terminal) never
-    // advertises a path that isn't there.
+    if let Some(retained) = lifecycle.retained.as_deref() {
+        parts.push(retained.to_string());
+    }
+    // A terminal from before retained capture names its scratch log, only
+    // while the file actually exists.
     if let Some(path) = log_path.filter(|p| p.exists()) {
         parts.push(format!("log: {}", path.display()));
     }
@@ -411,6 +545,8 @@ fn not_found_message(slug: &str, slugs: &[String]) -> String {
 
 #[derive(Debug, Clone)]
 struct TerminalInfo {
+    /// The row's id, which its retained capture record is found by.
+    terminal_id: String,
     session_id: String,
     status: String,
     exit_code: Option<i32>,
@@ -451,7 +587,7 @@ async fn lookup_terminal_info(
                 .query(
                     format!(
                         "SELECT session_id, status, exit_code, created_at, exited_at, output_tail,
-                                job_id, exit_reason, lost_at, restart_policy
+                                job_id, exit_reason, lost_at, restart_policy, id
                          FROM job_terminals WHERE {scope} AND slug = ?2 LIMIT 1"
                     ),
                     params![id.as_str(), slug.as_str()],
@@ -460,6 +596,7 @@ async fn lookup_terminal_info(
             let row = rows.next().await?;
             row.map(|row| {
                 Ok(TerminalInfo {
+                    terminal_id: row.text(10)?,
                     session_id: row.text(0)?,
                     status: row.text(1)?,
                     exit_code: row.opt_i64(2)?.map(|value| value as i32),
@@ -503,6 +640,9 @@ struct ParsedTerminalUri {
     slug: String,
     /// `?new=true`: incremental cursor read instead of the idempotent full buffer.
     new: bool,
+    /// `?output=<id>`: read that retained capture of this terminal instead of
+    /// the terminal's current state.
+    output: Option<String>,
     annotations_suppressed: bool,
     anchor_uri: String,
 }
@@ -564,9 +704,20 @@ fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
     let split =
         split_target_query(uri).map_err(|error| format!("Malformed URI '{uri}': {error}"))?;
     let mut new = false;
+    let mut output = None;
     let mut annotations_suppressed = false;
     for param in &split.params {
         match param.key.as_str() {
+            "output" => {
+                if !crate::terminal_output::is_output_id(&param.value) {
+                    return Err(format!(
+                        "Invalid value '{}' for `output` (expected the retained output id an \
+                         exit notification or a terminal read gave).",
+                        param.value
+                    ));
+                }
+                output = Some(param.value.clone());
+            }
             "full" => match param.value.as_str() {
                 "true" | "1" | "false" | "0" | "" => {}
                 other => {
@@ -597,7 +748,7 @@ fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
             key => {
                 return Err(format!(
                     "Unsupported query parameter `{key}` for terminal reads. Supported: `new`, \
-                     `full`, `annotations`, plus the universal `offset`/`limit`/`grep` grammar."
+                     `full`, `annotations`, `output`, plus the universal `offset`/`limit`/`grep` grammar."
                 ))
             }
         }
@@ -625,6 +776,7 @@ fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
             node_id: Some(node_id),
             slug,
             new,
+            output: output.clone(),
             annotations_suppressed,
             anchor_uri,
         }),
@@ -642,6 +794,7 @@ fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
             node_id: Some(node_id),
             slug,
             new,
+            output: output.clone(),
             annotations_suppressed,
             anchor_uri,
         }),
@@ -652,6 +805,7 @@ fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
             node_id: None,
             slug,
             new,
+            output: output.clone(),
             annotations_suppressed,
             anchor_uri,
         }),
@@ -1226,7 +1380,7 @@ mod tests {
         let lifecycle = BannerLifecycle {
             lost_at: Some(lost_at),
             settles_at: Some(settles_at),
-            restart_never: false,
+            ..BannerLifecycle::default()
         };
         let read_at = |now: i64| {
             format_status_banner(
@@ -1273,8 +1427,7 @@ mod tests {
             None,
             &BannerLifecycle {
                 lost_at: Some(lost_at),
-                settles_at: None,
-                restart_never: false,
+                ..BannerLifecycle::default()
             },
         );
         assert!(
@@ -1417,6 +1570,147 @@ mod tests {
         let cursors = StdMutex::new(HashMap::new());
         let raw = handle_read_resource(orch, &request, &cursors).await;
         serde_json::from_str(&raw).unwrap()
+    }
+
+    const RETAINED_URI_OWNER: &str = "cairn://p/nt/42/2/builder/terminal/ci";
+
+    /// A capture of the parent node's `ci` terminal row `terminal_id`, holding
+    /// `content`, finalized with `exit_code` at `exited_at`.
+    async fn retained_capture(
+        orch: &Orchestrator,
+        terminal_id: &str,
+        content: &[u8],
+        exit_code: i32,
+        exited_at: i64,
+    ) -> crate::terminal_output::OutputRecord {
+        use crate::terminal_output as out;
+        let capture = out::NewCapture {
+            terminal_uri: RETAINED_URI_OWNER.to_string(),
+            slug: "ci".to_string(),
+            job_id: Some("parent-nt".to_string()),
+            project_id: "proj-nt".to_string(),
+            basis: out::ExpiryBasis::Resolution,
+        };
+        let id = out::attach(&orch.db.local, terminal_id, &capture)
+            .await
+            .unwrap();
+        let mut log = out::TerminalLog::open(&id);
+        log.append(content);
+        let end = out::CaptureEnd {
+            exit_code: Some(exit_code),
+            exit_reason: None,
+            summary: Some(log.summary()),
+        };
+        drop(log);
+        out::finalize(&orch.db.local, &id, end, exited_at)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// bug sink #544: a test terminal stopped by a merge must stay readable at
+    /// the URI its exit notification gave, after its row and its job's scratch
+    /// are gone, beyond the 64 KB ring, and only under the terminal it belongs
+    /// to.
+    #[tokio::test]
+    async fn retained_output_outlives_its_terminal_and_answers_only_its_owner() {
+        let orch = seeded_orch().await;
+        seed_node_and_task_terminals(&orch).await;
+        let mut content = b"EARLY_SENTINEL\n".to_vec();
+        content.extend(std::iter::repeat_n(b'.', 100_000));
+        content.extend(b"\nFINAL_SENTINEL test result: FAILED\n");
+        let record = retained_capture(&orch, "term-parent-nt", &content, 100, 1_000).await;
+
+        // Resolution, then teardown releases the rows and the scratch.
+        crate::terminal_output::record_resolution(
+            &orch.db.local,
+            &["parent-nt".to_string()],
+            2_000,
+        )
+        .await
+        .unwrap();
+        exec(
+            &orch,
+            "DELETE FROM job_terminals WHERE job_id = 'parent-nt'",
+        )
+        .await;
+        crate::scratch::remove_job_scratch_dir("parent-nt");
+
+        let read = read_terminal(&orch, &record.retained_uri()).await;
+        assert_eq!(read.status, "exited", "{}", read.output);
+        assert_eq!(read.exit_code, Some(100));
+        assert!(
+            read.output.contains("EARLY_SENTINEL"),
+            "{}",
+            &read.output[..200]
+        );
+        assert!(read.output.contains("FINAL_SENTINEL"));
+        assert!(read.total_bytes > 64 * 1024);
+        // 2,000 s after the epoch plus seven days.
+        assert!(
+            read.output.contains("kept until 1970-01-08 00:33 UTC"),
+            "{}",
+            &read.output[..200]
+        );
+        assert!(read.output.contains("capture complete"));
+
+        // The same id under another terminal reads nothing.
+        let foreign = read_terminal(
+            &orch,
+            &format!(
+                "cairn://p/nt/42/2/builder/task/Explore/terminal/ci?output={}",
+                record.id
+            ),
+        )
+        .await;
+        assert_eq!(foreign.status, "error");
+        assert!(!foreign.output.contains("FINAL_SENTINEL"));
+
+        let malformed = read_terminal(&orch, &format!("{RETAINED_URI_OWNER}?output=../x")).await;
+        assert_eq!(malformed.status, "error");
+    }
+
+    /// Re-creating a slug gives the new terminal its own record. The older
+    /// notification's URI keeps reading the older run, never the newer one,
+    /// and an ordinary read of the terminal links the newer record.
+    #[tokio::test]
+    async fn a_same_slug_terminal_never_answers_an_older_retained_uri() {
+        let orch = seeded_orch().await;
+        seed_node_and_task_terminals(&orch).await;
+        let older = retained_capture(&orch, "term-parent-nt", b"OLDER_RUN\n", 1, 1_000).await;
+
+        exec(
+            &orch,
+            "DELETE FROM job_terminals WHERE id = 'term-parent-nt'",
+        )
+        .await;
+        exec(
+            &orch,
+            "INSERT INTO job_terminals
+               (id, job_id, project_id, run_id, session_id, command, status, created_at, slug, output_tail)
+             VALUES ('term-parent-nt-2', 'parent-nt', NULL, NULL, 'sess-parent-nt-2', 'ci', 'exited', 2, 'ci', 'newer-tail')",
+        )
+        .await;
+        let newer = retained_capture(&orch, "term-parent-nt-2", b"NEWER_RUN\n", 0, 2_000).await;
+
+        let old_read = read_terminal(&orch, &older.retained_uri()).await;
+        assert!(old_read.output.contains("OLDER_RUN"), "{}", old_read.output);
+        assert!(
+            !old_read.output.contains("NEWER_RUN"),
+            "{}",
+            old_read.output
+        );
+        assert_eq!(old_read.exit_code, Some(1));
+
+        let current = read_terminal(&orch, RETAINED_URI_OWNER).await;
+        assert!(current.output.contains("NEWER_RUN"), "{}", current.output);
+        assert!(
+            current
+                .output
+                .contains(&format!("retained output: {}", newer.retained_uri())),
+            "{}",
+            current.output
+        );
     }
 
     async fn seed_node_and_task_terminals(orch: &Orchestrator) {

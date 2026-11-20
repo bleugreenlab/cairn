@@ -890,10 +890,16 @@ pub(crate) const BROWSER_READ_PROJECTIONS: &[ProjectionSpec] = &[
 /// Terminal reads (node, task, and project scoped) share one parser,
 /// `parse_terminal_uri` in cairn-core; the universal offset/limit/grep view
 /// grammar rides alongside.
-pub(crate) const TERMINAL_PROJECTIONS: &[ProjectionSpec] = &[ProjectionSpec {
-    key: "new",
-    values: "true — only the bytes appended since your last new=true read, advancing a cursor (default: the whole buffer, idempotent)",
-}];
+pub(crate) const TERMINAL_PROJECTIONS: &[ProjectionSpec] = &[
+    ProjectionSpec {
+        key: "new",
+        values: "true — only the bytes appended since your last new=true read, advancing a cursor (default: the whole buffer, idempotent)",
+    },
+    ProjectionSpec {
+        key: "output",
+        values: "ID — one retained capture of this terminal, by the id its exit notification or read banner gave; readable after the terminal is replaced or released, for 7 days after the later of exit and issue resolution",
+    },
+];
 pub(crate) const NO_RELATED: &[RelatedSpec] = &[];
 pub(crate) const NO_CROSS_ACTIONS: &[CrossActionSpec] = &[];
 // Shared read-query projections for the symbol resources (node- and project-scoped).

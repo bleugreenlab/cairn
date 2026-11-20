@@ -9869,6 +9869,7 @@ mod tests {
                         publish_isolation: None,
                         machine_services: Vec::new(),
                         credential_floor_service_residents: false,
+                        resident_output_end: false,
                         service_bounds: None,
                     },
                     current_load: 0,

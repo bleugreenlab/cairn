@@ -643,7 +643,12 @@ impl Fleet {
                     *stream,
                     data,
                 );
-                if settled.is_empty() {
+                // A PTY chunk the scrubber withholds whole still arrives, empty,
+                // so a terminal can count every chunk its executor sent; its
+                // bytes follow in a later chunk or in the tail released at exit.
+                if settled.is_empty()
+                    && *stream != cairn_common::executor_protocol::ResidentProcessStream::Pty
+                {
                     return Vec::new();
                 }
                 *data = settled;
@@ -659,6 +664,7 @@ impl Fleet {
                     &event.process_key,
                     event.process_generation,
                 );
+                debug_assert!(tails.len() as u64 <= output_guard::RELEASED_TAIL_SEQUENCES);
                 let mut sequence = u64::MAX - tails.len() as u64;
                 let mut settled: Vec<ResidentProcessEvent> = tails
                     .into_iter()
@@ -680,7 +686,8 @@ impl Fleet {
                 settled.push(event);
                 settled
             }
-            ResidentProcessEventKind::State { .. } => vec![event],
+            ResidentProcessEventKind::State { .. }
+            | ResidentProcessEventKind::OutputEnded { .. } => vec![event],
         }
     }
 
@@ -723,6 +730,33 @@ impl Fleet {
     /// subscriber matches the exact fence and generation it holds, so precision
     /// lives there; this gate exists to keep a superseded or foreign link's
     /// events from reaching any of them.
+    /// Whether the executor holding `holder`'s environment says it ends each
+    /// resident PTY's output before its exit
+    /// ([`ExecutorCapabilities::resident_output_end`]). Read from the routed
+    /// executor, else from whichever connected executor's snapshot holds the
+    /// residency. `false` when neither answers, which a terminal reads as
+    /// completeness not reported.
+    ///
+    /// [`ExecutorCapabilities::resident_output_end`]: cairn_common::executor_protocol::ExecutorCapabilities::resident_output_end
+    pub(crate) fn reports_resident_output_end(
+        &self,
+        holder: &cairn_common::executor_protocol::ResidencyHolder,
+    ) -> bool {
+        let routed = self.residency_route_executor(holder);
+        let connections = self.lock_connections();
+        let connection = routed.and_then(|id| connections.get(&id)).or_else(|| {
+            connections.values().find(|connection| {
+                connection.snapshot.cells.iter().any(|cell| {
+                    cell.residency
+                        .as_ref()
+                        .is_some_and(|residency| residency.holder == *holder)
+                })
+            })
+        });
+        connection
+            .is_some_and(|connection| connection.advertisement.capabilities.resident_output_end)
+    }
+
     pub(super) fn resident_event_is_current(
         &self,
         executor_id: &str,

@@ -226,6 +226,22 @@ impl Fleet {
         self.attach_colocated_advertising(sender, Vec::new())
     }
 
+    /// [`Fleet::attach_executor`] for an executor that ends each resident
+    /// PTY's output, as every current executor advertises.
+    #[cfg(test)]
+    pub(crate) fn attach_executor_ending_output(
+        &self,
+        sender: mpsc::UnboundedSender<ExecutorMessage>,
+    ) -> u64 {
+        let generation = self.attach_executor(sender);
+        if let Some(connection) = self.lock_connections().get_mut(COLOCATED_EXECUTOR_ID) {
+            Arc::make_mut(&mut connection.advertisement)
+                .capabilities
+                .resident_output_end = true;
+        }
+        generation
+    }
+
     /// [`Fleet::attach_executor`], advertising `toolchains` as a real executor
     /// does from its first frame, for a test whose work requires one.
     #[cfg(test)]
@@ -273,6 +289,7 @@ impl Fleet {
                 publish_isolation: None,
                 machine_services: Vec::new(),
                 credential_floor_service_residents: false,
+                resident_output_end: false,
                 service_bounds: None,
             },
             current_load: 0,

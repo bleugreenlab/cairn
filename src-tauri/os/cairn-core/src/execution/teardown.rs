@@ -125,7 +125,14 @@ pub(crate) async fn cleanup_issue_jobs(
         orch.invalidate_node_check_status(job_id, "issue-resolution");
     }
 
-    kill_terminals_for_jobs(orch, &db, &job_ids).await;
+    let retention = if archive {
+        OutputRetention::Resolved {
+            resolved_at: issue_resolved_at(&db, &issue_id).await,
+        }
+    } else {
+        OutputRetention::Deleted
+    };
+    kill_terminals_for_jobs(orch, &db, &job_ids, retention).await;
     kill_repls_for_jobs(orch, &job_ids).await;
     let mut dev_targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for target in &targets {
@@ -829,7 +836,16 @@ pub async fn cleanup_project_jobs(orch: &Orchestrator, project_id: &str) -> Resu
     for run_id in &run_ids {
         let _ = crate::orchestrator::lifecycle::kill_session(orch, run_id);
     }
-    kill_terminals_for_jobs(orch, &orch.db.local, &job_ids).await;
+    kill_terminals_for_jobs(orch, &orch.db.local, &job_ids, OutputRetention::Deleted).await;
+    if let Err(error) = crate::terminal_output::expire_for_project(
+        &orch.db.local,
+        project_id,
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+    {
+        log::warn!("Teardown: failed to expire the project's retained terminal output: {error}");
+    }
     kill_repls_for_jobs(orch, &job_ids).await;
     for job_id in &job_ids {
         crate::scratch::remove_job_scratch_dir(job_id);
@@ -933,11 +949,46 @@ async fn kill_repls_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
     }
 }
 
-/// Kill running PTY sessions for the given jobs and delete their terminal rows.
+/// What happens to the retained output of the jobs a teardown releases.
+#[derive(Debug, Clone, Copy)]
+enum OutputRetention {
+    /// The issue resolved at `resolved_at`: each record is kept seven days past
+    /// the later of its exit and this.
+    Resolved { resolved_at: i64 },
+    /// The issue or project is being deleted, which is destructive: the records
+    /// expire now and go at the next prune.
+    Deleted,
+}
+
+/// When the issue's resolution was recorded (`completed_at`, Unix seconds), or
+/// now if the row cannot say: a later stamp only keeps output longer.
+async fn issue_resolved_at(db: &LocalDb, issue_id: &str) -> i64 {
+    db.query_opt(
+        "SELECT completed_at FROM issues WHERE id = ?1",
+        params![issue_id.to_string()],
+        |row| row.opt_i64(0),
+    )
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .unwrap_or_else(|| chrono::Utc::now().timestamp())
+}
+
+/// Kill running PTY sessions for the given jobs and delete their terminal rows,
+/// keeping their retained output under `retention`.
 ///
 /// Uses the runner's terminal bindings to issue fenced executor stop/release
-/// operations before clearing durable rows.
-async fn kill_terminals_for_jobs(orch: &Orchestrator, db: &LocalDb, job_ids: &[String]) {
+/// operations before clearing durable rows. A terminal's output does not live
+/// in its row or its job's scratch, so releasing both loses nothing: its
+/// retained record (`crate::terminal_output`) outlives them, and an exit that
+/// arrives after the row is gone still finalizes that record and notifies.
+async fn kill_terminals_for_jobs(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_ids: &[String],
+    retention: OutputRetention,
+) {
     if job_ids.is_empty() {
         return;
     }
@@ -989,8 +1040,30 @@ async fn kill_terminals_for_jobs(orch: &Orchestrator, db: &LocalDb, job_ids: &[S
         }
     }
 
-    // Delete every terminal row for these jobs — the running ones we just killed
-    // and any lingering exited rows retained for post-exit reads / exit wakes.
+    // Retained records are this runner's, in its own database whichever
+    // database holds the issue.
+    let retained = match retention {
+        OutputRetention::Resolved { resolved_at } => {
+            crate::terminal_output::record_resolution(&orch.db.local, job_ids, resolved_at)
+                .await
+                .map(|_| ())
+        }
+        OutputRetention::Deleted => {
+            crate::terminal_output::expire_for_jobs(
+                &orch.db.local,
+                job_ids,
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+        }
+    };
+    if let Err(error) = retained {
+        log::warn!("Teardown: failed to set retained terminal output deadlines: {error}");
+    }
+
+    // Delete every terminal row for these jobs — the running ones we just
+    // stopped and the exited ones. Their output stays readable at the retained
+    // URIs their exit notifications gave.
     if let Err(e) = delete_all_terminal_rows_for_jobs(db, job_ids).await {
         log::warn!("Teardown: failed to delete terminal rows: {}", e);
     }

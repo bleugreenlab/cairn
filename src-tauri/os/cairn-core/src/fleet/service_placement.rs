@@ -643,7 +643,8 @@ impl LeaseCore {
                         output.exit_code = exit_code;
                         return Ok(output);
                     }
-                    ResidentProcessEventKind::State { .. } => {}
+                    ResidentProcessEventKind::State { .. }
+                    | ResidentProcessEventKind::OutputEnded { .. } => {}
                 }
             }
             Err(ServicePlacementError::EventStreamClosed {

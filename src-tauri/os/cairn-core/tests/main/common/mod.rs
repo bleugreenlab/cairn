@@ -385,6 +385,7 @@ fn test_executor_advertisement(
             publish_isolation: None,
             machine_services: Vec::new(),
             credential_floor_service_residents: false,
+            resident_output_end: false,
             service_bounds: None,
         },
         current_load: 0,
@@ -607,6 +608,8 @@ impl TestMcpRelay {
 
     /// Wait, as the executor's relay does, for a link that has announced this
     /// machine's relays; past the bound, the executor's 503.
+    // The error is the response the relay answers with, handed back whole.
+    #[allow(clippy::result_large_err)]
     async fn await_announced_link(&self) -> Result<(), Response> {
         let bound = std::time::Duration::from_millis(RELAY_GAP_WAIT_MS.load(Ordering::Relaxed));
         let started = std::time::Instant::now();

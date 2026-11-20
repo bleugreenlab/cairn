@@ -354,6 +354,12 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "deleted when the scratch's owner resolves",
     ),
     owned_by(
+        "terminal_outputs",
+        "cairn-core terminal_output::prune",
+        "seven days after the later of exit and issue resolution (exit alone for project and thread terminals), with the capture file each row names; never while still capturing for a live terminal",
+    )
+    .budget(16),
+    owned_by(
         "node_scratch_replicas",
         "cairn-core node_scratch::owner",
         "deleted with its scratch",

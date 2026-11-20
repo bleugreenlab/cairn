@@ -2713,6 +2713,7 @@ fn capabilities_with_cores(logical_cores: usize) -> ExecutorCapabilities {
         publish_isolation: None,
         machine_services: Vec::new(),
         credential_floor_service_residents: false,
+        resident_output_end: false,
         service_bounds: None,
     }
 }
@@ -2851,6 +2852,7 @@ fn containment_capabilities(
         publish_isolation: None,
         machine_services: Vec::new(),
         credential_floor_service_residents: false,
+        resident_output_end: false,
         service_bounds: None,
     }
 }
@@ -6607,6 +6609,7 @@ pub(super) fn fleet_entry_at(
                     publish_isolation: None,
                     machine_services: Vec::new(),
                     credential_floor_service_residents: false,
+                    resident_output_end: false,
                     service_bounds: None,
                 },
                 current_load: load,
@@ -9931,6 +9934,7 @@ fn test_prior_duration() -> DurationEstimate {
                 publish_isolation: None,
                 machine_services: Vec::new(),
                 credential_floor_service_residents: false,
+                resident_output_end: false,
                 service_bounds: None,
             },
         ),

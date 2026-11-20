@@ -542,7 +542,8 @@ impl IMessageExecutor for PlacedProcessExecutor {
                         format!("imsg watch exited with status {exit_code:?}")
                     });
                 }
-                ResidentProcessEventKind::State { .. } => {}
+                ResidentProcessEventKind::State { .. }
+                | ResidentProcessEventKind::OutputEnded { .. } => {}
             }
         }
         Err("imsg watch event stream closed".into())

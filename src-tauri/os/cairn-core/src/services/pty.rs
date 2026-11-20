@@ -168,11 +168,12 @@ pub struct PtySession {
     /// wake-subscribe path share this `Arc`, so a subscription created after the
     /// terminal starts is seen by the running loop without a restart.
     pub output_watchers: Option<Arc<Mutex<Vec<TerminalOutputWatcher>>>>,
-    /// The persisted log this session tees its output into, so a post-exit read
-    /// shows what a live read showed. Held here rather than only inside the
+    /// The retained capture this session tees its output into, so a post-exit
+    /// read shows what a live read showed. Held here rather than only inside the
     /// session's own event handler, so anything holding the session can say
-    /// something in this terminal's transcript and have it persist too.
-    pub output_log: Option<Arc<Mutex<Option<crate::scratch::TerminalLog>>>>,
+    /// something in this terminal's transcript and have it persist too, and so
+    /// the finalizer can state what the capture holds.
+    pub output_log: Option<Arc<Mutex<Option<crate::terminal_output::TerminalLog>>>>,
 }
 
 /// Manages all active PTY sessions

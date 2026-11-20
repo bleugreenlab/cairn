@@ -261,6 +261,17 @@ pub(crate) fn resident_stream_key(
     )
 }
 
+/// How many sequence numbers below `u64::MAX` are set aside for the tails
+/// [`finish_resident_process`] releases at exit, one per stream. An executor
+/// numbers its own chunks upward from 1 and never reaches them.
+pub(crate) const RELEASED_TAIL_SEQUENCES: u64 = 16;
+
+/// Whether an `Output` sequence names a tail the runner released at exit
+/// rather than a chunk the executor sent.
+pub(crate) fn is_released_tail(sequence: u64) -> bool {
+    sequence > u64::MAX - RELEASED_TAIL_SEQUENCES
+}
+
 /// Drain every stream of one resident process, in the order they are declared.
 ///
 /// Called when the process exits, before the exit reaches its subscribers, so

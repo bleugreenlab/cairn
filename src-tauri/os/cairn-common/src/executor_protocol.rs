@@ -9611,6 +9611,19 @@ pub struct LearnedResourceEstimate {
 /// capacity decline's free text, which now names each holder and its phase.
 /// What a runner gets wrong talking to an older executor: nothing; that
 /// executor holds a lane's whole reservation to its end, as it always did.
+///
+/// cairn/6259 does not move the number. A resident PTY's output gains an end:
+/// the executor's exit watcher waits, for at most `PTY_OUTPUT_DRAIN_BOUND`,
+/// for the PTY reader to reach end of stream, and the stream's one
+/// [`ResidentProcessEventKind::OutputEnded`] goes out behind its last chunk
+/// and ahead of the exit (marked `still_open` when the bound passed first). An
+/// executor that does this says so in
+/// [`ExecutorCapabilities::resident_output_end`], additive and defaulted. What
+/// a runner gets wrong talking to an older executor: nothing; that executor
+/// advertises no output end, and the runner records its terminals'
+/// completeness as not reported rather than reading the missing end as lost
+/// output. An older runner never meets the new event, because an executor is
+/// never newer than the runner that installs it.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 175;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -11148,6 +11161,13 @@ pub struct ExecutorCapabilities {
     /// says so on the instance. Additive and defaulted, so not a wire boundary.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub credential_floor_service_residents: bool,
+    /// Whether this executor ends each resident PTY's output with
+    /// [`ResidentProcessEventKind::OutputEnded`] ahead of its exit. An executor
+    /// built before it omits the key, and the runner reads the absence as
+    /// completeness not reported, never as lost output. Additive and
+    /// defaulted, so not a wire boundary.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resident_output_end: bool,
     /// The bounds this executor's service manager enforces on it and on
     /// everything it runs, read from the kernel rather than from the unit
     /// file. `None` from an executor with no bound: one predating bounds,
@@ -15862,6 +15882,21 @@ pub enum ResidentProcessEventKind {
     },
     State {
         status: ResidentProcessStatus,
+    },
+    /// A resident PTY's output reached its end: `sequence` is the number of
+    /// its last `Output` already sent (0 when it sent none). Sent once, ahead
+    /// of the exit, so a consumer can tell an exit that followed all of its
+    /// output from one that overtook it, and can count the chunks that never
+    /// arrived. Sent only by an executor advertising
+    /// [`ExecutorCapabilities::resident_output_end`].
+    ///
+    /// `still_open` is set when the drain bound passed with the PTY still open
+    /// (something the child started kept it so). The stream did not end then:
+    /// output written after it is not delivered.
+    OutputEnded {
+        sequence: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        still_open: bool,
     },
 }
 
@@ -29225,6 +29260,7 @@ mod tests {
                 publish_isolation: None,
                 machine_services: Vec::new(),
                 credential_floor_service_residents: false,
+                resident_output_end: false,
                 service_bounds: None,
             },
             current_load: 1,

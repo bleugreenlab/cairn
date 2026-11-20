@@ -1,5 +1,6 @@
 use crate::messages::queued::DeliveryUrgency;
 use crate::orchestrator::Orchestrator;
+pub use crate::terminal_output::RetainedNotice;
 
 use super::routing::{route_wake, route_wake_sync};
 use super::types::*;
@@ -18,15 +19,23 @@ fn fmt_runtime(secs: i64) -> String {
 
 /// The rich resume message an agent sees when a subscribed terminal exits:
 /// slug, exit code (or, for a terminal Cairn settled without a delivered exit,
-/// the recorded reason), runtime, the canonical URI to read, and a short output
+/// the recorded reason), runtime, where to read its output, and a short output
 /// tail.
+///
+/// With a retained record the message gives that record's own URI, how long it
+/// is kept, and anything that makes it less than the whole transcript (bytes
+/// compaction dropped, a capture gap). It never claims "full output": a
+/// capture is complete only when its record says so, and even then compaction
+/// may have dropped its head. Without a record (a terminal from before retained
+/// capture) it points at the terminal itself.
 pub(crate) fn format_terminal_exit_message(
     slug: &str,
-    detail_uri: &str,
+    terminal_uri: &str,
     exit_code: Option<i32>,
     runtime_secs: Option<i64>,
     tail: Option<&str>,
     reason: Option<&str>,
+    retained: Option<&RetainedNotice>,
 ) -> String {
     let mut out = match reason.map(str::trim).filter(|reason| !reason.is_empty()) {
         Some(reason) => format!("[Terminal exit] `{slug}` ended — {reason}."),
@@ -41,20 +50,33 @@ pub(crate) fn format_terminal_exit_message(
     if let Some(rt) = runtime_secs {
         out.push_str(&format!(" Ran {}.", fmt_runtime(rt)));
     }
-    out.push_str(&format!(" Read {detail_uri} for full output."));
+    match retained {
+        Some(notice) => {
+            out.push_str(&format!(
+                " Read {} for its retained output, {}.",
+                notice.uri, notice.retention
+            ));
+            if let Some(disclosure) = notice.disclosure.as_deref() {
+                out.push_str(&format!(" Note: {disclosure}."));
+            }
+        }
+        None => out.push_str(&format!(" Read {terminal_uri} for its output.")),
+    }
     if let Some(tail) = tail.map(str::trim).filter(|t| !t.is_empty()) {
         out.push_str(&format!("\n\nFinal output:\n```\n{tail}\n```"));
     }
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn terminal_exit_event(
     slug: &str,
-    detail_uri: &str,
+    terminal_uri: &str,
     exit_code: Option<i32>,
     runtime_secs: Option<i64>,
     tail: Option<&str>,
     reason: Option<&str>,
+    retained: Option<&RetainedNotice>,
     urgency: DeliveryUrgency,
 ) -> WakeEvent {
     WakeEvent {
@@ -62,19 +84,26 @@ fn terminal_exit_event(
         // slugs are only unique per job (and promotion auto-mints run-1, run-2,
         // … in every job), so a slug reference would cross-match every job's
         // same-slug subscriber. The slug stays in the human-readable message.
+        // The detail is the retained record, which stays readable after the
+        // terminal is replaced or released; matching stays on the terminal.
         source: WakeSource::Process {
-            reference: detail_uri.to_string(),
+            reference: terminal_uri.to_string(),
         },
         fact_kind: FACT_KIND_TERMINAL_EXIT.to_string(),
-        detail_uri: Some(detail_uri.to_string()),
+        detail_uri: Some(
+            retained
+                .map(|notice| notice.uri.clone())
+                .unwrap_or_else(|| terminal_uri.to_string()),
+        ),
         delivery: WakeDelivery::Broadcast {
             message: format_terminal_exit_message(
                 slug,
-                detail_uri,
+                terminal_uri,
                 exit_code,
                 runtime_secs,
                 tail,
                 reason,
+                retained,
             ),
         },
         urgency,
@@ -83,25 +112,46 @@ fn terminal_exit_event(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn terminal_exit_event_for_test(
+    slug: &str,
+    terminal_uri: &str,
+    retained: Option<&RetainedNotice>,
+) -> WakeEvent {
+    terminal_exit_event(
+        slug,
+        terminal_uri,
+        Some(0),
+        None,
+        None,
+        None,
+        retained,
+        DeliveryUrgency::Queue,
+    )
+}
+
 /// Route a terminal-exit wake (sync, from the PTY/promoted exit threads).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn route_terminal_exit(
     orch: &Orchestrator,
     slug: &str,
-    detail_uri: &str,
+    terminal_uri: &str,
     exit_code: Option<i32>,
     runtime_secs: Option<i64>,
     tail: Option<&str>,
     reason: Option<&str>,
+    retained: Option<&RetainedNotice>,
 ) -> Result<WakeRouteAction, String> {
     route_wake_sync(
         orch,
         terminal_exit_event(
             slug,
-            detail_uri,
+            terminal_uri,
             exit_code,
             runtime_secs,
             tail,
             reason,
+            retained,
             DeliveryUrgency::Queue,
         ),
     )
@@ -110,23 +160,26 @@ pub(crate) fn route_terminal_exit(
 /// Route a terminal-exit wake from an async context (the immediate-fire path when
 /// subscribing to an already-exited terminal). An exit observed live or at
 /// subscribe time is fresh news, so it wakes its subscriber.
+#[allow(clippy::too_many_arguments)]
 pub async fn route_terminal_exit_async(
     orch: &Orchestrator,
     slug: &str,
-    detail_uri: &str,
+    terminal_uri: &str,
     exit_code: Option<i32>,
     runtime_secs: Option<i64>,
     tail: Option<&str>,
     reason: Option<&str>,
+    retained: Option<&RetainedNotice>,
 ) -> Result<WakeRouteAction, String> {
     route_terminal_exit_at(
         orch,
         slug,
-        detail_uri,
+        terminal_uri,
         exit_code,
         runtime_secs,
         tail,
         reason,
+        retained,
         DeliveryUrgency::Queue,
     )
     .await
@@ -139,22 +192,24 @@ pub async fn route_terminal_exit_async(
 pub(crate) async fn route_terminal_exit_at(
     orch: &Orchestrator,
     slug: &str,
-    detail_uri: &str,
+    terminal_uri: &str,
     exit_code: Option<i32>,
     runtime_secs: Option<i64>,
     tail: Option<&str>,
     reason: Option<&str>,
+    retained: Option<&RetainedNotice>,
     urgency: DeliveryUrgency,
 ) -> Result<WakeRouteAction, String> {
     route_wake(
         orch,
         terminal_exit_event(
             slug,
-            detail_uri,
+            terminal_uri,
             exit_code,
             runtime_secs,
             tail,
             reason,
+            retained,
             urgency,
         ),
     )
