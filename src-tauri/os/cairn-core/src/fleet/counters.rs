@@ -33,9 +33,10 @@ pub(crate) struct FleetCounters {
 /// The counts at one instant, or their growth over a window.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PlacementCounts {
-    /// Times a waiting request surveyed and ranked the fleet.
+    /// Matches the dispatcher ran: a walk of one machine's announced room,
+    /// or one entry matched against the rooms.
     pub(crate) placement_passes: u64,
-    /// Machines judged for a request, summed over passes.
+    /// Fits evaluated, summed over those matches.
     pub(crate) fit_evaluations: u64,
     /// Offers that reached a machine.
     pub(crate) offers: u64,
@@ -104,11 +105,16 @@ impl CountedWindow {
 }
 
 impl FleetCounters {
-    /// One survey of the fleet for one waiting request, judging `machines`.
-    pub(crate) fn placement_pass(&self, machines: usize) {
-        self.placement_passes.fetch_add(1, Ordering::Relaxed);
-        self.fit_evaluations
-            .fetch_add(machines as u64, Ordering::Relaxed);
+    /// What the dispatcher did: `passes` matches (a walk of one machine's
+    /// room, or one entry placed), `fit_evaluations` fits evaluated in them.
+    pub(crate) fn placement_work(&self, passes: u64, fit_evaluations: u64) {
+        if passes > 0 {
+            self.placement_passes.fetch_add(passes, Ordering::Relaxed);
+        }
+        if fit_evaluations > 0 {
+            self.fit_evaluations
+                .fetch_add(fit_evaluations, Ordering::Relaxed);
+        }
     }
 
     /// An offer reached a machine; `reserving` when it authorized headroom.
@@ -196,10 +202,10 @@ mod tests {
     #[test]
     fn a_window_reports_growth_and_its_rate() {
         let counters = FleetCounters::default();
-        counters.placement_pass(10);
+        counters.placement_work(1, 10);
         let before = counters.totals();
-        counters.placement_pass(10);
-        counters.placement_pass(4);
+        counters.placement_work(1, 10);
+        counters.placement_work(1, 4);
         counters.offer(true);
         counters.offer(false);
         counters.refusal();

@@ -52,13 +52,6 @@ impl WarmRootSet {
         self.revision
     }
 
-    /// The roots this machine holds for `repository`, sorted, shared with
-    /// the set rather than copied.
-    pub(crate) fn commits(&self, repository: &RepositoryIdentity) -> Arc<[String]> {
-        self.held(repository)
-            .map_or_else(|| Arc::from([]), Arc::clone)
-    }
-
     pub(crate) fn holds(&self, repository: &RepositoryIdentity, commit: &str) -> bool {
         self.held(repository).is_some_and(|commits| {
             commits

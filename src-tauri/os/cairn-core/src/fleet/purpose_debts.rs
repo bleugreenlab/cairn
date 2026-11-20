@@ -297,7 +297,7 @@ impl Fleet {
     /// What ending it takes depends on where the work is, and the retirement is
     /// recorded before anything is delivered because the item may not be on the
     /// wire yet. Work this runner still holds (being prepared, queued, offered)
-    /// is ended by the runner itself: the retirement wakes the placement loop in
+    /// is ended by the runner itself: the retirement wakes the entry's own task in
     /// [`Fleet::execute_entry`], which withdraws the entry and answers
     /// `Cancelled`, and that answer is the attempt's own terminal outcome. It
     /// must not wait for a machine to claim the work first: a check's wait

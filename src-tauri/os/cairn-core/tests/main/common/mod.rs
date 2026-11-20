@@ -1053,8 +1053,31 @@ pub fn drop_link(orch: &Orchestrator, executor_id: &str) -> u64 {
             )
             .expect("re-attach the test executor");
         link.generation.store(next, Ordering::Release);
+        publish_room_on_current_link(orch, &link.pool, link.executor_id, &link.generation);
         next
     })
+}
+
+/// Announce `pool`'s room on the link `generation` holds now, as a real
+/// executor's session does from the moment it opens and on every material
+/// change after: placement happens only against an announced room. The
+/// publisher ends with that link, and the next link starts its own.
+fn publish_room_on_current_link(
+    orch: &Orchestrator,
+    pool: &ExecutorPool,
+    executor_id: &'static str,
+    generation: &Arc<AtomicU64>,
+) {
+    let link = generation.load(Ordering::Acquire);
+    let generation = generation.clone();
+    let fleet = orch.fleet.clone();
+    pool.spawn_room_publisher(move |seq, room| {
+        if generation.load(Ordering::Acquire) != link {
+            return false;
+        }
+        fleet.handle_executor_message(executor_id, link, ExecutorMessage::Room { seq, room });
+        true
+    });
 }
 
 /// The new link's first frame, as the executor sends it: every relay the
@@ -1200,6 +1223,7 @@ fn attach_executor(
         )
         .expect("attach the test executor");
     generation.store(attached_generation, Ordering::Release);
+    publish_room_on_current_link(orch, &executor_pool, executor_id, &generation);
     // Every frame below goes out on whichever link is current, as a real
     // executor's does, so a link bounced by [`drop_link`] carries on.
     TEST_LINKS.lock().unwrap().push(TestLink {

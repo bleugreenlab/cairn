@@ -529,7 +529,7 @@ fn account(
 }
 
 /// `a`, `a and b`, `a, b and c`.
-pub(crate) fn listed(items: &[String]) -> String {
+pub(super) fn listed(items: &[String]) -> String {
     match items {
         [] => String::new(),
         [one] => one.clone(),

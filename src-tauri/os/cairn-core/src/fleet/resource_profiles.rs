@@ -3130,6 +3130,29 @@ pub(super) async fn seed_memory_profile_for_test(
     }
 }
 
+/// One completion of `identity` on `context` written to the profile store, for
+/// tests outside this module: exactly one write, so exactly one publication of
+/// moved needs.
+#[cfg(test)]
+pub(super) async fn record_completion_for_test(
+    db: Arc<LocalDb>,
+    identity: &CommandResourceIdentity,
+    context: &ProfileContext,
+    peak_rss_bytes: u64,
+) {
+    update_profile(
+        db,
+        identity,
+        context,
+        1,
+        Some(peak_rss_bytes),
+        Some(1024 * 1024),
+        Some(1_000),
+    )
+    .await
+    .unwrap();
+}
+
 /// A completion the kernel's out-of-memory killer ended, for tests outside this
 /// module: `victim_resident_bytes` is the killed process's size, and
 /// `co_resident_compile_jobs` is what else of Cairn's was compiling there when

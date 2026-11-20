@@ -330,7 +330,7 @@ async fn fixers_chain_as_requests_and_each_verdict_is_its_own_request_recorded_a
     // all three are granted; then every one but beta is answered, and beta
     // waits for the test.
     let (sender, mut executor) = mpsc::unbounded_channel();
-    let generation = orch.fleet.attach_executor(sender);
+    let generation = orch.fleet.attach_announced_executor(sender);
     let fleet = orch.fleet.clone();
     let machine_repo = repo.clone();
     let (grants_tx, mut grants) = mpsc::unbounded_channel::<Grant>();

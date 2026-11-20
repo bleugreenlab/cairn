@@ -4566,8 +4566,6 @@ mod rationale_tests {
                 reason: DeclineReason::Pressure,
                 detail: Some(refusal.into()),
                 at_unix_ms: 30_000,
-                superseded_at_unix_ms: None,
-                retry_after_unix_ms: 40_000,
                 room_seq: Some(41),
             }],
             placement: None,

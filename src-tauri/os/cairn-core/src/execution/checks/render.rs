@@ -47,9 +47,7 @@ pub(super) fn decline_reason_words(
     }
 }
 
-/// One machine's decline in its own words, and, once the condition it posted
-/// has changed, that it is the last thing the machine said rather than what
-/// it says now.
+/// One machine's decline in its own words, and the room it was given under.
 pub(crate) fn describe_decline(decline: &crate::fleet::CheckDispatchDecline) -> String {
     let reason = decline_reason_words(decline.reason);
     let mut words = match decline
@@ -63,13 +61,6 @@ pub(crate) fn describe_decline(decline: &crate::fleet::CheckDispatchDecline) -> 
     if let Some(seq) = decline.room_seq {
         words.push_str(&format!("; under its room #{seq}"));
     }
-    if let Some(superseded) = decline.superseded_at_unix_ms {
-        words.push_str(&format!(
-            "; its posted state changed at {}, offerable again from {}",
-            clock_utc(superseded),
-            clock_utc(decline.retry_after_unix_ms)
-        ));
-    }
     format!("{} ({words})", decline.executor_name)
 }
 
@@ -82,53 +73,102 @@ pub(super) fn describe_declines(declines: &[crate::fleet::CheckDispatchDecline])
     })
 }
 
-/// What holds a queued request, as one sentence: what the latest placement
-/// pass did with each machine it named (or every machine's latest refusal),
-/// then the turns it waits behind. The one account of a queued request
-/// (cairn/6499): the check board writes it on a check request's row, and an
-/// executor's placement view renders it for any queued request.
+/// What holds a queued request, as one sentence: where it stands with each
+/// machine (or every machine's latest refusal, when it is not waiting in
+/// the dispatcher), then the turn it takes. The one account of a queued
+/// request (cairn/6499): the check board writes it on a check request's
+/// row, an executor's placement view renders it for any queued request, and
+/// a run's wait text quotes it.
 pub(crate) fn describe_queued_hold(
     declines: &[crate::fleet::CheckDispatchDecline],
-    placement: Option<&crate::fleet::CheckPlacementPass>,
+    placement: Option<&crate::fleet::CheckPlacementAccount>,
     turn: Option<&String>,
 ) -> Option<String> {
     let candidates = match placement {
-        Some(pass) => Some(describe_placement_pass(pass, declines)),
+        Some(account) => Some(describe_placement_account(account, declines)),
         None => describe_declines(declines),
     };
     let held: Vec<String> = [candidates, turn.cloned()].into_iter().flatten().collect();
     (!held.is_empty()).then(|| held.join("; "))
 }
 
-/// What the latest placement pass did with every machine it named, so a wait
-/// whose machines were excluded before any offer says so instead of reading
-/// as their declines. A decline the pass does not name (its machine was not
-/// considered this time) is still told, as earlier.
-///
-/// A cadence-turn row is left to the dispatch phase's own `turn`, which tells
-/// it already.
-pub(super) fn describe_placement_pass(
-    pass: &crate::fleet::CheckPlacementPass,
+/// Where a queued request stands with every machine, so a wait whose
+/// machines have no room, have said nothing yet, or are away says which,
+/// and silence never reads as a lack of room. A refusal under a room the
+/// machine has since replaced is told as superseded, never as the reason
+/// now. A decline from a machine the account does not name (one since
+/// detached) is still told, as earlier.
+pub(super) fn describe_placement_account(
+    account: &crate::fleet::CheckPlacementAccount,
     declines: &[crate::fleet::CheckDispatchDecline],
 ) -> String {
     use crate::fleet::CheckCandidateStatus;
     use cairn_common::executor_protocol::PlacementRejectionReason;
-    let mut chosen = Vec::new();
+    let mut offered = Vec::new();
     let mut declined = Vec::new();
-    let mut outranked = Vec::new();
-    // One clause per distinct reason, its machines in the pass's order.
+    let mut each = Vec::new();
+    let mut superseded = Vec::new();
+    // One clause per distinct reason, its machines in the account's order.
     let mut not_offered: Vec<(String, Vec<&str>)> = Vec::new();
-    for candidate in &pass.candidates {
-        let name = candidate.executor_name.as_str();
-        match &candidate.status {
-            CheckCandidateStatus::Offered => chosen.push(format!("offered to {name}, unanswered")),
-            CheckCandidateStatus::Chosen => {
-                chosen.push(format!("chose {name}, no offer outstanding"))
-            }
+    for machine in &account.machines {
+        let name = machine.executor_name.as_str();
+        if let Some(old) = &machine.superseded {
+            superseded.push(match old.current_seq {
+                Some(seq) => format!(
+                    "{}, room #{seq} announced since",
+                    describe_decline(&old.decline)
+                ),
+                None => format!("{}, from an earlier link", describe_decline(&old.decline)),
+            });
+        }
+        match &machine.status {
+            CheckCandidateStatus::Offered => offered.push(format!("offered to {name}, unanswered")),
             CheckCandidateStatus::Declined(decline) => declined.push(decline.clone()),
-            CheckCandidateStatus::Outranked { by } => {
-                outranked.push(format!("{name} (outranked by {by})"))
+            CheckCandidateStatus::OfferUndelivered { room_seq } => each.push(format!(
+                "{name}: the offer under its room #{room_seq} did not reach it"
+            )),
+            CheckCandidateStatus::NoRoomFits {
+                needs,
+                room_seq,
+                since_unix_ms,
+            } => each.push(format!(
+                "{name}: no announced room fits: needs {needs} (room #{room_seq}, since {})",
+                clock_utc(*since_unix_ms)
+            )),
+            CheckCandidateStatus::RefusedTwice { room_seq } => each.push(format!(
+                "{name} refused twice under its current room #{room_seq}; waiting for it to announce"
+            )),
+            CheckCandidateStatus::HoldingRoom { room_seq, hold } => each.push(match hold {
+                Some(hold) => format!("{name} holding room for it ({hold}; room #{room_seq})"),
+                None => format!(
+                    "{name} asked to hold room for it, not yet in its announced room #{room_seq}"
+                ),
+            }),
+            CheckCandidateStatus::RoomNotAnnounced {
+                attached_at_unix_ms,
+            } => each.push(match attached_at_unix_ms {
+                Some(at) => format!(
+                    "{name} has not announced room (attached {})",
+                    clock_utc(*at)
+                ),
+                None => format!("{name} has not announced room"),
+            }),
+            CheckCandidateStatus::LinkStale { since_unix_ms } => each.push(format!(
+                "{name}: link stale since {}",
+                clock_utc(*since_unix_ms)
+            )),
+            CheckCandidateStatus::Away { sentence, .. } => {
+                each.push(format!("away for now: {sentence}"))
             }
+            CheckCandidateStatus::Fits { room_seq } => each.push(format!(
+                "{name}: its room #{room_seq} fits; offered on its next announcement"
+            )),
+            CheckCandidateStatus::WaitsFor {
+                executor_name,
+                room_seq,
+            } => each.push(format!(
+                "{name}: its room #{room_seq} fits, but the work waits for {executor_name}, which could hold it and ranks ahead on memory"
+            )),
             CheckCandidateStatus::NotOffered(PlacementRejectionReason::CadenceTurn { .. }) => {}
             CheckCandidateStatus::NotOffered(reason) => {
                 let why = reason.describe();
@@ -142,37 +182,36 @@ pub(super) fn describe_placement_pass(
     let earlier: Vec<String> = declines
         .iter()
         .filter(|decline| {
-            !pass
-                .candidates
+            !account
+                .machines
                 .iter()
-                .any(|candidate| candidate.executor_name == decline.executor_name)
+                .any(|machine| machine.executor_name == decline.executor_name)
         })
         .map(describe_decline)
         .collect();
-    let mut clauses = chosen;
-    clauses.extend(pass.candidates.iter().flat_map(|candidate| {
-        candidate
+    let mut clauses = offered;
+    clauses.extend(account.machines.iter().flat_map(|machine| {
+        machine
             .unreadable_memory
             .iter()
-            .map(|failure| format!("{}: {}", candidate.executor_name, failure.describe()))
+            .map(|failure| format!("{}: {}", machine.executor_name, failure.describe()))
     }));
     clauses.extend(describe_declines(&declined));
-    if !outranked.is_empty() {
-        clauses.push(format!("eligible, not chosen: {}", outranked.join(", ")));
-    }
+    clauses.extend(each);
     clauses.extend(
         not_offered
             .into_iter()
             .map(|(why, names)| format!("not offered to {} ({why})", names.join(", "))),
     );
+    if !superseded.is_empty() {
+        clauses.push(format!("superseded refusals: {}", superseded.join(", ")));
+    }
     if !earlier.is_empty() {
         clauses.push(format!("earlier declined by {}", earlier.join(", ")));
     }
     let header = format!(
-        "latest placement pass {} (request {}, attempt {})",
-        clock_utc(pass.decided_at_unix_ms),
-        pass.request_id,
-        pass.attempt_id
+        "placement of request {} (attempt {})",
+        account.request_id, account.attempt_id
     );
     if clauses.is_empty() {
         header

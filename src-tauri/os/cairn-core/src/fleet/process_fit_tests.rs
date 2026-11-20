@@ -140,7 +140,6 @@ fn a_ten_gib_process_fits_a_large_machine_and_not_a_small_one() {
         text.starts_with("needs one process of ~12.5 GiB (rustc, suite rust-tests, 10.0 GiB measured on bgsrv-ub2 x 1.25 headroom; estimated here); this machine can give one process 10.3 GiB (13.0 GiB total, 2.7 GiB standing)"),
         "{text}"
     );
-    assert!(excluded_by_memory_kill(&reason), "a filter, never a clamp");
     assert_eq!(
         refuse(
             &demand,

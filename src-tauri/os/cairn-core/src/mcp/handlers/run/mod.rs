@@ -15063,7 +15063,10 @@ pub(crate) mod host_batch_tests {
             refusal.contains(&format!("request `{}`", control.request_id)),
             "{refusal}"
         );
-        assert!(refusal.contains("ProjectProvisioning"), "{refusal}");
+        assert!(
+            refusal.contains("provisioning another cell for this project"),
+            "{refusal}"
+        );
         assert!(refusal.contains("holder-request"), "{refusal}");
 
         // The run ends: its supervisor stops the batches it still holds.
@@ -15071,7 +15074,10 @@ pub(crate) mod host_batch_tests {
         let _ = tx.send(batch_answer(&RunFailure::Cancelled(None).text()));
         let (verdict, output) = settled_verdict_and_output(&orch, &control.request_id).await;
         assert!(verdict.starts_with("it was never placed"), "{verdict}");
-        assert!(verdict.contains("ProjectProvisioning"), "{verdict}");
+        assert!(
+            verdict.contains("provisioning another cell for this project"),
+            "{verdict}"
+        );
         assert!(verdict.contains("holder-request"), "{verdict}");
         assert!(output.contains("none of its commands ran"), "{output}");
     }

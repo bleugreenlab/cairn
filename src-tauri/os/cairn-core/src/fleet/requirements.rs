@@ -928,22 +928,6 @@ pub(super) fn nested_sandbox_preference(
         .collect()
 }
 
-/// The waiver a selection on `entry` records for `request`, when the request
-/// requires a nested Seatbelt write and the machine is only
-/// [`NestedSandboxFit::Waivable`].
-pub(super) fn nested_sandbox_waiver(
-    request: &CellRequest,
-    entry: &ExecutorConnectionState,
-) -> Option<cairn_common::executor_protocol::NestedSandboxWaiver> {
-    let capabilities = &entry.advertisement.capabilities;
-    request.executor.as_ref().filter(|selector| {
-        nested_sandbox_fit(capabilities, selector) == NestedSandboxFit::Waivable
-    })?;
-    cairn_common::executor_protocol::NestedSandboxWaiver::for_evidence(
-        capabilities.sandbox.as_ref()?,
-    )
-}
-
 /// The nested-Seatbelt fact as a refusal inventory states it.
 pub(super) fn nested_sandbox_summary(evidence: &SandboxCapabilityEvidence) -> String {
     let state = if evidence.nested_sandbox_write_context.is_none() {

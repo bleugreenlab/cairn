@@ -165,7 +165,7 @@ fn a_write_check_submission_fits_in_half_a_default_stack() {
         .build();
 
         let (sender, mut executor) = mpsc::unbounded_channel();
-        let generation = orch.fleet.attach_executor(sender);
+        let generation = orch.fleet.attach_announced_executor(sender);
         let fleet = orch.fleet.clone();
         let machine = tokio::spawn(async move {
             let entry_id = loop {

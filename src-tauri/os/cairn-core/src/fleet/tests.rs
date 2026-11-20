@@ -4,7 +4,6 @@ use cairn_common::executor_protocol::{
     AllocatorState, LivenessRefreshBlocked, LivenessRefreshPhase, RemoteConnectionPhase,
     LIVENESS_REFRESH_BOUND_MS,
 };
-use cairn_common::executor_protocol::{GithubCredentialEvidence, GithubCredentialState};
 
 struct TestListenerRotationControl {
     regenerate_at: AtomicU64,
@@ -570,7 +569,7 @@ async fn cancelling_unclaimed_work_parked_on_an_update_prevents_later_placement(
     let temp = tempfile::tempdir().unwrap();
     let orch = Arc::new(test_orchestrator(temp.path()).await);
     let (sender, mut machine) = mpsc::unbounded_channel();
-    let generation = orch.fleet.attach_executor(sender);
+    let generation = orch.fleet.attach_announced_executor(sender);
     orch.fleet
         .set_update_hold_for_test(COLOCATED_EXECUTOR_ID, true);
     let request = provenance_request();
@@ -581,14 +580,7 @@ async fn cancelling_unclaimed_work_parked_on_an_update_prevents_later_placement(
             if let Some(entry) = orch
                 .fleet
                 .queue
-                .with_entry_by_identity(&identity, |entry| {
-                    matches!(
-                        entry.latest_placement().map(|decision| &decision.outcome),
-                        Some(PlacementOutcome::Waiting { .. })
-                    )
-                    .then(|| entry.id.clone())
-                })
-                .flatten()
+                .with_entry_by_identity(&identity, |entry| entry.id.clone())
             {
                 break entry;
             }
@@ -596,7 +588,15 @@ async fn cancelling_unclaimed_work_parked_on_an_update_prevents_later_placement(
         }
     })
     .await
-    .expect("the pinned batch parks on the update without an offer");
+    .expect("the pinned batch is queued");
+    // Long enough to have joined the dispatcher and been matched against the
+    // room the machine announced, were the update hold not keeping it off.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !std::iter::from_fn(|| machine.try_recv().ok())
+            .any(|frame| matches!(frame, ExecutorMessage::Offer { .. })),
+        "the pinned batch parks on the update without an offer"
+    );
     assert!(orch
         .fleet
         .claimed_executor_of(&request.request_id)
@@ -640,7 +640,7 @@ async fn a_batch_stop_before_grant_withdraws_but_after_grant_waits_for_the_machi
         let temp = tempfile::tempdir().unwrap();
         let orch = Arc::new(test_orchestrator(temp.path()).await);
         let (sender, mut machine) = mpsc::unbounded_channel();
-        let generation = orch.fleet.attach_executor(sender);
+        let generation = orch.fleet.attach_announced_executor(sender);
         let stop = Arc::new(PlacementStop::default());
         let submitting = scratch_submission_with_stop(&orch, Some(stop.clone()), true).await;
         let offered = loop {
@@ -1047,7 +1047,6 @@ fn the_refusal_names_the_machine_the_phase_and_a_restart() {
 use crate::db::DbState;
 use crate::services::testing::TestServicesBuilder;
 use crate::storage::{LocalDb, SearchIndex};
-use cairn_codec::testutil::{commit_all, init_repo, write_file};
 use cairn_common::executor_protocol::{
     CellOccupancy, GitObjectFormat, MachineMemory, ResidencyFence, ResidentOccupancyEvidence,
     WarmRepositoryRoots, WarmRootChange, WarmRootInventory, EXECUTOR_LINK_STALL_REMEDIATION_MS,
@@ -2631,13 +2630,7 @@ async fn an_elapsed_horizon_under_a_live_substrate_diagnoses_rather_than_panicki
     request.executor = None;
     request.wait_horizon_unix_ms = unix_time_ms().saturating_sub(1);
 
-    let outcome = pool
-        .select_executor(
-            &request,
-            None,
-            &ActivePlacementPolicy::default_profile(),
-            None,
-        )
+    let outcome = place_through_dispatcher(&pool, &request, None)
         .await
         .unwrap_err();
 
@@ -3167,128 +3160,6 @@ async fn a_class_suites_build_jobs_never_price_an_ad_hoc_compile() {
     );
 }
 
-/// The why-rust specimen (cairn/7303; cairn://p/cairn/execution/task/why-rust):
-/// the combined Rust review wave on a bginf-sp2-sized machine, 20 cores in two
-/// compile slots of ten under a 105.5 GiB executor bound. Merging its members'
-/// per-job models once charged it 144.52 GiB, rust-lint's marginal from a
-/// two-job run times nineteen, above the bound, and the machine was excluded.
-/// Each member is now priced at the machine's slot width from the tree it
-/// reached there, and a sequential wave is its heaviest member: it fits, and
-/// asks one slot's cores.
-#[tokio::test]
-async fn the_combined_rust_wave_fits_a_bginf_sp2_sized_machine() {
-    use cairn_common::executor_protocol::{
-        BuildJobs, ExecutionAllocation, NoCapReason, PeakProcess, SlotPrice,
-    };
-    const GIB: u64 = 1 << 30;
-    let db = Arc::new(crate::storage::migrated_test_db("why-rust-wave.db").await);
-    let mut capabilities = capabilities_with_cores(20);
-    capabilities.memory_budget_bytes = Some(105 * GIB);
-    let context = ReservationPlan::context_for("device", "executor", &capabilities);
-    let mut request = provenance_request();
-    request.command_class = CellCommandClass::CargoTest;
-    // The largest process of each member as bginf-sp2's rows hold it, and
-    // the tree a cold run reached there at ten jobs.
-    let members = [
-        ("rust-lint", 16_739_962_880, 24 * GIB),
-        ("rust-tests", 29_816_995_840, 42 * GIB),
-        ("source-scans", 29_603_549_184, 38 * GIB),
-    ];
-    for (suite, largest, tree) in members {
-        resource_profiles::observe_suite(
-            db.clone(),
-            Some(&format!("{}/{suite}", request.project_id)),
-            CellCommandClass::CargoTest,
-            &context,
-            &CellExecutionMeta {
-                stop: None,
-                peak_process: Some(PeakProcess {
-                    bytes: largest,
-                    name: Some("rustc".into()),
-                }),
-                peak_rss_bytes: Some(tree),
-                warmth: Some(ExecutionWarmth::Cold),
-                allocation: Some(
-                    ExecutionAllocation::uncapped(10, NoCapReason::CapNotImplemented, None, 1)
-                        .with_build_jobs(BuildJobs::new(10)),
-                ),
-                ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
-            },
-            resource_profiles::CompletionKind::Succeeded,
-            resource_profiles::MachineAdmission::default(),
-            resource_profiles::CompletedSource::default(),
-        )
-        .await;
-    }
-    let item = |suite: &str| ProcessBatchItem {
-        command_resource_identity: Some(CommandResourceIdentity {
-            version: 1,
-            key: format!("{suite}:cold"),
-            suite: Some(suite.into()),
-        }),
-        ..cache_batch_item(Vec::new())
-    };
-    let wave = ProcessBatch {
-        files: Vec::new(),
-        runtime_packages: Vec::new(),
-        sequential: true,
-        stop_on_error: false,
-        sandbox_mode: ProcessSandboxMode::Unconfined,
-        timeout_bases: Vec::new(),
-        items: members.iter().map(|(suite, ..)| item(suite)).collect(),
-        runner_context_id: None,
-        execution_residency: None,
-        containment: None,
-        node_scratch: None,
-    };
-    let resolved = ReservationPlan::new(db, &request, Some(&wave))
-        .resolve_for(
-            &request,
-            "device",
-            "executor",
-            &capabilities,
-            resource_profiles::DurationContext {
-                class: CellCommandClass::CargoTest,
-                warmth: ExecutionWarmth::Cold,
-                now_unix_ms: NOW,
-            },
-        )
-        .await;
-    assert_eq!(
-        resolved.reservation.memory_charge_bytes(),
-        42 * GIB,
-        "the wave is its heaviest member at the slot width: {:?}",
-        resolved.reservation
-    );
-    assert_eq!(resolved.reservation.concurrency_units, 10, "one slot");
-    assert_eq!(
-        resolved.rationale.slot_price,
-        Some(SlotPrice {
-            jobs: 10,
-            tree_bytes: 42 * GIB
-        })
-    );
-
-    let bound = 105 * GIB + GIB / 2;
-    let (key, mut sp2) = fleet_entry("bginf-sp2", "linux", 0, &[]);
-    measured(&mut sp2, 0.01, 120 << 30, 500 << 30);
-    Arc::make_mut(&mut sp2.advertisement)
-        .capabilities
-        .service_bounds = Some(cairn_common::wire_vocabulary::ServiceBounds {
-        memory_max_bytes: Some(bound),
-        ..Default::default()
-    });
-    let draft = choose_executor_with(
-        &HashMap::from([(key.clone(), sp2)]),
-        &spillable_request(),
-        &HashMap::from([(key, resolved)]),
-        |_, _| SyncCost::Known(0),
-        NOW,
-    )
-    .unwrap();
-    assert_eq!(chosen(&draft).executor_id, "bginf-sp2");
-}
-
 /// A reservation has two independent halves, and the record must carry both.
 ///
 /// Concurrency comes from the caller and memory/disk come from the learned
@@ -3515,45 +3386,40 @@ fn enqueue_owned_entry(pool: &Fleet, key: &RequestIdentity) -> String {
         .0
 }
 
+/// A run's wait text is the queued request's account, the one the check row
+/// and the placement view read, until a machine claims it.
 #[test]
-fn unplaced_wait_reports_the_queued_placement_diagnostic_until_offered() {
+fn unplaced_wait_quotes_the_queued_account_until_claimed() {
     let pool = Fleet::default();
     let key = ("parked-summary".to_string(), "attempt".to_string());
     let entry = enqueue_owned_entry(&pool, &key);
-    assert!(pool
-        .unplaced_wait(&key.0)
-        .unwrap()
-        .contains("no machine has refused it yet"));
-    let mut request = provenance_request();
-    request.request_id.clone_from(&key.0);
-    request.attempt_id.clone_from(&key.1);
-    for diagnostic in [
-        "waiting on `fedora` to finish its self-update.",
-        "held from new admission: `fedora` is drained for maintenance.",
-    ] {
-        pool.queue.record_placement(&placement_decision(
-            &request,
-            42,
-            None,
-            None,
-            PlacementOutcome::Waiting {
-                diagnostic: diagnostic.into(),
-            },
-            Vec::new(),
-        ));
-        let summary = pool.unplaced_wait(&key.0).unwrap();
-        assert!(summary.contains(diagnostic), "{summary}");
-        assert!(
-            !summary.contains("no machine has refused it yet"),
-            "{summary}"
-        );
-    }
-    assert!(pool.queue.offer(&entry, "fedora", "fedora", 3, 2_000));
     let summary = pool.unplaced_wait(&key.0).unwrap();
-    assert!(summary.contains("offered to"), "{summary}");
-    assert!(!summary.contains("held from new admission"), "{summary}");
+    assert!(
+        summary.starts_with("waiting to be placed since "),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("no machine has refused it yet"),
+        "{summary}"
+    );
+    assert!(pool.queue.offer(&entry, "fedora", "fedora", 3, 2_000));
+    pool.queue.decline(
+        &entry,
+        "fedora",
+        3,
+        DeclineReason::Pressure,
+        Some("cpu 97%".into()),
+        None,
+        2_500,
+    );
+    let summary = pool.unplaced_wait(&key.0).unwrap();
+    assert!(
+        summary.contains("declined by fedora (host pressure: cpu 97%)"),
+        "{summary}"
+    );
+    assert!(pool.queue.offer(&entry, "fedora", "fedora", 3, 3_000));
     assert_eq!(
-        pool.queue.claim(&entry, "fedora", 3, 2_100),
+        pool.queue.claim(&entry, "fedora", 3, 3_100),
         queue::ClaimVerdict::Granted
     );
     assert!(pool.unplaced_wait(&key.0).is_none());
@@ -3594,7 +3460,6 @@ fn check_dispatch_phase_reports_placing_with_the_latest_decline() {
         DeclineReason::Pressure,
         Some("memory floor".into()),
         None,
-        None,
         2_500,
     );
     assert_eq!(
@@ -3609,8 +3474,6 @@ fn check_dispatch_phase_reports_placing_with_the_latest_decline() {
                     reason: DeclineReason::Pressure,
                     detail: Some("memory floor".into()),
                     at_unix_ms: 2_500,
-                    superseded_at_unix_ms: None,
-                    retry_after_unix_ms: 3_500,
                     room_seq: None,
                 }],
             },
@@ -3670,7 +3533,6 @@ fn a_queued_request_is_accounted_for_by_request_id_with_the_room_it_was_refused_
         DeclineReason::Pressure,
         Some(refusal.into()),
         None,
-        None,
         2_500,
     );
     pool.queue.note_decline_room(&entry, "bgsrv-ub", 41);
@@ -3713,7 +3575,6 @@ fn request_dispatch_phase_reads_a_write_check_batch_by_its_own_identity() {
         DeclineReason::Pressure,
         Some("cpu 97%".into()),
         None,
-        None,
         2_500,
     );
     assert_eq!(
@@ -3727,8 +3588,6 @@ fn request_dispatch_phase_reads_a_write_check_batch_by_its_own_identity() {
                 reason: DeclineReason::Pressure,
                 detail: Some("cpu 97%".into()),
                 at_unix_ms: 2_500,
-                superseded_at_unix_ms: None,
-                retry_after_unix_ms: 3_500,
                 room_seq: None,
             }],
         })
@@ -3751,124 +3610,415 @@ fn request_dispatch_phase_reads_a_write_check_batch_by_its_own_identity() {
     );
 }
 
-/// The cairn/7189 shape: two machines excluded before any offer by the
-/// memory ceiling, one that was asked and declined, and one drained. The
-/// dispatch phase carries the latest pass under the request's own identity
-/// with every one of them, and only the machine that was asked is a
-/// decline.
-#[test]
-fn request_dispatch_phase_carries_every_candidate_of_the_latest_pass() {
-    let pool = Fleet::default();
-    let key = ("parked-wave".to_string(), "parked-attempt".to_string());
-    let entry = enqueue_owned_entry(&pool, &key);
-    assert!(pool.queue.offer(&entry, "fedora", "fedora", 3, 2_000));
-    pool.queue.decline(
-        &entry,
-        "fedora",
-        3,
-        DeclineReason::Pressure,
-        Some("owed 53.9 GiB + 67.3 GiB for this request > available 94.6 GiB".into()),
-        None,
-        None,
-        2_500,
-    );
-    let mut request = provenance_request();
-    request.request_id.clone_from(&key.0);
-    request.attempt_id.clone_from(&key.1);
-    let unreadable = |name: &str| {
-        if name == "mac" {
-            vec![cairn_common::executor_protocol::MemoryEvidenceFailure {
-                query: "suite_evidence".into(),
-                error_class: "schema".into(),
-                error: "no such column: job_census_samples".into(),
-            }]
-        } else {
-            Vec::new()
-        }
-    };
-    let row = |name: &str, reason: PlacementRejectionReason| PlacementRejection {
-        unreadable_memory: unreadable(name),
-        drain_blockers: Vec::new(),
-        executor_name: name.into(),
-        executor_id: name.into(),
-        reason,
-        prediction: None,
-    };
-    let ceiling = |estimate_bytes| PlacementRejectionReason::ExceedsMemoryCeiling {
-        estimate_bytes,
-        ceiling_bytes: 72_215_848_550,
-        killed_here: None,
-    };
-    pool.queue.record_placement(&placement_decision(
-        &request,
-        3_000,
-        None,
-        None,
-        PlacementOutcome::Waiting {
-            diagnostic: "waiting".into(),
-        },
-        vec![
-            row("bginf-sp1", ceiling(73_152_409_600)),
-            row("bginf-sp2", ceiling(72_489_070_720)),
-            row(
-                "fedora",
-                PlacementRejectionReason::Declined {
-                    reason: DeclineReason::Pressure,
-                    detail: Some("stale words".into()),
-                    declined_at_unix_ms: 2_500,
-                },
-            ),
-            row("mac", PlacementRejectionReason::Drained),
-        ],
-    ));
+/// The kind of an account row, for assertions that name it.
+fn status_kind(status: &CheckCandidateStatus) -> &'static str {
+    match status {
+        CheckCandidateStatus::Offered => "offered",
+        CheckCandidateStatus::Declined(_) => "declined",
+        CheckCandidateStatus::OfferUndelivered { .. } => "undelivered",
+        CheckCandidateStatus::NoRoomFits { .. } => "no room fits",
+        CheckCandidateStatus::RefusedTwice { .. } => "refused twice",
+        CheckCandidateStatus::HoldingRoom { .. } => "holding room",
+        CheckCandidateStatus::RoomNotAnnounced { .. } => "not announced",
+        CheckCandidateStatus::LinkStale { .. } => "link stale",
+        CheckCandidateStatus::Away { .. } => "away",
+        CheckCandidateStatus::Fits { .. } => "fits",
+        CheckCandidateStatus::WaitsFor { .. } => "waits for",
+        CheckCandidateStatus::NotOffered(_) => "not offered",
+    }
+}
 
-    let Some(CheckDispatchPhase::Placing {
-        declines,
-        placement,
-        ..
-    }) = pool.request_dispatch_phase(&key)
-    else {
-        panic!("a queued request is placing");
-    };
-    let fedora = CheckDispatchDecline {
-        executor_name: "fedora".into(),
-        reason: DeclineReason::Pressure,
-        detail: Some("owed 53.9 GiB + 67.3 GiB for this request > available 94.6 GiB".into()),
-        at_unix_ms: 2_500,
-        superseded_at_unix_ms: None,
-        retry_after_unix_ms: 3_500,
-        room_seq: None,
-    };
-    assert_eq!(declines, vec![fedora.clone()]);
-    let candidate = |name: &str, status| CheckPlacementCandidate {
-        unreadable_memory: unreadable(name),
-        executor_name: name.into(),
-        status,
-    };
-    assert_eq!(
-        placement,
-        Some(CheckPlacementPass {
-            request_id: "parked-wave".into(),
-            attempt_id: "parked-attempt".into(),
-            decided_at_unix_ms: 3_000,
-            candidates: vec![
-                candidate(
-                    "bginf-sp1",
-                    CheckCandidateStatus::NotOffered(ceiling(73_152_409_600))
-                ),
-                candidate(
-                    "bginf-sp2",
-                    CheckCandidateStatus::NotOffered(ceiling(72_489_070_720))
-                ),
-                candidate("fedora", CheckCandidateStatus::Declined(fedora)),
-                candidate(
-                    "mac",
-                    CheckCandidateStatus::NotOffered(PlacementRejectionReason::Drained)
-                ),
-            ],
-        }),
-        "every candidate of the pass survives, and the machine's own words win over the pass's copy"
+/// A fleet of five linux machines, one per way a machine can stand with
+/// waiting work: `refuser`, `small` and `stale` announce a room with no
+/// memory available, `silent` is attached and has announced nothing, and
+/// `private-away` (publicly `public-away`) is drained by an operator once
+/// the work is queued, as `stale`'s link goes silent then ([`go_stale`]).
+fn account_fleet(now: u64) -> Fleet {
+    const GIB: u64 = 1 << 30;
+    let pool = Fleet::default();
+    let mut connections = HashMap::new();
+    for id in ["refuser", "small", "silent", "stale", "private-away"] {
+        let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
+        if id == "private-away" {
+            entry.identity.display_name = "public-away".into();
+        }
+        connections.insert(id, entry);
+    }
+    *pool.lock_connections() = connections;
+    for id in ["refuser", "small", "stale", "private-away"] {
+        pool.announce_room_with_memory_for_test(id, 1, Some((0, 512 * GIB)));
+    }
+    pool.dispatcher_attached("silent", 1);
+    pool
+}
+
+/// `stale`'s link has heard nothing for ten minutes, and an operator drains
+/// `private-away`. A pin to a link already stale, or to a machine already
+/// drained, is refused at once, so both happen once the work has queued.
+fn go_stale(pool: &Fleet, now: u64) {
+    let mut connections = pool.lock_connections();
+    connections.get_mut("stale").unwrap().last_progress_unix_ms = now - 10 * 60_000;
+    let away = connections.get_mut("private-away").unwrap();
+    away.drained = true;
+    away.drain_blockers = vec![cairn_common::executor_protocol::DrainBlocker {
+        owner: "operator".into(),
+        reason: "storage repair".into(),
+        generation: 3,
+        incarnation: None,
+        estimate: None,
+        admission_effect: Default::default(),
+    }];
+}
+
+/// cairn/6499 under the dispatcher: one account says why a queued request
+/// waits, machine by machine, whether it may spill or is pinned: a refusal
+/// verbatim with the room it came under, a room that fits nothing with what
+/// it is short of, a machine that has announced nothing (silence, never
+/// "no room"), a stale link, and a machine away for now, named publicly.
+/// A refusal under a room the machine has replaced is superseded, never the
+/// reason now.
+#[tokio::test]
+async fn one_account_says_why_a_pinned_or_spillable_request_waits_on_each_machine() {
+    const REFUSAL: &str = "owed 6.5 GiB + 2.0 GiB for this request > available 6.4 GiB";
+    let policy = ActivePlacementPolicy::default_profile();
+    let expected = [
+        ("refuser", "declined"),
+        ("small", "no room fits"),
+        ("silent", "not announced"),
+        ("stale", "link stale"),
+        ("public-away", "away"),
+    ];
+    let phrases = [
+        "declined by refuser (host pressure: owed 6.5 GiB + 2.0 GiB for this request > available 6.4 GiB; under its room #1)",
+        "small: no announced room fits: needs ",
+        "silent has not announced room (attached ",
+        "stale: link stale since ",
+        "away for now: public-away held from new admission: operator generation 3: storage repair",
+    ];
+    // Spill-eligible first, then pinned to each machine in turn.
+    let pins: Vec<Option<&str>> = std::iter::once(None)
+        .chain(
+            ["refuser", "small", "silent", "stale", "private-away"]
+                .into_iter()
+                .map(Some),
+        )
+        .collect();
+    for (case, pin) in pins.into_iter().enumerate() {
+        let now = unix_time_ms();
+        let pool = account_fleet(now);
+        let mut request = spillable_request();
+        request.request_id = format!("wait-{case}");
+        request.pinned_executor_id = pin.map(str::to_string);
+        request.wait_horizon_unix_ms = now + 600_000;
+        let (entry, _waiter) = pool
+            .queue
+            .enqueue(
+                queue::NewEntry {
+                    request: request.clone(),
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                    standing: false,
+                },
+                now,
+            )
+            .unwrap();
+        let _deliveries = pool
+            .join_dispatcher(&entry, &request, None, &policy)
+            .await
+            .unwrap_or_else(|outcome| panic!("{pin:?} waits rather than {outcome:?}"));
+        go_stale(&pool, now);
+        if matches!(pin, None | Some("refuser")) {
+            // The machine refuses it under its room #1, in its own words.
+            assert!(pool.queue.offer(&entry, "refuser", "refuser", 1, now));
+            pool.queue.decline(
+                &entry,
+                "refuser",
+                1,
+                DeclineReason::Pressure,
+                Some(REFUSAL.into()),
+                None,
+                now + 1,
+            );
+            pool.queue.note_decline_room(&entry, "refuser", 1);
+            pool.dispatcher_declined(&entry, "refuser");
+        }
+        let Some(CheckDispatchPhase::Placing {
+            declines,
+            placement: Some(account),
+            turn,
+            ..
+        }) = pool.queued_request_account(&request.request_id)
+        else {
+            panic!("{pin:?}: a queued request in the dispatcher has an account");
+        };
+        let kinds: HashMap<&str, &str> = account
+            .machines
+            .iter()
+            .map(|machine| (machine.executor_name.as_str(), status_kind(&machine.status)))
+            .collect();
+        let held = crate::execution::checks::describe_queued_hold(
+            &declines,
+            Some(&account),
+            turn.as_ref(),
+        )
+        .unwrap();
+        for ((name, kind), phrase) in expected.iter().zip(phrases) {
+            let named = pin.is_none_or(|pin| {
+                pin == *name || (pin == "private-away" && *name == "public-away")
+            });
+            if named {
+                assert_eq!(kinds.get(name), Some(kind), "{pin:?}: {held}");
+                assert!(held.contains(phrase), "{pin:?}: {phrase} in {held}");
+            } else {
+                assert_eq!(kinds.get(name), None, "{pin:?}: {held}");
+            }
+        }
+        assert!(!held.contains("private-away"), "{held}");
+        if matches!(pin, None | Some("small")) {
+            assert!(held.contains("of memory, 0.0 GiB available"), "{held}");
+        }
+        if pin.is_none() {
+            // The same figures announced again move the seq, but the machine
+            // would refuse the same need against them: the refusal stands.
+            pool.announce_room_with_memory_for_test("refuser", 1, Some((0, 512 << 30)));
+            let Some(CheckDispatchPhase::Placing {
+                declines,
+                placement: Some(account),
+                ..
+            }) = pool.queued_request_account(&request.request_id)
+            else {
+                panic!("still queued");
+            };
+            let refuser = account
+                .machines
+                .iter()
+                .find(|machine| machine.executor_name == "refuser")
+                .unwrap();
+            assert_eq!(status_kind(&refuser.status), "declined");
+            assert!(refuser.superseded.is_none());
+            let held =
+                crate::execution::checks::describe_queued_hold(&declines, Some(&account), None)
+                    .unwrap();
+            assert!(held.contains(phrases[0]), "{held}");
+
+            // New figures replace the room the refusal came under.
+            pool.announce_room_with_memory_for_test("refuser", 1, Some((0, 256 << 30)));
+            let Some(CheckDispatchPhase::Placing {
+                declines,
+                placement: Some(account),
+                ..
+            }) = pool.queued_request_account(&request.request_id)
+            else {
+                panic!("still queued");
+            };
+            let refuser = account
+                .machines
+                .iter()
+                .find(|machine| machine.executor_name == "refuser")
+                .unwrap();
+            assert_eq!(status_kind(&refuser.status), "no room fits");
+            assert_eq!(
+                refuser
+                    .superseded
+                    .as_ref()
+                    .map(|old| (old.decline.room_seq, old.current_seq)),
+                Some((Some(1), Some(3)))
+            );
+            let held =
+                crate::execution::checks::describe_queued_hold(&declines, Some(&account), None)
+                    .unwrap();
+            assert!(!held.contains("declined by refuser"), "{held}");
+            assert!(
+                held.contains(&format!(
+                    "superseded refusals: refuser (host pressure: {REFUSAL}; under its room #1), room #3 announced since"
+                )),
+                "{held}"
+            );
+        }
+    }
+}
+
+/// Work waiting on a machine's update is told so while it waits, in the
+/// update's own words, without promising a safe restart time while work
+/// remains there; the refusal at its horizon records the machine as
+/// update-pending with no bound. Before cairn/6382 work parked on bbs's
+/// 68-minute drain left no decision anywhere.
+#[tokio::test]
+async fn a_wait_on_a_machines_update_records_an_unknown_safe_bound_while_work_remains() {
+    let pool = Fleet::default();
+    let now = unix_time_ms();
+    let (executor_id, mut connection) = fleet_entry_at("bbs", "linux", 0, &[], now);
+    connection.executor_build_id = Some("build-0759".into());
+    Arc::make_mut(&mut connection.snapshot).granted_attempts =
+        vec![cairn_common::executor_protocol::GrantedAttempt {
+            request_id: "long-lane".into(),
+            attempt_id: "a".into(),
+        }];
+    pool.lock_connections()
+        .insert(executor_id.clone(), connection);
+    pool.record_executor_artifact_build("x86_64-unknown-linux-gnu", Ok("build-1329".into()));
+    pool.advance_self_update_rollout(now, |_| Ok(())).unwrap();
+    assert!(pool.lock_connections()[&executor_id].update_hold);
+    runtime_update_hold_fixture(pool.lock_connections().get_mut(&executor_id).unwrap(), true);
+
+    let mut request = targeted_request("linux");
+    request.repository = spillable_request().repository;
+    request.executor = Some(ExecutorSelector {
+        name: Some("bbs".into()),
+        ..ExecutorSelector::default()
+    });
+    request.wait_horizon_unix_ms = unix_time_ms() + 400;
+    let policy = ActivePlacementPolicy::default_profile();
+    let (entry, _waiter) = pool
+        .queue
+        .enqueue(
+            queue::NewEntry {
+                request: request.clone(),
+                admission_kind: CellAdmissionKind::Command,
+                interactive: false,
+                execution_residency: None,
+                standing: false,
+            },
+            now,
+        )
+        .unwrap();
+    let mut deliveries = Some(
+        pool.join_dispatcher(&entry, &request, None, &policy)
+            .await
+            .expect("work naming an updating machine waits for it"),
     );
+    let wait = pool.unplaced_wait(&request.request_id).unwrap();
+    assert!(
+        wait.contains(
+            "away for now: bbs being emptied for an executor update (1 in flight, request long-lane"
+        ),
+        "{wait}"
+    );
+    assert!(wait.contains("cairn://executors/bbs"), "{wait}");
+    assert!(wait.contains("no safe restart time"), "{wait}");
+    assert!(!wait.contains("expected back by"), "{wait}");
+    // An unmeasured scheduling budget never promises a safe restart.
+    assert_eq!(
+        pool.self_update.lock().unwrap().returns_by(&executor_id),
+        None
+    );
+
+    let _joined = super::assignments::JoinedDispatcher {
+        pool: pool.clone(),
+        entry_id: entry.clone(),
+    };
+    pool.await_assignment(&entry, &request, None, &policy, &mut deliveries)
+        .await
+        .expect_err("the horizon arrives before the update ends");
+    let bounds: Vec<Option<u64>> = pool
+        .placements_naming("bbs")
+        .into_iter()
+        .flat_map(|decision| decision.rejected)
+        .filter_map(|rejection| match rejection.reason {
+            PlacementRejectionReason::UpdatePending { returns_by_unix_ms } => {
+                Some(returns_by_unix_ms)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!bounds.is_empty(), "the refusal names the updating machine");
+    assert!(bounds.iter().all(Option::is_none), "{bounds:?}");
+}
+
+/// An enrolled machine away within its link grace is a bounded wait for
+/// work that names it, told as reconnecting; a pin or a public name waits
+/// the same, and an expired absence is refused rather than waited on.
+#[tokio::test]
+async fn detached_targeted_requests_wait_only_within_the_return_bound() {
+    let pool = Fleet::default();
+    pool.declare_enrolled_remote("win", "windows-builder", "windows", "x86_64");
+    let mut request = targeted_request("windows");
+    request.repository = spillable_request().repository;
+    // The absence is stamped when the enrollments are read, so `now` comes
+    // after: the return bound is then within the grace of `now`.
+    let detached = pool.unattached_enrolled_remotes();
+    let now = unix_time_ms();
+    let attached = HashMap::new();
+    let survey = survey_candidates(&attached, &detached, &request, now)
+        .expect("a detached enrollment is a bounded wait, not no matching executor");
+    let win = survey
+        .rejected
+        .iter()
+        .find(|rejection| rejection.executor_id == "win")
+        .unwrap_or_else(|| panic!("the enrollment is named: {:?}", survey.rejected));
+    assert!(
+        matches!(win.reason,
+            PlacementRejectionReason::Reconnecting { returns_by_unix_ms }
+                if returns_by_unix_ms > now
+                    && returns_by_unix_ms <= now + ENVIRONMENT_LEASE_GRACE_MS
+        ),
+        "{:?}",
+        survey.rejected
+    );
+    request.wait_horizon_unix_ms = now + 600_000;
+    let (entry, _waiter) = pool
+        .queue
+        .enqueue(
+            queue::NewEntry {
+                request: request.clone(),
+                admission_kind: CellAdmissionKind::Command,
+                interactive: false,
+                execution_residency: None,
+                standing: false,
+            },
+            now,
+        )
+        .unwrap();
+    let _deliveries = pool
+        .join_dispatcher(
+            &entry,
+            &request,
+            None,
+            &ActivePlacementPolicy::default_profile(),
+        )
+        .await
+        .expect("the reconnect is waited for");
+    let wait = pool.unplaced_wait(&request.request_id).unwrap();
+    assert!(wait.contains("windows-builder"), "{wait}");
+    assert!(wait.contains("reconnecting"), "{wait}");
+
+    for named in [false, true] {
+        // Each from a fresh enrollment: the previous case expired its absence.
+        let pool = Fleet::default();
+        pool.declare_enrolled_remote("win", "windows-builder", "windows", "x86_64");
+        let mut pinned = request.clone();
+        pinned.executor = None;
+        if named {
+            pinned.executor = Some(ExecutorSelector {
+                name: Some("windows-builder".into()),
+                ..Default::default()
+            });
+        } else {
+            pinned.pinned_executor_id = Some("win".into());
+        }
+        assert!(
+            survey_candidates(
+                &HashMap::new(),
+                &pool.unattached_enrolled_remotes(),
+                &pinned,
+                unix_time_ms()
+            )
+            .is_ok(),
+            "named {named}: a detached enrollment within its grace is waited for"
+        );
+        pool.stage_link_absent("win", ENVIRONMENT_LEASE_GRACE_MS + 1_000);
+        assert!(
+            survey_candidates(
+                &HashMap::new(),
+                &pool.unattached_enrolled_remotes(),
+                &pinned,
+                unix_time_ms(),
+            )
+            .is_err(),
+            "an expired detached pin must not wait forever"
+        );
+    }
 }
 
 #[test]
@@ -5252,6 +5402,7 @@ async fn a_request_waits_out_an_attaching_supervisor_within_its_horizon() {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(40)).await;
         attaching.attach_executor(tx);
+        announce_every_room(&attaching);
         attaching.clear_colocated_substrate();
     });
     let request = CellRequest {
@@ -5302,10 +5453,11 @@ async fn a_request_waits_out_an_attaching_supervisor_within_its_horizon() {
         population_source_root: None,
     };
 
-    let sender = pool
-        .wait_for_executor(request.wait_horizon_unix_ms)
+    let sender = place_through_dispatcher(&pool, &request, None)
         .await
-        .unwrap();
+        .unwrap()
+        .selected
+        .sender;
     sender
         .send(ExecutorMessage::Granted {
             entry_id: "entry".into(),
@@ -5976,13 +6128,7 @@ async fn absent_executor_fails_fast_with_typed_unavailable() {
         publication: None,
     };
     let started = Instant::now();
-    let outcome = pool
-        .select_executor(
-            &request,
-            None,
-            &ActivePlacementPolicy::default_profile(),
-            None,
-        )
+    let outcome = place_through_dispatcher(&pool, &request, None)
         .await
         .unwrap_err();
     assert!(started.elapsed() < Duration::from_millis(20));
@@ -5993,255 +6139,6 @@ async fn absent_executor_fails_fast_with_typed_unavailable() {
             ..
         }
     ));
-}
-
-fn distance_slot(head: &str) -> cairn_common::executor_protocol::SlotState {
-    cairn_common::executor_protocol::SlotState {
-        cell_id: format!("slot-{head}"),
-        project_id: "p".into(),
-        head_commit: Some(head.into()),
-        last_distance: Some(cairn_common::cache_distance::MeasuredDistance {
-            target_commit: "old-target".into(),
-            distance: Default::default(),
-            measured_at_unix_ms: NOW,
-        }),
-        last_used_unix_ms: NOW,
-        size_bytes: 0,
-        lifecycle: cairn_common::executor_protocol::PersistentCellLifecycle::Idle,
-        measured_bytes: None,
-        measured_at_unix_ms: None,
-    }
-}
-
-fn distance_request(path: &std::path::Path) -> CellRequest {
-    let mut request = targeted_request("linux");
-    request.repository = RepositoryLocator::ColocatedPath {
-        project_id: "p".into(),
-        repository_id: "repo".into(),
-        absolute_path: path.to_string_lossy().into_owned(),
-    };
-    request.base_commit = "current-target".into();
-    request
-}
-
-#[test]
-fn cache_distance_measures_current_health_heads_and_memoizes_success_and_failure_per_placement() {
-    use cairn_common::cache_distance::CacheDistance;
-    use cairn_common::executor_protocol::PersistentCellLifecycle;
-    let directory = tempfile::tempdir().unwrap();
-    let mut request = distance_request(directory.path());
-    let (_, mut first) = fleet_entry("first", "linux", 0, &[]);
-    Arc::make_mut(&mut first.health).inventory.authority = InventoryAuthorityState::Authoritative;
-    let mut active = distance_slot("active");
-    active.lifecycle = PersistentCellLifecycle::Active;
-    let mut foreign = distance_slot("foreign");
-    foreign.project_id = "other".into();
-    let mut no_head = distance_slot("missing");
-    no_head.head_commit = None;
-    Arc::make_mut(&mut first.health).slots = vec![
-        active,
-        foreign,
-        no_head,
-        distance_slot("near"),
-        distance_slot("unknown"),
-    ];
-    let (_, mut second) = fleet_entry("second", "linux", 0, &[]);
-    Arc::make_mut(&mut second.health).inventory.authority = InventoryAuthorityState::Authoritative;
-    Arc::make_mut(&mut second.health).slots = vec![distance_slot("near"), distance_slot("unknown")];
-    let distance = CacheDistance {
-        files: 7,
-        ..Default::default()
-    };
-    let mut calls = Vec::new();
-    for target in ["current-target", "next-target"] {
-        request.base_commit = target.into();
-        // Even a same-target historical zero must be remeasured, not reused.
-        for slot in &mut Arc::make_mut(&mut second.health).slots {
-            slot.last_distance.as_mut().unwrap().target_commit = target.into();
-        }
-        let result = candidate_cache_distances_with(
-            &[&first, &second],
-            &request,
-            NOW,
-            |repo, head, measured_target| {
-                assert_eq!(repo, directory.path());
-                calls.push((head.to_string(), measured_target.to_string()));
-                (head == "near").then_some(distance)
-            },
-        );
-        assert_eq!(
-            result,
-            HashMap::from([("first".into(), distance), ("second".into(), distance)])
-        );
-    }
-    assert_eq!(
-        calls,
-        vec![
-            ("near".into(), "current-target".into()),
-            ("unknown".into(), "current-target".into()),
-            ("near".into(), "next-target".into()),
-            ("unknown".into(), "next-target".into())
-        ]
-    );
-}
-
-#[test]
-fn cache_distance_unknown_missing_repository_and_untrusted_inventory_stay_unmeasured() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut request = distance_request(directory.path());
-    let (_, mut entry) = fleet_entry("first", "linux", 0, &[]);
-    Arc::make_mut(&mut entry.health).inventory.authority = InventoryAuthorityState::Authoritative;
-    Arc::make_mut(&mut entry.health).slots = vec![distance_slot("unknown")];
-    assert!(candidate_cache_distances_with(&[&entry], &request, NOW, |_, _, _| None).is_empty());
-    // A real non-repository directory must also fail gracefully through the production measurer.
-    let prices = pricing::PlacementPrices::default();
-    for _ in 0..2 {
-        assert!(
-            candidate_cache_distances_with(&[&entry], &request, NOW, |repo, head, target| {
-                prices.cache_distance(repo, head, target)
-            })
-            .is_empty()
-        );
-        prices.settle();
-    }
-    request = distance_request(&directory.path().join("absent"));
-    assert!(
-        candidate_cache_distances_with(&[&entry], &request, NOW, |_, _, _| panic!(
-            "missing repository measured"
-        ))
-        .is_empty()
-    );
-    request = distance_request(directory.path());
-    assert!(candidate_cache_distances_with(
-        &[&entry],
-        &request,
-        NOW + EXECUTOR_TELEMETRY_STALE_AFTER_MS + 1,
-        |_, _, _| panic!("stale slots measured")
-    )
-    .is_empty());
-    Arc::make_mut(&mut entry.health).inventory.authority =
-        ExecutorSubstrateReport::default().inventory.authority;
-    assert_ne!(
-        entry.health.inventory.authority,
-        InventoryAuthorityState::Authoritative
-    );
-    assert!(
-        candidate_cache_distances_with(&[&entry], &request, NOW, |_, _, _| panic!(
-            "untrusted slots measured"
-        ))
-        .is_empty()
-    );
-}
-
-#[test]
-fn cache_distance_ranking_breaks_equal_cost_ties_and_records_target_without_overriding_cost() {
-    use cairn_common::cache_distance::{CacheDistance, MeasuredDistance};
-    let request = targeted_request("linux");
-    let (_, mut first) = fleet_entry("a-far", "linux", 0, &[]);
-    let (_, mut second) = fleet_entry("z-near", "linux", 0, &[]);
-    measured(&mut first, 0.1, 8_000_000_000, 8_000_000_000);
-    measured(&mut second, 0.1, 8_000_000_000, 8_000_000_000);
-    let prediction = unpredicted_candidate(&first, &request, SyncCost::Known(0));
-    let mut predictions = HashMap::from([
-        ("a-far".into(), prediction.clone()),
-        ("z-near".into(), prediction),
-    ]);
-    let near = CacheDistance {
-        files: 2,
-        ..Default::default()
-    };
-    let far = CacheDistance {
-        files: 20,
-        ..Default::default()
-    };
-    let select = |distances: &HashMap<String, CacheDistance>,
-                  predictions: &HashMap<String, PlacementPrediction>| {
-        rank_survey(
-            &request,
-            CandidateSurvey {
-                usable: vec![&first, &second],
-                rejected: vec![],
-                view: AdmissionView::default(),
-                declined_here: HashMap::new(),
-                journal: vec![],
-                memory_budgets: HashMap::new(),
-            },
-            SurveyRankingContext {
-                reservations: &HashMap::new(),
-                predictions,
-                sync_costs: &HashMap::new(),
-                cache_distances: distances,
-                policy: &ActivePlacementPolicy::default_profile(),
-                now_unix_ms: NOW,
-                exploration: &ExplorationState::default(),
-                cadence_lane: None,
-            },
-        )
-        .unwrap()
-        .selected
-        .unwrap()
-        .1
-    };
-    let baseline = select(&HashMap::new(), &predictions);
-    assert_eq!(baseline.executor_id, "a-far");
-    assert_eq!(baseline.cache_distance, None);
-    let distances = HashMap::from([("a-far".into(), far), ("z-near".into(), near)]);
-    let winner = select(&distances, &predictions);
-    assert_eq!(winner.executor_id, "z-near");
-    assert_eq!(
-        winner.cache_distance,
-        Some(MeasuredDistance {
-            target_commit: request.base_commit.clone(),
-            distance: near,
-            measured_at_unix_ms: NOW
-        })
-    );
-    assert_eq!(
-        select(&HashMap::from([("z-near".into(), far)]), &predictions).executor_id,
-        "z-near",
-        "unknown is not zero"
-    );
-    predictions.get_mut("z-near").unwrap().predicted_verdict_ms += 10_000;
-    assert_eq!(select(&distances, &predictions).executor_id, "a-far");
-}
-
-#[test]
-fn cache_distance_uses_the_nearest_idle_slot_and_bounds_measurements() {
-    use cairn_common::cache_distance::CacheDistance;
-    use cairn_common::executor_protocol::{
-        PersistentCellLifecycle, IDLE_RETENTION_CEILING_PER_PROJECT,
-    };
-    let directory = tempfile::tempdir().unwrap();
-    let request = distance_request(directory.path());
-    let (_, mut entry) = fleet_entry("first", "linux", 0, &[]);
-    Arc::make_mut(&mut entry.health).inventory.authority = InventoryAuthorityState::Authoritative;
-    for lifecycle in [
-        PersistentCellLifecycle::Active,
-        PersistentCellLifecycle::Materializing,
-        PersistentCellLifecycle::Deleting,
-        PersistentCellLifecycle::Quarantined,
-    ] {
-        let mut slot = distance_slot("ineligible");
-        slot.lifecycle = lifecycle;
-        Arc::make_mut(&mut entry.health).slots.push(slot);
-    }
-    for index in 0..=IDLE_RETENTION_CEILING_PER_PROJECT {
-        Arc::make_mut(&mut entry.health)
-            .slots
-            .push(distance_slot(&index.to_string()));
-    }
-    let mut calls = 0;
-    let result = candidate_cache_distances_with(&[&entry], &request, NOW, |_, head, _| {
-        let index: usize = head.parse().expect("only idle heads may be measured");
-        assert!(index < IDLE_RETENTION_CEILING_PER_PROJECT);
-        calls += 1;
-        Some(CacheDistance {
-            files: (IDLE_RETENTION_CEILING_PER_PROJECT - index) as u32,
-            ..Default::default()
-        })
-    });
-    assert_eq!(calls, IDLE_RETENTION_CEILING_PER_PROJECT);
-    assert_eq!(result["first"].files, 1);
 }
 
 #[test]
@@ -6531,8 +6428,84 @@ impl Fleet {
                 },
             )
             .collect();
-        self.lock_connections().insert(id, connection);
+        let generation = connection.generation;
+        self.lock_connections().insert(id.clone(), connection);
+        // A real executor announces its room as it attaches (cairn/7303).
+        self.announce_room_for_test(&id, generation);
         receiver
+    }
+
+    /// Announce, for `id` on `generation`, a room that fits any test's work:
+    /// what a real executor sends as it attaches, and what the dispatcher
+    /// places by.
+    pub(crate) fn announce_room_for_test(&self, id: &str, generation: u64) {
+        self.announce_room_with_memory_for_test(id, generation, None);
+    }
+
+    /// [`Fleet::attach_executor`], announcing the room a real executor sends
+    /// as its link opens: a fake that answers offers itself only receives
+    /// one once the dispatcher has a room to place by.
+    pub(crate) fn attach_announced_executor(
+        &self,
+        sender: mpsc::UnboundedSender<ExecutorMessage>,
+    ) -> u64 {
+        let generation = self.attach_executor(sender);
+        self.announce_room_for_test(COLOCATED_EXECUTOR_ID, generation);
+        generation
+    }
+
+    /// [`Self::announce_room_for_test`], with the memory room `memory`
+    /// (available, total) where it is given, as a machine whose posted
+    /// reading is that would announce.
+    pub(crate) fn announce_room_with_memory_for_test(
+        &self,
+        id: &str,
+        generation: u64,
+        memory: Option<(u64, u64)>,
+    ) {
+        use cairn_common::executor_protocol::{
+            Allowance, AnnouncedRoom, CompileSlots, DiskRoom, MemoryRoom,
+        };
+        const GIB: u64 = 1 << 30;
+        let (available_bytes, total_bytes) = memory.unwrap_or((512 * GIB, 512 * GIB));
+        // Newer than whatever the link announced before, as a real
+        // executor's sequence is; an older or equal one changes nothing.
+        let seq = self
+            .lock_connections()
+            .get(id)
+            .and_then(|entry| entry.room.as_ref().map(|held| held.seq))
+            .unwrap_or(0)
+            + 1;
+        self.record_room(
+            id,
+            generation,
+            seq,
+            AnnouncedRoom {
+                slots: CompileSlots::of(64),
+                cores: Allowance {
+                    limit: 64,
+                    committed: 0,
+                },
+                memory: Some(MemoryRoom {
+                    available_bytes,
+                    owed_bytes: 0,
+                    total_bytes,
+                }),
+                memory_budget: None,
+                disk: Some(DiskRoom {
+                    free_bytes: 10_000 * GIB,
+                    watermark_bytes: GIB,
+                    reserved_bytes: 0,
+                    inodes: None,
+                }),
+                disk_budget: None,
+                reclaimable_memory_bytes: 0,
+                alone: None,
+                provisioning: Vec::new(),
+                holds: Vec::new(),
+                closures: Vec::new(),
+            },
+        );
     }
 
     /// A placement template a test can persist a settlement with.
@@ -6855,415 +6828,6 @@ fn a_batch_naming_another_machine_than_its_environment_runs_there_or_nowhere() {
     ));
 }
 
-#[test]
-fn hermetic_shadow_lifts_all_three_execution_home_gates() {
-    let mut request = targeted_request("linux");
-    request.executor = None;
-    request.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
-    request.placement_mobility = PlacementMobility::PinnedOrColocated;
-    request.repository = RepositoryLocator::ColocatedPath {
-        project_id: "p".into(),
-        repository_id: "repo".into(),
-        absolute_path: "/repo".into(),
-    };
-
-    let shadow = hermetic_shadow_request(&request).expect("a pinned request has a shadow");
-
-    assert_eq!(shadow.pinned_executor_id, None);
-    assert_eq!(shadow.placement_mobility, PlacementMobility::SpillEligible);
-    assert!(matches!(
-        shadow.repository,
-        RepositoryLocator::ManagedObjects { .. }
-    ));
-    assert_eq!(shadow.base_commit, request.base_commit);
-}
-
-#[tokio::test]
-async fn production_placement_records_shadow_without_changing_dispatch() {
-    let pool = Fleet::default();
-    let measured_at_unix_ms = unix_time_ms();
-    let (local_id, mut local) =
-        fleet_entry_at(COLOCATED_EXECUTOR_ID, "linux", 0, &[], measured_at_unix_ms);
-    measured_at(
-        &mut local,
-        0.95,
-        8_000_000_000,
-        8_000_000_000,
-        measured_at_unix_ms,
-    );
-    let (remote_id, mut remote) = fleet_entry_at("remote", "linux", 0, &[], measured_at_unix_ms);
-    measured_at(
-        &mut remote,
-        0.01,
-        8_000_000_000,
-        8_000_000_000,
-        measured_at_unix_ms,
-    );
-    *pool.lock_connections() = HashMap::from([(local_id, local), (remote_id, remote)]);
-    let mut request = spillable_request();
-    request.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
-    request.placement_mobility = PlacementMobility::PinnedOrColocated;
-    request.repository = RepositoryLocator::ColocatedPath {
-        project_id: "p".into(),
-        repository_id: "repo".into(),
-        absolute_path: "/repo".into(),
-    };
-
-    let placement = pool
-        .select_executor_once_with(
-            &request,
-            None,
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, entry| SyncCost::Known(if entry.colocated { 1_000_000_000 } else { 0 }),
-        )
-        .await
-        .unwrap()
-        .placed()
-        .unwrap();
-
-    assert_eq!(placement.selected.executor_id, COLOCATED_EXECUTOR_ID);
-    assert_eq!(
-        placement
-            .decision
-            .unpinned_winner
-            .as_ref()
-            .unwrap()
-            .executor_id,
-        "remote",
-        "{:#?}",
-        placement.decision
-    );
-}
-
-#[tokio::test]
-async fn unavailable_home_refusal_keeps_the_hermetic_winner() {
-    let pool = Fleet::default();
-    let measured_at_unix_ms = unix_time_ms();
-    let (remote_id, mut remote) = fleet_entry_at("remote", "linux", 0, &[], measured_at_unix_ms);
-    measured_at(
-        &mut remote,
-        0.01,
-        8_000_000_000,
-        8_000_000_000,
-        measured_at_unix_ms,
-    );
-    *pool.lock_connections() = HashMap::from([(remote_id, remote)]);
-    let mut request = spillable_request();
-    request.pinned_executor_id = Some("missing-home".into());
-    request.placement_mobility = PlacementMobility::PinnedOrColocated;
-    request.repository = RepositoryLocator::ColocatedPath {
-        project_id: "p".into(),
-        repository_id: "repo".into(),
-        absolute_path: "/repo".into(),
-    };
-
-    let refusal = pool
-        .select_executor_once_with(
-            &request,
-            None,
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .unwrap_err();
-
-    assert_eq!(
-        refusal.decision.unpinned_winner.unwrap().executor_id,
-        "remote"
-    );
-}
-
-/// One placement pass for a queued entry, reading its declines and view
-/// from the queue the way `select_executor` does.
-async fn select_entry(pool: &Fleet, request: &CellRequest, entry: &str) -> Selection {
-    let (declined, view) = pool
-        .queue
-        .with_entry(entry, |held| (held.declined.clone(), held.admission_view()))
-        .unwrap();
-    pool.select_executor_once_with(
-        request,
-        None,
-        &ActivePlacementPolicy::default_profile(),
-        &declined,
-        &view,
-        |_, _| SyncCost::Known(0),
-    )
-    .await
-    .unwrap()
-}
-
-/// cairn/5035 at placement: fedora refused two requests for its
-/// provisioning hold on the project, and the hold has cleared. The junior
-/// is passed over there, naming the senior it waits behind, and the
-/// senior is placed; once the senior has claimed, the junior's turn comes.
-#[tokio::test]
-async fn a_cleared_provisioning_hold_is_offered_to_the_senior_request_first() {
-    let pool = Fleet::default();
-    let now = unix_time_ms();
-    let (fedora_id, mut fedora) = fleet_entry_at("fedora", "linux", 0, &[], now);
-    measured_at(&mut fedora, 0.01, 8_000_000_000, 8_000_000_000, now);
-    let generation = fedora.generation;
-    *pool.lock_connections() = HashMap::from([(fedora_id, fedora)]);
-    let request = |request_id: &str, waited_ms: u64| {
-        let mut request = spillable_request();
-        request.request_id = request_id.into();
-        request.project_id = "p".into();
-        request.repository = RepositoryLocator::ManagedObjects {
-            project_id: "p".into(),
-            repository_id: "repo".into(),
-            object_format: GitObjectFormat::Sha1,
-        };
-        request.waiting_since_unix_ms = now - waited_ms;
-        request.wait_horizon_unix_ms = now + 600_000;
-        request
-    };
-    let senior = request("senior", 300_000);
-    let junior = request("junior", 5_000);
-    let mut entries = Vec::new();
-    for request in [&senior, &junior] {
-        let (entry, _waiter) = pool
-            .queue
-            .enqueue(
-                queue::NewEntry {
-                    request: request.clone(),
-                    admission_kind: CellAdmissionKind::Command,
-                    interactive: false,
-                    execution_residency: None,
-                    standing: false,
-                },
-                now,
-            )
-            .unwrap();
-        assert!(pool
-            .queue
-            .offer(&entry, "fedora", "fedora", generation, now));
-        pool.queue.decline(
-            &entry,
-            "fedora",
-            generation,
-            DeclineReason::ProjectProvisioning,
-            Some("project p is provisioning for request holder".into()),
-            None,
-            Some(decline_condition::PostedCondition::ProjectProvisioning {
-                owner_request_id: "holder".into(),
-                entry_id: None,
-                since_unix_ms: now - 60_000,
-            }),
-            now,
-        );
-        entries.push(entry);
-    }
-    assert!(pool
-        .queue
-        .supersede_declines_for("fedora", now, |_, _, _| false));
-
-    let Selection::Waiting { rejected } = select_entry(&pool, &junior, &entries[1]).await else {
-        panic!("the junior took the hold ahead of the senior");
-    };
-    let row = rejected
-        .iter()
-        .find(|row| row.executor_id == "fedora")
-        .expect("fedora is on the record");
-    assert!(
-        matches!(
-            &row.reason,
-            PlacementRejectionReason::ProvisioningTurn { ahead_request_id, .. }
-                if ahead_request_id == "senior"
-        ),
-        "{:?}",
-        row.reason
-    );
-    assert!(
-        row.reason.describe().contains("request senior"),
-        "{}",
-        row.reason.describe()
-    );
-    assert!(waits_on_machine(&row.reason));
-
-    let placed = select_entry(&pool, &senior, &entries[0])
-        .await
-        .placed()
-        .expect("the senior is placed");
-    assert_eq!(placed.selected.executor_id, "fedora");
-    assert!(pool
-        .queue
-        .offer(&entries[0], "fedora", "fedora", generation, now + 1));
-    assert_eq!(
-        pool.queue.claim(&entries[0], "fedora", generation, now + 1),
-        queue::ClaimVerdict::Granted
-    );
-    let placed = select_entry(&pool, &junior, &entries[1])
-        .await
-        .placed()
-        .expect("the junior's turn");
-    assert_eq!(placed.selected.executor_id, "fedora");
-}
-
-/// cairn/7220: a write check that cannot leave the runner's Mac, whose
-/// verdict counts only from macOS, was refused naming bbs three
-/// milliseconds after the Mac declined it for memory. Its home's decline
-/// is something to wait for, and the wait names the home.
-#[tokio::test]
-async fn a_colocated_pressure_decline_parks_immobile_work_on_its_home() {
-    let pool = Fleet::default();
-    let now = unix_time_ms();
-    let (local_id, mut local) = fleet_entry_at(COLOCATED_EXECUTOR_ID, "macos", 0, &[], now);
-    measured_at(&mut local, 0.01, 8_000_000_000, 8_000_000_000, now);
-    let generation = local.generation;
-    let mut connections = HashMap::from([(local_id, local)]);
-    for id in ["bbs", "fedora"] {
-        let (id, mut remote) = fleet_entry_at(id, "linux", 0, &[], now);
-        measured_at(&mut remote, 0.01, 8_000_000_000, 8_000_000_000, now);
-        connections.insert(id, remote);
-    }
-    *pool.lock_connections() = connections;
-    let mut request = spillable_request();
-    request.placement_mobility = PlacementMobility::PinnedOrColocated;
-    request.verdict_platforms = vec!["macos".into()];
-    request.repository = RepositoryLocator::ColocatedPath {
-        project_id: "p".into(),
-        repository_id: "repo".into(),
-        absolute_path: "/repo".into(),
-    };
-    request.wait_horizon_unix_ms = now + 600_000;
-    let (entry, _waiter) = pool
-        .queue
-        .enqueue(
-            queue::NewEntry {
-                request: request.clone(),
-                admission_kind: CellAdmissionKind::Command,
-                interactive: false,
-                execution_residency: None,
-                standing: false,
-            },
-            now,
-        )
-        .unwrap();
-    assert!(pool
-        .queue
-        .offer(&entry, COLOCATED_EXECUTOR_ID, "local", generation, now));
-    pool.queue.decline(
-        &entry,
-        COLOCATED_EXECUTOR_ID,
-        generation,
-        DeclineReason::Pressure,
-        Some("memory short: owed 111.4 GiB + 2.0 GiB for this request > available 53.5 GiB of 128.0 GiB".into()),
-        None,
-        None,
-        now,
-    );
-    let (declined, view) = pool
-        .queue
-        .with_entry(&entry, |held| {
-            (held.declined.clone(), held.admission_view())
-        })
-        .unwrap();
-    let selection = pool
-        .select_executor_once_with(
-            &request,
-            None,
-            &ActivePlacementPolicy::default_profile(),
-            &declined,
-            &view,
-            |_, _| SyncCost::Known(0),
-        )
-        .await;
-    let rejected = match selection {
-        Ok(Selection::Waiting { rejected }) => rejected,
-        Ok(other) => panic!(
-            "expected a wait on the home, got {}",
-            match other {
-                Selection::Placed(_) => "placed",
-                Selection::ReleasingHeadroom { .. } => "releasing headroom",
-                Selection::Waiting { .. } => unreachable!(),
-            }
-        ),
-        Err(refused) => panic!("refused instead of waiting: {}", refused.diagnostic),
-    };
-    let waiting = wait_decision(
-        &request,
-        &ActivePlacementPolicy::default_profile(),
-        &rejected,
-        &[],
-        &[],
-    )
-    .expect("the wait is recorded");
-    let PlacementOutcome::Waiting { diagnostic } = waiting.outcome else {
-        panic!("expected a wait");
-    };
-    assert!(diagnostic.contains("local"), "{diagnostic}");
-    assert!(diagnostic.contains("memory short"), "{diagnostic}");
-    assert!(!diagnostic.contains("bbs"), "{diagnostic}");
-
-    // A check has no placement deadline, so nothing but room ends this
-    // wait; what the write wave's Progress line reads names the home and
-    // its current decline for as long as it lasts.
-    let Some(CheckDispatchPhase::Placing { declines, .. }) =
-        pool.request_dispatch_phase(&(request.request_id.clone(), request.attempt_id.clone()))
-    else {
-        panic!("a parked write check reads as placing");
-    };
-    assert!(
-        declines
-            .iter()
-            .any(|decline| decline.executor_name == "local"
-                && decline.reason == DeclineReason::Pressure
-                && decline
-                    .detail
-                    .as_deref()
-                    .is_some_and(|detail| detail.contains("memory short"))),
-        "{declines:?}"
-    );
-
-    // Room freed: the home posts new state and the same request is placed
-    // on it, never anywhere else.
-    let mut recovered = declined.clone();
-    let decline = recovered.get_mut(COLOCATED_EXECUTOR_ID).unwrap();
-    decline.superseded_at_unix_ms = Some(now);
-    decline.retry_after_unix_ms = 0;
-    let placed = pool
-        .select_executor_once_with(
-            &request,
-            None,
-            &ActivePlacementPolicy::default_profile(),
-            &recovered,
-            &view,
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .unwrap_or_else(|refused| panic!("refused after recovery: {}", refused.diagnostic))
-        .placed()
-        .expect("placed once the home has room");
-    assert_eq!(placed.selected.executor_id, COLOCATED_EXECUTOR_ID);
-
-    // Where a horizon exists (a run batch pinned to its home, bounded by
-    // its declared timeout), the refusal it ends in carries the home's
-    // last answer.
-    let mut pinned = request.clone();
-    pinned.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
-    pinned.priority = CellPriority::AgentInteractive;
-    pinned.wait_horizon_unix_ms = unix_time_ms() + 300;
-    let refusal = pool
-        .select_executor(
-            &pinned,
-            None,
-            &ActivePlacementPolicy::default_profile(),
-            Some(&entry),
-        )
-        .await
-        .expect_err("the home never recovers inside the horizon");
-    let CellOutcome::Unavailable { diagnostic, .. } = refusal else {
-        panic!("expected a refusal at the horizon, got {refusal:?}");
-    };
-    assert!(diagnostic.contains("wait horizon"), "{diagnostic}");
-    assert!(diagnostic.contains("local"), "{diagnostic}");
-    assert!(diagnostic.contains("memory short"), "{diagnostic}");
-}
-
 /// cairn/7220, the execution thread's ruling: a fresh-pipe floor latched
 /// on the home of work that cannot leave it is waited out, visibly, and
 /// the home posting recovery is what places the parked entry there.
@@ -7282,6 +6846,7 @@ async fn immobile_work_waits_out_its_homes_pipe_floor_and_places_on_recovery() {
         connections.insert(id, remote);
     }
     *pool.lock_connections() = connections;
+    announce_every_room(&pool);
     let mut request = spillable_request();
     request.placement_mobility = PlacementMobility::PinnedOrColocated;
     request.verdict_platforms = vec!["macos".into()];
@@ -7309,11 +6874,12 @@ async fn immobile_work_waits_out_its_homes_pipe_floor_and_places_on_recovery() {
         let request = request.clone();
         let entry = entry.clone();
         async move {
-            pool.select_executor(
+            assign(
+                &pool,
+                &entry,
                 &request,
-                None,
                 &ActivePlacementPolicy::default_profile(),
-                Some(&entry),
+                None,
             )
             .await
         }
@@ -7324,30 +6890,6 @@ async fn immobile_work_waits_out_its_homes_pipe_floor_and_places_on_recovery() {
         "a latched home is waited out, not refused"
     );
 
-    // What the write wave's Progress line reads names the home's floor.
-    let Some(CheckDispatchPhase::Placing {
-        placement: Some(pass),
-        ..
-    }) = pool.request_dispatch_phase(&(request.request_id.clone(), request.attempt_id.clone()))
-    else {
-        panic!("a parked request reads as placing, with its latest pass");
-    };
-    let home = pass
-        .candidates
-        .iter()
-        .find(|candidate| candidate.executor_name == "local")
-        .expect("the home is on the pass");
-    assert!(
-        matches!(
-            &home.status,
-            CheckCandidateStatus::NotOffered(PlacementRejectionReason::Held {
-                evidence: AdmissionHoldEvidence::FreshPipeFloor { .. }
-            })
-        ),
-        "{:?}",
-        home.status
-    );
-
     // The home posts two spaced healthy readings: the floor lifts, and
     // the parked entry is placed there.
     {
@@ -7356,124 +6898,13 @@ async fn immobile_work_waits_out_its_homes_pipe_floor_and_places_on_recovery() {
         pipes_reading(local, degraded_at + 5_000, 65_536);
         pipes_reading(local, unix_time_ms(), 65_536);
     }
-    pool.connection_ready.notify_waiters();
+    pool.machine_facts_posted(COLOCATED_EXECUTOR_ID);
     let placed = tokio::time::timeout(Duration::from_secs(5), placing)
         .await
         .expect("recovery places the parked entry promptly")
         .unwrap()
         .unwrap_or_else(|refusal| panic!("refused after recovery: {refusal:?}"));
     assert_eq!(placed.selected.executor_id, COLOCATED_EXECUTOR_ID);
-}
-
-/// cairn/7220's contract, row by row, for work pinned to its home and for
-/// untargeted work that cannot leave the colocated machine: an answer
-/// from the home that can clear parks the work; one that cannot is
-/// refused at once, naming the home.
-#[test]
-fn an_immobile_request_waits_on_its_home_only_when_the_home_can_clear() {
-    let fleet = || {
-        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]);
-        measured(&mut local, 0.01, 48 * GIB, 900 * GIB);
-        let mut connections = HashMap::from([(local_id, local)]);
-        for id in ["bbs", "fedora"] {
-            let (id, mut remote) = fleet_entry(id, "linux", 0, &[]);
-            measured(&mut remote, 0.01, 48 * GIB, 900 * GIB);
-            connections.insert(id, remote);
-        }
-        connections
-    };
-    let mut colocated_only = spillable_request();
-    colocated_only.placement_mobility = PlacementMobility::PinnedOrColocated;
-    colocated_only.verdict_platforms = vec!["macos".into()];
-    let mut pinned = colocated_only.clone();
-    pinned.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
-
-    let declines = [
-        (DeclineReason::Capacity, true),
-        (DeclineReason::Pressure, true),
-        (DeclineReason::Disk, true),
-        (DeclineReason::ProjectProvisioning, true),
-        (DeclineReason::BuildVolumeAbsent, true),
-        (DeclineReason::Unknown, true),
-        (DeclineReason::Constraint, false),
-    ];
-    for request in [&colocated_only, &pinned] {
-        let connections = fleet();
-        let view = AdmissionView::of_request(request);
-        for (reason, waits) in declines {
-            let declined = HashMap::from([(
-                COLOCATED_EXECUTOR_ID.to_string(),
-                queue::EntryDecline {
-                    generation: connections[COLOCATED_EXECUTOR_ID].generation,
-                    reason,
-                    detail: Some(format!("declined for {reason:?}")),
-                    disk: None,
-                    at_unix_ms: NOW,
-                    condition: None,
-                    backoff_ms: 0,
-                    retry_after_unix_ms: 0,
-                    room_seq: None,
-                    superseded_at_unix_ms: None,
-                },
-            )]);
-            let placed = place_entry(&connections, request, &declined, &view);
-            let pin = request.pinned_executor_id.is_some();
-            if waits {
-                let draft = placed.unwrap_or_else(|refusal| {
-                    panic!("{reason:?} (pinned {pin}) must wait: {refusal}")
-                });
-                assert!(draft.selected.is_none(), "{reason:?} (pinned {pin})");
-            } else {
-                let refusal = placed.expect_err("a home that can never take it refuses");
-                assert!(
-                    refusal.contains("local"),
-                    "{reason:?} (pinned {pin}): {refusal}"
-                );
-                assert!(!refusal.contains("cannot leave bbs"), "{refusal}");
-            }
-        }
-
-        // The home's fresh-pipe floor recovers by itself: waited out.
-        let mut piped = fleet();
-        pipes_reading(piped.get_mut(COLOCATED_EXECUTOR_ID).unwrap(), NOW, 512);
-        let draft = place_entry(
-            &piped,
-            request,
-            &HashMap::new(),
-            &AdmissionView::of_request(request),
-        )
-        .unwrap_or_else(|refusal| panic!("a latched pipe floor must wait: {refusal}"));
-        assert!(draft.selected.is_none());
-        assert!(matches!(
-            rejection_for(&draft, COLOCATED_EXECUTOR_ID),
-            PlacementRejectionReason::Held {
-                evidence: AdmissionHoldEvidence::FreshPipeFloor { .. }
-            }
-        ));
-
-        // The home's own standing state, rather than its answer.
-        let mut drained = fleet();
-        drained.get_mut(COLOCATED_EXECUTOR_ID).unwrap().drained = true;
-        let mut closed = fleet();
-        let (sender, receiver) = mpsc::unbounded_channel();
-        drop(receiver);
-        closed.get_mut(COLOCATED_EXECUTOR_ID).unwrap().sender = sender;
-        for (label, connections) in [("drained", drained), ("closed", closed)] {
-            let refusal = place_entry(
-                &connections,
-                request,
-                &HashMap::new(),
-                &AdmissionView::of_request(request),
-            )
-            .expect_err("only an operator or a new link changes it");
-            let pin = request.pinned_executor_id.is_some();
-            assert!(
-                refusal.contains("local"),
-                "{label} (pinned {pin}): {refusal}"
-            );
-            assert!(!refusal.contains("cannot leave bbs"), "{refusal}");
-        }
-    }
 }
 
 /// cairn/7220: the parked write lanes' refusals quoted bbs, the first
@@ -7507,795 +6938,6 @@ fn an_immobile_refusal_names_its_home_and_never_another_machine() {
     let refusal = place(&connections, &request).expect_err("the home is not gated on");
     assert!(refusal.contains("cannot leave local"), "{refusal}");
     assert!(refusal.contains("counts only from linux"), "{refusal}");
-}
-
-/// One request parked on fedora for room: `(request id, how long it has
-/// waited, whether it is interactive)`.
-struct Parked {
-    id: &'static str,
-    waited_ms: u64,
-    interactive: bool,
-}
-
-const fn parked(id: &'static str, waited_ms: u64) -> Parked {
-    Parked {
-        id,
-        waited_ms,
-        interactive: false,
-    }
-}
-
-/// fedora refused every request in `parked` for memory pressure five
-/// seconds ago, past its re-offer backoff, and has since posted the room
-/// back. Returns the pool, each request, and its queue entry, in order.
-fn room_freed_on_fedora(parked: &[Parked]) -> (Fleet, Vec<(CellRequest, String)>) {
-    let pool = Fleet::default();
-    let now = unix_time_ms();
-    let (fedora_id, mut fedora) = fleet_entry_at("fedora", "linux", 0, &[], now);
-    measured_at(&mut fedora, 0.01, 8_000_000_000, 8_000_000_000, now);
-    let generation = fedora.generation;
-    *pool.lock_connections() = HashMap::from([(fedora_id, fedora)]);
-    let declined_at = now - 5_000;
-    let mut entries = Vec::new();
-    for parked in parked {
-        let mut request = spillable_request();
-        request.request_id = parked.id.into();
-        request.attempt_id = format!("{}-attempt", parked.id);
-        request.waiting_since_unix_ms = now - parked.waited_ms;
-        request.wait_horizon_unix_ms = now + 600_000;
-        if parked.interactive {
-            request.priority = CellPriority::AgentInteractive;
-        }
-        let (entry, _waiter) = pool
-            .queue
-            .enqueue(
-                queue::NewEntry {
-                    request: request.clone(),
-                    admission_kind: CellAdmissionKind::Command,
-                    interactive: parked.interactive,
-                    execution_residency: None,
-                    standing: false,
-                },
-                declined_at,
-            )
-            .unwrap();
-        assert!(pool
-            .queue
-            .offer(&entry, "fedora", "fedora", generation, declined_at));
-        pool.queue.decline(
-            &entry,
-            "fedora",
-            generation,
-            DeclineReason::Pressure,
-            Some("memory floor".into()),
-            None,
-            None,
-            declined_at,
-        );
-        entries.push((request, entry));
-    }
-    assert_eq!(
-        pool.queue
-            .supersede_declines_for("fedora", now, |_, _, _| false),
-        !parked.is_empty()
-    );
-    (pool, entries)
-}
-
-fn aging_entry(pool: &Fleet, now: u64) -> (CellRequest, String, oneshot::Receiver<CellOutcome>) {
-    let mut request = spillable_request();
-    request.request_id = "aging-senior".into();
-    request.attempt_id = "aging-attempt".into();
-    request.waiting_since_unix_ms = now - 120_000;
-    request.wait_horizon_unix_ms = now + 600_000;
-    request.verdict_platforms = vec!["linux".into()];
-    let (id, waiter) = pool
-        .queue
-        .enqueue(
-            queue::NewEntry {
-                request: request.clone(),
-                admission_kind: CellAdmissionKind::Command,
-                interactive: false,
-                execution_residency: None,
-                standing: false,
-            },
-            now,
-        )
-        .unwrap();
-    pool.queue.observe_queue_forecast(&id, Some(50_000));
-    (request, id, waiter)
-}
-
-#[tokio::test]
-async fn aging_target_and_first_forecast_follow_canonical_ranking_despite_historical_decline() {
-    let (pool, _) = room_freed_on_fedora(&[]);
-    let now = unix_time_ms();
-    let mut request = spillable_request();
-    request.request_id = "aging-best".into();
-    request.waiting_since_unix_ms = now - 120_000;
-    request.wait_horizon_unix_ms = now + 600_000;
-    let (other_id, mut other) = fleet_entry_at("other", "linux", 0, &[], now);
-    measured_at(&mut other, 0.01, 8_000_000_000, 8_000_000_000, now);
-    pool.lock_connections().insert(other_id, other);
-    for machine in pool.lock_connections().values_mut() {
-        Arc::make_mut(&mut machine.health)
-            .admission
-            .concurrency_capacity = Some(4);
-    }
-    let canonical = pool
-        .select_executor_once_with(
-            &request,
-            None,
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .unwrap()
-        .placed()
-        .unwrap();
-    let best = canonical.selected.executor_id.clone();
-    let forecast = match &canonical.decision.outcome {
-        PlacementOutcome::Selected(selection) => selection
-            .prediction
-            .as_ref()
-            .and_then(|prediction| prediction.queue.predicted_ms()),
-        _ => panic!("canonical selection"),
-    };
-    assert_eq!(
-        forecast,
-        Some(0),
-        "this fixture has measured free admission capacity, not an unknown fifteen-minute wait"
-    );
-    let (id, _waiter) = pool
-        .queue
-        .enqueue(
-            queue::NewEntry {
-                request: request.clone(),
-                admission_kind: CellAdmissionKind::Command,
-                interactive: false,
-                execution_residency: None,
-                standing: false,
-            },
-            now,
-        )
-        .unwrap();
-    let generation = pool.lock_connections()[&best].generation;
-    assert!(pool.queue.offer(&id, &best, &best, generation, now));
-    pool.queue.decline(
-        &id,
-        &best,
-        generation,
-        DeclineReason::Capacity,
-        None,
-        None,
-        None,
-        now,
-    );
-    let placed = select_entry(&pool, &request, &id)
-        .await
-        .placed()
-        .expect("historical decline cannot promote an inferior reservation target");
-    assert_eq!(placed.selected.executor_id, best);
-    let plan = pool.queue.headroom_plan(&id, now).unwrap();
-    assert_eq!(plan.forecast_ms, forecast);
-    assert_eq!(plan.target.unwrap().executor_id, best);
-}
-
-#[tokio::test]
-async fn aging_target_is_eligible_and_authorization_does_not_wait_for_old_backoff() {
-    let (pool, _) = room_freed_on_fedora(&[]);
-    let now = unix_time_ms();
-    let (request, id, _waiter) = aging_entry(&pool, now);
-    let generation = pool.lock_connections()["fedora"].generation;
-    assert!(pool.queue.offer(&id, "fedora", "fedora", generation, now));
-    pool.queue.decline(
-        &id,
-        "fedora",
-        generation,
-        DeclineReason::Capacity,
-        None,
-        None,
-        None,
-        now,
-    );
-    assert!(!pool
-        .queue
-        .with_entry(&id, |entry| entry.may_offer_to("fedora", generation, now))
-        .unwrap());
-    let placed = select_entry(&pool, &request, &id)
-        .await
-        .placed()
-        .expect("aged authorization reaches the eligible executor immediately");
-    assert_eq!(placed.selected.executor_id, "fedora");
-    let plan = pool.queue.headroom_plan(&id, now).unwrap();
-    assert_eq!(plan.forecast_ms, Some(50_000));
-    assert_eq!(
-        plan.reserve_from_unix_ms,
-        request.waiting_since_unix_ms + 100_000
-    );
-    assert_eq!(plan.target.unwrap().executor_id, "fedora");
-    assert!(pool
-        .queue
-        .with_entry(&id, |entry| entry.may_offer_to("fedora", generation, now))
-        .unwrap());
-}
-
-#[tokio::test]
-async fn aging_target_revokes_before_moving_when_its_machine_becomes_ineligible() {
-    let (pool, _) = room_freed_on_fedora(&[]);
-    let now = unix_time_ms();
-    let (request, id, _waiter) = aging_entry(&pool, now);
-    select_entry(&pool, &request, &id)
-        .await
-        .placed()
-        .expect("initial target");
-    let generation = pool.lock_connections()["fedora"].generation;
-    {
-        let mut machines = pool.lock_connections();
-        let fedora = machines.get_mut("fedora").unwrap();
-        Arc::make_mut(&mut fedora.health)
-            .admission
-            .headroom_reservations
-            .push(cairn_common::executor_protocol::HeadroomReservation {
-                memory_floor_bytes: Some(request.resource_reservation.memory_charge_bytes()),
-                protected: true,
-                entry_id: id.clone(),
-                request_id: request.request_id.clone(),
-                attempt_id: request.attempt_id.clone(),
-                reservation: request.resource_reservation.clone(),
-                waiting_since_unix_ms: request.waiting_since_unix_ms,
-                forecast_ms: Some(50_000),
-                reserved_at_unix_ms: now,
-            });
-        Arc::make_mut(&mut fedora.advertisement).capabilities.os = "macos".into();
-        let (other_id, mut other) = fleet_entry_at("other", "linux", 0, &[], now);
-        measured_at(&mut other, 0.01, 8_000_000_000, 8_000_000_000, now);
-        machines.insert(other_id, other);
-    }
-    assert!(matches!(
-        select_entry(&pool, &request, &id).await,
-        Selection::ReleasingHeadroom { .. }
-    ));
-    let revoking = pool.queue.headroom_plan(&id, now).unwrap().target.unwrap();
-    assert_eq!(revoking.executor_id, "fedora");
-    assert!(!revoking.enabled);
-    assert!(pool
-        .queue
-        .waiting_request_ids("fedora", generation)
-        .is_empty());
-    Arc::make_mut(&mut pool.lock_connections().get_mut("fedora").unwrap().health)
-        .admission
-        .headroom_reservations
-        .clear();
-    assert!(
-        matches!(
-            select_entry(&pool, &request, &id).await,
-            Selection::ReleasingHeadroom { .. }
-        ),
-        "an empty cached snapshot is not release acknowledgement"
-    );
-    assert!(!pool.queue.headroom_released(&id, "fedora", generation + 1));
-    assert!(!pool.queue.headroom_released(&id, "other", generation));
-    let releasing_pass = select_entry(&pool, &request, &id).await;
-    assert!(pool.queue.headroom_released(&id, "fedora", generation));
-    assert!(
-        matches!(releasing_pass, Selection::ReleasingHeadroom { .. }),
-        "a fast acknowledgement cannot erase this pass's transient wait evidence"
-    );
-    let placed = select_entry(&pool, &request, &id)
-        .await
-        .placed()
-        .expect("new eligible target after old hold release");
-    assert_eq!(placed.selected.executor_id, "other");
-    assert_eq!(
-        pool.queue
-            .headroom_plan(&id, now)
-            .unwrap()
-            .target
-            .unwrap()
-            .executor_id,
-        "other"
-    );
-}
-
-#[tokio::test]
-async fn aging_revocation_is_a_live_wait_in_the_full_remote_only_selection_loop() {
-    let (pool, _) = room_freed_on_fedora(&[]);
-    let now = unix_time_ms();
-    let (request, id, _waiter) = aging_entry(&pool, now);
-    select_entry(&pool, &request, &id)
-        .await
-        .placed()
-        .expect("initial target");
-    let (sender, mut receiver) = mpsc::unbounded_channel();
-    let generation = {
-        let mut machines = pool.lock_connections();
-        let old = machines.get_mut("fedora").unwrap();
-        old.sender = sender;
-        Arc::make_mut(&mut old.advertisement).capabilities.os = "macos".into();
-        let generation = old.generation;
-        let (other_id, mut other) = fleet_entry_at("other", "linux", 0, &[], now);
-        measured_at(&mut other, 0.01, 8_000_000_000, 8_000_000_000, now);
-        machines.insert(other_id, other);
-        generation
-    };
-    let policy = ActivePlacementPolicy::default_profile();
-    let mut selecting = Box::pin(pool.select_executor(&request, None, &policy, Some(&id)));
-    tokio::select! {
-        biased;
-        result = &mut selecting => panic!("release is a wait, not unavailable: {result:?}"),
-        frame = receiver.recv() => assert!(matches!(frame, Some(ExecutorMessage::ReleaseHeadroom { entry_id }) if entry_id == id)),
-    }
-    let status = pool
-        .headroom_status(
-            &(request.request_id.clone(), request.attempt_id.clone()),
-            now,
-        )
-        .unwrap()
-        .1;
-    assert!(status.contains("releasing headroom on fedora"), "{status}");
-    assert!(pool.queue.headroom_released(&id, "fedora", generation));
-    pool.connection_ready.notify_waiters();
-    let placed = selecting
-        .await
-        .expect("another eligible remote after acknowledged release");
-    assert_eq!(placed.selected.executor_id, "other");
-}
-
-#[tokio::test]
-async fn aging_revocation_wait_ends_at_the_requesters_horizon() {
-    let (pool, _) = room_freed_on_fedora(&[]);
-    let now = unix_time_ms();
-    let (mut request, id, _waiter) = aging_entry(&pool, now);
-    select_entry(&pool, &request, &id)
-        .await
-        .placed()
-        .expect("initial target");
-    let (sender, mut receiver) = mpsc::unbounded_channel();
-    pool.lock_connections().get_mut("fedora").unwrap().sender = sender;
-    Arc::make_mut(
-        &mut pool
-            .lock_connections()
-            .get_mut("fedora")
-            .unwrap()
-            .advertisement,
-    )
-    .capabilities
-    .os = "macos".into();
-    let (other_id, mut other) = fleet_entry_at("other", "linux", 0, &[], now);
-    measured_at(&mut other, 0.01, 8_000_000_000, 8_000_000_000, now);
-    pool.lock_connections().insert(other_id, other);
-    request.wait_horizon_unix_ms = unix_time_ms() + 250;
-    let policy = ActivePlacementPolicy::default_profile();
-    let mut selecting = Box::pin(pool.select_executor(&request, None, &policy, Some(&id)));
-    tokio::select! {
-        biased;
-        result = &mut selecting => panic!("must begin by waiting for release: {result:?}"),
-        frame = receiver.recv() => assert!(matches!(frame, Some(ExecutorMessage::ReleaseHeadroom { entry_id }) if entry_id == id)),
-    }
-    assert!(
-        selecting.await.is_err(),
-        "an unanswered release cannot extend the requester horizon or run elsewhere after it"
-    );
-    assert!(matches!(
-        pool.queue.state_of(&id),
-        Some(queue::EntryState::Queued)
-    ));
-}
-
-#[tokio::test]
-async fn aging_review_revokes_for_main_cadence_and_interactive_work_stays_exempt() {
-    let (pool, _) = room_freed_on_fedora(&[]);
-    let now = unix_time_ms();
-    let (review, review_id, _review_waiter) = aging_entry(&pool, now);
-    select_entry(&pool, &review, &review_id)
-        .await
-        .placed()
-        .expect("review target");
-    let generation = pool.lock_connections()["fedora"].generation;
-    Arc::make_mut(&mut pool.lock_connections().get_mut("fedora").unwrap().health)
-        .admission
-        .headroom_reservations
-        .push(cairn_common::executor_protocol::HeadroomReservation {
-            memory_floor_bytes: Some(review.resource_reservation.memory_charge_bytes()),
-            protected: true,
-            entry_id: review_id.clone(),
-            request_id: review.request_id.clone(),
-            attempt_id: review.attempt_id.clone(),
-            reservation: review.resource_reservation.clone(),
-            waiting_since_unix_ms: review.waiting_since_unix_ms,
-            forecast_ms: Some(50_000),
-            reserved_at_unix_ms: now,
-        });
-    let main = CellRequest {
-        request_id: "main".into(),
-        attempt_id: "main-attempt".into(),
-        waiting_since_unix_ms: now - 10_000,
-        ..review.clone()
-    };
-    let (main_id, _main_waiter) = pool
-        .queue
-        .enqueue(
-            queue::NewEntry {
-                request: main.clone(),
-                admission_kind: CellAdmissionKind::Command,
-                interactive: false,
-                execution_residency: None,
-                standing: true,
-            },
-            now - 5_000,
-        )
-        .unwrap();
-    assert!(pool
-        .queue
-        .offer(&main_id, "fedora", "fedora", generation, now - 5_000));
-    pool.queue.decline(
-        &main_id,
-        "fedora",
-        generation,
-        DeclineReason::Capacity,
-        None,
-        None,
-        None,
-        now - 5_000,
-    );
-    arm_main_cadence(&pool, &main, now);
-    assert!(matches!(
-        select_entry(&pool, &review, &review_id).await,
-        Selection::ReleasingHeadroom { .. }
-    ));
-    assert!(
-        !pool
-            .queue
-            .headroom_plan(&review_id, now)
-            .unwrap()
-            .target
-            .unwrap()
-            .enabled
-    );
-    let interactive = CellRequest {
-        request_id: "interactive".into(),
-        priority: CellPriority::AgentInteractive,
-        ..review.clone()
-    };
-    let (interactive_id, _interactive_waiter) = pool
-        .queue
-        .enqueue(
-            queue::NewEntry {
-                request: interactive.clone(),
-                admission_kind: CellAdmissionKind::Command,
-                interactive: true,
-                execution_residency: None,
-                standing: false,
-            },
-            now,
-        )
-        .unwrap();
-    assert_eq!(
-        select_entry(&pool, &interactive, &interactive_id)
-            .await
-            .placed()
-            .unwrap()
-            .selected
-            .executor_id,
-        "fedora"
-    );
-    assert!(pool
-        .queue
-        .headroom_released(&review_id, "fedora", generation));
-    Arc::make_mut(&mut pool.lock_connections().get_mut("fedora").unwrap().health)
-        .admission
-        .headroom_reservations
-        .clear();
-    pool.queue
-        .supersede_declines_for("fedora", now, |_, _, _| false);
-    assert_eq!(
-        select_entry(&pool, &main, &main_id)
-            .await
-            .placed()
-            .unwrap()
-            .selected
-            .executor_id,
-        "fedora"
-    );
-}
-
-/// Make `request` the live answer to main's rust-tests question on linux:
-/// what the cadence does once its ledger read finds no complete row for
-/// the tip.
-fn arm_main_cadence(pool: &Fleet, request: &CellRequest, armed_at_unix_ms: u64) {
-    pool.purposes.lock().unwrap().admit(
-        purpose::PurposeKey::main_cadence("cairn", "rust-tests", "linux"),
-        (request.request_id.clone(), request.attempt_id.clone()),
-        armed_at_unix_ms,
-    );
-}
-
-fn cadence_turn_ahead(selection: Selection) -> String {
-    let Selection::Waiting { rejected } = selection else {
-        panic!("placed ahead of main's cadence lane");
-    };
-    let row = rejected
-        .iter()
-        .find(|row| row.executor_id == "fedora")
-        .expect("fedora is on the record");
-    assert!(waits_on_machine(&row.reason), "{:?}", row.reason);
-    match &row.reason {
-        PlacementRejectionReason::CadenceTurn {
-            check,
-            platform,
-            ahead_request_id,
-            ..
-        } => {
-            assert_eq!((check.as_str(), platform.as_str()), ("rust-tests", "linux"));
-            ahead_request_id.clone()
-        }
-        other => panic!("not a cadence turn: {other:?}"),
-    }
-}
-
-/// cairn/6497: main's Linux rust-tests lane, parked on fedora for memory
-/// behind an older branch lane, takes the room fedora frees first; the
-/// branch lane is passed over naming it, and has its turn once the main
-/// lane has claimed.
-#[tokio::test]
-async fn main_cadence_lane_for_an_unobserved_tip_takes_freed_room_first() {
-    let (pool, entries) = room_freed_on_fedora(&[parked("branch", 300_000), parked("main", 1_000)]);
-    let (branch, branch_entry) = &entries[0];
-    let (main, main_entry) = &entries[1];
-    arm_main_cadence(&pool, main, 1);
-
-    let ahead = cadence_turn_ahead(select_entry(&pool, branch, branch_entry).await);
-    assert_eq!(ahead, "main");
-    let placed = select_entry(&pool, main, main_entry)
-        .await
-        .placed()
-        .expect("main's cadence lane takes the room");
-    assert_eq!(placed.selected.executor_id, "fedora");
-
-    let generation = pool.lock_connections()["fedora"].generation;
-    let now = unix_time_ms();
-    assert!(pool
-        .queue
-        .offer(main_entry, "fedora", "fedora", generation, now));
-    assert_eq!(
-        pool.queue.claim(main_entry, "fedora", generation, now),
-        queue::ClaimVerdict::Granted
-    );
-    let placed = select_entry(&pool, branch, branch_entry)
-        .await
-        .placed()
-        .expect("the branch lane's turn once main has claimed");
-    assert_eq!(placed.selected.executor_id, "fedora");
-}
-
-/// A main tip that already has a complete row is answered by the cadence
-/// without a run, so no lane of its holds the question live, and freed
-/// room goes by the ordinary order.
-#[tokio::test]
-async fn without_a_live_cadence_question_freed_room_goes_by_arrival_order() {
-    let (pool, entries) = room_freed_on_fedora(&[parked("branch", 300_000), parked("main", 1_000)]);
-    let (branch, branch_entry) = &entries[0];
-    let placed = select_entry(&pool, branch, branch_entry)
-        .await
-        .placed()
-        .expect("no cadence lane holds precedence");
-    assert_eq!(placed.selected.executor_id, "fedora");
-}
-
-/// Two main lanes for one suite and platform: the one that displaced the
-/// other holds the question, and only it jumps. The displaced lane waits
-/// behind it like any other.
-#[tokio::test]
-async fn only_one_main_lane_per_suite_and_platform_takes_precedence() {
-    let (pool, entries) = room_freed_on_fedora(&[
-        parked("branch", 300_000),
-        parked("main-old", 200_000),
-        parked("main-new", 1_000),
-    ]);
-    let (branch, branch_entry) = &entries[0];
-    let (old, old_entry) = &entries[1];
-    let (new, new_entry) = &entries[2];
-    arm_main_cadence(&pool, old, 1);
-    arm_main_cadence(&pool, new, 2);
-
-    assert_eq!(
-        cadence_turn_ahead(select_entry(&pool, branch, branch_entry).await),
-        "main-new"
-    );
-    assert_eq!(
-        cadence_turn_ahead(select_entry(&pool, old, old_entry).await),
-        "main-new",
-        "the displaced lane holds no precedence"
-    );
-    assert!(select_entry(&pool, new, new_entry).await.placed().is_some());
-}
-
-/// Interactive work is never passed over behind the cadence lane, and the
-/// rule withholds offers only: work already claimed stays where it runs.
-#[tokio::test]
-async fn interactive_and_running_work_are_unaffected_by_the_cadence_turn() {
-    let (pool, entries) = room_freed_on_fedora(&[
-        Parked {
-            id: "agent",
-            waited_ms: 1_000,
-            interactive: true,
-        },
-        parked("running", 400_000),
-        parked("main", 1_000),
-    ]);
-    let (agent, agent_entry) = &entries[0];
-    let (_, running_entry) = &entries[1];
-    let (main, _) = &entries[2];
-    let generation = pool.lock_connections()["fedora"].generation;
-    let now = unix_time_ms();
-    assert!(pool
-        .queue
-        .offer(running_entry, "fedora", "fedora", generation, now));
-    assert_eq!(
-        pool.queue.claim(running_entry, "fedora", generation, now),
-        queue::ClaimVerdict::Granted
-    );
-    arm_main_cadence(&pool, main, 1);
-
-    let placed = select_entry(&pool, agent, agent_entry)
-        .await
-        .placed()
-        .expect("interactive work is offered as before");
-    assert_eq!(placed.selected.executor_id, "fedora");
-    assert!(matches!(
-        pool.queue.state_of(running_entry),
-        Some(queue::EntryState::Claimed { .. })
-    ));
-}
-
-/// The decision text on both sides of the turn: the parked-request
-/// decision, the lane's dispatch phase, and the machine's room line.
-#[tokio::test]
-async fn the_cadence_turn_is_told_on_both_sides() {
-    let (pool, entries) = room_freed_on_fedora(&[parked("branch", 300_000), parked("main", 1_000)]);
-    let (branch, branch_entry) = &entries[0];
-    let (main, _) = &entries[1];
-    arm_main_cadence(&pool, main, 1);
-    let policy = ActivePlacementPolicy::default_profile();
-    let now = unix_time_ms();
-    let main_identity = (main.request_id.clone(), main.attempt_id.clone());
-    let branch_identity = (branch.request_id.clone(), branch.attempt_id.clone());
-
-    let takes_room_on = pool.room_taken_first_on(&main_identity, now);
-    assert_eq!(takes_room_on, vec!["fedora".to_string()]);
-    let PlacementOutcome::Waiting { diagnostic } =
-        wait_decision(main, &policy, &[], &[], &takes_room_on)
-            .expect("the cadence lane's wait is recorded")
-            .outcome
-    else {
-        unreachable!("a wait");
-    };
-    assert_eq!(
-        diagnostic,
-        "main cadence, tip unobserved: takes the next freed room on fedora."
-    );
-    assert!(pool.room_taken_first_on(&branch_identity, now).is_empty());
-
-    let Selection::Waiting { rejected } = select_entry(&pool, branch, branch_entry).await else {
-        panic!("placed ahead of main's cadence lane");
-    };
-    let waiting = wait_decision(branch, &policy, &rejected, &[], &[])
-        .expect("the branch lane's wait is recorded");
-    let PlacementOutcome::Waiting { diagnostic } = &waiting.outcome else {
-        unreachable!("a wait");
-    };
-    assert!(
-        diagnostic.starts_with("fedora: behind main's cadence lane for rust-tests on linux."),
-        "{diagnostic}"
-    );
-    let row = rejected
-        .iter()
-        .find(|row| row.executor_id == "fedora")
-        .unwrap();
-    assert!(
-        row.reason.describe().starts_with(
-            "in line: behind main's cadence lane for rust-tests on linux (request main, waiting since "
-        ),
-        "{}",
-        row.reason.describe()
-    );
-    pool.queue.record_placement(&waiting);
-
-    let turn = |identity: &RequestIdentity| match pool.request_dispatch_phase(identity) {
-        Some(CheckDispatchPhase::Placing { turn, .. }) => turn,
-        other => panic!("not placing: {other:?}"),
-    };
-    assert_eq!(
-        turn(&main_identity).as_deref(),
-        Some("main cadence, tip unobserved: takes the next freed room on fedora")
-    );
-    assert_eq!(
-        turn(&branch_identity).as_deref(),
-        Some("fedora: behind main's cadence lane for rust-tests on linux")
-    );
-
-    let line = pool.room_line("fedora", unix_time_ms());
-    assert_eq!(line.behind, 1);
-    assert_eq!(
-        line.holders
-            .iter()
-            .map(|holder| holder.request_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["main"]
-    );
-    let page = crate::resources::executors::render_room_line(&line, "fedora", unix_time_ms());
-    assert!(page.contains("## Room line"), "{page}");
-    assert!(
-        page.contains(
-            "- main cadence, tip unobserved: rust-tests on linux, request main, waiting "
-        ) && page.contains("; takes the next freed room on fedora\n"),
-        "{page}"
-    );
-    assert!(
-        page.contains("- 1 other request waits behind them for this machine\n"),
-        "{page}"
-    );
-}
-
-/// [`ceiling_fleet`], where the second machine may state no budget and may
-/// never have run the command itself (cold, so it borrows the fleet's).
-async fn ceiling_fleet_with(
-    db_name: &str,
-    other_budget: Option<u64>,
-    other_measured: bool,
-    other_cpu: f64,
-    other_available: u64,
-) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let db = Arc::new(crate::storage::migrated_test_db(db_name).await);
-    let identity = CommandResourceIdentity {
-        version: 1,
-        key: "test:rust".into(),
-        suite: None,
-    };
-    let pool = Fleet::default();
-    let now = unix_time_ms();
-    let mut connections = HashMap::new();
-    for (id, budget, measured, cpu, available) in [
-        ("bgsrv-ub", Some(11_042_782_208), true, 0.01, 10 * GIB),
-        (
-            "bglab-mac",
-            other_budget,
-            other_measured,
-            other_cpu,
-            other_available,
-        ),
-    ] {
-        let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
-        Arc::make_mut(&mut entry.advertisement)
-            .capabilities
-            .memory_budget_bytes = budget;
-        measured_at(&mut entry, cpu, available, 500 * GIB, now);
-        if !measured {
-            connections.insert(id, entry);
-            continue;
-        }
-        resource_profiles::seed_memory_profile_for_test(
-            db.clone(),
-            &identity,
-            &ReservationPlan::context_for(
-                &entry.identity.device_id,
-                &entry.identity.executor_id,
-                &entry.advertisement.capabilities,
-            ),
-            8 * GIB,
-        )
-        .await;
-        connections.insert(id, entry);
-    }
-    *pool.lock_connections() = connections;
-    let mut request = spillable_request();
-    request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
-    request.command_resource_identity = Some(identity);
-    (pool, db, request)
 }
 
 /// Two Linux machines and a suite whose largest process is 10 GiB:
@@ -8688,23 +7330,57 @@ async fn an_old_kill_still_posted_is_never_counted_again() {
     );
 }
 
+/// Work whose process fits only machines that are attached but away for now
+/// (here: drained) waits for one of them, rather than being refused as
+/// though no machine could ever hold it.
+///
+/// Red since the dispatcher took placement over: `refusal_at_join` refuses
+/// when every candidate is excluded for size, without asking whether a
+/// machine it filtered out as away for now would hold the work. The old
+/// placement loop parked on the size exclusion instead.
+#[tokio::test]
+async fn a_process_whose_only_fitting_machine_is_drained_waits_for_it() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let (pool, db, request) = process_fit_fleet("process-fit-drained.db", 125 * GIB, true).await;
+    announce_posted_rooms(&pool);
+    let plan = Arc::new(ReservationPlan::new(db, &request, None));
+    let placing = tokio::spawn({
+        let pool = pool.clone();
+        async move { place_through_dispatcher(&pool, &request, Some(plan)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    if placing.is_finished() {
+        panic!(
+            "a drained machine that fits is worth waiting for: {:?}",
+            placing.await
+        );
+    }
+
+    // The drain lifts: the machine's facts moved, and the room it already
+    // announced takes the work.
+    pool.lock_connections().get_mut("other").unwrap().drained = false;
+    pool.machine_facts_posted("other");
+    let placement = tokio::time::timeout(Duration::from_secs(5), placing)
+        .await
+        .expect("placed once the drain lifts")
+        .expect("the placing task ends")
+        .expect("the undrained machine takes it");
+    assert_eq!(placement.selected.executor_id, "other");
+}
+
 /// The issue's test end to end: a never-seen identity of a suite whose
 /// rustc is 10 GiB is not offered to a 13 GiB machine and is offered to a
-/// 125 GiB one; when every machine is too small it is refused on the first
-/// pass rather than waiting out its horizon; and when the machine that
-/// would fit is only drained, it waits.
+/// 125 GiB one; when every machine is too small it is refused at once
+/// rather than waiting out its horizon.
 #[tokio::test]
-async fn a_process_larger_than_a_machine_is_placed_elsewhere_refused_or_waits() {
+async fn a_process_larger_than_a_machine_is_placed_elsewhere_or_refused() {
     const GIB: u64 = 1024 * 1024 * 1024;
     let select = |pool: Fleet, db, request: CellRequest| async move {
-        let plan = ReservationPlan::new(db, &request, None);
-        pool.select_executor_once_with(
-            &request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
+        announce_posted_rooms(&pool);
+        let plan = Arc::new(ReservationPlan::new(db, &request, None));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            place_through_dispatcher(&pool, &request, Some(plan)),
         )
         .await
     };
@@ -8712,378 +7388,156 @@ async fn a_process_larger_than_a_machine_is_placed_elsewhere_refused_or_waits() 
     let (pool, db, request) = process_fit_fleet("process-fit-elsewhere.db", 125 * GIB, false).await;
     let placement = select(pool, db, request)
         .await
-        .unwrap()
-        .placed()
+        .expect("assigned at once")
         .expect("the large machine takes it");
     assert_eq!(placement.selected.executor_id, "other");
-    let small = placement
-        .decision
-        .rejected
-        .iter()
-        .find(|rejection| rejection.executor_id == "bgsrv-ub")
-        .expect("bgsrv-ub is on the record");
-    let text = small.reason.describe();
-    assert!(
-        matches!(small.reason, PlacementRejectionReason::ProcessTooLarge(_)),
-        "{text}"
-    );
-    assert!(
-        text.contains("needs one process of ~12.5 GiB (rustc, suite rust-tests"),
-        "{text}"
-    );
 
     let (pool, db, request) = process_fit_fleet("process-fit-nowhere.db", 14 * GIB, false).await;
     let refusal = select(pool, db, request)
         .await
-        .expect_err("no machine can give one process 12.5 GiB")
-        .diagnostic;
+        .expect("refused at once")
+        .expect_err("no machine can give one process 12.5 GiB");
+    let CellOutcome::Unavailable { diagnostic, .. } = refusal else {
+        panic!("a refusal, got {refusal:?}");
+    };
     assert!(
-        refusal.contains("no machine can run this work"),
-        "{refusal}"
+        diagnostic.contains("no attached machine can hold one process of this work"),
+        "{diagnostic}"
     );
-    assert!(refusal.contains("bgsrv-ub: needs one process"), "{refusal}");
-
-    let (pool, db, request) = process_fit_fleet("process-fit-drained.db", 125 * GIB, true).await;
     assert!(
-        select(pool, db, request).await.unwrap().placed().is_none(),
-        "a drained machine that fits is worth waiting for"
+        diagnostic.contains("bgsrv-ub: needs one process"),
+        "{diagnostic}"
     );
 }
 
-/// cairn/7189: a single process larger than a machine can give is a fact
-/// about the machine's size, so neither a decline nor a posted hold on a
-/// machine that is too small may turn the refusal into a wait. Every
-/// matching machine is judged, held or not. A machine that could hold
-/// the process and has only said "not yet" still keeps the request
-/// waiting (cairn/5602).
-#[tokio::test]
-async fn a_hard_process_misfit_is_not_hidden_behind_a_decline_or_a_hold() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let select = |pool: Fleet,
-                  db,
-                  request: CellRequest,
-                  declined: HashMap<String, queue::EntryDecline>| async move {
-        let plan = ReservationPlan::new(db, &request, None);
-        pool.select_executor_once_with(
-            &request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &declined,
-            &AdmissionView::of_request(&request),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
+/// The room a machine of `total_bytes` announces with `free_cores` of its
+/// 64 cores not given out and all but 3 GiB of its memory available.
+fn sized_room(total_bytes: u64, free_cores: u64) -> cairn_common::executor_protocol::AnnouncedRoom {
+    use cairn_common::executor_protocol::{
+        Allowance, AnnouncedRoom, CompileSlots, DiskRoom, MemoryRoom,
     };
-    let declined_by = |pool: &Fleet, id: &str| {
-        HashMap::from([(
-            id.to_string(),
-            queue::EntryDecline {
-                generation: pool.lock_connections()[id].generation,
-                reason: DeclineReason::Pressure,
-                detail: Some("build volume write stall".into()),
-                disk: None,
-                at_unix_ms: unix_time_ms(),
-                condition: None,
-                backoff_ms: 0,
-                retry_after_unix_ms: 0,
-                room_seq: None,
-                superseded_at_unix_ms: None,
+    const GIB: u64 = 1 << 30;
+    AnnouncedRoom {
+        slots: CompileSlots::of(64),
+        cores: Allowance {
+            limit: 64,
+            committed: 64 - free_cores,
+        },
+        memory: Some(MemoryRoom {
+            available_bytes: total_bytes - 3 * GIB,
+            owed_bytes: 0,
+            total_bytes,
+        }),
+        memory_budget: None,
+        disk: Some(DiskRoom {
+            free_bytes: 10_000 * GIB,
+            watermark_bytes: GIB,
+            reserved_bytes: 0,
+            inodes: None,
+        }),
+        disk_budget: None,
+        reclaimable_memory_bytes: 0,
+        alone: None,
+        provisioning: Vec::new(),
+        holds: Vec::new(),
+        closures: Vec::new(),
+    }
+}
+
+/// Queue `request` and join it to the dispatcher, keeping its channel.
+async fn joined(
+    pool: &Fleet,
+    request: &CellRequest,
+    plan: Arc<ReservationPlan>,
+) -> mpsc::UnboundedReceiver<super::assignments::Delivery> {
+    let (entry, waiter) = pool
+        .queue
+        .enqueue(
+            queue::NewEntry {
+                request: request.clone(),
+                admission_kind: CellAdmissionKind::Command,
+                interactive: false,
+                execution_residency: None,
+                standing: false,
             },
-        )])
-    };
-    let both_too_small = |refusal: &str| {
-        assert!(
-            refusal.contains("no machine can run this work"),
-            "{refusal}"
-        );
-        assert!(refusal.contains("bgsrv-ub: needs one process"), "{refusal}");
-        assert!(refusal.contains("other: needs one process"), "{refusal}");
-    };
-
-    // Declined, and backing off: never surveyed as usable, still judged.
-    let (pool, db, request) = process_fit_fleet("hard-fit-declined.db", 14 * GIB, false).await;
-    let declined = declined_by(&pool, "other");
-    let refusal = select(pool, db, request, declined)
-        .await
-        .expect_err("a decline from a machine too small for one rustc is no wait")
-        .diagnostic;
-    both_too_small(&refusal);
-
-    // Held on a disk floor nothing is sweeping: filtered before ranking.
-    let (pool, db, request) = process_fit_fleet("hard-fit-disk-held.db", 14 * GIB, false).await;
-    Arc::make_mut(&mut pool.lock_connections().get_mut("other").unwrap().health)
-        .disk
-        .watermark_bytes = 1000 * GIB;
-    let refusal = select(pool, db, request, HashMap::new())
-        .await
-        .expect_err("a hold on a machine too small for one rustc is no wait")
-        .diagnostic;
-    both_too_small(&refusal);
-
-    // Held on pressure: ranked behind, and judged the same way.
-    let (pool, db, request) = process_fit_fleet("hard-fit-pressure-held.db", 14 * GIB, false).await;
-    Arc::make_mut(&mut pool.lock_connections().get_mut("other").unwrap().health)
-        .host
-        .memory_admission = cairn_common::executor_protocol::StallInstrumentHealth {
-        state: StallInstrumentState::Pressured,
-        reading: Some(0.4),
-        state_since_unix_ms: Some(unix_time_ms()),
-        measured_at_unix_ms: Some(unix_time_ms()),
-    };
-    let refusal = select(pool, db, request, HashMap::new())
-        .await
-        .expect_err("pressure on a machine too small for one rustc is no wait")
-        .diagnostic;
-    both_too_small(&refusal);
-
-    // A capable machine that declined is still something to wait for.
-    let (pool, db, request) =
-        process_fit_fleet("hard-fit-capable-declined.db", 125 * GIB, false).await;
-    let declined = declined_by(&pool, "other");
-    let Selection::Waiting { rejected } = select(pool, db, request, declined)
-        .await
-        .expect("a capable decliner keeps the request alive")
-    else {
-        panic!("the only capable machine declined; nothing may be placed");
-    };
-    assert!(rejected.iter().any(|row| row.executor_id == "other"
-        && matches!(row.reason, PlacementRejectionReason::Declined { .. })));
-    assert!(rejected.iter().any(|row| row.executor_id == "bgsrv-ub"
-        && matches!(row.reason, PlacementRejectionReason::ProcessTooLarge(_))));
-}
-
-#[tokio::test]
-async fn large_work_parks_for_a_detached_enrollment_and_places_on_reattach() {
-    let (pool, db, request) = process_fit_fleet("process-fit-detached.db", 125 * GIB, false).await;
-    pool.declare_enrolled_remote("other", "other", "linux", "x86_64");
-    let large = pool.lock_connections()["other"].clone();
-    assert!(pool.disconnect_advertised_executor("other", large.generation));
-    let plan = ReservationPlan::new(db, &request, None);
-    let policy = ActivePlacementPolicy::default_profile();
-    let view = AdmissionView::of_request(&request);
-    let declined = HashMap::new();
-    let select = || {
-        pool.select_executor_once_with(&request, Some(&plan), &policy, &declined, &view, |_, _| {
-            SyncCost::Known(0)
-        })
-    };
-    let waiting = select()
-        .await
-        .expect("the capable enrollment is reconnecting");
-    let Selection::Waiting { rejected } = waiting else {
-        panic!("the small attached machine cannot run this process");
-    };
-    assert!(rejected.iter().any(|row| row.executor_id == "other"
-        && matches!(row.reason, PlacementRejectionReason::Reconnecting { .. })));
-    assert!(rejected.iter().any(|row| row.executor_id == "bgsrv-ub"
-        && matches!(row.reason, PlacementRejectionReason::ProcessTooLarge(_))));
-
-    pool.stage_link_absent("other", ENVIRONMENT_LEASE_GRACE_MS + 1_000);
-    select()
-        .await
-        .expect_err("no capable machine returned before its absence bound");
-
-    pool.attach_advertised_executor(
-        (*large.advertisement).clone(),
-        Default::default(),
-        large.sender.clone(),
-        false,
-        None,
-        None,
+            unix_time_ms(),
+        )
+        .unwrap();
+    std::mem::forget(waiter);
+    pool.join_dispatcher(
+        &entry,
+        request,
+        Some(plan),
+        &ActivePlacementPolicy::default_profile(),
     )
-    .unwrap();
-    // The returning executor posts the fresh measured room on its new link.
-    {
-        let mut connections = pool.lock_connections();
-        let returned = connections.get_mut("other").unwrap();
-        returned.health = large.health.clone();
-        returned.link_clock.stage(0, 0);
-    }
-    let placed = select()
-        .await
-        .unwrap()
-        .placed()
-        .expect("reattach frees the wait");
-    assert_eq!(placed.selected.executor_id, "other");
+    .await
+    .unwrap_or_else(|outcome| panic!("waits rather than {outcome:?}"))
 }
 
-/// cairn/6312 pin (b) end to end: a cold workspace-compile identity that
-/// nothing measured on any platform, in a project whose rust-tests suite
-/// lost a 9.2 GiB rustc. bgsrv-ub (12.1 GiB) is deferred while a 62 GiB
-/// machine can take the work, and the winner's record names the prior;
-/// with the large machine drained, bgsrv-ub takes it, and its record says
-/// no larger machine could. With no rustc measured anywhere, the record
-/// says the work was placed unmeasured, and the larger machine wins.
-#[tokio::test]
-async fn a_cold_compile_is_offered_the_small_machine_last_on_the_class_prior() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    async fn fleet(
-        db_name: &str,
-        large_drained: bool,
-        prior: bool,
-    ) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
-        let db = Arc::new(crate::storage::migrated_test_db(db_name).await);
-        let pool = Fleet::default();
-        let now = unix_time_ms();
-        let mut connections = HashMap::new();
-        let mut small = None;
-        for (id, total) in [("bgsrv-ub", 12_992_276_070_u64), ("bbs", 62 * GIB)] {
-            let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
-            Arc::make_mut(&mut entry.advertisement)
-                .capabilities
-                .memory_budget_bytes = Some(total / 100 * 85);
-            measured_at(&mut entry, 0.01, total - 3 * GIB, 500 * GIB, now);
-            Arc::make_mut(&mut entry.health).machine.memory = Measurement::measured(
-                now,
-                MachineMemory {
-                    total_bytes: total,
-                    available_bytes: total - 3 * GIB,
-                },
-            );
-            Arc::make_mut(&mut entry.health)
-                .memory_record
-                .standing_bytes = Some(5 * GIB / 2);
-            entry.drained = id == "bbs" && large_drained;
-            small.get_or_insert_with(|| {
-                ReservationPlan::context_for(
-                    &entry.identity.device_id,
-                    &entry.identity.executor_id,
-                    &entry.advertisement.capabilities,
-                )
-            });
-            connections.insert(id, entry);
+/// The machine the dispatcher next assigns from `deliveries`, or `None`
+/// when it assigns nothing within half a second.
+async fn assigned_within(
+    deliveries: &mut mpsc::UnboundedReceiver<super::assignments::Delivery>,
+) -> Option<String> {
+    match tokio::time::timeout(Duration::from_millis(500), deliveries.recv()).await {
+        Err(_) => None,
+        Ok(Some(super::assignments::Delivery::Assigned(assignment))) => {
+            Some(assignment.executor_id)
         }
-        *pool.lock_connections() = connections;
-        let mut request = spillable_request();
-        request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoCheck;
-        if prior {
-            resource_profiles::observe_suite(
-                db.clone(),
-                Some(&format!("{}/rust-tests", request.project_id)),
-                CellCommandClass::CargoTest,
-                &small.unwrap(),
-                &CellExecutionMeta {
-                    stop: None,
-                    peak_process: Some(cairn_common::executor_protocol::PeakProcess {
-                        bytes: 9_910_000_000,
-                        name: Some("rustc".into()),
-                    }),
-                    ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
-                },
-                resource_profiles::CompletionKind::Failed,
-                resource_profiles::MachineAdmission::default(),
-                resource_profiles::CompletedSource::default(),
-            )
-            .await;
-        }
-        request.command_resource_identity = Some(CommandResourceIdentity {
-            version: 1,
-            key: "workspace-compile:cold".into(),
-            suite: Some("workspace-compile".into()),
-        });
-        (pool, db, request)
+        Ok(other) => panic!("an assignment or nothing, not {other:?}"),
     }
-    let select = |pool: Fleet, db, request: CellRequest| async move {
-        let plan = ReservationPlan::new(db, &request, None);
-        pool.select_executor_once_with(
-            &request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-    };
-    let selection = |placement: &Placement| match &placement.decision.outcome {
-        PlacementOutcome::Selected(selection) => selection.as_ref().clone(),
-        other => panic!("placed means selected: {other:?}"),
-    };
+}
 
-    let (pool, db, request) = fleet("process-prior-large.db", false, true).await;
-    let placement = select(pool, db, request)
-        .await
-        .unwrap()
-        .placed()
-        .expect("the large machine takes it");
-    assert_eq!(placement.selected.executor_id, "bbs");
-    let small = placement
-        .decision
-        .rejected
-        .iter()
-        .find(|rejection| rejection.executor_id == "bgsrv-ub")
-        .expect("bgsrv-ub is on the record");
-    assert!(
-        matches!(small.reason, PlacementRejectionReason::ProcessDeferred(_)),
-        "{}",
-        small.reason.describe()
-    );
-    let demand = selection(&placement)
-        .process_demand
-        .expect("the winner's record names its single process");
-    assert!(
-        demand
-            .describe()
-            .starts_with("one process of ~11.5 GiB (rustc, unmeasured; standing in: suite rust-tests's peak 9.2 GiB from bgsrv-ub x 1.25 headroom)"),
-        "{}",
-        demand.describe()
-    );
-    assert!(!demand.measured_on_this_platform());
-
-    let (pool, db, request) = fleet("process-prior-drained.db", true, true).await;
-    let placement = select(pool, db, request)
-        .await
-        .unwrap()
-        .placed()
-        .expect("with the large machine drained, the small one is last but not never");
-    assert_eq!(placement.selected.executor_id, "bgsrv-ub");
-    let waiver = selection(&placement)
-        .process_fit_waived
-        .expect("the record says why the small machine took it");
-    assert_eq!(
-        waiver.reason,
-        cairn_common::executor_protocol::ProcessFitWaiverReason::NoLargerMachine
-    );
-
-    let (pool, db, request) = fleet("process-prior-none.db", false, false).await;
-    let placement = select(pool, db, request)
-        .await
-        .unwrap()
-        .placed()
-        .expect("unmeasured work is still placed");
-    assert_eq!(
-        placement.selected.executor_id, "bbs",
-        "the machine that can give one process the most"
-    );
-    let demand = selection(&placement).process_demand.unwrap();
-    assert!(
-        matches!(
-            demand,
-            cairn_common::executor_protocol::ProcessDemandRecord::Unmeasured { .. }
-        ),
-        "{demand:?}"
-    );
-    assert!(demand.describe().starts_with("placed unmeasured"));
-
-    // cairn/7027: an agent's ad-hoc `cargo test -p cairn-codec`, measured
-    // nowhere, stands on its class suite's 9.2 GiB. Deferral is for pinned or
-    // last-resort placement only: unpinned, it still goes to the machine that
-    // can hold the borrowed number, and the small one is deferred, not refused.
-    let (pool, db, mut request) = fleet("process-prior-ad-hoc.db", false, false).await;
-    let small = {
-        let connections = pool.lock_connections();
-        let entry = connections.get("bgsrv-ub").expect("the small machine");
-        ReservationPlan::context_for(
-            &entry.identity.device_id,
-            &entry.identity.executor_id,
-            &entry.advertisement.capabilities,
-        )
-    };
+/// A cold compile, nothing of it measured, in a project whose rust-tests
+/// suite peaked at a 9.9 GB rustc: that class prior is more than bgsrv-ub
+/// (12.1 GiB) can give one process. With the 62 GiB machine busy and
+/// bgsrv-ub idle, the work waits for the large machine rather than being
+/// bgsrv-ub's first measurement of it, and the account says so naming the
+/// machine waited for; the large machine takes it when its cores free.
+/// (Main's ranking queued it on the busy machine; cairn/7339 S3.)
+#[tokio::test]
+async fn a_cold_compile_waits_for_a_busy_machine_that_holds_its_class_prior() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const SMALL: u64 = 12_992_276_070;
+    let db = Arc::new(crate::storage::migrated_test_db("process-prior-busy.db").await);
+    let pool = Fleet::default();
+    let now = unix_time_ms();
+    let mut connections = HashMap::new();
+    let mut small = None;
+    for (id, total) in [("bgsrv-ub", SMALL), ("bbs", 62 * GIB)] {
+        let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
+        Arc::make_mut(&mut entry.advertisement)
+            .capabilities
+            .memory_budget_bytes = Some(total / 100 * 85);
+        measured_at(&mut entry, 0.01, total - 3 * GIB, 500 * GIB, now);
+        Arc::make_mut(&mut entry.health).machine.memory = Measurement::measured(
+            now,
+            MachineMemory {
+                total_bytes: total,
+                available_bytes: total - 3 * GIB,
+            },
+        );
+        Arc::make_mut(&mut entry.health)
+            .memory_record
+            .standing_bytes = Some(5 * GIB / 2);
+        small.get_or_insert_with(|| {
+            ReservationPlan::context_for(
+                &entry.identity.device_id,
+                &entry.identity.executor_id,
+                &entry.advertisement.capabilities,
+            )
+        });
+        connections.insert(id, entry);
+    }
+    *pool.lock_connections() = connections;
+    let mut request = spillable_request();
+    request.command_class = CellCommandClass::CargoCheck;
+    request.wait_horizon_unix_ms = now + 600_000;
     resource_profiles::observe_suite(
         db.clone(),
-        Some(&format!("{}/class:cargoTest", request.project_id)),
+        Some(&format!("{}/rust-tests", request.project_id)),
         CellCommandClass::CargoTest,
-        &small,
+        &small.unwrap(),
         &CellExecutionMeta {
             stop: None,
             peak_process: Some(cairn_common::executor_protocol::PeakProcess {
@@ -9097,201 +7551,117 @@ async fn a_cold_compile_is_offered_the_small_machine_last_on_the_class_prior() {
         resource_profiles::CompletedSource::default(),
     )
     .await;
-    request.command_resource_identity = None;
-    request.command_class = CellCommandClass::CargoTest;
-    let batch = ProcessBatch {
-        files: Vec::new(),
-        runtime_packages: Vec::new(),
-        sequential: true,
-        stop_on_error: false,
-        sandbox_mode: ProcessSandboxMode::Unconfined,
-        timeout_bases: Vec::new(),
-        items: vec![ProcessBatchItem {
-            args: vec!["cargo test -p cairn-codec --lib".into()],
-            ..cache_batch_item(Vec::new())
-        }],
-        runner_context_id: None,
-        execution_residency: None,
-        containment: None,
-        node_scratch: None,
-    };
-    let plan = ReservationPlan::new(db, &request, Some(&batch));
-    let placement = pool
-        .select_executor_once_with(
-            &request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .unwrap()
-        .placed()
-        .expect("the large machine takes it");
-    assert_eq!(
-        placement.selected.executor_id, "bbs",
-        "unpinned, an unmeasured ad-hoc compile prefers the machine its borrowed number fits"
-    );
-    let small = placement
-        .decision
-        .rejected
-        .iter()
-        .find(|rejection| rejection.executor_id == "bgsrv-ub")
-        .expect("bgsrv-ub is on the record");
-    assert!(
-        matches!(small.reason, PlacementRejectionReason::ProcessDeferred(_)),
-        "{}",
-        small.reason.describe()
-    );
-    assert!(
-        small
-            .reason
-            .describe()
-            .contains("unmeasured; standing in: suite class:cargoTest's peak 9.2 GiB"),
-        "{}",
-        small.reason.describe()
-    );
-}
-
-/// cairn/6310 end to end: bgsrv-mac, the only macOS machine, whose
-/// sampler recorded the whole suite's 15.6 GiB with no process named, is
-/// judged against its 15.3 GiB reservation cap (it posts no standing
-/// use). It is offered the suite, and the placement record keeps the
-/// refusal that would have been made and why it was not.
-#[tokio::test]
-async fn the_only_macos_machine_is_offered_a_suite_its_unnamed_peak_would_have_refused() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let db = Arc::new(crate::storage::migrated_test_db("process-fit-macos.db").await);
-    let identity = CommandResourceIdentity {
+    request.command_resource_identity = Some(CommandResourceIdentity {
         version: 1,
-        key: "rust-tests:whole".into(),
-        suite: Some("rust-tests".into()),
+        key: "workspace-compile:cold".into(),
+        suite: Some("workspace-compile".into()),
+    });
+    pool.record_room("bbs", 1, 1, sized_room(62 * GIB, 0));
+    pool.record_room("bgsrv-ub", 1, 1, sized_room(SMALL, 64));
+    let plan = Arc::new(ReservationPlan::new(db, &request, None));
+    let mut deliveries = joined(&pool, &request, plan).await;
+    assert_eq!(assigned_within(&mut deliveries).await, None);
+
+    let Some(CheckDispatchPhase::Placing {
+        declines,
+        placement: Some(account),
+        turn,
+        ..
+    }) = pool.queued_request_account(&request.request_id)
+    else {
+        panic!("a queued request in the dispatcher has an account");
     };
-    let pool = Fleet::default();
-    let now = unix_time_ms();
-    let total = 24 * GIB;
-    let (id, mut entry) = fleet_entry_at("bgsrv-mac", "macos", 0, &[], now);
-    Arc::make_mut(&mut entry.advertisement)
-        .capabilities
-        .memory_budget_bytes = Some(total / 100 * 85);
-    measured_at(&mut entry, 0.01, total - 3 * GIB, 500 * GIB, now);
-    Arc::make_mut(&mut entry.health).machine.memory = Measurement::measured(
-        now,
-        MachineMemory {
-            total_bytes: total,
-            available_bytes: total - 3 * GIB,
-        },
+    let ub = account
+        .machines
+        .iter()
+        .find(|machine| machine.executor_name == "bgsrv-ub")
+        .expect("bgsrv-ub is in the account");
+    assert_eq!(status_kind(&ub.status), "waits for");
+    let held =
+        crate::execution::checks::describe_queued_hold(&declines, Some(&account), turn.as_ref())
+            .unwrap();
+    assert!(
+        held.contains("bgsrv-ub: its room #1 fits, but the work waits for bbs"),
+        "{held}"
     );
-    Arc::make_mut(&mut entry.health)
-        .memory_record
-        .standing_bytes = None;
-    let context = ReservationPlan::context_for(
-        &entry.identity.device_id,
-        &entry.identity.executor_id,
-        &entry.advertisement.capabilities,
-    );
-    pool.lock_connections().insert(id, entry);
-    let mut request = spillable_request();
-    request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
-    let suite =
-        resource_profiles::suite_key(&request.project_id, Some(&identity), request.command_class);
-    resource_profiles::observe_suite(
-        db.clone(),
-        suite.as_deref(),
-        CellCommandClass::CargoTest,
-        &context,
-        &CellExecutionMeta {
-            stop: None,
-            peak_process: Some(cairn_common::executor_protocol::PeakProcess {
-                bytes: 16_751_935_488,
-                name: None,
-            }),
-            ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
-        },
-        resource_profiles::CompletionKind::Succeeded,
-        resource_profiles::MachineAdmission::default(),
-        resource_profiles::CompletedSource::default(),
-    )
-    .await;
-    request.command_resource_identity = Some(identity);
-    let plan = ReservationPlan::new(db, &request, None);
-    let placement = pool
-        .select_executor_once_with(
-            &request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .unwrap()
-        .placed()
-        .expect("bgsrv-mac is offered the suite");
-    assert_eq!(placement.selected.executor_id, "bgsrv-mac");
-    let PlacementOutcome::Selected(selection) = &placement.decision.outcome else {
-        panic!("placed means selected");
-    };
-    let waiver = selection
-        .process_fit_waived
-        .as_ref()
-        .expect("the record says why the fit did not refuse");
+
+    pool.record_room("bbs", 1, 2, sized_room(62 * GIB, 64));
     assert_eq!(
-        waiver.reason,
-        cairn_common::executor_protocol::ProcessFitWaiverReason::UnattributedPeak
-    );
-    let text = waiver.describe();
-    assert!(
-        text.contains("~19.5 GiB (suite rust-tests, 15.6 GiB measured here x 1.25 headroom)"),
-        "{text}"
+        assigned_within(&mut deliveries).await.as_deref(),
+        Some("bbs")
     );
 }
 
-fn pinned_to(mut request: CellRequest, home: &str) -> CellRequest {
-    request.pinned_executor_id = Some(home.into());
-    request.placement_mobility = PlacementMobility::PinnedOrColocated;
-    request.repository = RepositoryLocator::ColocatedPath {
-        project_id: "p".into(),
-        repository_id: "repo".into(),
-        absolute_path: "/repo".into(),
-    };
-    request
-}
-
-/// A machine with no stated budget has no measured fit either way. It is not
-/// named as able to hold the work, and the note does not claim that nothing
-/// can.
+/// A learned peak above bgsrv-ub's ceiling: placed there it runs at the
+/// clamp. While a busy machine whose budget holds the peak is attached,
+/// work free to move waits for it; pinned to bgsrv-ub it runs there at
+/// once; and with no machine able to hold the peak it runs at the clamp at
+/// once, since waiting buys nothing (cairn/5731; cairn/7339 S3).
 #[tokio::test]
-async fn a_machine_whose_fit_is_unknown_is_neither_the_safe_choice_nor_proof_none_exists() {
+async fn a_clamped_peak_waits_only_for_a_machine_that_could_hold_it() {
     const GIB: u64 = 1024 * 1024 * 1024;
-    let (pool, db, request) =
-        ceiling_fleet_with("ceiling-unknown.db", None, true, 0.01, 60 * GIB).await;
-    let request = pinned_to(request, "bgsrv-ub");
-    let plan = ReservationPlan::new(db, &request, None);
-
-    let placement = pool
-        .select_executor_once_with(
-            &request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .expect("an unknown fit is not a machine that can hold it")
-        .placed()
-        .unwrap();
-    assert_eq!(placement.selected.executor_id, "bgsrv-ub");
-    let above = placement.above_ceiling.unwrap();
-    assert!(above.unknown_elsewhere);
-    let note = above.note();
-    assert!(
-        note.contains("no usable machine is known to hold it"),
-        "{note}"
-    );
-    assert!(!note.contains("no executor can hold"), "{note}");
+    const UB_BUDGET: u64 = 11_042_782_208;
+    for (case, other_budget, pinned, waits) in [
+        ("holdable elsewhere", 100 * GIB, false, true),
+        ("pinned home", 100 * GIB, true, false),
+        ("nowhere larger", UB_BUDGET, false, false),
+    ] {
+        let db = Arc::new(
+            crate::storage::migrated_test_db(&format!("ceiling-{}.db", case.replace(' ', "-")))
+                .await,
+        );
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "test:rust".into(),
+            suite: None,
+        };
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let mut connections = HashMap::new();
+        for (id, budget) in [("bgsrv-ub", UB_BUDGET), ("large", other_budget)] {
+            let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
+            Arc::make_mut(&mut entry.advertisement)
+                .capabilities
+                .memory_budget_bytes = Some(budget);
+            measured_at(&mut entry, 0.01, 10 * GIB, 500 * GIB, now);
+            resource_profiles::seed_memory_profile_for_test(
+                db.clone(),
+                &identity,
+                &ReservationPlan::context_for(
+                    &entry.identity.device_id,
+                    &entry.identity.executor_id,
+                    &entry.advertisement.capabilities,
+                ),
+                8 * GIB,
+            )
+            .await;
+            connections.insert(id, entry);
+        }
+        *pool.lock_connections() = connections;
+        let mut request = spillable_request();
+        request.command_class = CellCommandClass::CargoTest;
+        request.command_resource_identity = Some(identity);
+        request.wait_horizon_unix_ms = now + 600_000;
+        if pinned {
+            request.pinned_executor_id = Some("bgsrv-ub".into());
+        }
+        pool.record_room("large", 1, 1, sized_room(128 * GIB, 0));
+        pool.record_room("bgsrv-ub", 1, 1, sized_room(64 * GIB, 64));
+        let plan = Arc::new(ReservationPlan::new(db, &request, None));
+        let mut deliveries = joined(&pool, &request, plan).await;
+        let first = assigned_within(&mut deliveries).await;
+        if !waits {
+            assert_eq!(first.as_deref(), Some("bgsrv-ub"), "{case}");
+            continue;
+        }
+        assert_eq!(first, None, "{case}");
+        pool.record_room("large", 1, 2, sized_room(128 * GIB, 64));
+        assert_eq!(
+            assigned_within(&mut deliveries).await.as_deref(),
+            Some("large"),
+            "{case}"
+        );
+    }
 }
 
 /// bgsrv-ub, freshly killed for memory, beside fedora, which has never run
@@ -9383,77 +7753,21 @@ async fn place_once(
     db: Arc<cairn_db::storage::LocalDb>,
     request: &CellRequest,
 ) -> Placement {
-    let plan = ReservationPlan::new(db, request, None);
-    pool.select_executor_once_with(
-        request,
-        Some(&plan),
-        &ActivePlacementPolicy::default_profile(),
-        &HashMap::new(),
-        &AdmissionView::default(),
-        |_, _| SyncCost::Known(0),
+    announce_posted_rooms(pool);
+    let plan = Arc::new(ReservationPlan::new(db, request, None));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        place_through_dispatcher(pool, request, Some(plan)),
     )
     .await
-    .unwrap()
-    .placed()
-    .unwrap()
-}
-
-/// cairn/7301: a parked request is re-priced against every candidate on each
-/// placement pass, at least four times a second, and every pricing re-read
-/// the same profile rows, which held twelve of the runner host's cores. A
-/// pass over parked requests against machines nothing has taught anything
-/// since the last pass issues no statement, and a profile written between
-/// passes is read by the next one.
-#[tokio::test]
-async fn re_pricing_unchanged_requests_against_unchanged_machines_reads_nothing() {
-    let (pool, db, request) = killed_fleet("re-pricing-reads.db", 2_684_354_560, 1).await;
-    let parked: Vec<CellRequest> = (0..4)
-        .map(|n| CellRequest {
-            request_id: format!("parked-{n}"),
-            ..request.clone()
-        })
-        .collect();
-    for request in &parked {
-        place_once(&pool, db.clone(), request).await;
-    }
-    let before = db.read_statement_count();
-    for _ in 0..3 {
-        for request in &parked {
-            place_once(&pool, db.clone(), request).await;
-        }
-    }
-    assert_eq!(
-        db.read_statement_count() - before,
-        0,
-        "three more passes over {} parked requests read the store again",
-        parked.len()
-    );
-
-    let ub = pool.lock_connections()["bgsrv-ub"].clone();
-    resource_profiles::seed_memory_profile_for_test(
-        db.clone(),
-        request.command_resource_identity.as_ref().unwrap(),
-        &ReservationPlan::context_for(
-            &ub.identity.device_id,
-            &ub.identity.executor_id,
-            &ub.advertisement.capabilities,
-        ),
-        1024 * 1024 * 1024,
-    )
-    .await;
-    let before = db.read_statement_count();
-    place_once(&pool, db.clone(), &parked[0]).await;
-    assert!(
-        db.read_statement_count() > before,
-        "a profile written between passes is read by the next one"
-    );
+    .expect("assigned at once")
+    .expect("a machine takes it")
 }
 
 /// cairn/5416's specimen: a `rustc` killed at 3.4 GiB beside another
 /// compile on a 12.1 GiB machine now showing 2.5 GiB free. The re-armed
 /// lane is charged the kill, not the 2 GiB class prior that fit, so it goes
-/// to the machine that can take it, and the record says why with both
-/// numbers. The charge is the victim's own floor: a compile runs at its one
+/// to the machine that can take it. The charge is the victim's own floor: a compile runs at its one
 /// slot width, so there is no per-job model to narrow it and no width pricing
 /// to raise it (cairn/7303).
 #[tokio::test]
@@ -9462,18 +7776,14 @@ async fn a_command_killed_for_memory_is_not_placed_back_where_it_does_not_fit() 
     let (pool, db, request) = killed_fleet("oom-floor-placement.db", available, 1).await;
     let placement = place_once(&pool, db, &request).await;
     assert_eq!(placement.selected.executor_id, "fedora");
-    let refused = placement
-        .decision
-        .rejected
-        .iter()
-        .find(|rejection| rejection.executor_id == "bgsrv-ub")
-        .expect("the killed machine is on the record");
-    assert_eq!(
-        refused.reason,
-        PlacementRejectionReason::InsufficientMemory {
-            required_bytes: 3_650_722_201,
-            available_bytes: available,
-        }
+    assert!(
+        placement
+            .decision
+            .rejected
+            .iter()
+            .any(|rejection| rejection.executor_id == "bgsrv-ub"),
+        "the decision names the machine the command was killed on: {:?}",
+        placement.decision.rejected
     );
 }
 
@@ -9531,1347 +7841,158 @@ async fn a_runner_booting_onto_a_kill_ledger_retires_the_false_host_exclusion() 
     );
 }
 
-/// cairn/5731's specimen: a macOS-only whole-suite pass measured above the
-/// only Mac's ceiling, and a 125 GiB Linux machine on an executor-update
-/// hold. The Linux machine can hold the memory and can never run the work,
-/// so it is neither a machine to wait for nor one that "can hold it": the
-/// pass goes to the Mac at the clamp, and its note says nothing could.
-#[tokio::test]
-async fn holdable_elsewhere_is_false_when_the_only_larger_machine_fails_the_selector() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let db = Arc::new(crate::storage::migrated_test_db("ceiling-selector-scoped.db").await);
-    let identity = CommandResourceIdentity {
-        version: 1,
-        key: "test:rust".into(),
-        suite: None,
-    };
-    let now = unix_time_ms();
-    let mut connections = HashMap::new();
-    for (id, os, budget, update_hold) in [
-        ("bgsrv-mac", "macos", 11_042_782_208, false),
-        ("fedora", "linux", 125 * GIB, true),
-    ] {
-        let (id, mut entry) = fleet_entry_at(id, os, 0, &[], now);
-        Arc::make_mut(&mut entry.advertisement)
-            .capabilities
-            .memory_budget_bytes = Some(budget);
-        runtime_update_hold_fixture(&mut entry, update_hold);
-        measured_at(&mut entry, 0.01, budget, 500 * GIB, now);
-        resource_profiles::seed_memory_profile_for_test(
-            db.clone(),
-            &identity,
-            &ReservationPlan::context_for(
-                &entry.identity.device_id,
-                &entry.identity.executor_id,
-                &entry.advertisement.capabilities,
-            ),
-            8 * GIB,
-        )
-        .await;
-        connections.insert(id, entry);
-    }
-    let pool = Fleet::default();
-    *pool.lock_connections() = connections;
-    let mut request = spillable_request();
-    request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
-    request.command_resource_identity = Some(identity);
-    request.repository = RepositoryLocator::ManagedObjects {
-        project_id: "p".into(),
-        repository_id: "repo".into(),
-        object_format: GitObjectFormat::Sha1,
-    };
-    request.executor = Some(ExecutorSelector {
-        os: Some("macos".into()),
-        ..ExecutorSelector::default()
-    });
-    let plan = ReservationPlan::new(db, &request, None);
-
-    let placement = pool
-        .select_executor_once_with(
-            &request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .unwrap()
-        .placed()
-        .expect("waited on a machine that cannot run the work");
-    assert_eq!(placement.selected.executor_id, "bgsrv-mac");
-    assert!(placement.decision.rejected.iter().any(|rejection| {
-        rejection.executor_id == "fedora"
-            && matches!(
-                rejection.reason,
-                PlacementRejectionReason::SelectorMismatch { .. }
-            )
-    }));
-    assert!(!placement
-        .decision
-        .rejected
-        .iter()
-        .any(|rejection| waits_on_machine(&rejection.reason)));
-    let above = placement.above_ceiling.expect("placed at the clamp");
-    assert!(!above.holdable_elsewhere);
-    assert!(
-        above.note().contains("no executor can hold"),
-        "{}",
-        above.note()
-    );
-}
-
-/// The other half of cairn/5731: a learned peak above every eligible
-/// machine's ceiling. One Mac has declined, the other is usable, and both
-/// budgets are under the demand. Waiting on the decliner can only end at
-/// the clamp too, and while nothing runs the peak is never re-measured,
-/// so the pass places a probe at the clamp now instead of waiting.
-#[tokio::test]
-async fn a_learned_peak_above_every_eligible_ceiling_places_a_probe_rather_than_waiting() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let db = Arc::new(crate::storage::migrated_test_db("ceiling-probe.db").await);
-    let identity = CommandResourceIdentity {
-        version: 1,
-        key: "test:rust".into(),
-        suite: None,
-    };
-    let now = unix_time_ms();
-    let mut connections = HashMap::new();
-    for id in ["bgsrv-mac", "bgsrv-mac-2"] {
-        let (id, mut entry) = fleet_entry_at(id, "macos", 0, &[], now);
-        Arc::make_mut(&mut entry.advertisement)
-            .capabilities
-            .memory_budget_bytes = Some(11_042_782_208);
-        measured_at(&mut entry, 0.01, 10 * GIB, 500 * GIB, now);
-        resource_profiles::seed_memory_profile_for_test(
-            db.clone(),
-            &identity,
-            &ReservationPlan::context_for(
-                &entry.identity.device_id,
-                &entry.identity.executor_id,
-                &entry.advertisement.capabilities,
-            ),
-            8 * GIB,
-        )
-        .await;
-        connections.insert(id, entry);
-    }
-    let pool = Fleet::default();
-    *pool.lock_connections() = connections;
-    let mut request = spillable_request();
-    request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
-    request.command_resource_identity = Some(identity);
-    request.repository = RepositoryLocator::ManagedObjects {
-        project_id: "p".into(),
-        repository_id: "repo".into(),
-        object_format: GitObjectFormat::Sha1,
-    };
-    request.executor = Some(ExecutorSelector {
-        os: Some("macos".into()),
-        ..ExecutorSelector::default()
-    });
-    let generation = pool.lock_connections()["bgsrv-mac-2"].generation;
-    let declined = HashMap::from([(
-        "bgsrv-mac-2".to_string(),
-        queue::EntryDecline {
-            generation,
-            reason: DeclineReason::ProjectProvisioning,
-            detail: Some("provisioning project p".into()),
-            disk: None,
-            at_unix_ms: now,
-            condition: None,
-            backoff_ms: 0,
-            retry_after_unix_ms: 0,
-            room_seq: None,
-            superseded_at_unix_ms: None,
-        },
-    )]);
-    let plan = ReservationPlan::new(db, &request, None);
-
-    let placement = pool
-        .select_executor_once_with(
-            &request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &declined,
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .unwrap()
-        .placed()
-        .expect("waited on a machine that could not hold the work either");
-    assert_eq!(placement.selected.executor_id, "bgsrv-mac");
-    assert!(
-        placement.above_ceiling.is_some(),
-        "the probe is placed at the clamp, and says so"
-    );
-}
-
-#[test]
-fn unpinned_shadow_can_choose_a_remote_machine_without_changing_dispatch() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(&mut local, 0.95, 8_000_000_000, 8_000_000_000);
-    let (remote_id, mut remote) = fleet_entry("remote", "linux", 0, &[]);
-    measured(&mut remote, 0.01, 8_000_000_000, 8_000_000_000);
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-    let mut request = spillable_request();
-    request.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
-    request.placement_mobility = PlacementMobility::PinnedOrColocated;
-    request.repository = RepositoryLocator::ColocatedPath {
-        project_id: "p".into(),
-        repository_id: "repo".into(),
-        absolute_path: "/repo".into(),
-    };
-
-    let estimate = |_: &CellRequest, entry: &ExecutorConnectionState| {
-        SyncCost::Known(if entry.colocated { 1_000_000_000 } else { 0 })
-    };
-    let actual =
-        choose_executor_with(&connections, &request, &HashMap::new(), estimate, NOW).unwrap();
-    let shadow = choose_executor_with(
-        &connections,
-        &hermetic_shadow_request(&request).unwrap(),
-        &HashMap::new(),
-        estimate,
-        NOW,
-    )
-    .unwrap();
-
-    assert_eq!(chosen(&actual).executor_id, COLOCATED_EXECUTOR_ID);
-    assert_eq!(chosen(&shadow).executor_id, "remote");
+/// What placement can tell about `request` on this fleet before any room is
+/// read: the one machine it could go to, when only one could, and every
+/// machine passed over with its reason. Which of several eligible machines
+/// takes the work is the dispatcher's, by announced room.
+#[derive(Debug)]
+struct PlacementDraft {
+    selected: Option<(SelectedExecutor, PlacementSelection)>,
+    rejected: Vec<PlacementRejection>,
 }
 
 fn place(
     connections: &HashMap<String, ExecutorConnectionState>,
     request: &CellRequest,
 ) -> Result<PlacementDraft, String> {
-    choose_executor_with(
-        connections,
-        request,
-        &HashMap::new(),
-        |_, _| SyncCost::Known(0),
-        NOW,
-    )
+    let survey =
+        survey_candidates(connections, &[], request, NOW).map_err(|failure| failure.diagnostic)?;
+    let selected = match survey.usable.as_slice() {
+        [only] => Some((selected_executor(only), sole_selection(only, request))),
+        _ => None,
+    };
+    Ok(PlacementDraft {
+        selected,
+        rejected: survey.rejected,
+    })
 }
 
-fn place_with_profile(
+/// The selection record of the only machine that could take `request`.
+fn sole_selection(entry: &ExecutorConnectionState, request: &CellRequest) -> PlacementSelection {
+    PlacementSelection {
+        executor_name: executor_public_name(entry),
+        executor_id: entry.identity.executor_id.clone(),
+        colocated: entry.colocated,
+        reason: PlacementReason::OnlyCandidate,
+        tie_break: None,
+        readings: super::selection::placement_readings(&entry.health.machine),
+        reservation: request.resource_reservation.clone(),
+        reservation_rationale: unresolved_rationale(&request.resource_reservation),
+        sync_cost: PlacementSyncCost::Unknown,
+        object_transfer: None,
+        observation_reuse: if entry.colocated {
+            ObservationReuse::Colocated
+        } else {
+            ObservationReuse::UntrustedRemoteEnvironment
+        },
+        prediction: None,
+        memory_ceiling: None,
+        process_fit_waived: None,
+        nested_sandbox_waived: None,
+        restart_exposure: None,
+        process_demand: None,
+        cache_distance: None,
+    }
+}
+
+/// The one machine `request` could go to on this fleet, `None` when none
+/// could, or the refusal owed at once.
+fn choose_executor(
     connections: &HashMap<String, ExecutorConnectionState>,
     request: &CellRequest,
-    name: &str,
-    profile: PlacementProfile,
-) -> Result<PlacementDraft, String> {
-    choose_executor_with_policy(
-        connections,
-        request,
-        &HashMap::new(),
-        &ActivePlacementPolicy {
-            name: name.to_string(),
-            profile,
-        },
-        |_, _| SyncCost::Known(0),
-        NOW,
-    )
+) -> Result<Option<SelectedExecutor>, String> {
+    Ok(place(connections, request)?
+        .selected
+        .map(|(selected, _)| selected))
 }
 
-#[test]
-fn remote_first_prefers_a_comparable_remote_and_records_policy_evidence() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    let (remote_id, mut remote) = fleet_entry("remote", "linux", 0, &[]);
-    measured(&mut local, 0.1, 8_000_000_000, 8_000_000_000);
-    measured(&mut remote, 0.1, 8_000_000_000, 8_000_000_000);
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-    let request = spillable_request();
-    let profile = profile_with_routes(30, |_| PlacementStance::RemoteFirst);
-
-    let draft = place_with_profile(&connections, &request, "interactive", profile).unwrap();
-
-    assert_eq!(chosen(&draft).executor_id, "remote");
-    assert_eq!(draft.policy.profile_name, "interactive");
-    assert!(draft.policy.changed_earliest_winner);
-}
-
-#[test]
-fn explicit_selector_leaves_profile_preference_no_choice() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    let (remote_id, mut remote) = fleet_entry("remote", "linux", 0, &[]);
-    measured(&mut local, 0.1, 8_000_000_000, 8_000_000_000);
-    measured(&mut remote, 0.1, 8_000_000_000, 8_000_000_000);
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-    let mut request = spillable_request();
-    request.placement_work_class = PlacementWorkClass::AgentSessions;
-    request.executor = Some(ExecutorSelector {
-        name: Some("remote".into()),
-        ..ExecutorSelector::default()
-    });
-    let mut profile = profile_with_routes(30, |_| PlacementStance::LocalFirst);
-    profile.machine_priority = vec![LOCAL_EXECUTOR_NAME.into(), "remote".into()];
-
-    let draft = place_with_profile(&connections, &request, "interactive", profile).unwrap();
-
-    assert_eq!(chosen(&draft).executor_id, "remote");
-    assert!(!draft.policy.changed_earliest_winner);
-}
-
-#[test]
-fn machine_priority_breaks_comparable_candidates_without_crossing_hard_gates() {
-    let (a_id, mut a) = fleet_entry("a", "linux", 0, &[]);
-    let (b_id, mut b) = fleet_entry("b", "linux", 0, &[]);
-    measured(&mut a, 0.1, 8_000_000_000, 8_000_000_000);
-    measured(&mut b, 0.1, 8_000_000_000, 8_000_000_000);
-    let connections = HashMap::from([(a_id, a), (b_id, b)]);
-    let mut profile = profile_with_routes(0, |_| PlacementStance::Any);
-    profile.machine_priority = vec!["b".into(), "a".into()];
-
-    let draft = place_with_profile(&connections, &spillable_request(), "custom", profile).unwrap();
-
-    assert_eq!(chosen(&draft).executor_id, "b");
-}
-
-/// The labeled class prior, for a fixture whose reservation is the point and
-/// whose duration is not.
-#[test]
-fn zero_unit_request_ignores_unmeasured_running_cargo_when_capacity_is_free() {
-    let (_, mut entry) = fleet_entry("local", "linux", 0, &[]);
-    measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
-    Arc::make_mut(&mut entry.advertisement).observed_at_unix_ms = NOW;
-    Arc::make_mut(&mut entry.advertisement).liveness_observed_at_unix_ms = Some(NOW);
-    Arc::make_mut(&mut entry.health)
-        .admission
-        .concurrency_capacity = Some(14);
-    Arc::make_mut(&mut entry.health)
-        .admission
-        .active_reservation
-        .concurrency_units = 1;
-    let mut running = executing("cargo test", 300_000);
-    running.learned_estimate = None;
-    running.started_at_unix_ms = NOW - 21_314;
-    Arc::make_mut(&mut entry.snapshot).executing_requests = vec![running];
-    let context =
-        ReservationPlan::context_for("device", "executor", &entry.advertisement.capabilities);
-    let prices = QueuePrices::from_priors(&entry, &context);
-    let mut request = spillable_request();
-    request.resource_reservation = ResourceReservation {
-        concurrency_units: 0,
-        source: ResourceReservationSource::Declared,
-        ..ResourceReservation::default()
-    };
-
-    assert_eq!(
-        forecast_queue_wait(&entry, &prices, &request, 10_000, NOW),
-        QueueForecast::Forecast {
-            predicted_ms: 0,
-            requests_ahead: 0,
-            running_ahead: 1,
-            fully_measured: true,
-            observed_at_unix_ms: NOW,
-            stalled_head_ms: None,
-        }
-    );
-}
-
-#[test]
-fn full_machine_forecasts_the_kth_capacity_release_not_the_sum() {
-    let (_, mut entry) = fleet_entry("local", "linux", 0, &[]);
-    measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
-    Arc::make_mut(&mut entry.advertisement).observed_at_unix_ms = NOW;
-    Arc::make_mut(&mut entry.advertisement).liveness_observed_at_unix_ms = Some(NOW);
-    Arc::make_mut(&mut entry.health)
-        .admission
-        .concurrency_capacity = Some(4);
-    Arc::make_mut(&mut entry.health)
-        .admission
-        .active_reservation
-        .concurrency_units = 4;
-    let mut first = executing("first", 300_000);
-    first.resource_reservation.concurrency_units = 2;
-    first.learned_estimate = None;
-    first.started_at_unix_ms = NOW - 299_900;
-    let mut second = executing("second", 300_000);
-    second.resource_reservation.concurrency_units = 2;
-    second.learned_estimate = None;
-    second.started_at_unix_ms = NOW - 299_800;
-    Arc::make_mut(&mut entry.snapshot).executing_requests = vec![first, second];
-    let context =
-        ReservationPlan::context_for("device", "executor", &entry.advertisement.capabilities);
-    let prices = QueuePrices::from_priors(&entry, &context);
-    let mut request = spillable_request();
-    request.resource_reservation = ResourceReservation {
-        concurrency_units: 3,
-        source: ResourceReservationSource::Declared,
-        ..ResourceReservation::default()
-    };
-
-    let QueueForecast::Forecast { predicted_ms, .. } =
-        forecast_queue_wait(&entry, &prices, &request, 10_000, NOW)
-    else {
-        panic!("capacity facts should produce a forecast");
-    };
-    assert_eq!(predicted_ms, 200);
-}
-
-fn test_prior_duration() -> DurationEstimate {
-    resource_profiles::unmeasured_duration(
-        CellCommandClass::Other,
-        &ReservationPlan::context_for(
-            "device",
-            "executor",
-            &ExecutorCapabilities {
-                os: "linux".into(),
-                arch: "x86_64".into(),
-                logical_cores: 8,
-                concurrency_capacity: None,
-                toolchains: Vec::new(),
-                projects_served: Vec::new(),
-                disk_budget_bytes: None,
-                memory_budget_bytes: None,
-                sandbox: None,
-                toolchain_detection: None,
-                build_prerequisites: None,
-                containment: None,
-                page_call_programs: None,
-                github_credential: None,
-                publish_isolation: None,
-                machine_services: Vec::new(),
-                credential_floor_service_residents: false,
-                resident_output_end: false,
-                service_bounds: None,
-            },
-        ),
-        None,
-        ExecutionWarmth::Cold,
-        DurationFallback::NoProfileStore,
-    )
-}
-
-/// A missing queue reading is not a fast queue. Even when that machine's run
-/// prior is numerically lower, it cannot outrank a candidate whose complete
-/// queue-plus-run prediction is known.
-#[test]
-fn an_unknown_queue_never_wins_by_looking_empty() {
-    let (unknown_id, mut unknown) = fleet_entry("unknown-queue", "linux", 0, &[]);
-    let (known_id, mut known) = fleet_entry("known-queue", "linux", 0, &[]);
-    measured(&mut unknown, 0.1, 8_000_000_000, 8_000_000_000);
-    measured(&mut known, 0.1, 8_000_000_000, 8_000_000_000);
-
-    let warmth = CacheWarmthEvidence::Observed {
-        warmth: ExecutionWarmth::Cold,
-        observed_at_unix_ms: NOW,
-    };
-    let mut short_run = test_prior_duration();
-    short_run.predicted_ms = 10_000;
-    let mut longer_run = test_prior_duration();
-    longer_run.predicted_ms = 15_000;
-    let unknown_prediction = placement_prediction(
-        &unknown,
-        warmth.clone(),
-        QueueForecast::Unknown {
-            reason: QueueUnknownReason::NoAdmissionCapacity,
-        },
-        short_run,
-        SyncCost::Known(0),
-    );
-    let known_prediction = placement_prediction(
-        &known,
-        warmth,
-        QueueForecast::Forecast {
-            predicted_ms: 5_000,
-            requests_ahead: 1,
-            running_ahead: 0,
-            fully_measured: true,
-            observed_at_unix_ms: NOW,
-            stalled_head_ms: None,
-        },
-        longer_run,
-        SyncCost::Known(0),
-    );
-    let scored = vec![
-        ScoredCandidate::new(
-            &unknown,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            unknown_prediction,
-            None,
-            None,
-            NOW,
-        ),
-        ScoredCandidate::new(
-            &known,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            known_prediction,
-            None,
-            None,
-            NOW,
-        ),
-    ];
-
-    let request = spillable_request();
-    let (winner, _, _, _, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
-        &ActivePlacementPolicy::default_profile(),
-        &ExplorationState::default(),
-        None,
-    );
-    assert_eq!(
-        winner
-            .expect("one measurable candidate wins")
-            .entry
-            .identity
-            .executor_id,
-        known_id
-    );
-    assert_ne!(unknown_id, known_id);
-}
-
-#[test]
-fn contention_can_make_an_idle_slower_machine_win() {
-    let (_, mut fast_busy) = fleet_entry("fast-busy", "linux", 0, &[]);
-    let (idle_id, mut slower_idle) = fleet_entry("slower-idle", "linux", 0, &[]);
-    measured(&mut fast_busy, 0.1, 8_000_000_000, 8_000_000_000);
-    measured(&mut slower_idle, 0.1, 8_000_000_000, 8_000_000_000);
-    let warmth = CacheWarmthEvidence::Observed {
-        warmth: ExecutionWarmth::Cold,
-        observed_at_unix_ms: NOW,
-    };
-    let queue = QueueForecast::Forecast {
-        predicted_ms: 0,
-        requests_ahead: 0,
-        running_ahead: 0,
-        fully_measured: true,
-        observed_at_unix_ms: NOW,
-        stalled_head_ms: None,
-    };
-    let mut fast_run = test_prior_duration();
-    fast_run.predicted_ms = 5_000;
-    let mut slower_run = test_prior_duration();
-    slower_run.predicted_ms = 9_000;
-    let busy = ContentionEstimate {
-        co_resident_compile_jobs: 2,
-        co_resident_light_jobs: 0,
-        multiplier_millis: 2_200,
-        source: cairn_common::executor_protocol::ContentionEvidence::Machine,
-        sample_count: 12,
-        fallback: None,
-    };
-    let idle = ContentionEstimate {
-        co_resident_compile_jobs: 0,
-        co_resident_light_jobs: 0,
-        multiplier_millis: 1_000,
-        source: cairn_common::executor_protocol::ContentionEvidence::Machine,
-        sample_count: 12,
-        fallback: None,
-    };
-    let predictions = [
-        placement_prediction_with_contention(
-            &fast_busy,
-            warmth.clone(),
-            queue.clone(),
-            fast_run,
-            busy,
-            SyncCost::Known(0),
-        ),
-        placement_prediction_with_contention(
-            &slower_idle,
-            warmth,
-            queue,
-            slower_run,
-            idle,
-            SyncCost::Known(0),
-        ),
-    ];
-    assert_eq!(predictions[0].predicted_verdict_ms, 11_000);
-    assert_eq!(predictions[1].predicted_verdict_ms, 9_000);
-    let scored = vec![
-        ScoredCandidate::new(
-            &fast_busy,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            predictions[0].clone(),
-            None,
-            None,
-            NOW,
-        ),
-        ScoredCandidate::new(
-            &slower_idle,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            predictions[1].clone(),
-            None,
-            None,
-            NOW,
-        ),
-    ];
-    let request = spillable_request();
-    let (winner, _, _, _, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
-        &ActivePlacementPolicy::default_profile(),
-        &ExplorationState::default(),
-        None,
-    );
-    assert_eq!(winner.unwrap().entry.identity.executor_id, idle_id);
-}
-
-/// A colocated macOS home and an idle Linux remote that would otherwise
-/// tie, the home carrying `penalty_ms` of its own stall history.
-fn priced_home_and_remote(
-    penalty_ms: Option<u64>,
-) -> (
-    ExecutorConnectionState,
-    ExecutorConnectionState,
-    [PlacementPrediction; 2],
-) {
-    let (_, mut home) = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]);
-    let (_, mut remote) = fleet_entry("fedora", "linux", 0, &[]);
-    home.colocated = true;
-    measured(&mut home, 0.1, 8_000_000_000, 8_000_000_000);
-    measured(&mut remote, 0.1, 8_000_000_000, 8_000_000_000);
-    let warmth = CacheWarmthEvidence::Observed {
-        warmth: ExecutionWarmth::Cold,
-        observed_at_unix_ms: NOW,
-    };
-    let queue = QueueForecast::Forecast {
-        predicted_ms: 0,
-        requests_ahead: 0,
-        running_ahead: 0,
-        fully_measured: true,
-        observed_at_unix_ms: NOW,
-        stalled_head_ms: None,
-    };
-    let mut run = test_prior_duration();
-    run.predicted_ms = 600_000;
-    let idle = ContentionEstimate {
-        co_resident_compile_jobs: 0,
-        co_resident_light_jobs: 0,
-        multiplier_millis: 1_000,
-        source: cairn_common::executor_protocol::ContentionEvidence::Machine,
-        sample_count: 12,
-        fallback: None,
-    };
-    let mut home_prediction = placement_prediction_with_contention(
-        &home,
-        warmth.clone(),
-        queue.clone(),
-        run.clone(),
-        idle.clone(),
-        SyncCost::Known(0),
-    );
-    price_reliability(
-        &mut home_prediction,
-        penalty_ms.map(|penalty_ms| ReliabilityEstimate {
-            executor_name: LOCAL_EXECUTOR_NAME.into(),
-            signature: "silent_stop".into(),
-            failures: 2,
-            of: 4,
-            mean_failure_ms: penalty_ms,
-            penalty_ms,
-        }),
-    );
-    let remote_prediction =
-        placement_prediction_with_contention(&remote, warmth, queue, run, idle, SyncCost::Known(0));
-    (home, remote, [home_prediction, remote_prediction])
-}
-
-/// Two otherwise identical Linux remotes, one fully stalled on memory
-/// 85% of the time (bgsrv-ub before its kill): the thrashing one is priced
-/// at `run * 0.85/0.15` and ranks behind the idle one. A machine that
-/// cannot measure memory pressure is never priced as if it were quiet or
-/// thrashing: it adds nothing and says why.
-#[test]
-fn a_machine_thrashing_on_memory_ranks_behind_an_idle_one() {
-    use cairn_common::executor_protocol::{HostStallPrice, MemoryPressure};
-    use cairn_common::wire_vocabulary::MeasurementGap;
-    let (_, mut thrashing) = fleet_entry("bgsrv-ub", "linux", 0, &[]);
-    let (_, mut idle) = fleet_entry("fedora", "linux", 0, &[]);
-    let (_, unmeasured) = fleet_entry("mini", "linux", 0, &[]);
-    for entry in [&mut thrashing, &mut idle] {
-        measured(entry, 0.1, 8_000_000_000, 8_000_000_000);
+/// Every attached machine announces a roomy room, as a real executor does
+/// when it attaches.
+fn announce_every_room(pool: &Fleet) {
+    let machines: Vec<(String, u64)> = pool
+        .lock_connections()
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.generation))
+        .collect();
+    for (id, generation) in machines {
+        pool.announce_room_for_test(&id, generation);
     }
-    Arc::make_mut(&mut thrashing.health).host.memory_pressure = Measurement::measured(
-        NOW,
-        MemoryPressure {
-            full_avg10_millis: 850,
-            full_avg60_millis: 700,
-        },
-    );
-    Arc::make_mut(&mut idle.health).host.memory_pressure =
-        Measurement::measured(NOW, MemoryPressure::default());
-    let warmth = CacheWarmthEvidence::Observed {
-        warmth: ExecutionWarmth::Cold,
-        observed_at_unix_ms: NOW,
-    };
-    let queue = QueueForecast::Forecast {
-        predicted_ms: 0,
-        requests_ahead: 0,
-        running_ahead: 0,
-        fully_measured: true,
-        observed_at_unix_ms: NOW,
-        stalled_head_ms: None,
-    };
-    let mut run = test_prior_duration();
-    run.predicted_ms = 600_000;
-    let contention = ContentionEstimate {
-        co_resident_compile_jobs: 0,
-        co_resident_light_jobs: 0,
-        multiplier_millis: 1_000,
-        source: cairn_common::executor_protocol::ContentionEvidence::Machine,
-        sample_count: 12,
-        fallback: None,
-    };
-    let predict = |entry: &ExecutorConnectionState| {
-        let mut prediction = placement_prediction_with_contention(
-            entry,
-            warmth.clone(),
-            queue.clone(),
-            run.clone(),
-            contention.clone(),
-            SyncCost::Known(0),
-        );
-        price_host_stall(&mut prediction, &entry.health.host, NOW);
-        prediction
-    };
-    let thrashing_prediction = predict(&thrashing);
-    let idle_prediction = predict(&idle);
-    let unmeasured_prediction = predict(&unmeasured);
-
-    assert_eq!(
-        thrashing_prediction.memory_pressure,
-        Some(HostStallPrice::Priced {
-            full_millis: 850,
-            penalty_ms: 3_400_000,
-        })
-    );
-    assert_eq!(
-        thrashing_prediction.predicted_verdict_ms,
-        600_000 + 3_400_000
-    );
-    assert_eq!(idle_prediction.predicted_verdict_ms, 600_000);
-    assert_eq!(unmeasured_prediction.predicted_verdict_ms, 600_000);
-    assert!(matches!(
-        unmeasured_prediction.memory_pressure,
-        Some(HostStallPrice::Unmeasured {
-            gap: MeasurementGap::NotSampled
-        })
-    ));
-
-    let request = spillable_request();
-    let scored = vec![
-        ScoredCandidate::new(
-            &thrashing,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            thrashing_prediction,
-            None,
-            None,
-            NOW,
-        ),
-        ScoredCandidate::new(
-            &idle,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            idle_prediction,
-            None,
-            None,
-            NOW,
-        ),
-    ];
-    let (winner, _, _, _, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
-        &ActivePlacementPolicy::default_profile(),
-        &ExplorationState::default(),
-        None,
-    );
-    assert_eq!(winner.unwrap().entry.identity.executor_id, "fedora");
-
-    // A reading past the telemetry bound is not this machine now.
-    Arc::make_mut(&mut thrashing.health).host.memory_pressure = Measurement::measured(
-        NOW - EXECUTOR_TELEMETRY_STALE_AFTER_MS - 1,
-        MemoryPressure {
-            full_avg10_millis: 850,
-            full_avg60_millis: 850,
-        },
-    );
-    let stale = predict(&thrashing);
-    assert_eq!(stale.predicted_verdict_ms, 600_000);
-    assert!(matches!(
-        stale.memory_pressure,
-        Some(HostStallPrice::Stale { .. })
-    ));
 }
 
-/// bbs on 10-29 (cairn/5549): I/O fully stalled 58.8% of the last ten
-/// seconds and 48.1% of the last minute. Its run is priced at the worse
-/// window, `run * 0.588/0.412`, and it ranks behind an idle machine; it is
-/// never refused. Memory and storage stalls overlap (a swap-in waits on
-/// both), so storage is charged only for what it adds beyond memory, and a
-/// machine that cannot measure I/O pressure adds nothing and says why.
-#[test]
-fn a_machine_stalled_on_storage_ranks_behind_an_idle_one() {
-    use cairn_common::executor_protocol::{HostStallPrice, IoPressure, MemoryPressure};
-    use cairn_common::wire_vocabulary::MeasurementGap;
-    let (_, mut stalled) = fleet_entry("bbs", "linux", 0, &[]);
-    let (_, mut idle) = fleet_entry("fedora", "linux", 0, &[]);
-    let (_, unmeasured) = fleet_entry("mini", "linux", 0, &[]);
-    for entry in [&mut stalled, &mut idle] {
-        measured(entry, 0.1, 8_000_000_000, 8_000_000_000);
-        Arc::make_mut(&mut entry.health).host.memory_pressure =
-            Measurement::measured(NOW, MemoryPressure::default());
+/// Every attached machine announces the memory room its posted reading
+/// gives it, the way its own admission would: the room is what decides
+/// whether work fits there.
+fn announce_posted_rooms(pool: &Fleet) {
+    /// A machine, its link, and its posted (available, total) memory.
+    type Posted = (String, u64, Option<(u64, u64)>);
+    let machines: Vec<Posted> = pool
+        .lock_connections()
+        .iter()
+        .map(|(id, entry)| {
+            (
+                id.clone(),
+                entry.generation,
+                entry
+                    .health
+                    .machine
+                    .memory
+                    .value()
+                    .map(|memory| (memory.available_bytes, memory.total_bytes)),
+            )
+        })
+        .collect();
+    for (id, generation, memory) in machines {
+        pool.announce_room_with_memory_for_test(&id, generation, memory);
     }
-    let io = |full_avg10_millis, full_avg60_millis| {
-        Measurement::measured(
-            NOW,
-            IoPressure {
-                build_device: None,
-                full_avg10_millis,
-                full_avg60_millis,
-                slowest_device: None,
+}
+
+/// Wait for the dispatcher to assign the queued `entry_id` a machine, as
+/// `execute_entry` does, leaving the dispatcher on the way out.
+// The outcome owed, as `await_assignment` returns it.
+#[allow(clippy::result_large_err)]
+async fn assign(
+    pool: &Fleet,
+    entry_id: &str,
+    request: &CellRequest,
+    policy: &ActivePlacementPolicy,
+    plan: Option<Arc<ReservationPlan>>,
+) -> Result<Placement, CellOutcome> {
+    let _joined = super::assignments::JoinedDispatcher {
+        pool: pool.clone(),
+        entry_id: entry_id.to_string(),
+    };
+    pool.await_assignment(entry_id, request, plan.as_ref(), policy, &mut None)
+        .await
+}
+
+/// Queue `request` and wait for the dispatcher to assign it a machine.
+#[allow(clippy::result_large_err)]
+async fn place_through_dispatcher(
+    pool: &Fleet,
+    request: &CellRequest,
+    plan: Option<Arc<ReservationPlan>>,
+) -> Result<Placement, CellOutcome> {
+    let (entry_id, _waiter) = pool
+        .queue
+        .enqueue(
+            queue::NewEntry {
+                request: request.clone(),
+                admission_kind: CellAdmissionKind::Command,
+                interactive: false,
+                execution_residency: None,
+                standing: false,
             },
+            unix_time_ms(),
         )
-    };
-    Arc::make_mut(&mut stalled.health).host.io_pressure = io(588, 481);
-    Arc::make_mut(&mut idle.health).host.io_pressure = io(0, 0);
-    let mut run = test_prior_duration();
-    run.predicted_ms = 600_000;
-    let predict = |entry: &ExecutorConnectionState| {
-        let mut prediction = placement_prediction_with_contention(
-            entry,
-            CacheWarmthEvidence::Observed {
-                warmth: ExecutionWarmth::Cold,
-                observed_at_unix_ms: NOW,
-            },
-            QueueForecast::Forecast {
-                predicted_ms: 0,
-                requests_ahead: 0,
-                running_ahead: 0,
-                fully_measured: true,
-                observed_at_unix_ms: NOW,
-                stalled_head_ms: None,
-            },
-            run.clone(),
-            ContentionEstimate {
-                co_resident_compile_jobs: 0,
-                co_resident_light_jobs: 0,
-                multiplier_millis: 1_000,
-                source: cairn_common::executor_protocol::ContentionEvidence::Machine,
-                sample_count: 12,
-                fallback: None,
-            },
-            SyncCost::Known(0),
-        );
-        price_host_stall(&mut prediction, &entry.health.host, NOW);
-        prediction
-    };
-
-    let stalled_prediction = predict(&stalled);
-    assert_eq!(
-        stalled_prediction.io_pressure,
-        Some(HostStallPrice::Priced {
-            full_millis: 588,
-            penalty_ms: 856_310,
-        })
-    );
-    assert_eq!(stalled_prediction.predicted_verdict_ms, 600_000 + 856_310);
-    assert!(
-        stalled_prediction
-            .describe()
-            .contains("I/O stalled 58.8% of the time, +14m"),
-        "{}",
-        stalled_prediction.describe()
-    );
-    let idle_prediction = predict(&idle);
-    assert_eq!(idle_prediction.predicted_verdict_ms, 600_000);
-    let unmeasured_prediction = predict(&unmeasured);
-    assert_eq!(unmeasured_prediction.predicted_verdict_ms, 600_000);
-    assert!(matches!(
-        unmeasured_prediction.io_pressure,
-        Some(HostStallPrice::Unmeasured {
-            gap: MeasurementGap::NotSampled
-        })
-    ));
-
-    let request = spillable_request();
-    let scored = [(&stalled, stalled_prediction), (&idle, idle_prediction)]
-        .into_iter()
-        .map(|(entry, prediction)| {
-            ScoredCandidate::new(
-                entry,
-                SyncCost::Known(0),
-                None,
-                &ResourceReservation::default(),
-                prediction,
-                None,
-                None,
-                NOW,
-            )
-        })
-        .collect::<Vec<_>>();
-    let (winner, _, _, _, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
+        .expect("the request enqueues");
+    assign(
+        pool,
+        &entry_id,
+        request,
         &ActivePlacementPolicy::default_profile(),
-        &ExplorationState::default(),
-        None,
-    );
-    assert_eq!(winner.unwrap().entry.identity.executor_id, "fedora");
-
-    // Swapping on top: memory 20% stalled is charged first, and storage
-    // only for the rest of its 58.8%, so the total is the 58.8% price.
-    Arc::make_mut(&mut stalled.health).host.memory_pressure = Measurement::measured(
-        NOW,
-        MemoryPressure {
-            full_avg10_millis: 200,
-            full_avg60_millis: 150,
-        },
-    );
-    let swapping = predict(&stalled);
-    assert_eq!(
-        swapping
-            .memory_pressure
-            .as_ref()
-            .map(HostStallPrice::penalty_ms),
-        Some(150_000)
-    );
-    assert_eq!(
-        swapping
-            .io_pressure
-            .as_ref()
-            .map(HostStallPrice::penalty_ms),
-        Some(706_310)
-    );
-    assert_eq!(swapping.predicted_verdict_ms, 600_000 + 856_310);
-
-    // Memory the worse of the two: storage adds nothing beyond it.
-    Arc::make_mut(&mut stalled.health).host.memory_pressure = Measurement::measured(
-        NOW,
-        MemoryPressure {
-            full_avg10_millis: 700,
-            full_avg60_millis: 700,
-        },
-    );
-    let thrashing = predict(&stalled);
-    assert_eq!(
-        thrashing
-            .io_pressure
-            .as_ref()
-            .map(HostStallPrice::penalty_ms),
-        Some(0)
-    );
-    assert_eq!(thrashing.predicted_verdict_ms, 600_000 + 1_400_000);
-}
-
-/// A host whose storage is stalled for a fraction of the time, with its
-/// slowest device's writes, in the shape bbs advertised on 11-01.
-fn stalled_host(
-    entry: &mut ExecutorConnectionState,
-    io_full_millis: u32,
-    memory_full_millis: u32,
-    measured_at_unix_ms: u64,
-) {
-    use cairn_common::executor_protocol::{DeviceWriteLatency, IoPressure, MemoryPressure};
-    measured(entry, 0.1, 40_000_000_000, 2_000_000_000_000);
-    let host = &mut Arc::make_mut(&mut entry.health).host;
-    host.io_pressure = Measurement::measured(
-        measured_at_unix_ms,
-        IoPressure {
-            build_device: None,
-            full_avg10_millis: io_full_millis,
-            full_avg60_millis: io_full_millis,
-            slowest_device: Some(DeviceWriteLatency {
-                device: "sda".into(),
-                mean_write_ms: Some(190),
-                writes: 120,
-                in_flight: 16,
-                window_ms: 5_000,
-            }),
-        },
-    );
-    host.memory_pressure = Measurement::measured(
-        measured_at_unix_ms,
-        MemoryPressure {
-            full_avg10_millis: memory_full_millis,
-            full_avg60_millis: memory_full_millis,
-        },
-    );
-}
-
-fn stall_priced_prediction(
-    entry: &ExecutorConnectionState,
-    run: DurationEstimate,
-    contention: ContentionEstimate,
-) -> PlacementPrediction {
-    let mut prediction = placement_prediction_with_contention(
-        entry,
-        CacheWarmthEvidence::Observed {
-            warmth: ExecutionWarmth::PreparedWarmSlot,
-            observed_at_unix_ms: NOW,
-        },
-        QueueForecast::Forecast {
-            predicted_ms: 0,
-            requests_ahead: 0,
-            running_ahead: 0,
-            fully_measured: true,
-            observed_at_unix_ms: NOW,
-            stalled_head_ms: None,
-        },
-        run,
-        contention,
-        SyncCost::Known(0),
-    );
-    price_host_stall(&mut prediction, &entry.health.host, NOW);
-    prediction
-}
-
-fn learned_run(predicted_ms: u64, sample_count: u64) -> DurationEstimate {
-    let mut run = test_prior_duration();
-    run.predicted_ms = predicted_ms;
-    run.source = cairn_common::executor_protocol::DurationEvidence::Learned;
-    run.sample_count = sample_count;
-    run.profile_key = Some("skip-census".into());
-    run.fallback = None;
-    run
-}
-
-/// A release build adopted on a machine is a compile it carries, so a
-/// compile-class lane is priced higher there than on an otherwise equal
-/// machine. A price, never a gate: nothing here refuses the machine.
-#[test]
-fn an_adopted_release_build_prices_its_machine_as_carrying_a_compile() {
-    let host = cairn_common::executor_protocol::HostHealth::default();
-    let carrying = FleetSnapshot {
-        executing_requests: vec![ExecutingCellRequest {
-            executor_id: String::new(),
-            cell_id: String::new(),
-            request_id: "rebuild:attempt:build".into(),
-            attempt_id: "attempt".into(),
-            owner: None,
-            command_class: CellCommandClass::ReleaseBuild,
-            command: "rebuild build: bun run tauri build --bundles app".into(),
-            started_at_unix_ms: 0,
-            process_ids: vec![4242],
-            priority: None,
-            subscriber_count: 1,
-            resource_reservation: ResourceReservation {
-                concurrency_units: 0,
-                ..ResourceReservation::default()
-            },
-            learned_estimate: None,
-            command_resource_identity: None,
-            live_usage: None,
-            build_jobs: None,
-            adopted: Some(cairn_common::executor_protocol::AdoptedTree {
-                label: "computer.cairn.rebuild".into(),
-                leader_pid: 4242,
-            }),
-            memory_phase: None,
-        }],
-        ..FleetSnapshot::default()
-    };
-    let busy = load_context(&carrying, &host);
-    let idle = load_context(&FleetSnapshot::default(), &host);
-    assert_eq!(busy.co_resident_compile_jobs, 1);
-    assert_eq!(idle.co_resident_compile_jobs, 0);
-    assert!(
-        resource_profiles::contention_prior(&busy).multiplier_millis
-            > resource_profiles::contention_prior(&idle).multiplier_millis
-    );
-}
-
-fn machine_curve(compile: u32, light: u32, multiplier_millis: u32) -> ContentionEstimate {
-    ContentionEstimate {
-        co_resident_compile_jobs: compile,
-        co_resident_light_jobs: light,
-        multiplier_millis,
-        source: cairn_common::executor_protocol::ContentionEvidence::Machine,
-        sample_count: 100,
-        fallback: None,
-    }
-}
-
-fn ranked_winner(
-    candidates: Vec<(&ExecutorConnectionState, PlacementPrediction)>,
-) -> (String, bool) {
-    let scored = candidates
-        .into_iter()
-        .map(|(entry, prediction)| {
-            ScoredCandidate::new(
-                entry,
-                SyncCost::Known(0),
-                None,
-                &ResourceReservation::default(),
-                prediction,
-                None,
-                None,
-                NOW,
-            )
-        })
-        .collect::<Vec<_>>();
-    let (winner, _, _, exploring, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &spillable_request(),
-        &ActivePlacementPolicy::default_profile(),
-        &ExplorationState::default(),
-        None,
-    );
-    (
-        winner.unwrap().entry.identity.executor_id.clone(),
-        exploring,
+        plan,
     )
-}
-
-/// cairn/4999's specimen, replayed from what the orchestrator recorded for
-/// request 6dc74b43 (01:22:33Z 11-02, a main-cadence `skip-census` lane).
-/// The three losers' predictions are their placement-rejection rows, digit
-/// for digit. bbs won: fifteen cargo lanes and one light job beside it,
-/// 47.4% of the time fully stalled on I/O, and one sample of the lane, so
-/// it was a bootstrap candidate and the due exploration chose it over
-/// bginf-sp2's 1.6 s. The run died at vitest's 60 s worker-start bound,
-/// taught nothing, and left bbs as thin for the next due decision. A run
-/// beside other work never becomes a baseline sample, so the lane now goes
-/// to the earliest verdict. Idle, the same machine is still explored at the
-/// same stall, because its sample is de-stalled; on a stale reading it is
-/// not, because its sample could not be.
-#[test]
-fn exploration_never_spends_a_lane_where_the_run_cannot_teach() {
-    use cairn_common::executor_protocol::{ContentionEvidence, ContentionFallback};
-    let (_, mut sp2) = fleet_entry("bginf-sp2", "linux", 0, &[]);
-    let (_, mut fedora) = fleet_entry("fedora", "linux", 0, &[]);
-    let (_, mut ub) = fleet_entry("bgsrv-ub", "linux", 0, &[]);
-    let (_, mut bbs) = fleet_entry("bbs", "linux", 0, &[]);
-    stalled_host(&mut sp2, 111, 0, NOW);
-    stalled_host(&mut fedora, 43, 0, NOW);
-    stalled_host(&mut ub, 193, 1, NOW);
-    stalled_host(&mut bbs, 474, 9, NOW);
-    let sp2_prediction =
-        stall_priced_prediction(&sp2, learned_run(1_403, 4), machine_curve(1, 0, 1_000));
-    let fedora_prediction =
-        stall_priced_prediction(&fedora, learned_run(1_304, 15), machine_curve(4, 1, 2_295));
-    let ub_prediction =
-        stall_priced_prediction(&ub, learned_run(3_205, 43), machine_curve(1, 0, 1_384));
-    assert_eq!(
-        [
-            sp2_prediction.predicted_verdict_ms,
-            fedora_prediction.predicted_verdict_ms,
-            ub_prediction.predicted_verdict_ms,
-        ],
-        [1_578, 3_127, 5_496],
-        "the replay reproduces the recorded predictions"
-    );
-    let mut thin = test_prior_duration();
-    thin.predicted_ms = 30_000;
-    thin.profile_key = Some("skip-census".into());
-    thin.fallback = Some(DurationFallback::BelowConfidenceFloor);
-    let prior = |compile, light| ContentionEstimate {
-        multiplier_millis: 1_000 + compile * 600 + light * 100,
-        source: ContentionEvidence::Prior,
-        sample_count: 0,
-        fallback: Some(ContentionFallback::NoGlobalCurve),
-        ..machine_curve(compile, light, 1_000)
-    };
-    let rivals = || {
-        vec![
-            (&sp2, sp2_prediction.clone()),
-            (&fedora, fedora_prediction.clone()),
-            (&ub, ub_prediction.clone()),
-        ]
-    };
-
-    let busy = stall_priced_prediction(&bbs, thin.clone(), prior(15, 1));
-    assert!(
-        busy.describe().contains("I/O stalled 47.4% of the time"),
-        "the price is on the page: {}",
-        busy.describe()
-    );
-    let mut fleet = rivals();
-    fleet.push((&bbs, busy));
-    assert_eq!(
-        ranked_winner(fleet),
-        ("bginf-sp2".to_string(), false),
-        "a run beside fifteen cargo lanes teaches no baseline, so it buys none"
-    );
-
-    let mut fleet = rivals();
-    fleet.push((
-        &bbs,
-        stall_priced_prediction(&bbs, thin.clone(), prior(0, 0)),
-    ));
-    assert_eq!(
-        ranked_winner(fleet),
-        ("bbs".to_string(), true),
-        "alone, its run is a sample even at 47% stall: the stall is divided out"
-    );
-
-    stalled_host(
-        &mut bbs,
-        474,
-        9,
-        NOW - EXECUTOR_TELEMETRY_STALE_AFTER_MS - 1,
-    );
-    let mut fleet = rivals();
-    fleet.push((&bbs, stall_priced_prediction(&bbs, thin, prior(0, 0))));
-    assert_eq!(
-        ranked_winner(fleet),
-        ("bginf-sp2".to_string(), false),
-        "on a stale reading the stall could not be divided out"
-    );
-}
-
-/// cairn/4999's short lane: a three-second lane both machines have learned,
-/// one host at bbs's 11-01 reading (44% of the time fully stalled, its
-/// slowest device writing in 190 ms) and one idle. The stalled machine is
-/// predicted at `3 s / 0.56` and ranks second, and wins when it is the only
-/// candidate: a price, never a refusal. A machine with no stall reading is
-/// predicted at its count-only run and says why.
-#[test]
-fn a_short_lane_ranks_a_disk_stalled_machine_below_an_idle_one() {
-    use cairn_common::executor_protocol::HostStallPrice;
-    use cairn_common::wire_vocabulary::MeasurementGap;
-    let (_, mut stalled) = fleet_entry("bbs", "linux", 0, &[]);
-    let (_, mut idle) = fleet_entry("bginf-sp2", "linux", 0, &[]);
-    let (_, mut unmeasured) = fleet_entry("bgsrv-mac", "macos", 0, &[]);
-    stalled_host(&mut stalled, 440, 0, NOW);
-    stalled_host(&mut idle, 0, 0, NOW);
-    measured(&mut unmeasured, 0.1, 40_000_000_000, 2_000_000_000_000);
-    let predict =
-        |entry| stall_priced_prediction(entry, learned_run(3_000, 16), machine_curve(0, 0, 1_000));
-
-    let stalled_prediction = predict(&stalled);
-    assert_eq!(
-        stalled_prediction.io_pressure,
-        Some(HostStallPrice::Priced {
-            full_millis: 440,
-            penalty_ms: 2_357,
-        })
-    );
-    assert_eq!(stalled_prediction.predicted_verdict_ms, 5_357);
-    let idle_prediction = predict(&idle);
-    assert_eq!(idle_prediction.predicted_verdict_ms, 3_000);
-    let unmeasured_prediction = predict(&unmeasured);
-    assert_eq!(unmeasured_prediction.predicted_verdict_ms, 3_000);
-    assert!(matches!(
-        unmeasured_prediction.io_pressure,
-        Some(HostStallPrice::Unmeasured {
-            gap: MeasurementGap::NotSampled
-        })
-    ));
-
-    assert_eq!(
-        ranked_winner(vec![
-            (&stalled, stalled_prediction.clone()),
-            (&idle, idle_prediction),
-        ]),
-        ("bginf-sp2".to_string(), false)
-    );
-    assert_eq!(
-        ranked_winner(vec![(&stalled, stalled_prediction)]),
-        ("bbs".to_string(), false)
-    );
-}
-
-fn local_first() -> ActivePlacementPolicy {
-    ActivePlacementPolicy {
-        name: "local-first".into(),
-        profile: profile_with_routes(60, |_| PlacementStance::LocalFirst),
-    }
-}
-
-/// Without stall history the local-first stance keeps a comparable lane
-/// home; a home whose own stalls cost more than the preference window
-/// ranks behind an idle remote, and the stance no longer rescues it.
-#[test]
-fn a_stalling_home_is_priced_behind_an_idle_remote() {
-    let request = spillable_request();
-    let (home, remote, predictions) = priced_home_and_remote(None);
-    let scored = vec![
-        ScoredCandidate::new(
-            &home,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            predictions[0].clone(),
-            None,
-            None,
-            NOW,
-        ),
-        ScoredCandidate::new(
-            &remote,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            predictions[1].clone(),
-            None,
-            None,
-            NOW,
-        ),
-    ];
-    let (winner, _, _, _, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
-        &local_first(),
-        &ExplorationState::default(),
-        None,
-    );
-    assert_eq!(
-        winner.unwrap().entry.identity.executor_id,
-        COLOCATED_EXECUTOR_ID,
-        "an unpenalized home keeps the comparable lane"
-    );
-
-    let (home, remote, predictions) = priced_home_and_remote(Some(30 * 60_000));
-    assert_eq!(predictions[0].predicted_verdict_ms, 600_000 + 30 * 60_000);
-    assert_eq!(predictions[0].reliability_penalty_ms(), 30 * 60_000);
-    let scored = vec![
-        ScoredCandidate::new(
-            &home,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            predictions[0].clone(),
-            None,
-            None,
-            NOW,
-        ),
-        ScoredCandidate::new(
-            &remote,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            predictions[1].clone(),
-            None,
-            None,
-            NOW,
-        ),
-    ];
-    let (winner, _, _, _, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
-        &local_first(),
-        &ExplorationState::default(),
-        None,
-    );
-    assert_eq!(winner.unwrap().entry.identity.executor_id, "fedora");
+    .await
 }
 
 /// A check lane's verdict is reproducible against the branch alone, so the
@@ -10880,526 +8001,6 @@ fn a_stalling_home_is_priced_behind_an_idle_remote() {
 fn a_check_lane_batch_carries_no_node_scratch() {
     let batch = Fleet::check_process_batch(Vec::new(), Some("context".into()), None, 0);
     assert!(batch.node_scratch.is_none());
-}
-
-/// A node scratch is affinity, not a pin: at equal predictions the machine
-/// where it is already warm ranks first, and a cold machine that is the only
-/// candidate still takes the work.
-#[test]
-fn a_warm_node_scratch_ranks_ahead_of_a_cold_one_and_never_excludes_it() {
-    let (_, mut warm) = fleet_entry("warm", "linux", 0, &[]);
-    let (_, mut cold) = fleet_entry("cold", "linux", 0, &[]);
-    measured(&mut warm, 0.1, 8_000_000_000, 8_000_000_000);
-    measured(&mut cold, 0.1, 8_000_000_000, 8_000_000_000);
-    let warmth = CacheWarmthEvidence::Observed {
-        warmth: ExecutionWarmth::Cold,
-        observed_at_unix_ms: NOW,
-    };
-    let queue = QueueForecast::Forecast {
-        predicted_ms: 0,
-        requests_ahead: 0,
-        running_ahead: 0,
-        fully_measured: true,
-        observed_at_unix_ms: NOW,
-        stalled_head_ms: None,
-    };
-    let mut learned = test_prior_duration();
-    learned.source = cairn_common::executor_protocol::DurationEvidence::Learned;
-    learned.sample_count = 20;
-    learned.fallback = None;
-    let warm_prediction = placement_prediction(
-        &warm,
-        warmth.clone(),
-        queue.clone(),
-        learned.clone(),
-        SyncCost::Known(0),
-    );
-    let cold_prediction = placement_prediction(&cold, warmth, queue, learned, SyncCost::Known(0));
-    assert_eq!(
-        warm_prediction.predicted_verdict_ms,
-        cold_prediction.predicted_verdict_ms
-    );
-    let mut cold_candidate = ScoredCandidate::new(
-        &cold,
-        SyncCost::Known(0),
-        None,
-        &ResourceReservation::default(),
-        cold_prediction.clone(),
-        None,
-        None,
-        NOW,
-    );
-    // A 61 MB scratch over an unmeasured remote link.
-    cold_candidate.scratch_sync_ms = 6_100;
-    let warm_candidate = ScoredCandidate::new(
-        &warm,
-        SyncCost::Known(0),
-        None,
-        &ResourceReservation::default(),
-        warm_prediction,
-        None,
-        None,
-        NOW,
-    );
-    let request = spillable_request();
-    let policy = ActivePlacementPolicy::default_profile();
-    let history = ExplorationState {
-        decisions_since_exploration: 0,
-        ..Default::default()
-    };
-    let scored = vec![cold_candidate, warm_candidate];
-    let (winner, _, _, _, _) =
-        rank_candidates(&scored, false, true, &request, &policy, &history, None);
-    assert_eq!(winner.unwrap().entry.identity.executor_id, "warm");
-
-    let mut only_cold = ScoredCandidate::new(
-        &cold,
-        SyncCost::Known(0),
-        None,
-        &ResourceReservation::default(),
-        cold_prediction,
-        None,
-        None,
-        NOW,
-    );
-    only_cold.scratch_sync_ms = 6_100;
-    let scored = vec![only_cold];
-    let (winner, _, _, _, _) =
-        rank_candidates(&scored, false, true, &request, &policy, &history, None);
-    assert_eq!(
-        winner
-            .expect("a cold machine is priced, never excluded")
-            .entry
-            .identity
-            .executor_id,
-        "cold"
-    );
-}
-
-/// Priced, never excluded: a penalized machine that is the only candidate
-/// still takes the work.
-#[test]
-fn a_penalized_machine_still_wins_when_it_is_the_only_candidate() {
-    let request = spillable_request();
-    let (home, _, predictions) = priced_home_and_remote(Some(90 * 60_000));
-    let scored = vec![ScoredCandidate::new(
-        &home,
-        SyncCost::Known(0),
-        None,
-        &ResourceReservation::default(),
-        predictions[0].clone(),
-        None,
-        None,
-        NOW,
-    )];
-    let (winner, _, _, _, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
-        &local_first(),
-        &ExplorationState::default(),
-        None,
-    );
-    assert_eq!(
-        winner.unwrap().entry.identity.executor_id,
-        COLOCATED_EXECUTOR_ID
-    );
-}
-
-#[test]
-fn idle_unmeasured_capacity_bootstraps_a_profile_before_pure_exploitation() {
-    let (favorite_id, mut favorite) = fleet_entry("favorite", "linux", 0, &[]);
-    let (fresh_id, mut fresh) = fleet_entry("fresh", "linux", 0, &[]);
-    measured(&mut favorite, 0.1, 8_000_000_000, 8_000_000_000);
-    measured(&mut fresh, 0.1, 8_000_000_000, 8_000_000_000);
-
-    let warmth = CacheWarmthEvidence::Observed {
-        warmth: ExecutionWarmth::Cold,
-        observed_at_unix_ms: NOW,
-    };
-    let mut learned = test_prior_duration();
-    learned.predicted_ms = 10_000;
-    learned.source = cairn_common::executor_protocol::DurationEvidence::Learned;
-    learned.sample_count = 20;
-    learned.fallback = None;
-    let favorite_prediction = placement_prediction(
-        &favorite,
-        warmth.clone(),
-        QueueForecast::Forecast {
-            predicted_ms: 0,
-            requests_ahead: 0,
-            running_ahead: 0,
-            fully_measured: true,
-            observed_at_unix_ms: NOW,
-            stalled_head_ms: None,
-        },
-        learned,
-        SyncCost::Known(0),
-    );
-    let mut unmeasured = test_prior_duration();
-    unmeasured.profile_key = Some("check:rust".into());
-    unmeasured.fallback = Some(DurationFallback::NoProfileRecorded);
-    let fresh_prediction = placement_prediction(
-        &fresh,
-        warmth,
-        QueueForecast::Forecast {
-            predicted_ms: 0,
-            requests_ahead: 0,
-            running_ahead: 0,
-            fully_measured: true,
-            observed_at_unix_ms: NOW,
-            stalled_head_ms: None,
-        },
-        unmeasured,
-        SyncCost::Known(0),
-    );
-    let scored = vec![
-        ScoredCandidate::new(
-            &favorite,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            favorite_prediction,
-            None,
-            None,
-            NOW,
-        ),
-        ScoredCandidate::new(
-            &fresh,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            fresh_prediction,
-            None,
-            None,
-            NOW,
-        ),
-    ];
-    let request = spillable_request();
-
-    let (winner, _, changed, exploring, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
-        &ActivePlacementPolicy::default_profile(),
-        &ExplorationState::default(),
-        None,
-    );
-
-    assert_eq!(winner.unwrap().entry.identity.executor_id, fresh_id);
-    assert_ne!(favorite_id, fresh_id);
-    assert!(changed);
-    assert!(exploring);
-
-    let mut history = ExplorationState::default();
-    history.record(Some(&fresh_id));
-    let (winner, _, _, exploring, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
-        &ActivePlacementPolicy::default_profile(),
-        &history,
-        None,
-    );
-    assert_eq!(winner.unwrap().entry.identity.executor_id, favorite_id);
-    assert!(!exploring, "the next three waves preserve exploitation");
-
-    for _ in 0..3 {
-        history.record(None);
-    }
-    let (winner, _, _, exploring, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
-        &ActivePlacementPolicy::default_profile(),
-        &history,
-        None,
-    );
-    assert_eq!(winner.unwrap().entry.identity.executor_id, fresh_id);
-    assert!(exploring, "the fourth wave restores the exploration budget");
-}
-
-#[test]
-fn equal_predictions_rotate_while_a_faster_prediction_remains_authoritative() {
-    let (first_id, mut first) = fleet_entry("first", "linux", 0, &[]);
-    let (second_id, mut second) = fleet_entry("second", "linux", 0, &[]);
-    measured(&mut first, 0.1, 8_000_000_000, 8_000_000_000);
-    measured(&mut second, 0.1, 8_000_000_000, 8_000_000_000);
-    let warmth = CacheWarmthEvidence::Observed {
-        warmth: ExecutionWarmth::Cold,
-        observed_at_unix_ms: NOW,
-    };
-    let queue = QueueForecast::Forecast {
-        predicted_ms: 0,
-        requests_ahead: 0,
-        running_ahead: 0,
-        fully_measured: true,
-        observed_at_unix_ms: NOW,
-        stalled_head_ms: None,
-    };
-    let mut learned = test_prior_duration();
-    learned.source = cairn_common::executor_protocol::DurationEvidence::Learned;
-    learned.sample_count = 20;
-    learned.fallback = None;
-    let predictions = [
-        placement_prediction(
-            &first,
-            warmth.clone(),
-            queue.clone(),
-            learned.clone(),
-            SyncCost::Known(0),
-        ),
-        placement_prediction(&second, warmth, queue, learned, SyncCost::Known(0)),
-    ];
-    let scored = vec![
-        ScoredCandidate::new(
-            &first,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            predictions[0].clone(),
-            None,
-            None,
-            NOW,
-        ),
-        ScoredCandidate::new(
-            &second,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            predictions[1].clone(),
-            None,
-            None,
-            NOW,
-        ),
-    ];
-    let request = spillable_request();
-    let policy = ActivePlacementPolicy::default_profile();
-    let mut history = ExplorationState {
-        decisions_since_exploration: 0,
-        ..Default::default()
-    };
-
-    let (winner, _, _, _, tie_break) =
-        rank_candidates(&scored, false, true, &request, &policy, &history, None);
-    let first_winner = winner.unwrap().entry.identity.executor_id.clone();
-    assert_eq!(
-        tie_break.unwrap().deciding_reason,
-        "stable executor identity seeded recent-selection history"
-    );
-    history.record_selection(&first_winner);
-
-    let (winner, _, _, _, tie_break) =
-        rank_candidates(&scored, false, true, &request, &policy, &history, None);
-    let second_winner = winner.unwrap().entry.identity.executor_id.clone();
-    assert_ne!(first_winner, second_winner);
-    assert_eq!(
-        tie_break.unwrap().deciding_reason,
-        "least recently selected among candidates equal on every earlier placement key"
-    );
-    assert!([first_id.clone(), second_id.clone()].contains(&second_winner));
-
-    let mut faster = predictions[1].clone();
-    faster.predicted_verdict_ms = predictions[0].predicted_verdict_ms - 1;
-    faster.adjusted_run_ms = faster.adjusted_run_ms.saturating_sub(1);
-    let faster_scored = vec![
-        ScoredCandidate::new(
-            &first,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            predictions[0].clone(),
-            None,
-            None,
-            NOW,
-        ),
-        ScoredCandidate::new(
-            &second,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            faster,
-            None,
-            None,
-            NOW,
-        ),
-    ];
-    history.record_selection(&second_id);
-    let (winner, _, _, _, tie_break) = rank_candidates(
-        &faster_scored,
-        false,
-        true,
-        &request,
-        &policy,
-        &history,
-        None,
-    );
-    assert_eq!(winner.unwrap().entry.identity.executor_id, second_id);
-    assert!(tie_break.is_none());
-
-    let mut faster_unmeasured = predictions[0].clone();
-    faster_unmeasured.run.profile_key = Some("check:rust".into());
-    faster_unmeasured.run.fallback = Some(DurationFallback::NoProfileRecorded);
-    let mut slower_unmeasured = predictions[1].clone();
-    slower_unmeasured.run.profile_key = Some("check:rust".into());
-    slower_unmeasured.run.fallback = Some(DurationFallback::NoProfileRecorded);
-    slower_unmeasured.predicted_verdict_ms += 10_000;
-    let bootstrap_scored = vec![
-        ScoredCandidate::new(
-            &first,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            faster_unmeasured,
-            None,
-            None,
-            NOW,
-        ),
-        ScoredCandidate::new(
-            &second,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            slower_unmeasured,
-            None,
-            None,
-            NOW,
-        ),
-    ];
-    let mut bootstrap_history = ExplorationState::default();
-    bootstrap_history.record(Some(&first_id));
-    for _ in 0..3 {
-        bootstrap_history.record(None);
-    }
-    let (winner, _, _, exploring, evidence) = rank_candidates(
-        &bootstrap_scored,
-        false,
-        true,
-        &request,
-        &policy,
-        &bootstrap_history,
-        None,
-    );
-    assert_eq!(
-        winner.unwrap().entry.identity.executor_id,
-        second_id,
-        "unexplored bootstrap capacity gets its turn even with a slower prior"
-    );
-    assert!(exploring);
-    let evidence = evidence.unwrap();
-    assert_eq!(
-        evidence.deciding_reason,
-        "least recently explored bootstrap candidate"
-    );
-    assert_eq!(evidence.candidates.len(), 2);
-}
-
-#[test]
-fn other_work_classes_cannot_evict_an_exploration_cooldown() {
-    let mut states = HashMap::<PlacementWorkClass, ExplorationState>::new();
-    states
-        .entry(PlacementWorkClass::ReviewChecks)
-        .or_default()
-        .record(Some("fresh"));
-
-    for _ in 0..(RECENT_PLACEMENT_DECISIONS * 2) {
-        states
-            .entry(PlacementWorkClass::AgentSessions)
-            .or_default()
-            .record(None);
-    }
-
-    let review = states.get(&PlacementWorkClass::ReviewChecks).unwrap();
-    assert_eq!(review.decisions_since_exploration, 0);
-    assert_eq!(review.explored_executors, VecDeque::from(["fresh".into()]));
-}
-
-#[test]
-fn bootstrap_never_queues_behind_work_on_an_unmeasured_machine() {
-    let (favorite_id, mut favorite) = fleet_entry("favorite", "linux", 0, &[]);
-    let (_fresh_id, mut fresh) = fleet_entry("fresh", "linux", 0, &[]);
-    measured(&mut favorite, 0.1, 8_000_000_000, 8_000_000_000);
-    measured(&mut fresh, 0.1, 8_000_000_000, 8_000_000_000);
-    let warmth = CacheWarmthEvidence::Observed {
-        warmth: ExecutionWarmth::Cold,
-        observed_at_unix_ms: NOW,
-    };
-    let mut learned = test_prior_duration();
-    learned.predicted_ms = 10_000;
-    learned.source = cairn_common::executor_protocol::DurationEvidence::Learned;
-    learned.sample_count = 20;
-    learned.fallback = None;
-    let favorite_prediction = placement_prediction(
-        &favorite,
-        warmth.clone(),
-        QueueForecast::Forecast {
-            predicted_ms: 0,
-            requests_ahead: 0,
-            running_ahead: 0,
-            fully_measured: true,
-            observed_at_unix_ms: NOW,
-            stalled_head_ms: None,
-        },
-        learned,
-        SyncCost::Known(0),
-    );
-    let mut unmeasured = test_prior_duration();
-    unmeasured.profile_key = Some("check:rust".into());
-    unmeasured.fallback = Some(DurationFallback::NoProfileRecorded);
-    let fresh_prediction = placement_prediction(
-        &fresh,
-        warmth,
-        QueueForecast::Forecast {
-            predicted_ms: 1_000,
-            requests_ahead: 1,
-            running_ahead: 0,
-            fully_measured: true,
-            observed_at_unix_ms: NOW,
-            stalled_head_ms: None,
-        },
-        unmeasured,
-        SyncCost::Known(0),
-    );
-    let scored = vec![
-        ScoredCandidate::new(
-            &favorite,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            favorite_prediction,
-            None,
-            None,
-            NOW,
-        ),
-        ScoredCandidate::new(
-            &fresh,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            fresh_prediction,
-            None,
-            None,
-            NOW,
-        ),
-    ];
-    let request = spillable_request();
-
-    let (winner, _, _, exploring, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
-        &ActivePlacementPolicy::default_profile(),
-        &ExplorationState::default(),
-        None,
-    );
-
-    assert_eq!(winner.unwrap().entry.identity.executor_id, favorite_id);
-    assert!(!exploring);
 }
 
 fn chosen(draft: &PlacementDraft) -> &PlacementSelection {
@@ -11415,857 +8016,7 @@ fn rejection_for<'a>(draft: &'a PlacementDraft, executor_id: &str) -> &'a Placem
         .reason
 }
 
-/// The whole point of the policy: a check suite that nobody targeted runs on
-/// the machine that is actually idle, not on the one the operator is typing
-/// on. Local competes with interactive use; an enrolled machine mostly does
-/// not.
-#[test]
-fn spill_eligible_work_leaves_a_busy_local_for_a_measured_idle_remote() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(
-        &mut local,
-        0.85,
-        8 * 1024 * 1024 * 1024,
-        500 * 1024 * 1024 * 1024,
-    );
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.03,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-
-    let draft = place(&connections, &spillable_request()).unwrap();
-    let selection = chosen(&draft);
-    assert_eq!(selection.executor_id, "bglab-ub");
-    assert_eq!(selection.reason, PlacementReason::PredictedEarliestVerdict);
-    assert_eq!(
-        selection.observation_reuse,
-        ObservationReuse::UntrustedRemoteEnvironment,
-        "a spilled verdict gates its run and seeds no reusable baseline"
-    );
-    assert_eq!(
-        rejection_for(&draft, COLOCATED_EXECUTOR_ID),
-        &PlacementRejectionReason::OutrankedBy {
-            executor_name: "bglab-ub".into()
-        }
-    );
-}
-
-#[test]
-fn spill_eligible_work_uses_remote_when_local_admission_is_full() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(
-        &mut local,
-        0.01,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    Arc::make_mut(&mut local.health)
-        .admission
-        .concurrency_capacity = Some(16);
-    Arc::make_mut(&mut local.health)
-        .admission
-        .active_reservation
-        .concurrency_units = 16;
-    Arc::make_mut(&mut local.health)
-        .applied_policy
-        .maximum_queue_depth = 16;
-
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.50,
-        16 * 1024 * 1024 * 1024,
-        500 * 1024 * 1024 * 1024,
-    );
-    Arc::make_mut(&mut remote.health)
-        .admission
-        .concurrency_capacity = Some(16);
-    Arc::make_mut(&mut remote.health)
-        .applied_policy
-        .maximum_queue_depth = 16;
-
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-    assert_eq!(
-        chosen(&place(&connections, &spillable_request()).unwrap()).executor_id,
-        "bglab-ub",
-        "resident capacity absent from command forecasts still participates in placement"
-    );
-}
-
-#[test]
-fn spill_eligible_work_avoids_a_full_preferred_queue() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(
-        &mut local,
-        0.01,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    Arc::make_mut(&mut local.health)
-        .admission
-        .concurrency_capacity = Some(16);
-    Arc::make_mut(&mut local.health)
-        .applied_policy
-        .maximum_queue_depth = 1;
-    Arc::make_mut(&mut local.health).queues =
-        vec![cairn_common::executor_protocol::QueueClassHealth {
-            priority: CellPriority::ReviewCheck,
-            depth: 1,
-            oldest_age_ms: Some(1_000),
-            waits: Default::default(),
-        }];
-
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.50,
-        16 * 1024 * 1024 * 1024,
-        500 * 1024 * 1024 * 1024,
-    );
-    Arc::make_mut(&mut remote.health)
-        .admission
-        .concurrency_capacity = Some(16);
-    Arc::make_mut(&mut remote.health)
-        .applied_policy
-        .maximum_queue_depth = 1;
-
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-    assert_eq!(
-        chosen(&place(&connections, &spillable_request()).unwrap()).executor_id,
-        "bglab-ub",
-        "a preferred executor that cannot retain a queue entry must not win re-placement"
-    );
-}
-
-/// Measured CPU remains observational rather than declared demand, but the
-/// executor's fresh accepting state breaks an otherwise-comparable tie.
-#[test]
-fn measured_cpu_headroom_breaks_only_equal_verdict_predictions() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(
-        &mut local,
-        0.02,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.90,
-        4 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    Arc::make_mut(&mut local.health).host.cpu_admission =
-        cairn_common::executor_protocol::StallInstrumentHealth {
-            state: StallInstrumentState::Accepting,
-            reading: Some(0.02),
-            state_since_unix_ms: Some(NOW),
-            measured_at_unix_ms: Some(NOW),
-        };
-    Arc::make_mut(&mut remote.health).host.cpu_admission =
-        cairn_common::executor_protocol::StallInstrumentHealth {
-            state: StallInstrumentState::Accepting,
-            reading: Some(0.89),
-            state_since_unix_ms: Some(NOW),
-            measured_at_unix_ms: Some(NOW),
-        };
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-
-    let selection = place(&connections, &spillable_request()).unwrap();
-    let selection = chosen(&selection);
-    assert_eq!(
-        selection.executor_id, COLOCATED_EXECUTOR_ID,
-        "fresh measured headroom breaks an otherwise-equal prediction tie"
-    );
-    assert_eq!(selection.reason, PlacementReason::PredictedEarliestVerdict);
-    assert_eq!(selection.observation_reuse, ObservationReuse::Colocated);
-}
-
-#[test]
-fn continuing_cpu_pressure_remains_authoritative_after_an_entry_window() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(
-        &mut local,
-        0.95,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    Arc::make_mut(&mut local.health).host.cpu_admission =
-        cairn_common::executor_protocol::StallInstrumentHealth {
-            state: StallInstrumentState::Pressured,
-            reading: Some(0.95),
-            state_since_unix_ms: Some(NOW - 20_000),
-            measured_at_unix_ms: Some(NOW),
-        };
-
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.20,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-
-    assert_eq!(
-        chosen(&place(&connections, &spillable_request()).unwrap()).executor_id,
-        "bglab-ub",
-        "a fresh sample must keep an executor rejected after pressure has remained active beyond one sampling interval"
-    );
-}
-
 const GIB: u64 = 1024 * 1024 * 1024;
-
-/// Survey and rank as production does for one queue entry: its declines
-/// and the admission view its offer will carry.
-fn place_entry(
-    connections: &HashMap<String, ExecutorConnectionState>,
-    request: &CellRequest,
-    declined: &HashMap<String, queue::EntryDecline>,
-    view: &AdmissionView,
-) -> Result<PlacementDraft, String> {
-    place_entry_resolved(connections, request, declined, view, &HashMap::new())
-}
-
-/// [`place_entry`] with the demand resolved for each machine, as
-/// production resolves it between the survey and ranking.
-fn place_entry_resolved(
-    connections: &HashMap<String, ExecutorConnectionState>,
-    request: &CellRequest,
-    declined: &HashMap<String, queue::EntryDecline>,
-    view: &AdmissionView,
-    reservations: &HashMap<String, resource_profiles::ResolvedResourceProfile>,
-) -> Result<PlacementDraft, String> {
-    let survey = survey_candidates(connections, &[], request, NOW, declined, view)?;
-    let (predictions, sync_costs) =
-        prior_predictions(&survey.usable, request, |_, _| SyncCost::Known(0), NOW);
-    rank_survey(
-        request,
-        survey,
-        SurveyRankingContext {
-            reservations,
-            predictions: &predictions,
-            sync_costs: &sync_costs,
-            cache_distances: &HashMap::new(),
-            policy: &ActivePlacementPolicy::default_profile(),
-            now_unix_ms: NOW,
-            exploration: &ExplorationState::default(),
-            cadence_lane: None,
-        },
-    )
-    .map_err(Into::into)
-}
-
-fn idle(id: &str) -> (String, ExecutorConnectionState) {
-    let (id, mut entry) = fleet_entry(id, "linux", 0, &[]);
-    measured(&mut entry, 0.05, 48 * GIB, 900 * GIB);
-    Arc::make_mut(&mut entry.health)
-        .admission
-        .concurrency_capacity = Some(8);
-    (id, entry)
-}
-
-fn queued_ahead(request_id: &str, queued_at_unix_ms: u64) -> QueuedCellRequest {
-    QueuedCellRequest {
-        admission_kind: CellAdmissionKind::Command,
-        executor_id: String::new(),
-        request_id: request_id.into(),
-        attempt_id: "a".into(),
-        project_id: "p".into(),
-        command: "true".into(),
-        command_class: CellCommandClass::Other,
-        owner: None,
-        priority: CellPriority::ReviewCheck,
-        effective_priority: None,
-        requesting_job_id: None,
-        affinity_key: None,
-        command_resource_identity: None,
-        queued_at_unix_ms,
-        resource_reservation: ResourceReservation {
-            concurrency_units: 1,
-            ..ResourceReservation::default()
-        },
-        learned_estimate: None,
-        subscriber_count: 1,
-        substrate_hold: None,
-        placement: None,
-    }
-}
-
-/// 09-03: bglab-mac's volume sat at 1.4 GiB against a 2 GiB watermark with
-/// no sweep running, posted that, declined every offer for it, and still
-/// outranked local on free units. Posted state that the machine's own
-/// admission declines on now keeps work that can go elsewhere off it.
-#[test]
-fn a_machine_under_its_disk_floor_is_not_offered_work_that_can_go_elsewhere() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(&mut local, 0.60, 16 * GIB, 400 * GIB);
-    let (mac_id, mut mac) = idle("bglab-mac");
-    measured(&mut mac, 0.05, 48 * GIB, GIB * 14 / 10);
-    let health = Arc::make_mut(&mut mac.health);
-    health.disk.watermark_bytes = 2 * GIB;
-    health.admission.concurrency_capacity = Some(12);
-    health.admission.active_reservation.concurrency_units = 3;
-    let connections = HashMap::from([(local_id, local), (mac_id, mac)]);
-    let request = spillable_request();
-
-    let draft = place_entry(
-        &connections,
-        &request,
-        &HashMap::new(),
-        &AdmissionView::of_request(&request),
-    )
-    .unwrap();
-    assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
-    assert_eq!(
-        rejection_for(&draft, "bglab-mac"),
-        &PlacementRejectionReason::Held {
-            evidence: AdmissionHoldEvidence::Disk {
-                inodes: None,
-                free_bytes: GIB * 14 / 10,
-                floor_bytes: 2 * GIB,
-                sweep_in_flight: false,
-            }
-        }
-    );
-    assert!(rejection_for(&draft, "bglab-mac")
-        .describe()
-        .starts_with("held: disk free 1.4 GiB (floor 2.0 GiB)"));
-
-    let mut pinned = request.clone();
-    pinned.pinned_executor_id = Some("bglab-mac".into());
-    let draft = place_entry(
-        &connections,
-        &pinned,
-        &HashMap::new(),
-        &AdmissionView::of_request(&pinned),
-    )
-    .unwrap();
-    assert_eq!(
-        chosen(&draft).executor_id,
-        "bglab-mac",
-        "work that cannot leave the machine is still offered, and gets the executor's own decline"
-    );
-}
-
-/// 10-17: fedora and bgsrv-ub rotated provisioning holders on the project
-/// all afternoon, bgsrv-mac sat on a latched cleanup, and each outranked an
-/// idle local in turn. However the holder changes between surveys, local
-/// wins every one, and each row names what demoted it.
-#[test]
-fn rotating_provisioning_holders_and_a_latched_cleanup_never_outrank_an_idle_machine() {
-    for pass in 0..10 {
-        let (local_id, local) = idle(COLOCATED_EXECUTOR_ID);
-        let mut connections = HashMap::from([(local_id, local)]);
-        for name in ["fedora", "bgsrv-ub"] {
-            let (id, mut entry) = idle(name);
-            Arc::make_mut(&mut entry.snapshot).provisioning_holds =
-                vec![cairn_common::executor_protocol::ProvisioningHold {
-                    project_id: "p".into(),
-                    owner_request_id: format!("holder-{name}-{pass}"),
-                    entry_id: Some(format!("residency-acquire:job:{pass}")),
-                    since_unix_ms: NOW - 61_000,
-                }];
-            connections.insert(id, entry);
-        }
-        let (mac_id, mut mac) = idle("bgsrv-mac");
-        let health = Arc::make_mut(&mut mac.health);
-        health.disk.cleanup_blocked = true;
-        health.disk.cleanup_last_error = Some("Directory not empty".into());
-        connections.insert(mac_id, mac);
-
-        let mut request = spillable_request();
-        request.request_id = format!("acquire-{pass}");
-        let view = AdmissionView {
-            interactive: true,
-            entry_id: Some(format!("entry-{pass}")),
-            execution_residency: None,
-        };
-        let draft = place_entry(&connections, &request, &HashMap::new(), &view).unwrap();
-        assert_eq!(
-            chosen(&draft).executor_id,
-            COLOCATED_EXECUTOR_ID,
-            "pass {pass}"
-        );
-        for name in ["fedora", "bgsrv-ub"] {
-            assert!(
-                matches!(
-                    rejection_for(&draft, name),
-                    PlacementRejectionReason::Held {
-                        evidence: AdmissionHoldEvidence::ProjectProvisioning { .. }
-                    }
-                ),
-                "{name}: {:?}",
-                rejection_for(&draft, name)
-            );
-        }
-        assert_eq!(
-            rejection_for(&draft, "bgsrv-mac"),
-            &PlacementRejectionReason::Held {
-                evidence: AdmissionHoldEvidence::CleanupLatched {
-                    error: Some("Directory not empty".into())
-                }
-            }
-        );
-    }
-}
-
-/// A hold on the machine placement would otherwise prefer is
-/// current evidence that it will decline, so work free to move goes to an
-/// admissible alternative in the same pass, whatever the hold: nothing
-/// waits on the preferred machine's warmth or stable-order advantage. A
-/// pin or a platform selector still keeps the work where its caller put
-/// it.
-#[test]
-fn every_hold_on_the_preferred_machine_spills_to_an_idle_alternative_in_one_pass() {
-    use cairn_common::executor_protocol::StallInstrumentHealth;
-    type Hold = fn(&mut ExecutorConnectionState);
-    let holds: Vec<(&str, Hold)> = vec![
-        ("cpu pressure", |entry| {
-            Arc::make_mut(&mut entry.health).host.cpu_admission = StallInstrumentHealth {
-                state: StallInstrumentState::Pressured,
-                reading: Some(0.95),
-                state_since_unix_ms: Some(NOW - 20_000),
-                measured_at_unix_ms: Some(NOW),
-            };
-        }),
-        ("available memory owed", |entry| {
-            Arc::make_mut(&mut entry.health).admission.owed_memory_bytes = Some(128 * GIB);
-        }),
-        ("memory stall", |entry| {
-            Arc::make_mut(&mut entry.health).host.memory_admission = StallInstrumentHealth {
-                state: StallInstrumentState::Pressured,
-                reading: Some(0.4),
-                state_since_unix_ms: Some(NOW - 20_000),
-                measured_at_unix_ms: Some(NOW),
-            };
-        }),
-        ("build volume write stall", |entry| {
-            Arc::make_mut(&mut entry.health).host.disk_write_arms.stall = StallInstrumentHealth {
-                state: StallInstrumentState::Pressured,
-                reading: Some(0.04),
-                state_since_unix_ms: Some(NOW - 20_000),
-                measured_at_unix_ms: Some(NOW),
-            };
-        }),
-        ("provisioning", |entry| {
-            Arc::make_mut(&mut entry.snapshot).provisioning_holds =
-                vec![cairn_common::executor_protocol::ProvisioningHold {
-                    project_id: "p".into(),
-                    owner_request_id: "another-request".into(),
-                    entry_id: Some("another-entry".into()),
-                    since_unix_ms: NOW - 61_000,
-                }];
-        }),
-        ("latched cleanup", |entry| {
-            Arc::make_mut(&mut entry.health).disk.cleanup_blocked = true;
-        }),
-        ("disk floor", |entry| {
-            Arc::make_mut(&mut entry.health).disk.watermark_bytes = 1000 * GIB;
-        }),
-        ("operator drain", |entry| {
-            published_drains_fixture(entry, false, true);
-        }),
-        ("update pending", |entry| {
-            published_drains_fixture(entry, true, false);
-        }),
-    ];
-    let mut request = spillable_request();
-    request.command = "bun run test:rust".into();
-    request.command_class = CellCommandClass::classify(&request.command);
-    let view = AdmissionView {
-        interactive: false,
-        entry_id: Some("entry".into()),
-        execution_residency: None,
-    };
-    let fleet = |hold: Option<Hold>, alternative_os: &str| {
-        let (preferred_id, mut preferred) = idle("a-preferred");
-        if let Some(hold) = hold {
-            hold(&mut preferred);
-        }
-        let (alternative_id, mut alternative) =
-            fleet_entry("b-alternative", alternative_os, 0, &[]);
-        measured(&mut alternative, 0.05, 48 * GIB, 900 * GIB);
-        Arc::make_mut(&mut alternative.health)
-            .admission
-            .concurrency_capacity = Some(8);
-        HashMap::from([(preferred_id, preferred), (alternative_id, alternative)])
-    };
-    assert_eq!(
-        chosen(&place_entry(&fleet(None, "linux"), &request, &HashMap::new(), &view).unwrap())
-            .executor_id,
-        "a-preferred",
-        "unheld, the stable order prefers a-preferred"
-    );
-    for (class, hold) in holds {
-        let connections = fleet(Some(hold), "linux");
-        let draft = place_entry(&connections, &request, &HashMap::new(), &view)
-            .unwrap_or_else(|refusal| panic!("{class}: refused: {refusal}"));
-        let selected = draft
-            .selected
-            .as_ref()
-            .unwrap_or_else(|| panic!("{class}: waited instead of spilling"));
-        assert_eq!(selected.1.executor_id, "b-alternative", "{class}");
-        assert!(
-            !matches!(
-                rejection_for(&draft, "a-preferred"),
-                PlacementRejectionReason::OutrankedBy { .. }
-            ),
-            "{class}: the held machine names its hold, not a lost race: {:?}",
-            rejection_for(&draft, "a-preferred")
-        );
-
-        // A pin keeps the work on its machine, held or not.
-        let mut pinned = request.clone();
-        pinned.pinned_executor_id = Some("a-preferred".into());
-        if let Ok(draft) = place_entry(&connections, &pinned, &HashMap::new(), &view) {
-            assert_ne!(
-                draft.selected.map(|(_, selection)| selection.executor_id),
-                Some("b-alternative".to_string()),
-                "{class}: a pin is never spilled"
-            );
-        }
-
-        // A platform selector the alternative fails keeps it out.
-        let connections = fleet(Some(hold), "macos");
-        let mut constrained = request.clone();
-        constrained.executor = Some(ExecutorSelector {
-            os: Some("linux".into()),
-            ..ExecutorSelector::default()
-        });
-        if let Ok(draft) = place_entry(&connections, &constrained, &HashMap::new(), &view) {
-            assert_ne!(
-                draft.selected.map(|(_, selection)| selection.executor_id),
-                Some("b-alternative".to_string()),
-                "{class}: a platform selector is never overridden"
-            );
-        }
-    }
-}
-
-/// A hold this entry's own acquisition took is not a hold on it.
-#[test]
-fn an_entrys_own_provisioning_hold_does_not_demote_the_machine() {
-    let (id, mut entry) = idle("fedora");
-    Arc::make_mut(&mut entry.snapshot).provisioning_holds =
-        vec![cairn_common::executor_protocol::ProvisioningHold {
-            project_id: "p".into(),
-            owner_request_id: "someone".into(),
-            entry_id: Some("mine".into()),
-            since_unix_ms: NOW - 1_000,
-        }];
-    let connections = HashMap::from([(id, entry)]);
-    let request = spillable_request();
-    let view = AdmissionView {
-        entry_id: Some("mine".into()),
-        ..AdmissionView::of_request(&request)
-    };
-    let draft = place_entry(&connections, &request, &HashMap::new(), &view).unwrap();
-    assert_eq!(chosen(&draft).executor_id, "fedora");
-    assert!(chosen(&draft)
-        .prediction
-        .as_ref()
-        .is_some_and(|prediction| prediction.queue.predicted_ms().is_some()));
-}
-
-/// A queue whose oldest entry ahead has waited an hour has not moved, and
-/// free units do not make that wait zero.
-#[test]
-fn a_stalled_queue_head_is_priced_at_its_wait() {
-    let (id, mut stalled) = idle("bglab-ub");
-    Arc::make_mut(&mut stalled.health)
-        .admission
-        .concurrency_capacity = Some(8);
-    Arc::make_mut(&mut stalled.snapshot).queued_requests = vec![
-        queued_ahead("head", NOW - 61 * 60_000),
-        queued_ahead("next", NOW - 60_000),
-    ];
-    let request = spillable_request();
-    let context =
-        ReservationPlan::context_for("device", "executor", &stalled.advertisement.capabilities);
-    let prices = QueuePrices::from_priors(&stalled, &context);
-    let forecast = forecast_queue_wait(&stalled, &prices, &request, 10_000, NOW);
-    let QueueForecast::Forecast {
-        predicted_ms,
-        requests_ahead,
-        fully_measured,
-        stalled_head_ms,
-        ..
-    } = &forecast
-    else {
-        panic!("a priced queue: {forecast:?}");
-    };
-    assert_eq!(*requests_ahead, 2);
-    assert!(*predicted_ms >= 61 * 60_000, "{forecast:?}");
-    assert_eq!(*stalled_head_ms, Some(61 * 60_000));
-    assert!(!fully_measured);
-    assert!(
-        forecast.describe().ends_with("head waiting 61m"),
-        "{}",
-        forecast.describe()
-    );
-
-    let (peer_id, mut peer) = idle("bgsrv-ub");
-    Arc::make_mut(&mut peer.health)
-        .admission
-        .concurrency_capacity = Some(8);
-    let connections = HashMap::from([(id, stalled), (peer_id, peer)]);
-    let draft = place_entry(
-        &connections,
-        &request,
-        &HashMap::new(),
-        &AdmissionView::of_request(&request),
-    )
-    .unwrap();
-    assert_eq!(chosen(&draft).executor_id, "bgsrv-ub");
-}
-
-/// A head younger than the run it would wait on is an ordinary queue, and
-/// free units still read it as no wait.
-#[test]
-fn a_moving_queue_head_keeps_the_arithmetic_forecast() {
-    let (_, mut entry) = idle("bglab-ub");
-    Arc::make_mut(&mut entry.health)
-        .admission
-        .concurrency_capacity = Some(8);
-    Arc::make_mut(&mut entry.snapshot).queued_requests = vec![queued_ahead("head", NOW - 5_000)];
-    let context =
-        ReservationPlan::context_for("device", "executor", &entry.advertisement.capabilities);
-    let prices = QueuePrices::from_priors(&entry, &context);
-    assert_eq!(
-        forecast_queue_wait(&entry, &prices, &spillable_request(), 10_000, NOW),
-        QueueForecast::Forecast {
-            predicted_ms: 0,
-            requests_ahead: 1,
-            running_ahead: 0,
-            fully_measured: true,
-            observed_at_unix_ms: NOW,
-            stalled_head_ms: None,
-        }
-    );
-}
-
-/// Advertised capacity is already net of the interactive reserve, so a
-/// request that fits it exactly does not wait.
-#[test]
-fn the_interactive_reserve_is_not_subtracted_from_advertised_capacity_again() {
-    let (_, mut entry) = idle("local-ish");
-    let admission = &mut Arc::make_mut(&mut entry.health).admission;
-    admission.concurrency_capacity = Some(14);
-    admission.interactive_reserve = 2;
-    let mut request = spillable_request();
-    request.resource_reservation.concurrency_units = 14;
-    let context =
-        ReservationPlan::context_for("device", "executor", &entry.advertisement.capabilities);
-    let prices = QueuePrices::from_priors(&entry, &context);
-    assert_eq!(
-        forecast_queue_wait(&entry, &prices, &request, 10_000, NOW).predicted_ms(),
-        Some(0)
-    );
-}
-
-/// A machine that declined this entry ranks behind one that has not, even
-/// after its decline is superseded and nothing it posts explains it.
-#[test]
-fn a_machine_that_declined_this_entry_ranks_behind_one_that_has_not() {
-    let (a_id, a) = idle("a-machine");
-    let (b_id, b) = idle("b-machine");
-    let connections = HashMap::from([(a_id, a), (b_id, b)]);
-    let request = spillable_request();
-    let view = AdmissionView::of_request(&request);
-    assert_eq!(
-        chosen(&place_entry(&connections, &request, &HashMap::new(), &view).unwrap()).executor_id,
-        "a-machine",
-        "otherwise equal, the stable order prefers a-machine"
-    );
-
-    let declined = HashMap::from([(
-        "a-machine".to_string(),
-        queue::EntryDecline {
-            generation: 1,
-            reason: DeclineReason::Unknown,
-            detail: None,
-            disk: None,
-            at_unix_ms: NOW - 12_000,
-            condition: None,
-            backoff_ms: 0,
-            retry_after_unix_ms: 0,
-            room_seq: None,
-            superseded_at_unix_ms: Some(NOW - 1_000),
-        },
-    )]);
-    let draft = place_entry(&connections, &request, &declined, &view).unwrap();
-    assert_eq!(chosen(&draft).executor_id, "b-machine");
-    let row = draft
-        .rejected
-        .iter()
-        .find(|row| row.executor_id == "a-machine")
-        .unwrap();
-    assert!(matches!(
-        row.reason,
-        PlacementRejectionReason::OutrankedBy { .. }
-    ));
-    let prediction = row.prediction.as_ref().unwrap();
-    assert_eq!(
-        prediction.declined_here,
-        Some(PriorDecline {
-            reason: DeclineReason::Unknown,
-            declined_at_unix_ms: NOW - 12_000,
-        })
-    );
-    assert!(prediction
-        .describe()
-        .contains("(Unknown); ranked after machines that have not"));
-}
-
-#[test]
-fn a_pinned_pressure_decline_parks_until_the_machine_posts_recovery() {
-    let (id, entry) = idle("fedora");
-    let generation = entry.generation;
-    let connections = HashMap::from([(id.clone(), entry)]);
-    let mut request = spillable_request();
-    request.pinned_executor_id = Some(id.clone());
-    let view = AdmissionView::of_request(&request);
-    let mut declined = HashMap::from([(
-        id,
-        queue::EntryDecline {
-            generation,
-            reason: DeclineReason::Pressure,
-            detail: Some("CPU brake and memory floor".into()),
-            disk: None,
-            at_unix_ms: NOW,
-            condition: None,
-            backoff_ms: 0,
-            retry_after_unix_ms: 0,
-            room_seq: None,
-            superseded_at_unix_ms: None,
-        },
-    )]);
-    let draft = place_entry(&connections, &request, &declined, &view)
-        .expect("a pin narrows where to wait, not whether pressure is waited out");
-    assert!(draft.selected.is_none());
-    let waiting = wait_decision(
-        &request,
-        &ActivePlacementPolicy::default_profile(),
-        &draft.rejected,
-        &[],
-        &[],
-    )
-    .expect("the pressure wait is recorded");
-    let PlacementOutcome::Waiting { diagnostic } = waiting.outcome else {
-        panic!("pressure must be recorded as waiting");
-    };
-    assert!(diagnostic.contains("fedora"), "{diagnostic}");
-    assert!(
-        diagnostic.contains("CPU brake and memory floor"),
-        "{diagnostic}"
-    );
-    declined.get_mut("fedora").unwrap().superseded_at_unix_ms = Some(NOW);
-    assert_eq!(
-        chosen(&place_entry(&connections, &request, &declined, &view).unwrap()).executor_id,
-        "fedora",
-        "recovery re-offers the same pinned machine"
-    );
-}
-
-/// With every capable machine held on its disk, a request free to move
-/// waits out its horizon rather than taking the immediate no-machine
-/// refusal: a latch retries and an operator can free disk.
-#[test]
-fn a_fleet_held_on_disk_is_waited_for_not_refused() {
-    let (id, mut entry) = idle("bglab-mac");
-    let health = Arc::make_mut(&mut entry.health);
-    health.disk.watermark_bytes = 1000 * GIB;
-    let connections = HashMap::from([(id, entry)]);
-    let mut request = targeted_request("linux");
-    request.placement_mobility = PlacementMobility::SpillEligible;
-    let draft = place_entry(
-        &connections,
-        &request,
-        &HashMap::new(),
-        &AdmissionView::of_request(&request),
-    )
-    .expect("a held machine is waited for, not refused");
-    assert!(draft.selected.is_none());
-    assert!(matches!(
-        draft.rejected[0].reason,
-        PlacementRejectionReason::Held {
-            evidence: AdmissionHoldEvidence::Disk { .. }
-        }
-    ));
-    assert!(describe_declines(&draft.rejected).contains("held: disk free"));
-}
-
-/// An ordinary submission declares no disk growth; the reservation
-/// resolved for each machine does, and it is what the offer names. A
-/// machine with 8 GiB free, a 2 GiB watermark, and 4 GiB of growth already
-/// admitted looks fine against the declared zero and against the resolved
-/// 4 GiB without the admitted growth (both a 6 GiB floor), but its admission
-/// charges all three and declines below 10 GiB. Its posted state already
-/// says so, and is read against the demand the offer will carry.
-#[test]
-fn a_posted_hold_is_read_against_the_reservation_resolved_for_that_machine() {
-    let (fast_id, mut fast) = idle("a-fast");
-    measured(&mut fast, 0.05, 48 * GIB, 8 * GIB);
-    let health = Arc::make_mut(&mut fast.health);
-    health.disk.watermark_bytes = 2 * GIB;
-    health.admission.active_reservation.disk_growth_bytes = 4 * GIB;
-    let (peer_id, peer) = idle("b-peer");
-    let connections = HashMap::from([(fast_id, fast), (peer_id, peer)]);
-    let request = spillable_request();
-    assert_eq!(request.resource_reservation.disk_growth_bytes, 0);
-    let view = AdmissionView::of_request(&request);
-
-    assert_eq!(
-        chosen(&place_entry(&connections, &request, &HashMap::new(), &view).unwrap()).executor_id,
-        "a-fast",
-        "against the declared zero nothing holds a-fast, which wins the stable order"
-    );
-
-    let demand = resource_profiles::ResolvedResourceProfile {
-        duration: test_prior_duration(),
-        reservation: ResourceReservation {
-            memory_bytes: GIB,
-            disk_growth_bytes: 4 * GIB,
-            concurrency_units: 1,
-            source: ResourceReservationSource::Learned,
-            measured_peak_bytes: None,
-            test_phase: None,
-        },
-        learned_estimate: None,
-        rationale: unresolved_rationale(&ResourceReservation::default()),
-        memory_fit: resource_profiles::MemoryFit::Unknown,
-        process_evidence: resource_profiles::ProcessEvidence::default(),
-    };
-    let reservations = HashMap::from([
-        ("a-fast".to_string(), demand.clone()),
-        ("b-peer".to_string(), demand),
-    ]);
-    let draft = place_entry_resolved(
-        &connections,
-        &request,
-        &HashMap::new(),
-        &view,
-        &reservations,
-    )
-    .unwrap();
-    assert_eq!(chosen(&draft).executor_id, "b-peer");
-    assert_eq!(
-        rejection_for(&draft, "a-fast"),
-        &PlacementRejectionReason::Held {
-            evidence: AdmissionHoldEvidence::Disk {
-                inodes: None,
-                free_bytes: 8 * GIB,
-                floor_bytes: 10 * GIB,
-                sweep_in_flight: false,
-            }
-        }
-    );
-}
 
 /// Untargeted is not the same property as free to move. An agent's own batch
 /// states no selector and is still bound to the machine holding its tree.
@@ -12289,35 +8040,6 @@ fn conservative_untargeted_work_never_leaves_the_colocated_executor() {
     assert_eq!(
         rejection_for(&draft, "bglab-ub"),
         &PlacementRejectionReason::NotColocated
-    );
-}
-
-/// A pin is a fact about where the work already lives, and no measurement
-/// overrules it.
-#[test]
-fn a_pinned_request_ignores_a_more_idle_machine() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(&mut local, 0.99, 1024 * 1024 * 1024, 1024 * 1024 * 1024);
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.01,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-
-    let mut request = spillable_request();
-    request.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
-    let draft = place(&connections, &request).unwrap();
-    let selection = chosen(&draft);
-    assert_eq!(selection.executor_id, COLOCATED_EXECUTOR_ID);
-    assert_eq!(selection.reason, PlacementReason::Pinned);
-    assert_eq!(
-        rejection_for(&draft, "bglab-ub"),
-        &PlacementRejectionReason::PinMismatch {
-            pinned_executor_id: COLOCATED_EXECUTOR_ID.into()
-        }
     );
 }
 
@@ -12409,41 +8131,6 @@ fn pinned_stale_executor_reports_link_unavailability_instead_of_rehoming() {
     let error = place(&connections, &request).unwrap_err();
     assert!(error.contains("local"), "{error}");
     assert!(error.contains("published no progress"), "{error}");
-}
-
-/// A machine whose load cannot be seen is not a machine to ship a tree to.
-/// The gap is named, and it is never read as no load.
-#[test]
-fn a_placement_gap_excludes_a_remote_and_never_reads_as_idle() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(
-        &mut local,
-        0.85,
-        8 * 1024 * 1024 * 1024,
-        500 * 1024 * 1024 * 1024,
-    );
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.01,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    Arc::make_mut(&mut remote.health).machine.volume = Measurement::unavailable(
-        NOW,
-        cairn_common::wire_vocabulary::MeasurementGap::SamplingFailed,
-    );
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-
-    let draft = place(&connections, &spillable_request()).unwrap();
-    assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
-    assert_eq!(
-        rejection_for(&draft, "bglab-ub"),
-        &PlacementRejectionReason::TelemetryGap {
-            measurement: MachineMeasurement::Volume,
-            gap: cairn_common::wire_vocabulary::MeasurementGap::SamplingFailed,
-        }
-    );
 }
 
 fn pipes_reading(entry: &mut ExecutorConnectionState, at_unix_ms: u64, accepted_bytes: u64) {
@@ -12568,353 +8255,6 @@ fn an_agent_command_passes_recovery_hysteresis_and_nothing_else_does() {
     assert!(rejected(&local, &acquisition, at));
 }
 
-/// A value measured long enough ago is history, and deciding on it would be
-/// deciding on a machine's past.
-#[test]
-fn a_stale_reading_excludes_a_remote_by_its_own_age() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(
-        &mut local,
-        0.85,
-        8 * 1024 * 1024 * 1024,
-        500 * 1024 * 1024 * 1024,
-    );
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.01,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    Arc::make_mut(&mut remote.health)
-        .machine
-        .cpu
-        .measured_at_unix_ms = NOW - EXECUTOR_TELEMETRY_STALE_AFTER_MS - 1;
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-
-    let draft = place(&connections, &spillable_request()).unwrap();
-    assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
-    assert!(matches!(
-        rejection_for(&draft, "bglab-ub"),
-        PlacementRejectionReason::TelemetryStale {
-            measurement: MachineMeasurement::Cpu,
-            ..
-        }
-    ));
-}
-
-/// The executor's own brake going blind is an earlier, narrower signal than
-/// the telemetry cache going stale: the pressure tracker stops advancing the
-/// moment its sampler does, while the cache is refreshed by any admission
-/// attempt that reads it. A machine in that state is not a machine with
-/// headroom, however good the numbers it last managed to report look.
-#[test]
-fn a_machine_whose_cpu_brake_went_blind_loses_to_one_that_can_still_see() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(
-        &mut local,
-        0.85,
-        8 * 1024 * 1024 * 1024,
-        500 * 1024 * 1024 * 1024,
-    );
-    Arc::make_mut(&mut local.health).host.cpu_admission =
-        cairn_common::executor_protocol::StallInstrumentHealth {
-            state: StallInstrumentState::Accepting,
-            reading: Some(0.85),
-            state_since_unix_ms: Some(NOW),
-            measured_at_unix_ms: Some(NOW),
-        };
-
-    // Idler, roomier, and its machine telemetry is fresh enough that the
-    // placement staleness gate has nothing to say about it. Only its
-    // sampler stopped.
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.01,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    let went_quiet = NOW - MACHINE_SAMPLE_BLIND_AFTER_MS - 1;
-    Arc::make_mut(&mut remote.health).host.cpu_admission =
-        cairn_common::executor_protocol::StallInstrumentHealth {
-            state: StallInstrumentState::Accepting,
-            reading: Some(0.01),
-            state_since_unix_ms: Some(went_quiet),
-            measured_at_unix_ms: Some(went_quiet),
-        };
-    // The control: with that same machine still sampling, its numbers win.
-    // Asserting only the blind case would pass on any fixture that happened
-    // to favour the colocated machine for unrelated reasons.
-    let mut seeing = remote.clone();
-    Arc::make_mut(&mut seeing.health)
-        .host
-        .cpu_admission
-        .measured_at_unix_ms = Some(NOW);
-    Arc::make_mut(&mut seeing.health)
-        .host
-        .cpu_admission
-        .state_since_unix_ms = Some(NOW);
-    // A broken write instrument on that sampling remote is not a blind
-    // machine: its CPU reading proves the sampler current, so it ranks on
-    // its numbers as the control does.
-    let mut faulted = seeing.clone();
-    Arc::make_mut(&mut faulted.health).host.disk_write_arms =
-        cairn_common::executor_protocol::DiskWriteArms {
-            stall: cairn_common::executor_protocol::StallInstrumentHealth {
-                state: StallInstrumentState::Pressured,
-                reading: Some(0.3),
-                state_since_unix_ms: Some(went_quiet),
-                measured_at_unix_ms: Some(went_quiet),
-            },
-            latency: cairn_common::executor_protocol::StallInstrumentHealth::default(),
-            last_pressured_unix_ms: Some(went_quiet),
-        };
-    let control = HashMap::from([
-        (local_id.clone(), local.clone()),
-        (remote_id.clone(), seeing),
-    ]);
-    assert_eq!(
-        chosen(&place(&control, &spillable_request()).unwrap()).executor_id,
-        remote_id,
-        "control: a sampling remote with better numbers should win"
-    );
-    let faulted = HashMap::from([
-        (local_id.clone(), local.clone()),
-        (remote_id.clone(), faulted),
-    ]);
-    assert_eq!(
-        chosen(&place(&faulted, &spillable_request()).unwrap()).executor_id,
-        remote_id,
-        "an instrument faulted under a current sampler must not rank its machine as blind"
-    );
-
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-    let draft = place(&connections, &spillable_request()).unwrap();
-    assert_eq!(
-        chosen(&draft).executor_id,
-        COLOCATED_EXECUTOR_ID,
-        "a machine that stopped measuring its own load must not outrank one that has not"
-    );
-}
-
-/// cairn/5600: fedora and bbs were each running seven or eight commands on
-/// a stalling disk, every refresh pass waited tens of seconds for pool
-/// state, and every Linux lane was refused because both machines' CPU
-/// reading was minutes old. A machine's readings now also arrive on its
-/// beat and in their own frame, neither of which waits for pool state, and
-/// a late snapshot from the stuck pass cannot drag them back. An executor
-/// that sends no sample is read exactly as it posts itself, as before.
-#[test]
-fn sampled_readings_keep_a_machine_placeable_while_its_refresh_pass_is_minutes_old() {
-    let gib = 1024 * 1024 * 1024;
-    let pass_measured_at = NOW - 4 * 60 * 1_000;
-    let brake = |measured_at_unix_ms| cairn_common::executor_protocol::StallInstrumentHealth {
-        state: StallInstrumentState::Accepting,
-        reading: Some(0.2),
-        state_since_unix_ms: Some(pass_measured_at),
-        measured_at_unix_ms: Some(measured_at_unix_ms),
-    };
-    let pool = Fleet::default();
-    let mut stuck_pass = HashMap::new();
-    for id in ["fedora", "bbs"] {
-        let (executor_id, mut connection) = fleet_entry(id, "linux", 0, &[]);
-        measured_at(&mut connection, 0.2, 48 * gib, 900 * gib, pass_measured_at);
-        Arc::make_mut(&mut connection.health).host.cpu_admission = brake(pass_measured_at);
-        Arc::make_mut(&mut connection.health)
-            .host
-            .disk_write_arms
-            .stall = brake(pass_measured_at);
-        Arc::make_mut(&mut connection.health)
-            .host
-            .disk_write_arms
-            .latency = brake(pass_measured_at);
-        stuck_pass.insert(id, (*connection.health).clone());
-        pool.lock_connections().insert(executor_id, connection);
-    }
-    let sample_at = |measured_at_unix_ms| {
-        let mut fresh = stuck_pass["fedora"].clone();
-        fresh.machine.cpu.measured_at_unix_ms = measured_at_unix_ms;
-        fresh.machine.memory.measured_at_unix_ms = measured_at_unix_ms;
-        fresh.machine.volume.measured_at_unix_ms = measured_at_unix_ms;
-        fresh.host.cpu_admission = brake(measured_at_unix_ms);
-        fresh.host.disk_write_arms.stall = brake(measured_at_unix_ms);
-        fresh.host.disk_write_arms.latency = brake(measured_at_unix_ms);
-        MachineSample::of_report(&fresh)
-    };
-    let beat = |id: &str, machine: Option<MachineSample>| {
-        let advertisement = pool.lock_connections()[id].advertisement.as_ref().clone();
-        assert!(pool.handle_executor_message(
-            id,
-            1,
-            ExecutorMessage::Heartbeat {
-                advertisement,
-                health: stuck_pass[id].clone(),
-                last_update: None,
-                machine,
-            },
-        ));
-    };
-
-    // Both beat on time, carrying the stuck pass's health. fedora's beat
-    // also carries the sample its sampler took twenty seconds ago, inside
-    // the staleness bound but outside the brake's.
-    beat("fedora", Some(sample_at(NOW - 20_000)));
-    beat("bbs", None);
-    let fedora = pool.lock_connections()["fedora"].health.clone();
-    assert_eq!(fedora.machine.cpu.measured_at_unix_ms, NOW - 20_000);
-    assert_eq!(
-        fedora.host.cpu_admission.measured_at_unix_ms,
-        Some(NOW - 20_000)
-    );
-
-    // The sample frame brings the brake inside its bound between beats.
-    assert!(!pool.handle_executor_message(
-        "fedora",
-        1,
-        ExecutorMessage::MachineSampled {
-            sample: sample_at(NOW),
-        },
-    ));
-    // Then the stuck pass finally returns and publishes what it measured
-    // four minutes ago. Its cells and queues are the news; its readings
-    // are not, and they do not displace the newer ones.
-    pool.set_executor_snapshot(
-        "fedora",
-        1,
-        FleetSnapshot::default(),
-        stuck_pass["fedora"].clone(),
-    );
-    pool.set_executor_snapshot(
-        "bbs",
-        1,
-        FleetSnapshot::default(),
-        stuck_pass["bbs"].clone(),
-    );
-
-    let connections = pool.lock_connections().clone();
-    let fedora = &connections["fedora"].health;
-    assert_eq!(fedora.machine.cpu.measured_at_unix_ms, NOW);
-    assert_eq!(fedora.machine.memory.measured_at_unix_ms, NOW);
-    assert_eq!(fedora.machine.volume.measured_at_unix_ms, NOW);
-    assert_eq!(fedora.host.cpu_admission.measured_at_unix_ms, Some(NOW));
-    // The write arms ride the same sample as the CPU brake, so they are
-    // exactly as fresh; on the report alone they aged with the beat.
-    assert_eq!(
-        fedora.host.disk_write_arms.stall.measured_at_unix_ms,
-        Some(NOW)
-    );
-    assert_eq!(
-        fedora.host.disk_write_arms.latency.measured_at_unix_ms,
-        Some(NOW)
-    );
-    assert_eq!(
-        *connections["bbs"].health, stuck_pass["bbs"],
-        "an executor that sends no sample is held to exactly what it posted"
-    );
-
-    let draft = place(&connections, &spillable_request()).unwrap();
-    assert_eq!(
-        chosen(&draft).executor_id,
-        "fedora",
-        "a machine whose readings are fresh is placeable however old its pass is"
-    );
-    assert!(
-        matches!(
-            rejection_for(&draft, "bbs"),
-            PlacementRejectionReason::TelemetryStale {
-                measurement: MachineMeasurement::Cpu,
-                ..
-            }
-        ),
-        "the stale-telemetry bound still holds for a machine that cannot freshen its readings"
-    );
-}
-
-/// A gap that describes the daemon rather than the machine says nothing
-/// about whether the machine can take work, and must not exclude it.
-#[test]
-fn a_diagnostic_gap_does_not_exclude_a_candidate() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(
-        &mut local,
-        0.85,
-        8 * 1024 * 1024 * 1024,
-        500 * 1024 * 1024 * 1024,
-    );
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.01,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    Arc::make_mut(&mut remote.health)
-        .machine
-        .process
-        .physical_footprint_bytes = Measurement::unavailable(
-        NOW,
-        cairn_common::wire_vocabulary::MeasurementGap::UnsupportedPlatform,
-    );
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-
-    assert_eq!(
-        chosen(&place(&connections, &spillable_request()).unwrap()).executor_id,
-        "bglab-ub"
-    );
-}
-
-/// When nothing in the fleet can be measured, the work stays where it is —
-/// and the record says the fleet was blind rather than implying a
-/// measurement happened.
-#[test]
-fn a_measured_blind_fleet_keeps_work_home_and_says_so() {
-    let connections = HashMap::from([
-        fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]),
-        fleet_entry("bglab-ub", "linux", 0, &[]),
-    ]);
-    let draft = place(&connections, &spillable_request()).unwrap();
-    let selection = chosen(&draft);
-    assert_eq!(selection.executor_id, COLOCATED_EXECUTOR_ID);
-    assert_eq!(selection.reason, PlacementReason::MeasuredBlindFleet);
-    assert!(matches!(
-        rejection_for(&draft, "bglab-ub"),
-        PlacementRejectionReason::TelemetryGap { .. }
-    ));
-}
-
-/// Constraining the fleet is not settling placement. `os: linux` narrows the
-/// candidate set and leaves policy choosing among what is left, so a machine
-/// whose readings are missing is exactly as disqualified there as it is for
-/// an unconstrained request.
-#[test]
-fn a_platform_constrained_spill_batch_still_refuses_a_blind_remote() {
-    let (measured_id, mut measured_remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut measured_remote,
-        0.20,
-        48 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    let (blind_id, blind_remote) = fleet_entry("bglab-win", "linux", 0, &[]);
-    let connections = HashMap::from([(measured_id, measured_remote), (blind_id, blind_remote)]);
-
-    let mut request = spillable_request();
-    request.executor = Some(ExecutorSelector {
-        os: Some("linux".into()),
-        ..ExecutorSelector::default()
-    });
-    let draft = place(&connections, &request).unwrap();
-    assert_eq!(chosen(&draft).executor_id, "bglab-ub");
-    assert!(
-        matches!(
-            rejection_for(&draft, "bglab-win"),
-            PlacementRejectionReason::TelemetryGap { .. }
-        ),
-        "a constrained set is still a set policy chooses from"
-    );
-}
-
 /// The CAIRN-3452 specimen, as placement sees it.
 ///
 /// A review wave with nowhere idle to go locally found one measured, idle
@@ -12961,45 +8301,6 @@ fn a_verdict_never_travels_to_a_platform_the_project_does_not_gate_on() {
     assert!(rejection.describe().contains("windows"), "{rejection:?}");
 }
 
-/// Trust decides eligibility, so a same-platform machine still competes on
-/// its readings. The rule narrows WHERE a verdict may come from; it does not
-/// pin every check back to the runner's own machine, which would trade one
-/// wrong answer for a fleet that never spills at all.
-#[test]
-fn a_gated_platform_still_spills_to_the_idle_machine_on_it() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]);
-    measured(
-        &mut local,
-        0.95,
-        2 * 1024 * 1024 * 1024,
-        100 * 1024 * 1024 * 1024,
-    );
-    let (mac_id, mut mac) = fleet_entry("bglab-mac", "macos", 0, &[]);
-    measured(
-        &mut mac,
-        0.02,
-        64 * 1024 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    let (windows_id, mut windows) = fleet_entry("bglab-win", "windows", 0, &[]);
-    measured(
-        &mut windows,
-        0.00,
-        96 * 1024 * 1024 * 1024,
-        999 * 1024 * 1024 * 1024,
-    );
-    let connections = HashMap::from([(local_id, local), (mac_id, mac), (windows_id, windows)]);
-
-    let mut request = spillable_request();
-    request.verdict_platforms = vec!["macos".into()];
-    let draft = place(&connections, &request).unwrap();
-    assert_eq!(chosen(&draft).executor_id, "bglab-mac");
-    assert_eq!(
-        chosen(&draft).reason,
-        PlacementReason::PredictedEarliestVerdict
-    );
-}
-
 /// A batch that cannot move has one possible machine, and waiting cannot
 /// change its platform. That is a contradiction between what a check
 /// declared and the cadence it runs at, and it is answered immediately
@@ -13043,30 +8344,6 @@ fn mobile_work_waits_when_only_ungated_platforms_are_attached() {
     assert!(draft.selected.is_none(), "{draft:?}");
 }
 
-/// And when the constraint leaves only machines whose readings stopped,
-/// the answer is the typed telemetry refusal. Narrowing the fleet cannot
-/// make a measurement that stopped safe to act on.
-#[test]
-fn a_platform_constrained_spill_batch_with_only_blind_remotes_refuses() {
-    let (ub_id, mut ub) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured_at(&mut ub, 0.05, 48 * GIB, 900 * GIB, NOW - 700_000);
-    let (win_id, mut win) = fleet_entry("bglab-win", "linux", 0, &[]);
-    Arc::make_mut(&mut win.health).machine.cpu = Measurement::unavailable(
-        NOW,
-        cairn_common::wire_vocabulary::MeasurementGap::SamplingFailed,
-    );
-    let connections = HashMap::from([(ub_id, ub), (win_id, win)]);
-    let mut request = spillable_request();
-    request.executor = Some(ExecutorSelector {
-        os: Some("linux".into()),
-        ..ExecutorSelector::default()
-    });
-    let refusal = place(&connections, &request).unwrap_err();
-    assert!(refusal.contains("bglab-ub"), "{refusal}");
-    assert!(refusal.contains("bglab-win"), "{refusal}");
-    assert!(refusal.contains("sampling failed"), "{refusal}");
-}
-
 /// Naming one machine is different: the caller settled placement, there is
 /// nothing for a measurement to decide, and the work runs where it was sent.
 #[test]
@@ -13088,200 +8365,6 @@ fn naming_one_machine_runs_there_whether_or_not_it_can_be_measured() {
         PlacementReason::OnlyCandidate,
         "nothing was measured for, so the record must not claim the fleet was blind"
     );
-}
-
-/// The exact local-degradation case: local is the last machine standing and
-/// nothing about it can be seen. "It was the only one" would describe that as
-/// a choice; the record has to say measurement was impossible.
-#[test]
-fn a_lone_blind_home_records_that_measurement_was_impossible() {
-    let connections = HashMap::from([fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[])]);
-    let draft = place(&connections, &spillable_request()).unwrap();
-    let selection = chosen(&draft);
-    assert_eq!(selection.executor_id, COLOCATED_EXECUTOR_ID);
-    assert_eq!(
-        selection.reason,
-        PlacementReason::MeasuredBlindFleet,
-        "a sole blind home is not a decision that was made, it is one that could not be"
-    );
-}
-
-#[test]
-fn a_stale_fleet_parks_with_a_return_bound_then_places_on_fresh_telemetry() {
-    let (id, mut remote) = idle("fedora");
-    measured_at(
-        &mut remote,
-        0.05,
-        48 * GIB,
-        900 * GIB,
-        NOW - EXECUTOR_TELEMETRY_STALE_AFTER_MS - 1_000,
-    );
-    let mut connections = HashMap::from([(id.clone(), remote)]);
-    let request = spillable_request();
-    let draft = place(&connections, &request).expect("recently stale telemetry is waited for");
-    assert!(draft.selected.is_none());
-    let waiting = wait_decision(
-        &request,
-        &ActivePlacementPolicy::default_profile(),
-        &draft.rejected,
-        &[],
-        &[],
-    )
-    .expect("the stale wait is visible");
-    let PlacementOutcome::Waiting { diagnostic } = waiting.outcome else {
-        panic!("the stale wait must not be a refusal");
-    };
-    assert!(diagnostic.contains("fedora"), "{diagnostic}");
-    assert!(
-        diagnostic.contains("waiting for fresh telemetry by"),
-        "{diagnostic}"
-    );
-    measured(connections.get_mut(&id).unwrap(), 0.05, 48 * GIB, 900 * GIB);
-    assert_eq!(
-        chosen(&place(&connections, &request).unwrap()).executor_id,
-        id
-    );
-    measured_at(
-        connections.get_mut(&id).unwrap(),
-        0.05,
-        48 * GIB,
-        900 * GIB,
-        NOW - EXECUTOR_TELEMETRY_STALE_AFTER_MS - ENVIRONMENT_LEASE_GRACE_MS - 1,
-    );
-    assert!(
-        place(&connections, &request).is_err(),
-        "a stopped sampler is bounded"
-    );
-}
-
-/// A fleet whose measurements failed, with nowhere to fall back to, refuses
-/// in words carrying the same evidence a success would. A reading that was
-/// attempted and failed is evidence, and acting against it would be the
-/// silent degradation this policy exists to prevent. One reading never
-/// taken beside it does not make the machine merely unsampled.
-#[test]
-fn an_unmeasurable_fleet_with_no_home_refuses_with_its_evidence() {
-    let (id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    Arc::make_mut(&mut remote.health).machine.volume = Measurement::unavailable(
-        NOW,
-        cairn_common::wire_vocabulary::MeasurementGap::SamplingFailed,
-    );
-    let connections = HashMap::from([(id, remote)]);
-    let refusal = place(&connections, &spillable_request()).unwrap_err();
-    assert!(refusal.contains("bglab-ub"), "{refusal}");
-    assert!(refusal.contains("unavailable"), "{refusal}");
-}
-
-/// cairn/6557, the bginf-sp2 specimen: one machine drained, the other
-/// attached but not yet through its first sample, and no home. Its
-/// telemetry was never measured, which fails open (tenet 302), so it is
-/// offered the work rather than the request being refused, and the record
-/// says the decision was blind and which reading was missing.
-#[test]
-fn a_machine_that_has_not_sampled_yet_takes_work_nothing_seeing_can() {
-    let (drained_id, mut drained) = fleet_entry("scratch-b", "linux", 0, &[]);
-    measured(&mut drained, 0.05, 48 * GIB, 900 * GIB);
-    drained.drained = true;
-    let (fresh_id, fresh) = fleet_entry("scratch-a", "linux", 0, &[]);
-    let connections = HashMap::from([(drained_id, drained), (fresh_id, fresh)]);
-
-    let draft = place(&connections, &spillable_request()).unwrap();
-    let selection = chosen(&draft);
-    assert_eq!(selection.executor_id, "scratch-a");
-    assert_eq!(selection.reason, PlacementReason::MeasuredBlindFleet);
-    assert_eq!(
-        selection.readings.cpu.gap(),
-        Some(cairn_common::wire_vocabulary::MeasurementGap::NotSampled),
-        "the decision names the missing reading"
-    );
-    assert_eq!(
-        rejection_for(&draft, "scratch-b"),
-        &PlacementRejectionReason::Drained
-    );
-}
-
-/// The fallback is a last resort, never a preference: beside a machine
-/// placement can see, an unsampled one is still not a spill target.
-#[test]
-fn an_unsampled_machine_never_outranks_a_measured_one() {
-    let (measured_id, mut measured_remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(&mut measured_remote, 0.95, 4 * GIB, 900 * GIB);
-    let (fresh_id, fresh) = fleet_entry("bglab-sp2", "linux", 0, &[]);
-    let connections = HashMap::from([(measured_id, measured_remote), (fresh_id, fresh)]);
-
-    let draft = place(&connections, &spillable_request()).unwrap();
-    assert_eq!(chosen(&draft).executor_id, "bglab-ub");
-    assert!(matches!(
-        rejection_for(&draft, "bglab-sp2"),
-        PlacementRejectionReason::TelemetryGap { .. }
-    ));
-}
-
-/// A machine whose other readings are fresh but whose CPU sample has gone
-/// stale stopped measuring; that is not "not sampled yet", and it refuses.
-#[test]
-fn a_stale_reading_beside_an_unsampled_one_still_refuses() {
-    let (id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured_at(&mut remote, 0.05, 48 * GIB, 900 * GIB, NOW - 200_000);
-    Arc::make_mut(&mut remote.health).machine.volume = Measurement::default();
-    let connections = HashMap::from([(id, remote)]);
-    let refusal = place(&connections, &spillable_request()).unwrap_err();
-    assert!(refusal.contains("bglab-ub"), "{refusal}");
-}
-
-/// Both machines answered this request, one on disk and one on host
-/// pressure, and by the time the refusal is composed the admission view
-/// reads each of them as stale. The refusal is the journal's account: each
-/// machine's own decline, not the staleness visible when the sentence is
-/// written, which reads as a runner restart that never happened.
-#[test]
-fn a_refusal_names_each_machines_decline_not_the_staleness_read_when_it_is_composed() {
-    let (fedora_id, mut fedora) = fleet_entry("fedora", "linux", 0, &[]);
-    measured_at(&mut fedora, 0.05, 48 * GIB, 900 * GIB, NOW - 604_488);
-    let (ub_id, mut ub) = fleet_entry("bgsrv-ub", "linux", 0, &[]);
-    measured_at(&mut ub, 0.05, 48 * GIB, 900 * GIB, NOW - 700_000);
-    let connections = HashMap::from([(fedora_id, fedora), (ub_id, ub)]);
-    let request = spillable_request();
-    let decline = |reason, detail: &str, at_unix_ms| queue::EntryDecline {
-        generation: 1,
-        reason,
-        detail: Some(detail.into()),
-        disk: None,
-        at_unix_ms,
-        condition: None,
-        backoff_ms: 0,
-        retry_after_unix_ms: 0,
-        room_seq: None,
-        // Superseded and past backoff: neither decline keeps its machine
-        // out of ranking, which is where the staleness is read.
-        superseded_at_unix_ms: Some(at_unix_ms),
-    };
-    let declined = HashMap::from([
-        (
-            "fedora".to_string(),
-            decline(DeclineReason::Disk, "disk, sweep in flight", NOW - 40_000),
-        ),
-        (
-            "bgsrv-ub".to_string(),
-            decline(DeclineReason::Pressure, "host pressure", NOW - 60_000),
-        ),
-    ]);
-    let refusal = place_entry(
-        &connections,
-        &request,
-        &declined,
-        &AdmissionView::of_request(&request),
-    )
-    .expect_err("a blind fleet with no home refuses");
-    assert!(
-        refusal.contains("fedora (declined this request (Disk): disk, sweep in flight"),
-        "{refusal}"
-    );
-    assert!(
-        refusal.contains("bgsrv-ub (declined this request (Pressure): host pressure"),
-        "{refusal}"
-    );
-    assert!(!refusal.contains("was measured"), "{refusal}");
 }
 
 /// A machine's last decline replaces what the runner reads of it now, a
@@ -13327,351 +8410,6 @@ fn the_journal_replaces_readings_but_not_structural_reasons() {
     assert!(matches!(rows[1].reason, PlacementRejectionReason::Drained));
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[2].executor_id, "gone");
-}
-
-#[test]
-fn executor_unit_bound_is_hard_but_planning_ceiling_is_not() {
-    const CHARGE: u64 = 56_839_822_320;
-    const BOUND: u64 = 49_660_559_360;
-    const CAP: u64 = 31_658_606_592;
-    let machine = |id: &str, bound| {
-        let (key, mut state) = fleet_entry(id, "linux", 0, &[]);
-        measured(&mut state, 0.01, 64 << 30, 500 << 30);
-        Arc::make_mut(&mut state.advertisement)
-            .capabilities
-            .service_bounds = Some(cairn_common::wire_vocabulary::ServiceBounds {
-            memory_max_bytes: bound,
-            ..Default::default()
-        });
-        (key, state)
-    };
-    let demand = resource_profiles::ResolvedResourceProfile {
-        duration: test_prior_duration(),
-        reservation: ResourceReservation {
-            memory_bytes: CHARGE,
-            source: ResourceReservationSource::Unmeasured,
-            ..Default::default()
-        },
-        learned_estimate: None,
-        rationale: unresolved_rationale(&ResourceReservation::default()),
-        memory_fit: resource_profiles::MemoryFit::Exceeds(
-            cairn_common::executor_protocol::MemoryCeiling {
-                estimate_bytes: CHARGE,
-                ceiling_bytes: CAP,
-                killed_here: None,
-            },
-        ),
-        process_evidence: Default::default(),
-    };
-    let reason = PlacementRejectionReason::ExceedsExecutorMemoryBound {
-        charge_bytes: CHARGE,
-        bound_bytes: BOUND,
-    };
-    assert_eq!(
-        reason.describe(),
-        "charged 52.94 GiB, its learned memory at this machine's compile slot width, above executor cgroup memory.max 46.25 GiB"
-    );
-    let reservations = HashMap::from([
-        ("bbs".into(), demand.clone()),
-        ("other".into(), demand.clone()),
-    ]);
-    let connections = HashMap::from([
-        machine("bbs", Some(BOUND)),
-        machine("other", Some(64 << 30)),
-    ]);
-    let choose =
-        |connections: &HashMap<String, ExecutorConnectionState>,
-         request: &CellRequest,
-         reservations: &HashMap<String, resource_profiles::ResolvedResourceProfile>| {
-            choose_executor_with(
-                connections,
-                request,
-                reservations,
-                |_, _| SyncCost::Known(0),
-                NOW,
-            )
-        };
-    let draft = choose(&connections, &spillable_request(), &reservations).unwrap();
-    assert_eq!(chosen(&draft).executor_id, "other");
-    assert_eq!(rejection_for(&draft, "bbs"), &reason);
-
-    let only = HashMap::from([machine("bbs", Some(BOUND))]);
-    let draft = choose(&only, &spillable_request(), &reservations).unwrap();
-    assert!(
-        draft.selected.is_none(),
-        "the only candidate cannot use the clamp"
-    );
-    assert_eq!(rejection_for(&draft, "bbs"), &reason);
-    let mut pinned = spillable_request();
-    pinned.pinned_executor_id = Some("bbs".into());
-    let failure = choose(&only, &pinned, &reservations).unwrap_err();
-    assert!(failure.contains("executor cgroup memory.max 46.25 GiB"));
-    assert!(failure.contains(&reason.describe()));
-
-    for bound in [None, Some(CHARGE)] {
-        let only = HashMap::from([machine("bbs", bound)]);
-        let draft = choose(&only, &spillable_request(), &reservations).unwrap();
-        assert_eq!(chosen(&draft).executor_id, "bbs");
-    }
-    let mut missing = HashMap::from([machine("bbs", Some(BOUND))]);
-    Arc::make_mut(&mut missing.get_mut("bbs").unwrap().advertisement)
-        .capabilities
-        .service_bounds = None;
-    assert_eq!(
-        chosen(&choose(&missing, &spillable_request(), &reservations).unwrap()).executor_id,
-        "bbs"
-    );
-}
-
-/// Fit is the first ranking key, so a machine that measurably cannot hold the
-/// work loses to one that can even when it is the idler of the two.
-#[test]
-fn resolved_demand_that_does_not_fit_loses_to_a_machine_that_holds_it() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(
-        &mut local,
-        0.50,
-        8 * 1024 * 1024 * 1024,
-        500 * 1024 * 1024 * 1024,
-    );
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.01,
-        512 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-
-    let demand = resource_profiles::ResolvedResourceProfile {
-        duration: test_prior_duration(),
-        reservation: ResourceReservation {
-            memory_bytes: 2 * 1024 * 1024 * 1024,
-            disk_growth_bytes: 1024 * 1024 * 1024,
-            concurrency_units: 1,
-            source: ResourceReservationSource::Learned,
-            measured_peak_bytes: None,
-            test_phase: None,
-        },
-        learned_estimate: None,
-        rationale: unresolved_rationale(&ResourceReservation::default()),
-        memory_fit: resource_profiles::MemoryFit::Unknown,
-        process_evidence: resource_profiles::ProcessEvidence::default(),
-    };
-    let reservations = HashMap::from([
-        (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
-        ("bglab-ub".to_string(), demand),
-    ]);
-    let draft = choose_executor_with(
-        &connections,
-        &spillable_request(),
-        &reservations,
-        |_, _| SyncCost::Known(0),
-        NOW,
-    )
-    .unwrap();
-    assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
-    assert_eq!(
-        rejection_for(&draft, "bglab-ub"),
-        &PlacementRejectionReason::InsufficientMemory {
-            required_bytes: 2 * 1024 * 1024 * 1024,
-            available_bytes: 512 * 1024 * 1024,
-        }
-    );
-}
-
-/// Memory pressure is transient capacity, not a structural placement fault.
-/// When every measured candidate is short right now, placement still chooses
-/// one so executor admission can retain and visibly park the request.
-#[test]
-fn an_all_memory_constrained_fleet_still_places_for_capacity_waiting() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(
-        &mut local,
-        0.50,
-        512 * 1024 * 1024,
-        500 * 1024 * 1024 * 1024,
-    );
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(
-        &mut remote,
-        0.01,
-        768 * 1024 * 1024,
-        900 * 1024 * 1024 * 1024,
-    );
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-    let demand = resource_profiles::ResolvedResourceProfile {
-        duration: test_prior_duration(),
-        reservation: ResourceReservation {
-            memory_bytes: 2 * 1024 * 1024 * 1024,
-            disk_growth_bytes: 1024 * 1024 * 1024,
-            concurrency_units: 1,
-            source: ResourceReservationSource::Learned,
-            measured_peak_bytes: None,
-            test_phase: None,
-        },
-        learned_estimate: None,
-        rationale: unresolved_rationale(&ResourceReservation::default()),
-        memory_fit: resource_profiles::MemoryFit::Unknown,
-        process_evidence: resource_profiles::ProcessEvidence::default(),
-    };
-    let reservations = HashMap::from([
-        (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
-        ("bglab-ub".to_string(), demand),
-    ]);
-
-    let draft = choose_executor_with(
-        &connections,
-        &spillable_request(),
-        &reservations,
-        |_, _| SyncCost::Known(0),
-        NOW,
-    )
-    .expect("transient memory pressure must remain placeable for admission waiting");
-
-    assert!(matches!(
-        rejection_for(&draft, COLOCATED_EXECUTOR_ID),
-        PlacementRejectionReason::InsufficientMemory { .. }
-    ));
-}
-
-/// Equal verdict predictions fall through to transfer cost and then stable
-/// executor identity. Memory and volume are eligibility facts, not ranking
-/// preferences once both machines can fit the work.
-#[test]
-fn equal_verdict_predictions_are_ranked_deterministically() {
-    let entry = |id: &str| {
-        let (key, mut state) = fleet_entry(id, "linux", 0, &[]);
-        measured(
-            &mut state,
-            0.10,
-            40 * 1024 * 1024 * 1024,
-            100 * 1024 * 1024 * 1024,
-        );
-        (key, state)
-    };
-
-    let by_sync = HashMap::from([entry(COLOCATED_EXECUTOR_ID), entry("far")]);
-    let draft = choose_executor_with(
-        &by_sync,
-        &spillable_request(),
-        &HashMap::new(),
-        |_, candidate| {
-            if candidate.identity.executor_id == "far" {
-                SyncCost::Known(1_000_000)
-            } else {
-                SyncCost::Known(0)
-            }
-        },
-        NOW,
-    )
-    .unwrap();
-    assert_eq!(
-        chosen(&draft).executor_id,
-        COLOCATED_EXECUTOR_ID,
-        "otherwise equal machines separate on what has to be transferred"
-    );
-
-    let tied = HashMap::from([entry("aaa"), entry("zzz")]);
-    for _ in 0..8 {
-        assert_eq!(
-            chosen(&place(&tied, &spillable_request()).unwrap()).executor_id,
-            "aaa",
-            "a completely tied fleet still ranks the same way every time"
-        );
-    }
-}
-
-/// Tight is a price, never a gate: beside an otherwise-equal machine whose
-/// volume is not tight it ranks second, and when it is the only machine it
-/// is still chosen.
-#[test]
-fn a_tight_volume_ranks_second_and_is_still_chosen_alone() {
-    let entry = |id: &str, status| {
-        let (key, mut state) = fleet_entry(id, "linux", 0, &[]);
-        measured(
-            &mut state,
-            0.10,
-            40 * 1024 * 1024 * 1024,
-            100 * 1024 * 1024 * 1024,
-        );
-        Arc::make_mut(&mut state.health).disk.status = status;
-        (key, state)
-    };
-
-    // Without the price, the stable order picks "aaa".
-    let pair = HashMap::from([
-        entry("aaa", DiskHealthStatus::Tight),
-        entry("zzz", DiskHealthStatus::Ok),
-    ]);
-    let draft = place(&pair, &spillable_request()).unwrap();
-    assert_eq!(chosen(&draft).executor_id, "zzz");
-    assert!(matches!(
-        rejection_for(&draft, "aaa"),
-        PlacementRejectionReason::OutrankedBy { .. }
-    ));
-
-    let alone = HashMap::from([entry("aaa", DiskHealthStatus::Tight)]);
-    assert_eq!(
-        chosen(&place(&alone, &spillable_request()).unwrap()).executor_id,
-        "aaa",
-        "the only eligible machine is chosen however tight its volume"
-    );
-}
-
-/// The machine's own admission floor counts: a volume with room for the
-/// resolved growth but not for the growth plus the watermark would only
-/// decline the work. With no sweep in flight nothing will free the bytes, so
-/// work that can go elsewhere is kept off it, and the row names the floor
-/// and the sweep state rather than only a shortfall.
-#[test]
-fn the_volume_misfit_includes_the_machines_watermark() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
-    measured(&mut local, 0.01, 40 * GIB, 3 * GIB);
-    Arc::make_mut(&mut local.health).disk.watermark_bytes = 2 * GIB;
-    let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
-    measured(&mut remote, 0.50, 40 * GIB, 900 * GIB);
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-    let demand = resource_profiles::ResolvedResourceProfile {
-        duration: test_prior_duration(),
-        reservation: ResourceReservation {
-            memory_bytes: GIB,
-            disk_growth_bytes: 2 * GIB,
-            concurrency_units: 1,
-            source: ResourceReservationSource::Learned,
-            measured_peak_bytes: None,
-            test_phase: None,
-        },
-        learned_estimate: None,
-        rationale: unresolved_rationale(&ResourceReservation::default()),
-        memory_fit: resource_profiles::MemoryFit::Unknown,
-        process_evidence: resource_profiles::ProcessEvidence::default(),
-    };
-    let reservations = HashMap::from([
-        (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
-        ("bglab-ub".to_string(), demand),
-    ]);
-    let draft = choose_executor_with(
-        &connections,
-        &spillable_request(),
-        &reservations,
-        |_, _| SyncCost::Known(0),
-        NOW,
-    )
-    .unwrap();
-    assert_eq!(chosen(&draft).executor_id, "bglab-ub");
-    assert_eq!(
-        rejection_for(&draft, COLOCATED_EXECUTOR_ID),
-        &PlacementRejectionReason::Held {
-            evidence: AdmissionHoldEvidence::Disk {
-                inodes: None,
-                free_bytes: 3 * GIB,
-                floor_bytes: 4 * GIB,
-                sweep_in_flight: false,
-            }
-        }
-    );
 }
 
 /// A checkout that already exists on one machine cannot be recreated
@@ -14311,22 +9049,6 @@ fn model_residents_stamp_live_connections_by_name() {
         .is_empty());
 }
 
-/// A busy home and an idle, never-explored remote under a remote-first
-/// profile: everything placement weighs (stance, load, and the exploration
-/// the default state has due) favours the remote, so only its role can
-/// keep work off it.
-fn place_remote_first(
-    connections: &HashMap<String, ExecutorConnectionState>,
-    request: &CellRequest,
-) -> Result<PlacementDraft, String> {
-    place_with_profile(
-        connections,
-        request,
-        "low-power",
-        profile_with_routes(30, |_| PlacementStance::RemoteFirst),
-    )
-}
-
 fn busy_home_and_idle_remote(role: MachineRole) -> HashMap<String, ExecutorConnectionState> {
     let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
     let (remote_id, mut remote) = fleet_entry("sp1", "linux", 0, &[]);
@@ -14334,86 +9056,6 @@ fn busy_home_and_idle_remote(role: MachineRole) -> HashMap<String, ExecutorConne
     measured(&mut remote, 0.05, 64_000_000_000, 800_000_000_000);
     remote.machine_role = role;
     HashMap::from([(local_id, local), (remote_id, remote)])
-}
-
-/// An inference-only machine is never chosen for any batch class, however
-/// idle it is and however due exploration is; its sibling takes the work
-/// and the record says why.
-#[test]
-fn an_inference_only_machine_is_passed_over_for_every_batch_class() {
-    let control = busy_home_and_idle_remote(MachineRole::General);
-    assert_eq!(
-        chosen(&place_remote_first(&control, &spillable_request()).unwrap()).executor_id,
-        "sp1",
-        "without a role the idle remote wins, so the role is what decides below"
-    );
-    let connections = busy_home_and_idle_remote(MachineRole::InferenceOnly);
-    for class in PlacementWorkClass::ALL {
-        let mut request = spillable_request();
-        request.placement_work_class = class;
-        let draft = place_remote_first(&connections, &request).unwrap();
-        assert_eq!(
-            chosen(&draft).executor_id,
-            COLOCATED_EXECUTOR_ID,
-            "{class:?}"
-        );
-        assert_eq!(
-            rejection_for(&draft, "sp1"),
-            &PlacementRejectionReason::RoleExcluded {
-                role: MachineRole::InferenceOnly,
-                work_class: class,
-                publication_leg: false,
-            },
-            "{class:?}"
-        );
-    }
-}
-
-#[test]
-fn builds_only_and_general_machines_take_every_batch_class() {
-    for role in [MachineRole::BuildsOnly, MachineRole::General] {
-        let connections = busy_home_and_idle_remote(role);
-        for class in PlacementWorkClass::ALL {
-            let mut request = spillable_request();
-            request.placement_work_class = class;
-            assert_eq!(
-                chosen(&place_remote_first(&connections, &request).unwrap()).executor_id,
-                "sp1",
-                "{role:?} {class:?}"
-            );
-        }
-    }
-}
-
-/// A services-only machine takes a service resident and nothing else,
-/// however idle it is: no run batch, check lane, REPL or terminal (all
-/// `agentSessions`), or dev instance. The record names its role.
-#[test]
-fn a_services_only_machine_takes_services_and_is_passed_over_for_every_other_class() {
-    let connections = busy_home_and_idle_remote(MachineRole::ServicesOnly);
-    for class in PlacementWorkClass::ALL {
-        let mut request = spillable_request();
-        request.placement_work_class = class;
-        let draft = place_remote_first(&connections, &request).unwrap();
-        if class == PlacementWorkClass::Services {
-            assert_eq!(chosen(&draft).executor_id, "sp1");
-            continue;
-        }
-        assert_eq!(
-            chosen(&draft).executor_id,
-            COLOCATED_EXECUTOR_ID,
-            "{class:?}"
-        );
-        assert_eq!(
-            rejection_for(&draft, "sp1"),
-            &PlacementRejectionReason::RoleExcluded {
-                role: MachineRole::ServicesOnly,
-                work_class: class,
-                publication_leg: false,
-            },
-            "{class:?}"
-        );
-    }
 }
 
 /// `run` with `executor:{name:"bgsrv-ub2"}` on a services box is refused
@@ -14446,63 +9088,6 @@ fn publication_leg(publisher_required: bool) -> CellRequest {
     request.placement_work_class = PlacementWorkClass::ReviewChecks;
     request.publication = Some(PublicationCustody { publisher_required });
     request
-}
-
-/// A publisher takes publication legs and nothing else, however idle: an
-/// agent batch, check lane, terminal, dev instance or service goes to its
-/// sibling, and the record says it publishes only.
-#[test]
-fn a_publish_only_machine_takes_publication_legs_and_is_passed_over_for_everything_else() {
-    let connections = busy_home_and_idle_remote(MachineRole::PublishOnly);
-    for class in PlacementWorkClass::ALL {
-        let mut request = spillable_request();
-        request.placement_work_class = class;
-        let draft = place_remote_first(&connections, &request).unwrap();
-        assert_eq!(
-            chosen(&draft).executor_id,
-            COLOCATED_EXECUTOR_ID,
-            "{class:?}"
-        );
-        let reason = rejection_for(&draft, "sp1");
-        assert_eq!(
-            reason,
-            &PlacementRejectionReason::RoleExcluded {
-                role: MachineRole::PublishOnly,
-                work_class: class,
-                publication_leg: false,
-            }
-        );
-        assert_eq!(
-            reason.describe(),
-            format!("publishes only; this request is {}", class.as_str())
-        );
-    }
-    let draft = place_remote_first(&connections, &publication_leg(false)).unwrap();
-    assert_eq!(chosen(&draft).executor_id, "sp1");
-}
-
-/// The roles that take no publication leg refuse one by name, whatever
-/// class it travels as; general and builds-only take a secret-free one.
-#[test]
-fn only_general_builds_only_and_publish_only_take_a_publication_leg() {
-    for role in [MachineRole::ServicesOnly, MachineRole::InferenceOnly] {
-        let connections = busy_home_and_idle_remote(role);
-        let draft = place_remote_first(&connections, &publication_leg(false)).unwrap();
-        assert_eq!(
-            chosen(&draft).executor_id,
-            COLOCATED_EXECUTOR_ID,
-            "{role:?}"
-        );
-        assert_eq!(
-            rejection_for(&draft, "sp1").describe(),
-            format!("runs {}; this request is publicationLeg", role.label())
-        );
-    }
-    for role in [MachineRole::General, MachineRole::BuildsOnly] {
-        let connections = busy_home_and_idle_remote(role);
-        let draft = place_remote_first(&connections, &publication_leg(false)).unwrap();
-        assert_eq!(chosen(&draft).executor_id, "sp1", "{role:?}");
-    }
 }
 
 /// A secret-bearing leg goes only to a publisher whose isolation measured
@@ -14602,235 +9187,6 @@ fn a_publisher_enrolled_under_another_role_is_refused_all_work() {
                 if why.starts_with("started as a publisher but enrolled as general")
         ));
     }
-}
-
-/// Rank a service resident (or `class`) among `candidates`, each at the
-/// verdict forecast it is given, under `profile`, with exploration due.
-fn rank_at_forecasts(
-    candidates: &[(&ExecutorConnectionState, u64)],
-    class: PlacementWorkClass,
-    profile: PlacementProfile,
-    run: DurationEstimate,
-) -> (String, bool) {
-    let scored = candidates
-        .iter()
-        .map(|(entry, verdict_ms)| {
-            let mut prediction = placement_prediction(
-                entry,
-                CacheWarmthEvidence::Observed {
-                    warmth: ExecutionWarmth::Cold,
-                    observed_at_unix_ms: NOW,
-                },
-                QueueForecast::Forecast {
-                    predicted_ms: 0,
-                    requests_ahead: 0,
-                    running_ahead: 0,
-                    fully_measured: true,
-                    observed_at_unix_ms: NOW,
-                    stalled_head_ms: None,
-                },
-                run.clone(),
-                SyncCost::Known(0),
-            );
-            prediction.predicted_verdict_ms = *verdict_ms;
-            ScoredCandidate::new(
-                entry,
-                SyncCost::Known(0),
-                None,
-                &ResourceReservation::default(),
-                prediction,
-                None,
-                None,
-                NOW,
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut request = spillable_request();
-    request.placement_work_class = class;
-    let (winner, _, _, exploring, _) = rank_candidates(
-        &scored,
-        false,
-        true,
-        &request,
-        &ActivePlacementPolicy {
-            name: "test".into(),
-            profile,
-        },
-        &ExplorationState {
-            decisions_since_exploration: EXPLORATION_INTERVAL,
-            ..Default::default()
-        },
-        None,
-    );
-    (
-        winner.unwrap().entry.identity.executor_id.clone(),
-        exploring,
-    )
-}
-
-fn learned_duration() -> DurationEstimate {
-    let mut learned = test_prior_duration();
-    learned.source = cairn_common::executor_protocol::DurationEvidence::Learned;
-    learned.sample_count = 20;
-    learned.fallback = None;
-    learned
-}
-
-/// The service tier's order under the built-in default profile: a
-/// services-only machine, then home, then another machine only when home
-/// is clearly slower. Each preference holds only inside the profile's
-/// window, so a service box that is clearly slower loses: priced, never
-/// pinned (tenet 314).
-#[test]
-fn a_service_prefers_a_services_only_machine_then_home_then_a_clearly_faster_machine() {
-    let entry = |id: &str, role: MachineRole| {
-        let (_, mut entry) = fleet_entry(id, "linux", 0, &[]);
-        measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
-        entry.machine_role = role;
-        entry
-    };
-    let local = entry(COLOCATED_EXECUTOR_ID, MachineRole::General);
-    let builder = entry("bgsrv", MachineRole::General);
-    let service_box = entry("pi1", MachineRole::ServicesOnly);
-    let default = || built_in_profile(DEFAULT_PLACEMENT_PROFILE).unwrap().clone();
-    let window_ms = default().max_preference_delay_seconds * 1_000;
-    assert!(window_ms > 0, "a preference needs a window to be priced in");
-    let services = PlacementWorkClass::Services;
-    let rank = |candidates: &[(&ExecutorConnectionState, u64)]| {
-        rank_at_forecasts(candidates, services, default(), learned_duration()).0
-    };
-
-    assert_eq!(
-        rank(&[(&local, 10_000), (&builder, 5_000), (&service_box, 12_000)]),
-        "pi1",
-        "inside the window the service box wins over a faster builder and home"
-    );
-    assert_eq!(
-        rank(&[
-            (&local, 10_000),
-            (&builder, 5_000),
-            (&service_box, 5_000 + window_ms + 1),
-        ]),
-        COLOCATED_EXECUTOR_ID,
-        "a service box clearly slower than the window yields, and home is next"
-    );
-    assert_eq!(
-        rank(&[(&local, 10_000), (&builder, 5_000)]),
-        COLOCATED_EXECUTOR_ID,
-        "with no service box a service stays home"
-    );
-    assert_eq!(
-        rank(&[(&local, 5_000 + window_ms + 1), (&builder, 5_000)]),
-        "bgsrv",
-        "another machine wins only when home is clearly slower"
-    );
-
-    let general_box = entry("pi1", MachineRole::General);
-    assert_eq!(
-        rank(&[(&local, 10_000), (&builder, 5_000), (&general_box, 12_000)]),
-        COLOCATED_EXECUTOR_ID,
-        "the role, not the name, is what ranks the box first"
-    );
-}
-
-/// Exploration lands work on whichever idle machine is due, which for a
-/// service would skip the service box and home; a resident never
-/// completes, so it would teach nothing anyway.
-#[test]
-fn a_service_never_spends_its_placement_on_exploration() {
-    let entry = |id: &str| {
-        let (_, mut entry) = fleet_entry(id, "linux", 0, &[]);
-        measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
-        entry
-    };
-    let local = entry(COLOCATED_EXECUTOR_ID);
-    let thin_remote = entry("bgsrv");
-    let mut thin = test_prior_duration();
-    thin.profile_key = Some("svc".into());
-    thin.fallback = Some(DurationFallback::NoProfileRecorded);
-    let candidates = [(&local, 5_000), (&thin_remote, 5_000)];
-    let any = || profile_with_routes(30, |_| PlacementStance::LocalFirst);
-    assert!(
-        rank_at_forecasts(
-            &candidates,
-            PlacementWorkClass::AgentSessions,
-            any(),
-            thin.clone()
-        )
-        .1,
-        "the fixture is one where a batch class explores"
-    );
-    assert_eq!(
-        rank_at_forecasts(&candidates, PlacementWorkClass::Services, any(), thin),
-        (COLOCATED_EXECUTOR_ID.to_string(), false)
-    );
-}
-
-/// A service's own residency request, end to end through placement: it
-/// needs no checkout and no cell contents, it goes to the service box
-/// while that is up and among machines with bun, and home when it is not.
-#[test]
-fn a_service_residency_takes_the_service_box_and_falls_back_home_without_it() {
-    let request = residency_placement_request(&service_placement::service_acquire_request(
-        "thread:t-1:bugs",
-        ExecutorSelector {
-            required_toolchains: vec!["bun".into()],
-            ..ExecutorSelector::default()
-        },
-        cairn_common::executor_protocol::ResidencyFootprint {
-            memory_bytes: 256 * 1024 * 1024,
-            disk_growth_bytes: 64 * 1024 * 1024,
-        },
-        cairn_common::executor_protocol::OwnerDeathPolicy {
-            heartbeat_timeout_ms: 90_000,
-            reclaim_grace_ms: 30_000,
-        },
-    ));
-    assert!(matches!(
-        request.repository,
-        RepositoryLocator::ScratchOnly { .. }
-    ));
-    assert!(request.base_commit.is_empty(), "no commit to materialize");
-    assert_eq!(request.placement_work_class, PlacementWorkClass::Services);
-    assert!(request.pinned_executor_id.is_none());
-
-    let entry = |id: &str, role: MachineRole, toolchains: &[&str]| {
-        let (key, mut entry) = fleet_entry(id, "linux", 0, &[]);
-        measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
-        entry.machine_role = role;
-        Arc::make_mut(&mut entry.advertisement)
-            .capabilities
-            .toolchains = toolchains.iter().map(|name| name.to_string()).collect();
-        // Enrolled without `--project`, as a service box is: a scratch-only
-        // residency's project is its service id, which no project list names.
-        Arc::make_mut(&mut entry.advertisement)
-            .capabilities
-            .projects_served = Vec::new();
-        (key, entry)
-    };
-    let mut connections = HashMap::from([
-        entry(COLOCATED_EXECUTOR_ID, MachineRole::General, &["bun"]),
-        entry("bgsrv", MachineRole::General, &["bun", "rust"]),
-        entry("pi1", MachineRole::ServicesOnly, &["bun"]),
-    ]);
-    let draft = place(&connections, &request).unwrap();
-    assert_eq!(chosen(&draft).executor_id, "pi1", "{:#?}", draft.rejected);
-
-    let without_bun = entry("pi1", MachineRole::ServicesOnly, &[]);
-    connections.insert(without_bun.0, without_bun.1);
-    let draft = place(&connections, &request).unwrap();
-    assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
-    assert!(matches!(
-        rejection_for(&draft, "pi1"),
-        PlacementRejectionReason::SelectorMismatch { .. }
-    ));
-
-    connections.remove("pi1");
-    assert_eq!(
-        chosen(&place(&connections, &request).unwrap()).executor_id,
-        COLOCATED_EXECUTOR_ID,
-        "with the service box away, the service falls back home"
-    );
 }
 
 /// A pin by name is refused before anything runs, naming the machine, its
@@ -16056,17 +10412,10 @@ fn a_pin_elsewhere_is_not_reported_as_waiting_on_another_machines_update() {
     request.pinned_executor_id = Some("bgsrv-ub".into());
     let rejected = match place(&connections, &request) {
         Ok(draft) => draft.rejected,
-        Err(_) => survey_candidates(
-            &connections,
-            &[],
-            &request,
-            NOW,
-            &HashMap::new(),
-            &AdmissionView::of_request(&request),
-        )
-        .err()
-        .map(|_| Vec::new())
-        .unwrap_or_default(),
+        Err(_) => survey_candidates(&connections, &[], &request, NOW)
+            .err()
+            .map(|_| Vec::new())
+            .unwrap_or_default(),
     };
     assert!(
         !rejected
@@ -16087,90 +10436,6 @@ fn a_pin_elsewhere_is_not_reported_as_waiting_on_another_machines_update() {
         matches!(reason, Some(PlacementRejectionReason::PinMismatch { .. })),
         "{reason:?}"
     );
-}
-
-/// A request waiting on a machine's update records the wait where its
-/// reader looks, naming the machine, the reason, and how long is left;
-/// before cairn/6382 only a memory wait was recorded, and work parked on
-/// bbs's 68-minute drain left no decision anywhere.
-#[tokio::test]
-async fn a_wait_on_a_machines_update_records_an_unknown_safe_bound_while_work_remains() {
-    let pool = Fleet::default();
-    let now = unix_time_ms();
-    let (executor_id, mut connection) = fleet_entry_at("bbs", "linux", 0, &[], now);
-    connection.executor_build_id = Some("build-0759".into());
-    Arc::make_mut(&mut connection.snapshot).granted_attempts =
-        vec![cairn_common::executor_protocol::GrantedAttempt {
-            request_id: "long-lane".into(),
-            attempt_id: "a".into(),
-        }];
-    pool.lock_connections()
-        .insert(executor_id.clone(), connection);
-    pool.record_executor_artifact_build("x86_64-unknown-linux-gnu", Ok("build-1329".into()));
-    pool.advance_self_update_rollout(now, |_| Ok(())).unwrap();
-    assert!(pool.lock_connections()[&executor_id].update_hold);
-    // What publishing the rollout's required drain leaves on the machine.
-    runtime_update_hold_fixture(pool.lock_connections().get_mut(&executor_id).unwrap(), true);
-
-    let mut request = targeted_request("linux");
-    request.executor = Some(ExecutorSelector {
-        name: Some("bbs".into()),
-        ..ExecutorSelector::default()
-    });
-    request.wait_horizon_unix_ms = unix_time_ms() + 400;
-    let policy = ActivePlacementPolicy::default_profile();
-    pool.select_executor(&request, None, &policy, None)
-        .await
-        .expect_err("the horizon arrives before the update ends");
-
-    let waits: Vec<String> = pool
-        .placements_naming("bbs")
-        .into_iter()
-        .filter_map(|decision| match decision.outcome {
-            PlacementOutcome::Waiting { diagnostic } => Some(diagnostic),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(waits.len(), 1, "recorded once while unchanged: {waits:?}");
-    assert!(
-        waits[0].starts_with(
-            "waiting on bbs being emptied for an executor update (1 in flight, request long-lane"
-        ),
-        "{}",
-        waits[0]
-    );
-    assert!(waits[0].contains("cairn://executors/bbs"), "{}", waits[0]);
-
-    // An unmeasured scheduling budget never promises a safe restart.
-    assert_eq!(
-        pool.self_update.lock().unwrap().returns_by(&executor_id),
-        None
-    );
-    let refusals: Vec<Option<u64>> = pool
-        .placements_naming("bbs")
-        .into_iter()
-        .flat_map(|decision| decision.rejected)
-        .filter_map(|rejection| match rejection.reason {
-            PlacementRejectionReason::UpdatePending { returns_by_unix_ms } => {
-                Some(returns_by_unix_ms)
-            }
-            _ => None,
-        })
-        .collect();
-    assert!(!refusals.is_empty());
-    assert!(refusals.iter().all(Option::is_none), "{refusals:?}");
-    assert!(!waits[0].contains("expected back by"), "{}", waits[0]);
-    assert!(waits[0].contains("no safe restart time"), "{}", waits[0]);
-    // A bound that moves is a different verdict, so the wait is recorded
-    // again rather than left standing with a stale clock time.
-    let returns_by = now + 60_000;
-    let moved = |at: u64| {
-        placement_rejection_signature(&PlacementRejectionReason::UpdatePending {
-            returns_by_unix_ms: Some(at),
-        })
-    };
-    assert_eq!(moved(returns_by), moved(returns_by - returns_by % 60_000));
-    assert_ne!(moved(returns_by), moved(returns_by + 60_000));
 }
 
 /// A machine that closes its link to install the runner's build is about
@@ -16210,9 +10475,7 @@ async fn work_naming_a_machine_installing_its_update_waits_for_its_return() {
         ..ExecutorSelector::default()
     });
     request.wait_horizon_unix_ms = unix_time_ms() + 400;
-    let policy = ActivePlacementPolicy::default_profile();
-    let refusal = pool
-        .select_executor(&request, None, &policy, None)
+    let refusal = place_through_dispatcher(&pool, &request, None)
         .await
         .expect_err("bbs does not return inside the horizon");
     let CellOutcome::Unavailable { diagnostic, .. } = refusal else {
@@ -16221,19 +10484,6 @@ async fn work_naming_a_machine_installing_its_update_waits_for_its_return() {
     assert!(
         diagnostic.contains("wait horizon"),
         "waited rather than refused at once: {diagnostic}"
-    );
-    let waits: Vec<String> = pool
-        .placements_naming("bbs")
-        .into_iter()
-        .filter_map(|decision| match decision.outcome {
-            PlacementOutcome::Waiting { diagnostic } => Some(diagnostic),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        waits.iter().any(|wait| wait
-            .contains("bbs being emptied for an executor update (installing it, directed")),
-        "{waits:?}"
     );
 }
 
@@ -16295,363 +10545,6 @@ fn nested_sandbox_lane(os: &str) -> CellRequest {
         ..ExecutorSelector::default()
     });
     request
-}
-
-const MINUTE_MS: u64 = 60 * 1_000;
-
-/// The 11-11 macOS fleet: the colocated executor and bgsrv-mac, both
-/// floor-confined and so both eligible for the nested-Seatbelt lane under
-/// cairn/6341's fallback.
-fn floor_confined_macs() -> HashMap<String, ExecutorConnectionState> {
-    let (_, floored) = capable_and_floored_evidence();
-    let mut connections = HashMap::from([
-        fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]),
-        fleet_entry("bgsrv-mac", "macos", 0, &[]),
-    ]);
-    for entry in connections.values_mut() {
-        measured(entry, 0.1, 16_000_000_000, 500_000_000_000);
-    }
-    set_sandbox(
-        &mut connections,
-        COLOCATED_EXECUTOR_ID,
-        Some(floored.clone()),
-    );
-    set_sandbox(&mut connections, "bgsrv-mac", Some(floored));
-    connections
-}
-
-fn macos_rust_tests() -> CellRequest {
-    let mut request = spillable_request();
-    request.executor = Some(ExecutorSelector {
-        os: Some("macos".into()),
-        required_toolchains: vec!["rust".into()],
-        requires_macos_nested_sandbox_write: true,
-        ..ExecutorSelector::default()
-    });
-    request
-}
-
-fn macos_main_lane() -> CadenceLaneRestart {
-    CadenceLaneRestart {
-        check: "rust-tests".into(),
-        platform: "macos".into(),
-        bound_ms: runner_events::RESTART_BOUND_CEILING_MS,
-    }
-}
-
-/// Survey and rank as production does, every machine having learned a
-/// `run_ms` run with nothing queued ahead, and the colocated executor,
-/// warm, predicted to answer a quarter-hour sooner; `adjust` then shapes
-/// one machine's prediction.
-fn place_lane(
-    connections: &HashMap<String, ExecutorConnectionState>,
-    request: &CellRequest,
-    lane: Option<&CadenceLaneRestart>,
-    run_ms: u64,
-    adjust: impl Fn(&str, &mut PlacementPrediction),
-) -> PlacementDraft {
-    let survey = survey_candidates(
-        connections,
-        &[],
-        request,
-        NOW,
-        &HashMap::new(),
-        &AdmissionView::of_request(request),
-    )
-    .unwrap();
-    let (mut predictions, sync_costs) =
-        prior_predictions(&survey.usable, request, |_, _| SyncCost::Known(0), NOW);
-    for (executor_id, prediction) in predictions.iter_mut() {
-        prediction.run.source = cairn_common::executor_protocol::DurationEvidence::Learned;
-        prediction.run.predicted_ms = run_ms;
-        prediction.queue = QueueForecast::Forecast {
-            predicted_ms: 0,
-            requests_ahead: 0,
-            running_ahead: 0,
-            fully_measured: true,
-            observed_at_unix_ms: NOW,
-            stalled_head_ms: None,
-        };
-        prediction.predicted_verdict_ms = run_ms
-            + if executor_id == COLOCATED_EXECUTOR_ID {
-                0
-            } else {
-                15 * MINUTE_MS
-            };
-        adjust(executor_id, prediction);
-    }
-    rank_survey(
-        request,
-        survey,
-        SurveyRankingContext {
-            reservations: &HashMap::new(),
-            predictions: &predictions,
-            sync_costs: &sync_costs,
-            cache_distances: &HashMap::new(),
-            policy: &ActivePlacementPolicy::default_profile(),
-            now_unix_ms: NOW,
-            exploration: &ExplorationState::default(),
-            cadence_lane: lane,
-        },
-    )
-    .unwrap()
-}
-
-fn queued_for(prediction: &mut PlacementPrediction, wait_ms: u64) {
-    prediction.queue = QueueForecast::Forecast {
-        predicted_ms: wait_ms,
-        requests_ahead: 1,
-        running_ahead: 1,
-        fully_measured: true,
-        observed_at_unix_ms: NOW,
-        stalled_head_ms: None,
-    };
-    prediction.predicted_verdict_ms += wait_ms;
-}
-
-/// cairn/6969, specimen 11-11: macOS main rust-tests ran 96-155 min on
-/// the colocated executor while the runner restarted every 2 h 34 min,
-/// and both restarts ended the pass. With a learned 96-minute run over
-/// the hour bound, the adoptable Mac takes the lane though the colocated
-/// executor is warm and forecast to answer first, and the record says
-/// the colocated executor was passed over and why.
-#[test]
-fn a_main_cadence_lane_longer_than_the_restart_bound_prefers_an_adoptable_host() {
-    let connections = floor_confined_macs();
-    let request = macos_rust_tests();
-    let lane = macos_main_lane();
-
-    let draft = place_lane(
-        &connections,
-        &request,
-        Some(&lane),
-        96 * MINUTE_MS,
-        |_, _| {},
-    );
-    let selection = chosen(&draft);
-    assert_eq!(selection.executor_id, "bgsrv-mac");
-    let exposure = selection
-        .restart_exposure
-        .as_ref()
-        .expect("the passed-over note is recorded");
-    assert_eq!(
-        exposure.describe(),
-        "colocated local passed over: main cadence rust-tests on macos expected 1 h 36 m (learned) exceeds the restart bound 60 m; an adoptable host is eligible"
-    );
-    assert!(
-        draft.rejected.iter().any(|rejection| {
-            rejection.executor_id == COLOCATED_EXECUTOR_ID
-                && matches!(
-                    rejection.reason,
-                    PlacementRejectionReason::OutrankedBy { .. }
-                )
-        }),
-        "the colocated executor stays a candidate that lost, not a refused one: {:?}",
-        draft.rejected
-    );
-
-    // Under the bound nothing changes: the colocated executor wins on its
-    // forecast and the record says nothing about restarts.
-    let draft = place_lane(
-        &connections,
-        &request,
-        Some(&lane),
-        20 * MINUTE_MS,
-        |_, _| {},
-    );
-    assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
-    assert_eq!(chosen(&draft).restart_exposure, None);
-
-    // A review lane of the same suite is no main-cadence lane.
-    let draft = place_lane(&connections, &request, None, 96 * MINUTE_MS, |_, _| {});
-    assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
-    assert_eq!(chosen(&draft).restart_exposure, None);
-}
-
-/// The lane is a main-cadence lane exactly when the purpose registry holds
-/// the request as the live answer to a main-cadence question.
-#[test]
-fn only_a_live_main_cadence_holder_is_weighed_against_restarts() {
-    let pool = Fleet::default();
-    let request = macos_rust_tests();
-    assert_eq!(pool.cadence_lane_restart(&request), None);
-    pool.purposes.lock().unwrap().admit(
-        purpose::PurposeKey::main_cadence("p", "rust-tests", "macos"),
-        (request.request_id.clone(), request.attempt_id.clone()),
-        1,
-    );
-    assert_eq!(pool.cadence_lane_restart(&request), Some(macos_main_lane()));
-    let mut other = request.clone();
-    other.request_id = "review".into();
-    assert_eq!(pool.cadence_lane_restart(&other), None);
-}
-
-/// With no adoptable host able to take the lane, the colocated executor
-/// takes it, never refused by name, and the record says why each remote
-/// that could have served it did not.
-#[test]
-fn the_colocated_executor_takes_a_restart_exposed_lane_when_no_adoptable_host_can() {
-    let request = macos_rust_tests();
-    let lane = macos_main_lane();
-
-    let mut connections = floor_confined_macs();
-    connections.get_mut("bgsrv-mac").unwrap().drained = true;
-    connections.extend([fleet_entry("fedora", "linux", 0, &[])]);
-    let draft = place_lane(
-        &connections,
-        &request,
-        Some(&lane),
-        96 * MINUTE_MS,
-        |_, _| {},
-    );
-    let selection = chosen(&draft);
-    assert_eq!(selection.executor_id, COLOCATED_EXECUTOR_ID);
-    let exposure = selection
-        .restart_exposure
-        .as_ref()
-        .expect("last resort recorded");
-    let cairn_common::executor_protocol::RestartExposureOutcome::NoAdoptableHost { remotes } =
-        &exposure.outcome
-    else {
-        panic!("{exposure:?}");
-    };
-    assert_eq!(
-        remotes.len(),
-        1,
-        "the Linux machine was never a host: {remotes:?}"
-    );
-    assert!(remotes[0].starts_with("bgsrv-mac: "), "{remotes:?}");
-    assert!(
-        exposure
-            .describe()
-            .starts_with("restart-exposed: no adoptable host eligible (bgsrv-mac: "),
-        "{}",
-        exposure.describe()
-    );
-
-    connections.remove("bgsrv-mac");
-    let draft = place_lane(
-        &connections,
-        &request,
-        Some(&lane),
-        96 * MINUTE_MS,
-        |_, _| {},
-    );
-    assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
-    assert_eq!(
-        chosen(&draft).restart_exposure.as_ref().unwrap().describe(),
-        "restart-exposed: no adoptable host eligible (no remote machine serves this lane); main cadence rust-tests on macos expected 1 h 36 m (learned) exceeds the restart bound 60 m"
-    );
-}
-
-/// A busy adoptable host still outranks an idle colocated executor, since
-/// a wait costs the lane minutes and a restart the whole pass, unless its
-/// own queue is forecast to outlast the lane's run.
-#[test]
-fn a_busy_adoptable_host_is_preferred_unless_its_queue_outlasts_the_run() {
-    let request = macos_rust_tests();
-    let lane = macos_main_lane();
-    let mut connections = floor_confined_macs();
-    Arc::make_mut(&mut connections.get_mut("bgsrv-mac").unwrap().health)
-        .applied_policy
-        .maximum_queue_depth = 0;
-    let busy_for = |wait_ms: u64| {
-        move |executor_id: &str, prediction: &mut PlacementPrediction| {
-            if executor_id == "bgsrv-mac" {
-                queued_for(prediction, wait_ms);
-            }
-        }
-    };
-
-    let draft = place_lane(
-        &connections,
-        &request,
-        Some(&lane),
-        96 * MINUTE_MS,
-        busy_for(10 * MINUTE_MS),
-    );
-    assert_eq!(chosen(&draft).executor_id, "bgsrv-mac");
-
-    let draft = place_lane(
-        &connections,
-        &request,
-        Some(&lane),
-        96 * MINUTE_MS,
-        busy_for(3 * 60 * MINUTE_MS),
-    );
-    assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
-    let exposure = chosen(&draft).restart_exposure.as_ref().unwrap();
-    assert!(
-        exposure
-            .describe()
-            .contains("bgsrv-mac: its queue is forecast at 10800 s, longer than the lane's run"),
-        "{}",
-        exposure.describe()
-    );
-}
-
-/// cairn/6341. A Mac whose check lanes the credential floor refuses a
-/// nested profile is eligible for a lane that requires one, but never
-/// while a capable machine could take it: with both attached and idle the
-/// capable Mac wins and the floored one is passed over by name, whatever
-/// order ranking would otherwise have put them in.
-#[test]
-fn a_capable_mac_is_chosen_over_one_under_the_credential_floor() {
-    let (capable, floored) = capable_and_floored_evidence();
-    let mut connections = HashMap::from([
-        fleet_entry("bgsrv-mac", "macos", 6, &[]),
-        fleet_entry("mac-floor", "macos", 0, &[]),
-        fleet_entry("fedora", "linux", 0, &[]),
-    ]);
-    set_sandbox(&mut connections, "bgsrv-mac", Some(capable));
-    set_sandbox(&mut connections, "mac-floor", Some(floored.clone()));
-    let request = nested_sandbox_lane("macos");
-
-    let draft = place(&connections, &request).expect("the capable Mac takes it");
-    let (selected, selection) = draft.selected.expect("placed");
-    assert_eq!(selected.executor_id, "bgsrv-mac");
-    assert_eq!(selection.nested_sandbox_waived, None);
-    let passed_over = draft
-        .rejected
-        .iter()
-        .find(|rejection| rejection.executor_id == "mac-floor")
-        .expect("the floored Mac is accounted for");
-    assert_eq!(
-        passed_over.reason,
-        PlacementRejectionReason::NestedSandboxCapableElsewhere {
-            capable: vec!["bgsrv-mac".into()],
-        }
-    );
-    assert!(
-        passed_over
-            .reason
-            .describe()
-            .contains("bgsrv-mac can take the work, so the requirement is not waived here"),
-        "{}",
-        passed_over.reason.describe()
-    );
-
-    // With no capable Mac attached the floored one takes the lane, and the
-    // record says it ran without the capability and why.
-    connections.remove("bgsrv-mac");
-    let draft = place(&connections, &request).expect("the fallback takes it");
-    let (selected, selection) = draft.selected.expect("placed on the fallback");
-    assert_eq!(selected.executor_id, "mac-floor");
-    let waiver = selection
-        .nested_sandbox_waived
-        .expect("the record names the waiver");
-    assert_eq!(waiver.credential_floor_sha256, "f1007f1007f1007");
-    let text = waiver.describe();
-    assert!(
-        text.contains("operator credential floor f1007f1007f1"),
-        "{text}"
-    );
-    assert!(
-        text.contains("outer profile inherited: a confined process cannot apply a second profile"),
-        "{text}"
-    );
-    assert!(text.contains("skip as nested-sandbox-exec"), "{text}");
-    assert!(text.contains("cairn/6339"), "{text}");
 }
 
 /// The waiver is for the floor alone. A Mac whose executor is itself
@@ -16730,131 +10623,6 @@ fn the_nested_sandbox_preference_leaves_linux_placement_alone() {
     either.executor.as_mut().unwrap().os = None;
     let draft = place(&connections, &either).expect("either platform places");
     assert_eq!(draft.selected.expect("placed").0.executor_id, "fedora");
-}
-
-/// The macOS cadence's refusal named only the Mac being emptied for its
-/// update. While the capable Mac is only being emptied the lane waits for
-/// it, and the Mac under the operator credential floor is passed over
-/// because the capable one is coming back. Under an operator's drain the
-/// capable Mac is not coming back on its own, so the floored Mac takes the
-/// lane with the waiver on its record (cairn/6341); before that Mac has
-/// reported its probe at all, the refusal says it is waiting on one.
-#[test]
-fn a_macos_refusal_names_the_excluded_mac_and_the_capability_it_lacks() {
-    let context = cairn_common::executor_protocol::NestedSandboxProbeContext {
-        launcher: cairn_common::executor_protocol::SandboxLauncherClass::Unconfined,
-        credential_floor_sha256: None,
-        outer_profile_sha256: None,
-        fingerprint: Some("f".into()),
-        measured_at_unix_ms: 1,
-    };
-    let capable = SandboxCapabilityEvidence {
-        cairn_sandboxed_marker: false,
-        nested_sandbox_write_available: true,
-        nested_sandbox_write_detail: "live probe succeeded".into(),
-        nested_sandbox_write_context: Some(context.clone()),
-        violation_recovery: None,
-    };
-    let floored = SandboxCapabilityEvidence {
-        nested_sandbox_write_available: false,
-        nested_sandbox_write_detail:
-            "outer profile inherited: a confined process cannot apply a second profile".into(),
-        nested_sandbox_write_context: Some(
-            cairn_common::executor_protocol::NestedSandboxProbeContext {
-                credential_floor_sha256: Some("floor".into()),
-                outer_profile_sha256: Some("outer".into()),
-                ..context
-            },
-        ),
-        ..capable.clone()
-    };
-    let mut connections = HashMap::from([
-        fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]),
-        fleet_entry("bgsrv-mac", "macos", 0, &[]),
-        fleet_entry("fedora", "linux", 0, &[]),
-        fleet_entry("bgsrv-ub", "linux", 0, &[]),
-        fleet_entry("bglab-win", "windows", 0, &[]),
-    ]);
-    Arc::make_mut(
-        &mut connections
-            .get_mut(COLOCATED_EXECUTOR_ID)
-            .unwrap()
-            .advertisement,
-    )
-    .capabilities
-    .sandbox = Some(floored);
-    let mac = connections.get_mut("bgsrv-mac").unwrap();
-    Arc::make_mut(&mut mac.advertisement).capabilities.sandbox = Some(capable);
-    runtime_update_hold_fixture(mac, true);
-    let mut request = targeted_request("macos");
-    request.executor = Some(ExecutorSelector {
-        os: Some("macos".into()),
-        required_toolchains: vec!["rust".into()],
-        requires_macos_nested_sandbox_write: true,
-        ..ExecutorSelector::default()
-    });
-    let draft = place(&connections, &request)
-        .expect("the lane waits for the Mac being emptied for its update");
-    assert!(draft.selected.is_none());
-    assert!(
-        draft
-            .rejected
-            .iter()
-            .any(|rejection| rejection.executor_name == "bgsrv-mac"
-                && matches!(
-                    rejection.reason,
-                    PlacementRejectionReason::UpdatePending { .. }
-                )),
-        "{:?}",
-        draft.rejected
-    );
-    assert!(
-        draft
-            .rejected
-            .iter()
-            .any(|rejection| rejection.executor_name == "local"
-                && rejection.reason
-                    == PlacementRejectionReason::NestedSandboxCapableElsewhere {
-                        capable: vec!["bgsrv-mac".into()],
-                    }),
-        "{:?}",
-        draft.rejected
-    );
-
-    let mac = connections.get_mut("bgsrv-mac").unwrap();
-    runtime_update_hold_fixture(mac, false);
-    mac.drained = true;
-    let draft = place(&connections, &request)
-        .expect("with the capable Mac drained, the floored Mac takes the lane");
-    let (selected, selection) = draft.selected.expect("placed on the fallback");
-    assert_eq!(selected.executor_id, COLOCATED_EXECUTOR_ID);
-    assert!(
-        selection
-            .nested_sandbox_waived
-            .as_ref()
-            .is_some_and(|waiver| waiver
-                .detail
-                .contains("a confined process cannot apply a second profile")),
-        "{selection:?}"
-    );
-
-    // Just attached, before its first sandbox probe has reported: a wait
-    // with an age, not evidence that the capability is absent.
-    Arc::make_mut(
-        &mut connections
-            .get_mut(COLOCATED_EXECUTOR_ID)
-            .unwrap()
-            .advertisement,
-    )
-    .capabilities
-    .sandbox = None;
-    let refusal = place(&connections, &request).unwrap_err();
-    assert!(
-        refusal.contains(
-            "local: check-lane nested Seatbelt probe not yet reported since it advertised"
-        ),
-        "{refusal}"
-    );
 }
 
 #[test]
@@ -18124,7 +11892,7 @@ async fn a_job_whose_machine_is_gone_acquires_again_on_a_live_one() {
     machine_left(&orch.fleet, "departed");
 
     let (sender, mut executor) = mpsc::unbounded_channel();
-    let generation = orch.fleet.attach_executor(sender);
+    let generation = orch.fleet.attach_announced_executor(sender);
     assert!(matches!(
         executor.recv().await,
         Some(ExecutorMessage::DrainModeRequest { enabled: false, .. })
@@ -18199,7 +11967,7 @@ async fn executor_restart_configures_a_cell_in_the_submission_that_consumes_it()
     drop(first_executor);
 
     let (replacement_sender, mut replacement_executor) = mpsc::unbounded_channel();
-    let replacement_generation = orch.fleet.attach_executor(replacement_sender);
+    let replacement_generation = orch.fleet.attach_announced_executor(replacement_sender);
     assert!(replacement_generation > first_generation);
 
     let answering_fleet = orch.fleet.clone();
@@ -18279,6 +12047,7 @@ async fn a_drain_between_claim_and_grant_releases_the_unstarted_machine_reservat
             None,
         )
         .unwrap();
+    orch.fleet.announce_room_for_test("remote", generation);
     let mut request = provenance_request();
     request.repository = RepositoryLocator::ScratchOnly {
         owner_id: request.project_id.clone(),
@@ -18446,7 +12215,7 @@ async fn offered_and_held(
     String,
 ) {
     let (sender, mut machine) = mpsc::unbounded_channel();
-    let generation = orch.fleet.attach_executor(sender);
+    let generation = orch.fleet.attach_announced_executor(sender);
     orch.fleet.claimed_attempt_silence.0.store(
         TEST_CLAIMED_SILENCE_MS,
         std::sync::atomic::Ordering::Relaxed,
@@ -20094,98 +13863,6 @@ pub(super) fn targeted_request(os: &str) -> CellRequest {
 }
 
 #[test]
-fn detached_targeted_requests_wait_only_within_the_return_bound() {
-    let pool = Fleet::default();
-    pool.declare_enrolled_remote("win", "windows-builder", "windows", "x86_64");
-    let mut request = targeted_request("windows");
-    request.repository = spillable_request().repository;
-    let detached = pool.unattached_enrolled_remotes();
-    let now = unix_time_ms();
-    let connections = HashMap::new();
-    let survey = survey_candidates(
-        &connections,
-        &detached,
-        &request,
-        now,
-        &HashMap::new(),
-        &AdmissionView::of_request(&request),
-    )
-    .expect("a detached enrollment is a bounded wait, not no matching executor");
-    assert!(matches!(survey.rejected[0].reason,
-        PlacementRejectionReason::Reconnecting { returns_by_unix_ms }
-            if returns_by_unix_ms > now
-                && returns_by_unix_ms <= now + ENVIRONMENT_LEASE_GRACE_MS
-    ));
-    let policy = ActivePlacementPolicy::default_profile();
-    let decision = wait_decision(&request, &policy, &survey.rejected, &[], &[])
-        .expect("the reconnect wait is recorded");
-    let PlacementOutcome::Waiting { diagnostic } = decision.outcome else {
-        panic!("expected a wait");
-    };
-    assert!(diagnostic.contains("windows-builder"), "{diagnostic}");
-    assert!(diagnostic.contains("reconnecting"), "{diagnostic}");
-
-    // A pin and a public name have the same bounded wait as a platform.
-    for named in [false, true] {
-        let mut pinned = request.clone();
-        pinned.executor = None;
-        if named {
-            pinned.executor = Some(ExecutorSelector {
-                name: Some("windows-builder".into()),
-                ..Default::default()
-            });
-        } else {
-            pinned.pinned_executor_id = Some("win".into());
-        }
-        assert!(survey_candidates(
-            &HashMap::new(),
-            &detached,
-            &pinned,
-            now,
-            &HashMap::new(),
-            &AdmissionView::of_request(&pinned),
-        )
-        .is_ok());
-        pool.stage_link_absent("win", ENVIRONMENT_LEASE_GRACE_MS + 1_000);
-        assert!(
-            survey_candidates(
-                &HashMap::new(),
-                &pool.unattached_enrolled_remotes(),
-                &pinned,
-                unix_time_ms(),
-                &HashMap::new(),
-                &AdmissionView::of_request(&pinned),
-            )
-            .is_err(),
-            "an expired detached pin must not wait forever"
-        );
-    }
-
-    let mut updating = detached[0].clone();
-    updating.drained = true;
-    updating.update_returns_by_unix_ms = Some(now + rollout::RETURN_BUDGET_MS);
-    assert!(matches!(
-        detached_candidate_rejection(&updating, &request, now),
-        PlacementRejectionReason::UpdatePending { returns_by_unix_ms: Some(at) }
-            if at == now + rollout::RETURN_BUDGET_MS
-    ));
-    assert!(matches!(
-        detached_candidate_rejection(&updating, &request, now + rollout::RETURN_BUDGET_MS),
-        PlacementRejectionReason::AbsenceExpired { .. }
-    ));
-    updating.drained = false;
-    updating.update_returns_by_unix_ms = None;
-    updating.role = MachineRole::InferenceOnly;
-    assert!(
-        matches!(
-            detached_candidate_rejection(&updating, &request, now),
-            PlacementRejectionReason::RoleExcluded { .. }
-        ),
-        "a structural role mismatch must not turn into a reconnect wait"
-    );
-}
-
-#[test]
 fn a_windows_targeted_refusal_names_the_absent_windows_machine_and_its_cause() {
     let request = targeted_request("windows");
     let absent = EnrolledRemote {
@@ -20297,168 +13974,6 @@ fn a_platform_selector_routes_only_to_matching_executor() {
     assert_eq!(selected.executor_id, "windows");
 }
 
-#[test]
-fn transfer_estimation_does_not_hold_executor_connection_lock() {
-    let pool = Fleet::default();
-    let (id, entry) = fleet_entry_at("remote", "linux", 0, &[], unix_time_ms());
-    pool.lock_connections().insert(id, entry);
-    let request = targeted_request("linux");
-    let selecting_pool = pool.clone();
-    let (estimation_started_tx, estimation_started_rx) = std::sync::mpsc::channel();
-    let (release_estimation_tx, release_estimation_rx) = std::sync::mpsc::channel();
-    let selector = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(selecting_pool.select_executor_once_with(
-                &request,
-                None,
-                &ActivePlacementPolicy::default_profile(),
-                &HashMap::new(),
-                &AdmissionView::default(),
-                |_, _| {
-                    estimation_started_tx.send(()).unwrap();
-                    release_estimation_rx.recv().unwrap();
-                    SyncCost::Unknown
-                },
-            ))
-            .unwrap()
-            .placed()
-    });
-    estimation_started_rx
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap();
-
-    let updating_pool = pool.clone();
-    let (updated_tx, updated_rx) = std::sync::mpsc::channel();
-    let updater = std::thread::spawn(move || {
-        let changed = updating_pool.set_executor_snapshot(
-            "remote",
-            1,
-            FleetSnapshot::default(),
-            ExecutorSubstrateReport::default(),
-        );
-        updated_tx.send(changed).unwrap();
-    });
-    let update_completed_while_estimation_blocked =
-        updated_rx.recv_timeout(Duration::from_millis(250)).is_ok();
-    release_estimation_tx.send(()).unwrap();
-    selector.join().unwrap();
-    updater.join().unwrap();
-
-    assert!(
-        update_completed_while_estimation_blocked,
-        "executor WebSocket updates must remain responsive during repository estimation"
-    );
-}
-
-#[test]
-fn transfer_estimation_rejects_a_reconnected_executor_generation() {
-    let pool = Fleet::default();
-    let (id, entry) = fleet_entry_at("remote", "linux", 0, &[], unix_time_ms());
-    pool.lock_connections().insert(id, entry);
-    let request = targeted_request("linux");
-    let selecting_pool = pool.clone();
-    let (estimation_started_tx, estimation_started_rx) = std::sync::mpsc::channel();
-    let (release_estimation_tx, release_estimation_rx) = std::sync::mpsc::channel();
-    let selector = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(selecting_pool.select_executor_once_with(
-                &request,
-                None,
-                &ActivePlacementPolicy::default_profile(),
-                &HashMap::new(),
-                &AdmissionView::default(),
-                |_, _| {
-                    estimation_started_tx.send(()).unwrap();
-                    release_estimation_rx.recv().unwrap();
-                    SyncCost::Unknown
-                },
-            ))
-            .unwrap()
-            .placed()
-    });
-    estimation_started_rx
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap();
-
-    let mut replacement = fleet_entry_at("remote", "linux", 0, &[], unix_time_ms()).1;
-    replacement.generation = 2;
-    pool.lock_connections().insert("remote".into(), replacement);
-    release_estimation_tx.send(()).unwrap();
-
-    assert!(
-        selector.join().unwrap().is_none(),
-        "placement must not return a sender retired during repository estimation"
-    );
-    let selected = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(pool.select_executor_once_with(
-            &targeted_request("linux"),
-            None,
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Unknown,
-        ))
-        .unwrap()
-        .placed()
-        .unwrap()
-        .selected;
-    assert_eq!(selected.executor_id, "remote");
-    assert_eq!(selected.generation, 2);
-}
-
-#[test]
-fn warm_executor_remains_eligible_as_inventory_grows() {
-    let connections = HashMap::from([
-        fleet_entry("cold", "linux", 0, &[]),
-        fleet_entry("warm", "linux", 2, &["base"]),
-    ]);
-    assert_eq!(
-        choose_executor(&connections, &targeted_request("linux"))
-            .unwrap()
-            .unwrap()
-            .executor_id,
-        "warm"
-    );
-}
-
-#[test]
-fn missing_byte_cost_is_scoped_to_the_request_repository() {
-    let repo = tempfile::tempdir().unwrap();
-    init_repo(repo.path());
-    write_file(repo.path(), "base.txt", b"base");
-    let warm = commit_all(repo.path(), "warm");
-    write_file(repo.path(), "added.txt", b"request-specific bytes");
-    let base = commit_all(repo.path(), "base");
-
-    let cold =
-        pricing::missing_reachable_object_bytes(repo.path().to_str().unwrap(), &base, &[]).unwrap();
-    let incremental = pricing::missing_reachable_object_bytes(
-        repo.path().to_str().unwrap(),
-        &base,
-        std::slice::from_ref(&warm),
-    )
-    .unwrap();
-    assert!(incremental > 0);
-    assert!(incremental < cold);
-
-    let unrelated_repo = tempfile::tempdir().unwrap();
-    init_repo(unrelated_repo.path());
-    write_file(unrelated_repo.path(), "other.txt", b"other");
-    let unrelated = commit_all(unrelated_repo.path(), "other");
-    assert!(pricing::missing_reachable_object_bytes(
-        repo.path().to_str().unwrap(),
-        &base,
-        &[unrelated],
-    )
-    .is_err());
-}
-
 /// The managed-object repository every `fleet_entry` serves, under
 /// `repository_id`, holding `commits` as warm roots.
 fn test_warm_roots(repository_id: &str, commits: &[&str]) -> WarmRepositoryRoots {
@@ -20471,131 +13986,6 @@ fn test_warm_roots(repository_id: &str, commits: &[&str]) -> WarmRepositoryRoots
         .identity(),
         commits: commits.iter().map(|commit| commit.to_string()).collect(),
     }
-}
-
-#[test]
-fn warm_root_is_zero_only_for_the_requested_repository() {
-    let (_, mut entry) = fleet_entry("warm", "linux", 0, &["base"]);
-    let request = targeted_request("linux");
-    assert_eq!(measured_sync_cost(&request, &entry), SyncCost::Known(0));
-
-    entry.warm_roots = Arc::new(warm_roots::WarmRootSet::from_inventory(WarmRootInventory {
-        revision: 1,
-        repositories: vec![test_warm_roots("other-repo", &["base"])],
-    }));
-    assert_eq!(measured_sync_cost(&request, &entry), SyncCost::Unknown);
-}
-
-/// A machine whose roots arrived as a Hello and two deltas answers both
-/// placement lookups exactly as one built whole from the final set: the
-/// exact-commit hit and miss per repository, and the haves a sync walk is
-/// priced with.
-#[test]
-fn warm_roots_moved_by_deltas_answer_as_the_whole_final_set() {
-    let fleet = Fleet::default();
-    let (sender, _frames) = mpsc::unbounded_channel();
-    let (_, entry) = fleet_entry("moved", "linux", 0, &[]);
-    let generation = fleet
-        .attach_advertised_executor(
-            (*entry.advertisement).clone(),
-            WarmRootInventory {
-                revision: 4,
-                repositories: vec![
-                    test_warm_roots("repo", &["a1", "a2"]),
-                    test_warm_roots("other-repo", &["b1"]),
-                ],
-            },
-            sender,
-            false,
-            None,
-            None,
-        )
-        .unwrap();
-    // A fetch added a root to the first repository; then a consolidation
-    // dropped one there and the other repository fetched.
-    let deltas = [
-        (
-            5,
-            WarmRootChange::Delta {
-                base_revision: 4,
-                added: vec![test_warm_roots("repo", &["a3"])],
-                removed: Vec::new(),
-            },
-        ),
-        (
-            6,
-            WarmRootChange::Delta {
-                base_revision: 5,
-                added: vec![test_warm_roots("other-repo", &["b2"])],
-                removed: vec![test_warm_roots("repo", &["a1"])],
-            },
-        ),
-    ];
-    for (revision, change) in deltas {
-        fleet.handle_executor_message(
-            "moved",
-            generation,
-            ExecutorMessage::WarmRootsChanged { revision, change },
-        );
-    }
-    let moved = fleet.lock_connections().get("moved").unwrap().clone();
-    let (_, mut whole) = fleet_entry("whole", "linux", 0, &[]);
-    whole.warm_roots = Arc::new(warm_roots::WarmRootSet::from_inventory(WarmRootInventory {
-        revision: 1,
-        repositories: vec![
-            test_warm_roots("other-repo", &["b2", "b1"]),
-            test_warm_roots("repo", &["a3", "a2"]),
-        ],
-    }));
-    assert_eq!(moved.warm_roots.revision(), 6);
-
-    let haves = |entry: &ExecutorConnectionState, request: &CellRequest| {
-        let mut given = None;
-        let cost = repository_sync_cost(request, entry, |_, roots, _| {
-            given = Some(roots.to_vec());
-            SyncCost::Known(7)
-        });
-        (cost, given)
-    };
-    let mut request = targeted_request("linux");
-    for (repository_id, commit) in [
-        ("repo", "a1"),
-        ("repo", "a2"),
-        ("repo", "a3"),
-        ("repo", "b2"),
-        ("other-repo", "b1"),
-        ("other-repo", "b2"),
-        ("other-repo", "a2"),
-    ] {
-        request.repository = RepositoryLocator::ColocatedPath {
-            project_id: "p".into(),
-            repository_id: repository_id.into(),
-            absolute_path: "/repo".into(),
-        };
-        request.base_commit = commit.into();
-        assert_eq!(
-            warm_root_holds_commit(&moved, &request),
-            warm_root_holds_commit(&whole, &request),
-            "{repository_id}@{commit}"
-        );
-        assert_eq!(
-            haves(&moved, &request),
-            haves(&whole, &request),
-            "{repository_id}@{commit}"
-        );
-    }
-    request.repository = targeted_request("linux").repository;
-    request.base_commit = "a3".into();
-    assert_eq!(haves(&moved, &request), (SyncCost::Known(0), None));
-    request.base_commit = "a1".into();
-    assert_eq!(
-        haves(&moved, &request),
-        (
-            SyncCost::Known(7),
-            Some(vec!["a2".to_string(), "a3".to_string()])
-        ),
-        "the walk is given the surviving roots, sorted"
-    );
 }
 
 /// A delta against a revision the runner does not hold changes nothing and
@@ -20676,139 +14066,6 @@ fn an_unmatched_warm_root_delta_asks_once_for_the_whole_inventory() {
         },
     );
     assert_eq!(*held(&fleet), *after);
-}
-
-/// Each sync walk a counted runner was asked for: (target, warm roots).
-type WalkLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
-/// Each distance a counted runner was asked for: (slot head, target).
-type MeasureLog = Arc<Mutex<Vec<(String, String)>>>;
-
-/// A runner whose repository prices are counted rather than computed, with
-/// two remote candidates that advertise the same warm root and one idle
-/// slot at the same head.
-fn priced_fleet() -> (Fleet, WalkLog, MeasureLog, tempfile::TempDir) {
-    let walks = Arc::new(Mutex::new(Vec::new()));
-    let measures = Arc::new(Mutex::new(Vec::new()));
-    let (walked, measured) = (Arc::clone(&walks), Arc::clone(&measures));
-    let pool = Fleet {
-        placement_prices: Arc::new(pricing::PlacementPrices::with(
-            move |_, target, roots| {
-                walked
-                    .lock()
-                    .unwrap()
-                    .push((target.to_owned(), roots.to_vec()));
-                Ok(4096)
-            },
-            move |_, head, target| {
-                measured
-                    .lock()
-                    .unwrap()
-                    .push((head.to_owned(), target.to_owned()));
-                Some(cairn_common::cache_distance::CacheDistance {
-                    files: 3,
-                    ..Default::default()
-                })
-            },
-        )),
-        ..Fleet::default()
-    };
-    for id in ["first", "second"] {
-        let (id, mut entry) = fleet_entry_at(id, "linux", 0, &["warm"], unix_time_ms());
-        let health = Arc::make_mut(&mut entry.health);
-        health.inventory.authority = InventoryAuthorityState::Authoritative;
-        health.slots = vec![distance_slot("near")];
-        pool.lock_connections().insert(id, entry);
-    }
-    (pool, walks, measures, tempfile::tempdir().unwrap())
-}
-
-fn place_priced(pool: &Fleet, request: &CellRequest) -> PlacementSelection {
-    let placement = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(pool.select_executor_once_with(
-            request,
-            None,
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |request, entry| pool.priced_sync_cost(request, entry),
-        ))
-        .unwrap()
-        .placed()
-        .unwrap();
-    match placement.decision.outcome {
-        PlacementOutcome::Selected(selection) => *selection,
-        other => panic!("expected a selection, got {other:?}"),
-    }
-}
-
-#[test]
-fn a_priced_target_is_placed_again_without_starting_git() {
-    let (pool, walks, measures, directory) = priced_fleet();
-    let request = distance_request(directory.path());
-    place_priced(&pool, &request);
-    pool.placement_prices.settle();
-    let started = pool.placement_prices.computations_started();
-    // A sync price per machine, and one distance for the slot head they share.
-    assert_eq!(started, 3);
-
-    for _ in 0..5 {
-        place_priced(&pool, &request);
-    }
-    pool.placement_prices.settle();
-    assert_eq!(pool.placement_prices.computations_started(), started);
-    assert_eq!(walks.lock().unwrap().len(), 2);
-    assert_eq!(measures.lock().unwrap().len(), 1);
-
-    // A new target is new pairs: priced once more, then never again.
-    let mut next = request.clone();
-    next.base_commit = "next-target".into();
-    place_priced(&pool, &next);
-    pool.placement_prices.settle();
-    place_priced(&pool, &next);
-    assert_eq!(pool.placement_prices.computations_started(), started + 3);
-}
-
-#[test]
-fn known_missing_byte_cost_ranks_before_unknown() {
-    let connections = HashMap::from([
-        fleet_entry("known", "linux", 1, &[]),
-        fleet_entry("unknown", "linux", 0, &[]),
-    ]);
-    let selected = choose_executor_with(
-        &connections,
-        &targeted_request("linux"),
-        &HashMap::new(),
-        |_, entry| {
-            if entry.identity.executor_id == "known" {
-                SyncCost::Known(10)
-            } else {
-                SyncCost::Unknown
-            }
-        },
-        NOW,
-    )
-    .unwrap()
-    .selected
-    .unwrap();
-    assert_eq!(selected.0.executor_id, "known");
-}
-
-#[test]
-fn unknown_cost_does_not_exclude_the_only_usable_executor() {
-    let connections = HashMap::from([fleet_entry("only", "linux", 0, &[])]);
-    let selected = choose_executor_with(
-        &connections,
-        &targeted_request("linux"),
-        &HashMap::new(),
-        |_, _| SyncCost::Unknown,
-        NOW,
-    )
-    .unwrap()
-    .selected
-    .unwrap();
-    assert_eq!(selected.0.executor_id, "only");
 }
 
 #[test]
@@ -22846,6 +16103,7 @@ fn residency_queue_attach_on(
         512 * 1024 * 1024 * 1024,
         unix_time_ms(),
     );
+    pool.announce_room_for_test(id, generation);
     (generation, receiver)
 }
 
@@ -23148,7 +16406,7 @@ async fn a_shared_execution_outlives_the_runtime_of_the_wave_that_opened_it() {
     let temp = tempfile::tempdir().unwrap();
     let orch = test_orchestrator(temp.path()).await;
     let (sender, mut executor) = mpsc::unbounded_channel();
-    let generation = orch.fleet.attach_executor(sender);
+    let generation = orch.fleet.attach_announced_executor(sender);
     let check = |request_id: &str| {
         let mut request = provenance_request();
         request.request_id = request_id.into();
@@ -23337,7 +16595,7 @@ async fn an_identity_free_batch_teaches_each_items_suite_and_counts_its_kills() 
     let temp = tempfile::tempdir().unwrap();
     let orch = test_orchestrator(temp.path()).await;
     let (sender, mut executor) = mpsc::unbounded_channel();
-    let generation = orch.fleet.attach_executor(sender);
+    let generation = orch.fleet.attach_announced_executor(sender);
     let commands = [
         "bun run test:frontend",
         "cargo test -p cairn-core",
@@ -23745,7 +17003,8 @@ async fn work_refused_a_model_s_room_waits_reports_the_refusal_and_places_when_i
     let pool = Fleet::default();
     let (sender, _colocated) = mpsc::unbounded_channel();
     pool.attach_executor(sender);
-    let (_generation, _remote) = residency_queue_attach(&pool, "remote");
+    let (generation, _remote) = residency_queue_attach(&pool, "remote");
+    pool.announce_room_for_test("remote", generation);
     let remote_name = pool.executor_public_name("remote").unwrap();
     let mut request = spillable_request();
     request.repository = RepositoryLocator::ScratchOnly {
@@ -23757,8 +17016,8 @@ async fn work_refused_a_model_s_room_waits_reports_the_refusal_and_places_when_i
         .profile
         .routes
         .insert(request.placement_work_class, PlacementStance::RemoteOnly);
-    // Fresh against the clock select_executor reads, so the machine is
-    // measured rather than blind.
+    // Fresh against the clock admission reads, so the machine is measured
+    // rather than blind.
     measured_at(
         pool.lock_connections().get_mut("remote").unwrap(),
         0.1,
@@ -23791,7 +17050,7 @@ async fn work_refused_a_model_s_room_waits_reports_the_refusal_and_places_when_i
         async move {
             tokio::time::timeout(
                 Duration::from_secs(5),
-                waiting.select_executor(&request, None, &policy, Some(&entry)),
+                assign(&waiting, &entry, &request, &policy, None),
             )
             .await
         }
@@ -23829,7 +17088,8 @@ async fn unmeasured_work_waits_out_a_loading_model_and_places_once_it_is_healthy
     let pool = Fleet::default();
     let (sender, _colocated) = mpsc::unbounded_channel();
     pool.attach_executor(sender);
-    let (_generation, _remote) = residency_queue_attach(&pool, "remote");
+    let (generation, _remote) = residency_queue_attach(&pool, "remote");
+    pool.announce_room_for_test("remote", generation);
     let remote_name = pool.executor_public_name("remote").unwrap();
     let mut request = spillable_request();
     request.repository = RepositoryLocator::ScratchOnly {
@@ -23873,7 +17133,7 @@ async fn unmeasured_work_waits_out_a_loading_model_and_places_once_it_is_healthy
         async move {
             tokio::time::timeout(
                 Duration::from_secs(5),
-                waiting.select_executor(&request, None, &policy, Some(&entry)),
+                assign(&waiting, &entry, &request, &policy, None),
             )
             .await
         }
@@ -23897,8 +17157,8 @@ async fn unmeasured_work_waits_out_a_loading_model_and_places_once_it_is_healthy
     assert_eq!(placement.selected.executor_id, "remote");
 }
 
-/// A machine declines, posts state, and is offered the request again, but
-/// the requester's horizon arrives while that re-offer is out. The
+/// A machine declines, announces a new room, and is offered the request
+/// again, but the requester's horizon arrives while that re-offer is out. The
 /// refusal still names the decline, and the newest placement decision for
 /// the request is that same refusal carrying the same decline, not the
 /// still-selected offer.
@@ -23907,7 +17167,7 @@ async fn a_horizon_that_arrives_during_a_re_offer_records_the_refusal_it_returns
     let temp = tempfile::tempdir().unwrap();
     let orch = test_orchestrator(temp.path()).await;
     let (sender, mut executor) = mpsc::unbounded_channel();
-    let generation = orch.fleet.attach_executor(sender);
+    let generation = orch.fleet.attach_announced_executor(sender);
     let detail = "project p is provisioning for request holder, 1s ago";
     let fleet = orch.fleet.clone();
     let machine = tokio::spawn(async move {
@@ -23926,13 +17186,12 @@ async fn a_horizon_that_arrives_during_a_re_offer_records_the_refusal_it_returns
             },
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
-        fleet.handle_executor_message(
+        // The decline stands under the figures it was made against; new
+        // figures are what make the machine worth asking again.
+        fleet.announce_room_with_memory_for_test(
             COLOCATED_EXECUTOR_ID,
             generation,
-            ExecutorMessage::SnapshotUpdated {
-                snapshot: FleetSnapshot::default(),
-                health: ExecutorSubstrateReport::default(),
-            },
+            Some((256 << 30, 512 << 30)),
         );
         // The re-offer arrives and is never answered.
         assert!(matches!(
@@ -23946,8 +17205,7 @@ async fn a_horizon_that_arrives_during_a_re_offer_records_the_refusal_it_returns
     request.repository = RepositoryLocator::ScratchOnly {
         owner_id: request.project_id.clone(),
     };
-    // Past the decline's one-second re-offer backoff, so the re-offer
-    // goes out before the horizon arrives.
+    // Long enough for the re-offer to go out before the horizon arrives.
     request.wait_horizon_unix_ms = unix_time_ms() + 2_500;
     let outcome = orch.fleet.submit(&orch, request).await;
     machine.abort();
@@ -24290,122 +17548,6 @@ async fn a_selector_no_machine_satisfies_is_refused_by_name_and_acquires_nothing
         );
     })
     .await;
-}
-
-#[test]
-fn a_home_affinity_prices_and_never_excludes() {
-    const BASE_MS: u64 = 20 * 60_000;
-    let entries = [("a-linux", "linux"), ("b-mac", "macos"), ("c-mac", "macos")].map(|(id, os)| {
-        let (_, mut entry) = fleet_entry(id, os, 0, &[]);
-        measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
-        entry
-    });
-    let [linux, b_mac, c_mac] = &entries;
-    fn candidate<'a>(
-        entry: &'a ExecutorConnectionState,
-        verdict_ms: u64,
-        affinity: Option<&HomeAffinity>,
-    ) -> ScoredCandidate<'a> {
-        let mut prediction = placement_prediction(
-            entry,
-            CacheWarmthEvidence::Observed {
-                warmth: ExecutionWarmth::Cold,
-                observed_at_unix_ms: NOW,
-            },
-            QueueForecast::Forecast {
-                predicted_ms: 0,
-                requests_ahead: 0,
-                running_ahead: 0,
-                fully_measured: true,
-                observed_at_unix_ms: NOW,
-                stalled_head_ms: None,
-            },
-            test_prior_duration(),
-            SyncCost::Known(0),
-        );
-        prediction.predicted_verdict_ms = verdict_ms;
-        let mut scored = ScoredCandidate::new(
-            entry,
-            SyncCost::Known(0),
-            None,
-            &ResourceReservation::default(),
-            prediction,
-            None,
-            None,
-            NOW,
-        );
-        scored.home_affinity_ms = affinity.map_or(0, |affinity| {
-            affinity.price_ms(
-                &entry.identity.executor_id,
-                &entry.advertisement.capabilities.os,
-            )
-        });
-        scored
-    }
-    let request = spillable_request();
-    let policy = ActivePlacementPolicy::default_profile();
-    let history = ExplorationState {
-        decisions_since_exploration: 0,
-        ..Default::default()
-    };
-    let winner_of = |scored: Vec<ScoredCandidate<'_>>| {
-        let (winner, _, _, _, _) =
-            rank_candidates(&scored, false, true, &request, &policy, &history, None);
-        winner
-            .expect("a priced machine is never excluded")
-            .entry
-            .identity
-            .executor_id
-            .clone()
-    };
-    let on_a_mac = HomeAffinity {
-        runner_os: "macos".into(),
-        previous_executor_id: None,
-    };
-
-    assert_eq!(
-        winner_of(vec![
-            candidate(linux, BASE_MS - 60_000, Some(&on_a_mac)),
-            candidate(b_mac, BASE_MS, Some(&on_a_mac)),
-        ]),
-        "b-mac",
-        "a minute's head start does not take a thread off the runner's platform"
-    );
-    assert_eq!(
-        winner_of(vec![
-            candidate(linux, BASE_MS - 10 * 60_000, Some(&on_a_mac)),
-            candidate(b_mac, BASE_MS, Some(&on_a_mac)),
-        ]),
-        "a-linux",
-        "a genuinely backlogged Mac still spills"
-    );
-    assert_eq!(
-        winner_of(vec![candidate(linux, BASE_MS, Some(&on_a_mac))]),
-        "a-linux",
-        "the only candidate takes the home whatever it costs"
-    );
-
-    let returning = HomeAffinity {
-        runner_os: "macos".into(),
-        previous_executor_id: Some("c-mac".into()),
-    };
-    assert_eq!(
-        winner_of(vec![
-            candidate(b_mac, BASE_MS, Some(&returning)),
-            candidate(c_mac, BASE_MS, Some(&returning)),
-        ]),
-        "c-mac",
-        "the previous machine beats a peer on the same platform on a tie"
-    );
-
-    assert_eq!(
-        winner_of(vec![
-            candidate(linux, BASE_MS, None),
-            candidate(b_mac, BASE_MS, None),
-        ]),
-        "a-linux",
-        "an issue-owned home carries no affinity, so ordinary order decides"
-    );
 }
 
 /// cairn/5875's third requirement, through one `operate_residency`.
@@ -25308,47 +18450,6 @@ fn a_structural_project_mismatch_is_not_masked_by_a_transient_hold_or_link() {
     ));
 }
 
-/// The specimen: an idle machine advertising no toolchains and a busy one
-/// that can run the project. Without the project's setup requirement the
-/// idle machine wins on predicted time; with it, it is never a candidate,
-/// and the refusal names the requirement in the selector's vocabulary.
-#[test]
-fn an_unselected_request_never_lands_where_the_project_setup_cannot_run() {
-    let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 3, &[]);
-    let (remote_id, mut remote) = fleet_entry("bgsrv-ub2", "linux", 0, &[]);
-    local.colocated = true;
-    advertising(&mut local, &["bun", "rust"]);
-    advertising(&mut remote, &[]);
-    measured(&mut local, 0.95, 2_000_000_000, 8_000_000_000);
-    measured(&mut remote, 0.0, 14_000_000_000, 80_000_000_000);
-    let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
-    let mut request = spillable_request();
-
-    assert_eq!(
-        chosen(&place(&connections, &request).unwrap()).executor_id,
-        "bgsrv-ub2",
-        "the counterfactual: idleness alone sends the work to the empty machine"
-    );
-
-    request.project_requirements = project_needs(&["bun"], &[]).into();
-    let draft = place(&connections, &request).unwrap();
-    assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
-    let rejection = rejection_for(&draft, "bgsrv-ub2");
-    assert_eq!(
-        rejection,
-        &PlacementRejectionReason::PreparationToolchainMissing {
-            project_id: "p".into(),
-            missing: vec!["bun".into()],
-            advertised: Vec::new(),
-            evidence: Vec::new(),
-        }
-    );
-    assert_eq!(
-        rejection.describe(),
-        "project setup for p requires bun; this machine advertises none"
-    );
-}
-
 /// A thin fleet whose only machine cannot prepare the project, for work
 /// that cannot leave it: refused now, naming the requirement, rather than
 /// waiting out a horizon on a fact time does not change.
@@ -25781,118 +18882,6 @@ fn a_preparation_refusal_excludes_the_machine_for_its_project_and_setup_only() {
     assert!(pool.lock_connections()["bbs"]
         .preparation_refusals
         .is_empty());
-}
-
-fn github(entry: &mut ExecutorConnectionState, state: Option<GithubCredentialState>) {
-    Arc::make_mut(&mut entry.advertisement)
-        .capabilities
-        .github_credential = state.map(|state| GithubCredentialEvidence {
-        state,
-        measured_at_unix_ms: NOW,
-        probed_repositories: Vec::new(),
-    });
-}
-
-fn needs_github() -> ProjectPlacementRequirements {
-    ProjectPlacementRequirements {
-        capabilities: vec![ProjectCapability::GithubCredential],
-        ..ProjectPlacementRequirements::default()
-    }
-}
-
-/// cairn/5873's specimen: a project whose build fetches a private GitHub
-/// repository is never placed on a machine that measured itself without a
-/// credential, and the refusal names the machine and why. A machine that
-/// has one, or has not measured, still takes the work, and a project that
-/// requires nothing is unaffected.
-#[test]
-fn a_project_that_needs_github_is_never_placed_where_no_credential_was_measured() {
-    let no_helper = "no credential helper answers for https://github.com";
-    let (sp1_id, mut sp1) = fleet_entry("bginf-sp1", "linux", 0, &[]);
-    let (ub_id, mut ub) = fleet_entry("bgsrv-ub", "linux", 3, &[]);
-    advertising(&mut sp1, &[]);
-    advertising(&mut ub, &[]);
-    measured(&mut sp1, 0.0, 14_000_000_000, 80_000_000_000);
-    measured(&mut ub, 0.95, 2_000_000_000, 8_000_000_000);
-    github(
-        &mut sp1,
-        Some(GithubCredentialState::Absent {
-            reason: no_helper.into(),
-        }),
-    );
-    github(
-        &mut ub,
-        Some(GithubCredentialState::Available {
-            account: Some("bleugreen".into()),
-            verified_against: Some("https://github.com/bleugreen/tm-cards".into()),
-            note: None,
-        }),
-    );
-    let connections = HashMap::from([(sp1_id.clone(), sp1.clone()), (ub_id, ub)]);
-    let mut request = spillable_request();
-    assert_eq!(
-        chosen(&place(&connections, &request).unwrap()).executor_id,
-        "bginf-sp1",
-        "the counterfactual: a project that requires nothing takes the idle machine"
-    );
-
-    request.project_requirements = needs_github().into();
-    let draft = place(&connections, &request).unwrap();
-    assert_eq!(chosen(&draft).executor_id, "bgsrv-ub");
-    let rejection = rejection_for(&draft, "bginf-sp1");
-    assert_eq!(
-        rejection,
-        &PlacementRejectionReason::GithubCredentialMissing {
-            project_id: "p".into(),
-            reason: no_helper.into(),
-        }
-    );
-    assert_eq!(
-        rejection.describe(),
-        format!(
-            "has no GitHub credential and this project fetches a private repository ({no_helper})"
-        )
-    );
-
-    // Pinned work is refused too: it would fail at its first fetch.
-    let mut pinned = request.clone();
-    pinned.executor = Some(ExecutorSelector {
-        name: Some("bginf-sp1".into()),
-        ..Default::default()
-    });
-    assert!(matches!(
-        candidate_rejection(&sp1, PlacementScope::of(&pinned), NOW),
-        Some(PlacementRejectionReason::GithubCredentialMissing { .. })
-    ));
-
-    // A live checkout fetches too, and preparation stamps the capability
-    // on it (see the stamping test), so it is held to it.
-    let mut live = request.clone();
-    live.repository = live_checkout();
-    assert!(matches!(
-        candidate_rejection(&sp1, PlacementScope::of(&live), NOW),
-        Some(PlacementRejectionReason::GithubCredentialMissing { .. })
-    ));
-
-    // Unmeasured gates nothing: an executor too old to probe, or a probe
-    // that could not tell.
-    for state in [
-        None,
-        Some(GithubCredentialState::Unmeasured {
-            reason: "git not found".into(),
-        }),
-    ] {
-        let mut unmeasured = sp1.clone();
-        github(&mut unmeasured, state);
-        assert!(!matches!(
-            candidate_rejection(&unmeasured, PlacementScope::of(&request), NOW),
-            Some(PlacementRejectionReason::GithubCredentialMissing { .. })
-        ));
-    }
-    assert!(!matches!(
-        candidate_rejection(&sp1, PlacementScope::of(&spillable_request()), NOW),
-        Some(PlacementRejectionReason::GithubCredentialMissing { .. })
-    ));
 }
 
 /// Preparation stamps a project's declared and learned capabilities onto
@@ -26658,59 +19647,6 @@ async fn residency_queue_duplicate_horizon_names_live_entry_and_state() {
         }).await;
 }
 
-/// When no machine can hold it the pin holds, at the clamp, and nothing
-/// about that is silent: every machine that could not hold it says so in
-/// the decision, and the selection carries the ceiling it went above.
-#[tokio::test]
-async fn when_no_machine_can_hold_it_the_pinned_batch_runs_home_at_the_clamp_and_says_so() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let (pool, db, request) =
-        ceiling_fleet("ceiling-nothing-holds.db", 10 * GIB, 0.01, 8 * GIB).await;
-    let request = pinned_to(request, "bgsrv-ub");
-    let plan = ReservationPlan::new(db, &request, None);
-
-    let placement = pool
-        .select_executor_once_with(
-            &request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .unwrap()
-        .placed()
-        .expect("the pin holds when nothing else can hold the work");
-    assert_eq!(placement.selected.executor_id, "bgsrv-ub");
-    assert_eq!(
-        placement
-            .reservation
-            .as_ref()
-            .unwrap()
-            .reservation
-            .memory_bytes,
-        8_282_086_656,
-        "the reservation is the clamp"
-    );
-    let PlacementOutcome::Selected(selection) = &placement.decision.outcome else {
-        panic!("selected");
-    };
-    assert!(selection.memory_ceiling.is_some());
-    assert!(placement.decision.rejected.iter().any(|rejection| {
-        rejection.executor_id == "bglab-mac"
-            && matches!(
-                rejection.reason,
-                PlacementRejectionReason::ExceedsMemoryCeiling { .. }
-            )
-    }));
-    let above = placement.above_ceiling.expect("the result is told");
-    assert!(!above.holdable_elsewhere);
-    let note = above.note();
-    assert!(note.contains("no executor can hold"), "{note}");
-    assert!(note.contains("bgsrv-ub"), "{note}");
-}
-
 /// A grant speaks only for the link it was answered on. With that link
 /// gone, the refusal names the machine and that it stopped answering; on
 /// the machine's next link, before and after that link's opening snapshot,
@@ -26768,45 +19704,6 @@ async fn a_grant_on_a_retired_link_is_refused_naming_the_routing_case() {
     .await;
 }
 
-/// A big machine that is busy right now queues the work in its own
-/// admission; a small idle one runs it into its memory limit. The ceiling
-/// therefore outranks momentary fit and predicted speed alike.
-#[tokio::test]
-async fn unpinned_work_prefers_a_machine_that_can_ever_hold_it_over_a_more_idle_one_that_cannot() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let (pool, db, request) = ceiling_fleet("ceiling-ranking.db", 100 * GIB, 0.60, 4 * GIB).await;
-    let mut request = request;
-    request.repository = RepositoryLocator::ManagedObjects {
-        project_id: "p".into(),
-        repository_id: "repo".into(),
-        object_format: GitObjectFormat::Sha1,
-    };
-    let plan = ReservationPlan::new(db, &request, None);
-
-    let placement = pool
-        .select_executor_once_with(
-            &request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .unwrap()
-        .placed()
-        .unwrap();
-    assert_eq!(placement.selected.executor_id, "bglab-mac");
-    assert!(placement.above_ceiling.is_none());
-    assert!(placement.decision.rejected.iter().any(|rejection| {
-        rejection.executor_id == "bgsrv-ub"
-            && matches!(
-                rejection.reason,
-                PlacementRejectionReason::ExceedsMemoryCeiling { .. }
-            )
-    }));
-}
-
 /// Object authority names one machine, one request, and one connection
 /// generation, and only the runner closes it. Opening it at the claim left
 /// it open whenever the runner then failed to dispatch: the machine never
@@ -26830,6 +19727,7 @@ async fn a_claim_the_runner_never_grants_leaves_no_object_authority_behind() {
             None,
         )
         .expect("attach an enrolled machine");
+    orch.fleet.announce_room_for_test("remote", generation);
 
     let mut request = provenance_request();
     request.repository = RepositoryLocator::ScratchOnly {
@@ -27051,77 +19949,6 @@ async fn an_operation_right_after_its_grant_routes_to_the_granting_link() {
     .await;
 }
 
-/// cairn/5472's specimens: the capable machines had declined on provisioning
-/// holds, leaving one too small for the command as the only usable machine,
-/// and the pass placed it there at the clamp. The clamp is for a fleet with
-/// nowhere bigger to go; this one has a machine that only said "not yet", so
-/// the work waits for it.
-#[tokio::test]
-async fn work_too_big_for_the_only_usable_machine_waits_for_a_capable_one_that_declined() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let (pool, db, mut request) =
-        ceiling_fleet("ceiling-waits-on-decliner.db", 100 * GIB, 0.01, 60 * GIB).await;
-    request.repository = RepositoryLocator::ManagedObjects {
-        project_id: "p".into(),
-        repository_id: "repo".into(),
-        object_format: GitObjectFormat::Sha1,
-    };
-    let generation = pool.lock_connections()["bglab-mac"].generation;
-    let declined = HashMap::from([(
-        "bglab-mac".to_string(),
-        queue::EntryDecline {
-            generation,
-            reason: DeclineReason::ProjectProvisioning,
-            detail: Some("provisioning project p".into()),
-            disk: None,
-            at_unix_ms: unix_time_ms(),
-            condition: None,
-            backoff_ms: 0,
-            retry_after_unix_ms: 0,
-            room_seq: None,
-            superseded_at_unix_ms: None,
-        },
-    )]);
-    let plan = ReservationPlan::new(db, &request, None);
-    let policy = ActivePlacementPolicy::default_profile();
-
-    let selection = pool
-        .select_executor_once_with(
-            &request,
-            Some(&plan),
-            &policy,
-            &declined,
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .unwrap();
-    let Selection::Waiting { rejected } = selection else {
-        panic!("placed at the clamp while a capable machine had only declined");
-    };
-    assert!(rejected.iter().any(|rejection| {
-        rejection.executor_id == "bgsrv-ub"
-            && matches!(
-                rejection.reason,
-                PlacementRejectionReason::ExceedsMemoryCeiling { .. }
-            )
-    }));
-    assert!(rejected.iter().any(|rejection| {
-        rejection.executor_id == "bglab-mac"
-            && matches!(rejection.reason, PlacementRejectionReason::Declined { .. })
-    }));
-    let waiting =
-        wait_decision(&request, &policy, &rejected, &[], &[]).expect("the wait is recorded");
-    let PlacementOutcome::Waiting { diagnostic } = waiting.outcome else {
-        unreachable!("a memory wait is a waiting decision");
-    };
-    assert!(
-        diagnostic.contains("bgsrv-ub: its measured memory demand"),
-        "{diagnostic}"
-    );
-    assert!(diagnostic.contains("Waited on: bglab-mac"), "{diagnostic}");
-}
-
 /// A freshly attached machine on another platform has never been selected,
 /// which sorts it first on every tie, and its id sorts first too.
 #[tokio::test(flavor = "multi_thread")]
@@ -27158,80 +19985,12 @@ async fn a_thread_home_prefers_the_runners_platform_over_a_fresh_machine() {
     .await;
 }
 
-/// cairn/4931 review: a cold machine with a smaller budget than the home
-/// is never named as the place that can hold the work, and the pin holds
-/// at the clamp. Since cairn/6089 a borrowed process-tree total no longer
-/// decides any machine's fit (it grew with the width the measuring machine
-/// granted), so the cold machine's fit is unknown rather than a ceiling,
-/// and unknown is still not "can hold it".
-#[tokio::test]
-async fn a_smaller_cold_machine_is_never_named_as_able_to_hold_what_its_home_cannot() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let (pool, db, request) = ceiling_fleet_with(
-        "ceiling-smaller-cold.db",
-        Some(6 * GIB),
-        false,
-        0.01,
-        5 * GIB,
-    )
-    .await;
-    let request = pinned_to(request, "bgsrv-ub");
-    let plan = ReservationPlan::new(db, &request, None);
-
-    let placement = pool
-        .select_executor_once_with(
-            &request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .expect("no HomeCannotHold naming the smaller machine")
-        .placed()
-        .expect("the pin holds");
-    assert_eq!(placement.selected.executor_id, "bgsrv-ub");
-    assert!(!placement.decision.rejected.iter().any(|rejection| {
-        rejection.executor_id == "bglab-mac"
-            && matches!(
-                rejection.reason,
-                PlacementRejectionReason::ExceedsMemoryCeiling { .. }
-            )
-    }));
-    let above = placement.above_ceiling.unwrap();
-    assert!(!above.holdable_elsewhere && above.unknown_elsewhere);
-    assert!(above
-        .note()
-        .contains("no usable machine is known to hold it"));
-}
-
 /// A platform no test machine that means to lose is ever on by accident.
 fn another_platform() -> &'static str {
     match std::env::consts::OS {
         "windows" => "linux",
         _ => "windows",
     }
-}
-
-/// cairn/4931 specimen B, as placement sees it: a ~12 GiB home whose
-/// reservation cap is exactly the 8,282,086,656 bytes it once reported as a
-/// cargo test's requirement, a measured demand above that cap, and a second
-/// machine with room. `other_budget` sizes the second machine.
-async fn ceiling_fleet(
-    db_name: &str,
-    other_budget: u64,
-    other_cpu: f64,
-    other_available: u64,
-) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
-    ceiling_fleet_with(
-        db_name,
-        Some(other_budget),
-        true,
-        other_cpu,
-        other_available,
-    )
-    .await
 }
 
 async fn residency_stop_refusal(orch: &Orchestrator, cell: &PersistentCellState) -> String {

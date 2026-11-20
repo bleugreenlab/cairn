@@ -1,14 +1,15 @@
-//! Profile-store reads, memoized across placement passes.
+//! Profile-store reads, memoized across the times a request's needs are
+//! worked out.
 //!
-//! A request waiting for a machine is re-priced against every candidate on
-//! each placement pass, at least four times a second, and every pricing reads
-//! the same few rows: the command's resource and duration profiles in that
-//! machine's context, its suite's memory evidence, the context's contention
-//! curve, and the machine's recent outcomes of it. On 11-16 those point reads,
-//! repeated for every parked request against every machine, held twelve of
-//! the runner host's sixteen cores (cairn/7301). The rows change only when a
-//! run on some machine teaches the store something, so a pass that finds
-//! nothing new should read nothing.
+//! Working out what a waiting request needs on each machine it may run on
+//! reads the same few rows: the command's resource and duration profiles in
+//! that machine's context, its suite's memory evidence and the context's
+//! contention curve. On 11-16, when a per-request placement loop re-priced
+//! every parked request against every machine four times a second, those
+//! point reads held twelve of the runner host's sixteen cores (cairn/7301).
+//! The rows change only when a run on some machine teaches the store
+//! something, so working a need out again for an unchanged request should
+//! read nothing.
 //!
 //! Each loader names its lookup by its own arguments and asks [`Lookup`]
 //! first. A value is reused while the database instance's profile revision
@@ -178,6 +179,19 @@ pub(super) fn needs_stamp(db: &LocalDb, scopes: &[String]) -> NeedsStamp {
     }
 }
 
+/// Moves whenever a write may have changed some request's needs. The
+/// placement deadline task waits on it to work out again the needs of the
+/// waiting entries whose stamp moved, once per burst of writes: a watch
+/// keeps only the latest value, so writes that land while the task works
+/// fold into one more round.
+static NEEDS_MOVED: LazyLock<tokio::sync::watch::Sender<u64>> =
+    LazyLock::new(|| tokio::sync::watch::channel(0).0);
+
+/// A receiver that wakes when a profile write may have moved some needs.
+pub(super) fn needs_moved() -> tokio::sync::watch::Receiver<u64> {
+    NEEDS_MOVED.subscribe()
+}
+
 enum Taught {
     /// Anything may have changed: the default, which errs toward re-reading.
     Anything,
@@ -237,7 +251,9 @@ impl Drop for Writing {
                         .or_default() += 1;
                 }
             }
-            Taught::NoNeeds => {}
+            Taught::NoNeeds => return,
         }
+        drop(reads);
+        NEEDS_MOVED.send_modify(|moved| *moved = moved.wrapping_add(1));
     }
 }

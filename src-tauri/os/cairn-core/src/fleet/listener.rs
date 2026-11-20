@@ -544,6 +544,7 @@ impl Fleet {
                 record.unreturned_update = None;
             }
         }
+        self.dispatcher_attached(&executor_id, generation);
         self.connection_ready.notify_waiters();
         Ok(generation)
     }
@@ -729,6 +730,7 @@ impl Fleet {
                 sweep.released_offers.len()
             );
         }
+        self.dispatcher_detached(executor_id, generation, &sweep.released_offers);
         match origin {
             ExecutorDisconnectOrigin::RunnerInitiated => {
                 self.fail_calls_for_executor(executor_id, &diagnostic);
@@ -748,7 +750,6 @@ impl Fleet {
                 "the runner ended this machine's link on its own authority",
             );
         }
-        self.binding_changed.notify_waiters();
         self.connection_ready.notify_waiters();
     }
 

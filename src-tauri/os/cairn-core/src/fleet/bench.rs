@@ -1,13 +1,15 @@
 //! What waiting for a machine costs the runner, measured.
 //!
-//! Parks N requests on ten machines that decline every offer, through the
-//! same placement loop, offer path and frame handler the runner uses, and
-//! measures a window of real time: process CPU, placement passes, fit
-//! evaluations, offers, refusals and database statements. Two modes:
+//! Parks N requests on ten machines that announce room and decline every
+//! offer, through the same dispatcher, offer path and frame handler the runner
+//! uses, and measures a window of real time: process CPU, placement passes
+//! (the dispatcher's matches), fit evaluations, offers, refusals and database
+//! statements. A refusal stands under the room the machine announced, and no
+//! machine announces newer room here, so once every machine has refused every
+//! request nothing is placed again. Two modes:
 //!
 //! - silent: every link is kept fresh (its progress stamp moved, as a beat
-//!   would) and nothing new is posted, so nothing wakes placement or
-//!   supersedes a decline;
+//!   would) and nothing new is posted;
 //! - posting: every machine posts what a live executor does, through the
 //!   runner's own handlers: a sample twice a second, a snapshot every five
 //!   seconds and a beat every thirty.
@@ -100,7 +102,15 @@ fn fleet_of_machines(
         frames.push((id.clone(), receiver));
         connections.insert(id, entry);
     }
+    let generations: Vec<(String, u64)> = connections
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.generation))
+        .collect();
     *fleet.lock_connections() = connections;
+    // A real executor announces its room as it attaches.
+    for (id, generation) in generations {
+        fleet.announce_room_for_test(&id, generation);
+    }
     (fleet, frames)
 }
 
@@ -125,14 +135,14 @@ fn parked_request(n: usize, now: u64, identities: Identities) -> CellRequest {
     request
 }
 
-/// One request's wait, as `execute_entry` runs it: place, offer, and go
-/// round again on a decline.
+/// One request's wait, as `execute_entry` runs it: wait for the dispatcher to
+/// assign it a machine, offer it there, and wait again on a decline.
 async fn wait_for_a_machine(
     fleet: Fleet,
     db: Arc<cairn_db::storage::LocalDb>,
     request: CellRequest,
 ) {
-    let plan = ReservationPlan::new(db, &request, None);
+    let plan = Arc::new(ReservationPlan::new(db, &request, None));
     let policy = ActivePlacementPolicy::default_profile();
     let Ok((entry_id, _outcome)) = fleet.queue.enqueue(
         queue::NewEntry {
@@ -146,9 +156,14 @@ async fn wait_for_a_machine(
     ) else {
         return;
     };
+    let _joined = super::assignments::JoinedDispatcher {
+        pool: fleet.clone(),
+        entry_id: entry_id.clone(),
+    };
+    let mut deliveries = None;
     loop {
         let Ok(placement) = fleet
-            .select_executor(&request, Some(&plan), &policy, Some(&entry_id))
+            .await_assignment(&entry_id, &request, Some(&plan), &policy, &mut deliveries)
             .await
         else {
             return;
@@ -160,7 +175,13 @@ async fn wait_for_a_machine(
             attempt.learned_estimate = resolved.learned_estimate;
         }
         match fleet
-            .offer_once(&entry_id, &attempt, &placement.selected, &mut decision)
+            .offer_once(
+                &entry_id,
+                &attempt,
+                &placement.selected,
+                &mut decision,
+                placement.headroom,
+            )
             .await
         {
             OfferAnswer::Requeued => continue,
@@ -450,27 +471,42 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// Waits until every parked request has gone through `passes` more placement
-/// passes each.
-async fn passes_each(fleet: &Fleet, parked: usize, passes: u64) {
-    let from = fleet.placement_counters().totals().placement_passes;
-    until("placement passes", || {
-        fleet.placement_counters().totals().placement_passes >= from + parked as u64 * passes
-    })
-    .await;
+/// What the dispatcher has done so far, as one comparable value.
+fn work_done(fleet: &Fleet) -> (u64, u64, u64, u64, u64) {
+    let totals = fleet.placement_counters().totals();
+    (
+        totals.placement_passes,
+        totals.fit_evaluations,
+        totals.offers,
+        totals.refusals,
+        totals.needs_worked_out,
+    )
 }
 
-/// A parked request costs the profile store nothing, however many placement
-/// passes it goes through, while nothing its needs were derived from is
-/// written; and one command finishing works out that command's needs again
-/// and no other's. Each request runs its own command, so a read per request
-/// cannot hide behind one shared memo.
-///
-/// Statements are counted over a window far shorter than the profile reads'
-/// thirty-second memo, which ranking's duration, contention and reliability
-/// reads still go through: past it those are read again per request.
+/// Waits until the dispatcher's counters have stood still for half a second:
+/// every offer answered, every refusal recorded, nothing left to work out.
+async fn settled(fleet: &Fleet) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last = work_done(fleet);
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = work_done(fleet);
+        if now == last {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the dispatcher never settled");
+        last = now;
+    }
+}
+
+/// A parked request costs nothing while nothing it waits on moves: no
+/// placement work, no needs worked out, no statement read, with every machine
+/// posting samples. One command finishing (one profile write, so one
+/// publication of moved needs) works out that command's needs again, at most
+/// once per machine, and no other request's. Each request runs its own
+/// command, so a read per request cannot hide behind one shared memo.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn parked_passes_read_nothing_and_a_finish_redoes_only_its_own_needs() {
+async fn parked_requests_read_nothing_and_a_finish_redoes_only_its_own_needs() {
     const PARKED: usize = 20;
     let now = unix_time_ms();
     let db = Arc::new(crate::storage::migrated_test_db("parked-passes-read-nothing.db").await);
@@ -501,37 +537,41 @@ async fn parked_passes_read_nothing_and_a_finish_redoes_only_its_own_needs() {
         fleet.clone(),
         executor_ids.clone(),
     )));
-    let needs = || fleet.placement_counters().totals().needs_worked_out;
+    let totals = || fleet.placement_counters().totals();
 
-    // Parked: settled once a round of passes works nothing out.
-    loop {
-        let settled = needs();
-        passes_each(&fleet, PARKED, 4).await;
-        if needs() == settled {
-            break;
-        }
-    }
+    // Parked: every request has been offered and refused, and the dispatcher
+    // has nothing left to do.
+    until("every request to be offered", || {
+        totals().offers >= PARKED as u64
+    })
+    .await;
+    settled(&fleet).await;
     assert!(
-        needs() >= PARKED as u64,
-        "every request's needs were worked out when it was first placed"
+        totals().needs_worked_out >= PARKED as u64,
+        "every request's needs were worked out when it joined"
     );
 
-    // Waiting: passes go on, and neither needs nor statements are paid for.
-    let (needs_before, statements_before) = (needs(), db.read_statement_count());
-    passes_each(&fleet, PARKED, 10).await;
+    // Waiting: samples go on, and a parked request costs nothing at all.
+    let (before, statements_before) = (totals(), db.read_statement_count());
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let waited = totals().since(before);
     assert_eq!(
-        needs() - needs_before,
-        0,
-        "a pass that learned nothing works nothing out"
+        (
+            waited.placement_passes,
+            waited.fit_evaluations,
+            waited.needs_worked_out
+        ),
+        (0, 0, 0),
+        "a parked request is not placed again while nothing it waits on moves"
     );
     assert_eq!(
         db.read_statement_count() - statements_before,
         0,
-        "a pass that learned nothing reads nothing"
+        "a parked request reads nothing"
     );
 
     // One command finishes on one machine: only its request's needs are
-    // worked out again, once on each machine it is placed against.
+    // worked out again, once on each machine it may run on.
     let finished = fleet
         .lock_connections()
         .get(&executor_ids[0])
@@ -543,19 +583,29 @@ async fn parked_passes_read_nothing_and_a_finish_redoes_only_its_own_needs() {
             )
         })
         .unwrap();
-    let needs_before = needs();
-    resource_profiles::seed_memory_profile_for_test(
+    let before = totals();
+    resource_profiles::record_completion_for_test(
         db.clone(),
         requests[0].command_resource_identity.as_ref().unwrap(),
         &finished,
         6 * GIB,
     )
     .await;
-    passes_each(&fleet, PARKED, 10).await;
-    let redone = needs() - needs_before;
+    until(
+        "the finished command's needs to be worked out again",
+        || totals().needs_worked_out > before.needs_worked_out,
+    )
+    .await;
+    settled(&fleet).await;
+    let redone = totals().since(before);
     assert!(
-        (1..=MACHINES as u64).contains(&redone),
-        "one finish redoes one request's needs, at most once per machine; redone {redone}"
+        (1..=MACHINES as u64).contains(&redone.needs_worked_out),
+        "one finish redoes one request's needs, at most once per machine; redone {}",
+        redone.needs_worked_out
+    );
+    assert_eq!(
+        redone.offers, 0,
+        "every machine refused it under the room it still announces, so nothing is offered"
     );
 
     let ended = waits.iter().filter(|wait| wait.is_finished()).count();

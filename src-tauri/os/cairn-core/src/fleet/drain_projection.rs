@@ -459,7 +459,9 @@ impl Fleet {
                 });
             }
         }
+        drop(connections);
         self.connection_ready.notify_waiters();
+        self.machine_facts_posted_all();
     }
 
     #[cfg(test)]
@@ -636,39 +638,6 @@ mod tests {
             fleet.lift_admission_fence(&fence);
             assert_eq!(last_drain(&mut inbox), Some(false));
         }
-    }
-
-    #[test]
-    fn drain_wait_diagnostics_name_the_public_machine_not_its_opaque_identity() {
-        let request = super::super::tests::targeted_request("macos");
-        let decision = wait_decision(
-            &request,
-            &ActivePlacementPolicy::default_profile(),
-            &[PlacementRejection {
-                unreadable_memory: Vec::new(),
-                executor_id: "private-executor-id".into(),
-                executor_name: "public-machine".into(),
-                reason: PlacementRejectionReason::Drained,
-                prediction: None,
-                drain_blockers: vec![DrainBlocker {
-                    owner: "operator".into(),
-                    reason: "storage repair".into(),
-                    generation: 3,
-                    incarnation: None,
-                    estimate: None,
-                    admission_effect: Default::default(),
-                }],
-            }],
-            &[],
-            &[],
-        )
-        .unwrap();
-        let PlacementOutcome::Waiting { diagnostic } = decision.outcome else {
-            panic!("a drain records a waiting decision");
-        };
-        assert!(diagnostic.contains("public-machine"));
-        assert!(diagnostic.contains("operator generation 3: storage repair"));
-        assert!(!diagnostic.contains("private-executor-id"));
     }
 
     #[test]

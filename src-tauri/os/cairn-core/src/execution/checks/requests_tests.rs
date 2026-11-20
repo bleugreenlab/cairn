@@ -927,7 +927,7 @@ fn a_filed_request_places_one_lane_and_survives_a_restart_before_its_grant() {
         // never claims it.
         let first = runner("search-1");
         let (sender, mut machine) = tokio::sync::mpsc::unbounded_channel();
-        first.fleet.attach_executor(sender);
+        first.fleet.attach_announced_executor(sender);
         let filed = file_check_request(&first, spec("unit", Some("main")))
             .await
             .unwrap();
@@ -972,7 +972,7 @@ fn a_filed_request_places_one_lane_and_survives_a_restart_before_its_grant() {
         drop(machine);
         let second = runner("search-2");
         let (sender, mut machine) = tokio::sync::mpsc::unbounded_channel();
-        let generation = second.fleet.attach_executor(sender);
+        let generation = second.fleet.attach_announced_executor(sender);
         let fleet = second.fleet.clone();
         let executor = tokio::spawn(async move {
             let entry_id = loop {
@@ -1192,7 +1192,7 @@ fn a_threads_request_records_a_verdict_in_the_ledger() {
         .jj_binary_path(bin.clone())
         .build();
         let (sender, mut machine) = tokio::sync::mpsc::unbounded_channel();
-        let generation = orch.fleet.attach_executor(sender);
+        let generation = orch.fleet.attach_announced_executor(sender);
         let fleet = orch.fleet.clone();
         let executor = tokio::spawn(async move {
             let entry_id = loop {

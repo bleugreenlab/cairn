@@ -1077,8 +1077,6 @@ async fn the_write_wave_board_feeds_its_dispatch_to_the_inline_wait() {
                 reason: cairn_common::executor_protocol::DeclineReason::Pressure,
                 detail: Some("cpu 97%".into()),
                 at_unix_ms: PARKED_AT + 1_000,
-                superseded_at_unix_ms: None,
-                retry_after_unix_ms: PARKED_AT + 2_000,
                 room_seq: None,
             }],
         },
@@ -7101,8 +7099,6 @@ fn a_parked_check_names_the_machines_that_declined_it() {
                 reason: cairn_common::executor_protocol::DeclineReason::Disk,
                 detail: Some("12 GiB free, floor 20 GiB".into()),
                 at_unix_ms: PARKED_AT + 1_000,
-                superseded_at_unix_ms: None,
-                retry_after_unix_ms: PARKED_AT + 2_000,
                 room_seq: None,
             }],
         },
@@ -7120,66 +7116,105 @@ fn a_parked_check_names_the_machines_that_declined_it() {
     );
 }
 
-/// Every machine of the latest pass is named with what actually happened
-/// to it, past any count: machines the runner excluded before an offer
-/// are not offered, never declined; a superseded decline says so; and a
-/// decline the pass did not consider is still told.
+/// Every machine of a queued check is named with where it stands, past any
+/// count, in one sentence form each: the machine's own refusal with the
+/// room it came under; a room that fits nothing, with what it is short of;
+/// a machine that refused twice under its room, waiting for it to announce;
+/// a machine that has said nothing yet, never read as having no room; a
+/// stale link; a machine away for now; a hold; a refusal superseded by a
+/// newer room, never told as the reason now; and a decline from a machine
+/// the account no longer names.
 #[test]
-fn a_parked_check_names_every_machine_of_its_latest_placement_pass() {
+fn a_parked_check_names_where_it_stands_with_every_machine() {
     use crate::fleet::{
-        CheckCandidateStatus, CheckDispatchDecline, CheckPlacementCandidate, CheckPlacementPass,
+        CheckCandidateStatus, CheckDispatchDecline, CheckPlacementAccount, CheckPlacementCandidate,
+        SupersededDecline,
     };
     use cairn_common::executor_protocol::{DeclineReason, PlacementRejectionReason};
     let mut narrator = DispatchNarrator::new(
         GroupWait::from_occupancy(crate::fleet::occupancy::MachineOccupancy::Idle),
         PARKED_AT,
     );
-    let decline = |name: &str, superseded_at_unix_ms| CheckDispatchDecline {
+    let decline = |name: &str, room_seq| CheckDispatchDecline {
         executor_name: name.into(),
         reason: DeclineReason::Pressure,
         detail: Some("memory short".into()),
         at_unix_ms: PARKED_AT + 1_000,
-        superseded_at_unix_ms,
-        retry_after_unix_ms: PARKED_AT + 5_000,
-        room_seq: None,
+        room_seq,
     };
-    let ceiling = |estimate_bytes| {
-        CheckCandidateStatus::NotOffered(PlacementRejectionReason::ExceedsMemoryCeiling {
-            estimate_bytes,
-            ceiling_bytes: 72_215_848_550,
-            killed_here: None,
-        })
+    let ceiling = |estimate_bytes| PlacementRejectionReason::ExceedsMemoryCeiling {
+        estimate_bytes,
+        ceiling_bytes: 72_215_848_550,
+        killed_here: None,
     };
-    let candidate = |name: &str, status| CheckPlacementCandidate {
+    let machine = |name: &str, status| CheckPlacementCandidate {
         unreadable_memory: Vec::new(),
         executor_name: name.into(),
         status,
+        superseded: None,
     };
-    let pass = CheckPlacementPass {
+    let account = CheckPlacementAccount {
         request_id: "d9e55c03".into(),
         attempt_id: "3e18a12d".into(),
-        decided_at_unix_ms: PARKED_AT + 3_000,
-        candidates: vec![
-            candidate("bginf-sp1", ceiling(73_152_409_600)),
-            candidate("bginf-sp2", ceiling(72_489_070_720)),
-            candidate(
+        machines: vec![
+            machine(
+                "bginf-sp1",
+                CheckCandidateStatus::NotOffered(ceiling(73_152_409_600)),
+            ),
+            machine(
+                "bginf-sp2",
+                CheckCandidateStatus::NotOffered(ceiling(72_489_070_720)),
+            ),
+            machine(
                 "fedora",
-                CheckCandidateStatus::Declined(decline("fedora", None)),
+                CheckCandidateStatus::Declined(decline("fedora", Some(41))),
             ),
-            candidate(
+            machine(
                 "bbs",
-                CheckCandidateStatus::Declined(decline("bbs", Some(PARKED_AT + 4_000))),
+                CheckCandidateStatus::NoRoomFits {
+                    needs: "8 unit(s), 2 of 16 free".into(),
+                    room_seq: 7,
+                    since_unix_ms: PARKED_AT + 2_000,
+                },
             ),
-            candidate("mac", CheckCandidateStatus::Outranked { by: "win".into() }),
-            candidate("win", CheckCandidateStatus::Offered),
-            candidate(
+            machine(
+                "refuser",
+                CheckCandidateStatus::RefusedTwice { room_seq: 12 },
+            ),
+            machine(
+                "mac",
+                CheckCandidateStatus::RoomNotAnnounced {
+                    attached_at_unix_ms: Some(PARKED_AT + 1_000),
+                },
+            ),
+            machine(
+                "lab",
+                CheckCandidateStatus::LinkStale {
+                    since_unix_ms: PARKED_AT,
+                },
+            ),
+            machine(
                 "inf-1",
-                CheckCandidateStatus::NotOffered(PlacementRejectionReason::Drained),
+                CheckCandidateStatus::Away {
+                    reason: PlacementRejectionReason::Drained,
+                    sentence: "inf-1 drained, refusing new work".into(),
+                },
             ),
-            candidate(
-                "inf-2",
-                CheckCandidateStatus::NotOffered(PlacementRejectionReason::Drained),
+            machine("win", CheckCandidateStatus::Offered),
+            machine(
+                "spark",
+                CheckCandidateStatus::HoldingRoom {
+                    room_seq: 3,
+                    hold: Some("8 unit(s), 16.0 GiB memory, 0.0 GiB disk, protected".into()),
+                },
             ),
+            CheckPlacementCandidate {
+                superseded: Some(SupersededDecline {
+                    decline: decline("old", Some(8)),
+                    current_seq: Some(9),
+                }),
+                ..machine("old", CheckCandidateStatus::Fits { room_seq: 9 })
+            },
         ],
     };
     let dispatch = crate::fleet::CheckDispatch {
@@ -7187,11 +7222,11 @@ fn a_parked_check_names_every_machine_of_its_latest_placement_pass() {
             since_unix_ms: PARKED_AT,
             turn: None,
             declines: vec![
-                decline("fedora", None),
-                decline("bbs", Some(PARKED_AT + 4_000)),
+                decline("fedora", Some(41)),
+                decline("old", Some(8)),
                 decline("gone", None),
             ],
-            placement: Some(pass),
+            placement: Some(account),
         },
         joined: None,
     };
@@ -7200,30 +7235,24 @@ fn a_parked_check_names_every_machine_of_its_latest_placement_pass() {
     assert_eq!(
         held_by,
         format!(
-            "latest placement pass 09:48:03Z (request d9e55c03, attempt 3e18a12d): \
+            "placement of request d9e55c03 (attempt 3e18a12d): \
              offered to win, unanswered; \
-             declined by fedora (host pressure: memory short), \
-             bbs (host pressure: memory short; its posted state changed at 09:48:04Z, offerable again from 09:48:05Z); \
-             eligible, not chosen: mac (outranked by win); \
+             declined by fedora (host pressure: memory short; under its room #41); \
+             bbs: no announced room fits: needs 8 unit(s), 2 of 16 free (room #7, since 09:48:02Z); \
+             refuser refused twice under its current room #12; waiting for it to announce; \
+             mac has not announced room (attached 09:48:01Z); \
+             lab: link stale since 09:48:00Z; \
+             away for now: inf-1 drained, refusing new work; \
+             spark holding room for it (8 unit(s), 16.0 GiB memory, 0.0 GiB disk, protected; room #3); \
+             old: its room #9 fits; offered on its next announcement; \
              not offered to bginf-sp1 ({}); \
              not offered to bginf-sp2 ({}); \
-             not offered to inf-1, inf-2 (drained, refusing new work); \
+             superseded refusals: old (host pressure: memory short; under its room #8), room #9 announced since; \
              earlier declined by gone (host pressure: memory short)",
-            PlacementRejectionReason::ExceedsMemoryCeiling {
-                estimate_bytes: 73_152_409_600,
-                ceiling_bytes: 72_215_848_550,
-                killed_here: None,
-            }
-            .describe(),
-            PlacementRejectionReason::ExceedsMemoryCeiling {
-                estimate_bytes: 72_489_070_720,
-                ceiling_bytes: 72_215_848_550,
-                killed_here: None,
-            }
-            .describe(),
+            ceiling(73_152_409_600).describe(),
+            ceiling(72_489_070_720).describe(),
         )
     );
-    assert!(!held_by.contains("more"), "{held_by}");
     assert!(
         status
             .diagnostic
@@ -7232,15 +7261,18 @@ fn a_parked_check_names_every_machine_of_its_latest_placement_pass() {
             .ends_with(&format!("; parked since 09:48:00Z; {held_by}")),
         "{status:?}"
     );
+    // Read again later with nothing changed, it is the same line: the board
+    // is not rewritten.
+    assert!(narrator.next(&dispatch, PARKED_AT + 6_000).is_some());
+    assert_eq!(narrator.next(&dispatch, PARKED_AT + 600_000), None);
 }
 
 #[test]
 fn a_check_wait_names_unreadable_memory_evidence() {
-    let pass = crate::fleet::CheckPlacementPass {
+    let account = crate::fleet::CheckPlacementAccount {
         request_id: "request".into(),
         attempt_id: "attempt".into(),
-        decided_at_unix_ms: 1,
-        candidates: vec![crate::fleet::CheckPlacementCandidate {
+        machines: vec![crate::fleet::CheckPlacementCandidate {
             executor_name: "spark".into(),
             status: crate::fleet::CheckCandidateStatus::NotOffered(
                 cairn_common::executor_protocol::PlacementRejectionReason::Drained,
@@ -7250,9 +7282,10 @@ fn a_check_wait_names_unreadable_memory_evidence() {
                 error_class: "schema".into(),
                 error: "no such column: job_census_samples".into(),
             }],
+            superseded: None,
         }],
     };
-    let line = describe_placement_pass(&pass, &[]);
+    let line = describe_placement_account(&account, &[]);
     assert!(line.contains("not offered to spark (drained"), "{line}");
     assert!(
         line.contains("spark: memory evidence unreadable: suite_evidence (schema:"),

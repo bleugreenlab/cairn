@@ -713,8 +713,8 @@ impl PurposeRegistry {
     /// Every item that is the live answer to a main-cadence question, keyed by
     /// its request identity.
     ///
-    /// These are the lanes that hold precedence for a machine's freed room
-    /// (see `queue::ExecutionQueue::ahead_for_room`). A lane is live here only
+    /// These are the dispatcher's standing work, which a machine's room walks
+    /// ahead of every other waiting entry. A lane is live here only
     /// because the cadence's own ledger read found no complete row for its tip
     /// before dispatching it (`checks_main::attempt_lane`; a covered tip is
     /// answered without a run), and a key has at most one live item, so this

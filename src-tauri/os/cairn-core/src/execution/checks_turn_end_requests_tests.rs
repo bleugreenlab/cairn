@@ -250,7 +250,7 @@ async fn each_missed_suite_is_its_own_request_recorded_as_it_settles_and_deliver
     // answers every suite at once except beta, whose result it holds until
     // the test releases it.
     let (sender, mut executor) = mpsc::unbounded_channel();
-    let generation = orch.fleet.attach_executor(sender);
+    let generation = orch.fleet.attach_announced_executor(sender);
     let fleet = orch.fleet.clone();
     let (grants_tx, mut grants) = mpsc::unbounded_channel::<Grant>();
     let (release_held, held_released) = oneshot::channel::<()>();

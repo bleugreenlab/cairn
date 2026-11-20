@@ -464,7 +464,6 @@ impl Drop for EntryDropGuard {
             ),
         };
         self.pool.queue.withdraw(&identity, cause, unix_time_ms());
-        self.pool.binding_changed.notify_waiters();
         if let Some(stopped_at) = stopped_at {
             if self.granted_to.is_some() && self.pool.check_shutdown(&identity, stopped_at) {
                 return;
@@ -636,7 +635,6 @@ impl Fleet {
                 if !direct {
                     self.acknowledge_settled_result(executor_id, &key);
                 }
-                self.binding_changed.notify_waiters();
                 false
             }
             ExecutorMessage::TransfersReauthorized {
@@ -662,18 +660,17 @@ impl Fleet {
             // A machine takes responsibility for an entry it was offered. This
             // is the moment work binds; the placement pass waiting on the entry
             // sees the transition and sends the grant.
-            ExecutorMessage::HeadroomReleased { entry_id } => {
-                self.queue
-                    .headroom_released(&entry_id, executor_id, generation);
-                self.connection_ready.notify_waiters();
-                false
-            }
+            // The dispatcher forgets a hold when it sends the release, so the
+            // acknowledgement has nothing left to finish.
+            ExecutorMessage::HeadroomReleased { .. } => false,
             ExecutorMessage::Claim { entry_id } => {
                 match self
                     .queue
                     .claim(&entry_id, executor_id, generation, unix_time_ms())
                 {
-                    queue::ClaimVerdict::Granted => {}
+                    queue::ClaimVerdict::Granted => {
+                        self.dispatcher_claimed(&entry_id, executor_id);
+                    }
                     // The entry moved on while this claim was in flight. Say so,
                     // so the machine releases the ticket it is holding: nothing
                     // was granted, so there is nothing to cancel.
@@ -685,7 +682,6 @@ impl Fleet {
                         );
                     }
                 }
-                self.binding_changed.notify_waiters();
                 false
             }
             // A truthful refusal. The entry returns to the queue and routes to
@@ -711,30 +707,9 @@ impl Fleet {
                         .map(|disk| format!("; {}", queue::disk_decline_summary(disk)))
                         .unwrap_or_default()
                 );
-                // What the machine has posted that explains this reason, so the
-                // decline stands until that changes rather than until the
-                // machine posts anything at all.
-                let condition =
-                    self.posted_state(executor_id)
-                        .and_then(|(snapshot, health, colocated)| {
-                            self.queue
-                                .with_entry(&entry_id, |entry| {
-                                    decline_condition::posted_condition(
-                                        reason,
-                                        &entry.admission_view(),
-                                        &entry.request,
-                                        decline_condition::PostedState {
-                                            snapshot: &snapshot,
-                                            health: &health,
-                                            colocated,
-                                        },
-                                    )
-                                })
-                                .flatten()
-                        });
-                // A parked request is re-asked whenever the condition behind
-                // its decline changes, so the same answer can come back for as
-                // long as a hold lasts. The first answer of a kind is the news;
+                // A parked request is re-asked when the machine announces newer
+                // room, so the same answer can come back for as long as a hold
+                // lasts. The first answer of a kind is the news;
                 // its repeats are folded into the entry's recorded decline and
                 // logged quietly.
                 let recorded = self.queue.decline(
@@ -744,7 +719,6 @@ impl Fleet {
                     reason,
                     detail,
                     disk,
-                    condition,
                     unix_time_ms(),
                 );
                 match recorded {
@@ -764,8 +738,8 @@ impl Fleet {
                         self.queue
                             .note_decline_room(&entry_id, executor_id, room_seq);
                     }
+                    self.dispatcher_declined(&entry_id, executor_id);
                 }
-                self.binding_changed.notify_waiters();
                 false
             }
             ExecutorMessage::ResidencyResponse {
@@ -905,24 +879,14 @@ impl Fleet {
                 // off the executor's own beat rather than a runner-side timer is
                 // what lets both sides size the reap window from one constant.
                 self.report_waiting_requests(executor_id, generation);
-                let updated = self.update_advertisement_and_health(
+                self.update_advertisement_and_health(
                     executor_id,
                     generation,
                     advertisement,
                     health,
                     last_update,
                     machine,
-                );
-                // A beat is posted state too, and the floor under a decline
-                // nothing posted explains: an executor whose release of a hold
-                // published nothing (an older build, or a path that changes no
-                // snapshot) still makes those decliners offerable within one
-                // beat, so a request parked on a horizon it may never reach is
-                // not parked forever.
-                if let Some((snapshot, health, _)) = self.posted_state(executor_id) {
-                    self.supersede_declines(executor_id, &snapshot, &health);
-                }
-                updated
+                )
             }
             ExecutorMessage::AdvertisementUpdated { advertisement } => {
                 self.update_advertisement(executor_id, generation, advertisement)
@@ -938,7 +902,7 @@ impl Fleet {
                 self.record_machine_sample(executor_id, generation, sample);
                 false
             }
-            // Recorded and shown; nothing places by it yet (cairn/7303).
+            // What the dispatcher places by (cairn/7303).
             ExecutorMessage::Room { seq, room } => {
                 self.record_room(executor_id, generation, seq, room);
                 false
@@ -1221,19 +1185,10 @@ impl Fleet {
         identity: &RequestIdentity,
     ) -> Option<(CheckDispatchPhase, Option<String>)> {
         let queued = self.queue.with_entry_by_identity(identity, |entry| {
-            let declines: Vec<_> = entry
-                .declined
-                .iter()
-                .map(|(executor_id, decline)| (executor_id.clone(), decline.clone()))
-                .collect();
-            let waited_behind = entry
-                .latest_placement()
-                .filter(|decision| matches!(decision.outcome, PlacementOutcome::Waiting { .. }))
-                .and_then(|decision| describe_cadence_turns(&decision.rejected));
             (
                 entry.state.clone(),
                 entry.queued_at_unix_ms(),
-                (declines, waited_behind, check_placement_pass(entry)),
+                (entry.id.clone(), entry.declined.clone()),
                 entry
                     .request
                     .owner
@@ -1258,18 +1213,13 @@ impl Fleet {
                 },
                 owner,
             ),
-            Some((_, since_unix_ms, (raw_declines, waited_behind, placement), owner)) => {
-                let takes_room_on = self.room_taken_first_on(identity, unix_time_ms());
-                let cadence = if takes_room_on.is_empty() {
-                    waited_behind
-                } else {
-                    Some(describe_room_taken_first(&takes_room_on))
-                };
-                let turn = match (self.headroom_status(identity, unix_time_ms()), cadence) {
-                    (Some((_, hold)), Some(cadence)) => Some(format!("{hold}; {cadence}")),
-                    (Some((_, hold)), None) => Some(hold),
-                    (None, cadence) => cadence,
-                };
+            Some((state, since_unix_ms, (entry_id, raw_declines), owner)) => {
+                let now = unix_time_ms();
+                let placement =
+                    self.placement_account(&entry_id, &raw_declines, state.executor_id(), now);
+                let takes_room_on = self.room_taken_first_on(identity, now);
+                let turn =
+                    (!takes_room_on.is_empty()).then(|| describe_room_taken_first(&takes_room_on));
                 let mut declines: Vec<_> = raw_declines
                     .into_iter()
                     .map(|(executor_id, decline)| {
@@ -3671,6 +3621,12 @@ impl Fleet {
             cause: None,
             armed: true,
         };
+        let plan = Arc::new(plan);
+        let _joined = assignments::JoinedDispatcher {
+            pool: self.clone(),
+            entry_id: entry_id.clone(),
+        };
+        let mut deliveries = None;
         // Offer, and let the machine answer from its own live facts. A decline
         // is routing information rather than a failure: the entry comes back
         // around this loop to the next candidate, having never been parked.
@@ -3683,6 +3639,7 @@ impl Fleet {
                 reservation,
                 mut decision,
                 above_ceiling,
+                headroom,
             } = match tokio::select! {
                 biased;
                 stopped_at = self.runner_stop.stopped() => {
@@ -3698,7 +3655,6 @@ impl Fleet {
                         "withdrawn: retired before any machine claimed it".into(),
                         unix_time_ms(),
                     );
-                    self.binding_changed.notify_waiters();
                     guard.disarm();
                     return CellOutcome::Cancelled {
                         request_id: key.0.clone(),
@@ -3706,12 +3662,13 @@ impl Fleet {
                     }
                     .into();
                 }
-                selection = off_frame(|| self.select_executor(
+                selection = self.await_assignment(
+                    &entry_id,
                     &request,
                     Some(&plan),
                     &placement_policy,
-                    Some(&entry_id),
-                )) => selection,
+                    &mut deliveries,
+                ) => selection,
             } {
                 Ok(placement) => placement,
                 Err(outcome) => {
@@ -3771,7 +3728,6 @@ impl Fleet {
                         "withdrawn: retired while offered, before any grant".into(),
                         unix_time_ms(),
                     );
-                    self.binding_changed.notify_waiters();
                     guard.disarm();
                     withdraw_claim(&selected, &entry_id);
                     return CellOutcome::Cancelled {
@@ -3785,6 +3741,7 @@ impl Fleet {
                     &attempt_request,
                     &selected,
                     &mut decision,
+                    headroom,
                 ) => answer,
             };
             match answer {
@@ -4651,7 +4608,6 @@ impl Fleet {
         {
             entry.witnessed_grants.retain(|key| !absent.contains(key));
         }
-        self.binding_changed.notify_waiters();
     }
 
     /// Settle work held across a gap against what the machine says it has.
@@ -4748,7 +4704,6 @@ impl Fleet {
                 );
             }
         }
-        self.binding_changed.notify_waiters();
     }
 
     /// Give up on everything a machine holds, because its enrollment is gone.
@@ -4787,7 +4742,6 @@ impl Fleet {
         // those whose attempts nothing waits on any more and the ones a
         // previous runner process left.
         self.settle_purpose_debts_for_lost_machine(executor_id, diagnostic);
-        self.binding_changed.notify_waiters();
     }
 
     /// Resolve the calls whose answers were in flight when the link went.

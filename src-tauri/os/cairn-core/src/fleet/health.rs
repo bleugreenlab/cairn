@@ -107,9 +107,9 @@ impl Fleet {
     }
 
     /// Hold the room an executor announced (cairn/7303): shown on its page,
-    /// and what the room-driven dispatcher will place by. A frame from a
-    /// replaced link, or one no newer than the room already held, changes
-    /// nothing.
+    /// and handed to the dispatcher, which walks the entries that may run
+    /// there. A frame from a replaced link, or one no newer than the room
+    /// already held, changes nothing.
     pub fn record_room(
         &self,
         executor_id: &str,
@@ -132,9 +132,10 @@ impl Fleet {
             cairn_common::executor_protocol::RoomAnnouncement {
                 seq,
                 received_at_unix_ms: unix_time_ms(),
-                room,
+                room: room.clone(),
             },
         ));
+        self.dispatcher_room(&connections, executor_id, generation, seq, room);
     }
 
     /// Adopt a machine sample into this connection's posted health.
@@ -142,10 +143,9 @@ impl Fleet {
     /// Only the readings in it move. Cells, queues, reservations, and the rest
     /// of the posted health stay as the last snapshot or beat left them, and
     /// may be minutes older; the executor page already says so when they are.
-    /// A reading that advanced is new posted state, so declines it no longer
-    /// bears out are superseded and placement is woken: that is how a machine
-    /// whose brake read blind becomes placeable again one sample after its
-    /// readings resume, rather than at the next beat.
+    /// A sample never wakes placement: what a machine has room for arrives in
+    /// its own announcement (cairn/7303), which its executor sends when the
+    /// room moves.
     ///
     /// Link progress is deliberately not stamped. The beat stamps it, and what
     /// reads it judges whether the machine is accounting for its work, which a
@@ -158,7 +158,7 @@ impl Fleet {
         generation: u64,
         sample: MachineSample,
     ) -> bool {
-        let posted = {
+        {
             let mut connections = self.lock_connections();
             let Some(entry) = connections
                 .get_mut(executor_id)
@@ -168,14 +168,8 @@ impl Fleet {
             };
             entry.publishes_machine_samples = true;
             entry.live_usage.adopt(&sample.live_usage);
-            if !Arc::make_mut(&mut entry.health).adopt_newer_readings(&sample) {
-                return true;
-            }
-            (entry.snapshot.clone(), entry.health.clone())
-        };
-        let (snapshot, health) = posted;
-        self.supersede_declines(executor_id, &snapshot, &health);
-        self.connection_ready.notify_waiters();
+            Arc::make_mut(&mut entry.health).adopt_newer_readings(&sample);
+        }
         true
     }
 
@@ -211,7 +205,7 @@ impl Fleet {
                 replicas,
             });
         }
-        self.connection_ready.notify_waiters();
+        self.machine_facts_posted(executor_id);
         true
     }
 
@@ -247,8 +241,6 @@ impl Fleet {
                 if whole {
                     entry.warm_roots_resync_requested = false;
                 }
-                drop(connections);
-                self.connection_ready.notify_waiters();
             }
             warm_roots::WarmRootApply::Stale => {
                 log::debug!(
@@ -320,61 +312,7 @@ impl Fleet {
             first_of_connection,
             &snapshot,
         );
-        // New posted state is what makes reconsidering a machine that declined
-        // meaningful, but only state that bears on the reason it gave: a
-        // snapshot whose free-disk figure moved says nothing new about a CPU
-        // verdict, and treating it as if it did is the offer-and-decline loop
-        // this guards against.
-        self.supersede_declines(executor_id, &snapshot, &health);
         self.set_executor_snapshot(executor_id, generation, snapshot, health)
-    }
-
-    /// This connection's latest posted snapshot and health, shared, and
-    /// whether it is the colocated machine.
-    pub(super) fn posted_state(
-        &self,
-        executor_id: &str,
-    ) -> Option<(Arc<FleetSnapshot>, Arc<ExecutorSubstrateReport>, bool)> {
-        self.lock_connections().get(executor_id).map(|entry| {
-            (
-                entry.snapshot.clone(),
-                entry.health.clone(),
-                entry.colocated,
-            )
-        })
-    }
-
-    /// Supersede this machine's declines whose reason the posted state no
-    /// longer bears out, and wake placement if any were.
-    ///
-    /// A decline with no recorded condition is tied to nothing the machine
-    /// posts, so any post supersedes it. The queue's re-offer backoff still
-    /// bounds how soon either kind can be asked again.
-    pub(super) fn supersede_declines(
-        &self,
-        executor_id: &str,
-        snapshot: &FleetSnapshot,
-        health: &ExecutorSubstrateReport,
-    ) {
-        let colocated = self
-            .lock_connections()
-            .get(executor_id)
-            .is_some_and(|entry| entry.colocated);
-        let machine = decline_condition::PostedState {
-            snapshot,
-            health,
-            colocated,
-        };
-        let superseded = self.queue.supersede_declines_for(
-            executor_id,
-            unix_time_ms(),
-            |request, view, decline| {
-                decline_condition::still_posted(decline, view, request, machine)
-            },
-        );
-        if superseded {
-            self.connection_ready.notify_waiters();
-        }
     }
 
     /// Store a snapshot as this connection's posted state, and nothing else.
@@ -565,7 +503,7 @@ impl Fleet {
             self.end_relay_of_exited_process(executor_id, &event);
             self.publish_resident_process_event(event);
         }
-        self.connection_ready.notify_waiters();
+        self.machine_facts_posted(executor_id);
         snapshot_changed
     }
 

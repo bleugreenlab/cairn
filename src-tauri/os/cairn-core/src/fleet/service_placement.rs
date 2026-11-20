@@ -1085,6 +1085,17 @@ pub(crate) mod tests {
         // executor advertises from its first frame.
         let attached = fleet.attach_executor_with_toolchains(sender, &["bun"]);
         generation.store(attached, Ordering::Release);
+        // The room its own admission leaves, as the executor binary announces
+        // it once the link opens: placement happens only against it.
+        let room_fleet = fleet.clone();
+        pool.spawn_room_publisher(move |seq, room| {
+            room_fleet.handle_executor_message(
+                EXECUTOR_ID,
+                attached,
+                ExecutorMessage::Room { seq, room },
+            );
+            true
+        });
         tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 match message {

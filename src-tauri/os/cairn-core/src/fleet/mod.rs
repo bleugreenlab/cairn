@@ -4,13 +4,14 @@
 //! the cached UI snapshot. Scheduling, workspaces, processes, cancellation, and
 //! mutation sealing exist only in the executor process.
 
+mod assignments;
 mod check_adoptions;
 pub(crate) use check_adoptions::{CheckConsumerGuard, RETAINED_RESULT_RETRY};
 mod coalescing;
 pub(crate) mod counters;
+mod dispatcher;
 mod drain_projection;
 pub use drain_projection::AdmissionFenceToken;
-pub(crate) mod decline_condition;
 pub(crate) mod inference;
 pub mod initialization;
 pub(crate) mod learned_requirements;
@@ -27,7 +28,6 @@ pub(crate) mod placement;
 pub(crate) mod placement_default;
 pub mod pools;
 pub(crate) mod preparation;
-mod pricing;
 mod profile_reads;
 pub(crate) mod purpose;
 pub(crate) mod queue;
@@ -51,40 +51,35 @@ pub use cairn_config::fleet::*;
 use crate::mcp::handlers::run::{ResolvedRunBatch, RunSpec};
 use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::needs_build_volume;
-use cairn_common::executor_protocol::DiskHealthStatus;
 use cairn_common::executor_protocol::MachineSample;
 pub(crate) use cairn_common::executor_protocol::PublicationCustody;
 use cairn_common::executor_protocol::SandboxCapabilityEvidence;
-use cairn_common::executor_protocol::StallInstrumentState;
-#[cfg(test)]
-use cairn_common::executor_protocol::MACHINE_SAMPLE_BLIND_AFTER_MS;
 use cairn_common::executor_protocol::{
-    aged_priority, CacheWarmthEvidence, CellCheckoutKind, CellCommandClass, CellResidency,
-    ContentionEstimate, DeclineReason, DurationEstimate, DurationFallback, EnrolledRemote,
-    ExecutionLoadContext, ExecutionWarmth, ExecutorAdvertisement, ExecutorCapabilities,
-    ExecutorConfig, ExecutorHealthSnapshot, ExecutorHealthStatus, ExecutorIdentity,
-    ExecutorInspection, ExecutorListenerAdvertisement, ExecutorMessage, ExecutorSelector,
-    ExecutorSubstrateEvidence, ExecutorSubstrateReport, ExecutorSubstrateState,
-    GenerationEndMemory, InventoryAuthorityState, MachineMeasurement,
-    MaterializationReadFailureKind, MaterializationReadRequest, MaterializationReadResult,
-    ObjectTransferCoordinate, ObservationReuse, PlacementCounterfactualWinner, PlacementDecision,
-    PlacementMobility, PlacementOutcome, PlacementPolicyEvidence, PlacementPrediction,
-    PlacementReadings, PlacementReason, PlacementRejection, PlacementRejectionReason,
-    PlacementSelection, PlacementSyncCost, PlacementTieBreak, PreparationForecast, ProcessBatch,
+    executor_names_match, AdmissionHoldEvidence, ClaimedAttemptAccount, MachineModelResident,
+};
+use cairn_common::executor_protocol::{
+    CacheWarmthEvidence, CellCheckoutKind, CellResidency, DeclineReason, EnrolledRemote,
+    ExecutionWarmth, ExecutorAdvertisement, ExecutorCapabilities, ExecutorConfig,
+    ExecutorHealthSnapshot, ExecutorHealthStatus, ExecutorIdentity, ExecutorInspection,
+    ExecutorListenerAdvertisement, ExecutorMessage, ExecutorSelector, ExecutorSubstrateEvidence,
+    ExecutorSubstrateReport, ExecutorSubstrateState, GenerationEndMemory, InventoryAuthorityState,
+    MachineMeasurement, MaterializationReadFailureKind, MaterializationReadRequest,
+    MaterializationReadResult, ObjectTransferCoordinate, PlacementCounterfactualWinner,
+    PlacementDecision, PlacementMobility, PlacementOutcome, PlacementPolicyEvidence,
+    PlacementReadings, PlacementRejection, PlacementRejectionReason, ProcessBatch,
     ProcessBatchExecution, ProcessBatchFile, ProcessBatchItem, ProcessSandboxMode,
-    ProcessTelemetry, QueueForecast, QueueUnknownReason, QueuedPlacementEvidence,
-    QueuedPlacementRejection, QueuedPlacementTarget, ReliabilityEstimate, RemoteAttachAttempt,
-    RemoteConnectionTransition, RemoteLinkState, RepositoryLocator, ReservationFallback,
-    ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence,
-    ResidencyHolder, ResidencyOperation, ResidencyResult, ResidencyRuntimeConfig,
+    ProcessTelemetry, QueuedPlacementEvidence, QueuedPlacementRejection, QueuedPlacementTarget,
+    RemoteAttachAttempt, RemoteConnectionTransition, RemoteLinkState, RepositoryLocator,
+    ReservationFallback, ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind,
+    ResidencyFence, ResidencyHolder, ResidencyOperation, ResidencyResult, ResidencyRuntimeConfig,
     ResidentProcessEvent, ResidentProcessEventKind, RunnerCallback, RunnerCallbackResult,
     UpdateReport, WarmthUnknownReason, EXECUTOR_HEARTBEAT_INTERVAL_MS,
     EXECUTOR_LINK_STALL_REMEDIATION_MS, EXECUTOR_PROGRESS_FRESHNESS_MS,
     EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS, LOCAL_EXECUTOR_NAME, RESIDENCY_ACQUIRE_ATTEMPT_ID,
 };
+#[cfg(test)]
 use cairn_common::executor_protocol::{
-    executor_names_match, AdmissionHoldEvidence, ClaimedAttemptAccount, MachineModelResident,
-    PriorDecline,
+    CellCommandClass, ObservationReuse, PlacementReason, PlacementSelection, PlacementSyncCost,
 };
 use cairn_common::executor_protocol::{HomeAffinity, ScratchSyncEstimate};
 use cairn_common::executor_protocol::{
@@ -93,7 +88,6 @@ use cairn_common::executor_protocol::{
 use cairn_common::pipe_health::PipeFloorWork;
 use cairn_common::wire_vocabulary::CellAdmissionKind;
 use cairn_uri::normalize_executor_name;
-use decline_condition::{AdmissionView, PostedHold};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -181,9 +175,8 @@ use requirements::{
     applicable_refusal, build_prerequisite_deficiency, containment_deficiency,
     describe_preparation_rejections, github_credential_deficiency, is_preparation_rejection,
     matches_selector, nested_sandbox_fit, nested_sandbox_preference, nested_sandbox_summary,
-    nested_sandbox_waiver, project_eligibility, refused, runs_project_setup, selector_shortfall,
-    serves_project, setup_toolchain_deficiency, stamp_preparation_refusals, NestedSandboxFit,
-    SelectorShortfall,
+    project_eligibility, refused, runs_project_setup, selector_shortfall, serves_project,
+    setup_toolchain_deficiency, stamp_preparation_refusals, NestedSandboxFit, SelectorShortfall,
 };
 #[cfg(test)]
 use requirements::{
@@ -208,68 +201,22 @@ pub use residency_routes::{DrainResidents, HeldEnvironment};
 #[cfg(test)]
 use selection::{
     absent_enrolled_inventory, account_from_journal, aggregate_batch_learned_estimates,
-    candidate_cache_distances_with, choose_executor, choose_executor_with,
-    choose_executor_with_policy, clamp_declared_concurrency, describe_declines,
-    detached_candidate_rejection, excluded_by_memory_kill, forecast_queue_wait,
-    hermetic_shadow_request, judge_process_evidence, kernel_kills_for_memory, measured_sync_cost,
+    clamp_declared_concurrency, describe_declines, judge_process_evidence, kernel_kills_for_memory,
     model_room_rejection, no_matching_executor_diagnostic, own_label_refusal,
-    pipe_health_rejection, placement_prediction, placement_prediction_with_contention,
-    placement_rejection_signature, price_host_stall, price_reliability, prior_predictions,
-    rank_candidates, rank_survey, repository_sync_cost, unpredicted_candidate,
-    unresolved_rationale, wait_decision, warm_root_holds_commit, CandidateSurvey, PlacementDraft,
-    QueuePrices, ScoredCandidate, Selection, SurveyRankingContext, RECENT_PLACEMENT_DECISIONS,
+    pipe_health_rejection, placement_rejection_signature, unresolved_rationale,
+    RECENT_PLACEMENT_DECISIONS,
 };
 use selection::{
-    candidate_rejection, deadline_evidence, declared_project_requirements_at,
-    describe_cadence_turns, environment_identity, memory_brake_exists, missing_wait_reason_is_new,
-    pipe_health_assessment, placement_decision, presence_cause, process_fit,
-    queued_placement_evidence, record_command_outcome, repository_is_transferable,
-    selected_executor, survey_candidates, waits_on_machine, CadenceLaneRestart, Placement,
-    PlacementRejectionLog, ProcessFit, ReservationPlan, SelectedExecutor, SyncCost,
+    candidate_rejection, deadline_evidence, declared_project_requirements_at, environment_identity,
+    memory_brake_exists, missing_wait_reason_is_new, pipe_health_assessment, placement_decision,
+    presence_cause, process_fit, queued_placement_evidence, record_command_outcome,
+    repository_is_transferable, selected_executor, survey_candidates, waits_on_machine, Placement,
+    PlacementRejectionLog, ProcessFit, ReservationPlan, SelectedExecutor,
 };
 pub(crate) use selection::{
     describe_room_taken_first, project_config_refusal, publication_role_rejection,
     publisher_ineligibility, AboveMemoryCeiling, PlacementScope, PROJECT_CONFIG_REFUSAL,
 };
-
-/// What a candidate machine is carrying, in the shape an execution records the
-/// load it ran under, so a forecast and its eventual observation compare like
-/// with like.
-fn load_context(
-    snapshot: &FleetSnapshot,
-    host: &cairn_common::executor_protocol::HostHealth,
-) -> ExecutionLoadContext {
-    let (compile, light) =
-        snapshot
-            .executing_requests
-            .iter()
-            .fold((0_u32, 0_u32), |counts, request| {
-                if request.command_class.is_compile_class() {
-                    (counts.0.saturating_add(1), counts.1)
-                } else {
-                    (counts.0, counts.1.saturating_add(1))
-                }
-            });
-    ExecutionLoadContext {
-        co_resident_compile_jobs: compile,
-        co_resident_light_jobs: light,
-        cpu_utilization_millis: host
-            .cpu_admission
-            .reading
-            .map(|value| (value.clamp(0.0, 1.0) * 1_000.0).round() as u32),
-        io_pressure_full_millis: host
-            .io_pressure
-            .value()
-            .map(cairn_common::executor_protocol::IoPressure::priced_full_millis),
-        memory_pressure_full_millis: host
-            .memory_pressure
-            .value()
-            .map(cairn_common::executor_protocol::MemoryPressure::priced_full_millis),
-        // How old the readings are is a question about an instant, which the
-        // prediction's stall prices answer; see [`forecast_start`].
-        host_stall_stale: false,
-    }
-}
 
 /// `5h57m`, `3m12s`, `41s`: a duration read at a glance in a diagnostic.
 pub(crate) fn compact_duration(ms: u64) -> String {
@@ -453,16 +400,15 @@ pub(crate) enum CheckDispatchPhase {
     /// `since_unix_ms` is when the request began waiting.
     Placing {
         since_unix_ms: u64,
-        /// The latest answer from each machine that declined it, superseded
-        /// ones included.
+        /// The latest answer from each machine that declined it.
         declines: Vec<CheckDispatchDecline>,
-        /// The latest placement pass recorded for this request, every machine
-        /// it considered with what happened to it. `None` before any pass has
-        /// been recorded.
-        placement: Option<CheckPlacementPass>,
+        /// Where the request stands with every machine, read from the
+        /// dispatcher as it is now. `None` while the request is not waiting
+        /// in the dispatcher (being prepared, or between leaving it and its
+        /// settlement).
+        placement: Option<CheckPlacementAccount>,
         /// Main's cadence turn for freed room, when it bears on this request:
-        /// the machines whose next freed room it takes first, when it is that
-        /// lane, or the machines its latest pass waited behind that lane for.
+        /// the machines whose next freed room it takes first.
         turn: Option<String>,
     },
     /// A machine claimed it at `since_unix_ms`, so it is running there.
@@ -478,12 +424,6 @@ pub(crate) struct CheckDispatchDecline {
     pub(crate) reason: DeclineReason,
     pub(crate) detail: Option<String>,
     pub(crate) at_unix_ms: u64,
-    /// When the machine's posted condition behind `reason` was seen to change.
-    /// A superseded decline is the last thing the machine said, not what it
-    /// says now.
-    pub(crate) superseded_at_unix_ms: Option<u64>,
-    /// No re-offer to this machine before this instant.
-    pub(crate) retry_after_unix_ms: u64,
     /// The room the machine had last announced when it declined.
     pub(crate) room_seq: Option<u64>,
 }
@@ -495,23 +435,28 @@ impl CheckDispatchDecline {
             reason: decline.reason,
             detail: decline.detail.clone(),
             at_unix_ms: decline.at_unix_ms,
-            superseded_at_unix_ms: decline.superseded_at_unix_ms,
-            retry_after_unix_ms: decline.retry_after_unix_ms,
             room_seq: decline.room_seq,
         }
     }
 }
 
-/// One placement pass over a queued request, projected from its
-/// [`PlacementDecision`]: a point-in-time verdict that the next pass replaces,
-/// not a promise about current capacity.
+/// Why a queued request is still queued, machine by machine (cairn/6499):
+/// what each machine it may use, or was kept off, is doing with it now.
+///
+/// Worked out on read from the dispatcher's state and the connection table,
+/// never recorded. Recording it would cost a statement per waiting entry
+/// each time any machine announced room, which is the per-request cost the
+/// dispatcher exists to remove. Every time in it is an event's (a refusal,
+/// a room announced, a link last heard), so the account reads the same until
+/// one of those changes and the check row that renders it is rewritten only
+/// then.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CheckPlacementPass {
+pub(crate) struct CheckPlacementAccount {
     pub(crate) request_id: String,
     pub(crate) attempt_id: String,
-    pub(crate) decided_at_unix_ms: u64,
-    /// Every machine the pass named, chosen or passed over, in its order.
-    pub(crate) candidates: Vec<CheckPlacementCandidate>,
+    /// Every machine the request may run on, then every machine it is kept
+    /// off, each once.
+    pub(crate) machines: Vec<CheckPlacementCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,94 +464,100 @@ pub(crate) struct CheckPlacementCandidate {
     pub(crate) unreadable_memory: Vec<cairn_common::executor_protocol::MemoryEvidenceFailure>,
     pub(crate) executor_name: String,
     pub(crate) status: CheckCandidateStatus,
+    /// The machine's latest refusal when it no longer stands: it came under
+    /// a room older than the one the machine has announced since, or from a
+    /// link since replaced. Told as superseded, never as the reason now.
+    pub(crate) superseded: Option<SupersededDecline>,
 }
 
-/// What one pass did with one machine. Only [`Self::Declined`] is the
-/// machine's own answer; every other status is the runner's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SupersededDecline {
+    pub(crate) decline: CheckDispatchDecline,
+    /// The room the machine has announced since, when it has.
+    pub(crate) current_seq: Option<u64>,
+}
+
+/// Where a queued request stands with one machine. Only [`Self::Declined`]
+/// is the machine's own answer; the rest are the runner's reading of what
+/// the machine announced and of its own facts about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CheckCandidateStatus {
-    /// The pass chose it and the offer is outstanding.
+    /// Offered to it, unanswered.
     Offered,
-    /// The pass chose it and no offer to it stands now.
-    Chosen,
-    /// It was asked and its own admission said no.
+    /// Its refusal, which stands under the room it last announced.
     Declined(CheckDispatchDecline),
-    /// Eligible, and beaten by the machine named.
-    Outranked { by: String },
-    /// Never offered by this pass, for the reason placement recorded.
+    /// An offer made under this room never reached the machine; it is
+    /// offered there again on the machine's next announcement.
+    OfferUndelivered { room_seq: u64 },
+    /// What is left of the room it announced does not fit the request:
+    /// `needs` says what the room is short of, from the shared `fits`.
+    NoRoomFits {
+        needs: String,
+        room_seq: u64,
+        since_unix_ms: u64,
+    },
+    /// What is left of its room fits the request only with the shares it
+    /// keeps back: it refused two offers under its current figures with no
+    /// claim between, and the second's share stays taken until it announces
+    /// new figures (cairn/7339 comment 11).
+    RefusedTwice { room_seq: u64 },
+    /// It was asked to hold room for the request until its running work
+    /// ends. `hold` is the hold its announced room carries, when it does.
+    HoldingRoom { room_seq: u64, hold: Option<String> },
+    /// Attached, and has announced no room yet: silence, not a lack of room.
+    RoomNotAnnounced { attached_at_unix_ms: Option<u64> },
+    /// Its link is stale by the placement liveness bound (tenet 1311): last
+    /// heard at `since_unix_ms`. Nothing is offered over it.
+    LinkStale { since_unix_ms: u64 },
+    /// Away for now: drained, or emptied for its executor update. `sentence`
+    /// says what it waits on and, for an update, when it is expected back.
+    Away {
+        reason: PlacementRejectionReason,
+        sentence: String,
+    },
+    /// Its room fits the request; the runner's own last look turned it away
+    /// there for nothing it records, and its next announcement walks it.
+    Fits { room_seq: u64 },
+    /// Its room fits the request, but the work waits for `executor_name`,
+    /// a machine that could hold it and ranks ahead of this one on what its
+    /// memory can do for this work (deferred on a class prior here, clamped
+    /// here, or less single-process capacity for an unmeasured compile).
+    WaitsFor {
+        executor_name: String,
+        room_seq: u64,
+    },
+    /// Kept off it for the reason placement records.
     NotOffered(PlacementRejectionReason),
 }
 
-/// The latest pass over `entry`, with each candidate's status reconciled
-/// against the queue's own binding state: the chosen machine is offered,
-/// declined since, or chosen without an outstanding offer.
-fn check_placement_pass(entry: &queue::QueueEntry) -> Option<CheckPlacementPass> {
-    let decision = entry.latest_placement()?;
-    let mut candidates = Vec::with_capacity(decision.rejected.len() + 1);
-    if let PlacementOutcome::Selected(selection) = &decision.outcome {
-        let offered = matches!(
-            &entry.state,
-            queue::EntryState::Offered { executor_id, .. } if *executor_id == selection.executor_id
-        );
-        let declined_since = entry
-            .declined
-            .get(&selection.executor_id)
-            .filter(|decline| decline.at_unix_ms >= decision.decided_at_unix_ms);
-        let status = match (offered, declined_since) {
-            (true, _) => CheckCandidateStatus::Offered,
-            (false, Some(decline)) => CheckCandidateStatus::Declined(
-                CheckDispatchDecline::from_entry(&selection.executor_name, decline),
-            ),
-            (false, None) => CheckCandidateStatus::Chosen,
-        };
-        candidates.push(CheckPlacementCandidate {
-            unreadable_memory: selection.reservation_rationale.unreadable_memory.clone(),
-            executor_name: selection.executor_name.clone(),
-            status,
-        });
-    }
-    candidates.extend(decision.rejected.iter().map(|rejection| {
-        let status = match &rejection.reason {
-            PlacementRejectionReason::Declined {
-                reason,
-                detail,
-                declined_at_unix_ms,
-            } => CheckCandidateStatus::Declined(
-                entry
-                    .declined
-                    .get(&rejection.executor_id)
-                    .map(|decline| {
-                        CheckDispatchDecline::from_entry(&rejection.executor_name, decline)
-                    })
-                    .unwrap_or_else(|| CheckDispatchDecline {
-                        executor_name: rejection.executor_name.clone(),
-                        reason: *reason,
-                        detail: detail.clone(),
-                        at_unix_ms: *declined_at_unix_ms,
-                        superseded_at_unix_ms: None,
-                        retry_after_unix_ms: *declined_at_unix_ms,
-                        room_seq: None,
-                    }),
-            ),
-            PlacementRejectionReason::OutrankedBy { executor_name } => {
-                CheckCandidateStatus::Outranked {
-                    by: executor_name.clone(),
-                }
-            }
-            reason => CheckCandidateStatus::NotOffered(reason.clone()),
-        };
-        CheckPlacementCandidate {
-            unreadable_memory: rejection.unreadable_memory.clone(),
-            executor_name: rejection.executor_name.clone(),
-            status,
+impl CheckCandidateStatus {
+    /// The status as a placement decision's rejection row, where the wire
+    /// vocabulary has a reason that says it. A room shortfall other than
+    /// memory or disk, and a machine that has announced no room, have none.
+    fn rejection_reason(&self, now_unix_ms: u64) -> Option<PlacementRejectionReason> {
+        match self {
+            Self::Declined(decline) => Some(PlacementRejectionReason::Declined {
+                reason: decline.reason,
+                detail: decline.detail.clone(),
+                declined_at_unix_ms: decline.at_unix_ms,
+            }),
+            Self::LinkStale { since_unix_ms } => Some(PlacementRejectionReason::ConnectionStale {
+                silence_ms: now_unix_ms.saturating_sub(*since_unix_ms),
+                stale_after_ms: EXECUTOR_PROGRESS_FRESHNESS_MS,
+            }),
+            Self::Away { reason, .. } | Self::NotOffered(reason) => Some(reason.clone()),
+            Self::WaitsFor { executor_name, .. } => Some(PlacementRejectionReason::OutrankedBy {
+                executor_name: executor_name.clone(),
+            }),
+            Self::Offered
+            | Self::OfferUndelivered { .. }
+            | Self::NoRoomFits { .. }
+            | Self::RefusedTwice { .. }
+            | Self::HoldingRoom { .. }
+            | Self::RoomNotAnnounced { .. }
+            | Self::Fits { .. } => None,
         }
-    }));
-    Some(CheckPlacementPass {
-        request_id: decision.request_id.clone(),
-        attempt_id: decision.attempt_id.clone(),
-        decided_at_unix_ms: decision.decided_at_unix_ms,
-        candidates,
-    })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1172,52 +1123,6 @@ struct GenerationProcessReport {
 
 const REMOTE_CONNECTION_TIMELINE_LIMIT: usize = 32;
 
-const EXPLORATION_INTERVAL: usize = 4;
-
-#[derive(Debug, Clone)]
-struct ExplorationState {
-    decisions_since_exploration: usize,
-    /// Least recently explored first. Executors not present have never received
-    /// a bootstrap attempt and precede every entry here.
-    explored_executors: VecDeque<String>,
-    /// Least recently selected first. Missing executors have never won and sort
-    /// ahead of every executor present here when all authoritative keys tie.
-    selected_executors: VecDeque<String>,
-}
-
-impl Default for ExplorationState {
-    fn default() -> Self {
-        Self {
-            decisions_since_exploration: EXPLORATION_INTERVAL - 1,
-            explored_executors: VecDeque::new(),
-            selected_executors: VecDeque::new(),
-        }
-    }
-}
-
-impl ExplorationState {
-    fn record(&mut self, explored_executor_id: Option<&str>) {
-        match explored_executor_id {
-            Some(executor_id) => {
-                self.decisions_since_exploration = 0;
-                self.explored_executors.retain(|known| known != executor_id);
-                self.explored_executors.push_back(executor_id.to_string());
-            }
-            None => {
-                self.decisions_since_exploration = self
-                    .decisions_since_exploration
-                    .saturating_add(1)
-                    .min(EXPLORATION_INTERVAL - 1);
-            }
-        }
-    }
-
-    fn record_selection(&mut self, executor_id: &str) {
-        self.selected_executors.retain(|known| known != executor_id);
-        self.selected_executors.push_back(executor_id.to_string());
-    }
-}
-
 /// What a drain write reached.
 ///
 /// A drain is durable runner state either way: the runner has stopped placing
@@ -1279,11 +1184,19 @@ pub struct Fleet {
     /// machine, not the link's.
     load_rings: Arc<Mutex<HashMap<String, load::LoadRing>>>,
     disconnect_origins: Arc<Mutex<HashMap<(String, u64), ExecutorDisconnectOrigin>>>,
+    /// Woken when a machine attaches or its link ends, for what waits for a
+    /// machine to be present (enrollment, a named executor, a residency
+    /// response's link). Placement never waits on it.
     connection_ready: Arc<tokio::sync::Notify>,
-    /// Woken whenever a queue entry's binding changes, so a placement pass
-    /// waiting on an offer learns of the claim or the decline instead of
-    /// polling for it.
-    binding_changed: Arc<tokio::sync::Notify>,
+    /// Every waiting entry's placement and every machine's announced room
+    /// (see [`assignments`] and [`dispatcher`]). Lock order: `connections`,
+    /// then this, then the queue.
+    placing: Arc<Mutex<assignments::Placing>>,
+    /// Re-arms the placement deadline task when an entry joins, since its
+    /// deadlines may be earlier than the one the task sleeps to.
+    placing_deadline: Arc<tokio::sync::Notify>,
+    /// Whether this fleet's placement deadline task has been started.
+    placing_task: Arc<std::sync::atomic::AtomicBool>,
     /// Every execution this runner has admitted but not yet settled: waiting to
     /// be placed, offered to a machine, or claimed and running. One home for
     /// what used to be two — a map of pre-dispatch leaders and a map of
@@ -1480,13 +1393,6 @@ pub struct Fleet {
     /// about one machine for one request is logged when it changes and in a
     /// periodic summary, not on every pass. The placement record keeps them all.
     placement_rejection_log: Arc<Mutex<PlacementRejectionLog>>,
-    /// Atomic cadence accounting, separate from the operator ledger because a
-    /// placement must consume its exploration slot before concurrent ranking can
-    /// spend the same slot.
-    exploration_by_work_class: Arc<Mutex<HashMap<PlacementWorkClass, ExplorationState>>>,
-    /// What syncing a candidate and rebuilding its warm slots would cost, priced
-    /// once per commit pair in the background (see [`pricing`]).
-    placement_prices: Arc<pricing::PlacementPrices>,
     /// What placing queued work has cost this runner (see [`counters`]).
     counters: Arc<counters::FleetCounters>,
     /// Rate limit for the pushed telemetry frame. One per runner rather than
@@ -1528,10 +1434,6 @@ pub struct Fleet {
     /// This runner process's identity in every journal it writes, set once
     /// when the journals attach.
     runner_incarnation: Arc<std::sync::OnceLock<String>>,
-    /// The restart bound a long main-cadence lane is weighed against
-    /// ([`runner_events::restart_bound_ms`]), read once from the journal when
-    /// it attaches: the restart history cannot change until the next boot.
-    restart_bound_ms: Arc<std::sync::OnceLock<u64>>,
     /// Results that arrived for no binding this process holds, for the
     /// orchestrator's adoption to decide (`run::adopted`).
     unbound_results: Arc<Mutex<UnboundResults>>,
@@ -1699,50 +1601,6 @@ impl Fleet {
             log::error!("runner event journal did not attach: {error}");
         }
         let _ = self.runner_incarnation.set(runner_incarnation);
-        let bound = self.restart_bound_ms.clone();
-        let started_at_ms = self.runner_events.started_at_ms();
-        crate::orchestrator::spawn_onto(
-            tokio::runtime::Handle::try_current().ok().as_ref(),
-            async move {
-                match runner_events::load_restart_bound(&db, unix_time_ms(), started_at_ms).await
-                {
-                    Ok(bound_ms) => {
-                        log::info!(
-                            "placement restart bound: {} ms from the last week's runner starts",
-                            bound_ms
-                        );
-                        let _ = bound.set(bound_ms);
-                    }
-                    Err(error) => log::warn!(
-                        "runner starts could not be read, so the restart bound stays at its ceiling: {error}"
-                    ),
-                }
-            },
-            || log::warn!("the restart bound could not be read; it stays at its ceiling"),
-        );
-    }
-
-    /// The restart bound placement weighs a long main-cadence lane against:
-    /// [`runner_events::RESTART_BOUND_CEILING_MS`] until the journal has been
-    /// read.
-    fn restart_bound_ms(&self) -> u64 {
-        self.restart_bound_ms
-            .get()
-            .copied()
-            .unwrap_or(runner_events::RESTART_BOUND_CEILING_MS)
-    }
-
-    /// The main-cadence lane `request` is the live answer to, with the restart
-    /// bound it is weighed against; `None` for every other request.
-    fn cadence_lane_restart(&self, request: &CellRequest) -> Option<CadenceLaneRestart> {
-        let identity = (request.request_id.clone(), request.attempt_id.clone());
-        let precedence = self.cadence_precedence();
-        let (check, platform) = precedence.get(&identity)?.main_cadence_lane()?;
-        Some(CadenceLaneRestart {
-            check: check.to_string(),
-            platform: platform.to_string(),
-            bound_ms: self.restart_bound_ms(),
-        })
     }
 
     fn record_memory_lookup_failures(
@@ -1910,9 +1768,9 @@ struct ExecutorConnectionState {
     /// The network path this connection took, when the runner's executor
     /// listener accepted it.
     link_path: Option<cairn_common::executor_protocol::ExecutorLinkPath>,
-    /// The room this link last announced (cairn/7303). Recorded and shown;
-    /// placement does not read it until the room-driven dispatcher replaces
-    /// the per-request loop. `None` until the link announces.
+    /// The room this link last announced (cairn/7303), as shown on its page.
+    /// The dispatcher holds its own copy, less what it has assigned since.
+    /// `None` until the link announces.
     room: Option<Arc<cairn_common::executor_protocol::RoomAnnouncement>>,
 }
 
@@ -2177,6 +2035,7 @@ impl Fleet {
         // hold's end is what offers it the waiting work.
         if released {
             self.connection_ready.notify_waiters();
+            self.machine_facts_posted_all();
         }
         if let (Some(directive), Some(false)) = (&step.direct, delivered) {
             log::info!(
@@ -2478,12 +2337,15 @@ mod tests;
 #[cfg(all(test, unix))]
 mod bench;
 
+#[cfg(test)]
+mod loop_regressions;
+
+#[cfg(test)]
+mod dispatcher_properties;
+
 /// A fence wait relayed from an executor batch, end to end through
 /// [`Fleet::handle_runner_callback`]: what happens to the permission and the
 /// turn when the batch context closes before the inline budget, and when it
 /// does not (cairn/4937).
 #[cfg(test)]
 mod handoff_tests;
-
-#[cfg(test)]
-mod load_context_tests;

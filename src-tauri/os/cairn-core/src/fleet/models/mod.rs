@@ -156,6 +156,7 @@ impl Fleet {
         }
         if changed {
             self.connection_ready.notify_waiters();
+            self.machine_facts_posted_all();
         }
     }
 }

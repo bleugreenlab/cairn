@@ -85,7 +85,7 @@ fn a_queued_manual_check_stays_on_its_capture_while_branch_base_and_contract_mov
         // The colocated machine holds the offer (the check is queued) until
         // the test lets it claim, then reports what it was granted.
         let (sender, mut executor) = mpsc::unbounded_channel();
-        let generation = orch.fleet.attach_executor(sender);
+        let generation = orch.fleet.attach_announced_executor(sender);
         let fleet = orch.fleet.clone();
         let (offered_tx, offered) = oneshot::channel::<()>();
         let (go, go_rx) = oneshot::channel::<()>();

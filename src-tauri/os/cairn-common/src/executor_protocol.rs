@@ -9624,6 +9624,29 @@ pub struct LearnedResourceEstimate {
 /// completeness as not reported rather than reading the missing end as lost
 /// output. An older runner never meets the new event, because an executor is
 /// never newer than the runner that installs it.
+///
+/// cairn/7339 does not move the number. The runner places by the room each
+/// executor announces (the room-driven dispatcher) instead of re-surveying the
+/// fleet per waiting request; the frames are the ones step 3 added (`Room`,
+/// `Offer` with its `headroom`, `Claim`, `Decline`, `ReleaseHeadroom`), sent
+/// with the same meaning. [`PlacementReason::FirstWithRoom`] is new, but a
+/// placement decision is the runner's own record and never crosses to an
+/// executor. What a runner gets wrong talking to an older executor: nothing
+/// new; an executor older than 175 is refused at `Hello` as before.
+///
+/// The precedence of an offer over the protected headroom hold moves into
+/// this crate under the same number: the executor's claim decides every
+/// offer by [`fits_offer`] over the room it announces (net of that hold),
+/// with the hold's need given back when the offer passes it
+/// ([`passes_protected_hold`]: its own entry, interactive work, or an
+/// entitled older offer the drained room fits), which is the rule its claim
+/// already applied, and the runner offers by the same function over the
+/// announced room. [`Need`] gains `charged_cores`, which is never
+/// serialized. Frames, fields and their meaning are unchanged; a runner
+/// sends the `headroom` authorization on more offers (also to the machine
+/// already holding room for the entry), which an executor already reads.
+/// What a runner gets wrong talking to a 175 executor built before this:
+/// nothing; that executor decides every offer the same way.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 175;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -12803,6 +12826,10 @@ pub struct Need {
     /// work never less than one compile slot's width. A compile that declared
     /// the whole machine (an exclusive check) keeps it.
     pub cores: u32,
+    /// The concurrency units a claim of the work, or a headroom hold for it,
+    /// charges against the machine: what the reservation asks, without the
+    /// slot width `cores` is checked at.
+    pub charged_cores: u32,
     /// The disk growth charged against the watermark: none for interactive
     /// work in a cell it already has, which grows nothing predictable.
     pub disk_bytes: u64,
@@ -12839,6 +12866,7 @@ impl Need {
             } else {
                 reservation.concurrency_units
             },
+            charged_cores: reservation.concurrency_units,
             disk_bytes: if interactive && provisions.is_none() {
                 0
             } else {
@@ -13196,11 +13224,105 @@ pub fn fits(room: &AnnouncedRoom, need: &Need) -> Result<(), RoomShort> {
     Ok(())
 }
 
+/// Where an offer stands against the protected standing headroom hold
+/// ([`HeadroomRoomHold::protected`]) its machine's announced room is net of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precedence<'a> {
+    /// Judged beside the hold, or the room protects none: the room as it is.
+    Behind,
+    /// Ahead of the hold, whose need this is: judged against the room with
+    /// that need given back ([`AnnouncedRoom::give_back`]).
+    Passes(&'a Need),
+}
+
+/// Whether an offer passes the protected headroom hold (tenet 1444), each
+/// side ordered by its `(waiting since, entry id)` key. Interactive work
+/// always does: headroom is never held against it (tenet 1323). Other work
+/// passes only when it is itself entitled to hold room (an authorization in
+/// force), the machine's drained room fits it, and it has waited longer than
+/// the hold's work, so no collection of holds can block one another.
+///
+/// The hold's own entry is not judged by this: it passes its own hold, since
+/// the executor sets an entry's hold aside before judging its offer.
+pub fn passes_protected_hold(
+    interactive: bool,
+    entitled_and_drained_fit: bool,
+    offer: (u64, &str),
+    hold: (u64, &str),
+) -> bool {
+    interactive || (entitled_and_drained_fit && offer < hold)
+}
+
+/// Whether an offer fits `room`, a room net of its machine's protected
+/// headroom hold, standing as `precedence` says: [`fits`] over the room, with
+/// the hold given back when the offer passes it. The executor decides every
+/// offer by this, and the runner offers by it over the room the executor
+/// announced, so both read one rule (tenet 834).
+#[allow(clippy::result_large_err)]
+pub fn fits_offer(
+    room: &AnnouncedRoom,
+    need: &Need,
+    precedence: Precedence<'_>,
+) -> Result<(), RoomShort> {
+    match precedence {
+        Precedence::Behind => fits(room, need),
+        Precedence::Passes(hold) => {
+            let mut ahead = room.clone();
+            ahead.give_back(hold);
+            fits(&ahead, need)
+        }
+    }
+}
+
 impl AnnouncedRoom {
+    /// Charge `need` to this room the way the machine's ledger does once it
+    /// claims the work or protects a hold for it: units and the budgets
+    /// committed, memory owed, disk reserved.
+    pub fn charge(&mut self, need: &Need) {
+        self.cores.committed = self
+            .cores
+            .committed
+            .saturating_add(u64::from(need.charged_cores));
+        if let Some(memory) = self.memory.as_mut() {
+            memory.owed_bytes = memory.owed_bytes.saturating_add(need.memory_bytes);
+        }
+        if let Some(budget) = self.memory_budget.as_mut() {
+            budget.committed = budget.committed.saturating_add(need.budget_memory_bytes);
+        }
+        if let Some(disk) = self.disk.as_mut() {
+            disk.reserved_bytes = disk.reserved_bytes.saturating_add(need.disk_bytes);
+        }
+        if let Some(budget) = self.disk_budget.as_mut() {
+            budget.committed = budget.committed.saturating_add(need.disk_bytes);
+        }
+    }
+
+    /// Give back what [`Self::charge`] took for `need`: the room as it was
+    /// before, short of a figure that saturated.
+    pub fn give_back(&mut self, need: &Need) {
+        self.cores.committed = self
+            .cores
+            .committed
+            .saturating_sub(u64::from(need.charged_cores));
+        if let Some(memory) = self.memory.as_mut() {
+            memory.owed_bytes = memory.owed_bytes.saturating_sub(need.memory_bytes);
+        }
+        if let Some(budget) = self.memory_budget.as_mut() {
+            budget.committed = budget.committed.saturating_sub(need.budget_memory_bytes);
+        }
+        if let Some(disk) = self.disk.as_mut() {
+            disk.reserved_bytes = disk.reserved_bytes.saturating_sub(need.disk_bytes);
+        }
+        if let Some(budget) = self.disk_budget.as_mut() {
+            budget.committed = budget.committed.saturating_sub(need.disk_bytes);
+        }
+    }
+
     /// The room this machine would have were every job it admitted to end:
     /// nothing committed, nothing owed, and the pages its occupants hold
     /// returned. Closures and provisioning stand, since they are not about
-    /// what is running. Whether aged work could ever fit here.
+    /// what is running: whether aged work could fit here once its turn came.
+    /// Whether it could ever fit is [`Self::capacity`].
     pub fn drained(&self) -> Self {
         Self {
             slots: self.slots,
@@ -13233,6 +13355,31 @@ impl AnnouncedRoom {
             provisioning: self.provisioning.clone(),
             holds: Vec::new(),
             closures: self.closures.clone(),
+        }
+    }
+
+    /// The most this machine can ever hold: what [`fits`] judges by when the
+    /// question is whether work could fit here at all, not whether it fits
+    /// now. It is [`Self::drained`] without anything that lifts on its own or
+    /// by an operator's hand, which is every closure the executor announces (a
+    /// drain, a missing build volume, a home volume under its floor, a failed
+    /// storage cleanup, the pipe floor, every host-pressure brake) and every
+    /// provisioning hold. Memory is the machine's whole, since what other
+    /// processes hold beyond Cairn's own work comes and goes; disk is not
+    /// judged, since the volume's size is not announced and free space
+    /// returns as cells are reclaimed. What is left are the budgets, which
+    /// only a new executor build moves.
+    pub fn capacity(&self) -> Self {
+        let drained = self.drained();
+        Self {
+            memory: drained.memory.map(|memory| MemoryRoom {
+                available_bytes: memory.total_bytes,
+                ..memory
+            }),
+            disk: None,
+            provisioning: Vec::new(),
+            closures: Vec::new(),
+            ..drained
         }
     }
 
@@ -13601,6 +13748,47 @@ mod room_tests {
         assert_eq!(drained.memory.unwrap().available_bytes, 125 * GIB);
         assert_eq!(drained.cores.committed, 0);
         assert_eq!(fits(&drained, &compile), Ok(()));
+    }
+
+    /// A protected hold is charged as a claim is, units at what the
+    /// reservation asks rather than the slot width it is checked at, and
+    /// giving it back restores the room exactly; an offer that passes it is
+    /// judged in that restored room, one that does not beside the hold.
+    #[test]
+    fn an_offer_ahead_of_the_protected_hold_is_judged_without_it() {
+        let mut slot_sized = reservation(40 * GIB);
+        slot_sized.concurrency_units = 2;
+        let hold = Need::of(
+            &slot_sized,
+            CellCommandClass::CargoTest,
+            false,
+            PipeFloorWork::Process,
+            true,
+            None,
+            CompileSlots::of(32),
+        );
+        assert_eq!((hold.cores, hold.charged_cores), (8, 2));
+        let mut room = idle();
+        room.disk_budget = Some(Allowance {
+            limit: 100 * GIB,
+            committed: 3 * GIB,
+        });
+        let before = room.clone();
+        room.charge(&hold);
+        assert_eq!(room.cores.committed, 2);
+        let mut given = room.clone();
+        given.give_back(&hold);
+        assert_eq!(given, before);
+
+        // Beside the hold 80 GiB is free less 40 owed; the offer needs 50.
+        let offer = need(50 * GIB, CellCommandClass::Other, false);
+        assert!(fits_offer(&room, &offer, Precedence::Behind).is_err());
+        assert_eq!(fits_offer(&room, &offer, Precedence::Passes(&hold)), Ok(()));
+
+        assert!(passes_protected_hold(true, false, (9, "b"), (1, "a")));
+        assert!(!passes_protected_hold(false, false, (1, "a"), (9, "b")));
+        assert!(passes_protected_hold(false, true, (1, "b"), (1, "c")));
+        assert!(!passes_protected_hold(false, true, (2, "a"), (1, "z")));
     }
 
     #[test]
@@ -21863,6 +22051,10 @@ pub enum PlacementReason {
     /// readings name the gap. Named explicitly because it is exactly the state
     /// that must not pass for a measured decision.
     MeasuredBlindFleet,
+    /// The room this machine announced fit the work when it was matched: the
+    /// first such machine, preferring one whose warm roots hold the work's
+    /// commit, then the one with most room left after it (cairn/7303).
+    FirstWithRoom,
 }
 
 impl PlacementReason {
@@ -21874,6 +22066,7 @@ impl PlacementReason {
             Self::PredictedEarliestVerdict => "predictedEarliestVerdict",
             Self::BootstrapExploration => "bootstrapExploration",
             Self::MeasuredBlindFleet => "measuredBlindFleet",
+            Self::FirstWithRoom => "firstWithRoom",
         }
     }
 }

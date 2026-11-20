@@ -195,7 +195,7 @@ pub(crate) use render::{
     suppressed_check_message,
 };
 #[cfg(test)]
-use render::{describe_placement_pass, DispatchNarrator};
+use render::{describe_placement_account, DispatchNarrator};
 #[cfg(feature = "test-utils")]
 pub use write_wave::expire_write_check_wait_for_test;
 #[cfg(test)]

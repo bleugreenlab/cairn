@@ -1089,11 +1089,18 @@ impl Fleet {
         // Always inspect the live identity before consulting route authority:
         // the winner may already have published its still-pending route.
         let (entry_id, mut entry_rx, placement, prepared) = loop {
-            let notified = self.binding_changed.notified();
-            if let Some((entry_id, state)) = self
-                .queue
-                .with_entry_by_identity(&identity, |entry| (entry.id.clone(), entry.state.clone()))
-            {
+            if let Some((entry_id, state, wake)) = self.queue.wake_by_identity(&identity) {
+                // Registered before the state is read again, so a change in
+                // between is not missed.
+                let notified = wake.notified();
+                if self
+                    .queue
+                    .wake_by_identity(&identity)
+                    .map(|(id, state, _)| (id, state))
+                    != Some((entry_id.clone(), state.clone()))
+                {
+                    continue;
+                }
                 let remaining = original.wait_horizon_unix_ms.saturating_sub(unix_time_ms());
                 if remaining == 0 {
                     return residency_core_failure(
@@ -1109,7 +1116,7 @@ impl Fleet {
                 }
                 tokio::select! {
                     _ = notified => {},
-                    _ = tokio::time::sleep(Duration::from_millis(remaining.min(250))) => {},
+                    _ = tokio::time::sleep(Duration::from_millis(remaining)) => {},
                 }
                 continue;
             }
@@ -1187,7 +1194,6 @@ impl Fleet {
             if !matches!(routed, Ok(None)) {
                 self.queue
                     .take(&identity, queue::TerminalState::Cancelled, unix_time_ms());
-                self.binding_changed.notify_waiters();
                 match routed {
                     Ok(Some(selected)) => {
                         match self
@@ -1213,6 +1219,12 @@ impl Fleet {
             cause: None,
             armed: true,
         };
+        let plan: Option<Arc<ReservationPlan>> = None;
+        let _joined = assignments::JoinedDispatcher {
+            pool: self.clone(),
+            entry_id: entry_id.clone(),
+        };
+        let mut deliveries = None;
         'offer: loop {
             // An entry comes back here only when it has returned to the queue,
             // so whatever claim follows is a new one. A grant delivered to an
@@ -1225,13 +1237,15 @@ impl Fleet {
             let Placement {
                 selected,
                 mut decision,
+                headroom,
                 ..
             } = match self
-                .select_executor(
+                .await_assignment(
+                    &entry_id,
                     &placement,
-                    None,
+                    plan.as_ref(),
                     &prepared.placement_policy,
-                    Some(&entry_id),
+                    &mut deliveries,
                 )
                 .await
             {
@@ -1275,7 +1289,13 @@ impl Fleet {
             // An acquisition is what provisions the environment, so it never
             // names one to run inside.
             match self
-                .offer_once(&entry_id, &attempt_request, &selected, &mut decision)
+                .offer_once(
+                    &entry_id,
+                    &attempt_request,
+                    &selected,
+                    &mut decision,
+                    headroom,
+                )
                 .await
             {
                 OfferAnswer::Requeued => continue,
@@ -1508,7 +1528,6 @@ impl Fleet {
                         self.queue
                             .take(&identity, queue::TerminalState::Completed, unix_time_ms());
                         entry_guard.disarm();
-                        self.binding_changed.notify_waiters();
                         // Only an answer that withdrew the machine continues:
                         // the runner's own persistence failures share its kind
                         // and must not loop. And only while a machine remains,
@@ -1548,8 +1567,6 @@ impl Fleet {
                 &unattached,
                 request,
                 unix_time_ms(),
-                &HashMap::new(),
-                &AdmissionView::of_request(request),
             ),
             Ok(survey) if !survey.usable.is_empty()
         )
@@ -1653,7 +1670,14 @@ impl Fleet {
         let mut deadline = Instant::now() + Duration::from_millis(RESIDENCY_RESPONSE_FLOOR_MS);
         let mut observed = Instant::now();
         loop {
-            let notified = self.binding_changed.notified();
+            let Some(wake) = self.queue.wake_of(entry_id) else {
+                return ResidencyGrantAnswer::Gone(Box::new(
+                    entry_rx
+                        .await
+                        .unwrap_or_else(|_| executor_unavailable("acquisition cancelled".into())),
+                ));
+            };
+            let notified = wake.notified();
             let connection_ready = self.connection_ready.notified();
             let binding =
                 match self.queue.state_of(entry_id) {
