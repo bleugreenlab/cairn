@@ -48,9 +48,21 @@ async fn fixture(
 }
 
 async fn seed_run(db: &LocalDb, started_at: Option<i64>, created_at: i64, status: &str) {
+    seed_run_as(db, RUN_ID, started_at, created_at, status).await;
+}
+
+async fn seed_run_as(
+    db: &LocalDb,
+    run_id: &str,
+    started_at: Option<i64>,
+    created_at: i64,
+    status: &str,
+) {
     let status = status.to_string();
+    let run_id = run_id.to_string();
     db.write(move |conn| {
         let status = status.clone();
+        let run_id = run_id.clone();
         Box::pin(async move {
             for sql in [
                 "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
@@ -72,7 +84,7 @@ async fn seed_run(db: &LocalDb, started_at: Option<i64>, created_at: i64, status
                 "INSERT INTO runs (id, project_id, issue_id, job_id, status, session_id,
                                    started_at, created_at, updated_at, start_mode)
                  VALUES (?1, 'proj-1', 'issue-1', 'job-1', ?2, 'session-1', ?3, ?4, ?4, 'fresh')",
-                params![RUN_ID, status.as_str(), started_at, created_at],
+                params![run_id.as_str(), status.as_str(), started_at, created_at],
             )
             .await?;
             Ok(())
@@ -122,6 +134,42 @@ fn assert_refused(result: &str) {
         result.contains("no longer served") && result.contains("Stop here"),
         "expected the ownership refusal, got: {result}"
     );
+}
+
+fn assert_erased(result: &str) {
+    assert_refused(result);
+    assert!(
+        result.contains("record no longer exists"),
+        "expected the erased-run refusal, got: {result}"
+    );
+}
+
+/// A `read` of an absolute file, as the agent's own `read` tool sends it.
+fn file_read(run_id: &str, path: &std::path::Path) -> McpCallbackRequest {
+    McpCallbackRequest {
+        answer_bound_ms: None,
+        thread_id: None,
+        cwd: "/tmp".to_string(),
+        run_id: Some(run_id.to_string()),
+        tool: "read".to_string(),
+        payload: serde_json::json!({ "path": format!("file:{}", path.display()) }),
+        tool_use_id: None,
+        origin: None,
+    }
+}
+
+fn register_process(orch: &Orchestrator, run_id: &str) {
+    let handle = RunHandle::new(
+        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(None)),
+        Some("session-1".to_string()),
+        Some("job-1".to_string()),
+    );
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register(run_id.to_string(), handle);
 }
 
 /// The incident, reduced: a run spawned before this runner booted asks for a
@@ -212,17 +260,7 @@ async fn a_finalized_run_is_refused_even_though_it_postdates_boot() {
 #[tokio::test]
 async fn a_registered_process_is_served_whatever_its_row_says() {
     let (_temp, db, orch) = fixture(Some(BOOT_AT - 45), BOOT_AT - 60, "live").await;
-    let handle = RunHandle::new(
-        Arc::new(Mutex::new(None)),
-        Arc::new(Mutex::new(None)),
-        Some("session-1".to_string()),
-        Some("job-1".to_string()),
-    );
-    orch.process_state
-        .processes
-        .lock()
-        .unwrap()
-        .register(RUN_ID.to_string(), handle);
+    register_process(&orch, RUN_ID);
 
     let result = dispatch(&orch, &commenting_write(RUN_ID)).await;
 
@@ -233,18 +271,93 @@ async fn a_registered_process_is_served_whatever_its_row_says() {
     );
 }
 
-/// The fence refuses runs it positively identifies as unowned; it is not a second
-/// gate on run resolution. An unknown run keeps each handler's own "No run found"
-/// behavior rather than being told its owner died.
+/// Run rows are deleted only when their issue or thread is erased, so a routed
+/// database that answers with no row is a definite fact: the run was erased, or
+/// its id is stale or forged. Nothing records what such a caller does.
 #[tokio::test]
-async fn an_unknown_run_is_not_fenced() {
-    let (_temp, _db, orch) = fixture(Some(BOOT_AT + 1), BOOT_AT + 1, "live").await;
+async fn an_unknown_run_is_refused_as_erased() {
+    let (_temp, db, orch) = fixture(Some(BOOT_AT + 1), BOOT_AT + 1, "live").await;
 
     let result = dispatch(&orch, &commenting_write("run-that-never-existed")).await;
 
+    assert_erased(&result);
+    assert_eq!(comment_count(&db).await, 0);
+}
+
+/// The live process of an erased job. The registry entry proves this runner
+/// spawned it, but not that anything still records it: the process-map hit must
+/// not short-circuit past the missing row, for reads or for writes.
+#[tokio::test]
+async fn a_registered_run_whose_row_was_erased_is_refused_on_reads_and_writes() {
+    let (temp, db, orch) = fixture(Some(BOOT_AT + 1), BOOT_AT + 1, "live").await;
+    register_process(&orch, RUN_ID);
+    let file = temp.path().join("erased-read.txt");
+    std::fs::write(&file, "content an erased run must not see").unwrap();
+
+    // Served while its record exists, so the refusals below are the erasure's.
+    let before = dispatch(&orch, &file_read(RUN_ID, &file)).await;
     assert!(
-        !result.contains("no longer served"),
-        "an unresolvable run must not be reported as a dead owner: {result}"
+        before.contains("content an erased run must not see"),
+        "{before}"
+    );
+
+    common::execute(&db, "DELETE FROM runs WHERE id = 'run-fenced'")
+        .await
+        .unwrap();
+
+    let write = dispatch(&orch, &commenting_write(RUN_ID)).await;
+    assert_erased(&write);
+    assert_eq!(
+        comment_count(&db).await,
+        0,
+        "an erased run's write must not reach the handler: {write}"
+    );
+
+    let read = dispatch(&orch, &file_read(RUN_ID, &file)).await;
+    assert_erased(&read);
+    assert!(
+        !read.contains("content an erased run must not see"),
+        "an erased run's read must not reach the handler: {read}"
+    );
+}
+
+/// A record the host cannot read right now is not a record that is gone. A
+/// team-routed run whose replica is not open fails routing: that call is refused
+/// as retryable, nothing is latched, and once the replica opens the next call is
+/// served normally.
+#[tokio::test]
+async fn an_unreadable_run_record_refuses_only_the_call_it_hit() {
+    const TEAM: &str = "teamFence1";
+    let run_id = format!("{TEAM}~{}", uuid::Uuid::new_v4());
+    let (temp, db) = common::migrated_db().await;
+    let orch = common::orchestrator_booted_at(&temp, Arc::new(db), BOOT_AT);
+    let (_team_temp, team_db) = common::migrated_db().await;
+    let team_db = Arc::new(team_db);
+    seed_run_as(&team_db, &run_id, Some(BOOT_AT + 1), BOOT_AT + 1, "live").await;
+    register_process(&orch, &run_id);
+    let file = temp.path().join("transient-read.txt");
+    std::fs::write(&file, "served once the record is readable").unwrap();
+
+    let refused = dispatch(&orch, &file_read(&run_id, &file)).await;
+    assert!(
+        refused.contains("could not read this run's record") && refused.contains("Retry"),
+        "expected the retryable refusal, got: {refused}"
+    );
+    assert!(
+        !refused.contains("no longer served") && !refused.contains("record no longer exists"),
+        "a read failure must not be reported as a disowned or erased run: {refused}"
+    );
+    assert!(
+        !refused.contains("served once the record is readable"),
+        "{refused}"
+    );
+
+    orch.db.insert_team_db_for_test(TEAM, team_db).await;
+
+    let served = dispatch(&orch, &file_read(&run_id, &file)).await;
+    assert!(
+        served.contains("served once the record is readable"),
+        "the next call, with the record readable, must be served: {served}"
     );
 }
 

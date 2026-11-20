@@ -376,21 +376,26 @@ fn resolve_pooled_thread_request(
 /// with its runner. Serving such a call is therefore strictly worse than
 /// refusing it: the work happens and leaves no record that it happened.
 ///
-/// Two independent signals, both required before refusing, so a false positive
-/// (which would block every tool call of a genuinely live agent) needs both to
-/// be wrong at once:
+/// The run's row is read first, on every call, because its absence is decisive
+/// on its own. Run rows are deleted only when their issue or thread is erased
+/// (`jobs::cleanup::delete_owned_jobs`), and every launch path commits the row
+/// before the process can call, so a routed database that answers with no row
+/// means the run was erased or its id is stale or forged: [`Disowned::Erased`].
+/// A process this runner spawned is no exception — its job can be erased while
+/// it runs, and then nothing records what it does.
+///
+/// A row that is present disowns its run only on two independent signals, both
+/// required, so a false positive (which would block every tool call of a
+/// genuinely live agent) needs both to be wrong at once:
 ///
 /// 1. The run has no handle in this runner's process registry. That registry is
 ///    in-memory and starts empty at boot, so a run it holds was spawned here by
-///    definition — and every serving run reaches the registry at spawn. This is
-///    also the fast path: an owned run pays one mutex, no query.
+///    definition — and every serving run reaches the registry at spawn.
 /// 2. The run's own row disowns it — see [`disowned_reason`].
 ///
-/// Fail-open everywhere else: a request with no run id, a run that resolves in
-/// no database, or a database that cannot answer all dispatch normally, leaving
-/// each handler's existing "No run found with id" behavior alone. The fence adds
-/// a refusal for runs positively identified as unowned; it does not become a
-/// second gate on run resolution.
+/// A routing failure or a read error is not absence: it refuses only the call it
+/// hit, as an [`UnreadableRunRecord`], and the next call reads again. A request
+/// with no run id (the CLI, the operator) is not fenced.
 async fn refuse_disowned_run(
     orch: &crate::orchestrator::Orchestrator,
     request: &crate::mcp::types::McpCallbackRequest,
@@ -400,22 +405,21 @@ async fn refuse_disowned_run(
         .as_deref()
         .filter(|run_id| !run_id.is_empty())?;
 
-    if orch
-        .process_state
-        .processes
-        .lock()
-        .is_ok_and(|processes| processes.contains_key(run_id))
-    {
-        return None;
-    }
-
-    // Route the lookup the way every other run-scoped read routes it: a team
-    // replica's run must resolve against that replica rather than missing in the
-    // private database and falling through unfenced.
-    let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
-        .await
-        .ok()?;
-    let reason = disowned_reason(&load_run_ownership(&db, run_id).await?, orch.boot_at)?;
+    let reason = match read_run_ownership(orch, run_id).await {
+        Ok(None) => Disowned::Erased,
+        Ok(Some(ownership)) => {
+            if orch
+                .process_state
+                .processes
+                .lock()
+                .is_ok_and(|processes| processes.contains_key(run_id))
+            {
+                return None;
+            }
+            disowned_reason(&ownership, orch.boot_at)?
+        }
+        Err(unreadable) => return Some(unreadable.refuse("run_ownership_fence", request, run_id)),
+    };
 
     // An operator seeing this line is seeing a zombie run — the signal that was
     // entirely absent from the incident's logs.
@@ -430,6 +434,71 @@ async fn refuse_disowned_run(
     })
 }
 
+/// A fence could not read the run's record for this call: the id did not route
+/// (a closed team replica, an unparseable id) or the database read failed.
+///
+/// Deliberately not a [`Disowned`] reason. Nothing is known about the run, so
+/// only this call is refused, as retryable, and nothing is latched: the next
+/// call reads again and is served if the record is there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnreadableRunRecord {
+    error: String,
+}
+
+impl UnreadableRunRecord {
+    fn new(error: impl std::fmt::Display) -> Self {
+        Self {
+            error: error.to_string(),
+        }
+    }
+
+    /// What the agent reads instead of a tool result. Phrased as the opposite of
+    /// the disowned refusals: transient, nothing done, retry.
+    fn refusal(&self) -> String {
+        format!(
+            "This tool call was not served: Cairn could not read this run's record just now \
+             ({}), so it could not confirm the run is still recorded. Nothing this call asked \
+             for was done. This is transient and says nothing about the run itself. Retry the \
+             call; if it keeps failing, report the error above.",
+            self.error
+        )
+    }
+
+    fn refuse(
+        &self,
+        fence: &str,
+        request: &crate::mcp::types::McpCallbackRequest,
+        run_id: &str,
+    ) -> DispatchOutput {
+        log::warn!(
+            "{fence}: refused tool={} run={run_id} reason=unreadable_record (retryable) error={}",
+            request.tool,
+            self.error
+        );
+        DispatchOutput {
+            content: self.refusal(),
+            reminders: Vec::new(),
+        }
+    }
+}
+
+/// The run's ownership columns from its routed database: `Ok(None)` when that
+/// database answered and holds no row for it.
+///
+/// Routed the way every other run-scoped read routes it: a team replica's run
+/// resolves against that replica, never the private database.
+async fn read_run_ownership(
+    orch: &crate::orchestrator::Orchestrator,
+    run_id: &str,
+) -> Result<Option<RunOwnership>, UnreadableRunRecord> {
+    let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
+        .await
+        .map_err(UnreadableRunRecord::new)?;
+    load_run_ownership(&db, run_id)
+        .await
+        .map_err(UnreadableRunRecord::new)
+}
+
 /// Refuse a tool call from a run whose execution no longer owns its issue's
 /// attempt (CAIRN-4665).
 ///
@@ -437,10 +506,12 @@ async fn refuse_disowned_run(
 /// the same files its successor was editing, and every one of those edits
 /// arrived as an ordinary tool call. This is the seam that refuses them.
 ///
-/// Fails OPEN only where there is genuinely nothing to judge: a request with no
-/// run id, a run that resolves in no database, a run with no job or no execution
-/// (thread runs, chat runs). A run whose lineage says superseded, or whose
-/// admission generation no longer matches its execution's, is refused.
+/// Proceeds only where there is genuinely nothing to judge: a request with no
+/// run id, or a run with no job or no execution (thread runs, chat runs). A run
+/// with no row at all never reaches here; [`refuse_disowned_run`] refused it. A
+/// run whose lineage says superseded, or whose admission generation no longer
+/// matches its execution's, is refused, and a lineage that cannot be read
+/// refuses this call as an [`UnreadableRunRecord`].
 async fn refuse_superseded_execution(
     orch: &crate::orchestrator::Orchestrator,
     request: &crate::mcp::types::McpCallbackRequest,
@@ -449,12 +520,16 @@ async fn refuse_superseded_execution(
         .run_id
         .as_deref()
         .filter(|run_id| !run_id.is_empty())?;
-    let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
-        .await
-        .ok()?;
-    let fence = crate::execution::canonical::fence_for_run(&db, run_id)
-        .await
-        .ok()?;
+    let fence = match crate::execution::routing::routing_db_for_id(&orch.db, run_id).await {
+        Ok(db) => crate::execution::canonical::fence_for_run(&db, run_id)
+            .await
+            .map_err(UnreadableRunRecord::new),
+        Err(error) => Err(UnreadableRunRecord::new(error)),
+    };
+    let fence = match fence {
+        Ok(fence) => fence,
+        Err(unreadable) => return Some(unreadable.refuse("canonical_fence", request, run_id)),
+    };
     let refusal = fence.refusal()?;
     log::warn!(
         "canonical_fence: refused tool={} run={run_id} — its execution was superseded",
@@ -483,6 +558,9 @@ enum Disowned {
     /// Already finalized: whatever is still calling tools for it has outlived
     /// the bookkeeping that would record what it does.
     Finalized,
+    /// Its routed database holds no row for it: the issue or thread that owned
+    /// it was erased, or the id is stale or forged.
+    Erased,
 }
 
 impl Disowned {
@@ -499,6 +577,15 @@ impl Disowned {
                 "The Cairn runner process that started this session has exited"
             }
             Disowned::Finalized => "This run has already been finalized",
+            // No successor execution to point at: the issue itself may be gone.
+            Disowned::Erased => {
+                return "This run is no longer served. Its record no longer exists: the issue \
+                        or thread it belonged to was erased, or this run id is not one Cairn \
+                        issued. Nothing records this session, so anything this call did would \
+                        happen with no record that it happened. Stop here. Retrying will not \
+                        help and no further tool call for this run will be served."
+                    .to_string()
+            }
         };
         format!(
             "This run is no longer served. {cause}, so nothing is recording this session's \
@@ -539,9 +626,11 @@ fn disowned_reason(ownership: &RunOwnership, boot_at: i64) -> Option<Disowned> {
         .map(|_| Disowned::Finalized)
 }
 
-/// Read one run's ownership columns. `None` when the row is absent or the read
-/// fails, both of which leave the call unfenced.
-async fn load_run_ownership(db: &crate::storage::LocalDb, run_id: &str) -> Option<RunOwnership> {
+/// Read one run's ownership columns. `Ok(None)` when the row is absent.
+async fn load_run_ownership(
+    db: &crate::storage::LocalDb,
+    run_id: &str,
+) -> crate::storage::DbResult<Option<RunOwnership>> {
     use crate::storage::RowExt;
     let run_id = run_id.to_string();
     db.read(|conn| {
@@ -564,8 +653,6 @@ async fn load_run_ownership(db: &crate::storage::LocalDb, run_id: &str) -> Optio
         })
     })
     .await
-    .ok()
-    .flatten()
 }
 
 /// Execute a read-family call with content-aware dedup, or execute any other
@@ -1582,12 +1669,31 @@ mod tests {
 
     #[test]
     fn every_refusal_tells_the_agent_to_stop_rather_than_retry() {
-        for reason in [Disowned::PredatesBoot, Disowned::Finalized] {
+        for reason in [
+            Disowned::PredatesBoot,
+            Disowned::Finalized,
+            Disowned::Erased,
+        ] {
             let refusal = reason.refusal();
             assert!(refusal.contains("no longer served"), "{refusal}");
             assert!(refusal.contains("Stop here"), "{refusal}");
             assert!(refusal.contains("Retrying will not help"), "{refusal}");
-            assert!(refusal.contains("new execution"), "{refusal}");
+        }
+        for reason in [Disowned::PredatesBoot, Disowned::Finalized] {
+            assert!(reason.refusal().contains("new execution"));
+        }
+        assert!(Disowned::Erased
+            .refusal()
+            .contains("record no longer exists"));
+    }
+
+    #[test]
+    fn an_unreadable_record_is_refused_as_retryable_never_as_disowned() {
+        let refusal = UnreadableRunRecord::new("replica closed").refusal();
+        assert!(refusal.contains("Retry the call"), "{refusal}");
+        assert!(refusal.contains("replica closed"), "{refusal}");
+        for disowned in ["no longer served", "Stop here", "Retrying will not help"] {
+            assert!(!refusal.contains(disowned), "{refusal}");
         }
     }
 

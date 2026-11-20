@@ -41,6 +41,7 @@ async fn active_turn_fixture() -> (
     Mutex<HashMap<String, usize>>,
 ) {
     let (temp, orch) = common::test_orchestrator().await;
+    common::seed_bare_run(&orch, "run-1").await;
     register_run_with_turn(&orch, "run-1", "turn-1");
     (temp, orch, Mutex::new(HashMap::new()))
 }

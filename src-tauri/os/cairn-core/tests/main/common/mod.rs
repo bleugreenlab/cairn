@@ -1696,6 +1696,20 @@ pub async fn pending(db: &LocalDb, id: &str) -> bool {
         == 1
 }
 
+/// A `runs` row with no job behind it, for a fixture that dispatches tool calls
+/// as `run_id`. Dispatch refuses a run whose row is absent as erased, whatever
+/// the process registry holds, so registering a process is not enough.
+pub async fn seed_bare_run(orch: &Orchestrator, run_id: &str) {
+    orch.db
+        .local
+        .execute(
+            "INSERT INTO runs(id, status, created_at, updated_at) VALUES (?1, 'live', 1, 1)",
+            params![run_id],
+        )
+        .await
+        .unwrap();
+}
+
 pub async fn test_orchestrator() -> (tempfile::TempDir, Orchestrator) {
     let temp = tempfile::tempdir().unwrap();
     let (_db_temp, db) = migrated_db().await;

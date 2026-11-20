@@ -88,6 +88,7 @@ async fn fixture() -> (
     Mutex<HashMap<String, usize>>,
 ) {
     let (temp, orch) = common::test_orchestrator().await;
+    common::seed_bare_run(&orch, "run-1").await;
     register_run(&orch, "run-1");
     orch.process_state.begin_turn("run-1", "turn-1");
     (temp, orch, Mutex::new(HashMap::new()))
