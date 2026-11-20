@@ -464,7 +464,16 @@ impl SweepSchedule {
                 None => std::future::pending().await,
             }
         };
+        // Biased so that when several wakes are ready the safety net wins. Its
+        // first tick is ready at once, and a session is usually announced
+        // before its loop starts, so the first call has two ready wakes.
+        // Unbiased, a quarter of sessions sweep for the signal first and then
+        // run the net's tick as a second FULL sweep a floor later, re-reading
+        // everything and acting on writes nothing announced. No wake is lost
+        // to the order: a ready one stays ready for the next call, and work a
+        // sweep owes is due by its deadline whatever woke it.
         let reason = tokio::select! {
+            biased;
             _ = self.safety_net.tick() => SweepReason::SafetyNet,
             _ = self.signal.notified() => SweepReason::Signal,
             open = gate_inputs => {
@@ -6399,6 +6408,17 @@ mod tests {
         );
     }
 
+    /// A session's first sweep is the safety net's even when it was announced
+    /// before the loop started, and the announcement is the next sweep's.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_sweep_is_the_safety_net_even_when_announced() {
+        let (mut schedule, signal, _inputs) = isolated_schedule();
+        signal.notify_one();
+        assert_eq!(schedule.next(None).await, SweepReason::SafetyNet);
+        schedule.finished();
+        assert_eq!(schedule.next(None).await, SweepReason::Signal);
+    }
+
     /// Every wake but the safety net is an external event, so the floor holds
     /// for each: a source that flaps can advance a sweep, but it cannot spin the
     /// loop, and a burst of announcements is one sweep, not one per announcement.
@@ -7301,6 +7321,13 @@ mod tests {
         };
         let looping = spawn_sweeps(&router);
         settle().await;
+        // The session's one full sweep has read the lease, so nothing after
+        // it can find the zeroed lease but the deadline it scheduled.
+        assert_eq!(router.sweeps(), vec![SweepReason::SafetyNet]);
+        assert!(
+            router.state().action_retry_at.is_some(),
+            "the lease's expiry is scheduled"
+        );
         assert_eq!(attempts().await, 0, "held elsewhere");
         db.execute(
             "UPDATE channel_ask_action SET lease_until = 0 WHERE action_ref = 'gone-prompt'",
