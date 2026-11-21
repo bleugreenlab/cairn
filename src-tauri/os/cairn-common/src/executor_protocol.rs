@@ -7390,6 +7390,12 @@ pub struct LearnedResourceEstimate {
 /// gets nothing wrong; that executor's commands start without a shell level,
 /// as they always have.
 ///
+/// cairn/5918 does not move the number. Project cell-root migration releases
+/// interior ownership locks before relocation or case-only renaming and takes
+/// them again at the destination. Rename refusals are local disk records and
+/// do not stop migration of other projects. No frame, field or variant changes;
+/// an older executor only retains its former local migration failure behavior.
+///
 /// cairn/5872 does not move the number. A claim at a commit git refuses to check
 /// out on the executor's platform (a tracked path its `verify_path` rejects,
 /// such as a colon on NTFS) answers the existing
