@@ -9508,6 +9508,16 @@ pub struct LearnedResourceEstimate {
 /// floor's transitions reach the runner in the same machine samples as
 /// before, so a runner talking to an older executor gets nothing wrong.
 ///
+/// cairn/6365 does not move the number. The categorized walk prices retired
+/// trees mid-deletion (`.discard-`) in a new defaulted
+/// [`DiskCategoryAccounting::discards_bytes`] instead of inside
+/// `quarantinesBytes`, which now holds forensic holds only. `usedBytes` is
+/// unchanged, and nothing prices, places or admits on either category. What a
+/// runner gets wrong talking to an older executor: nothing it concludes; it
+/// reads no discards and renders that executor's discards inside its
+/// quarantines, as before. An older runner ignores the key, and its page's
+/// categories then sum short of `usedBytes` by the discards.
+///
 /// Version 174 (cairn/5893) lets a review wave record each member's verdict
 /// as that member finishes, rather than when its slowest sibling does.
 /// [`RunnerCallback::ProcessItemCompleted`] gains an optional `result`
@@ -19263,7 +19273,13 @@ pub struct DiskCategoryAccounting {
     pub warm_caches_bytes: u64,
     #[serde(default)]
     pub external_managed_caches_bytes: u64,
+    /// Forensic holds (`.quarantine-` trees). From an executor that predates
+    /// [`Self::discards_bytes`], discards are inside this figure.
     pub quarantines_bytes: u64,
+    /// Retired trees mid-deletion (`.discard-`): already condemned, freeing
+    /// themselves. Zero from an executor that predates it.
+    #[serde(default)]
+    pub discards_bytes: u64,
     pub temporary_other_bytes: u64,
     /// What retired executor homes still hold, counted in `usedBytes`.
     #[serde(default)]
@@ -30608,6 +30624,7 @@ mod tests {
                         warm_caches_bytes: 3,
                         external_managed_caches_bytes: 7,
                         quarantines_bytes: 4,
+                        discards_bytes: 0,
                         temporary_other_bytes: 5,
                         node_scratch_bytes: 0,
                         former_build_root_bytes: 0,

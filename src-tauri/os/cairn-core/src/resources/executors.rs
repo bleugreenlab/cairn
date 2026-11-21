@@ -2361,6 +2361,7 @@ fn render_services_only_storage(executor: &ExecutorInspection) -> String {
             ("tool caches", tool_caches),
             ("warm caches", categories.warm_caches_bytes),
             ("quarantines", categories.quarantines_bytes),
+            ("discards pending deletion", categories.discards_bytes),
         ] {
             if size > 0 {
                 left.push(format!("{name}: {}", bytes(size)));
@@ -3015,8 +3016,19 @@ fn render_holdings(
                 String::new()
             };
             let external_caches = external_cache_breakdown(&categories.external_caches);
+            // Apart from quarantines, because they are already being freed: an
+            // operator reading a near-full volume must not mistake bytes the
+            // executor is deleting for holds to release by hand.
+            let discards = if categories.discards_bytes > 0 {
+                format!(
+                    " · discards pending deletion {}",
+                    bytes(categories.discards_bytes)
+                )
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "- Cairn holds{on} {} (logical bytes, accounting {}): live cells {} · external caches {}{external_caches} · quarantines {} · managed objects {} · warm caches {} · other {}{other_top}{retired_homes}\n",
+                "- Cairn holds{on} {} (logical bytes, accounting {}): live cells {} · external caches {}{external_caches} · quarantines {}{discards} · managed objects {} · warm caches {} · other {}{other_top}{retired_homes}\n",
                 bytes(accounting.used_bytes),
                 age(captured.saturating_sub(accounting_reading.measured_at_unix_ms)),
                 bytes(categories.live_cells_bytes),
@@ -7616,6 +7628,7 @@ mod storage_section_tests {
                     warm_caches_bytes: 0,
                     external_managed_caches_bytes: 93 * GIB,
                     quarantines_bytes: 104 * GIB,
+                    discards_bytes: 0,
                     temporary_other_bytes: 125 * GIB,
                     node_scratch_bytes: 0,
                     former_build_root_bytes: 0,
@@ -7803,6 +7816,35 @@ mod storage_section_tests {
         );
     }
 
+    /// Bytes the executor is already deleting are named as that, beside the
+    /// quarantines rather than inside them: an operator freeing a near-full
+    /// volume by hand acts on holds, and a discard needs nobody (cairn/6365).
+    #[test]
+    fn discards_pending_deletion_render_apart_from_quarantines() {
+        let mut executor = tight_local();
+        let at = executor.captured_at_unix_ms;
+        let mut accounting = executor
+            .health
+            .machine
+            .disk_accounting
+            .value()
+            .cloned()
+            .unwrap();
+        accounting.categories.quarantines_bytes = 2 * GIB;
+        accounting.categories.discards_bytes = 102 * GIB;
+        executor.health.machine.disk_accounting =
+            Measurement::measured(at.saturating_sub(120_000), accounting);
+
+        let rendered = render_executor(&executor);
+
+        assert!(
+            rendered.contains(
+                "quarantines 2.0 GiB · discards pending deletion 102.0 GiB · managed objects"
+            ),
+            "{rendered}"
+        );
+    }
+
     /// The section the CAIRN-4860 operator had to reconstruct by hand: the
     /// verdict against its thresholds, Cairn's bytes by category, and what of
     /// the volume is not Cairn's.
@@ -7824,6 +7866,10 @@ mod storage_section_tests {
                 && rendered.contains("quarantines 104.0 GiB")
                 && rendered.contains("other 125.0 GiB (cairn.db 16.0 GiB)"),
             "{rendered}"
+        );
+        assert!(
+            !rendered.contains("discards pending deletion"),
+            "no discards, no segment: {rendered}"
         );
         assert!(
             rendered
