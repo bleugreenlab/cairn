@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::panic::{AssertUnwindSafe, Location};
@@ -21,6 +21,7 @@ use tokio::time::{error::Elapsed, sleep, timeout};
 use turso::{params::IntoParams, Builder, Connection, Row};
 
 use super::commit_watch::{watch_commit, CommitWatchBounds};
+use super::migration::{is_provisional_version, Migration};
 use super::plan_audit::{self, PlanAudit};
 
 const CONTENTION_ATTEMPT_THRESHOLD: usize = 1;
@@ -897,6 +898,26 @@ impl LocalDb {
     }
 
     pub async fn open_with_retry(path: impl AsRef<Path>, retry: RetryConfig) -> DbResult<Self> {
+        Self::open_local(path, retry, None).await
+    }
+
+    /// [`open`](Self::open) a store that `lineage` migrates, refusing it with
+    /// [`DbError::StoreNewerThanBuild`] when its ledger records a migration
+    /// `lineage` does not register.
+    ///
+    /// The check is the first thing Cairn does with the store: it reads the
+    /// ledger on a bare engine connection before [`configure`](Self::configure)
+    /// writes any pragma and before any caller can query or migrate, so a
+    /// refused store is left exactly as the newer build left it.
+    pub async fn open_lineage(path: impl AsRef<Path>, lineage: &[Migration]) -> DbResult<Self> {
+        Self::open_local(path, RetryConfig::default(), Some(lineage)).await
+    }
+
+    async fn open_local(
+        path: impl AsRef<Path>,
+        retry: RetryConfig,
+        lineage: Option<&[Migration]>,
+    ) -> DbResult<Self> {
         let path = path.as_ref().to_path_buf();
         require_db_path(&path)?;
         let path_string = path.to_string_lossy().to_string();
@@ -931,9 +952,70 @@ impl LocalDb {
             history_catalog_present: AtomicBool::new(false),
             history_evicted: AtomicBool::new(false),
         };
+        if let Some(lineage) = lineage {
+            db.refuse_newer_store(lineage).await?;
+        }
         db.configure().await?;
         db.initialize_history_capability().await?;
         Ok(db)
+    }
+
+    /// Refuse this store with [`DbError::StoreNewerThanBuild`] when its ledger
+    /// records a bound migration `lineage` does not register.
+    ///
+    /// Membership, not a maximum: the authored apply order is not numeric, so a
+    /// newer build can apply a lower-numbered migration an older build lacks
+    /// while both share the same highest number. Provisional `NEXT_name` rows
+    /// are left alone; they exist only in a dev store on the branch that
+    /// authored them and are adopted by name once the landing binds a number.
+    ///
+    /// Only reads, on a bare engine connection that carries none of the pool's
+    /// pragmas. A store with no ledger yet is new and passes.
+    pub async fn refuse_newer_store(&self, lineage: &[Migration]) -> DbResult<()> {
+        let conn = match self.database.as_ref() {
+            DbHandle::Local(db) => db.connect()?,
+            DbHandle::Synced(db) => db.connect().await?,
+        };
+        let mut tables = conn
+            .query(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'cairn_schema_migrations'",
+                (),
+            )
+            .await?;
+        if tables.next().await?.is_none() {
+            return Ok(());
+        }
+        drop(tables);
+        let mut rows = conn
+            .query("SELECT version, name FROM cairn_schema_migrations", ())
+            .await?;
+        let known: HashSet<&str> = lineage.iter().map(|migration| migration.version).collect();
+        let mut unknown = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let version: String = row.get(0)?;
+            if is_provisional_version(&version) || known.contains(version.as_str()) {
+                continue;
+            }
+            let name: String = row.get(1)?;
+            unknown.push(format!("{version}_{name}"));
+        }
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        unknown.sort();
+        let build_latest = lineage
+            .iter()
+            .rev()
+            .find(|migration| !is_provisional_version(migration.version))
+            .map_or_else(
+                || "none".to_string(),
+                |migration| format!("{}_{}", migration.version, migration.name),
+            );
+        Err(DbError::StoreNewerThanBuild {
+            path: self.path.display().to_string(),
+            unknown,
+            build_latest,
+        })
     }
 
     /// Open a Turso Sync replica at `path`, reconciling against the sync server

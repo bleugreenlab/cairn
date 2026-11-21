@@ -1234,4 +1234,161 @@ mod tests {
              pre-existing drift as this migration's failure"
         );
     }
+
+    /// Open `path` for `lineage`, apply it, and close the store again.
+    async fn migrate_with(path: &std::path::Path, lineage: &[Migration]) {
+        let db = LocalDb::open_lineage(path, lineage).await.unwrap();
+        MigrationRunner::new(lineage.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+    }
+
+    /// Every file in `dir`, by name, with its bytes.
+    fn store_files(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn refused_unknown(error: DbError) -> Vec<String> {
+        match error {
+            DbError::StoreNewerThanBuild { unknown, .. } => unknown,
+            other => panic!("expected a newer-store refusal, got {other:?}"),
+        }
+    }
+
+    /// A store a newer build migrated is refused by a build that lacks one of its
+    /// migrations, by name, and the refused open changes nothing on disk: the
+    /// store's files are byte-for-byte what they were before the open, so no
+    /// pragma, ledger table, or migration of the older build reached them.
+    #[tokio::test]
+    async fn a_store_a_newer_build_migrated_is_refused_untouched() {
+        let dir = tempdir().unwrap().keep();
+        let path = dir.join("newer-store.db");
+        let first = Migration::new("9001", "first", "CREATE TABLE first (id INTEGER);");
+        let retired = Migration::new(
+            "9002",
+            "retire_first",
+            "CREATE TABLE retirements (id INTEGER);",
+        );
+        migrate_with(&path, &[first, retired]).await;
+        let before = store_files(&dir);
+
+        // The older build carries a provisional migration of its own; it must
+        // not apply against the newer store.
+        let older = [
+            first,
+            Migration::new("NEXT_older", "older", "CREATE TABLE older (id INTEGER);"),
+        ];
+        let error = LocalDb::open_lineage(&path, &older).await.unwrap_err();
+        let message = error.to_string();
+        assert_eq!(
+            refused_unknown(error),
+            vec!["9002_retire_first".to_string()]
+        );
+        for expected in [
+            path.display().to_string().as_str(),
+            "9002_retire_first",
+            "end at 9001_first",
+            "Upgrade Cairn",
+            "changed nothing",
+        ] {
+            assert!(
+                message.contains(expected),
+                "{expected:?} missing from: {message}"
+            );
+        }
+        assert_eq!(
+            store_files(&dir),
+            before,
+            "a refused open must leave the store's files exactly as they were"
+        );
+
+        // The build that migrated it, and any newer one, still opens it.
+        let db = LocalDb::open_lineage(&path, &[first, retired])
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_versions(&db).await,
+            vec!["9001".to_string(), "9002".to_string()]
+        );
+    }
+
+    /// Apply order is authored, not numeric: a newer build can apply a
+    /// lower-numbered migration after a higher one both builds share. The store
+    /// and the older build then have the same highest number, and the older
+    /// build must still be refused for the migration it lacks.
+    #[tokio::test]
+    async fn the_refusal_holds_when_apply_order_is_not_numeric() {
+        let dir = tempdir().unwrap().keep();
+        let path = dir.join("out-of-order.db");
+        let first = Migration::new("9001", "first", "CREATE TABLE first (id INTEGER);");
+        let third = Migration::new("9003", "third", "CREATE TABLE third (id INTEGER);");
+        let late = Migration::new("9002", "late", "CREATE TABLE late (id INTEGER);");
+        migrate_with(&path, &[first, third, late]).await;
+
+        let error = LocalDb::open_lineage(&path, &[first, third])
+            .await
+            .unwrap_err();
+        assert_eq!(refused_unknown(error), vec!["9002_late".to_string()]);
+    }
+
+    /// A newer build opens an older store and upgrades it; a new store, and a
+    /// dev store holding an unrelated provisional row, open too.
+    #[tokio::test]
+    async fn a_build_opens_new_older_and_provisional_stores() {
+        let dir = tempdir().unwrap().keep();
+        let first = Migration::new("9001", "first", "CREATE TABLE first (id INTEGER);");
+        let second = Migration::new("9002", "second", "CREATE TABLE second (id INTEGER);");
+
+        let path = dir.join("older.db");
+        migrate_with(&path, &[first]).await;
+        let db = LocalDb::open_lineage(&path, &[first, second])
+            .await
+            .unwrap();
+        assert_eq!(
+            MigrationRunner::new(vec![first, second])
+                .run(&db)
+                .await
+                .unwrap(),
+            vec!["9002_second".to_string()]
+        );
+
+        LocalDb::open_lineage(dir.join("new.db"), &[first])
+            .await
+            .unwrap();
+
+        let dev = dir.join("dev.db");
+        migrate_with(
+            &dev,
+            &[
+                first,
+                Migration::new("NEXT_other", "other", "CREATE TABLE other (id INTEGER);"),
+            ],
+        )
+        .await;
+        LocalDb::open_lineage(&dev, &[first]).await.unwrap();
+    }
+
+    /// A store many releases ahead names its first few unknown migrations and
+    /// counts the rest rather than printing its whole history.
+    #[test]
+    fn the_refusal_names_a_few_unknown_migrations_and_counts_the_rest() {
+        let error = DbError::StoreNewerThanBuild {
+            path: "/store.db".to_string(),
+            unknown: (9002..9009).map(|n| format!("{n}_m")).collect(),
+            build_latest: "9001_first".to_string(),
+        };
+        let message = error.to_string();
+        assert!(message.contains("migrations 9002_m, 9003_m, 9004_m, 9005_m, 9006_m and 2 more"));
+        assert!(!message.contains("9007_m"));
+    }
 }

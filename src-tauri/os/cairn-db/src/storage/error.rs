@@ -48,8 +48,46 @@ pub enum DbError {
         statement: Arc<str>,
     },
 
+    /// The store's migration ledger records migrations the build opening it does
+    /// not register, so a newer build has migrated it. Raised by
+    /// [`LocalDb::open_lineage`](super::LocalDb::open_lineage) and
+    /// [`LocalDb::refuse_newer_store`](super::LocalDb::refuse_newer_store)
+    /// before Cairn configures, queries, or migrates the store.
+    #[error(
+        "{path} records {} that this Cairn build does not have (its migrations end at {build_latest}), so a newer build has migrated it. An older build would serve tables and rows a newer one changed or retired, so this build refuses to open the store and changed nothing in it. Upgrade Cairn to a build that includes every migration the store records, or point this build at a store of its own.",
+        summarize_migrations(.unknown)
+    )]
+    StoreNewerThanBuild {
+        path: String,
+        /// `version_name` of every recorded migration the build does not
+        /// register, in version order.
+        unknown: Vec<String>,
+        /// `version_name` of the build's last registered migration in apply
+        /// order, or `none`.
+        build_latest: String,
+    },
+
     #[error("{0}")]
     Internal(String),
+}
+
+/// How many of a newer store's unknown migrations the refusal names before it
+/// summarizes the rest; a store many releases ahead would otherwise print its
+/// whole history.
+const NAMED_MIGRATIONS: usize = 5;
+
+fn summarize_migrations(unknown: &[String]) -> String {
+    let named = unknown
+        .iter()
+        .take(NAMED_MIGRATIONS)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match unknown.len() {
+        1 => format!("migration {named}"),
+        count if count <= NAMED_MIGRATIONS => format!("migrations {named}"),
+        count => format!("migrations {named} and {} more", count - NAMED_MIGRATIONS),
+    }
 }
 
 /// What `COMMIT` reports when the engine has already ended the transaction

@@ -668,6 +668,10 @@ impl DbState {
         // bootstrap_if_empty pulls the server's schema/data (including the synced
         // cairn_schema_migrations ledger) on open; converge once more first.
         let _ = db.pull().await;
+        // After the pull, so a teammate's newer migrations are in the ledger
+        // this reads: a member whose build lacks them stops here, before the
+        // runner or the repairs below touch the replica.
+        db.refuse_newer_store(TEAM_MIGRATIONS).await?;
         // Always run the idempotent runner. A freshly bootstrapped replica carries
         // every applied version in its synced ledger, so nothing applies; a newly
         // created replica establishes the schema; an existing replica missing a

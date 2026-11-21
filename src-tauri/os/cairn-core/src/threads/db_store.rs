@@ -482,7 +482,13 @@ pub(crate) async fn open_path(path: PathBuf) -> Result<Arc<LocalDb>, String> {
     if let Some(db) = cache().read().await.get(&path).cloned() {
         return Ok(db);
     }
-    let db = Arc::new(LocalDb::open(&path).await.map_err(sanitize_error)?);
+    // Every thread migration is known here, including one the guard below may
+    // hold back, so only a store a newer build migrated is refused.
+    let db = Arc::new(
+        LocalDb::open_lineage(&path, super::db_schema::THREAD_MIGRATIONS)
+            .await
+            .map_err(sanitize_error)?,
+    );
     let claimed = claim_app_table_names(&db).await.map_err(sanitize_error)?;
     let migrations: Vec<_> = match unimported_rulings(&db, &path)
         .await
