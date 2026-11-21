@@ -204,7 +204,31 @@ async fn every_writable_thread_task_descendant_reaches_dispatch() {
             !result.contains("Unsupported resource mutation"),
             "{target} mode={mode} was gate-rejected: {result}"
         );
+        if target == base {
+            assert!(
+                result.contains("Placement default: none (there was none to clear)."),
+                "the task-home patch must reach the placement dispatcher: {result}"
+            );
+        }
     }
+
+    // The task home is writable by placement patch, not by append. An append
+    // must be refused for its mode rather than mislabeling the home read-only.
+    let unsupported_append = common::change_resource(
+        &orch,
+        json!([{ "target": base, "mode": "append", "payload": {"content": "x"} }]),
+    )
+    .await;
+    assert!(
+        unsupported_append.contains("Unsupported resource mutation")
+            && unsupported_append.contains("mode 'append' is not valid for this resource"),
+        "a task-home append should be refused by mode: {unsupported_append}"
+    );
+    assert!(
+        !unsupported_append.contains("This resource is read-only")
+            && !unsupported_append.contains("no dispatch arm handles it"),
+        "a task home supports placement patching, not append: {unsupported_append}"
+    );
 
     // A read-only descendant is refused by the contract, which is an answer the
     // caller can act on — unlike the internal catch-all, which advertises the
