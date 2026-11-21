@@ -7129,6 +7129,11 @@ pub struct LearnedResourceEstimate {
 /// talking to an older executor gets the once-per-process verdict it always
 /// got, and an older runner reads the newer verdicts as ordinary updates.
 ///
+/// cairn/7143 does not move the number. The adopted-release metadata
+/// constructor now compiles on every platform; only its macOS caller runs it.
+/// Its fields and values are unchanged, so a runner talking to an older
+/// executor gets nothing wrong.
+///
 /// cairn/7220 does not move the number. For work that cannot leave its home,
 /// only the home's own rejection row decides: it is waited on, or refused
 /// naming the home, and never another machine's row by id. A fresh-pipe floor

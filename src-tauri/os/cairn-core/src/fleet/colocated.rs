@@ -975,7 +975,9 @@ pub(super) fn require_colocated_population(
 
 /// An adopted tree's measurement in the shape the profile learner reads, with
 /// no warmth claim and no load context: what it says about speed is nothing.
-#[cfg(target_os = "macos")]
+// Compile the constructor everywhere so new metadata fields cannot break only
+// the macOS adoption path, whose caller is platform-gated.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) fn adopted_release_metadata(
     selected: &SelectedExecutor,
     measured: &cairn_common::executor_protocol::AdoptedTreeMeasurement,
