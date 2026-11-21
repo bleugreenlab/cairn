@@ -1336,6 +1336,7 @@ pub(super) fn executor_health_snapshot(
         resident_processes: entry.health.resident_processes.clone(),
         command_processes: entry.health.command_processes.clone(),
         evicted_cells: entry.health.evicted_cells.clone(),
+        unadopted_cells: entry.health.unadopted_cells.clone(),
         busy_declined_cells: entry.health.busy_declined_cells.clone(),
         stopped_commands: entry.health.stopped_commands.clone(),
         memory_record: entry.health.memory_record.clone(),

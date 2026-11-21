@@ -9662,6 +9662,20 @@ pub struct LearnedResourceEstimate {
 /// already holding room for the entry), which an executor already reads.
 /// What a runner gets wrong talking to a 175 executor built before this:
 /// nothing; that executor decides every offer the same way.
+///
+/// cairn/6075 does not move the number. A held cell whose authority cannot be
+/// loaded, and a retained project root whose migration fails, no longer stop
+/// the executor before it dials: the executor comes up without them and names
+/// them in [`ExecutorSubstrateReport::unadopted_cells`], a defaulted list, as
+/// it does a cell inventory it cannot list ([`UnadoptedStage::Inventory`]).
+/// [`UnadoptedStage`] is open by construction: a stage a reader does not know
+/// decodes as `Unknown` rather than failing the report, so adding one later
+/// does not move the number either. What
+/// a runner gets wrong talking to an older executor: nothing; that executor
+/// never attaches with such a cell at all, so an empty list from it is never
+/// read as a machine that adopted everything. What an older runner gets wrong
+/// talking to a newer executor: it ignores the list, and sees a machine that
+/// attached where it used to see none.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 175;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -20846,6 +20860,11 @@ pub struct ExecutorSubstrateReport {
     /// last. Bounded, and cleared by nothing but a restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evicted_cells: Vec<EvictedCellReport>,
+    /// Retained cells and project roots this executor came up without, because
+    /// taking them failed, oldest first. An entry leaves when a later pass takes
+    /// what it names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unadopted_cells: Vec<UnadoptedCellReport>,
     /// Idle slots claims keep declining because someone appears to be writing
     /// them, listed once a streak reaches [`BUSY_DECLINE_REPORT_THRESHOLD`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -21162,6 +21181,96 @@ pub struct EvictedCellReport {
     pub retirement_failed: bool,
 }
 
+/// Which startup step could not take a retained cell or root.
+///
+/// Open by construction: a stage this build does not know decodes as
+/// [`UnadoptedStage::Unknown`] instead of failing the substrate report that
+/// carries it, so a later stage is never a wire boundary.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum UnadoptedStage {
+    /// Moving a project's retained inventory to its human-readable key. The
+    /// root's cells are still adopted where they stand, but provisioning
+    /// migrates before it mints, so the project gets no new cell on this
+    /// machine until the root moves.
+    Migration,
+    /// Taking one held cell's authority, or listing a project's authority
+    /// root.
+    #[default]
+    Adoption,
+    /// Listing the cell inventory itself: it is there and cannot be read, so
+    /// no project's cells are adopted until it can be. Distinct from an absent
+    /// build volume, which is reported as such, and from an empty inventory,
+    /// which is not reported at all.
+    Inventory,
+    /// A stage a newer executor named that this build does not know. Never
+    /// sent; only read.
+    #[serde(other)]
+    Unknown,
+}
+
+#[cfg(test)]
+mod unadopted_stage_tests {
+    use super::*;
+
+    /// The next stage anyone adds must not fail a deployed runner's decode
+    /// of the whole substrate report.
+    #[test]
+    fn an_unrecognized_stage_decodes_as_unknown() {
+        let report: UnadoptedCellReport = serde_json::from_str(
+            r#"{"stage":"somethingLater","path":"/cairn/build-slots","error":"e","recordedAtUnixMs":1}"#,
+        )
+        .unwrap();
+        assert_eq!(report.stage, UnadoptedStage::Unknown);
+        assert_eq!(report.path, "/cairn/build-slots");
+        let known: UnadoptedCellReport = serde_json::from_str(
+            r#"{"stage":"inventory","path":"/p","error":"e","recordedAtUnixMs":1}"#,
+        )
+        .unwrap();
+        assert_eq!(known.stage, UnadoptedStage::Inventory);
+    }
+}
+
+/// A retained cell, or a root, the executor came up without.
+///
+/// One cell that cannot be taken is that cell's fault, not the machine's: it is
+/// withdrawn and the executor dials with the rest. A cell refused for what it
+/// records goes into the persisted quarantine, which retires it into forensic
+/// retention once nothing holds its tree; one kept for a fault of the
+/// machine's, and a root that could not be listed, are retried by the
+/// background adoption loop. Either way its holder holds nothing on this
+/// machine until a later pass takes it, so its next acquisition provisions
+/// elsewhere.
+///
+/// Reported, not only logged, because the machine's log is on the machine, and
+/// a cell that silently stopped existing reads as a fleet that lost track of it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnadoptedCellReport {
+    #[serde(default)]
+    pub stage: UnadoptedStage,
+    /// Empty when neither the cell's state nor its path names one.
+    #[serde(default)]
+    pub project_id: String,
+    /// The slot, when the entry is one cell; absent for a project root or an
+    /// authority root that could not be listed.
+    #[serde(rename = "slotId", default, skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<String>,
+    /// The authority directory, project root, or authority root concerned.
+    pub path: String,
+    /// The residency holder, as its storage key (`job:…`). Empty when the
+    /// cell's state named none or could not be read.
+    #[serde(default)]
+    pub holder: String,
+    /// What the authority's lock record names as its last holder, `pid N`,
+    /// with `(this executor)` when that is the reporting process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_holder: Option<String>,
+    /// The failure, verbatim, so the report and the log line agree.
+    pub error: String,
+    pub recorded_at_unix_ms: u64,
+}
+
 /// How many claims in a row must decline one slot before the executor reports
 /// it. A writer that holds a slot's lock for milliseconds never reaches three
 /// consecutive claims; a lock nothing will release reaches it quickly under
@@ -21263,6 +21372,8 @@ pub struct ExecutorHealthSnapshot {
     pub command_processes: CommandProcessHealth,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evicted_cells: Vec<EvictedCellReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unadopted_cells: Vec<UnadoptedCellReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub busy_declined_cells: Vec<BusyDeclinedCellReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -31114,6 +31225,7 @@ mod tests {
                 resident_processes: ResidentProcessHealth::default(),
                 command_processes: CommandProcessHealth::default(),
                 evicted_cells: Vec::new(),
+                unadopted_cells: Vec::new(),
                 busy_declined_cells: Vec::new(),
                 repository_faults: Vec::new(),
                 quarantines: None,

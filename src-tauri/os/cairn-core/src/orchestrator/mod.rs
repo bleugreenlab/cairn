@@ -5094,6 +5094,7 @@ mod tests {
             resident_processes: Default::default(),
             command_processes: Default::default(),
             evicted_cells: Vec::new(),
+            unadopted_cells: Vec::new(),
             busy_declined_cells: Vec::new(),
             repository_faults: Vec::new(),
             quarantines: None,

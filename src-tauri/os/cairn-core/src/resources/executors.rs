@@ -204,7 +204,7 @@ use cairn_common::executor_protocol::{
     UpdateReport, UpdateState, MACHINE_READING_STALE_AFTER_MS, MACHINE_SAMPLE_BLIND_AFTER_MS,
 };
 
-use cairn_common::executor_protocol::{CpuArm, LoweredCpu, LoweredWaitHold};
+use cairn_common::executor_protocol::{CpuArm, LoweredCpu, LoweredWaitHold, UnadoptedStage};
 
 use cairn_common::abnormal_exit::{crash_report_for, AbnormalExit};
 use cairn_common::executor_protocol::{
@@ -2064,6 +2064,51 @@ pub(crate) fn render_executor_with_kills(
                 } else {
                     ""
                 }
+            ));
+        }
+    }
+    // Only when there are any. The machine attached without these, so this is
+    // the one place that says it holds cells it is not managing, and why: the
+    // reason otherwise lives only in a log file on the machine.
+    if !health.unadopted_cells.is_empty() {
+        out.push_str(&format!(
+            "\n## Not adopted at startup ({})\n",
+            health.unadopted_cells.len()
+        ));
+        for unadopted in &health.unadopted_cells {
+            let subject = match (&unadopted.stage, &unadopted.cell_id) {
+                (UnadoptedStage::Migration, _) => format!(
+                    "project root {} (not migrated; its cells are adopted where they stand, and no new cell is provisioned for the project until it migrates)",
+                    unadopted.path
+                ),
+                (UnadoptedStage::Adoption, Some(cell_id)) => cell_id.clone(),
+                (UnadoptedStage::Adoption, None) => format!("authority root {}", unadopted.path),
+                (UnadoptedStage::Inventory, _) => format!(
+                    "cell inventory {} (cannot be listed; no project's cells are adopted until it can be)",
+                    unadopted.path
+                ),
+                (UnadoptedStage::Unknown, _) => format!(
+                    "{} (not adopted; stage unknown to this runner)",
+                    unadopted.cell_id.as_deref().unwrap_or(&unadopted.path)
+                ),
+            };
+            let mut context = Vec::new();
+            if !unadopted.project_id.is_empty() {
+                context.push(unadopted.project_id.clone());
+            }
+            if !unadopted.holder.is_empty() {
+                context.push(unadopted.holder.clone());
+            }
+            if let Some(lock_holder) = &unadopted.lock_holder {
+                context.push(format!("lock held last by {lock_holder}"));
+            }
+            context.push(age(executor
+                .captured_at_unix_ms
+                .saturating_sub(unadopted.recorded_at_unix_ms)));
+            out.push_str(&format!(
+                "- {subject} ({}): {}\n",
+                context.join(", "),
+                unadopted.error
             ));
         }
     }
@@ -9936,6 +9981,7 @@ mod tests {
                 resident_processes: Default::default(),
                 command_processes: Default::default(),
                 evicted_cells: Vec::new(),
+                unadopted_cells: Vec::new(),
                 busy_declined_cells: Vec::new(),
                 repository_faults: Vec::new(),
                 quarantines: None,
@@ -13113,6 +13159,92 @@ mod tests {
         let rendered = render_executor(&executor);
         assert!(
             rendered.contains("STILL ON DISK: retirement failed"),
+            "{rendered}"
+        );
+    }
+
+    /// A cell the machine came up without is named on its page, with the
+    /// holder and the error, because the machine's log is on the machine.
+    #[test]
+    fn an_unadopted_cell_names_its_slot_holder_and_error() {
+        use cairn_common::executor_protocol::UnadoptedCellReport;
+        let mut executor = inspection("bgsrv-win", false);
+        assert!(
+            !render_executor(&executor).contains("Not adopted at startup"),
+            "a machine that adopted everything says nothing"
+        );
+
+        executor.health.unadopted_cells = vec![
+            UnadoptedCellReport {
+                stage: UnadoptedStage::Adoption,
+                project_id: "cairn".into(),
+                cell_id: Some("slot-1".into()),
+                path: r"C:\cairn\build-slots\cairn\.authority\slot-1".into(),
+                holder: "job:held".into(),
+                lock_holder: Some("pid 4242 (this executor)".into()),
+                error: "quarantine cell slot-1's authority: Access is denied. (os error 5)".into(),
+                recorded_at_unix_ms: CAPTURED_AT - 60_000,
+            },
+            UnadoptedCellReport {
+                stage: UnadoptedStage::Migration,
+                project_id: "other".into(),
+                cell_id: None,
+                path: "/cairn/build-slots/OTHER".into(),
+                holder: String::new(),
+                lock_holder: None,
+                error: "ambiguous project cell inventory".into(),
+                recorded_at_unix_ms: CAPTURED_AT - 60_000,
+            },
+            UnadoptedCellReport {
+                stage: UnadoptedStage::Inventory,
+                project_id: String::new(),
+                cell_id: None,
+                path: "/cairn/build-slots".into(),
+                holder: String::new(),
+                lock_holder: None,
+                error:
+                    "list the cell inventory /cairn/build-slots: Permission denied (os error 13)"
+                        .into(),
+                recorded_at_unix_ms: CAPTURED_AT - 60_000,
+            },
+        ];
+        executor.health.unadopted_cells.push(UnadoptedCellReport {
+            stage: UnadoptedStage::Unknown,
+            project_id: "cairn".into(),
+            cell_id: None,
+            path: "/cairn/build-slots/LATER".into(),
+            holder: String::new(),
+            lock_holder: None,
+            error: "a stage from a newer executor".into(),
+            recorded_at_unix_ms: CAPTURED_AT - 60_000,
+        });
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "- /cairn/build-slots/LATER (not adopted; stage unknown to this runner) (cairn, 1m ago): a stage from a newer executor"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("## Not adopted at startup (4)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "- cell inventory /cairn/build-slots (cannot be listed; no project's cells are adopted until it can be) (1m ago): list the cell inventory /cairn/build-slots: Permission denied (os error 13)"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "- slot-1 (cairn, job:held, lock held last by pid 4242 (this executor), 1m ago): quarantine cell slot-1's authority: Access is denied. (os error 5)"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "- project root /cairn/build-slots/OTHER (not migrated; its cells are adopted where they stand, and no new cell is provisioned for the project until it migrates) (other, 1m ago): ambiguous project cell inventory"
+            ),
             "{rendered}"
         );
     }

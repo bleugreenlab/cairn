@@ -453,20 +453,34 @@ impl ExecutorPaths {
     /// A project directory never starts with a dot. Dot-entries beside the
     /// projects are Cairn's own: the machine authority, and the build
     /// service's capability-probe directory (`.compile-cache-probe`).
+    ///
+    /// For a caller that only looks: an inventory that cannot be listed
+    /// contributes no project. One that must tell that from an empty
+    /// inventory asks [`Self::listed_cell_authority_roots`].
     pub fn cell_authority_roots(&self) -> Vec<PathBuf> {
+        self.listed_cell_authority_roots()
+            .unwrap_or_else(|_| vec![self.machine_authority_dir()])
+    }
+
+    /// [`Self::cell_authority_roots`], failing when the cell inventory is
+    /// there and cannot be listed instead of reading it as holding no project.
+    /// An absent inventory holds none.
+    pub fn listed_cell_authority_roots(&self) -> std::io::Result<Vec<PathBuf>> {
         let mut roots = vec![self.machine_authority_dir()];
-        if let Ok(projects) = std::fs::read_dir(self.cell_inventory()) {
-            roots.extend(
-                projects
-                    .flatten()
-                    .filter(|entry| {
-                        entry.path().is_dir()
-                            && !entry.file_name().to_string_lossy().starts_with('.')
-                    })
-                    .map(|entry| entry.path().join(AUTHORITY_DIR)),
-            );
-        }
-        roots
+        let projects = match std::fs::read_dir(self.cell_inventory()) {
+            Ok(projects) => projects,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(roots),
+            Err(error) => return Err(error),
+        };
+        roots.extend(
+            projects
+                .flatten()
+                .filter(|entry| {
+                    entry.path().is_dir() && !entry.file_name().to_string_lossy().starts_with('.')
+                })
+                .map(|entry| entry.path().join(AUTHORITY_DIR)),
+        );
+        Ok(roots)
     }
 }
 
