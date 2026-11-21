@@ -7164,28 +7164,23 @@ mod tests {
         (orch, jobs)
     }
 
-    /// What concurrent continuations did with admission.
+    /// What concurrent continuations observed at the preparation boundary.
     #[derive(Debug)]
     struct AdmissionTrace {
-        wall: std::time::Duration,
-        /// Per continuation: whether it still held admission for itself when
-        /// its session preparation began.
         admitted_into_preparation: Vec<bool>,
-        /// The longest any one acquisition was seen held (1 ms sampling).
-        longest_hold: std::time::Duration,
     }
 
-    /// Continue `jobs` concurrently with `cause`, each spending `preparation`
-    /// in session preparation.
+    /// Hold every continuation inside preparation until all have arrived. This
+    /// proves overlap without making host scheduling latency part of the contract.
     async fn concurrent_continuations(
         orch: &Orchestrator,
         jobs: &[String],
         cause: crate::execution::jobs::WakeCause,
-        preparation: std::time::Duration,
     ) -> AdmissionTrace {
-        let admitted_into_preparation = Arc::new(Mutex::new(Vec::new()));
+        let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         for job in jobs {
-            let (seen, job_id) = (admitted_into_preparation.clone(), job.clone());
+            let (arrived, release, job_id) = (arrived.clone(), release.clone(), job.clone());
             PREPARATION_HOOKS.lock().unwrap().insert(
                 job.clone(),
                 Arc::new(move |orch: &Orchestrator| {
@@ -7193,30 +7188,19 @@ mod tests {
                         .admission_lock
                         .holder()
                         .is_some_and(|holder| holder.subject == job_id);
-                    seen.lock().unwrap().push(own);
-                    std::thread::sleep(preparation);
+                    arrived.send(own).unwrap();
+                    let (lock, changed) = &*release;
+                    let _released = changed
+                        .wait_while(lock.lock().unwrap(), |released| !*released)
+                        .unwrap();
                 }),
             );
         }
+        drop(arrived);
         let _backend =
             crate::orchestrator::session::install_orchestrator_test_session_backend(orch, || {
                 Box::new(RegisteringBackend)
             });
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let sampler = {
-            let (orch, done) = (orch.clone(), done.clone());
-            std::thread::spawn(move || {
-                let mut longest = std::time::Duration::ZERO;
-                while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some(holder) = orch.admission_lock.holder() {
-                        longest = longest.max(holder.held);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                longest
-            })
-        };
-        let started = std::time::Instant::now();
         let launches: Vec<_> = jobs
             .iter()
             .map(|job| {
@@ -7226,24 +7210,34 @@ mod tests {
                 })
             })
             .collect();
-        let mut outcomes = Vec::new();
-        for launch in launches {
-            outcomes.push(launch.await.unwrap().map(|_| ()));
+        // Only a hang watchdog: success depends on every arrival, not elapsed time.
+        let overlap = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let mut seen = Vec::new();
+            for _ in jobs {
+                seen.push(arrivals.recv().await.expect("preparation hook disappeared"));
+            }
+            seen
+        })
+        .await;
+        // Release blocked workers even if the rendezvous failed.
+        {
+            let (lock, changed) = &*release;
+            *lock.lock().unwrap() = true;
+            changed.notify_all();
         }
-        let wall = started.elapsed();
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let longest_hold = sampler.join().unwrap();
         for job in jobs {
             PREPARATION_HOOKS.lock().unwrap().remove(job);
         }
-        let admitted_into_preparation = admitted_into_preparation.lock().unwrap().clone();
+        let admitted_into_preparation =
+            overlap.expect("continuations did not reach preparation concurrently");
         let trace = AdmissionTrace {
-            wall,
             admitted_into_preparation,
-            longest_hold,
         };
-        for outcome in outcomes {
-            outcome.unwrap_or_else(|error| panic!("a continuation failed: {error}; {trace:?}"));
+        for launch in launches {
+            launch
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| panic!("a continuation failed: {error}; {trace:?}"));
         }
         trace
     }
@@ -7262,13 +7256,9 @@ mod tests {
             .acquire(AdmissionSite::SweepPass, "175")
             .await
             .unwrap();
-        let trace = concurrent_continuations(
-            &orch,
-            &jobs,
-            crate::execution::jobs::WakeCause::Addressed,
-            std::time::Duration::ZERO,
-        )
-        .await;
+        let trace =
+            concurrent_continuations(&orch, &jobs, crate::execution::jobs::WakeCause::Addressed)
+                .await;
         drop(sweep);
         assert_eq!(trace.admitted_into_preparation, vec![false], "{trace:?}");
         assert_eq!(
@@ -7424,16 +7414,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
     async fn system_continuations_release_admission_before_session_preparation() {
         use crate::execution::gates::capacity::AdmissionSite;
-        const PREPARATION: std::time::Duration = std::time::Duration::from_millis(300);
         let (orch, jobs) = idle_cold_jobs("system-reservation-only-", 4).await;
-        let trace = concurrent_continuations(
-            &orch,
-            &jobs,
-            crate::execution::jobs::WakeCause::System,
-            PREPARATION,
-        )
-        .await;
-        eprintln!("4 concurrent system continuations, {PREPARATION:?} preparation each: {trace:?}");
+        let trace =
+            concurrent_continuations(&orch, &jobs, crate::execution::jobs::WakeCause::System).await;
         assert_eq!(
             orch.admission_lock.acquisitions(AdmissionSite::HoldRelease),
             4
@@ -7443,8 +7426,6 @@ mod tests {
             vec![false; 4],
             "a continuation prepared its session admitted: {trace:?}"
         );
-        assert!(trace.longest_hold < PREPARATION, "{trace:?}");
-        assert!(trace.wall < PREPARATION * 3, "{trace:?}");
     }
 
     /// Records every byte a test process's stdin receives.
