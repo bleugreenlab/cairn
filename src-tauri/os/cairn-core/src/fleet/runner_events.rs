@@ -37,6 +37,9 @@ use std::sync::mpsc::{
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use cairn_common::executor_protocol::{
+    ReachHistory, ReachReport, ReachReportSource, ReachVerdict, RecordedReachReport,
+};
 use serde_json::{json, Value};
 
 use crate::storage::{DbResult, LocalDb, RowExt};
@@ -72,6 +75,7 @@ pub enum RunnerEventKind {
     RuntimeStall,
     RuntimeRecovered,
     ExecutorAttached,
+    ExecutorReachProbed,
     ExecutorAttachRefused,
     ExecutorProtocolIncompatible,
     ExecutorDetached,
@@ -91,12 +95,13 @@ pub enum RunnerEventKind {
 }
 
 impl RunnerEventKind {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::RunnerStarted,
         Self::RunnerHandoff,
         Self::RuntimeStall,
         Self::RuntimeRecovered,
         Self::ExecutorAttached,
+        Self::ExecutorReachProbed,
         Self::ExecutorAttachRefused,
         Self::ExecutorProtocolIncompatible,
         Self::ExecutorDetached,
@@ -118,6 +123,7 @@ impl RunnerEventKind {
             Self::RuntimeStall => "runtime_stall",
             Self::RuntimeRecovered => "runtime_recovered",
             Self::ExecutorAttached => "executor_attached",
+            Self::ExecutorReachProbed => "executor_reach_probed",
             Self::ExecutorAttachRefused => "executor_attach_refused",
             Self::ExecutorProtocolIncompatible => "executor_protocol_incompatible",
             Self::ExecutorDetached => "executor_detached",
@@ -186,6 +192,88 @@ impl RunnerEvent {
     }
 }
 
+fn reach_report(event: &RunnerEvent) -> Option<(String, RecordedReachReport)> {
+    let source = match event.kind {
+        RunnerEventKind::ExecutorAttached => ReachReportSource::Attach,
+        RunnerEventKind::ExecutorReachProbed => ReachReportSource::Bootstrap,
+        _ => return None,
+    };
+    let report: ReachReport =
+        serde_json::from_value(event.detail.get("reach_report")?.clone()).ok()?;
+    let legacy_bootstrap_verdicts = event
+        .detail
+        .get("legacy_bootstrap_verdicts")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default();
+    Some((
+        event.executor_id.clone()?,
+        RecordedReachReport {
+            received_at_unix_ms: event.occurred_at_ms,
+            source,
+            report,
+            legacy_bootstrap_verdicts,
+        },
+    ))
+}
+
+fn observe_reach(
+    cache: &mut HashMap<String, ReachHistory>,
+    id: String,
+    report: RecordedReachReport,
+) {
+    match cache.get_mut(&id) {
+        Some(history) => history.observe(report),
+        None => {
+            cache.insert(id, ReachHistory::from_report(report));
+        }
+    }
+}
+
+async fn store_reach_history(
+    db: &LocalDb,
+    snapshot: HashMap<String, ReachHistory>,
+    forgotten: HashSet<String>,
+) -> DbResult<()> {
+    db.write(move |conn| {
+        let snapshot = snapshot.clone();
+        let forgotten = forgotten.clone();
+        Box::pin(async move {
+            for id in forgotten {
+                conn.execute(
+                    "DELETE FROM executor_reach_history WHERE executor_id = ?1",
+                    [id.as_str()],
+                )
+                .await?;
+            }
+            for (id, history) in snapshot {
+                let encoded = serde_json::to_string(&history)
+                    .map_err(|error| crate::storage::DbError::internal(error.to_string()))?;
+                conn.execute(
+                    "INSERT INTO executor_reach_history(executor_id, history_json) VALUES (?1, ?2)
+                     ON CONFLICT(executor_id) DO UPDATE SET history_json = excluded.history_json",
+                    (id.as_str(), encoded.as_str()),
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
+async fn load_reach_history(db: &LocalDb) -> DbResult<Vec<(String, ReachHistory)>> {
+    db.query_all(
+        "SELECT executor_id, history_json FROM executor_reach_history",
+        (),
+        |row| {
+            let history = serde_json::from_str(&row.text(1)?)
+                .map_err(|error| crate::storage::DbError::internal(error.to_string()))?;
+            Ok((row.text(0)?, history))
+        },
+    )
+    .await
+}
+
 fn journal_gap(reason: &str, count: u64, horizon_ms: Option<u64>) -> RunnerEvent {
     RunnerEvent::new(RunnerEventKind::JournalGap).detail(json!({
         "reason": reason,
@@ -210,6 +298,9 @@ fn bounded_cause(cause: &str) -> String {
 /// writer exits, releasing the database.
 #[derive(Default)]
 struct Shared {
+    reach: Mutex<HashMap<String, ReachHistory>>,
+    forgotten_reach: Mutex<HashSet<String>>,
+    reach_revision: AtomicU64,
     /// Events refused because the channel was full (or, before attach, pushed
     /// out of the ring), not yet accounted for by a `journal_gap` row.
     dropped: AtomicU64,
@@ -323,6 +414,25 @@ impl RunnerEvents {
 
     /// Record one fact. Never blocks, never awaits.
     pub fn record(&self, event: RunnerEvent) {
+        if let Some((executor_id, report)) = reach_report(&event) {
+            let mut cache = self
+                .inner
+                .shared
+                .reach
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            self.inner
+                .shared
+                .forgotten_reach
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&executor_id);
+            observe_reach(&mut cache, executor_id, report);
+            self.inner
+                .shared
+                .reach_revision
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let mut mode = self.mode();
         match &mut *mode {
             Mode::Unattached(ring) => {
@@ -339,6 +449,56 @@ impl RunnerEvents {
                 }
             },
         }
+    }
+
+    pub fn forget_reach_history(&self, executor_id: &str) {
+        let mut cache = self
+            .inner
+            .shared
+            .reach
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        cache.remove(executor_id);
+        self.inner
+            .shared
+            .forgotten_reach
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(executor_id.into());
+        self.inner
+            .shared
+            .reach_revision
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn reach_history(&self, executor_id: &str) -> Option<ReachHistory> {
+        self.inner
+            .shared
+            .reach
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(executor_id)
+            .cloned()
+    }
+
+    /// The bootstrap result is history even when enrollment cannot proceed.
+    pub fn record_reach_probe(&self, executor_id: &str, verdicts: &[ReachVerdict]) {
+        let report = ReachReport {
+            candidates: verdicts
+                .iter()
+                .filter_map(|verdict| verdict.measurement.clone())
+                .collect(),
+        };
+        let legacy: Vec<_> = verdicts
+            .iter()
+            .filter(|verdict| verdict.measurement.is_none())
+            .cloned()
+            .collect();
+        self.record(
+            RunnerEvent::new(RunnerEventKind::ExecutorReachProbed)
+                .executor(executor_id)
+                .detail(json!({"reach_report": report, "legacy_bootstrap_verdicts": legacy})),
+        );
     }
 
     /// The events recorded so far on a sink with no journal, oldest first.
@@ -488,6 +648,8 @@ fn spawn_writer(
                 shared,
                 retention,
                 last_error_logged: None,
+                reach_loaded: false,
+                reach_saved_revision: 0,
             }
             .run(receiver, initial);
         })
@@ -506,6 +668,8 @@ struct Writer {
     shared: Arc<Shared>,
     retention: Retention,
     last_error_logged: Option<Instant>,
+    reach_loaded: bool,
+    reach_saved_revision: u64,
 }
 
 impl Writer {
@@ -514,16 +678,22 @@ impl Writer {
         self.sweep();
         let mut last_sweep = Instant::now();
         loop {
-            let first =
-                match receiver.recv_timeout(SWEEP_INTERVAL.saturating_sub(last_sweep.elapsed())) {
-                    Ok(message) => message,
-                    Err(RecvTimeoutError::Timeout) => {
+            let first = match receiver.recv_timeout(
+                SWEEP_INTERVAL
+                    .saturating_sub(last_sweep.elapsed())
+                    .min(Duration::from_secs(1)),
+            ) {
+                Ok(message) => message,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.write(Vec::new(), Vec::new());
+                    if last_sweep.elapsed() >= SWEEP_INTERVAL {
                         self.sweep();
                         last_sweep = Instant::now();
-                        continue;
                     }
-                    Err(RecvTimeoutError::Disconnected) => break,
-                };
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
             let mut events = Vec::new();
             let mut acks = Vec::new();
             let mut disconnected = false;
@@ -594,8 +764,75 @@ impl Writer {
                 }
             }
         }
+        self.checkpoint_reach();
         for ack in acks {
             let _ = ack.try_send(());
+        }
+    }
+
+    fn checkpoint_reach(&mut self) {
+        if !self.reach_loaded {
+            match self.runtime.block_on(load_reach_history(&self.db)) {
+                Ok(stored) => {
+                    let mut cache = self.shared.reach.lock().unwrap_or_else(|p| p.into_inner());
+                    let forgotten = self
+                        .shared
+                        .forgotten_reach
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    for (id, history) in stored {
+                        if forgotten.contains(&id) {
+                            continue;
+                        }
+                        match cache.get_mut(&id) {
+                            Some(current) => current.merge(history),
+                            None => {
+                                cache.insert(id, history);
+                            }
+                        }
+                    }
+                    self.reach_loaded = true;
+                }
+                Err(error) => {
+                    self.note_error(format!("executor reach history could not load: {error}"));
+                    return;
+                }
+            }
+        }
+        let (revision, snapshot, forgotten) = {
+            let cache = self.shared.reach.lock().unwrap_or_else(|p| p.into_inner());
+            let revision = self.shared.reach_revision.load(Ordering::Relaxed);
+            if revision == self.reach_saved_revision {
+                return;
+            }
+            (
+                revision,
+                cache.clone(),
+                self.shared
+                    .forgotten_reach
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+            )
+        };
+        match self
+            .runtime
+            .block_on(store_reach_history(&self.db, snapshot, forgotten))
+        {
+            Ok(()) => {
+                self.reach_saved_revision = revision;
+                let _cache = self.shared.reach.lock().unwrap_or_else(|p| p.into_inner());
+                if self.shared.reach_revision.load(Ordering::Relaxed) == revision {
+                    self.shared
+                        .forgotten_reach
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clear();
+                }
+            }
+            Err(error) => {
+                self.note_error(format!("executor reach history checkpoint failed: {error}"))
+            }
         }
     }
 
@@ -946,6 +1183,178 @@ mod tests {
             .unwrap()
     }
 
+    fn reach_event(at: u64, endpoint: &str, won: bool, pinned: bool) -> RunnerEvent {
+        use cairn_common::executor_protocol::{ReachCandidateOutcome, ReachCandidateReport};
+        RunnerEvent::new(RunnerEventKind::ExecutorAttached)
+            .at(at)
+            .executor("machine")
+            .detail(
+                json!({"reach_report": ReachReport { candidates: vec![ReachCandidateReport {
+                    endpoint: endpoint.into(),
+                    resolved_addresses: vec!["192.0.2.1:3850".into()],
+                    outcome: ReachCandidateOutcome::Connected,
+                    latency_ms: Some(12),
+                    bound_ms: Some(2000),
+                    won,
+                    pinned,
+                    detail: "measured TCP connect".into(),
+                }]}}),
+            )
+    }
+
+    #[test]
+    fn reach_history_survives_restart_and_journal_pruning_and_unions_reports() {
+        let runtime = runtime();
+        let db = test_db(&runtime, "runner_reach_history.db");
+        let first = RunnerEvents::default();
+        first.attach_journal(db.clone(), "boot-1").unwrap();
+        first.record(reach_event(10, "wss://wired/executor", true, true));
+        first.record(reach_event(20, "wss://tailnet/executor", false, true));
+        // An open TCP socket without authenticated TLS is not an answering route.
+        first.record(reach_event(30, "wss://impostor/executor", false, false));
+        // A peer with no optional report must not erase the last report.
+        first.record(
+            RunnerEvent::new(RunnerEventKind::ExecutorAttached)
+                .at(40)
+                .executor("machine"),
+        );
+        assert!(first.flush(Duration::from_secs(10)));
+        let expected = first.reach_history("machine").unwrap();
+        assert_eq!(
+            expected.answered_endpoints,
+            ["wss://tailnet/executor", "wss://wired/executor"]
+        );
+        assert_eq!(expected.latest.received_at_unix_ms, 30);
+        assert_eq!(expected.latest.source, ReachReportSource::Attach);
+        runtime
+            .block_on(db.execute("DELETE FROM runner_events", ()))
+            .unwrap();
+        drop(first);
+
+        let restarted = RunnerEvents::default();
+        // A pre-journal attach races hydration: union both, keep the newer report.
+        restarted.record(reach_event(50, "wss://new/executor", true, true));
+        restarted.attach_journal(db.clone(), "boot-2").unwrap();
+        assert!(restarted.flush(Duration::from_secs(10)));
+        let actual = restarted.reach_history("machine").unwrap();
+        assert_eq!(
+            actual.answered_endpoints,
+            [
+                "wss://new/executor",
+                "wss://tailnet/executor",
+                "wss://wired/executor"
+            ]
+        );
+        assert_eq!(actual.latest.received_at_unix_ms, 50);
+        let durable = runtime.block_on(load_reach_history(&db)).unwrap();
+        assert_eq!(durable, vec![("machine".into(), actual)]);
+    }
+
+    #[test]
+    fn reach_checkpoint_survives_queue_overflow_write_failure_and_removal() {
+        let runtime = runtime();
+        let db = test_db(&runtime, "runner_reach_checkpoint.db");
+        let events = RunnerEvents::default();
+        // Deliberately keep the one-slot queue full with no event consumer.
+        let (sender, _receiver) = sync_channel(1);
+        events.install(sender).unwrap();
+        events.record(reach_event(10, "wss://wired/executor", true, true));
+        events.record(reach_event(20, "wss://tailnet/executor", true, true));
+        assert_eq!(events.journal_state().dropped, 1);
+        let mut writer = Writer {
+            runtime,
+            db: db.clone(),
+            runner_incarnation: "boot".into(),
+            shared: events.inner.shared.clone(),
+            retention: Retention::default(),
+            last_error_logged: None,
+            reach_loaded: false,
+            reach_saved_revision: 0,
+        };
+        writer.checkpoint_reach();
+        let expected = events.reach_history("machine").unwrap();
+        assert_eq!(
+            writer.runtime.block_on(load_reach_history(&db)).unwrap(),
+            vec![("machine".into(), expected)]
+        );
+
+        writer
+            .runtime
+            .block_on(db.execute(
+                "ALTER TABLE executor_reach_history RENAME TO unavailable_reach",
+                (),
+            ))
+            .unwrap();
+        events.record(reach_event(30, "wss://new/executor", true, true));
+        writer.checkpoint_reach();
+        assert_ne!(
+            writer.reach_saved_revision,
+            events.inner.shared.reach_revision.load(Ordering::Relaxed)
+        );
+        writer
+            .runtime
+            .block_on(db.execute(
+                "ALTER TABLE unavailable_reach RENAME TO executor_reach_history",
+                (),
+            ))
+            .unwrap();
+        writer.checkpoint_reach();
+        let expected = events.reach_history("machine").unwrap();
+        assert_eq!(expected.answered_endpoints.len(), 3);
+        assert_eq!(
+            writer.runtime.block_on(load_reach_history(&db)).unwrap(),
+            vec![("machine".into(), expected)]
+        );
+
+        // A new sink hydrates from durable rows, not the overflowed event queue.
+        let restarted = RunnerEvents::default();
+        restarted.attach_journal(db.clone(), "boot-next").unwrap();
+        assert!(restarted.flush(Duration::from_secs(10)));
+        assert_eq!(
+            restarted.reach_history("machine"),
+            events.reach_history("machine")
+        );
+        restarted.forget_reach_history("machine");
+        assert!(restarted.flush(Duration::from_secs(10)));
+        assert!(writer
+            .runtime
+            .block_on(load_reach_history(&db))
+            .unwrap()
+            .is_empty());
+        assert!(restarted.reach_history("machine").is_none());
+    }
+
+    #[test]
+    fn legacy_bootstrap_verdicts_are_history_not_invented_measurements() {
+        use cairn_common::executor_protocol::ReachOutcome;
+        let runtime = runtime();
+        let db = test_db(&runtime, "runner_reach_legacy.db");
+        let events = RunnerEvents::default();
+        events.attach_journal(db.clone(), "boot").unwrap();
+        events.record_reach_probe(
+            "machine",
+            &[ReachVerdict {
+                measurement: None,
+                endpoint: "wss://wired/executor".into(),
+                outcome: ReachOutcome::Reached,
+                detail: "pinned TLS".into(),
+            }],
+        );
+        let history = events.reach_history("machine").unwrap();
+        assert_eq!(history.latest.source, ReachReportSource::Bootstrap);
+        assert!(history.latest.report.candidates.is_empty());
+        assert_eq!(history.latest.legacy_bootstrap_verdicts.len(), 1);
+        assert_eq!(history.answered_endpoints, ["wss://wired/executor"]);
+        events.record(RunnerEvent::new(RunnerEventKind::ExecutorAttached).executor("old-peer"));
+        assert!(events.reach_history("old-peer").is_none());
+        assert!(events.flush(Duration::from_secs(10)));
+        let restarted = RunnerEvents::default();
+        restarted.attach_journal(db, "boot-next").unwrap();
+        assert!(restarted.flush(Duration::from_secs(10)));
+        assert_eq!(restarted.reach_history("machine"), Some(history));
+        assert!(restarted.reach_history("old-peer").is_none());
+    }
+
     #[test]
     fn the_kind_vocabulary_is_pinned() {
         let strings: Vec<&str> = RunnerEventKind::ALL
@@ -960,6 +1369,7 @@ mod tests {
                 "runtime_stall",
                 "runtime_recovered",
                 "executor_attached",
+                "executor_reach_probed",
                 "executor_attach_refused",
                 "executor_protocol_incompatible",
                 "executor_detached",

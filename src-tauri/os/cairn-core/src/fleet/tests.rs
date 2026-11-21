@@ -13954,6 +13954,7 @@ pub(super) fn targeted_request(os: &str) -> CellRequest {
 fn a_windows_targeted_refusal_names_the_absent_windows_machine_and_its_cause() {
     let request = targeted_request("windows");
     let absent = EnrolledRemote {
+        reach_history: None,
         executor_id: "bglab-win".into(),
         name: "bglab-win".into(),
         os: "windows".into(),
@@ -13982,6 +13983,7 @@ fn a_windows_targeted_refusal_names_the_absent_windows_machine_and_its_cause() {
 fn a_windows_targeted_refusal_says_when_no_windows_machine_is_enrolled() {
     let request = targeted_request("windows");
     let linux = EnrolledRemote {
+        reach_history: None,
         executor_id: "bglab-ub".into(),
         name: "bglab-ub".into(),
         os: "linux".into(),
@@ -14017,6 +14019,7 @@ fn a_pinned_refusal_names_only_the_machine_the_work_is_pinned_to() {
     request.executor = None;
     request.pinned_executor_id = Some("execution-home".into());
     let pinned = EnrolledRemote {
+        reach_history: None,
         executor_id: "execution-home".into(),
         name: "bglab-ub".into(),
         os: "linux".into(),

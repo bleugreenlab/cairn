@@ -252,6 +252,11 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     evict("branch_regenerations", Eviction::SettledRegenerations).budget(16),
     // Pruned by their own owners.
     owned_by(
+        "executor_reach_history",
+        "cairn-core fleet::runner_events",
+        "one latest report and endpoint union per machine; deleted on enrollment removal",
+    ).budget(16),
+    owned_by(
         "runner_events",
         "cairn-core fleet::runner_events",
         "14 days or 200,000 rows",

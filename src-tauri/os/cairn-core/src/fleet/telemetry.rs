@@ -253,6 +253,7 @@ mod tests {
         };
         let report = ExecutorSubstrateReport::default();
         ExecutorInspection {
+            reach_history: None,
             drain_state: Default::default(),
             name: name.to_string(),
             link_path: None,

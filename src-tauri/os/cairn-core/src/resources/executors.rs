@@ -23,8 +23,8 @@
 use cairn_common::executor_protocol::{
     BindingEvent, DeclineReason, ExecutorHealthStatus, ExecutorInspection, MachineRole,
     PlacementDecision, PlacementOutcome, PlacementPrediction, PlacementReason,
-    PlacementRejectionReason, PlacementSyncCost, ReservationRationale,
-    MIN_CONFIDENT_RESERVATION_SAMPLES,
+    PlacementRejectionReason, PlacementSyncCost, ReachCandidateOutcome, ReachCandidateReport,
+    ReachHistory, ReachReportSource, ReservationRationale, MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_common::executor_protocol::{
     DiskDecline, DiskReliefOutlook, ExternalCacheBreakdown, OccupancyLineageReport, OccupancyRule,
@@ -501,6 +501,7 @@ pub(crate) fn render_executors(
             }
         }
         out.push_str(&format!("- Link: {}\n", link_summary(executor)));
+        out.push_str(&reach_warning(executor.reach_history.as_ref()));
         out.push_str(&pipe_floor_line(&executor_pipe_floor(
             &executor.health.host,
             executor.captured_at_unix_ms,
@@ -543,6 +544,10 @@ pub(crate) fn render_executors(
         ));
         for remote in enrolled {
             out.push_str(&format!("### {}\n", remote.name));
+            out.push_str(&render_reach(
+                remote.reach_history.as_ref(),
+                captured_at_unix_ms,
+            ));
             out.push_str(&format!("- Platform: {} / {}\n", remote.os, remote.arch));
             out.push_str(&format!(
                 "- Link: {}\n",
@@ -867,6 +872,142 @@ fn role_census(executors: &[ExecutorInspection], enrolled: &[EnrolledRemote]) ->
     format!("Roles: {}\n\n", groups.join(" · "))
 }
 
+fn reach_endpoint(endpoint: &str) -> String {
+    one_line(
+        endpoint
+            .split_once("://")
+            .map_or(endpoint, |(_, rest)| rest)
+            .split('/')
+            .next()
+            .unwrap_or(endpoint),
+    )
+}
+
+fn reach_warning(history: Option<&ReachHistory>) -> String {
+    let Some(history) = history else {
+        return String::new();
+    };
+    if history.answered_endpoints.len() != 1 {
+        return String::new();
+    }
+    format!(
+        "- single path: this machine reaches the runner only via {}; if that path fails it cannot reattach (only answering endpoint in stored reports; unmeasured alternatives are not proven failures)\n",
+        reach_endpoint(&history.answered_endpoints[0])
+    )
+}
+
+fn reach_candidate(candidate: &ReachCandidateReport) -> String {
+    let mut endpoint = reach_endpoint(&candidate.endpoint);
+    if !candidate.resolved_addresses.is_empty() {
+        endpoint.push_str(&format!(
+            " = {}",
+            candidate
+                .resolved_addresses
+                .iter()
+                .map(|address| one_line(address))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let mut facts = Vec::new();
+    if let Some(address) = candidate
+        .resolved_addresses
+        .first()
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+    {
+        facts.push(
+            if cairn_common::link_transport::is_tunnel_address(address.ip()) {
+                "tailnet".to_string()
+            } else {
+                "direct".to_string()
+            },
+        );
+    }
+    facts.push(match candidate.outcome {
+        ReachCandidateOutcome::Connected if candidate.won || candidate.pinned => "connected".into(),
+        ReachCandidateOutcome::Connected => "TCP connected; pinned runner not verified".into(),
+        ReachCandidateOutcome::Refused => "refused".into(),
+        ReachCandidateOutcome::TimedOut => candidate.bound_ms.map_or_else(
+            || "connection or handshake did not complete within bound".into(),
+            |bound| {
+                format!(
+                    "connection or handshake did not complete within {} s",
+                    bound as f64 / 1000.0
+                )
+            },
+        ),
+        ReachCandidateOutcome::DidNotResolve => "did not resolve".into(),
+        ReachCandidateOutcome::PinMismatch => "TLS pin mismatch".into(),
+        ReachCandidateOutcome::Unmeasured => "unmeasured".into(),
+        ReachCandidateOutcome::Failed => "failed".into(),
+    });
+    if let Some(latency) = candidate.latency_ms {
+        facts.push(format!("{latency} ms"));
+    }
+    if candidate.won {
+        facts.push("won".into());
+    }
+    if !candidate.detail.is_empty() {
+        facts.push(one_line(&candidate.detail));
+    }
+    format!("{endpoint} ({})", facts.join(", "))
+}
+
+fn render_reach(history: Option<&ReachHistory>, captured_at_unix_ms: u64) -> String {
+    let Some(history) = history else {
+        return "- Reach: unmeasured (no reach report received)\n".into();
+    };
+    let latest = &history.latest;
+    let when = i64::try_from(latest.received_at_unix_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| format!("{} ms since epoch", latest.received_at_unix_ms));
+    let source = match latest.source {
+        ReachReportSource::Attach => "last attach",
+        ReachReportSource::Bootstrap => "bootstrap probe",
+    };
+    let mut out = format!(
+        "- Reach reported: {source} {when} ({})\n",
+        age(captured_at_unix_ms.saturating_sub(latest.received_at_unix_ms))
+    );
+    let mut candidates = latest
+        .report
+        .candidates
+        .iter()
+        .map(reach_candidate)
+        .collect::<Vec<_>>();
+    {
+        use cairn_common::executor_protocol::ReachOutcome;
+        candidates.extend(latest.legacy_bootstrap_verdicts.iter().map(|verdict| {
+            format!(
+                "{} ({}; addresses and latency unmeasured{})",
+                reach_endpoint(&verdict.endpoint),
+                match verdict.outcome {
+                    ReachOutcome::Reached => "connected",
+                    ReachOutcome::Unreachable => "unreachable",
+                    ReachOutcome::PinRefused => "TLS pin mismatch",
+                },
+                if verdict.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", one_line(&verdict.detail))
+                }
+            )
+        }));
+    }
+    out.push_str(&format!(
+        "- Reach: {}\n",
+        if candidates.is_empty() {
+            "unmeasured (report contains no candidate measurements)".into()
+        } else {
+            candidates.join(" · ")
+        }
+    ));
+    out.push_str(&reach_warning(Some(history)));
+    out
+}
+
 /// What a machine is for, and what that means for today's classes of work,
 /// derived from the role's own [`MachineRole::accepts`].
 fn machine_role_line(role: MachineRole) -> String {
@@ -885,6 +1026,10 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
     out.push_str(&format!(
         "- Status: {}\n",
         enrolled_link_summary(remote, captured_at_unix_ms)
+    ));
+    out.push_str(&render_reach(
+        remote.reach_history.as_ref(),
+        captured_at_unix_ms,
     ));
     // Draining is runner-side state, so it is one of the few things worth
     // saying about a machine that is reporting nothing: it decides what happens
@@ -1575,6 +1720,12 @@ pub(crate) fn render_executor_with_kills(
             },
             path.executor.ip(),
             path.runner
+        ));
+    }
+    if !executor.colocated {
+        out.push_str(&render_reach(
+            executor.reach_history.as_ref(),
+            executor.captured_at_unix_ms,
         ));
     }
     out.push_str(&format!(
@@ -9925,6 +10076,7 @@ mod tests {
             drain_state: Default::default(),
             name: name.into(),
             link_path: None,
+            reach_history: None,
             recent_placements: Vec::new(),
             colocated,
             health: ExecutorHealthSnapshot {
@@ -11503,6 +11655,7 @@ mod tests {
                 "ssh unreachable (ssh: connect to host bglab-ub port 22: No route to host)",
             )),
             last_seen_unix_ms: Some(REMOTE_CAPTURED_AT - 7_200_000),
+            reach_history: None,
             retired: Vec::new(),
             connection_timeline: Vec::new(),
             drained: false,
@@ -12526,6 +12679,154 @@ mod tests {
 
         executor.health.advertisement.last_refresh = None;
         assert!(!render_executor(&executor).contains("Last refresh"));
+    }
+
+    fn reach_specimen() -> ReachHistory {
+        use cairn_common::executor_protocol::{ReachReport, RecordedReachReport};
+        ReachHistory {
+            latest: RecordedReachReport {
+                received_at_unix_ms: CAPTURED_AT - 60_000,
+                source: ReachReportSource::Attach,
+                report: ReachReport {
+                    candidates: vec![
+                        ReachCandidateReport {
+                            endpoint: "wss://10.10.10.51:3846/api/executor".into(),
+                            resolved_addresses: vec!["10.10.10.51:3846".into()],
+                            outcome: ReachCandidateOutcome::Connected,
+                            latency_ms: Some(1),
+                            bound_ms: Some(10_000),
+                            won: true,
+                            pinned: true,
+                            detail: String::new(),
+                        },
+                        ReachCandidateReport {
+                            endpoint: "wss://bbl.tigon-trout.ts.net:3846/api/executor".into(),
+                            resolved_addresses: vec!["100.75.184.96:3846".into()],
+                            outcome: ReachCandidateOutcome::TimedOut,
+                            latency_ms: Some(10_000),
+                            bound_ms: Some(10_000),
+                            won: false,
+                            pinned: false,
+                            detail: String::new(),
+                        },
+                    ],
+                },
+                legacy_bootstrap_verdicts: Vec::new(),
+            },
+            answered_endpoints: vec!["wss://10.10.10.51:3846/api/executor".into()],
+        }
+    }
+
+    #[test]
+    fn reach_renders_the_winner_and_failed_alternative_beside_the_path() {
+        let mut executor = inspection("bginf-sp2", false);
+        executor.reach_history = Some(reach_specimen());
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("10.10.10.51:3846 = 10.10.10.51:3846 (direct, connected, 1 ms, won)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("bbl.tigon-trout.ts.net:3846 = 100.75.184.96:3846 (tailnet, connection or handshake did not complete within 10 s"), "{rendered}");
+        assert!(rendered.contains("single path: this machine reaches the runner only via 10.10.10.51:3846; if that path fails it cannot reattach"), "{rendered}");
+        let overview = render_executors(&[executor], &[], &[], None, CAPTURED_AT, false);
+        assert!(overview.contains("- single path:"), "{overview}");
+    }
+
+    #[test]
+    fn absent_machine_keeps_its_timestamped_reach_report_and_single_path_warning() {
+        let mut remote = enrolled(
+            "bginf-sp2",
+            RemoteLinkState::Absent {
+                last_beat_unix_ms: Some(CAPTURED_AT - 60_000),
+                last_reason: "connection lost".into(),
+            },
+        );
+        remote.last_attempt = None;
+        remote.reach_history = Some(reach_specimen());
+        let rendered = render_enrolled_remote(&remote, CAPTURED_AT);
+        assert!(
+            rendered.contains("- Reach reported: last attach "),
+            "{rendered}"
+        );
+        assert!(rendered.contains("(1m ago)"), "{rendered}");
+        assert!(rendered.contains("1 ms, won"), "{rendered}");
+        assert!(
+            rendered.contains("connection or handshake did not complete within 10 s"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("- single path:"), "{rendered}");
+        let overview = render_executors(&[], &[remote], &[], None, CAPTURED_AT, false);
+        assert!(
+            overview.contains("- Reach reported: last attach "),
+            "{overview}"
+        );
+        assert!(overview.contains("- single path:"), "{overview}");
+    }
+
+    #[test]
+    fn a_second_historical_answer_removes_the_single_path_warning() {
+        let mut history = reach_specimen();
+        history
+            .answered_endpoints
+            .push("wss://bbl.tigon-trout.ts.net:3846/api/executor".into());
+        assert!(!render_reach(Some(&history), CAPTURED_AT).contains("single path:"));
+        assert!(render_reach(None, CAPTURED_AT).contains("unmeasured"));
+        assert!(!render_reach(None, CAPTURED_AT).contains("single path:"));
+    }
+
+    #[test]
+    fn reach_distinguishes_resolution_refusal_and_pin_failure() {
+        let mut candidate = reach_specimen().latest.report.candidates.remove(1);
+        candidate.latency_ms = Some(2);
+        candidate.resolved_addresses.clear();
+        for (outcome, expected) in [
+            (ReachCandidateOutcome::DidNotResolve, "did not resolve"),
+            (ReachCandidateOutcome::Refused, "refused"),
+            (ReachCandidateOutcome::PinMismatch, "TLS pin mismatch"),
+        ] {
+            candidate.outcome = outcome;
+            assert!(reach_candidate(&candidate).contains(expected));
+        }
+        candidate.outcome = ReachCandidateOutcome::Connected;
+        assert!(reach_candidate(&candidate).contains("TCP connected; pinned runner not verified"));
+    }
+
+    #[test]
+    fn pending_alternatives_are_not_rendered_as_failed_paths() {
+        let mut history = reach_specimen();
+        let alternative = &mut history.latest.report.candidates[1];
+        alternative.outcome = ReachCandidateOutcome::Unmeasured;
+        alternative.latency_ms = None;
+        alternative.detail = "race ended before this candidate completed".into();
+        let rendered = render_reach(Some(&history), CAPTURED_AT);
+        assert!(rendered.contains("unmeasured"), "{rendered}");
+        assert!(
+            !rendered.contains("connection or handshake did not complete within"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("never answered"), "{rendered}");
+    }
+
+    #[test]
+    fn bootstrap_is_the_first_report_and_legacy_probe_measurements_stay_unknown() {
+        use cairn_common::executor_protocol::{ReachOutcome, ReachVerdict};
+        let mut history = reach_specimen();
+        history.latest.source = ReachReportSource::Bootstrap;
+        history.latest.report.candidates.clear();
+        history.latest.legacy_bootstrap_verdicts = vec![ReachVerdict {
+            endpoint: history.answered_endpoints[0].clone(),
+            outcome: ReachOutcome::Reached,
+            detail: String::new(),
+            measurement: None,
+        }];
+        let rendered = render_reach(Some(&history), CAPTURED_AT);
+        assert!(rendered.contains("bootstrap probe"), "{rendered}");
+        assert!(
+            rendered.contains("addresses and latency unmeasured"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("- single path:"), "{rendered}");
+        assert!(!rendered.contains(", won"), "{rendered}");
     }
 
     /// Which route a remote link took reads off the page.

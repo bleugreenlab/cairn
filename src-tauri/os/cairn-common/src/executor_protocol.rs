@@ -9058,6 +9058,11 @@ pub struct LearnedResourceEstimate {
 /// older executor: nothing; that executor's commands carry no record, which the
 /// test process reports as no record handed down.
 ///
+/// cairn/6229 does not move the number. Hello's optional reach_report and the
+/// bootstrap verdict's optional measurement describe existing dial observations.
+/// Older senders omit them and older readers ignore them; neither admission nor
+/// placement changes. Connected describes TCP, while won proves the upgrade.
+///
 /// Version 169 (cairn/6950) moves a machine's warm roots off the beat. The
 /// advertisement no longer carries `warmRoots`: [`ExecutorMessage::Hello`]
 /// carries the whole [`WarmRootInventory`] once per link, and the new
@@ -21518,6 +21523,76 @@ pub struct ExecutorHealthSnapshot {
     pub build_volume: Option<BuildVolumeReport>,
 }
 
+/// Where the runner received a machine's account of its reachable endpoints.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReachReportSource {
+    Attach,
+    Bootstrap,
+}
+
+/// One report stamped by the receiving runner, not by the remote clock.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordedReachReport {
+    pub received_at_unix_ms: u64,
+    pub source: ReachReportSource,
+    pub report: ReachReport,
+    /// Old bootstrap probes carry verdicts but no measurements. Preserve those
+    /// facts without manufacturing addresses, timings, bounds or a dial winner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_bootstrap_verdicts: Vec<ReachVerdict>,
+}
+
+/// Durable knowledge, independent of the current link and journal retention.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReachHistory {
+    pub latest: RecordedReachReport,
+    /// Sorted, distinct endpoints that completed a configured WebSocket link
+    /// or authenticated this runner through pinned TLS at least once.
+    pub answered_endpoints: Vec<String>,
+}
+
+impl ReachHistory {
+    pub fn from_report(report: RecordedReachReport) -> Self {
+        let mut history = Self {
+            latest: report.clone(),
+            answered_endpoints: Vec::new(),
+        };
+        history.observe(report);
+        history
+    }
+
+    pub fn observe(&mut self, report: RecordedReachReport) {
+        self.answered_endpoints.extend(
+            report
+                .report
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.won || candidate.pinned)
+                .map(|candidate| candidate.endpoint.clone()),
+        );
+        self.answered_endpoints.extend(
+            report
+                .legacy_bootstrap_verdicts
+                .iter()
+                .filter(|verdict| verdict.outcome == ReachOutcome::Reached)
+                .map(|verdict| verdict.endpoint.clone()),
+        );
+        self.answered_endpoints.sort();
+        self.answered_endpoints.dedup();
+        if report.received_at_unix_ms >= self.latest.received_at_unix_ms {
+            self.latest = report;
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.answered_endpoints.extend(other.answered_endpoints);
+        self.observe(other.latest);
+    }
+}
+
 /// One executor as an agent inspects it: its public address, everything the
 /// runner has cached about the machine, and the work resident on it.
 ///
@@ -21532,6 +21607,8 @@ pub struct ExecutorHealthSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorInspection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach_history: Option<ReachHistory>,
     #[serde(default)]
     pub drain_state: ExecutorDrainState,
     /// The public address of this machine, and the only name a placement
@@ -21734,10 +21811,53 @@ pub enum ReachOutcome {
     PinRefused,
 }
 
+/// Measurements from the executor's existing dial, not an active network survey.
+/// Entries describe individual resolved address attempts; aliases suppressed by
+/// the dial and attempts abandoned at the winner remain unmeasured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReachReport {
+    pub candidates: Vec<ReachCandidateReport>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReachCandidateOutcome {
+    Connected,
+    Refused,
+    TimedOut,
+    DidNotResolve,
+    PinMismatch,
+    Unmeasured,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReachCandidateReport {
+    /// The peer completed TLS with a pinned certificate.
+    #[serde(default)]
+    pub pinned: bool,
+    pub endpoint: String,
+    pub resolved_addresses: Vec<String>,
+    pub outcome: ReachCandidateOutcome,
+    /// Elapsed measurement time, excluding the dial stagger. Resident dial
+    /// success measures TCP; upgrade failure measures the upgrade stage.
+    /// Bootstrap measures total elapsed across resolution/TCP and TLS.
+    pub latency_ms: Option<u64>,
+    pub bound_ms: Option<u64>,
+    /// Only a completed WebSocket upgrade wins a resident dial.
+    pub won: bool,
+    /// Names the measurement stage: TCP alone does not prove a usable link.
+    pub detail: String,
+}
+
 /// One endpoint's verdict from `cairn-exec reach`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ReachVerdict {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<ReachCandidateReport>,
     pub endpoint: String,
     pub outcome: ReachOutcome,
     /// The error or the fingerprint presented, for a person reading why.
@@ -21903,6 +22023,8 @@ fn split_account(account: String) -> (String, Option<String>) {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EnrolledRemote {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach_history: Option<ReachHistory>,
     /// First observed link absence, adjusted for runner sleep by its link clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absence_since_unix_ms: Option<u64>,
@@ -26594,6 +26716,8 @@ pub enum RelayIdentity {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ExecutorMessage {
     Hello {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reach_report: Option<ReachReport>,
         protocol_version: u32,
         advertisement: ExecutorAdvertisement,
         /// Every warm root this machine holds, so placement reads a machine
@@ -27762,6 +27886,7 @@ mod tests {
     #[test]
     fn update_fields_are_optional_for_pre_v92_messages() {
         let hello = ExecutorMessage::Hello {
+            reach_report: None,
             protocol_version: 91,
             advertisement: sample_advertisement(),
             warm_roots: WarmRootInventory::default(),
@@ -27773,10 +27898,12 @@ mod tests {
         };
         let hello_value = serde_json::to_value(hello).unwrap();
         assert!(hello_value.get("last_update").is_none());
+        assert!(hello_value.get("reach_report").is_none());
         let hello: ExecutorMessage = serde_json::from_value(hello_value).unwrap();
         assert!(matches!(
             hello,
             ExecutorMessage::Hello {
+                reach_report: None,
                 last_update: None,
                 ..
             }
@@ -28148,6 +28275,7 @@ mod tests {
         let advertisement = sample_advertisement();
         vec![
             ExecutorMessage::Hello {
+                reach_report: None,
                 protocol_version: EXECUTOR_PROTOCOL_VERSION,
                 advertisement: advertisement.clone(),
                 warm_roots: WarmRootInventory {
@@ -31185,6 +31313,7 @@ mod tests {
             // tiers cannot quietly start painting like the loud one.
             enrolled_remotes: vec![
                 EnrolledRemote {
+                    reach_history: None,
                     drain_state: Default::default(),
                     executor_id: "bglab-mac".into(),
                     name: "bglab-mac".into(),
@@ -31211,6 +31340,7 @@ mod tests {
                     update_returns_by_unix_ms: None,
                 },
                 EnrolledRemote {
+                    reach_history: None,
                     drain_state: Default::default(),
                     executor_id: "bglab-ub".into(),
                     name: "bglab-ub".into(),
@@ -31238,6 +31368,7 @@ mod tests {
                     update_returns_by_unix_ms: None,
                 },
                 EnrolledRemote {
+                    reach_history: None,
                     drain_state: Default::default(),
                     executor_id: "bglab-win".into(),
                     name: "bglab-win".into(),
@@ -31651,6 +31782,7 @@ mod tests {
         let mut advertisement = sample_advertisement();
         advertisement.capabilities.service_bounds = Some(bounds);
         let hello = ExecutorMessage::Hello {
+            reach_report: None,
             protocol_version: 171,
             advertisement: advertisement.clone(),
             warm_roots: WarmRootInventory::default(),
@@ -32118,6 +32250,7 @@ mod tests {
             // honest answer and both have to survive the wire, because a client
             // that read them as zero would render a machine last seen in 1970.
             enrolled_remotes: vec![EnrolledRemote {
+                reach_history: None,
                 drain_state: Default::default(),
                 executor_id: "bglab-win".into(),
                 name: "bglab-win".into(),

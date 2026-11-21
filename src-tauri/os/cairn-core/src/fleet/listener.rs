@@ -1280,6 +1280,7 @@ impl Fleet {
     }
 
     pub fn forget_enrolled_remote(&self, executor_id: &str) {
+        self.runner_events.forget_reach_history(executor_id);
         if self
             .enrolled_remotes
             .lock()
@@ -1320,6 +1321,7 @@ impl Fleet {
             .iter()
             .filter(|(executor_id, _)| !attached.contains(*executor_id))
             .map(|(executor_id, record)| EnrolledRemote {
+                reach_history: self.runner_events.reach_history(executor_id),
                 absence_since_unix_ms: Some(self.link_absent_since(executor_id, now)),
                 update_returns_by_unix_ms: returns_by.get(executor_id).copied(),
                 drain_state: projection.view(executor_id),

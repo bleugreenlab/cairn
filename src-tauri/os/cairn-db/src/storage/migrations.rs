@@ -2287,6 +2287,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "runner_events",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    (
+        "executor_reach_history",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // What a page's open frames read and reported on this install, and which
     // viewer had it open: an audit trail of this install's own viewers, pruned
     // to the newest rows per page.

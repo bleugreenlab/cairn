@@ -710,6 +710,9 @@ impl Fleet {
         let mut values: Vec<_> = connections
             .values()
             .map(|entry| ExecutorInspection {
+                reach_history: self
+                    .runner_events
+                    .reach_history(&entry.identity.executor_id),
                 drain_state: entry.drain_state.clone(),
                 name: executor_public_name(entry),
                 link_path: entry.link_path,
