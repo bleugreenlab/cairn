@@ -441,10 +441,11 @@ pub const HOME_RETENTION: &[HomeEntry] = &[
     ),
     dir(
         "executor-artifacts",
-        "cairn-core executor distribution",
-        "devops",
-        Undecided {
-            issue: "cairn://p/cairn/6763",
+        "cairn-orch executor distribution",
+        "execution",
+        Lifecycle {
+            keyed_on: "executor protocol (current and predecessor) and machine-service selection",
+            enforcer: "cairn-orch executor_distribution retention",
         },
     ),
     dir(
