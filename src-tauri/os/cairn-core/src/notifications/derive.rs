@@ -15,6 +15,35 @@ use super::{
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::turso::{params, Row};
 use cairn_uri as uri;
+use std::collections::HashSet;
+
+/// The jobs and turns one rebuild read, taken from every source row before any
+/// row is filtered out in Rust, so a row held back (a failure inside its
+/// settle window, a question on a turn that is not current) is watched too.
+///
+/// A write to any of them may move the answer. A write to any other job or
+/// turn can only by committing a state that opens an entry by itself, which is
+/// how the generation cache's `touches_a_notification` scopes the frames it is
+/// sent. So every source that reads a job must record it here.
+#[derive(Debug, Default)]
+pub(super) struct Watched {
+    pub(super) jobs: HashSet<String>,
+    pub(super) turns: HashSet<String>,
+}
+
+impl Watched {
+    fn job(&mut self, id: Option<&str>) {
+        if let Some(id) = id {
+            self.jobs.insert(id.to_string());
+        }
+    }
+
+    fn turn(&mut self, id: Option<&str>) {
+        if let Some(id) = id {
+            self.turns.insert(id.to_string());
+        }
+    }
+}
 
 /// The longest summary line, in characters.
 const SUMMARY_CHARS: usize = 160;
@@ -28,9 +57,10 @@ const PLACE_JOINS: &str = "LEFT JOIN jobs parent ON parent.id = j.parent_job_id
     LEFT JOIN issues i ON i.id = j.issue_id
     LEFT JOIN threads th ON th.id = COALESCE(j.thread_id, parent.thread_id)";
 
-/// Read from [`PLACE_COLUMNS`] after its leading `j.id`, which a caller reads
-/// on its own to tell whether the job row exists at all.
+/// Read from [`PLACE_COLUMNS`]. `job_id` is `None` only where the job is
+/// LEFT JOINed and absent.
 struct JobPlace {
+    job_id: Option<String>,
     node_name: Option<String>,
     segment: Option<String>,
     parent_segment: Option<String>,
@@ -44,6 +74,7 @@ struct JobPlace {
 impl JobPlace {
     fn read(row: &Row, at: usize) -> Result<Self, DbError> {
         Ok(Self {
+            job_id: row.opt_text(at)?,
             node_name: row.opt_text(at + 1)?,
             segment: row.opt_text(at + 2)?,
             parent_segment: row.opt_text(at + 3)?,
@@ -309,25 +340,27 @@ async fn open_and_recent<T: Send + 'static>(
 
 /// Every database-backed kind, for one project, and the earliest moment the
 /// answer changes with no write (see [`agent_failures`]). `since` bounds how
-/// far back resolved entries are read.
+/// far back resolved entries are read. Every job and turn read is recorded in
+/// `watched`.
 pub(super) async fn from_sources(
     db: &LocalDb,
     local: &LocalDb,
     project: &ProjectRef,
     since: i64,
     now: i64,
+    watched: &mut Watched,
 ) -> Result<(Vec<OperatorNotification>, Option<i64>), String> {
     let mut entries = Vec::new();
     entries.extend(operator_messages(local, project, since).await?);
-    entries.extend(questions(db, project, since).await?);
-    entries.extend(permissions(db, project, since).await?);
+    entries.extend(questions(db, project, since, watched).await?);
+    entries.extend(permissions(db, project, since, watched).await?);
     entries.extend(tenets(db, project, since).await?);
-    entries.extend(pull_requests(db, project, since).await?);
-    let (failures, failures_settle_at) = agent_failures(db, project, since, now).await?;
+    entries.extend(pull_requests(db, project, since, watched).await?);
+    let (failures, failures_settle_at) = agent_failures(db, project, since, now, watched).await?;
     entries.extend(failures);
-    let (reviews, stale_at) = awaiting_review(db, project, now).await?;
+    let (reviews, stale_at) = awaiting_review(db, project, now, watched).await?;
     entries.extend(reviews);
-    entries.extend(missing_outputs(db, project).await?);
+    entries.extend(missing_outputs(db, project, watched).await?);
     let next_change_at = match (failures_settle_at, stale_at) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -358,10 +391,11 @@ pub(super) async fn questions(
     db: &LocalDb,
     project: &ProjectRef,
     since: i64,
+    watched: &mut Watched,
 ) -> Result<Vec<OperatorNotification>, String> {
     let sql = format!(
         "SELECT p.id, p.run_id, p.questions, p.created_at, p.answered_at, p.withdrawn_at,
-                {pending_question}, p.uri_segment, p.context,
+                {pending_question}, p.uri_segment, p.context, p.turn_id,
                 {PLACE_COLUMNS}
            FROM prompts p
            JOIN runs r ON r.id = p.run_id
@@ -388,16 +422,32 @@ pub(super) async fn questions(
                 row.i64(3)?,
                 row.opt_i64(4)?.or(row.opt_i64(5)?),
                 row.opt_i64(6)?.unwrap_or(0) != 0,
-                (row.opt_text(7)?, row.opt_text(8)?),
-                JobPlace::read(row, 9)?,
+                (row.opt_text(7)?, row.opt_text(8)?, row.opt_text(9)?),
+                JobPlace::read(row, 10)?,
             ))
         },
     )
     .await?;
+    // Whether a question is open turns on its job's status and current turn
+    // and on its own turn's state, so a question not open now is watched too:
+    // resuming its job can reopen it.
+    for (.., (_, _, turn_id), place) in &rows {
+        watched.job(place.job_id.as_deref());
+        watched.turn(turn_id.as_deref());
+    }
     Ok(rows
         .into_iter()
         .filter_map(
-            |(id, run_id, questions, created_at, closed_at, current, (segment, context), place)| {
+            |(
+                id,
+                run_id,
+                questions,
+                created_at,
+                closed_at,
+                current,
+                (segment, context, _),
+                place,
+            )| {
                 let resolved_at = match closed_at {
                     Some(at) => Some(at),
                     // Unanswered: open only on the current turn of a live issue.
@@ -437,6 +487,7 @@ pub(super) async fn permissions(
     db: &LocalDb,
     project: &ProjectRef,
     since: i64,
+    watched: &mut Watched,
 ) -> Result<Vec<OperatorNotification>, String> {
     let sql = format!(
         "SELECT pr.id, pr.run_id, pr.tool_use_id, pr.tool_name, pr.tool_input, pr.created_at,
@@ -472,6 +523,9 @@ pub(super) async fn permissions(
         },
     )
     .await?;
+    for (.., place) in &rows {
+        watched.job(place.job_id.as_deref());
+    }
     Ok(rows
         .into_iter()
         .filter_map(|(request, status, responded_at, place)| {
@@ -571,6 +625,7 @@ pub(super) async fn pull_requests(
     db: &LocalDb,
     project: &ProjectRef,
     since: i64,
+    watched: &mut Watched,
 ) -> Result<Vec<OperatorNotification>, String> {
     let sql = format!(
         "SELECT mr.id, mr.job_id, mr.title, mr.status, mr.merge_method, mr.opened_at,
@@ -614,6 +669,9 @@ pub(super) async fn pull_requests(
         ))
     })
     .await?;
+    for (.., place) in &rows {
+        watched.job(place.as_ref().and_then(|place| place.job_id.as_deref()));
+    }
     Ok(rows
         .into_iter()
         .filter_map(
@@ -689,6 +747,7 @@ pub(super) async fn agent_failures(
     project: &ProjectRef,
     since: i64,
     now: i64,
+    watched: &mut Watched,
 ) -> Result<(Vec<OperatorNotification>, Option<i64>), String> {
     const FAILED_TURN: &str = "(t.state = 'failed' OR (t.state = 'interrupted' AND t.end_reason IN ('crash', 'provider_failure')))";
     // What the entry calls the ending: a failure, a crash, or a turn the
@@ -729,6 +788,12 @@ pub(super) async fn agent_failures(
         .await
         .map_err(db_error)?,
     );
+    // A held-back failure included: its successor's insert is what resolves
+    // it, and that insert names nothing but its job.
+    for (turn_id, .., place) in &rows {
+        watched.turn(Some(turn_id));
+        watched.job(place.job_id.as_deref());
+    }
     let mut settles_at: Option<i64> = None;
     let entries = rows
         .into_iter()
@@ -780,11 +845,23 @@ pub(super) async fn awaiting_review(
     db: &LocalDb,
     project: &ProjectRef,
     now: i64,
+    watched: &mut Watched,
 ) -> Result<(Vec<OperatorNotification>, Option<i64>), String> {
-    use crate::execution::approvals::{pending_approvals, ApprovalScope};
+    use crate::execution::approvals::{approval_candidate_jobs, pending_approvals, ApprovalScope};
     let approvals = pending_approvals(db, ApprovalScope::Project(project.id.clone()))
         .await
         .map_err(db_error)?;
+    // A pending approval admits any job that has not ended, so a job joins it
+    // through a status no frame can single out (a resume). Watch every job an
+    // unconfirmed artifact could make pending instead.
+    watched.jobs.extend(
+        approval_candidate_jobs(db, &project.id)
+            .await
+            .map_err(db_error)?,
+    );
+    for approval in &approvals {
+        watched.job(Some(&approval.job_id));
+    }
     let stale_at = approvals
         .iter()
         .filter_map(|approval| approval.stale_from())
@@ -832,12 +909,17 @@ pub(super) async fn awaiting_review(
 pub(super) async fn missing_outputs(
     db: &LocalDb,
     project: &ProjectRef,
+    watched: &mut Watched,
 ) -> Result<Vec<OperatorNotification>, String> {
     use crate::execution::approvals::ApprovalScope;
-    use crate::execution::missing_output::blocked_on_output;
-    let blocked = blocked_on_output(db, ApprovalScope::Project(project.id.clone()))
-        .await
-        .map_err(db_error)?;
+    use crate::execution::missing_output::blocked_on_output_with_candidates;
+    // A job joins this list by reaching `blocked`, which its frame carries;
+    // every blocked candidate is watched for what moves it after that.
+    let (blocked, candidates) =
+        blocked_on_output_with_candidates(db, ApprovalScope::Project(project.id.clone()))
+            .await
+            .map_err(db_error)?;
+    watched.jobs.extend(candidates);
     Ok(blocked
         .into_iter()
         .map(|missing| {

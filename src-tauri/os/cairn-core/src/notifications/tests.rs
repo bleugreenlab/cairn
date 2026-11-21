@@ -278,3 +278,261 @@ async fn a_threads_non_blocking_question_stays_open_across_turns_and_resolves_ev
         .unwrap();
     }
 }
+
+// ── Which writes can move the center ──
+//
+// The generation cache skips a `turns` or `jobs` frame unless it names a job or
+// turn the last rebuild read, or commits a state that opens an entry by
+// itself. These tests hold that rule to the derivation: the frames come from
+// the real builders after real writes, and each class either leaves the
+// derived answer unchanged or is a frame the cache lets through.
+
+use crate::orchestrator::generation_cache::dirties_notification_center;
+
+const NOW: i64 = 10_000;
+
+/// One project with an agent in each situation the center reads: one asking a
+/// blocking question, one working, a planner that ended with its plan
+/// unconfirmed, and one whose turn failed five seconds ago (held back).
+async fn lifecycle_fixture(name: &str) -> LocalDb {
+    let db = crate::storage::migrated_test_db(name).await;
+    let mut script = String::from(
+        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+           VALUES ('p-lc', 'default', 'Lifecycle', 'lc', '/tmp/lc', 1, 1);
+         INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+           VALUES ('lc-i1', 'p-lc', 1, 'One', 'active', 1, 1);
+         INSERT INTO executions (id, recipe_id, project_id, issue_id, status, started_at, seq)
+           VALUES ('lc-e', 'build', 'p-lc', 'lc-i1', 'running', 1, 1);",
+    );
+    for (job, status, turn, state, created, ended) in [
+        ("asker", "running", "a1", "yielded", 100, None),
+        ("worker", "running", "w1", "complete", 100, Some(200)),
+        ("planner", "complete", "p1", "complete", 100, Some(200)),
+        ("flaky", "running", "f1", "failed", NOW - 50, Some(NOW - 5)),
+    ] {
+        let ended = ended.map_or("NULL".to_string(), |at: i64| at.to_string());
+        script.push_str(&format!(
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+               VALUES ('lc-{job}', 'lc-e', 'lc-i1', 'p-lc', '{status}', '{job}', '{job}', 1, 1);
+             INSERT INTO sessions (id, job_id, created_at, updated_at) VALUES ('lc-{job}-s', 'lc-{job}', 1, 1);
+             INSERT INTO runs (id, job_id, session_id, status, created_at, updated_at)
+               VALUES ('lc-{job}-r', 'lc-{job}', 'lc-{job}-s', 'live', 1, 1);
+             INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at, ended_at)
+               VALUES ('lc-{turn}', 'lc-{job}-s', 'lc-{job}-r', 'lc-{job}', 1, '{state}', 'initial', {created}, {created}, {ended});
+             UPDATE jobs SET current_turn_id = 'lc-{turn}' WHERE id = 'lc-{job}';"
+        ));
+    }
+    script.push_str(
+        "INSERT INTO prompts (id, run_id, job_id, questions, created_at, turn_id, uri_segment, background)
+           VALUES ('lc-q', 'lc-asker-r', 'lc-asker', '[{\"question\":\"Ship it?\"}]', 150, 'lc-a1', 'q-1', 0);
+         INSERT INTO artifacts (id, job_id, artifact_type, data, version, output_name, confirmed, created_at, updated_at)
+           VALUES ('lc-plan', 'lc-planner', 'plan', '{}', 1, 'plan', 0, 150, 150);",
+    );
+    db.execute_script(&script).await.unwrap();
+    db
+}
+
+async fn derive_lifecycle(db: &LocalDb) -> OperatorNotificationsSnapshot {
+    derive_snapshot(
+        db,
+        db,
+        &HoldRegistry::default(),
+        "p-lc",
+        NOW,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap()
+}
+
+/// A write, and the frame its real call site would announce for it.
+enum Write {
+    Turn(&'static str, &'static str, &'static str),
+    Job(&'static str, &'static str),
+    Run(&'static str, &'static str),
+}
+
+impl Write {
+    async fn apply(&self, db: &LocalDb) -> serde_json::Value {
+        match self {
+            Self::Turn(sql, turn, action) => {
+                db.execute(*sql, ()).await.unwrap();
+                crate::notify::turn_db_change_for_id(db, turn, action).await
+            }
+            Self::Job(sql, job) => {
+                db.execute(*sql, ()).await.unwrap();
+                crate::notify::job_db_change_for_id(db, job, "update").await
+            }
+            Self::Run(sql, run) => {
+                db.execute(*sql, ()).await.unwrap();
+                crate::notify::run_db_change_for_id(db, run, "update").await
+            }
+        }
+    }
+}
+
+/// The in-test measurement the frame filter was built for: a whole agent turn
+/// on a job with no entry, through to its run ending, moves nothing and
+/// dirties the center zero times. The same turn ending in failure moves the
+/// answer and dirties it.
+#[tokio::test]
+async fn a_working_agents_turn_dirties_the_center_zero_times_and_a_failure_does() {
+    let db = lifecycle_fixture("notif-lifecycle-tally").await;
+    let published = derive_lifecycle(&db).await;
+    assert!(published
+        .entries
+        .iter()
+        .any(|entry| entry.key == "question:lc-q"));
+    assert_eq!(
+        published.next_change_at,
+        Some(NOW + 25),
+        "flaky is held back"
+    );
+    for job in ["lc-asker", "lc-planner", "lc-flaky"] {
+        assert!(published.watched_job_ids.contains(job), "{job} is read");
+    }
+    assert!(
+        !published.watched_job_ids.contains("lc-worker"),
+        "a job with nothing to show is not"
+    );
+    for turn in ["lc-a1", "lc-f1"] {
+        assert!(published.watched_turn_ids.contains(turn), "{turn} is read");
+    }
+
+    let mut turn = vec![
+        Write::Turn(
+            "INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+               VALUES ('lc-w2', 'lc-worker-s', 'lc-worker-r', 'lc-worker', 2, 'pending', 'user_message', 9000, 9000)",
+            "lc-w2",
+            "insert",
+        ),
+        Write::Job("UPDATE jobs SET current_turn_id = 'lc-w2' WHERE id = 'lc-worker'", "lc-worker"),
+        Write::Turn("UPDATE turns SET state = 'running' WHERE id = 'lc-w2'", "lc-w2", "update"),
+    ];
+    for _ in 0..5 {
+        turn.push(Write::Job(
+            "UPDATE jobs SET updated_at = updated_at + 1 WHERE id = 'lc-worker'",
+            "lc-worker",
+        ));
+    }
+    turn.extend([
+        Write::Turn(
+            "UPDATE turns SET state = 'complete', ended_at = 9500 WHERE id = 'lc-w2'",
+            "lc-w2",
+            "update",
+        ),
+        Write::Job(
+            "UPDATE jobs SET status = 'idle' WHERE id = 'lc-worker'",
+            "lc-worker",
+        ),
+        Write::Run(
+            "UPDATE runs SET status = 'exited' WHERE id = 'lc-worker-r'",
+            "lc-worker-r",
+        ),
+    ]);
+    let mut dirtied = 0;
+    for write in &turn {
+        let frame = write.apply(&db).await;
+        if dirties_notification_center(Some(&published), &frame) {
+            dirtied += 1;
+            eprintln!("dirtied by {frame}");
+        }
+    }
+    assert_eq!(dirtied, 0, "{} writes", turn.len());
+    assert_eq!(
+        derive_lifecycle(&db).await,
+        published,
+        "and the answer did not move"
+    );
+
+    let failing = [
+        Write::Turn(
+            "INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+               VALUES ('lc-w3', 'lc-worker-s', 'lc-worker-r', 'lc-worker', 3, 'running', 'user_message', 9600, 9600)",
+            "lc-w3",
+            "insert",
+        ),
+        Write::Job("UPDATE jobs SET current_turn_id = 'lc-w3', status = 'running' WHERE id = 'lc-worker'", "lc-worker"),
+        Write::Turn(
+            "UPDATE turns SET state = 'failed', ended_at = 9700 WHERE id = 'lc-w3'",
+            "lc-w3",
+            "update",
+        ),
+    ];
+    let mut dirtied = Vec::new();
+    for write in &failing {
+        let frame = write.apply(&db).await;
+        dirtied.push(dirties_notification_center(Some(&published), &frame));
+    }
+    assert_eq!(dirtied, [false, false, true], "only the failure itself");
+    let failed = derive_lifecycle(&db).await;
+    assert!(
+        failed
+            .entries
+            .iter()
+            .any(|entry| entry.key == "agent_failed:lc-w3"),
+        "{:#?}",
+        failed.entries
+    );
+}
+
+/// Each write that can open, close or resolve an entry on a job the center
+/// would otherwise skip is a frame it lets through, and the answer moves.
+#[tokio::test]
+async fn writes_that_move_an_entry_are_frames_the_center_lets_through() {
+    let cases = [
+        (
+            "a planner resumed with its plan unconfirmed reopens its review",
+            Write::Job("UPDATE jobs SET status = 'running' WHERE id = 'lc-planner'", "lc-planner"),
+            true,
+        ),
+        (
+            "a successor inside the settle window resolves the held failure",
+            Write::Turn(
+                "INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+                   VALUES ('lc-f2', 'lc-flaky-s', 'lc-flaky-r', 'lc-flaky', 2, 'pending', 'user_message', 9999, 9999)",
+                "lc-f2",
+                "insert",
+            ),
+            true,
+        ),
+        (
+            "the asker's turn being cancelled closes its question",
+            Write::Turn("UPDATE turns SET state = 'cancelled' WHERE id = 'lc-a1'", "lc-a1", "update"),
+            true,
+        ),
+        (
+            "the asker's job ending closes its question",
+            Write::Job("UPDATE jobs SET status = 'complete' WHERE id = 'lc-asker'", "lc-asker"),
+            true,
+        ),
+        (
+            "a turn crashing at its provider",
+            Write::Turn(
+                "UPDATE turns SET state = 'interrupted', end_reason = 'provider_failure', ended_at = 9000 WHERE id = 'lc-w1'",
+                "lc-w1",
+                "update",
+            ),
+            true,
+        ),
+        (
+            // The fixture has no recipe for its derivation to find, so this
+            // one only checks the frame.
+            "a job reaching blocked may be missing its output",
+            Write::Job("UPDATE jobs SET status = 'blocked' WHERE id = 'lc-worker'", "lc-worker"),
+            false,
+        ),
+    ];
+    for (n, (why, write, moves)) in cases.iter().enumerate() {
+        let db = lifecycle_fixture(&format!("notif-moves-{n}")).await;
+        let published = derive_lifecycle(&db).await;
+        let frame = write.apply(&db).await;
+        assert!(
+            dirties_notification_center(Some(&published), &frame),
+            "{why}: {frame}"
+        );
+        if *moves {
+            assert_ne!(derive_lifecycle(&db).await, published, "{why}");
+        }
+    }
+}

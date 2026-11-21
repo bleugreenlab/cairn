@@ -1252,7 +1252,11 @@ pub async fn thread_activity_rows(
                 .await?;
             // Every thread gets a row, including one whose LEFT JOIN found no
             // job at all: a thread with no work under it is idle, not absent.
-            let mut by_thread: HashMap<String, NodeActivity> = HashMap::new();
+            // Ordered, because the snapshot is compared whole after each
+            // rebuild: a hash map's per-instance seed would reorder the rows
+            // every time and announce a change that never happened.
+            let mut by_thread: std::collections::BTreeMap<String, NodeActivity> =
+                std::collections::BTreeMap::new();
             let mut job_ids: HashSet<String> = HashSet::new();
             while let Some(row) = rows.next().await? {
                 let thread_id = row.text(0)?;
@@ -1886,7 +1890,10 @@ pub async fn issue_status_indicators(
                         .cmp(&a.activity_updated_at)
                         .then_with(|| a.job_id.cmp(&b.job_id))
                 });
-                let job_ids = jobs.iter().map(|job| job.job_id.clone()).collect();
+                // Sorted: the statement has no ORDER BY, and the indicator is
+                // compared whole after each rebuild.
+                let mut job_ids: Vec<String> = jobs.iter().map(|job| job.job_id.clone()).collect();
+                job_ids.sort_unstable();
                 out.push(IssueStatusIndicator {
                     issue_id: issue_id.clone(),
                     activity,
@@ -2258,6 +2265,40 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// The cache publishes a rebuild as a change, and so announces it and makes
+    /// every mounted sidebar refetch, whenever the snapshot differs from the
+    /// last one. Two censuses of unchanged rows must therefore be equal, row
+    /// order included.
+    #[tokio::test]
+    async fn an_unchanged_project_rebuilds_to_an_equal_thread_snapshot() {
+        let db = census_fixture_read(8, 3, true).await;
+        let first = super::thread_status_snapshot(&db, &db, "p").await.unwrap();
+        assert!(
+            first.indicators.len() >= 5,
+            "enough rows for order to matter"
+        );
+        for _ in 0..10 {
+            assert_eq!(
+                super::thread_status_snapshot(&db, &db, "p").await.unwrap(),
+                first
+            );
+        }
+    }
+
+    /// The same for the issue rollup, whose job ids come from a statement with
+    /// no ORDER BY.
+    #[tokio::test]
+    async fn an_unchanged_project_rebuilds_to_an_equal_issue_rollup() {
+        let db = census_fixture_read(1, 1, true).await;
+        seed_issues(&db, 3, 6).await;
+        let first = issue_status_indicators(&db, "p").await.unwrap();
+        assert!(first.iter().any(|indicator| indicator.job_ids.len() == 6));
+        for indicator in &first {
+            assert!(indicator.job_ids.is_sorted(), "{:?}", indicator.job_ids);
+        }
+        assert_eq!(issue_status_indicators(&db, "p").await.unwrap(), first);
     }
 
     /// What the sidebar census costs, printed rather than asserted.

@@ -258,6 +258,29 @@ pub async fn pending_approvals(
     .await
 }
 
+/// Every top-level job in the project holding an unconfirmed artifact, whatever
+/// its status, its issue's state, or whether a newer version superseded it.
+///
+/// A superset of the jobs [`pending_approvals`] can name. A cache of that
+/// answer watches these jobs because one can join it through a write that
+/// says nothing distinctive about itself: a job resumed from `complete` to
+/// `running` reopens its unconfirmed plan, and its frame looks like any other
+/// running job's. Shaped like `PENDING_SQL` so it takes the same seek through
+/// `idx_artifacts_awaiting_confirmation`.
+pub async fn approval_candidate_jobs(db: &LocalDb, project_id: &str) -> DbResult<Vec<String>> {
+    db.query_all(
+        "SELECT DISTINCT j.id
+           FROM jobs j
+           JOIN artifacts a ON a.job_id = j.id
+          WHERE a.confirmed = 0
+            AND j.parent_job_id IS NULL
+            AND j.project_id = ?1",
+        cairn_db::turso::params![project_id.to_string()],
+        |row| row.text(0),
+    )
+    .await
+}
+
 /// The pending approval on one job, if there is one.
 pub async fn pending_approval_for_job_conn(
     conn: &crate::storage::TrackedConnection,

@@ -206,22 +206,36 @@ pub(crate) const ISSUE_LIST_INPUT_TABLES: &[&str] = &[
 /// The tables the operator notification center derives its entries from.
 ///
 /// Each kind's source of truth (`crate::notifications::derive`), plus the
-/// rows that place a job (`executions`, `threads`, `action_runs`), the
-/// operator's dismissals, and the frame hold sources announce on. No entry
-/// reads a transcript, so `events` is absent.
+/// rows that place a job (`executions`, `threads`, `action_runs`), the project
+/// key every entry carries (`projects`), the operator's dismissals, and the
+/// frame hold sources announce on. No entry reads a transcript, so `events` is
+/// absent.
 ///
-/// Scoping by job set is deliberately not attempted here. The center reads
-/// every job in the project (any of them can ask a question or fail), so a
-/// project-scoped frame is already as narrow as the answer allows, and the
-/// cadence floor bounds what a burst of them costs.
+/// `runs` is absent too. The center reads a run only as the join from a
+/// question or permission to its job (`runs.job_id`), which is fixed when the
+/// run is inserted, and a run is deleted only with its issue or thread, whose
+/// own frames move the center. Nothing about a run starting, ending or
+/// crashing is an entry.
+///
+/// `operator_messages` is absent because its frame names no project: every
+/// write to it (`operator::messages`, and the operator-message dispatch)
+/// dirties exactly the projects whose waiting messages moved, directly, and
+/// routing the bare frame here would rebuild every project as well.
+///
+/// `turns` and `jobs` are the two inputs every working agent writes several
+/// times a second, and almost none of those writes can move an entry. Which
+/// ones can is answered per frame by
+/// [`ProjectionInvalidatingEmitter::touches_a_notification`]. A job set alone
+/// cannot answer it (any job in the project may yet ask or fail), but the
+/// state a frame carries plus the jobs and turns the last rebuild read can.
 const OPERATOR_NOTIFICATION_INPUT_TABLES: &[&str] = &[
     "prompts",
     "permission_requests",
     "tenets",
     "merge_requests",
-    "runs",
     "turns",
     "jobs",
+    "projects",
     "issues",
     "executions",
     "artifacts",
@@ -455,6 +469,18 @@ pub(crate) fn every_projection_input_table() -> Vec<&'static str> {
     tables
 }
 
+/// The `'static` name of a projection input table, so a cache can tally the
+/// frame's table in its activity summary without allocating per frame.
+fn input_table_name(table: &str) -> Option<&'static str> {
+    THREAD_STATUS_INPUT_TABLES
+        .iter()
+        .chain(ISSUE_STATUS_INPUT_TABLES)
+        .chain(ISSUE_LIST_INPUT_TABLES)
+        .chain(OPERATOR_NOTIFICATION_INPUT_TABLES)
+        .find(|name| **name == table)
+        .copied()
+}
+
 /// Advances projection generations at the one boundary every durable mutation
 /// already crosses: the post-commit `db-change` notification.
 ///
@@ -512,6 +538,7 @@ impl ProjectionInvalidatingEmitter {
         if !thread_input && !issue_input && !list_input && !notification_input {
             return;
         }
+        let tallied = input_table_name(table);
         let Some(project_id) = payload
             .get("projectId")
             .or_else(|| payload.get("project_id"))
@@ -522,35 +549,62 @@ impl ProjectionInvalidatingEmitter {
             // project. Rebuilding all of them is the honest answer; the
             // alternative is serving a snapshot the write invalidated.
             if thread_input {
-                self.thread_status
-                    .invalidate_matching("thread-input-unscoped", |_| true);
+                self.thread_status.invalidate_matching_from(
+                    "thread-input-unscoped",
+                    tallied,
+                    |_| true,
+                );
             }
             if issue_input {
                 self.issue_status
-                    .invalidate_matching("issue-input-unscoped", |_| true);
+                    .invalidate_matching_from("issue-input-unscoped", tallied, |_| true);
             }
             if list_input {
-                self.issue_list
-                    .invalidate_matching("issue-list-input-unscoped", |_| true);
+                self.issue_list.invalidate_matching_from(
+                    "issue-list-input-unscoped",
+                    tallied,
+                    |_| true,
+                );
             }
             if notification_input {
-                self.operator_notifications
-                    .invalidate_matching("notification-input-unscoped", |_| true);
+                self.operator_notifications.invalidate_matching_from(
+                    "notification-input-unscoped",
+                    tallied,
+                    |_| true,
+                );
             }
             return;
         };
-        if thread_input && self.touches_a_thread(project_id, table, payload) {
-            self.thread_status.invalidate(project_id, "thread-input");
+        if thread_input {
+            if self.touches_a_thread(project_id, table, payload) {
+                self.thread_status
+                    .invalidate_from(project_id, "thread-input", tallied);
+            } else {
+                self.thread_status.note_filtered(tallied);
+            }
         }
         if notification_input {
-            self.operator_notifications
-                .invalidate(project_id, "notification-input");
+            if self.touches_a_notification(project_id, table, payload) {
+                self.operator_notifications.invalidate_from(
+                    project_id,
+                    "notification-input",
+                    tallied,
+                );
+            } else {
+                self.operator_notifications.note_filtered(tallied);
+            }
         }
-        if issue_input && self.touches_an_issue(project_id, table, payload) {
-            self.issue_status.invalidate(project_id, "issue-input");
+        if issue_input {
+            if self.touches_an_issue(project_id, table, payload) {
+                self.issue_status
+                    .invalidate_from(project_id, "issue-input", tallied);
+            } else {
+                self.issue_status.note_filtered(tallied);
+            }
         }
         if list_input {
-            self.issue_list.invalidate(project_id, "issue-list-input");
+            self.issue_list
+                .invalidate_from(project_id, "issue-list-input", tallied);
         }
     }
 
@@ -636,7 +690,7 @@ impl ProjectionInvalidatingEmitter {
             // Everything else is a row UNDER a job.
             _ => self
                 .thread_status
-                .published(project_id)
+                .published_if_current(project_id)
                 .is_none_or(|snapshot| frame_could_touch(payload, &snapshot.thread_job_ids)),
         }
     }
@@ -655,10 +709,92 @@ impl ProjectionInvalidatingEmitter {
             "jobs" => payload.get("issueId").and_then(Value::as_str).is_some(),
             _ => self
                 .issue_status
-                .published(project_id)
+                .published_if_current(project_id)
                 .is_none_or(|snapshot| frame_could_touch(payload, &snapshot.job_ids)),
         }
     }
+
+    /// The same question for the operator notification center, which only
+    /// `turns` and `jobs` frames are asked: every other input is either rare or
+    /// a direct source of entries.
+    ///
+    /// The center's entries hang off a few jobs (an open or recent question or
+    /// permission, a PR, a recent failure, a pending approval candidate, a
+    /// blocked job), and the published snapshot names them and their turns
+    /// (`watched_job_ids`, `watched_turn_ids`). Any write to one of those is
+    /// relevant. A write to any other job can open an entry only by carrying a
+    /// state that opens one by itself, and the frame says which state it
+    /// committed:
+    ///
+    /// - a turn reaching `failed` or `interrupted` may be an agent failure, and
+    ///   one reaching `cancelled` may close a question on it;
+    /// - a job reaching `blocked` may be missing its output;
+    /// - a job inserted or deleted is relevant whatever it says.
+    ///
+    /// A running agent's turn starting, streaming and completing, and its job's
+    /// `running`/`idle`/current-turn updates, are none of these. Everything
+    /// unplaceable (no current snapshot, no job, no state) is relevant, because
+    /// this decides whether to skip work. A snapshot an invalidation has
+    /// outrun is not current: see [`CadencedCache::published_if_current`].
+    fn touches_a_notification(&self, project_id: &str, table: &str, payload: &Value) -> bool {
+        notification_frame_could_move(
+            self.operator_notifications
+                .published_if_current(project_id)
+                .as_deref(),
+            table,
+            payload,
+        )
+    }
+}
+
+/// Whether one committed write's frame dirties a notification center whose
+/// published snapshot is `published`: the emitter's whole decision, input
+/// list included, for tests that feed it frames from the real builders.
+#[cfg(test)]
+pub(crate) fn dirties_notification_center(
+    published: Option<&crate::notifications::OperatorNotificationsSnapshot>,
+    payload: &Value,
+) -> bool {
+    payload
+        .get("table")
+        .and_then(Value::as_str)
+        .is_some_and(|table| {
+            OPERATOR_NOTIFICATION_INPUT_TABLES.contains(&table)
+                && notification_frame_could_move(published, table, payload)
+        })
+}
+
+/// The body of [`ProjectionInvalidatingEmitter::touches_a_notification`].
+fn notification_frame_could_move(
+    published: Option<&crate::notifications::OperatorNotificationsSnapshot>,
+    table: &str,
+    payload: &Value,
+) -> bool {
+    if !matches!(table, "turns" | "jobs") {
+        return true;
+    }
+    let Some(snapshot) = published else {
+        return true;
+    };
+    let Some(job_id) = payload
+        .get("jobId")
+        .or_else(|| payload.get("job_id"))
+        .and_then(Value::as_str)
+    else {
+        return true;
+    };
+    if snapshot.watched_job_ids.contains(job_id) {
+        return true;
+    }
+    let text = |field: &str| payload.get(field).and_then(Value::as_str);
+    if table == "turns" {
+        if text("turnId").is_some_and(|turn| snapshot.watched_turn_ids.contains(turn)) {
+            return true;
+        }
+        return text("state")
+            .is_none_or(|state| matches!(state, "failed" | "interrupted" | "cancelled"));
+    }
+    text("action") != Some("update") || text("status").is_none_or(|status| status == "blocked")
 }
 
 /// Whether a frame describing a row under some job could touch a projection
@@ -719,10 +855,26 @@ const SLOW_REBUILD: Duration = Duration::from_millis(250);
 
 /// One thing a cache did, for its activity summary.
 enum Activity<'a> {
-    Invalidated { key: &'a str, reason: &'static str },
+    /// A key went dirty. `table` names the input whose frame did it, when one
+    /// did.
+    Invalidated {
+        key: &'a str,
+        reason: &'static str,
+        table: Option<&'static str>,
+    },
+    /// A frame on an input table that the cache's scoping judged unable to
+    /// move anything it published, so it dirtied nothing.
+    Filtered(&'static str),
     Read(&'static str),
     Rebuilt,
 }
+
+/// How a [`CadencedCache`] read was served: from a published value that was
+/// current, from one already invalidated (whose rebuild the read may start),
+/// or by waiting for a first value.
+const READ_SERVED_CLEAN: &str = "served-clean";
+const READ_SERVED_DIRTY: &str = "served-dirty";
+const READ_WAITED: &str = "waited";
 
 /// What a cache did since its last activity summary.
 ///
@@ -733,6 +885,8 @@ enum Activity<'a> {
 struct ActivityTally {
     since: Option<Instant>,
     invalidations: BTreeMap<&'static str, u64>,
+    by_table: BTreeMap<&'static str, u64>,
+    filtered: BTreeMap<&'static str, u64>,
     keys: HashSet<String>,
     reads: BTreeMap<&'static str, u64>,
     rebuilds: u64,
@@ -744,12 +898,16 @@ impl ActivityTally {
     fn record(&mut self, activity: Activity<'_>, now: Instant) -> Option<String> {
         let since = *self.since.get_or_insert(now);
         match activity {
-            Activity::Invalidated { key, reason } => {
+            Activity::Invalidated { key, reason, table } => {
                 *self.invalidations.entry(reason).or_default() += 1;
+                if let Some(table) = table {
+                    *self.by_table.entry(table).or_default() += 1;
+                }
                 if !self.keys.contains(key) {
                     self.keys.insert(key.to_string());
                 }
             }
+            Activity::Filtered(table) => *self.filtered.entry(table).or_default() += 1,
             Activity::Read(outcome) => *self.reads.entry(outcome).or_default() += 1,
             Activity::Rebuilt => self.rebuilds += 1,
         }
@@ -774,11 +932,13 @@ impl ActivityTally {
                 .join(",")
         };
         format!(
-            "interval_s={} invalidations={} keys={} by_reason={} reads={} rebuilds={}",
+            "interval_s={} invalidations={} keys={} by_reason={} by_table={} filtered={} reads={} rebuilds={}",
             elapsed.as_secs(),
             self.invalidations.values().sum::<u64>(),
             self.keys.len(),
             tally(&self.invalidations),
+            tally(&self.by_table),
+            tally(&self.filtered),
             tally(&self.reads),
             self.rebuilds,
         )
@@ -912,7 +1072,15 @@ impl<V: Clone> GenerationCache<V> {
             .invalidations_since_compute
             .entry(key.to_string())
             .or_default() += 1;
-        Self::note_locked(state, label, Activity::Invalidated { key, reason });
+        Self::note_locked(
+            state,
+            label,
+            Activity::Invalidated {
+                key,
+                reason,
+                table: None,
+            },
+        );
         generation
     }
 
@@ -1387,6 +1555,24 @@ where
         self.activity_summaries.load(Ordering::Relaxed)
     }
 
+    /// Reads counted in the open summary window, by how each was served.
+    #[cfg(test)]
+    pub(crate) fn activity_reads(&self) -> BTreeMap<&'static str, u64> {
+        self.activity.lock().unwrap().reads.clone()
+    }
+
+    /// Frames the scoping declined in the open summary window, by table.
+    #[cfg(test)]
+    pub(crate) fn activity_filtered(&self) -> BTreeMap<&'static str, u64> {
+        self.activity.lock().unwrap().filtered.clone()
+    }
+
+    /// Invalidations in the open summary window, by the frame's table.
+    #[cfg(test)]
+    pub(crate) fn activity_by_table(&self) -> BTreeMap<&'static str, u64> {
+        self.activity.lock().unwrap().by_table.clone()
+    }
+
     /// Run this cache's drivers on `runtime` from now on. The orchestrator binds
     /// its long-lived runtime here when it is built; construction captures the
     /// current runtime as a default.
@@ -1421,6 +1607,28 @@ where
         Some(slots.get(key)?.published.as_ref()?.value.clone())
     }
 
+    /// The value last published for a key, but only while it is current:
+    /// `None` when nothing is published, or when an invalidation has outrun it
+    /// and a rebuild is owed or in flight.
+    ///
+    /// For callers that skip a write because it touches nothing the published
+    /// value read. A running rebuild may be reading rows the published value
+    /// never named (a question just asked, on a job nobody watched), and a
+    /// write to one of those that lands before the rebuild publishes would
+    /// otherwise be judged against the old dependency set, skipped, and leave
+    /// the rebuild's stale answer published with nothing owed after it. The
+    /// dirty check and the read share one critical section: a rebuild starts
+    /// only after an invalidation, so a write judged against a current value
+    /// committed before any later rebuild reads.
+    pub(crate) fn published_if_current(&self, key: &str) -> Option<V> {
+        let slots = self.slots.lock().ok()?;
+        let slot = slots.get(key)?;
+        if slot.dirty() {
+            return None;
+        }
+        Some(slot.published.as_ref()?.value.clone())
+    }
+
     /// The current correctness generation for a key.
     #[cfg(test)]
     pub(crate) fn generation(&self, key: &str) -> u64 {
@@ -1440,7 +1648,27 @@ where
     /// Record that a committed write moved one of this key's inputs. Call only
     /// after the write commits, or a rebuild may read the row before it lands.
     pub(crate) fn invalidate(&self, key: &str, reason: &'static str) {
-        self.advance(key, reason, false);
+        self.advance(key, reason, None, false);
+    }
+
+    /// [`Self::invalidate`] for a `db-change` frame, tallying the frame's
+    /// input table in the activity summary so the summary says which table
+    /// drives the rebuilds.
+    pub(crate) fn invalidate_from(
+        &self,
+        key: &str,
+        reason: &'static str,
+        table: Option<&'static str>,
+    ) {
+        self.advance(key, reason, table, false);
+    }
+
+    /// Count a frame on one of this cache's input tables that its scoping
+    /// declined, so the summary shows what the scoping saved.
+    pub(crate) fn note_filtered(&self, table: Option<&'static str>) {
+        if let Some(table) = table {
+            self.note(Activity::Filtered(table));
+        }
     }
 
     /// The same, rebuilding at once regardless of the floor.
@@ -1450,7 +1678,7 @@ where
     /// important ones included, goes through the floor: importance is not what
     /// the floor protects against, rate is.
     pub(crate) fn invalidate_now(&self, key: &str, reason: &'static str) {
-        self.advance(key, reason, true);
+        self.advance(key, reason, None, true);
     }
 
     /// Invalidate every key the predicate accepts. For workspace-level rows and
@@ -1460,13 +1688,24 @@ where
         reason: &'static str,
         predicate: impl Fn(&str) -> bool,
     ) {
+        self.invalidate_matching_from(reason, None, predicate);
+    }
+
+    /// [`Self::invalidate_matching`] for a `db-change` frame, tallying its
+    /// table (see [`Self::invalidate_from`]).
+    pub(crate) fn invalidate_matching_from(
+        &self,
+        reason: &'static str,
+        table: Option<&'static str>,
+        predicate: impl Fn(&str) -> bool,
+    ) {
         let keys: Vec<String> = self
             .slots
             .lock()
             .map(|slots| slots.keys().filter(|key| predicate(key)).cloned().collect())
             .unwrap_or_default();
         for key in keys {
-            self.invalidate(&key, reason);
+            self.advance(&key, reason, table, false);
         }
     }
 
@@ -1517,7 +1756,7 @@ where
         }
     }
 
-    fn advance(&self, key: &str, reason: &'static str, urgent: bool) {
+    fn advance(&self, key: &str, reason: &'static str, table: Option<&'static str>, urgent: bool) {
         let announce_idle = {
             let Ok(mut slots) = self.slots.lock() else {
                 return;
@@ -1542,7 +1781,7 @@ where
                 false
             }
         };
-        self.note(Activity::Invalidated { key, reason });
+        self.note(Activity::Invalidated { key, reason, table });
         if announce_idle {
             (self.announce)(key);
         }
@@ -1584,9 +1823,17 @@ where
             slot.idle_announced = false;
             if let Some(published) = &slot.published {
                 let value = published.value.clone();
+                let served = if slot.dirty() {
+                    READ_SERVED_DIRTY
+                } else {
+                    READ_SERVED_CLEAN
+                };
                 if slot.owes_rebuild(now) {
                     self.drive_locked(key, slot);
                 }
+                // `activity` is never taken while `slots` is held.
+                drop(slots);
+                self.note(Activity::Read(served));
                 return Ok(value);
             }
             let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -1595,6 +1842,7 @@ where
             self.drive_locked(key, slot);
             receiver
         };
+        self.note(Activity::Read(READ_WAITED));
         waiter
             .await
             .map_err(|_| format!("{} rebuild was abandoned", self.label))?
@@ -2254,6 +2502,7 @@ mod tests {
                     Activity::Invalidated {
                         key: "job",
                         reason: "pending-delivery-input",
+                        table: Some("messages"),
                     },
                     at,
                 ),
@@ -2267,6 +2516,7 @@ mod tests {
                 Activity::Invalidated {
                     key: "other",
                     reason: "pending-delivery-carrier",
+                    table: None,
                 },
                 start + ACTIVITY_SUMMARY_INTERVAL,
             )
@@ -2275,7 +2525,7 @@ mod tests {
             summary,
             "interval_s=60 invalidations=1001 keys=2 \
              by_reason=pending-delivery-carrier:1,pending-delivery-input:1000 \
-             reads=none rebuilds=1"
+             by_table=messages:1000 filtered=none reads=none rebuilds=1"
         );
         assert_eq!(
             tally.record(Activity::Read("hit"), start + ACTIVITY_SUMMARY_INTERVAL),
@@ -2284,7 +2534,65 @@ mod tests {
         );
     }
 
+    /// The summary says which table drove the invalidations, what the scoping
+    /// declined, and how reads were served, so a production log can tell
+    /// "rebuilt for nobody" from "rebuilt for a hot key".
+    #[test]
+    fn the_summary_tallies_tables_filtered_frames_and_reads() {
+        let mut tally = ActivityTally::default();
+        let start = Instant::now();
+        tally.record(
+            Activity::Invalidated {
+                key: "proj",
+                reason: "notification-input",
+                table: Some("turns"),
+            },
+            start,
+        );
+        for table in ["turns", "turns", "jobs"] {
+            tally.record(Activity::Filtered(table), start);
+        }
+        for served in [
+            READ_SERVED_CLEAN,
+            READ_SERVED_CLEAN,
+            READ_SERVED_DIRTY,
+            READ_WAITED,
+        ] {
+            tally.record(Activity::Read(served), start);
+        }
+        let summary = tally
+            .record(Activity::Rebuilt, start + ACTIVITY_SUMMARY_INTERVAL)
+            .unwrap();
+        assert_eq!(
+            summary,
+            "interval_s=60 invalidations=1 keys=1 by_reason=notification-input:1 \
+             by_table=turns:1 filtered=jobs:1,turns:2 \
+             reads=served-clean:2,served-dirty:1,waited:1 rebuilds=1"
+        );
+    }
+
     // ── The cadenced cache ──
+
+    /// Every read is counted, by how it was served: waiting for a first value,
+    /// from a current one, and from one already invalidated.
+    #[tokio::test(start_paused = true)]
+    async fn cadenced_reads_are_counted_by_how_they_were_served() {
+        let c = cadenced(Duration::from_secs(30));
+        c.cache.get("k").await.unwrap();
+        c.cache.get("k").await.unwrap();
+        c.cache.get("k").await.unwrap();
+        // Inside the floor, so the rebuild it owes has not run yet.
+        c.cache.invalidate("k", "test");
+        c.cache.get("k").await.unwrap();
+        assert_eq!(
+            c.cache.activity_reads(),
+            BTreeMap::from([
+                (READ_SERVED_CLEAN, 2),
+                (READ_SERVED_DIRTY, 1),
+                (READ_WAITED, 1),
+            ])
+        );
+    }
 
     /// N invalidations of one key write at most one activity summary, and the
     /// rebuild that follows them is told how many there were.
@@ -2697,6 +3005,9 @@ mod tests {
         gate_inputs: Arc<GateInputGenerations>,
         thread_jobs: Arc<Mutex<HashSet<String>>>,
         issue_jobs: Arc<Mutex<HashSet<String>>>,
+        /// The jobs and turns the next notification rebuild says it read.
+        watched_jobs: Arc<Mutex<HashSet<String>>>,
+        watched_turns: Arc<Mutex<HashSet<String>>>,
         announced: Arc<Mutex<Vec<String>>>,
     }
 
@@ -2748,10 +3059,28 @@ mod tests {
             rebuild_with(|_key| async { Ok(EncodedIssueList::from_json("[]")) }),
             recording(&announced, "issue_list"),
         );
+        let watched_jobs = Arc::new(Mutex::new(HashSet::new()));
+        let watched_turns = Arc::new(Mutex::new(HashSet::new()));
         let notifications = OperatorNotificationsCache::new(
             "test-notifications",
             floor,
-            rebuild_with(|_key| async { Ok(Arc::default()) }),
+            rebuild_with({
+                let jobs = watched_jobs.clone();
+                let turns = watched_turns.clone();
+                move |_key| {
+                    let watched_job_ids = jobs.lock().unwrap().clone();
+                    let watched_turn_ids = turns.lock().unwrap().clone();
+                    async move {
+                        Ok(Arc::new(
+                            crate::notifications::OperatorNotificationsSnapshot {
+                                watched_job_ids,
+                                watched_turn_ids,
+                                ..Default::default()
+                            },
+                        ))
+                    }
+                }
+            }),
             recording(&announced, "operator_notifications"),
         );
         let pending = PendingDeliveriesCache::new(
@@ -2780,6 +3109,8 @@ mod tests {
             pending,
             thread_jobs,
             issue_jobs,
+            watched_jobs,
+            watched_turns,
             announced,
         }
     }
@@ -2853,6 +3184,336 @@ mod tests {
             before,
             "a table no entry reads"
         );
+    }
+
+    fn turn_frame(job: &str, turn: &str, action: &str, state: Option<&str>) -> Value {
+        serde_json::json!({
+            "table": "turns",
+            "action": action,
+            "projectId": "proj",
+            "jobId": job,
+            "turnId": turn,
+            "state": state,
+        })
+    }
+
+    fn job_frame(job: &str, action: &str, status: Option<&str>) -> Value {
+        serde_json::json!({
+            "table": "jobs",
+            "action": action,
+            "projectId": "proj",
+            "jobId": job,
+            "issueId": "issue",
+            "status": status,
+        })
+    }
+
+    /// A center that read one asking job and its turn, published.
+    async fn watching_center() -> Sidebar {
+        let s = sidebar(STATUS_ROLLUP_FLOOR);
+        *s.watched_jobs.lock().unwrap() = job_set(&["asker"]);
+        *s.watched_turns.lock().unwrap() = job_set(&["asked-turn"]);
+        s.notifications.get("proj").await.unwrap();
+        s
+    }
+
+    /// What a working agent writes while its turn runs and ends, on a job the
+    /// center did not read, cannot open an entry, so it dirties nothing. The
+    /// declines are counted, which is what the post-deploy summary reads.
+    #[tokio::test(start_paused = true)]
+    async fn an_agents_progress_writes_do_not_dirty_the_notification_center() {
+        let s = watching_center().await;
+        let before = s.notifications.generation("proj");
+        for frame in [
+            turn_frame("worker", "w-t2", "insert", Some("pending")),
+            turn_frame("worker", "w-t2", "update", Some("running")),
+            job_frame("worker", "update", Some("running")),
+            job_frame("worker", "update", Some("running")),
+            turn_frame("worker", "w-t2", "update", Some("yielded")),
+            turn_frame("worker", "w-t2", "update", Some("complete")),
+            job_frame("worker", "update", Some("idle")),
+            job_frame("worker", "update", Some("complete")),
+            // A run's join to its job is fixed at insert, so the center does
+            // not read `runs` at all.
+            serde_json::json!({"table": "runs", "action": "update", "projectId": "proj", "runId": "r", "jobId": "worker"}),
+        ] {
+            s.emit(frame);
+        }
+        assert_eq!(s.notifications.generation("proj"), before);
+        assert_eq!(
+            s.notifications.activity_filtered(),
+            BTreeMap::from([("jobs", 4), ("turns", 4)])
+        );
+    }
+
+    /// Each write that can open, close or move an entry still dirties the
+    /// center, and is tallied under its table.
+    #[tokio::test(start_paused = true)]
+    async fn writes_that_can_move_an_entry_dirty_the_notification_center() {
+        let s = watching_center().await;
+        for (frame, why) in [
+            (
+                turn_frame("worker", "w-t2", "update", Some("failed")),
+                "a failure",
+            ),
+            (
+                turn_frame("worker", "w-t2", "update", Some("interrupted")),
+                "a crash or provider failure",
+            ),
+            (
+                turn_frame("worker", "w-t2", "update", Some("cancelled")),
+                "a cancelled turn",
+            ),
+            (
+                turn_frame("asker", "a-t2", "insert", Some("pending")),
+                "a successor on a read job",
+            ),
+            (
+                turn_frame("elsewhere", "asked-turn", "update", Some("running")),
+                "a read turn",
+            ),
+            (
+                turn_frame("worker", "w-t2", "update", None),
+                "a turn frame without its state",
+            ),
+            (
+                serde_json::json!({"table": "turns", "action": "update", "projectId": "proj"}),
+                "a turn frame without its job",
+            ),
+            (
+                job_frame("asker", "update", Some("complete")),
+                "the asker's job ending",
+            ),
+            (
+                job_frame("worker", "update", Some("blocked")),
+                "a job missing its output",
+            ),
+            (
+                job_frame("worker", "update", None),
+                "a job frame without its status",
+            ),
+            (job_frame("new-job", "insert", Some("pending")), "a new job"),
+            (
+                job_frame("worker", "delete", Some("complete")),
+                "a deleted job",
+            ),
+            (
+                serde_json::json!({"table": "jobs", "action": "update", "projectId": "proj"}),
+                "a job frame without its job",
+            ),
+            (
+                serde_json::json!({"table": "projects", "action": "update"}),
+                "a project rename",
+            ),
+        ] {
+            let before = s.notifications.generation("proj");
+            s.emit(frame);
+            assert_eq!(s.notifications.generation("proj"), before + 1, "{why}");
+        }
+        assert!(s.notifications.activity_filtered().is_empty());
+        assert_eq!(
+            s.notifications.activity_by_table(),
+            BTreeMap::from([("jobs", 6), ("projects", 1), ("turns", 7)])
+        );
+    }
+
+    /// A rebuild in flight may be reading a job its published predecessor
+    /// never watched. Here it reads a question just asked on job J, and J's
+    /// job ends before the rebuild publishes. Judged against the old watched
+    /// set that write would be skipped and the open question published with
+    /// nothing owed after it; instead the frame counts, and the settled center
+    /// matches a fresh derivation.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_during_a_rebuild_is_judged_against_what_that_rebuild_reads() {
+        // (question asked, J live): the derivation lists the question only
+        // while both hold, and watches J once the question exists.
+        let rows = Arc::new(Mutex::new((false, true)));
+        let pause = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let derive = |(asked, live): (bool, bool)| {
+            crate::notifications::OperatorNotificationsSnapshot {
+                // Stands in for the question entry.
+                next_change_at: (asked && live).then_some(1),
+                watched_job_ids: if asked {
+                    job_set(&["J"])
+                } else {
+                    HashSet::new()
+                },
+                ..Default::default()
+            }
+        };
+        let s = sidebar(STATUS_ROLLUP_FLOOR);
+        let notifications = OperatorNotificationsCache::new(
+            "test-racing",
+            STATUS_ROLLUP_FLOOR,
+            rebuild_with({
+                let (rows, pause, entered, release) = (
+                    rows.clone(),
+                    pause.clone(),
+                    entered.clone(),
+                    release.clone(),
+                );
+                move |_key| {
+                    let (rows, pause, entered, release) = (
+                        rows.clone(),
+                        pause.clone(),
+                        entered.clone(),
+                        release.clone(),
+                    );
+                    async move {
+                        let read = *rows.lock().unwrap();
+                        if pause.swap(false, Ordering::SeqCst) {
+                            entered.notify_one();
+                            release.notified().await;
+                        }
+                        Ok(Arc::new(derive(read)))
+                    }
+                }
+            }),
+            Arc::new(|_key: &str| {}),
+        );
+        let emitter = ProjectionInvalidatingEmitter::new(
+            Arc::new(CapturingEmitter::new()),
+            s.threads.clone(),
+            s.issues.clone(),
+            s.list.clone(),
+            notifications.clone(),
+            s.pending.clone(),
+            s.gate_inputs.clone(),
+        );
+        notifications.get("proj").await.unwrap();
+
+        pause.store(true, Ordering::SeqCst);
+        rows.lock().unwrap().0 = true;
+        emitter
+            .emit(
+                "db-change",
+                serde_json::json!({"table": "prompts", "action": "insert", "projectId": "proj", "jobId": "J"}),
+            )
+            .unwrap();
+        entered.notified().await;
+
+        // The rebuild has read the question; J's job ends before it publishes.
+        rows.lock().unwrap().1 = false;
+        let generation = notifications.generation("proj");
+        emitter
+            .emit("db-change", job_frame("J", "update", Some("complete")))
+            .unwrap();
+        assert_eq!(notifications.generation("proj"), generation + 1);
+
+        release.notify_one();
+        notifications.settle("proj").await;
+        assert_eq!(
+            *notifications.published("proj").unwrap(),
+            derive(*rows.lock().unwrap())
+        );
+    }
+
+    /// Until a center has published, it has no record of what it read, so
+    /// every frame is relevant.
+    #[tokio::test(start_paused = true)]
+    async fn every_frame_dirties_a_center_that_has_published_nothing() {
+        let s = sidebar(STATUS_ROLLUP_FLOOR);
+        s.emit(turn_frame("worker", "w-t2", "update", Some("running")));
+        s.emit(job_frame("worker", "update", Some("running")));
+        assert_eq!(s.notifications.generation("proj"), 2);
+    }
+
+    /// A center over a held-back agent failure, rebuilt the way the
+    /// orchestrator rebuilds it: the second rebuild holds the failure back and
+    /// asks to be rebuilt when it settles; every later one has it settled.
+    fn settling_center() -> (Arc<OperatorNotificationsCache>, Arc<Mutex<Vec<String>>>) {
+        let announced = Arc::new(Mutex::new(Vec::new()));
+        let slot: Arc<std::sync::OnceLock<Weak<OperatorNotificationsCache>>> = Arc::default();
+        let rebuilds = Arc::new(AtomicU64::new(0));
+        let cache = OperatorNotificationsCache::new(
+            "test-settling",
+            STATUS_ROLLUP_FLOOR,
+            rebuild_with({
+                let slot = slot.clone();
+                move |key| {
+                    let n = rebuilds.fetch_add(1, Ordering::SeqCst);
+                    let cache = slot.get().and_then(Weak::upgrade);
+                    async move {
+                        let next_change_at = (n == 1).then_some(31);
+                        if let (true, Some(cache)) = (n == 1, cache) {
+                            cache.invalidate_after(
+                                &key,
+                                Duration::from_secs(31),
+                                "time-dependent-entry-due",
+                            );
+                        }
+                        Ok(Arc::new(
+                            crate::notifications::OperatorNotificationsSnapshot {
+                                next_change_at,
+                                // Settled: a failure now stands as an entry,
+                                // modeled by the answer simply differing.
+                                watched_job_ids: job_set(&["failer"]),
+                                ..Default::default()
+                            },
+                        ))
+                    }
+                }
+            }),
+            recording(&announced, "operator_notifications"),
+        );
+        slot.set(Arc::downgrade(&cache)).unwrap();
+        (cache, announced)
+    }
+
+    /// A failure held back by its settle window is published once it settles,
+    /// with no frame of any kind after the failing write. Now that a working
+    /// agent's progress no longer dirties the center, nothing incidental would
+    /// publish it; the time the rebuild asked for must.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_back_failure_is_published_when_it_settles_with_no_further_frame() {
+        let (cache, announced) = settling_center();
+        cache.get("proj").await.unwrap();
+        // The failing turn's own frame, the last write anyone makes.
+        cache.invalidate("proj", "notification-input");
+        cache.settle("proj").await;
+        assert_eq!(cache.published("proj").unwrap().next_change_at, Some(31));
+        announced.lock().unwrap().clear();
+
+        tokio::time::sleep(Duration::from_secs(33)).await;
+        cache.settle("proj").await;
+        assert_eq!(
+            cache.published("proj").unwrap().next_change_at,
+            None,
+            "the reader is still inside the read horizon, so it was rebuilt"
+        );
+        assert_eq!(
+            *announced.lock().unwrap(),
+            vec!["operator_notifications:proj"]
+        );
+    }
+
+    /// The same when nobody has read the center inside the read horizon: the
+    /// key goes dirty when the failure settles and says so once, which is what
+    /// brings a mounted reader back to fetch it, as it did before frames were
+    /// scoped.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_back_failure_that_settles_unread_is_announced_for_the_next_read() {
+        let (cache, announced) = settling_center();
+        cache.get("proj").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(50)).await;
+        cache.invalidate("proj", "notification-input");
+        cache.settle("proj").await;
+        assert_eq!(cache.published("proj").unwrap().next_change_at, Some(31));
+        announced.lock().unwrap().clear();
+        let generation = cache.generation("proj");
+
+        // Settles 81 s after the last read, past the 60 s horizon.
+        tokio::time::sleep(Duration::from_secs(33)).await;
+        assert_eq!(cache.generation("proj"), generation + 1);
+        assert_eq!(
+            *announced.lock().unwrap(),
+            vec!["operator_notifications:proj"]
+        );
+        cache.get("proj").await.unwrap();
+        cache.settle("proj").await;
+        assert_eq!(cache.published("proj").unwrap().next_change_at, None);
     }
 
     /// A job's pending-delivery list cannot be placed against the frame's job for

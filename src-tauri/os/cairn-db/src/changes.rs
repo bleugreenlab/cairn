@@ -99,20 +99,38 @@ pub fn job_db_change_ids(
     })
 }
 
-/// Build a fully-scoped `jobs` db-change payload from a `Job`.
+/// Build a fully-scoped `jobs` db-change payload from a `Job`, carrying its
+/// status.
 ///
-/// See [`job_db_change_ids`] for the scoping invariant.
+/// `job` must be the row as it stands after the write being announced, never a
+/// copy loaded before it: see [`with_job_status`]. See [`job_db_change_ids`]
+/// for the scoping invariant.
 pub fn job_db_change(job: &models::Job, action: &str) -> Value {
-    job_db_change_ids(
-        action,
-        &job.id,
-        job.issue_id.as_deref(),
-        job.thread_id.as_deref(),
-        job.execution_id.as_deref(),
-        job.parent_job_id.as_deref(),
-        job.parent_tool_use_id.as_deref(),
-        &job.project_id,
+    with_job_status(
+        job_db_change_ids(
+            action,
+            &job.id,
+            job.issue_id.as_deref(),
+            job.thread_id.as_deref(),
+            job.execution_id.as_deref(),
+            job.parent_job_id.as_deref(),
+            job.parent_tool_use_id.as_deref(),
+            &job.project_id,
+        ),
+        &job.status.to_string(),
     )
+}
+
+/// Stamp a `jobs` payload with the status the job holds after the write.
+///
+/// The operator notification center skips a status-bearing `jobs` frame for a
+/// job it did not read unless that status could open an entry by itself, so a
+/// status read before the write would hide the very transition being announced.
+/// Only a builder holding the committed row may call this. A payload without
+/// `status` is always treated as relevant, which is the safe degradation.
+fn with_job_status(mut payload: Value, status: &str) -> Value {
+    payload["status"] = json!(status);
+    payload
 }
 
 /// Load the authoritative job scope after a write and build its payload.
@@ -129,7 +147,8 @@ pub async fn job_db_change_for_id(db: &LocalDb, job_id: &str, action: &str) -> V
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT issue_id, thread_id, execution_id, parent_job_id, parent_tool_use_id, project_id
+                        "SELECT issue_id, thread_id, execution_id, parent_job_id, parent_tool_use_id, project_id,
+                                status
                          FROM jobs WHERE id = ?1 LIMIT 1",
                         (job_id.as_str(),),
                     )
@@ -142,6 +161,7 @@ pub async fn job_db_change_for_id(db: &LocalDb, job_id: &str, action: &str) -> V
                         row.opt_text(3)?,
                         row.opt_text(4)?,
                         row.opt_text(5)?,
+                        row.text(6)?,
                     ))),
                     None => Ok(None),
                 }
@@ -156,15 +176,19 @@ pub async fn job_db_change_for_id(db: &LocalDb, job_id: &str, action: &str) -> V
             parent_job_id,
             parent_tool_use_id,
             Some(project_id),
-        ))) => job_db_change_ids(
-            action,
-            job_id,
-            issue_id.as_deref(),
-            thread_id.as_deref(),
-            execution_id.as_deref(),
-            parent_job_id.as_deref(),
-            parent_tool_use_id.as_deref(),
-            &project_id,
+            status,
+        ))) => with_job_status(
+            job_db_change_ids(
+                action,
+                job_id,
+                issue_id.as_deref(),
+                thread_id.as_deref(),
+                execution_id.as_deref(),
+                parent_job_id.as_deref(),
+                parent_tool_use_id.as_deref(),
+                &project_id,
+            ),
+            &status,
         ),
         Ok(_) => json!({"table": "jobs", "action": action}),
         Err(error) => {
@@ -240,6 +264,11 @@ pub async fn run_db_change_for_id(db: &LocalDb, run_id: &str, action: &str) -> V
     }
 }
 
+/// A `turns` payload. `state` is the turn's state as committed by the write
+/// being announced, present only when the builder read the row after it: the
+/// operator notification center places a turn frame by it, and treats a frame
+/// without one as relevant.
+#[allow(clippy::too_many_arguments)]
 fn turn_db_change_ids(
     action: &str,
     turn_id: Option<&str>,
@@ -248,6 +277,7 @@ fn turn_db_change_ids(
     session_id: Option<&str>,
     issue_id: Option<&str>,
     project_id: Option<&str>,
+    state: Option<&str>,
 ) -> Value {
     json!({
         "table": "turns",
@@ -258,6 +288,7 @@ fn turn_db_change_ids(
         "sessionId": session_id,
         "issueId": issue_id,
         "projectId": project_id,
+        "state": state,
     })
 }
 
@@ -269,7 +300,7 @@ pub async fn turn_db_change_for_id(db: &LocalDb, turn_id: &str, action: &str) ->
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT t.job_id, t.run_id, t.session_id, j.issue_id, j.project_id
+                        "SELECT t.job_id, t.run_id, t.session_id, j.issue_id, j.project_id, t.state
                          FROM turns t LEFT JOIN jobs j ON j.id = t.job_id
                          WHERE t.id = ?1 LIMIT 1",
                         (turn_id.as_str(),),
@@ -282,6 +313,7 @@ pub async fn turn_db_change_for_id(db: &LocalDb, turn_id: &str, action: &str) ->
                         row.opt_text(2)?,
                         row.opt_text(3)?,
                         row.opt_text(4)?,
+                        row.opt_text(5)?,
                     ))),
                     None => Ok(None),
                 }
@@ -289,7 +321,7 @@ pub async fn turn_db_change_for_id(db: &LocalDb, turn_id: &str, action: &str) ->
         })
         .await;
     match scope {
-        Ok(Some((job_id, run_id, session_id, issue_id, project_id))) => turn_db_change_ids(
+        Ok(Some((job_id, run_id, session_id, issue_id, project_id, state))) => turn_db_change_ids(
             action,
             Some(turn_id),
             job_id.as_deref(),
@@ -297,11 +329,12 @@ pub async fn turn_db_change_for_id(db: &LocalDb, turn_id: &str, action: &str) ->
             session_id.as_deref(),
             issue_id.as_deref(),
             project_id.as_deref(),
+            state.as_deref(),
         ),
-        Ok(None) => turn_db_change_ids(action, Some(turn_id), None, None, None, None, None),
+        Ok(None) => turn_db_change_ids(action, Some(turn_id), None, None, None, None, None, None),
         Err(error) => {
             log::warn!("Failed to load turn scope for db-change {turn_id}: {error}");
-            turn_db_change_ids(action, Some(turn_id), None, None, None, None, None)
+            turn_db_change_ids(action, Some(turn_id), None, None, None, None, None, None)
         }
     }
 }
@@ -326,6 +359,7 @@ pub async fn turn_db_change_for_job_id(db: &LocalDb, job_id: &str, action: &str)
         })
         .await;
     match scope {
+        // Several of the job's turns may have moved, so there is no one state.
         Ok(Some((issue_id, project_id, session_id))) => turn_db_change_ids(
             action,
             None,
@@ -334,11 +368,12 @@ pub async fn turn_db_change_for_job_id(db: &LocalDb, job_id: &str, action: &str)
             session_id.as_deref(),
             issue_id.as_deref(),
             project_id.as_deref(),
+            None,
         ),
-        Ok(None) => turn_db_change_ids(action, None, Some(job_id), None, None, None, None),
+        Ok(None) => turn_db_change_ids(action, None, Some(job_id), None, None, None, None, None),
         Err(error) => {
             log::warn!("Failed to load job scope for turns db-change {job_id}: {error}");
-            turn_db_change_ids(action, None, Some(job_id), None, None, None, None)
+            turn_db_change_ids(action, None, Some(job_id), None, None, None, None, None)
         }
     }
 }
@@ -560,7 +595,8 @@ pub async fn job_db_changes_for_execution(
 ) -> Vec<Value> {
     job_db_changes_where(
         db,
-        "SELECT id, issue_id, thread_id, execution_id, parent_job_id, parent_tool_use_id, project_id
+        "SELECT id, issue_id, thread_id, execution_id, parent_job_id, parent_tool_use_id, project_id,
+                status
          FROM jobs WHERE execution_id = ?1",
         execution_id,
         action,
@@ -572,7 +608,8 @@ pub async fn job_db_changes_for_execution(
 pub async fn job_db_changes_for_issue(db: &LocalDb, issue_id: &str, action: &str) -> Vec<Value> {
     job_db_changes_where(
         db,
-        "SELECT id, issue_id, thread_id, execution_id, parent_job_id, parent_tool_use_id, project_id
+        "SELECT id, issue_id, thread_id, execution_id, parent_job_id, parent_tool_use_id, project_id,
+                status
          FROM jobs WHERE issue_id = ?1",
         issue_id,
         action,
@@ -603,6 +640,7 @@ async fn job_db_changes_where(
                         row.opt_text(4)?,
                         row.opt_text(5)?,
                         row.text(6)?,
+                        row.text(7)?,
                     ));
                 }
                 Ok(jobs)
@@ -621,16 +659,20 @@ async fn job_db_changes_where(
                     parent_job_id,
                     parent_tool_use_id,
                     project_id,
+                    status,
                 )| {
-                    job_db_change_ids(
-                        action,
-                        job_id,
-                        issue_id.as_deref(),
-                        thread_id.as_deref(),
-                        execution_id.as_deref(),
-                        parent_job_id.as_deref(),
-                        parent_tool_use_id.as_deref(),
-                        project_id,
+                    with_job_status(
+                        job_db_change_ids(
+                            action,
+                            job_id,
+                            issue_id.as_deref(),
+                            thread_id.as_deref(),
+                            execution_id.as_deref(),
+                            parent_job_id.as_deref(),
+                            parent_tool_use_id.as_deref(),
+                            project_id,
+                        ),
+                        status,
                     )
                 },
             )
@@ -1280,8 +1322,10 @@ mod tests {
             Some("session-1"),
             Some("issue-1"),
             Some("project-1"),
+            Some("failed"),
         );
         assert_eq!(payload["table"], "turns");
+        assert_eq!(payload["state"], "failed");
         assert_eq!(payload["action"], "update");
         assert_eq!(payload["turnId"], "turn-1");
         assert_eq!(payload["jobId"], "job-1");

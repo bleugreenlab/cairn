@@ -117,6 +117,28 @@ pub async fn blocked_on_output_conn(
     conn: &crate::storage::TrackedConnection,
     scope: &ApprovalScope,
 ) -> DbResult<Vec<BlockedOnOutput>> {
+    Ok(blocked_and_candidates_conn(conn, scope).await?.0)
+}
+
+/// [`blocked_on_output`], with the id of every candidate it examined: each
+/// blocked top-level job on an unresolved issue, whether or not its facts said
+/// the output is missing. A reader caching the answer watches these jobs,
+/// since a write to any of them can move it without changing its status.
+pub async fn blocked_on_output_with_candidates(
+    db: &LocalDb,
+    scope: ApprovalScope,
+) -> DbResult<(Vec<BlockedOnOutput>, Vec<String>)> {
+    db.read(move |conn| {
+        let scope = scope.clone();
+        Box::pin(async move { blocked_and_candidates_conn(conn, &scope).await })
+    })
+    .await
+}
+
+async fn blocked_and_candidates_conn(
+    conn: &crate::storage::TrackedConnection,
+    scope: &ApprovalScope,
+) -> DbResult<(Vec<BlockedOnOutput>, Vec<String>)> {
     let mut candidates = Vec::new();
     for (sql, params) in scoped_statements(scope) {
         let mut rows = conn.query(&sql, params).await?;
@@ -153,6 +175,10 @@ pub async fn blocked_on_output_conn(
         }
     }
 
+    let candidate_ids = candidates
+        .iter()
+        .map(|candidate| candidate.row.job_id.clone())
+        .collect();
     let mut blocked = Vec::new();
     for candidate in candidates {
         let Candidate {
@@ -182,7 +208,7 @@ pub async fn blocked_on_output_conn(
         }
     }
     blocked.sort_by(|a, b| (a.since, &a.job_id).cmp(&(b.since, &b.job_id)));
-    Ok(blocked)
+    Ok((blocked, candidate_ids))
 }
 
 /// [`blocked_on_output_conn`] on its own read.

@@ -199,12 +199,25 @@ impl NotificationView {
 }
 
 /// One project's derived list, newest first, with dismissals applied.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct OperatorNotificationsSnapshot {
     pub entries: Vec<OperatorNotification>,
     /// Unix seconds when this answer next changes with no write to announce
     /// it (a held-back failure settling). The cache schedules a rebuild then.
     pub next_change_at: Option<i64>,
+    /// Every job and turn the rebuild read, which the cache's frame scoping
+    /// (`touches_a_notification`) treats as able to move the answer. Not part
+    /// of the answer: two rebuilds that read different rows but derive the
+    /// same entries are equal, and the cache replaces the published value on
+    /// every rebuild either way, so these are always the latest read's.
+    pub(crate) watched_job_ids: HashSet<String>,
+    pub(crate) watched_turn_ids: HashSet<String>,
+}
+
+impl PartialEq for OperatorNotificationsSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries && self.next_change_at == other.next_change_at
+    }
 }
 
 /// The project an entry belongs to.
@@ -258,8 +271,9 @@ pub(crate) async fn derive_snapshot(
         key,
     };
     let since = now - RECENT_WINDOW_SECS;
+    let mut watched = derive::Watched::default();
     let (mut entries, next_change_at) =
-        derive::from_sources(db, local, &project, since, now).await?;
+        derive::from_sources(db, local, &project, since, now, &mut watched).await?;
     entries.extend(derive::holds(holds, &project));
     derive::attach_headlines(db, &project, &mut entries).await;
     for entry in &mut entries {
@@ -279,6 +293,8 @@ pub(crate) async fn derive_snapshot(
     Ok(OperatorNotificationsSnapshot {
         entries,
         next_change_at,
+        watched_job_ids: watched.jobs,
+        watched_turn_ids: watched.turns,
     })
 }
 

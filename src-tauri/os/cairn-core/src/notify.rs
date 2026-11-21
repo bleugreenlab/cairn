@@ -257,6 +257,9 @@ mod tests {
         assert_eq!(payload["parentJobId"], "parent-1");
         assert_eq!(payload["parentToolUseId"], "tool-1");
         assert_eq!(payload["projectId"], "project-1");
+        // The model is the committed row, so its status rides along for the
+        // notification center to place the frame by.
+        assert_eq!(payload["status"], job.status.to_string());
     }
 
     #[test]
