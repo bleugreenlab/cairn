@@ -1190,6 +1190,10 @@ async fn suspend_parent_for_tasks(
     materialized: &[MaterializedTask],
 ) -> CallbackResponse {
     let first = &materialized[0];
+    let turn_owner = first.packet.parent_turn_id.as_deref().and_then(|turn_id| {
+        orch.process_state
+            .capture_turn_owner(&parent_ctx.run_id, turn_id)
+    });
     if let Err(error) = prepare_parent_for_delegated_wait(orch, parent_ctx, &first.packet) {
         log::warn!(
             "Failed to prepare durable wait for parent job {}: {}",
@@ -1202,11 +1206,7 @@ async fn suspend_parent_for_tasks(
             parent_ctx.run_id.clone(),
             parent_ctx.job_id.clone(),
             first.job_id.clone(),
-            first
-                .packet
-                .parent_turn_id
-                .clone()
-                .expect("prepared dependency wait has a parent turn"),
+            turn_owner,
         );
     }
     // Name the address each task was actually minted at. A task's slug is

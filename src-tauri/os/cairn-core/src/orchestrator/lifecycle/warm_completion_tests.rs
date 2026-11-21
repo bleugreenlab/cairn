@@ -13,9 +13,12 @@ use cairn_session::agent_process::completion::TurnFailureDisposition;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
+type DbChangeHook = Box<dyn FnMut() -> bool + Send>;
+
 #[derive(Clone, Default)]
 struct SharedCaptureEmitter {
     events: Arc<Mutex<Vec<(String, Value)>>>,
+    on_db_change: Arc<Mutex<Option<DbChangeHook>>>,
 }
 
 #[tokio::test]
@@ -69,6 +72,13 @@ async fn durable_wait_and_pending_park_share_codex_pause_before_interrupt_bounda
             },
         )
         .expect("wait/self-suspend must pause before parking");
+        assert_eq!(
+            self::turn_state(&orch, "turn-park").await,
+            turn_state,
+            "a direct wait parks the provider without rewriting logical work"
+        );
+        assert!(orch.process_state.is_warm("run-park"));
+        assert_eq!(orch.process_state.get_current_turn_id("run-park"), None);
         *provider_turn.lock().unwrap() = None;
 
         let sent = requests.lock().unwrap();
@@ -85,6 +95,108 @@ async fn durable_wait_and_pending_park_share_codex_pause_before_interrupt_bounda
             sent.iter().all(|request| request["method"] != "turn/start"),
             "{turn_state} park must leave the unfinished goal non-continuing"
         );
+    }
+}
+
+/// The permission/prompt suspension stakes and parks only the exact turn it
+/// yielded. A missing owner, a successor attached before the budget expired, or
+/// a replacement registration must receive no goal control and no park.
+#[tokio::test]
+async fn user_input_suspension_stakes_and_parks_only_its_exact_yielded_turn() {
+    for case in ["current", "missing", "successor", "replacement"] {
+        let db = test_db().await;
+        seed_top_level_run(&db, "run-ask", "job-ask", "turn-ask", "none").await;
+        db.execute_script(
+            "INSERT INTO sessions (id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
+               VALUES ('session-ask','job-ask','codex','native-thread','open',1,1,1);
+             UPDATE jobs SET current_session_id='session-ask' WHERE id='job-ask';
+             UPDATE runs SET session_id='session-ask' WHERE id='run-ask';
+             UPDATE turns SET session_id='session-ask',run_id='run-ask' WHERE id='turn-ask';",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+        let scripted_handle = || {
+            let (stdin, requests, _provider_turn) =
+                crate::backends::codex::scripted_user_stop_stdin_for_test(
+                    "native-thread",
+                    "provider-live",
+                );
+            let mut handle = RunHandle::new(
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(Some(stdin))),
+                Some("session-ask".into()),
+                Some("job-ask".into()),
+            );
+            handle.backend = Some("codex".into());
+            handle.begin_turn("turn-ask");
+            (handle, requests)
+        };
+        let (handle, mut requests) = scripted_handle();
+        orch.process_state
+            .processes
+            .lock()
+            .unwrap()
+            .register("run-ask".into(), handle);
+        orch.process_state.yield_for_host("run-ask", "turn-ask");
+        let captured = orch.process_state.capture_turn_owner("run-ask", "turn-ask");
+        assert!(captured.is_some(), "{case}: the yielded turn is capturable");
+        let turn_owner = match case {
+            "missing" => None,
+            "successor" => {
+                assert!(orch.process_state.begin_turn("run-ask", "turn-successor"));
+                captured
+            }
+            "replacement" => {
+                // Even the same run and turn id: generation fences the old token.
+                let (replacement, replacement_requests) = scripted_handle();
+                orch.process_state
+                    .processes
+                    .lock()
+                    .unwrap()
+                    .register("run-ask".into(), replacement);
+                requests = replacement_requests;
+                captured
+            }
+            _ => captured,
+        };
+        let current_before = orch.process_state.get_current_turn_id("run-ask");
+
+        crate::orchestrator::lifecycle::suspend_run_for_durable_wait_after_handoff(
+            &orch,
+            "run-ask",
+            "permission_wait_suspended",
+            turn_owner,
+            GoalPauseOwner::UserInput {
+                request_id: "perm-ask".into(),
+            },
+        );
+
+        let sent = requests.lock().unwrap().clone();
+        if case == "current" {
+            assert_eq!(sent.len(), 2, "the exact owner stakes its pause at once");
+            assert_eq!(sent[0]["method"], "thread/goal/get");
+            assert_eq!(sent[1]["method"], "thread/goal/set");
+            assert_eq!(sent[1]["params"]["status"], "paused");
+            assert!(
+                orch.park_slots.armed("run-ask"),
+                "the exact owner's park is armed"
+            );
+        } else {
+            assert!(
+                sent.is_empty(),
+                "{case}: no goal control may reach a turn this suspension does not own"
+            );
+            assert!(
+                !orch.park_slots.armed("run-ask"),
+                "{case}: no park may be armed without the exact owner"
+            );
+            assert_eq!(
+                orch.process_state.get_current_turn_id("run-ask"),
+                current_before,
+                "{case}: the current registration's turn is untouched"
+            );
+        }
     }
 }
 
@@ -244,6 +356,14 @@ impl SharedCaptureEmitter {
 
 impl EventEmitter for SharedCaptureEmitter {
     fn emit(&self, event: &str, payload: Value) -> Result<(), String> {
+        if event == "db-change" {
+            let callback = self.on_db_change.lock().unwrap().take();
+            if let Some(mut callback) = callback {
+                if !callback() {
+                    *self.on_db_change.lock().unwrap() = Some(callback);
+                }
+            }
+        }
         self.events
             .lock()
             .unwrap()
@@ -830,16 +950,23 @@ async fn finalize_ends_the_run_s_pooled_thread_bindings() {
 #[tokio::test]
 async fn warm_transition_broadcasts_run_completion() {
     let db = test_db().await;
+    seed_top_level_run(&db, "run-bcast", "job-bcast", "turn-bcast", "none").await;
     let orch = test_orchestrator(db);
-    register_warm_process(&orch, "run-bcast", None);
+    register_warm_process(&orch, "run-bcast", Some("job-bcast"));
+    orch.process_state
+        .set_current_turn_id("run-bcast", Some("turn-bcast"));
 
     // `spawn_task_packets`' inline 45s wait subscribes here to detect a
     // fast-finishing child. A warmed child must broadcast on it just like
     // `finalize_run` does, or a sub-45s batch never returns inline.
     let mut rx = orch.run_completions.subscribe();
     assert!(transition_to_warm_state(&orch, "run-bcast", None));
-
     assert_eq!(rx.try_recv().ok(), Some("run-bcast".to_string()));
+
+    // The released process owns no turn, so a repeated completion is refused
+    // and must not announce the run a second time.
+    assert!(!transition_to_warm_state(&orch, "run-bcast", None));
+    assert!(rx.try_recv().is_err());
 }
 
 /// Seed a parent suspended on a delegated wait (anchor turn + pending
@@ -906,6 +1033,10 @@ async fn warm_completion_resumes_suspended_delegated_parent() {
     seed_suspended_parent_with_completed_child(&db, snapshot).await;
     let orch = test_orchestrator(db);
     register_warm_process(&orch, "run-child", Some("j-child"));
+    // The child's last turn is an untracked one (a direct-message resume), the
+    // occupancy `transition_to_active` admits. A registration that never
+    // admitted a turn has nothing to complete.
+    assert!(orch.process_state.transition_to_active("run-child"));
 
     // Pre-completion: the parent's resume successor is still pending.
     assert_eq!(turn_state(&orch, "succ").await, "pending");
@@ -1635,14 +1766,429 @@ mod backend_turn {
                 session_lifetime: lifetime,
             },
             CodexTurnContext {
+                fatal_cause: None,
+                accounting_only: false,
+                process_identity: orch.process_state.capture_process_identity(run_id).unwrap(),
+                owner: orch.process_state.capture_turn_owner_for_identity(
+                    &orch.process_state.capture_process_identity(run_id).unwrap(),
+                ),
                 failure_disposition: if handled {
                     TurnFailureDisposition::AlreadyHandled
                 } else {
                     TurnFailureDisposition::Unhandled
                 },
-                fatal_cause: None,
             },
         );
+    }
+
+    #[tokio::test]
+    async fn failed_completion_settlement_retains_owner_until_retry_succeeds() {
+        let db = test_db().await;
+        seed_top_level_run(&db, "r", "j", "t", "none").await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+        register_warm_process(&orch, "r", Some("j"));
+        orch.process_state.set_current_turn_id("r", Some("t"));
+        let identity = orch.process_state.capture_process_identity("r").unwrap();
+        let owner = orch
+            .process_state
+            .capture_turn_owner_for_identity(&identity)
+            .unwrap();
+        orch.db
+            .local
+            .execute_script(
+                "CREATE TRIGGER reject_completion BEFORE UPDATE OF state ON turns
+             WHEN OLD.id='t' AND NEW.state='complete'
+             BEGIN SELECT RAISE(ABORT, 'injected settlement failure'); END;",
+            )
+            .await
+            .unwrap();
+        let release = || {
+            super::super::finalize::release_owned_completion(
+                &orch,
+                &identity,
+                Some(&owner),
+                Some((crate::models::TurnState::Complete, None)),
+            )
+        };
+        let published = emitter.events_named("db-change").len();
+        assert!(!release(), "failed settlement must not advertise Idle");
+        assert!(orch.process_state.is_turn_owner_current(&owner));
+        assert_eq!(turn_state(&orch, "t").await, "running");
+        assert_eq!(emitter.events_named("db-change").len(), published);
+        assert!(orch.job_launch_lock("j").try_lock().is_ok());
+        orch.db
+            .local
+            .execute_script("DROP TRIGGER reject_completion;")
+            .await
+            .unwrap();
+        assert!(
+            release(),
+            "the accepted owner can retry a failed settlement"
+        );
+        assert_eq!(turn_state(&orch, "t").await, "complete");
+        assert_eq!(orch.process_state.get_current_turn_id("r"), None);
+        assert_eq!(emitter.events_named("db-change").len(), published + 1);
+        assert!(!release(), "a successful release cannot replay");
+        assert_eq!(emitter.events_named("db-change").len(), published + 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_and_replaced_completion_callbacks_preserve_successors() {
+        for mode in ["idle", "successor", "replacement"] {
+            let db = test_db().await;
+            seed_top_level_run(&db, "r", "j", "t", "none").await;
+            let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+            register_warm_process(&orch, "r", Some("j"));
+            orch.process_state.set_current_turn_id("r", Some("t"));
+            let identity = orch.process_state.capture_process_identity("r").unwrap();
+            let owner = orch
+                .process_state
+                .capture_turn_owner_for_identity(&identity);
+            let replay = || {
+                apply_codex_turn_completion(
+                    &orch,
+                    &orch.db.local,
+                    &orch.services.emitter,
+                    "r",
+                    None,
+                    SessionTurnCompletion {
+                        outcome: SessionTurnOutcome::Completed,
+                        usage: TokenCounts::default(),
+                        session_lifetime: SessionLifetime::Persistent,
+                    },
+                    CodexTurnContext {
+                        fatal_cause: None,
+                        accounting_only: false,
+                        process_identity: identity.clone(),
+                        owner: owner.clone(),
+                        failure_disposition: TurnFailureDisposition::Unhandled,
+                    },
+                );
+            };
+            replay();
+            assert_eq!(turn_state(&orch, "t").await, "complete");
+            if mode != "idle" {
+                orch.db.local.execute_script(
+                    "INSERT INTO turns(id,session_id,job_id,run_id,sequence,state,start_reason,created_at,updated_at)
+                       VALUES('new','sess-attn','j','r',2,'running','prompt_response',2,2);
+                     UPDATE jobs SET current_turn_id='new' WHERE id='j';",
+                ).await.unwrap();
+                if mode == "replacement" {
+                    register_warm_process(&orch, "r", Some("j"));
+                }
+                orch.process_state.set_current_turn_id("r", Some("new"));
+            }
+            replay();
+            replay();
+            assert_eq!(result_count(&orch).await, 1, "{mode}: no duplicate results");
+            assert_eq!(
+                emitter.events_named("run-turn-completed").len(),
+                1,
+                "{mode}: no repeated completion effects"
+            );
+            assert_eq!(
+                orch.process_state.get_current_turn_id("r").as_deref(),
+                (mode != "idle").then_some("new"),
+                "{mode}: preserve the current owner"
+            );
+            if mode != "idle" {
+                assert_eq!(turn_state(&orch, "new").await, "running");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_shot_completion_replay_and_stale_process_have_no_effects() {
+        for (occupancy, stale) in ["tracked", "idle", "busy"]
+            .into_iter()
+            .flat_map(|occupancy| [false, true].map(|stale| (occupancy, stale)))
+        {
+            let db = test_db().await;
+            seed_top_level_run(&db, "r", "j", "t", "none").await;
+            let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+            register_warm_process(&orch, "r", Some("j"));
+            if occupancy == "tracked" {
+                orch.process_state.set_current_turn_id("r", Some("t"));
+            } else {
+                orch.db.local.execute_script(
+                    "UPDATE jobs SET current_turn_id=NULL WHERE id='j'; DELETE FROM turns WHERE id='t';"
+                ).await.unwrap();
+                if occupancy == "busy" {
+                    orch.process_state.transition_to_active("r");
+                }
+            }
+            let identity = orch.process_state.capture_process_identity("r").unwrap();
+            let owner = orch
+                .process_state
+                .capture_turn_owner_for_identity(&identity);
+            let replay = || {
+                apply_codex_turn_completion(
+                    &orch,
+                    &orch.db.local,
+                    &orch.services.emitter,
+                    "r",
+                    None,
+                    SessionTurnCompletion {
+                        outcome: SessionTurnOutcome::Completed,
+                        usage: TokenCounts::default(),
+                        session_lifetime: SessionLifetime::OneShot,
+                    },
+                    CodexTurnContext {
+                        fatal_cause: None,
+                        accounting_only: false,
+                        process_identity: identity.clone(),
+                        owner: owner.clone(),
+                        failure_disposition: TurnFailureDisposition::Unhandled,
+                    },
+                )
+            };
+            if stale {
+                register_warm_process(&orch, "r", Some("j"));
+                orch.process_state.set_current_turn_id("r", Some("t"));
+            } else {
+                replay();
+            }
+            let before = emitter.events.lock().unwrap().len();
+            replay();
+            replay();
+            assert_eq!(
+                emitter.events.lock().unwrap().len(),
+                before,
+                "stale={stale}: no repeated publication"
+            );
+            assert_eq!(result_count(&orch).await, i64::from(!stale));
+            if occupancy == "tracked" {
+                assert_eq!(
+                    turn_state(&orch, "t").await,
+                    if stale { "running" } else { "complete" }
+                );
+            } else {
+                assert_eq!(
+                    orch.db
+                        .local
+                        .query_opt_i64("SELECT COUNT(*) FROM turns WHERE job_id='j'", (),)
+                        .await
+                        .unwrap(),
+                    Some(0),
+                    "untracked startup cannot rediscover a head"
+                );
+            }
+            assert_eq!(
+                scalar_text(&orch, "SELECT status FROM runs WHERE id=?1", "r")
+                    .await
+                    .as_deref(),
+                Some(if stale { "live" } else { "exited" })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_terminal_claims_leave_lifecycle_to_restart_recovery() {
+        for status in [RunStatus::Exited, RunStatus::Crashed] {
+            for tracked in [true, false] {
+                let db = test_db().await;
+                seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
+                // Shutdown settles unfinished work before provider cleanup can
+                // report success or failure. Neither may replace that cause.
+                db.execute_script(
+                    "UPDATE runs SET exit_reason='runner_shutdown' WHERE id='run-child';
+                     UPDATE turns SET state='interrupted',end_reason='host_restart'
+                       WHERE id='child-turn';",
+                )
+                .await
+                .unwrap();
+                let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+                register_warm_process(&orch, "run-child", Some("j-child"));
+                if tracked {
+                    orch.process_state
+                        .set_current_turn_id("run-child", Some("child-turn"));
+                } else {
+                    orch.process_state.transition_to_active("run-child");
+                }
+                let identity = orch
+                    .process_state
+                    .capture_process_identity("run-child")
+                    .unwrap();
+                let owner = orch
+                    .process_state
+                    .capture_turn_owner_for_identity(&identity);
+                let published = std::cell::Cell::new(0);
+                for _ in 0..2 {
+                    assert!(!crate::orchestrator::lifecycle::finalize_owned_completion(
+                        &orch,
+                        &identity,
+                        owner.as_ref(),
+                        status.clone(),
+                        Some("turn_failed"),
+                        None,
+                        || published.set(published.get() + 1),
+                    ));
+                }
+                assert_eq!(published.get(), 0);
+                assert!(emitter.events.lock().unwrap().is_empty());
+                assert_eq!(turn_state(&orch, "child-turn").await, "interrupted");
+                assert_eq!(
+                    scalar_text(
+                        &orch,
+                        "SELECT end_reason FROM turns WHERE id=?1",
+                        "child-turn"
+                    )
+                    .await
+                    .as_deref(),
+                    Some("host_restart"),
+                );
+                assert_eq!(
+                    turn_state(&orch, "succ").await,
+                    "pending",
+                    "shutdown must not resume the parent",
+                );
+                assert_eq!(
+                    scalar_text(&orch, "SELECT status FROM runs WHERE id=?1", "run-child")
+                        .await
+                        .as_deref(),
+                    Some("live"),
+                );
+                assert_eq!(
+                    scalar_text(
+                        &orch,
+                        "SELECT exit_reason FROM runs WHERE id=?1",
+                        "run-child"
+                    )
+                    .await
+                    .as_deref(),
+                    Some("runner_shutdown"),
+                );
+                assert!(orch.process_state.is_process_identity_current(&identity));
+                assert_eq!(
+                    orch.process_state
+                        .get_current_turn_id("run-child")
+                        .as_deref(),
+                    tracked.then_some("child-turn"),
+                );
+                assert!(
+                    !orch
+                        .process_state
+                        .processes
+                        .lock()
+                        .unwrap()
+                        .get("run-child")
+                        .unwrap()
+                        .is_warm(),
+                    "refused terminal claims cannot release tracked or untracked busy occupancy",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_publication_cannot_finalize_a_replacement_head() {
+        for same_run in [false, true] {
+            let db = test_db().await;
+            seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
+            if same_run {
+                db.execute_script(r#"INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at)
+                 VALUES('terminal-call','local-runtime','isolated','call:run-child','{"residentProcessUnits":1,"logicalStreamUnits":1}',0,1,'active','test',1,9999999999,1,1);"#).await.unwrap();
+            }
+            let replacement_run = if same_run {
+                "run-child"
+            } else {
+                "replacement-run"
+            };
+            let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+            register_warm_process(&orch, "run-child", Some("j-child"));
+            orch.process_state
+                .set_current_turn_id("run-child", Some("child-turn"));
+            let callback_orch = orch.clone();
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let callback_fired = fired.clone();
+            *emitter.on_db_change.lock().unwrap() = Some(Box::new(move || {
+                let db = callback_orch.db.local.clone();
+                let has_result = crate::storage::run_db_blocking({
+                    let db = db.clone();
+                    move || async move {
+                        db.query_opt_i64(
+                            "SELECT COUNT(*) FROM events WHERE event_type='result:error'",
+                            (),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())
+                    }
+                })
+                .unwrap()
+                    == Some(1);
+                if !has_result {
+                    return false;
+                }
+                let lock = callback_orch.job_launch_lock("j-child");
+                let _guard = lock
+                    .try_lock()
+                    .expect("result publication releases launch authority");
+                crate::storage::run_db_blocking(move || async move {
+                if same_run {
+                    assert_eq!(db.query_opt_text(
+                        "SELECT state FROM runtime_admission_requests WHERE request_id='terminal-call'", (),
+                    ).await.unwrap().as_deref(), Some("released"),
+                        "call lease cleanup precedes result publication");
+                }
+                let run_insert = if same_run { String::new() } else {
+                    "INSERT INTO runs(id,job_id,session_id,status,created_at,updated_at) VALUES('replacement-run','j-child','replacement-session','live',3,3);".to_string()
+                };
+                db.execute_script(format!(
+                    "INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at)
+                       VALUES('replacement-session','j-child','codex','open',2,3,3);
+                     {run_insert}
+                     INSERT INTO turns(id,session_id,job_id,run_id,sequence,state,start_reason,created_at,updated_at)
+                       VALUES('replacement-turn','replacement-session','j-child','{replacement_run}',2,'running','prompt_response',3,3);
+                     UPDATE jobs SET current_turn_id='replacement-turn',current_session_id='replacement-session',status='running' WHERE id='j-child';"
+                )).await.map_err(|e| e.to_string())
+            }).unwrap();
+                register_warm_process(&callback_orch, replacement_run, Some("j-child"));
+                callback_orch
+                    .process_state
+                    .set_current_turn_id(replacement_run, Some("replacement-turn"));
+                callback_fired.store(true, std::sync::atomic::Ordering::Release);
+                true
+            }));
+            complete(
+                &orch,
+                "run-child",
+                SessionTurnOutcome::Failed {
+                    status: "fatal".into(),
+                },
+                SessionLifetime::Persistent,
+                false,
+            );
+            assert!(
+                fired.load(std::sync::atomic::Ordering::Acquire),
+                "result:error boundary exercised"
+            );
+            assert_eq!(turn_state(&orch, "child-turn").await, "failed");
+            assert_eq!(turn_state(&orch, "replacement-turn").await, "running");
+            assert_eq!(
+                scalar_text(&orch, "SELECT status FROM runs WHERE id=?1", "run-child")
+                    .await
+                    .as_deref(),
+                Some("crashed")
+            );
+            if !same_run {
+                assert_eq!(
+                    scalar_text(
+                        &orch,
+                        "SELECT status FROM runs WHERE id=?1",
+                        replacement_run
+                    )
+                    .await
+                    .as_deref(),
+                    Some("live")
+                );
+            }
+            assert_eq!(
+                orch.process_state
+                    .get_current_turn_id(replacement_run)
+                    .as_deref(),
+                Some("replacement-turn")
+            );
+        }
     }
 
     async fn result_count(orch: &Orchestrator) -> i64 {
@@ -1756,6 +2302,11 @@ mod backend_turn {
                 if failed { "failed" } else { "complete" }
             );
             assert_eq!(
+                orch.process_state.get_current_turn_id("run-child"),
+                None,
+                "terminal failure must release its exact process occupancy"
+            );
+            assert_eq!(
                 turn_state(&orch, "succ").await,
                 "complete",
                 "the actual resume gate must claim the pending parent successor"
@@ -1799,6 +2350,13 @@ mod backend_turn {
                 .unwrap()
                 .terminal_tool_called
                 .store(terminal_tool, std::sync::atomic::Ordering::Release);
+            let identity = orch
+                .process_state
+                .capture_process_identity("run-child")
+                .unwrap();
+            let owner = orch
+                .process_state
+                .capture_turn_owner_for_identity(&identity);
             complete(
                 &orch,
                 "run-child",
@@ -1829,8 +2387,121 @@ mod backend_turn {
                     "provider_interrupt"
                 })
             );
+            let before = result_count(&orch).await;
+            apply_codex_turn_completion(
+                &orch,
+                &orch.db.local,
+                &orch.services.emitter,
+                "run-child",
+                None,
+                SessionTurnCompletion {
+                    outcome: SessionTurnOutcome::Interrupted(ProviderInterruption::default()),
+                    usage: TokenCounts::default(),
+                    session_lifetime: SessionLifetime::Persistent,
+                },
+                CodexTurnContext {
+                    fatal_cause: None,
+                    accounting_only: false,
+                    process_identity: identity,
+                    owner,
+                    failure_disposition: TurnFailureDisposition::Unhandled,
+                },
+            );
+            assert_eq!(
+                result_count(&orch).await,
+                before,
+                "duplicate interruption must not repeat effects or release the parent again"
+            );
             assert_usage_attached(&orch, "child-turn", "result:interrupted").await;
         }
+    }
+
+    #[tokio::test]
+    async fn actual_handoff_late_accounting_and_replay_wake_parent_only_once() {
+        let db = test_db().await;
+        seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
+        db.execute_script(
+            // One row per wake: an INSERT body reads no table, where a counter
+            // UPDATE would walk parent_wakes and the plan audit would charge
+            // that trigger scan to the production `UPDATE turns` firing it.
+            "CREATE TABLE parent_wakes(turn_id TEXT NOT NULL);
+             CREATE TRIGGER count_parent_wake AFTER UPDATE OF state ON turns
+             WHEN NEW.id='succ' AND OLD.state='pending' AND NEW.state!='pending'
+             BEGIN INSERT INTO parent_wakes(turn_id) VALUES(NEW.id); END;",
+        )
+        .await
+        .unwrap();
+        let (orch, capture) = test_orchestrator_with_emitter(db, None);
+        register_warm_process(&orch, "run-child", Some("j-child"));
+        orch.process_state
+            .set_current_turn_id("run-child", Some("child-turn"));
+        let identity = orch
+            .process_state
+            .capture_process_identity("run-child")
+            .unwrap();
+        let owner = orch
+            .process_state
+            .capture_turn_owner_for_identity(&identity);
+        assert!(
+            crate::orchestrator::lifecycle::transition_owned_completion_to_warm(
+                &orch,
+                &identity,
+                owner.as_ref(),
+                Some((
+                    crate::models::TurnState::Complete,
+                    Some(TurnEndReason::ArtifactHandoff)
+                )),
+            )
+        );
+        assert_eq!(turn_state(&orch, "succ").await, "complete");
+        let before = capture.events.lock().unwrap().len();
+        for _ in 0..2 {
+            apply_codex_turn_completion(
+                &orch,
+                &orch.db.local,
+                &orch.services.emitter,
+                "run-child",
+                None,
+                SessionTurnCompletion {
+                    outcome: SessionTurnOutcome::Interrupted(ProviderInterruption {
+                        provider_turn_id: Some("p1".into()),
+                        cause: Some(
+                            cairn_models::interface::session::InterruptCause::ArtifactHandoff,
+                        ),
+                        ..Default::default()
+                    }),
+                    usage: TokenCounts {
+                        input: Some(11),
+                        output: Some(7),
+                        cache_read: Some(3),
+                        cache_create: Some(2),
+                        thinking: Some(5),
+                    },
+                    session_lifetime: SessionLifetime::Persistent,
+                },
+                CodexTurnContext {
+                    fatal_cause: None,
+                    accounting_only: true,
+                    process_identity: identity.clone(),
+                    owner: owner.clone(),
+                    failure_disposition: TurnFailureDisposition::Unhandled,
+                },
+            );
+        }
+        assert_eq!(result_count(&orch).await, 1);
+        assert_usage_attached(&orch, "child-turn", "result:interrupted").await;
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_i64("SELECT COUNT(*) FROM parent_wakes", ())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(orch.process_state.get_current_turn_id("run-child"), None);
+        assert!(capture.events.lock().unwrap()[before..]
+            .iter()
+            .all(|(name, _)| name != "run-turn-completed" && name != "run-completed"));
     }
 
     #[tokio::test]
@@ -1899,8 +2570,19 @@ mod backend_turn {
                 session_lifetime: SessionLifetime::Persistent,
             },
             CodexTurnContext {
-                failure_disposition: TurnFailureDisposition::DiagnosticRecorded,
                 fatal_cause: None,
+                accounting_only: false,
+                process_identity: orch
+                    .process_state
+                    .capture_process_identity("run-child")
+                    .unwrap(),
+                owner: orch.process_state.capture_turn_owner_for_identity(
+                    &orch
+                        .process_state
+                        .capture_process_identity("run-child")
+                        .unwrap(),
+                ),
+                failure_disposition: TurnFailureDisposition::DiagnosticRecorded,
             },
         );
         assert_eq!(turn_state(&orch, "child-turn").await, "failed");
@@ -1932,6 +2614,10 @@ mod backend_turn {
         disposition: TurnFailureDisposition,
         cause: Option<&str>,
     ) {
+        let process_identity = orch.process_state.capture_process_identity(run_id).unwrap();
+        let owner = orch
+            .process_state
+            .capture_turn_owner_for_identity(&process_identity);
         apply_codex_turn_completion(
             orch,
             &orch.db.local,
@@ -1946,6 +2632,9 @@ mod backend_turn {
                 session_lifetime: SessionLifetime::Persistent,
             },
             CodexTurnContext {
+                accounting_only: false,
+                process_identity,
+                owner,
                 failure_disposition: disposition,
                 fatal_cause: cause.map(str::to_string),
             },
@@ -2089,8 +2778,13 @@ mod backend_turn {
                     session_lifetime: SessionLifetime::Persistent,
                 },
                 CodexTurnContext {
-                    failure_disposition: TurnFailureDisposition::AlreadyHandled,
                     fatal_cause: None,
+                    accounting_only: false,
+                    process_identity: orch.process_state.capture_process_identity("r").unwrap(),
+                    owner: orch.process_state.capture_turn_owner_for_identity(
+                        &orch.process_state.capture_process_identity("r").unwrap(),
+                    ),
+                    failure_disposition: TurnFailureDisposition::AlreadyHandled,
                 },
             );
             assert_eq!(result_count(&orch).await, expected);
@@ -2702,6 +3396,225 @@ mod honest_pause_regressions {
     }
 }
 
+/// Drive the publication boundary, not a fabricated unowned database head.
+/// The emitter runs after the predecessor settles but before its occupancy is
+/// released. A launch admitted there must not be erased by that release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_publication_cannot_erase_an_attention_successors_occupancy() {
+    let db = test_db().await;
+    db.execute_script(
+        "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+         INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+         INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'I','active',1,1);
+         INSERT INTO jobs(id,project_id,issue_id,status,node_name,uri_segment,current_session_id,model,created_at,updated_at)
+           VALUES('j','p','i','running','builder','builder','s','opus',1,1);
+         INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
+           VALUES('s','j','claude','native-thread','open',1,1,1);
+         INSERT INTO runs(id,job_id,project_id,session_id,status,started_at,start_mode,created_at,updated_at)
+           VALUES('r','j','p','s','live',2,'fresh',1,3);
+         INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,started_at,updated_at)
+           VALUES('t','s','r','j',1,'running','initial',1,2,3);
+         UPDATE jobs SET current_turn_id='t' WHERE id='j';
+         INSERT INTO messages(id,channel_type,sender_run_id,sender_name,content,created_at)
+           VALUES('m','direct','peer','peer','please inspect the successor',2);
+         INSERT INTO message_recipients(message_id,position,recipient_job_id,recipient_run_id,created_at)
+           VALUES('m',0,'j','r',2);",
+    ).await.unwrap();
+    let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+    let queued = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::messages::delivery::enqueue_direct_push_with_operator_trigger(
+            &queued,
+            "j",
+            "m",
+            crate::messages::queued::Delivery::Queue,
+            None,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let mut handle = RunHandle::new(
+        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(Some(
+            cairn_models::session::claude::ClaudeControl::boxed(Box::new(Capture(sent.clone()))),
+        ))),
+        Some("s".into()),
+        Some("j".into()),
+    );
+    handle.model = Some("opus".into());
+    handle.begin_turn("t");
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register("r".into(), handle);
+    orch.process_state.set_current_turn_id("r", Some("t"));
+
+    let launched = Arc::new(Mutex::new(None));
+    let callback_launch = launched.clone();
+    let callback_orch = orch.clone();
+    *emitter.on_db_change.lock().unwrap() = Some(Box::new(move || {
+        if super::common::turn_state(&callback_orch, "t").as_deref() != Some("complete") {
+            return false;
+        }
+        let lock = callback_orch.job_launch_lock("j");
+        assert!(
+            lock.try_lock().is_ok(),
+            "publication callbacks must run after releasing launch authority"
+        );
+        // Synchronously force the previously legal ordering:
+        // settlement -> successor attach -> predecessor clear. No timing or
+        // scheduler luck is involved, and a lock regression fails, not hangs.
+        *callback_launch.lock().unwrap() = Some(crate::execution::jobs::continue_job_impl(
+            crate::execution::jobs::WakeCause::Addressed,
+            &callback_orch,
+            "j",
+            None,
+            None,
+            None,
+        ));
+        true
+    }));
+    let finishing = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(serde_json::json!({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "provider-predecessor", "status": "completed"}}
+        }))
+        .unwrap();
+        tx.send(serde_json::json!({
+            "method": "turn/started",
+            "params": {"turn": {"id": "provider-successor"}}
+        }))
+        .unwrap();
+        drop(tx);
+        crate::backends::codex::CodexBackend::reader_thread_app_server(
+            &finishing,
+            &finishing.services.emitter,
+            "r",
+            Some("s".into()),
+            rx,
+            Arc::new(
+                cairn_models::codex::app_server::AppServerClient::for_test_scripted(
+                    vec![],
+                    Arc::new(Mutex::new(Vec::new())),
+                ),
+            ),
+            Arc::new(Mutex::new(Some("provider-predecessor".into()))),
+            None,
+            "codex".into(),
+            finishing.db.local.clone(),
+            None,
+        );
+    })
+    .await
+    .unwrap();
+    let run = launched
+        .lock()
+        .unwrap()
+        .take()
+        .expect("settlement published")
+        .expect("attention continuation launches");
+    assert_eq!(run.id, "r", "reuse the retained process");
+    let head = orch
+        .db
+        .local
+        .query_opt_text("SELECT current_turn_id FROM jobs WHERE id='j'", ())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(head, "t");
+    let error = orch
+        .db
+        .local
+        .query_opt_text(
+            "SELECT data FROM events WHERE event_type='system:error' ORDER BY sequence LIMIT 1",
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(
+        error.is_none(),
+        "the scripted reader must admit the attention successor without watchdog failure: {error:?}"
+    );
+    assert_eq!(turn_state(&orch, "t").await, "complete");
+    assert_eq!(turn_state(&orch, &head).await, "running");
+    let current = orch.process_state.get_current_turn_id("r");
+    assert_eq!(
+        current.as_deref(),
+        Some(head.as_str()),
+        "the reader must retain the real attention successor's owner"
+    );
+    let sent = String::from_utf8(sent.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        sent.matches("please inspect the successor").count(),
+        1,
+        "the attention prompt is delivered exactly once: {sent}"
+    );
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_i64("SELECT COUNT(*) FROM runs WHERE job_id='j'", (),)
+            .await
+            .unwrap(),
+        Some(1),
+        "no replacement run"
+    );
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_i64("SELECT COUNT(*) FROM sessions WHERE job_id='j'", (),)
+            .await
+            .unwrap(),
+        Some(1),
+        "no replacement session"
+    );
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_text(
+                "SELECT turn_id FROM events WHERE id='codex-goal-turn:provider-successor'",
+                (),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(head.as_str())
+    );
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_i64("SELECT COUNT(*) FROM turns WHERE job_id='j'", (),)
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE turn_id=?1 AND event_type='attention:briefing'",
+                (head,),
+            )
+            .await
+            .unwrap(),
+        Some(1)
+    );
+}
+
 /// Record an open `read` call `tool_use_id` on `turn`, as run `run`'s process
 /// made it, in that turn's own session.
 async fn seed_open_read(db: &LocalDb, run: &str, turn: &str, tool_use_id: &str) {
@@ -2713,7 +3626,9 @@ async fn seed_open_read(db: &LocalDb, run: &str, turn: &str, tool_use_id: &str) 
     .to_string();
     db.execute(
         "INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,created_at)
-         SELECT 'e-open-' || ?3, ?1, session_id, id, 50, 50, 'assistant', ?4, 50 FROM turns WHERE id = ?2",
+         SELECT 'e-open-' || ?3, ?1, session_id, id,
+                COALESCE((SELECT MAX(sequence) + 1 FROM events WHERE run_id = ?1), 50),
+                50, 'assistant', ?4, 50 FROM turns WHERE id = ?2",
         cairn_db::turso::params![run, turn, tool_use_id, data],
     )
     .await
@@ -2792,4 +3707,649 @@ async fn a_delegated_fail_run_answers_the_calls_its_process_left_open() {
     assert_eq!(results.len(), 1, "{results:?}");
     assert_eq!(results[0]["raw"]["reason"], "process_lost");
     assert_eq!(results[0]["raw"]["exit_reason"], "turn_failed");
+}
+
+#[tokio::test]
+async fn owned_failure_answers_all_calls_before_publication() {
+    for delegated in [false, true] {
+        let db = test_db().await;
+        let (run, job, turn) = if delegated {
+            seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
+            ("run-child", "j-child", "child-turn")
+        } else {
+            seed_top_level_run(&db, "run-owned", "job-owned", "turn-owned", "none").await;
+            ("run-owned", "job-owned", "turn-owned")
+        };
+        for id in ["owned-read-a", "owned-read-b"] {
+            seed_open_read(&db, run, turn, id).await;
+        }
+        let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+        register_warm_process(&orch, run, Some(job));
+        orch.process_state.set_current_turn_id(run, Some(turn));
+        let stale_identity = orch.process_state.capture_process_identity(run).unwrap();
+        let stale_owner = orch
+            .process_state
+            .capture_turn_owner_for_identity(&stale_identity)
+            .unwrap();
+        register_warm_process(&orch, run, Some(job));
+        orch.process_state.set_current_turn_id(run, Some(turn));
+        assert!(!super::finalize_owned_completion(
+            &orch,
+            &stale_identity,
+            Some(&stale_owner),
+            RunStatus::Crashed,
+            Some("turn_failed"),
+            Some("stale owner's cause"),
+            || panic!("stale owner published"),
+        ));
+        assert!(results_for(&orch, "owned-read-a").await.is_empty());
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text("SELECT error_message FROM runs WHERE id=?1", (run,))
+                .await
+                .unwrap(),
+            None,
+            "a stale registration cannot record its cause"
+        );
+        const CAUSE: &str = "provider refused\nAuthorization: Bearer abcdefgh12345678";
+        let sanitized = crate::security::sanitize::failure_cause(CAUSE).unwrap();
+        assert!(!sanitized.contains("abcdefgh12345678"));
+        assert!(!sanitized.chars().any(char::is_control));
+        let expected_cause = if delegated {
+            orch.db
+                .local
+                .execute(
+                    "UPDATE runs SET error_message='first recorded cause' WHERE id=?1",
+                    (run,),
+                )
+                .await
+                .unwrap();
+            "first recorded cause".to_string()
+        } else {
+            sanitized
+        };
+        let expected_for_callback = expected_cause.clone();
+        let identity = orch.process_state.capture_process_identity(run).unwrap();
+        let owner = orch
+            .process_state
+            .capture_turn_owner_for_identity(&identity)
+            .unwrap();
+        let callback_orch = orch.clone();
+        *emitter.on_db_change.lock().unwrap() = Some(Box::new(move || {
+            let lock = callback_orch.job_launch_lock(job);
+            let _guard = lock
+                .try_lock()
+                .expect("settlement publication must not hold launch lock");
+            let db = callback_orch.db.local.clone();
+            let count = crate::storage::run_db_blocking(move || async move {
+                db.query_opt_i64(
+                    "SELECT COUNT(*) FROM events WHERE event_type='tool_result' AND json_extract(data,'$.raw.reason')='process_lost'",
+                    (),
+                ).await.map_err(|e| e.to_string())
+            }).unwrap();
+            assert_eq!(count, Some(2), "first notification sees every answer");
+            let db = callback_orch.db.local.clone();
+            let cause = crate::storage::run_db_blocking(move || async move {
+                db.query_opt_text("SELECT error_message FROM runs WHERE id=?1", (run,))
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+            assert_eq!(
+                cause.as_deref(),
+                Some(expected_for_callback.as_str()),
+                "the cause precedes publication"
+            );
+            true
+        }));
+        let published = std::cell::Cell::new(false);
+        assert!(super::finalize_owned_completion(
+            &orch,
+            &identity,
+            Some(&owner),
+            RunStatus::Crashed,
+            Some("turn_failed"),
+            Some(CAUSE),
+            || published.set(true),
+        ));
+        assert!(published.get());
+        assert!(!super::finalize_owned_completion(
+            &orch,
+            &identity,
+            Some(&owner),
+            RunStatus::Crashed,
+            Some("turn_failed"),
+            Some("duplicate callback's cause"),
+            || panic!("duplicate owner published"),
+        ));
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text("SELECT error_message FROM runs WHERE id=?1", (run,))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(expected_cause.as_str()),
+            "a duplicate completion cannot replace the first cause"
+        );
+        assert_eq!(
+            turn_state(&orch, turn).await,
+            if delegated { "failed" } else { "interrupted" }
+        );
+        for id in ["owned-read-a", "owned-read-b"] {
+            let results = results_for(&orch, id).await;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0]["raw"]["reason"], "process_lost");
+            assert_eq!(results[0]["raw"]["exit_reason"], "turn_failed");
+        }
+        let note =
+            super::unanswered_calls::lost_calls_note(&orch.db.local, run, turn, &["process_lost"])
+                .await
+                .unwrap()
+                .expect("successor prompt carries lost-call answers");
+        assert!(note.contains("file:a.rs"));
+    }
+}
+
+#[tokio::test]
+async fn owned_failure_drains_write_without_launch_lock_and_blocks_retry() {
+    let db = test_db().await;
+    seed_top_level_run(&db, "run-drain", "job-drain", "turn-drain", "none").await;
+    seed_open_read(&db, "run-drain", "turn-drain", "owned-write").await;
+    db.execute(
+        "UPDATE events SET data=json_set(data,'$.toolUses[0].name','mcp__cairn__write','$.toolUses[0].input',json(?1)) WHERE id='e-open-owned-write'",
+        (r#"{"changes":[{"target":"cairn:~/todos","mode":"append","payload":{"todos":[]}}]}"#,),
+    ).await.unwrap();
+    let orch = test_orchestrator(db);
+    register_warm_process(&orch, "run-drain", Some("job-drain"));
+    orch.process_state
+        .set_current_turn_id("run-drain", Some("turn-drain"));
+    let identity = orch
+        .process_state
+        .capture_process_identity("run-drain")
+        .unwrap();
+    let owner = orch
+        .process_state
+        .capture_turn_owner_for_identity(&identity)
+        .unwrap();
+    let delivery = crate::dispatch::Delivery::new();
+    let registration = orch.write_stops.enter("run-drain", "owned-write", delivery);
+    let writer_orch = orch.clone();
+    let writer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !writer_orch
+            .write_stops
+            .is_raised("run-drain", "owned-write")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process-loss drain never began"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        stop_session_internal(&writer_orch, "run-drain", StopReason::OperatorStop).unwrap();
+        super::stop::stop_active_turn_for_run(&writer_orch, "run-drain", true);
+        finalize_run(&writer_orch, "run-drain", RunStatus::Exited);
+        finalize_run(&writer_orch, "run-drain", RunStatus::Crashed);
+        assert!(writer_orch.has_terminal_completion_claim("run-drain"));
+        assert!(writer_orch.is_turn_terminal_claimed("turn-drain"));
+        let shutdown_orch = writer_orch.clone();
+        crate::storage::run_db_blocking(move || async move {
+            Ok::<_, String>(
+                super::stop::stop_agents_for_host_shutdown(
+                    &shutdown_orch,
+                    std::time::Duration::from_secs(1),
+                )
+                .await,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            writer_orch.process_state.has_process("run-drain"),
+            Some(false)
+        );
+        finalize_run(&writer_orch, "run-drain", RunStatus::Exited);
+        finalize_run(&writer_orch, "run-drain", RunStatus::Crashed);
+        stop_session_internal(&writer_orch, "run-drain", StopReason::OperatorStop).unwrap();
+        super::stop::stop_active_turn_for_run(&writer_orch, "run-drain", true);
+        stop_job(&writer_orch, "job-drain").unwrap();
+        assert!(
+            writer_orch.has_terminal_completion_claim("run-drain"),
+            "transport teardown must not erase completion authority"
+        );
+        let db = writer_orch.db.local.clone();
+        let state = crate::storage::run_db_blocking(move || async move {
+            db.query_opt_text("SELECT state FROM turns WHERE id='turn-drain'", ())
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            state.as_deref(),
+            Some("running"),
+            "Stop cannot adopt a finalizing turn"
+        );
+        let lock = writer_orch.job_launch_lock("job-drain");
+        let _guard = lock
+            .try_lock()
+            .expect("write boundary needs unlocked launch authority");
+        assert!(
+            crate::execution::jobs::claim_retry_successor_if_head_matches(
+                &writer_orch,
+                writer_orch.db.local.clone(),
+                "job-drain",
+                "sess-attn",
+                "turn-drain",
+            )
+            .unwrap()
+            .is_none(),
+            "active turn prevents retry before answers exist"
+        );
+        let settlement_lock = writer_orch.call_settlement_lock("run-drain", "turn-drain");
+        assert!(
+            settlement_lock.try_lock().is_err(),
+            "process-loss owns answer discovery through persistence"
+        );
+        let competing_orch = writer_orch.clone();
+        let competing = std::thread::spawn(move || {
+            super::unanswered_calls::settle_unanswered_calls(
+                &competing_orch,
+                "run-drain",
+                "turn-drain",
+                super::unanswered_calls::InterruptCause::UserStop,
+            )
+            .unwrap()
+        });
+        drop(registration);
+        assert_eq!(
+            competing.join().unwrap(),
+            0,
+            "Stop cannot answer a call already claimed by process loss"
+        );
+    });
+    assert!(super::finalize_owned_completion(
+        &orch,
+        &identity,
+        Some(&owner),
+        RunStatus::Crashed,
+        Some("turn_failed"),
+        None,
+        || {},
+    ));
+    writer.join().unwrap();
+    assert!(!orch.has_terminal_completion_claim("run-drain"));
+    assert!(!orch.is_turn_terminal_claimed("turn-drain"));
+    let results = results_for(&orch, "owned-write").await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]["raw"]["effect"], "none",
+        "write drained rather than timing out unknown"
+    );
+    assert_eq!(results[0]["raw"]["exit_reason"], "turn_failed");
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_text("SELECT exit_reason FROM runs WHERE id='run-drain'", ())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("turn_failed"),
+    );
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_text("SELECT end_reason FROM turns WHERE id='turn-drain'", ())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("provider_failure"),
+    );
+}
+
+#[tokio::test]
+async fn owned_failure_guard_keeps_no_process_operator_stop_cancellation() {
+    let db = test_db().await;
+    seed_top_level_run(
+        &db,
+        "run-no-process",
+        "job-no-process",
+        "turn-no-process",
+        "none",
+    )
+    .await;
+    db.execute_script(
+        "INSERT INTO sessions(id,job_id,status,backend_id,created_at,updated_at)
+         VALUES('session-no-process','job-no-process','open','handle-no-process',1,1);
+         UPDATE runs SET session_id='session-no-process',status='crashed' WHERE id='run-no-process';
+         UPDATE turns SET session_id='session-no-process',state='yielded',yield_reason='wait' WHERE id='turn-no-process';
+         INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at)
+         VALUES('wait-no-process','job-no-process','run-no-process','session-no-process','turn-no-process','tool-no-process','{\"kind\":\"terminal\"}','pending',1);",
+    ).await.unwrap();
+    let orch = test_orchestrator(db);
+    assert_eq!(
+        orch.process_state.has_process("run-no-process"),
+        Some(false)
+    );
+    super::stop::operator_stop_run(&orch, "run-no-process").unwrap();
+    assert_eq!(turn_state(&orch, "turn-no-process").await, "cancelled");
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_text(
+                "SELECT state FROM agent_waits WHERE id='wait-no-process'",
+                ()
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("cancelled"),
+    );
+}
+
+/// A foreground answer rotates the host turn inside a still-running provider
+/// turn. Its terminal must follow that authorized rotation, but not a later
+/// provider's ordinary turn attachment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_inline_question_rotation_preserves_completion_and_distinct_provider() {
+    use crate::mcp::handlers::planning::{answer_prompt_payload, ask_questions};
+    use crate::mcp::types::{AskUserPayload, McpCallbackRequest};
+    use std::time::Duration;
+
+    let db = test_db().await;
+    seed_top_level_run(&db, "r", "j", "t", "none").await;
+    db.execute_script(
+        "INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
+           VALUES('s','j','codex','native-thread','open',1,1,1);
+         UPDATE jobs SET current_session_id='s',model='codex' WHERE id='j';
+         UPDATE runs SET session_id='s',project_id='p-attn',issue_id='i-attn' WHERE id='r';
+         UPDATE turns SET session_id='s' WHERE id='t';",
+    )
+    .await
+    .unwrap();
+    let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+    // This fixture has no native goal. Reconciliation reads that absence,
+    // rather than consuming the unrelated stop/resume fixture's goal script.
+    let client = Arc::new(
+        cairn_models::codex::app_server::AppServerClient::for_test_scripted(
+            vec![Ok(serde_json::json!({"result":{"goal":null}})); 8],
+            Arc::new(Mutex::new(Vec::new())),
+        ),
+    );
+    let provider_turn = Arc::new(Mutex::new(None));
+    let stdin = cairn_models::session::codex::CodexControl::new(
+        client.clone(),
+        "native-thread".into(),
+        "/tmp/prj".into(),
+        None,
+        None,
+        None,
+        provider_turn.clone(),
+    );
+    let mut handle = RunHandle::new(
+        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(Some(Box::new(stdin)))),
+        Some("s".into()),
+        Some("j".into()),
+    );
+    handle.backend = Some("codex".into());
+    handle.model = Some("codex".into());
+    handle.begin_turn("t");
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register("r".into(), handle);
+
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let reader_orch = orch.clone();
+    let reader_turn = provider_turn.clone();
+    let reader = tokio::task::spawn_blocking(move || {
+        crate::backends::codex::CodexBackend::reader_thread_app_server(
+            &reader_orch,
+            &reader_orch.services.emitter,
+            "r",
+            Some("s".into()),
+            rx,
+            client,
+            reader_turn,
+            None,
+            "codex".into(),
+            reader_orch.db.local.clone(),
+            None,
+        );
+    });
+    let started = |id: &str| {
+        serde_json::json!({
+            "method":"turn/started","params":{"turn":{"id":id}}
+        })
+    };
+    let completed = |id: &str| {
+        serde_json::json!({
+            "method":"turn/completed","params":{"turn":{"id":id,"status":"completed"}}
+        })
+    };
+    let usage = |id: &str, total: u32| {
+        serde_json::json!({
+            "method":"thread/tokenUsage/updated","params":{"turnId":id,"tokenUsage":{
+                "last":{"inputTokens":total,"outputTokens":1,"totalTokens":total+1},
+                "total":{"inputTokens":total,"outputTokens":1,"totalTokens":total+1}
+            }}
+        })
+    };
+    tx.send(started("P")).unwrap();
+    // The reader writes this only after binding the owner and arming its lease.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while provider_turn.lock().unwrap().as_deref() != Some("P") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actual reader starts P under t");
+    tx.send(usage("P", 100)).unwrap();
+
+    let request: McpCallbackRequest = serde_json::from_value(serde_json::json!({
+        "cwd":"/tmp/prj","run_id":"r","tool":"write","payload":{},
+        "tool_use_id":"inline-question"
+    }))
+    .unwrap();
+    let payload: AskUserPayload = serde_json::from_value(serde_json::json!({
+        "questions":[{"question":"Continue within this provider turn?","options":[],"multiSelect":false}]
+    })).unwrap();
+    let receivers_before = orch.prompt_responses.receiver_count();
+    let ask = ask_questions(&orch, &request, payload, false, Some("inline-question"));
+    let answer = async {
+        // Subscription is established after the prompt commits and the process
+        // yields. Waiting for that fact avoids racing the broadcast itself.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while orch.prompt_responses.receiver_count() <= receivers_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("question inline waiter subscribed");
+        let prompt_id = orch
+            .db
+            .local
+            .query_opt_text("SELECT id FROM prompts WHERE run_id='r'", ())
+            .await
+            .unwrap()
+            .expect("real question stored");
+        answer_prompt_payload(
+            &orch,
+            &prompt_id,
+            &serde_json::json!({"answer":"yes"}),
+            crate::turns::queries::ResolutionProvenance::new(
+                cairn_common::identity::AppearanceTransport::ResourcePatch,
+                Some("cairn://p/prj/42/1/reviewer".into()),
+            ),
+        )
+        .await
+        .expect("real question answer commits");
+    };
+    let (outcome, ()) = tokio::join!(ask, answer);
+    assert!(
+        outcome.answers.is_some(),
+        "answer returned inline: {}",
+        outcome.text
+    );
+    let rotated = orch
+        .process_state
+        .get_current_turn_id("r")
+        .expect("answer successor attached");
+    assert_ne!(rotated, "t");
+    assert_eq!(turn_state(&orch, "t").await, "yielded");
+    assert_eq!(turn_state(&orch, &rotated).await, "running");
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_text(
+                "SELECT start_reason FROM turns WHERE id=?1",
+                (rotated.clone(),),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("prompt_response")
+    );
+
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_text(
+                "SELECT state FROM codex_watchdog_leases WHERE run_id='r' AND provider_turn_id='P'",
+                (),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("active"),
+    );
+    tx.send(completed("P")).unwrap();
+    // Publication is after both settlement and occupancy release.
+    let published = tokio::time::timeout(Duration::from_secs(5), async {
+        while emitter.events_named("run-turn-completed").is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let lease = orch
+        .db
+        .local
+        .query_opt_text(
+            "SELECT state FROM codex_watchdog_leases WHERE run_id='r' AND provider_turn_id='P'",
+            (),
+        )
+        .await
+        .unwrap();
+    let state = turn_state(&orch, &rotated).await;
+    let occupant = orch.process_state.get_current_turn_id("r");
+    assert!(
+        published.is_ok(),
+        "P completion follows its inline-question rotation: T2={rotated} state={state} occupant={occupant:?} P_lease={lease:?}"
+    );
+    assert_eq!(lease.as_deref(), Some("disarmed"));
+    assert_eq!(state, "complete");
+    assert!(orch.process_state.is_warm("r"));
+    assert_eq!(orch.process_state.get_current_turn_id("r"), None);
+    assert_eq!(emitter.events_named("run-turn-completed").len(), 1);
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE event_type='result:success'",
+                (),
+            )
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_i64(
+                "SELECT input_tokens FROM events WHERE event_type='result:success' AND turn_id=?1",
+                (rotated.clone(),),
+            )
+            .await
+            .unwrap(),
+        Some(100)
+    );
+
+    // Q enters through continuation admission, minting a distinct FollowUp
+    // from the terminal head despite this fixture having no native goal.
+    // It is not another host-side rotation of P.
+    tx.send(started("Q")).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while provider_turn.lock().unwrap().as_deref() != Some("Q") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("distinct provider Q starts");
+    let next = orch
+        .process_state
+        .get_current_turn_id("r")
+        .expect("Q owns its own turn");
+    assert_ne!(next, rotated);
+    tx.send(completed("P")).unwrap();
+    // A context snapshot is an ordered reader barrier after the duplicate.
+    let snapshots_before = emitter.events_named("context-tokens-updated").len();
+    tx.send(usage("Q", 110)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while emitter.events_named("context-tokens-updated").len() <= snapshots_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reader consumes duplicate P before Q usage");
+    assert_eq!(turn_state(&orch, &next).await, "running");
+    assert_eq!(
+        orch.process_state.get_current_turn_id("r").as_deref(),
+        Some(next.as_str())
+    );
+    assert_eq!(emitter.events_named("run-turn-completed").len(), 1);
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE event_type='result:success'",
+                (),
+            )
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    tx.send(completed("Q")).unwrap();
+    tx.send(completed("Q")).unwrap();
+    drop(tx);
+    reader.await.unwrap();
+    assert_eq!(turn_state(&orch, &next).await, "complete");
+    assert_eq!(turn_state(&orch, &rotated).await, "complete");
+    assert!(orch.process_state.is_warm("r"));
+    assert_eq!(orch.process_state.get_current_turn_id("r"), None);
+    assert_eq!(emitter.events_named("run-turn-completed").len(), 2);
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE event_type='result:success'",
+                (),
+            )
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE event_type='system:error'",
+                (),
+            )
+            .await
+            .unwrap(),
+        Some(0),
+        "no watchdog/admission failure"
+    );
 }

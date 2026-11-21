@@ -33,6 +33,19 @@ pub(super) fn apply_turn_outcome(
     outcome: TurnState,
     end_reason: Option<TurnEndReason>,
 ) -> Result<(), String> {
+    let change = settle_turn_outcome(orch, turn_id, outcome, end_reason)?;
+    let _ = orch.services.emitter.emit("db-change", change);
+    Ok(())
+}
+
+/// Settle without publishing: an ownership handoff publishes only after releasing
+/// launch authority, so notification callbacks cannot reenter the launch lock.
+pub(super) fn settle_turn_outcome(
+    orch: &Orchestrator,
+    turn_id: &str,
+    outcome: TurnState,
+    end_reason: Option<TurnEndReason>,
+) -> Result<serde_json::Value, String> {
     if !matches!(
         outcome,
         TurnState::Complete | TurnState::Failed | TurnState::Cancelled
@@ -148,8 +161,7 @@ pub(super) fn apply_turn_outcome(
             Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await)
         }
     })?;
-    let _ = orch.services.emitter.emit("db-change", change);
-    Ok(())
+    Ok(change)
 }
 
 pub(super) fn interrupt_turn(
@@ -157,6 +169,16 @@ pub(super) fn interrupt_turn(
     turn_id: &str,
     end_reason: Option<TurnEndReason>,
 ) -> Result<(), String> {
+    let change = settle_turn_interruption(orch, turn_id, end_reason)?;
+    let _ = orch.services.emitter.emit("db-change", change);
+    Ok(())
+}
+
+pub(super) fn settle_turn_interruption(
+    orch: &Orchestrator,
+    turn_id: &str,
+    end_reason: Option<TurnEndReason>,
+) -> Result<serde_json::Value, String> {
     let turn_id = turn_id.to_string();
     let end_reason = end_reason.map(|reason| reason.to_string());
     let change = run_db_blocking({
@@ -240,8 +262,7 @@ pub(super) fn interrupt_turn(
             Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await)
         }
     })?;
-    let _ = orch.services.emitter.emit("db-change", change);
-    Ok(())
+    Ok(change)
 }
 
 /// Route a run-status transition to the run's owning database and apply it

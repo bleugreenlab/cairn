@@ -2912,22 +2912,12 @@ async fn shutdown_codex_terminal_frames_preserve_restart_and_resume_once() {
         orch.process_state
             .register_process("r-j".into(), handle)
             .unwrap();
-        let stopped = crate::orchestrator::lifecycle::stop_agents_for_host_shutdown(
-            &orch,
-            std::time::Duration::from_secs(30),
-        )
-        .await;
-        assert_eq!(stopped.stopped, 1);
+        // As in production, the reader binds the turn while its process is
+        // registered; shutdown then removes the handle before frames drain.
         let (tx, rx) = crossbeam_channel::unbounded();
-        // Aborts with no usage intentionally omit their result event. Supply
-        // usage so both terminal shapes exercise late result attribution.
-        let counts = serde_json::json!({"totalTokens":12,"inputTokens":10,"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0});
-        tx.send(serde_json::json!({"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","tokenUsage":{"total":counts,"last":counts}}})).unwrap();
-        tx.send(terminal).unwrap();
-        drop(tx);
         let reader_orch = orch.clone();
         let reader_db = db.clone();
-        tokio::task::spawn_blocking(move || {
+        let reader = tokio::task::spawn_blocking(move || {
             crate::backends::codex::CodexBackend::reader_thread_app_server(
                 &reader_orch,
                 &reader_orch.services.emitter,
@@ -2946,9 +2936,36 @@ async fn shutdown_codex_terminal_frames_preserve_restart_and_resume_once() {
                 reader_db,
                 None,
             );
-        })
-        .await
-        .unwrap();
+        });
+        let reader_started = std::time::Instant::now();
+        while db
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE run_id='r-j' AND event_type='system:init'",
+                (),
+            )
+            .await
+            .unwrap()
+            != Some(1)
+        {
+            assert!(
+                reader_started.elapsed() < std::time::Duration::from_secs(30),
+                "reader never bound its turn"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let stopped = crate::orchestrator::lifecycle::stop_agents_for_host_shutdown(
+            &orch,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(stopped.stopped, 1);
+        // Aborts with no usage intentionally omit their result event. Supply
+        // usage so both terminal shapes exercise late result attribution.
+        let counts = serde_json::json!({"totalTokens":12,"inputTokens":10,"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0});
+        tx.send(serde_json::json!({"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","tokenUsage":{"total":counts,"last":counts}}})).unwrap();
+        tx.send(terminal).unwrap();
+        drop(tx);
+        reader.await.unwrap();
         assert_eq!(settlement(&db, "turn-j").await, "interrupted/host_restart");
         assert_eq!(db.query_opt_i64(
             "SELECT COUNT(*) FROM events WHERE run_id='r-j' AND event_type LIKE 'result:%' AND turn_id='turn-j'", (),

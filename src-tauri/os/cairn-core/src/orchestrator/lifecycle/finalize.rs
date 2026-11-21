@@ -1,7 +1,7 @@
 //! Warm transition, run finalization, task-failure finalize, and memory-review
 //! completion. Sliced verbatim from the former `lifecycle.rs`.
 
-use crate::agent_process::process::JobPauseState;
+use crate::agent_process::process::{JobPauseState, ProcessIdentity, ProcessTurnOwner};
 use crate::execution::jobs::GoalReconciliation;
 use crate::models::{RunStatus, TurnEndReason, TurnState};
 use crate::orchestrator::Orchestrator;
@@ -15,6 +15,9 @@ use super::review_push::{emit_for_turn_end, spawn_checks_settled_edge, spawn_tur
 /// process and refreshes the projection. The work is unfinished, so it must not
 /// publish a turn-end verdict or check wave. The yielded turn remains the job
 /// head until the hold resolves it.
+///
+/// This run-scoped boundary serves Claude's host-owned provider hold. Provider
+/// terminal callbacks must instead carry their captured process and turn owner.
 pub fn warm_provider_held_run(orch: &Orchestrator, run_id: &str) -> bool {
     let warmed = orch.process_state.transition_to_warm(run_id);
     if let Some(job_id) = job_id_for_run(orch, run_id) {
@@ -23,54 +26,6 @@ pub fn warm_provider_held_run(orch: &Orchestrator, run_id: &str) -> bool {
         }
     }
     warmed
-}
-
-/// End a persistent provider session's failed turn without ending its process.
-///
-/// A provider that refuses or errors one turn (Codex's "selected model is at
-/// capacity", a fatal turn error) has lost neither its process nor its native
-/// conversation, so the run stays `Live` and only the turn ends. It ends
-/// interrupted with [`TurnEndReason::ProviderFailure`], never completed, so the
-/// recompute derives no finished work and advances nothing. `Crashed` stays
-/// reserved for evidence that the process itself died.
-///
-/// Returns `false` and touches nothing when this host holds no process for the
-/// run (or cannot tell); the caller then takes the ordinary crash path.
-///
-/// What happens next belongs to the caller: a capacity retry claims its
-/// successor, and any other failure is left to the queued-content flush and to
-/// the unowned-running sweep, which resumes or reports a job nothing owns.
-pub(crate) fn settle_provider_turn_failure(orch: &Orchestrator, run_id: &str) -> bool {
-    if host_shutdown_in_progress(orch, run_id)
-        || orch.process_state.has_process(run_id) != Some(true)
-    {
-        return false;
-    }
-    let turn_id = orch
-        .process_state
-        .get_current_turn_id(run_id)
-        .or_else(|| current_turn_id_for_run(orch, run_id));
-    if let Some(turn_id) = turn_id.as_deref() {
-        if turn_state(orch, turn_id).as_deref() == Some("running") {
-            if let Err(error) = interrupt_turn(orch, turn_id, Some(TurnEndReason::ProviderFailure))
-            {
-                log::warn!(
-                    "Failed to settle provider-failed turn {turn_id} for run {run_id}: {error}"
-                );
-            }
-        }
-    }
-    orch.process_state.transition_to_warm(run_id);
-    if let Some(job_id) = job_id_for_run(orch, run_id) {
-        if let Err(error) = crate::execution::advancement::recompute_job(orch, &job_id) {
-            log::error!("Failed to recompute job {job_id} after a provider turn failure: {error}");
-        }
-    }
-    log::info!(
-        "Run {} kept live after a provider turn failure (process retained)",
-        &run_id[..run_id.len().min(8)]
-    );
-    true
 }
 
 /// Transition a run to warm state after successful turn completion.
@@ -84,117 +39,178 @@ pub fn transition_to_warm_state(
     run_id: &str,
     end_reason: Option<TurnEndReason>,
 ) -> bool {
-    // An abort acknowledgement or a success racing shutdown cannot warm the
-    // process and flush queued work into a host that is leaving.
-    if host_shutdown_in_progress(orch, run_id) {
+    let Some(identity) = orch.process_state.capture_process_identity(run_id) else {
+        return false;
+    };
+    let owner = orch
+        .process_state
+        .capture_turn_owner_for_identity(&identity);
+    transition_owned_completion_to_warm(
+        orch,
+        &identity,
+        owner.as_ref(),
+        Some((TurnState::Complete, end_reason)),
+    )
+}
+
+/// Settle and release only the turn accepted by the reader. The lock order is
+/// job launch authority, then short process-registry snapshots or database work,
+/// never the registry mutex across database work. All publication and turn-end
+/// callbacks run after launch authority is released: they can launch successors.
+pub(crate) fn transition_owned_completion_to_warm(
+    orch: &Orchestrator,
+    identity: &ProcessIdentity,
+    owner: Option<&ProcessTurnOwner>,
+    outcome: Option<(TurnState, Option<TurnEndReason>)>,
+) -> bool {
+    if !release_owned_completion(orch, identity, owner, outcome) {
         return false;
     }
-    // Complete the current turn before transitioning occupancy
-    let completed_turn_id = orch.process_state.get_current_turn_id(run_id);
-    if let Some(turn_id) = completed_turn_id.as_deref() {
-        let _ = apply_turn_outcome(orch, turn_id, TurnState::Complete, end_reason);
-    }
+    finish_warm_transition(orch, identity.run_id())
+}
 
-    if orch.process_state.transition_to_warm(run_id) {
-        // Emit the completed turn with its authoritative job/project scope.
-        if let Some(turn_id) = completed_turn_id.as_deref() {
-            let change = run_db_blocking({
-                let dbs = orch.db.clone();
-                let run_id = run_id.to_string();
-                let turn_id = turn_id.to_string();
-                move || async move {
-                    let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await)
+pub(crate) fn release_owned_completion(
+    orch: &Orchestrator,
+    identity: &ProcessIdentity,
+    owner: Option<&ProcessTurnOwner>,
+    outcome: Option<(TurnState, Option<TurnEndReason>)>,
+) -> bool {
+    let run_id = identity.run_id();
+    let job_id = job_id_for_run(orch, run_id);
+    let launch_lock = job_id.as_deref().map(|job_id| orch.job_launch_lock(job_id));
+    let launch_guard = launch_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    if host_shutdown_in_progress(orch, run_id)
+        || orch.has_terminal_completion_claim(run_id)
+        || !orch.process_state.is_process_identity_current(identity)
+        || owner.is_some_and(|owner| {
+            owner.process_identity() != identity || !orch.process_state.is_turn_owner_current(owner)
+        })
+    {
+        return false;
+    }
+    let change = if let (Some(owner), Some((state, reason))) = (owner, outcome) {
+        // A durable park, operator stop or terminal tool may already have settled
+        // this exact turn. Preserve that disposition; a failed lookup or write is
+        // not permission to clear occupancy and advertise successful completion.
+        let Some(current) = turn_state(orch, owner.turn_id()) else {
+            log::error!("Cannot read completing turn {}", owner.turn_id());
+            return false;
+        };
+        let Ok(current) = current.parse::<TurnState>() else {
+            log::error!(
+                "Invalid state for completing turn {}: {current}",
+                owner.turn_id()
+            );
+            return false;
+        };
+        if current.is_terminal() {
+            None
+        } else {
+            let settled = if state == TurnState::Interrupted {
+                settle_turn_interruption(orch, owner.turn_id(), reason)
+            } else {
+                settle_turn_outcome(orch, owner.turn_id(), state, reason)
+            };
+            match settled {
+                Ok(change) => Some(change),
+                Err(error) => {
+                    log::error!("Cannot settle completing turn {}: {error}", owner.turn_id());
+                    return false;
                 }
-            });
-            if let Ok(change) = change {
-                let _ = orch.services.emitter.emit("db-change", change);
             }
         }
-
-        log::info!(
-            "Run {} transitioned to warm state (process retained for potential follow-up)",
-            &run_id[..run_id.len().min(8)]
-        );
-
-        // The turn just completed (recorded above). Job status is a derived
-        // projection, so recompute it now that the turn is terminal — this is
-        // what derives Blocked (open `user` confirm gate), Complete, and the DAG
-        // advance. Previously the `return` tool's interrupt routed completion
-        // through `finalize_run`; with the interrupt gone, the clean warm
-        // transition is the turn-complete signal and must drive the recompute.
-        if let Some(job_id) = job_id_for_run(orch, run_id) {
-            // Turn-end project checks (when:review), detached so the suite never
-            // blocks the turn from ending. Detached review-cadence checks are
-            // child feedback and do not gate the parent review wake; semantic
-            // liveness remains owned by `issue_settled` in the recompute hook.
-            spawn_turn_end_checks(orch, &job_id);
-            // Immediately after, so a turn end that arms NO wave still settles
-            // this node's watchers instead of leaving them asleep on lanes
-            // nothing will ever run (CAIRN-3437).
-            spawn_checks_settled_edge(orch, &job_id);
-            if let Err(e) = crate::execution::advancement::recompute_job(orch, &job_id) {
-                log::error!(
-                    "Failed to recompute job {} after warm transition: {}",
-                    job_id,
-                    e
-                );
-            }
-            reduce_nodeless_delegated_child(orch, &job_id);
-            settle_missing_return(orch, &job_id, run_id);
-            finish_memory_review_if_due(orch, &job_id, run_id);
-            reconcile_warm_codex_goal_from_job(orch, run_id, &job_id);
-            // Turn-end: the agent went idle. Emit a fact-driven event so any
-            // in-flight `watch` learns the issue is actionable (or resolved)
-            // without depending on the recompute sweep poke that this work
-            // is replacing.
-            emit_for_turn_end(orch, &job_id);
-            // Flush any directs/side-channel notices queued mid-turn for this
-            // run. If this turn was the run's last, no further prompt boundary
-            // fires, so without this they would sit unclaimed (CAIRN-1297).
-            if let Err(error) =
-                crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id)
-            {
-                log::warn!("turn-end queued delivery flush failed: {error}");
-            }
-        }
-
-        // CAIRN-1576 routes terminal-tool completion (e.g. a child's `return`)
-        // through this warm transition instead of `finalize_run`, so the full
-        // completion contract must live here too. Mirror `finalize_run`'s tail:
-        //
-        // 1. Wake a suspended delegated parent. A child that completes via the
-        //    terminal-tool warm path is recomputed to `complete` but its process
-        //    is retained warm — it never reaches stdout EOF, so `finalize_run`
-        //    never runs for it. Without this call the resume trigger is dropped
-        //    entirely and a suspended batch parent hangs forever. self-gates on
-        //    the packet/sibling terminal state, so it is a cheap no-op for
-        //    non-delegated jobs and every other warm-transition caller.
-        try_resume_delegated_parent(orch, run_id);
-
-        // 2. Signal the internal completion broadcast consumed by
-        //    `spawn_task_packets`' inline 45s wait so a child that finishes
-        //    fast is detected and the batch returns inline. This is the tokio
-        //    broadcast, NOT the frontend `run-completed` emit — the run is warm,
-        //    not exited, so the frontend keeps receiving `run-turn-completed`.
-        //    Harmless for top-level jobs: their run ids are never in an inline
-        //    wait's pending set.
-        let _ = orch.run_completions.send(run_id.to_string());
-
-        // A one-shot ephemeral call child is never resumed; once its work is
-        // done, reap it instead of leaving it in the warm pool (CAIRN-2543).
-        maybe_kill_completed_call_child(orch, run_id);
-
-        true
     } else {
-        log::warn!(
-            "Failed to transition run {} to warm state (process not found)",
-            &run_id[..run_id.len().min(8)]
-        );
-        false
+        None
+    };
+    let warmed = match owner {
+        Some(owner) => orch.process_state.transition_to_warm_if_owned(owner),
+        None => orch.process_state.transition_to_warm_if_untracked(identity),
+    };
+    drop(launch_guard);
+    if !warmed {
+        return false;
     }
+    if let Some(change) = change {
+        let _ = orch.services.emitter.emit("db-change", change);
+    }
+    true
+}
+
+fn finish_warm_transition(orch: &Orchestrator, run_id: &str) -> bool {
+    log::info!(
+        "Run {} transitioned to warm state (process retained for potential follow-up)",
+        &run_id[..run_id.len().min(8)]
+    );
+
+    // The turn just completed (recorded above). Job status is a derived
+    // projection, so recompute it now that the turn is terminal — this is
+    // what derives Blocked (open `user` confirm gate), Complete, and the DAG
+    // advance. Previously the `return` tool's interrupt routed completion
+    // through `finalize_run`; with the interrupt gone, the clean warm
+    // transition is the turn-complete signal and must drive the recompute.
+    if let Some(job_id) = job_id_for_run(orch, run_id) {
+        // Turn-end project checks (when:review), detached so the suite never
+        // blocks the turn from ending. Detached review-cadence checks are
+        // child feedback and do not gate the parent review wake; semantic
+        // liveness remains owned by `issue_settled` in the recompute hook.
+        spawn_turn_end_checks(orch, &job_id);
+        // Immediately after, so a turn end that arms NO wave still settles
+        // this node's watchers instead of leaving them asleep on lanes
+        // nothing will ever run (CAIRN-3437).
+        spawn_checks_settled_edge(orch, &job_id);
+        if let Err(e) = crate::execution::advancement::recompute_job(orch, &job_id) {
+            log::error!(
+                "Failed to recompute job {} after warm transition: {}",
+                job_id,
+                e
+            );
+        }
+        reduce_nodeless_delegated_child(orch, &job_id);
+        settle_missing_return(orch, &job_id, run_id);
+        finish_memory_review_if_due(orch, &job_id, run_id);
+        reconcile_warm_codex_goal_from_job(orch, run_id, &job_id);
+        // Turn-end: the agent went idle. Emit a fact-driven event so any
+        // in-flight `watch` learns the issue is actionable (or resolved)
+        // without depending on the recompute sweep poke that this work
+        // is replacing.
+        emit_for_turn_end(orch, &job_id);
+        // Flush any directs/side-channel notices queued mid-turn for this
+        // run. If this turn was the run's last, no further prompt boundary
+        // fires, so without this they would sit unclaimed (CAIRN-1297).
+        if let Err(error) = crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id) {
+            log::warn!("turn-end queued delivery flush failed: {error}");
+        }
+    }
+
+    // CAIRN-1576 routes terminal-tool completion (e.g. a child's `return`)
+    // through this warm transition instead of `finalize_run`, so the full
+    // completion contract must live here too. Mirror `finalize_run`'s tail:
+    //
+    // 1. Wake a suspended delegated parent. A child that completes via the
+    //    terminal-tool warm path is recomputed to `complete` but its process
+    //    is retained warm — it never reaches stdout EOF, so `finalize_run`
+    //    never runs for it. Without this call the resume trigger is dropped
+    //    entirely and a suspended batch parent hangs forever. self-gates on
+    //    the packet/sibling terminal state, so it is a cheap no-op for
+    //    non-delegated jobs and every other warm-transition caller.
+    try_resume_delegated_parent(orch, run_id);
+
+    // 2. Signal the internal completion broadcast consumed by
+    //    `spawn_task_packets`' inline 45s wait so a child that finishes
+    //    fast is detected and the batch returns inline. This is the tokio
+    //    broadcast, NOT the frontend `run-completed` emit — the run is warm,
+    //    not exited, so the frontend keeps receiving `run-turn-completed`.
+    //    Harmless for top-level jobs: their run ids are never in an inline
+    //    wait's pending set.
+    let _ = orch.run_completions.send(run_id.to_string());
+
+    // A one-shot ephemeral call child is never resumed; once its work is
+    // done, reap it instead of leaving it in the warm pool (CAIRN-2543).
+    maybe_kill_completed_call_child(orch, run_id);
+
+    true
 }
 
 /// End a retained physical process lifetime without losing its admission claim.
@@ -934,8 +950,15 @@ pub(crate) fn finalize_killed_run(
     status: RunStatus,
     cut_off: Option<TurnEndReason>,
 ) {
-    if let Err(error) = finalize_run_inner(orch, run_id, status, FinalizeEffects::Ordinary, cut_off)
-    {
+    if let Err(error) = finalize_run_inner(
+        orch,
+        run_id,
+        status,
+        FinalizeEffects::Ordinary,
+        cut_off,
+        None,
+        None,
+    ) {
         log::error!("Failed to finalize run {run_id}: {error}");
     }
 }
@@ -974,6 +997,8 @@ pub(crate) fn finalize_run_for_recovery(
         status,
         FinalizeEffects::Ordinary,
         Some(TurnEndReason::WatchdogRecovery),
+        None,
+        None,
     )
 }
 
@@ -983,8 +1008,184 @@ pub(crate) fn finalize_run_for_operator_compact(
     orch: &Orchestrator,
     run_id: &str,
     status: RunStatus,
+    locked_job_id: Option<&str>,
 ) -> Result<(), String> {
-    finalize_run_inner(orch, run_id, status, FinalizeEffects::OperatorCompact, None)
+    finalize_run_inner(
+        orch,
+        run_id,
+        status,
+        FinalizeEffects::OperatorCompact,
+        None,
+        None,
+        locked_job_id,
+    )
+}
+
+/// A terminal report carries its accepted turn through finalization; no callback
+/// can redirect settlement to a newly attached turn.
+struct TerminalCompletionClaim<'a> {
+    turn_id: Option<String>,
+    changes: Vec<serde_json::Value>,
+    lost_call_changes: Vec<serde_json::Value>,
+    publish: Box<dyn FnOnce() + 'a>,
+}
+
+/// Claim terminal completion under the same authority as successor launch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_owned_completion(
+    orch: &Orchestrator,
+    identity: &ProcessIdentity,
+    owner: Option<&ProcessTurnOwner>,
+    status: RunStatus,
+    reason: Option<&str>,
+    cause: Option<&str>,
+    publish: impl FnOnce(),
+) -> bool {
+    let run_id = identity.run_id();
+    let job_id = job_id_for_run(orch, run_id);
+    let lock = job_id.as_deref().map(|id| orch.job_launch_lock(id));
+    let guard = lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|p| p.into_inner()));
+    if host_shutdown_in_progress(orch, run_id)
+        || orch.has_terminal_completion_claim(run_id)
+        || !orch.process_state.is_process_identity_current(identity)
+        || match owner {
+            Some(owner) => {
+                owner.process_identity() != identity
+                    || !orch.process_state.is_turn_owner_current(owner)
+            }
+            None => orch.process_state.get_current_turn_id(run_id).is_some(),
+        }
+        || !matches!(
+            run_status(orch, run_id).as_deref(),
+            Some("starting" | "live")
+        )
+    {
+        return false;
+    }
+    let result = (|| -> Result<_, String> {
+        let mut changes = Vec::new();
+        let mut process_loss_reason = None;
+        let mut terminal_claim = None;
+        if let Some(owner) = owner {
+            let current = turn_state(orch, owner.turn_id())
+                .ok_or_else(|| format!("Missing completing turn {}", owner.turn_id()))?
+                .parse::<TurnState>()?;
+            if !current.is_terminal() && status != RunStatus::Exited {
+                terminal_claim = Some(
+                    orch.claim_terminal_completion(run_id, owner.turn_id())
+                        .ok_or_else(|| {
+                            format!("Run {run_id} already has a terminal completion claim")
+                        })?,
+                );
+                process_loss_reason = Some(reason.unwrap_or("crash").to_string());
+            } else if !current.is_terminal() {
+                changes.push(settle_turn_outcome(
+                    orch,
+                    owner.turn_id(),
+                    TurnState::Complete,
+                    None,
+                )?);
+            }
+        }
+        if let Some(reason) = reason {
+            set_exit_reason(orch, run_id, reason)?;
+        }
+        // Ownership is still fenced and the run still active. Keep the cause
+        // before terminal persistence and any notification can resume its parent.
+        if status == RunStatus::Crashed {
+            if let Some(cause) = cause {
+                record_run_cause_if_active(orch, run_id, cause);
+            }
+        }
+        let change = settle_finalized_run(orch, run_id, status.clone())?;
+        changes.push(change);
+        // The run is durably terminal; release only its accepted occupancy, not
+        // the success effects of a warm turn end. A one-shot startup may already
+        // be idle, in which case the untracked compare-release is a no-op.
+        if let Some(owner) = owner {
+            if !orch.process_state.transition_to_warm_if_owned(owner) {
+                log::warn!("Terminal run {run_id} no longer owns its accepted occupancy");
+            }
+        } else {
+            orch.process_state.transition_to_warm_if_untracked(identity);
+        }
+        Ok((changes, process_loss_reason, terminal_claim))
+    })();
+    drop(guard);
+    let (mut changes, process_loss_reason, mut terminal_claim) = match result {
+        Ok(changes) => changes,
+        Err(error) => {
+            log::error!("Cannot claim terminal completion for run {run_id}: {error}");
+            return false;
+        }
+    };
+    let mut lost_call_changes = Vec::new();
+    if let (Some(owner), Some(reason)) = (owner, process_loss_reason) {
+        // The run is terminal, but the turn remains active: cold successor
+        // admission must wait until its prompt can include every lost answer.
+        match super::unanswered_calls::settle_unanswered_calls_unpublished(
+            orch,
+            run_id,
+            owner.turn_id(),
+            super::unanswered_calls::InterruptCause::ProcessLost {
+                exit_reason: reason,
+            },
+        ) {
+            Ok(persisted) => lost_call_changes = persisted,
+            Err(error) => {
+                log::warn!("Cannot answer owned process-loss calls for {run_id}: {error}")
+            }
+        }
+        let _guard = lock
+            .as_ref()
+            .map(|lock| lock.lock().unwrap_or_else(|p| p.into_inner()));
+        // Only this claim's fixed turn is settled. A concurrent terminal cause
+        // remains authoritative; never rediscover the job's mutable head.
+        let mut settle = || -> Result<(), String> {
+            let current = turn_state(orch, owner.turn_id())
+                .ok_or_else(|| format!("Missing completing turn {}", owner.turn_id()))?
+                .parse::<TurnState>()?;
+            if !current.is_terminal() {
+                let change = if run_fails_terminally(orch, run_id) {
+                    settle_turn_outcome(orch, owner.turn_id(), TurnState::Failed, None)?
+                } else {
+                    settle_turn_interruption(
+                        orch,
+                        owner.turn_id(),
+                        Some(TurnEndReason::ProviderFailure),
+                    )?
+                };
+                changes.push(change);
+            }
+            Ok(())
+        };
+        // A transient persistence error must not strand an active turn on the
+        // already-terminal run. Retry against the same fixed turn, never a head.
+        if let Err(error) = settle().or_else(|_| settle()) {
+            log::error!("Cannot settle claimed terminal turn for {run_id}: {error}");
+        }
+        drop(terminal_claim.take());
+    }
+    let claim = TerminalCompletionClaim {
+        turn_id: owner.map(|owner| owner.turn_id().to_string()),
+        changes,
+        lost_call_changes,
+        publish: Box::new(publish),
+    };
+    if let Err(error) = finalize_run_inner(
+        orch,
+        run_id,
+        status,
+        FinalizeEffects::Ordinary,
+        None,
+        Some(claim),
+        None,
+    ) {
+        log::error!("Failed to finalize claimed completion for run {run_id}: {error}");
+    }
+    true
 }
 
 /// The exit reason to answer `turn_id`'s open calls with, when this
@@ -1022,6 +1223,27 @@ fn process_end_cut_off(
     cut.then(|| run_exit_reason(orch, run_id).unwrap_or_else(|| "crash".to_string()))
 }
 
+/// Persist a run transition without publishing under launch authority.
+fn settle_finalized_run(
+    orch: &Orchestrator,
+    run_id: &str,
+    status: RunStatus,
+) -> Result<serde_json::Value, String> {
+    run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            cairn_workflow::transitions::run::settle_run(&db, &run_id, status)
+                .await
+                .map(|(_, change)| change)
+                .map_err(|e| e.to_string())
+        }
+    })
+}
+
 /// `cut_off`, when a deliberate kill names one, is the end reason of a turn
 /// still running when the run is finalized, whatever the exit's status.
 fn finalize_run_inner(
@@ -1030,7 +1252,10 @@ fn finalize_run_inner(
     status: RunStatus,
     effects: FinalizeEffects,
     cut_off: Option<TurnEndReason>,
+    claim: Option<TerminalCompletionClaim<'_>>,
+    locked_job_id: Option<&str>,
 ) -> Result<(), String> {
+    let claimed = claim.is_some();
     let mut first_error = None;
     // A finalized run's agent must not keep acting through the HTTP MCP
     // endpoint. First, so every terminal path below (the already-finalized
@@ -1054,16 +1279,58 @@ fn finalize_run_inner(
         );
     }
 
+    // Compact already holds the root's authority; descendants acquire their
+    // own lock (parent before child). No draining or publication holds a lock
+    // acquired here. Generic finalization reserves the same fixed-turn marker
+    // so an owned report cannot overtake its unlocked settlement phase. A kill
+    // arriving after this reservation only tears down transport; the first
+    // finalizer retains its disposition rather than adopting the later cause.
+    let job_id = job_id_for_run(orch, run_id);
+    let launch_lock = job_id
+        .as_deref()
+        .filter(|id| Some(*id) != locked_job_id && !claimed)
+        .map(|id| orch.job_launch_lock(id));
+    let mut guard = launch_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|p| p.into_inner()));
+    if !claimed && orch.has_terminal_completion_claim(run_id) {
+        return Ok(());
+    }
+    let mut generic_claim = None;
+    let mut generic_changes = Vec::new();
+
     // Finalize the current turn based on run outcome.
     // Primary: in-memory process state. Fallback: the turn durably stamped with
     // this run id (covers crashes where the process was never registered or was
     // already deregistered). Never follow jobs.current_turn_id here: resume
     // publishes its successor before rotating the old process, so the job head
     // may already belong to the next run when this exit is finalized.
-    let turn_id = orch
-        .process_state
-        .get_current_turn_id(run_id)
-        .or_else(|| current_turn_id_for_run(orch, run_id));
+    let turn_id = if let Some(claim) = claim {
+        // A call slot release also reaps its process by run ID. Do this before
+        // any completion publication can replace that registration.
+        crate::execution::jobs::on_call_run_finalized(orch, run_id);
+        // All lost-call answers and cleanup precede the first notification,
+        // which may synchronously attach a successor.
+        for change in claim.lost_call_changes.into_iter().chain(claim.changes) {
+            let _ = orch.services.emitter.emit("db-change", change);
+        }
+        (claim.publish)();
+        claim.turn_id
+    } else {
+        orch.process_state
+            .get_current_turn_id(run_id)
+            .or_else(|| current_turn_id_for_run(orch, run_id))
+    };
+    if !claimed {
+        if let Some(turn_id) = turn_id.as_deref() {
+            generic_claim = Some(
+                orch.claim_terminal_completion(run_id, turn_id)
+                    .ok_or_else(|| {
+                        format!("Run {run_id} already has a terminal completion claim")
+                    })?,
+            );
+        }
+    }
     let provider_held = if let Some(turn_id) = turn_id.as_deref() {
         run_db_blocking({
             let dbs = orch.db.clone();
@@ -1088,23 +1355,44 @@ fn finalize_run_inner(
             run_status(orch, run_id).as_deref(),
             Some("exited" | "crashed")
         ) {
-            transition_owned_run(orch, run_id, status)?;
+            generic_changes.push(settle_finalized_run(orch, run_id, status)?);
         }
-        crate::execution::jobs::on_call_run_finalized(orch, run_id);
+        drop(generic_claim.take());
+        drop(guard.take());
+        for change in generic_changes {
+            let _ = orch.services.emitter.emit("db-change", change);
+        }
+        if !claimed {
+            crate::execution::jobs::on_call_run_finalized(orch, run_id);
+        }
         return Ok(());
     }
     // Answered before the turn is terminalized below, and before anything this
     // finalization sets off can launch a successor whose prompt must carry the
     // answers.
+    drop(guard.take());
     if let Some(turn_id) = turn_id.as_deref() {
         if let Some(exit_reason) =
             process_end_cut_off(orch, run_id, turn_id, &status, effects, cut_off.as_ref())
         {
-            super::settle_calls_cut_off_by_process_end(orch, run_id, turn_id, &exit_reason);
+            match super::unanswered_calls::settle_unanswered_calls_unpublished(
+                orch,
+                run_id,
+                turn_id,
+                super::unanswered_calls::InterruptCause::ProcessLost { exit_reason },
+            ) {
+                Ok(changes) => generic_changes.extend(changes),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
         }
     }
+    guard = launch_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|p| p.into_inner()));
     let had_active_turn = turn_id.is_some();
-    if let Some(ref turn_id) = turn_id {
+    if let Some(ref turn_id) = turn_id.as_ref().filter(|_| !claimed) {
         if let Some(turn_state) = turn_state(orch, turn_id) {
             // A terminal turn is authoritative even when its owning process exits
             // later. Terminal tools complete the turn before the retained provider
@@ -1114,33 +1402,24 @@ fn finalize_run_inner(
             let result = if matches!(
                 turn_state.as_str(),
                 "complete" | "failed" | "cancelled" | "interrupted" | "yielded"
-            ) {
-                Ok(())
-            } else if effects == FinalizeEffects::OperatorCompact {
-                // The Compact settled every live turn before killing. One that
-                // started in between was cut off, not completed; the Compact's
-                // re-sweep after the kill settles it and counts it, so this
-                // must not read it as a clean exit.
-                Ok(())
+            ) || effects == FinalizeEffects::OperatorCompact
+            {
+                Ok(None)
             } else if let (Some(reason), "running") = (cut_off.as_ref(), turn_state.as_str()) {
-                // A kill cut the turn off mid-work: it neither completed nor
-                // crashed, whichever of its abort and the exit came first.
-                interrupt_turn(orch, turn_id, Some(reason.clone()))
+                settle_turn_interruption(orch, turn_id, Some(reason.clone())).map(Some)
             } else if status == RunStatus::Exited {
-                // Clean exit: a Running turn completed; a turn that never reached
-                // Running (Pending) produced nothing, so fail it rather than
-                // leaving it live (which would keep the job derived as Running).
-                if turn_state.as_str() == "pending" {
-                    apply_turn_outcome(orch, turn_id, TurnState::Failed, None)
+                let outcome = if turn_state.as_str() == "pending" {
+                    TurnState::Failed
                 } else {
-                    apply_turn_outcome(orch, turn_id, TurnState::Complete, None)
-                }
+                    TurnState::Complete
+                };
+                settle_turn_outcome(orch, turn_id, outcome, None).map(Some)
             } else if turn_state.as_str() == "running" {
-                interrupt_turn(orch, turn_id, Some(TurnEndReason::Crash))
+                settle_turn_interruption(orch, turn_id, Some(TurnEndReason::Crash)).map(Some)
             } else {
-                apply_turn_outcome(orch, turn_id, TurnState::Failed, None)
+                settle_turn_outcome(orch, turn_id, TurnState::Failed, None).map(Some)
             };
-
+            let result = result.map(|change| generic_changes.extend(change));
             if let Err(e) = result {
                 log::warn!(
                     "Failed to finalize turn {} for run {}: {}",
@@ -1153,16 +1432,21 @@ fn finalize_run_inner(
         }
     }
 
-    // Transition run via transitions::transition_run (validates state machine, emits db-change).
-    // Also get the job_id for subsequent job lifecycle.
+    // Turn and run persistence share launch authority; their notifications and
+    // all lifecycle callbacks run only after releasing the generic claim.
     let current_status = run_status(orch, run_id);
-    if matches!(current_status.as_deref(), Some("exited") | Some("crashed")) {
+    if !claimed && matches!(current_status.as_deref(), Some("exited") | Some("crashed")) {
         log::info!(
             "Run {} already finalized as {:?}, skipping re-finalization as {:?}",
             &run_id[..run_id.len().min(8)],
             current_status,
             status
         );
+        drop(generic_claim.take());
+        drop(guard.take());
+        for change in generic_changes {
+            let _ = orch.services.emitter.emit("db-change", change);
+        }
         // A real exit still owes the call ledger its release. The run may have
         // been settled by something that never saw a process (the stale-run
         // sweep, the boot reconcile) while the process was still spawning; this
@@ -1187,9 +1471,19 @@ fn finalize_run_inner(
         return first_error.map_or(Ok(()), Err);
     }
 
-    if let Err(e) = transition_owned_run(orch, run_id, status.clone()) {
-        log::error!("Failed to transition run {}: {}", run_id, e);
-        first_error.get_or_insert(e);
+    if !claimed {
+        match settle_finalized_run(orch, run_id, status.clone()) {
+            Ok(change) => generic_changes.push(change),
+            Err(error) => {
+                log::error!("Failed to transition run {run_id}: {error}");
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    drop(generic_claim.take());
+    drop(guard.take());
+    for change in generic_changes {
+        let _ = orch.services.emitter.emit("db-change", change);
     }
 
     // CAIRN-4665, enforcement point 5: the last line of defence, for the
@@ -1210,7 +1504,9 @@ fn finalize_run_inner(
         );
         let _ = set_exit_reason(orch, run_id, EXIT_REASON_SUPERSEDED);
         log::debug!("canonical_fence: {fence_reason}");
-        crate::execution::jobs::on_call_run_finalized(orch, run_id);
+        if !claimed {
+            crate::execution::jobs::on_call_run_finalized(orch, run_id);
+        }
         let _ = orch
             .services
             .emitter
@@ -1222,7 +1518,9 @@ fn finalize_run_inner(
     // Release this run's call-admission slot (if it held one) and start the next
     // queued call. No-op for uncapped/non-call runs; idempotent. Tied to the
     // finalize choke so a crashed/killed call cannot leak its slot.
-    crate::execution::jobs::on_call_run_finalized(orch, run_id);
+    if !claimed {
+        crate::execution::jobs::on_call_run_finalized(orch, run_id);
+    }
 
     if effects == FinalizeEffects::OperatorCompact {
         let _ = orch
@@ -1718,11 +2016,18 @@ mod ordering_tests {
         assert!(!body.contains("emit_for_turn_end("));
     }
 
-    fn assert_spawn_before_recompute(func_signature: &str) {
+    fn function_source(func_signature: &str) -> &str {
         let start = SOURCE
             .find(func_signature)
             .unwrap_or_else(|| panic!("caller {func_signature} present in source"));
-        let body = &SOURCE[start..];
+        SOURCE[start..]
+            .split_once("\n}")
+            .expect("top-level function has a closing brace")
+            .0
+    }
+
+    fn assert_spawn_before_recompute(func_signature: &str) {
+        let body = function_source(func_signature);
         let spawn = body
             .find("spawn_turn_end_checks(orch")
             .expect("spawn_turn_end_checks call present");
@@ -1737,8 +2042,8 @@ mod ordering_tests {
 
     #[test]
     fn turn_end_callers_claim_checks_slot_before_recompute() {
-        assert_spawn_before_recompute("pub fn transition_to_warm_state");
-        assert_spawn_before_recompute("pub fn finalize_run");
+        assert_spawn_before_recompute("fn finish_warm_transition(");
+        assert_spawn_before_recompute("fn finalize_run_inner(");
     }
 
     /// CAIRN-3437: the settled-checks edge must be evaluated AFTER
@@ -1749,10 +2054,7 @@ mod ordering_tests {
     /// these two lines would report every lane about to run as one that never
     /// will, and wake a watching orchestrator to act on it.
     fn assert_settled_edge_after_spawn(func_signature: &str) {
-        let start = SOURCE
-            .find(func_signature)
-            .unwrap_or_else(|| panic!("caller {func_signature} present in source"));
-        let body = &SOURCE[start..];
+        let body = function_source(func_signature);
         let spawn = body
             .find("spawn_turn_end_checks(orch")
             .expect("spawn_turn_end_checks call present");
@@ -1767,8 +2069,8 @@ mod ordering_tests {
 
     #[test]
     fn turn_end_callers_evaluate_settlement_after_arming_the_wave() {
-        assert_settled_edge_after_spawn("pub fn transition_to_warm_state");
-        assert_settled_edge_after_spawn("pub fn finalize_run");
+        assert_settled_edge_after_spawn("fn finish_warm_transition(");
+        assert_settled_edge_after_spawn("fn finalize_run_inner(");
     }
 
     /// CAIRN-3104: the digest-reseed fallback opens a NEW turn on the job, so it
@@ -1778,10 +2080,7 @@ mod ordering_tests {
     /// recompute of the crashed one.
     #[test]
     fn reseed_fallback_is_spawned_after_recompute() {
-        let start = SOURCE
-            .find("pub fn finalize_run")
-            .expect("finalize_run present in source");
-        let body = &SOURCE[start..];
+        let body = function_source("fn finalize_run_inner(");
         let recompute = body
             .find("recompute_job(orch")
             .expect("recompute_job call present");

@@ -1,9 +1,10 @@
-use crate::agent_process::process::AgentProcessState;
+use crate::agent_process::process::{AgentProcessState, ProcessIdentity, ProcessTurnOwner};
 use cairn_models::types::usage::ProviderUsageSnapshot;
 
 /// Host admission of a provider-initiated turn, after the host reconciles its job.
 pub enum GoalTurnAdmission {
-    Admitted,
+    Admitted { owner: ProcessTurnOwner },
+    Ignored,
     Deferred { predecessor_turn_id: String },
 }
 
@@ -22,23 +23,36 @@ pub trait CodexHost: Send + Sync {
     fn capture_output(&self, output: Value);
     fn account_usage(&self, snapshot: ProviderUsageSnapshot);
     fn context_snapshot(&self, snapshot: ContextTokenState);
-    fn admit_goal_turn(&self, provider_turn_id: &str) -> Result<Option<GoalTurnAdmission>, String>;
+    fn admit_goal_turn(
+        &self,
+        provider_turn_id: &str,
+        registration: &ProcessIdentity,
+    ) -> Result<Option<GoalTurnAdmission>, String>;
     /// Interrupt the turn at its terminal tool's boundary, as a handoff.
-    fn interrupt(&self) -> Result<(), String>;
+    fn interrupt(
+        &self,
+        identity: &ProcessIdentity,
+        owner: Option<&ProcessTurnOwner>,
+    ) -> Result<(), String>;
     /// Why Cairn interrupted `provider_turn_id`, consuming the record; `None`
     /// when it never asked. Called once per terminal notification.
     fn take_interrupt_cause(&self, provider_turn_id: &str) -> Option<InterruptCause>;
-    fn artifact_handoff(&self);
+    fn artifact_handoff(
+        &self,
+        identity: &ProcessIdentity,
+        owner: Option<&ProcessTurnOwner>,
+    ) -> bool;
     /// Terminalize the run whose provider turn could not enter Cairn's
     /// ownership. `evidence` says why, already reported through [`Self::error`];
     /// the host keeps it as the run's failure cause.
     fn watchdog_arm_failed(&self, evidence: &str) -> Result<(), String>;
+
     fn recover_watchdog(
         &self,
         identity: &crate::runs::watchdog_ledger::WatchdogIdentity,
         now: i64,
     ) -> Result<(), String>;
-    fn capacity_failure(&self) -> bool;
+    fn capacity_failure(&self, owner: Option<&ProcessTurnOwner>) -> bool;
     fn complete(&self, completion: SessionTurnCompletion, context: CodexTurnContext);
 
     fn reader_closed(&self);
@@ -1010,6 +1024,236 @@ impl crate::agent_process::host_calls::HostCallWitness for Mutex<CodexTurnProgre
     }
 }
 
+/// Provider identifiers bind once to the Cairn owner observed at admission.
+/// Consuming a binding precedes every callback which can launch another turn.
+struct CodexReaderOwners {
+    identity: ProcessIdentity,
+    one_shot: bool,
+    owners: HashMap<String, Option<ProcessTurnOwner>>,
+    settled_usage: HashMap<String, CodexTurnUsageAccumulator>,
+    settled_initial_usage: Option<CodexTurnUsageAccumulator>,
+    seen: HashSet<String>,
+    started: HashSet<String>,
+    initial: Option<Option<ProcessTurnOwner>>,
+}
+
+impl CodexReaderOwners {
+    fn new(
+        state: &AgentProcessState,
+        identity: ProcessIdentity,
+        current: &Mutex<Option<String>>,
+        one_shot: bool,
+    ) -> Self {
+        let owner = state.capture_turn_owner_for_identity(&identity);
+        let initial =
+            if owner.is_some() || state.is_untracked_busy_for_identity(&identity) || one_shot {
+                Some(owner)
+            } else {
+                None
+            };
+        let mut bindings = Self {
+            identity,
+            one_shot,
+            owners: HashMap::new(),
+            settled_usage: HashMap::new(),
+            settled_initial_usage: None,
+            seen: HashSet::new(),
+            started: HashSet::new(),
+            initial,
+        };
+        if let Some(id) = current.lock().ok().and_then(|id| id.clone()) {
+            if let Some(owner) = bindings.initial.take() {
+                bindings.owners.insert(id, owner);
+            }
+        }
+        bindings
+    }
+
+    fn claim_start(&mut self, id: &str) -> bool {
+        !self.seen.contains(id) && self.started.insert(id.to_string())
+    }
+
+    fn start(&mut self, state: &AgentProcessState, id: &str) -> bool {
+        if self.seen.contains(id) {
+            return false;
+        }
+        if self.owners.contains_key(id) {
+            return true;
+        }
+        let owner = state.capture_turn_owner_for_identity(&self.identity);
+        if !state.is_process_identity_current(&self.identity)
+            || (owner.is_none()
+                && !self.one_shot
+                && !state.is_untracked_busy_for_identity(&self.identity))
+        {
+            return false;
+        }
+        self.initial = None;
+        self.owners.insert(id.to_string(), owner);
+        true
+    }
+
+    fn peek(&self, id: Option<&str>) -> Option<Option<ProcessTurnOwner>> {
+        let owner = match id {
+            Some(id) => self.owners.get(id).cloned(),
+            None => self.initial.clone(),
+        };
+        owner.map(|owner| owner.map(|owner| owner.resolve_provider_owner()))
+    }
+
+    fn freeze_accounting(&mut self, id: Option<&str>, usage: CodexTurnUsageAccumulator) {
+        match id {
+            Some(id) => {
+                self.settled_usage.insert(id.to_string(), usage);
+            }
+            None => self.settled_initial_usage = Some(usage),
+        }
+    }
+
+    fn take_retired_usage(&mut self, id: Option<&str>) -> Option<Option<Usage>> {
+        let mut accumulator = match id {
+            Some(id) => self.settled_usage.remove(id),
+            None => self.settled_initial_usage.take(),
+        }?;
+        Some(accumulator.take_turn_usage())
+    }
+
+    fn take_accounting_only_usage(
+        &mut self,
+        id: Option<&str>,
+        owner: Option<&ProcessTurnOwner>,
+        active_id: Option<&str>,
+        active_usage: &mut CodexTurnUsageAccumulator,
+    ) -> Option<Option<Usage>> {
+        self.take_retired_usage(id).or_else(|| {
+            owner.filter(|owner| owner.accounting_only()).map(|_| {
+                // A retirement can race terminal parsing. Only the accumulator
+                // still bound to this provider may supply the unfrozen usage.
+                if id == active_id {
+                    active_usage.take_turn_usage()
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    fn accept(&mut self, id: Option<&str>) -> Option<Option<ProcessTurnOwner>> {
+        match id {
+            Some(id) => {
+                if self.seen.contains(id) {
+                    return None;
+                }
+                let owner = self.owners.remove(id)?;
+                self.seen.insert(id.to_string());
+                Some(owner.map(|owner| owner.accept_provider_owner()))
+            }
+            None => self
+                .initial
+                .take()
+                .map(|owner| owner.map(|owner| owner.accept_provider_owner())),
+        }
+    }
+}
+
+/// One frame read after the reader's registration stopped being current. Only
+/// accounting is applied: usage accrues to the binding it names without moving
+/// the live gauge, and a terminal for a provider turn this reader already bound
+/// records that exact owner's result. Admission, interrupts, diagnostics and
+/// lifecycle belong to the registration's successor or its teardown. Returns
+/// whether a terminal was accounted.
+#[allow(clippy::too_many_arguments)]
+fn account_retired_notification(
+    host: &CodexRuntime,
+    msg: &Value,
+    owners: &mut CodexReaderOwners,
+    usage_accumulator: &mut CodexTurnUsageAccumulator,
+    deferred_goal_turns: &mut HashSet<String>,
+    current_turn_id: &Arc<Mutex<Option<String>>>,
+    active_id: Option<&str>,
+    registration: &ProcessIdentity,
+    ephemeral: bool,
+) -> bool {
+    let (provider_turn_id, status, provider_reason) = match Notification::parse(msg) {
+        Notification::TokenUsageUpdated {
+            params: Some(params),
+        } => {
+            let usage_id = notification_turn_id(msg).or(active_id);
+            let live = usage_id.is_none_or(|id| active_id == Some(id) && !owners.seen.contains(id));
+            let settled = match usage_id {
+                Some(id) => owners.settled_usage.get_mut(id),
+                None => owners.settled_initial_usage.as_mut(),
+            };
+            if let Some(accumulator) = settled {
+                accumulator.observe(params);
+            } else if live {
+                usage_accumulator.observe(params);
+            }
+            return false;
+        }
+        Notification::TurnCompleted { turn_id, status } => (
+            turn_id_or_cached(turn_id, current_turn_id),
+            status,
+            status.as_str().to_string(),
+        ),
+        Notification::TurnAborted { turn_id, reason } => (
+            turn_id_or_cached(turn_id, current_turn_id),
+            ProviderTurnStatus::from_abort_reason(reason),
+            reason.to_string(),
+        ),
+        Notification::Error {
+            turn_id,
+            will_retry: false,
+            ..
+        } => (
+            turn_id_or_cached(turn_id, current_turn_id),
+            ProviderTurnStatus::Other("error"),
+            "error".to_string(),
+        ),
+        _ => return false,
+    };
+    if consume_deferred_goal_terminal(deferred_goal_turns, provider_turn_id.as_deref()) {
+        return false;
+    }
+    let Some(owner) = owners.accept(provider_turn_id.as_deref()) else {
+        return false;
+    };
+    // Every binding of a retired registration is retired; only the accumulator
+    // still bound to this provider may supply usage that was never frozen.
+    let usage = owners
+        .take_retired_usage(provider_turn_id.as_deref())
+        .unwrap_or_else(|| {
+            if provider_turn_id.as_deref() == active_id {
+                usage_accumulator.take_turn_usage()
+            } else {
+                None
+            }
+        });
+    let cause = provider_turn_id
+        .as_deref()
+        .and_then(|id| host.host.take_interrupt_cause(id));
+    host.host.complete(
+        codex_turn_completion(
+            status,
+            usage,
+            ephemeral,
+            ProviderInterruption {
+                provider_turn_id,
+                provider_reason: Some(provider_reason),
+                cause,
+            },
+        ),
+        CodexTurnContext {
+            accounting_only: true,
+            owner,
+            process_identity: registration.clone(),
+            failure_disposition: TurnFailureDisposition::Unhandled,
+            fatal_cause: None,
+        },
+    );
+    true
+}
+
 impl CodexRuntime {
     #[allow(clippy::too_many_arguments)]
     pub fn reader_thread_app_server(
@@ -1027,10 +1271,27 @@ impl CodexRuntime {
         // never signal the shared app-server, and deregisters its routing entries
         // on exit. None for the legacy process-per-session path.
         ephemeral: bool,
+        registration: ProcessIdentity,
     ) {
+        if !host
+            .process_state
+            .is_process_identity_current(&registration)
+        {
+            host.host.reader_closed();
+            return;
+        }
+        let mut owners = CodexReaderOwners::new(
+            &host.process_state,
+            registration.clone(),
+            &current_turn_id,
+            ephemeral,
+        );
         log::debug!("codex_app_server: reader started");
         let mut streaming_state: Option<StreamingState> = None;
         let mut usage_accumulator = CodexTurnUsageAccumulator::default();
+        // Unlike the client's cache, this moves only when this reader accepts
+        // a start. A host may already have sent S while P's reports are queued.
+        let mut accounting_provider_id = current_turn_id.lock().ok().and_then(|id| id.clone());
         let mut last_agent_message_text: Option<String> = None;
         let mut pending_tool_ids: HashSet<String> = HashSet::new();
         let mut tool_output_chars: HashMap<String, i32> = HashMap::new();
@@ -1065,12 +1326,56 @@ impl CodexRuntime {
         store_event(host, run_id, session_id.as_deref(), &init_event);
 
         for msg in notifications.iter() {
+            if !host
+                .process_state
+                .is_process_identity_current(&registration)
+            {
+                // Host shutdown removes the handle before its process's last
+                // frames drain. Turns this reader bound still owe their usage;
+                // whoever retired the registration settles their lifecycle.
+                if account_retired_notification(
+                    host,
+                    &msg,
+                    &mut owners,
+                    &mut usage_accumulator,
+                    &mut deferred_goal_turns,
+                    &current_turn_id,
+                    accounting_provider_id.as_deref(),
+                    &registration,
+                    ephemeral,
+                ) && ephemeral
+                {
+                    break;
+                }
+                continue;
+            }
+            let retired_owner = owners
+                .peek(accounting_provider_id.as_deref())
+                .flatten()
+                .is_some_and(|owner| owner.accounting_only());
+            let already_frozen = match accounting_provider_id.as_deref() {
+                Some(id) => owners.settled_usage.contains_key(id),
+                None => owners.settled_initial_usage.is_some(),
+            };
+            if retired_owner && !already_frozen {
+                owners.freeze_accounting(
+                    accounting_provider_id.as_deref(),
+                    std::mem::take(&mut usage_accumulator),
+                );
+                owned_watchdog.disarm_turn(accounting_provider_id.as_deref(), "host_retired_turn");
+            }
             if answer_server_request(host.host.as_ref(), &msg) {
                 continue;
             }
             let notification = Notification::parse(&msg);
-            if let Ok(mut watchdog) = progress_watchdog.lock() {
-                watchdog.observe_notification(notification_label(&notification), Instant::now());
+            let retired_provider = notification_turn_id(&msg).is_some_and(|id| {
+                owners.settled_usage.contains_key(id) || owners.seen.contains(id)
+            });
+            if !retired_provider {
+                if let Ok(mut watchdog) = progress_watchdog.lock() {
+                    watchdog
+                        .observe_notification(notification_label(&notification), Instant::now());
+                }
             }
 
             if terminal_tool_called_for_run(host, run_id)
@@ -1092,19 +1397,32 @@ impl CodexRuntime {
                             "Terminal artifact/tool reached Codex tool boundary for run {}; pausing, interrupting, and warming",
                             &run_id[..run_id.len().min(8)]
                         );
+                        let provider_id = current_turn_id.lock().ok().and_then(|id| id.clone());
+                        let Some(boundary_owner) = owners.peek(provider_id.as_deref()) else { continue; };
                         if let Err(error) =
-                            host.host.interrupt()
+                            host.host.interrupt(&registration, boundary_owner.as_ref())
                         {
                             let evidence = format!(
                                 "Codex terminal handoff refused because its goal could not be paused and its turn interrupted: {error}"
                             );
                             log::error!("{evidence} (run {run_id})");
-                            host.host.error(&evidence);
+                            if boundary_owner.as_ref().is_some_and(|owner| host.process_state.is_turn_owner_current(owner)) {
+                                host.host.error(&evidence);
+                            }
                             break;
                         }
                         terminal_tool_suspended = true;
-                        host.host.artifact_handoff();
-                        crate::backends::codex::events::emit_codex_run_turn_completed(emitter, run_id);
+                        finalize_streaming(
+                            host, &run_db, emitter, &mut streaming_state, session_id.as_deref(),
+                        );
+                        if host.host.artifact_handoff(&registration, boundary_owner.as_ref()) {
+                            // Keep P's aggregate AND cumulative baseline on its binding.
+                            // S's first snapshot must use last, not a thread-total delta
+                            // which may include P usage that has not arrived yet.
+                            owners.freeze_accounting(provider_id.as_deref(), std::mem::take(&mut usage_accumulator));
+                            owned_watchdog.disarm_turn(provider_id.as_deref(), "artifact_handoff");
+                            crate::backends::codex::events::emit_codex_run_turn_completed(emitter, run_id);
+                        }
                     }
                 };
             }
@@ -1115,11 +1433,14 @@ impl CodexRuntime {
                 | Notification::AuthTokensRefreshRequest { .. } => {}
                 Notification::TurnStarted { turn_id } => {
                     if let Some(turn_id) = turn_id {
+                        if !owners.claim_start(turn_id) {
+                            continue;
+                        }
                         if !ephemeral {
                             if is_deferred_goal_turn(&deferred_goal_turns, Some(turn_id)) {
                                 continue;
                             }
-                            match host.host.admit_goal_turn(turn_id) {
+                            match host.host.admit_goal_turn(turn_id, &registration) {
                                 Ok(Some(GoalTurnAdmission::Deferred {
                                     predecessor_turn_id,
                                 })) => {
@@ -1129,18 +1450,37 @@ impl CodexRuntime {
                                     claim_deferred_goal_turn(&mut deferred_goal_turns, turn_id);
                                     continue;
                                 }
-                                Ok(_) => {}
+                                Ok(Some(GoalTurnAdmission::Admitted { owner })) => {
+                                    owners.initial = None;
+                                    owners
+                                        .owners
+                                        .entry(turn_id.to_string())
+                                        .or_insert(Some(owner));
+                                }
+                                Ok(Some(GoalTurnAdmission::Ignored)) => continue,
+                                Ok(None) => {}
                                 Err(error) => {
                                     let evidence = format!(
                                         "Codex native goal turn {turn_id} could not enter Cairn's turn lifecycle: {error}"
                                     );
                                     log::error!("{evidence}");
-                                    host.host.error(&evidence);
-                                    let _ = host.host.watchdog_arm_failed(&evidence);
+                                    if host
+                                        .process_state
+                                        .is_process_identity_current(&registration)
+                                    {
+                                        host.host.error(&evidence);
+                                        let _ = host.host.watchdog_arm_failed(&evidence);
+                                    }
+
                                     break;
                                 }
                             }
                         }
+                        if !owners.start(&host.process_state, turn_id) {
+                            continue;
+                        }
+                        accounting_provider_id = Some(turn_id.to_string());
+                        terminal_tool_suspended = false;
                         if let Err(error) = owned_watchdog.arm(turn_id) {
                             let evidence = format!(
                                 "Codex provider turn {turn_id} was interrupted because durable watchdog ownership could not be acquired: {error}"
@@ -1480,6 +1820,36 @@ impl CodexRuntime {
                         );
                         continue;
                     }
+                    let Some(owner) = owners.accept(completed_provider_turn_id.as_deref()) else {
+                        continue;
+                    };
+                    if let Some(usage) = owners.take_accounting_only_usage(
+                        completed_provider_turn_id.as_deref(),
+                        owner.as_ref(),
+                        accounting_provider_id.as_deref(),
+                        &mut usage_accumulator,
+                    ) {
+                        host.host.complete(
+                            codex_turn_completion(
+                                status,
+                                usage,
+                                ephemeral,
+                                ProviderInterruption {
+                                    provider_turn_id: completed_provider_turn_id.clone(),
+                                    provider_reason: Some(status.as_str().to_string()),
+                                    cause: interrupt_cause,
+                                },
+                            ),
+                            CodexTurnContext {
+                                accounting_only: true,
+                                owner,
+                                process_identity: registration.clone(),
+                                failure_disposition: TurnFailureDisposition::Unhandled,
+                                fatal_cause: None,
+                            },
+                        );
+                        continue;
+                    }
                     if names_a_superseded_turn(turn_id, &current_turn_id) {
                         log::info!(
                             "Ignoring late turn/completed for superseded Codex turn {:?} on run {}",
@@ -1488,6 +1858,22 @@ impl CodexRuntime {
                         );
                         continue;
                     }
+                    owned_watchdog.disarm_turn(
+                        completed_provider_turn_id.as_deref(),
+                        "provider_turn_completed",
+                    );
+                    let owner_is_current = owner.as_ref().map_or_else(
+                        || {
+                            host.process_state
+                                .is_untracked_busy_for_identity(&registration)
+                                || ephemeral
+                        },
+                        |owner| host.process_state.is_turn_owner_current(owner),
+                    );
+                    if !owner_is_current {
+                        continue;
+                    }
+
                     // Publish provider terminality before finalization. Recovery
                     // may be waiting for this exact notification while the
                     // finalizer performs database and orchestration work.
@@ -1500,10 +1886,6 @@ impl CodexRuntime {
                     // marks the turn complete and parks the run warm. A lease
                     // still active in that window is claimable by a reconciler
                     // for a turn that has already ended.
-                    owned_watchdog.disarm_turn(
-                        completed_provider_turn_id.as_deref(),
-                        "provider_turn_completed",
-                    );
                     // Schema-constrained call (CAIRN-2505): when the turn's final
                     // agent message is the native structured output, capture it as
                     // the return artifact server-side BEFORE the run finalizes.
@@ -1511,7 +1893,7 @@ impl CodexRuntime {
                     // contract) and idempotent (a no-op if the model also wrote
                     // cairn:~/return), so non-call turns and schema-less codex
                     // sessions are unaffected.
-                    if status == ProviderTurnStatus::Completed {
+                    if owner_is_current && status == ProviderTurnStatus::Completed {
                         if let Some(value) = last_agent_message_text
                             .as_deref()
                             .and_then(|text| serde_json::from_str::<Value>(text).ok())
@@ -1528,11 +1910,12 @@ impl CodexRuntime {
                         let state = provider_turn_failures
                             .entry(turn_id.to_string())
                             .or_default();
-                        if status.is_failed()
+                        if owner_is_current
+                            && status.is_failed()
                             && !state.terminalized
                             && state.capacity_message.is_some()
                         {
-                            state.terminalized = host.host.capacity_failure();
+                            state.terminalized = host.host.capacity_failure(owner.as_ref());
                         }
                         if state.terminalized {
                             TurnFailureDisposition::AlreadyHandled
@@ -1571,6 +1954,9 @@ impl CodexRuntime {
                             },
                         ),
                         CodexTurnContext {
+                            accounting_only: false,
+                            owner,
+                            process_identity: registration.clone(),
                             failure_disposition,
                             // A provider status names no cause. A fatal error
                             // reported before it already ended this turn and
@@ -1604,6 +1990,41 @@ impl CodexRuntime {
                         );
                         continue;
                     }
+                    clear_provider_turn_if_current(
+                        aborted_provider_turn_id.as_deref(),
+                        &current_turn_id,
+                        &progress_watchdog,
+                    );
+                    let Some(owner) = owners.accept(aborted_provider_turn_id.as_deref()) else {
+                        continue;
+                    };
+                    if let Some(usage) = owners.take_accounting_only_usage(
+                        aborted_provider_turn_id.as_deref(),
+                        owner.as_ref(),
+                        accounting_provider_id.as_deref(),
+                        &mut usage_accumulator,
+                    ) {
+                        host.host.complete(
+                            codex_turn_completion(
+                                ProviderTurnStatus::from_abort_reason(reason),
+                                usage,
+                                ephemeral,
+                                ProviderInterruption {
+                                    provider_turn_id: aborted_provider_turn_id.clone(),
+                                    provider_reason: Some(reason.to_string()),
+                                    cause: interrupt_cause,
+                                },
+                            ),
+                            CodexTurnContext {
+                                accounting_only: true,
+                                owner,
+                                process_identity: registration.clone(),
+                                failure_disposition: TurnFailureDisposition::Unhandled,
+                                fatal_cause: None,
+                            },
+                        );
+                        continue;
+                    }
                     if names_a_superseded_turn(turn_id, &current_turn_id) {
                         log::info!(
                             "Ignoring late turn/aborted for superseded Codex turn {:?} on run {}",
@@ -1612,11 +2033,14 @@ impl CodexRuntime {
                         );
                         continue;
                     }
-                    clear_provider_turn_if_current(
-                        aborted_provider_turn_id.as_deref(),
-                        &current_turn_id,
-                        &progress_watchdog,
-                    );
+                    owned_watchdog
+                        .disarm_turn(aborted_provider_turn_id.as_deref(), "provider_turn_aborted");
+                    if owner
+                        .as_ref()
+                        .is_some_and(|owner| !host.process_state.is_turn_owner_current(owner))
+                    {
+                        continue;
+                    }
                     // Interrupt acknowledgement is the terminal notification,
                     // not completion of Cairn's downstream finalization.
                     log::info!(
@@ -1624,8 +2048,6 @@ impl CodexRuntime {
                         aborted_provider_turn_id,
                         chrono::Utc::now().timestamp_millis()
                     );
-                    owned_watchdog
-                        .disarm_turn(aborted_provider_turn_id.as_deref(), "provider_turn_aborted");
                     let status = ProviderTurnStatus::from_abort_reason(reason);
                     if status == ProviderTurnStatus::Interrupted {
                         log::info!(
@@ -1655,6 +2077,9 @@ impl CodexRuntime {
                             },
                         ),
                         CodexTurnContext {
+                            accounting_only: false,
+                            owner,
+                            process_identity: registration.clone(),
                             failure_disposition: TurnFailureDisposition::Unhandled,
                             fatal_cause: None,
                         },
@@ -1702,6 +2127,36 @@ impl CodexRuntime {
                             }
                         }
                     } else {
+                        let Some(owner) = owners.accept(error_provider_turn_id.as_deref()) else {
+                            continue;
+                        };
+                        if let Some(usage) = owners.take_accounting_only_usage(
+                            error_provider_turn_id.as_deref(),
+                            owner.as_ref(),
+                            accounting_provider_id.as_deref(),
+                            &mut usage_accumulator,
+                        ) {
+                            host.host.complete(
+                                codex_turn_completion(
+                                    ProviderTurnStatus::Other("error"),
+                                    usage,
+                                    ephemeral,
+                                    ProviderInterruption {
+                                        provider_turn_id: error_provider_turn_id.clone(),
+                                        provider_reason: Some("error".to_string()),
+                                        cause: None,
+                                    },
+                                ),
+                                CodexTurnContext {
+                                    accounting_only: true,
+                                    owner,
+                                    process_identity: registration.clone(),
+                                    failure_disposition: TurnFailureDisposition::Unhandled,
+                                    fatal_cause: None,
+                                },
+                            );
+                            continue;
+                        }
                         if names_a_superseded_turn(turn_id, &current_turn_id) {
                             log::info!(
                                 "Ignoring late fatal error for superseded Codex turn {:?} on run {}: {}",
@@ -1711,6 +2166,15 @@ impl CodexRuntime {
                             );
                             continue;
                         }
+                        owned_watchdog
+                            .disarm_turn(error_provider_turn_id.as_deref(), "provider_turn_error");
+                        if owner
+                            .as_ref()
+                            .is_some_and(|owner| !host.process_state.is_turn_owner_current(owner))
+                        {
+                            continue;
+                        }
+
                         let already_terminalized = error_provider_turn_id
                             .as_ref()
                             .and_then(|turn_id| provider_turn_failures.get(turn_id))
@@ -1726,12 +2190,30 @@ impl CodexRuntime {
                                 &mut streaming_state,
                                 session_id.as_deref(),
                             );
-                            if host.host.capacity_failure() {
+                            if host.host.capacity_failure(owner.as_ref()) {
+                                host.host.complete(
+                                    codex_turn_completion(
+                                        ProviderTurnStatus::Other("error"),
+                                        usage_accumulator.take_turn_usage(),
+                                        ephemeral,
+                                        ProviderInterruption::default(),
+                                    ),
+                                    CodexTurnContext {
+                                        accounting_only: false,
+                                        owner,
+                                        process_identity: registration.clone(),
+                                        failure_disposition: TurnFailureDisposition::AlreadyHandled,
+                                        fatal_cause: None,
+                                    },
+                                );
                                 if let Some(turn_id) = error_provider_turn_id {
                                     let state = provider_turn_failures.entry(turn_id).or_default();
                                     state.capacity_message =
                                         Some(normalize_capacity_error(message));
                                     state.terminalized = true;
+                                }
+                                if ephemeral {
+                                    break;
                                 }
                                 continue;
                             }
@@ -1744,8 +2226,15 @@ impl CodexRuntime {
                             &mut streaming_state,
                             session_id.as_deref(),
                         );
+                        if owner
+                            .as_ref()
+                            .is_some_and(|owner| !host.process_state.is_turn_owner_current(owner))
+                        {
+                            continue;
+                        }
                         let fatal_cause = format!("Codex error: {}", message);
                         host.host.error(&fatal_cause);
+
                         if let Some(turn_id) = error_provider_turn_id.as_deref() {
                             // The turn is over; a cause recorded for it has
                             // nothing left to attribute.
@@ -1759,6 +2248,9 @@ impl CodexRuntime {
                                 ProviderInterruption::default(),
                             ),
                             CodexTurnContext {
+                                accounting_only: false,
+                                owner,
+                                process_identity: registration.clone(),
                                 failure_disposition: TurnFailureDisposition::DiagnosticRecorded,
                                 fatal_cause: Some(fatal_cause),
                             },
@@ -1777,6 +2269,25 @@ impl CodexRuntime {
                 }
                 Notification::TokenUsageUpdated { params } => {
                     if let Some(params) = params {
+                        let usage_id = notification_turn_id(&msg)
+                            .map(str::to_string)
+                            .or_else(|| current_turn_id.lock().ok().and_then(|id| id.clone()));
+                        let detached = match usage_id.as_deref() {
+                            Some(id) => owners.settled_usage.get_mut(id),
+                            None => owners.settled_initial_usage.as_mut(),
+                        };
+                        if let Some(accumulator) = detached {
+                            accumulator.observe(params);
+                            // Accounting for a settled binding cannot alter the live gauge
+                            // or move the active provider turn's cumulative baseline.
+                            continue;
+                        }
+                        if let Some(id) = usage_id.as_deref() {
+                            let current = current_turn_id.lock().ok().and_then(|id| id.clone());
+                            if current.as_deref() != Some(id) || owners.seen.contains(id) {
+                                continue;
+                            }
+                        }
                         let model = host.process_state.get_model(run_id);
                         if let Some(state) = codex_context_tokens_from_notification(
                             params,
@@ -1819,13 +2330,18 @@ impl CodexRuntime {
         }
 
         owned_watchdog.disarm("notification_stream_closed");
-        finalize_streaming(
-            host,
-            &run_db,
-            emitter,
-            &mut streaming_state,
-            session_id.as_deref(),
-        );
+        if host
+            .process_state
+            .is_process_identity_current(&registration)
+        {
+            finalize_streaming(
+                host,
+                &run_db,
+                emitter,
+                &mut streaming_state,
+                session_id.as_deref(),
+            );
+        }
 
         // Pooled ephemeral call: drop this call's routing entries so the pool no
         // longer maps its threadId. Idempotent with crash teardown (which fails
@@ -1839,6 +2355,126 @@ impl CodexRuntime {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn reader_completion_keeps_predecessor_and_consumes_provider_identity_once() {
+        use crate::agent_process::process::RunHandle;
+        let state = AgentProcessState::default();
+        let mut handle = RunHandle::test_handle(Some("s"), Some("j"));
+        handle.begin_turn("first");
+        state.processes.lock().unwrap().register("r".into(), handle);
+        let identity = state.capture_process_identity("r").unwrap();
+        let mut owners =
+            CodexReaderOwners::new(&state, identity, &Mutex::new(Some("p1".to_string())), false);
+        assert!(owners.claim_start("p1"));
+        assert!(state.begin_turn("r", "second"));
+        assert!(
+            !owners.claim_start("p1"),
+            "a bound start cannot re-enter admission after the successor attaches"
+        );
+        let first = owners.accept(Some("p1")).unwrap().unwrap();
+        assert_eq!(first.turn_id(), "first");
+        assert!(!state.is_turn_owner_current(&first));
+        assert!(owners.accept(Some("p1")).is_none());
+        assert!(!owners.start(&state, "p1"));
+        assert!(owners.start(&state, "p2"));
+        assert_eq!(
+            owners.accept(Some("p2")).unwrap().unwrap().turn_id(),
+            "second"
+        );
+        assert!(owners.accept(Some("unknown")).is_none());
+    }
+
+    #[test]
+    fn reader_binding_follows_only_authorized_inline_rotations() {
+        use crate::agent_process::process::RunHandle;
+        let state = AgentProcessState::default();
+        let mut handle = RunHandle::test_handle(Some("s"), Some("j"));
+        handle.begin_turn("first");
+        state.processes.lock().unwrap().register("r".into(), handle);
+        let identity = state.capture_process_identity("r").unwrap();
+        let mut owners = CodexReaderOwners::new(&state, identity.clone(), &Mutex::new(None), false);
+        let original = state.capture_turn_owner("r", "first").unwrap();
+        assert!(owners.start(&state, "p1"));
+        let second = state.rotate_turn_if_owned(&original, "second").unwrap();
+        let third = state.rotate_turn_if_owned(&second, "third").unwrap();
+        assert_eq!(owners.peek(Some("p1")).unwrap().unwrap(), third);
+        // An unnamed initial binding follows the same explicit authorization.
+        let mut initial = CodexReaderOwners::new(&state, identity, &Mutex::new(None), false);
+        let fourth = state.rotate_turn_if_owned(&third, "fourth").unwrap();
+        assert_eq!(owners.accept(Some("p1")).unwrap().unwrap(), fourth);
+        assert!(owners.accept(Some("p1")).is_none());
+        assert!(!owners.claim_start("p1"));
+        assert!(state
+            .rotate_turn_if_owned(&fourth, "after-terminal")
+            .is_none());
+        assert!(state.retire_turn_accounting_if_owned(&fourth));
+        assert!(initial.peek(None).unwrap().unwrap().accounting_only());
+        let accepted_initial = initial.accept(None).unwrap().unwrap();
+        assert_eq!(accepted_initial, fourth);
+        assert!(accepted_initial.accounting_only());
+        assert!(initial.accept(None).is_none());
+        state.begin_turn("r", "new-provider");
+        assert!(initial.start(&state, "p2"));
+        let new_provider = initial.peek(Some("p2")).unwrap().unwrap();
+        assert_eq!(new_provider.turn_id(), "new-provider");
+        assert!(!new_provider.accounting_only());
+        assert_eq!(original.resolve_provider_owner(), fourth);
+        assert!(!state.is_turn_owner_current(&fourth));
+        assert!(state.is_turn_owner_current(&new_provider));
+        assert_eq!(initial.accept(Some("p2")).unwrap().unwrap(), new_provider);
+        assert!(initial.accept(Some("p2")).is_none());
+    }
+
+    #[test]
+    fn reader_terminal_acceptance_prevents_late_inline_rotation() {
+        use crate::agent_process::process::RunHandle;
+        for named in [false, true] {
+            let state = AgentProcessState::default();
+            let mut handle = RunHandle::test_handle(Some("s"), Some("j"));
+            handle.begin_turn("first");
+            state.processes.lock().unwrap().register("r".into(), handle);
+            let identity = state.capture_process_identity("r").unwrap();
+            let original = state.capture_turn_owner("r", "first").unwrap();
+            let mut owners = CodexReaderOwners::new(&state, identity, &Mutex::new(None), false);
+            if named {
+                assert!(owners.start(&state, "p1"));
+            }
+            assert!(state.yield_for_host_if_owned(&original));
+            let id = named.then_some("p1");
+            let accepted = owners.accept(id).unwrap().unwrap();
+            assert_eq!(accepted, original);
+            assert!(state.rotate_turn_if_owned(&original, "too-late").is_none());
+            assert!(state.is_awaiting_host("r", Some("first")));
+            assert!(owners.accept(id).is_none());
+            assert!(state.transition_to_warm_if_owned(&accepted));
+            assert!(state.is_warm("r"));
+        }
+    }
+
+    #[test]
+    fn reader_cannot_bind_a_replacement_registration() {
+        use crate::agent_process::process::RunHandle;
+        let state = AgentProcessState::default();
+        let mut handle = RunHandle::test_handle(Some("s"), Some("j"));
+        handle.begin_turn("first");
+        state.processes.lock().unwrap().register("r".into(), handle);
+        let identity = state.capture_process_identity("r").unwrap();
+        let mut owners = CodexReaderOwners::new(&state, identity, &Mutex::new(None), false);
+        let mut replacement = RunHandle::test_handle(Some("s"), Some("j"));
+        replacement.begin_turn("replacement");
+        state
+            .processes
+            .lock()
+            .unwrap()
+            .register("r".into(), replacement);
+        assert!(!owners.start(&state, "p2"));
+        assert!(owners.accept(Some("p2")).is_none());
+        assert_eq!(
+            state.get_current_turn_id("r").as_deref(),
+            Some("replacement")
+        );
+    }
+
     #[test]
     fn completion_report_preserves_unknown_status_and_usage_without_host_policy() {
         for ephemeral in [false, true] {

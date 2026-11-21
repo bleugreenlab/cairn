@@ -24,8 +24,8 @@ use crate::agent_process::process::{GoalPause, PauseIntent};
 use crate::mcp::handlers::permission::{HandBackPolicy, Withdrawal, WithdrawalCause};
 use crate::models::Run;
 use crate::orchestrator::lifecycle::{
-    find_descendant_job_ids, kill_session_with_reason, settle_live_turn, TerminalPolicy,
-    TurnSettlement, OPERATOR_COMPACT_EXIT_REASON,
+    find_descendant_job_ids, kill_session_with_reason_launch_locked, settle_live_turn,
+    TerminalPolicy, TurnSettlement, OPERATOR_COMPACT_EXIT_REASON,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, LocalDb, RowExt};
@@ -346,6 +346,8 @@ pub fn compact_job(
         return idle(identity_override);
     }
 
+    refuse_claimed_turns(orch, &live)?;
+
     // Everything the bookkeeping after the kill needs is read now. Past the
     // kill, only the successor's own launch may fail the call: a read failing
     // there would leave the job torn down with no successor.
@@ -505,6 +507,7 @@ fn tear_down(
     job_id: &str,
     live: LiveWork,
 ) -> Result<OperatorCompactReport, String> {
+    refuse_claimed_turns(orch, &live)?;
     let mut report = OperatorCompactReport::default();
 
     // The job's in-flight turn-end check wave is deliberately left running. It
@@ -538,18 +541,19 @@ fn tear_down(
         }
     }
 
-    settle_asks_and_turns(orch, db, &live, &mut report)?;
+    settle_asks_and_turns(orch, db, job_id, &live, &mut report)?;
     #[cfg(any(test, feature = "test-utils"))]
     test_hooks::after_settle(orch, job_id);
 
     // Sub-agents first, so no child outlives the parent it reports to.
     doomed.sort_by_key(|run| run.job_id == job_id);
     for run in &doomed {
-        kill_session_with_reason(
+        kill_session_with_reason_launch_locked(
             orch,
             &run.id,
             OPERATOR_COMPACT_EXIT_REASON,
             TerminalPolicy::Finalize,
+            job_id,
         )
         .map_err(|error| format!("failed to kill run {}: {error}", run.id))?;
         report.runs_killed += 1;
@@ -569,13 +573,15 @@ fn tear_down(
     // ended the same way. Nothing non-terminal may reach the rotation.
     let after = live_work_for_job(orch, job_id)?;
     if !after.is_empty() {
-        settle_asks_and_turns(orch, db, &after, &mut report)?;
+        refuse_claimed_turns(orch, &after)?;
+        settle_asks_and_turns(orch, db, job_id, &after, &mut report)?;
         for run in &after.runs {
-            kill_session_with_reason(
+            kill_session_with_reason_launch_locked(
                 orch,
                 &run.id,
                 OPERATOR_COMPACT_EXIT_REASON,
                 TerminalPolicy::Finalize,
+                job_id,
             )
             .map_err(|error| format!("failed to kill run {}: {error}", run.id))?;
             report.runs_killed += 1;
@@ -592,12 +598,27 @@ fn tear_down(
     Ok(report)
 }
 
+fn refuse_claimed_turns(orch: &Orchestrator, live: &LiveWork) -> Result<(), String> {
+    if let Some(turn) = live
+        .turns
+        .iter()
+        .find(|turn| orch.is_turn_terminal_claimed(&turn.id))
+    {
+        return Err(format!(
+            "Turn {} is finishing its terminal completion; retry Compact",
+            turn.id
+        ));
+    }
+    Ok(())
+}
+
 /// Withdraw asks, abandon waits, then settle turns — in that order: a
 /// withdrawn permission can hand an outer run-batch wait back, which the
 /// abandonment that follows must then see.
 fn settle_asks_and_turns(
     orch: &Orchestrator,
     db: &Arc<LocalDb>,
+    locked_job_id: &str,
     live: &LiveWork,
     report: &mut OperatorCompactReport,
 ) -> Result<(), String> {
@@ -691,6 +712,7 @@ fn settle_asks_and_turns(
             turn.run_id.as_deref(),
             &turn.id,
             TurnSettlement::OperatorCompact,
+            locked_job_id,
         )
         .map_err(|error| format!("failed to cancel turn {}: {error}", turn.id))?
         {
@@ -816,6 +838,98 @@ mod tests {
             .await
             .expect("seed the job's state");
         db
+    }
+
+    #[tokio::test]
+    async fn compact_teardown_refuses_a_claimed_failure_before_touching_live_work() {
+        let db = seeded(
+            "compact-owned-failure.db",
+            "INSERT INTO runs(id, job_id, session_id, status, exit_reason, created_at, updated_at)
+               VALUES ('r1', 'job', 's1', 'crashed', 'turn_failed', 1, 1);
+             INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+               VALUES ('t1', 's1', 'r1', 'job', 1, 'running', 'initial', 1, 1);
+             INSERT INTO prompts(id, run_id, job_id, turn_id, questions, created_at)
+               VALUES ('q1', 'r1', 'job', 't1', '[]', 1);
+             INSERT INTO permission_requests(id, run_id, job_id, tool_use_id, tool_name, tool_input, status, created_at, turn_id)
+               VALUES ('perm1', 'r1', 'job', 'tu1', 'Bash', '{}', 'pending', 1, 't1');",
+        ).await;
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(db);
+        let state = Arc::new(crate::db::DbState::new(
+            db.clone(),
+            Arc::new(
+                crate::storage::SearchIndex::open_or_create(root.path().join("search.db")).unwrap(),
+            ),
+        ));
+        let orch = Orchestrator::builder(
+            state,
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root.path().to_path_buf(),
+        )
+        .build();
+        let lock = orch.job_launch_lock("job");
+        let guard = lock.lock().unwrap();
+        let claim = orch.claim_terminal_completion("r1", "t1").unwrap();
+        let live = live_work_for_job(&orch, "job").unwrap();
+        assert!(
+            live.runs.is_empty(),
+            "a terminal run still has a claimed running turn"
+        );
+        let error = tear_down(&orch, &db, "job", live).unwrap_err();
+        assert!(error.contains("retry Compact"), "{error}");
+        assert_eq!(
+            db_text(&db, "SELECT state FROM turns WHERE id=?1", "t1")
+                .unwrap()
+                .as_deref(),
+            Some("running"),
+        );
+        assert_eq!(
+            db_text(&db, "SELECT exit_reason FROM runs WHERE id=?1", "r1")
+                .unwrap()
+                .as_deref(),
+            Some("turn_failed"),
+        );
+        assert_eq!(
+            db_text(
+                &db,
+                "SELECT status FROM permission_requests WHERE id=?1",
+                "perm1"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("pending"),
+        );
+        assert_eq!(
+            db_text(
+                &db,
+                "SELECT CAST(withdrawn_at AS TEXT) FROM prompts WHERE id=?1",
+                "q1"
+            )
+            .unwrap(),
+            None,
+        );
+        assert_eq!(
+            live_work_for_job(&orch, "job").unwrap().counts(),
+            LiveWorkCounts {
+                turns: 1,
+                runs: 0,
+                waits: 0,
+                permissions: 1,
+                questions: 1
+            },
+        );
+        assert_eq!(
+            db_text(
+                &db,
+                "SELECT current_session_id FROM jobs WHERE id=?1",
+                "job"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("s1"),
+        );
+        drop(claim);
+        drop(guard);
     }
 
     /// A warm process parked between turns serves nothing: Compact on it is

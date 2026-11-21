@@ -365,6 +365,10 @@ pub struct RunHandle {
     /// cairn:// resources this run has read.
     /// Lazily seeded once from prior events, then appended on each read.
     pub consumed_uris: Arc<Mutex<HashSet<String>>>,
+    /// Shared only with snapshots of the current turn. Retired snapshots keep
+    /// their disposition after a successor installs its own cell.
+    turn_accounting_only: Arc<AtomicBool>,
+    turn_forward: Arc<Mutex<ProviderOwnerLink>>,
     /// Whether `consumed_uris` has been seeded from prior events yet.
     pub consumed_seeded: Arc<AtomicBool>,
     /// The session position vector used at the last recommendation. The
@@ -460,6 +464,8 @@ impl RunHandle {
             credential_feed: None,
             terminal_tool_called: Arc::new(AtomicBool::new(false)),
             consumed_uris: Arc::new(Mutex::new(HashSet::new())),
+            turn_accounting_only: Arc::new(AtomicBool::new(false)),
+            turn_forward: Arc::new(Mutex::new(ProviderOwnerLink::default())),
             consumed_seeded: Arc::new(AtomicBool::new(false)),
             last_recommend_pos: Arc::new(Mutex::new(None)),
             turn_seen_calls: Arc::new(Mutex::new(TurnSeenCalls::default())),
@@ -517,6 +523,10 @@ impl RunHandle {
 
     /// Begin a new turn.
     pub fn begin_turn(&mut self, turn_id: &str) {
+        if self.current_turn_id() != Some(turn_id) {
+            self.turn_accounting_only = Arc::new(AtomicBool::new(false));
+            self.turn_forward = Arc::new(Mutex::new(ProviderOwnerLink::default()));
+        }
         self.occupancy = RunOccupancy::ServingTurn(turn_id.to_string());
         self.last_activity = Instant::now();
         self.terminal_tool_called.store(false, Ordering::Release);
@@ -698,6 +708,104 @@ pub type ProcessMap = RunRegistry;
 // ============================================================================
 // AgentProcessState
 // ============================================================================
+
+/// Identity of one registration, independent of which turn it currently serves.
+/// Capture before asynchronous work; a run id or session id alone can be reused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    run_id: String,
+    generation: u64,
+}
+
+impl ProcessIdentity {
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+}
+
+/// A registration's exact tracked turn, whether serving or awaiting the host.
+/// Fields are private so only a registry snapshot can establish ownership.
+#[derive(Clone, Debug)]
+pub struct ProcessTurnOwner {
+    process: ProcessIdentity,
+    turn_id: String,
+    accounting_only: Arc<AtomicBool>,
+    forward: Arc<Mutex<ProviderOwnerLink>>,
+}
+
+#[derive(Debug, Default)]
+struct ProviderOwnerLink {
+    next: Option<ProcessTurnOwner>,
+    terminal_accepted: bool,
+}
+
+impl PartialEq for ProcessTurnOwner {
+    fn eq(&self, other: &Self) -> bool {
+        self.process == other.process && self.turn_id == other.turn_id
+    }
+}
+
+impl Eq for ProcessTurnOwner {}
+
+impl ProcessTurnOwner {
+    /// Follow only explicit in-provider rotations, never the registry's current
+    /// turn. Exact ownership checks on this token remain unchanged.
+    pub fn resolve_provider_owner(&self) -> Self {
+        let mut owner = self.clone();
+        loop {
+            let next = owner.forward.lock().ok().and_then(|link| link.next.clone());
+            match next {
+                Some(next) => owner = next,
+                None => return owner,
+            }
+        }
+    }
+
+    /// Consume provider terminal ownership at the end of its authorized chain.
+    /// Sealing and rotation use the same mutex: whichever wins defines whether
+    /// the terminal belongs to the old turn or its authorized successor.
+    pub fn accept_provider_owner(&self) -> Self {
+        let mut owner = self.clone();
+        loop {
+            let next = {
+                let mut link = owner
+                    .forward
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                match link.next.clone() {
+                    Some(next) => Some(next),
+                    None => {
+                        link.terminal_accepted = true;
+                        None
+                    }
+                }
+            };
+            match next {
+                Some(next) => owner = next,
+                None => return owner,
+            }
+        }
+    }
+
+    /// A producer has durably retired this turn before its provider terminal.
+    /// This disposition grants accounting, never ownership of newer occupancy.
+    pub fn accounting_only(&self) -> bool {
+        self.accounting_only.load(Ordering::Acquire)
+    }
+
+    /// The reader's process identity remains checkable after this turn ends.
+    pub fn process_identity(&self) -> &ProcessIdentity {
+        &self.process
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.process.run_id
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+}
 
 /// A warm (live + idle) process surfaced for garbage collection: its run id,
 /// OS pid (present while the child handle is still attached), idle duration, and
@@ -1192,6 +1300,164 @@ impl AgentProcessState {
         Some(self.workflow_leases.lock().ok()?.contains_key(run_id))
     }
 
+    /// Snapshot a registration without holding the registry across external work.
+    pub fn capture_process_identity(&self, run_id: &str) -> Option<ProcessIdentity> {
+        let processes = self.processes.lock().ok()?;
+        processes.get(run_id)?;
+        Some(ProcessIdentity {
+            run_id: run_id.to_string(),
+            generation: *processes.generations.get(run_id)?,
+        })
+    }
+
+    /// Capture only the registration that consumed this launch's admission claim.
+    pub fn capture_admitted_process_identity(
+        &self,
+        run_id: &str,
+        claim: &ProcessAdmissionClaim,
+    ) -> Option<ProcessIdentity> {
+        let processes = self.processes.lock().ok()?;
+        if processes.get(run_id)?.admission_claim.as_ref() != Some(claim) {
+            return None;
+        }
+        Some(ProcessIdentity {
+            run_id: run_id.to_string(),
+            generation: *processes.generations.get(run_id)?,
+        })
+    }
+
+    /// Whether this exact registration is still present, regardless of occupancy.
+    pub fn is_process_identity_current(&self, identity: &ProcessIdentity) -> bool {
+        let Ok(processes) = self.processes.lock() else {
+            return false;
+        };
+        processes.generations.get(&identity.run_id) == Some(&identity.generation)
+            && processes.contains_key(&identity.run_id)
+    }
+
+    /// Whether this reader's registration is serving an untracked turn.
+    pub fn is_untracked_busy_for_identity(&self, identity: &ProcessIdentity) -> bool {
+        let Ok(processes) = self.processes.lock() else {
+            return false;
+        };
+        processes.generations.get(&identity.run_id) == Some(&identity.generation)
+            && processes
+                .get(&identity.run_id)
+                .is_some_and(|process| matches!(process.occupancy, RunOccupancy::Busy))
+    }
+
+    /// Release an untracked turn, never a tracked turn or already-warm process.
+    /// Starting + Idle is not evidence of an admitted turn and cannot be released.
+    pub fn transition_to_warm_if_untracked(&self, identity: &ProcessIdentity) -> bool {
+        let Ok(mut processes) = self.processes.lock() else {
+            return false;
+        };
+        if processes.generations.get(&identity.run_id) != Some(&identity.generation)
+            || !processes
+                .get(&identity.run_id)
+                .is_some_and(|process| matches!(process.occupancy, RunOccupancy::Busy))
+        {
+            return false;
+        }
+        processes
+            .get_mut(&identity.run_id)
+            .unwrap()
+            .transition_to_warm();
+        true
+    }
+
+    /// Capture only if this registration still serves the expected tracked turn.
+    /// Busy and Idle never establish turn ownership.
+    pub fn capture_turn_owner(&self, run_id: &str, turn_id: &str) -> Option<ProcessTurnOwner> {
+        let processes = self.processes.lock().ok()?;
+        if processes.get(run_id)?.current_turn_id() != Some(turn_id) {
+            return None;
+        }
+        Some(ProcessTurnOwner {
+            process: ProcessIdentity {
+                run_id: run_id.to_string(),
+                generation: *processes.generations.get(run_id)?,
+            },
+            turn_id: turn_id.to_string(),
+            accounting_only: processes.get(run_id)?.turn_accounting_only.clone(),
+            forward: processes.get(run_id)?.turn_forward.clone(),
+        })
+    }
+
+    /// Capture the current tracked turn only from the reader's original process.
+    /// An old reader cannot acquire ownership of a replacement registration.
+    pub fn capture_turn_owner_for_identity(
+        &self,
+        identity: &ProcessIdentity,
+    ) -> Option<ProcessTurnOwner> {
+        let processes = self.processes.lock().ok()?;
+        if processes.generations.get(&identity.run_id) != Some(&identity.generation) {
+            return None;
+        }
+        Some(ProcessTurnOwner {
+            process: identity.clone(),
+            turn_id: processes
+                .get(&identity.run_id)?
+                .current_turn_id()?
+                .to_string(),
+            accounting_only: processes
+                .get(&identity.run_id)?
+                .turn_accounting_only
+                .clone(),
+            forward: processes.get(&identity.run_id)?.turn_forward.clone(),
+        })
+    }
+
+    /// Whether both the registration and its exact tracked turn remain current.
+    /// This is a snapshot, not a lease across subsequent external work.
+    pub fn is_turn_owner_current(&self, owner: &ProcessTurnOwner) -> bool {
+        let Ok(processes) = self.processes.lock() else {
+            return false;
+        };
+        processes.generations.get(&owner.process.run_id) == Some(&owner.process.generation)
+            && processes
+                .get(&owner.process.run_id)
+                .is_some_and(|process| process.current_turn_id() == Some(owner.turn_id.as_str()))
+    }
+
+    /// Retire accounting after the host establishes this exact turn's durable
+    /// yield, Stop, or direct durable-wait park, before interrupt delivery can
+    /// race its terminal report. Retirement does not terminalize logical work.
+    pub fn retire_turn_accounting_if_owned(&self, owner: &ProcessTurnOwner) -> bool {
+        let Ok(processes) = self.processes.lock() else {
+            return false;
+        };
+        if processes.generations.get(&owner.process.run_id) != Some(&owner.process.generation)
+            || !processes
+                .get(&owner.process.run_id)
+                .is_some_and(|process| process.current_turn_id() == Some(owner.turn_id.as_str()))
+        {
+            return false;
+        }
+        owner.accounting_only.store(true, Ordering::Release);
+        true
+    }
+
+    /// Compare and release under one registry lock. A stale or duplicate completion
+    /// changes nothing, including activity timestamps and terminal-tool flags.
+    pub fn transition_to_warm_if_owned(&self, owner: &ProcessTurnOwner) -> bool {
+        let Ok(mut processes) = self.processes.lock() else {
+            return false;
+        };
+        if processes.generations.get(&owner.process.run_id) != Some(&owner.process.generation)
+            || !processes
+                .get(&owner.process.run_id)
+                .is_some_and(|process| process.current_turn_id() == Some(owner.turn_id.as_str()))
+        {
+            return false;
+        }
+        processes
+            .get_mut(&owner.process.run_id)
+            .expect("registration checked under the same lock")
+            .transition_to_warm();
+        true
+    }
+
     /// Transition a process to warm state.
     pub fn transition_to_warm(&self, run_id: &str) -> bool {
         if let Ok(mut processes) = self.processes.lock() {
@@ -1214,6 +1480,84 @@ impl AgentProcessState {
             }
         }
         false
+    }
+
+    /// Activate and attach a turn only to the expected registration, returning
+    /// its rollback owner in the same critical section. Launch serialization
+    /// decides admission; this check fences process replacement.
+    pub fn begin_turn_if_identity(
+        &self,
+        identity: &ProcessIdentity,
+        turn_id: &str,
+    ) -> Option<ProcessTurnOwner> {
+        let mut processes = self.processes.lock().ok()?;
+        if processes.generations.get(&identity.run_id) != Some(&identity.generation) {
+            return None;
+        }
+        let process = processes.get_mut(&identity.run_id)?;
+        process.transition_to_active();
+        process.begin_turn(turn_id);
+        Some(ProcessTurnOwner {
+            process: identity.clone(),
+            turn_id: turn_id.to_string(),
+            accounting_only: process.turn_accounting_only.clone(),
+            forward: process.turn_forward.clone(),
+        })
+    }
+
+    /// Rotate one live provider's logical owner after an inline host response.
+    /// Launch authority must serialize durable admission with this transition.
+    /// Independent captures share the link; ordinary attachment never links.
+    pub fn rotate_turn_if_owned(
+        &self,
+        owner: &ProcessTurnOwner,
+        turn_id: &str,
+    ) -> Option<ProcessTurnOwner> {
+        let mut processes = self.processes.lock().ok()?;
+        if processes.generations.get(&owner.process.run_id) != Some(&owner.process.generation)
+            || owner.turn_id == turn_id
+            || owner.accounting_only()
+        {
+            return None;
+        }
+        let process = processes.get_mut(&owner.process.run_id)?;
+        if process.current_turn_id() != Some(owner.turn_id.as_str())
+            || !Arc::ptr_eq(&process.turn_forward, &owner.forward)
+        {
+            return None;
+        }
+        let mut forward = owner.forward.lock().ok()?;
+        if forward.next.is_some() || forward.terminal_accepted {
+            return None;
+        }
+        process.begin_turn(turn_id);
+        let next = ProcessTurnOwner {
+            process: owner.process.clone(),
+            turn_id: turn_id.to_string(),
+            accounting_only: process.turn_accounting_only.clone(),
+            forward: process.turn_forward.clone(),
+        };
+        forward.next = Some(next.clone());
+        Some(next)
+    }
+
+    /// Park only the exact turn that established this host wait.
+    pub fn yield_for_host_if_owned(&self, owner: &ProcessTurnOwner) -> bool {
+        let Ok(mut processes) = self.processes.lock() else {
+            return false;
+        };
+        if processes.generations.get(&owner.process.run_id) != Some(&owner.process.generation)
+            || !processes
+                .get(&owner.process.run_id)
+                .is_some_and(|process| process.current_turn_id() == Some(owner.turn_id.as_str()))
+        {
+            return false;
+        }
+        processes
+            .get_mut(&owner.process.run_id)
+            .expect("registration checked under the same lock")
+            .yield_for_host(&owner.turn_id);
+        true
     }
 
     /// Begin a turn on a process.
@@ -1848,9 +2192,31 @@ impl AgentProcessState {
             Ok(mut processes) => processes.remove(run_id),
             Err(_) => return false,
         };
-        let Some(handle) = handle else {
-            return false;
+        handle.is_some_and(Self::stop_removed_handle)
+    }
+
+    /// Roll back a failed launch without stopping a replacement or a newer turn.
+    /// Its captured admission obligation must be durable before calling this.
+    pub fn stop_failed_launch(&self, identity: &ProcessIdentity, turn_id: &str) -> bool {
+        let handle = {
+            let Ok(mut processes) = self.processes.lock() else {
+                return false;
+            };
+            if processes.generations.get(&identity.run_id) != Some(&identity.generation)
+                || processes.get(&identity.run_id).is_none_or(|process| {
+                    process
+                        .current_turn_id()
+                        .is_some_and(|current| current != turn_id)
+                })
+            {
+                return false;
+            }
+            processes.remove(&identity.run_id)
         };
+        handle.is_some_and(Self::stop_removed_handle)
+    }
+
+    fn stop_removed_handle(handle: RunHandle) -> bool {
         // A pooled thread's reader holds the thread too, so dropping the
         // handle alone would not let it go: release it explicitly.
         if let Some(thread) = handle.pooled_thread.as_ref() {
@@ -2256,6 +2622,223 @@ mod tests {
             Some("run-1".to_string())
         );
         assert_eq!(state.find_process_by_session("nonexistent"), None);
+    }
+
+    #[test]
+    fn exact_turn_owner_atomic_attach_and_park_fence_replacement() {
+        let state = state_with_run("run-1");
+        let identity = state.capture_process_identity("run-1").unwrap();
+        let owner = state.begin_turn_if_identity(&identity, "turn-1").unwrap();
+        assert!(state.is_turn_owner_current(&owner));
+        assert_eq!(owner.run_id(), "run-1");
+        assert_eq!(owner.turn_id(), "turn-1");
+        assert!(state.yield_for_host_if_owned(&owner));
+        assert!(state.is_awaiting_host("run-1", Some("turn-1")));
+        let successor = state.begin_turn_if_identity(&identity, "turn-2").unwrap();
+        assert!(!state.yield_for_host_if_owned(&owner));
+        assert!(state.is_turn_owner_current(&successor));
+        {
+            let mut processes = state.processes.lock().unwrap();
+            assert_eq!(
+                processes.get("run-1").unwrap().lifecycle,
+                RunLifecycle::Live
+            );
+            processes.register("run-1".into(), RunHandle::test_handle(Some("sess"), None));
+        }
+        let (activity, flag) = {
+            let processes = state.processes.lock().unwrap();
+            let handle = processes.get("run-1").unwrap();
+            handle.terminal_tool_called.store(true, Ordering::Release);
+            (handle.last_activity, handle.terminal_tool_called.clone())
+        };
+        assert!(state.begin_turn_if_identity(&identity, "stale").is_none());
+        assert!(!state.yield_for_host_if_owned(&successor));
+        let processes = state.processes.lock().unwrap();
+        let handle = processes.get("run-1").unwrap();
+        assert_eq!(handle.occupancy, RunOccupancy::Idle);
+        assert_eq!(handle.lifecycle, RunLifecycle::Starting);
+        assert_eq!(handle.last_activity, activity);
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn exact_turn_owner_rotation_links_only_authorized_successors() {
+        let state = state_with_run("run-1");
+        state.begin_turn("run-1", "first");
+        let original = state.capture_turn_owner("run-1", "first").unwrap();
+        let independent = state.capture_turn_owner("run-1", "first").unwrap();
+        assert!(state.rotate_turn_if_owned(&original, "first").is_none());
+        state.yield_for_host_if_owned(&original);
+        let second = state.rotate_turn_if_owned(&original, "second").unwrap();
+        assert_eq!(independent.resolve_provider_owner(), second);
+        assert_eq!(original.turn_id(), "first");
+        assert!(!state.transition_to_warm_if_owned(&original));
+        assert!(state.rotate_turn_if_owned(&original, "duplicate").is_none());
+        let third = state.rotate_turn_if_owned(&second, "third").unwrap();
+        assert_eq!(original.resolve_provider_owner(), third);
+        assert!(state.retire_turn_accounting_if_owned(&third));
+        assert!(original.resolve_provider_owner().accounting_only());
+        assert!(!original.accounting_only());
+        assert!(state.rotate_turn_if_owned(&third, "retired").is_none());
+        state.begin_turn("run-1", "new-provider");
+        assert_eq!(original.resolve_provider_owner(), third);
+        assert!(state.rotate_turn_if_owned(&third, "unrelated").is_none());
+        let current = state.capture_turn_owner("run-1", "new-provider").unwrap();
+        let (activity, flag) = {
+            let processes = state.processes.lock().unwrap();
+            let process = processes.get("run-1").unwrap();
+            process.terminal_tool_called.store(true, Ordering::Release);
+            (process.last_activity, process.terminal_tool_called.clone())
+        };
+        assert!(state
+            .rotate_turn_if_owned(&second, "unauthorized")
+            .is_none());
+        assert_eq!(
+            state.get_current_turn_id("run-1").as_deref(),
+            Some("new-provider")
+        );
+        assert_eq!(
+            state
+                .processes
+                .lock()
+                .unwrap()
+                .get("run-1")
+                .unwrap()
+                .last_activity,
+            activity
+        );
+        assert!(flag.load(Ordering::Acquire));
+        let mut replacement = RunHandle::test_handle(Some("sess"), None);
+        replacement.begin_turn("new-provider");
+        state
+            .processes
+            .lock()
+            .unwrap()
+            .register("run-1".into(), replacement);
+        assert!(state
+            .rotate_turn_if_owned(&current, "replacement")
+            .is_none());
+        assert_eq!(current.resolve_provider_owner(), current);
+        assert_eq!(
+            state.get_current_turn_id("run-1").as_deref(),
+            Some("new-provider")
+        );
+    }
+
+    #[test]
+    fn exact_turn_owner_untracked_release_requires_busy_registration() {
+        let state = state_with_run("run-1");
+        let identity = state.capture_process_identity("run-1").unwrap();
+        assert!(!state.transition_to_warm_if_untracked(&identity));
+        state.transition_to_active("run-1");
+        assert!(state.is_untracked_busy_for_identity(&identity));
+        assert!(state.transition_to_warm_if_untracked(&identity));
+        assert!(!state.transition_to_warm_if_untracked(&identity));
+        state.begin_turn("run-1", "tracked");
+        assert!(!state.transition_to_warm_if_untracked(&identity));
+        state.yield_for_host("run-1", "tracked");
+        assert!(!state.transition_to_warm_if_untracked(&identity));
+        state
+            .processes
+            .lock()
+            .unwrap()
+            .register("run-1".into(), RunHandle::test_handle(Some("sess"), None));
+        state.transition_to_active("run-1");
+        assert!(!state.is_untracked_busy_for_identity(&identity));
+        assert!(!state.transition_to_warm_if_untracked(&identity));
+        assert_eq!(state.get_occupancy("run-1"), Some(RunOccupancy::Busy));
+    }
+
+    #[test]
+    fn exact_turn_owner_releases_serving_or_awaiting_once() {
+        for awaiting in [false, true] {
+            let state = state_with_run("run-1");
+            assert!(state.capture_turn_owner("run-1", "turn-1").is_none());
+            state.transition_to_active("run-1");
+            assert!(state.capture_turn_owner("run-1", "turn-1").is_none());
+            state.begin_turn("run-1", "turn-1");
+            let owner = state.capture_turn_owner("run-1", "turn-1").unwrap();
+            assert!(state.capture_turn_owner("run-1", "wrong").is_none());
+            if awaiting {
+                state.yield_for_host("run-1", "turn-1");
+            }
+            let flag = {
+                let processes = state.processes.lock().unwrap();
+                processes.get("run-1").unwrap().terminal_tool_called.clone()
+            };
+            flag.store(true, Ordering::Release);
+            assert!(state.is_turn_owner_current(&owner));
+            let reader_owner = state.capture_turn_owner("run-1", "turn-1").unwrap();
+            assert!(!reader_owner.accounting_only());
+            assert!(state.retire_turn_accounting_if_owned(&owner));
+            assert!(reader_owner.accounting_only());
+            assert_eq!(reader_owner, owner);
+            assert!(state.transition_to_warm_if_owned(&owner.clone()));
+            assert!(state.is_warm("run-1"));
+            assert!(!flag.load(Ordering::Acquire));
+            assert!(!state.is_turn_owner_current(&owner));
+            assert!(state.is_process_identity_current(owner.process_identity()));
+            assert!(!state.transition_to_warm_if_owned(&owner));
+            assert!(!state.retire_turn_accounting_if_owned(&owner));
+            state.begin_turn("run-1", "turn-2");
+            let successor = state.capture_turn_owner("run-1", "turn-2").unwrap();
+            assert!(!successor.accounting_only());
+            assert!(reader_owner.accounting_only());
+        }
+    }
+
+    #[test]
+    fn exact_turn_owner_rejects_successors_and_replacements_without_mutation() {
+        for replacement in ["serving", "awaiting", "same-run", "same-session"] {
+            let state = state_with_run("run-1");
+            state.begin_turn("run-1", "turn-1");
+            let owner = state.capture_turn_owner("run-1", "turn-1").unwrap();
+            let identity = state.capture_process_identity("run-1").unwrap();
+            let run_id = if replacement == "same-session" {
+                "run-2"
+            } else {
+                "run-1"
+            };
+            if matches!(replacement, "same-run" | "same-session") {
+                let mut processes = state.processes.lock().unwrap();
+                // Reuse even the turn ID: generation must still fence the old reader.
+                let mut handle = RunHandle::test_handle(Some("sess"), None);
+                handle.begin_turn("turn-1");
+                processes.register(run_id.into(), handle);
+            } else {
+                state.begin_turn(run_id, "turn-2");
+                if replacement == "awaiting" {
+                    state.yield_for_host(run_id, "turn-2");
+                }
+            }
+            let (occupancy, lifecycle, activity, flag) = {
+                let processes = state.processes.lock().unwrap();
+                let handle = processes.get(run_id).unwrap();
+                handle.terminal_tool_called.store(true, Ordering::Release);
+                (
+                    handle.occupancy.clone(),
+                    handle.lifecycle,
+                    handle.last_activity,
+                    handle.terminal_tool_called.clone(),
+                )
+            };
+            assert!(!state.is_turn_owner_current(&owner));
+            assert!(!state.retire_turn_accounting_if_owned(&owner));
+            assert!(!owner.accounting_only());
+            assert!(!state.transition_to_warm_if_owned(&owner));
+            let replaced = matches!(replacement, "same-run" | "same-session");
+            assert_eq!(state.is_process_identity_current(&identity), !replaced);
+            assert_eq!(
+                state.capture_turn_owner_for_identity(&identity).is_none(),
+                replaced
+            );
+            let processes = state.processes.lock().unwrap();
+            let handle = processes.get(run_id).unwrap();
+            assert_eq!(handle.occupancy, occupancy);
+            assert_eq!(handle.lifecycle, lifecycle);
+            assert_eq!(handle.last_activity, activity);
+            assert!(flag.load(Ordering::Acquire));
+        }
     }
 
     #[test]

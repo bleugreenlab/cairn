@@ -89,6 +89,12 @@ pub enum TurnFailureDisposition {
 }
 
 pub struct CodexTurnContext {
+    /// The host already retired this exact provider binding at a durable
+    /// park, operator Stop, or artifact handoff.
+    /// Its terminal report records accounting only, never lifecycle effects.
+    pub accounting_only: bool,
+    pub owner: Option<super::process::ProcessTurnOwner>,
+    pub process_identity: super::process::ProcessIdentity,
     pub failure_disposition: TurnFailureDisposition,
     /// The reader's own explanation of why this turn failed, when it knows one:
     /// the provider's fatal error, as reported for this completion and no

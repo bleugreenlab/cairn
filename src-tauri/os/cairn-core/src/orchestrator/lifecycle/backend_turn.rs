@@ -22,7 +22,7 @@ pub(crate) use cairn_session::agent_process::completion::TurnFailureDisposition;
 pub(crate) use cairn_session::agent_process::completion::CodexTurnContext;
 
 /// Apply a report after the backend has flushed its final transcript chunks.
-/// Usage must be recorded before transitions clear the current Cairn turn ID.
+/// Usage is attributed to the reader's accepted turn, never a moving current pointer.
 pub(crate) fn apply_codex_turn_completion(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
@@ -32,6 +32,145 @@ pub(crate) fn apply_codex_turn_completion(
     completion: SessionTurnCompletion,
     context: CodexTurnContext,
 ) {
+    if context.process_identity.run_id() != run_id {
+        log::error!("Completion identity does not belong to run {run_id}");
+        return;
+    }
+    if context
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner.process_identity() != &context.process_identity)
+    {
+        return;
+    }
+    // Accounting writes only the bound owner's own result row, so a reader
+    // whose registration was retired (host shutdown) still records it; every
+    // lifecycle effect below requires the registration to be current.
+    let retired = || {
+        context.accounting_only
+            || context
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.accounting_only())
+    };
+    if retired() {
+        store_accounting_only_completion(
+            orch,
+            run_db,
+            emitter,
+            run_id,
+            session_id,
+            &completion,
+            &context,
+        );
+        return;
+    }
+    if !orch
+        .process_state
+        .is_process_identity_current(&context.process_identity)
+    {
+        if retired() {
+            store_accounting_only_completion(
+                orch,
+                run_db,
+                emitter,
+                run_id,
+                session_id,
+                &completion,
+                &context,
+            );
+        }
+        return;
+    }
+    if context
+        .owner
+        .as_ref()
+        .is_some_and(|owner| !orch.process_state.is_turn_owner_current(owner))
+        && context.failure_disposition != TurnFailureDisposition::AlreadyHandled
+    {
+        if retired() {
+            store_accounting_only_completion(
+                orch,
+                run_db,
+                emitter,
+                run_id,
+                session_id,
+                &completion,
+                &context,
+            );
+        }
+        return;
+    }
+    let terminal_status = match &completion.outcome {
+        SessionTurnOutcome::Completed
+            if completion.session_lifetime == SessionLifetime::OneShot =>
+        {
+            Some((RunStatus::Exited, None))
+        }
+        SessionTurnOutcome::Failed { .. }
+            if context.failure_disposition != TurnFailureDisposition::AlreadyHandled
+                && (completion.session_lifetime == SessionLifetime::OneShot
+                    || super::finalize::run_fails_terminally(orch, run_id)) =>
+        {
+            Some((RunStatus::Crashed, Some("turn_failed")))
+        }
+        _ => None,
+    };
+    if let Some((run_status, reason)) = terminal_status {
+        let claimed = super::finalize::finalize_owned_completion(
+            orch,
+            &context.process_identity,
+            context.owner.as_ref(),
+            run_status,
+            reason,
+            context.fatal_cause.as_deref(),
+            || {
+                let failed = matches!(&completion.outcome, SessionTurnOutcome::Failed { .. });
+                store_usage_result_event(
+                    orch,
+                    run_db,
+                    emitter,
+                    run_id,
+                    session_id,
+                    context.owner.as_ref().map(|owner| owner.turn_id()),
+                    if failed {
+                        "result:error"
+                    } else {
+                        "result:success"
+                    },
+                    failed,
+                    completion.usage,
+                    !failed,
+                    None,
+                );
+                if context.failure_disposition == TurnFailureDisposition::Unhandled {
+                    if let SessionTurnOutcome::Failed { status } = &completion.outcome {
+                        insert_error_event(
+                            orch,
+                            run_id,
+                            session_id,
+                            &format!("Codex turn failed: {status}"),
+                        );
+                    }
+                }
+            },
+        );
+        // A park/Stop can win launch authority after the initial owner check.
+        // Its shared disposition preserves accounting without finalizing its
+        // successor or publishing completion effects for the retired work.
+        if !claimed && retired() {
+            store_accounting_only_completion(
+                orch,
+                run_db,
+                emitter,
+                run_id,
+                session_id,
+                &completion,
+                &context,
+            );
+        }
+        return;
+    }
     match completion.outcome {
         SessionTurnOutcome::Completed => {
             store_usage_result_event(
@@ -40,6 +179,7 @@ pub(crate) fn apply_codex_turn_completion(
                 emitter,
                 run_id,
                 session_id,
+                context.owner.as_ref().map(|owner| owner.turn_id()),
                 "result:success",
                 false,
                 completion.usage,
@@ -47,21 +187,17 @@ pub(crate) fn apply_codex_turn_completion(
                 None,
             );
 
-            if completion.session_lifetime == SessionLifetime::OneShot {
-                // The pooled thread is abandoned after this turn. Finalize
-                // explicitly — driving `on_call_run_finalized` (slot release,
-                // workflow journal, parent resume) — rather than warming a
-                // process that no longer maps 1:1 to this run.
-                super::transition_to_warm_state(orch, run_id, None);
-                super::finalize_run(orch, run_id, RunStatus::Exited);
-                return;
-            }
-
             // A delegated task's persistent session keeps its run live across
             // turns, exactly like a top-level run: the re-prompt, follow-up and
             // wait-resolved turns it takes next all start on this run.
-            super::transition_to_warm_state(orch, run_id, None);
-            emit_codex_run_turn_completed(emitter, run_id);
+            if super::finalize::transition_owned_completion_to_warm(
+                orch,
+                &context.process_identity,
+                context.owner.as_ref(),
+                Some((crate::models::TurnState::Complete, None)),
+            ) {
+                emit_codex_run_turn_completed(emitter, run_id);
+            }
         }
         SessionTurnOutcome::Interrupted(interruption) => {
             // Stored even without usage: it is the ledger's record of who
@@ -72,13 +208,20 @@ pub(crate) fn apply_codex_turn_completion(
                 emitter,
                 run_id,
                 session_id,
+                context.owner.as_ref().map(|owner| owner.turn_id()),
                 "result:interrupted",
                 false,
                 completion.usage,
                 true,
                 Some(interruption_record(&interruption)),
             );
-            handle_codex_interrupted_turn(orch, emitter, run_id, interruption.cause.as_ref());
+            handle_codex_interrupted_turn(
+                orch,
+                emitter,
+                run_id,
+                interruption.cause.as_ref(),
+                &context,
+            );
         }
         SessionTurnOutcome::Failed { status } => {
             store_usage_result_event(
@@ -87,6 +230,7 @@ pub(crate) fn apply_codex_turn_completion(
                 emitter,
                 run_id,
                 session_id,
+                context.owner.as_ref().map(|owner| owner.turn_id()),
                 "result:error",
                 true,
                 completion.usage,
@@ -110,22 +254,74 @@ pub(crate) fn apply_codex_turn_completion(
             // parent waiting on it hears the failure instead of a stranded child.
             if completion.session_lifetime == SessionLifetime::Persistent
                 && !super::finalize::run_fails_terminally(orch, run_id)
-                && super::settle_provider_turn_failure(orch, run_id)
             {
+                if !super::finalize::release_owned_completion(
+                    orch,
+                    &context.process_identity,
+                    context.owner.as_ref(),
+                    Some((
+                        crate::models::TurnState::Interrupted,
+                        Some(TurnEndReason::ProviderFailure),
+                    )),
+                ) {
+                    if context
+                        .owner
+                        .as_ref()
+                        .is_some_and(|owner| orch.process_state.is_turn_owner_current(owner))
+                    {
+                        log::warn!("Provider-failed run {run_id} retains its accepted turn after failed settlement; the provider-terminal watchdog lease is disarmed, so operator Stop may be required");
+                    }
+                    return;
+                }
+                if let Some(job_id) = super::common::job_id_for_run(orch, run_id) {
+                    if let Err(error) = crate::execution::advancement::recompute_job(orch, &job_id)
+                    {
+                        log::error!("Failed to recompute provider-failed job {job_id}: {error}");
+                    }
+                }
                 emit_codex_run_turn_completed(emitter, run_id);
                 if let Err(error) =
                     crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id)
                 {
                     log::warn!("provider-failure queued delivery flush failed: {error}");
                 }
-                return;
             }
-            // A genuine turn failure: finalize task-aware so a delegated child
-            // fails terminally (its parent resumes) rather than stranding it,
-            // told why when the reader or host knew.
-            super::fail_run_with_cause(orch, run_id, "turn_failed", context.fatal_cause.as_deref());
+            // Terminal failures were claimed before publishing their result above.
         }
     }
+}
+
+fn store_accounting_only_completion(
+    orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
+    emitter: &Arc<dyn EventEmitter>,
+    run_id: &str,
+    session_id: Option<&str>,
+    completion: &SessionTurnCompletion,
+    context: &CodexTurnContext,
+) {
+    let (event_type, failed, raw) = match &completion.outcome {
+        SessionTurnOutcome::Completed => ("result:success", false, None),
+        SessionTurnOutcome::Interrupted(interruption) => (
+            "result:interrupted",
+            false,
+            Some(interruption_record(interruption)),
+        ),
+        SessionTurnOutcome::Failed { .. } => ("result:error", true, None),
+    };
+    store_usage_result_event(
+        orch,
+        run_db,
+        emitter,
+        run_id,
+        session_id,
+        context.owner.as_ref().map(|owner| owner.turn_id()),
+        event_type,
+        failed,
+        completion.usage,
+        true,
+        raw,
+    );
 }
 
 /// The `result:interrupted` event's record of who stopped the turn, so the
@@ -199,35 +395,65 @@ fn handle_codex_interrupted_turn(
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     cause: Option<&InterruptCause>,
+    context: &CodexTurnContext,
 ) {
     let settlement = interrupt_settlement(terminal_tool_called_for_run(orch, run_id), cause);
-    let warm_reason = match settlement {
-        InterruptSettlement::Teardown => {
-            log::info!(
-                "Codex turn on run {} aborted by its teardown; the teardown settles it",
-                &run_id[..run_id.len().min(8)]
-            );
-            return;
+    let outcome = match settlement {
+        InterruptSettlement::Teardown => return,
+        InterruptSettlement::Handoff => Some((
+            crate::models::TurnState::Complete,
+            Some(TurnEndReason::ArtifactHandoff),
+        )),
+        InterruptSettlement::AlreadySettled
+            if matches!(cause, Some(InterruptCause::OperatorStop)) =>
+        {
+            match context
+                .owner
+                .as_ref()
+                .map(|owner| super::common::turn_state(orch, owner.turn_id()))
+            {
+                None => None,
+                Some(state) => match state.as_deref() {
+                    Some("running") => Some((
+                        crate::models::TurnState::Interrupted,
+                        Some(TurnEndReason::UserStop),
+                    )),
+                    Some("pending" | "yielded") => Some((
+                        crate::models::TurnState::Cancelled,
+                        Some(TurnEndReason::UserStop),
+                    )),
+                    Some("complete" | "failed" | "cancelled" | "interrupted") => None,
+                    _ => {
+                        log::warn!("Cannot read exact stopped turn for run {run_id}; retaining its occupancy");
+                        return;
+                    }
+                },
+            }
         }
-        InterruptSettlement::Handoff => Some(TurnEndReason::ArtifactHandoff),
         InterruptSettlement::AlreadySettled => None,
         InterruptSettlement::Interrupted(reason) => {
-            // `interrupt_turn` is the sole writer of `interrupted`; after it
-            // the warm transition's Complete is refused by the terminal row.
-            if let Some(turn_id) = orch.process_state.get_current_turn_id(run_id) {
-                if let Err(error) =
-                    super::common::interrupt_turn(orch, &turn_id, Some(reason.clone()))
-                {
-                    log::info!(
-                        "Interrupted Codex turn {turn_id} was already settled; leaving it ({reason}): {error}"
-                    );
-                }
-            }
-            None
+            Some((crate::models::TurnState::Interrupted, Some(reason)))
         }
     };
-    super::transition_to_warm_state(orch, run_id, warm_reason);
-    emit_codex_run_turn_completed(emitter, run_id);
+    if matches!(cause, Some(InterruptCause::OperatorStop)) {
+        if super::finalize::release_owned_completion(
+            orch,
+            &context.process_identity,
+            context.owner.as_ref(),
+            outcome,
+        ) {
+            super::stop::publish_retained_turn_idle(orch, run_id);
+        }
+        return;
+    }
+    if super::finalize::transition_owned_completion_to_warm(
+        orch,
+        &context.process_identity,
+        context.owner.as_ref(),
+        outcome,
+    ) {
+        emit_codex_run_turn_completed(emitter, run_id);
+    }
 }
 
 #[cfg(test)]

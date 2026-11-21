@@ -553,7 +553,7 @@ async fn user_stop_results(
                 parent_tool_use_id: call.parent_tool_use_id,
                 result: USER_STOP_TOOL_RESULT.to_string(),
                 is_error: true,
-                reason: "user_stop",
+                reason: USER_STOP_REASON,
                 effect: None,
                 exit_reason: None,
                 seal_report: None,
@@ -584,7 +584,7 @@ async fn user_stop_results(
                 parent_tool_use_id: call.parent_tool_use_id,
                 result,
                 is_error: false,
-                reason: "user_stop_after_write_effect",
+                reason: USER_STOP_AFTER_WRITE_EFFECT_REASON,
                 effect: None,
                 exit_reason: None,
                 seal_report: None,
@@ -706,6 +706,8 @@ pub(crate) const HOST_RESTART_REASON: &str = "host_restart";
 
 /// `raw.reason` of a result a process teardown's settlement wrote.
 pub(crate) const PROCESS_LOST_REASON: &str = "process_lost";
+pub(crate) const USER_STOP_REASON: &str = "user_stop";
+pub(crate) const USER_STOP_AFTER_WRITE_EFFECT_REASON: &str = "user_stop_after_write_effect";
 
 fn pending_tool_results(
     orch: &Orchestrator,
@@ -756,9 +758,26 @@ pub(crate) fn settle_unanswered_calls(
     turn_id: &str,
     cause: InterruptCause,
 ) -> Result<usize, String> {
+    let changes = settle_unanswered_calls_unpublished(orch, run_id, turn_id, cause)?;
+    let inserted = changes.len();
+    for change in changes {
+        let _ = orch.services.emitter.emit("db-change", change);
+    }
+    Ok(inserted)
+}
+
+/// Persist all answers before any notification can launch a successor.
+pub(crate) fn settle_unanswered_calls_unpublished(
+    orch: &Orchestrator,
+    run_id: &str,
+    turn_id: &str,
+    cause: InterruptCause,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lock = orch.call_settlement_lock(run_id, turn_id);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let pending = pending_tool_results(orch, run_id, turn_id, cause)?;
     if pending.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     let owning = run_db_blocking({
@@ -771,7 +790,7 @@ pub(crate) fn settle_unanswered_calls(
         }
     })?;
     let now = chrono::Utc::now().timestamp() as i32;
-    let mut inserted = 0;
+    let mut changes = Vec::new();
     for pending_result in pending {
         let event_id = ids::mint_child(run_id);
         let mut raw = serde_json::json!({ "synthetic": true, "reason": pending_result.reason });
@@ -817,17 +836,13 @@ pub(crate) fn settle_unanswered_calls(
             cost_usd: None,
         };
         if stream_store::insert_event(owning.clone(), event_insert)? {
-            inserted += 1;
             let scope = crate::notify::event_run_scope(orch.db.local.clone(), run_id);
-            let _ = orch.services.emitter.emit(
-                "db-change",
-                crate::notify::event_db_change_scoped(
-                    run_id,
-                    pending_result.session_id.as_deref(),
-                    &scope,
-                    "insert",
-                ),
-            );
+            changes.push(crate::notify::event_db_change_scoped(
+                run_id,
+                pending_result.session_id.as_deref(),
+                &scope,
+                "insert",
+            ));
         }
         if let Some(report) = pending_result.seal_report {
             let local = orch.db.local.clone();
@@ -838,7 +853,7 @@ pub(crate) fn settle_unanswered_calls(
             })?;
         }
     }
-    Ok(inserted)
+    Ok(changes)
 }
 
 /// Answer the open calls of `turn_id`, which the end of run `run_id`'s agent

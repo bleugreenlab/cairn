@@ -195,6 +195,30 @@ mod codex_goal_admission_tests {
             1,
             "the provider notification binds to the launch turn instead of entering continuation admission"
         );
+        for (run, session, job) in [
+            ("r", "wrong-session", "j"),
+            ("r", "s", "wrong-job"),
+            ("wrong-run", "s", "j"),
+        ] {
+            assert!(admit_codex_goal_turn(
+                &orch,
+                db.clone(),
+                run,
+                session,
+                job,
+                "provider-mismatch",
+                Some("t0"),
+            )
+            .is_err());
+        }
+        assert_eq!(event_count(&db, "system:codex_goal_turn_started").await, 1);
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM turns", ())
+                .await
+                .unwrap(),
+            Some(1),
+            "identity rejection must neither bind a marker nor mint a turn"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -309,12 +333,34 @@ mod codex_goal_admission_tests {
         assert_eq!(
             db.query_opt_text(
                 "SELECT predecessor_id FROM turns WHERE id=?1",
-                (successor_id,),
+                (successor_id.clone(),),
             )
             .await
             .unwrap()
             .as_deref(),
             Some("t0")
+        );
+        for current in [None, Some(successor_id.as_str())] {
+            assert_eq!(
+                admit_codex_goal_turn(
+                    &orch,
+                    db.clone(),
+                    "r",
+                    "s",
+                    "j",
+                    "provider-after-complete",
+                    current,
+                )
+                .unwrap(),
+                CodexGoalTurnAdmission::Admitted(successor_id.clone())
+            );
+        }
+        assert_eq!(event_count(&db, "system:codex_goal_turn_started").await, 1);
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM turns WHERE predecessor_id='t0'", ())
+                .await
+                .unwrap(),
+            Some(1)
         );
     }
 }
@@ -1463,12 +1509,15 @@ pub(super) fn start_prepared_turn_and_publish(
     orch: &Orchestrator,
     turn_id: &str,
     launch_run_id: &str,
-    run_id: &str,
-) -> Result<(), String> {
+    identity: &crate::agent_process::process::ProcessIdentity,
+) -> Result<crate::agent_process::process::ProcessTurnOwner, String> {
+    let run_id = identity.run_id();
     start_prepared_turn(orch, turn_id, launch_run_id, run_id)?;
     orch.process_state
-        .set_current_turn_id(run_id, Some(turn_id));
-    Ok(())
+        .begin_turn_if_identity(identity, turn_id)
+        .ok_or_else(|| {
+            format!("process {run_id} disappeared or was replaced during prepared turn attachment")
+        })
 }
 
 /// Every identity field on which a stored `record` disagrees with the active

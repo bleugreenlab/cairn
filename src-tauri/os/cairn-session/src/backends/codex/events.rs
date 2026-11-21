@@ -253,6 +253,7 @@ pub fn store_usage_result_event(
     host: &CodexRuntime,
     run_id: &str,
     session_id: Option<&str>,
+    turn_id: Option<&str>,
     event_type: &str,
     is_error: bool,
     counts: TokenCounts,
@@ -283,8 +284,20 @@ pub fn store_usage_result_event(
         queued_message_id: None,
         raw,
     };
-    let event_id = ids::mint_child(run_id);
-    store_event_with_id(host, run_id, session_id, &event_id, &event, counts);
+    // A tracked Cairn turn has one provider terminal result, regardless of
+    // terminal notification kind or replay after the early handoff.
+    let event_id = turn_id
+        .map(|id| format!("{id}:codex-result"))
+        .unwrap_or_else(|| ids::mint_child(run_id));
+    store_event_with_id_for_turn(
+        host,
+        run_id,
+        session_id,
+        &event_id,
+        &event,
+        counts,
+        Some(turn_id),
+    );
 }
 
 pub fn emit_codex_run_turn_completed(
@@ -399,7 +412,7 @@ fn store_event_with_id_for_turn(
     event_id: &str,
     event: &TranscriptEvent,
     counts: TokenCounts,
-    explicit_turn_id: Option<&str>,
+    explicit_turn_id: Option<Option<&str>>,
 ) {
     let now = chrono::Utc::now().timestamp() as i32;
     // Transcript crossing (CAIRN-3822). Codex's discrete event path reaches the
@@ -407,9 +420,12 @@ fn store_event_with_id_for_turn(
     // streaming finalizer, so it needs the guard in its own right.
     let data = event.clone().observed().to_event_json();
 
-    let current_turn = explicit_turn_id
-        .map(str::to_string)
-        .or_else(|| host.process_state.get_current_turn_id(run_id));
+    // A completion carries its accepted owner, including an explicitly untracked
+    // turn. It must never acquire attribution from a successor's current pointer.
+    let current_turn = match explicit_turn_id {
+        Some(turn_id) => turn_id.map(str::to_string),
+        None => host.process_state.get_current_turn_id(run_id),
+    };
     if host
         .host
         .transcripts()

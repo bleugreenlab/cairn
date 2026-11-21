@@ -542,6 +542,10 @@ impl AgentBackend for CodexBackend {
         let emitter = orch.services.emitter.clone();
         // Use the Cairn UUID for event storage, not the Codex thread_id
         let event_session_id = session_id;
+        let reader_identity = orch
+            .process_state
+            .capture_process_identity(&run_id)
+            .ok_or_else(|| "Codex reader lost its process before spawning".to_string())?;
         thread::spawn(move || {
             CodexRuntime::reader_thread_app_server(
                 &reader_host,
@@ -553,6 +557,7 @@ impl AgentBackend for CodexBackend {
                 "codex".to_string(),
                 run_db,
                 false,
+                reader_identity,
             );
         });
         unclaimed.claim();
@@ -1131,6 +1136,10 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
         None,
         Some(cleanup),
     );
+    let reader_identity = orch
+        .process_state
+        .capture_process_identity(&run_id)
+        .ok_or_else(|| "Codex pooled reader lost its process before spawning".to_string())?;
     thread::spawn(move || {
         CodexRuntime::reader_thread_app_server(
             &reader_host,
@@ -1142,6 +1151,7 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
             "codex".to_string(),
             run_db,
             true,
+            reader_identity,
         );
     });
 

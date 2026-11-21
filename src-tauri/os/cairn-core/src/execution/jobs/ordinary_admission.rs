@@ -478,7 +478,7 @@ pub(super) fn enqueue_or_start(
             defer_stateless_start(orch, prepared, identity_override);
             return Ok(false);
         }
-        return start_stateless_now(orch, prepared, identity_override);
+        return start_stateless_now(orch, prepared, identity_override, &mut None);
     }
 
     let team_id = match cairn_common::ids::parse_route_scope(&prepared.project_id)
@@ -697,6 +697,7 @@ fn start_stateless_now(
     orch: &Orchestrator,
     prepared: &mut PreparedJob,
     identity_override: Option<crate::identity::UserIdentity>,
+    registration: &mut Option<crate::agent_process::process::ProcessIdentity>,
 ) -> Result<bool, String> {
     // Cold continuation drops its launch guard before this handoff; initial
     // starts and child tasks carry no guard. Deferred starts enter here only
@@ -765,12 +766,18 @@ fn start_stateless_now(
         }
         return Ok(false);
     }
-    super::start_ordinary_session_now(orch, prepared, identity_override)?;
+    let started = super::start_ordinary_session_now(orch, prepared, identity_override);
+    *registration = orch
+        .process_state
+        .capture_process_identity(&prepared.run_id);
+    started?;
     super::start_prepared_turn_and_publish(
         orch,
         &prepared.turn_id,
         &prepared.run_id,
-        &prepared.run_id,
+        registration.as_ref().ok_or_else(|| {
+            "stateless process disappeared before prepared turn attachment".to_string()
+        })?,
     )?;
     Ok(true)
 }
@@ -817,8 +824,14 @@ fn defer_stateless_start(
         let turn_id = deferred.turn_id.clone();
         // The locked handoff revalidates durable session, run and turn facts;
         // missing or unreadable facts never permit a provider prompt.
-        if let Err(error) = start_stateless_now(&orch, &mut deferred, identity_override) {
+        let mut registration = None;
+        if let Err(error) =
+            start_stateless_now(&orch, &mut deferred, identity_override, &mut registration)
+        {
             log::warn!("deferred stateless launch of run {run_id} failed to start: {error}");
+            if let Some(identity) = registration.as_ref() {
+                orch.process_state.stop_failed_launch(identity, &turn_id);
+            }
             terminalize_failed_start(
                 &orch,
                 &run_id,
@@ -826,8 +839,9 @@ fn defer_stateless_start(
                 &deferred.job_id,
                 &turn_id,
                 &error,
+                TurnDelivery::Unknown,
+                deferred.launch_claim.take(),
             );
-            orch.process_state.stop_and_remove(&run_id);
         }
         // Dropping `deferred` releases its launch claim, now that the process
         // registered or the start failed.
@@ -1171,31 +1185,52 @@ fn start_leased(
     let session_id = snapshot.session_id.clone();
     let job_id = snapshot.job_id.clone();
     let turn_id = snapshot.turn_id.clone();
-    let result = start_leased_inner(orch, &lease, snapshot);
+    let mut registration = None;
+    let mut delivery = TurnDelivery::Unknown;
+    let result = start_leased_inner(orch, &lease, snapshot, &mut registration, &mut delivery);
     if let Err(error) = &result {
-        terminalize_failed_start(orch, &run_id, &session_id, &job_id, &turn_id, error);
-        // Once a generation has been leased, every restoration and start error
-        // must close that exact generation, and capacity may only be returned
-        // once no process holds it. A claim still pending never reached a
-        // process. A claim that registration moved onto a live handle means a
-        // dedicated process is resident: release-and-stop consumes that claim
-        // exactly once and finishes its generation, so the lease must not also
-        // be finished here.
-        let _ = orch.process_state.cancel_pending_admission_claim(&run_id);
-        if orch.process_state.admission_claim(&run_id).is_some() {
-            if !crate::orchestrator::lifecycle::release_and_stop_process(orch, &run_id) {
-                log::error!(
-                    "promoted run {run_id} failed after registration and its claim release is pending retry"
-                );
-            }
-        } else {
-            orch.process_state.stop_and_remove(&run_id);
-            if let Err(finish_error) = finish(orch, &lease, "failed", Some(error)) {
+        let launch_lock = orch.job_launch_lock(&job_id);
+        let launch_guard = launch_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        orch.process_state.revoke_pending_admission_claim(
+            &run_id,
+            lease.request_id(),
+            lease.generation(),
+        );
+        let newer_turn = registration.as_ref().is_some_and(|identity| {
+            orch.process_state
+                .capture_turn_owner_for_identity(identity)
+                .is_some_and(|owner| owner.turn_id() != turn_id)
+        });
+        if !newer_turn {
+            // Journal only the lease this launch held. Never take a claim from
+            // the current run-id pointer: it may belong to a replacement.
+            let state = if registration.is_some() {
+                "released"
+            } else {
+                "failed"
+            };
+            if let Err(finish_error) = finish(orch, &lease, state, Some(error)) {
                 return Err(format!(
                     "{error}; additionally failed to terminalize admission lease: {finish_error}"
                 ));
             }
+            if let Some(identity) = registration.as_ref() {
+                orch.process_state.stop_failed_launch(identity, &turn_id);
+            }
         }
+        drop(launch_guard);
+        terminalize_failed_start(
+            orch,
+            &run_id,
+            &session_id,
+            &job_id,
+            &turn_id,
+            error,
+            delivery,
+            None,
+        );
     }
     result
 }
@@ -1205,6 +1240,7 @@ fn start_leased(
 /// nothing upstream will see this error: return the turn's attention delivery
 /// and terminalize the run and job exactly as a direct start failure would, or
 /// the job stays `running` forever.
+#[allow(clippy::too_many_arguments)]
 fn terminalize_failed_start(
     orch: &Orchestrator,
     run_id: &str,
@@ -1212,9 +1248,17 @@ fn terminalize_failed_start(
     job_id: &str,
     turn_id: &str,
     error: &str,
+    delivery: TurnDelivery,
+    launch_claim: Option<crate::orchestrator::JobLaunchClaim>,
 ) {
-    return_undelivered_attention(orch, run_id, turn_id, TurnDelivery::Unknown);
-    crate::orchestrator::session::insert_error_event(orch, run_id, Some(session_id), error);
+    let launch_lock = orch.job_launch_lock(job_id);
+    let launch_guard = launch_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    return_undelivered_attention(orch, run_id, turn_id, delivery);
+    // Process cleanup already removed our registration. Any remaining handle
+    // belongs to a replacement or a successor and owns the shared run row.
+    let preserve_run = orch.process_state.has_process(run_id) != Some(false);
     let failed = run_db({
         let dbs = orch.db.clone();
         let run_id = run_id.to_string();
@@ -1225,29 +1269,65 @@ fn terminalize_failed_start(
         }
     })
     .and_then(|owning| {
-        let orch = orch.clone();
-        let job_id = job_id.to_string();
         let error = error.to_string();
         let turn_id = turn_id.to_string();
         let run_id = run_id.to_string();
         run_db(async move {
-            if crate::orchestrator::wakes::restore_provider_hold_after_admission_failure(
-                &orch, &owning, &turn_id, chrono::Utc::now().timestamp(),
-            ).await? {
-                // The process launch failed, but its provider-held work did
-                // not. Record the physical failure without a work verdict.
-                owning.execute(
-                    "UPDATE runs SET status='crashed', error_message=?1, exit_reason='session_start_failed', updated_at=?2 WHERE id=?3",
-                    cairn_db::turso::params![error, chrono::Utc::now().timestamp(), run_id],
-                ).await.map_err(|error| error.to_string())?;
-            } else {
-                super::mark_job_start_failed(&orch, &owning, &job_id, &error, false).await;
-            }
-            Ok::<(), String>(())
+            let now = chrono::Utc::now().timestamp();
+            let held = !preserve_run
+                && crate::orchestrator::wakes::restore_provider_hold_after_admission_failure(
+                    &owning, &turn_id, now,
+                ).await?;
+            let published_turn_id = turn_id.clone();
+            owning.write(move |conn| {
+                let error = error.clone();
+                let turn_id = turn_id.clone();
+                let run_id = run_id.clone();
+                Box::pin(async move {
+                    if !held {
+                        conn.execute(
+                            "UPDATE turns SET state='failed', failure_reason=?1, ended_at=?2, updated_at=?2
+                             WHERE id=?3 AND run_id=?4 AND
+                             (state IN ('pending','running') OR (state='cancelled' AND end_reason='launch_refused'))",
+                            cairn_db::turso::params![error.as_str(), now, turn_id.as_str(), run_id.as_str()],
+                        ).await?;
+                    }
+                    if !preserve_run {
+                        conn.execute(
+                            "UPDATE runs SET status='crashed',error_message=?1,exit_reason='session_start_failed',
+                             exited_at=?2,updated_at=?2 WHERE id=?3 AND status IN ('starting','live')
+                             AND NOT EXISTS (SELECT 1 FROM turns WHERE run_id=?3 AND id!=?4 AND state IN ('pending','running'))",
+                            cairn_db::turso::params![error.as_str(), now, run_id.as_str(), turn_id.as_str()],
+                        ).await?;
+                    }
+                    Ok(())
+                })
+            }).await.map_err(|error| error.to_string())?;
+            let change = crate::notify::turn_db_change_for_id(&owning, &published_turn_id, "update").await;
+            Ok::<_, String>(change)
         })
     });
-    if let Err(mark_error) = failed {
-        log::error!("could not mark promoted job {job_id} start failed: {mark_error}");
+    // Keep the deferred launch protected from reaping until its attention and
+    // durable lifecycle are settled. Release under the mutex before a successor
+    // can acquire launch authority, and before callbacks can launch one.
+    drop(launch_claim);
+    drop(launch_guard);
+    crate::orchestrator::session::insert_error_event(orch, run_id, Some(session_id), error);
+    match failed {
+        Ok(change) => {
+            let _ = orch.services.emitter.emit("db-change", change);
+            if let Err(error) = crate::execution::advancement::recompute_job(orch, job_id) {
+                log::error!("could not recompute job {job_id} after launch failure: {error}");
+            }
+            super::wake_waiters_after_start_failure(
+                orch,
+                job_id,
+                (!preserve_run).then_some(run_id),
+            );
+        }
+        Err(mark_error) => {
+            log::error!("could not mark promoted job {job_id} start failed: {mark_error}");
+        }
     }
 }
 
@@ -1255,6 +1335,8 @@ fn start_leased_inner(
     orch: &Orchestrator,
     lease: &OrdinaryLease,
     snapshot: crate::storage::PreparedOrdinaryLaunch,
+    registration: &mut Option<crate::agent_process::process::ProcessIdentity>,
+    delivery: &mut TurnDelivery,
 ) -> Result<bool, String> {
     let launch_lock = orch.job_launch_lock(&snapshot.job_id);
     let launch_guard = launch_lock
@@ -1457,17 +1539,16 @@ fn start_leased_inner(
         });
         apply_prepared_identity_metadata(identity, metadata);
     }
-    orch.process_state.prepare_admission_claim(
-        snapshot.run_id.clone(),
-        crate::agent_process::process::ProcessAdmissionClaim {
-            request_id: lease.request_id().to_string(),
-            workspace_key: lease.workspace_key(),
-            launch_key: lease.launch_key().to_string(),
-            owner: lease.owner()?,
-            generation: lease.generation(),
-            team_workspace_id: lease.team_workspace_id(),
-        },
-    );
+    let admission_claim = crate::agent_process::process::ProcessAdmissionClaim {
+        request_id: lease.request_id().to_string(),
+        workspace_key: lease.workspace_key(),
+        launch_key: lease.launch_key().to_string(),
+        owner: lease.owner()?,
+        generation: lease.generation(),
+        team_workspace_id: lease.team_workspace_id(),
+    };
+    orch.process_state
+        .prepare_admission_claim(snapshot.run_id.clone(), admission_claim.clone());
     // Both lanes renew their lease from here, before the backend call: a
     // launch can wait there for minutes (a managed CLI's first install), and
     // its lease must outlive that wait. Renewal stops once the admission claim
@@ -1505,15 +1586,28 @@ fn start_leased_inner(
         Some(&snapshot.execution_id),
         identity_override,
     );
+    *registration = orch
+        .process_state
+        .capture_admitted_process_identity(&snapshot.run_id, &admission_claim);
     drop(claim);
     match result {
         Ok(()) => {
+            let mut pending_turn = super::lifecycle::PendingLaunchTurnGuard::for_turn(
+                orch,
+                owning.clone(),
+                &snapshot.turn_id,
+            );
+            *delivery = TurnDelivery::NeverSent;
             super::start_prepared_turn_and_publish(
                 orch,
                 &snapshot.turn_id,
                 &snapshot.run_id,
-                &snapshot.run_id,
+                registration.as_ref().ok_or_else(|| {
+                    "admitted process disappeared before prepared turn attachment".to_string()
+                })?,
             )?;
+            pending_turn.adopted();
+            *delivery = TurnDelivery::Unknown;
             crate::orchestrator::lifecycle::notify_watchdog_successor_started(
                 owning,
                 &snapshot.run_id,
@@ -1777,10 +1871,10 @@ fn finish(
                 generation: request.lease_generation,
                 team_workspace_id: lease.team_workspace_id(),
             },
-            if state == "cancelled" {
-                crate::runtime_admission::AdmissionTerminalAction::Cancelled
-            } else {
-                crate::runtime_admission::AdmissionTerminalAction::Failed
+            match state {
+                "cancelled" => crate::runtime_admission::AdmissionTerminalAction::Cancelled,
+                "released" => crate::runtime_admission::AdmissionTerminalAction::Released,
+                _ => crate::runtime_admission::AdmissionTerminalAction::Failed,
             },
             detail,
         );
@@ -2397,6 +2491,44 @@ mod tests {
         );
     }
 
+    struct OnPreparedTurnPublication {
+        callback: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        launch_lock: Arc<Mutex<()>>,
+        injected: Arc<std::sync::atomic::AtomicBool>,
+        diagnostics: Arc<std::sync::atomic::AtomicUsize>,
+        projections: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::services::EventEmitter for OnPreparedTurnPublication {
+        fn emit(&self, event: &str, payload: serde_json::Value) -> Result<(), String> {
+            if event == "db-change" && payload["table"] == "turns" && payload["turnId"] == "t" {
+                let callback = self.callback.lock().unwrap().take();
+                if let Some(callback) = callback {
+                    callback();
+                }
+            }
+            if event == "db-change" && self.injected.load(std::sync::atomic::Ordering::SeqCst) {
+                let counter = match payload["table"].as_str() {
+                    Some("events") => Some(&self.diagnostics),
+                    Some("jobs") => Some(&self.projections),
+                    _ => None,
+                };
+                if let Some(counter) = counter {
+                    assert!(
+                        self.launch_lock.try_lock().is_ok(),
+                        "failure publication retained launch authority: {payload}"
+                    );
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            Ok(())
+        }
+
+        fn emit_empty(&self, event: &str) -> Result<(), String> {
+            self.emit(event, serde_json::Value::Null)
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn post_registration_start_failure_stops_the_process_and_releases_its_claim_once() {
         let (orch, request, snapshot) =
@@ -2420,6 +2552,203 @@ mod tests {
             .unwrap();
         assert_eq!(request.state, "released");
         assert_eq!(request.lease_generation, 1);
+        assert_eq!(
+            text(&orch, "SELECT status FROM runs WHERE id='cold'").await,
+            "crashed"
+        );
+        assert_eq!(
+            text(&orch, "SELECT state FROM turns WHERE id='t'").await,
+            "failed"
+        );
+        assert_eq!(
+            text(
+                &orch,
+                "SELECT CAST(COUNT(*) AS TEXT) FROM turns WHERE job_id='j'"
+            )
+            .await,
+            "1"
+        );
+
+        for (replacement, provider_hold) in [(false, false), (true, false), (false, true)] {
+            let (mut orch, request, snapshot) = lifecycle_fixture(&format!(
+                "ordinary-cold-attach-replacement-{replacement}-hold-{provider_hold}.db"
+            ))
+            .await;
+            if provider_hold {
+                // Execution-backed projections require a readable recipe. Keep
+                // this fixture's unrelated launch cases snapshot-free.
+                let execution_snapshot = serde_json::json!({
+                    "recipe": {
+                        "id": "r", "name": "R", "description": null, "trigger": "manual",
+                        "nodes": [
+                            {"id": "builder", "nodeType": "agent", "name": "Builder", "position": {"x": 0.0, "y": 0.0}}
+                        ],
+                        "edges": []
+                    },
+                    "agents": {}, "skills": {},
+                    "triggerContext": {"issueId": "i", "projectId": "p", "triggerType": "manual"},
+                    "delegatedPackets": [], "createdAt": 1
+                }).to_string();
+                orch.db
+                    .local
+                    .execute(
+                        "UPDATE executions SET snapshot=?1 WHERE id='e'",
+                        [execution_snapshot],
+                    )
+                    .await
+                    .unwrap();
+                orch.db.local.execute_script(
+                    "INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,yield_reason,created_at,updated_at)
+                       VALUES('held','s','cold','j',0,'yielded','initial','provider_limit',0,0);
+                     UPDATE turns SET start_reason='wait_resolved',predecessor_id='held' WHERE id='t';
+                     UPDATE jobs SET current_turn_id='t' WHERE id='j';
+                     INSERT INTO provider_limit_holds(id,job_id,run_id,turn_id,backend,boundary_source,kind,state,created_at,updated_at)
+                       VALUES('hold','j','cold','held','claude','result_text','yield','resolved',1,1);",
+                ).await.unwrap();
+            }
+            brief(&orch, "cold", "t", "j").await;
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let injected = fired.clone();
+            let callback_orch = orch.clone();
+            let diagnostics = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let projections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            orch.services = Arc::new(TestServicesBuilder::new().with_emitter(
+                OnPreparedTurnPublication {
+                    launch_lock: orch.job_launch_lock("j"),
+                    injected: fired.clone(),
+                    diagnostics: diagnostics.clone(),
+                    projections: projections.clone(),
+                    callback: Mutex::new(Some(Box::new(move || {
+                    // Publication is between the durable start and the atomic
+                    // attachment, after the launch captured its registration.
+                    let db = callback_orch.db.local.clone();
+                    assert_eq!(run_db(async move {
+                        db.query_opt_text("SELECT state FROM turns WHERE id='t'", ())
+                            .await.map_err(|error| error.to_string())
+                    }).unwrap().as_deref(), Some("running"));
+                    if provider_hold {
+                        // Force an observable projection edge at rollback:
+                        // the restored yielded head must repair this stale cache.
+                        let db = callback_orch.db.local.clone();
+                        run_db(async move {
+                            db.execute("UPDATE jobs SET status='idle' WHERE id='j'", ())
+                                .await.map_err(|error| error.to_string())
+                        }).unwrap();
+                    }
+                    injected.store(true, std::sync::atomic::Ordering::SeqCst);
+                    callback_orch.process_state.stop_and_remove("cold");
+                    if replacement {
+                        let db = callback_orch.db.local.clone();
+                        run_db(async move {
+                            db.execute_script(
+                                "UPDATE runs SET status='live',error_message=NULL,exit_reason=NULL WHERE id='cold';
+                                 INSERT INTO turns(id,session_id,run_id,job_id,sequence,predecessor_id,state,start_reason,created_at,updated_at)
+                                   VALUES('successor','s','cold','j',2,'t','running','follow_up',2,2);
+                                 UPDATE runtime_admission_requests SET state='active',lease_owner='replacement',lease_generation=2 WHERE request_id='req';",
+                            ).await.map_err(|error| error.to_string())
+                        }).unwrap();
+                        callback_orch.process_state.prepare_admission_claim(
+                            "cold".into(),
+                            ProcessAdmissionClaim {
+                                request_id: "req".into(),
+                                workspace_key: "private-runtime".into(),
+                                launch_key: "ordinary:cold".into(),
+                                owner: "replacement".into(),
+                                generation: 2,
+                                team_workspace_id: None,
+                            },
+                        );
+                        callback_orch.process_state.register_process(
+                            "cold".into(),
+                            crate::agent_process::process::RunHandle::test_handle(Some("s"), Some("j")),
+                        ).unwrap();
+                        callback_orch.process_state.begin_turn("cold", "successor");
+                    }
+                    }))),
+                }
+            ).build());
+            let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            crate::orchestrator::session::install_test_session_backend(Box::new(CountingBackend(
+                starts.clone(),
+            )));
+            let error =
+                super::start_leased(&orch, super::OrdinaryLease::Private(request), snapshot)
+                    .unwrap_err();
+            assert!(
+                error.contains("replaced during prepared turn attachment"),
+                "{error}"
+            );
+            assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(delivery_returned(&orch, "j", "t").await);
+            assert!(diagnostics.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            assert_eq!(
+                text(&orch, "SELECT state FROM turns WHERE id='t'").await,
+                if provider_hold { "cancelled" } else { "failed" }
+            );
+            if provider_hold {
+                assert_eq!(
+                    text(
+                        &orch,
+                        "SELECT state FROM provider_limit_holds WHERE id='hold'"
+                    )
+                    .await,
+                    "active"
+                );
+                assert_eq!(
+                    text(&orch, "SELECT current_turn_id FROM jobs WHERE id='j'").await,
+                    "held"
+                );
+                assert_eq!(
+                    text(&orch, "SELECT state FROM turns WHERE id='held'").await,
+                    "yielded"
+                );
+                assert_eq!(
+                    text(&orch, "SELECT status FROM jobs WHERE id='j'").await,
+                    "running"
+                );
+                assert!(projections.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            }
+            if replacement {
+                assert_eq!(
+                    orch.process_state.get_current_turn_id("cold").as_deref(),
+                    Some("successor")
+                );
+                let claim = orch.process_state.admission_claim("cold").unwrap();
+                assert_eq!((claim.owner.as_str(), claim.generation), ("replacement", 2));
+                assert_eq!(
+                    text(&orch, "SELECT status FROM runs WHERE id='cold'").await,
+                    "live"
+                );
+                assert_eq!(text(&orch, "SELECT CAST(error_message IS NULL AND exit_reason IS NULL AS TEXT) FROM runs WHERE id='cold'").await, "1");
+                assert_eq!(
+                    text(&orch, "SELECT state FROM turns WHERE id='successor'").await,
+                    "running"
+                );
+                assert_eq!(
+                    text(
+                        &orch,
+                        "SELECT state FROM runtime_admission_requests WHERE request_id='req'"
+                    )
+                    .await,
+                    "active"
+                );
+            } else {
+                assert_eq!(orch.process_state.has_process("cold"), Some(false));
+                assert_eq!(
+                    text(&orch, "SELECT status FROM runs WHERE id='cold'").await,
+                    "crashed"
+                );
+                assert_eq!(
+                    text(
+                        &orch,
+                        "SELECT state FROM runtime_admission_requests WHERE request_id='req'"
+                    )
+                    .await,
+                    "released"
+                );
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -2939,6 +3268,15 @@ mod tests {
                     "a warm process with no stdin cannot take the prompt"
                 );
                 assert!(delivery_returned(&orch, "j", "t").await);
+                assert_eq!(
+                    text(&orch, "SELECT state FROM turns WHERE id='t'").await,
+                    "cancelled"
+                );
+                assert_eq!(
+                    orch.process_state.get_occupancy("warm"),
+                    Some(crate::agent_process::process::RunOccupancy::Idle),
+                    "failed delivery must release the attached successor"
+                );
             }
         }
     }
@@ -3305,9 +3643,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.resume_json.as_deref(), Some(input.as_str()));
-        let error =
-            super::start_leased_inner(&orch, &super::OrdinaryLease::Private(request), reloaded)
-                .unwrap_err();
+        let mut registration = None;
+        let mut delivery = crate::orchestrator::attention_push::TurnDelivery::Unknown;
+        let error = super::start_leased_inner(
+            &orch,
+            &super::OrdinaryLease::Private(request),
+            reloaded,
+            &mut registration,
+            &mut delivery,
+        )
+        .unwrap_err();
         assert!(error.contains("no longer available"), "{error}");
         let held = crate::orchestrator::wakes::active_supply_hold(&orch.db.local, "j")
             .await

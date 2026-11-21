@@ -1723,8 +1723,9 @@ async fn restore_resume_claim_conn(
 /// Cold admission can fail after the resolver returned: queued launches belong
 /// to the admission worker, not the original call stack. Recover its pending
 /// provider successor before generic failure projection can settle the DAG.
+/// Durable-only: the caller holds the job launch lock across this call, then
+/// publishes and recomputes after releasing it.
 pub(crate) async fn restore_provider_hold_after_admission_failure(
-    orch: &Orchestrator,
     db: &LocalDb,
     successor: &str,
     now: i64,
@@ -1755,49 +1756,33 @@ pub(crate) async fn restore_provider_hold_after_admission_failure(
     }).await.map_err(|error| error.to_string())?;
     let Some(hold) = hold else { return Ok(false) };
     if hold.kind == HoldKind::Resume {
-        let db = crate::execution::routing::owning_db_for_job(&orch.db, &hold.job_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let task_orch = orch.clone();
-        let successor = successor.to_owned();
-        // The admission worker has returned from its failed start, so it no
-        // longer owns the launch mutex. Reacquire it and fence this exact
-        // successor before restoring; an operator's newer head wins.
-        tokio::task::spawn_blocking(move || {
-            let mutex = task_orch.job_launch_lock(&hold.job_id);
-            let _guard = mutex
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            crate::storage::run_db_blocking(|| async move {
-                db.write(move |conn| {
-                    let (hold_id, job_id, successor) =
-                        (hold.id.clone(), hold.job_id.clone(), successor.clone());
-                    Box::pin(async move {
-                        let mut rows = conn
-                            .query(
-                                "SELECT 1 FROM jobs WHERE id=?1 AND current_turn_id=?2",
-                                params![job_id, successor],
-                            )
-                            .await?;
-                        let ours = rows.next().await?.is_some();
-                        drop(rows);
-                        if ours {
-                            restore_resume_claim_conn(conn, &hold_id, now).await?;
-                        }
-                        Ok(())
-                    })
-                })
-                .await
-                .map_err(|error| error.to_string())
+        // The caller holds the job launch lock, so no successor can launch
+        // between this fence and the restore. Restore only while this exact
+        // successor is still the job's head; an operator's newer head wins.
+        let (hold_id, job_id, successor) =
+            (hold.id.clone(), hold.job_id.clone(), successor.to_owned());
+        db.write(move |conn| {
+            let (hold_id, job_id, successor) = (hold_id.clone(), job_id.clone(), successor.clone());
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT 1 FROM jobs WHERE id=?1 AND current_turn_id=?2",
+                        params![job_id, successor],
+                    )
+                    .await?;
+                let ours = rows.next().await?.is_some();
+                drop(rows);
+                if ours {
+                    restore_resume_claim_conn(conn, &hold_id, now).await?;
+                }
+                Ok(())
             })
         })
         .await
-        .map_err(|error| error.to_string())??;
+        .map_err(|error| error.to_string())?;
         return Ok(true);
     }
-    if restore_after_launch_failure(db, &hold, successor, now).await? {
-        crate::execution::advancement::recompute_job(orch, &hold.job_id)?;
-    }
+    restore_after_launch_failure(db, &hold, successor, now).await?;
     // A newer head is authoritative too: this stale launch must not fail it.
     Ok(true)
 }

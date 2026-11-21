@@ -1,7 +1,7 @@
 //! Stopping and killing sessions: turn interruption, cascade stop, hard kill,
 //! and durable-wait suspension. Sliced verbatim from the former `lifecycle.rs`.
 
-use crate::agent_process::process::{GoalPause, GoalPauseOwner, PauseIntent};
+use crate::agent_process::process::{GoalPause, GoalPauseOwner, PauseIntent, ProcessTurnOwner};
 use crate::models::{RunStatus, TurnEndReason, TurnState};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbResult, RowExt};
@@ -13,60 +13,88 @@ use super::common::*;
 use super::unanswered_calls::{settle_unanswered_calls, InterruptCause};
 
 pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str, cancel_owned_waits: bool) {
-    // A durable self-suspend parks warm on its OWN pending `agent_waits` row and
-    // must leave it intact so the eventual resolver can resume the run; only an
-    // external stop cancels the wait. Unconditionally cancelling here — including on
-    // a self-suspend — was the latent defect behind never-resumed durable waits
-    // (CAIRN-2970).
-    if cancel_owned_waits {
-        cancel_owned_waits_for_stop(orch, run_id);
-    } else {
-        // A durable self-suspend already yielded its turn with the actual cause.
-        // The provider interrupt only parks the process; it must not relabel the
-        // turn as an operator `user_stop`. External Stop takes the path below.
+    // A durable self-suspend already yielded on its own wait; only external
+    // Stop cancels that wait and relabels its turn as user_stop.
+    if !cancel_owned_waits {
         return;
     }
-    settle_active_turn(orch, run_id);
-}
-
-/// End the run's live turn as a warm stop, answering its still-open calls.
-fn settle_active_turn(orch: &Orchestrator, run_id: &str) {
-    let Some(turn_id) = active_turn_id_for_run(orch, run_id) else {
+    let job_id = job_id_for_run(orch, run_id);
+    let launch_lock = job_id.as_deref().map(|id| orch.job_launch_lock(id));
+    let (identity, owner, turn_id) = {
+        let _guard = launch_lock
+            .as_ref()
+            .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        let identity = orch.process_state.capture_process_identity(run_id);
+        let owner = identity
+            .as_ref()
+            .and_then(|identity| orch.process_state.capture_turn_owner_for_identity(identity));
+        if orch.has_terminal_completion_claim(run_id) {
+            return;
+        }
+        let turn_id = owner
+            .as_ref()
+            .map(|owner| owner.turn_id().to_string())
+            .or_else(|| active_turn_id_for_run(orch, run_id));
+        (identity, owner, turn_id)
+    };
+    cancel_owned_waits_for_run(orch, run_id);
+    let Some(turn_id) = turn_id else {
         return;
     };
-
-    if let Err(error) = settle_live_turn(orch, Some(run_id), &turn_id, TurnSettlement::UserStop) {
-        log::warn!("Failed to stop turn {turn_id} for run {run_id}: {error}");
+    if let Err(error) =
+        settle_live_turn_calls(orch, Some(run_id), &turn_id, TurnSettlement::UserStop)
+    {
+        log::warn!("Failed to answer stopped turn {turn_id} for run {run_id}: {error}");
+    }
+    let guard = launch_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    if orch.has_terminal_completion_claim(run_id) {
+        return;
+    }
+    if identity.as_ref().is_some_and(|identity| {
+        !orch.process_state.is_process_identity_current(identity)
+            || owner.as_ref().map_or_else(
+                || {
+                    !matches!(
+                        run_status(orch, run_id).as_deref(),
+                        Some("starting" | "live")
+                    )
+                },
+                |owner| !orch.process_state.is_turn_owner_current(owner),
+            )
+    }) {
+        return;
+    }
+    let change = settle_live_turn_outcome(orch, &turn_id, TurnSettlement::UserStop);
+    drop(guard);
+    match change {
+        Ok(Some(change)) => {
+            let _ = orch.services.emitter.emit("db-change", change);
+        }
+        Ok(None) => {}
+        Err(error) => log::warn!("Failed to stop turn {turn_id} for run {run_id}: {error}"),
     }
 }
 
-/// An external stop's claim on the run's own work: its resource writes stop at
-/// their next item, and its durable waits are cancelled.
-fn cancel_owned_waits_for_stop(orch: &Orchestrator, run_id: &str) {
-    {
-        // Ask each resource write the run is applying to stop before its next
-        // item, before the turn's pending results are settled. Only an
-        // external stop: a self-suspend's own write is the call that suspends.
-        orch.write_stops.raise(run_id);
-        let cancel_result = run_db_blocking({
-            let dbs = orch.db.clone();
-            let run_id = run_id.to_string();
-            move || async move {
-                let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                crate::mcp::handlers::durable_suspend::cancel_run_waits_for_stop(&db, &run_id).await
-            }
-        });
-        match cancel_result {
-            // A batch that can disturb the branch still holds it through the
-            // detached row the cancel wrote; any other hold the cancelled waits
-            // made is gone, so serve the replay request it deferred, if any.
-            Ok(()) => {
-                crate::orchestrator::base_advance::on_branch_hold_released_for_run(orch, run_id)
-            }
-            Err(error) => log::warn!("Failed to cancel owned wait for run {run_id}: {error}"),
+fn cancel_owned_waits_for_run(orch: &Orchestrator, run_id: &str) {
+    orch.write_stops.raise(run_id);
+    let cancelled = run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            crate::mcp::handlers::durable_suspend::cancel_run_waits_for_stop(&db, &run_id).await
         }
+    });
+    match cancelled {
+        // A batch that can disturb the branch still holds it through the
+        // detached row the cancel wrote; any other hold the cancelled waits
+        // made is gone, so serve the replay request it deferred, if any.
+        Ok(()) => crate::orchestrator::base_advance::on_branch_hold_released_for_run(orch, run_id),
+        Err(error) => log::warn!("Failed to cancel owned wait for run {run_id}: {error}"),
     }
 }
 
@@ -89,17 +117,64 @@ pub(crate) fn settle_live_turn(
     run_id: Option<&str>,
     turn_id: &str,
     settlement: TurnSettlement,
+    locked_job_id: &str,
 ) -> Result<bool, String> {
-    let state = turn_state(orch, turn_id).ok_or_else(|| format!("turn {turn_id} was not found"))?;
+    let job_id = run_db_blocking({
+        let dbs = orch.db.clone();
+        let turn_id = turn_id.to_string();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_turn(&dbs, &turn_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            db.query_opt_text("SELECT job_id FROM turns WHERE id=?1", (turn_id,))
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })?;
+    let launch_lock = job_id
+        .as_deref()
+        .filter(|id| *id != locked_job_id)
+        .map(|id| orch.job_launch_lock(id));
+    let guard = launch_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    if orch.is_turn_terminal_claimed(turn_id) {
+        return Err(format!(
+            "Turn {turn_id} is finishing its terminal completion; retry Compact"
+        ));
+    }
+    drop(guard);
+    settle_live_turn_calls(orch, run_id, turn_id, settlement)?;
+    let guard = launch_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    if orch.is_turn_terminal_claimed(turn_id) {
+        return Err(format!(
+            "Turn {turn_id} is finishing its terminal completion; retry Compact"
+        ));
+    }
+    let change = settle_live_turn_outcome(orch, turn_id, settlement)?;
+    drop(guard);
+    let Some(change) = change else {
+        return Ok(false);
+    };
+    let _ = orch.services.emitter.emit("db-change", change);
+    Ok(true)
+}
 
+fn settle_live_turn_calls(
+    orch: &Orchestrator,
+    run_id: Option<&str>,
+    turn_id: &str,
+    settlement: TurnSettlement,
+) -> Result<(), String> {
+    let state = turn_state(orch, turn_id).ok_or_else(|| format!("turn {turn_id} was not found"))?;
     if state == "running" {
         if let Some(run_id) = run_id {
             if let Err(error) =
                 settle_unanswered_calls(orch, run_id, turn_id, InterruptCause::UserStop)
             {
-                let error = format!(
-                    "failed to settle pending run tool results for run {run_id} turn {turn_id}: {error}"
-                );
+                let error = format!("failed to settle pending run tool results for run {run_id} turn {turn_id}: {error}");
                 match settlement {
                     TurnSettlement::UserStop => log::warn!("{error}"),
                     TurnSettlement::OperatorCompact => return Err(error),
@@ -107,26 +182,39 @@ pub(crate) fn settle_live_turn(
             }
         }
     }
+    Ok(())
+}
 
+/// The durable transition, separated from notifications so an exact-owner
+/// stop can retire accounting and release occupancy before publishing.
+fn settle_live_turn_outcome(
+    orch: &Orchestrator,
+    turn_id: &str,
+    settlement: TurnSettlement,
+) -> Result<Option<serde_json::Value>, String> {
+    let state = turn_state(orch, turn_id).ok_or_else(|| format!("turn {turn_id} was not found"))?;
     match (state.as_str(), settlement) {
         ("running", TurnSettlement::UserStop) => {
-            interrupt_turn(orch, turn_id, Some(TurnEndReason::UserStop))?
+            settle_turn_interruption(orch, turn_id, Some(TurnEndReason::UserStop)).map(Some)
         }
-        ("pending" | "yielded", TurnSettlement::UserStop) => apply_turn_outcome(
+        ("pending" | "yielded", TurnSettlement::UserStop) => settle_turn_outcome(
             orch,
             turn_id,
             TurnState::Cancelled,
             Some(TurnEndReason::UserStop),
-        )?,
-        ("running" | "pending" | "yielded", TurnSettlement::OperatorCompact) => apply_turn_outcome(
-            orch,
-            turn_id,
-            TurnState::Cancelled,
-            Some(TurnEndReason::OperatorCompact),
-        )?,
-        _ => return Ok(false),
+        )
+        .map(Some),
+        ("running" | "pending" | "yielded", TurnSettlement::OperatorCompact) => {
+            settle_turn_outcome(
+                orch,
+                turn_id,
+                TurnState::Cancelled,
+                Some(TurnEndReason::OperatorCompact),
+            )
+            .map(Some)
+        }
+        _ => Ok(None),
     }
-    Ok(true)
 }
 
 fn running_terminals_for_job(orch: &Orchestrator, job_id: &str) -> Vec<(String, String)> {
@@ -215,7 +303,7 @@ struct ParkSlot {
     done: broadcast::Sender<Result<(), String>>,
 }
 
-/// The debounce state behind [`suspend_run_for_durable_wait_after_handoff_then`],
+/// The debounce state behind [`suspend_owned_run_after_handoff_then`],
 /// keyed by run.
 ///
 /// It lives on the orchestrator so every clone shares it and it is scoped to one
@@ -239,27 +327,66 @@ impl ParkSlots {
 ///
 /// This is the canonical way a Cairn-initiated suspension ends a turn. See
 /// [`SUSPEND_HANDOFF_GRACE`] for what parking synchronously costs.
+///
+/// `turn_owner` is the exact turn the caller yielded, captured when it yielded.
+/// The stake and the park belong to that turn alone: a missing, finished, or
+/// replaced owner stakes nothing and parks nothing, so a late suspension cannot
+/// pause or interrupt a successor.
 pub fn suspend_run_for_durable_wait_after_handoff(
     orch: &Orchestrator,
     run_id: &str,
     exit_reason: &str,
+    turn_owner: Option<ProcessTurnOwner>,
     owner: GoalPauseOwner,
 ) {
+    let Some(turn_owner) = turn_owner else {
+        log::info!("{exit_reason} on {run_id} has no yielded turn owner; nothing to park");
+        return;
+    };
+    if !stake_owned_goal_pause(orch, run_id, &turn_owner, owner, exit_reason) {
+        return;
+    }
+    suspend_owned_run_after_handoff_then(orch, run_id, exit_reason, Some(turn_owner), |_| async {});
+}
+
+/// Stake a durable-wait goal pause only while `turn_owner` still owns the run,
+/// under the launch authority that admission and completion share. Never holds
+/// the registry mutex across provider control.
+fn stake_owned_goal_pause(
+    orch: &Orchestrator,
+    run_id: &str,
+    turn_owner: &ProcessTurnOwner,
+    owner: GoalPauseOwner,
+    exit_reason: &str,
+) -> bool {
+    let job_id = job_id_for_run(orch, run_id);
+    let launch_lock = job_id.as_deref().map(|id| orch.job_launch_lock(id));
+    let _guard = launch_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    if turn_owner.run_id() != run_id || !orch.process_state.is_turn_owner_current(turn_owner) {
+        log::info!(
+            "{exit_reason} on {run_id}: turn {} no longer owns the run; not staking its pause",
+            turn_owner.turn_id()
+        );
+        return false;
+    }
     if let Err(error) = crate::backends::stdin::pause_goal_for_durable_wait(
         &orch.process_state,
         run_id,
-        PauseIntent::Stake(GoalPause::Owned(owner.clone())),
+        PauseIntent::Stake(GoalPause::Owned(owner)),
     ) {
         log::warn!("Failed to pause goal for {exit_reason} on {run_id}: {error}");
-        return;
+        return false;
     }
-    suspend_run_for_durable_wait_after_handoff_then(orch, run_id, exit_reason, owner, |_| async {})
+    true
 }
 
-/// Complete a park whose owner was already staked, then run a continuation.
+/// Park the exact turn the originating callback captured, then run a
+/// continuation. Its goal pause, if any, was staked before publication.
 ///
-/// The deferred interrupt reasserts the live pause without restaking this owner:
-/// an operator Stop or newer wait may have superseded it during the grace period.
+/// The deferred interrupt reasserts the live pause without restaking: an
+/// operator Stop or newer wait may have superseded it during the grace period.
 ///
 /// `after_park` receives the park's outcome and runs once the predecessor turn
 /// has actually been interrupted. Anything that can resume the run belongs
@@ -270,17 +397,24 @@ pub fn suspend_run_for_durable_wait_after_handoff(
 /// The park itself is coalesced per run rather than per suspension — see
 /// [`arm_coalesced_park`] — so a turn suspending several of its calls at once is
 /// interrupted once, after the last of them has had its grace.
-pub fn suspend_run_for_durable_wait_after_handoff_then<F, Fut>(
+pub(crate) fn suspend_owned_run_after_handoff_then<F, Fut>(
     orch: &Orchestrator,
     run_id: &str,
     exit_reason: &str,
-    owner: GoalPauseOwner,
+    turn_owner: Option<ProcessTurnOwner>,
     after_park: F,
 ) where
     F: FnOnce(Result<(), String>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let mut parked = arm_coalesced_park(orch, run_id, exit_reason, owner);
+    if turn_owner
+        .as_ref()
+        .is_none_or(|owner| !orch.process_state.is_turn_owner_current(owner))
+    {
+        tokio::spawn(after_park(Ok(())));
+        return;
+    }
+    let mut parked = arm_coalesced_park(orch, run_id, exit_reason, turn_owner);
     tokio::spawn(async move {
         let outcome = match parked.recv().await {
             Ok(outcome) => outcome,
@@ -317,7 +451,7 @@ fn arm_coalesced_park(
     orch: &Orchestrator,
     run_id: &str,
     exit_reason: &str,
-    owner: GoalPauseOwner,
+    turn_owner: Option<ProcessTurnOwner>,
 ) -> broadcast::Receiver<Result<(), String>> {
     let (generation, done, parked) = {
         let mut slots = orch.park_slots.0.lock().unwrap();
@@ -343,16 +477,7 @@ fn arm_coalesced_park(
             let orch = orch.clone();
             let run_id = run_id.clone();
             tokio::task::spawn_blocking(move || {
-                stop_session_with_pause_intent(
-                    &orch,
-                    &run_id,
-                    StopReason::Park(owner),
-                    // The owner was staked before publishing the suspension. The park
-                    // generation guards this slot, not whether its wait has resolved;
-                    // re-staking here could resurrect a resolved owner or overwrite
-                    // newer ownership. Preserve the live claim, including its absence.
-                    PauseIntent::Reassert,
-                )
+                park_owned_turn(&orch, &run_id, turn_owner.as_ref())
             })
             .await
         };
@@ -380,6 +505,65 @@ fn arm_coalesced_park(
         }
     });
     parked
+}
+
+/// Admission and completion share this authority. Never hold the registry mutex
+/// across provider control or database work.
+pub(crate) fn park_owned_turn(
+    orch: &Orchestrator,
+    run_id: &str,
+    owner: Option<&ProcessTurnOwner>,
+) -> Result<(), String> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let job_id = job_id_for_run(orch, run_id);
+    let launch_lock = job_id.as_deref().map(|id| orch.job_launch_lock(id));
+    let guard = launch_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    if owner.process_identity().run_id() != run_id
+        || !orch.process_state.is_turn_owner_current(owner)
+    {
+        return Ok(());
+    }
+    if turn_state(orch, owner.turn_id()).as_deref() != Some("yielded") {
+        log::warn!(
+            "Refusing durable park for run {run_id}: turn {} is not durably yielded",
+            owner.turn_id()
+        );
+        return Ok(());
+    }
+    if !orch.process_state.retire_turn_accounting_if_owned(owner) {
+        return Ok(());
+    }
+    // Do not restake a wait resolved during handoff or overwrite operator Stop.
+    if let Err(error) = crate::backends::stdin::send_interrupt(
+        &orch.process_state,
+        run_id,
+        PauseIntent::Reassert,
+        cairn_models::interface::session::InterruptCause::DurablePark,
+    ) {
+        log::warn!("Failed to interrupt owned durable park for {run_id}: {error}");
+    }
+    let parked = orch.process_state.transition_to_warm_if_owned(owner);
+    drop(guard);
+    if parked {
+        publish_retained_turn_idle(orch, run_id);
+    }
+    Ok(())
+}
+
+/// Publish an actual park or Stop, never successful completion effects.
+/// Call only after compare-release and after dropping launch authority.
+pub(super) fn publish_retained_turn_idle(orch: &Orchestrator, run_id: &str) {
+    if let Some(job_id) = job_id_for_run(orch, run_id) {
+        if let Err(error) = crate::execution::advancement::recompute_job(orch, &job_id) {
+            log::warn!("Failed to recompute idle job {job_id}: {error}");
+        }
+        super::review_push::emit_for_turn_end(orch, &job_id);
+    }
+    crate::backends::codex::emit_codex_run_turn_completed(&orch.services.emitter, run_id);
 }
 
 fn park_generation_is_current(orch: &Orchestrator, run_id: &str, generation: u64) -> bool {
@@ -825,6 +1009,12 @@ fn cancel_open_input_and_live_turns_for_job(
     job_id: &str,
 ) -> Result<(), String> {
     cancel_provider_holds(orch, job_id)?;
+    let launch_lock = orch.job_launch_lock(job_id);
+    let _guard = launch_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let claimed_turns = serde_json::to_string(&orch.terminal_completion_turn_ids())
+        .map_err(|error| error.to_string())?;
     let dbs = orch.db.clone();
     let job_id = job_id.to_string();
     run_db_blocking(move || async move {
@@ -833,6 +1023,7 @@ fn cancel_open_input_and_live_turns_for_job(
             .map_err(|e| e.to_string())?;
         db.write(|conn| {
             let job_id = job_id.clone();
+            let claimed_turns = claimed_turns.clone();
             Box::pin(async move {
                 let now = chrono::Utc::now().timestamp();
                 crate::mcp::handlers::planning::withdraw_job_prompts_conn(
@@ -845,8 +1036,9 @@ fn cancel_open_input_and_live_turns_for_job(
                 conn.execute(
                     "UPDATE turns
                      SET state = 'cancelled', ended_at = ?1, updated_at = ?1
-                     WHERE job_id = ?2 AND state IN ('pending', 'running', 'yielded')",
-                    (now, job_id.as_str()),
+                     WHERE job_id = ?2 AND state IN ('pending', 'running', 'yielded')
+                       AND id NOT IN (SELECT value FROM json_each(?3))",
+                    (now, job_id.as_str(), claimed_turns.as_str()),
                 )
                 .await?;
                 conn.on_commit(cairn_db::admission_hint::evidence_changed);
@@ -924,15 +1116,119 @@ fn stop_session_with_pause_intent(
     reason: StopReason,
     intent: PauseIntent,
 ) -> Result<(), String> {
+    let job_id = job_id_for_run(orch, run_id);
+    let launch_lock = job_id.as_deref().map(|id| orch.job_launch_lock(id));
+    let (identity, owner, turn_id) = {
+        let _guard = launch_lock
+            .as_ref()
+            .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        let identity = orch.process_state.capture_process_identity(run_id);
+        let owner = identity
+            .as_ref()
+            .and_then(|identity| orch.process_state.capture_turn_owner_for_identity(identity));
+        // An owned failure keeps its turn active while draining calls after
+        // closing the run. Its released occupancy is not a DB fallback to adopt.
+        if orch.has_terminal_completion_claim(run_id) {
+            return Ok(());
+        }
+        let turn_id = owner
+            .as_ref()
+            .map(|owner| owner.turn_id().to_string())
+            .or_else(|| active_turn_id_for_run(orch, run_id));
+        (identity, owner, turn_id)
+    };
+    // Calls can publish events, so settle only the captured turn here, outside
+    // launch authority. Its durable outcome and accounting retirement follow
+    // together under that authority after ownership is checked again.
+    let settle_active_turn = |orch: &Orchestrator, run_id: &str| {
+        if let Some(turn_id) = turn_id.as_deref() {
+            if let Err(error) =
+                settle_live_turn_calls(orch, Some(run_id), turn_id, TurnSettlement::UserStop)
+            {
+                log::warn!("Failed to settle stopped turn's tool calls for {run_id}: {error}");
+            }
+        }
+    };
     match &reason {
         StopReason::OperatorStop => {
             if let Some(job_id) = job_id_for_run(orch, run_id) {
                 cancel_provider_holds(orch, &job_id)?;
             }
-            stop_active_turn_for_run(orch, run_id, true);
+            cancel_owned_waits_for_run(orch, run_id);
+            settle_active_turn(orch, run_id);
         }
         StopReason::Message => settle_active_turn(orch, run_id),
         StopReason::Park(_) => stop_active_turn_for_run(orch, run_id, false),
+    }
+    let settle_turn = !matches!(reason, StopReason::Park(_));
+    let guard = launch_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    if orch.has_terminal_completion_claim(run_id) {
+        return Ok(());
+    }
+    if match identity.as_ref() {
+        Some(identity) => {
+            !orch.process_state.is_process_identity_current(identity)
+                || owner.as_ref().map_or_else(
+                    || orch.process_state.get_current_turn_id(run_id).is_some(),
+                    |owner| !orch.process_state.is_turn_owner_current(owner),
+                )
+        }
+        None => orch
+            .process_state
+            .capture_process_identity(run_id)
+            .is_some(),
+    } {
+        return if reason.is_operator_stop() {
+            Err(format!(
+                "Run {run_id} changed ownership while Stop was settling tool calls; retry Stop"
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    let turn_change = if settle_turn {
+        match turn_id
+            .as_deref()
+            .map(|turn_id| settle_live_turn_outcome(orch, turn_id, TurnSettlement::UserStop))
+            .transpose()
+        {
+            Ok(change) => change.flatten(),
+            Err(error) => {
+                log::warn!("Failed to durably settle stopped turn for {run_id}: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Direct durable-wait callers intentionally park the captured provider
+    // turn without changing its logical Running/Pending state. Unlike a
+    // deferred park, that API does not require a separately published yield.
+    // Stop and message interruption require durable settlement before retirement.
+    let disposed = !settle_turn
+        || owner.as_ref().is_none_or(|owner| {
+            turn_state(orch, owner.turn_id())
+                .and_then(|state| state.parse::<TurnState>().ok())
+                .is_some_and(|state| state.is_terminal())
+        });
+    if disposed {
+        if let Some(owner) = owner.as_ref() {
+            if !orch.process_state.retire_turn_accounting_if_owned(owner) {
+                drop(guard);
+                if let Some(change) = turn_change {
+                    let _ = orch.services.emitter.emit("db-change", change);
+                }
+                return Err(format!(
+                    "Run {run_id} changed ownership before Stop could retire accounting"
+                ));
+            }
+        }
+    } else {
+        // Still attempt the physical interrupt. An unfinished turn cannot be
+        // retired or released; its accepted terminal can retry settlement.
+        log::warn!("Run {run_id} could not durably stop its captured turn; interrupting without releasing ownership");
     }
 
     // Send interrupt via the backend-aware stdin handler. For Codex this pauses
@@ -955,6 +1251,10 @@ fn stop_session_with_pause_intent(
                 run_id,
                 e
             );
+            drop(guard);
+            if let Some(change) = turn_change {
+                let _ = orch.services.emitter.emit("db-change", change);
+            }
             return kill_session_with_reason(orch, run_id, "user_stop", TerminalPolicy::Finalize);
         } else {
             log::warn!(
@@ -963,6 +1263,19 @@ fn stop_session_with_pause_intent(
                 e
             );
         }
+    }
+
+    let warmed = disposed
+        && match owner.as_ref() {
+            Some(owner) => orch.process_state.transition_to_warm_if_owned(owner),
+            None => identity.as_ref().is_some_and(|identity| {
+                orch.process_state.transition_to_warm_if_untracked(identity)
+                    || orch.process_state.is_warm(run_id)
+            }),
+        };
+    drop(guard);
+    if let Some(change) = turn_change {
+        let _ = orch.services.emitter.emit("db-change", change);
     }
 
     // Only kill foreground bash processes — background terminals survive the
@@ -990,13 +1303,19 @@ fn stop_session_with_pause_intent(
         }
     }
 
+    if !disposed {
+        return Err(format!(
+            "Run {run_id} was interrupted but its turn could not be durably settled"
+        ));
+    }
     // Transition to warm state instead of killing
-    if orch.process_state.transition_to_warm(run_id) {
+    if warmed {
+        publish_retained_turn_idle(orch, run_id);
         log::info!(
             "Run {} interrupted and transitioned to warm state",
             &run_id[..run_id.len().min(8)]
         );
-    } else {
+    } else if identity.is_none() {
         log::warn!(
             "Run {} not found in process map after interrupt",
             &run_id[..run_id.len().min(8)]
@@ -1203,6 +1522,41 @@ pub fn kill_session_with_reason(
     exit_reason: &str,
     terminals: TerminalPolicy,
 ) -> Result<(), String> {
+    kill_session_with_reason_inner(orch, run_id, exit_reason, terminals, None)
+}
+
+/// The caller already owns launch authority for `locked_job_id`.
+pub(crate) fn kill_session_with_reason_launch_locked(
+    orch: &Orchestrator,
+    run_id: &str,
+    exit_reason: &str,
+    terminals: TerminalPolicy,
+    locked_job_id: &str,
+) -> Result<(), String> {
+    kill_session_with_reason_inner(orch, run_id, exit_reason, terminals, Some(locked_job_id))
+}
+
+fn kill_session_with_reason_inner(
+    orch: &Orchestrator,
+    run_id: &str,
+    exit_reason: &str,
+    terminals: TerminalPolicy,
+    locked_job_id: Option<&str>,
+) -> Result<(), String> {
+    let job_id = job_id_for_run(orch, run_id);
+    let launch_lock = job_id
+        .as_deref()
+        .filter(|id| Some(*id) != locked_job_id)
+        .map(|id| orch.job_launch_lock(id));
+    let guard = launch_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    // A terminal completion may still be draining calls with its turn active.
+    // Its claim owns durable disposition; a concurrent kill only ends transport.
+    if orch.has_terminal_completion_claim(run_id) {
+        drop(guard);
+        return teardown_process(orch, run_id, terminals, exit_reason);
+    }
     if exit_reason == RUNNER_SHUTDOWN_EXIT_REASON {
         // Persist the cause and the unfinished work BEFORE the interrupt can
         // produce a Result or EOF. Those frames describe transport cleanup, not
@@ -1231,7 +1585,17 @@ pub fn kill_session_with_reason(
             }
         })?;
     }
+    set_exit_reason(orch, run_id, exit_reason)?;
+    drop(guard);
     teardown_process(orch, run_id, terminals, exit_reason)?;
+    let guard = launch_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let completion_claimed = orch.has_terminal_completion_claim(run_id);
+    drop(guard);
+    if completion_claimed {
+        return Ok(());
+    }
 
     // Set exit reason and finalize as Exited (clean kill) or Crashed
     let final_status = if matches!(
@@ -1243,12 +1607,10 @@ pub fn kill_session_with_reason(
         RunStatus::Exited
     };
 
-    set_exit_reason(orch, run_id, exit_reason)?;
-
     if exit_reason == PROVIDER_SILENCE_RECOVERY_EXIT_REASON {
         super::finalize_run_for_recovery(orch, run_id, final_status)?;
     } else if exit_reason == OPERATOR_COMPACT_EXIT_REASON {
-        super::finalize_run_for_operator_compact(orch, run_id, final_status)?;
+        super::finalize_run_for_operator_compact(orch, run_id, final_status, locked_job_id)?;
     } else {
         super::finalize::finalize_killed_run(
             orch,

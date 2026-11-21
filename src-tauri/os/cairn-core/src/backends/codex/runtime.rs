@@ -45,7 +45,11 @@ fn admit_native_goal_turn(
     run_id: &str,
     session_id: Option<&str>,
     provider_turn_id: &str,
-) -> Result<Option<crate::execution::jobs::CodexGoalTurnAdmission>, String> {
+    identity: &crate::agent_process::process::ProcessIdentity,
+) -> Result<Option<GoalTurnAdmission>, String> {
+    if identity.run_id() != run_id || !orch.process_state.is_process_identity_current(identity) {
+        return Err("Codex reader no longer owns its process registration".to_string());
+    }
     let session_id =
         session_id.ok_or_else(|| "native Codex goal turn has no Cairn session".to_string())?;
     let Some(job_id) = goal_job_id_for_run(db, run_id)? else {
@@ -58,6 +62,9 @@ fn admit_native_goal_turn(
     let _launch_guard = launch_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !orch.process_state.is_process_identity_current(identity) {
+        return Err("Codex reader lost its process registration before admission".to_string());
+    }
     let current = orch.process_state.get_current_turn_id(run_id);
     let admission = crate::execution::jobs::admit_codex_goal_turn(
         orch,
@@ -69,8 +76,25 @@ fn admit_native_goal_turn(
         current.as_deref(),
     )?;
     if let crate::execution::jobs::CodexGoalTurnAdmission::Admitted(turn_id) = &admission {
+        let state = crate::storage::run_db_blocking({
+            let db = db.clone();
+            let turn_id = turn_id.clone();
+            move || async move {
+                db.query_opt_text("SELECT state FROM turns WHERE id=?1", (turn_id,))
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        })?
+        .ok_or_else(|| format!("admitted Codex turn {turn_id} disappeared before attachment"))?
+        .parse::<crate::models::TurnState>()?;
+        if state.is_terminal() {
+            return Ok(Some(GoalTurnAdmission::Ignored));
+        }
         if current.as_deref() != Some(turn_id.as_str())
-            && !orch.process_state.begin_turn(run_id, turn_id)
+            && orch
+                .process_state
+                .begin_turn_if_identity(identity, turn_id)
+                .is_none()
         {
             return Err("native Codex goal turn lost its warm process".to_string());
         }
@@ -86,18 +110,29 @@ fn admit_native_goal_turn(
         )?;
     }
 
-    Ok(Some(admission))
+    Ok(Some(match admission {
+        crate::execution::jobs::CodexGoalTurnAdmission::Admitted(turn_id) => {
+            let owner = orch
+                .process_state
+                .capture_turn_owner_for_identity(identity)
+                .filter(|owner| owner.turn_id() == turn_id)
+                .ok_or_else(|| "native Codex goal turn lost its admitted owner".to_string())?;
+            GoalTurnAdmission::Admitted { owner }
+        }
+        crate::execution::jobs::CodexGoalTurnAdmission::Deferred {
+            predecessor_turn_id,
+        } => GoalTurnAdmission::Deferred {
+            predecessor_turn_id,
+        },
+    }))
 }
 
 fn capacity_retry_target(
     db: &Arc<LocalDb>,
-    run_id: &str,
-    orch: &Orchestrator,
+    owner: &crate::agent_process::process::ProcessTurnOwner,
 ) -> Result<Option<CapacityRetryTarget>, String> {
-    let cairn_turn_id = orch
-        .process_state
-        .get_current_turn_id(run_id)
-        .ok_or_else(|| "capacity failure has no active Cairn turn".to_string())?;
+    let run_id = owner.run_id();
+    let cairn_turn_id = owner.turn_id().to_string();
     crate::storage::run_db_blocking({
         let db = db.clone();
         let run_id = run_id.to_string();
@@ -145,8 +180,12 @@ fn handle_selected_model_capacity_failure(
     run_db: &Arc<LocalDb>,
     run_id: &str,
     session_id: Option<&str>,
+    owner: &crate::agent_process::process::ProcessTurnOwner,
 ) -> bool {
-    let target = match capacity_retry_target(run_db, run_id, orch) {
+    if owner.run_id() != run_id || !orch.process_state.is_turn_owner_current(owner) {
+        return false;
+    }
+    let target = match capacity_retry_target(run_db, owner) {
         Ok(Some(target)) => target,
         Ok(None) => return false,
         Err(error) => {
@@ -169,14 +208,18 @@ fn handle_selected_model_capacity_failure(
                 run_id,
                 error
             );
-            crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_failed");
-            return true;
+            return false;
         }
     };
     let next_attempt = completed_retries + 1;
     if next_attempt > CAPACITY_RETRY_DELAYS.len() as u32 {
-        if hold_at_capacity(orch, run_db, run_id, session_id, &target) {
-            return true;
+        match hold_at_capacity(orch, run_db, run_id, session_id, &target, owner) {
+            CapacityHoldOutcome::Armed => return true,
+            CapacityHoldOutcome::StaleOwner => return false,
+            CapacityHoldOutcome::Unarmed => {}
+        }
+        if !settle_capacity_failed_turn(orch, run_db, run_id, "turn_failed", owner) {
+            return false;
         }
         insert_error_event(
             orch,
@@ -184,11 +227,12 @@ fn handle_selected_model_capacity_failure(
             session_id,
             "The selected Codex model remained at capacity after three automatic retries. You can continue this job manually to try again.",
         );
-        settle_capacity_failed_turn(orch, run_db, run_id, "turn_failed");
         return true;
     }
 
-    settle_capacity_failed_turn(orch, run_db, run_id, "capacity_retry");
+    if !settle_capacity_failed_turn(orch, run_db, run_id, "capacity_retry", owner) {
+        return false;
+    }
     let retry_turn_id = match crate::execution::jobs::claim_retry_successor_if_head_matches(
         orch,
         run_db.clone(),
@@ -289,6 +333,13 @@ fn handle_selected_model_capacity_failure(
     true
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CapacityHoldOutcome {
+    StaleOwner,
+    Unarmed,
+    Armed,
+}
+
 /// Hold a turn whose model stayed at capacity through every in-session retry,
 /// rather than failing it: at capacity is a want of supply, which waiting
 /// cures. The turn yields as a provider limit with no reset time, because
@@ -297,15 +348,23 @@ fn handle_selected_model_capacity_failure(
 /// warm for the resume. Switching an open session to another offer is its own
 /// lifecycle operation (cairn/4693), so the hold waits for this model.
 ///
-/// Returns `false` when the hold could not be armed; the caller then fails the
-/// turn as before.
+/// Only an unarmed hold permits exact-owner failure fallback. Once persisted,
+/// the hold owns recovery even if its process occupancy could not be released.
 fn hold_at_capacity(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
     run_id: &str,
     session_id: Option<&str>,
     target: &CapacityRetryTarget,
-) -> bool {
+    owner: &crate::agent_process::process::ProcessTurnOwner,
+) -> CapacityHoldOutcome {
+    let launch_lock = orch.job_launch_lock(&target.job_id);
+    let launch_guard = launch_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !orch.process_state.is_turn_owner_current(owner) {
+        return CapacityHoldOutcome::StaleOwner;
+    }
     let refusal = cairn_models::supply::CapacityRefusal {
         subject: "the selected Codex model".to_string(),
         reason: "The selected Codex model remained at capacity after three automatic retries"
@@ -336,10 +395,23 @@ fn hold_at_capacity(
         Ok(hold) => hold,
         Err(error) => {
             log::warn!("Could not hold run {run_id} at Codex capacity: {error}");
-            return false;
+            return CapacityHoldOutcome::Unarmed;
         }
     };
-    crate::orchestrator::lifecycle::warm_provider_held_run(orch, run_id);
+    let warmed = orch.process_state.transition_to_warm_if_owned(owner);
+    drop(launch_guard);
+    if !warmed {
+        // The durable hold already yielded this turn. Do not fail it, or any
+        // replacement owner, just because its occupancy is no longer ours.
+        log::warn!("Capacity hold for run {run_id} armed without releasing its accepted occupancy");
+        return CapacityHoldOutcome::Armed;
+    }
+    if let Err(error) = crate::execution::advancement::recompute_job(orch, &target.job_id) {
+        log::error!(
+            "Failed to recompute capacity-held job {}: {error}",
+            target.job_id
+        );
+    }
     crate::backends::codex::emit_codex_run_turn_completed(&orch.services.emitter, run_id);
     if hold.observed_count == 1 {
         let note = format!(
@@ -362,29 +434,45 @@ fn hold_at_capacity(
             log::warn!("Failed to record the Codex capacity hold for run {run_id}: {error}");
         }
     }
-    true
+    CapacityHoldOutcome::Armed
 }
 
 /// End the turn the provider refused for capacity.
 ///
 /// A capacity refusal says nothing about the process, so a top-level or recipe
 /// job keeps its live run and native conversation and only the turn ends, as
-/// `provider_failure`. A delegated child or workflow goes through `fail_run`,
-/// which records `reason`: once its retries are spent that is what tells the
-/// waiting parent, and while they remain the retry successor claimed next keeps
-/// the child's job running. A run this host holds no process for has nothing to
-/// keep and takes the same path.
+/// `provider_failure`. An exhausted delegated child finalizes its exact owner,
+/// recording `reason` so its waiting parent receives the failure. A stale owner
+/// or failed settlement authorizes no fallback finalization.
 fn settle_capacity_failed_turn(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
     run_id: &str,
     reason: &str,
-) {
+    owner: &crate::agent_process::process::ProcessTurnOwner,
+) -> bool {
     let exhausted = reason == "turn_failed";
     let delegated = crate::backends::is_task_spawned_run(super::CODEX_BACKEND_NAME, run_db, run_id);
-    if !(exhausted && delegated)
-        && crate::orchestrator::lifecycle::settle_provider_turn_failure(orch, run_id)
-    {
+    if exhausted && delegated {
+        return crate::orchestrator::lifecycle::finalize_owned_completion(
+            orch,
+            owner.process_identity(),
+            Some(owner),
+            crate::models::RunStatus::Crashed,
+            Some(reason),
+            None,
+            || {},
+        );
+    }
+    if crate::orchestrator::lifecycle::release_owned_completion(
+        orch,
+        owner.process_identity(),
+        Some(owner),
+        Some((
+            crate::models::TurnState::Interrupted,
+            Some(crate::models::TurnEndReason::ProviderFailure),
+        )),
+    ) {
         crate::backends::codex::emit_codex_run_turn_completed(&orch.services.emitter, run_id);
         // With retries left, the retry claimed next drains whatever is queued.
         // Once they are spent nothing else will, so the turn end flushes it.
@@ -395,9 +483,9 @@ fn settle_capacity_failed_turn(
                 log::warn!("capacity-exhausted queued delivery flush failed: {error}");
             }
         }
-        return;
+        return true;
     }
-    crate::orchestrator::lifecycle::fail_run(orch, run_id, reason);
+    false
 }
 
 struct CapacityRetryTarget {
@@ -465,6 +553,10 @@ impl CodexBackend {
             oauth_state,
             cleanup,
         );
+        let Some(identity) = orch.process_state.capture_process_identity(run_id) else {
+            host.host.reader_closed();
+            return;
+        };
         CodexRuntime::reader_thread_app_server(
             &host,
             emitter,
@@ -475,6 +567,7 @@ impl CodexBackend {
             backend_key,
             run_db,
             ephemeral,
+            identity,
         );
     }
 }
@@ -680,30 +773,44 @@ impl CodexHost for CodexReaderHost {
     fn context_snapshot(&self, snapshot: ContextTokenState) {
         self.session.orch.store_context_token_snapshot(snapshot);
     }
-    fn admit_goal_turn(&self, turn_id: &str) -> Result<Option<GoalTurnAdmission>, String> {
+    fn admit_goal_turn(
+        &self,
+        turn_id: &str,
+        identity: &crate::agent_process::process::ProcessIdentity,
+    ) -> Result<Option<GoalTurnAdmission>, String> {
         admit_native_goal_turn(
             &self.session.orch,
             &self.session.run_db,
             &self.session.run_id,
             self.session.session_id.as_deref(),
             turn_id,
+            identity,
         )
-        .map(|outcome| {
-            outcome.map(|outcome| match outcome {
-                crate::execution::jobs::CodexGoalTurnAdmission::Admitted(_) => {
-                    GoalTurnAdmission::Admitted
-                }
-                crate::execution::jobs::CodexGoalTurnAdmission::Deferred {
-                    predecessor_turn_id,
-                } => GoalTurnAdmission::Deferred {
-                    predecessor_turn_id,
-                },
-            })
-        })
     }
     /// The terminal-artifact handoff: the agent wrote its output, so the goal
     /// must not continue past it. It lifts when the job next runs.
-    fn interrupt(&self) -> Result<(), String> {
+    fn interrupt(
+        &self,
+        identity: &crate::agent_process::process::ProcessIdentity,
+        owner: Option<&crate::agent_process::process::ProcessTurnOwner>,
+    ) -> Result<(), String> {
+        let job_id = goal_job_id_for_run(&self.session.run_db, &self.session.run_id)?;
+        let launch_lock = job_id
+            .as_deref()
+            .map(|id| self.session.orch.job_launch_lock(id));
+        let _guard = launch_lock
+            .as_ref()
+            .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        let state = &self.session.orch.process_state;
+        if identity.run_id() != self.session.run_id
+            || !state.is_process_identity_current(identity)
+            || owner.map_or_else(
+                || !state.is_untracked_busy_for_identity(identity),
+                |owner| owner.process_identity() != identity || !state.is_turn_owner_current(owner),
+            )
+        {
+            return Err("Codex terminal boundary no longer owns its process turn".to_string());
+        }
         crate::backends::stdin::send_interrupt(
             &self.session.orch.process_state,
             &self.session.run_id,
@@ -721,12 +828,20 @@ impl CodexHost for CodexReaderHost {
             .as_ref()
             .and_then(|client| client.take_interrupt_cause(provider_turn_id))
     }
-    fn artifact_handoff(&self) {
-        crate::orchestrator::lifecycle::transition_to_warm_state(
+    fn artifact_handoff(
+        &self,
+        identity: &crate::agent_process::process::ProcessIdentity,
+        owner: Option<&crate::agent_process::process::ProcessTurnOwner>,
+    ) -> bool {
+        crate::orchestrator::lifecycle::transition_owned_completion_to_warm(
             &self.session.orch,
-            &self.session.run_id,
-            None,
-        );
+            identity,
+            owner,
+            Some((
+                crate::models::TurnState::Complete,
+                Some(crate::models::TurnEndReason::ArtifactHandoff),
+            )),
+        )
     }
     fn watchdog_arm_failed(&self, evidence: &str) -> Result<(), String> {
         // The exit reason stays the stable category; the evidence is the
@@ -752,24 +867,36 @@ impl CodexHost for CodexReaderHost {
         crate::orchestrator::lifecycle::recover_provider_watchdog(&self.session.orch, identity, now)
             .map(|_| ())
     }
-    fn capacity_failure(&self) -> bool {
+    fn capacity_failure(
+        &self,
+        owner: Option<&crate::agent_process::process::ProcessTurnOwner>,
+    ) -> bool {
+        let Some(owner) = owner else {
+            return false;
+        };
         handle_selected_model_capacity_failure(
             &self.session.orch,
             &self.session.run_db,
             &self.session.run_id,
             self.session.session_id.as_deref(),
+            owner,
         )
     }
     fn complete(&self, completion: SessionTurnCompletion, mut context: CodexTurnContext) {
-        // Codex reports a turn that ran out of tokens in its own words (a
-        // routing or auth error) and drops the reason Cairn gave it, so the
-        // run is told that reason beside Codex's, and it is the cause a
-        // waiting parent hears: Cairn's account-scoped refusal explains the
-        // failure, where Codex's "unauthorized" does not. A failure another
-        // path already took over (a capacity retry) is not this turn's to
-        // explain, and only a failed turn has a cause.
-        let failed = matches!(completion.outcome, SessionTurnOutcome::Failed { .. })
-            && context.failure_disposition != TurnFailureDisposition::AlreadyHandled;
+        // Cairn's account-scoped refusal explains an opaque provider auth error.
+        // Retired bindings may account usage, but cannot give another turn a cause.
+        let failed = !context.accounting_only
+            && matches!(completion.outcome, SessionTurnOutcome::Failed { .. })
+            && context.failure_disposition != TurnFailureDisposition::AlreadyHandled
+            && context.owner.as_ref().map_or_else(
+                || {
+                    self.session
+                        .orch
+                        .process_state
+                        .is_process_identity_current(&context.process_identity)
+                },
+                |owner| self.session.orch.process_state.is_turn_owner_current(owner),
+            );
         context.fatal_cause = if failed {
             let refusal = self.standing_token_refusal();
             if let Some(notice) = refusal.as_deref() {
@@ -1241,6 +1368,175 @@ mod tests {
         }
     }
 
+    /// The transport must deliver a response while admission is parked behind
+    /// launch ownership; notification handling must not hold the sender's lock.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notification_before_attachment_does_not_block_the_launch_response() {
+        use cairn_platform::services::process::{ChildProcess, SpawnConfig};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        struct PipeChild(Option<UnixStream>, Option<UnixStream>);
+        impl ChildProcess for PipeChild {
+            fn id(&self) -> u32 {
+                0
+            }
+            fn take_stdout(&mut self) -> Option<Box<dyn BufRead + Send>> {
+                self.0
+                    .take()
+                    .map(|pipe| Box::new(BufReader::new(pipe)) as _)
+            }
+            fn take_stderr(&mut self) -> Option<Box<dyn BufRead + Send>> {
+                None
+            }
+            fn take_stdin(&mut self) -> Option<Box<dyn Write + Send>> {
+                self.1.take().map(|pipe| Box::new(pipe) as _)
+            }
+            fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+                Ok(None)
+            }
+            fn kill(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (db, orch) = persistent_codex_turn("codex-launch-response-order", "").await;
+        db.execute_script(
+            "UPDATE turns SET state='pending',started_at=NULL WHERE id='t';
+             INSERT INTO events(id,run_id,turn_id,sequence,event_type,data,timestamp,created_at)
+               VALUES('brief-t','r','t',1,'attention:briefing','{}',1,1);",
+        )
+        .await
+        .unwrap();
+        orch.process_state.transition_to_warm("r");
+        let launch_lock = orch.job_launch_lock("j");
+        let launch_guard = launch_lock.lock().unwrap();
+        let (client_pipe, mut server_pipe) = UnixStream::pair().unwrap();
+        let client_write = client_pipe.try_clone().unwrap();
+        let client = Arc::new(
+            AppServerClient::launch(
+                |_| Ok(Box::new(PipeChild(Some(client_pipe), Some(client_write)))),
+                SpawnConfig::new("test-codex"),
+            )
+            .unwrap(),
+        );
+        let notifications = client.notifications();
+        let (contended_tx, contended_rx) = crossbeam_channel::bounded(1);
+        let (admitted_tx, admitted_rx) = crossbeam_channel::bounded(1);
+        let reader_orch = orch.clone();
+        let reader_db = db.clone();
+        let reader_client = client.clone();
+        let provider_turn = Arc::new(Mutex::new(None));
+        let reader_provider_turn = provider_turn.clone();
+        let reader = std::thread::spawn(move || {
+            let notification = notifications
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(notification["method"], "turn/started");
+            assert!(reader_orch.job_launch_lock("j").try_lock().is_err());
+            contended_tx.send(()).unwrap();
+            let (tx, rx) = crossbeam_channel::unbounded();
+            tx.send(notification).unwrap();
+            drop(tx);
+            CodexBackend::reader_thread_app_server(
+                &reader_orch,
+                &reader_orch.services.emitter,
+                "r",
+                Some("s".into()),
+                rx,
+                reader_client,
+                reader_provider_turn,
+                None,
+                "codex".into(),
+                reader_db,
+                None,
+            );
+            admitted_tx.send(()).unwrap();
+        });
+        let server = std::thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(server_pipe.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "turn/start");
+            writeln!(
+                server_pipe,
+                "{}",
+                json!({
+                    "method":"turn/started", "params":{"turn":{"id":"provider-launch"}}
+                })
+            )
+            .unwrap();
+            contended_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            writeln!(
+                server_pipe,
+                "{}",
+                json!({
+                    "id":request["id"], "result":{"turn":{"id":"provider-launch"}}
+                })
+            )
+            .unwrap();
+        });
+        // This response crosses the real stdout demultiplexer while the
+        // notification consumer is unable to acquire the job launch lock.
+        let response = client
+            .send_request_within(
+                "turn/start",
+                json!({"threadId":"native-thread"}),
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(response["turn"]["id"], "provider-launch");
+        assert!(admitted_rx.try_recv().is_err());
+        crate::execution::jobs::start_turn(&orch, "t", "r").unwrap();
+        let identity = orch.process_state.capture_process_identity("r").unwrap();
+        orch.process_state
+            .begin_turn_if_identity(&identity, "t")
+            .unwrap();
+        drop(launch_guard);
+        admitted_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            provider_turn.lock().unwrap().as_deref(),
+            Some("provider-launch")
+        );
+        reader.join().unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            orch.process_state.get_current_turn_id("r").as_deref(),
+            Some("t")
+        );
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM turns WHERE job_id='j'", ())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE event_type='attention:briefing'",
+                ()
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE event_type='system:codex_goal_turn_started'",
+                ()
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+    }
+
     /// A Codex job mid-turn on a warm persistent session: job `j` (shaped by
     /// `job_sql`), session `s` on native thread `native-thread`, live run `r`
     /// serving Cairn turn `t`, which maps to provider turn `p1`.
@@ -1276,6 +1572,195 @@ mod tests {
             .register("r".into(), handle);
         orch.process_state.set_current_turn_id("r", Some("t"));
         (db, orch)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exhausted_capacity_distinguishes_unarmed_fallback_from_armed_hold() {
+        for arm_hold in [false, true] {
+            let (db, orch) = persistent_codex_turn(
+                if arm_hold {
+                    "codex-capacity-armed"
+                } else {
+                    "codex-capacity-unarmed"
+                },
+                "",
+            )
+            .await;
+            db.execute_script(
+                "INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('t0','s','j',-2,'interrupted','initial',0,0);
+                 INSERT INTO turns(id,session_id,job_id,sequence,predecessor_id,state,start_reason,created_at,updated_at) VALUES('ta','s','j',-1,'t0','interrupted','retry',0,0);
+                 INSERT INTO turns(id,session_id,job_id,sequence,predecessor_id,state,start_reason,created_at,updated_at) VALUES('tb','s','j',0,'ta','interrupted','retry',0,0);
+                 UPDATE turns SET start_reason='retry', predecessor_id='tb' WHERE id='t';",
+            )
+            .await
+            .unwrap();
+            if !arm_hold {
+                // Fail the hold write, not the turn settlement. Its transaction
+                // must roll back the yield before exact-owner failure fallback.
+                db.execute_script(
+                    "CREATE TRIGGER refuse_capacity_hold BEFORE INSERT ON provider_limit_holds
+                     BEGIN SELECT RAISE(ABORT, 'capacity hold unavailable'); END;",
+                )
+                .await
+                .unwrap();
+            }
+            let identity = orch.process_state.capture_process_identity("r").unwrap();
+            let owner = orch
+                .process_state
+                .capture_turn_owner_for_identity(&identity)
+                .unwrap();
+            assert!(handle_selected_model_capacity_failure(
+                &orch,
+                &db,
+                "r",
+                Some("s"),
+                &owner
+            ));
+            assert_eq!(
+                turn_row(&db).await.as_deref(),
+                Some(if arm_hold {
+                    "yielded/"
+                } else {
+                    "interrupted/provider_failure"
+                })
+            );
+            assert_eq!(
+                db.query_opt_i64(
+                    "SELECT COUNT(*) FROM provider_limit_holds WHERE state='active'",
+                    ()
+                )
+                .await
+                .unwrap(),
+                Some(i64::from(arm_hold))
+            );
+            assert_eq!(
+                db.query_opt_i64(
+                    "SELECT COUNT(*) FROM events WHERE event_type='system:error' AND data LIKE '%remained at capacity after three automatic retries%'",
+                    (),
+                )
+                .await.unwrap(),
+                Some(i64::from(!arm_hold)),
+                "only a successfully settled unarmed fallback reports exhaustion"
+            );
+            assert_eq!(
+                text(&db, "SELECT status FROM runs WHERE id='r'")
+                    .await
+                    .as_deref(),
+                Some("live")
+            );
+            assert_eq!(
+                db.query_opt_i64("SELECT COUNT(*) FROM turns WHERE predecessor_id='t'", ())
+                    .await
+                    .unwrap(),
+                Some(0),
+                "neither outcome starts a fourth retry"
+            );
+            assert!(orch.process_state.begin_turn("r", "successor"));
+            assert!(!handle_selected_model_capacity_failure(
+                &orch,
+                &db,
+                "r",
+                Some("s"),
+                &owner
+            ));
+            assert_eq!(
+                orch.process_state.get_current_turn_id("r").as_deref(),
+                Some("successor")
+            );
+            assert_eq!(
+                db.query_opt_i64(
+                    "SELECT COUNT(*) FROM events WHERE event_type='system:error' AND data LIKE '%remained at capacity after three automatic retries%'",
+                    (),
+                )
+                .await.unwrap(),
+                Some(i64::from(!arm_hold)),
+                "stale replay cannot diagnose or fail the successor"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_capacity_owner_cannot_settle_or_hold_a_successor() {
+        let (db, orch) = persistent_codex_turn("codex-stale-capacity-owner", "").await;
+        let identity = orch.process_state.capture_process_identity("r").unwrap();
+        let owner = orch
+            .process_state
+            .capture_turn_owner_for_identity(&identity)
+            .unwrap();
+        let target = capacity_retry_target(&db, &owner).unwrap().unwrap();
+        assert!(orch.process_state.begin_turn("r", "successor"));
+        assert!(!handle_selected_model_capacity_failure(
+            &orch,
+            &db,
+            "r",
+            Some("s"),
+            &owner
+        ));
+        assert!(!settle_capacity_failed_turn(
+            &orch,
+            &db,
+            "r",
+            "capacity_retry",
+            &owner
+        ));
+        assert!(!settle_capacity_failed_turn(
+            &orch,
+            &db,
+            "r",
+            "turn_failed",
+            &owner
+        ));
+        assert_eq!(
+            hold_at_capacity(&orch, &db, "r", Some("s"), &target, &owner),
+            CapacityHoldOutcome::StaleOwner
+        );
+        assert_eq!(
+            orch.process_state.get_current_turn_id("r").as_deref(),
+            Some("successor")
+        );
+        assert_eq!(
+            text(&db, "SELECT state FROM turns WHERE id='t'")
+                .await
+                .as_deref(),
+            Some("running")
+        );
+        assert_eq!(
+            text(&db, "SELECT status FROM runs WHERE id='r'")
+                .await
+                .as_deref(),
+            Some("live")
+        );
+        assert_eq!(
+            text(
+                &db,
+                "SELECT CAST(COUNT(*) AS TEXT) FROM provider_limit_holds"
+            )
+            .await
+            .as_deref(),
+            Some("0")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replayed_terminal_provider_marker_cannot_reattach_over_successor() {
+        let (db, orch) = persistent_codex_turn("codex-terminal-marker-replay", "").await;
+        let identity = orch.process_state.capture_process_identity("r").unwrap();
+        assert!(matches!(
+            admit_native_goal_turn(&orch, &db, "r", Some("s"), "p1", &identity).unwrap(),
+            Some(GoalTurnAdmission::Admitted { .. })
+        ));
+        db.execute_script("UPDATE turns SET state='complete' WHERE id='t';")
+            .await
+            .unwrap();
+        assert!(orch.process_state.begin_turn("r", "successor"));
+        assert!(matches!(
+            admit_native_goal_turn(&orch, &db, "r", Some("s"), "p1", &identity).unwrap(),
+            Some(GoalTurnAdmission::Ignored)
+        ));
+        assert_eq!(
+            orch.process_state.get_current_turn_id("r").as_deref(),
+            Some("successor")
+        );
     }
 
     /// Run the dedicated-session reader over `notifications` to the end.
@@ -1451,28 +1936,573 @@ mod tests {
         );
     }
 
-    /// An operator Stop settles the turn `user_stop` before it interrupts;
-    /// the abort that follows writes nothing over it.
+    type RetirementReaderHook = Box<dyn FnMut(&str) + Send>;
+    type RetirementDbChangeHook = Box<dyn FnOnce() + Send>;
+
+    #[derive(Clone, Default)]
+    struct RetirementReaderEmitter {
+        events: Arc<Mutex<Vec<String>>>,
+        on_marker: Arc<Mutex<Option<RetirementReaderHook>>>,
+        on_db_change: Arc<Mutex<Option<RetirementDbChangeHook>>>,
+    }
+
+    impl crate::services::EventEmitter for RetirementReaderEmitter {
+        fn emit(&self, event: &str, payload: Value) -> Result<(), String> {
+            self.events.lock().unwrap().push(event.to_string());
+            if event == "db-change"
+                && payload["table"] == "events"
+                && payload["action"] == "insert"
+                && payload["runId"] == "r"
+            {
+                let callback = self.on_db_change.lock().unwrap().take();
+                if let Some(callback) = callback {
+                    callback();
+                }
+            }
+            if event == "tool-output-delta" && payload["toolUseId"] == "retirement-marker" {
+                let callback = self.on_marker.lock().unwrap().take();
+                if let Some(mut callback) = callback {
+                    callback(payload["delta"].as_str().unwrap());
+                    *self.on_marker.lock().unwrap() = Some(callback);
+                }
+            }
+            Ok(())
+        }
+
+        fn emit_empty(&self, event: &str) -> Result<(), String> {
+            self.emit(event, Value::Null)
+        }
+    }
+
+    /// Actual park/Stop release precedes the terminal report. Its accepted
+    /// binding still owns accounting, not the successor's stream or lifecycle.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_operator_stop_abort_leaves_the_stops_settlement() {
-        let (db, orch) = persistent_codex_turn("codex-stop-abort", "").await;
-        db.execute(
-            "UPDATE turns SET state='interrupted', end_reason='user_stop' WHERE id='t'",
-            (),
-        )
-        .await
-        .unwrap();
-        let (client, _) =
-            client_that_interrupted(cairn_models::interface::session::InterruptCause::OperatorStop);
-        read_through(&orch, &db, client, vec![aborted("interrupted")]);
-        assert_eq!(
-            turn_row(&db).await.as_deref(),
-            Some("interrupted/user_stop")
-        );
-        assert_eq!(
-            interrupted_record(&db).await.as_deref(),
-            Some("operator_stop/interrupted/p1")
-        );
+    async fn park_and_stop_terminals_account_once_without_successor_effects() {
+        for (
+            stop,
+            successor,
+            interrupt_fails,
+            completed,
+            settlement_fails,
+            stale_stop,
+            idle_registration,
+        ) in [
+            (false, true, false, false, false, false, 0),
+            (false, false, true, true, false, false, 0),
+            (true, false, false, false, false, false, 0),
+            (true, false, false, true, false, false, 0),
+            (true, false, false, false, true, false, 0),
+            (true, true, false, false, false, true, 0),
+            (true, false, false, false, false, false, 1),
+            (true, false, false, false, false, false, 2),
+        ] {
+            let (db, _) = persistent_codex_turn("codex-retired-accounting", "").await;
+            let emitter = RetirementReaderEmitter::default();
+            let root = tempfile::tempdir().unwrap().keep();
+            let state = Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.join("search.db")).unwrap()),
+            ));
+            let orch = OrchestratorBuilder::new(
+                state,
+                Arc::new(
+                    TestServicesBuilder::new()
+                        .with_emitter(emitter.clone())
+                        .build(),
+                ),
+                root,
+            )
+            .build();
+            let goal = |status: &str| {
+                json!({"result":{"goal":{
+                    "threadId":"native-thread","objective":"finish work","status":status,
+                    "tokenBudget":null,"tokensUsed":0,"timeUsedSeconds":0,"createdAt":1,"updatedAt":2
+                }}})
+            };
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let responses = if interrupt_fails {
+                vec![Err("pause transport failed".to_string())]
+            } else {
+                vec![Ok(goal("active")), Ok(goal("paused")), Ok(Value::Null)]
+            };
+            let client = Arc::new(AppServerClient::for_test_scripted(
+                responses,
+                requests.clone(),
+            ));
+            let provider = Arc::new(Mutex::new(Some("p1".to_string())));
+            let control = cairn_models::session::codex::CodexControl::new(
+                client.clone(),
+                "native-thread".into(),
+                "/tmp/p".into(),
+                None,
+                None,
+                None,
+                provider.clone(),
+            );
+            let mut handle = RunHandle::new(
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(Some(Box::new(control)))),
+                Some("s".into()),
+                Some("j".into()),
+            );
+            handle.backend = Some("codex".into());
+            if idle_registration == 0 {
+                handle.begin_turn("t");
+            }
+            orch.process_state
+                .processes
+                .lock()
+                .unwrap()
+                .register("r".into(), handle);
+            if idle_registration != 0 {
+                let status = if idle_registration == 1 {
+                    "starting"
+                } else {
+                    "live"
+                };
+                if idle_registration == 2 {
+                    assert!(orch.process_state.transition_to_warm("r"));
+                }
+                db.execute("UPDATE runs SET status=?1 WHERE id='r'", (status,))
+                    .await
+                    .unwrap();
+                db.execute("UPDATE turns SET state='pending' WHERE id='t'", ())
+                    .await
+                    .unwrap();
+                *provider.lock().unwrap() = None;
+                let identity = orch.process_state.capture_process_identity("r").unwrap();
+                crate::orchestrator::lifecycle::operator_stop_run(&orch, "r").unwrap();
+                assert_eq!(
+                    text(&db, "SELECT status FROM runs WHERE id='r'")
+                        .await
+                        .as_deref(),
+                    Some(status)
+                );
+                assert!(orch.process_state.is_process_identity_current(&identity));
+                assert!(!emitter
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event == "run-completed"));
+                continue;
+            }
+            let owner = orch.process_state.capture_turn_owner("r", "t").unwrap();
+            let mut broadcasts = orch.run_completions.subscribe();
+            let action = orch.clone();
+            let action_db = db.clone();
+            let action_emitter = emitter.clone();
+            *emitter.on_marker.lock().unwrap() = Some(Box::new(move |phase| {
+                if phase == "retire" {
+                    if stop {
+                        if settlement_fails {
+                            crate::storage::run_db_blocking({
+                                let db = action_db.clone();
+                                move || async move {
+                                    db.execute_script("CREATE TRIGGER reject_stop BEFORE UPDATE OF state ON turns WHEN NEW.id='t' AND NEW.state='interrupted' BEGIN SELECT RAISE(ABORT,'injected stop settlement failure'); END;")
+                                        .await.map_err(|error| error.to_string())
+                                }
+                            }).unwrap();
+                        }
+                        if stale_stop {
+                            assert!(crate::transcripts::stream_store::insert_event(
+                                action_db.clone(),
+                                crate::transcripts::stream_store::EventInsert {
+                                    id: "pending-call".into(),
+                                    run_id: "r".into(),
+                                    session_id: Some("s".into()),
+                                    timestamp: 1,
+                                    selected_model: None,
+                                    event_type: "assistant".into(),
+                                    data: json!({"eventType":"assistant","isError":false,"sessionId":"s","toolUses":[{"id":"pending-run","name":"run","input":{"commands":[]}}]}).to_string(),
+                                    parent_tool_use_id: None,
+                                    created_at: 1,
+                                    input_tokens: None,
+                                    cache_read_tokens: None,
+                                    cache_create_tokens: None,
+                                    output_tokens: None,
+                                    thinking_tokens: None,
+                                    turn_id: Some("t".into()),
+                                    cost_usd: None,
+                                },
+                            ).unwrap());
+                            let raced = action.clone();
+                            let raced_db = action_db.clone();
+                            let predecessor = owner.clone();
+                            *action_emitter.on_db_change.lock().unwrap() = Some(Box::new(
+                                move || {
+                                    assert!(raced.job_launch_lock("j").try_lock().is_ok());
+                                    assert!(raced
+                                        .process_state
+                                        .is_turn_owner_current(&predecessor));
+                                    let answered = crate::storage::run_db_blocking({
+                                        let db = raced_db.clone();
+                                        move || async move {
+                                            db.query_opt_i64(
+                                                "SELECT COUNT(*) FROM events WHERE run_id='r' AND turn_id='t' AND event_type='tool_result'
+                                                 AND json_extract(data,'$.toolUseId')='pending-run'
+                                                 AND json_extract(data,'$.raw.synthetic')=1
+                                                 AND json_extract(data,'$.raw.reason')='user_stop'",
+                                                (),
+                                            ).await.map_err(|error| error.to_string())
+                                        }
+                                    }).unwrap();
+                                    assert_eq!(
+                                        answered,
+                                        Some(1),
+                                        "inject only after Stop answers P's pending tool"
+                                    );
+                                    crate::storage::run_db_blocking(move || async move {
+                                    raced_db.execute_script(
+                                        "UPDATE turns SET state='complete' WHERE id='t';
+                                         INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,started_at,updated_at)
+                                         VALUES('successor','s','r','j',2,'running','attention',2,2,2);
+                                         UPDATE jobs SET current_turn_id='successor' WHERE id='j';"
+                                    ).await.map_err(|error| error.to_string())
+                                }).unwrap();
+                                    assert!(raced
+                                        .process_state
+                                        .retire_turn_accounting_if_owned(&predecessor));
+                                    assert!(raced
+                                        .process_state
+                                        .transition_to_warm_if_owned(&predecessor));
+                                    raced.process_state.begin_turn("r", "successor");
+                                },
+                            ));
+                        }
+                        let stopped =
+                            crate::orchestrator::lifecycle::operator_stop_run(&action, "r");
+                        if stale_stop {
+                            assert!(
+                                action_emitter.on_db_change.lock().unwrap().is_none(),
+                                "the synthetic-result boundary must have fired"
+                            );
+                            assert_eq!(
+                                action.process_state.get_current_turn_id("r").as_deref(),
+                                Some("successor")
+                            );
+                        }
+                        if settlement_fails || stale_stop {
+                            let error = stopped.unwrap_err();
+                            assert!(error.contains(if stale_stop {
+                                "changed ownership"
+                            } else {
+                                "durably settled"
+                            }));
+                        } else {
+                            stopped.unwrap();
+                        }
+                        if settlement_fails {
+                            assert!(!owner.accounting_only());
+                            assert_eq!(
+                                action.process_state.get_current_turn_id("r").as_deref(),
+                                Some("t")
+                            );
+                            crate::storage::run_db_blocking({
+                                let db = action_db.clone();
+                                move || async move {
+                                    db.execute_script("DROP TRIGGER reject_stop;")
+                                        .await
+                                        .map_err(|error| error.to_string())
+                                }
+                            })
+                            .unwrap();
+                        }
+                    } else {
+                        crate::storage::run_db_blocking({
+                            let db = action_db.clone();
+                            move || async move {
+                                db.execute_script(
+                                    "UPDATE turns SET state='yielded' WHERE id='t';
+                                     INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at)
+                                     VALUES('wait','j','r','s','t','tool','{\"kind\":\"duration\"}','pending',1);"
+                                ).await.map_err(|error| error.to_string())
+                            }
+                        }).unwrap();
+                        action.process_state.yield_for_host("r", "t");
+                        for _ in 0..2 {
+                            crate::orchestrator::lifecycle::park_owned_turn(
+                                &action,
+                                "r",
+                                Some(&owner),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    assert_eq!(owner.accounting_only(), !settlement_fails);
+                    assert_eq!(
+                        action.process_state.get_current_turn_id("r").as_deref(),
+                        if stale_stop {
+                            Some("successor")
+                        } else if settlement_fails {
+                            Some("t")
+                        } else {
+                            None
+                        }
+                    );
+                } else if phase == "attach" {
+                    crate::storage::run_db_blocking({
+                        let db = action_db.clone();
+                        move || async move {
+                            db.execute_script(
+                                "UPDATE agent_waits SET state='resolved' WHERE id='wait';
+                                 UPDATE turns SET state='complete' WHERE id='t';
+                                 INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,started_at,updated_at)
+                                 VALUES('successor','s','r','j',2,'running','wait_resolved',2,2,2);
+                                 UPDATE jobs SET current_turn_id='successor' WHERE id='j';"
+                            ).await.map_err(|error| error.to_string())
+                        }
+                    }).unwrap();
+                    action.process_state.begin_turn("r", "successor");
+                } else if phase == "verify" {
+                    assert_eq!(
+                        action.process_state.get_current_turn_id("r").as_deref(),
+                        if successor { Some("successor") } else { None }
+                    );
+                    assert!(action.job_launch_lock("j").try_lock().is_ok());
+                    let lease = crate::storage::run_db_blocking({
+                        let db = action_db.clone();
+                        move || async move {
+                            db.query_opt_text("SELECT state FROM codex_watchdog_leases WHERE provider_turn_id='p1'", ())
+                                .await.map_err(|error| error.to_string())
+                        }
+                    }).unwrap();
+                    assert_eq!(lease.as_deref(), Some("disarmed"));
+                    if successor {
+                        let successor_lease = crate::storage::run_db_blocking({
+                            let db = action_db.clone();
+                            move || async move {
+                                db.query_opt_text("SELECT state FROM codex_watchdog_leases WHERE provider_turn_id='p2'", ())
+                                    .await.map_err(|error| error.to_string())
+                            }
+                        }).unwrap();
+                        assert_eq!(successor_lease.as_deref(), Some("active"));
+                    }
+                    if successor {
+                        let buffered = crate::storage::run_db_blocking({
+                            let db = action_db.clone();
+                            move || async move {
+                                db.query_opt_i64(
+                                    "SELECT COUNT(*) FROM events WHERE event_type='assistant' AND json_extract(data,'$.content')='successor buffer'",
+                                    (),
+                                )
+                                .await
+                                .map_err(|error| error.to_string())
+                            }
+                        })
+                        .unwrap();
+                        assert_eq!(buffered, Some(0), "P terminal must not flush S");
+                    }
+                }
+            }));
+            let usage = |id: &str, last: u32, total: u32| {
+                json!({
+                    "method":"thread/tokenUsage/updated","params":{"turnId":id,"tokenUsage":{
+                        "last":{"inputTokens":last,"outputTokens":1,"totalTokens":last+1},
+                        "total":{"inputTokens":total,"outputTokens":total/10}
+                    }}
+                })
+            };
+            let marker = |phase: &str| {
+                json!({"method":"item/commandExecution/outputDelta",
+                "params":{"itemId":"retirement-marker","delta":phase}})
+            };
+            let mut notifications = vec![
+                json!({"method":"turn/started","params":{"turn":{"id":"p1"}}}),
+                usage("p1", 100, 100),
+                marker("retire"),
+            ];
+            if successor {
+                notifications.extend([
+                    marker(if stale_stop { "already-attached" } else { "attach" }),
+                    json!({"method":"turn/started","params":{"turn":{"id":"p2"}}}),
+                    usage("p2", 10, 130),
+                    json!({"method":"item/agentMessage/delta","params":{"turnId":"p2","delta":"successor buffer"}}),
+                ]);
+            }
+            let terminal = if completed {
+                json!({"method":"turn/completed","params":{"turn":{"id":"p1","status":"completed"}}})
+            } else {
+                aborted("interrupted")
+            };
+            notifications.extend([
+                usage("p1", 20, 120), terminal.clone(), terminal,
+                aborted("interrupted"),
+                json!({"method":"error","params":{"turnId":"p1","message":"capacity exceeded","willRetry":false}}),
+                usage("p1", 999, 999), marker("verify"),
+            ]);
+            let (tx, rx) = crossbeam_channel::unbounded();
+            for notification in notifications {
+                tx.send(notification).unwrap();
+            }
+            drop(tx);
+            let reader_emitter: Arc<dyn crate::services::EventEmitter> = Arc::new(emitter.clone());
+            CodexBackend::reader_thread_app_server(
+                &orch,
+                &reader_emitter,
+                "r",
+                Some("s".into()),
+                rx,
+                client,
+                provider,
+                None,
+                "codex".into(),
+                db.clone(),
+                None,
+            );
+            assert_eq!(db.query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE turn_id='t' AND event_type LIKE 'result:%' AND input_tokens=120", ()
+            ).await.unwrap(), Some(1));
+            assert_eq!(
+                db.query_opt_i64(
+                    "SELECT COUNT(*) FROM events WHERE event_type LIKE 'result:%'",
+                    ()
+                )
+                .await
+                .unwrap(),
+                Some(1),
+                "replay cannot account again or charge S"
+            );
+            assert_eq!(
+                turn_row(&db).await.as_deref(),
+                Some(if stale_stop {
+                    "complete/"
+                } else if stop {
+                    "interrupted/user_stop"
+                } else if successor {
+                    "complete/"
+                } else {
+                    "yielded/"
+                })
+            );
+            assert_eq!(
+                text(&db, "SELECT status FROM runs WHERE id='r'")
+                    .await
+                    .as_deref(),
+                Some("live")
+            );
+            assert_eq!(
+                orch.get_context_token_state("s").await.unwrap().used_tokens,
+                if successor {
+                    11
+                } else if settlement_fails {
+                    21
+                } else {
+                    101
+                }
+            );
+            assert_eq!(
+                db.query_opt_i64("SELECT COUNT(*) FROM provider_limit_holds", ())
+                    .await
+                    .unwrap(),
+                Some(0)
+            );
+            assert_eq!(
+                emitter
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| *event == "run-turn-completed")
+                    .count(),
+                if stale_stop { 0 } else { 1 },
+                "actual park/Stop publishes its idle edge once"
+            );
+            assert!(
+                broadcasts.try_recv().is_err(),
+                "retired work must not broadcast success or wake its parent"
+            );
+            if stop {
+                assert_eq!(
+                    text(&db, "SELECT goal_intent FROM jobs WHERE id='j'")
+                        .await
+                        .as_deref(),
+                    Some("off")
+                );
+                if !stale_stop {
+                    assert_eq!(
+                        text(&db, "SELECT status FROM jobs WHERE id='j'")
+                            .await
+                            .as_deref(),
+                        Some("idle")
+                    );
+                    if !completed && !settlement_fails {
+                        db.execute_script(
+                            "INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,end_reason,created_at,updated_at)
+                             VALUES('refused','s',NULL,'j',2,'cancelled','attention','launch_refused',2,2);"
+                        ).await.unwrap();
+                        crate::execution::advancement::recompute_job(&orch, "j").unwrap();
+                        assert_eq!(
+                            text(&db, "SELECT status FROM jobs WHERE id='j'")
+                                .await
+                                .as_deref(),
+                            Some("idle"),
+                            "an unserved follow-up cannot revive the stopped retained run"
+                        );
+                        db.execute_script(
+                            "INSERT INTO runs(id,project_id,job_id,status,session_id,created_at,updated_at)
+                             VALUES('resume','p','j','starting','s',3,3);"
+                        ).await.unwrap();
+                        crate::execution::advancement::recompute_job(&orch, "j").unwrap();
+                        assert_eq!(
+                            text(&db, "SELECT status FROM jobs WHERE id='j'")
+                                .await
+                                .as_deref(),
+                            Some("running"),
+                            "a newly admitted run still witnesses the resume gap"
+                        );
+                        db.execute("UPDATE runs SET status='exited' WHERE id='resume'", ())
+                            .await
+                            .unwrap();
+                        crate::execution::advancement::recompute_job(&orch, "j").unwrap();
+                        assert_eq!(
+                            text(&db, "SELECT status FROM jobs WHERE id='j'")
+                                .await
+                                .as_deref(),
+                            Some("idle")
+                        );
+                        db.execute_script(
+                            "INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at)
+                             VALUES('review','s','r','j',3,'running','memory_review',4,4);"
+                        ).await.unwrap();
+                        crate::execution::advancement::recompute_job(&orch, "j").unwrap();
+                        assert_eq!(
+                            text(&db, "SELECT status FROM jobs WHERE id='j'")
+                                .await
+                                .as_deref(),
+                            Some("running"),
+                            "a genuinely live memory review remains work"
+                        );
+                        db.execute("UPDATE turns SET state='cancelled' WHERE id='review'", ())
+                            .await
+                            .unwrap();
+                        crate::execution::advancement::recompute_job(&orch, "j").unwrap();
+                        assert_eq!(
+                            text(&db, "SELECT status FROM jobs WHERE id='j'")
+                                .await
+                                .as_deref(),
+                            Some("idle"),
+                            "a cancelled memory review cannot revive the stopped work turn"
+                        );
+                    }
+                } else {
+                    crate::execution::advancement::recompute_job(&orch, "j").unwrap();
+                    assert_eq!(
+                        text(&db, "SELECT status FROM jobs WHERE id='j'")
+                            .await
+                            .as_deref(),
+                        Some("running"),
+                        "the live successor overrides its stopped predecessor"
+                    );
+                }
+            }
+            assert!(requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request["method"] != "turn/start"
+                    && request["params"]["status"] != "active"));
+        }
     }
 
     /// A teardown's abort leaves the turn to the teardown's finalization, so
@@ -1489,6 +2519,160 @@ mod tests {
         assert_eq!(
             interrupted_record(&db).await.as_deref(),
             Some("teardown/interrupted/p1")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handoff_terminal_accounts_predecessor_once_without_touching_native_successor() {
+        for (successor, finish_successor) in [(false, false), (true, false), (true, true)] {
+            let (db, orch) = persistent_codex_turn("codex-late-handoff-accounting", "").await;
+            assert!(orch.process_state.arm_terminal_tool("r"));
+            let usage = |id: &str, last: u32, total: u32| {
+                json!({
+                    "method": "thread/tokenUsage/updated",
+                    "params": {"turnId": id, "tokenUsage": {
+                        "last": {"inputTokens":last, "outputTokens":1, "totalTokens":last+1},
+                        "total": {"inputTokens":total, "outputTokens":total/10}
+                    }}
+                })
+            };
+            let mut notifications = vec![
+                usage("p1", 100, 100),
+                json!({"method":"item/completed","params":{"turnId":"p1","item":{
+                    "type":"mcpToolCall","id":"return-1","server":"cairn","tool":"write",
+                    "status":"completed","result":{"content":[]}
+                }}}),
+            ];
+            if successor {
+                notifications.extend([
+                    json!({"method":"turn/started","params":{"turn":{"id":"p2"}}}),
+                    usage("p2", 10, 130),
+                    json!({"method":"item/agentMessage/delta","params":{"turnId":"p2","delta":"successor buffer"}}),
+                ]);
+            }
+            // This older P total arrives after S's newer total. Its baseline
+            // belongs to P; it must neither charge S nor rewind S's baseline.
+            notifications.push(usage("p1", 20, 120));
+            notifications.extend([
+                aborted("interrupted"),
+                aborted("interrupted"),
+                json!({"method":"turn/completed","params":{"turn":{"id":"p1","status":"completed"}}}),
+                json!({"method":"error","params":{"turnId":"p1","message":"capacity exceeded","willRetry":false}}),
+                usage("p1", 999, 999),
+            ]);
+            if successor && !finish_successor {
+                // S's stream spans P's late frames. Had any of them finalized
+                // it, this tail would open a second assistant event.
+                notifications.push(json!({"method":"item/agentMessage/delta","params":{"turnId":"p2","delta":" successor tail"}}));
+            }
+            if finish_successor {
+                notifications.extend([
+                    usage("p2", 10, 140),
+                    json!({"method":"turn/completed","params":{"turn":{"id":"p2","status":"completed"}}}),
+                ]);
+            }
+            read_notifications(&orch, &db, notifications);
+            assert_eq!(
+                turn_row(&db).await.as_deref(),
+                Some("complete/artifact_handoff")
+            );
+            assert_eq!(db.query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE turn_id='t' AND event_type LIKE 'result:%' AND input_tokens=120",
+                (),
+            ).await.unwrap(), Some(1));
+            assert_eq!(
+                db.query_opt_i64(
+                    "SELECT COUNT(*) FROM events WHERE event_type LIKE 'result:%'",
+                    (),
+                )
+                .await
+                .unwrap(),
+                Some(if finish_successor { 2 } else { 1 }),
+                "replay must not insert another result or charge S"
+            );
+            assert_eq!(
+                text(&db, "SELECT status FROM runs WHERE id='r'")
+                    .await
+                    .as_deref(),
+                Some("live")
+            );
+            assert_eq!(
+                db.query_opt_i64("SELECT COUNT(*) FROM provider_limit_holds", ())
+                    .await
+                    .unwrap(),
+                Some(0)
+            );
+            let gauge = orch.get_context_token_state("s").await.unwrap();
+            assert_eq!(gauge.used_tokens, if successor { 11 } else { 101 });
+            if finish_successor {
+                assert_eq!(db.query_opt_i64(
+                    "SELECT input_tokens FROM events WHERE event_type='result:success' AND turn_id!='t'", (),
+                ).await.unwrap(), Some(20), "S gets only its two 10-token responses");
+                assert_eq!(orch.process_state.get_current_turn_id("r"), None);
+            } else if successor {
+                let owner = orch
+                    .process_state
+                    .capture_process_identity("r")
+                    .and_then(|id| orch.process_state.capture_turn_owner_for_identity(&id))
+                    .unwrap();
+                assert_ne!(owner.turn_id(), "t");
+                assert_eq!(text(&db, "SELECT state FROM turns WHERE id=(SELECT current_turn_id FROM jobs WHERE id='j')")
+                    .await.as_deref(), Some("running"));
+                // The stream closing under live S finalizes S's partial message
+                // once; late P frames must not have split it beforehand.
+                assert_eq!(db.query_opt_i64(
+                    "SELECT COUNT(*) FROM events WHERE event_type='assistant' AND json_extract(data,'$.content') LIKE '%successor%'", (),
+                ).await.unwrap(), Some(1), "late P must not finalize S's stream");
+                assert_eq!(db.query_opt_i64(
+                    "SELECT COUNT(*) FROM events WHERE event_type='assistant' AND json_extract(data,'$.content') LIKE 'successor buffer%successor tail'", (),
+                ).await.unwrap(), Some(1), "S's one message carries both halves");
+            } else {
+                assert_eq!(orch.process_state.get_current_turn_id("r"), None);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_boundary_settles_before_native_successor_and_cannot_replay() {
+        let (db, orch) = persistent_codex_turn("codex-terminal-boundary-owner", "").await;
+        let identity = orch.process_state.capture_process_identity("r").unwrap();
+        let owner = orch
+            .process_state
+            .capture_turn_owner_for_identity(&identity)
+            .unwrap();
+        let runtime = CodexBackend::session_runtime(
+            &orch,
+            "r",
+            Some("s".into()),
+            db.clone(),
+            Arc::new(AppServerClient::for_test_scripted(
+                vec![],
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+            None,
+            None,
+        );
+        assert!(runtime.host.artifact_handoff(&identity, Some(&owner)));
+        assert_eq!(
+            turn_row(&db).await.as_deref(),
+            Some("complete/artifact_handoff")
+        );
+        let Some(GoalTurnAdmission::Admitted { owner: successor }) =
+            admit_native_goal_turn(&orch, &db, "r", Some("s"), "p2", &identity).unwrap()
+        else {
+            panic!("native successor must be admitted after the handoff");
+        };
+        assert_ne!(successor.turn_id(), owner.turn_id());
+        assert!(!runtime.host.artifact_handoff(&identity, Some(&owner)));
+        assert!(orch.process_state.is_turn_owner_current(&successor));
+        assert_eq!(
+            text(
+                &db,
+                &format!("SELECT state FROM turns WHERE id='{}'", successor.turn_id())
+            )
+            .await
+            .as_deref(),
+            Some("running")
         );
     }
 

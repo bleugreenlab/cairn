@@ -21,6 +21,18 @@ pub async fn transition_run(
     to: RunStatus,
     emitter: &dyn EventEmitter,
 ) -> Result<RunStatus, TransitionError> {
+    let (from, change) = settle_run(db, run_id, to).await?;
+    let _ = emitter.emit("db-change", change);
+    Ok(from)
+}
+
+/// Commit a run transition without publishing to reentrant consumers. The caller
+/// publishes the returned change after releasing its launch authority.
+pub async fn settle_run(
+    db: &LocalDb,
+    run_id: &str,
+    to: RunStatus,
+) -> Result<(RunStatus, serde_json::Value), TransitionError> {
     let refusal = |from: String, reason: String| TransitionError {
         entity: "run",
         id: run_id.to_string(),
@@ -115,9 +127,7 @@ pub async fn transition_run(
         db.provider_admission_changed();
     }
     let change = cairn_db::changes::run_db_change_for_id(db, run_id, "update").await;
-    let _ = emitter.emit("db-change", change);
-
-    Ok(from)
+    Ok((from, change))
 }
 
 /// Set exit_reason on a run.

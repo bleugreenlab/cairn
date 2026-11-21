@@ -645,9 +645,18 @@ async fn a_task_cut_off_by_its_provider_is_still_asked_for_its_return() {
                 session_lifetime: SessionLifetime::Persistent,
             },
             CodexTurnContext {
+                fatal_cause: None,
+                accounting_only: false,
+                process_identity: orch
+                    .process_state
+                    .capture_process_identity("run-child")
+                    .unwrap(),
+                owner: orch
+                    .process_state
+                    .get_current_turn_id("run-child")
+                    .and_then(|id| orch.process_state.capture_turn_owner("run-child", &id)),
                 failure_disposition:
                     cairn_session::agent_process::completion::TurnFailureDisposition::Unhandled,
-                fatal_cause: None,
             },
         );
     })
@@ -990,24 +999,36 @@ async fn heal_parked_parents_releases_a_parent_whose_children_finished_without_a
     );
     assert_eq!(successor_count(&orch).await, 0);
 
+    // The park recomputes the parent's execution, which returns the never-launched
+    // child (no run, no launch claim) to `pending`; the post-park resume check
+    // then refreshes its packet to `materialized`. Wait for that last write so
+    // the stale packet seeded below cannot be overwritten.
+    let packet_status =
+        format!("SELECT status FROM delegated_packets WHERE result_artifact_job_id = '{child}'");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while text(&orch, &packet_status).await.as_deref() != Some("materialized") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the post-park refresh never settled the packet: {:?}",
+            text(&orch, &packet_status).await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
     write_return(&orch, &child, RETURNED).await;
+    // The child finished without its completion reaching the parent: the job is
+    // terminal while its packet still records it as running.
     orch.db
         .local
-        .execute(
-            "UPDATE jobs SET status = 'complete' WHERE id = ?1",
-            params![child.clone()],
-        )
+        .execute_script(format!(
+            "UPDATE jobs SET status = 'complete' WHERE id = '{child}';
+             UPDATE delegated_packets SET status = 'running'
+              WHERE result_artifact_job_id = '{child}';"
+        ))
         .await
         .unwrap();
     assert_eq!(
-        text(
-            &orch,
-            &format!(
-                "SELECT status FROM delegated_packets WHERE result_artifact_job_id = '{child}'"
-            )
-        )
-        .await
-        .as_deref(),
+        text(&orch, &packet_status).await.as_deref(),
         Some("running"),
         "the stale packet is the shape the heal must see past"
     );
@@ -1170,9 +1191,18 @@ async fn complete_codex_child_turn(orch: &Orchestrator) {
                 session_lifetime: crate::agent_process::completion::SessionLifetime::Persistent,
             },
             cairn_session::agent_process::completion::CodexTurnContext {
+                fatal_cause: None,
+                accounting_only: false,
+                process_identity: orch
+                    .process_state
+                    .capture_process_identity("run-child")
+                    .unwrap(),
+                owner: orch
+                    .process_state
+                    .get_current_turn_id("run-child")
+                    .and_then(|id| orch.process_state.capture_turn_owner("run-child", &id)),
                 failure_disposition:
                     cairn_session::agent_process::completion::TurnFailureDisposition::Unhandled,
-                fatal_cause: None,
             },
         );
     })
@@ -1310,6 +1340,13 @@ fn blocking_text(delivered: &str) -> String {
 
 async fn fail_codex_child_turn(orch: &Orchestrator, cause: Option<&'static str>) {
     on_blocking_thread(orch, move |orch| {
+        let process_identity = orch
+            .process_state
+            .capture_process_identity("run-child")
+            .unwrap();
+        let owner = orch
+            .process_state
+            .capture_turn_owner_for_identity(&process_identity);
         crate::orchestrator::lifecycle::apply_codex_turn_completion(
             orch,
             &orch.db.local,
@@ -1324,6 +1361,9 @@ async fn fail_codex_child_turn(orch: &Orchestrator, cause: Option<&'static str>)
                 session_lifetime: crate::agent_process::completion::SessionLifetime::Persistent,
             },
             cairn_session::agent_process::completion::CodexTurnContext {
+                accounting_only: false,
+                process_identity,
+                owner,
                 failure_disposition:
                     cairn_session::agent_process::completion::TurnFailureDisposition::DiagnosticRecorded,
                 fatal_cause: cause.map(str::to_string),

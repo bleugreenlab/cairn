@@ -1043,6 +1043,9 @@ pub(crate) async fn suspend(
     // Reject a known competing owner before touching provider state. The same
     // check remains in the insert transaction below because permission can win
     // after this read and before the row lands.
+    let turn_owner = orch
+        .process_state
+        .capture_turn_owner(&record.run_id, &record.turn_id);
     validate_run_batch_ownership(db, record).await?;
     // Codex decides whether to continue a goal as soon as its provider turn
     // becomes idle. Claim that decision before publishing the yielded turn or
@@ -1050,21 +1053,27 @@ pub(crate) async fn suspend(
     // after the marker, and pausing only there leaves the marker-to-interrupt
     // window owned by the provider. The status response is validated, so a
     // provider that acknowledges the request without applying it fails closed.
-    let goal_pause = pause_goal_for_park(orch, record)?;
+    let goal_pause = pause_goal_for_park(orch, record, turn_owner.as_ref())?;
     let established = async {
         supersede_abandoned(orch, db, record).await?;
         insert(db, record).await
     }
     .await;
     let yielded = settle_goal_pause(orch, record, goal_pause, established)?;
-    Ok(finish_park(orch, db, record, yielded).await)
+    Ok(finish_park(orch, db, record, yielded, turn_owner).await)
 }
 
 /// Claim the native goal's continue decision for a park, or fail.
 fn pause_goal_for_park(
     orch: &Orchestrator,
     record: &Record,
+    turn_owner: Option<&crate::agent_process::process::ProcessTurnOwner>,
 ) -> Result<Option<crate::backends::codex::DurableGoalPause>, String> {
+    let lock = orch.job_launch_lock(&record.job_id);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if turn_owner.is_none_or(|owner| !orch.process_state.is_turn_owner_current(owner)) {
+        return Ok(None);
+    }
     crate::backends::stdin::pause_goal_for_durable_wait(
         &orch.process_state,
         &record.run_id,
@@ -1218,7 +1227,10 @@ pub(crate) async fn convert_hold_to_park(
     db: &LocalDb,
     record: &Record,
 ) -> Result<ParkHandoff, String> {
-    let goal_pause = pause_goal_for_park(orch, record)?;
+    let turn_owner = orch
+        .process_state
+        .capture_turn_owner(&record.run_id, &record.turn_id);
+    let goal_pause = pause_goal_for_park(orch, record, turn_owner.as_ref())?;
     let (id, turn_id) = (record.id.clone(), record.turn_id.clone());
     let converted = db
         .write(|c| {
@@ -1247,7 +1259,7 @@ pub(crate) async fn convert_hold_to_park(
             SUSPENSION_UNAVAILABLE.to_string()
         });
     let yielded = settle_goal_pause(orch, record, goal_pause, converted)?;
-    Ok(finish_park(orch, db, record, yielded).await)
+    Ok(finish_park(orch, db, record, yielded, turn_owner).await)
 }
 
 /// Turn the pending wait of a `run` batch (`batch`) into a more specific wait
@@ -1294,7 +1306,10 @@ pub(crate) async fn take_over_run_batch(
         created: chrono::Utc::now().timestamp_millis(),
         ..batch.clone()
     };
-    let goal_pause = pause_goal_for_park(orch, &record)?;
+    let turn_owner = orch
+        .process_state
+        .capture_turn_owner(&record.run_id, &record.turn_id);
+    let goal_pause = pause_goal_for_park(orch, &record, turn_owner.as_ref())?;
     let converted = convert_run_batch(db, &record).await;
     let (yielded, parks) = settle_goal_pause(orch, &record, goal_pause, converted)?;
     // A pending batch row holds the branch; the continuation it became holds
@@ -1307,7 +1322,7 @@ pub(crate) async fn take_over_run_batch(
     if parks {
         // Nothing awaits this park: the continuation's scheduler is what
         // holds its first transition back.
-        let _ = finish_park(orch, db, &record, yielded).await;
+        let _ = finish_park(orch, db, &record, yielded, turn_owner).await;
     }
     Ok(record)
 }
@@ -1374,6 +1389,7 @@ async fn finish_park(
     db: &LocalDb,
     record: &Record,
     yielded: bool,
+    turn_owner: Option<crate::agent_process::process::ProcessTurnOwner>,
 ) -> ParkHandoff {
     // Say out loud that the turn parked. The row and the yield land inside one
     // write, which announces nothing on its own, and every reader of turn state
@@ -1387,16 +1403,15 @@ async fn finish_park(
         let change = crate::notify::turn_db_change_for_id(db, &record.turn_id, "update").await;
         let _ = orch.services.emitter.emit("db-change", change);
     }
-    orch.process_state
-        .yield_for_host(&record.run_id, &record.turn_id);
+    if let Some(owner) = &turn_owner {
+        orch.process_state.yield_for_host_if_owned(owner);
+    }
     let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
-    crate::orchestrator::lifecycle::suspend_run_for_durable_wait_after_handoff_then(
+    crate::orchestrator::lifecycle::suspend_owned_run_after_handoff_then(
         orch,
         &record.run_id,
         "durable_suspend",
-        crate::agent_process::process::GoalPauseOwner::DurableWait {
-            wait_id: record.id.clone(),
-        },
+        turn_owner,
         move |parked| async move {
             if parked.is_ok() {
                 let _ = parked_tx.send(());
@@ -7460,6 +7475,102 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn late_durable_park_preserves_native_goal_successor_and_duplicate_result() {
+        use crate::agent_process::completion::{
+            SessionLifetime, SessionTurnCompletion, SessionTurnOutcome, TurnFailureDisposition,
+        };
+        use crate::orchestrator::lifecycle::{apply_codex_turn_completion, CodexTurnContext};
+        let (orch, record, requests, goal_status) = owned_goal_env().await;
+        let identity = orch
+            .process_state
+            .capture_process_identity(&record.run_id)
+            .unwrap();
+        let owner = orch
+            .process_state
+            .capture_turn_owner(&record.run_id, &record.turn_id)
+            .unwrap();
+        apply_codex_turn_completion(
+            &orch,
+            &orch.db.local,
+            &orch.services.emitter,
+            &record.run_id,
+            Some(&record.session_id),
+            SessionTurnCompletion {
+                outcome: SessionTurnOutcome::Completed,
+                usage: Default::default(),
+                session_lifetime: SessionLifetime::Persistent,
+            },
+            CodexTurnContext {
+                accounting_only: false,
+                process_identity: identity.clone(),
+                owner: Some(owner.clone()),
+                failure_disposition: TurnFailureDisposition::Unhandled,
+                fatal_cause: None,
+            },
+        );
+        let admission = crate::execution::jobs::admit_codex_goal_turn(
+            &orch,
+            orch.db.local.clone(),
+            &record.run_id,
+            &record.session_id,
+            &record.job_id,
+            "native-successor",
+            None,
+        )
+        .unwrap();
+        let crate::execution::jobs::CodexGoalTurnAdmission::Admitted(successor) = admission else {
+            panic!("native successor must be admitted before the late wait");
+        };
+        orch.process_state
+            .begin_turn_if_identity(&identity, &successor)
+            .unwrap();
+        let requests_before = requests.lock().unwrap().len();
+
+        // The old callback publishes its durable wait after the provider has
+        // completed P and started S. Neither publication nor its late park owns S.
+        let handoff = suspend(&orch, &orch.db.local, &record).await.unwrap();
+        assert_eq!(
+            orch.process_state
+                .get_current_turn_id(&record.run_id)
+                .as_deref(),
+            Some(successor.as_str())
+        );
+        assert!(handoff.parked().await);
+        for _ in 0..2 {
+            crate::orchestrator::lifecycle::park_owned_turn(&orch, &record.run_id, Some(&owner))
+                .unwrap();
+            resolve(&orch, &orch.db.local, &record, ELAPSED, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                orch.process_state
+                    .get_current_turn_id(&record.run_id)
+                    .as_deref(),
+                Some(successor.as_str())
+            );
+        }
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            requests_before,
+            "late park must send no pause, interrupt, or prompt"
+        );
+        assert_eq!(*goal_status.lock().unwrap(), "active");
+        assert_eq!(tool_results(&orch).await.len(), 1);
+        assert!(
+            wait_resolved_turns(&orch).await.is_empty(),
+            "the existing native successor owns the single continuation"
+        );
+        assert_eq!(
+            load_resolution(&orch.db.local, &record.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            "resolved"
+        );
     }
 
     #[tokio::test]

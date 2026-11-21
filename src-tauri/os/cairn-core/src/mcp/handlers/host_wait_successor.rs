@@ -18,7 +18,7 @@
 //! refusal is recorded on, and (through [`HostWaitAnswer`]) how the result is
 //! delivered.
 
-use crate::agent_process::process::GoalPauseOwner;
+use crate::agent_process::process::{GoalPauseOwner, ProcessTurnOwner};
 use crate::execution::jobs::GoalReactivation;
 use crate::models::{TurnEndReason, TurnStartReason, TurnState};
 use crate::orchestrator::Orchestrator;
@@ -297,7 +297,7 @@ pub(crate) async fn ensure_host_wait_successor_conn(
 /// broadcast -- but it goes through the same minter so the two paths cannot
 /// disagree about which turn is the successor, and so a steer's turn is never
 /// adopted as the answer's.
-pub(crate) async fn start_host_wait_successor(
+async fn start_host_wait_successor(
     db: &LocalDb,
     run_id: &str,
     predecessor_turn_id: &str,
@@ -326,6 +326,184 @@ pub(crate) async fn start_host_wait_successor(
         })
     })
     .await
+}
+
+/// Start an inline answer only while its captured process and predecessor still
+/// own the job. The synchronous critical section never publishes callbacks:
+/// readers may observe the successor only after its checked registry handoff.
+pub(crate) async fn start_inline_host_wait_successor(
+    orch: &Orchestrator,
+    db: &std::sync::Arc<LocalDb>,
+    run_id: &str,
+    predecessor_turn_id: &str,
+    owner: Option<&ProcessTurnOwner>,
+    kind: HostWaitKind,
+) -> Result<(), String> {
+    let blocking_orch = orch.clone();
+    let blocking_db = db.clone();
+    let run_id = run_id.to_string();
+    let predecessor_turn_id = predecessor_turn_id.to_string();
+    let owner = owner.cloned();
+    let (update, outcome) = tokio::task::spawn_blocking(move || {
+        let result = start_inline_host_wait_successor_locked(
+            &blocking_orch,
+            &blocking_db,
+            &run_id,
+            &predecessor_turn_id,
+            owner.as_ref(),
+            kind,
+        )?;
+        if result.0.is_some() && result.1.is_err() {
+            // The lock is released before projection may notify or launch work.
+            let job_id = crate::storage::run_db_blocking(|| async {
+                blocking_db
+                    .query_opt(
+                        "SELECT job_id FROM runs WHERE id = ?1",
+                        params![run_id.as_str()],
+                        |row| row.opt_text(0),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+            })?
+            .flatten();
+            if let Some(job_id) = job_id {
+                if let Err(error) =
+                    crate::execution::advancement::recompute_job(&blocking_orch, &job_id)
+                {
+                    log::warn!("Failed to recompute job after refused inline handoff: {error}");
+                }
+            }
+        }
+        Ok::<_, String>(result)
+    })
+    .await
+    .map_err(|error| format!("Inline host-wait handoff task failed: {error}"))??;
+    if let Some(update) = update {
+        emit_successor_turn_events(db, &*orch.services.emitter, &update).await;
+    }
+    outcome
+}
+
+fn start_inline_host_wait_successor_locked(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    run_id: &str,
+    predecessor_turn_id: &str,
+    owner: Option<&ProcessTurnOwner>,
+    kind: HostWaitKind,
+) -> Result<(Option<SuccessorTurnUpdate>, Result<(), String>), String> {
+    let job_id = crate::storage::run_db_blocking(|| async {
+        db.query_opt(
+            "SELECT job_id FROM runs WHERE id = ?1",
+            params![run_id],
+            |row| row.opt_text(0),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    })?
+    .flatten()
+    .ok_or_else(|| format!("Run {run_id} has no owning job"))?;
+    let launch_lock = orch.job_launch_lock(&job_id);
+    let _guard = launch_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let valid = owner.is_some_and(|owner| {
+        owner.run_id() == run_id
+            && owner.turn_id() == predecessor_turn_id
+            && !owner.accounting_only()
+            && orch.process_state.is_turn_owner_current(owner)
+            && !orch.is_turn_terminal_claimed(predecessor_turn_id)
+    });
+    if !valid {
+        // Answer recording may already have minted a pending head. Do not leave
+        // it stranded when its inline waiter lost ownership, and never cancel a
+        // running successor or one admitted by another launch.
+        let update = cancel_inline_pending_successor(orch, db, &job_id, predecessor_turn_id, kind)?;
+        return Ok((
+            update,
+            Err(format!(
+                "Inline {} answer lost its predecessor process ownership",
+                kind.label()
+            )),
+        ));
+    }
+    let update = match crate::storage::run_db_blocking(|| async {
+        start_host_wait_successor(db, run_id, predecessor_turn_id, kind)
+            .await
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(update) => update,
+        Err(error) => {
+            let update =
+                cancel_inline_pending_successor(orch, db, &job_id, predecessor_turn_id, kind)?;
+            return Ok((update, Err(error.to_string())));
+        }
+    };
+    let Some(update) = update else {
+        // An open provider turn (notably Codex) needs no logical rotation.
+        return Ok((None, Ok(())));
+    };
+    if update.started
+        && orch
+            .process_state
+            .rotate_turn_if_owned(owner.unwrap(), &update.turn_id)
+            .is_some()
+    {
+        return Ok((Some(update), Ok(())));
+    }
+    if update.started {
+        crate::storage::run_db_blocking(|| async {
+            db.execute(
+                "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, updated_at = ?2 \
+                 WHERE id = ?3 AND run_id = ?4 AND state = 'running'",
+                params![kind.end_reason().to_string(), chrono::Utc::now().timestamp(),
+                    update.turn_id.as_str(), run_id],
+            ).await.map_err(|error| error.to_string())
+        })?;
+    }
+    Ok((
+        Some(update),
+        Err(format!(
+            "Inline {} successor could not acquire its predecessor process ownership",
+            kind.label()
+        )),
+    ))
+}
+
+/// The caller holds this job's launch authority. Only an unadmitted pending
+/// continuation can be unwound; a running successor belongs to its launcher.
+fn cancel_inline_pending_successor(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_id: &str,
+    predecessor_turn_id: &str,
+    kind: HostWaitKind,
+) -> Result<Option<SuccessorTurnUpdate>, String> {
+    if orch.claimed_launch_run(job_id).is_some() {
+        return Ok(None);
+    }
+    crate::storage::run_db_blocking(|| async {
+        let turn_id = db.query_opt(
+            "SELECT id FROM turns WHERE predecessor_id = ?1 AND start_reason = ?2 AND state = 'pending' \
+             AND NOT EXISTS (SELECT 1 FROM runs WHERE job_id = ?3 AND status = 'starting')",
+            params![predecessor_turn_id, kind.start_reason().to_string(), job_id],
+            |row| row.text(0),
+        ).await.map_err(|error| error.to_string())?;
+        let Some(turn_id) = turn_id else {
+            return Ok(None);
+        };
+        let changed = db.execute(
+            "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, updated_at = ?2 \
+             WHERE id = ?3 AND state = 'pending'",
+            params![kind.end_reason().to_string(), chrono::Utc::now().timestamp(), turn_id.as_str()],
+        ).await.map_err(|error| error.to_string())?;
+        Ok((changed > 0).then_some(SuccessorTurnUpdate {
+            // `started` requests the update notification, including this cancellation.
+            turn_id,
+            inserted: false,
+            started: true,
+        }))
+    })
 }
 
 /// Continue a job into the successor an answer minted, and make sure that turn

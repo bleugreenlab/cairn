@@ -68,15 +68,35 @@ pub struct JobStatusChange {
     pub cause: ChangeCause,
 }
 
+// A retained live run is not work after its own latest turn was stopped.
+// A newly admitted run still witnesses the resume gap, and a newer live turn
+// supplies liveness independently through TurnFacts::live.
 async fn has_active_run_conn(
     conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<bool> {
     let mut rows = conn
         .query(
-            "SELECT 1 FROM runs
-             WHERE job_id = ?1 AND status IN ('starting', 'live')
-             LIMIT 1",
+            &format!(
+                "SELECT 1 FROM runs r
+             WHERE r.job_id = ?1 AND r.status IN ('starting', 'live')
+               AND NOT (
+                 r.status = 'live' AND EXISTS (
+                   SELECT 1 FROM turns t
+                   WHERE t.id = (
+                     SELECT latest.id FROM turns latest
+                     WHERE latest.job_id = ?1
+                       AND latest.start_reason != 'memory_review'
+                       AND NOT {UNSERVED_LAUNCH}
+                     ORDER BY latest.created_at DESC, latest.sequence DESC LIMIT 1
+                   )
+                     AND t.run_id = r.id
+                     AND t.state IN ('interrupted', 'cancelled')
+                     AND t.end_reason = 'user_stop'
+                 )
+               )
+             LIMIT 1"
+            ),
             (job_id,),
         )
         .await?;

@@ -47,10 +47,11 @@ pub(crate) use child_unresumed::{render_unresumed_push_body, sweep_unresumed_chi
 pub(crate) use common::live_turn_id_for_run;
 pub(crate) use common::set_exit_reason;
 pub(crate) use finalize::{
-    current_session_closed, fail_run_with_cause, finalize_run_for_operator_compact,
+    current_session_closed, finalize_owned_completion, finalize_run_for_operator_compact,
     finalize_run_for_recovery, interrupt_run_for_provider_depletion, memory_review_turn_ended,
     record_run_cause_if_active, record_run_failure_if_active, release_and_stop_process,
-    settle_provider_turn_failure, stop_processes_for_sessions, LAUNCH_ATTACH_FAILED_EXIT_REASON,
+    release_owned_completion, stop_processes_for_sessions, transition_owned_completion_to_warm,
+    LAUNCH_ATTACH_FAILED_EXIT_REASON,
 };
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state, warm_provider_held_run};
 #[cfg(test)]
@@ -66,17 +67,20 @@ pub use review_push::{
     create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_bounded_failed_review,
     rearm_review_checks_on_startup,
 };
+#[cfg(test)]
+pub(crate) use stop::park_owned_turn;
+pub(crate) use stop::suspend_owned_run_after_handoff_then;
 pub(crate) use stop::{
-    find_descendant_job_ids, settle_live_turn, TurnSettlement, OPERATOR_COMPACT_EXIT_REASON,
-    PROVIDER_SILENCE_RECOVERY_EXIT_REASON, WATCHDOG_ARM_FAILED_EXIT_REASON,
+    find_descendant_job_ids, kill_session_with_reason_launch_locked, settle_live_turn,
+    TurnSettlement, OPERATOR_COMPACT_EXIT_REASON, PROVIDER_SILENCE_RECOVERY_EXIT_REASON,
+    WATCHDOG_ARM_FAILED_EXIT_REASON,
 };
 pub use stop::{
     interrupt_turn_for_message, kill_session, kill_session_with_reason, live_run_id_for_job,
     operator_stop_job, operator_stop_run, stop_active_turn_for_run, stop_agents_for_host_shutdown,
     stop_call, stop_job, stop_session, stop_workflow, suspend_run_for_durable_wait,
-    suspend_run_for_durable_wait_after_handoff, suspend_run_for_durable_wait_after_handoff_then,
-    HostShutdownStops, ParkSlots, TerminalPolicy, RUNNER_SHUTDOWN_EXIT_REASON,
-    SUSPEND_HANDOFF_GRACE,
+    suspend_run_for_durable_wait_after_handoff, HostShutdownStops, ParkSlots, TerminalPolicy,
+    RUNNER_SHUTDOWN_EXIT_REASON, SUSPEND_HANDOFF_GRACE,
 };
 #[cfg(test)]
 pub(crate) use unanswered_calls::{
@@ -85,7 +89,8 @@ pub(crate) use unanswered_calls::{
 };
 pub(crate) use unanswered_calls::{
     lost_calls_note, open_call_names, settle_calls_cut_off_by_process_end, settle_unanswered_calls,
-    InterruptCause, HOST_RESTART_REASON, PROCESS_LOST_REASON,
+    InterruptCause, HOST_RESTART_REASON, PROCESS_LOST_REASON, USER_STOP_AFTER_WRITE_EFFECT_REASON,
+    USER_STOP_REASON,
 };
 pub(crate) use unowned_running::{render_unowned_push_body, sweep_unowned_running};
 pub(crate) use watchdog_recovery::notify_watchdog_successor_started;

@@ -122,6 +122,10 @@ fn only_the_facet_starts_an_app_server_for_a_session() {
                 "a test fixture: a scripted app-server process",
             ),
             (
+                "cairn-core/src/backends/codex/runtime.rs",
+                "a test fixture: an in-memory pipe child exercises response demultiplexing",
+            ),
+            (
                 "cairn-models-subscriptions/src/usage/codex.rs",
                 "subscription usage probe, not a session",
             ),

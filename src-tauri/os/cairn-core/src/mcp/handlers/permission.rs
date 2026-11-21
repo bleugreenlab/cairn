@@ -24,9 +24,9 @@ use cairn_common::ids;
 use cairn_db::turso::params;
 
 use super::host_wait_successor::{
-    continue_into_host_wait_successor, emit_successor_turn_events, ensure_host_wait_successor_conn,
-    ensure_successor_turn, record_resume_error, run_turn_context, start_host_wait_successor,
-    HostWaitAnswer, HostWaitKind, HostWaitSuccessor, SuccessorTurnUpdate,
+    continue_into_host_wait_successor, ensure_host_wait_successor_conn, ensure_successor_turn,
+    record_resume_error, run_turn_context, start_inline_host_wait_successor, HostWaitAnswer,
+    HostWaitKind, HostWaitSuccessor, SuccessorTurnUpdate,
 };
 
 /// The inline wait and every callback bound wrapping it: `cairn_common::callback_contract`.
@@ -549,6 +549,11 @@ pub(crate) async fn await_permission_decision(
     if let Some(ref turn_id) = current_turn_id {
         orch.process_state.yield_for_host(run_id, turn_id);
     }
+    // The suspension below parks only this exact yielded turn, never whatever
+    // the process serves when the budget expires.
+    let turn_owner = current_turn_id
+        .as_deref()
+        .and_then(|turn_id| orch.process_state.capture_turn_owner(run_id, turn_id));
 
     // Emit event for frontend
     let _ = services.emitter.emit(
@@ -645,22 +650,27 @@ pub(crate) async fn await_permission_decision(
             // (pending) before it broadcast; the inline waiter is the one owner
             // that starts it, because this process continues the provider turn.
             if let Some(ref pred_turn_id) = current_turn_id {
-                match start_host_wait_successor(
+                if let Err(error) = start_inline_host_wait_successor(
+                    orch,
                     &orch.db.local,
                     run_id,
                     pred_turn_id,
+                    turn_owner.as_ref(),
                     HostWaitKind::Permission,
                 )
                 .await
                 {
-                    Ok(Some(successor)) => {
-                        emit_successor_turn_events(&orch.db.local, &*services.emitter, &successor)
-                            .await;
-                        orch.process_state
-                            .set_current_turn_id(run_id, Some(&successor.turn_id));
-                    }
-                    Ok(None) => {}
-                    Err(e) => log::warn!("Failed to start permission successor turn: {}", e),
+                    record_resume_error(
+                        orch,
+                        &orch.db.local,
+                        HostWaitKind::Permission,
+                        &request_id,
+                        &error,
+                    )
+                    .await;
+                    return PermissionWait::Unavailable(format!(
+                        "The permission answer was recorded, but this inline call no longer owns its continuation: {error}"
+                    ));
                 }
             }
             PermissionWait::Decided(response)
@@ -671,6 +681,7 @@ pub(crate) async fn await_permission_decision(
                 orch,
                 run_id,
                 "permission_wait_suspended",
+                turn_owner,
                 GoalPauseOwner::UserInput {
                     request_id: request_id.clone(),
                 },
@@ -685,6 +696,7 @@ pub(crate) async fn await_permission_decision(
                 orch,
                 run_id,
                 "permission_wait_suspended",
+                turn_owner,
                 GoalPauseOwner::UserInput {
                     request_id: request_id.clone(),
                 },
@@ -5377,6 +5389,274 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn inline_host_wait_stale_owner_preserves_answer_and_unwinds_pending_head() {
+        use crate::agent_process::process::RunHandle;
+        for kind in [HostWaitKind::Question, HostWaitKind::Permission] {
+            let orch = test_orchestrator().await;
+            seed_successor_lineage(&orch, "yielded").await;
+            orch.db.local.execute_script(
+                "UPDATE jobs SET execution_id = NULL WHERE id = 'job-1';
+                 INSERT INTO prompts(id, run_id, job_id, turn_id, questions, response, created_at)
+                   VALUES('question', 'run-1', 'job-1', 'turn-pred', '[]', 'kept answer', 1);
+                 INSERT INTO permission_requests(id, run_id, job_id, turn_id, tool_use_id, tool_name, tool_input, status, response, created_at)
+                   VALUES('permission', 'run-1', 'job-1', 'turn-pred', 'tu', 'Bash', '{}', 'allowed', 'kept permission answer', 1);"
+            ).await.unwrap();
+            let mut handle = RunHandle::test_handle(Some("session-1"), Some("job-1"));
+            handle.begin_turn("turn-pred");
+            orch.process_state
+                .processes
+                .lock()
+                .unwrap()
+                .register("run-1".into(), handle);
+            let owner = orch
+                .process_state
+                .capture_turn_owner("run-1", "turn-pred")
+                .unwrap();
+            let successor = orch
+                .db
+                .local
+                .write(|conn| {
+                    Box::pin(async move {
+                        ensure_host_wait_successor_conn(conn, "run-1", "turn-pred", kind).await
+                    })
+                })
+                .await
+                .unwrap();
+            let HostWaitSuccessor::Successor { turn_id, .. } = successor else {
+                panic!("pending successor");
+            };
+            // The callback's captured owner belongs to the previous registration,
+            // even though the replacement serves the same logical turn id.
+            let mut replacement = RunHandle::test_handle(Some("session-1"), Some("job-1"));
+            replacement.begin_turn("turn-pred");
+            orch.process_state
+                .processes
+                .lock()
+                .unwrap()
+                .register("run-1".into(), replacement);
+            let replacement = orch
+                .process_state
+                .capture_turn_owner("run-1", "turn-pred")
+                .unwrap();
+            let derived_before = orch
+                .db
+                .local
+                .write(|conn| {
+                    Box::pin(async move {
+                        crate::execution::advancement::recompute_job_status_conn(conn, "job-1")
+                            .await
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                derived_before.to_string(),
+                "running",
+                "the live run keeps this standalone job running"
+            );
+            // Idle is valid but cannot describe this live run. Cleanup must replace
+            // this stale projection after releasing the launch lock.
+            orch.db
+                .local
+                .execute("UPDATE jobs SET status = 'idle' WHERE id = 'job-1'", ())
+                .await
+                .unwrap();
+            let before = orch
+                .db
+                .local
+                .query_one("SELECT status FROM jobs WHERE id = 'job-1'", (), |row| {
+                    row.text(0)
+                })
+                .await
+                .unwrap();
+            assert_eq!(before, "idle");
+            assert_ne!(before, derived_before.to_string());
+            let error = start_inline_host_wait_successor(
+                &orch,
+                &orch.db.local,
+                "run-1",
+                "turn-pred",
+                Some(&owner),
+                kind,
+            )
+            .await
+            .unwrap_err();
+            let id = if kind == HostWaitKind::Question {
+                "question"
+            } else {
+                "permission"
+            };
+            record_resume_error(&orch, &orch.db.local, kind, id, &error).await;
+            assert!(orch.process_state.is_turn_owner_current(&replacement));
+            assert_eq!(owner.resolve_provider_owner(), owner);
+            let (state, reason, run) = orch
+                .db
+                .local
+                .query_one(
+                    "SELECT state, end_reason, run_id FROM turns WHERE id = ?1",
+                    params![turn_id.as_str()],
+                    |row| Ok((row.text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
+                )
+                .await
+                .unwrap();
+            assert_eq!(state, "cancelled");
+            assert_eq!(
+                reason.as_deref(),
+                Some(kind.end_reason().to_string().as_str())
+            );
+            assert_eq!(run, None, "no successor was launched");
+            assert_eq!(
+                orch.db
+                    .local
+                    .query_one("SELECT COUNT(*) FROM runs", (), |row| row.i64(0),)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                orch.db
+                    .local
+                    .query_one(
+                        "SELECT response FROM prompts WHERE id = 'question'",
+                        (),
+                        |row| row.text(0),
+                    )
+                    .await
+                    .unwrap(),
+                "kept answer"
+            );
+            assert_eq!(
+                orch.db
+                    .local
+                    .query_one(
+                        "SELECT response FROM permission_requests WHERE id = 'permission'",
+                        (),
+                        |row| row.text(0),
+                    )
+                    .await
+                    .unwrap(),
+                "kept permission answer"
+            );
+            let table = if kind == HostWaitKind::Question {
+                "prompts"
+            } else {
+                "permission_requests"
+            };
+            assert_eq!(
+                orch.db
+                    .local
+                    .query_opt_text(
+                        format!("SELECT resume_error FROM {table} WHERE id = ?1"),
+                        params![id],
+                    )
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(error.as_str())
+            );
+            let expected = orch
+                .db
+                .local
+                .write(|conn| {
+                    Box::pin(async move {
+                        crate::execution::advancement::recompute_job_status_conn(conn, "job-1")
+                            .await
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                orch.db
+                    .local
+                    .query_one("SELECT status FROM jobs WHERE id = 'job-1'", (), |row| row
+                        .text(0),)
+                    .await
+                    .unwrap(),
+                expected.to_string(),
+                "cleanup re-derived the cancelled head after unlocking"
+            );
+            assert_ne!(
+                before,
+                expected.to_string(),
+                "projection was stale before cleanup"
+            );
+            assert!(orch.job_launch_lock("job-1").try_lock().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_host_wait_foreign_successor_delivers_without_rotation() {
+        use crate::agent_process::process::RunHandle;
+        for (answer, other) in [
+            (HostWaitKind::Question, HostWaitKind::Permission),
+            (HostWaitKind::Permission, HostWaitKind::Question),
+        ] {
+            let orch = test_orchestrator().await;
+            seed_successor_lineage(&orch, "yielded").await;
+            let mut handle = RunHandle::test_handle(Some("session-1"), Some("job-1"));
+            handle.begin_turn("turn-pred");
+            orch.process_state
+                .processes
+                .lock()
+                .unwrap()
+                .register("run-1".into(), handle);
+            let owner = orch
+                .process_state
+                .capture_turn_owner("run-1", "turn-pred")
+                .unwrap();
+            let successor = orch
+                .db
+                .local
+                .write(|conn| {
+                    Box::pin(async move {
+                        ensure_host_wait_successor_conn(conn, "run-1", "turn-pred", other).await
+                    })
+                })
+                .await
+                .unwrap();
+            let HostWaitSuccessor::Successor { turn_id, .. } = successor else {
+                panic!("sibling successor");
+            };
+            // Success here is the callers' signal to return the inline answer,
+            // not an authorization to attach the sibling wait's continuation.
+            start_inline_host_wait_successor(
+                &orch,
+                &orch.db.local,
+                "run-1",
+                "turn-pred",
+                Some(&owner),
+                answer,
+            )
+            .await
+            .expect("a foreign successor must not swallow the inline answer");
+            assert!(orch.process_state.is_turn_owner_current(&owner));
+            assert_eq!(owner.resolve_provider_owner(), owner);
+            let (state, run, reason) = orch
+                .db
+                .local
+                .query_one(
+                    "SELECT state, run_id, start_reason FROM turns WHERE id = ?1",
+                    params![turn_id.as_str()],
+                    |row| Ok((row.text(0)?, row.opt_text(1)?, row.text(2)?)),
+                )
+                .await
+                .unwrap();
+            assert_eq!(state, "pending");
+            assert_eq!(run, None);
+            assert_eq!(reason, other.start_reason().to_string());
+            assert_eq!(
+                orch.db
+                    .local
+                    .query_one("SELECT COUNT(*) FROM turns", (), |row| row.i64(0),)
+                    .await
+                    .unwrap(),
+                2,
+                "the foreign answer mints no second successor"
+            );
+        }
     }
 
     async fn successor_for(orch: &Orchestrator, run_id: &str) -> HostWaitSuccessor {

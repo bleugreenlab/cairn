@@ -122,6 +122,7 @@ pub use crate::account::AnonDeviceManager;
 pub use account_manager::AccountManager;
 pub use attention::{AttentionEvent, AttentionFact, AttentionFactKey};
 
+type CallSettlementLocks = HashMap<(String, String), Arc<Mutex<()>>>;
 type ReviewLogGeneration = Arc<Mutex<Option<String>>>;
 type ProviderUsageSnapshots = Arc<cairn_models::usage::book::UsageBook>;
 pub(crate) type ProviderUsageCaptures = Arc<Mutex<HashSet<(String, String)>>>;
@@ -952,6 +953,8 @@ impl OrchestratorBuilder {
             team_attention_push_dedupe: Arc::new(TokioMutex::new(HashMap::new())),
             execution_locks: Arc::new(Mutex::new(HashMap::new())),
             job_launch_locks: Arc::new(Mutex::new(HashMap::new())),
+            call_settlement_locks: Arc::new(Mutex::new(HashMap::new())),
+            terminal_completion_claims: Arc::new(Mutex::new(HashMap::new())),
             job_launch_claims: Arc::new(Mutex::new(HashMap::new())),
             jj_store_locks: Arc::new(Mutex::new(HashMap::new())),
             jj_store_lock_metrics: Arc::new(Mutex::new(HashMap::new())),
@@ -2024,6 +2027,14 @@ pub struct Orchestrator {
     /// exactly one level.
     job_launch_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 
+    /// Serializes transcript answer discovery through persistence for competing
+    /// Stop and process-loss causes. Never held while publishing notifications.
+    call_settlement_locks: Arc<Mutex<CallSettlementLocks>>,
+
+    /// The fixed turn whose terminal completion is draining calls. Unlike a
+    /// process owner, this authority survives transport teardown.
+    terminal_completion_claims: Arc<Mutex<HashMap<String, Arc<TerminalCompletionOwner>>>>,
+
     /// Jobs whose launch has been admitted but whose process has not registered
     /// yet, mapped to the run that launch minted.
     ///
@@ -2127,6 +2138,30 @@ fn resolve_embed_token(account: &AccountManager, anon: &AnonDeviceManager) -> Op
         .ok()
         .flatten()
         .or_else(|| anon.get_anon_jwt().ok().flatten())
+}
+
+struct TerminalCompletionOwner {
+    turn_id: String,
+}
+
+/// In-memory terminal authority, released under launch authority after the turn
+/// settles. Unwinding also releases it; a prior guard cannot erase a new claim.
+pub(crate) struct TerminalCompletionGuard {
+    claims: Arc<Mutex<HashMap<String, Arc<TerminalCompletionOwner>>>>,
+    run_id: String,
+    owner: Arc<TerminalCompletionOwner>,
+}
+
+impl Drop for TerminalCompletionGuard {
+    fn drop(&mut self) {
+        let mut claims = self.claims.lock().unwrap_or_else(|p| p.into_inner());
+        if claims
+            .get(&self.run_id)
+            .is_some_and(|owner| Arc::ptr_eq(owner, &self.owner))
+        {
+            claims.remove(&self.run_id);
+        }
+    }
 }
 
 /// Ownership of a job's launch across the gap between admission and process
@@ -2629,6 +2664,74 @@ impl Orchestrator {
         let mut map = self.execution_locks.lock().unwrap();
         map.entry(execution_id.to_string())
             .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
+    /// Claim a fixed terminal turn while holding its job's launch lock. Callers
+    /// retain this through call draining, then release it under that lock.
+    pub(crate) fn claim_terminal_completion(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Option<TerminalCompletionGuard> {
+        let mut claims = self
+            .terminal_completion_claims
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if claims.contains_key(run_id) {
+            return None;
+        }
+        let owner = Arc::new(TerminalCompletionOwner {
+            turn_id: turn_id.to_string(),
+        });
+        claims.insert(run_id.to_string(), owner.clone());
+        Some(TerminalCompletionGuard {
+            claims: self.terminal_completion_claims.clone(),
+            run_id: run_id.to_string(),
+            owner,
+        })
+    }
+
+    /// Query under the same launch lock as the prospective turn mutation.
+    pub(crate) fn has_terminal_completion_claim(&self, run_id: &str) -> bool {
+        self.terminal_completion_claims
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(run_id)
+    }
+
+    /// Snapshot under launch authority before a job-level bulk turn mutation.
+    pub(crate) fn terminal_completion_turn_ids(&self) -> Vec<String> {
+        self.terminal_completion_claims
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|owner| owner.turn_id.clone())
+            .collect()
+    }
+
+    /// Job-level turn writers must exclude a fixed turn being terminalized.
+    pub(crate) fn is_turn_terminal_claimed(&self, turn_id: &str) -> bool {
+        self.terminal_completion_claims
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|owner| owner.turn_id == turn_id)
+    }
+
+    /// Answer discovery and persistence share one per-turn authority, separate
+    /// from launch so a write being drained can still reach its boundary.
+    pub(crate) fn call_settlement_lock(&self, run_id: &str, turn_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .call_settlement_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A waiter keeps its own Arc before locking; only map-exclusive entries
+        // can be removed without splitting settlement authority.
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        locks
+            .entry((run_id.to_string(), turn_id.to_string()))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 

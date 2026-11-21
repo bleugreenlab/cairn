@@ -169,14 +169,14 @@ pub(super) fn schedule_deferred_parent_suspend_for_delegated_wait(
     parent_run_id: String,
     parent_job_id: String,
     child_job_id: String,
-    parked_turn_id: String,
+    turn_owner: Option<crate::agent_process::process::ProcessTurnOwner>,
 ) {
     let after_park_orch = orch.clone();
-    crate::orchestrator::lifecycle::suspend_run_for_durable_wait_after_handoff_then(
+    crate::orchestrator::lifecycle::suspend_owned_run_after_handoff_then(
         &orch,
         &parent_run_id,
         "delegated_wait_suspended",
-        GoalPauseOwner::DependencyWait { parked_turn_id },
+        turn_owner,
         move |parked| async move {
             if parked.is_err() {
                 return;
@@ -1416,7 +1416,11 @@ pub(super) mod background_completion_tests {
         let db = crate::storage::migrated_test_db("delegated-wait-launcher.db").await;
         // The production specimen that escaped the prior regression: parking
         // happens while the blocking child is genuinely still running.
-        seed(&db, &[("pkt-1", "j-c1", false, "running")]).await;
+        let mut children = vec![("pkt-1", "j-c1", false, "running")];
+        if child_artifact.is_none() {
+            children.push(("pkt-2", "j-c2", false, "running"));
+        }
+        seed(&db, &children).await;
         db.execute_script(
             "INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
                VALUES('session-parent','j-parent','codex','native-thread','open',1,1,1);
@@ -1567,6 +1571,32 @@ pub(super) mod background_completion_tests {
         );
 
         set_job_status(&orch.db.local, "j-c1", "complete").await;
+        if child_artifact.is_none() {
+            for _ in 0..2 {
+                resume_suspended_parent_after_task_completion(&orch, "j-c1").unwrap();
+            }
+            assert!(
+                orch.db
+                    .local
+                    .query_opt_text(
+                        "SELECT id FROM turns WHERE predecessor_id = ?1",
+                        (ANCHOR.to_string(),),
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a nonfinal child cannot publish an unblock"
+            );
+            assert!(requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r["method"] != "turn/start"));
+            set_job_status(&orch.db.local, "j-c2", "cancelled").await;
+            for _ in 0..2 {
+                resume_suspended_parent_after_task_completion(&orch, "j-c2").unwrap();
+            }
+        }
         resume_suspended_parent_after_task_completion(&orch, "j-c1")
             .expect("the terminal child should launch its waiting parent");
         resume_suspended_parent_after_task_completion(&orch, "j-c1")
@@ -1623,7 +1653,16 @@ pub(super) mod background_completion_tests {
             assert_eq!(sent[7]["params"]["threadId"], "native-thread");
             let prompt = sent[7]["params"]["input"][0]["text"].as_str().unwrap();
             assert!(!prompt.contains("[Goal state: paused"));
-            assert!(prompt.contains("Delegated task"));
+            if child_artifact.is_none() {
+                // The final sibling's wake carries every sibling's result.
+                assert!(prompt.contains("## Task 1: Explore"), "{prompt}");
+                assert!(prompt.contains("## Task 2: Explore"), "{prompt}");
+            } else {
+                assert!(
+                    prompt.contains("Delegated task 'Explore' result:"),
+                    "{prompt}"
+                );
+            }
             assert_eq!(
                 sent.iter()
                     .filter(|request| request["method"] == "turn/start")

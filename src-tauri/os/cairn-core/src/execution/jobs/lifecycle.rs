@@ -45,8 +45,26 @@ pub(super) fn deliver_prepared_warm_continuation(
     project_id: &str,
 ) -> Result<(), String> {
     let turn_id = launch.turn_id.as_str();
-    orch.process_state.transition_to_active(run_id);
-    super::start_prepared_turn_and_publish(orch, turn_id, &launch.run_id, run_id)?;
+    let identity = orch
+        .process_state
+        .capture_process_identity(run_id)
+        .ok_or_else(|| format!("process {run_id} disappeared before prepared turn attachment"))?;
+    let mut pending_launch_turn = PendingLaunchTurnGuard {
+        orch,
+        db: owning_db.clone(),
+        turn_id: Some(turn_id.to_string()),
+        run_id: None,
+        inserted_run_id: None,
+        wrote_running_job_id: None,
+        unwind_preclaimed: None,
+        launch_guard: None,
+    };
+    pending_launch_turn.run_id = Some(super::start_prepared_turn_and_publish(
+        orch,
+        turn_id,
+        &launch.run_id,
+        &identity,
+    )?);
 
     let project_key = run_db({
         let db = owning_db.clone();
@@ -76,6 +94,7 @@ pub(super) fn deliver_prepared_warm_continuation(
         &launch.session_id,
         None,
     )?;
+    pending_launch_turn.adopted();
     Ok(())
 }
 
@@ -349,11 +368,11 @@ impl Drop for ClaimedMessagesLaunchGuard<'_> {
 /// Owns a newly-created successor until it is attached to a run. Any `?` in
 /// launch preparation therefore terminalizes the pending head instead of
 /// leaving the job permanently unsendable.
-struct PendingLaunchTurnGuard<'a> {
+pub(super) struct PendingLaunchTurnGuard<'a> {
     orch: &'a Orchestrator,
     db: std::sync::Arc<crate::storage::LocalDb>,
     turn_id: Option<String>,
-    run_id: Option<String>,
+    run_id: Option<crate::agent_process::process::ProcessTurnOwner>,
     inserted_run_id: Option<String>,
     /// Set once this launch has written the job `running`. A launch refused
     /// after that point must not leave the job resting on a status only the
@@ -364,12 +383,27 @@ struct PendingLaunchTurnGuard<'a> {
     /// fails before delivering it settles it `cancelled` here, while the job's
     /// launch lock is still held.
     unwind_preclaimed: Option<(String, String)>,
+    launch_guard: Option<std::sync::MutexGuard<'a, ()>>,
 }
 
-impl PendingLaunchTurnGuard<'_> {
+impl<'a> PendingLaunchTurnGuard<'a> {
+    pub(super) fn for_turn(orch: &'a Orchestrator, db: Arc<LocalDb>, turn_id: &str) -> Self {
+        Self {
+            orch,
+            db,
+            turn_id: Some(turn_id.to_string()),
+            run_id: None,
+            inserted_run_id: None,
+            wrote_running_job_id: None,
+            unwind_preclaimed: None,
+            launch_guard: None,
+        }
+    }
+
+    #[cfg(test)]
     fn started(&mut self, run_id: &str) {
-        if self.turn_id.is_some() {
-            self.run_id = Some(run_id.to_string());
+        if let Some(turn_id) = self.turn_id.as_deref() {
+            self.run_id = self.orch.process_state.capture_turn_owner(run_id, turn_id);
         }
     }
 
@@ -379,13 +413,11 @@ impl PendingLaunchTurnGuard<'_> {
     /// the turn. The turn itself stays the caller's, unless the caller named an
     /// end reason to unwind it with; then the guard settles it too, so no lock
     /// holder ever observes a started-but-undelivered preclaimed turn.
-    fn started_preclaimed(
+    fn arm_preclaimed_unwind(
         &mut self,
-        run_id: &str,
         turn_id: &str,
         unwind_as: Option<&crate::models::TurnEndReason>,
     ) {
-        self.run_id = Some(run_id.to_string());
         self.unwind_preclaimed = unwind_as.map(|reason| (turn_id.to_string(), reason.to_string()));
     }
 
@@ -410,7 +442,7 @@ impl PendingLaunchTurnGuard<'_> {
         }
     }
 
-    fn adopted(&mut self) {
+    pub(super) fn adopted(&mut self) {
         self.turn_id = None;
         self.run_id = None;
         self.inserted_run_id = None;
@@ -422,10 +454,11 @@ impl PendingLaunchTurnGuard<'_> {
 impl Drop for PendingLaunchTurnGuard<'_> {
     fn drop(&mut self) {
         let turn_id = self.turn_id.take();
-        if let Some(run_id) = self.run_id.take() {
-            self.orch.process_state.transition_to_warm(&run_id);
+        if let Some(owner) = self.run_id.take() {
+            self.orch.process_state.transition_to_warm_if_owned(&owner);
         }
         let now = chrono::Utc::now().timestamp();
+        let mut changed_turns = Vec::new();
         if let Some((turn_id, end_reason)) = self.unwind_preclaimed.take() {
             let result = run_db({
                 let db = self.db.clone();
@@ -447,7 +480,7 @@ impl Drop for PendingLaunchTurnGuard<'_> {
                     "failed to settle preclaimed successor {turn_id} after launch failure: {error}"
                 );
             }
-            self.emit_turn_change(&turn_id);
+            changed_turns.push(turn_id);
         }
         if let Some(turn_id) = turn_id {
             let result = run_db({
@@ -468,6 +501,12 @@ impl Drop for PendingLaunchTurnGuard<'_> {
             if let Err(error) = result {
                 log::error!("failed to cancel pending successor after launch failure: {error}");
             }
+            changed_turns.push(turn_id);
+        }
+        // Durable rollback precedes unlock; publication and finalization may
+        // synchronously launch a successor or acquire launch authority themselves.
+        drop(self.launch_guard.take());
+        for turn_id in changed_turns {
             self.emit_turn_change(&turn_id);
         }
         if let Some(run_id) = self.inserted_run_id.take() {
@@ -3450,6 +3489,7 @@ fn continue_job_launch_locked_inner(
         inserted_run_id: None,
         wrote_running_job_id: None,
         unwind_preclaimed: None,
+        launch_guard: launch_guard.take(),
     };
 
     // ---- Transition job to Running if in terminal state -------------------
@@ -4147,6 +4187,9 @@ fn continue_job_launch_locked_inner(
         );
         (new_run_id, false)
     };
+    let reused_process_identity = is_process_reuse
+        .then(|| orch.process_state.capture_process_identity(&run_id))
+        .flatten();
     if session_boundary.is_none()
         && !is_process_reuse
         && !resumes_provider_change
@@ -4219,8 +4262,11 @@ fn continue_job_launch_locked_inner(
     let retry_turn_prestarted = prompt_resume
         .as_ref()
         .is_some_and(|context| context.preclaimed_retry_turn_id.is_some());
-    if retry_turn_prestarted && !claim_retry_turn_start(orch, &turn_id, &run_id)? {
-        return Err("automatic retry was superseded before turn reservation".to_string());
+    if retry_turn_prestarted {
+        if !claim_retry_turn_start(orch, &turn_id, &run_id)? {
+            return Err("automatic retry was superseded before turn reservation".to_string());
+        }
+        pending_launch_turn.turn_id = Some(turn_id.clone());
     }
 
     // ---- Artifact schema ------------------------------------------------
@@ -4558,22 +4604,30 @@ fn continue_job_launch_locked_inner(
         // (`start_turn` writes `jobs.current_turn_id`) ahead of the wake closes
         // that window: a tool call produced on resume always observes
         // `ServingTurn(turn)`, never `Busy`.
-        orch.process_state.transition_to_active(&run_id);
-        if !retry_turn_prestarted {
-            start_turn(orch, &turn_id, &run_id)?;
-        }
-        pending_launch_turn.started(&run_id);
         if let Some(successor_id) = preclaimed_successor_turn_id.as_deref() {
-            pending_launch_turn.started_preclaimed(
-                &run_id,
+            pending_launch_turn.arm_preclaimed_unwind(
                 successor_id,
                 prompt_resume
                     .as_ref()
                     .and_then(|context| context.unwind_preclaimed_start_as.as_ref()),
             );
         }
-        orch.process_state
-            .set_current_turn_id(&run_id, Some(&turn_id));
+
+        let process_identity = reused_process_identity
+            .as_ref()
+            .ok_or_else(|| format!("warm process {run_id} disappeared before turn attachment"))?;
+        if !retry_turn_prestarted {
+            start_turn(orch, &turn_id, &run_id)?;
+        }
+        pending_launch_turn.run_id = Some(
+            orch.process_state
+                .begin_turn_if_identity(process_identity, &turn_id)
+                .ok_or_else(|| {
+                    format!(
+                        "warm process {run_id} disappeared or was replaced during turn attachment"
+                    )
+                })?,
+        );
 
         // Run stays Live — no durable status change for warm reuse.
         let warm_prompt_started = std::time::Instant::now();
@@ -4675,7 +4729,7 @@ fn continue_job_launch_locked_inner(
     } else {
         // Durable admission is now the launch owner. It may remain queued, and
         // promotion reacquires this same lock before its final state recheck.
-        drop(launch_guard.take());
+        drop(pending_launch_turn.launch_guard.take());
         let started = super::start_prepared_job_session(
             orch,
             PreparedJob {
@@ -4846,10 +4900,10 @@ fn restart_resume_note(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<String>
     });
     let host_restart = crate::models::TurnEndReason::HostRestart.to_string();
     let orphaned = crate::models::TurnEndReason::OrphanedPending.to_string();
-    let calls_note = |run_id: String, turn_id: String, reason: &'static str| {
+    let calls_note = |run_id: String, turn_id: String, reasons: &'static [&'static str]| {
         let db = owning_db.clone();
         run_db(async move {
-            crate::orchestrator::lifecycle::lost_calls_note(&db, &run_id, &turn_id, &[reason])
+            crate::orchestrator::lifecycle::lost_calls_note(&db, &run_id, &turn_id, reasons)
                 .await
                 .map_err(|error| error.to_string())
         })
@@ -4864,7 +4918,7 @@ fn restart_resume_note(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<String>
                 calls_note(
                     run_id,
                     turn_id,
-                    crate::orchestrator::lifecycle::HOST_RESTART_REASON,
+                    &[crate::orchestrator::lifecycle::HOST_RESTART_REASON],
                 )
             });
             Some(match calls {
@@ -4875,14 +4929,25 @@ fn restart_resume_note(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<String>
         Ok(Some((reason, _, _, _))) if reason == host_restart || reason == orphaned => {
             Some(ORPHANED_PENDING_RESUME_NOTE.to_string())
         }
-        // Whatever ended the turn (watchdog recovery, a stop, a crash), a
-        // process end that answered its calls owes the agent those answers.
-        Ok(Some((_, true, turn_id, Some(run_id)))) => calls_note(
-            run_id,
-            turn_id,
-            crate::orchestrator::lifecycle::PROCESS_LOST_REASON,
-        )
-        .map(|calls| format!("{PROCESS_LOST_RESUME_NOTE}\n\n{calls}")),
+        Ok(Some((reason, true, turn_id, Some(run_id)))) => {
+            use crate::orchestrator::lifecycle::{
+                PROCESS_LOST_REASON, USER_STOP_AFTER_WRITE_EFFECT_REASON, USER_STOP_REASON,
+            };
+            // Stop may have answered some or all calls before a process-loss
+            // claim won the turn. Native resume still needs those answers.
+            // An ordinary warm Stop is not evidence that the process ended.
+            let reasons: &'static [&'static str] = if reason == "user_stop" {
+                &[PROCESS_LOST_REASON]
+            } else {
+                &[
+                    PROCESS_LOST_REASON,
+                    USER_STOP_REASON,
+                    USER_STOP_AFTER_WRITE_EFFECT_REASON,
+                ]
+            };
+            calls_note(run_id, turn_id, reasons)
+                .map(|calls| format!("{PROCESS_LOST_RESUME_NOTE}\n\n{calls}"))
+        }
         Ok(_) => None,
         Err(error) => {
             log::warn!(
@@ -6604,6 +6669,99 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn process_loss_resume_prompt_includes_stop_answers_but_warm_stop_does_not() {
+        use crate::orchestrator::lifecycle::{
+            PROCESS_LOST_REASON, USER_STOP_AFTER_WRITE_EFFECT_REASON, USER_STOP_REASON,
+        };
+        let db = super::run_db(async {
+            let db = Arc::new(migrated_test_db("mixed-loss-resume-note").await);
+            db.execute_script(
+                "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+                 INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+                 INSERT INTO jobs(id,project_id,status,current_session_id,created_at,updated_at) VALUES('j','p','idle','s',1,1);
+                 INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at) VALUES('s','j','codex','open',1,1,1);
+                 INSERT INTO runs(id,job_id,project_id,session_id,status,created_at,updated_at) VALUES('r','j','p','s','exited',1,2);
+                 INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,end_reason,started_at,ended_at,created_at,updated_at)
+                 VALUES('t','s','r','j',1,'interrupted','initial','provider_failure',1,2,1,2);"
+            ).await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(db)
+        }).unwrap();
+        // These are the durable answers left by the settlement-mutex orderings.
+        // Exercise the launch consumer, not just the lower-level list renderer.
+        for (end_reason, read_reason, expect_note) in [
+            ("provider_failure", PROCESS_LOST_REASON, true),
+            ("provider_failure", USER_STOP_REASON, true),
+            ("user_stop", USER_STOP_REASON, false),
+            ("user_stop", PROCESS_LOST_REASON, true),
+        ] {
+            let setup_db = db.clone();
+            super::run_db(async move {
+                setup_db.execute("UPDATE turns SET end_reason=?1 WHERE id='t'", (end_reason,))
+                    .await.map_err(|e| e.to_string())?;
+                setup_db.execute("DELETE FROM events WHERE run_id='r'", ())
+                    .await.map_err(|e| e.to_string())?;
+                let events = [
+                    ("assistant", serde_json::json!({
+                        "eventType":"assistant", "isError":false,
+                        "toolUses":[
+                            {"id":"run-call","name":"run","input":{"commands":[{"command":"echo run-marker"}]}},
+                            {"id":"read-call","name":"read","input":{"paths":["file:read-marker"]}},
+                            {"id":"write-call","name":"write","input":{"changes":[{"target":"file:write-marker"}]}}
+                        ]
+                    })),
+                    ("tool_result", serde_json::json!({
+                        "eventType":"tool_result", "isError":true, "toolUseId":"run-call",
+                        "toolName":"run", "toolResult":"Run interrupted by user stop.",
+                        "raw":{"synthetic":true,"reason":USER_STOP_REASON}
+                    })),
+                    ("tool_result", serde_json::json!({
+                        "eventType":"tool_result", "isError":true, "toolUseId":"read-call",
+                        "toolName":"read", "toolResult":"Read answer-marker.",
+                        "raw":{"synthetic":true,"reason":read_reason}
+                    })),
+                    ("tool_result", serde_json::json!({
+                        "eventType":"tool_result", "isError":false, "toolUseId":"write-call",
+                        "toolName":"write", "toolResult":"Applied write-marker; do not retry.",
+                        "raw":{"synthetic":true,"reason":USER_STOP_AFTER_WRITE_EFFECT_REASON}
+                    })),
+                ];
+                for (index, (kind, data)) in events.into_iter().enumerate() {
+                    setup_db.execute(
+                        "INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,created_at)
+                         VALUES(?1,'r','s','t',?2,1,?3,?4,1)",
+                        params![format!("event-{index}"), index as i64 + 1, kind, data.to_string()],
+                    ).await.map_err(|e| e.to_string())?;
+                }
+                Ok::<_, String>(())
+            }).unwrap();
+            let note = super::restart_resume_note(&db, "j");
+            assert_eq!(note.is_some(), expect_note, "{end_reason}/{read_reason}");
+            let prompt = assemble_resume_prompt(note.as_deref(), None, "Continue now.", None, None);
+            if expect_note {
+                assert!(prompt.starts_with(super::PROCESS_LOST_RESUME_NOTE));
+                assert!(prompt.contains("file:read-marker"));
+                assert!(prompt.contains("Read answer-marker."));
+                if end_reason != "user_stop" {
+                    for text in [
+                        "run-marker",
+                        "Run interrupted by user stop.",
+                        "write-marker",
+                        "Applied write-marker; do not retry.",
+                    ] {
+                        assert!(prompt.contains(text), "missing {text}: {prompt}");
+                    }
+                } else {
+                    assert!(!prompt.contains("run-marker"));
+                    assert!(!prompt.contains("write-marker"));
+                }
+                assert!(prompt.ends_with("Continue now."));
+            } else {
+                assert_eq!(prompt, "Continue now.");
+            }
+        }
+    }
+
+    #[test]
     fn session_boundary_payloads_use_the_transcript_contract() {
         let boundaries = [
             SessionBoundary::provider_change("codex".into(), "claude".into(), Some("fable"), 100),
@@ -6747,6 +6905,7 @@ mod tests {
                 inserted_run_id: None,
                 wrote_running_job_id: None,
                 unwind_preclaimed: None,
+                launch_guard: None,
             };
             guard.started("r");
         }
@@ -7648,6 +7807,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn launch_rollback_cannot_clear_a_successor_or_replacement_process() {
+        let orch = test_orchestrator(migrated_test_db("launch-rollback-owner").await);
+        for replacement in [false, true] {
+            orch.process_state.stop_and_remove("r");
+            orch.process_state
+                .register_process("r".into(), RunHandle::test_handle(Some("s"), Some("j")))
+                .unwrap();
+            orch.process_state.begin_turn("r", "old");
+            let owner = orch.process_state.capture_turn_owner("r", "old").unwrap();
+            let guard = PendingLaunchTurnGuard {
+                orch: &orch,
+                db: orch.db.local.clone(),
+                turn_id: None,
+                run_id: Some(owner),
+                inserted_run_id: None,
+                wrote_running_job_id: None,
+                unwind_preclaimed: None,
+                launch_guard: None,
+            };
+            if replacement {
+                orch.process_state.stop_and_remove("r");
+                orch.process_state
+                    .register_process("r".into(), RunHandle::test_handle(Some("s"), Some("j")))
+                    .unwrap();
+            }
+            orch.process_state.begin_turn("r", "new");
+            drop(guard);
+            assert_eq!(
+                orch.process_state.get_current_turn_id("r").as_deref(),
+                Some("new")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn adopted_launch_keeps_precreated_successor_serving() {
         let orch = test_orchestrator(migrated_test_db("adopted-launch-occupancy").await);
         let db = orch.db.local.clone();
@@ -7669,6 +7863,7 @@ mod tests {
                 inserted_run_id: None,
                 wrote_running_job_id: None,
                 unwind_preclaimed: None,
+                launch_guard: None,
             };
             guard.started("r");
             guard.adopted();
@@ -7760,6 +7955,7 @@ mod tests {
                 inserted_run_id: None,
                 wrote_running_job_id: None,
                 unwind_preclaimed: None,
+                launch_guard: None,
             };
             guard.inserted_run("r");
         }

@@ -1029,6 +1029,15 @@ fn register_codex_process_aborting_on_interrupt(
                     session_lifetime: SessionLifetime::Persistent,
                 },
                 CodexTurnContext {
+                    accounting_only: false,
+                    process_identity: aborting
+                        .process_state
+                        .capture_process_identity("run")
+                        .unwrap(),
+                    owner: aborting
+                        .process_state
+                        .get_current_turn_id("run")
+                        .and_then(|id| aborting.process_state.capture_turn_owner("run", &id)),
                     failure_disposition: TurnFailureDisposition::Unhandled,
                     fatal_cause: None,
                 },

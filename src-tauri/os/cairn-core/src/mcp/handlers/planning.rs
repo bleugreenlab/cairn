@@ -15,9 +15,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::host_wait_successor::{
-    continue_into_host_wait_successor, emit_successor_turn_events, ensure_host_wait_successor_conn,
-    record_resume_error, start_host_wait_successor, HostWaitAnswer, HostWaitContinuation,
-    HostWaitKind, HostWaitSuccessor,
+    continue_into_host_wait_successor, ensure_host_wait_successor_conn, record_resume_error,
+    start_inline_host_wait_successor, HostWaitAnswer, HostWaitContinuation, HostWaitKind,
+    HostWaitSuccessor,
 };
 use super::permission::{
     issue_id_for_run, recompute_issue_status_for_issue, yield_turn_for_host, WithdrawalCause,
@@ -629,6 +629,12 @@ async fn ask_questions_owned(
         return PROMPT_SUSPENDED_OWNED_LOOP_MARKER.to_string().into();
     }
 
+    // The suspension below parks only the exact turn yielded above, never
+    // whatever the process serves when the budget expires.
+    let turn_owner = current_turn_id
+        .as_deref()
+        .and_then(|turn_id| orch.process_state.capture_turn_owner(&run_id, turn_id));
+
     // Block waiting for user response (like the permission wait does)
     let mut rx = orch.prompt_responses.subscribe();
     let prompt_id_clone = prompt_id.clone();
@@ -665,22 +671,27 @@ async fn ask_questions_owned(
             // it broadcast; the inline waiter is the one owner that starts it,
             // because this process continues the provider turn.
             if let Some(ref pred_turn_id) = current_turn_id {
-                match start_host_wait_successor(
+                if let Err(error) = start_inline_host_wait_successor(
+                    orch,
                     &owning_db,
                     &run_id,
                     pred_turn_id,
+                    turn_owner.as_ref(),
                     HostWaitKind::Question,
                 )
                 .await
                 {
-                    Ok(Some(successor)) => {
-                        emit_successor_turn_events(&owning_db, &*services.emitter, &successor)
-                            .await;
-                        orch.process_state
-                            .set_current_turn_id(&run_id, Some(&successor.turn_id));
-                    }
-                    Ok(None) => {}
-                    Err(e) => log::warn!("Failed to ensure successor turn: {}", e),
+                    record_resume_error(
+                        orch,
+                        &owning_db,
+                        HostWaitKind::Question,
+                        &prompt_id,
+                        &error,
+                    )
+                    .await;
+                    return format!(
+                        "The answer was recorded, but this inline call no longer owns its continuation: {error}"
+                    ).into();
                 }
             }
             let _ = &question_uri;
@@ -726,6 +737,7 @@ async fn ask_questions_owned(
                 orch,
                 &run_id,
                 "prompt_wait_suspended",
+                turn_owner,
                 GoalPauseOwner::UserInput {
                     request_id: prompt_id.clone(),
                 },
@@ -737,6 +749,7 @@ async fn ask_questions_owned(
                 orch,
                 &run_id,
                 "prompt_wait_suspended",
+                turn_owner,
                 GoalPauseOwner::UserInput {
                     request_id: prompt_id.clone(),
                 },
