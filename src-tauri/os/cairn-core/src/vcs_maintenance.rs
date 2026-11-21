@@ -39,11 +39,14 @@
 //!    made visible again would otherwise stay visible for good, as divergent
 //!    twins and unreferenced heads that keep their objects alive. Hiding
 //!    changes only the view; objects go only through step 5's reclaim.
-//! 4. Under the store lock, the operation log older than [`OP_LOG_WINDOW`],
-//!    on every prune, stopping with nothing changed at [`TRUNCATION_BUDGET`]
-//!    ([`truncate_under_lock`]). Its cost follows the size of the window it
-//!    keeps, not what it drops, so truncating daily costs what weekly would
-//!    and keeps the store at about one window and a day of views.
+//! 4. The operation log older than [`OP_LOG_WINDOW`], on every prune. The
+//!    rewrite, whose cost follows the size of the window it keeps rather than
+//!    what it drops, runs without the store lock and stops with nothing
+//!    changed at [`TRUNCATION_BUDGET`]. Only the head swap takes the lock
+//!    ([`truncate_under_lock`]): it rewrites what landed meanwhile, at most
+//!    `LOCKED_CATCH_UP_LIMIT` operations, and stops at [`LOCKED_BUDGET`], so
+//!    the hold does not grow with the window. Truncating daily costs what
+//!    weekly would and keeps the store at about one window and a day of views.
 //! 5. Outside the store lock, unreachable operations and views, keep refs for
 //!    anything that is not an index head, and the commit metadata table; then,
 //!    at most once per retention window and outside every Cairn lock, a cruft
@@ -125,10 +128,25 @@ pub(crate) const OP_LOG_WINDOW: Duration = Duration::from_secs(7 * DAY);
 /// update that names the operation it just wrote.
 const OP_STORE_GC_GRACE: Duration = Duration::from_secs(60 * 60);
 
-/// The truncation's rewrite holds the store lock; past this it stops with
-/// nothing changed. Rewriting 33,306 retained operations took 182 s on a copy
-/// of the Cairn store.
+/// The truncation's unlocked rewrite stops here with nothing changed.
+/// Rewriting 33,306 retained operations took 182 s on a copy of the Cairn
+/// store; the rate is about 5.7 ms per retained operation.
 const TRUNCATION_BUDGET: Duration = Duration::from_secs(10 * 60);
+
+/// The truncation's head swap, under the store lock, stops here with nothing
+/// changed. It rewrites at most `LOCKED_CATCH_UP_LIMIT` operations, about
+/// 1.2 s, so this is a ceiling, not an estimate.
+const LOCKED_BUDGET: Duration = Duration::from_secs(30);
+
+/// Times the head swap is tried when the store outruns its locked catch-up.
+const FINISH_ATTEMPTS: u32 = 3;
+
+// A prepared truncation's operations are unreachable until its head swap, so
+// the collection's grace must outlive every prepared truncation.
+const _: () = assert!(
+    TRUNCATION_BUDGET.as_secs() <= crate::jj::PREPARED_TRUNCATION_LIFETIME.as_secs()
+        && crate::jj::PREPARED_TRUNCATION_LIFETIME.as_secs() < OP_STORE_GC_GRACE.as_secs()
+);
 
 /// The longest one hold of the store lock retiring finished bookmarks. Each
 /// retirement is a jj transaction that writes a full view, and a landing that
@@ -876,35 +894,14 @@ async fn run_prune(
         Err(outcome) => log::warn!("store view sweep of {}: {outcome}", store.display()),
     }
 
-    {
-        let Ok(guard) = orch
-            .acquire_jj_store_lock_with_timeout(
-                &store,
-                crate::orchestrator::StoreLockClass::Background,
-                "ref-store maintenance: truncate the operation log",
-                Some(STORE_LOCK_WAIT),
-            )
-            .await
-        else {
-            return Err("skipped:store-busy".into());
-        };
-        // The lock is what every reconcile takes, so this answer cannot change
-        // until the truncation is done.
-        if reconcile_in_flight(orch, &store).await {
-            return Err("skipped:reconcile-in-flight".into());
-        }
-        let cutoff = SystemTime::now() - OP_LOG_WINDOW;
-        report.truncation_cutoff = Some(unix_of(cutoff));
-        let deadline = Instant::now() + TRUNCATION_BUDGET;
-        let result =
-            crate::jj::in_place_blocking(|| truncate_under_lock(&guard, &store, cutoff, deadline));
-        match result {
-            Ok(truncation) => report.truncation = Some(truncation),
-            // A live foreign workspace, or the deadline, refuses with nothing
-            // changed; the rest of the pass still bounds the refs.
-            Err(error) if error.contains("refused") => report.truncation_refusal = Some(error),
-            Err(error) => return Err(failed(error)),
-        }
+    let cutoff = SystemTime::now() - OP_LOG_WINDOW;
+    report.truncation_cutoff = Some(unix_of(cutoff));
+    match truncate_operation_log(orch, &store, cutoff).await? {
+        Ok(truncation) => report.truncation = Some(truncation),
+        // A live foreign workspace, a busy store, or a deadline refuses with
+        // nothing changed; the rest of the pass still bounds the refs.
+        Err(error) if error.contains("refused") => report.truncation_refusal = Some(error),
+        Err(error) => return Err(failed(error)),
     }
 
     // Outside the store lock: see the module documentation for why the grace
@@ -979,25 +976,96 @@ async fn run_prune(
     Ok(())
 }
 
-/// Truncate `store`'s operation log at `cutoff`, under the store lock `guard`
-/// must be. The truncation gives every retained operation a new id, so a
-/// caller without the lock could cross a landing that snapshotted one for
-/// rollback; this refuses, with nothing changed, unless `guard` covers the
-/// store.
-pub(crate) fn truncate_under_lock(
-    guard: &crate::orchestrator::JjStoreGuard,
+/// Truncate `store`'s operation log at `cutoff`: the rewrite without the
+/// store lock, then the head swap under it. The outer `Err` is a recorded
+/// outcome, as in [`run_prune`]; the inner one is the truncation's own.
+async fn truncate_operation_log(
+    orch: &Orchestrator,
     store: &Path,
     cutoff: SystemTime,
+) -> Result<Result<OperationLogTruncation, String>, String> {
+    let prepared = blocking({
+        let store = store.to_owned();
+        move || {
+            crate::jj::prepare_operation_log_truncation(
+                &store,
+                cutoff,
+                Instant::now() + TRUNCATION_BUDGET,
+            )
+        }
+    })
+    .await;
+    let mut prepared = match prepared {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => return Ok(Ok(OperationLogTruncation::default())),
+        Err(error) => return Ok(Err(error)),
+    };
+    let mut attempt = 1;
+    loop {
+        let Ok(guard) = orch
+            .acquire_jj_store_lock_with_timeout(
+                store,
+                crate::orchestrator::StoreLockClass::Background,
+                "ref-store maintenance: truncate the operation log",
+                Some(STORE_LOCK_WAIT),
+            )
+            .await
+        else {
+            return Err("skipped:store-busy".into());
+        };
+        // The lock is what every reconcile takes, so this answer cannot change
+        // until the head swap is done.
+        if reconcile_in_flight(orch, store).await {
+            return Err("skipped:reconcile-in-flight".into());
+        }
+        let deadline = Instant::now() + LOCKED_BUDGET;
+        let result =
+            crate::jj::in_place_blocking(|| truncate_under_lock(&guard, &mut prepared, deadline));
+        drop(guard);
+        match result {
+            Err(error)
+                if error.starts_with(crate::jj::TRUNCATION_BUSY) && attempt < FINISH_ATTEMPTS =>
+            {
+                attempt += 1;
+                let catch_up = move || {
+                    let mut prepared = prepared;
+                    prepared.catch_up().map(|()| prepared)
+                };
+                prepared = match blocking(catch_up).await {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Ok(Err(error)),
+                };
+            }
+            result => return Ok(result),
+        }
+    }
+}
+
+/// Swap `prepared`'s operation head, under the store lock `guard` must be.
+/// The swap gives every retained operation a new id, so a caller without the
+/// lock could cross a landing that snapshotted one for rollback; this refuses,
+/// with nothing changed, unless `guard` covers the store.
+pub(crate) fn truncate_under_lock(
+    guard: &crate::orchestrator::JjStoreGuard,
+    prepared: &mut crate::jj::PreparedTruncation,
     deadline: Instant,
 ) -> Result<OperationLogTruncation, String> {
-    if !guard.covers(store) {
+    if !guard.covers(prepared.store()) {
         return Err(format!(
             "operation-log truncation refused: it needs the lock of {}, which this caller does \
              not hold; nothing was changed",
-            store.display()
+            prepared.store().display()
         ));
     }
-    crate::jj::truncate_operation_log(store, cutoff, deadline)
+    prepared.finish(deadline, guard)
+}
+
+/// Each step of the head swap is a named phase of the hold, so a long one
+/// says which step took it.
+impl crate::jj::TruncationPhases for crate::orchestrator::JjStoreGuard {
+    fn phase<T>(&self, name: &'static str, work: impl FnOnce() -> T) -> T {
+        self.blocking_phase(name, work)
+    }
 }
 
 fn mib(bytes: u64) -> String {
@@ -1039,11 +1107,18 @@ fn prune_summary(store: &Path, report: &PruneReport) -> String {
         .unwrap_or_else(|| "-".to_string());
     match (&report.truncation, &report.truncation_refusal) {
         (Some(truncation), _) => parts.push(format!(
-            "truncated the operation log at {cutoff}, reparented {} (truncate {:.1}s, reindex \
-             {:.1}s, under the store lock)",
-            truncation.reparented,
-            truncation.truncate.as_secs_f64(),
-            truncation.reindex.as_secs_f64()
+            "truncated the operation log at {cutoff}: rewrote {} off the lock in {:.1}s (caught \
+             up {} in {} round(s)), carried the index in {:.1}s; held the store lock {:.1}s \
+             (caught up {})",
+            truncation
+                .reparented
+                .saturating_sub(truncation.caught_up_locked),
+            truncation.prepare.as_secs_f64(),
+            truncation.caught_up,
+            truncation.catch_up_rounds,
+            truncation.index_carry.as_secs_f64(),
+            truncation.locked.as_secs_f64(),
+            truncation.caught_up_locked
         )),
         (None, Some(refusal)) => parts.push(format!("did not truncate: {refusal}")),
         (None, None) => {}
@@ -1841,8 +1916,12 @@ async fn record_prune(
         "truncation": report.truncation.as_ref().map(|truncation| json!({
             "cutoff": report.truncation_cutoff,
             "reparented": truncation.reparented,
-            "truncate_ms": truncation.truncate.as_millis() as u64,
-            "reindex_ms": truncation.reindex.as_millis() as u64,
+            "caught_up": truncation.caught_up,
+            "catch_up_rounds": truncation.catch_up_rounds,
+            "caught_up_locked": truncation.caught_up_locked,
+            "prepare_ms": truncation.prepare.as_millis() as u64,
+            "index_carry_ms": truncation.index_carry.as_millis() as u64,
+            "locked_ms": truncation.locked.as_millis() as u64,
         })),
         "truncation_refusal": report.truncation_refusal,
         "gc": report.gc.as_ref().map(|gc| json!({

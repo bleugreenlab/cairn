@@ -648,6 +648,16 @@ impl JjStoreGuard {
         *self.trace.store == *store_dir.to_string_lossy()
     }
 
+    /// The names of the phases recorded in this hold so far, in order.
+    #[cfg(test)]
+    pub(crate) fn phase_names(&self) -> Vec<String> {
+        let hold = self.trace.hold.lock().unwrap();
+        hold.phases
+            .iter()
+            .map(|phase| phase.name.to_string())
+            .collect()
+    }
+
     /// See [`JjStoreOperationTrace::blocking_phase`].
     pub(crate) fn blocking_phase<T>(
         &self,

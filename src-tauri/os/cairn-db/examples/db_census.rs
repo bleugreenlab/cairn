@@ -2,18 +2,17 @@
 //!
 //! Measures what the database holds, what grows, and what the history tier
 //! would move, so retention windows and the hot budget are set from numbers.
-//! Point it at an APFS clone of the three-file set, never at the live file:
-//!
-//!   cp -c ~/.cairn/cairn.db ~/.cairn/cairn.db-log ~/.cairn/cairn.db-wal <dir>/
-//!
-//! taken with the app quit (exact) or while it runs (approximate: the three
-//! files are cloned at slightly different instants), with `<dir>` on
-//! `~/.cairn`'s volume and then copied off it at once (docs/database.md
-//! "Taking a census"). Every subcommand refuses
-//! a database inside a live Cairn data directory. `fold` checkpoints the clone
-//! it is given; `delete-probe` clones its input again and deletes only from
-//! that sibling copy. `scripts/db-census.ts` drives every subcommand, caps
-//! each process's memory, and renders the report.
+//! Never point it at the live file. docs/database.md "Taking a census" owns
+//! the procedure: scripts/db-census-window.ts runs a prebuilt consumer on a
+//! complete same-volume APFS clone, with monitored checkpoint budgets and
+//! clone creation through verified deletion bounded to 900 seconds. Running
+//! captures are approximate and carry TAKEN_WHILE_RUNNING; operator-approved
+//! quiescent copies carry TAKEN. Keep the .db filename and all three files.
+//! Every subcommand refuses a database inside a live Cairn data directory.
+//! Select explicit steps: fold writes the supplied clone; delete-probe creates
+//! a sibling clone and is prohibited on the bounded in-place path, as is reclaim.
+//! Longer workloads use the documented exceptional copy procedures.
+//! scripts/db-census.ts caps each process's memory and renders the report.
 //!
 //! Each subcommand prints one JSON document on stdout:
 //!

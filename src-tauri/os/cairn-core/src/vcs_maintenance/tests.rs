@@ -679,9 +679,10 @@ mod pass {
         heads
     }
 
-    /// The truncation rewrites every retained operation id, so it runs only
-    /// under the lock of the store it rewrites; a guard for any other store
-    /// is refused with nothing changed.
+    /// The head swap publishes every retained operation's new id, so it runs
+    /// only under the lock of the store it rewrites; a guard for any other
+    /// store is refused with nothing changed. Under its own store's lock each
+    /// step is a named phase of the hold.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(jj)]
     async fn the_truncation_refuses_without_the_store_lock() {
@@ -690,9 +691,23 @@ mod pass {
             return;
         };
         let jj = crate::jj::environment(&fx.orch.jj_binary_path, &fx.orch.config_dir);
+        std::thread::sleep(Duration::from_millis(20));
+        let cutoff = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(20));
         for name in ["one", "two"] {
             crate::jj::create_bookmark_at(&jj, &fx.project.store, name, &fx.commit).unwrap();
         }
+        let deadline = Instant::now() + Duration::from_secs(600);
+        let mut prepared = {
+            let store = fx.project.store.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::jj::prepare_operation_log_truncation(&store, cutoff, deadline)
+            })
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("two operations inside the window")
+        };
         let other = fx._temp.path().join("another-store");
         let guard = fx
             .orch
@@ -705,17 +720,15 @@ mod pass {
             .await
             .unwrap();
         let heads = op_heads(&fx.project.store);
-        let cutoff = SystemTime::now();
-        let deadline = Instant::now() + Duration::from_secs(600);
 
-        let error = crate::jj::in_place_blocking(|| {
-            truncate_under_lock(&guard, &fx.project.store, cutoff, deadline)
-        })
-        .unwrap_err();
+        let error =
+            crate::jj::in_place_blocking(|| truncate_under_lock(&guard, &mut prepared, deadline))
+                .unwrap_err();
 
         assert!(error.contains("refused"), "{error}");
         assert!(error.contains("nothing was changed"), "{error}");
         assert_eq!(op_heads(&fx.project.store), heads);
+        assert!(guard.phase_names().is_empty());
         drop(guard);
 
         let own = fx
@@ -728,10 +741,12 @@ mod pass {
             )
             .await
             .unwrap();
-        crate::jj::in_place_blocking(|| {
-            truncate_under_lock(&own, &fx.project.store, cutoff, deadline)
-        })
-        .expect("under its own store's lock the truncation runs");
+        let truncation =
+            crate::jj::in_place_blocking(|| truncate_under_lock(&own, &mut prepared, deadline))
+                .expect("under its own store's lock the truncation runs");
+        assert_eq!(truncation.reparented, 2);
+        assert_eq!(own.phase_names(), crate::jj::TRUNCATION_FINISH_PHASES);
+        assert_ne!(op_heads(&fx.project.store), heads);
     }
 
     /// The backlog sweep retires a finished branch through teardown's own

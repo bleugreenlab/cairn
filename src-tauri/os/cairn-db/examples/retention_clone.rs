@@ -9,12 +9,12 @@
 //! directory is removed before the report prints. A synthetic measurement,
 //! not a clone measurement.
 //!
-//! Point it at an APFS clone of the three-file set, never at the live file:
-//!
-//!   cp -c ~/.cairn/cairn.db ~/.cairn/cairn.db-log ~/.cairn/cairn.db-wal <dir>/
-//!
-//! `<dir>` must be on `~/.cairn`'s volume, and the clone must not be kept beside
-//! the running database; docs/database.md "Taking a census" has the sequence.
+//! Never point this at live files or take an unmonitored clone. For production
+//! data, docs/database.md "Taking a census" requires the guarded window wrapper.
+//! This example is not yet an admitted consumer: first add a reviewed bounded
+//! subcommand route to `validateConsumer` in scripts/db-census-window.ts and
+//! prebuild the binary. Until then use synthetic data or an explicitly approved
+//! operator-run app-quit copy, not a bare `cp -c`.
 //!
 //! Every subcommand refuses a database inside a live Cairn data directory and
 //! any path not ending in `.db` (Turso names the logical log from the

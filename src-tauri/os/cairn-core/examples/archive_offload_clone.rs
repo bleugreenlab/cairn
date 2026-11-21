@@ -1,12 +1,12 @@
 //! Clone-only rehearsal of the archive offload (`archival::offload`).
 //!
-//! Point it at an APFS clone of the three-file set, never at the live file, and
-//! at an archive directory in scratch, never at `~/.cairn/archive`:
-//!
-//!   cp -c ~/.cairn/cairn.db ~/.cairn/cairn.db-log ~/.cairn/cairn.db-wal <dir>/
-//!
-//! `<dir>` must be on `~/.cairn`'s volume, and the clone must not be kept beside
-//! the running database; docs/database.md "Taking a census" has the sequence.
+//! Never point this at live files or `~/.cairn/archive`. Production data requires
+//! the guarded window in docs/database.md "Taking a census", not bare `cp -c`.
+//! This example is not yet admitted: first add a reviewed bounded subcommand
+//! route to `validateConsumer` in scripts/db-census-window.ts, with archive
+//! output outside the owned clone and live directories, and prebuild the binary.
+//! Until then use synthetic data or an explicitly approved operator-run app-quit
+//! copy. Archive output must never target the production archive.
 //!
 //! Every subcommand refuses a database inside a live Cairn data directory, any
 //! path not ending in `.db` (Turso names the logical log from the extension;

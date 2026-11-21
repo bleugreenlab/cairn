@@ -832,6 +832,10 @@ pub struct LocalDb {
     /// drop its hold and reopen the boolean gate while another is still draining
     /// or running TRUNCATE.
     checkpoint_lock: AsyncMutex<()>,
+    /// Set only on the process's live database, by
+    /// [`Self::observe_checkpoints`]. Clones, team replicas and test handles
+    /// leave it unset and never write a lifecycle line.
+    checkpoint_observer: OnceLock<CheckpointObserver>,
     /// Read transactions opened over this handle's life. Lets a test assert
     /// that an operation's transaction count is a constant rather than a
     /// function of how much data it covers — a load-independent guard against
@@ -914,6 +918,7 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
+            checkpoint_observer: OnceLock::new(),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -980,6 +985,7 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
+            checkpoint_observer: OnceLock::new(),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -1042,6 +1048,7 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
+            checkpoint_observer: OnceLock::new(),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -2230,6 +2237,118 @@ impl LocalDb {
         self.gate.checkpoint_in_engine.load(Ordering::SeqCst)
     }
 
+    /// Make every checkpoint pass on this database observable, for the life of
+    /// the handle: write `ready` now, a `start` and `end` around every pass,
+    /// and a `heartbeat` every [`CHECKPOINT_LIFECYCLE_HEARTBEAT`] from a task of
+    /// its own (see [`CheckpointObserver`] for the protocol). Idempotent.
+    ///
+    /// Only the process's live database is observed; its owner calls this once
+    /// at open, before any pass can run. A clone or replica stays unobserved,
+    /// so its folds never read as the live database's.
+    ///
+    /// The heartbeat samples the shared active pass rather than any one
+    /// caller's, so it keeps reporting a pass however it was started and
+    /// whatever the caller that started it is awaiting. It stops with
+    /// [`Self::stop_observing_checkpoints`] or when the handle is dropped.
+    pub fn observe_checkpoints(self: &Arc<Self>) {
+        if self
+            .checkpoint_observer
+            .set(CheckpointObserver::new())
+            .is_err()
+        {
+            return;
+        }
+        self.sample_checkpoint_lifecycle("ready");
+        let db = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + CHECKPOINT_LIFECYCLE_HEARTBEAT,
+                CHECKPOINT_LIFECYCLE_HEARTBEAT,
+            );
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let Some(db) = db.upgrade() else { return };
+                if !db.sample_checkpoint_lifecycle("heartbeat") {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Write the terminal `stopped` sample and end the heartbeat. Nothing is
+    /// written after it, so a monitor reads it as observation ending, not as
+    /// the database going idle.
+    pub fn stop_observing_checkpoints(&self) {
+        let Some(observer) = self.checkpoint_observer.get() else {
+            return;
+        };
+        let mut state = observer.lock();
+        if state.stopped {
+            return;
+        }
+        state.stopped = true;
+        observer.emit(
+            "stopped",
+            None,
+            "stopped",
+            self.logical_log_bytes(),
+            self.checkpoint_in_flight(),
+        );
+    }
+
+    /// Write one `ready` or `heartbeat` sample of the active pass, or of no
+    /// pass. False once observation has stopped, or was never enabled.
+    fn sample_checkpoint_lifecycle(&self, event: &'static str) -> bool {
+        let Some(observer) = self.checkpoint_observer.get() else {
+            return false;
+        };
+        // Sampled and written under the state lock, so a heartbeat of a pass
+        // can never land in the log after that pass's `end`.
+        let state = observer.lock();
+        if state.stopped {
+            return false;
+        }
+        let outcome = if state.active.is_some() {
+            "running"
+        } else {
+            "idle"
+        };
+        observer.emit(
+            event,
+            state.active.as_ref(),
+            outcome,
+            self.logical_log_bytes(),
+            self.checkpoint_in_flight(),
+        );
+        true
+    }
+
+    fn begin_observed_pass(&self, origin: &'static Location<'static>) -> ObservedPassGuard<'_> {
+        let pass = self.checkpoint_observer.get().and_then(|observer| {
+            let mut state = observer.lock();
+            if state.stopped {
+                return None;
+            }
+            let pass = ObservedPass {
+                id: uuid::Uuid::new_v4(),
+                origin,
+                unix_ms: chrono::Utc::now().timestamp_millis(),
+                started: tokio::time::Instant::now(),
+            };
+            state.active = Some(pass);
+            observer.emit(
+                "start",
+                Some(&pass),
+                "running",
+                self.logical_log_bytes(),
+                self.checkpoint_in_flight(),
+            );
+            Some(pass)
+        });
+        ObservedPassGuard { db: self, pass }
+    }
+
     /// Fold the logical log back into the main database, creating the quiet
     /// instant it needs rather than waiting to be handed one.
     ///
@@ -2297,12 +2416,17 @@ impl LocalDb {
     ///
     /// Returns `Err` only when no connection could be obtained; a checkpoint that
     /// ran and lost is a successful call reporting an unsuccessful pass.
-    pub async fn checkpoint(
+    ///
+    /// On a database whose checkpoints are observed (see
+    /// [`Self::observe_checkpoints`]) every pass, whoever calls it, writes a
+    /// lifecycle `start` and `end` naming this call's source location.
+    #[track_caller]
+    pub fn checkpoint(
         &self,
         max_attempts: usize,
         between_attempts: Duration,
         drain_budget: DrainBudget,
-    ) -> DbResult<CheckpointReport> {
+    ) -> impl Future<Output = DbResult<CheckpointReport>> + '_ {
         self.checkpoint_bounded(
             max_attempts,
             between_attempts,
@@ -2310,13 +2434,46 @@ impl LocalDb {
             AttemptBounds::PRODUCTION,
             Arc::new(truncate_attempt),
         )
-        .await
     }
 
     /// [`Self::checkpoint`] with the attempts' bounds and the attempt itself
     /// supplied, so a test can stand in an engine call that is slow or never
     /// returns.
-    async fn checkpoint_bounded(
+    #[track_caller]
+    fn checkpoint_bounded(
+        &self,
+        max_attempts: usize,
+        between_attempts: Duration,
+        drain_budget: DrainBudget,
+        bounds: AttemptBounds,
+        attempt: CheckpointAttempt,
+    ) -> impl Future<Output = DbResult<CheckpointReport>> + '_ {
+        let origin = Location::caller();
+        async move {
+            // `checkpoint` is public and callers are not required to
+            // coordinate. Keep this permit outside every other operation in the
+            // pass so a second call cannot close the gate until the first
+            // call's GateHold has dropped.
+            let _checkpoint_permit = self.checkpoint_lock.lock().await;
+            // Declared after the permit, so a cancelled pass reports its end
+            // before the next pass can take the lock and report a start.
+            let observed = self.begin_observed_pass(origin);
+            let result = self
+                .checkpoint_pass(
+                    max_attempts,
+                    between_attempts,
+                    drain_budget,
+                    bounds,
+                    attempt,
+                )
+                .await;
+            observed.end(&result);
+            result
+        }
+    }
+
+    /// One pass, run under `checkpoint_lock`.
+    async fn checkpoint_pass(
         &self,
         max_attempts: usize,
         between_attempts: Duration,
@@ -2324,10 +2481,6 @@ impl LocalDb {
         bounds: AttemptBounds,
         attempt: CheckpointAttempt,
     ) -> DbResult<CheckpointReport> {
-        // `checkpoint` is public and callers are not required to coordinate.
-        // Keep this permit outside every other operation in the pass so a second
-        // call cannot close the gate until the first call's GateHold has dropped.
-        let _checkpoint_permit = self.checkpoint_lock.lock().await;
         let started = Instant::now();
         let log_bytes_before = self.logical_log_bytes();
 
@@ -3439,6 +3592,160 @@ async fn run_checkpoint_attempt(
     (outcome, slow)
 }
 
+/// How often an observed database writes a lifecycle heartbeat.
+///
+/// The census wrapper (`scripts/db-census-window.ts`) treats a heartbeat older
+/// than three seconds as monitoring lost, so one a second leaves it two misses.
+/// The cost is a line a second for the life of the process, about 400 bytes
+/// with the log envelope, so roughly 35 MB of log a day. That is accepted for
+/// now rather than carried by a second, lease-conditioned channel.
+pub const CHECKPOINT_LIFECYCLE_HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// Every lifecycle line is this prefix followed by one version-1 JSON object.
+const CHECKPOINT_LIFECYCLE_PREFIX: &str = "checkpoint_lifecycle ";
+
+/// The lifecycle record of an observed database's checkpoint passes: the
+/// line-oriented protocol a monitor (the storage census wrapper) attaches to
+/// in order to bound what production folds cost while it runs.
+///
+/// One `owner_id` covers the handle's whole observed life, so the startup fold,
+/// the periodic pass and every other caller (archival pacing, retention, the
+/// packet backfill) report under one owner. Events are `ready`, `heartbeat`,
+/// `start`, `end` and `stopped`. A sample of a pass carries its `pass_id`,
+/// `started_unix_ms`, a monotonic `elapsed_ms`, and `phase`, the source
+/// location of the `checkpoint` call that started it; a sample of no pass
+/// carries nulls, `outcome:"idle"` and `phase:"monitor"`. Heartbeats repeat
+/// the active pass, so a reader attaching mid-pass need not have seen its
+/// start. Missing heartbeats mean monitoring is lost, not that the database
+/// is idle.
+///
+/// An `end` marks the checkpoint call returning or being cancelled (a
+/// cancelled call ends `failed`), not necessarily engine completion: the wedge
+/// backstop or a cancellation can leave the attempt's thread in the engine.
+/// Every sample therefore carries the live `in_engine` flag, so a monitor can
+/// keep that pass unresolved until it clears.
+struct CheckpointObserver {
+    owner_id: uuid::Uuid,
+    state: Mutex<ObserverState>,
+    #[cfg(test)]
+    lines: Mutex<Vec<String>>,
+}
+
+#[derive(Default)]
+struct ObserverState {
+    active: Option<ObservedPass>,
+    stopped: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ObservedPass {
+    id: uuid::Uuid,
+    origin: &'static Location<'static>,
+    unix_ms: i64,
+    started: tokio::time::Instant,
+}
+
+impl CheckpointObserver {
+    fn new() -> Self {
+        Self {
+            owner_id: uuid::Uuid::new_v4(),
+            state: Mutex::new(ObserverState::default()),
+            #[cfg(test)]
+            lines: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ObserverState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Write one line. Callers hold [`Self::lock`] across the sample and this
+    /// write, which is what keeps the log's order the passes' order.
+    fn emit(
+        &self,
+        event: &str,
+        pass: Option<&ObservedPass>,
+        outcome: &str,
+        log_bytes: u64,
+        in_engine: bool,
+    ) {
+        let event = serde_json::json!({
+            "version": 1,
+            "event": event,
+            "owner_id": self.owner_id.to_string(),
+            "unix_ms": chrono::Utc::now().timestamp_millis(),
+            "phase": pass.map_or_else(
+                || "monitor".to_string(),
+                |pass| format!("{}:{}", pass.origin.file(), pass.origin.line()),
+            ),
+            "pass_id": pass.map(|pass| pass.id.to_string()),
+            "started_unix_ms": pass.map(|pass| pass.unix_ms),
+            "elapsed_ms": pass.map_or(0, |pass| {
+                pass.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+            }),
+            "log_bytes": log_bytes,
+            "outcome": outcome,
+            "in_engine": in_engine,
+        });
+        let line = format!("{CHECKPOINT_LIFECYCLE_PREFIX}{event}");
+        log::info!("{line}");
+        #[cfg(test)]
+        self.lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(line);
+    }
+}
+
+/// Reports the `end` of one observed pass exactly once: from [`Self::end`]
+/// with the pass's outcome, or from `Drop` as `failed` when the checkpoint
+/// future is cancelled before it returns.
+struct ObservedPassGuard<'a> {
+    db: &'a LocalDb,
+    pass: Option<ObservedPass>,
+}
+
+impl ObservedPassGuard<'_> {
+    fn end(mut self, result: &DbResult<CheckpointReport>) {
+        let (outcome, reported_in_engine) = match result {
+            Ok(report) if report.maintenance_read.is_some() => ("skipped", report.in_engine),
+            Ok(report) if report.succeeded() => ("succeeded", report.in_engine),
+            Ok(report) => ("failed", report.in_engine),
+            Err(_) => ("failed", false),
+        };
+        self.finish(outcome, reported_in_engine);
+    }
+
+    fn finish(&mut self, outcome: &str, reported_in_engine: bool) {
+        let Some(pass) = self.pass.take() else {
+            return;
+        };
+        let Some(observer) = self.db.checkpoint_observer.get() else {
+            return;
+        };
+        let mut state = observer.lock();
+        state.active = None;
+        if state.stopped {
+            return;
+        }
+        observer.emit(
+            "end",
+            Some(&pass),
+            outcome,
+            self.db.logical_log_bytes(),
+            reported_in_engine || self.db.checkpoint_in_flight(),
+        );
+    }
+}
+
+impl Drop for ObservedPassGuard<'_> {
+    fn drop(&mut self) {
+        self.finish("failed", false);
+    }
+}
+
 /// What one [`LocalDb::checkpoint`] pass did: whether it won, what it cost, and
 /// how much logical log it folded away.
 #[derive(Debug, Clone)]
@@ -4370,12 +4677,15 @@ mod tests {
     /// statements, drop. Mode B is `read`. Same statement mix, same nodes, N
     /// concurrent readers for D seconds each. Reports per-call p50/p99,
     /// connections opened, the peak live count (sampled every 10 ms), and what
-    /// the free-list retains afterwards. Run against an APFS clone of a real
-    /// database, taken on its volume and not kept (docs/database.md "Taking a
-    /// census"), never the live file:
+    /// the free-list retains afterwards. Never use the live file or an
+    /// unmonitored clone. Production clones require the guarded wrapper in
+    /// docs/database.md "Taking a census". This probe is not yet admitted: add
+    /// a reviewed exact-test route to `validateConsumer` in
+    /// scripts/db-census-window.ts that supplies `CAIRN_PROBE_DB` and bounds
+    /// its duration, then prebuild the binary before capture. Until then use
+    /// synthetic data or an explicitly approved operator-run app-quit copy:
     ///
     /// ```text
-    /// cp -c ~/.cairn/cairn.db* /tmp/probe/
     /// CAIRN_PROBE_DB=/tmp/probe/cairn.db cargo test --release -p cairn-db --lib \
     ///   -- --ignored --nocapture pool_read_load_probe
     /// ```
@@ -4797,6 +5107,7 @@ mod tests {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
+            checkpoint_observer: OnceLock::new(),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -7231,5 +7542,188 @@ mod tests {
             .unwrap(),
             40
         );
+    }
+
+    fn lifecycle_events(db: &LocalDb) -> Vec<serde_json::Value> {
+        let observer = db.checkpoint_observer.get().expect("observed");
+        let lines = observer.lines.lock().unwrap();
+        lines
+            .iter()
+            .map(|line| {
+                let json = line
+                    .strip_prefix(CHECKPOINT_LIFECYCLE_PREFIX)
+                    .expect("every line carries the protocol prefix");
+                serde_json::from_str(json).unwrap()
+            })
+            .collect()
+    }
+
+    /// An attempt that blocks inside "the engine" until released, announcing
+    /// when it entered.
+    fn held_attempt() -> (CheckpointAttempt, Arc<Notify>, std::sync::mpsc::Sender<()>) {
+        let entered = Arc::new(Notify::new());
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        let attempt: CheckpointAttempt = {
+            let entered = entered.clone();
+            Arc::new(move |_conn| {
+                entered.notify_one();
+                let _ = released.lock().unwrap().recv();
+                Ok(())
+            })
+        };
+        (attempt, entered, release)
+    }
+
+    /// Bounds no paused-clock test reaches, so only the release ends a pass.
+    const UNREACHED: AttemptBounds = AttemptBounds {
+        slow_after: Duration::from_secs(86_400),
+        backstop: Duration::from_secs(2 * 86_400),
+    };
+
+    /// The heartbeat is the observer's own task sampling the shared active
+    /// pass, so it reports a pass whose checkpoint future is still pending in
+    /// another task, with its elapsed time growing, and goes idle after `end`.
+    #[tokio::test]
+    async fn an_observed_pass_heartbeats_while_its_checkpoint_is_pending() {
+        let db = Arc::new(test_db().await.unwrap());
+        tokio::time::pause();
+        db.observe_checkpoints();
+        let (attempt, entered, release) = held_attempt();
+        let checkpointing = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.checkpoint_bounded(1, Duration::ZERO, DRAIN_BUDGET, UNREACHED, attempt)
+                    .await
+                    .unwrap()
+            })
+        };
+        entered.notified().await;
+        sleep(Duration::from_millis(3_500)).await;
+        let while_pending = lifecycle_events(&db);
+        release.send(()).unwrap();
+        assert!(checkpointing.await.unwrap().succeeded());
+        sleep(Duration::from_millis(1_500)).await;
+        let events = lifecycle_events(&db);
+
+        assert_eq!(events[0]["event"], "ready");
+        assert_eq!(events[0]["phase"], "monitor");
+        assert!(events.iter().all(|e| e["version"] == 1));
+        assert!(events
+            .iter()
+            .all(|e| e["owner_id"] == events[0]["owner_id"]));
+        let start = events.iter().find(|e| e["event"] == "start").unwrap();
+        let pass = start["pass_id"].clone();
+        assert!(pass.is_string());
+        assert!(start["phase"].as_str().unwrap().contains("local_db.rs:"));
+
+        let running: Vec<_> = while_pending
+            .iter()
+            .filter(|e| e["event"] == "heartbeat" && e["pass_id"] == pass)
+            .collect();
+        assert!(running.len() >= 3, "{while_pending:#?}");
+        assert!(running.iter().all(|e| e["outcome"] == "running"
+            && e["in_engine"] == true
+            && e["started_unix_ms"] == start["started_unix_ms"]));
+        let elapsed: Vec<u64> = running
+            .iter()
+            .map(|e| e["elapsed_ms"].as_u64().unwrap())
+            .collect();
+        assert!(elapsed.windows(2).all(|w| w[0] < w[1]), "{elapsed:?}");
+        assert!(*elapsed.last().unwrap() >= 2_000, "{elapsed:?}");
+
+        let end_at = events.iter().position(|e| e["event"] == "end").unwrap();
+        assert_eq!(events[end_at]["pass_id"], pass);
+        assert_eq!(events[end_at]["outcome"], "succeeded");
+        assert_eq!(events[end_at]["in_engine"], false);
+        let after = &events[end_at + 1..];
+        assert!(after.iter().all(|e| e["pass_id"].is_null()));
+        assert!(after
+            .iter()
+            .any(|e| e["event"] == "heartbeat" && e["outcome"] == "idle"));
+    }
+
+    /// A pass whose caller is cancelled still ends, as `failed`, and its
+    /// attempt still in the engine is reported on every sample until it
+    /// leaves.
+    #[tokio::test]
+    async fn a_cancelled_pass_ends_failed_and_reports_the_engine_until_it_leaves() {
+        let db = Arc::new(test_db().await.unwrap());
+        tokio::time::pause();
+        db.observe_checkpoints();
+        let (attempt, entered, release) = held_attempt();
+        let checkpointing = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.checkpoint_bounded(1, Duration::ZERO, DRAIN_BUDGET, UNREACHED, attempt)
+                    .await
+            })
+        };
+        entered.notified().await;
+        checkpointing.abort();
+        assert!(checkpointing.await.unwrap_err().is_cancelled());
+        sleep(Duration::from_millis(1_500)).await;
+        let cancelled = lifecycle_events(&db);
+        let end_at = cancelled.iter().position(|e| e["event"] == "end").unwrap();
+        assert_eq!(cancelled[end_at]["outcome"], "failed");
+        assert_eq!(cancelled[end_at]["in_engine"], true);
+        let idle_in_engine = &cancelled[end_at + 1..];
+        assert!(!idle_in_engine.is_empty());
+        assert!(idle_in_engine
+            .iter()
+            .all(|e| e["outcome"] == "idle" && e["in_engine"] == true));
+
+        release.send(()).unwrap();
+        for _ in 0..10_000 {
+            if !db.checkpoint_in_flight() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!db.checkpoint_in_flight());
+        sleep(Duration::from_millis(1_500)).await;
+        let last = lifecycle_events(&db).pop().unwrap();
+        assert_eq!(last["outcome"], "idle");
+        assert_eq!(last["in_engine"], false);
+    }
+
+    /// Observation is at the shared checkpoint boundary: an ordinary
+    /// `checkpoint` call from anywhere reports a start and end naming its own
+    /// call site, nothing follows `stopped`, and an unobserved handle (a clone,
+    /// a replica) writes nothing.
+    #[tokio::test]
+    async fn every_pass_on_an_observed_database_reports_its_call_site() {
+        let unobserved = test_db().await.unwrap();
+        assert!(unobserved
+            .checkpoint(1, Duration::ZERO, DRAIN_BUDGET)
+            .await
+            .unwrap()
+            .succeeded());
+        assert!(unobserved.checkpoint_observer.get().is_none());
+
+        let db = Arc::new(test_db().await.unwrap());
+        db.observe_checkpoints();
+        db.observe_checkpoints();
+        let line = line!() + 1;
+        let pass = db.checkpoint(1, Duration::ZERO, DRAIN_BUDGET);
+        let report = pass.await.unwrap();
+        assert!(report.succeeded(), "{report}");
+        let events = lifecycle_events(&db);
+        assert_eq!(events.iter().filter(|e| e["event"] == "ready").count(), 1);
+        let start = events.iter().find(|e| e["event"] == "start").unwrap();
+        let end = events.iter().find(|e| e["event"] == "end").unwrap();
+        assert_eq!(start["pass_id"], end["pass_id"]);
+        assert_eq!(start["phase"], format!("{}:{line}", file!()));
+        assert_eq!(end["phase"], start["phase"]);
+        assert_eq!(end["outcome"], "succeeded");
+
+        db.stop_observing_checkpoints();
+        let stopped = lifecycle_events(&db).len();
+        assert_eq!(lifecycle_events(&db)[stopped - 1]["event"], "stopped");
+        db.checkpoint(1, Duration::ZERO, DRAIN_BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(lifecycle_events(&db).len(), stopped);
     }
 }

@@ -56,7 +56,7 @@ use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::OperationId;
 use jj_lib::op_walk;
 use jj_lib::operation::Operation;
-use jj_lib::repo::{ReadonlyRepo, Repo as _};
+use jj_lib::repo::{ReadonlyRepo, Repo as _, RepoLoader};
 use jj_lib::stacked_table::TableStore;
 
 use super::packed_refs::{with_packed_refs_patience, PackedRefs};
@@ -428,118 +428,139 @@ pub fn operation_count(store: &Path) -> Result<u64, String> {
 /// What truncating the operation log did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OperationLogTruncation {
-    /// Retained operations rewritten onto the root operation, each with a new id.
+    /// Retained operations rewritten onto the root operation, each with a new
+    /// id: the window the prepare found, plus every catch-up.
     pub reparented: u64,
-    pub truncate: Duration,
-    /// Rebuilding the commit index for the rewritten operation ids, paid here so
-    /// the next publication does not.
-    pub reindex: Duration,
+    /// Of those, operations written after the prepare's first walk and
+    /// rewritten by off-lock catch-up rounds.
+    pub caught_up: u64,
+    pub catch_up_rounds: u64,
+    /// Of those, operations rewritten under the store lock.
+    pub caught_up_locked: u64,
+    /// Time spent rewriting without the store lock, catch-up rounds included.
+    pub prepare: Duration,
+    /// Time spent linking the old head's commit index to its rewritten id,
+    /// summed over every carry. Nothing is ever reindexed.
+    pub index_carry: Duration,
+    /// Time the finish ran, all of it under the caller's store lock.
+    pub locked: Duration,
 }
 
-/// Drop every operation that ended before `older_than` from the store's
-/// operation log, the in-process equivalent of `jj op abandon ..<op>`.
-///
-/// Every retained operation is rewritten with a new id, so the caller must hold
-/// the store lock: anything that snapshotted an operation id for rollback would
-/// otherwise restore to an id that no longer exists.
-///
-/// The store's own working copy records an operation id too, and jj treats an
-/// id it cannot load as a hard error that stale-workspace recovery does not
-/// handle. That record is normally stale, because every store write except
-/// `jj workspace add` passes `--ignore-working-copy`, so it is first brought to
-/// the head operation (the files in the store's checkout are moved to the
-/// view's working-copy commit, the direction `jj workspace update-stale`
-/// takes), and then remapped to the head's new id. Clamping the cut to the
-/// stale record instead would pin the retention boundary wherever the store was
-/// last refreshed, so a store only ever written by publications would keep its
-/// whole history. Only a view that names no working-copy commit for the store
-/// falls back to that clamp. Any other workspace registered in the store records
-/// an id the rewrite cannot reach, so the truncation refuses while one of them
-/// still exists on disk; a registration whose directory is gone is a leftover
-/// nothing will load again. Nothing the rewrite writes is visible until the
-/// operation heads move, and that is the last step.
-///
-/// The rewrite's cost grows with the window it keeps, not with what it drops,
-/// and the caller holds the store lock across it, so it stops at `deadline`.
-/// Everything the store's working copy and operation heads record is changed
-/// only after the rewrite is complete, so a truncation that reaches its
-/// deadline refuses with nothing changed; the rewritten operations it leaves
-/// are unreachable files the next garbage collection deletes.
-///
-/// How many operations became unreachable is not counted here (counting means
-/// loading every one of them); the garbage collection that deletes them reports
-/// it.
-pub fn truncate_operation_log(
-    store: &Path,
-    older_than: SystemTime,
-    deadline: Instant,
-) -> Result<OperationLogTruncation, String> {
-    let _reclamation = super::object_lease::Reclamation::for_store(store)?;
-    block_on(truncate_operation_log_inner(store, older_than, deadline))
-}
+/// The most operations [`PreparedTruncation::finish`] rewrites under the store
+/// lock; more refuses with [`TRUNCATION_BUSY`] and nothing changed. At the
+/// measured 5.7 ms per operation this is about 1.2 s.
+pub const LOCKED_CATCH_UP_LIMIT: usize = 200;
+
+/// Off-lock catch-up rounds a prepare runs before it decides the store writes
+/// operations faster than it can follow.
+pub const CATCH_UP_ROUNDS: u64 = 5;
+
+/// How long a prepared truncation stays usable after its first rewritten
+/// operation was written. Those operations are unreachable until the finish
+/// moves the head, so the store's garbage collection must not be able to
+/// delete them first: its grace for unreachable operations has to exceed this.
+pub const PREPARED_TRUNCATION_LIFETIME: Duration = Duration::from_secs(45 * 60);
+
+/// The refusal a truncation returns when the store wrote more operations than
+/// it can rewrite under the lock. The caller may release the lock, catch up
+/// with [`PreparedTruncation::catch_up`], and finish again.
+pub const TRUNCATION_BUSY: &str = "operation-log truncation refused: the store is too busy";
 
 /// The refusal a truncation that reached its deadline returns.
 pub const TRUNCATION_DEADLINE: &str = "operation-log truncation refused: it reached its deadline";
 
-async fn truncate_operation_log_inner(
+/// Names each step of [`PreparedTruncation::finish`] for whoever holds the
+/// lock it runs under, so a long hold says where its time went. `()` runs
+/// each step as it is.
+pub trait TruncationPhases {
+    fn phase<T>(&self, name: &'static str, work: impl FnOnce() -> T) -> T;
+}
+
+impl TruncationPhases for () {
+    fn phase<T>(&self, _name: &'static str, work: impl FnOnce() -> T) -> T {
+        work()
+    }
+}
+
+/// The steps of [`PreparedTruncation::finish`], in the order they run.
+pub const TRUNCATION_FINISH_PHASES: [&str; 5] = [
+    "acquire maintenance reclamation",
+    "catch up operations written while waiting",
+    "bring the store working copy to the head",
+    "move the operation head",
+    "remap the working copy operation",
+];
+
+/// Drop every operation that ended before `older_than` from the store's
+/// operation log, the in-process equivalent of `jj op abandon ..<op>`, in two
+/// halves: this slow one, which takes no lock, and
+/// [`PreparedTruncation::finish`], which the caller runs under the store lock.
+///
+/// Operation ids are content hashes, so cutting the log gives every retained
+/// operation a new id, and the rewrite costs about the same whatever it drops.
+/// Writing the rewritten operations publishes nothing: they are new,
+/// unreachable files until the operation head moves. So they are written here,
+/// without the lock, and so is the commit index for the new head. The new head
+/// has exactly the old head's view, so its index is the old head's, linked
+/// under the new id; without that link jj finds no indexed ancestor among the
+/// rewritten ids and reindexes the whole store from scratch.
+///
+/// Publications keep landing meanwhile. Catch-up rounds rewrite what they
+/// added on top of the head, mapping each parent through the ids already
+/// rewritten, until at most [`LOCKED_CATCH_UP_LIMIT`] are pending; the finish
+/// rewrites that remainder under the lock. A store that keeps outrunning the
+/// rounds is refused as too busy, and an operation that does not descend from
+/// the rewritten log (a fork from before the cut, or a head moved backwards)
+/// is refused, both with nothing changed.
+///
+/// The cut keeps the operation the store's own working copy records when the
+/// view names no working-copy commit for the store; otherwise the finish
+/// brings the working copy to the head first (see
+/// [`PreparedTruncation::finish`]). Any other workspace registered in the
+/// store records an id the rewrite cannot reach, so the truncation refuses
+/// while one of them still exists on disk; a registration whose directory is
+/// gone is a leftover nothing will load again.
+///
+/// It stops at `deadline` with nothing changed, the rewritten operations left
+/// as unreachable files the next garbage collection deletes. `Ok(None)` is a
+/// store with nothing older than the cut, or one idle for the whole window.
+///
+/// How many operations became unreachable is not counted here (counting means
+/// loading every one of them); the garbage collection that deletes them reports
+/// it.
+pub fn prepare_operation_log_truncation(
     store: &Path,
     older_than: SystemTime,
     deadline: Instant,
-) -> Result<OperationLogTruncation, String> {
-    let started = Instant::now();
-    let mut workspace = crate::load_workspace(store)?;
-    let loader = workspace.repo_loader().clone();
-    let op_store = loader.op_store().clone();
-    // Loading at head would merge divergent operation heads and publish the
-    // merge, which is a change nobody judged; a split log is refused instead,
-    // and the one head is loaded without touching the heads.
-    let heads = loader
-        .op_heads_store()
-        .get_op_heads()
-        .await
-        .map_err(|error| format!("read the store's operation heads: {error}"))?;
-    let [head_id] = heads.as_slice() else {
-        return Err(format!(
-            "operation-log truncation refused: the store has {} operation heads, and \
-             truncating only from one settled head; nothing was changed",
-            heads.len()
-        ));
-    };
-    past_deadline(deadline, 0, 0)?;
-    let head = loader
-        .load_operation(head_id)
-        .await
-        .map_err(|error| format!("load the store's head operation: {error}"))?;
-    let repo = loader
-        .load_at(&head)
-        .await
-        .map_err(|error| format!("load the store at its operation head: {error}"))?;
-    let mut wc_op_id = workspace.working_copy().operation_id().clone();
-    refuse_live_foreign_workspaces(&workspace, &repo)?;
+) -> Result<Option<PreparedTruncation>, String> {
+    block_on(prepare_inner(store, older_than, deadline))
+}
 
-    // A stale working copy is brought to the head only once the rewrite is
-    // complete, so a truncation that stops early leaves it as it was.
-    let mut refresh_working_copy = None;
+async fn prepare_inner(
+    store: &Path,
+    older_than: SystemTime,
+    deadline: Instant,
+) -> Result<Option<PreparedTruncation>, String> {
+    let started = Instant::now();
+    let workspace = crate::load_workspace(store)?;
+    let loader = workspace.repo_loader();
+    let op_store = loader.op_store().clone();
+    let head = single_head(loader).await?;
+    past_deadline(deadline, 0, 0)?;
+    let view = head
+        .view()
+        .await
+        .map_err(|error| format!("load the store's head view: {error}"))?;
+    refuse_live_foreign_workspaces(&workspace, &view)?;
+
     let mut cutoff_ms = millis_since_epoch(older_than);
-    if wc_op_id != *head.id() {
-        let own = workspace.workspace_name().to_owned();
-        match repo.view().get_wc_commit_id(&own).cloned() {
-            Some(wc_commit_id) => {
-                let wc_commit = repo
-                    .store()
-                    .get_commit(&wc_commit_id)
-                    .map_err(|error| format!("read the store's working-copy commit: {error}"))?;
-                refresh_working_copy = Some(wc_commit);
-                wc_op_id = head.id().clone();
-            }
-            None => {
-                let wc_op = loader
-                    .load_operation(&wc_op_id)
-                    .await
-                    .map_err(|error| format!("load the store working copy's operation: {error}"))?;
-                cutoff_ms = cutoff_ms.min(wc_op.metadata().time.end.timestamp.0);
-            }
-        }
+    let wc_op_id = workspace.working_copy().operation_id().clone();
+    if wc_op_id != *head.id() && view.get_wc_commit_id(workspace.workspace_name()).is_none() {
+        let wc_op = loader
+            .load_operation(&wc_op_id)
+            .await
+            .map_err(|error| format!("load the store working copy's operation: {error}"))?;
+        cutoff_ms = cutoff_ms.min(wc_op.metadata().time.end.timestamp.0);
     }
 
     let mut newest_old: Option<Operation> = None;
@@ -560,85 +581,411 @@ async fn truncate_operation_log_inner(
         }
     }
     let Some(newest_old) = newest_old else {
-        return Ok(OperationLogTruncation {
-            truncate: started.elapsed(),
-            ..Default::default()
-        });
+        return Ok(None);
     };
     if newest_old.id() == head.id() {
         // The store has been idle for the whole window; the head itself cannot
         // be abandoned, and there is nothing older worth the rewrite.
-        return Ok(OperationLogTruncation {
-            truncate: started.elapsed(),
-            ..Default::default()
-        });
+        return Ok(None);
     }
 
     let root = loader.root_operation().await;
+    let first_written = Instant::now();
     let rewritten = reparent_onto(op_store.as_ref(), &newest_old, &head, &root, deadline).await?;
-    let Some(new_head) = rewritten.ids.get(head.id()).cloned() else {
-        return Err("operation-log truncation did not rewrite the head operation".to_string());
+    let mut prepared = PreparedTruncation {
+        store: store.to_owned(),
+        deadline,
+        first_written,
+        report: OperationLogTruncation {
+            reparented: rewritten.ids.len() as u64,
+            ..Default::default()
+        },
+        ids: rewritten.ids,
+        old_head: head.id().clone(),
+        carried: None,
     };
-    let new_wc_op = if wc_op_id == *head.id() {
-        new_head.clone()
-    } else {
-        rewritten.ids.get(&wc_op_id).cloned().ok_or_else(|| {
-            format!(
-                "operation-log truncation would abandon the store working copy's operation {}; \
-                 nothing was changed",
-                wc_op_id.hex()
-            )
-        })?
-    };
-    past_deadline(deadline, rewritten.ids.len(), rewritten.ids.len())?;
+    prepared.new_head()?;
+    prepared.carry_index(loader).await?;
+    prepared.catch_up_rounds(loader).await?;
+    prepared.report.prepare = started.elapsed();
+    Ok(Some(prepared))
+}
 
-    if let Some(wc_commit) = refresh_working_copy {
-        workspace
-            .check_out(head.id().clone(), None, &wc_commit)
-            .await
-            .map_err(|error| {
-                format!("bring the store's working copy to the head operation: {error}")
-            })?;
+/// A rewritten operation log waiting for its head swap; see
+/// [`prepare_operation_log_truncation`].
+#[derive(Debug)]
+pub struct PreparedTruncation {
+    store: PathBuf,
+    deadline: Instant,
+    first_written: Instant,
+    /// Every retained operation's new id, by its old one. The store's working
+    /// copy may record any of them, not just the head.
+    ids: HashMap<OperationId, OperationId>,
+    /// The newest operation of the live log that has been rewritten.
+    old_head: OperationId,
+    /// The old head whose index was last linked to its rewritten id.
+    carried: Option<OperationId>,
+    report: OperationLogTruncation,
+}
+
+impl PreparedTruncation {
+    pub fn store(&self) -> &Path {
+        &self.store
     }
-    loader
-        .op_heads_store()
-        .update_op_heads(std::slice::from_ref(head.id()), &new_head)
-        .await
-        .map_err(|error| format!("move the operation head to the truncated log: {error}"))?;
-    let locked = workspace
-        .start_working_copy_mutation()
-        .await
-        .map_err(|error| format!("lock the store working copy: {error}"))?;
-    locked
-        .finish(new_wc_op)
-        .await
-        .map_err(|error| format!("remap the store working copy's operation: {error}"))?;
-    let truncate = started.elapsed();
 
-    let reindex_started = Instant::now();
-    loader
-        .load_at_head()
+    /// Rewrite, without the lock, what the store wrote since the last
+    /// catch-up: for a caller whose finish was refused as too busy, before it
+    /// takes the lock again.
+    pub fn catch_up(&mut self) -> Result<(), String> {
+        let started = Instant::now();
+        let result = block_on(async {
+            let workspace = crate::load_workspace(&self.store)?;
+            self.catch_up_rounds(workspace.repo_loader()).await
+        });
+        self.report.prepare += started.elapsed();
+        result
+    }
+
+    /// Swap the operation head to the rewritten log, under the store lock the
+    /// caller holds; every rewritten id is only safe to publish while nothing
+    /// that snapshotted an operation id for rollback is in flight.
+    ///
+    /// It takes [`Reclamation`](super::object_lease::Reclamation), refusing
+    /// while a detached advance or other maintenance holds the store's objects,
+    /// then rewrites what landed while the caller waited for the lock (refusing
+    /// with [`TRUNCATION_BUSY`] past [`LOCKED_CATCH_UP_LIMIT`]) and links the
+    /// final head's index. The store's own working copy is normally stale,
+    /// because every store write except `jj workspace add` passes
+    /// `--ignore-working-copy`, so it is brought to the head (the files in the
+    /// store's checkout are moved to the view's working-copy commit, the
+    /// direction `jj workspace update-stale` takes); then the head moves, and
+    /// the working copy is remapped to the head's new id. Clamping the cut to
+    /// the stale record instead would pin the retention boundary wherever the
+    /// store was last refreshed.
+    ///
+    /// None of it grows with the window: the hold is the catch-up, a working
+    /// copy refresh and two small writes. Up to the head move, a refusal
+    /// (including `deadline`) changes nothing visible, and the prepared state
+    /// stays usable for another attempt.
+    pub fn finish(
+        &mut self,
+        deadline: Instant,
+        phases: &impl TruncationPhases,
+    ) -> Result<OperationLogTruncation, String> {
+        let started = Instant::now();
+        let deadline = deadline.min(self.first_written + PREPARED_TRUNCATION_LIFETIME);
+        self.finish_steps(deadline, phases)?;
+        self.report.locked = started.elapsed();
+        Ok(self.report.clone())
+    }
+
+    fn finish_steps(
+        &mut self,
+        deadline: Instant,
+        phases: &impl TruncationPhases,
+    ) -> Result<(), String> {
+        let [reclaim, catch_up, refresh, move_head, remap] = TRUNCATION_FINISH_PHASES;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("start the store maintenance runtime: {error}"))?;
+        let _reclamation = phases
+            .phase(reclaim, || {
+                super::object_lease::Reclamation::for_store(&self.store)
+            })
+            .map_err(|error| {
+                format!("operation-log truncation refused: {error}; nothing was changed")
+            })?;
+        past_locked_deadline(deadline)?;
+
+        let mut workspace = crate::load_workspace(&self.store)?;
+        let loader = workspace.repo_loader().clone();
+        let swap = phases.phase(catch_up, || {
+            runtime.block_on(async {
+                let (head, pending) = self.pending(&loader).await?;
+                if pending.len() > LOCKED_CATCH_UP_LIMIT {
+                    return Err(format!(
+                        "{TRUNCATION_BUSY}: it found {} operation(s) written since its last \
+                         catch-up, more than the {LOCKED_CATCH_UP_LIMIT} it rewrites under the \
+                         store lock; nothing was changed",
+                        pending.len()
+                    ));
+                }
+                let caught_up = self.rewrite(&loader, &head, pending, deadline).await?;
+                self.report.caught_up_locked = caught_up;
+                self.report.reparented += caught_up;
+                self.carry_index(&loader).await?;
+                self.plan_swap(&workspace, &loader, &head).await
+            })
+        })?;
+        past_locked_deadline(deadline)?;
+
+        phases.phase(refresh, || match &swap.refresh_working_copy {
+            Some(wc_commit) => runtime
+                .block_on(workspace.check_out(swap.old_head.clone(), None, wc_commit))
+                .map(drop)
+                .map_err(|error| {
+                    format!("bring the store's working copy to the head operation: {error}")
+                }),
+            None => Ok(()),
+        })?;
+        past_locked_deadline(deadline)?;
+
+        phases.phase(move_head, || {
+            runtime
+                .block_on(
+                    loader
+                        .op_heads_store()
+                        .update_op_heads(std::slice::from_ref(&swap.old_head), &swap.new_head),
+                )
+                .map_err(|error| format!("move the operation head to the truncated log: {error}"))
+        })?;
+        phases.phase(remap, || {
+            runtime.block_on(async {
+                let locked = workspace
+                    .start_working_copy_mutation()
+                    .await
+                    .map_err(|error| format!("lock the store working copy: {error}"))?;
+                locked
+                    .finish(swap.new_wc_op)
+                    .await
+                    .map(drop)
+                    .map_err(|error| format!("remap the store working copy's operation: {error}"))
+            })
+        })
+    }
+
+    /// What the head swap writes, decided from the head the finish caught up
+    /// to, without writing anything.
+    async fn plan_swap(
+        &self,
+        workspace: &jj_lib::workspace::Workspace,
+        loader: &RepoLoader,
+        head: &Operation,
+    ) -> Result<HeadSwap, String> {
+        let view = head
+            .view()
+            .await
+            .map_err(|error| format!("load the store's head view: {error}"))?;
+        refuse_live_foreign_workspaces(workspace, &view)?;
+        let new_head = self.new_head()?;
+        let wc_op_id = workspace.working_copy().operation_id();
+        let (refresh_working_copy, new_wc_op) = if wc_op_id == head.id() {
+            (None, new_head.clone())
+        } else if let Some(wc_commit_id) = view.get_wc_commit_id(workspace.workspace_name()) {
+            let wc_commit = loader
+                .store()
+                .get_commit(wc_commit_id)
+                .map_err(|error| format!("read the store's working-copy commit: {error}"))?;
+            (Some(wc_commit), new_head.clone())
+        } else {
+            let new_wc_op = self.ids.get(wc_op_id).cloned().ok_or_else(|| {
+                format!(
+                    "operation-log truncation would abandon the store working copy's operation \
+                     {}; nothing was changed",
+                    wc_op_id.hex()
+                )
+            })?;
+            (None, new_wc_op)
+        };
+        Ok(HeadSwap {
+            old_head: head.id().clone(),
+            new_head,
+            refresh_working_copy,
+            new_wc_op,
+        })
+    }
+
+    fn new_head(&self) -> Result<OperationId, String> {
+        self.ids.get(&self.old_head).cloned().ok_or_else(|| {
+            "operation-log truncation did not rewrite the head operation".to_string()
+        })
+    }
+
+    /// Rewrite what landed on top of the head in rounds, until little enough
+    /// is pending for the lock to take the rest.
+    async fn catch_up_rounds(&mut self, loader: &RepoLoader) -> Result<(), String> {
+        for _ in 0..CATCH_UP_ROUNDS {
+            if Instant::now() >= self.first_written + PREPARED_TRUNCATION_LIFETIME {
+                return Err(format!(
+                    "{TRUNCATION_DEADLINE}: its rewritten operations are older than the {} \
+                     minute lifetime that keeps them clear of the garbage collection; nothing \
+                     was changed",
+                    PREPARED_TRUNCATION_LIFETIME.as_secs() / 60
+                ));
+            }
+            let (head, pending) = self.pending(loader).await?;
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let enough = pending.len() <= LOCKED_CATCH_UP_LIMIT;
+            let caught_up = self.rewrite(loader, &head, pending, self.deadline).await?;
+            self.report.caught_up += caught_up;
+            self.report.reparented += caught_up;
+            self.report.catch_up_rounds += 1;
+            self.carry_index(loader).await?;
+            if enough {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "{TRUNCATION_BUSY}: after {} catch-up round(s) more than {LOCKED_CATCH_UP_LIMIT} \
+             operations were still being written per round; nothing was changed",
+            self.report.catch_up_rounds
+        ))
+    }
+
+    /// The store's single head, and the operations it has that the rewritten
+    /// log does not, newest first.
+    async fn pending(&self, loader: &RepoLoader) -> Result<(Operation, Vec<Operation>), String> {
+        let head = single_head(loader).await?;
+        if *head.id() == self.old_head {
+            return Ok((head, Vec::new()));
+        }
+        let old_head = loader
+            .load_operation(&self.old_head)
+            .await
+            .map_err(|error| format!("load the rewritten head operation: {error}"))?;
+        let pending: Vec<Operation> = op_walk::walk_ancestors_range(
+            std::slice::from_ref(&head),
+            std::slice::from_ref(&old_head),
+        )
+        .try_collect()
         .await
-        .map_err(|error| format!("reindex the truncated store: {error}"))?;
-    Ok(OperationLogTruncation {
-        reparented: rewritten.ids.len() as u64,
-        truncate,
-        reindex: reindex_started.elapsed(),
-    })
+        .map_err(|error| format!("walk the operation log: {error}"))?;
+        // Every pending operation is an ancestor of the head, so one naming the
+        // old head as a parent is what makes the head its descendant.
+        if !pending
+            .iter()
+            .any(|op| op.parent_ids().contains(&self.old_head))
+        {
+            return Err(format!(
+                "operation-log truncation refused: the store's head {} does not descend from \
+                 the operation {} it rewrote; nothing was changed",
+                head.id().hex(),
+                self.old_head.hex()
+            ));
+        }
+        Ok((head, pending))
+    }
+
+    /// Rewrite `pending` (newest first, as [`Self::pending`] returns it) onto
+    /// the rewritten log and make `head` the old head. Every parent must
+    /// already be rewritten: one that is not was forked from before the cut.
+    async fn rewrite(
+        &mut self,
+        loader: &RepoLoader,
+        head: &Operation,
+        pending: Vec<Operation>,
+        deadline: Instant,
+    ) -> Result<u64, String> {
+        let total = pending.len();
+        let mut staged: HashMap<OperationId, OperationId> = HashMap::new();
+        for old in pending.into_iter().rev() {
+            past_deadline(deadline, staged.len(), total)?;
+            let mut data = old.store_operation().clone();
+            data.parents = data
+                .parents
+                .iter()
+                .map(|parent| {
+                    staged
+                        .get(parent)
+                        .or_else(|| self.ids.get(parent))
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "operation-log truncation refused: operation {} forked from {}, \
+                                 which the truncation does not keep; nothing was changed",
+                                old.id().hex(),
+                                parent.hex()
+                            )
+                        })
+                })
+                .collect::<Result<_, _>>()?;
+            let new_id = loader
+                .op_store()
+                .write_operation(&data)
+                .await
+                .map_err(|error| format!("write a reparented operation: {error}"))?;
+            staged.insert(old.id().clone(), new_id);
+        }
+        self.ids.extend(staged);
+        self.old_head = head.id().clone();
+        Ok(total as u64)
+    }
+
+    /// Link the old head's commit index to its rewritten id. Both name the
+    /// same view, so an empty modification of the old index is the new one,
+    /// and saving it writes only the operation link.
+    async fn carry_index(&mut self, loader: &RepoLoader) -> Result<(), String> {
+        if self.carried.as_ref() == Some(&self.old_head) {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let load = |id: OperationId| async move {
+            loader
+                .load_operation(&id)
+                .await
+                .map_err(|error| format!("load an operation to carry its index: {error}"))
+        };
+        let old = load(self.old_head.clone()).await?;
+        let new = load(self.new_head()?).await?;
+        let index = loader
+            .index_store()
+            .get_index_at_op(&old, loader.store())
+            .await
+            .map_err(|error| format!("load the head operation's index: {error}"))?;
+        loader
+            .index_store()
+            .write_index(index.start_modification(), &new)
+            .map_err(|error| format!("link the index to the rewritten head: {error}"))?;
+        self.carried = Some(self.old_head.clone());
+        self.report.index_carry += started.elapsed();
+        Ok(())
+    }
+}
+
+struct HeadSwap {
+    old_head: OperationId,
+    new_head: OperationId,
+    refresh_working_copy: Option<jj_lib::commit::Commit>,
+    new_wc_op: OperationId,
+}
+
+/// The store's one operation head. Loading at head would merge divergent heads
+/// and publish the merge, a change nobody judged; a split log is refused
+/// instead, without touching the heads.
+async fn single_head(loader: &RepoLoader) -> Result<Operation, String> {
+    let heads = loader
+        .op_heads_store()
+        .get_op_heads()
+        .await
+        .map_err(|error| format!("read the store's operation heads: {error}"))?;
+    let [head_id] = heads.as_slice() else {
+        return Err(format!(
+            "operation-log truncation refused: the store has {} operation heads, and \
+             truncating only from one settled head; nothing was changed",
+            heads.len()
+        ));
+    };
+    loader
+        .load_operation(head_id)
+        .await
+        .map_err(|error| format!("load the store's head operation: {error}"))
 }
 
 /// A workspace other than the store's own whose directory still exists would
 /// be left recording an operation id that no longer exists.
 fn refuse_live_foreign_workspaces(
     workspace: &jj_lib::workspace::Workspace,
-    repo: &ReadonlyRepo,
+    view: &jj_lib::view::View,
 ) -> Result<(), String> {
     use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
     let registry = SimpleWorkspaceStore::load(workspace.repo_path())
         .map_err(|error| format!("read the store's workspace registry: {error}"))?;
     let own = workspace.workspace_name();
     let mut live = Vec::new();
-    for name in repo.view().wc_commit_ids().keys() {
+    for name in view.wc_commit_ids().keys() {
         if name.as_str() == own.as_str() {
             continue;
         }
@@ -710,6 +1057,16 @@ fn past_deadline(deadline: Instant, rewritten: usize, total: usize) -> Result<()
     }
     Err(format!(
         "{TRUNCATION_DEADLINE} after rewriting {rewritten} of {total} retained operation(s); \
+         nothing was changed"
+    ))
+}
+
+fn past_locked_deadline(deadline: Instant) -> Result<(), String> {
+    if Instant::now() < deadline {
+        return Ok(());
+    }
+    Err(format!(
+        "{TRUNCATION_DEADLINE} under the store lock, before moving the operation head; \
          nothing was changed"
     ))
 }
@@ -2074,7 +2431,7 @@ mod tests {
         let cutoff = cut_after_rewrites(&fx);
         let operations = operation_count(&fx.store).unwrap();
 
-        let error = truncate_operation_log(&fx.store, cutoff, far_deadline()).unwrap_err();
+        let error = truncate(&fx.store, cutoff, far_deadline()).unwrap_err();
         assert!(error.contains("refused"), "{error}");
         assert!(error.contains("agent"), "names the live workspace: {error}");
         assert_eq!(
@@ -2086,7 +2443,7 @@ mod tests {
         // A registration whose directory is gone is a leftover, not a reader.
         std::fs::remove_dir_all(&ws).unwrap();
         assert!(
-            truncate_operation_log(&fx.store, cutoff, far_deadline())
+            truncate(&fx.store, cutoff, far_deadline())
                 .unwrap()
                 .reparented
                 > 0
@@ -2095,6 +2452,322 @@ mod tests {
 
     fn far_deadline() -> Instant {
         Instant::now() + Duration::from_secs(600)
+    }
+
+    /// A whole truncation, prepare and finish, with no lock to report to.
+    fn truncate(
+        store: &Path,
+        cutoff: SystemTime,
+        deadline: Instant,
+    ) -> Result<OperationLogTruncation, String> {
+        match prepare_operation_log_truncation(store, cutoff, deadline)? {
+            Some(mut prepared) => prepared.finish(deadline, &()),
+            None => Ok(OperationLogTruncation::default()),
+        }
+    }
+
+    /// `count` operations written in process, the way publications land,
+    /// without the CLI's start-up cost.
+    fn write_operations(store: &Path, count: usize, label: &str) {
+        block_on(async {
+            let mut repo = load_repo(store).await?;
+            for n in 0..count {
+                repo = repo
+                    .start_transaction()
+                    .commit(format!("{label} {n}"))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// `count` operations appended straight to the operation store, each
+    /// naming the head's view: a long window without paying for a
+    /// transaction per operation.
+    fn append_operations(store: &Path, count: usize, label: &str) {
+        block_on(async {
+            let workspace = crate::load_workspace(store)?;
+            let loader = workspace.repo_loader();
+            let head_id = loader.op_heads_store().get_op_heads().await.unwrap()[0].clone();
+            let head = loader.load_operation(&head_id).await.unwrap();
+            let mut parent = head_id.clone();
+            for n in 0..count {
+                let mut data = head.store_operation().clone();
+                data.parents = vec![parent];
+                data.metadata.description = format!("{label} {n}");
+                let now = jj_lib::backend::Timestamp::now();
+                data.metadata.time = jj_lib::op_store::TimestampRange {
+                    start: now,
+                    end: now,
+                };
+                parent = loader.op_store().write_operation(&data).await.unwrap();
+            }
+            loader
+                .op_heads_store()
+                .update_op_heads(std::slice::from_ref(&head_id), &parent)
+                .await
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A cutoff after everything the fixture wrote, before what comes next.
+    fn cut_now() -> SystemTime {
+        std::thread::sleep(Duration::from_millis(20));
+        let cutoff = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(20));
+        cutoff
+    }
+
+    fn file_names(dir: &Path) -> HashSet<String> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Records the finish's phases, and which operations had a commit index
+    /// linked when the head was about to move.
+    struct RecordedPhases {
+        op_links: PathBuf,
+        names: std::cell::RefCell<Vec<&'static str>>,
+        linked_before_move: std::cell::RefCell<HashSet<String>>,
+    }
+
+    impl RecordedPhases {
+        fn new(store: &Path) -> Self {
+            Self {
+                op_links: store.join(".jj/repo/index/op_links"),
+                names: Default::default(),
+                linked_before_move: Default::default(),
+            }
+        }
+    }
+
+    impl TruncationPhases for RecordedPhases {
+        fn phase<T>(&self, name: &'static str, work: impl FnOnce() -> T) -> T {
+            self.names.borrow_mut().push(name);
+            if name == "move the operation head" {
+                *self.linked_before_move.borrow_mut() = file_names(&self.op_links);
+            }
+            work()
+        }
+    }
+
+    /// The acceptance test for the lock bound: whether the window holds 100
+    /// operations or 1,000, the locked finish rewrites only what landed while
+    /// it waited, and nothing is reindexed, because the new head's index was
+    /// linked before the head moved. Each operation costs the rewrite a few
+    /// milliseconds whatever the store, so the window sizes are the test's
+    /// cost.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn the_locked_finish_does_not_grow_with_the_window() {
+        for window in [100, 1_000] {
+            let Some(fx) = Fixture::new() else {
+                eprintln!("skipping locked finish test: jj not resolvable");
+                return;
+            };
+            let cutoff = cut_now();
+            append_operations(&fx.store, window, "inside the window");
+            let mut prepared = prepare_operation_log_truncation(&fx.store, cutoff, far_deadline())
+                .unwrap()
+                .expect("a window to rewrite");
+            write_operations(&fx.store, 25, "published while the finish waited");
+            let segments = file_names(&fx.store.join(".jj/repo/index/segments"));
+            let phases = RecordedPhases::new(&fx.store);
+
+            let truncation = prepared.finish(far_deadline(), &phases).unwrap();
+
+            assert_eq!(truncation.caught_up_locked, 25, "window {window}");
+            assert_eq!(truncation.reparented, window as u64 + 25);
+            assert_eq!(*phases.names.borrow(), TRUNCATION_FINISH_PHASES);
+            let heads = op_heads(&fx.store);
+            assert_eq!(heads.len(), 1);
+            assert!(
+                phases.linked_before_move.borrow().contains(&heads[0]),
+                "the new head's index was linked before the head moved"
+            );
+            assert!(
+                truncation.locked < Duration::from_secs(5),
+                "window {window}: {truncation:?}"
+            );
+            block_on(load_repo(&fx.store)).unwrap();
+            assert_eq!(
+                file_names(&fx.store.join(".jj/repo/index/segments")),
+                segments,
+                "loading the truncated store indexed nothing"
+            );
+            assert_eq!(operation_log(&fx.store).len(), window + 25);
+            fx.jj(&["log", "-r", "all()", "--no-graph"]);
+        }
+    }
+
+    fn all_commits(fx: &Fixture) -> HashSet<String> {
+        fx.jj(&[
+            "log",
+            "-r",
+            "all()",
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ])
+        .lines()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// The carried index is the one the new head needs, not merely a file:
+    /// with commits created inside the window and more created by operations
+    /// the locked catch-up rewrites (publications landing during the prepare,
+    /// which production sees every day), the truncated store resolves exactly
+    /// the commits it did before, each caught-up commit by id through the
+    /// index at the new head, and loading it writes no segment.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn the_carried_index_resolves_every_commit_the_caught_up_operations_created() {
+        let Some(fx) = Fixture::new() else {
+            eprintln!("skipping carried index test: jj not resolvable");
+            return;
+        };
+        let cutoff = cut_now();
+        for n in 0..3 {
+            fx.jj(&["new", "main", "--no-edit", "-m", &format!("window {n}")]);
+        }
+        let mut prepared = prepare_operation_log_truncation(&fx.store, cutoff, far_deadline())
+            .unwrap()
+            .expect("a window to rewrite");
+        let prepared_commits = all_commits(&fx);
+        for n in 0..3 {
+            fx.jj(&["new", "main", "--no-edit", "-m", &format!("caught up {n}")]);
+        }
+        let before = all_commits(&fx);
+        let caught_up: Vec<&String> = before.difference(&prepared_commits).collect();
+        assert_eq!(caught_up.len(), 3, "precondition: {caught_up:?}");
+        let segments = file_names(&fx.store.join(".jj/repo/index/segments"));
+
+        let truncation = prepared.finish(far_deadline(), &()).unwrap();
+
+        assert_eq!(truncation.caught_up_locked, 3);
+        let repo = block_on(load_repo(&fx.store)).unwrap();
+        for id in &caught_up {
+            let id = jj_lib::backend::CommitId::try_from_hex(id.as_str()).unwrap();
+            assert!(
+                repo.index().has_id(&id).unwrap(),
+                "{} resolves through the index at the new head",
+                id.hex()
+            );
+        }
+        assert_eq!(
+            all_commits(&fx),
+            before,
+            "the same commits, no more, no fewer"
+        );
+        assert_eq!(
+            fx.jj(&["log", "-r", caught_up[0], "--no-graph", "-T", "commit_id"]),
+            *caught_up[0]
+        );
+        assert_eq!(
+            file_names(&fx.store.join(".jj/repo/index/segments")),
+            segments,
+            "nothing was reindexed"
+        );
+    }
+
+    /// More than the lock takes refuses with nothing changed, and the same
+    /// prepared truncation catches up off the lock and then finishes.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_finish_past_the_locked_catch_up_limit_changes_nothing() {
+        let Some(fx) = Fixture::new() else {
+            eprintln!("skipping catch-up limit test: jj not resolvable");
+            return;
+        };
+        let cutoff = cut_now();
+        write_operations(&fx.store, 10, "inside the window");
+        let mut prepared = prepare_operation_log_truncation(&fx.store, cutoff, far_deadline())
+            .unwrap()
+            .expect("a window to rewrite");
+        write_operations(&fx.store, LOCKED_CATCH_UP_LIMIT + 1, "a burst");
+        let heads = op_heads(&fx.store);
+        let working_copy = working_copy_operation(&fx.store);
+        let log = operation_log(&fx.store);
+
+        let error = prepared.finish(far_deadline(), &()).unwrap_err();
+
+        assert!(error.starts_with(TRUNCATION_BUSY), "{error}");
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert_eq!(op_heads(&fx.store), heads);
+        assert_eq!(working_copy_operation(&fx.store), working_copy);
+        assert_eq!(operation_log(&fx.store), log);
+
+        prepared.catch_up().unwrap();
+        let truncation = prepared.finish(far_deadline(), &()).unwrap();
+        assert_eq!(truncation.caught_up, LOCKED_CATCH_UP_LIMIT as u64 + 1);
+        assert_eq!(truncation.catch_up_rounds, 1);
+        assert_eq!(truncation.caught_up_locked, 0);
+        assert_eq!(
+            operation_log(&fx.store).len(),
+            10 + LOCKED_CATCH_UP_LIMIT + 1
+        );
+    }
+
+    /// An operation written after the prepare whose parent the truncation
+    /// drops would lose that parent's history; it is refused with nothing
+    /// changed.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_fork_from_before_the_cut_refuses_the_finish() {
+        let Some(fx) = Fixture::new() else {
+            eprintln!("skipping forked operation test: jj not resolvable");
+            return;
+        };
+        let before_cut = op_heads(&fx.store).remove(0);
+        let cutoff = cut_now();
+        write_operations(&fx.store, 5, "inside the window");
+        let mut prepared = prepare_operation_log_truncation(&fx.store, cutoff, far_deadline())
+            .unwrap()
+            .expect("a window to rewrite");
+        // A merge of the head with a writer that started from before the cut.
+        block_on(async {
+            let workspace = crate::load_workspace(&fx.store)?;
+            let loader = workspace.repo_loader();
+            let head_id = loader.op_heads_store().get_op_heads().await.unwrap()[0].clone();
+            let head = loader.load_operation(&head_id).await.unwrap();
+            let mut merge = head.store_operation().clone();
+            merge.parents = vec![
+                head_id.clone(),
+                jj_lib::op_store::OperationId::try_from_hex(&before_cut).unwrap(),
+            ];
+            let merge = loader.op_store().write_operation(&merge).await.unwrap();
+            loader
+                .op_heads_store()
+                .update_op_heads(std::slice::from_ref(&head_id), &merge)
+                .await
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let heads = op_heads(&fx.store);
+        let working_copy = working_copy_operation(&fx.store);
+
+        let error = prepared.finish(far_deadline(), &()).unwrap_err();
+
+        assert!(error.contains("refused"), "{error}");
+        assert!(
+            error.contains(&before_cut),
+            "names the dropped parent: {error}"
+        );
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert_eq!(op_heads(&fx.store), heads);
+        assert_eq!(working_copy_operation(&fx.store), working_copy);
     }
 
     /// One operation as the log holds it, minus its id, which a truncation
@@ -2176,7 +2849,7 @@ mod tests {
             "precondition: operations before the cut: {before:#?}"
         );
 
-        let truncation = truncate_operation_log(&fx.store, cutoff, far_deadline()).unwrap();
+        let truncation = truncate(&fx.store, cutoff, far_deadline()).unwrap();
 
         assert_eq!(truncation.reparented, inside.len() as u64);
         assert_eq!(
@@ -2190,7 +2863,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let after_head = SystemTime::now();
         let heads = op_heads(&fx.store);
-        let idle = truncate_operation_log(&fx.store, after_head, far_deadline()).unwrap();
+        let idle = truncate(&fx.store, after_head, far_deadline()).unwrap();
         assert_eq!(idle.reparented, 0);
         assert_eq!(op_heads(&fx.store), heads, "an idle store is not rewritten");
         assert_eq!(operation_log(&fx.store), inside);
@@ -2212,8 +2885,20 @@ mod tests {
             "precondition: the store's working copy is stale, so a truncation would move it"
         );
 
-        let error = truncate_operation_log(&fx.store, cutoff, Instant::now()).unwrap_err();
+        let error = truncate(&fx.store, cutoff, Instant::now()).unwrap_err();
 
+        assert!(error.starts_with(TRUNCATION_DEADLINE), "{error}");
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert_eq!(op_heads(&fx.store), heads);
+        assert_eq!(working_copy_operation(&fx.store), working_copy);
+        assert_eq!(operation_log(&fx.store), log);
+
+        // A finish that reaches its own deadline under the lock refuses before
+        // anything moves too.
+        let mut prepared = prepare_operation_log_truncation(&fx.store, cutoff, far_deadline())
+            .unwrap()
+            .expect("a window to rewrite");
+        let error = prepared.finish(Instant::now(), &()).unwrap_err();
         assert!(error.starts_with(TRUNCATION_DEADLINE), "{error}");
         assert!(error.contains("nothing was changed"), "{error}");
         assert_eq!(op_heads(&fx.store), heads);
@@ -2243,7 +2928,7 @@ mod tests {
         let working_copy = working_copy_operation(&fx.store);
 
         for deadline in [Instant::now(), far_deadline()] {
-            let error = truncate_operation_log(&fx.store, cutoff, deadline).unwrap_err();
+            let error = truncate(&fx.store, cutoff, deadline).unwrap_err();
             assert!(error.contains("refused"), "{error}");
             assert!(error.contains("2 operation heads"), "{error}");
             assert!(error.contains("nothing was changed"), "{error}");
@@ -2263,7 +2948,7 @@ mod tests {
         };
         let cutoff = cut_after_rewrites(&fx);
         let before = operation_log(&fx.store);
-        truncate_operation_log(&fx.store, cutoff, far_deadline()).unwrap();
+        truncate(&fx.store, cutoff, far_deadline()).unwrap();
         let retained: HashSet<String> = operation_log(&fx.store)
             .into_iter()
             .map(|op| op.view)

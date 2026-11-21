@@ -1211,9 +1211,9 @@ pub(super) fn render_ref_store(
                 {
                     out.push_str(&format!(
                         "{attempt} and only partly succeeded, in {took}. It removed {removed}, but \
-                         its truncation of the operation log reached its deadline under the store \
-                         lock and stopped with nothing changed, so the operation log is not being \
-                         bounded: {refusal}. The next prune tries again.\n\n"
+                         its truncation of the operation log reached its deadline and stopped \
+                         with nothing changed, so the operation log is not being bounded: \
+                         {refusal}. The next prune tries again.\n\n"
                     ))
                 }
                 Some(("partial", failure)) if failure.starts_with("reclaim-failed:") => {
@@ -2800,7 +2800,7 @@ mod ref_store_render_tests {
         };
         let text = render_ref_store(&timed_out, "CAIRN", NOW);
         assert!(
-            text.contains("reached its deadline under the store lock"),
+            text.contains("reached its deadline and stopped with nothing changed"),
             "{text}"
         );
         assert!(

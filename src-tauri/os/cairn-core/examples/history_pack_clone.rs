@@ -1,10 +1,13 @@
 //! Rehearsal of the history pack pass (`archival::pack`) on a disposable copy
 //! of a database and its archive, never on the live ones.
 //!
-//! The driver owns the copy: an APFS snapshot of the live three-file set into
-//! an internal temporary directory, copied at once to a scratch directory on
-//! another volume, the internal snapshot deleted, the live archive copied
-//! beside it, and the whole copy deleted by the batch that measures. The copy's
+//! docs/database.md "Taking a census" owns capture policy. This full-copy
+//! rehearsal requires an exceptional longer-workload path, not an unmonitored
+//! clone-and-transfer sequence. The legacy scripts/measure-history-pack.py
+//! driver does not enforce the current checkpoint budgets or exclusive lease
+//! and must not capture a running production database. Prepare an approved
+//! disposable database and archive copy; opening the archive mutates it.
+//! The whole copy must be deleted by the batch that measures. The copy's
 //! root holds a `HISTORY-PACK-CLONE` marker file; every subcommand refuses a
 //! database or archive that is not below a marked root, any database path not
 //! ending in `.db` (Turso names the logical log from the extension), and any

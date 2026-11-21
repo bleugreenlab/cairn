@@ -5896,6 +5896,9 @@ mod tests {
         drop(snapshot);
 
         let snapshot = capture_branch_advance(&store, "feature", "main").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let cutoff = SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
         run(&["bookmark", "set", "main", "-r", &owner]);
         assert!(!snapshot.coordinates_match().unwrap());
         assert_eq!(bookmark_commit(&jj, &store, "feature").unwrap(), owner);
@@ -5907,13 +5910,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("detached advance"), "{error}");
-        let error = truncate_operation_log(
-            &store,
-            SystemTime::now(),
-            std::time::Instant::now() + std::time::Duration::from_secs(600),
-        )
-        .unwrap_err();
+        // The truncation's rewrite publishes nothing, so a detached advance
+        // does not hold it off; only the head swap waits for the advance.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let mut prepared = prepare_operation_log_truncation(&store, cutoff, deadline)
+            .unwrap()
+            .expect("an operation inside the window to rewrite");
+        let head = operation_id(&jj, &store).unwrap();
+        let error = prepared.finish(deadline, &()).unwrap_err();
         assert!(error.contains("detached advance"), "{error}");
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert_eq!(operation_id(&jj, &store).unwrap(), head);
         let error = reclaim_unreachable_objects(&store_git_dir(&store).unwrap(), SystemTime::now())
             .unwrap_err();
         assert!(error.contains("detached advance"), "{error}");

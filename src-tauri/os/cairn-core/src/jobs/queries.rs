@@ -2365,9 +2365,13 @@ mod tests {
 
     /// The same three sidebar projections priced against a real database.
     ///
-    /// Point `CAIRN_MEASURE_DB` at an APFS clone of a production database
-    /// (`cp -c ~/.cairn/cairn.db{,-log,-wal} $TMPDIR/...`; same volume, not kept:
-    /// docs/database.md "Taking a census"), never at a live file:
+    /// Never point `CAIRN_MEASURE_DB` at a live file or an unmonitored clone.
+    /// Production clones require the wrapper in docs/database.md "Taking a
+    /// census". This probe is not yet admitted: add a reviewed exact-test route
+    /// to `validateConsumer` in scripts/db-census-window.ts that supplies this
+    /// environment variable, and prebuild the test binary before capture.
+    /// Until then the command below is only for synthetic data or an explicitly
+    /// approved operator-run app-quit copy:
     ///
     /// ```text
     /// CAIRN_MEASURE_DB=$TMPDIR/clone/cairn.db \
