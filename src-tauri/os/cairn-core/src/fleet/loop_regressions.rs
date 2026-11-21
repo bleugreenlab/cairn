@@ -58,6 +58,7 @@ async fn orchestrator(dir: &std::path::Path) -> Arc<Orchestrator> {
 fn room(full: bool) -> AnnouncedRoom {
     AnnouncedRoom {
         slots: CompileSlots::of(8),
+        standing: Default::default(),
         cores: Allowance {
             limit: 8,
             committed: if full { 8 } else { 0 },

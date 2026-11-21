@@ -419,8 +419,16 @@ fn account_rows(
                                 Some(Err(short)) => {
                                     let need = &candidates[executor_id].need;
                                     room_short = room_short_reason(&short, need);
+                                    let capacity = announced.capacity();
+                                    let needs = match cairn_common::executor_protocol::fits(&capacity, need) {
+                                        Err(capacity_short) => format!(
+                                            "{}; this work can never fit here while standing residents remain",
+                                            describe_room_short(&capacity_short, need, &capacity)
+                                        ),
+                                        Ok(()) => describe_room_short(&short, need, left),
+                                    };
                                     CheckCandidateStatus::NoRoomFits {
-                                        needs: describe_room_short(&short, need, left),
+                                        needs,
                                         room_seq: seq,
                                         since_unix_ms: core.room_since(executor_id).unwrap_or(0),
                                     }
@@ -544,16 +552,20 @@ struct Figured {
 /// generation and its placement facts as last recorded. Either moving
 /// re-figures every waiting entry there, so figures from an older epoch are
 /// never committed over a newer one's.
-type Epoch = (u64, Option<u64>);
+type Epoch = (u64, Option<u64>, Option<CompileSlots>);
 
 fn epoch(
     connections: &HashMap<String, ExecutorConnectionState>,
     facts: &HashMap<String, u64>,
     executor_id: &str,
 ) -> Option<Epoch> {
-    connections
-        .get(executor_id)
-        .map(|machine| (machine.generation, facts.get(executor_id).copied()))
+    connections.get(executor_id).map(|machine| {
+        (
+            machine.generation,
+            facts.get(executor_id).copied(),
+            machine.room.as_ref().map(|held| held.room.slots),
+        )
+    })
 }
 
 /// A rejection that clears with time alone. The machine stays a candidate,
@@ -1091,6 +1103,10 @@ impl Fleet {
                             &machine.identity.device_id,
                             &executor_id,
                             &machine.advertisement.capabilities,
+                            machine
+                                .room
+                                .as_ref()
+                                .map_or(0, |held| held.room.standing.cores),
                             duration_context,
                         )
                     })
@@ -1144,11 +1160,15 @@ impl Fleet {
                     machine.colocated,
                 )),
                 provisions.then_some(request.project_id.as_str()),
-                CompileSlots::of(
+                CompileSlots::net(
                     machine
                         .advertisement
                         .capabilities
                         .admission_concurrency_budget(),
+                    machine
+                        .room
+                        .as_ref()
+                        .map_or(0, |held| held.room.standing.cores),
                 ),
             );
             let warm = preferred_here(request, machine);
@@ -1184,7 +1204,7 @@ impl Fleet {
         policy: &ActivePlacementPolicy,
         figured: &Figured,
         now: u64,
-    ) -> Option<CellOutcome> {
+    ) -> Option<(CellOutcome, Option<PlacementDecision>)> {
         // Taken before the connection lock: it takes that lock itself.
         let unattached = self.unattached_enrolled_remotes();
         // The survey alone reads the table; everything after it takes locks
@@ -1202,13 +1222,13 @@ impl Fleet {
             Ok(waits) => waits,
             Err(failure) => {
                 let refused = refused_placement(request, now, policy, None, failure);
-                let mut decision = refused.decision;
-                self.stamp_update_bounds(&mut decision.rejected);
-                self.record_placement_decision(decision);
-                return Some(CellOutcome::Unavailable {
-                    reason: refused.reason,
-                    diagnostic: refused.diagnostic,
-                });
+                return Some((
+                    CellOutcome::Unavailable {
+                        reason: refused.reason,
+                        diagnostic: refused.diagnostic,
+                    },
+                    Some(refused.decision),
+                ));
             }
         };
         if !figured.candidates.is_empty() || !figured.away.is_empty() {
@@ -1241,11 +1261,13 @@ impl Fleet {
                     rejected,
                 },
             );
-            self.record_placement_decision(refused.decision);
-            return Some(CellOutcome::Unavailable {
-                reason: refused.reason,
-                diagnostic: refused.diagnostic,
-            });
+            return Some((
+                CellOutcome::Unavailable {
+                    reason: refused.reason,
+                    diagnostic: refused.diagnostic,
+                },
+                Some(refused.decision),
+            ));
         }
         if PlacementScope::of(request).targeted() {
             return None;
@@ -1265,8 +1287,9 @@ impl Fleet {
         if transient.is_some() {
             return None;
         }
-        Some(executor_unavailable(
-            generation_held.unwrap_or_else(|| NO_COLOCATED_EXECUTOR.into()),
+        Some((
+            executor_unavailable(generation_held.unwrap_or_else(|| NO_COLOCATED_EXECUTOR.into())),
+            None,
         ))
     }
 
@@ -1313,93 +1336,116 @@ impl Fleet {
                 .headroom_plan(entry_id, now)
                 .map_or(horizon, |plan| plan.reserve_from_unix_ms)
         };
-        let figured = self
-            .figure(
-                request,
-                plan.as_deref(),
-                interactive,
-                execution_residency.as_ref(),
-                None,
-            )
-            .await;
-        let stamp = plan.as_ref().map(|plan| plan.needs_stamp());
-        let now = unix_time_ms();
-        if let Some(outcome) = self.refusal_at_join(request, policy, &figured, now) {
-            return Err(outcome);
-        }
-        let connections = self.lock_connections();
-        let mut placing = self.lock_placing();
-        if !PlacementScope::of(request).targeted() && !figured.candidates.is_empty() {
-            // Every candidate has announced its room, and none could hold
-            // this work even with nothing running and every transient
-            // condition (a brake, a drain, a provisioning hold) lifted.
-            let never = figured.candidates.iter().all(|(executor_id, candidate)| {
-                placing.core.room(executor_id).is_some_and(|(_, room, _)| {
-                    cairn_common::executor_protocol::fits(&room.capacity(), &candidate.need)
-                        .is_err()
-                })
-            });
-            if never {
-                let need = figured
-                    .candidates
-                    .values()
-                    .next()
-                    .map(|candidate| format!("{:?}", candidate.need))
-                    .unwrap_or_default();
-                return Err(executor_unavailable(format!(
-                    "no announced room fits this work even with nothing else running: needs {need}"
-                )));
+        loop {
+            let figured = self
+                .figure(
+                    request,
+                    plan.as_deref(),
+                    interactive,
+                    execution_residency.as_ref(),
+                    None,
+                )
+                .await;
+            let stamp = plan.as_ref().map(|plan| plan.needs_stamp());
+            let now = unix_time_ms();
+            let refusal = self.refusal_at_join(request, policy, &figured, now);
+            let connections = self.lock_connections();
+            let mut placing = self.lock_placing();
+            // Refusals, resolved reservations and candidate needs all describe
+            // this snapshot. Commit none of them after a resident or link moved.
+            let fresh = connections.len() == figured.seen.len()
+                && connections.keys().all(|id| {
+                    epoch(&connections, &placing.facts, id) == figured.seen.get(id).copied()
+                });
+            if !fresh {
+                drop(placing);
+                drop(connections);
+                if !matches!(
+                    self.queue.state_of(entry_id),
+                    Some(queue::EntryState::Queued)
+                ) {
+                    return Err(cancelled());
+                }
+                if unix_time_ms() >= horizon {
+                    return Err(self.refuse_at_horizon(
+                        request,
+                        policy,
+                        Some(entry_id),
+                        Vec::new(),
+                    ));
+                }
+                continue;
             }
-        }
-        // A machine that attached, or whose facts moved, since the snapshot
-        // re-figured only the entries already waiting, not this one; it is
-        // figured here once the entry waits.
-        let missed: Vec<String> = connections
-            .keys()
-            .filter(|id| epoch(&connections, &placing.facts, id) != figured.seen.get(*id).copied())
-            .cloned()
-            .collect();
-        let (deliveries, receiver) = mpsc::unbounded_channel();
-        placing.pending.insert(
-            entry_id.to_string(),
-            Pending {
-                request: Arc::new(request.clone()),
-                plan,
-                interactive,
-                execution_residency,
-                resolved: figured.resolved,
-                stamp,
+            if let Some((outcome, decision)) = refusal {
+                drop(placing);
+                drop(connections);
+                if let Some(mut decision) = decision {
+                    self.stamp_update_bounds(&mut decision.rejected);
+                    self.record_placement_decision(decision);
+                }
+                return Err(outcome);
+            }
+            if !PlacementScope::of(request).targeted() && !figured.candidates.is_empty() {
+                // Every candidate has announced its room, and none could hold
+                // this work even with nothing running and every transient
+                // condition (a brake, a drain, a provisioning hold) lifted.
+                let never = figured.candidates.iter().all(|(executor_id, candidate)| {
+                    placing.core.room(executor_id).is_some_and(|(_, room, _)| {
+                        cairn_common::executor_protocol::fits(&room.capacity(), &candidate.need)
+                            .is_err()
+                    })
+                });
+                if never {
+                    let need = figured
+                        .candidates
+                        .values()
+                        .next()
+                        .map(|candidate| format!("{:?}", candidate.need))
+                        .unwrap_or_default();
+                    return Err(executor_unavailable(format!(
+                    "this work can never fit any announced machine while standing residents remain, even after running commands end: needs {need}"
+                )));
+                }
+            }
+            let (deliveries, receiver) = mpsc::unbounded_channel();
+            placing.pending.insert(
+                entry_id.to_string(),
+                Pending {
+                    request: Arc::new(request.clone()),
+                    plan,
+                    interactive,
+                    execution_residency,
+                    resolved: figured.resolved,
+                    stamp,
+                    reserve_from_unix_ms: reserve_from,
+                    excluded: figured.excluded,
+                    deliveries,
+                },
+            );
+            let waiting = Waiting {
+                entry_id: entry_id.to_string(),
+                standing,
+                priority: request.priority,
+                queued_at_unix_ms: queued_at,
+                sequence,
+                horizon_unix_ms: horizon,
                 reserve_from_unix_ms: reserve_from,
-                excluded: figured.excluded,
-                deliveries,
-            },
-        );
-        let waiting = Waiting {
-            entry_id: entry_id.to_string(),
-            standing,
-            priority: request.priority,
-            queued_at_unix_ms: queued_at,
-            sequence,
-            horizon_unix_ms: horizon,
-            reserve_from_unix_ms: reserve_from,
-            candidates: figured.candidates,
-            may_spill: request.placement_mobility.may_spill()
-                && request.pinned_executor_id.is_none()
-                && request
-                    .executor
-                    .as_ref()
-                    .is_none_or(|selector| selector.name.is_none()),
-        };
-        self.dispatch_locked(&connections, &mut placing, |core, mut admit, now| {
-            core.enqueue(waiting, now, &mut admit)
-        });
-        drop(placing);
-        drop(connections);
-        self.placing_deadline.notify_one();
-        for executor_id in missed {
-            self.spawn_refigure(Some(executor_id));
+                candidates: figured.candidates,
+                may_spill: request.placement_mobility.may_spill()
+                    && request.pinned_executor_id.is_none()
+                    && request
+                        .executor
+                        .as_ref()
+                        .is_none_or(|selector| selector.name.is_none()),
+            };
+            self.dispatch_locked(&connections, &mut placing, |core, mut admit, now| {
+                core.enqueue(waiting, now, &mut admit)
+            });
+            drop(placing);
+            drop(connections);
+            self.placing_deadline.notify_one();
+            return Ok(receiver);
         }
-        Ok(receiver)
     }
 
     /// Wait for the dispatcher to assign this entry a machine, and answer as
@@ -1822,9 +1868,42 @@ impl Fleet {
                 .attached_at
                 .insert(executor_id.to_string(), unix_time_ms());
         }
+        if placing.core.generation(executor_id) == Some(generation)
+            && placing
+                .core
+                .room(executor_id)
+                .is_some_and(|(held_seq, _, _)| held_seq >= seq)
+        {
+            return;
+        }
+        let slots_moved = placing
+            .core
+            .room(executor_id)
+            .is_none_or(|(_, held, _)| held.slots != room.slots);
+        // Learned tree figures and the charged reservation are priced at a
+        // slot width. Do not offer a figure from the previous width while
+        // its off-lock refresh is in flight.
+        let repricing: Vec<_> = if slots_moved {
+            placing
+                .pending
+                .iter()
+                .filter_map(|(id, pending)| {
+                    pending.plan.as_ref()?;
+                    let mut candidates = placing.core.candidates(id)?.clone();
+                    candidates.get_mut(executor_id)?.away = true;
+                    Some((id.clone(), candidates))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let needs_refigure = !repricing.is_empty();
         let turned_away = placing.admit_refused.remove(executor_id);
         self.dispatch_locked(connections, &mut placing, |core, mut admit, now| {
             let mut effects = core.attach_link(executor_id, generation, now, &mut admit);
+            for (id, candidates) in repricing {
+                effects.absorb(core.set_candidates(&id, candidates, now, &mut admit));
+            }
             let repeats = core
                 .room(executor_id)
                 .is_some_and(|(_, held, _)| *held == room);
@@ -1834,6 +1913,10 @@ impl Fleet {
             }
             effects
         });
+        drop(placing);
+        if needs_refigure {
+            self.spawn_refigure(Some(executor_id.to_string()));
+        }
     }
 
     /// A machine's link was made. It has no room until it announces; what

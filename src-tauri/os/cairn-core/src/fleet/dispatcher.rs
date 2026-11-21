@@ -75,7 +75,8 @@ pub(crate) struct Candidate {
     /// memory can do for this work, before warmth or room.
     pub(crate) key: HardKey,
     /// Away for a reason that ends on its own (emptied for an executor
-    /// update). Never offered the entry, and never asked to hold room for
+    /// update), or waiting for its figure at a changed slot width. Never
+    /// offered the entry, and never asked to hold room for
     /// it; it can still keep a deferred or clamped entry off a machine its
     /// key ranks ahead of, until the entry's reserve-from instant.
     pub(crate) away: bool,
@@ -879,6 +880,27 @@ impl Dispatcher {
             }
             _ => {}
         }
+        // A resident starting or ending changes the slot width, not the
+        // reservation an offer already took. Only candidate needs are repriced;
+        // Taken keeps the shares actually offered under earlier figures.
+        let mut effects = Effects::default();
+        for entry_id in self.eligible.get(executor_id).into_iter().flatten() {
+            let Some(entry) = self.entries.get_mut(entry_id) else {
+                continue;
+            };
+            let Some(candidate) = entry.waiting.candidates.get_mut(executor_id) else {
+                continue;
+            };
+            candidate.need = candidate.need.with_slots(room.slots);
+            if entry.reserved_on.as_deref() == Some(executor_id)
+                && fits(&room.capacity(), &candidate.need).is_err()
+            {
+                entry.reserved_on = None;
+                effects
+                    .released
+                    .push((entry_id.clone(), executor_id.to_string(), generation));
+            }
+        }
         let announced = Announced::new(seq, room, now_unix_ms);
         let capacity_moved = machine
             .room
@@ -886,7 +908,7 @@ impl Dispatcher {
             .is_none_or(|held| held.capacity != announced.capacity);
         machine.room = Some(announced);
         self.ask_admit_again(executor_id, admit);
-        let mut effects = self.walk(executor_id, now_unix_ms, admit);
+        effects.absorb(self.walk(executor_id, now_unix_ms, admit));
         effects.absorb(self.ask_for_headroom(executor_id, now_unix_ms, admit));
         if capacity_moved {
             effects.absorb(self.place_behind(executor_id, now_unix_ms, admit));
@@ -937,14 +959,27 @@ impl Dispatcher {
         effects
     }
 
+    fn price_candidates(&self, candidates: &mut HashMap<MachineId, Candidate>) {
+        for (id, candidate) in candidates {
+            if let Some(announced) = self
+                .machines
+                .get(id)
+                .and_then(|machine| machine.room.as_ref())
+            {
+                candidate.need = candidate.need.with_slots(announced.room.slots);
+            }
+        }
+    }
+
     /// An entry joins. It is matched once against the rooms already
     /// announced; after that only events that bear on it match it again.
     pub(crate) fn enqueue(
         &mut self,
-        waiting: Waiting,
+        mut waiting: Waiting,
         now_unix_ms: u64,
         admit: &mut impl FnMut(&str, &str) -> bool,
     ) -> Effects {
+        self.price_candidates(&mut waiting.candidates);
         let entry_id = waiting.entry_id.clone();
         let mut effects = self.withdraw(&entry_id, now_unix_ms, admit);
         for executor_id in waiting.candidates.keys() {
@@ -986,10 +1021,11 @@ impl Dispatcher {
     pub(crate) fn set_candidates(
         &mut self,
         entry_id: &str,
-        candidates: HashMap<MachineId, Candidate>,
+        mut candidates: HashMap<MachineId, Candidate>,
         now_unix_ms: u64,
         admit: &mut impl FnMut(&str, &str) -> bool,
     ) -> Effects {
+        self.price_candidates(&mut candidates);
         let Some(entry) = self.entries.get_mut(entry_id) else {
             return Effects::default();
         };
@@ -1474,8 +1510,9 @@ impl Dispatcher {
 
     /// Match one waiting entry against every room it may use, and when none
     /// fits and it is entitled, hold room for it on one machine. Rooms are
-    /// tried in hard-key order, so once one is kept off by a better machine
-    /// every later one is too, and the entry waits for that machine.
+    /// tried in hard-key order, but a blocked candidate does not end the
+    /// search: a silent better machine can block a clamped candidate without
+    /// blocking a later, unclamped candidate with less single-process capacity.
     fn place(
         &mut self,
         entry_id: &str,
@@ -1544,7 +1581,7 @@ impl Dispatcher {
                 .blocker(&self.entries[entry_id], &executor_id, now_unix_ms)
                 .is_some()
             {
-                break;
+                continue;
             }
             if admit(entry_id, &executor_id) {
                 return self.assign(
@@ -1604,7 +1641,17 @@ impl Dispatcher {
                 return self.place(entry_id, now_unix_ms, admit);
             }
             let entry = &self.entries[entry_id];
-            if self.blocker(entry, &reserved, now_unix_ms).is_none() {
+            let still_fits = self
+                .machines
+                .get(&reserved)
+                .zip(entry.waiting.candidates.get(&reserved))
+                .is_some_and(|(machine, candidate)| {
+                    !candidate.away
+                        && machine.room.as_ref().is_none_or(|announced| {
+                            fits(&announced.capacity, &candidate.need).is_ok()
+                        })
+                });
+            if still_fits && self.blocker(entry, &reserved, now_unix_ms).is_none() {
                 return effects;
             }
             let generation = self.machines.get(&reserved).map_or(0, |m| m.generation);
@@ -1667,7 +1714,7 @@ impl Dispatcher {
                 .blocker(&self.entries[entry_id], &choice.executor_id, now_unix_ms)
                 .is_some()
             {
-                break;
+                continue;
             }
             if admit(entry_id, &choice.executor_id) {
                 effects.absorb(self.assign(
@@ -1922,6 +1969,7 @@ mod tests {
     fn room(cores: u64, memory_gib: u64) -> AnnouncedRoom {
         AnnouncedRoom {
             slots: CompileSlots::of(u32::try_from(cores).unwrap()),
+            standing: Default::default(),
             cores: Allowance {
                 limit: cores,
                 committed: 0,
@@ -1990,6 +2038,111 @@ mod tests {
                 .collect(),
             may_spill: true,
         }
+    }
+
+    #[test]
+    fn an_idle_twelve_unit_machine_with_two_residents_admits_a_compile() {
+        let mut dispatcher = Dispatcher::default();
+        dispatcher.attach("mac", 1);
+        let mut idle = room(12, 32);
+        idle.cores.committed = 2;
+        idle.standing.cores = 2;
+        idle.slots = CompileSlots::net(12, idle.standing.cores);
+        let compile = Need::of(
+            &ResourceReservation {
+                concurrency_units: 1,
+                memory_bytes: GIB,
+                ..ResourceReservation::default()
+            },
+            CellCommandClass::CargoTest,
+            false,
+            PipeFloorWork::Process,
+            true,
+            None,
+            CompileSlots::of(12),
+        );
+        dispatcher.set_room("mac", 1, 1, idle, 0, &mut yes());
+        let effects = dispatcher.enqueue(waiting(0, &["mac"], &compile), 0, &mut yes());
+        assert_eq!(offered(&effects), vec!["e0"]);
+        assert!(!effects.assigned[0].reserve);
+    }
+
+    #[test]
+    fn a_lane_larger_than_resident_net_capacity_never_holds_room() {
+        let mut dispatcher = Dispatcher::default();
+        dispatcher.attach("mac", 1);
+        let mut idle = room(12, 32);
+        idle.cores.committed = 2;
+        idle.standing.cores = 2;
+        idle.slots = CompileSlots::net(12, idle.standing.cores);
+        dispatcher.set_room("mac", 1, 1, idle, 0, &mut yes());
+        let mut impossible = waiting(0, &["mac"], &need(11, 1));
+        impossible.standing = true;
+        impossible.reserve_from_unix_ms = 0;
+        let effects = dispatcher.enqueue(impossible, 0, &mut yes());
+        assert!(
+            effects.assigned.is_empty(),
+            "impossible work must not reserve"
+        );
+        assert_eq!(dispatcher.reserved_on("e0"), None);
+        let other = dispatcher.enqueue(waiting(1, &["mac"], &need(1, 1)), 0, &mut yes());
+        assert_eq!(offered(&other), vec!["e1"]);
+    }
+
+    #[test]
+    fn a_resident_change_reprices_a_waiting_compile() {
+        let mut dispatcher = Dispatcher::default();
+        dispatcher.attach("mac", 1);
+        let mut occupied = room(12, 32);
+        occupied.cores.committed = 12;
+        let mut compile = need(1, 1);
+        compile.compile = true;
+        compile = compile.with_slots(occupied.slots);
+        dispatcher.set_room("mac", 1, 1, occupied, 0, &mut yes());
+        assert!(dispatcher
+            .enqueue(waiting(0, &["mac"], &compile), 0, &mut yes())
+            .assigned
+            .is_empty());
+
+        let mut idle = room(12, 32);
+        idle.standing.cores = 2;
+        idle.cores.committed = 2;
+        idle.slots = CompileSlots::net(12, 2);
+        let effects = dispatcher.set_room("mac", 1, 2, idle, 0, &mut yes());
+        assert_eq!(offered(&effects), vec!["e0"]);
+        assert_eq!(dispatcher.candidates("e0").unwrap()["mac"].need.cores, 10);
+        assert!(!effects.assigned[0].reserve);
+    }
+
+    #[test]
+    fn resident_growth_releases_a_hold_that_can_no_longer_fit() {
+        let mut dispatcher = Dispatcher::default();
+        dispatcher.attach("mac", 1);
+        let mut occupied = room(12, 32);
+        occupied.cores.committed = 12;
+        dispatcher.set_room("mac", 1, 1, occupied, 0, &mut yes());
+        let mut senior = waiting(0, &["mac"], &need(11, 1));
+        senior.standing = true;
+        senior.reserve_from_unix_ms = 0;
+        let held = dispatcher.enqueue(senior, 0, &mut yes());
+        assert!(held.assigned[0].reserve);
+        dispatcher.decline("e0", "mac", 1, 0, &mut yes());
+
+        let mut idle = room(12, 32);
+        idle.standing.cores = 2;
+        idle.cores.committed = 2;
+        idle.slots = CompileSlots::net(12, 2);
+        let effects = dispatcher.set_room("mac", 1, 2, idle, 0, &mut yes());
+        assert_eq!(dispatcher.reserved_on("e0"), None);
+        assert!(effects
+            .released
+            .iter()
+            .any(|(id, machine, _)| id == "e0" && machine == "mac"));
+        assert!(effects.assigned.is_empty());
+        assert_eq!(
+            offered(&dispatcher.enqueue(waiting(1, &["mac"], &need(1, 1)), 0, &mut yes())),
+            vec!["e1"]
+        );
     }
 
     fn yes() -> impl FnMut(&str, &str) -> bool {
@@ -3039,6 +3192,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_silent_better_machine_blocks_a_clamped_candidate_but_not_an_unclamped_one() {
+        for reserve in [false, true] {
+            let mut dispatcher = Dispatcher::default();
+            dispatcher.attach("a", 1);
+            let a = if reserve { busy(17, 84) } else { room(17, 84) };
+            dispatcher.set_room("a", 1, 1, a, 0, &mut yes());
+            let mut w = waiting(0, &["a"], &need(3, 31));
+            w.standing = true;
+            w.candidates.get_mut("a").unwrap().key = HardKey {
+                unmeasured_capacity: Some(Some(48 * GIB)),
+                clamped: true,
+                ..HardKey::default()
+            };
+            dispatcher.enqueue(w.clone(), 0, &mut refuses("a"));
+            assert!(dispatcher.turned_away_stands("e0", "a"));
+
+            dispatcher.attach("d", 1);
+            dispatcher.attach("b", 1);
+            let b = if reserve { busy(21, 33) } else { room(21, 33) };
+            dispatcher.set_room("b", 1, 1, b, 0, &mut yes());
+            let mut candidates = w.candidates;
+            let mut silent = candidates["a"].clone();
+            silent.key.clamped = false;
+            candidates.insert("d".to_string(), silent);
+            let mut unclamped = candidates["d"].clone();
+            unclamped.key.unmeasured_capacity = Some(Some(32 * GIB));
+            candidates.insert("b".to_string(), unclamped);
+            let effects = dispatcher.set_candidates("e0", candidates, 0, &mut refuses("a"));
+            assert_eq!(assigned_to(&effects), vec![("e0", "b")]);
+            assert_eq!(effects.assigned[0].reserve, reserve);
+            assert!(dispatcher.stranded(0).is_empty());
+        }
+    }
+
     /// Property 5: after every event of a random sequence, no waiting entry
     /// fits an eligible machine's room unless that machine refused it under
     /// that room, and every refusal that stands was given by the process the
@@ -3122,7 +3310,10 @@ mod tests {
                         let s = seq.entry(machine).or_insert(0);
                         *s += 1;
                         let mut r = room(rng.gen_range(1..33), rng.gen_range(1..128));
-                        r.cores.committed = rng.gen_range(0..=r.cores.limit);
+                        r.standing.cores = rng.gen_range(0..=r.cores.limit as u32);
+                        r.slots = CompileSlots::net(r.cores.limit as u32, r.standing.cores);
+                        r.cores.committed =
+                            rng.gen_range(u64::from(r.standing.cores)..=r.cores.limit);
                         match event {
                             0 => {
                                 use cairn_common::executor_protocol::{
@@ -3276,9 +3467,14 @@ mod tests {
                         continue;
                     };
                     let eligible = dispatcher.generation(on).is_some()
-                        && dispatcher
-                            .candidates(id)
-                            .is_some_and(|candidates| candidates.contains_key(on));
+                        && dispatcher.candidates(id).is_some_and(|candidates| {
+                            candidates.get(on).is_some_and(|candidate| {
+                                !candidate.away
+                                    && dispatcher.room(on).is_none_or(|(_, room, _)| {
+                                        fits(&room.capacity(), &candidate.need).is_ok()
+                                    })
+                            })
+                        });
                     if now_on.as_ref() == Some(on) || !eligible {
                         continue;
                     }

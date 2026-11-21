@@ -2973,6 +2973,7 @@ async fn a_parallel_batch_is_charged_for_every_item_it_runs_at_once() {
                     "device",
                     "executor",
                     &capabilities,
+                    0,
                     resource_profiles::DurationContext {
                         class: request.command_class,
                         warmth: ExecutionWarmth::Cold,
@@ -3012,6 +3013,7 @@ async fn a_parallel_batch_is_charged_for_every_item_it_runs_at_once() {
                 "device",
                 "executor",
                 &capabilities_with_cores(16),
+                0,
                 resource_profiles::DurationContext {
                     class: compile.command_class,
                     warmth: ExecutionWarmth::Cold,
@@ -3020,6 +3022,35 @@ async fn a_parallel_batch_is_charged_for_every_item_it_runs_at_once() {
             )
             .await;
         assert_eq!(resolved.reservation.concurrency_units, 8, "{sequential}");
+    }
+
+    let capabilities = capabilities_with_cores(12);
+    let duration = resource_profiles::DurationContext {
+        class: compile.command_class,
+        warmth: ExecutionWarmth::Cold,
+        now_unix_ms: NOW,
+    };
+    // Both a single compile and either batch shape follow the current net
+    // slot width; a standing change must replace, not reuse, the memoized need.
+    for batch in [None, Some(batch(true, 3)), Some(batch(false, 3))] {
+        let plan = ReservationPlan::new(db.clone(), &compile, batch.as_ref());
+        for (standing, expected, worked_out) in
+            [(0, 12, 1), (2, 10, 1), (2, 10, 0), (3, 9, 1), (0, 12, 1)]
+        {
+            let resolved = plan
+                .resolve_for(
+                    &compile,
+                    "device",
+                    "executor",
+                    &capabilities,
+                    standing,
+                    duration,
+                )
+                .await;
+            assert_eq!(resolved.reservation.concurrency_units, expected);
+            assert_eq!(plan.take_needs_worked_out(), worked_out);
+            assert_eq!(plan.needs_held(), 1);
+        }
     }
 }
 
@@ -3085,6 +3116,7 @@ async fn a_class_suites_build_jobs_never_price_an_ad_hoc_compile() {
                     "device",
                     "executor",
                     &capabilities,
+                    0,
                     resource_profiles::DurationContext {
                         class: CellCommandClass::CargoTest,
                         warmth: ExecutionWarmth::Cold,
@@ -3190,6 +3222,7 @@ async fn a_declared_concurrency_and_a_learned_lookup_are_both_on_the_record() {
             "device",
             "executor",
             &capabilities,
+            0,
             resource_profiles::DurationContext {
                 class: request.command_class,
                 warmth: ExecutionWarmth::Cold,
@@ -3223,6 +3256,7 @@ async fn a_declared_concurrency_and_a_learned_lookup_are_both_on_the_record() {
             "device",
             "executor",
             &capabilities,
+            0,
             resource_profiles::DurationContext {
                 class: request.command_class,
                 warmth: ExecutionWarmth::Cold,
@@ -3245,6 +3279,7 @@ async fn a_declared_concurrency_and_a_learned_lookup_are_both_on_the_record() {
             "device",
             "executor",
             &capabilities,
+            0,
             resource_profiles::DurationContext {
                 class: request.command_class,
                 warmth: ExecutionWarmth::Cold,
@@ -3261,6 +3296,7 @@ async fn a_declared_concurrency_and_a_learned_lookup_are_both_on_the_record() {
             "device",
             "executor",
             &capabilities,
+            0,
             resource_profiles::DurationContext {
                 class: request.command_class,
                 warmth: ExecutionWarmth::Cold,
@@ -4077,7 +4113,7 @@ async fn a_parked_requests_needs_are_worked_out_once_and_only_its_own_lessons_re
     };
     macro_rules! place {
         ($plan:expr, $request:expr) => {
-            $plan.resolve_for($request, "device", "executor", &capabilities, duration)
+            $plan.resolve_for($request, "device", "executor", &capabilities, 0, duration)
         };
     }
 
@@ -4130,7 +4166,7 @@ async fn a_parked_requests_needs_are_worked_out_once_and_only_its_own_lessons_re
 
     // A different machine of the same request is its own context.
     plan_x
-        .resolve_for(&request_x, "device", "other", &capabilities, duration)
+        .resolve_for(&request_x, "device", "other", &capabilities, 0, duration)
         .await;
     assert_eq!(plan_x.take_needs_worked_out(), 1);
     assert_eq!(plan_x.needs_held(), 2);
@@ -6482,6 +6518,7 @@ impl Fleet {
             seq,
             AnnouncedRoom {
                 slots: CompileSlots::of(64),
+                standing: Default::default(),
                 cores: Allowance {
                     limit: 64,
                     committed: 0,
@@ -7419,6 +7456,7 @@ fn sized_room(total_bytes: u64, free_cores: u64) -> cairn_common::executor_proto
     const GIB: u64 = 1 << 30;
     AnnouncedRoom {
         slots: CompileSlots::of(64),
+        standing: Default::default(),
         cores: Allowance {
             limit: 64,
             committed: 64 - free_cores,
@@ -7441,6 +7479,56 @@ fn sized_room(total_bytes: u64, free_cores: u64) -> cairn_common::executor_proto
         provisioning: Vec::new(),
         holds: Vec::new(),
         closures: Vec::new(),
+    }
+}
+
+/// A resident transition during the initial figure must change both admission
+/// and the reservation offered, before the entry can be assigned or refused.
+#[tokio::test]
+async fn joining_compile_refigures_when_residents_start_or_stop() {
+    use cairn_common::executor_protocol::CompileSlots;
+    const GIB: u64 = 1 << 30;
+    let db = Arc::new(crate::storage::migrated_test_db("join-resident-width.db").await);
+    for (before, after) in [(0, 2), (2, 0)] {
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let (id, mut machine) = fleet_entry_at("compile", "linux", 0, &[], now);
+        Arc::make_mut(&mut machine.advertisement)
+            .capabilities
+            .logical_cores = 12;
+        measured_at(&mut machine, 0.01, 120 * GIB, 500 * GIB, now);
+        pool.lock_connections().insert(id, machine);
+        let room = |standing| {
+            let mut room = sized_room(128 * GIB, 64);
+            room.slots = CompileSlots::net(12, standing);
+            room.cores.limit = 12;
+            room.cores.committed = u64::from(standing);
+            room.standing.cores = standing;
+            room
+        };
+        pool.record_room("compile", 1, 1, room(before));
+        let next = room(after);
+        pool.after_figure_snapshot_for_test(Box::new(move |pool| {
+            Box::pin(async move {
+                pool.record_room("compile", 1, 2, next);
+            })
+        }));
+        let mut request = spillable_request();
+        request.command_class = CellCommandClass::CargoCheck;
+        request.wait_horizon_unix_ms = now + 30_000;
+        let plan = Arc::new(ReservationPlan::new(db.clone(), &request, None));
+        let placement = tokio::time::timeout(
+            Duration::from_secs(5),
+            place_through_dispatcher(&pool, &request, Some(plan)),
+        )
+        .await
+        .expect("joins without waiting for another room")
+        .expect("the current slot fits");
+        assert_eq!(
+            placement.reservation.unwrap().reservation.concurrency_units,
+            12 - after,
+            "resident cores changed from {before} to {after}"
+        );
     }
 }
 

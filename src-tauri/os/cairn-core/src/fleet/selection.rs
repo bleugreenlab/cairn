@@ -2617,6 +2617,7 @@ pub(super) struct ReservationPlan {
 /// One machine context's needs for a request, and what they were derived from.
 struct WorkedOutNeeds {
     capabilities: ExecutorCapabilities,
+    standing_units: u32,
     stamp: profile_reads::NeedsStamp,
     resolved: resource_profiles::ResolvedResourceProfile,
 }
@@ -2808,11 +2809,12 @@ impl ReservationPlan {
         device_id: &str,
         executor_id: &str,
         capabilities: &ExecutorCapabilities,
+        standing_units: u32,
         duration_context: resource_profiles::DurationContext,
     ) -> resource_profiles::ResolvedResourceProfile {
         let context = Self::context_for(device_id, executor_id, capabilities);
         // The needs are a function of the request, the machine's context and
-        // size, and what the profile store has learned about the request's
+        // size and standing occupants, and what the profile store has learned about the request's
         // identities and suites. None of those changes between two passes
         // unless a writer says so, so a pass that finds the stamp unchanged
         // reads nothing. Only the duration depends on the pass (it is
@@ -2827,13 +2829,23 @@ impl ReservationPlan {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&context.executor_class)
-            .filter(|held| held.stamp == stamp && held.capabilities == *capabilities)
+            .filter(|held| {
+                held.stamp == stamp
+                    && held.capabilities == *capabilities
+                    && held.standing_units == standing_units
+            })
             .map(|held| held.resolved.clone());
         let mut resolved = match held {
             Some(resolved) => resolved,
             None => {
                 let resolved = self
-                    .work_out_needs(request, &context, capabilities, duration_context)
+                    .work_out_needs(
+                        request,
+                        &context,
+                        capabilities,
+                        standing_units,
+                        duration_context,
+                    )
                     .await;
                 self.needs_worked_out
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2844,6 +2856,7 @@ impl ReservationPlan {
                         context.executor_class.clone(),
                         WorkedOutNeeds {
                             capabilities: capabilities.clone(),
+                            standing_units,
                             stamp,
                             resolved: resolved.clone(),
                         },
@@ -2875,15 +2888,17 @@ impl ReservationPlan {
         request: &CellRequest,
         context: &resource_profiles::ProfileContext,
         capabilities: &ExecutorCapabilities,
+        standing_units: u32,
         duration_context: resource_profiles::DurationContext,
     ) -> resource_profiles::ResolvedResourceProfile {
         let context = context.clone();
-        let slot_width = cairn_common::executor_protocol::CompileSlots::of(
+        let slot_width = cairn_common::executor_protocol::CompileSlots::net(
             capabilities.admission_concurrency_budget(),
+            standing_units,
         )
         .width;
         // A compile asks at least one compile slot's width of cores, as the
-        // machine judges it (`Need::of`), so the reservation it is charged and
+        // machine judges it after standing occupants, so the reservation it is charged and
         // releases is the one it was judged by. A compile that declared the
         // whole machine (an exclusive check) keeps it.
         let compile = self.command_class.is_compile_class();
@@ -2940,6 +2955,7 @@ impl ReservationPlan {
                 capabilities.memory_budget_bytes,
                 duration_context,
                 capabilities,
+                standing_units,
             )
             .await
         };
@@ -3062,6 +3078,7 @@ impl ReservationPlan {
         memory_budget_bytes: Option<u64>,
         duration_context: resource_profiles::DurationContext,
         capabilities: &ExecutorCapabilities,
+        standing_units: u32,
     ) -> resource_profiles::ResolvedResourceProfile {
         let mut reservation = ResourceReservation::default();
         let mut learned_estimates = Vec::with_capacity(self.batch_identities.len());
@@ -3074,8 +3091,9 @@ impl ReservationPlan {
         let mut memory_fits = Vec::with_capacity(self.batch_suites.len());
         let mut members = Vec::with_capacity(self.batch_suites.len());
         let mut process_evidence = None;
-        let slot_width = cairn_common::executor_protocol::CompileSlots::of(
+        let slot_width = cairn_common::executor_protocol::CompileSlots::net(
             capabilities.admission_concurrency_budget(),
+            standing_units,
         )
         .width;
         for (identity, suite, class) in &self.batch_suites {

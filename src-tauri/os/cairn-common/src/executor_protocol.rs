@@ -9668,6 +9668,12 @@ pub struct LearnedResourceEstimate {
 /// already holding room for the entry), which an executor already reads.
 /// What a runner gets wrong talking to a 175 executor built before this:
 /// nothing; that executor decides every offer the same way.
+/// Version 176 (cairn/7415) sizes compile slots net of standing residency
+/// and announces that charge in required `AnnouncedRoom::standing`. Drained
+/// and capacity room retain residency rather than promising it will end.
+/// Mixed peers disagree about capacity and compile width, so they must not
+/// admit together. Ordinary runner rebuild and executor self-update by build
+/// hash distribute the matching implementation.
 ///
 /// cairn/6075 does not move the number. A held cell whose authority cannot be
 /// loaded, and a retained project root whose migration fails, no longer stop
@@ -9682,7 +9688,7 @@ pub struct LearnedResourceEstimate {
 /// read as a machine that adopted everything. What an older runner gets wrong
 /// talking to a newer executor: it ignores the list, and sees a machine that
 /// attached where it used to see none.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 175;
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 176;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -12822,6 +12828,11 @@ pub struct CompileSlots {
 pub const COMPILE_SLOT_JOBS: u32 = 8;
 
 impl CompileSlots {
+    /// Compile capacity after the machine's standing occupants are charged.
+    pub const fn net(concurrency_units: u32, standing_units: u32) -> Self {
+        Self::of(concurrency_units.saturating_sub(standing_units))
+    }
+
     /// `max(1, units / 8)` slots, each `units / slots` build jobs wide.
     pub const fn of(concurrency_units: u32) -> Self {
         let units = if concurrency_units == 0 {
@@ -12843,6 +12854,15 @@ impl CompileSlots {
             .unwrap_or(u32::MAX)
             .min(self.slots)
     }
+}
+
+/// Resources held by residency, which ending transient work does not release.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StandingRoom {
+    pub cores: u32,
+    pub memory_bytes: u64,
+    pub disk_bytes: u64,
 }
 
 /// What one piece of work needs of a machine's [`AnnouncedRoom`], worked out
@@ -12882,6 +12902,18 @@ pub struct Need {
 }
 
 impl Need {
+    /// Re-express this need at the machine's current compile slot width.
+    pub fn with_slots(&self, slots: CompileSlots) -> Self {
+        Self {
+            cores: if self.compile {
+                self.charged_cores.max(slots.width)
+            } else {
+                self.charged_cores
+            },
+            ..self.clone()
+        }
+    }
+
     /// The need of work with `reservation`, on a machine with `slots`.
     pub fn of(
         reservation: &ResourceReservation,
@@ -13139,6 +13171,7 @@ pub const ROOM_ANNOUNCEMENT_INTERVAL_MS: u64 = 250;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnnouncedRoom {
+    pub standing: StandingRoom,
     pub slots: CompileSlots,
     /// Concurrency units: the machine's budget and what admitted work holds.
     pub cores: Allowance,
@@ -13354,15 +13387,16 @@ impl AnnouncedRoom {
     }
 
     /// The room this machine would have were every job it admitted to end:
-    /// nothing committed, nothing owed, and the pages its occupants hold
-    /// returned. Closures and provisioning stand, since they are not about
+    /// standing residency retained, nothing owed, and only the pages its
+    /// transient occupants hold returned. Closures and provisioning stand, since they are not about
     /// what is running: whether aged work could fit here once its turn came.
     /// Whether it could ever fit is [`Self::capacity`].
     pub fn drained(&self) -> Self {
         Self {
+            standing: self.standing,
             slots: self.slots,
             cores: Allowance {
-                committed: 0,
+                committed: u64::from(self.standing.cores),
                 ..self.cores
             },
             memory: self.memory.map(|memory| MemoryRoom {
@@ -13374,15 +13408,15 @@ impl AnnouncedRoom {
                 total_bytes: memory.total_bytes,
             }),
             memory_budget: self.memory_budget.map(|budget| Allowance {
-                committed: 0,
+                committed: self.standing.memory_bytes,
                 ..budget
             }),
             disk: self.disk.clone().map(|disk| DiskRoom {
-                reserved_bytes: 0,
+                reserved_bytes: self.standing.disk_bytes,
                 ..disk
             }),
             disk_budget: self.disk_budget.map(|budget| Allowance {
-                committed: 0,
+                committed: self.standing.disk_bytes,
                 ..budget
             }),
             reclaimable_memory_bytes: 0,
@@ -13408,7 +13442,9 @@ impl AnnouncedRoom {
         let drained = self.drained();
         Self {
             memory: drained.memory.map(|memory| MemoryRoom {
-                available_bytes: memory.total_bytes,
+                available_bytes: memory
+                    .total_bytes
+                    .saturating_sub(self.standing.memory_bytes),
                 ..memory
             }),
             disk: None,
@@ -13466,6 +13502,7 @@ impl AnnouncedRoom {
         };
         memory
             || disk
+            || self.standing != before.standing
             || self.slots != before.slots
             || self.cores != before.cores
             || self.memory_budget != before.memory_budget
@@ -13540,6 +13577,7 @@ mod room_tests {
     /// fedora with nothing running: 125 GiB, 32 units, a roomy volume.
     fn idle() -> AnnouncedRoom {
         AnnouncedRoom {
+            standing: StandingRoom::default(),
             slots: CompileSlots::of(32),
             cores: Allowance {
                 limit: 32,
@@ -13567,6 +13605,88 @@ mod room_tests {
             holds: Vec::new(),
             closures: Vec::new(),
         }
+    }
+
+    #[test]
+    fn standing_residency_survives_counterfactuals() {
+        let mut room = idle();
+        room.standing = StandingRoom {
+            cores: 2,
+            memory_bytes: 7 * GIB,
+            disk_bytes: 3 * GIB,
+        };
+        room.slots = CompileSlots::net(32, room.standing.cores);
+        room.cores.committed = 20;
+        room.memory.as_mut().unwrap().available_bytes = 60 * GIB;
+        room.memory.as_mut().unwrap().owed_bytes = 20 * GIB;
+        room.reclaimable_memory_bytes = 10 * GIB;
+        room.memory_budget.as_mut().unwrap().committed = 40 * GIB;
+        room.disk.as_mut().unwrap().reserved_bytes = 15 * GIB;
+        room.disk_budget = Some(Allowance {
+            limit: 100 * GIB,
+            committed: 15 * GIB,
+        });
+        let drained = room.drained();
+        assert_eq!(drained.standing, room.standing);
+        assert_eq!(drained.slots, room.slots);
+        assert_eq!(drained.cores.committed, 2);
+        assert_eq!(drained.memory.unwrap().available_bytes, 70 * GIB);
+        assert_eq!(drained.memory.unwrap().owed_bytes, 0);
+        assert_eq!(drained.memory_budget.unwrap().committed, 7 * GIB);
+        assert_eq!(drained.disk.as_ref().unwrap().reserved_bytes, 3 * GIB);
+        assert_eq!(drained.disk_budget.unwrap().committed, 3 * GIB);
+        assert_eq!(drained.reclaimable_memory_bytes, 0);
+        let capacity = room.capacity();
+        assert_eq!(capacity.cores.committed, 2);
+        assert_eq!(capacity.memory.unwrap().available_bytes, 118 * GIB);
+        assert_eq!(capacity.memory_budget.unwrap().committed, 7 * GIB);
+        assert_eq!(capacity.disk_budget.unwrap().committed, 3 * GIB);
+        let mut changed = room.clone();
+        changed.standing.memory_bytes += 1;
+        assert!(changed.differs_materially(&room));
+    }
+
+    #[test]
+    fn net_slots_leave_residents_charged_even_when_exhausted() {
+        let mut reservation = reservation(GIB);
+        reservation.concurrency_units = 1;
+        let gross = Need::of(
+            &reservation,
+            CellCommandClass::CargoTest,
+            false,
+            PipeFloorWork::Process,
+            false,
+            None,
+            CompileSlots::of(12),
+        );
+        let mut room = idle();
+        room.cores = Allowance {
+            limit: 12,
+            committed: 2,
+        };
+        room.standing.cores = 2;
+        room.slots = CompileSlots::net(12, 2);
+        assert_eq!(
+            room.slots,
+            CompileSlots {
+                slots: 1,
+                width: 10
+            }
+        );
+        assert_eq!(fits(&room, &gross), Err(RoomShort::Capacity));
+        assert_eq!(fits(&room, &gross.with_slots(room.slots)), Ok(()));
+        room.standing.cores = 12;
+        room.cores.committed = 12;
+        room.slots = CompileSlots::net(12, 12);
+        assert_eq!(room.slots.width, 1);
+        assert_eq!(
+            fits(&room.drained(), &gross.with_slots(room.slots)),
+            Err(RoomShort::Capacity)
+        );
+        assert_eq!(CompileSlots::net(12, 20), CompileSlots::of(0));
+        let mut other = gross.clone();
+        other.compile = false;
+        assert_eq!(other.with_slots(CompileSlots::of(32)).cores, 1);
     }
 
     #[test]
@@ -28521,6 +28641,7 @@ mod tests {
             ExecutorMessage::Room {
                 seq: 1,
                 room: AnnouncedRoom {
+                    standing: StandingRoom::default(),
                     slots: CompileSlots::of(20),
                     cores: Allowance {
                         limit: 20,
