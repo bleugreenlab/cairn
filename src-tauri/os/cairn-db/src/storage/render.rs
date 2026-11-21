@@ -54,10 +54,14 @@ pub fn duplicate_segment(uri: impl Into<String>, message: impl Into<String>) -> 
 /// construction; reconstruction calls it through this registry. All boundary
 /// types already live in [`cairn_common::read`], so the seam is clean both ways.
 pub trait ArchivedFileRenderer: Send + Sync {
+    /// `composition` selects which era's read composition the segment is
+    /// produced under; the live read and the archival writer always pass
+    /// [`ReadComposition::Current`].
     fn produce_archived_file_segment(
         &self,
         target: &str,
         bytes: &[u8],
+        composition: ReadComposition,
     ) -> Result<ReadSegment, String>;
 
     /// Whether any blob could ever reproduce `target`, decided from the target
@@ -66,6 +70,33 @@ pub trait ArchivedFileRenderer: Send + Sync {
     /// [`Self::produce_archived_file_segment`] refuses exactly these targets,
     /// so a caller that asks first never resolves a coordinate it cannot use.
     fn archived_target_support(&self, target: &str) -> Result<(), String>;
+}
+
+/// Which era's read composition an archived read is re-rendered under.
+///
+/// The archival rewrite recorded `content_render_sha` over the bytes the agent
+/// saw, and discarded them only after its own reconstruction reproduced them
+/// exactly. A reconstruction that no longer matches therefore means today's
+/// composition differs from the one the archiving build ran, not that the data
+/// is lost: the older composition is still fully determined and can be run
+/// again, with the recorded sha as the oracle.
+///
+/// This is a frozen decoder for old rows, not a second live renderer: nothing
+/// but reconstruction ever asks for an era other than `Current`. Delete
+/// `Summer2026` once every gitcoord row has been packed with verified bytes and
+/// its hot row evicted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadComposition {
+    /// What the live read renders now.
+    Current,
+    /// The composition of the June and July 2026 builds that archived the first
+    /// gitcoord reads, as it stood before `fca088e48` (cairn/6792). A content
+    /// grep prints `name:N:text` on every row rather than under a heading,
+    /// `head_limit` caps output lines (context included) rather than matches, and
+    /// the header counts what the capped body shows with no window footer. The
+    /// fair-share estimate is the character formula of that era, with no
+    /// reservation for affordance blocks.
+    Summer2026,
 }
 
 static ARCHIVED_FILE_RENDERER: OnceLock<&'static dyn ArchivedFileRenderer> = OnceLock::new();
@@ -1232,7 +1263,15 @@ impl Carried {
 
 /// Estimated untruncated length of a segment's text block, for fair-share
 /// budgeting: header (with suffix slack), body, a footer allowance, and history.
-fn estimate_len(segment: &ReadSegment, history: Option<&str>, meter: &Metering<'_, '_>) -> u32 {
+fn estimate_len(
+    segment: &ReadSegment,
+    history: Option<&str>,
+    meter: &Metering<'_, '_>,
+    composition: ReadComposition,
+) -> u32 {
+    if composition == ReadComposition::Summer2026 {
+        return summer2026_estimate_len(segment, history);
+    }
     let images = image_reference_trailer(&segment.images, &segment.meta.uri);
     let estimate = format!(
         "{}\n{}\n{}{}{}",
@@ -1243,6 +1282,25 @@ fn estimate_len(segment: &ReadSegment, history: Option<&str>, meter: &Metering<'
         history.unwrap_or_default()
     );
     meter.count(&estimate)
+}
+
+/// [`estimate_len`] as the [`ReadComposition::Summer2026`] builds computed it,
+/// in characters: a bare `=== uri ===` header plus 28 of suffix slack, the body
+/// and its separating newline, the 220-character footer allowance, and history
+/// with its blank line.
+fn summer2026_estimate_len(segment: &ReadSegment, history: Option<&str>) -> u32 {
+    let header = format!("=== {} ===", segment.meta.uri).len() + 28;
+    let history = history.map_or(0, |history| history.len() + 2);
+    let images = image_reference_trailer(&segment.images, &segment.meta.uri)
+        .text
+        .len();
+    let estimate = header
+        + usize::from(!segment.body.is_empty())
+        + segment.body.len()
+        + 220
+        + history
+        + images;
+    u32::try_from(estimate).unwrap_or(u32::MAX)
 }
 
 /// One pass's fair-share inputs. None depends on the batch budget, so the
@@ -1256,17 +1314,27 @@ struct FairShare {
 }
 
 impl FairShare {
-    fn new(segments: &[ReadSegment], carried: Carried, meter: &Metering<'_, '_>) -> Self {
+    fn new(
+        segments: &[ReadSegment],
+        carried: Carried,
+        meter: &Metering<'_, '_>,
+        composition: ReadComposition,
+    ) -> Self {
         let lengths = segments
             .iter()
-            .map(|segment| estimate_len(segment, carried.history(segment), meter))
+            .map(|segment| estimate_len(segment, carried.history(segment), meter, composition))
             .collect();
         let separators = meter.count(&"\n".repeat(segments.len().saturating_sub(1)));
         let affordances = distinct_affordances(segments, carried);
-        let blocks: u32 = affordances
-            .iter()
-            .map(|affordance| meter.count(&format!("\n\n{}", affordance.block)))
-            .sum();
+        // The Summer 2026 composer appended affordance blocks after the
+        // budgeted sections without reserving room for them.
+        let blocks: u32 = match composition {
+            ReadComposition::Current => affordances
+                .iter()
+                .map(|affordance| meter.count(&format!("\n\n{}", affordance.block)))
+                .sum(),
+            ReadComposition::Summer2026 => 0,
+        };
         Self {
             lengths,
             reserved: separators.saturating_add(blocks),
@@ -1302,12 +1370,14 @@ pub fn assemble_with_bodies(
     assemble_inner(segments, true, budget, meter)
 }
 
-/// Recompose archived reads written under the former character budget.
+/// Recompose archived reads written under the former character budget, with
+/// the fair-share estimate of `composition`'s era.
 pub fn assemble_legacy_chars(
     segments: Vec<ReadSegment>,
     meter: &dyn TokenMeter,
+    composition: ReadComposition,
 ) -> ReadBatchEnvelope {
-    assemble_at_budget(segments, false, meter, 45_000)
+    assemble_at_budget(segments, false, meter, 45_000, composition)
 }
 
 fn assemble_inner(
@@ -1390,7 +1460,12 @@ fn assemble_inner(
         ),
         None => "Empty read batch cannot be rendered below the 45,000-byte client ceiling.".to_string(),
     };
-    let share = FairShare::new(&segments, Carried::NEITHER, &meter);
+    let share = FairShare::new(
+        &segments,
+        Carried::NEITHER,
+        &meter,
+        ReadComposition::Current,
+    );
     let mut overflow = compose_at_budget(
         &segments,
         Carried::NEITHER,
@@ -1430,7 +1505,7 @@ fn assemble_fitting<'t>(
         }
         (envelope.text.len() <= ceiling).then_some(envelope)
     };
-    let share = FairShare::new(segments, carried, meter);
+    let share = FairShare::new(segments, carried, meter, ReadComposition::Current);
     let at_budget =
         |budget| compose_at_budget(segments, carried, &share, include_bodies, meter, budget);
 
@@ -1465,9 +1540,10 @@ fn assemble_at_budget(
     include_bodies: bool,
     meter: &dyn TokenMeter,
     batch_budget: u32,
+    composition: ReadComposition,
 ) -> ReadBatchEnvelope {
     let meter = Metering::new(meter);
-    let share = FairShare::new(&segments, Carried::ALL, &meter);
+    let share = FairShare::new(&segments, Carried::ALL, &meter, composition);
     compose_at_budget(
         &segments,
         Carried::ALL,
@@ -1628,6 +1704,83 @@ mod tests {
         meta.total_units = Some(total);
         meta.offset = offset;
         ReadSegment::text(numbered_body, meta)
+    }
+
+    /// The shown-line count a composed batch's `[lines 1–N of M — ...]`
+    /// footer names for `uri`.
+    fn footer_lines(text: &str, uri: &str) -> usize {
+        let section = &text[text.find(&format!("=== {uri}")).unwrap()..];
+        let section = &section[..section[4..]
+            .find("\n=== ")
+            .map_or(section.len(), |end| end + 4)];
+        assert!(
+            section.contains("output truncated to fit budget"),
+            "{section}"
+        );
+        // The footer, not the header that leads with the same words.
+        let footer =
+            &section[section.rfind("[lines 1\u{2013}").unwrap() + "[lines 1\u{2013}".len()..];
+        footer[..footer.find(' ').unwrap()].parse().unwrap()
+    }
+
+    /// The Summer 2026 fair share (cairn/6792): a short target takes exactly
+    /// that era's character estimate and a long one gets what is left, so
+    /// the long one is cut at a different line under each composition. This is
+    /// the shape of the two-file specimen that cut at 537 lines then and 538
+    /// now.
+    #[test]
+    fn the_summer_2026_estimate_moves_where_a_long_target_is_cut() {
+        let small = file_seg("file:small.rs", "1\tfn small() {}", 1, 0);
+        // Lines shorter than the gap between the two estimates, so the gap
+        // moves the cut.
+        let long_body = (1..=20_000)
+            .map(|line| format!("{line}\tx"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let long = file_seg("file:bash.rs", &long_body, 20_000, 0);
+        // "=== file:small.rs ===" (21) + 28, the body and its newline (16),
+        // and the 220-character footer allowance.
+        assert_eq!(summer2026_estimate_len(&small, None), 21 + 28 + 16 + 220);
+
+        let cut = |composition| {
+            let text =
+                assemble_legacy_chars(vec![small.clone(), long.clone()], &BYTE_METER, composition)
+                    .text;
+            assert!(text.starts_with("=== file:small.rs"), "{text}");
+            footer_lines(&text, "file:bash.rs")
+        };
+        let (current, summer) = (
+            cut(ReadComposition::Current),
+            cut(ReadComposition::Summer2026),
+        );
+        // The older estimate is the larger, so the long target kept one line
+        // fewer then, as the specimen did.
+        assert_eq!((current, summer), (6_526, 6_525));
+    }
+
+    /// Summer 2026 appended affordance blocks after the budgeted sections
+    /// without reserving room for them, so the same lone target keeps more of
+    /// its body under that composition.
+    #[test]
+    fn the_summer_2026_composer_reserves_nothing_for_affordances() {
+        let body = (1..=6_178)
+            .map(|line| format!("{line}\t{}", "x".repeat(70)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut segment = file_seg("file:bash.rs", &body, 6_178, 0);
+        segment.affordance = Some(Affordance {
+            kind: SegmentKind::File,
+            block: format!("## File affordance\n{}", "y".repeat(900)),
+            spec: None,
+        });
+        let cut = |composition| {
+            let text = assemble_legacy_chars(vec![segment.clone()], &BYTE_METER, composition).text;
+            footer_lines(&text, "file:bash.rs")
+        };
+        assert!(
+            cut(ReadComposition::Summer2026) > cut(ReadComposition::Current),
+            "the reservation is what the current composition subtracts"
+        );
     }
 
     fn image_seg(uri: &str, stored: Option<&str>) -> ReadSegment {
@@ -2803,6 +2956,7 @@ mod tests {
             false,
             &DensityMeter,
             READ_BATCH_TOKEN_BUDGET,
+            ReadComposition::Current,
         );
         let naive =
             &uncapped.text[..safe_char_boundary(&uncapped.text, CLIENT_TOOL_RESULT_BYTE_CEILING)];

@@ -69,6 +69,34 @@ pub struct TierEntry {
     pub packed_at: i64,
     pub evicted_at: Option<i64>,
     pub through_generation: Option<i64>,
+    /// Events the pack keeps in their stored form. `None` on a pack written
+    /// before reconstruction outcomes were recorded, as are the two below.
+    pub reconstruction_degraded: Option<i64>,
+    /// Git-coordinate reads whose render matches no recorded sha.
+    pub reconstruction_unverified: Option<i64>,
+    /// Git-coordinate reads that verified only under an older composition.
+    pub reconstruction_legacy: Option<i64>,
+}
+
+impl TierEntry {
+    /// Why eviction must not remove this scope's hot rows yet, or `None`.
+    ///
+    /// Eviction makes the pack the only copy, so the pack has to be provably
+    /// what an agent saw. A pack written before its reconstruction was recorded
+    /// is unknown, and one holding an unverified read holds bytes no sha
+    /// vouches for while the hot row's file coordinate may still be repaired by
+    /// a later composition. Degraded rows are no hold: the pack keeps their
+    /// stored form, so evicting loses nothing the hot row had. Only a re-pack
+    /// that records zero unverified reads clears the hold.
+    pub fn eviction_hold(&self) -> Option<String> {
+        match self.reconstruction_unverified {
+            None => Some("reconstruction not recorded (packed before disclosure)".to_string()),
+            Some(unverified) if unverified > 0 => Some(format!(
+                "{unverified} reconstructions do not match their recorded sha"
+            )),
+            Some(_) => None,
+        }
+    }
 }
 
 /// When a pack was made, and what the scope holds hot.
@@ -323,13 +351,16 @@ async fn record(
     }
     let row_counts = serde_json::to_string(&built.stats.rows)
         .map_err(|error| crate::storage::DbError::internal(error.to_string()))?;
+    let tally = &built.stats.reconstruction;
+    let count = |n: u64| Value::Integer(i64::try_from(n).unwrap_or(i64::MAX));
     let started = Instant::now();
     let changed = db
         .execute(
             "INSERT INTO history_tier
             (scope_id, kind, owner_id, content_hash, format, bytes, hot_bytes_estimate,
-             row_counts, resolved_at, packed_at, evicted_at, through_generation)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)
+             row_counts, resolved_at, packed_at, evicted_at, through_generation,
+             reconstruction_degraded, reconstruction_unverified, reconstruction_legacy)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?13, ?14)
          ON CONFLICT(scope_id) DO UPDATE SET
              content_hash = excluded.content_hash,
              format = excluded.format,
@@ -338,7 +369,10 @@ async fn record(
              row_counts = excluded.row_counts,
              resolved_at = excluded.resolved_at,
              packed_at = excluded.packed_at,
-             through_generation = excluded.through_generation
+             through_generation = excluded.through_generation,
+             reconstruction_degraded = excluded.reconstruction_degraded,
+             reconstruction_unverified = excluded.reconstruction_unverified,
+             reconstruction_legacy = excluded.reconstruction_legacy
          WHERE history_tier.evicted_at IS NULL",
             vec![
                 Value::Text(scope.id.clone()),
@@ -352,6 +386,9 @@ async fn record(
                 Value::Integer(facts.resolved_at),
                 Value::Integer(facts.packed_at),
                 scope.through_generation.map_or(Value::Null, Value::Integer),
+                count(tally.unresolved()),
+                count(tally.unverified),
+                count(tally.restored_legacy),
             ],
         )
         .await?;
@@ -422,7 +459,8 @@ pub async fn invalidate_for_event(db: &LocalDb, event_id: &str) -> DbResult<Opti
 pub async fn tier_entry(db: &LocalDb, scope_id: &str) -> DbResult<Option<TierEntry>> {
     db.query_opt(
         "SELECT scope_id, kind, owner_id, content_hash, format, bytes, hot_bytes_estimate,
-                row_counts, resolved_at, packed_at, evicted_at, through_generation
+                row_counts, resolved_at, packed_at, evicted_at, through_generation,
+                reconstruction_degraded, reconstruction_unverified, reconstruction_legacy
          FROM history_tier WHERE scope_id = ?1",
         (scope_id.to_string(),),
         |row| {
@@ -444,8 +482,50 @@ pub async fn tier_entry(db: &LocalDb, scope_id: &str) -> DbResult<Option<TierEnt
                 packed_at: row.i64(9)?,
                 evicted_at: row.opt_i64(10)?,
                 through_generation: row.opt_i64(11)?,
+                reconstruction_degraded: row.opt_i64(12)?,
+                reconstruction_unverified: row.opt_i64(13)?,
+                reconstruction_legacy: row.opt_i64(14)?,
             })
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(unverified: Option<i64>) -> TierEntry {
+        TierEntry {
+            scope_id: "exec".into(),
+            kind: ScopeKind::Execution,
+            owner_id: "exec".into(),
+            content_hash: "hash".into(),
+            format: 1,
+            bytes: 1,
+            hot_bytes_estimate: 1,
+            row_counts: BTreeMap::new(),
+            resolved_at: 1,
+            packed_at: 1,
+            evicted_at: None,
+            through_generation: None,
+            reconstruction_degraded: unverified.map(|_| 4),
+            reconstruction_unverified: unverified,
+            reconstruction_legacy: unverified.map(|_| 9),
+        }
+    }
+
+    #[test]
+    fn eviction_holds_a_pack_that_is_unknown_or_unverified() {
+        assert_eq!(
+            entry(None).eviction_hold().as_deref(),
+            Some("reconstruction not recorded (packed before disclosure)")
+        );
+        assert_eq!(
+            entry(Some(3)).eviction_hold().as_deref(),
+            Some("3 reconstructions do not match their recorded sha")
+        );
+        // Degraded and legacy-verified rows are recorded, and neither holds.
+        assert_eq!(entry(Some(0)).eviction_hold(), None);
+    }
 }

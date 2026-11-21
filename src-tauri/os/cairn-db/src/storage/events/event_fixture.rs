@@ -302,7 +302,11 @@ pub fn render_targets(targets: &[(&str, &[u8])]) -> String {
         .iter()
         .map(|(target, bytes)| {
             renderer
-                .produce_archived_file_segment(target, bytes)
+                .produce_archived_file_segment(
+                    target,
+                    bytes,
+                    crate::storage::render::ReadComposition::Current,
+                )
                 .expect("produce archived file segment")
         })
         .collect();
@@ -337,7 +341,11 @@ pub fn mixed_render_targets(sections: &[MixedSection]) -> String {
         .iter()
         .map(|section| match section {
             MixedSection::File(target, bytes) => renderer
-                .produce_archived_file_segment(target, bytes)
+                .produce_archived_file_segment(
+                    target,
+                    bytes,
+                    crate::storage::render::ReadComposition::Current,
+                )
                 .expect("produce archived file segment"),
             MixedSection::Resource(uri, body) => ReadSegment::text(
                 *body,
@@ -345,7 +353,11 @@ pub fn mixed_render_targets(sections: &[MixedSection]) -> String {
             ),
             MixedSection::PromotedImage(target, bytes, uri) => {
                 let mut segment = renderer
-                    .produce_archived_file_segment(target, bytes)
+                    .produce_archived_file_segment(
+                        target,
+                        bytes,
+                        crate::storage::render::ReadComposition::Current,
+                    )
                     .expect("produce archived image segment");
                 for image in &mut segment.images {
                     image.uri = Some(uri.to_string());

@@ -618,11 +618,24 @@ pub(super) const STALE_TASK_SQL: &str = "SELECT 1 FROM runs r WHERE r.job_id = ?
 /// Owner probes are restricted to packed sessions: its live tail is expected.
 /// Task probes cover the whole job, so reopening cannot leave a stale pack.
 /// This detects unmapped runs, not late appends to an already mapped run.
+///
+/// A range packed before its reconstruction outcomes were recorded is stale
+/// too: rebuilding it records them, once, from the same hot history.
 pub async fn is_stale(db: &LocalDb, scope_id: &str) -> DbResult<bool> {
-    let Some(owner) = db.query_text(
-        "SELECT owner_id FROM history_tier WHERE scope_id=?1 AND kind='thread_range' AND evicted_at IS NULL",
-        (scope_id.to_string(),),
-    ).await? else { return Ok(false); };
+    let Some((owner, unrecorded)) = db
+        .query_opt(
+            "SELECT owner_id, reconstruction_unverified IS NULL FROM history_tier
+             WHERE scope_id=?1 AND kind='thread_range' AND evicted_at IS NULL",
+            (scope_id.to_string(),),
+            |row| Ok((row.text(0)?, row.i64(1)? != 0)),
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    if unrecorded {
+        return Ok(true);
+    }
     let sessions = db
         .query_all(
             "SELECT session_id FROM history_tier_sessions WHERE scope_id=?1",

@@ -36,6 +36,7 @@ fn manifest() -> Manifest {
         turns: Vec::new(),
         sections: Vec::new(),
         token_rollup: TOKEN_ROLLUP_NOTE.to_string(),
+        reconstruction: None,
     }
 }
 
@@ -571,6 +572,34 @@ async fn publish_writes_the_catalog_and_changes_no_hot_row() {
     assert_eq!(entry.kind, ScopeKind::Execution);
     assert_eq!(entry.owner_id, "exec-1");
     assert_eq!(entry.through_generation, None);
+    // The fixture's degraded and undecodable rows keep their stored form; no
+    // read in it is git-addressed, so none is unverified or legacy.
+    assert_eq!(
+        built.manifest.reconstruction,
+        Some(super::ReconstructionTally {
+            degraded: 1,
+            undecodable: 1,
+            unverified: 0,
+            restored_legacy: 0,
+        })
+    );
+    assert_eq!(
+        built.manifest.reconstruction,
+        Some(built.stats.reconstruction.clone())
+    );
+    assert_eq!(
+        (
+            entry.reconstruction_degraded,
+            entry.reconstruction_unverified,
+            entry.reconstruction_legacy
+        ),
+        (Some(2), Some(0), Some(0))
+    );
+    assert_eq!(entry.eviction_hold(), None, "degraded rows are no hold");
+    assert!(
+        !entry.row_counts.contains_key("reconstruction"),
+        "the tally is not a section"
+    );
     assert_eq!(
         db.query_opt_i64("SELECT COUNT(*) FROM history_tier_runs", ())
             .await
@@ -849,7 +878,11 @@ async fn the_scope_migration_keeps_a_populated_catalog() {
     let db = LocalDb::open(temp.path().join("scopes.db")).await.unwrap();
     let before: Vec<_> = TURSO_MIGRATIONS
         .iter()
-        .filter(|migration| migration.name() != "history_tier_scopes")
+        // The reconstruction columns are added to the table this rebuilds, so
+        // they follow it here as they do on every real database.
+        .filter(|migration| {
+            !["history_tier_scopes", "history_tier_reconstruction"].contains(&migration.name())
+        })
         .copied()
         .collect();
     assert!(before.len() < TURSO_MIGRATIONS.len());
@@ -890,7 +923,16 @@ async fn the_scope_migration_keeps_a_populated_catalog() {
             packed_at: 20,
             evicted_at: Some(5),
             through_generation: None,
+            reconstruction_degraded: None,
+            reconstruction_unverified: None,
+            reconstruction_legacy: None,
         }
+    );
+    // A pack written before its reconstruction was recorded is unknown, not
+    // clean, and eviction must say so.
+    assert_eq!(
+        entry.eviction_hold().as_deref(),
+        Some("reconstruction not recorded (packed before disclosure)")
     );
     let second = catalog::tier_entry(&db, "exec-2").await.unwrap().unwrap();
     assert_eq!(

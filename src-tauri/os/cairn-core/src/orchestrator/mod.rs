@@ -3282,7 +3282,7 @@ impl Orchestrator {
             crate::archival::pack::PackBudget::PRODUCTION,
         )
         .await;
-        if report.halted || !report.failed.is_empty() {
+        if report.halted || !report.failed.is_empty() || report.has_sha_mismatches() {
             log::warn!("history pack: {report}");
         } else {
             log::info!("history pack: {report}");

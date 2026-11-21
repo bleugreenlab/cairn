@@ -380,6 +380,10 @@ pub struct EventTally {
     pub rows: u64,
     pub stored: u64,
     pub restored: u64,
+    /// Restored, and verified only under an older read composition.
+    pub restored_legacy: u64,
+    /// Restored completely, but matching no recorded render sha.
+    pub unverified: u64,
     pub degraded: u64,
     pub undecodable: u64,
     pub withheld: u64,
@@ -395,6 +399,8 @@ impl EventTally {
         match outcome {
             Reconstruction::Stored => self.stored += 1,
             Reconstruction::Restored => self.restored += 1,
+            Reconstruction::RestoredLegacy => self.restored_legacy += 1,
+            Reconstruction::Unverified => self.unverified += 1,
             Reconstruction::Degraded => self.degraded += 1,
             Reconstruction::Undecodable => self.undecodable += 1,
             Reconstruction::Withheld => self.withheld += 1,
@@ -406,6 +412,8 @@ impl EventTally {
             "rows": self.rows,
             "stored_plain": self.stored,
             "restored": self.restored,
+            "restored_legacy": self.restored_legacy,
+            "unverified": self.unverified,
             "degraded": self.degraded,
             "undecodable": self.undecodable,
             "unresolved": self.unresolved(),

@@ -9,6 +9,7 @@ pub mod batch;
 pub mod file;
 pub(crate) mod object_read;
 pub(crate) mod overlay;
+mod summer2026;
 
 use cairn_common::read::ReadSegment;
 
@@ -93,8 +94,9 @@ impl crate::storage::render::ArchivedFileRenderer for McpArchivedFileRenderer {
         &self,
         target: &str,
         bytes: &[u8],
+        composition: crate::storage::render::ReadComposition,
     ) -> Result<ReadSegment, String> {
-        file::produce_archived_file_segment(target, bytes)
+        file::produce_archived_file_segment(target, bytes, composition)
     }
 
     fn archived_target_support(&self, target: &str) -> Result<(), String> {

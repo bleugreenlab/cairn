@@ -80,7 +80,7 @@ use super::encoding::{
 use super::{decompress, diff, ObjectStore, CODEC_NONE, CODEC_ZSTD_V1};
 use crate::models::Event;
 use crate::storage::content_store::{content_hash, unframe_pack, ContentStore};
-use crate::storage::render::ArchivedFileRenderer;
+use crate::storage::render::{ArchivedFileRenderer, ReadComposition};
 use crate::storage::{DbResult, LocalDb, RowExt};
 
 /// Prefix of the stub substituted for an unresolvable coordinate.
@@ -167,8 +167,19 @@ pub enum Reconstruction {
     /// Stored `full`: `data` is the recorded content, untouched.
     Stored,
     /// Archived, and restored completely from its compressed form, its
-    /// content-addressed blobs, or its git coordinate.
+    /// content-addressed blobs, or its git coordinate. A git-coordinate read
+    /// with a recorded render sha matched it under the current composition.
     Restored,
+    /// A git-coordinate read restored completely whose recorded render sha
+    /// matched only under an older read composition ([`ReadComposition`]):
+    /// `data` is the content the agent saw, reproduced by the decoder of the
+    /// build that archived it.
+    RestoredLegacy,
+    /// A git-coordinate read restored completely, with no stub, whose recorded
+    /// render sha matches under no known composition: `data` is today's render
+    /// of the archived file bytes, which are complete, but it is not proven to
+    /// be the bytes the agent saw.
+    Unverified,
     /// Archived, and at least one part of it could not be resolved (a dropped
     /// pack, a commit or blob the store no longer has): `data` carries the rest,
     /// with each unresolvable part replaced by a [`STUB_PREFIX`] stub.
@@ -1027,33 +1038,20 @@ fn reconstruct_gitcoord_read(
                 .collect::<Vec<_>>()
         });
 
-    let (rendered, resolved) = match paths {
-        Some(paths) => reconstruct_read_resolving(commit_hex, &paths, store, &mut StubReport::Log),
+    let (rendered, outcome) = match paths {
+        Some(paths) => verified_render(
+            "gitcoord read",
+            &event.id,
+            event.content_render_sha.as_deref(),
+            |composition, report| {
+                reconstruct_read_resolving(commit_hex, &paths, store, report, composition)
+            },
+        ),
         None => {
             log::warn!("gitcoord read {} has no tool_input.paths", event.id);
-            (stub(commit_hex, "<read>"), false)
+            (stub(commit_hex, "<read>"), Reconstruction::Degraded)
         }
     };
-
-    // Drift tripwire: the verify-then-discard rewrite recorded the sha of the
-    // exact bytes the agent saw. The shared composition is now a stability
-    // contract — a future view-layer change would silently rewrite reconstructed
-    // history — so a mismatch here means the live/archival read composition has
-    // diverged since archival. We still inject `rendered`: it is the best
-    // available reconstruction. A degraded (stub) reconstruction legitimately
-    // differs and already logged its own warning, so skip the compare there.
-    if !rendered.contains(STUB_PREFIX) {
-        if let Some(expected) = event.content_render_sha.as_deref() {
-            let actual = format!("{:x}", Sha256::digest(rendered.as_bytes()));
-            if actual != expected {
-                log::warn!(
-                    "gitcoord read {} reconstruction sha mismatch (recorded {expected}, got {actual}); \
-                     the shared read composition may have diverged since archival",
-                    event.id
-                );
-            }
-        }
-    }
 
     if let Value::Object(ref mut map) = data {
         map.insert("toolResult".to_string(), Value::String(rendered));
@@ -1061,7 +1059,7 @@ fn reconstruct_gitcoord_read(
     match serde_json::to_string(&data) {
         Ok(serialized) => {
             event.data = serialized;
-            resolved_outcome(resolved)
+            outcome
         }
         Err(error) => {
             log::warn!(
@@ -1079,6 +1077,60 @@ fn resolved_outcome(resolved: bool) -> Reconstruction {
     } else {
         Reconstruction::Degraded
     }
+}
+
+/// Render an archived read and check it against its recorded sha, trying each
+/// known [`ReadComposition`] in turn.
+///
+/// The verify-then-discard rewrite recorded the sha of the exact bytes the
+/// agent saw, so the sha is an oracle: the composition whose render hashes to
+/// it is the one the archiving build ran. The current composition is tried
+/// first and is the only render almost every read needs; an older one runs
+/// only on a mismatch. A render that matches no composition is still injected,
+/// as the best available, and reported [`Reconstruction::Unverified`]. A
+/// degraded render (any target unresolved) legitimately differs and already
+/// logged its own cause, so it is never compared; a row with no recorded sha
+/// has nothing to compare against.
+fn verified_render(
+    shape: &str,
+    event_id: &str,
+    recorded_sha: Option<&str>,
+    render: impl Fn(ReadComposition, &mut StubReport<'_>) -> (String, bool),
+) -> (String, Reconstruction) {
+    let (current, resolved) = render(ReadComposition::Current, &mut StubReport::Log);
+    if !resolved {
+        return (current, Reconstruction::Degraded);
+    }
+    // `resolved` is the stub signal: every stub path clears it. The rendered
+    // text is no evidence either way, because the stub prefix can be real
+    // content (a source file, a grep pattern, a hybrid read's kept section).
+    let Some(expected) = recorded_sha else {
+        return (current, Reconstruction::Restored);
+    };
+    let current_sha = render_sha(&current);
+    if current_sha == expected {
+        return (current, Reconstruction::Restored);
+    }
+    // The current render already reported any stub; this one only re-renders.
+    let mut quiet = StubTally::default();
+    let (legacy, legacy_resolved) = render(
+        ReadComposition::Summer2026,
+        &mut StubReport::Tally(&mut quiet),
+    );
+    let legacy_sha = render_sha(&legacy);
+    if legacy_resolved && legacy_sha == expected {
+        return (legacy, Reconstruction::RestoredLegacy);
+    }
+    log::warn!(
+        "{shape} {event_id} reconstruction sha matches no known read composition \
+         (recorded {expected}; current {current_sha}; summer-2026 {legacy_sha}); \
+         serving the current render unverified"
+    );
+    (current, Reconstruction::Unverified)
+}
+
+fn render_sha(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
 /// Restore a mixed-target hybrid read: decompress the placeholder skeleton, splice
@@ -1140,30 +1192,24 @@ fn reconstruct_hybrid_read(
         })
         .unwrap_or_default();
 
-    let (rendered, resolved) = splice_hybrid_skeleton_resolving(
-        &skeleton,
-        commit_hex,
-        &paths,
-        &sections,
-        store,
-        &mut StubReport::Log,
+    // Each excised section re-renders under the composition being tried, so a
+    // hybrid read verifies as a whole exactly as a pure-file read does.
+    let (rendered, outcome) = verified_render(
+        "hybrid read",
+        &event.id,
+        event.content_render_sha.as_deref(),
+        |composition, report| {
+            splice_hybrid_skeleton_resolving(
+                &skeleton,
+                commit_hex,
+                &paths,
+                &sections,
+                store,
+                report,
+                composition,
+            )
+        },
     );
-
-    // Same drift tripwire as the pure-file read: a mismatch means the live and
-    // archival read composition diverged since archival. A degraded (stub) section
-    // legitimately differs and already logged, so skip the compare there.
-    if !rendered.contains(STUB_PREFIX) {
-        if let Some(expected) = event.content_render_sha.as_deref() {
-            let actual = format!("{:x}", Sha256::digest(rendered.as_bytes()));
-            if actual != expected {
-                log::warn!(
-                    "hybrid read {} reconstruction sha mismatch (recorded {expected}, got {actual}); \
-                     the shared read composition may have diverged since archival",
-                    event.id
-                );
-            }
-        }
-    }
 
     if let Value::Object(ref mut map) = data {
         map.insert("toolResult".to_string(), Value::String(rendered));
@@ -1173,7 +1219,7 @@ fn reconstruct_hybrid_read(
     match serde_json::to_string(&data) {
         Ok(serialized) => {
             event.data = serialized;
-            resolved_outcome(resolved)
+            outcome
         }
         Err(error) => {
             log::warn!(
@@ -1371,31 +1417,35 @@ pub fn reconstruct_read(
     store: Option<&ObjectStore>,
     report: &mut StubReport<'_>,
 ) -> String {
-    reconstruct_read_resolving(commit_hex, paths, store, report).0
+    reconstruct_read_resolving(commit_hex, paths, store, report, ReadComposition::Current).0
 }
 
-/// [`reconstruct_read`], also reporting whether every target resolved.
+/// [`reconstruct_read`] under `composition`, also reporting whether every
+/// target resolved.
 fn reconstruct_read_resolving(
     commit_hex: &str,
     paths: &[String],
     store: Option<&ObjectStore>,
     report: &mut StubReport<'_>,
+    composition: ReadComposition,
 ) -> (String, bool) {
     let renderer = crate::storage::render::archived_file_renderer();
     let mut resolved = true;
     let segments: Vec<ReadSegment> = paths
         .iter()
-        .map(
-            |target| match build_archived_segment(commit_hex, target, store, renderer, report) {
+        .map(|target| {
+            match build_archived_segment(commit_hex, target, store, renderer, report, composition) {
                 Ok(segment) => segment,
                 Err(stub) => {
                     resolved = false;
                     *stub
                 }
-            },
-        )
+            }
+        })
         .collect();
-    let text = crate::storage::render::assemble_legacy_chars(segments, &LEGACY_CHAR_METER).text;
+    let text =
+        crate::storage::render::assemble_legacy_chars(segments, &LEGACY_CHAR_METER, composition)
+            .text;
     (text, resolved)
 }
 
@@ -1410,22 +1460,32 @@ pub fn render_archived_file_section(
     store: Option<&ObjectStore>,
     report: &mut StubReport<'_>,
 ) -> String {
-    render_archived_file_section_resolving(commit_hex, target, store, report).0
+    render_archived_file_section_resolving(
+        commit_hex,
+        target,
+        store,
+        report,
+        ReadComposition::Current,
+    )
+    .0
 }
 
-/// [`render_archived_file_section`], also reporting whether the target resolved.
+/// [`render_archived_file_section`] under `composition`, also reporting whether
+/// the target resolved. The section renders at an unbounded budget, so only the
+/// segment's production differs between compositions.
 fn render_archived_file_section_resolving(
     commit_hex: &str,
     target: &str,
     store: Option<&ObjectStore>,
     report: &mut StubReport<'_>,
+    composition: ReadComposition,
 ) -> (String, bool) {
     let renderer = crate::storage::render::archived_file_renderer();
-    let (seg, resolved) = match build_archived_segment(commit_hex, target, store, renderer, report)
-    {
-        Ok(segment) => (segment, true),
-        Err(stub) => (*stub, false),
-    };
+    let (seg, resolved) =
+        match build_archived_segment(commit_hex, target, store, renderer, report, composition) {
+            Ok(segment) => (segment, true),
+            Err(stub) => (*stub, false),
+        };
     (
         crate::storage::render::render_section_text(seg, &LEGACY_CHAR_METER),
         resolved,
@@ -1453,7 +1513,16 @@ pub fn splice_hybrid_skeleton(
     store: Option<&ObjectStore>,
     report: &mut StubReport<'_>,
 ) -> String {
-    splice_hybrid_skeleton_resolving(skeleton, commit_hex, paths, sections, store, report).0
+    splice_hybrid_skeleton_resolving(
+        skeleton,
+        commit_hex,
+        paths,
+        sections,
+        store,
+        report,
+        ReadComposition::Current,
+    )
+    .0
 }
 
 /// [`splice_hybrid_skeleton`], also reporting whether every excised section
@@ -1466,6 +1535,7 @@ fn splice_hybrid_skeleton_resolving(
     sections: &[usize],
     store: Option<&ObjectStore>,
     report: &mut StubReport<'_>,
+    composition: ReadComposition,
 ) -> (String, bool) {
     let mut out = skeleton.to_string();
     let mut resolved = true;
@@ -1475,7 +1545,7 @@ fn splice_hybrid_skeleton_resolving(
             continue;
         };
         let (section, section_resolved) =
-            render_archived_file_section_resolving(commit_hex, target, store, report);
+            render_archived_file_section_resolving(commit_hex, target, store, report, composition);
         resolved &= section_resolved;
         out = out.replace(&section_placeholder(index), &section);
     }
@@ -1501,6 +1571,7 @@ fn build_archived_segment(
     store: Option<&ObjectStore>,
     renderer: Option<&dyn ArchivedFileRenderer>,
     report: &mut StubReport<'_>,
+    composition: ReadComposition,
 ) -> Result<ReadSegment, Box<ReadSegment>> {
     let stub_segment = |label: &str| {
         Box::new(crate::storage::render::error_segment(
@@ -1519,9 +1590,9 @@ fn build_archived_segment(
         return Err(stub_segment(&path));
     }
     match store.resolve_path_at_commit(commit_hex, &path) {
-        Ok(bytes) => {
-            render_archived_bytes(renderer, target, &bytes, report, || *stub_segment(&path))
-        }
+        Ok(bytes) => render_archived_bytes(renderer, target, &bytes, report, composition, || {
+            *stub_segment(&path)
+        }),
         Err(error) => {
             report.unresolvable(commit_hex, &path, &error);
             Err(stub_segment(&path))
@@ -1539,16 +1610,19 @@ fn render_archived_bytes(
     target: &str,
     bytes: &[u8],
     report: &mut StubReport<'_>,
+    composition: ReadComposition,
     stub: impl Fn() -> ReadSegment,
 ) -> Result<ReadSegment, Box<ReadSegment>> {
     match renderer {
-        Some(renderer) => match renderer.produce_archived_file_segment(target, bytes) {
-            Ok(segment) => Ok(segment),
-            Err(error) => {
-                report.render_failed(target, &error);
-                Err(Box::new(stub()))
+        Some(renderer) => {
+            match renderer.produce_archived_file_segment(target, bytes, composition) {
+                Ok(segment) => Ok(segment),
+                Err(error) => {
+                    report.render_failed(target, &error);
+                    Err(Box::new(stub()))
+                }
             }
-        },
+        }
         None => Err(Box::new(stub())),
     }
 }
@@ -1960,6 +2034,7 @@ mod tests {
             &self,
             target: &str,
             _bytes: &[u8],
+            _composition: ReadComposition,
         ) -> Result<ReadSegment, String> {
             assert!(
                 !target.contains("branch="),
@@ -1996,6 +2071,7 @@ mod tests {
                 Some(&store),
                 Some(&RefusesBranch),
                 &mut report,
+                ReadComposition::Current,
             )
         };
         let refused = build("file:ghost.txt?branch=feature").unwrap_err();
@@ -2019,9 +2095,15 @@ mod tests {
     fn render_archived_bytes_without_renderer_degrades_to_stub() {
         let stub =
             || crate::storage::render::error_segment("file:a.txt", stub("deadbeef", "file:a.txt"));
-        let segment =
-            render_archived_bytes(None, "file:a.txt", b"ignored", &mut StubReport::Log, stub)
-                .unwrap_err();
+        let segment = render_archived_bytes(
+            None,
+            "file:a.txt",
+            b"ignored",
+            &mut StubReport::Log,
+            ReadComposition::Current,
+            stub,
+        )
+        .unwrap_err();
         assert!(segment.body.contains(STUB_PREFIX));
     }
 }

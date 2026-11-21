@@ -57,7 +57,7 @@ mod threads;
 use crate::storage::content_store::ContentStore;
 use crate::storage::history_pack::catalog::{publish_to, PublishError, PublishFacts};
 use crate::storage::history_pack::write::{BuiltPack, HistoryPacker, PackBuildError, PackUnit};
-use crate::storage::history_pack::{PackError, FRAME_RAW_BYTES};
+use crate::storage::history_pack::{PackError, ReconstructionTally, FRAME_RAW_BYTES};
 use crate::storage::{DbResult, LocalDb, RowExt, FOLD_AT_LOG_BYTES};
 
 /// How long after boot the first pass waits: clear of the boot convoy and of
@@ -180,6 +180,10 @@ pub struct PackReport {
     /// or verification failure. Nothing was catalogued for them.
     pub failed: Vec<Passed>,
     pub pages: u64,
+    /// What reconstruction made of the packed scopes' events, summed: the
+    /// packs were written, but these rows are not, or not provably, the
+    /// content an agent saw.
+    pub reconstruction: ReconstructionTally,
     /// Each catalog statement's duration, in milliseconds.
     pub write_ms: Vec<u64>,
     pub gate_wait: Duration,
@@ -217,6 +221,13 @@ fn names(passed: &[Passed]) -> String {
 }
 
 impl PackReport {
+    /// Whether any packed read matched its recorded sha under no known
+    /// composition: a pass that packed bytes no sha vouches for is a warning,
+    /// however cleanly it otherwise ran.
+    pub fn has_sha_mismatches(&self) -> bool {
+        self.reconstruction.unverified > 0
+    }
+
     fn write_percentile(&self, pct: usize) -> u64 {
         if self.write_ms.is_empty() {
             return 0;
@@ -232,7 +243,9 @@ impl fmt::Display for PackReport {
         write!(
             f,
             "{} scopes packed ({} packed vs {} hot, estimate {} at {} B/row, {} events), \
-             {} skipped, {} failed in {} pages; catalog writes p50 {} ms, max {} ms; \
+             {} skipped, {} failed in {} pages; \
+             reconstruction: sha mismatches={}, degraded={}, legacy-verified={}; \
+             catalog writes p50 {} ms, max {} ms; \
              gate wait {} ms (max {} ms), held max {} ms",
             self.packed,
             mib(self.pack_bytes),
@@ -243,6 +256,9 @@ impl fmt::Display for PackReport {
             self.skipped.len(),
             self.failed.len(),
             self.pages,
+            self.reconstruction.unverified,
+            self.reconstruction.unresolved(),
+            self.reconstruction.restored_legacy,
             self.write_percentile(50),
             self.write_percentile(100),
             self.gate_wait.as_millis(),
@@ -642,8 +658,18 @@ async fn pack_unit_candidate(
     }
     match outcome {
         Ok(packed) => {
+            let tally = &packed.reconstruction;
+            let flagged = if tally.unverified > 0 || tally.unresolved() > 0 {
+                format!(
+                    ", sha mismatches={} degraded={}",
+                    tally.unverified,
+                    tally.unresolved()
+                )
+            } else {
+                String::new()
+            };
             log::info!(
-                "history pack: {label} {} runs, {} events: {} packed vs {} hot (estimate {} at {} B/row) in {} ms, {} pages, gate wait {} ms, held {} ms",
+                "history pack: {label} {} runs, {} events: {} packed vs {} hot (estimate {} at {} B/row) in {} ms, {} pages, gate wait {} ms, held {} ms{flagged}",
                 packed.runs,
                 packed.event_rows,
                 mib(packed.bytes),
@@ -655,6 +681,7 @@ async fn pack_unit_candidate(
                 gate_wait.as_millis(),
                 held.as_millis(),
             );
+            report.reconstruction.add(tally);
             report.packed += 1;
             report.pack_bytes += packed.bytes;
             report.hot_bytes += packed.hot_bytes;
@@ -701,6 +728,7 @@ struct Packed {
     hot_estimate: u64,
     pages: u64,
     took: Duration,
+    reconstruction: ReconstructionTally,
 }
 
 /// Build, verify and catalog one execution's pack. Called holding the
@@ -814,6 +842,7 @@ async fn pack_unit(
         hot_estimate,
         pages,
         took: started.elapsed(),
+        reconstruction: built.stats.reconstruction.clone(),
     })
 }
 
@@ -968,6 +997,10 @@ async fn save_cursor(db: &LocalDb, at: Option<&Candidate>) -> Result<(), Stop> {
 /// `idx_jobs_issue_id` and the catalog is probed by primary key: an execution
 /// scope's id is the execution's, and a thread range's (`<job>/<n>-<m>`) can
 /// never equal one.
+///
+/// An unevicted row packed before its reconstruction outcomes were recorded
+/// does not count: the walk re-packs it once, recording them, and a pack that
+/// recorded unverified reads is not re-selected by later passes.
 pub(crate) const CANDIDATES_SQL: &str = "SELECT DISTINCT i.completed_at, j.execution_id
      FROM issues i JOIN jobs j ON j.issue_id = i.id
      WHERE i.status IN ('merged', 'closed')
@@ -978,7 +1011,8 @@ pub(crate) const CANDIDATES_SQL: &str = "SELECT DISTINCT i.completed_at, j.execu
        AND NOT EXISTS (
            SELECT 1 FROM history_tier t
            WHERE t.scope_id = j.execution_id
-             AND (t.resolved_at >= i.completed_at OR t.evicted_at IS NOT NULL))
+             AND ((t.resolved_at >= i.completed_at AND t.reconstruction_unverified IS NOT NULL)
+                  OR t.evicted_at IS NOT NULL))
      ORDER BY i.completed_at ASC, j.execution_id ASC
      LIMIT ?4";
 

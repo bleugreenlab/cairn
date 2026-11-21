@@ -243,6 +243,84 @@ async fn an_issue_resolved_again_is_packed_again() {
     assert_eq!(entry.resolved_at, OLD + DAY);
 }
 
+/// A pack written before reconstruction outcomes were recorded is re-packed by
+/// the next pass, once: the re-pack records them, and the pass after it has
+/// nothing to do.
+#[tokio::test]
+async fn a_pack_from_before_disclosure_is_packed_again_once() {
+    let db = migrated_test_db("pack-pass-undisclosed.db").await;
+    seed_project(&db).await;
+    seed_execution(&db, 1, "merged", Some(OLD), "exited").await;
+    assert_eq!(
+        run_pack_pass_at(&db, NOW, policy(), budget()).await.packed,
+        1
+    );
+    db.execute(
+        "UPDATE history_tier SET reconstruction_degraded = NULL,
+             reconstruction_unverified = NULL, reconstruction_legacy = NULL",
+        (),
+    )
+    .await
+    .unwrap();
+    assert!(tier_entry(&db, "x1")
+        .await
+        .unwrap()
+        .unwrap()
+        .eviction_hold()
+        .is_some());
+
+    let report = run_pack_pass_at(&db, NOW, policy(), budget()).await;
+    assert_eq!(report.packed, 1, "{report}");
+    let entry = tier_entry(&db, "x1").await.unwrap().unwrap();
+    assert_eq!(
+        (
+            entry.reconstruction_degraded,
+            entry.reconstruction_unverified,
+            entry.reconstruction_legacy
+        ),
+        (Some(0), Some(0), Some(0))
+    );
+    assert_eq!(entry.eviction_hold(), None);
+
+    let report = run_pack_pass_at(&db, NOW, policy(), budget()).await;
+    assert_eq!(report.packed, 0, "{report}");
+}
+
+/// A degraded event is counted where the pass reports, and in the catalog.
+#[tokio::test]
+async fn a_pass_counts_what_reconstruction_could_not_resolve() {
+    let db = migrated_test_db("pack-pass-degraded.db").await;
+    seed_project(&db).await;
+    seed_execution(&db, 1, "merged", Some(OLD), "exited").await;
+    // A system prompt whose content-addressed segment no store holds.
+    db.execute(
+        "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at,
+                            storage_mode)
+         VALUES ('e1-3', 'r1', 3, 3, 'system:prompt', ?1, 3, 'gitcoord')",
+        (serde_json::json!({
+            "eventType": "system:prompt",
+            "archived": "system_prompt",
+            "segments": [{"hash": "0".repeat(64), "kind": "base"}],
+        })
+        .to_string(),),
+    )
+    .await
+    .unwrap();
+
+    let report = run_pack_pass_at(&db, NOW, policy(), budget()).await;
+    assert_eq!(report.packed, 1, "{report}");
+    assert_eq!(report.reconstruction.degraded, 1, "{report}");
+    assert!(!report.has_sha_mismatches());
+    let line = report.to_string();
+    assert!(
+        line.contains("reconstruction: sha mismatches=0, degraded=1, legacy-verified=0"),
+        "{line}"
+    );
+    let entry = tier_entry(&db, "x1").await.unwrap().unwrap();
+    assert_eq!(entry.reconstruction_degraded, Some(1));
+    assert_eq!(entry.eviction_hold(), None, "a degraded row is no hold");
+}
+
 #[tokio::test]
 async fn a_pass_interrupted_after_its_put_converges() {
     let db = migrated_test_db("pack-pass-resume.db").await;
@@ -551,9 +629,24 @@ fn the_report_names_skips_and_why_it_stopped() {
         hold_max_scope: Some("x9".into()),
         remaining: Some(1_001),
         stopped: Some("archive volume under its floor".into()),
+        reconstruction: ReconstructionTally {
+            degraded: 1,
+            undecodable: 1,
+            unverified: 3,
+            restored_legacy: 4,
+        },
         ..PackReport::default()
     };
+    assert!(report.has_sha_mismatches());
     let line = report.to_string();
+    // Beside skipped and failed, where a reader looks for what went wrong.
+    assert!(
+        line.contains(
+            "22 skipped, 0 failed in 0 pages; \
+             reconstruction: sha mismatches=3, degraded=2, legacy-verified=4; "
+        ),
+        "{line}"
+    );
     assert!(
         line.starts_with("2 scopes packed (3.0 MiB packed"),
         "{line}"

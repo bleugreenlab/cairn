@@ -85,6 +85,12 @@ pub fn event_columns_object(columns: &[String], values: &[Value]) -> Map<String,
 ///
 /// A withheld row carries no stored form: the label wins over the outcome
 /// underneath it, so a quarantined credential is never copied out.
+///
+/// A restored git-coordinate read that did not verify under the current
+/// composition also carries `verification` ([`verification_label`]) beside the
+/// `restored` label: its data is complete, which is what `restored` tells a
+/// reader that knows nothing more, and a decoder that predates the key ignores
+/// it rather than refusing the pack.
 pub fn finish_event_object(
     object: &mut Map<String, Json>,
     stored: &Event,
@@ -97,31 +103,64 @@ pub fn finish_event_object(
         "reconstruction".to_string(),
         Json::String(outcome_label(outcome).to_string()),
     );
+    if let Some(verification) = verification_label(outcome) {
+        object.insert(
+            "verification".to_string(),
+            Json::String(verification.to_string()),
+        );
+    }
     if outcome.is_unresolved() {
         object.insert("unresolved".to_string(), Json::Bool(true));
         object.insert("stored".to_string(), stored_form(stored));
     }
 }
 
-/// The label [`finish_event_object`] writes for an outcome.
+/// The `reconstruction` label [`finish_event_object`] writes for an outcome.
+///
+/// Every restored read shares `restored`, however it verified: a pack decoder
+/// refuses a label it does not know, so a new label would make every pack
+/// written by this build unreadable to the build before it.
 pub fn outcome_label(outcome: Reconstruction) -> &'static str {
     match outcome {
         Reconstruction::Stored => "stored_plain",
-        Reconstruction::Restored => "restored",
+        Reconstruction::Restored | Reconstruction::RestoredLegacy | Reconstruction::Unverified => {
+            "restored"
+        }
         Reconstruction::Degraded => "degraded",
         Reconstruction::Undecodable => "undecodable",
         Reconstruction::Withheld => "withheld",
     }
 }
 
-/// The outcome an [`outcome_label`] names.
-pub fn outcome_from_label(label: &str) -> Option<Reconstruction> {
-    Some(match label {
-        "stored_plain" => Reconstruction::Stored,
-        "restored" => Reconstruction::Restored,
-        "degraded" => Reconstruction::Degraded,
-        "undecodable" => Reconstruction::Undecodable,
-        "withheld" => Reconstruction::Withheld,
+/// The `verification` label of a restored read that did not verify under the
+/// current composition, or `None` for every other outcome.
+pub fn verification_label(outcome: Reconstruction) -> Option<&'static str> {
+    match outcome {
+        Reconstruction::RestoredLegacy => Some("restored_legacy"),
+        Reconstruction::Unverified => Some("unverified"),
+        _ => None,
+    }
+}
+
+/// The outcome an [`outcome_label`] and optional [`verification_label`] name.
+///
+/// An unknown `verification` on a restored row comes from a newer build, and
+/// the row is still restored, so it decodes as [`Reconstruction::Restored`].
+pub fn outcome_from_labels(label: &str, verification: Option<&str>) -> Option<Reconstruction> {
+    Some(match (label, verification) {
+        ("stored_plain", _) => Reconstruction::Stored,
+        ("restored", None) => Reconstruction::Restored,
+        ("restored", Some("restored_legacy")) => Reconstruction::RestoredLegacy,
+        ("restored", Some("unverified")) => Reconstruction::Unverified,
+        ("restored", Some(other)) => {
+            log::debug!(
+                "history pack row names an unknown verification {other:?}; read as restored"
+            );
+            Reconstruction::Restored
+        }
+        ("degraded", _) => Reconstruction::Degraded,
+        ("undecodable", _) => Reconstruction::Undecodable,
+        ("withheld", _) => Reconstruction::Withheld,
         _ => return None,
     })
 }
@@ -184,11 +223,30 @@ mod tests {
         for outcome in [
             Reconstruction::Stored,
             Reconstruction::Restored,
+            Reconstruction::RestoredLegacy,
+            Reconstruction::Unverified,
             Reconstruction::Degraded,
             Reconstruction::Undecodable,
             Reconstruction::Withheld,
         ] {
-            assert_eq!(outcome_from_label(outcome_label(outcome)), Some(outcome));
+            assert_eq!(
+                outcome_from_labels(outcome_label(outcome), verification_label(outcome)),
+                Some(outcome)
+            );
         }
+    }
+
+    /// The build before this one knows only the five labels, so the two new
+    /// outcomes must reach it as `restored`; and a verification this build does
+    /// not know reads as restored rather than refusing the pack.
+    #[test]
+    fn new_outcomes_stay_readable_to_older_and_newer_decoders() {
+        assert_eq!(outcome_label(Reconstruction::RestoredLegacy), "restored");
+        assert_eq!(outcome_label(Reconstruction::Unverified), "restored");
+        assert_eq!(
+            outcome_from_labels("restored", Some("from_the_future")),
+            Some(Reconstruction::Restored)
+        );
+        assert_eq!(outcome_from_labels("no_such_label", None), None);
     }
 }

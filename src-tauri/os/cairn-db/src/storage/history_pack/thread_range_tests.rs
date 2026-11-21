@@ -233,6 +233,22 @@ async fn reopened_task_invalidates_only_unevicted_scope_not_owner_live_tail() {
     );
     assert!(!is_stale(&db, &scope).await.unwrap());
     assert!(build(&db, &owner).await.candidates.is_empty());
+    // A range packed before its reconstruction outcomes were recorded is stale
+    // until it is packed again, which records them.
+    db.execute(
+        "UPDATE history_tier SET reconstruction_unverified=NULL WHERE scope_id=?1",
+        (scope.clone(),),
+    )
+    .await
+    .unwrap();
+    assert!(is_stale(&db, &scope).await.unwrap());
+    db.execute(
+        "UPDATE history_tier SET reconstruction_unverified=0 WHERE scope_id=?1",
+        (scope.clone(),),
+    )
+    .await
+    .unwrap();
+    assert!(!is_stale(&db, &scope).await.unwrap());
     db.execute_script(
         "INSERT INTO runs(id,job_id,project_id,session_id,status,created_at,updated_at)
            VALUES('reopened','task','p','task-s','live',999,999);",

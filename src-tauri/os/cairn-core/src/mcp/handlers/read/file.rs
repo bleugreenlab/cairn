@@ -5,6 +5,7 @@ use crate::mcp::handlers::read::{error_segment, Produced};
 use crate::mcp::handlers::target::invalid_target_error;
 use crate::mcp::types::{IssueHistoryMode, McpCallbackRequest, ReadFilePayload};
 use crate::orchestrator::Orchestrator;
+use crate::storage::render::ReadComposition;
 use crate::storage::RowExt;
 use cairn_common::query::{split_target_query, QueryParam};
 use cairn_common::read::{ImageBlock, NaturalUnit, ReadSegment, SegmentKind, SegmentMeta};
@@ -881,9 +882,15 @@ pub(crate) fn archived_file_target_support(target: &str) -> Result<(), String> {
 /// of the windowing/grep logic — only the disk read is swapped for the resolved
 /// git blob. Returns `Err` for any target [`parse_archived_file_target`] refuses;
 /// the caller then falls to zstd.
+///
+/// Under [`ReadComposition::Summer2026`] a single-file grep is produced as the
+/// builds of that era produced it (see `read::summer2026`). Every other shape
+/// produces as it does now: a plain file read has not changed since, and an
+/// `?ast` or `?outline` body that has changed is not reproduced.
 pub(crate) fn produce_archived_file_segment(
     target: &str,
     bytes: &[u8],
+    composition: ReadComposition,
 ) -> Result<ReadSegment, String> {
     let ArchivedFileTarget {
         rel_path,
@@ -944,6 +951,14 @@ pub(crate) fn produce_archived_file_segment(
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            if composition == ReadComposition::Summer2026 {
+                return Ok(super::summer2026::grep_segment(
+                    uri,
+                    bytes,
+                    &label,
+                    &grep_payload,
+                ));
+            }
             // A failed search reconstructs as the same error segment the live
             // read rendered, not as an ineligible target: the coordinate is
             // faithfully addressable, the search itself is what failed.
@@ -3082,7 +3097,9 @@ mod tests {
         // ImageBlock — the same shape the live producer builds — not the pre-#1485
         // JSON envelope.
         let bytes = b"\x89PNG\r\n\x1a\nbinary-bytes\x00\xff";
-        let segment = produce_archived_file_segment("file:logo.png", bytes).unwrap();
+        let segment =
+            produce_archived_file_segment("file:logo.png", bytes, ReadComposition::Current)
+                .unwrap();
         assert_eq!(segment.meta.kind, SegmentKind::Image);
         assert!(segment.body.is_empty(), "image segments carry no text body");
         assert_eq!(segment.images.len(), 1);
@@ -3107,7 +3124,8 @@ mod tests {
         for target in refused {
             let reason = archived_file_target_support(target).unwrap_err();
             assert_eq!(
-                produce_archived_file_segment(target, b"alpha\nbeta\n").unwrap_err(),
+                produce_archived_file_segment(target, b"alpha\nbeta\n", ReadComposition::Current)
+                    .unwrap_err(),
                 reason,
                 "{target}"
             );
@@ -3120,7 +3138,8 @@ mod tests {
             "file:a.ts?outline",
         ] {
             archived_file_target_support(target).unwrap();
-            produce_archived_file_segment(target, b"alpha\nbeta\n").unwrap();
+            produce_archived_file_segment(target, b"alpha\nbeta\n", ReadComposition::Current)
+                .unwrap();
         }
     }
 }

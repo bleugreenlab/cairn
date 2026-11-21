@@ -44,6 +44,10 @@
 //!   project export's event row ([`encode::finish_event_object`]): `data` is the
 //!   reconstructed text, `data_blob` is null, `reconstruction` labels the
 //!   outcome, and an unresolved row carries `unresolved` and its `stored` form.
+//!   A restored git-coordinate read that verified only under an older read
+//!   composition, or under none, keeps the `restored` label and adds
+//!   `verification` (`restored_legacy` or `unverified`); the manifest's
+//!   `reconstruction` tally counts both, and the unresolved rows.
 //!   A row the disclosure quarantine withheld at pack time is written as its
 //!   withholding notice with no stored form, so a quarantined credential is
 //!   never copied into the archive.
@@ -91,6 +95,7 @@ use sha2::{Digest, Sha256};
 
 use crate::models::Event;
 use crate::storage::events::history::{EventExtras, HistoryRow};
+use crate::storage::events::reconstruct::Reconstruction;
 use crate::storage::events::{
     decompress, CODEC_ZSTD_V1, RECONSTRUCT_BATCH_BYTES, RECONSTRUCT_BATCH_ROWS,
 };
@@ -285,6 +290,47 @@ pub struct SectionEntry {
     pub columns: Option<Vec<ColumnDecl>>,
 }
 
+/// What reconstruction made of the events a pack froze, beyond plain success.
+///
+/// A restored row and a stored row need no count: they are the content. These
+/// are the rows that are not, or not provably: `degraded` and `undecodable`
+/// rows carry their stored form in the pack (see
+/// [`encode::finish_event_object`]), `unverified` rows carry a complete render
+/// that matches no recorded sha, and `restored_legacy` rows verified only under
+/// an older read composition.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconstructionTally {
+    pub degraded: u64,
+    pub undecodable: u64,
+    pub unverified: u64,
+    pub restored_legacy: u64,
+}
+
+impl ReconstructionTally {
+    /// Count one event's outcome.
+    pub fn record(&mut self, outcome: Reconstruction) {
+        match outcome {
+            Reconstruction::Degraded => self.degraded += 1,
+            Reconstruction::Undecodable => self.undecodable += 1,
+            Reconstruction::Unverified => self.unverified += 1,
+            Reconstruction::RestoredLegacy => self.restored_legacy += 1,
+            Reconstruction::Stored | Reconstruction::Restored | Reconstruction::Withheld => {}
+        }
+    }
+
+    /// Rows the pack keeps in their stored form.
+    pub fn unresolved(&self) -> u64 {
+        self.degraded + self.undecodable
+    }
+
+    pub fn add(&mut self, other: &ReconstructionTally) {
+        self.degraded += other.degraded;
+        self.undecodable += other.undecodable;
+        self.unverified += other.unverified;
+        self.restored_legacy += other.restored_legacy;
+    }
+}
+
 /// Everything a pack says about itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -304,6 +350,10 @@ pub struct Manifest {
     pub turns: Vec<ManifestTurn>,
     pub sections: Vec<SectionEntry>,
     pub token_rollup: String,
+    /// What reconstruction made of the pack's events. Absent from a pack
+    /// written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconstruction: Option<ReconstructionTally>,
 }
 
 impl Manifest {
@@ -631,10 +681,11 @@ pub fn decode_event_row(object: &Map<String, Json>) -> Result<HistoryRow, PackEr
     };
     let opt_int = |name: &str| object.get(name).and_then(Json::as_i64);
     let opt_i32 = |name: &str| opt_int(name).map(|value| value as i32);
+    let verification = object.get("verification").and_then(Json::as_str);
     let reconstruction = object
         .get("reconstruction")
         .and_then(Json::as_str)
-        .and_then(encode::outcome_from_label)
+        .and_then(|label| encode::outcome_from_labels(label, verification))
         .ok_or_else(|| corrupt("event row without a reconstruction label"))?;
     let data_blob = match reconstruction.is_unresolved() {
         true => object

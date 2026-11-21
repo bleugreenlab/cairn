@@ -12,6 +12,10 @@
 //! A scope's resolution is its catalog row's `resolved_at`: an execution's
 //! issue resolution, or the closing of a thread range's last session. Ties go
 //! by `scope_id`, so the order is total.
+//!
+//! A held candidate ([`TierCandidate::hold`], from
+//! [`super::catalog::TierEntry::eviction_hold`]) is never ordered, in either
+//! phase, and its bytes are not counted as reclaimable.
 
 /// One scope eligible to leave the hot tier.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +25,8 @@ pub struct TierCandidate {
     pub resolved_at: i64,
     /// Its catalog row's `hot_bytes_estimate`: what eviction frees.
     pub hot_bytes_estimate: u64,
+    /// Why its pack cannot yet stand in for its hot rows, if it cannot.
+    pub hold: Option<String>,
 }
 
 /// The window and budget eviction is held to.
@@ -36,7 +42,10 @@ pub struct HotPolicy {
 
 /// The scopes to evict, in eviction order.
 pub fn eviction_order(candidates: &[TierCandidate], now: i64, policy: &HotPolicy) -> Vec<String> {
-    let mut ordered: Vec<&TierCandidate> = candidates.iter().collect();
+    let mut ordered: Vec<&TierCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.hold.is_none())
+        .collect();
     ordered.sort_by(|a, b| {
         (a.resolved_at, a.scope_id.as_str()).cmp(&(b.resolved_at, b.scope_id.as_str()))
     });
@@ -75,7 +84,37 @@ mod tests {
             scope_id: id.to_string(),
             resolved_at,
             hot_bytes_estimate: rows * 10,
+            hold: None,
         }
+    }
+
+    fn held(id: &str, resolved_at: i64, rows: u64) -> TierCandidate {
+        TierCandidate {
+            hold: Some("1 reconstructions do not match their recorded sha".to_string()),
+            ..candidate(id, resolved_at, rows)
+        }
+    }
+
+    /// A held scope is never evicted, however old or however far over budget,
+    /// and its bytes do not count toward the budget: the next oldest unheld
+    /// scope is taken in its place.
+    #[test]
+    fn a_held_candidate_is_never_ordered_for_eviction() {
+        let now = 100 * DAY;
+        let candidates = [
+            held("aged-held", now - 60 * DAY, 1_000),
+            candidate("aged", now - 50 * DAY, 1),
+            held("oldest-recent", now - 5 * DAY, 1_000),
+            candidate("recent", now - 3 * DAY, 1_000),
+            candidate("newest", now - DAY, 1_000),
+        ];
+        // 30,010 hot against a 20,000 budget: "aged" ages out, then the budget
+        // phase must skip "oldest-recent" and take "recent", which alone brings
+        // the total under.
+        assert_eq!(
+            eviction_order(&candidates, now, &policy(30_010, 20_000)),
+            ["aged", "recent"]
+        );
     }
 
     fn policy(hot_total_bytes: u64, budget_bytes: u64) -> HotPolicy {

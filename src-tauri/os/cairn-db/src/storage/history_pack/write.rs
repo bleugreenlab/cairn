@@ -36,8 +36,8 @@ use super::catalog::TierScope;
 use super::encode::{event_columns_object, finish_event_object, json_value};
 use super::{
     hex, ColumnDecl, IndexEntry, Manifest, ManifestJob, ManifestRun, ManifestSession, ManifestTurn,
-    PackError, Scope, ScopeKind, Section, SectionEntry, FOOTER_MAGIC, FORMAT, FRAME_RAW_BYTES,
-    FRAME_ROWS, MAGIC, NOT_PACKED, TOKEN_ROLLUP_NOTE,
+    PackError, ReconstructionTally, Scope, ScopeKind, Section, SectionEntry, FOOTER_MAGIC, FORMAT,
+    FRAME_RAW_BYTES, FRAME_ROWS, MAGIC, NOT_PACKED, TOKEN_ROLLUP_NOTE,
 };
 use crate::models::Event;
 use crate::storage::content_store::content_hash;
@@ -134,6 +134,9 @@ pub struct PackStats {
     pub hot_event_bytes: u64,
     /// Frames written.
     pub frames: u64,
+    /// What reconstruction made of the events, beyond plain success. Not a
+    /// section, so it stays out of [`Self::rows`] and the catalog's row counts.
+    pub reconstruction: ReconstructionTally,
 }
 
 impl PackStats {
@@ -902,6 +905,7 @@ impl HistoryPacker {
                     if let Some(turn) = &row.event.turn_id {
                         tally.turns.insert(turn.clone());
                     }
+                    self.stats.reconstruction.record(outcome);
                     let mut object = row.object;
                     finish_event_object(&mut object, &row.event, event.data, outcome);
                     self.writer.push(Section::Events, &run, row.rowid, object)?;
@@ -1008,6 +1012,7 @@ impl HistoryPacker {
             turns: skeleton.turns.clone(),
             sections: Vec::new(),
             token_rollup: TOKEN_ROLLUP_NOTE.to_string(),
+            reconstruction: Some(stats.reconstruction.clone()),
         };
         let (bytes, manifest, frames) = writer.finish(manifest)?;
         stats.frames = frames;

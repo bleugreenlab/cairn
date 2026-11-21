@@ -1033,31 +1033,11 @@ pub(crate) fn render_single_file_grep(
     label: &str,
     payload: &GrepPayload,
 ) -> Result<GrepWindow, String> {
+    let collected = collect_single_file_grep(bytes, label, payload)?;
     let output_mode = payload.output_mode.as_deref().unwrap_or("content");
-    if !matches!(output_mode, "files_with_matches" | "count" | "content") {
-        return Err(format!(
-            "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
-            output_mode
-        ));
-    }
-
     let show_line_numbers = payload.line_numbers.unwrap_or(true);
     let offset = payload.offset.unwrap_or(0) as usize;
     let head_limit = payload.head_limit;
-
-    let matcher = build_grep_matcher(payload)?;
-    let mut searcher = build_grep_searcher(payload);
-
-    let mut collected: Vec<GrepLine> = Vec::new();
-    grep_collect_into(
-        &mut searcher,
-        &matcher,
-        label,
-        GrepSource::Bytes(bytes),
-        output_mode,
-        None,
-        &mut collected,
-    )?;
 
     Ok(window_grep_lines(
         collected,
@@ -1068,6 +1048,38 @@ pub(crate) fn render_single_file_grep(
         head_limit,
         grep_context_window(payload),
     ))
+}
+
+/// The lines a grep over one file's bytes collects, before any window or
+/// rendering, after validating its output mode. Shared by
+/// [`render_single_file_grep`] and the frozen archived-read decoder
+/// (`read::summer2026`), so both search exactly alike and differ only in how
+/// they lay the lines out.
+pub(crate) fn collect_single_file_grep(
+    bytes: &[u8],
+    label: &str,
+    payload: &GrepPayload,
+) -> Result<Vec<GrepLine>, String> {
+    let output_mode = payload.output_mode.as_deref().unwrap_or("content");
+    if !matches!(output_mode, "files_with_matches" | "count" | "content") {
+        return Err(format!(
+            "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
+            output_mode
+        ));
+    }
+    let matcher = build_grep_matcher(payload)?;
+    let mut searcher = build_grep_searcher(payload);
+    let mut collected: Vec<GrepLine> = Vec::new();
+    grep_collect_into(
+        &mut searcher,
+        &matcher,
+        label,
+        GrepSource::Bytes(bytes),
+        output_mode,
+        None,
+        &mut collected,
+    )?;
+    Ok(collected)
 }
 
 // ---------------------------------------------------------------------------
