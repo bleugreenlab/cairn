@@ -322,7 +322,7 @@ pub(super) enum Execution<L> {
     /// The final locked comparison found a bound ref or the judged tree moved.
     /// Nothing was mutated.
     BoundStateChanged { observed: serde_json::Value },
-    /// The provider definitively refused; nothing landed.
+    /// The landing was definitively refused, locally or by the provider; nothing landed.
     Refused(String),
     /// Whether anything landed is unknown. `approved_head` is the head the
     /// mutation was bound to, when it got that far, so reconciliation can
@@ -1129,7 +1129,7 @@ impl Ceremony<'_> {
                     &ids,
                     &ids.report_id,
                     CompletionOutcome::Failed,
-                    serde_json::json!({ "reason": reason, "providerRefused": true }),
+                    serde_json::json!({ "reason": reason, "landingRefused": true }),
                     human(JournalEntry {
                         detail: Some(reason.clone()),
                         ..empty()
@@ -1161,8 +1161,10 @@ impl Ceremony<'_> {
                 )
                 .await;
                 Err(format!(
-                    "Whether the merge landed is not yet known ({reason}). Cairn will reconcile \
-                     it; check the pull request before merging again."
+                    "Whether the merge landed is not yet known ({reason}). Refresh the pull \
+                     request to run recovery, then read it again. Do not merge again until \
+                     recovery records the landing or settles the attempt as definitely not \
+                     landed; an unreadable origin leaves the hold in place."
                 ))
             }
             // ── Phase E: prove, then complete ──

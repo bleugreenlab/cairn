@@ -186,6 +186,8 @@ pub enum LeasedPushError {
     /// The receiver refused the update for another reason (a hook, branch
     /// protection). Origin is unchanged.
     Rejected(String),
+    /// The merge host could not authenticate; readback proved origin unchanged.
+    CredentialUnavailable(String),
     /// Origin's expected target is not an ancestor of the landing (the store
     /// rewrote the target since origin last took it), and the publication did
     /// not allow a rewrite. Nothing was sent.
@@ -250,6 +252,7 @@ impl std::fmt::Display for LeasedPushError {
                 name(expected)
             ),
             Self::Rejected(error) => write!(f, "origin refused the publication: {error}"),
+            Self::CredentialUnavailable(error) => write!(f, "{error}"),
             Self::RemoteNotAncestor {
                 branch,
                 remote,
@@ -593,7 +596,10 @@ fn send_refs(
     reached_step("leased push: preconditions proven");
 
     let output = match jj.command_output(
-        cairn_platform::env::git().args(&args).current_dir(repo),
+        cairn_platform::env::git()
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(&args)
+            .current_dir(repo),
         JJ_NETWORK_TIMEOUT,
         "git push (leased)",
     ) {
@@ -632,9 +638,75 @@ fn send_refs(
                 &stderr
             }
         );
-        return resolve_unknown(jj, repo, heads, error);
+        return resolve_exited_push(jj, repo, heads, error, &stderr);
     }
     classify_rejection(jj, repo, updates, &rejections, &stderr)
+}
+
+/// Authentication is refused before git sends any ref updates. Only classify
+/// an exited push this way; a timeout still needs unknown-outcome recovery.
+fn credential_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "could not read username",
+        "device not configured",
+        "authentication failed",
+    ]
+    .iter()
+    .any(|message| error.contains(message))
+}
+
+fn resolve_exited_push(
+    jj: &JjEnv,
+    repo: &Path,
+    heads: AcceptedHeads,
+    error: String,
+    stderr: &str,
+) -> Result<AcceptedHeads, LeasedPushError> {
+    settle_exited_push(
+        heads.clone(),
+        error,
+        stderr,
+        observe_origin_heads(jj, repo, &heads),
+    )
+}
+
+fn settle_exited_push(
+    heads: AcceptedHeads,
+    error: String,
+    stderr: &str,
+    observed: Result<HashMap<String, String>, String>,
+) -> Result<AcceptedHeads, LeasedPushError> {
+    let error = if credential_failure(stderr) {
+        format!("no GitHub credential in the merge host's context: {error}")
+    } else {
+        error
+    };
+    match observed {
+        Ok(observed) if holds_every_head(&observed, &heads) => Ok(heads),
+        Ok(observed)
+            if credential_failure(stderr)
+                && heads
+                    .refs
+                    .iter()
+                    .all(|head| observed.get(&head.branch) == head.expected_old.as_ref()) =>
+        {
+            Err(LeasedPushError::CredentialUnavailable(format!(
+                "no GitHub credential in the merge host's context; the push exited and origin \
+                 still holds every expected pre-push ref, so this landing is definitely not \
+                 landed and no merge hold remains. Restore the merge host's GitHub credential \
+                 helper (upgrade gh if its keychain read times out), then retry the merge; a \
+                 successful executor-shell login alone does not verify the app's context. {error}"
+            )))
+        }
+        Ok(observed) => Err(LeasedPushError::Unknown(format!(
+            "{error}; origin after the push: {observed:?}; expected {:?}",
+            heads.refs
+        ))),
+        Err(probe) => Err(LeasedPushError::Unknown(format!(
+            "{error}; origin could not be probed afterwards: {probe}"
+        ))),
+    }
 }
 
 /// A push that reported no outcome. When origin already holds every head the
@@ -1552,10 +1624,21 @@ fn observe_origin_heads(
         .iter()
         .map(|accepted| accepted.branch.as_str())
         .collect();
-    let mut args = vec!["ls-remote".to_string(), "--heads".into(), "origin".into()];
+    // Read the same endpoint that receives the push, including repositories
+    // whose origin has a distinct push URL.
+    let url = run_git(
+        jj,
+        repo,
+        &["remote", "get-url", "--push", "origin"],
+        "git remote get-url --push origin",
+    )?;
+    let mut args = vec!["ls-remote".to_string(), "--heads".into(), url];
     args.extend(branches.iter().map(|branch| format!("refs/heads/{branch}")));
     let output = jj.command_output(
-        cairn_platform::env::git().args(&args).current_dir(repo),
+        cairn_platform::env::git()
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(&args)
+            .current_dir(repo),
         JJ_NETWORK_TIMEOUT,
         "git ls-remote (leased push)",
     )?;
@@ -1700,6 +1783,90 @@ mod tests {
         assert_eq!(parsed[0].dst, "refs/heads/main");
         assert!(parsed[0].summary.contains("stale info"));
         assert!(parsed[1].accepted() && parsed[2].accepted());
+    }
+
+    #[test]
+    fn credential_refusal_with_unchanged_origin_is_definitely_not_landed() {
+        let heads = AcceptedHeads {
+            refs: vec![
+                AcceptedRef {
+                    branch: "main".into(),
+                    expected_old: Some("old".into()),
+                    commit: Some("landing".into()),
+                },
+                AcceptedRef {
+                    branch: "source".into(),
+                    expected_old: Some("source-old".into()),
+                    commit: Some("landing".into()),
+                },
+            ],
+        };
+        let unchanged = HashMap::from([
+            ("main".into(), "old".into()),
+            ("source".into(), "source-old".into()),
+        ]);
+        for stderr in [
+            "fatal: could not read Username for 'https://github.com': Device not configured",
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "fatal: Authentication failed for 'https://github.com/org/repo'",
+        ] {
+            let error = settle_exited_push(
+                heads.clone(),
+                format!("git push exited 128 without reporting every ref: {stderr}"),
+                stderr,
+                Ok(unchanged.clone()),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, LeasedPushError::CredentialUnavailable(_)),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(stderr), "{message}");
+            assert!(!message.contains("origin refused"), "{message}");
+            for wording in [
+                "no GitHub credential in the merge host's context",
+                "definitely not landed",
+                "no merge hold remains",
+                "retry the merge",
+                "executor-shell login alone does not verify the app's context",
+            ] {
+                assert!(message.contains(wording), "{message}");
+            }
+        }
+        let credential = "could not read Username";
+        assert!(matches!(
+            settle_exited_push(
+                heads.clone(),
+                "exit".into(),
+                credential,
+                Err("offline".into())
+            ),
+            Err(LeasedPushError::Unknown(_))
+        ));
+        let mut moved = unchanged.clone();
+        moved.insert("main".into(), "other".into());
+        assert!(matches!(
+            settle_exited_push(heads.clone(), "exit".into(), credential, Ok(moved)),
+            Err(LeasedPushError::Unknown(_))
+        ));
+        assert!(matches!(
+            settle_exited_push(
+                heads.clone(),
+                "exit".into(),
+                "connection lost",
+                Ok(unchanged)
+            ),
+            Err(LeasedPushError::Unknown(_))
+        ));
+        let landed = HashMap::from([
+            ("main".into(), "landing".into()),
+            ("source".into(), "landing".into()),
+        ]);
+        assert_eq!(
+            settle_exited_push(heads.clone(), "exit".into(), credential, Ok(landed)),
+            Ok(heads)
+        );
     }
 
     /// A store whose `source` branch is published with real work and then
@@ -2258,6 +2425,26 @@ mod tests {
     #[serial_test::serial(jj)]
     fn an_unrecorded_atomic_landing_moves_both_refs_on_origin_only() {
         let Some(fx) = landing_fixture() else { return };
+        // Fetch and push can address different repositories. Confirmation must
+        // read the one that received the landing, not the empty fetch remote.
+        let fetch_origin = TempDir::new().unwrap();
+        git(fetch_origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        git(
+            fx.project.path(),
+            &[
+                "config",
+                "remote.origin.pushurl",
+                &fx.origin.path().to_string_lossy(),
+            ],
+        );
+        git(
+            fx.project.path(),
+            &[
+                "config",
+                "remote.origin.url",
+                &fetch_origin.path().to_string_lossy(),
+            ],
+        );
         fx.unmove_bookmarks();
         let heads = publish_landing_atomic_unrecorded(
             &fx.jj,

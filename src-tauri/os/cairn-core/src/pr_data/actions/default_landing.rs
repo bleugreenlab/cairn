@@ -184,7 +184,7 @@ impl OriginRead {
 }
 
 /// What pushing a folded landing to origin's target did.
-enum Publish {
+pub(super) enum Publish {
     /// Origin accepted it. `unconfirmed` carries why the read-back did not
     /// complete; the publication happened regardless.
     Accepted { unconfirmed: Option<String> },
@@ -197,6 +197,84 @@ enum Publish {
     Refused(String),
     /// Origin may or may not hold it.
     Unknown(String),
+}
+
+/// How a publication origin did not accept settles.
+pub(super) struct Unaccepted {
+    /// What the attempt's journal records.
+    pub(super) outcome: PublicationOutcome,
+    /// Only an unknown outcome keeps the landing pinned, for recovery.
+    pub(super) keeps_pin: bool,
+    /// What the merge reports.
+    pub(super) result: Result<Attempt, String>,
+}
+
+impl Publish {
+    /// What a leased push's error comes to. Only `Unknown` leaves origin in
+    /// doubt; every other error is definitive and nothing was published.
+    pub(super) fn of_push_error(
+        publication: &Publication,
+        error: crate::jj::LeasedPushError,
+    ) -> Self {
+        match error {
+            crate::jj::LeasedPushError::Unknown(error) => Self::Unknown(error),
+            crate::jj::LeasedPushError::TargetMoved { observed, .. } => Self::TargetMoved {
+                error: format!(
+                    "target moved: origin's `{}` is {}, not the prepared {}; nothing was pushed",
+                    publication.target_branch,
+                    observed.as_deref().unwrap_or("<absent>"),
+                    publication.expected_old
+                ),
+                observed,
+            },
+            error => Self::Refused(error.to_string()),
+        }
+    }
+
+    /// The settlement of a publication of `source` as `commit` onto `target`
+    /// that origin did not accept, or, for an accepted one, `Err` with why its
+    /// read-back did not complete.
+    pub(super) fn unaccepted(
+        self,
+        source: &str,
+        target: &str,
+        commit: &str,
+    ) -> Result<Unaccepted, Option<String>> {
+        Ok(match self {
+            Self::Accepted { unconfirmed } => return Err(unconfirmed),
+            Self::TargetMoved { observed, error } => {
+                log::info!("landing: {error}; reading origin and preparing again");
+                Unaccepted {
+                    outcome: PublicationOutcome::TargetMoved { observed },
+                    keeps_pin: false,
+                    result: Ok(Attempt::OriginMoved),
+                }
+            }
+            // Definitive refusals settle now, rather than blocking subsequent
+            // merges behind an indeterminate attempt awaiting recovery.
+            Self::Refused(error) => Unaccepted {
+                result: Err(format!(
+                    "Refusing to merge `{source}` into `{target}`: {error}. Nothing was published."
+                )),
+                outcome: PublicationOutcome::Refused(error),
+                keeps_pin: false,
+            },
+            // Origin may hold the landing, so the store keeps it: rolling
+            // back would report as unpublished a commit origin may have taken.
+            Self::Unknown(error) => Unaccepted {
+                result: Err(format!(
+                    "The landing of `{source}` as {commit} on `{target}` has an unknown outcome \
+                     ({error}). Origin may hold it. Refresh this PR to run landing recovery, then \
+                     read it again to confirm settlement. Do not merge again until recovery \
+                     records the landing or settles this attempt as definitely not landed. An \
+                     unreadable origin leaves the hold in place; restore access in the merge \
+                     host's context first."
+                )),
+                outcome: PublicationOutcome::Unknown(error),
+                keeps_pin: true,
+            },
+        })
+    }
 }
 
 /// Defer the store's object reclamation for as long as a landing holds it.
@@ -488,17 +566,7 @@ async fn publish_released(
                 },
             }
         }
-        Ok(Err(crate::jj::LeasedPushError::Unknown(error))) => Publish::Unknown(error),
-        Ok(Err(crate::jj::LeasedPushError::TargetMoved { observed, .. })) => Publish::TargetMoved {
-            error: format!(
-                "target moved: origin's `{}` is {}, not the prepared {}; nothing was pushed",
-                publication.target_branch,
-                observed.as_deref().unwrap_or("<absent>"),
-                publication.expected_old
-            ),
-            observed,
-        },
-        Ok(Err(error)) => Publish::Refused(error.to_string()),
+        Ok(Err(error)) => Publish::of_push_error(publication, error),
     };
     (guard, publish)
 }
@@ -1666,11 +1734,16 @@ pub(super) async fn publish_pinned(
     let _settling = super::merge_metrics::time(super::merge_metrics::Phase::Bookkeeping);
     // From here the store already holds the outcome: nothing below rolls the
     // operation log back. Only an unknown outcome keeps the pin, for recovery.
-    if !matches!(publish, Publish::Unknown(_)) {
-        unpin_landing(repo_path, journal.attempt_id);
-    }
-    let landed = match publish {
-        Publish::Accepted { unconfirmed } => {
+    let landed = match publish.unaccepted(source, &merge_context.target_branch, &commit) {
+        Ok(settled) => {
+            if !settled.keeps_pin {
+                unpin_landing(repo_path, journal.attempt_id);
+            }
+            outcome(settled.outcome).await;
+            settled.result
+        }
+        Err(unconfirmed) => {
+            unpin_landing(repo_path, journal.attempt_id);
             if let Some(error) = unconfirmed {
                 log::warn!(
                     "landing: origin accepted {commit} for `{}`, but recording it in the store \
@@ -1688,31 +1761,6 @@ pub(super) async fn publish_pinned(
                     _driving: driving,
                 }),
             })))
-        }
-        Publish::TargetMoved { observed, error } => {
-            outcome(PublicationOutcome::TargetMoved { observed }).await;
-            log::info!("landing: {error}; reading origin and preparing again");
-            Ok(Attempt::OriginMoved)
-        }
-        Publish::Refused(error) => {
-            // Definitive: origin is unchanged. Recovery proves that from
-            // origin and closes the attempt.
-            outcome(PublicationOutcome::Unknown(format!("refused: {error}"))).await;
-            Err(format!(
-                "Refusing to merge `{source}` into `{}`: {error}. Nothing was published.",
-                merge_context.target_branch
-            ))
-        }
-        Publish::Unknown(error) => {
-            // Origin may hold the landing, so the store keeps it: rolling
-            // back would report as unpublished a commit origin may have taken.
-            outcome(PublicationOutcome::Unknown(error.clone())).await;
-            Err(format!(
-                "The landing of `{source}` as {commit} on `{}` has an unknown outcome ({error}). \
-                 Origin may hold it; Cairn records it once recovery proves it. Do not merge \
-                 again until then.",
-                merge_context.target_branch
-            ))
         }
     };
     drop(guard);

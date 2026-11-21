@@ -158,6 +158,8 @@ struct PublicationDetail {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PublicationOutcome {
+    /// Definitive refusal: no publication happened and no recovery hold is needed.
+    Refused(String),
     /// The target no longer held the expected old commit, or the update was
     /// not a fast-forward. Nothing was published.
     TargetMoved { observed: Option<String> },
@@ -214,6 +216,7 @@ pub(super) async fn journal_publication_outcome(
     outcome: &PublicationOutcome,
 ) -> Result<(), String> {
     let (state, detail) = match outcome {
+        PublicationOutcome::Refused(reason) => ("failed", Some(format!("not landed: {reason}"))),
         PublicationOutcome::TargetMoved { observed } => (
             "failed",
             Some(format!(
@@ -1486,6 +1489,58 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// A credential failure the push settled as not landed travels the
+    /// landing's own classification and settlement: it unpins, journals a
+    /// terminal `failed`, leaves no unsettled landing, and tells the user
+    /// nothing was published. An unknown outcome, by contrast, keeps the hold.
+    #[tokio::test]
+    async fn a_definitive_publication_refusal_is_terminal_not_indeterminate() {
+        use super::super::default_landing::Publish;
+        use crate::jj::LeasedPushError;
+        let fx = fixture("landing-credential-refused.db").await;
+        let publication = publication();
+        fx.journal_intent(&publication).await;
+        assert!(has_unsettled_landing(&fx.db, "mr-gh").await);
+        let reason = "no GitHub credential in the merge host's context; origin unchanged";
+        let settle = |error| {
+            Publish::of_push_error(&publication, error)
+                .unaccepted("feature", "main", &publication.landing_commit)
+                .unwrap_or_else(|_| panic!("a push error is never an accepted publication"))
+        };
+        let unknown = settle(LeasedPushError::Unknown(reason.into()));
+        assert!(unknown.keeps_pin);
+        assert!(matches!(unknown.outcome, PublicationOutcome::Unknown(_)));
+        let refused = settle(LeasedPushError::CredentialUnavailable(reason.into()));
+        assert!(!refused.keeps_pin);
+        assert_eq!(refused.outcome, PublicationOutcome::Refused(reason.into()));
+        assert_eq!(
+            refused.result.err().as_deref(),
+            Some(
+                format!(
+                    "Refusing to merge `feature` into `main`: {reason}. Nothing was published."
+                )
+                .as_str()
+            )
+        );
+        let attempt = MergeAttemptJournal {
+            attempt_id: "attempt-1",
+            project_id: "proj-gh",
+            merge_request_id: "mr-gh",
+            job_id: fx.job,
+            target_ref: "refs/heads/main",
+            source_ref: "refs/heads/feature",
+            policy_json: "{}",
+        };
+        journal_publication_outcome(&fx.db, &attempt, &publication, &refused.outcome)
+            .await
+            .unwrap();
+        assert_eq!(fx.journal_states().await, vec!["executing", "failed"]);
+        assert!(!has_unsettled_landing(&fx.db, "mr-gh").await);
+        assert!(fx.text(
+            "SELECT detail FROM merge_attempt_events WHERE attempt_id = 'attempt-1' AND sequence = 2"
+        ).await.unwrap().contains("not landed: no GitHub credential"));
     }
 
     fn gate(fact: &str, field: &str, value: &str) -> TriggerClause {
