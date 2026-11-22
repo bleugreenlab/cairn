@@ -7127,6 +7127,10 @@ pub struct LearnedResourceEstimate {
 /// occupancy for its slot. No wire field or meaning changes: an older executor
 /// supplies the same occupancy and the runner names unavailable slots as gaps.
 ///
+/// cairn/6793 does not move the number. Reclamation watchdog classification
+/// changes only executor-local logging; an older peer reads identical messages
+/// and fields and gets no wire semantics wrong.
+///
 /// cairn/7165 does not move the number. An executor re-runs its
 /// build-prerequisite script and its `rust` toolchain probe on every Ready
 /// and every tool-refresh interval instead of once per process, and sends
