@@ -1088,16 +1088,22 @@ fn insert_bound_relay_context(pool: &Fleet) {
     );
 }
 
-/// A machine's per-item reports for an agent's run batch reach that
-/// batch's live control, so the rebase hold can name the item running; a
-/// report for a request with no live batch here changes nothing.
+/// Overlapping remote item reports update the live batch from placement to
+/// parallel execution, then the remaining item, and finally settlement.
 #[tokio::test]
 async fn a_run_batch_item_report_marks_the_item_running_on_its_live_control() {
     use crate::mcp::handlers::run::detached::{self, BatchProgress};
     let dir = tempfile::tempdir().unwrap();
     let orch = test_orchestrator(dir.path()).await;
     let request_id = uuid::Uuid::new_v4().to_string();
-    let _live = detached::LiveBatch::claim_for_test(&request_id);
+    let live = detached::LiveBatch::claim_for_test(&request_id);
+    let _claimed = orch.fleet.claim_job_command_for_test(&request_id, "job", 1);
+    assert_eq!(
+        detached::live_progress(&orch, &request_id)
+            .unwrap()
+            .describe(0),
+        "placed on `local`; it has not reported per-item progress"
+    );
     orch.fleet.runner_contexts.lock().unwrap().insert(
         "run-batch-context".into(),
         RunnerContextEntry::new(
@@ -1120,18 +1126,53 @@ async fn a_run_batch_item_report_marks_the_item_running_on_its_live_control() {
             &orch,
             RunnerCallback::ProcessItemStarted {
                 runner_context_id: "run-batch-context".into(),
-                stream_id: "tool-1:2".into(),
+                stream_id: "tool-1:0".into(),
             },
         )
         .await;
     assert!(
         matches!(
             detached::live_progress(&orch, &request_id),
-            Some(BatchProgress::Running { index: 2, .. })
+            Some(BatchProgress::Running {
+                index: 0,
+                total: 1,
+                ..
+            })
         ),
         "{:?}",
         detached::live_progress(&orch, &request_id)
     );
+    orch.fleet
+        .handle_runner_callback(
+            &orch,
+            RunnerCallback::ProcessItemStarted {
+                runner_context_id: "run-batch-context".into(),
+                stream_id: "tool-1:2".into(),
+            },
+        )
+        .await;
+    assert!(matches!(
+        detached::live_progress(&orch, &request_id),
+        Some(BatchProgress::Parallel { running: 2, .. })
+    ));
+    orch.fleet
+        .handle_runner_callback(
+            &orch,
+            RunnerCallback::ProcessItemCompleted {
+                runner_context_id: "run-batch-context".into(),
+                stream_id: "tool-1:0".into(),
+                succeeded: true,
+                exit_code: Some(0),
+                timed_out: false,
+                duration_ms: 1_000,
+                result: None,
+            },
+        )
+        .await;
+    assert!(matches!(
+        detached::live_progress(&orch, &request_id),
+        Some(BatchProgress::Running { index: 2, .. })
+    ));
     orch.fleet
         .handle_runner_callback(
             &orch,
@@ -1146,13 +1187,17 @@ async fn a_run_batch_item_report_marks_the_item_running_on_its_live_control() {
             },
         )
         .await;
-    assert!(
-        !matches!(
-            detached::live_progress(&orch, &request_id),
-            Some(BatchProgress::Running { .. })
-        ),
-        "a finished item is no longer reported running"
+    assert!(matches!(
+        detached::live_progress(&orch, &request_id),
+        Some(BatchProgress::Placed { .. })
+    ));
+    live.begin_settling_for_test();
+    assert_eq!(
+        detached::live_progress(&orch, &request_id),
+        Some(BatchProgress::Settling)
     );
+    drop(live);
+    assert_eq!(detached::live_progress(&orch, &request_id), None);
 }
 
 #[test]

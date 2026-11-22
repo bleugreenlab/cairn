@@ -7240,11 +7240,17 @@ pub struct LearnedResourceEstimate {
 ///
 /// cairn/5457 does not move the number. No frame, variant or field changes.
 /// The runner now also reads the `ProcessItemStarted` and
-/// `ProcessItemCompleted` callbacks of an agent's run batch, which every
-/// executor already sends to any batch that names a runner context, to show
-/// which item is running; and cancelling one run batch sends the existing
-/// `Cancel` for its request. What a runner gets wrong talking to an older
-/// executor: nothing.
+/// `ProcessItemCompleted` callbacks of an agent's run batch to show which
+/// item is running; and cancelling one run batch sends the existing `Cancel`
+/// for its request. Executors originally sent item callbacks only for
+/// sequential batches; parallel reporting is completed by cairn/7202.
+///
+/// cairn/7202 does not move the number. Parallel batches now send the same
+/// existing item callbacks as sequential batches, including single-item
+/// batches, when a runner context is named. No frame, variant or field changes.
+/// An older executor may omit parallel item progress; the runner reports only
+/// that per-item progress has not been reported, not that nothing is running.
+/// Batch execution, cancellation and final results remain unchanged.
 ///
 /// cairn/6596 does not move the number. No frame, variant or field changes.
 /// The runner now ends a connection superseded by a newer generation of the

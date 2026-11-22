@@ -212,6 +212,11 @@ impl LiveBatch {
     pub(crate) fn claim_for_test(request_id: &str) -> Self {
         Self::claim(&super::BatchControl::with_request_id(request_id, false))
     }
+
+    #[cfg(test)]
+    pub(crate) fn begin_settling_for_test(&self) {
+        assert!(live_control(&self.0).unwrap().begin_settling());
+    }
 }
 
 /// The control of a batch whose task is running in this process.
@@ -283,7 +288,7 @@ pub(crate) enum BatchProgress {
         total: usize,
         since_ms: i64,
     },
-    /// A machine has it and has not reported an item running.
+    /// A machine has it, but it has not reported per-item progress.
     Placed { on: String },
     /// Its task is alive here but no machine holds it: between placement
     /// attempts.
@@ -329,7 +334,7 @@ impl BatchProgress {
                 elapsed(*since_ms)
             ),
             Self::Placed { on } => {
-                format!("placed on `{on}`, which has not yet reported an item running")
+                format!("placed on `{on}`; it has not reported per-item progress")
             }
             Self::InRunner => {
                 "between placement attempts; no machine holds it right now".to_string()
