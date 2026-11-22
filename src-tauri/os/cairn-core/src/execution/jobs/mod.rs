@@ -15,7 +15,6 @@ pub use cairn_workflow::effects::types::WakeCause;
 use crate::agent_process::stream::TranscriptEvent;
 use crate::config::{self, agents as config_agents, ConfigResult};
 use crate::db_records::{db_job_from_row, DbJob, DbRecipeNode, JOB_COLUMNS};
-use crate::execution::advancement::format_resolved_inputs;
 use crate::execution::step_behavior::resolve_node_behavior;
 use crate::models::{
     AgentConfig, AgentSnapshot, ExecutionSnapshot, Job, JobStatus, Model, OutputSchema,
@@ -126,6 +125,7 @@ mod team_admission_lifecycle;
 pub(crate) use persistence::prepare_session_for_test;
 mod slash_commands;
 mod snapshots;
+mod stale_plan;
 mod status;
 mod turns;
 mod workflow;

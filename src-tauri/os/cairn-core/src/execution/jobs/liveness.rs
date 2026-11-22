@@ -24,8 +24,8 @@
 //! [`Liveness`] is the reading of the first and third; the policy of what to do
 //! about it (continue, report, count, render) belongs to each caller.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::agent_process::process::AgentProcessState as ProcessState;
 use crate::orchestrator::Orchestrator;
@@ -170,17 +170,50 @@ pub(crate) struct WorkObserver {
     boot_at: i64,
 }
 
-impl WorkObserver {
-    /// Read this host's launch evidence in acquisition order, then its owed
-    /// advances. Admission rows and the outbox are runner-local, so they come
-    /// from this host's own database whichever database the jobs live in.
-    pub(crate) async fn read(orch: &Orchestrator) -> Result<Self, String> {
-        let claimed_jobs = orch.claimed_launch_job_ids();
+/// A live, non-owning source for projections whose rebuild outlives a request.
+/// It observes afresh on every read without keeping the runner or its caches alive.
+pub(crate) struct WorkObserverSource {
+    db: Weak<crate::db::DbState>,
+    processes: Weak<ProcessState>,
+    claims: Weak<Mutex<HashMap<String, String>>>,
+    boot_at: i64,
+}
+
+impl WorkObserverSource {
+    pub(crate) fn new(
+        db: Weak<crate::db::DbState>,
+        processes: Weak<ProcessState>,
+        claims: Weak<Mutex<HashMap<String, String>>>,
+        boot_at: i64,
+    ) -> Self {
+        Self {
+            db,
+            processes,
+            claims,
+            boot_at,
+        }
+    }
+
+    pub(crate) async fn read(&self) -> Result<WorkObserver, String> {
+        let db = self.db.upgrade().ok_or("work observer database is gone")?;
+        let processes = self
+            .processes
+            .upgrade()
+            .ok_or("work observer processes are gone")?;
+        let claims = self
+            .claims
+            .upgrade()
+            .ok_or("work observer launch claims are gone")?;
+        let claimed_jobs = claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         // One connection for both durable facts: this read runs under the
         // admission lock, where each extra checkout is a wait every decision
         // queued behind it shares.
-        let (admitted_runs, advancing_executions) = orch
-            .db
+        let (admitted_runs, advancing_executions) = db
             .local
             .read(|conn| {
                 Box::pin(async move {
@@ -195,13 +228,22 @@ impl WorkObserver {
             })
             .await
             .map_err(|error| format!("failed to read the launches and advances owed: {error}"))?;
-        Ok(Self {
-            processes: Some(orch.process_state.clone()),
+        Ok(WorkObserver {
+            processes: Some(processes),
             claimed_jobs: Arc::new(claimed_jobs),
             admitted_runs: Arc::new(admitted_runs),
             advancing_executions: Arc::new(advancing_executions),
-            boot_at: orch.boot_at,
+            boot_at: self.boot_at,
         })
+    }
+}
+
+impl WorkObserver {
+    /// Read this host's launch evidence in acquisition order, then its owed
+    /// advances. Admission rows and the outbox are runner-local, so they come
+    /// from this host's own database whichever database the jobs live in.
+    pub(crate) async fn read(orch: &Orchestrator) -> Result<Self, String> {
+        orch.work_observer_source().read().await
     }
 
     /// An observation that sees no process, no launch and no owed advance.

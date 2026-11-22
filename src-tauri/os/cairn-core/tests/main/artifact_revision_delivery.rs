@@ -177,7 +177,7 @@ async fn planner_writes_and_confirms(orch: &Orchestrator, content: &str) {
 }
 
 async fn launch(db: &Arc<LocalDb>, job_id: &str) -> String {
-    compose_launch_inputs(db.clone(), job_id.to_string())
+    compose_launch_inputs(db.clone(), job_id.to_string(), None)
         .await
         .expect("launch inputs compose")
         .0

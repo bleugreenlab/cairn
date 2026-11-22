@@ -95,6 +95,7 @@ pub(super) fn deliver_prepared_warm_continuation(
         None,
     )?;
     pending_launch_turn.adopted();
+    super::stale_plan::confirm_delivered(orch, turn_id, run_id);
     Ok(())
 }
 
@@ -1815,6 +1816,16 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<JobPreparation, 
         Err(CoordinateRefusal::Failed(error)) => return Err(error),
     };
 
+    // A branch's plan comparison starts at its live fork point with the base,
+    // which a restart or adopted work leaves behind the archival base commit.
+    // The bookmark exists by now, minted or not; a branchless job sits on its
+    // base.
+    let plan_base = match branch.as_deref() {
+        Some(branch) => Some(run_db_borrowed(super::stale_plan::live_fork_point(
+            &owning_db, job_id, &store, branch,
+        ))),
+        None => base_commit.clone().map(Ok),
+    };
     run_db(update_job_coordinate(
         owning_db.clone(),
         job_id.to_string(),
@@ -1956,8 +1967,18 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<JobPreparation, 
     create_initial_turn(orch, &turn_id, &session_id, job_id)?;
 
     // ---- Resolve inputs + build prompt ----------------------------------
-    let (mut prompt, artifact_schema_info) =
-        run_db(compose_launch_inputs(owning_db.clone(), job_id.to_string()))?;
+    let (mut prompt, artifact_schema_info, plan_notice_base) =
+        run_db_borrowed(compose_launch_inputs(
+            owning_db.clone(),
+            job_id.to_string(),
+            plan_base.map(|start| (store.as_path(), start)),
+        ))?;
+    if let Some(base) = plan_notice_base {
+        let _ = run_db_borrowed(async {
+            super::stale_plan::record_pending_notice(&owning_db, &turn_id, &base).await;
+            Ok(())
+        });
+    }
     // Provenance rides in the opening prompt rather than a side channel: it is
     // the one piece of context a successor must not be able to miss, and this is
     // the event a rebuilt or compacted session re-reads.
@@ -2021,18 +2042,48 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<JobPreparation, 
 /// The record is what lets a revision written after launch reach the job as a
 /// diff against exactly the version it holds (`execution::artifact_revisions`).
 /// Failing to write it costs only that later notice, never the launch.
+///
+/// The third value is the base a completed plan comparison measured against,
+/// for the caller to record as pending on the launch's turn; it becomes the
+/// job's freshness checkpoint only when that turn reaches a process.
 pub async fn compose_launch_inputs(
     db: Arc<LocalDb>,
     job_id: String,
-) -> Result<(String, Option<crate::models::OutputSchemaInfo>), String> {
+    plan_coordinate: Option<(&Path, Result<String, String>)>,
+) -> Result<
+    (
+        String,
+        Option<crate::models::OutputSchemaInfo>,
+        Option<String>,
+    ),
+    String,
+> {
     let job = load_job(db.clone(), job_id.clone(), "Job not found").await?;
+    let ships_pr = super::stale_plan::ships_pr(&db, &job).await;
     let (inputs, schema) = resolve_inputs_and_schema(db.clone(), job).await?;
+    let plan_error = ships_pr.as_ref().err().cloned();
+    let plan_coordinate = plan_coordinate.filter(|_| ships_pr.unwrap_or(false));
     if let Err(error) =
         crate::execution::artifact_revisions::record_launch_inputs(&db, &job_id, &inputs).await
     {
         log::warn!("[prepare_job] job {job_id}: {error}");
     }
-    Ok((format_resolved_inputs(&inputs), schema))
+    let (mut prompt, compared) = super::stale_plan::format_launch_inputs(
+        &db,
+        &inputs,
+        plan_coordinate
+            .as_ref()
+            .map(|(store, start)| (*store, start)),
+    )
+    .await;
+    let notice_base = match plan_coordinate {
+        Some((_, Ok(start))) if compared => Some(start),
+        _ => None,
+    };
+    if let Some(error) = plan_error {
+        prompt.push_str(&format!("\n\nPlan freshness could not be checked: {error}. Re-read the plan's named files before relying on it."));
+    }
+    Ok((prompt, schema, notice_base))
 }
 
 // ============================================================================
@@ -4400,10 +4451,22 @@ fn continue_job_launch_locked_inner(
         .as_ref()
         .is_some_and(|ctx| ctx.suppress_self_suspend_note);
     let artifact_handoff_note = artifact_handoff_resume_note(owning_db.clone(), job_id)?;
+    let plan_note = run_db_borrowed(async {
+        Ok(super::stale_plan::resume_notice(
+            orch,
+            owning_db.clone(),
+            &job,
+            project_path.as_deref(),
+            &turn_id,
+        )
+        .await)
+    })
+    .unwrap_or(None);
     let resume_notes: Vec<String> = [
         (suppress_user_event && !suppress_self_suspend_note)
             .then(|| RESUME_AFTER_SELF_SUSPEND_NOTE.to_string()),
         artifact_handoff_note,
+        plan_note,
         restart_note,
     ]
     .into_iter()
@@ -4725,6 +4788,7 @@ fn continue_job_launch_locked_inner(
         stdin_event.emit();
         // The warm agent now holds the prompt these pushes rode in on.
         stamped_pushes.delivered();
+        super::stale_plan::confirm_delivered(orch, &turn_id, &run_id);
         true
     } else {
         // Durable admission is now the launch owner. It may remain queued, and
@@ -11166,13 +11230,23 @@ mod tests {
     /// A second start that waited on the launch lock behind the first's
     /// preparation finds that launch and does nothing. Preparing again would be
     /// refused at the initial turn, and failing that start fails the winner.
+    ///
+    /// The winner is PlanBuild's builder under a confirmed plan the base moved
+    /// under, so the same real store also proves the plan-freshness seed: the
+    /// launch names the planned file the base changed and not the one it left
+    /// alone; an unmoved base, a version older than the written-commit column,
+    /// and a failed lookup each say so without the warning. Re-entry measures
+    /// to the live fork point of the branch with its base, never the builder's
+    /// own head or the archival `jobs.base_commit`. Evidence repeats until the
+    /// turn carrying it reaches a process, and then not again for that base.
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial(jj)]
     async fn a_duplicate_start_behind_a_prepared_launch_leaves_it_alone() {
-        let Some((_project, orch)) = job_about_to_prepare("prepare-duplicate-start").await else {
+        let Some((project, orch)) = job_about_to_prepare("prepare-duplicate-start").await else {
             return;
         };
         let db = orch.db.local.clone();
+        let (written, moved) = builder_under_a_plan_the_base_moved_under(&project, &db).await;
 
         let winner = prepared(super::prepare_job(&orch, "j").unwrap());
         match super::prepare_job(&orch, "j").unwrap() {
@@ -11212,6 +11286,386 @@ mod tests {
                 .as_deref(),
             Some("running")
         );
+
+        // ---- Plan freshness, on the same store ----
+        const WARNING: &str = "The base moved";
+        let short = |commit: &str| commit[..12].to_string();
+        // The freshness line(s) name commits; the embedded plan body names none.
+        let line_naming = |text: &str, commit: &str| -> String {
+            text.lines()
+                .find(|line| line.contains(&short(commit)))
+                .unwrap_or_else(|| panic!("no line names {commit}: {text}"))
+                .to_string()
+        };
+        assert_eq!(
+            db.query_opt_text("SELECT base_commit FROM jobs WHERE id='j'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(moved.as_str()),
+            "the premise: the builder starts at the moved base"
+        );
+        let prompt = &winner.prompt;
+        assert!(
+            prompt.contains("Edit `b.rs`"),
+            "the plan is embedded: {prompt}"
+        );
+        let notice = &prompt[prompt.find(WARNING).expect("the base-moved warning")..];
+        assert!(notice.contains("v1"), "{notice}");
+        assert!(notice.contains(&short(&written)), "{notice}");
+        assert!(notice.contains(&short(&moved)), "{notice}");
+        assert!(notice.contains("1 of the 2"), "{notice}");
+        assert!(notice.contains("`a.rs`"), "{notice}");
+        assert!(notice.contains("cairn/42 change A"), "{notice}");
+        assert!(
+            !notice.contains("b.rs"),
+            "the unchanged planned file: {notice}"
+        );
+        let winner_turn = winner.turn_id.clone();
+        drop(winner);
+        let checked = || {
+            let db = db.clone();
+            async move {
+                db.query_opt_text("SELECT plan_checked_base_commit FROM jobs WHERE id='j'", ())
+                    .await
+                    .unwrap()
+            }
+        };
+        let pending = |turn: String| {
+            let db = db.clone();
+            async move {
+                db.query_opt_text(
+                    "SELECT plan_notice_base_commit FROM turns WHERE id=?1",
+                    params![turn],
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(
+            pending(winner_turn.clone()).await.as_deref(),
+            Some(moved.as_str()),
+            "the launch turn carries the base its notice measured against"
+        );
+        assert_eq!(
+            checked().await,
+            None,
+            "composing a launch is not delivering it"
+        );
+
+        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, project.path());
+        let compose = |start: String| {
+            let (db, store) = (db.clone(), store.clone());
+            async move {
+                super::compose_launch_inputs(
+                    db,
+                    "j".to_string(),
+                    Some((store.as_path(), Ok(start))),
+                )
+                .await
+                .expect("launch inputs compose")
+                .0
+            }
+        };
+        let set_written = |commit: Option<String>| {
+            let db = db.clone();
+            async move {
+                db.execute(
+                    "UPDATE artifacts SET written_at_commit = ?1 WHERE id = 'a-plan'",
+                    params![commit],
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        // An unmoved base: one line naming the written commit, no warning.
+        let unmoved = compose(written.clone()).await;
+        assert!(!unmoved.contains(WARNING), "{unmoved}");
+        let line = line_naming(&unmoved, &written);
+        assert!(line.contains("none") && !line.contains("a.rs"), "{line}");
+
+        // A version stored before the column: a ceiling counted from the
+        // planner's recorded base, never presented as the written commit.
+        set_written(None).await;
+        let unrecorded = compose(moved.clone()).await;
+        assert!(!unrecorded.contains(WARNING), "{unrecorded}");
+        let line = line_naming(&unrecorded, &written);
+        assert!(
+            line.contains("no recorded written-commit provenance"),
+            "{line}"
+        );
+        assert!(
+            line.contains("1 commits since the planner's recorded branch base"),
+            "{line}"
+        );
+        assert!(line.contains("may have advanced since writing"), "{line}");
+        assert!(line.contains("not recorded"), "{line}");
+
+        // A failed lookup is a visible diagnostic and the launch still prepares.
+        set_written(Some(ABSENT_COMMIT.to_string())).await;
+        db.execute_script(
+            "UPDATE runs SET status='live' WHERE job_id='j';
+             UPDATE turns SET state='complete' WHERE job_id='j';",
+        )
+        .await
+        .unwrap();
+        let relaunch = prepared(
+            super::prepare_job(&orch, "j")
+                .expect("a failed freshness lookup never fails preparation"),
+        );
+        let prompt = &relaunch.prompt;
+        assert!(prompt.contains("could not be checked"), "{prompt}");
+        assert!(!prompt.contains(WARNING), "{prompt}");
+        assert!(prompt.contains("Edit `a.rs`"), "{prompt}");
+        let (relaunch_turn, relaunch_run) = (relaunch.turn_id.clone(), relaunch.run_id.clone());
+        drop(relaunch);
+        assert_eq!(
+            pending(relaunch_turn.clone()).await,
+            None,
+            "a failed comparison is never pending delivery"
+        );
+        assert_eq!(checked().await, None);
+
+        // Re-entry: the plan was written at the base the builder carries and
+        // the builder's own commit edits `a.rs`. Its own work is not the base
+        // moving, though a range ending at its head would say it was.
+        set_written(Some(moved.clone())).await;
+        const OWN_BRANCH: &str = "agent/p-1-builder-own";
+        git(project.path(), &["checkout", "-q", "-b", OWN_BRANCH]);
+        std::fs::write(project.path().join("a.rs"), "the builder's edit\n").unwrap();
+        git(
+            project.path(),
+            &["commit", "-q", "-am", "the builder's own edit"],
+        );
+        let own_head = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+        git(project.path(), &["checkout", "-q", "main"]);
+        import_project_store_locked(&orch, &db, "p", &jj, &store, project.path(), "test import")
+            .unwrap();
+        assert_eq!(
+            crate::jj::bookmark_commit(&jj, &store, OWN_BRANCH).as_deref(),
+            Some(own_head.as_str()),
+        );
+        // The archival base is left stale at `written`: re-entry must not
+        // resolve against it.
+        db.execute(
+            "UPDATE jobs SET branch = ?1, base_commit = ?2 WHERE id = 'j'",
+            params![OWN_BRANCH, written.as_str()],
+        )
+        .await
+        .unwrap();
+        let head_ended = compose(own_head).await;
+        assert!(
+            head_ended.contains(WARNING) && head_ended.contains("`a.rs`"),
+            "the discriminator: a head-ended range blames the base: {head_ended}"
+        );
+        let set_checked = |commit: Option<String>| {
+            let db = db.clone();
+            async move {
+                db.execute(
+                    "UPDATE jobs SET plan_checked_base_commit = ?1 WHERE id = 'j'",
+                    params![commit],
+                )
+                .await
+                .unwrap();
+            }
+        };
+        let (orch_ref, repository) = (&orch, project.path());
+        let resume = |turn: String| {
+            let db = db.clone();
+            async move {
+                let job = load_job(db.clone(), "j".to_string(), "Job not found")
+                    .await
+                    .unwrap();
+                super::super::stale_plan::resume_notice(orch_ref, db, &job, Some(repository), &turn)
+                    .await
+            }
+        };
+        // The launch's notice never reached a process: the next continuation
+        // on the same base repeats it, and so does one after that until a
+        // turn carrying it is taken by a process.
+        set_checked(None).await;
+        for turn in [winner_turn.clone(), relaunch_turn.clone()] {
+            let note = resume(turn.clone())
+                .await
+                .expect("undelivered evidence is repeated");
+            assert!(!note.contains(WARNING), "{note}");
+            assert!(note.contains(&short(&moved)), "{note}");
+            assert!(!note.contains("a.rs"), "{note}");
+            assert_eq!(note.lines().count(), 1, "{note}");
+            assert_eq!(pending(turn).await.as_deref(), Some(moved.as_str()));
+            assert_eq!(checked().await, None, "composition does not deliver");
+        }
+        // A warm process that overtook the relaunch binds and publishes its
+        // turn, then the send fails: publication is not receipt, so the
+        // evidence stays pending and the next continuation repeats it.
+        let session = db
+            .query_opt_text(
+                "SELECT session_id FROM runs WHERE id=?1",
+                params![relaunch_run.as_str()],
+            )
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        let overtaken = crate::storage::PreparedOrdinaryLaunch {
+            resume_json: None,
+            request_id: "req-overtaken".into(),
+            job_id: "j".into(),
+            run_id: relaunch_run.clone(),
+            session_id: session.clone(),
+            turn_id: relaunch_turn.clone(),
+            execution_id: "e".into(),
+            prompt: "the relaunch prompt".into(),
+            reason: crate::models::TurnStartReason::FollowUp,
+            session_start: crate::storage::PreparedSessionStart::New {
+                session_id: session,
+            },
+            model: String::new(),
+            agent_config: serde_json::Value::Null,
+            output_schema: None,
+            runtime_capability: serde_json::from_value(serde_json::json!({"class":"dedicated_process","lane":"lane","host_requirement":{"requirement":"resident_on","host_kind":"runner"},"claim":{"resident_process_units":1,"server_instance_key":null,"logical_stream_units":1,"estimated_memory_bytes":null},"supports_warm_reuse":true})).unwrap(),
+            provider_account_id: None,
+            identity_override: None,
+            origin: crate::storage::LaunchOrigin::Background,
+            created_at: 1,
+        };
+        assert!(
+            super::deliver_prepared_warm_continuation(&orch, &db, &relaunch_run, &overtaken, "p")
+                .is_err(),
+            "no process holds the run, so the warm send fails"
+        );
+        assert_eq!(checked().await, None, "a failed send delivers nothing");
+        assert!(resume(winner_turn.clone()).await.is_some());
+        // Receipt: the call each handoff seam makes once its backend took the
+        // prompt (a cold session start or a warm send).
+        super::super::stale_plan::confirm_delivered(&orch, &relaunch_turn, &relaunch_run);
+        assert_eq!(checked().await.as_deref(), Some(moved.as_str()));
+        assert_eq!(
+            resume(winner_turn.clone()).await,
+            None,
+            "a delivered base is not repeated"
+        );
+
+        // The builder was last told at `written`, and the base change to
+        // `a.rs` has since been carried onto its branch. The archival base
+        // still says `written`; only the live fork point finds the change.
+        set_written(Some(written.clone())).await;
+        set_checked(Some(written.clone())).await;
+        let note = resume(winner_turn.clone())
+            .await
+            .expect("a newly carried base gets its freshness evidence");
+        assert!(note.contains(WARNING), "{note}");
+        assert!(note.contains("`a.rs`"), "{note}");
+        assert!(note.contains("cairn/42 change A"), "{note}");
+        assert!(note.contains(&short(&moved)), "{note}");
+        assert!(!note.contains("the builder's own edit"), "{note}");
+        assert!(!note.contains("b.rs"), "{note}");
+        assert_eq!(checked().await.as_deref(), Some(written.as_str()));
+        super::super::stale_plan::confirm_delivered_on(&db, &winner_turn)
+            .await
+            .unwrap();
+        assert_eq!(checked().await.as_deref(), Some(moved.as_str()));
+        assert_eq!(
+            resume(winner_turn).await,
+            None,
+            "the next continuation after delivery hears nothing"
+        );
+    }
+
+    /// Make the fixture's job PlanBuild's builder, fed by a completed planner
+    /// whose confirmed plan v1 names `a.rs` and `b.rs` and was written at
+    /// `written`; `main` then advances to `moved` by changing `a.rs` only.
+    /// Returns `(written, moved)`.
+    async fn builder_under_a_plan_the_base_moved_under(
+        project: &TempDir,
+        db: &Arc<crate::storage::LocalDb>,
+    ) -> (String, String) {
+        std::fs::write(project.path().join("a.rs"), "a\n").unwrap();
+        std::fs::write(project.path().join("b.rs"), "b\n").unwrap();
+        git(project.path(), &["add", "-A"]);
+        git(project.path(), &["commit", "-q", "-m", "plan base"]);
+        let written = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(project.path().join("a.rs"), "a moved\n").unwrap();
+        git(
+            project.path(),
+            &["commit", "-q", "-am", "cairn/42 change A"],
+        );
+        let moved = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+
+        let recipe = crate::models::RecipeFile::from_yaml(include_str!(
+            "../../../../../packs/core/recipes/planbuild.yaml"
+        ))
+        .unwrap()
+        .into_recipe(None, Some("p".to_string()));
+        let agent_node = |agent: &str| {
+            recipe
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.agent_config
+                        .as_ref()
+                        .and_then(|config| config.agent_config_id.as_deref())
+                        == Some(agent)
+                })
+                .unwrap()
+                .id
+                .clone()
+        };
+        let (planner, builder) = (agent_node("planner"), agent_node("build"));
+        let snapshot = crate::models::ExecutionSnapshot::new(
+            crate::models::RecipeSnapshot {
+                id: recipe.id.clone(),
+                name: recipe.name.clone(),
+                description: recipe.description.clone(),
+                trigger: recipe.trigger.clone(),
+                nodes: recipe.nodes.clone(),
+                edges: recipe.edges.clone(),
+            },
+            Default::default(),
+            Default::default(),
+            crate::models::TriggerContext {
+                issue_id: Some("i".to_string()),
+                project_id: "p".to_string(),
+                trigger_type: crate::models::TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+        )
+        .to_json()
+        .unwrap();
+        let plan = serde_json::json!({
+            "title": "Plan",
+            "content": "1. Edit `a.rs`.\n2. Edit `b.rs`.",
+        })
+        .to_string();
+        db.execute(
+            "UPDATE executions SET snapshot = ?1 WHERE id = 'e'",
+            params![snapshot.as_str()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE jobs SET recipe_node_id = ?1, uri_segment = 'builder' WHERE id = 'j'",
+            params![builder.as_str()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO jobs (id, execution_id, recipe_node_id, project_id, issue_id, status, uri_segment, node_name, base_commit, created_at, updated_at)
+             VALUES ('jp', 'e', ?1, 'p', 'i', 'complete', 'planner', 'Planner', ?2, 1, 1)",
+            params![planner.as_str(), written.as_str()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at, written_at_commit)
+             VALUES ('a-plan', 'jp', 'plan', 1, ?1, 1, 'plan', 1, 1, ?2)",
+            params![plan.as_str(), written.as_str()],
+        )
+        .await
+        .unwrap();
+        (written, moved)
     }
 
     /// A warm process keeps its run `live` with no turn active. That run does not

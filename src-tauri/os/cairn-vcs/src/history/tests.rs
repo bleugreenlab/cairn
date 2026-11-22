@@ -69,6 +69,7 @@ async fn fixture() -> Fixture {
     std::fs::write(path.join("dir/c.txt"), "c\n").unwrap();
     let f1 = commit_all(path, "f1: add c");
     std::fs::write(path.join("dir/c.txt"), "c edited\n").unwrap();
+    std::fs::write(path.join("dir/new.txt"), "added\n").unwrap();
     let f2 = commit_all(path, "f2: edit c");
     git(path, &["checkout", "-q", "main"]);
     git(
@@ -238,6 +239,46 @@ async fn a_path_filter_skips_commits_that_do_not_touch_the_path() {
         .await
         .unwrap();
     assert_eq!(ids(&b), vec![f.c1.as_str(), f.c0.as_str()]);
+
+    let report = planned_path_changes(
+        f.dir.path(),
+        &f.c1,
+        &f.c2,
+        "Edit `a.txt:2:3` and file:b.txt. Also `missing.rs`.",
+        LIMIT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.named_files, vec!["a.txt", "b.txt"]);
+    assert_eq!(report.range_commit_count, 1);
+    assert_eq!(report.written_commit.commit_id, f.c1);
+    assert_eq!(report.written_commit.committer_time, 1767225600);
+    assert_eq!(report.changed_files.len(), 1);
+    assert_eq!(report.changed_files[0].path, "a.txt");
+    assert_eq!(report.changed_files[0].commits[0].commit_id, f.c2);
+    assert_eq!(report.changed_files[0].omitted_commits, 0);
+    let unchanged = planned_path_changes(f.dir.path(), &f.c2, &f.c2, "`a.txt`", LIMIT)
+        .await
+        .unwrap();
+    assert!(unchanged.changed_files.is_empty());
+    assert_eq!(unchanged.range_commit_count, 0);
+    let absent = planned_path_changes(f.dir.path(), &f.c0, &f.merge, "file:dir/", LIMIT)
+        .await
+        .unwrap();
+    assert!(
+        absent.named_files.is_empty(),
+        "directory did not exist when written"
+    );
+    assert_eq!(absent.range_commit_count, 5);
+    let directory =
+        planned_path_changes(f.dir.path(), &f.f1, &f.f2, "file:dir/ and `c.txt`", LIMIT)
+            .await
+            .unwrap();
+    assert_eq!(directory.named_files, vec!["dir/c.txt", "dir/new.txt"]);
+    assert_eq!(directory.changed_files.len(), 2);
+    assert_eq!(directory.changed_files[0].commits[0].commit_id, f.f2);
+    assert_eq!(directory.changed_files[1].path, "dir/new.txt");
+    assert_eq!(directory.changed_files[1].commits[0].commit_id, f.f2);
 }
 
 #[tokio::test]
@@ -341,4 +382,32 @@ async fn indexed_containment_distinguishes_descendants_siblings_and_missing_obje
         contains(path, &"f".repeat(40), &fx.merge).await,
         Err(HistoryError::UnknownCommit(_))
     ));
+}
+
+#[test]
+fn planned_paths_parse_coordinates_and_resolve_exact_or_unique_suffix() {
+    let tokens = planned_tokens(
+        "`a.rs:12:4` file:src/ `not code here` https://example.org `../bad.rs` `foo()`",
+    );
+    assert_eq!(tokens, BTreeSet::from(["a.rs".into(), "src".into()]));
+    let files = BTreeSet::from([
+        "a.rs".into(),
+        "src/a.rs".into(),
+        "src/b.rs".into(),
+        "other/b.rs".into(),
+        "nested/unique/c.rs".into(),
+    ]);
+    assert_eq!(
+        resolve_planned_files(&BTreeSet::from(["a.rs".into()]), &files),
+        vec!["a.rs"]
+    );
+    assert!(resolve_planned_files(&BTreeSet::from(["b.rs".into()]), &files).is_empty());
+    assert_eq!(
+        resolve_planned_files(&BTreeSet::from(["unique".into()]), &files),
+        vec!["nested/unique/c.rs"]
+    );
+    assert_eq!(
+        resolve_planned_files(&BTreeSet::from(["src".into(), "src/a.rs".into()]), &files),
+        vec!["src/a.rs", "src/b.rs"]
+    );
 }

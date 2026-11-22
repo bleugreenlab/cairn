@@ -680,9 +680,9 @@ pub(super) fn executions_census_sql(n: usize) -> String {
     ))
 }
 
-/// The census of each execution in `execution_ids` that has one, a started
-/// execution whose job its thread's bound holds included. Three queries per
-/// [`IN_LIST_CHUNK`] executions, however many a list shows.
+/// The census of each execution in `execution_ids` that has one, including
+/// started executions with job holds. Three queries per [`IN_LIST_CHUNK`]
+/// executions, plus a batched launch-hold projection.
 pub async fn census_for_executions_conn(
     conn: &crate::storage::TrackedConnection,
     execution_ids: &[String],
@@ -702,6 +702,64 @@ pub async fn census_for_executions_conn(
             out.insert(execution, census);
         }
     }
+    let mut launch_censuses = HashMap::<String, ExecutionGateCensus>::new();
+    // Release is one-way: a launch-side cap can still own a pending builder
+    // after the execution's authored gates have released.
+    for chunk in execution_ids.chunks(IN_LIST_CHUNK) {
+        let sql = format!(
+            concat!(
+                "SELECT e.id, COALESCE(j.node_name, j.recipe_node_id, j.id), supply_hold.boundary_source, supply_hold.observed_text,
+                        supply_hold.created_at, supply_hold.resume_gate,
+                        supply_hold.launch_attempts, supply_hold.updated_at
+                 FROM executions e JOIN issues i ON i.id = e.issue_id
+                 JOIN jobs j ON j.execution_id = e.id
+                 JOIN provider_limit_holds supply_hold ON supply_hold.job_id = j.id
+                 WHERE e.id IN ({}) AND i.merged_at IS NULL AND i.closed_at IS NULL AND ",
+                cairn_db::live_execution_sql!(),
+                " AND ", cairn_db::supply_hold_owns_job_sql!(),
+                " AND ", cairn_db::launch_held_execution_sql!(),
+                " ORDER BY supply_hold.created_at, supply_hold.id"
+            ), placeholders(chunk.len())
+        );
+        let mut rows = conn.query(&sql, bound_ids(chunk)).await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        while let Some(row) = rows.next().await? {
+            let source = row.text(2)?;
+            let standing = standing_for_hold(
+                &source,
+                row.opt_text(3)?.unwrap_or_else(|| source.clone()),
+                row.i64(4)?,
+                row.opt_text(5)?,
+                row.i64(6)?,
+                row.i64(7)?,
+                None,
+            );
+            let summary = format!("{} · {}", row.text(1)?, standing.line(now));
+            let queued = matches!(standing, FocusStanding::Queued { .. });
+            launch_censuses
+                .entry(row.text(0)?)
+                .and_modify(|census| {
+                    census.summary.push_str("; ");
+                    census.summary.push_str(&summary);
+                    census.queued &= queued;
+                })
+                .or_insert(ExecutionGateCensus {
+                    held: true,
+                    wont_start: None,
+                    queued,
+                    summary,
+                    detail: None,
+                    gates: Vec::new(),
+                    release_override: None,
+                    evaluated_at: None,
+                    job_held: None,
+                });
+        }
+    }
+    out.extend(launch_censuses);
     Ok(out)
 }
 
@@ -1563,13 +1621,48 @@ pub(crate) enum FocusStanding {
 }
 
 impl FocusStanding {
+    pub(crate) fn view(&self, observed_at: i64) -> crate::models::FocusStandingView {
+        let kind = match self {
+            Self::Running => crate::models::FocusStandingKind::Running,
+            Self::Queued { .. } => crate::models::FocusStandingKind::Queued,
+            Self::HeldForPrs { .. } => crate::models::FocusStandingKind::HeldForPrs,
+            Self::Stopped | Self::Unknown { .. } => crate::models::FocusStandingKind::Stopped,
+            Self::NeedsOperator { .. } => crate::models::FocusStandingKind::NeedsOperator,
+            Self::Parked { .. } => crate::models::FocusStandingKind::Parked,
+        };
+        let (reentry, place) = match self {
+            Self::Queued { reentry, place, .. } => (*reentry, *place),
+            _ => (false, None),
+        };
+        let label = match self {
+            Self::Parked { cause } => format!("Parked · {}", cause.render_line(None)),
+            Self::HeldForPrs { reason } => format!(
+                "Held · thread {}",
+                reason.split(':').next().unwrap_or(reason)
+            ),
+            _ => self.render_line(None),
+        };
+        crate::models::FocusStandingView {
+            observed_at: Some(observed_at),
+            label: Some(label),
+            kind,
+            line: self.render_line(None),
+            reentry,
+            place,
+        }
+    }
+
     pub(crate) fn line(&self, now: i64) -> String {
+        self.render_line(Some(now))
+    }
+
+    fn render_line(&self, now: Option<i64>) -> String {
         match self {
             Self::Running => "Running".into(),
             Self::Stopped => "Stopped".into(),
             Self::Unknown { since } => format!(
-                "Unknown · reads running with no process on this host · its run last updated {} ago",
-                crate::clock::format_elapsed(now.saturating_sub(*since).max(0))
+                "Unknown · reads running with no process on this host · its run last updated {}",
+                standing_age(now, *since)
             ),
             Self::Queued {
                 reentry,
@@ -1579,19 +1672,19 @@ impl FocusStanding {
             } => {
                 let band = if *reentry { "re-entry" } else { "fresh" };
                 let place = place
-                    .map(|n| format!(" · {}", ordinal(n)))
+                    .map(|n| format!(" · {} in line", ordinal(n)))
                     .unwrap_or_default();
                 format!(
                     "Queued · {band}{place} · {reason} · held {}",
-                    crate::clock::format_elapsed(now.saturating_sub(*since).max(0))
+                    standing_age(now, *since)
                 )
             }
-            Self::HeldForPrs { reason } => format!("Held by open-PR bound · {reason}"),
+            Self::HeldForPrs { reason } => format!("Held by open-PR bound · thread {reason}"),
             Self::NeedsOperator { reason, since } => format!(
                 "Stopped · needs the operator · {reason} · {}",
-                crate::clock::format_elapsed(now.saturating_sub(*since).max(0))
+                standing_age(now, *since)
             ),
-            Self::Parked { cause } => format!("Parked · {}", cause.line(now)),
+            Self::Parked { cause } => format!("Parked · {}", cause.render_line(now)),
         }
     }
 
@@ -1618,6 +1711,33 @@ fn gate_phrase(gate: &str, attempts: i64) -> String {
             "a tool call has no recorded result; Continue resumes it".into()
         }
         other => format!("held ({other}); Continue resumes it"),
+    }
+}
+
+fn standing_for_hold(
+    source: &str,
+    reason: String,
+    since: i64,
+    gate: Option<String>,
+    attempts: i64,
+    updated: i64,
+    place: Option<usize>,
+) -> FocusStanding {
+    match (gate, source) {
+        (Some(gate), _) => FocusStanding::NeedsOperator {
+            reason: gate_phrase(&gate, attempts),
+            since: updated,
+        },
+        (None, "thread_focus") => FocusStanding::Queued {
+            reentry: true,
+            place,
+            reason,
+            since,
+        },
+        (None, "thread_open_prs") => FocusStanding::HeldForPrs { reason },
+        (None, _) => FocusStanding::Parked {
+            cause: FocusParkCause::Other(format!("held ({source}) · {reason}")),
+        },
     }
 }
 
@@ -1705,25 +1825,18 @@ pub(crate) async fn focus_standings_conn(
         let reason = row.opt_text(2)?.unwrap_or_else(|| source.clone());
         // A gated hold is out of the band (`cairn_db::reentry_band_hold_sql!`):
         // nothing but the operator releases it, so it takes no place in line.
-        let standing = match (row.opt_text(4)?, source.as_str()) {
-            (Some(gate), _) => FocusStanding::NeedsOperator {
-                reason: gate_phrase(&gate, row.i64(5)?),
-                since: row.i64(6)?,
-            },
-            (None, "thread_focus") => {
-                place += 1;
-                FocusStanding::Queued {
-                    reentry: true,
-                    place: Some(place),
-                    reason,
-                    since: row.i64(3)?,
-                }
-            }
-            (None, "thread_open_prs") => FocusStanding::HeldForPrs { reason },
-            (None, _) => FocusStanding::Parked {
-                cause: FocusParkCause::Other(format!("held ({source}) · {reason}")),
-            },
-        };
+        if source == "thread_focus" && row.opt_text(4)?.is_none() {
+            place += 1;
+        }
+        let standing = standing_for_hold(
+            &source,
+            reason,
+            row.i64(3)?,
+            row.opt_text(4)?,
+            row.i64(5)?,
+            row.i64(6)?,
+            Some(place),
+        );
         standings
             .entry(id)
             .and_modify(|old| {
@@ -1981,8 +2094,15 @@ pub(crate) enum FocusParkCause {
     Other(String),
 }
 
+fn standing_age(now: Option<i64>, since: i64) -> String {
+    match now {
+        Some(now) => crate::clock::format_elapsed(now.saturating_sub(since).max(0)),
+        None => format!("since {}", standing_stamp(since)),
+    }
+}
+
 impl FocusParkCause {
-    fn line(&self, now: i64) -> String {
+    fn render_line(&self, now: Option<i64>) -> String {
         match self {
             Self::Inactive => "no agent work in flight".into(),
             Self::PlanAwaiting {
@@ -1991,12 +2111,15 @@ impl FocusParkCause {
                 since,
                 deferred_until,
             } => {
-                let waited = now.saturating_sub(*since).max(0);
-                let age = crate::clock::format_elapsed(waited);
+                let waited = now.map(|now| now.saturating_sub(*since).max(0));
+                let age = standing_age(now, *since);
                 let head = format!("{what} awaiting {who}");
                 match deferred_until {
                     Some(until) => format!("{head} · deferred until {until} · {age}"),
-                    None if waited > crate::execution::approvals::STALE_AFTER_SECS => {
+                    None if waited.is_some_and(|waited| {
+                        waited > crate::execution::approvals::STALE_AFTER_SECS
+                    }) =>
+                    {
                         format!("{head} · {age} · stale")
                     }
                     None => format!("{head} · {age}"),
@@ -2008,15 +2131,61 @@ impl FocusParkCause {
                     .map(|n| format!("#{n}"))
                     .unwrap_or_else(|| "(number unavailable)".into())
             ),
-            Self::OperatorAwaiting { kind, who, since } => format!(
-                "{kind} awaiting {who} · {}",
-                crate::clock::format_elapsed(now.saturating_sub(*since).max(0))
-            ),
+            Self::OperatorAwaiting { kind, who, since } => {
+                format!("{kind} awaiting {who} · {}", standing_age(now, *since))
+            }
             Self::LanesAwaited => "awaiting lanes".into(),
             Self::SleepingUntil(deadline) => deadline
                 .map(|ms| format!("waiting until {}", standing_stamp(ms / 1000)))
                 .unwrap_or_else(|| "sleeping (deadline unavailable)".into()),
             Self::Other(reason) => reason.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod focus_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn source_timestamps_do_not_tick_cached_display_text() {
+        let standings = [
+            FocusStanding::Queued {
+                reentry: true,
+                place: None,
+                reason: "focus".into(),
+                since: 1,
+            },
+            FocusStanding::NeedsOperator {
+                reason: "resume".into(),
+                since: 1,
+            },
+            FocusStanding::Parked {
+                cause: FocusParkCause::PlanAwaiting {
+                    what: "plan".into(),
+                    who: "you".into(),
+                    since: 1,
+                    deferred_until: None,
+                },
+            },
+            FocusStanding::Parked {
+                cause: FocusParkCause::OperatorAwaiting {
+                    kind: "question".into(),
+                    who: "operator".into(),
+                    since: 1,
+                },
+            },
+        ];
+        for standing in standings {
+            let earlier = standing.view(100);
+            let later = standing.view(100_000);
+            assert_eq!(earlier.line, later.line);
+            assert_eq!(earlier.label, later.label);
+            assert_eq!(earlier.observed_at, Some(100));
+            assert_eq!(later.observed_at, Some(100_000));
+        }
+        let unranked =
+            standing_for_hold("thread_focus", "focus".into(), 1, None, 0, 1, None).view(100);
+        assert_eq!(unranked.place, None);
     }
 }

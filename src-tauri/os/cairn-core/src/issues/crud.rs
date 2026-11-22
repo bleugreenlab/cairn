@@ -243,6 +243,7 @@ fn issue_from_row(row: &cairn_db::turso::Row) -> DbResult<Issue> {
         parent_issue_id: row.opt_text(16)?,
         parent_thread_id: row.opt_text(17)?,
         held_executions: Vec::new(),
+        focus_standing: None,
         wont_start_executions: Vec::new(),
         labels: Vec::new(),
     })
@@ -285,6 +286,97 @@ async fn hydrate_issue_relations_with_observer(
         issue.held_executions = gated.held;
         issue.wont_start_executions = gated.wont_start;
         issue.labels = labels.remove(&issue.id).unwrap_or_default();
+    }
+    Ok(())
+}
+
+async fn hydrate_focus_standings_conn(
+    conn: &crate::storage::TrackedConnection,
+    issues: &mut [Issue],
+    observer: &crate::execution::jobs::liveness::WorkObserver,
+) -> DbResult<()> {
+    let mut standings = std::collections::HashMap::new();
+    let threads = issues
+        .iter()
+        .filter_map(|issue| issue.parent_thread_id.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+    for thread in threads {
+        standings.extend(
+            crate::execution::gates::census::focus_standings_conn(conn, thread, observer).await?,
+        );
+    }
+    let mut observations = std::collections::HashMap::new();
+    let standing_ids = standings.keys().cloned().collect::<Vec<_>>();
+    for chunk in standing_ids.chunks(cairn_db::sql::IN_LIST_CHUNK) {
+        let sql = format!(
+            "SELECT i.id, MAX(i.updated_at,
+                COALESCE((SELECT MAX(j.updated_at) FROM jobs j WHERE j.issue_id=i.id), 0),
+                COALESCE((SELECT MAX(t.updated_at) FROM jobs j JOIN turns t ON t.id=j.current_turn_id WHERE j.issue_id=i.id), 0),
+                COALESCE((SELECT MAX(h.updated_at) FROM jobs j JOIN provider_limit_holds h ON h.job_id=j.id WHERE j.issue_id=i.id), 0))
+             FROM issues i WHERE i.id IN ({})",
+            cairn_db::sql::placeholders(chunk.len())
+        );
+        let values = chunk
+            .iter()
+            .cloned()
+            .map(cairn_db::turso::Value::Text)
+            .collect::<Vec<_>>();
+        let mut rows = conn.query(&sql, values).await?;
+        while let Some(row) = rows.next().await? {
+            observations.insert(row.text(0)?, row.i64(1)?);
+        }
+    }
+    for issue in issues {
+        issue.focus_standing = standings.remove(&issue.id).map(|standing| {
+            standing.view(observations.remove(&issue.id).unwrap_or(issue.updated_at))
+        });
+    }
+    Ok(())
+}
+
+/// Enrich issue DTOs with this host's observed work, outside database-only CRUD.
+/// Reads the launch evidence before reading the jobs it may have claimed.
+pub async fn hydrate_focus_standings(
+    orch: &crate::orchestrator::Orchestrator,
+    issues: &mut [Issue],
+) -> Result<(), CairnError> {
+    if !issues.iter().any(|issue| issue.parent_thread_id.is_some()) {
+        return Ok(());
+    }
+    let observer = crate::execution::jobs::liveness::WorkObserver::read(orch)
+        .await
+        .map_err(CairnError::Internal)?;
+    let projects = issues
+        .iter()
+        .filter(|issue| issue.parent_thread_id.is_some())
+        .map(|issue| issue.project_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for project in projects {
+        let db = crate::projects::crud::owning_db(&orch.db, &project).await?;
+        let rows = issues
+            .iter()
+            .filter(|issue| issue.project_id == project)
+            .cloned()
+            .collect::<Vec<_>>();
+        let enriched = db
+            .read(|conn| {
+                let mut rows = rows.clone();
+                let observer = observer.clone();
+                Box::pin(async move {
+                    hydrate_focus_standings_conn(conn, &mut rows, &observer).await?;
+                    Ok(rows
+                        .into_iter()
+                        .map(|issue| (issue.id, issue.focus_standing))
+                        .collect::<std::collections::HashMap<_, _>>())
+                })
+            })
+            .await?;
+        for issue in issues
+            .iter_mut()
+            .filter(|issue| issue.project_id == project)
+        {
+            issue.focus_standing = enriched.get(&issue.id).cloned().flatten();
+        }
     }
     Ok(())
 }
@@ -691,11 +783,23 @@ pub async fn published_issue_list(
 pub(crate) async fn rebuild_issue_list(
     dbs: &crate::db::DbState,
     project_id: &str,
+    observer: &crate::execution::jobs::liveness::WorkObserver,
 ) -> Result<EncodedIssueList, String> {
     let db = crate::projects::crud::owning_db(dbs, project_id)
         .await
         .map_err(|error| error.to_string())?;
     let mut issues = list(&db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    issues = db
+        .read(|conn| {
+            let mut issues = issues.clone();
+            let observer = observer.clone();
+            Box::pin(async move {
+                hydrate_focus_standings_conn(conn, &mut issues, &observer).await?;
+                Ok(issues)
+            })
+        })
         .await
         .map_err(|error| error.to_string())?;
     crate::identity::display::resolve_author_displays(&dbs.local, &mut issues).await;

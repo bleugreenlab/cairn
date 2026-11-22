@@ -358,12 +358,18 @@ mod jobs_base_commit_sql_reach {
     ///   the original recorded cut to prove routed receipt consumption.
     /// - `execution/jobs/lifecycle.rs` — restart fixtures check that a refused
     ///   resume preserves the previously recorded anchor.
+    /// - `execution/jobs/stale_plan.rs` — a plan version stored before
+    ///   `artifacts.written_at_commit` existed has no written commit, so its
+    ///   freshness notice says so and counts commits from the planner's recorded
+    ///   base, labelled as an approximate ceiling. It names no changed files from
+    ///   it, and the comparison's end is the live fork point, never this column.
     const SANCTIONED_SQL_SITES: &[&str] = &[
         "os/cairn-core/src/effects/dag/delegation.rs",
         "os/cairn-workflow/src/advancement/job_creation.rs",
         "os/cairn-workflow/src/effects/dag/delegation.rs",
         "os/cairn-core/src/execution/jobs/persistence.rs",
         "os/cairn-core/src/execution/jobs/lifecycle.rs",
+        "os/cairn-core/src/execution/jobs/stale_plan.rs",
         "os/cairn-core/src/resources/mutations/dispatch/rebase/acceptance.rs",
         "os/cairn-core/src/resources/mutations/dispatch/rebase/acceptance/tests.rs",
         "os/cairn-core/src/orchestrator/base_advance.rs",

@@ -60,6 +60,9 @@ pub struct Issue {
     /// a gate that never comes true would look like an issue nobody started.
     #[serde(default)]
     pub held_executions: Vec<crate::HeldExecution>,
+    /// Canonical census standing for an open thread child, not a lifecycle status.
+    #[serde(default)]
+    pub focus_standing: Option<FocusStandingView>,
     /// This issue's gated, unreleased executions that can never start —
     /// superseded, or on an issue already merged or closed. Listed apart from
     /// `held_executions` so a dead execution never reads as one still waiting.
@@ -376,6 +379,66 @@ mod tests {
             assert!(
                 v.blocks_status_projection(),
                 "{v} should block status projection"
+            );
+        }
+    }
+}
+
+/// Display projection of the canonical focus census; prose is rendered server-side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusStandingView {
+    /// Latest source-row time in unix seconds, for independently published activity.
+    #[serde(default)]
+    pub observed_at: Option<i64>,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub kind: FocusStandingKind,
+    pub line: String,
+    pub reentry: bool,
+    pub place: Option<usize>,
+}
+
+/// Closed display vocabulary, not a stored status.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusStandingKind {
+    Running,
+    Queued,
+    HeldForPrs,
+    Stopped,
+    NeedsOperator,
+    Parked,
+}
+
+#[cfg(test)]
+mod focus_standing_wire_tests {
+    use super::*;
+
+    #[test]
+    fn focus_standing_wire_matches_gui_contract() {
+        for (kind, expected) in [
+            (FocusStandingKind::Running, "running"),
+            (FocusStandingKind::Queued, "queued"),
+            (FocusStandingKind::HeldForPrs, "held_for_prs"),
+            (FocusStandingKind::Stopped, "stopped"),
+            (FocusStandingKind::NeedsOperator, "needs_operator"),
+            (FocusStandingKind::Parked, "parked"),
+        ] {
+            let wire = serde_json::to_value(FocusStandingView {
+                observed_at: Some(100),
+                kind,
+                label: Some("cause".into()),
+                line: "cause".into(),
+                reentry: true,
+                place: Some(2),
+            })
+            .unwrap();
+            assert_eq!(
+                wire,
+                serde_json::json!({
+                    "observedAt": 100, "kind": expected, "label": "cause", "line": "cause", "reentry": true, "place": 2,
+                })
             );
         }
     }

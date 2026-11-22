@@ -15,8 +15,8 @@ pub use actions::{
     retry_pr_publish, validate_pr_publish_retry,
 };
 pub(crate) use cairn_workflow::advancement::{
-    cancel_job_conn, create_jobs_for_execution, create_jobs_for_execution_conn,
-    format_resolved_inputs, issue_settled, run_advancement_db,
+    cancel_job_conn, create_jobs_for_execution, create_jobs_for_execution_conn, issue_settled,
+    run_advancement_db,
 };
 pub use cairn_workflow::advancement::{
     create_jobs_for_new_nodes, find_ready_action_nodes, find_ready_condition_nodes,

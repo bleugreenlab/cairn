@@ -260,6 +260,28 @@ macro_rules! job_held_sql {
     };
 }
 
+/// A live execution held entirely at pending job launch, even after release.
+/// The hold table supplies candidate execution ids; runnable siblings exclude it.
+/// Expects execution alias `e`.
+#[macro_export]
+macro_rules! launch_held_execution_sql {
+    () => {
+        concat!(
+            "e.id IN (SELECT j.execution_id FROM provider_limit_holds supply_hold
+                       JOIN jobs j ON j.id = supply_hold.job_id
+                       WHERE supply_hold.kind = 'launch' AND ",
+            $crate::supply_hold_owns_job_sql!(),
+            ") AND ", $crate::live_execution_sql!(),
+            " AND EXISTS (SELECT 1 FROM issues held_issue WHERE held_issue.id = e.issue_id
+                           AND held_issue.merged_at IS NULL AND held_issue.closed_at IS NULL)
+              AND NOT EXISTS (SELECT 1 FROM jobs live_job WHERE live_job.execution_id = e.id
+                   AND (live_job.status = 'running' OR (live_job.status = 'pending'
+                        AND NOT EXISTS (SELECT 1 FROM provider_limit_holds h
+                            WHERE h.job_id = live_job.id AND h.state = 'active' AND h.kind = 'launch'))))"
+        )
+    };
+}
+
 /// True when hold `supply_hold` is an active launch or resume hold that still
 /// owns job `j`: a launch hold's job is still `pending`, a resume hold's job
 /// still rests on the refused head. A hold whose node moved on (an operator's

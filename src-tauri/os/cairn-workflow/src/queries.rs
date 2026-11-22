@@ -273,19 +273,23 @@ async fn list_all_executions_async(
     let project_id = filters.project_id.clone();
     let triggered_by = filters.triggered_by.clone();
 
-    // The `held` filter means WAITING: the projection also derives `held` for a
-    // gated execution that can never start (superseded, or its issue resolved),
-    // so the shared predicate narrows it in both the count and the page. It is
-    // a top-level conjunct, beside the gate list as the row source, so the held
-    // list walks the gates instead of scanning every execution; under the
-    // `OR` that would let one statement serve every filter, no source could
-    // drive it.
+    // Each waiting band supplies execution ids independently, so neither the
+    // gate source nor the launch-hold source is buried under an OR.
     let status_clause = if status.as_deref() == Some("held") {
         concat!(
-            "e.status = ?1 AND ",
+            "e.id IN (SELECT e.id FROM executions e WHERE ",
             cairn_db::gated_execution_source_sql!(),
             " AND ",
-            cairn_db::awaiting_release_sql!()
+            cairn_db::awaiting_release_sql!(),
+            " UNION SELECT e.id FROM executions e WHERE ",
+            cairn_db::launch_held_execution_sql!(),
+            ")"
+        )
+    } else if status.as_deref() == Some("running") {
+        concat!(
+            "e.status = ?1 AND NOT (",
+            cairn_db::launch_held_execution_sql!(),
+            ")"
         )
     } else {
         "(?1 IS NULL OR e.status = ?1)"
@@ -857,5 +861,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(all.total, 3, "won't-start rows are still listed under All");
+        exec(&db, "INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,lifecycle,released_at)
+                   VALUES('launch-held','r','open','proj-1','running',4,3,'canonical',4)").await;
+        exec(&db, "INSERT INTO jobs(id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at)
+                   VALUES('builder','launch-held','open','proj-1','builder','pending',4,4)").await;
+        exec(&db, "INSERT INTO provider_limit_holds(id,job_id,backend,boundary_source,kind,created_at,updated_at)
+                   VALUES('h','builder','claude','thread_open_prs','launch',4,4)").await;
+        let held_page = list_all_executions_async(&db, &held, 1, 0).await.unwrap();
+        assert_eq!(held_page.items[0].id, "launch-held");
+        assert_eq!(held_page.total, 2);
+        let running = ExecutionFilters {
+            status: Some("running".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_all_executions_async(&db, &running, 10, 0)
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+        exec(
+            &db,
+            "UPDATE provider_limit_holds SET state='resolved' WHERE id='h'",
+        )
+        .await;
+        assert_eq!(
+            list_all_executions_async(&db, &running, 10, 0)
+                .await
+                .unwrap()
+                .total,
+            1
+        );
     }
 }

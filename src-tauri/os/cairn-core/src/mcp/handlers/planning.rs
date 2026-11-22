@@ -479,7 +479,11 @@ async fn ask_questions_owned(
             crate::execution::gates::sweep::notify_gate_evidence_changed();
             let _ = services.emitter.emit(
                 "db-change",
-                serde_json::json!({"table": "ask_conditions", "action": "insert"}),
+                crate::notify::ask_condition_db_change(
+                    "insert",
+                    &ctx.job_id,
+                    Some(&ctx.project_id),
+                ),
             );
         }
 

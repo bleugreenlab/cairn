@@ -159,6 +159,8 @@ pub struct OrchestratorBuilder {
     thread_status_cache: Arc<generation_cache::ThreadStatusCache>,
     issue_status_cache: Arc<generation_cache::IssueStatusCache>,
     issue_list_cache: Arc<generation_cache::IssueListCache>,
+    issue_work_source:
+        Arc<std::sync::OnceLock<crate::execution::jobs::liveness::WorkObserverSource>>,
     operator_notifications_cache: Arc<generation_cache::OperatorNotificationsCache>,
     pending_deliveries_cache: Arc<generation_cache::PendingDeliveriesCache>,
     gate_inputs: Arc<generation_cache::GateInputGenerations>,
@@ -420,14 +422,20 @@ impl OrchestratorBuilder {
             },
         );
         let _ = pending_deliveries_cache_slot.set(Arc::downgrade(&pending_deliveries_cache));
+        let issue_work_source: Arc<
+            std::sync::OnceLock<crate::execution::jobs::liveness::WorkObserverSource>,
+        > = Arc::default();
+        let issue_source = issue_work_source.clone();
         let issue_list_cache = generation_cache::IssueListCache::new(
             "issue list projection",
             generation_cache::ISSUE_LIST_FLOOR,
             generation_cache::rebuild_with(move |project_id: String| {
                 let dbs = dbs.clone();
+                let source = issue_source.clone();
                 async move {
                     let dbs = dbs.upgrade().ok_or_else(runner_gone)?;
-                    crate::issues::crud::rebuild_issue_list(&dbs, &project_id).await
+                    let observer = source.get().ok_or_else(runner_gone)?.read().await?;
+                    crate::issues::crud::rebuild_issue_list(&dbs, &project_id, &observer).await
                 }
             }),
             announce("issue_list"),
@@ -486,6 +494,7 @@ impl OrchestratorBuilder {
             thread_status_cache,
             issue_status_cache,
             issue_list_cache,
+            issue_work_source,
             operator_notifications_cache,
             pending_deliveries_cache,
             gate_inputs,
@@ -1004,6 +1013,9 @@ impl OrchestratorBuilder {
             ),
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
         };
+        let _ = self
+            .issue_work_source
+            .set(orchestrator.work_observer_source());
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             // The sidebar caches rebuild on the runner's own runtime, whatever
             // thread or short-lived runtime the write that invalidates them
@@ -2778,6 +2790,17 @@ impl Orchestrator {
     /// Jobs currently admitted for launch but not yet registered as processes.
     /// Startup reconciliation snapshots these identities so it cannot cancel the
     /// pending turn of a launch this host accepted while recovery was running.
+    pub(crate) fn work_observer_source(
+        &self,
+    ) -> crate::execution::jobs::liveness::WorkObserverSource {
+        crate::execution::jobs::liveness::WorkObserverSource::new(
+            Arc::downgrade(&self.db),
+            Arc::downgrade(&self.process_state),
+            Arc::downgrade(&self.job_launch_claims),
+            self.boot_at,
+        )
+    }
+
     pub fn claimed_launch_job_ids(&self) -> std::collections::HashSet<String> {
         self.job_launch_claims
             .lock()

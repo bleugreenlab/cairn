@@ -189,9 +189,9 @@ const THREAD_STATUS_INPUT_TABLES: &[&str] = &[
 /// is the honest one. Author display reads `executor_enrollments` in the local
 /// database, which is equally project-agnostic and rare.
 ///
-/// Transcript tables are absent on purpose. Nothing an agent writes while it
-/// works changes an issue row until the work ends, and that end is an `issues`
-/// or `executions` write.
+/// Focus standings also read head turns, waits, job holds and approvals.
+/// Transcript events remain absent: token streaming changes no standing.
+/// The cadence coalesces transitions without freezing a released builder's hold.
 pub(crate) const ISSUE_LIST_INPUT_TABLES: &[&str] = &[
     "issues",
     "issue_labels",
@@ -201,6 +201,13 @@ pub(crate) const ISSUE_LIST_INPUT_TABLES: &[&str] = &[
     "execution_supersessions",
     "projects",
     "executor_enrollments",
+    "jobs",
+    "turns",
+    "agent_waits",
+    "provider_limit_holds",
+    "artifacts",
+    "ask_conditions",
+    "merge_requests",
 ];
 
 /// The tables the operator notification center derives its entries from.
@@ -3777,21 +3784,24 @@ mod tests {
             ("events", (true, false, false)),
             ("tenets", (true, false, false)),
             ("requests", (true, false, false)),
-            ("turns", (true, true, false)),
-            ("jobs", (false, false, false)),
+            ("turns", (true, true, true)),
+            ("jobs", (false, false, true)),
             ("prompts", (true, true, false)),
             ("permission_requests", (true, true, false)),
             ("runs", (true, true, false)),
             ("issues", (false, true, true)),
             ("executions", (false, true, true)),
-            ("merge_requests", (false, true, false)),
+            ("merge_requests", (false, true, true)),
             ("action_runs", (false, true, false)),
-            ("artifacts", (false, true, false)),
+            ("artifacts", (false, true, true)),
             ("issue_labels", (false, false, true)),
             ("execution_gates", (false, false, true)),
             ("execution_supersessions", (false, false, true)),
             ("check_result_cache", (false, false, false)),
             ("comments", (false, false, false)),
+            ("agent_waits", (false, false, true)),
+            ("provider_limit_holds", (false, false, true)),
+            ("ask_conditions", (false, false, true)),
         ];
         for (table, want) in expected {
             assert_eq!(advances(table), want, "{table}: (thread, issue, list)");

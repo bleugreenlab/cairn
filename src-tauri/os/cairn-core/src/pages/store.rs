@@ -385,6 +385,7 @@ async fn store_conn(
     writer: &PageWriter,
     payload: &Value,
     is_patch: bool,
+    written_at_commit: Option<&str>,
 ) -> DbResult<Result<StoredPage, String>> {
     let owner = match resolve_owner_conn(conn, address).await? {
         Ok(owner) => owner,
@@ -422,8 +423,8 @@ async fn store_conn(
     conn.execute(
         "INSERT INTO artifacts (
              id, job_id, artifact_type, schema_version, data, version,
-             parent_version_id, output_name, confirmed, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, 1, ?8, ?8)",
+             parent_version_id, output_name, confirmed, created_at, updated_at, written_at_commit
+         ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, 1, ?8, ?8, ?9)",
         params![
             id.as_str(),
             job_id.as_str(),
@@ -432,7 +433,8 @@ async fn store_conn(
             version,
             parent_version_id.as_deref(),
             output_name(&address.name).as_str(),
-            now
+            now,
+            written_at_commit
         ],
     )
     .await?;
@@ -493,12 +495,53 @@ pub(crate) async fn write_page(
         return Ok(format!("Would {verb} page {uri}"));
     }
 
+    // Thread pages have no producing node branch. A node draft is an artifact
+    // version too, and uses the same logical-store provenance as other outputs.
+    let written_at_commit = if address.thread_name().is_none() {
+        let (address_in, writer_in) = (address.clone(), writer.clone());
+        let job_id = db
+            .read(move |conn| {
+                let (address, writer) = (address_in.clone(), writer_in.clone());
+                Box::pin(async move {
+                    let owner = match resolve_owner_conn(conn, &address).await? {
+                        Ok(owner) => owner,
+                        Err(message) => return Ok(Err(message)),
+                    };
+                    if !may_write_conn(conn, &owner, &writer).await? {
+                        return Ok(Err(not_the_owner(&address)));
+                    }
+                    Ok(Ok(match owner {
+                        PageOwner::Node { job_id } => Some(job_id),
+                        PageOwner::Thread { .. } => None,
+                    }))
+                })
+            })
+            .await
+            .map_err(|error| format!("Failed to resolve the page's owner: {error}"))??;
+        match job_id {
+            Some(job_id) => crate::artifacts::written_at_commit(orch, &db, &job_id).await,
+            None => None,
+        }
+    } else {
+        None
+    };
     let (address_in, writer_in, payload_in) = (address.clone(), writer.clone(), payload.clone());
     let stored = db
         .write(move |conn| {
             let (address, writer, payload) =
                 (address_in.clone(), writer_in.clone(), payload_in.clone());
-            Box::pin(async move { store_conn(conn, &address, &writer, &payload, is_patch).await })
+            let written_at_commit = written_at_commit.clone();
+            Box::pin(async move {
+                store_conn(
+                    conn,
+                    &address,
+                    &writer,
+                    &payload,
+                    is_patch,
+                    written_at_commit.as_deref(),
+                )
+                .await
+            })
         })
         .await
         .map_err(|error| format!("Failed to store page: {error}"))??;

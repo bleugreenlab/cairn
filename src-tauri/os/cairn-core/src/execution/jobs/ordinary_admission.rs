@@ -779,6 +779,8 @@ fn start_stateless_now(
             "stateless process disappeared before prepared turn attachment".to_string()
         })?,
     )?;
+    // The spawned process holds the prompt, plan-freshness evidence included.
+    super::stale_plan::confirm_delivered(orch, &prepared.turn_id, &prepared.run_id);
     Ok(true)
 }
 
@@ -1608,6 +1610,9 @@ fn start_leased_inner(
             )?;
             pending_turn.adopted();
             *delivery = TurnDelivery::Unknown;
+            // The spawned process holds the prompt, plan-freshness evidence
+            // included.
+            super::stale_plan::confirm_delivered(orch, &snapshot.turn_id, &snapshot.run_id);
             crate::orchestrator::lifecycle::notify_watchdog_successor_started(
                 owning,
                 &snapshot.run_id,

@@ -641,6 +641,32 @@ async fn an_open_pr_bound_hold_releases_on_the_pass_after_a_merge_without_a_hint
     );
     let hold = launch_is_held(&env, "sj102").await;
     assert_eq!(hold.boundary_source, "thread_open_prs");
+    env.db
+        .execute("UPDATE executions SET released_at=1 WHERE id='se102'", ())
+        .await
+        .unwrap();
+    let issue = crate::issues::crud::get(&env.db, "si102")
+        .await
+        .unwrap()
+        .unwrap();
+    let standing = issue
+        .focus_standing
+        .expect("released child carries canonical standing");
+    assert!(matches!(
+        standing.kind,
+        crate::models::FocusStandingKind::HeldForPrs
+    ));
+    let census = env
+        .db
+        .read(|conn| {
+            Box::pin(async move {
+                super::census::census_for_executions_conn(conn, &["se102".into()]).await
+            })
+        })
+        .await
+        .unwrap();
+    assert!(census["se102"].held);
+    assert!(census["se102"].summary.contains("builder"));
     assert_eq!(
         hold.observed_text.as_deref(),
         Some("harness has 2/2 open PRs: 100, 101")

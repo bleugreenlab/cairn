@@ -9,6 +9,17 @@ use serde_json::{json, Value};
 use crate::models;
 use crate::storage::{run_db_blocking, LocalDb, RowExt};
 
+/// Build an ask-condition change in its owning job's scope.
+/// A workspace-owned job has no project; retain an explicit null in that case.
+pub fn ask_condition_db_change(action: &str, job_id: &str, project_id: Option<&str>) -> Value {
+    json!({
+        "table": "ask_conditions",
+        "action": action,
+        "jobId": job_id,
+        "projectId": project_id,
+    })
+}
+
 /// Build a project-scoped `issues` db-change payload.
 pub fn issue_db_change_ids(action: &str, issue_id: &str, project_id: Option<&str>) -> Value {
     json!({
@@ -1168,6 +1179,17 @@ pub fn job_presence_db_change(scope: &EventRunScope) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_condition_changes_preserve_project_and_workspace_scope() {
+        for project_id in [Some("project-1"), None] {
+            let payload = ask_condition_db_change("update", "job-1", project_id);
+            assert_eq!(payload["table"], "ask_conditions");
+            assert_eq!(payload["action"], "update");
+            assert_eq!(payload["jobId"], "job-1");
+            assert_eq!(payload.get("projectId"), Some(&json!(project_id)));
+        }
+    }
 
     fn scope() -> JobScope {
         JobScope {

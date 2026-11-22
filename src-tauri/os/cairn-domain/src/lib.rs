@@ -66,8 +66,8 @@ pub use context_tokens::{ContextTokenEventSnapshot, ContextTokenState};
 
 // Issue types
 pub use issue::{
-    Comment, CommentSource, CreateComment, CreateIssue, Issue, IssueAttention, IssueProgress,
-    IssueStatus, SidebarActiveIssue, UpdateIssue,
+    Comment, CommentSource, CreateComment, CreateIssue, FocusStandingKind, FocusStandingView,
+    Issue, IssueAttention, IssueProgress, IssueStatus, SidebarActiveIssue, UpdateIssue,
 };
 pub use label::{CreateLabel, Label, UpdateLabel};
 pub use post::{CreatePost, CreatePostComment, Post, PostCamp, PostComment, PostRouting};

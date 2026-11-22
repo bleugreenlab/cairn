@@ -1567,7 +1567,9 @@ async fn store_artifact(
     let artifact_type = artifact_type.to_string();
     let output_name = output_name.to_string();
     let db = crate::execution::routing::owning_db_for_job(&orch.db, &job_id).await?;
+    let written_at_commit = crate::artifacts::written_at_commit(orch, &db, &job_id).await;
     db.write(|conn| {
+        let written_at_commit = written_at_commit.clone();
         let job_id = job_id.clone();
         let data_json = data_json.clone();
         let artifact_type = artifact_type.clone();
@@ -1580,6 +1582,7 @@ async fn store_artifact(
                 &output_name,
                 &data_json,
                 confirmed,
+                written_at_commit.as_deref(),
             )
             .await
         })
@@ -1608,17 +1611,27 @@ pub(crate) async fn append_restored_artifact_versions(
                 .map_err(|e| format!("Failed to serialize artifact: {e}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let written_at_commit = crate::artifacts::written_at_commit(orch, &db, job_id).await;
     let owned_job_id = job_id.to_string();
     let stored = db
         .write(|conn| {
             let job_id = owned_job_id.clone();
             let encoded = encoded.clone();
+            let written_at_commit = written_at_commit.clone();
             Box::pin(async move {
                 let mut stored = Vec::with_capacity(encoded.len());
                 for (name, json, confirmed) in &encoded {
                     stored.push(
-                        insert_next_artifact_version(conn, &job_id, name, name, json, *confirmed)
-                            .await?,
+                        insert_next_artifact_version(
+                            conn,
+                            &job_id,
+                            name,
+                            name,
+                            json,
+                            *confirmed,
+                            written_at_commit.as_deref(),
+                        )
+                        .await?,
                     );
                 }
                 Ok(stored)
@@ -1660,6 +1673,7 @@ async fn insert_next_artifact_version(
     output_name: &str,
     data_json: &str,
     confirmed: bool,
+    written_at_commit: Option<&str>,
 ) -> Result<StoredArtifact, DbError> {
     let mut rows = conn
         .query(
@@ -1690,9 +1704,9 @@ async fn insert_next_artifact_version(
         "
         INSERT INTO artifacts (
             id, job_id, artifact_type, schema_version, data, version,
-            parent_version_id, output_name, confirmed, created_at, updated_at
+            parent_version_id, output_name, confirmed, created_at, updated_at, written_at_commit
         )
-        VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+        VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)
         ",
         params![
             artifact_id.as_str(),
@@ -1703,7 +1717,8 @@ async fn insert_next_artifact_version(
             parent_version_id.as_deref(),
             output_name,
             if confirmed { 1 } else { 0 },
-            now
+            now,
+            written_at_commit
         ],
     )
     .await?;
@@ -2284,7 +2299,8 @@ mod tests {
             let name = name.clone();
             let data = data.clone();
             Box::pin(async move {
-                super::insert_next_artifact_version(conn, &job_id, &name, &name, &data, false).await
+                super::insert_next_artifact_version(conn, &job_id, &name, &name, &data, false, None)
+                    .await
             })
         })
         .await
@@ -2470,6 +2486,142 @@ mod capture_tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn artifact_versions_keep_the_producing_bookmark_not_checkout_head() {
+        let (orch, db) = orch_with_db().await;
+        seed_call(&db, "j-call", "r-call", Some(score_contract())).await;
+        let checkout = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(checkout.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@cairn.local"]);
+        git(&["config", "user.name", "Cairn Test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "plan baseline"]);
+        let baseline = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "checkout ahead"]);
+        let checkout_head = git(&["rev-parse", "HEAD"]);
+        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, checkout.path());
+        crate::jj::ensure_project_store(&jj, &store, checkout.path()).unwrap();
+        crate::jj::create_bookmark_at(&jj, &store, "producer", &baseline).unwrap();
+        db.execute(
+            "UPDATE projects SET repo_path = ?1 WHERE id = 'p'",
+            params![checkout.path().to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+
+        // A producer without a branch still writes, with explicit unknown provenance.
+        let branchless =
+            super::store_artifact(&orch, "j-call", "notes", "notes", "{}".into(), true)
+                .await
+                .unwrap();
+        db.execute(
+            "UPDATE jobs SET branch = 'producer' WHERE id = 'j-call'",
+            (),
+        )
+        .await
+        .unwrap();
+        let v1 = super::store_artifact(&orch, "j-call", "plan", "plan", "{}".into(), false)
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE jobs SET uri_segment = 'builder', node_name = 'builder' WHERE id = 'j-call'",
+            (),
+        )
+        .await
+        .unwrap();
+        crate::pages::write_page(
+            &orch,
+            &crate::pages::PageAddress::parse("cairn://p/prj/7/1/builder/pages/sketch").unwrap(),
+            &crate::pages::PageWriter { job_id: "j-call".into() },
+            &json!({"title": "Sketch", "files": {"index.js": "export default function Page() { return null; }"}}),
+            false,
+            false,
+        ).await.unwrap();
+        crate::jj::set_bookmark_at(&jj, &store, "producer", &checkout_head).unwrap();
+        let v2 = super::store_artifact(&orch, "j-call", "plan", "plan", "{}".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            v2.parent_version_id.as_deref(),
+            Some(v1.artifact_id.as_str())
+        );
+        super::append_restored_artifact_versions(
+            &orch,
+            "j-call",
+            vec![("plan".into(), json!({}), true)],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            super::capture_call_structured_output(&orch, "r-call", json!({"score": 7}),)
+                .await
+                .unwrap()
+        );
+
+        let provenance = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT output_name, version, written_at_commit FROM artifacts \
+                     WHERE job_id = 'j-call' ORDER BY output_name, version",
+                            (),
+                        )
+                        .await?;
+                    let mut values = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        values.push((row.text(0)?, row.i64(1)?, row.opt_text(2)?));
+                    }
+                    Ok(values)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(branchless.version, 1);
+        assert_eq!(
+            provenance,
+            vec![
+                ("notes".into(), 1, None),
+                ("pages/sketch".into(), 1, Some(baseline.clone())),
+                ("plan".into(), 1, Some(baseline)),
+                ("plan".into(), 2, Some(checkout_head.clone())),
+                ("plan".into(), 3, Some(checkout_head.clone())),
+                ("return".into(), 1, Some(checkout_head)),
+            ]
+        );
+        db.execute("UPDATE jobs SET branch = 'missing' WHERE id = 'j-call'", ())
+            .await
+            .unwrap();
+        let unknown = super::store_artifact(&orch, "j-call", "plan", "plan", "{}".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(unknown.version, 4);
+        let commit = db
+            .query_opt_text(
+                "SELECT written_at_commit FROM artifacts WHERE job_id = ?1 AND output_name = ?2 AND version = ?3",
+                params!["j-call", "plan", 4],
+            )
+            .await
+            .unwrap();
+        assert_eq!(commit, None);
+        assert_eq!(artifact_count(&db, "j-call").await, 7);
     }
 
     #[tokio::test]

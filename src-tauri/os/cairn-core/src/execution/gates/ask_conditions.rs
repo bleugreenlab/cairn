@@ -359,7 +359,7 @@ pub async fn defer(
         })
         .await
         .map_err(|error| format!("failed to record the deferral: {error}"))?;
-    announce(orch, project_id.as_deref(), "insert");
+    announce(orch, &approval.job_id, project_id.as_deref(), "insert");
     // A clock deferral moves the sweep's next due instant.
     super::sweep::notify_gate_evidence_changed();
     Ok(format!(
@@ -369,14 +369,10 @@ pub async fn defer(
     ))
 }
 
-fn announce(orch: &Orchestrator, project_id: Option<&str>, action: &str) {
+fn announce(orch: &Orchestrator, job_id: &str, project_id: Option<&str>, action: &str) {
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({
-            "table": "ask_conditions",
-            "action": action,
-            "projectId": project_id,
-        }),
+        crate::notify::ask_condition_db_change(action, job_id, project_id),
     );
 }
 
@@ -491,7 +487,7 @@ async fn sweep_db(
                 continue;
             }
             report.fired.push((row.id.clone(), kind));
-            announce(orch, row.project_id.as_deref(), "update");
+            announce(orch, &row.job_id, row.project_id.as_deref(), "update");
             row.fired_kind = Some(kind.to_string());
             row.fired_reason = Some(reason);
             if kind == "cleared" {
@@ -599,7 +595,7 @@ async fn sweep_question_condition(
             return Ok(());
         }
         report.fired.push((row.id.clone(), kind));
-        announce(orch, row.project_id.as_deref(), "update");
+        announce(orch, &row.job_id, row.project_id.as_deref(), "update");
         row.fired_kind = Some(kind.to_string());
         row.fired_reason = Some(reason);
         if kind == "cleared" {
@@ -697,7 +693,7 @@ async fn deliver_question_foreclosure(
             if let Some(recipient) = recipient {
                 super::sweep::nudge_woken(orch, &recipient, "question moot_when foreclosed");
             }
-            announce(orch, row.project_id.as_deref(), "update");
+            announce(orch, &row.job_id, row.project_id.as_deref(), "update");
             Ok(true)
         }
     }
@@ -834,7 +830,7 @@ async fn deliver(
             if let Some(recipient) = recipient {
                 super::sweep::nudge_woken(orch, &recipient, "deferred approval");
             }
-            announce(orch, row.project_id.as_deref(), "update");
+            announce(orch, &row.job_id, row.project_id.as_deref(), "update");
             Ok(true)
         }
     }

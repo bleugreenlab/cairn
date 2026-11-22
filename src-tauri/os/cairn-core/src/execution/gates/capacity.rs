@@ -2339,6 +2339,7 @@ pub struct QueuedExecution {
     pub thread_name: Option<String>,
     pub seq: Option<i64>,
     pub held_since: i64,
+    pub reentry: bool,
     pub census: Option<crate::models::ExecutionGateCensus>,
 }
 
@@ -2469,6 +2470,7 @@ pub(crate) async fn fleet_order(orch: &Orchestrator) -> Result<Vec<FleetOrdered>
                                 thread_id: row.opt_text(10)?,
                                 thread_name: row.opt_text(7)?,
                                 held_since: row.opt_i64(8)?.unwrap_or(0),
+                                reentry: false,
                                 census: None,
                             },
                         ));
@@ -2559,6 +2561,49 @@ pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
             orch.sweep_pulse.stamp(&queued.execution_id, census);
         }
     }
+    // Job-side focus holds are released re-entries, not fresh gate rows.
+    // Show that front band without changing the fleet's fresh release order.
+    let mut reentries = Vec::new();
+    for db in orch.db.all_dbs().await {
+        let mut found = db.read(|conn| Box::pin(async move {
+            let mut rows = conn.query(concat!(
+                "SELECT e.id, e.issue_id, e.seq, i.number, i.title, p.id, p.key,
+                        t.id, t.name, supply_hold.created_at, supply_hold.observed_text
+                 FROM provider_limit_holds supply_hold JOIN jobs j ON j.id = supply_hold.job_id
+                 JOIN executions e ON e.id = j.execution_id JOIN issues i ON i.id = e.issue_id
+                 JOIN projects p ON p.id = i.project_id JOIN threads t ON t.id = i.parent_thread_id
+                 WHERE supply_hold.boundary_source = 'thread_focus'
+                 AND i.merged_at IS NULL AND i.closed_at IS NULL AND ",
+                 cairn_db::live_execution_sql!(), " AND ", cairn_db::reentry_band_hold_sql!(),
+                 " ORDER BY COALESCE(supply_hold.queue_key, supply_hold.created_at * 1000000), supply_hold.id"
+            ), ()).await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let reason = row.opt_text(10)?.unwrap_or_else(|| "thread focus".into());
+                out.push(QueuedExecution {
+                    execution_id: row.text(0)?, issue_id: row.opt_text(1)?, seq: row.opt_i64(2)?,
+                    issue_number: row.opt_i64(3)?, issue_title: row.opt_text(4)?,
+                    project_id: row.opt_text(5)?, project_key: row.opt_text(6)?,
+                    thread_id: row.opt_text(7)?, thread_name: row.opt_text(8)?,
+                    held_since: row.i64(9)?, reentry: true,
+                    census: Some(crate::models::ExecutionGateCensus {
+                        held: true, queued: true, wont_start: None, job_held: None,
+                        summary: super::census::FocusStanding::Queued {
+                            reentry: true, place: None, reason, since: row.i64(9)?,
+                        }.line(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_secs() as i64),
+                        detail: None, gates: Vec::new(), release_override: None, evaluated_at: None,
+                    }),
+                });
+            }
+            Ok(out)
+        })).await.map_err(|error| format!("failed to list focus re-entries: {error}"))?;
+        reentries.append(&mut found);
+    }
+    let mut seen = std::collections::HashSet::new();
+    reentries.retain(|row| seen.insert(row.execution_id.clone()));
+    reentries.append(&mut held);
+    let held = reentries;
     Ok(QueueView {
         in_progress: fleet.in_progress,
         limit: settings.max_concurrent_executions.max(1) as usize,
@@ -3090,6 +3135,10 @@ pub(crate) mod tests {
             held_launch(&env, number).await;
         }
         assert_eq!(fleet(&env).await, baseline, "held work holds no slot");
+        let held_census = census_of(&env, "se101").await.unwrap();
+        assert!(held_census.held);
+        assert!(held_census.summary.contains("builder"));
+        assert!(!held_census.queued);
 
         // One supply change asks all three, oldest first, under one count.
         assert!(fits(&env, 101, true).await, "the one free slot");

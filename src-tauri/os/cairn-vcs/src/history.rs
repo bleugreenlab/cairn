@@ -11,7 +11,7 @@
 //! jj-lib futures are not `Send`, so each query runs to completion on a
 //! dedicated thread, the same pattern [`crate::merge_base`] uses.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -355,63 +355,290 @@ pub async fn log(
     limit: Duration,
 ) -> Result<LogPage, HistoryError> {
     with_repo(repository_path, move |repo| async move {
-        let started = Instant::now();
-        let to = indexed_commit(repo.as_ref(), &query.to)?;
-        let mut expression = ResolvedRevsetExpression::commit(to).ancestors();
-        if let Some(from) = query.from.as_deref() {
-            let from = indexed_commit(repo.as_ref(), from)?;
-            expression = expression.minus(&ResolvedRevsetExpression::commit(from).ancestors());
-        }
-        // jj's virtual root is an ancestor of everything and is not a commit
-        // anyone made.
-        expression = expression.minus(&ResolvedRevsetExpression::root());
-        // The path filter is tested one commit at a time against the walk,
-        // not folded into the revset. A filtered revset (and its
-        // `containing_fn`) evaluates lazily inside one step, so a path that
-        // rarely or never matches would diff trees across the whole history
-        // with no point at which the deadline could be consulted. The test is
-        // the one jj's `files()` applies: the commit's tree against its
-        // parents' merged tree, restricted to the path.
-        let matcher = query
-            .path
-            .as_deref()
-            .map(repo_path)
-            .transpose()?
-            .flatten()
-            .map(|path| FilesetExpression::prefix_path(path).to_matcher());
-        let revset = expression
-            .evaluate(repo.as_ref())
-            .map_err(repository_error)?;
-        let mut stream = revset.stream();
-        let mut skipped = 0;
-        let mut entries = Vec::new();
-        let mut more = false;
-        while let Some(item) = stream.next().await {
-            check_deadline(started, limit)?;
-            let id = item.map_err(repository_error)?;
-            let commit = repo.store().get_commit(&id).map_err(repository_error)?;
-            if let Some(matcher) = &matcher {
-                let parent_tree = commit
-                    .parent_tree(repo.as_ref())
-                    .await
-                    .map_err(repository_error)?;
-                let tree = commit.tree();
-                let mut changes = parent_tree.diff_stream(&tree, matcher.as_ref());
-                if changes.next().await.is_none() {
-                    continue;
-                }
-            }
-            if skipped < query.offset {
-                skipped += 1;
+        log_in_repo(repo.as_ref(), query, Instant::now(), limit, false)
+            .await
+            .map(|(page, _)| page)
+    })
+    .await
+}
+
+async fn log_in_repo(
+    repo: &dyn Repo,
+    query: LogQuery,
+    started: Instant,
+    limit: Duration,
+    count_all: bool,
+) -> Result<(LogPage, usize), HistoryError> {
+    let to = indexed_commit(repo, &query.to)?;
+    let mut expression = ResolvedRevsetExpression::commit(to).ancestors();
+    if let Some(from) = query.from.as_deref() {
+        let from = indexed_commit(repo, from)?;
+        expression = expression.minus(&ResolvedRevsetExpression::commit(from).ancestors());
+    }
+    // jj's virtual root is an ancestor of everything and is not a commit
+    // anyone made.
+    expression = expression.minus(&ResolvedRevsetExpression::root());
+    // The path filter is tested one commit at a time against the walk,
+    // not folded into the revset. A filtered revset (and its
+    // `containing_fn`) evaluates lazily inside one step, so a path that
+    // rarely or never matches would diff trees across the whole history
+    // with no point at which the deadline could be consulted. The test is
+    // the one jj's `files()` applies: the commit's tree against its
+    // parents' merged tree, restricted to the path.
+    let matcher = query
+        .path
+        .as_deref()
+        .map(repo_path)
+        .transpose()?
+        .flatten()
+        .map(|path| FilesetExpression::prefix_path(path).to_matcher());
+    let revset = expression.evaluate(repo).map_err(repository_error)?;
+    let mut stream = revset.stream();
+    let mut skipped = 0;
+    let mut entries = Vec::new();
+    let mut more = false;
+    let mut total = 0;
+    while let Some(item) = stream.next().await {
+        check_deadline(started, limit)?;
+        let id = item.map_err(repository_error)?;
+        let commit = repo.store().get_commit(&id).map_err(repository_error)?;
+        if let Some(matcher) = &matcher {
+            let parent_tree = commit.parent_tree(repo).await.map_err(repository_error)?;
+            let tree = commit.tree();
+            let mut changes = parent_tree.diff_stream(&tree, matcher.as_ref());
+            if changes.next().await.is_none() {
                 continue;
             }
-            if entries.len() == query.limit {
-                more = true;
-                break;
-            }
-            entries.push(CommitInfo::of(&commit));
         }
-        Ok(LogPage { entries, more })
+        total += 1;
+        if skipped < query.offset {
+            skipped += 1;
+            continue;
+        }
+        if entries.len() == query.limit {
+            more = true;
+            if count_all {
+                continue;
+            }
+            break;
+        }
+        entries.push(CommitInfo::of(&commit));
+    }
+    Ok((LogPage { entries, more }, total))
+}
+
+/// Immutable evidence about the files named by a plan, not a prose notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedPathChanges {
+    pub written_commit: CommitInfo,
+    pub prepared_start_commit: String,
+    /// Commits in written..prepared, including when no path resolves.
+    pub range_commit_count: usize,
+    /// Deduplicated files from paths resolved at the written commit, including
+    /// changed files added beneath those resolved directories.
+    pub named_files: Vec<String>,
+    pub changed_files: Vec<PlannedFileChanges>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedFileChanges {
+    pub path: String,
+    /// Newest first, at most ten per file and forty across the report.
+    pub commits: Vec<CommitInfo>,
+    pub omitted_commits: usize,
+}
+
+fn planned_tokens(markdown: &str) -> BTreeSet<String> {
+    let mut candidates = Vec::new();
+    for (index, part) in markdown.split('`').enumerate() {
+        if index % 2 == 1 {
+            candidates.push(part);
+        }
+    }
+    for (index, _) in markdown.match_indices("file:") {
+        candidates.push(
+            markdown[index..]
+                .split(|c: char| {
+                    c.is_whitespace() || matches!(c, '`' | ')' | ']' | '>' | '"' | '\'')
+                })
+                .next()
+                .unwrap_or(""),
+        );
+    }
+    candidates
+        .into_iter()
+        .filter_map(normalize_planned_path)
+        .collect()
+}
+
+fn normalize_planned_path(token: &str) -> Option<String> {
+    let mut path = token
+        .trim()
+        .strip_prefix("file:")
+        .unwrap_or(token.trim())
+        .trim_end_matches([',', ';', '.'])
+        .trim_end_matches('/');
+    // Coordinates are suffixes, not part of the immutable object-tree path.
+    for _ in 0..2 {
+        if let Some((base, number)) = path.rsplit_once(':') {
+            if !number.is_empty() && number.bytes().all(|c| c.is_ascii_digit()) {
+                path = base;
+            }
+        }
+    }
+    let path = path.strip_prefix("./").unwrap_or(path);
+    if path.is_empty()
+        || path.contains(char::is_whitespace)
+        || path.contains(':')
+        || path.starts_with('/')
+        || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+        || !(token.trim().starts_with("file:")
+            || token.trim().ends_with('/')
+            || path.contains('/')
+            || path.contains('.'))
+    {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// Resolve exact paths before suffixes; ambiguous suffixes name nothing.
+fn resolve_planned_paths(tokens: &BTreeSet<String>, files: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut paths = files.clone();
+    for file in files {
+        let mut parent = file.as_str();
+        while let Some((prefix, _)) = parent.rsplit_once('/') {
+            paths.insert(prefix.to_string());
+            parent = prefix;
+        }
+    }
+    let mut named = BTreeSet::new();
+    for token in tokens {
+        let resolved = if paths.contains(token) {
+            Some(token.as_str())
+        } else {
+            let suffix = format!("/{token}");
+            let mut matches = paths.iter().filter(|path| path.ends_with(&suffix));
+            let first = matches.next();
+            if matches.next().is_some() {
+                None
+            } else {
+                first.map(String::as_str)
+            }
+        };
+        if let Some(path) = resolved {
+            // Preserve directory identity for additions after the written commit.
+            named.insert(if files.contains(path) {
+                path.to_string()
+            } else {
+                format!("{path}/")
+            });
+        }
+    }
+    named
+}
+
+fn expand_planned_paths(paths: &BTreeSet<String>, files: &BTreeSet<String>) -> Vec<String> {
+    files
+        .iter()
+        .filter(|file| {
+            paths
+                .iter()
+                .any(|path| *file == path || (path.ends_with('/') && file.starts_with(path)))
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+fn resolve_planned_files(tokens: &BTreeSet<String>, files: &BTreeSet<String>) -> Vec<String> {
+    expand_planned_paths(&resolve_planned_paths(tokens, files), files)
+}
+
+/// Compare the plan's immutable tree with the prepared start tree. No checkout,
+/// branch lookup, working-copy read, or subprocess participates in the answer.
+/// The deadline covers tree enumeration, differences and all history walks.
+pub async fn planned_path_changes(
+    repository_path: &Path,
+    written_at_commit: &str,
+    prepared_start_commit: &str,
+    markdown: &str,
+    limit: Duration,
+) -> Result<PlannedPathChanges, HistoryError> {
+    let written = written_at_commit.to_string();
+    let prepared = prepared_start_commit.to_string();
+    let tokens = planned_tokens(markdown);
+    with_repo(repository_path, move |repo| async move {
+        let started = Instant::now();
+        check_deadline(started, limit)?;
+        let from_id = indexed_commit(repo.as_ref(), &written)?;
+        let to_id = indexed_commit(repo.as_ref(), &prepared)?;
+        let from = repo
+            .store()
+            .get_commit(&from_id)
+            .map_err(repository_error)?;
+        let to = repo.store().get_commit(&to_id).map_err(repository_error)?;
+        let root = repo
+            .store()
+            .get_commit(repo.store().root_commit_id())
+            .map_err(repository_error)?;
+        let from_tree = from.tree();
+        let root_tree = root.tree();
+        let mut files = BTreeSet::new();
+        let mut entries = root_tree.diff_stream(&from_tree, &jj_lib::matchers::EverythingMatcher);
+        while let Some(entry) = entries.next().await {
+            check_deadline(started, limit)?;
+            entry.values.map_err(repository_error)?;
+            files.insert(entry.path.as_internal_file_string().to_string());
+        }
+        let named_paths = resolve_planned_paths(&tokens, &files);
+        let to_tree = to.tree();
+        let mut changes = from_tree.diff_stream(&to_tree, &jj_lib::matchers::EverythingMatcher);
+        let mut changed = BTreeSet::new();
+        while let Some(entry) = changes.next().await {
+            check_deadline(started, limit)?;
+            entry.values.map_err(repository_error)?;
+            changed.insert(entry.path.as_internal_file_string().to_string());
+        }
+        // Resolve at the written tree, then include additions under named directories.
+        files.extend(changed.iter().cloned());
+        let named_files = expand_planned_paths(&named_paths, &files);
+        let range_commit_count =
+            count_exclusive(repo.as_ref(), &to_id, &from_id, usize::MAX, started, limit)
+                .await?
+                .count;
+        let mut changed_files = Vec::new();
+        let mut remaining = 40;
+        for path in named_files.iter().filter(|path| changed.contains(*path)) {
+            let (page, count) = log_in_repo(
+                repo.as_ref(),
+                LogQuery {
+                    to: to_id.hex(),
+                    from: Some(from_id.hex()),
+                    path: Some(path.clone()),
+                    limit: remaining.min(10),
+                    offset: 0,
+                },
+                started,
+                limit,
+                true,
+            )
+            .await?;
+            remaining -= page.entries.len();
+            changed_files.push(PlannedFileChanges {
+                path: path.clone(),
+                omitted_commits: count - page.entries.len(),
+                commits: page.entries,
+            });
+        }
+        check_deadline(started, limit)?;
+        Ok(PlannedPathChanges {
+            written_commit: CommitInfo::of(&from),
+            prepared_start_commit: to_id.hex(),
+            range_commit_count,
+            named_files,
+            changed_files,
+        })
     })
     .await
 }
