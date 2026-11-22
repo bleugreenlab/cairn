@@ -9,6 +9,7 @@ pub mod delivery;
 pub mod pending;
 pub mod queued;
 pub mod render;
+pub(crate) mod reporters;
 pub mod side_channel;
 pub mod system;
 pub mod transcript;

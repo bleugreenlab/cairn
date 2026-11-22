@@ -357,6 +357,8 @@ impl CairnResource {
             | Self::Bug
             | Self::Rebuilds
             | Self::Rebuild { .. }
+            | Self::Reporters
+            | Self::Reporter { .. }
             | Self::Help
             | Self::WebSearch
             | Self::Mcp { .. } => None,
@@ -577,6 +579,8 @@ impl CairnResource {
             | Self::Bug
             | Self::Rebuilds
             | Self::Rebuild { .. }
+            | Self::Reporters
+            | Self::Reporter { .. }
             | Self::Help
             | Self::WebSearch
             | Self::Mcp { .. } => None,

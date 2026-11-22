@@ -290,6 +290,8 @@ impl CairnResource {
             Self::Bug => "Bug".to_string(),
             Self::Rebuilds => "Rebuild ledger".to_string(),
             Self::Rebuild { id } => workspace("Rebuild", Some(id)),
+            Self::Reporters => "Reporters".to_string(),
+            Self::Reporter { name } => workspace("Reporter", Some(name)),
             Self::Help => "Help".to_string(),
             Self::WebSearch => "Web search".to_string(),
             Self::Mcp { server, resource } => match (server, resource) {

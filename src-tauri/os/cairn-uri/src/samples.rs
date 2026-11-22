@@ -516,6 +516,8 @@ resource_samples! {
     Bug {} => Parser,
     Rebuilds {} => Parser,
     Rebuild { id: "rebuild-1".to_string() } => Parser,
+    Reporters {} => Parser,
+    Reporter { name: "main-cadence".to_string() } => Parser,
     Help {} => Parser,
     WebSearch {} => Parser,
     Mcp { server: Some("turso".to_string()), resource: Some("execute_query".to_string()) } => Parser,

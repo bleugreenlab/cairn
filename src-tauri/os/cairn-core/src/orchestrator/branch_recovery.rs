@@ -1358,11 +1358,12 @@ async fn announce(
                     orch,
                     db,
                     &thread_id,
-                    crate::messages::delivery::ThreadSender::Operator {
-                        name: "jj branch recovery",
+                    crate::messages::delivery::ThreadSender::System {
+                        name: crate::messages::reporters::JJ_BRANCH_RECOVERY.name,
+                        uri: crate::messages::reporters::JJ_BRANCH_RECOVERY.uri,
                     },
                     notice,
-                    crate::messages::queued::DeliveryUrgency::Steer,
+                    crate::messages::reporters::JJ_BRANCH_RECOVERY.urgency,
                 )
                 .await?;
                 delivered += 1;
@@ -1427,6 +1428,133 @@ pub(crate) fn render_for_page(record: &RecoveryRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reporter_notice_uses_peer_identity_and_respects_its_mute() {
+        use crate::db::DbState;
+        use crate::orchestrator::wakes::{mute, subscribe};
+        use crate::services::testing::{RecordingProcessSpawner, TestServicesBuilder};
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+
+        let db = Arc::new(crate::storage::migrated_test_db("jj-branch-recovery-sender.db").await);
+        let config_dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(DbState::new(
+            db.clone(),
+            Arc::new(
+                SearchIndex::open_or_create(config_dir.path().join("search-index.db")).unwrap(),
+            ),
+        ));
+        let services = Arc::new(
+            TestServicesBuilder::new()
+                .with_process(RecordingProcessSpawner::new())
+                .build(),
+        );
+        let orch = Orchestrator::builder(state, services, config_dir.path().to_path_buf()).build();
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p','default','P','prj','/tmp/p',1,1);
+             INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+               VALUES ('t','p','execution','active','none',1,1);
+             INSERT INTO jobs(id, thread_id, project_id, node_name, uri_segment, status, created_at, updated_at)
+               VALUES ('j','t','p','thread','thread','idle',1,1);
+             INSERT INTO runs(id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('r','p','j','live',1,1);",
+        ).await.unwrap();
+        const REPORTER: &str = "cairn://reporters/jj-branch-recovery";
+        // Only the exact reporter may cross this broad peer mute. A missing or
+        // different reference cannot produce the push asserted below.
+        mute(&db, "j", "peer", None, None, None, None, "agent")
+            .await
+            .unwrap();
+        subscribe(&db, "j", "peer", Some(REPORTER), None, "agent")
+            .await
+            .unwrap();
+        let record = RecoveryRecord {
+            id: "recovery".into(),
+            project_id: "p".into(),
+            store_path: "/tmp/p".into(),
+            scope: RecoveryScope::Store,
+            phase: "restore_outcome_unknown".into(),
+            budget_class: BUDGET_AUTOMATIC.into(),
+            principal: None,
+            operation: "reconcile".into(),
+            affected: Vec::new(),
+            coordinates: RecoveryCoordinates {
+                scope: RecoveryScope::Store,
+                phase: cairn_vcs::jj::RollbackFailurePhase::RestoreOutcomeUnknown,
+                pre_op: None,
+                pre_view: None,
+                pre_git: None,
+                failed_view: None,
+                bookmarks: Vec::new(),
+                survivors: Vec::new(),
+                evidence: Vec::new(),
+            },
+            diagnostic: "unverified rollback".into(),
+            generation: 1,
+            repair_attempts: 0,
+            next_repair_at: 0,
+            last_repair_outcome: None,
+            created_at: 1,
+        };
+        announce(&orch, &db, &record, &record.notice("fenced"))
+            .await
+            .unwrap();
+        let pushes = db
+            .query_all(
+                "SELECT key, wake, boundary FROM attention_pushes WHERE recipient='j'",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pushes.len(),
+            1,
+            "the exact reporter reference enables delivery"
+        );
+        assert!(
+            !pushes[0].0.contains(":operator_message:"),
+            "a machine notice is not the user's word"
+        );
+        let urgency = db
+            .query_one(
+                "SELECT urgency FROM messages WHERE channel_type='direct'",
+                (),
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(urgency.as_deref(), Some("steer"));
+        assert_eq!(pushes[0].1, "wake");
+        assert_eq!(pushes[0].2, "event", "the incident retains steer urgency");
+
+        mute(&db, "j", "peer", Some(REPORTER), None, None, None, "agent")
+            .await
+            .unwrap();
+        announce(&orch, &db, &record, &record.notice("fenced"))
+            .await
+            .unwrap();
+        let messages = db
+            .query_one(
+                "SELECT COUNT(*) FROM messages WHERE channel_type='thread' AND channel_id='t'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(messages, 2, "muting retains the thread conversation record");
+        let pushes_after = db
+            .query_one(
+                "SELECT COUNT(*) FROM attention_pushes WHERE recipient='j'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pushes_after, 1, "the reporter mute prevents another wake");
+    }
 
     #[test]
     fn repair_backoff_starts_at_five_minutes_and_caps_at_an_hour() {

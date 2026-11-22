@@ -2318,3 +2318,42 @@ fn rebuild_ledger_uris_are_portable_and_replace_legacy() {
         assert_eq!(parse_uri(uri), None, "{uri}");
     }
 }
+
+#[test]
+fn reporter_uris_name_the_machine_notice_senders() {
+    let collection = parse_uri("cairn://reporters").expect("reporters collection");
+    assert_eq!(collection, CairnResource::Reporters);
+    assert_eq!(collection.kind(), ResourceKind::Reporters);
+    assert_eq!(collection.to_uri(), build_reporters_uri());
+    assert_eq!(
+        collection.label(&crate::LabelContext::default()),
+        "Reporters"
+    );
+    for name in ["main-cadence", "jj-branch-recovery", "default-branch-watch"] {
+        let uri = format!("cairn://reporters/{name}");
+        let resource = parse_uri(&uri).expect("reporter URI");
+        assert_eq!(resource, CairnResource::Reporter { name: name.into() });
+        assert_eq!(resource.kind(), ResourceKind::Reporter);
+        assert_eq!(resource.to_uri(), uri);
+        assert_eq!(build_reporter_uri(name), uri);
+        assert_eq!(resource.project(), None);
+        assert_eq!(resource.issue_number(), None);
+        assert_eq!(
+            resource.surface(),
+            crate::Surface::Read { uri: uri.clone() }
+        );
+        assert_eq!(
+            resource.label(&crate::LabelContext::default()),
+            format!("Reporter {name}")
+        );
+    }
+    for uri in [
+        "cairn://reporters/Main-Cadence",
+        "cairn://reporters/main_cadence",
+        "cairn://reporters/-main",
+        "cairn://reporters/main-",
+        "cairn://reporters/main-cadence/log",
+    ] {
+        assert_eq!(parse_uri(uri), None, "{uri}");
+    }
+}

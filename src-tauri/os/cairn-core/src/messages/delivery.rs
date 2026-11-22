@@ -35,6 +35,8 @@ pub enum ThreadSender<'a> {
     /// whose reference is the route's canonical URI, so a thread can mute that
     /// one route without muting its peers.
     Route { route_id: &'a str, uri: &'a str },
+    /// A known Cairn reporter, independently muted by its canonical peer URI.
+    System { name: &'a str, uri: &'a str },
 }
 
 impl<'a> ThreadSender<'a> {
@@ -56,7 +58,9 @@ impl<'a> ThreadSender<'a> {
 
     fn name(self) -> String {
         match self {
-            Self::Operator { name } | Self::Peer { name, .. } => name.to_string(),
+            Self::Operator { name } | Self::Peer { name, .. } | Self::System { name, .. } => {
+                name.to_string()
+            }
             Self::Unverified => crate::messages::render::UNVERIFIED_LOCAL_SENDER.to_string(),
             Self::Route { route_id, .. } => format!("route:{route_id}"),
         }
@@ -112,7 +116,7 @@ pub async fn append_thread_message(
             None,
         ),
         ThreadSender::Unverified => (WakeSource::Peer { reference: None }, None),
-        ThreadSender::Route { uri, .. } => (
+        ThreadSender::Route { uri, .. } | ThreadSender::System { uri, .. } => (
             WakeSource::Peer {
                 reference: Some(uri.to_string()),
             },

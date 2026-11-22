@@ -272,6 +272,8 @@ impl CairnResource {
             | Self::InferenceTemplate { .. }
             | Self::InferenceGenerations
             | Self::InferenceGeneration { .. }
+            | Self::Reporters
+            | Self::Reporter { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch

@@ -1462,16 +1462,18 @@ pub(crate) async fn produce_cairn_resource(
         })
     };
 
-    // A web search runs once, before the grep and window projections split.
-    // A provider failure is a failed read under either, rendered `[error]` as a
-    // failed web fetch is; guidance and results are the body both project.
-    let web_search = if matches!(resource, CairnResource::WebSearch) {
-        match web_search_body(orch, &split.params).await {
-            Ok(body) => Some(body),
-            Err(error) => return RenderedResource::failed(error),
-        }
-    } else {
-        None
+    // Fallible materialized reads run before the grep and window projections
+    // split, so an error remains a failed read under either projection.
+    let materialized_body = match &resource {
+        CairnResource::WebSearch => Some(web_search_body(orch, &split.params).await),
+        CairnResource::Reporters => Some(Ok(super::reporters::collection())),
+        CairnResource::Reporter { name } => Some(super::reporters::member(name)),
+        _ => None,
+    };
+    let materialized_body = match materialized_body {
+        Some(Ok(body)) => Some(body),
+        Some(Err(error)) => return RenderedResource::failed(error),
+        None => None,
     };
 
     // An image address is an immutable native block. It supports no text
@@ -1605,7 +1607,7 @@ pub(crate) async fn produce_cairn_resource(
                     Ok(page) => page.body,
                     Err(error) => return RenderedResource::line(error, affordance, None, None),
                 }
-            } else if let Some(results) = &web_search {
+            } else if let Some(results) = &materialized_body {
                 results.clone()
             } else {
                 render_resource_body(orch, request, &resource, body_params).await
@@ -1837,7 +1839,7 @@ pub(crate) async fn produce_cairn_resource(
     } else {
         strip_params(&split.params, &["offset", "limit"])
     };
-    let mut content = match web_search {
+    let mut content = match materialized_body {
         Some(results) => results,
         None => render_resource_body(orch, request, &resource, body_params).await,
     };
@@ -3819,6 +3821,9 @@ async fn render_resource_body(
             name,
             service,
         } => super::services::read_log(orch, &project, Some(&name), &service, &params).await,
+        CairnResource::Reporters | CairnResource::Reporter { .. } => {
+            unreachable!("reporter bodies are materialized before grep and window projections")
+        }
         CairnResource::Routes => super::routes::collection(orch, request, None, &params).await,
         CairnResource::Route { route_id } => {
             super::routes::member(orch, request, &route_id, None).await

@@ -1242,6 +1242,15 @@ pub enum CairnResource {
     Rebuild {
         id: String,
     },
+    /// The machine notice senders that wake threads in their own name rather
+    /// than the operator's (the main-cadence check reporter, jj branch
+    /// recovery, the default-branch watch).
+    Reporters,
+    /// One reporter, addressed by its fixed lowercase name. A thread mutes a
+    /// reporter by this address the same way it mutes any other peer.
+    Reporter {
+        name: String,
+    },
     /// Self-describing help page: URI grammar + read catalog + mutation matrix.
     Help,
     /// Web search via the active typed web-search provider. The query rides in
@@ -1422,6 +1431,8 @@ impl CairnResource {
             Self::Bug => ResourceKind::Bug,
             Self::Rebuilds => ResourceKind::Rebuilds,
             Self::Rebuild { .. } => ResourceKind::Rebuild,
+            Self::Reporters => ResourceKind::Reporters,
+            Self::Reporter { .. } => ResourceKind::Reporter,
             Self::Help => ResourceKind::Help,
             Self::WebSearch => ResourceKind::WebSearch,
             Self::Mcp { .. } => ResourceKind::Mcp,

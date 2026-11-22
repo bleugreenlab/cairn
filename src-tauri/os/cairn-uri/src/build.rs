@@ -828,6 +828,14 @@ pub fn build_rebuild_uri(id: &str) -> String {
     format!("cairn://rebuilds/{id}")
 }
 
+pub fn build_reporters_uri() -> String {
+    "cairn://reporters".to_string()
+}
+
+pub fn build_reporter_uri(name: &str) -> String {
+    format!("cairn://reporters/{name}")
+}
+
 pub fn build_packs_uri() -> String {
     "cairn://packs".to_string()
 }
@@ -1713,6 +1721,8 @@ impl CairnResource {
             Self::Bug => "cairn://bug".to_string(),
             Self::Rebuilds => build_rebuilds_uri(),
             Self::Rebuild { id } => build_rebuild_uri(id),
+            Self::Reporters => build_reporters_uri(),
+            Self::Reporter { name } => build_reporter_uri(name),
             Self::Help => "cairn://help".to_string(),
             Self::WebSearch => "cairn://websearch".to_string(),
             Self::Mcp { server, resource } => {

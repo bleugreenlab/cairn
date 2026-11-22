@@ -305,11 +305,12 @@ async fn notify_threads(orch: &Orchestrator, db: &LocalDb, incident: &Incident) 
             orch,
             db,
             &thread_id,
-            crate::messages::delivery::ThreadSender::Operator {
-                name: "default-branch watch",
+            crate::messages::delivery::ThreadSender::System {
+                name: crate::messages::reporters::DEFAULT_BRANCH_WATCH.name,
+                uri: crate::messages::reporters::DEFAULT_BRANCH_WATCH.uri,
             },
             &notice,
-            crate::messages::queued::DeliveryUrgency::Steer,
+            crate::messages::reporters::DEFAULT_BRANCH_WATCH.urgency,
         )
         .await
         {
@@ -385,6 +386,103 @@ pub(crate) fn register(orch: &Orchestrator) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reporter_notice_uses_peer_identity_and_respects_its_mute() {
+        use crate::db::DbState;
+        use crate::orchestrator::wakes::{mute, subscribe};
+        use crate::services::testing::{RecordingProcessSpawner, TestServicesBuilder};
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+
+        let db = Arc::new(crate::storage::migrated_test_db("default-branch-watch-sender.db").await);
+        let config_dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(DbState::new(
+            db.clone(),
+            Arc::new(
+                SearchIndex::open_or_create(config_dir.path().join("search-index.db")).unwrap(),
+            ),
+        ));
+        let services = Arc::new(
+            TestServicesBuilder::new()
+                .with_process(RecordingProcessSpawner::new())
+                .build(),
+        );
+        let orch = Orchestrator::builder(state, services, config_dir.path().to_path_buf()).build();
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p','default','P','prj','/tmp/p',1,1);
+             INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+               VALUES ('t','p','execution','active','none',1,1);
+             INSERT INTO jobs(id, thread_id, project_id, node_name, uri_segment, status, created_at, updated_at)
+               VALUES ('j','t','p','thread','thread','idle',1,1);
+             INSERT INTO runs(id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('r','p','j','live',1,1);",
+        ).await.unwrap();
+        const REPORTER: &str = "cairn://reporters/default-branch-watch";
+        // Only the exact reporter may cross this broad peer mute. A missing or
+        // different reference cannot produce the push asserted below.
+        mute(&db, "j", "peer", None, None, None, None, "agent")
+            .await
+            .unwrap();
+        subscribe(&db, "j", "peer", Some(REPORTER), None, "agent")
+            .await
+            .unwrap();
+        let incident = Incident::sighted("p", "main", "stray".into(), "origin".into(), 1);
+        notify_threads(&orch, &db, &incident).await;
+        let pushes = db
+            .query_all(
+                "SELECT key, wake, boundary FROM attention_pushes WHERE recipient='j'",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pushes.len(),
+            1,
+            "the exact reporter reference enables delivery"
+        );
+        assert!(
+            !pushes[0].0.contains(":operator_message:"),
+            "a machine notice is not the user's word"
+        );
+        let urgency = db
+            .query_one(
+                "SELECT urgency FROM messages WHERE channel_type='direct'",
+                (),
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(urgency.as_deref(), Some("steer"));
+        assert_eq!(pushes[0].1, "wake");
+        assert_eq!(pushes[0].2, "event", "the incident retains steer urgency");
+
+        mute(&db, "j", "peer", Some(REPORTER), None, None, None, "agent")
+            .await
+            .unwrap();
+        notify_threads(&orch, &db, &incident).await;
+        let messages = db
+            .query_one(
+                "SELECT COUNT(*) FROM messages WHERE channel_type='thread' AND channel_id='t'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(messages, 2, "muting retains the thread conversation record");
+        let pushes_after = db
+            .query_one(
+                "SELECT COUNT(*) FROM attention_pushes WHERE recipient='j'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pushes_after, 1, "the reporter mute prevents another wake");
+        assert_a_landings_own_commit_is_not_unlanded(&db).await;
+    }
 
     fn ahead(local: &str) -> Comparison {
         Comparison::Ahead {
@@ -462,29 +560,23 @@ mod tests {
 
     /// A local landing leaves the store ahead of origin by design; its head is
     /// its merge request's `merged_commit`, which is what tells the two apart.
-    #[tokio::test]
-    async fn a_landings_own_commit_is_not_unlanded() {
-        let db = crate::storage::migrated_test_db("unlanded-default-landed.db").await;
+    async fn assert_a_landings_own_commit_is_not_unlanded(db: &LocalDb) {
         db.execute_script(
-            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p','default','P','prj','/tmp/p',1,1);
-             INSERT INTO merge_requests(id, job_id, project_id, title, source_branch, target_branch,
+            "INSERT INTO merge_requests(id, job_id, project_id, title, source_branch, target_branch,
                                         status, merged_commit, opened_at, updated_at, is_local)
                VALUES ('mr','j','p','T','agent/prj-1-builder-0','main','merged','landed',1,1,1),
                       ('mr-open','j2','p','T','agent/prj-2-builder-0','main','open','pending',1,1,1);",
         )
         .await
         .unwrap();
-        assert!(landed_by_a_merge(&db, "p", "main", "landed").await.unwrap());
-        assert!(!landed_by_a_merge(&db, "p", "main", "stray").await.unwrap());
+        assert!(landed_by_a_merge(db, "p", "main", "landed").await.unwrap());
+        assert!(!landed_by_a_merge(db, "p", "main", "stray").await.unwrap());
         assert!(
-            !landed_by_a_merge(&db, "p", "main", "pending")
-                .await
-                .unwrap(),
+            !landed_by_a_merge(db, "p", "main", "pending").await.unwrap(),
             "only a merged request's commit counts"
         );
         assert!(
-            !landed_by_a_merge(&db, "p", "release", "landed")
+            !landed_by_a_merge(db, "p", "release", "landed")
                 .await
                 .unwrap(),
             "a landing counts only for the branch it landed on"

@@ -161,6 +161,10 @@ pub enum ResourceKind {
     Rebuilds,
     /// A single ingested rebuild record.
     Rebuild,
+    /// The machine notice senders that wake threads.
+    Reporters,
+    /// One machine notice sender.
+    Reporter,
     Skills,
     Skill,
     ProjectSkills,
@@ -389,6 +393,8 @@ impl ResourceKind {
         ResourceKind::Bug,
         ResourceKind::Rebuilds,
         ResourceKind::Rebuild,
+        ResourceKind::Reporters,
+        ResourceKind::Reporter,
         ResourceKind::Skills,
         ResourceKind::Skill,
         ResourceKind::ProjectSkills,

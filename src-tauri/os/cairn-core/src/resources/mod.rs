@@ -50,6 +50,7 @@ mod rebase;
 mod rebuilds;
 mod recipes;
 pub mod references;
+mod reporters;
 mod requests;
 mod responses;
 mod routes;

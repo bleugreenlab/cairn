@@ -15,6 +15,18 @@ fn valid_opaque_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
 }
 
+/// A reporter name is one fixed, lowercase, hyphenated word chosen in code
+/// (`main-cadence`), so anything else names no reporter rather than one to
+/// normalize.
+fn valid_reporter_name(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 fn valid_content_hash(value: &str) -> bool {
     value.len() == 64
         && value
@@ -225,6 +237,10 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["rebuilds"] => Some(CairnResource::Rebuilds),
         ["rebuilds", id] if valid_opaque_id(id) => Some(CairnResource::Rebuild {
             id: (*id).to_string(),
+        }),
+        ["reporters"] => Some(CairnResource::Reporters),
+        ["reporters", name] if valid_reporter_name(name) => Some(CairnResource::Reporter {
+            name: (*name).to_string(),
         }),
         ["help"] => Some(CairnResource::Help),
         ["websearch"] => Some(CairnResource::WebSearch),

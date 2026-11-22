@@ -108,7 +108,8 @@ pub(crate) const HEARTBEAT: Duration = Duration::from_secs(6 * 60 * 60);
 /// as still held.
 const SILENCE_BOUND_MS: i64 = 60 * 60 * 1000;
 /// The name cadence messages are sent under.
-const SENDER: &str = "main cadence";
+const SENDER: &str = crate::messages::reporters::MAIN_CADENCE.name;
+const REPORTER_URI: &str = crate::messages::reporters::MAIN_CADENCE.uri;
 /// How far back a bracket walk reads before it calls itself truncated.
 const BRACKET_SCAN: usize = 400;
 const MAX_GROUPS: usize = 15;
@@ -3335,9 +3336,12 @@ async fn try_deliver(
         orch,
         db,
         &thread_id,
-        crate::messages::delivery::ThreadSender::Operator { name: SENDER },
+        crate::messages::delivery::ThreadSender::System {
+            name: SENDER,
+            uri: REPORTER_URI,
+        },
         content,
-        crate::messages::queued::DeliveryUrgency::Steer,
+        crate::messages::reporters::MAIN_CADENCE.urgency,
     )
     .await
     .map(|_| ())
@@ -11766,11 +11770,109 @@ mod tests {
         );
         let orch = Orchestrator::builder(
             Arc::new(crate::db::DbState::new(db.clone(), search)),
-            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            Arc::new(
+                crate::services::testing::TestServicesBuilder::new()
+                    .with_process(crate::services::testing::RecordingProcessSpawner::new())
+                    .build(),
+            ),
             root.path().to_path_buf(),
         )
         .build();
         (orch, db)
+    }
+
+    #[tokio::test]
+    async fn main_cadence_steers_as_a_mutable_reporter_not_the_operator() {
+        let root = tempfile::tempdir().unwrap();
+        let (orch, db) = notifying_orchestrator(&root).await;
+        db.execute_script(
+            "INSERT INTO runs(id, project_id, job_id, status, created_at, updated_at)
+               VALUES('reporter-run','p','thread-job','live',1,1);
+             UPDATE jobs SET status='idle' WHERE id='thread-job';",
+        )
+        .await
+        .unwrap();
+        // With peers muted by default, only this exact reference can deliver.
+        cairn_attention::wakes::mute(&db, "thread-job", "peer", None, None, None, None, "agent")
+            .await
+            .unwrap();
+        cairn_attention::wakes::subscribe(
+            &db,
+            "thread-job",
+            "peer",
+            Some(REPORTER_URI),
+            None,
+            "agent",
+        )
+        .await
+        .unwrap();
+        try_deliver(&orch, &db, "p", "testing", "main rust-tests is red")
+            .await
+            .unwrap();
+        let directs = db.query_all(
+            "SELECT urgency FROM messages WHERE channel_type='direct' AND sender_name='main cadence'",
+            (), |row| row.opt_text(0),
+        ).await.unwrap();
+        assert_eq!(
+            directs,
+            [Some("steer".to_string())],
+            "the reporter reference matches, and a red still steers"
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT COUNT(*) FROM attention_pushes WHERE key LIKE '%:operator_message:%'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap(),
+            0,
+            "a report is not the operator's word"
+        );
+        let pushes = db
+            .query_one(
+                "SELECT COUNT(*) FROM attention_pushes WHERE recipient='thread-job'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert!(pushes > 0);
+        cairn_attention::wakes::mute(
+            &db,
+            "thread-job",
+            "peer",
+            Some(REPORTER_URI),
+            None,
+            None,
+            None,
+            "agent",
+        )
+        .await
+        .unwrap();
+        try_deliver(&orch, &db, "p", "testing", "main is still red")
+            .await
+            .unwrap();
+        assert_eq!(
+            cadence_messages(&db).await.len(),
+            2,
+            "mute keeps the conversation"
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT COUNT(*) FROM attention_pushes WHERE recipient='thread-job'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap(),
+            pushes,
+            "a reporter mute prevents a second wake"
+        );
+        assert_eq!(db.query_one(
+            "SELECT COUNT(*) FROM messages WHERE channel_type='direct' AND sender_name='main cadence'",
+            (), |row| row.i64(0),
+        ).await.unwrap(), 1);
     }
 
     async fn cadence_messages(db: &LocalDb) -> Vec<String> {

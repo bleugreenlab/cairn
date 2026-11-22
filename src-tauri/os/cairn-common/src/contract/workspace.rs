@@ -50,6 +50,28 @@ pub(crate) const REBUILD_CONTRACT: ResourceContract = ResourceContract {
     mutations: NO_MUTATIONS,
 };
 
+pub(crate) const REPORTERS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::Reporters,
+    uri_template: "cairn://reporters",
+    name: "Reporters",
+    description: "The machine notice senders that wake threads in their own name rather than the operator's. Read-only.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const REPORTER_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::Reporter,
+    uri_template: "cairn://reporters/{name}",
+    name: "Reporter",
+    description: "One machine notice sender: what it reports and the address a thread mutes it by. Read-only.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const PACKS_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::Packs,

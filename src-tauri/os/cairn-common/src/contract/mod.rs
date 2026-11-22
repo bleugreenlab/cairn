@@ -237,6 +237,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     workspace::BUG_CONTRACT,
     workspace::REBUILDS_CONTRACT,
     workspace::REBUILD_CONTRACT,
+    workspace::REPORTERS_CONTRACT,
+    workspace::REPORTER_CONTRACT,
     workspace::PACKS_CONTRACT,
     workspace::PACK_CONTRACT,
     workspace::SKILLS_CONTRACT,
