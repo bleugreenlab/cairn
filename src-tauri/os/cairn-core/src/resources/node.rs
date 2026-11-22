@@ -5575,6 +5575,8 @@ mod hold_header_tests {
             labels: vec!["waitFor: duration".into()],
             supersedable: true,
             notes: Vec::new(),
+            since: None,
+            bound: None,
         };
         let header =
             render_job_summary_header("builder", "running", None, None, Some(&wait), false, None);

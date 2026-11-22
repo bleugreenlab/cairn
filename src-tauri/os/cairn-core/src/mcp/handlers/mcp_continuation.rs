@@ -1201,6 +1201,7 @@ mod tests {
                 identity: None,
                 verdict_only: false,
                 settlement: None,
+                bound: None,
             },
         }
     }

@@ -3134,6 +3134,7 @@ pub(crate) mod slot_publication_tests {
                 identity: None,
                 verdict_only: false,
                 settlement: None,
+                bound: None,
             },
         )
         .unwrap();
@@ -9065,6 +9066,9 @@ struct BatchControl {
     /// The principal that cancelled this one batch ([`cancel::cancel_batch`]),
     /// which its cancelled result names.
     cancelled_by: std::sync::Mutex<Option<String>>,
+    /// When the call arrived (unix milliseconds), which its timeouts and the
+    /// batch ceiling are measured from.
+    arrived_ms: i64,
 }
 
 /// What a batch's items are doing, as its own task and its machine report.
@@ -9109,6 +9113,7 @@ impl BatchControl {
             owner: std::sync::Mutex::new(None),
             items: std::sync::Mutex::new(ItemProgress::default()),
             cancelled_by: std::sync::Mutex::new(None),
+            arrived_ms: chrono::Utc::now().timestamp_millis(),
         })
     }
 
@@ -9785,6 +9790,10 @@ async fn establish_durable_record(
             identity: batch_identity(&request.payload).map(|identity| identity.to_string()),
             verdict_only: facts.verdict_only,
             settlement: control.persisted_for_record(&orch.fleet).map(Box::new),
+            bound: Some(durable_suspend::RunBound::of_payload(
+                &request.payload,
+                control.arrived_ms,
+            )),
         },
         deadline: None,
         created: chrono::Utc::now().timestamp_millis(),

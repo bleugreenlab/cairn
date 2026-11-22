@@ -130,6 +130,12 @@ pub(crate) enum Condition {
         /// existed, whose commit then falls back to the precise report.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         settlement: Option<Box<super::run::PersistedSettlement>>,
+        /// When the batch ends at the latest, recorded when its wait is
+        /// created so a reader of the parked call can tell a long build from
+        /// a stuck one. Shown only: the batch's own timeouts and ceiling are
+        /// enforced where it runs. Absent on rows written before this existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bound: Option<RunBound>,
     },
     /// A waiting `cairn://requests` filing, answered by its request's outcome
     /// ([`crate::operator_requests::wait`]). Level-triggered from the request
@@ -141,6 +147,35 @@ pub(crate) enum Condition {
         #[serde(default)]
         settled_attempts: Vec<String>,
     },
+}
+
+/// When a `run` batch ends at the latest, measured from its arrival: its
+/// declared need (the longest item timeout in parallel, their sum in order)
+/// when every item declared one, and otherwise the batch ceiling. Time a batch
+/// spends waiting for room before its items start can carry an item past it,
+/// so it is an honest bound for a reader, not a schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RunBound {
+    /// Unix milliseconds.
+    pub(crate) at_ms: i64,
+    /// Whether every item declared a timeout; false means only the ceiling
+    /// ends the batch.
+    pub(crate) declared: bool,
+}
+
+impl RunBound {
+    /// The bound of the batch `payload` describes, arrived at `arrived_ms`.
+    pub(crate) fn of_payload(payload: &serde_json::Value, arrived_ms: i64) -> Self {
+        use cairn_common::run_contract::{declared_need_of_payload, RUN_BATCH_CEILING_MS};
+        let (span_ms, declared) = match declared_need_of_payload(payload) {
+            Some(need) => (i64::try_from(need.as_millis()).unwrap_or(i64::MAX), true),
+            None => (i64::from(RUN_BATCH_CEILING_MS), false),
+        };
+        Self {
+            at_ms: arrived_ms.saturating_add(span_ms),
+            declared,
+        }
+    }
 }
 
 /// Retire a wait whose continuation has been taken over by a more specific
@@ -240,6 +275,10 @@ pub(crate) struct ParkedWaits {
     /// What a reader should know about when a call resolves at the latest, such
     /// as the deadline of a recovering terminal a wait is parked on.
     pub(crate) notes: Vec<String>,
+    /// When the oldest active call parked, in unix seconds.
+    pub(crate) since: Option<i64>,
+    /// The earliest recorded bound among the active calls, in unix seconds.
+    pub(crate) bound: Option<crate::messages::delivery::WaitBound>,
 }
 
 /// The active (pending or resolving) suspensions a parked turn holds.
@@ -345,6 +384,9 @@ pub(crate) async fn parked_waits_of_turn(
             notes.push(note);
         }
     }
+    // The wait rows record milliseconds and a hold reads seconds; this is the
+    // one place the two meet.
+    let seconds = |ms: i64| ms.div_euclid(1000);
     Ok(ParkedWaits {
         labels: waits
             .iter()
@@ -352,6 +394,19 @@ pub(crate) async fn parked_waits_of_turn(
             .collect(),
         supersedable: steerable_waits_only(&waits),
         notes,
+        since: waits
+            .iter()
+            .map(|(record, _, _)| record.created)
+            .min()
+            .map(seconds),
+        bound: waits
+            .iter()
+            .filter_map(|(record, _, _)| record.recorded_bound_ms())
+            .min_by_key(|bound| bound.at)
+            .map(|bound| crate::messages::delivery::WaitBound {
+                at: seconds(bound.at),
+                ..bound
+            }),
     })
 }
 
@@ -862,6 +917,29 @@ pub(crate) struct Record {
     /// deadline minus this timestamp is the original requested length, even
     /// when the row is inserted or its inline hold is cleared later.
     pub(crate) created: i64,
+}
+
+impl Record {
+    /// When this call ends at the latest by what its row records, in unix
+    /// milliseconds: a `run` batch's stored [`RunBound`], and otherwise the
+    /// row's deadline. For display; nothing acts on it.
+    pub(crate) fn recorded_bound_ms(&self) -> Option<crate::messages::delivery::WaitBound> {
+        use crate::messages::delivery::{WaitBound, WaitBoundKind};
+        match &self.condition {
+            Condition::RunBatch { bound, .. } => bound.map(|bound| WaitBound {
+                kind: if bound.declared {
+                    WaitBoundKind::Timeout
+                } else {
+                    WaitBoundKind::Ceiling
+                },
+                at: bound.at_ms,
+            }),
+            _ => self.deadline.map(|at| WaitBound {
+                kind: WaitBoundKind::Until,
+                at,
+            }),
+        }
+    }
 }
 
 /// The turn a callback that is about to suspend belongs to.
@@ -3807,6 +3885,7 @@ mod tests {
             identity: None,
             verdict_only: false,
             settlement: None,
+            bound: None,
         }
     }
 
@@ -3819,6 +3898,7 @@ mod tests {
             identity: None,
             verdict_only: false,
             settlement: None,
+            bound: None,
         };
         record
     }
@@ -10329,9 +10409,8 @@ mod tests {
     #[tokio::test]
     async fn a_plain_direct_to_a_waitfor_park_is_held_and_names_the_escalation() {
         let (orch, base, _) = durable_env().await;
-        insert(&orch.db.local, &ten_minute_wait(base))
-            .await
-            .unwrap();
+        let wait = ten_minute_wait(base);
+        insert(&orch.db.local, &wait).await.unwrap();
         register_warm(&orch);
         let message = seed_direct(&orch, "steer").await;
 
@@ -10346,6 +10425,11 @@ mod tests {
                 labels: vec!["waitFor: duration".into()],
                 supersedable: true,
                 notes: Vec::new(),
+                since: Some(wait.created.div_euclid(1000)),
+                bound: Some(crate::messages::delivery::WaitBound {
+                    kind: crate::messages::delivery::WaitBoundKind::Until,
+                    at: wait.deadline.unwrap().div_euclid(1000),
+                }),
             }
         );
         let said = hold.render();
@@ -10482,6 +10566,7 @@ mod tests {
                 identity: None,
                 verdict_only: false,
                 settlement: None,
+                bound: None,
             },
             deadline: None,
             ..base
@@ -10495,6 +10580,8 @@ mod tests {
                 labels: vec!["run: slow".into()],
                 supersedable: false,
                 notes: Vec::new(),
+                since: Some(host.created.div_euclid(1000)),
+                bound: None,
             })
         );
         assert_eq!(wait_state(&orch).await, "pending");

@@ -1218,6 +1218,8 @@ mod reply_tests {
                     labels: vec!["waitFor: duration".into()],
                     supersedable: true,
                     notes: Vec::new(),
+                    since: None,
+                    bound: None,
                 }))),
                 "It has not started a turn: it is parked on its own `waitFor: duration`",
             ),
@@ -1245,5 +1247,38 @@ mod reply_tests {
             );
             assert!(said.contains(expected), "{said}");
         }
+    }
+
+    /// A sender told the recipient is parked also learns how long it has been
+    /// and what ends the wait, from the same hold the node summary renders.
+    #[test]
+    fn a_held_reply_says_how_long_the_wait_has_run_and_what_ends_it() {
+        use crate::messages::delivery::{WaitBound, WaitBoundKind};
+        let (since, end) = (1_790_000_000, 1_790_021_600);
+        let said = reply(Some(Ok(NudgeOutcome::Held(Hold::Wait {
+            labels: vec!["run: python".into()],
+            supersedable: true,
+            notes: Vec::new(),
+            since: Some(since),
+            bound: Some(WaitBound {
+                kind: WaitBoundKind::Ceiling,
+                at: end,
+            }),
+        }))));
+        let stamp = |at: i64| crate::clock::stamp(at).unwrap_or_else(|| at.to_string());
+        assert!(
+            said.contains(&format!(
+                "It has not started a turn: it is parked on its own `run: python` since {}",
+                stamp(since)
+            )),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!(
+                "only the batch ceiling ends it, at {}",
+                stamp(end)
+            )),
+            "{said}"
+        );
     }
 }

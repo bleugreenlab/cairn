@@ -495,6 +495,12 @@ pub enum Hold {
         /// When a call resolves at the latest, where something says (a
         /// recovering terminal's deadline); each is a full sentence.
         notes: Vec<String>,
+        /// When the oldest of these calls parked (unix seconds), so a reader
+        /// can tell a long wait from a fresh one.
+        since: Option<i64>,
+        /// The earliest point any of these calls ends at the latest, as its
+        /// wait row records it. `None` when no row records one.
+        bound: Option<WaitBound>,
     },
     /// Waiting on its own sub-agent tasks, or on a dependency when none is open.
     Tasks { pending: i64 },
@@ -524,6 +530,28 @@ pub enum Hold {
     /// Supply can serve its work again, but the fleet cap is full; it takes
     /// the next free slot, oldest held first, asking again at `next_at`.
     FleetSlot { next_at: Option<i64> },
+}
+
+/// When a parked call ends at the latest, as its wait row records it. It is
+/// shown to a reader and nothing acts on it: the call's own trigger, timeouts
+/// and ceiling are enforced where it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitBound {
+    pub kind: WaitBoundKind,
+    /// Unix seconds once on a [`Hold`]; the wait rows record milliseconds.
+    pub at: i64,
+}
+
+/// What ends a parked call at [`WaitBound::at`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitBoundKind {
+    /// A `waitFor` duration or an MCP task deadline: it resolves then.
+    Until,
+    /// A `run` batch whose every item declared a timeout.
+    Timeout,
+    /// A `run` batch with an item that declared none, which only the batch
+    /// ceiling ends.
+    Ceiling,
 }
 
 /// Why a provider-limit hold waits for the operator rather than for a reset or
@@ -559,14 +587,24 @@ impl Hold {
                 labels,
                 supersedable: true,
                 notes,
+                since,
+                bound,
             } => format!(
-                "it is parked on its own {}; it reads this when that wait resolves or the operator resumes it, and a message sent with escalate:true wakes it now, leaving any batch it waits on running{}",
+                "it is parked on its own {}{}; it reads this when that wait resolves or the operator resumes it, and a message sent with escalate:true wakes it now, leaving any batch it waits on running{}",
                 Self::calls(labels),
+                Self::wait_timing_clause(*since, *bound, labels.len() > 1),
                 Self::notes(notes)
             ),
-            Hold::Wait { labels, notes, .. } => format!(
-                "it is parked on its own {}, which is work in flight; it reads this when that call resolves or the operator resumes it{}",
+            Hold::Wait {
+                labels,
+                notes,
+                since,
+                bound,
+                ..
+            } => format!(
+                "it is parked on its own {}{}, which is work in flight; it reads this when that call resolves or the operator resumes it{}",
                 Self::calls(labels),
+                Self::wait_timing_clause(*since, *bound, labels.len() > 1),
                 Self::notes(notes)
             ),
             Hold::Tasks { pending } if *pending > 0 => format!(
@@ -668,11 +706,22 @@ impl Hold {
     /// The short form a node summary's title carries beside its status icon.
     pub fn qualifier(&self) -> String {
         match self {
-            Hold::Wait { labels, .. } => match labels.as_slice() {
-                [one] => format!("waiting: {one}"),
-                [] => "waiting: its own call".into(),
-                many => format!("waiting: {} calls", many.len()),
-            },
+            Hold::Wait {
+                labels,
+                since,
+                bound,
+                ..
+            } => {
+                let what = match labels.as_slice() {
+                    [one] => format!("waiting: {one}"),
+                    [] => "waiting: its own call".into(),
+                    many => format!("waiting: {} calls", many.len()),
+                };
+                format!(
+                    "{what}{}",
+                    Self::wait_timing(*since, *bound, labels.len() > 1)
+                )
+            }
             Hold::Tasks { pending } if *pending > 0 => format!(
                 "waiting: {pending} task{}",
                 if *pending == 1 { "" } else { "s" }
@@ -708,6 +757,52 @@ impl Hold {
             .join(", ")
     }
 
+    /// The qualifier's age and bound: ` · since A, timeout B`. With several
+    /// calls the bound is the earliest any of them ends.
+    fn wait_timing(since: Option<i64>, bound: Option<WaitBound>, several: bool) -> String {
+        let mut parts = Vec::new();
+        if let Some(at) = since {
+            parts.push(format!("since {}", Self::time(at)));
+        }
+        if let Some(WaitBound { kind, at }) = bound {
+            let at = Self::time(at);
+            parts.push(match (kind, several) {
+                (WaitBoundKind::Until, false) => format!("until {at}"),
+                (WaitBoundKind::Timeout, false) => format!("timeout {at}"),
+                (WaitBoundKind::Ceiling, false) => format!("no timeout (ceiling {at})"),
+                (WaitBoundKind::Until, true) => format!("earliest deadline {at}"),
+                (WaitBoundKind::Timeout, true) => format!("earliest timeout {at}"),
+                (WaitBoundKind::Ceiling, true) => format!("earliest ceiling {at}"),
+            });
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", parts.join(", "))
+        }
+    }
+
+    /// The same facts as prose, to follow the parked calls' names.
+    fn wait_timing_clause(since: Option<i64>, bound: Option<WaitBound>, several: bool) -> String {
+        let mut clause = since
+            .map(|at| format!(" since {}", Self::time(at)))
+            .unwrap_or_default();
+        if let Some(WaitBound { kind, at }) = bound {
+            let at = Self::time(at);
+            clause.push_str(&match (kind, several) {
+                (_, true) => format!(", the first of which ends by {at} at the latest"),
+                (WaitBoundKind::Until, false) => format!(", which ends by {at} at the latest"),
+                (WaitBoundKind::Timeout, false) => {
+                    format!(", which its declared timeout ends by {at}")
+                }
+                (WaitBoundKind::Ceiling, false) => format!(
+                    ", which declared no timeout, so only the batch ceiling ends it, at {at}"
+                ),
+            });
+        }
+        clause
+    }
+
     fn time(unix_seconds: i64) -> String {
         crate::clock::stamp(unix_seconds).unwrap_or_else(|| unix_seconds.to_string())
     }
@@ -741,6 +836,8 @@ pub(crate) async fn describe_hold(db: &LocalDb, job_id: &str) -> Option<Hold> {
                 labels: waits.labels,
                 supersedable: waits.supersedable,
                 notes: waits.notes,
+                since: waits.since,
+                bound: waits.bound,
             }
         }
         TurnYieldReason::DependencyWait => Hold::Tasks {
@@ -2814,6 +2911,179 @@ mod tests {
             format!("held: provider limit until {at}")
         );
         assert_eq!(Hold::Tasks { pending: 1 }.qualifier(), "waiting: 1 task");
+    }
+
+    fn parked(labels: &[&str], since: Option<i64>, bound: Option<WaitBound>) -> Hold {
+        Hold::Wait {
+            labels: labels.iter().map(|label| label.to_string()).collect(),
+            supersedable: false,
+            notes: Vec::new(),
+            since,
+            bound,
+        }
+    }
+
+    /// A five-hour deadlock and a long build once read the same: a parked
+    /// wait's title states how old it is and what ends it.
+    #[test]
+    fn a_parked_waits_title_states_its_age_and_its_bound() {
+        let since = 1_790_000_000;
+        let end = since + 3_600;
+        let (s, e) = (Hold::time(since), Hold::time(end));
+        let bound = |kind| Some(WaitBound { kind, at: end });
+
+        for (hold, expected) in [
+            (
+                parked(
+                    &["run: cargo test"],
+                    Some(since),
+                    bound(WaitBoundKind::Timeout),
+                ),
+                format!("waiting: run: cargo test · since {s}, timeout {e}"),
+            ),
+            (
+                parked(&["run: python"], Some(since), bound(WaitBoundKind::Ceiling)),
+                format!("waiting: run: python · since {s}, no timeout (ceiling {e})"),
+            ),
+            (
+                parked(
+                    &["waitFor: duration"],
+                    Some(since),
+                    bound(WaitBoundKind::Until),
+                ),
+                format!("waiting: waitFor: duration · since {s}, until {e}"),
+            ),
+            (
+                parked(
+                    &["run: a", "run: b", "waitFor: duration"],
+                    Some(since),
+                    bound(WaitBoundKind::Timeout),
+                ),
+                format!("waiting: 3 calls · since {s}, earliest timeout {e}"),
+            ),
+            (
+                parked(&["run: a", "run: b", "run: c"], Some(since), None),
+                format!("waiting: 3 calls · since {s}"),
+            ),
+            // A row written before bounds were recorded states its age alone.
+            (
+                parked(&["run: python"], Some(since), None),
+                format!("waiting: run: python · since {s}"),
+            ),
+            (
+                parked(&["run: python"], None, None),
+                "waiting: run: python".to_string(),
+            ),
+        ] {
+            assert_eq!(hold.qualifier(), expected);
+        }
+
+        let said = parked(&["run: python"], Some(since), bound(WaitBoundKind::Ceiling)).render();
+        assert!(
+            said.contains(&format!(
+                "`run: python` since {s}, which declared no timeout, so only the batch ceiling ends it, at {e}"
+            )),
+            "{said}"
+        );
+        let said = parked(
+            &["run: cargo test"],
+            Some(since),
+            bound(WaitBoundKind::Timeout),
+        )
+        .render();
+        assert!(
+            said.contains(&format!(
+                "since {s}, which its declared timeout ends by {e}"
+            )),
+            "{said}"
+        );
+    }
+
+    /// The node summary reads a parked `run` batch's age and bound from its
+    /// wait row: an undeclared item leaves only the batch ceiling, a fully
+    /// declared batch its timeout, and a row from before bounds were recorded
+    /// its age alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_parked_run_summary_reads_its_age_and_bound_from_the_wait_row() {
+        use crate::mcp::handlers::durable_suspend::{Condition, RunBound};
+        let db = migrated_db().await;
+        seed_run(&db, "run-1", "job-1").await;
+        db.execute(
+            "INSERT OR IGNORE INTO sessions (id, job_id, status, backend_id, created_at, updated_at)
+             VALUES ('sess', 'job-1', 'open', 'handle', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        set_head_turn(&db, "job-1", "yielded", Some("wait")).await;
+
+        let arrived_ms: i64 = 1_790_000_000_000;
+        let created_ms = arrived_ms + 120_000;
+        let condition = |label: &str, payload: Option<serde_json::Value>| {
+            serde_json::to_string(&Condition::RunBatch {
+                request_id: "request-1".into(),
+                commits: false,
+                label: Some(label.into()),
+                host: false,
+                identity: None,
+                verdict_only: false,
+                settlement: None,
+                bound: payload.map(|payload| RunBound::of_payload(&payload, arrived_ms)),
+            })
+            .unwrap()
+        };
+        let park = |json: String| {
+            let db = &db;
+            async move {
+                db.execute("DELETE FROM agent_waits", ()).await.unwrap();
+                db.execute(
+                    "INSERT INTO agent_waits (id, job_id, run_id, session_id, predecessor_turn_id, tool_use_id, condition_json, kind, state, created_at)
+                     VALUES ('wait-1', 'job-1', 'run-1', 'sess', 't-head', 'tool-1', ?1, 'run_batch', 'pending', ?2)",
+                    params![json.as_str(), created_ms],
+                )
+                .await
+                .unwrap();
+                describe_hold(db, "job-1")
+                    .await
+                    .expect("a parked turn has a hold")
+            }
+        };
+        let since = Hold::time(created_ms / 1000);
+
+        let undeclared = park(condition(
+            "python",
+            Some(serde_json::json!({"commands": [{"code": "x", "interpreter": "python"}]})),
+        ))
+        .await;
+        let ceiling = Hold::time(
+            (arrived_ms + i64::from(cairn_common::run_contract::RUN_BATCH_CEILING_MS)) / 1000,
+        );
+        assert_eq!(
+            undeclared.qualifier(),
+            format!("waiting: run: python · since {since}, no timeout (ceiling {ceiling})")
+        );
+
+        let declared = park(condition(
+            "cargo test",
+            Some(serde_json::json!({"sequential": true, "commands": [
+                {"command": "cargo build", "timeout": 600_000},
+                {"command": "cargo test", "timeout": 3_000_000}
+            ]})),
+        ))
+        .await;
+        let timeout = Hold::time((arrived_ms + 3_600_000) / 1000);
+        let title = declared.qualifier();
+        assert_eq!(
+            title,
+            format!("waiting: run: cargo test · since {since}, timeout {timeout}")
+        );
+        assert!(!title.contains("ceiling"), "{title}");
+
+        let old = park(condition("python", None)).await;
+        assert_eq!(
+            old.qualifier(),
+            format!("waiting: run: python · since {since}")
+        );
     }
 
     /// An escalate that cannot stop the recipient's turn is an error the sender
