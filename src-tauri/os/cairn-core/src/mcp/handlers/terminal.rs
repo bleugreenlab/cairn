@@ -1097,10 +1097,38 @@ async fn restart_terminal_process(
         }
     }
     target.cwd = cell.path;
+    target.lease = Some(fence.clone());
+    let answer = orch
+        .fleet
+        .operate_residency(
+            orch,
+            ResidencyOperation::Renew {
+                fence: fence.clone(),
+            },
+        )
+        .await;
+    let observed_here = orch
+        .pty_state
+        .sessions
+        .lock()
+        .map(|sessions| sessions.contains_key(&row.session_id))
+        .unwrap_or(false);
+    match judge_surviving_process(&answer, &row.session_id, row.process_generation) {
+        SurvivingProcess::Alive { .. } if observed_here => return Ok(None),
+        SurvivingProcess::Alive { generation } => {
+            return readopt_terminal_process(orch, resource, target, fence, &row, generation).await;
+        }
+        SurvivingProcess::Unknown => {
+            tracing::info!(
+                terminal = %terminal_uri, result = ?answer,
+                "terminal executor did not say whether its process survives; asking again next pass"
+            );
+            return Ok(None);
+        }
+        SurvivingProcess::Gone => {}
+    }
     if !terminal_restarts_on_loss(row.restart_policy) {
-        target.lease = Some(fence.clone());
-        return recover_without_restart(orch, resource, target, fence, &row, &owner, &terminal_uri)
-            .await;
+        return recover_without_restart(orch, &row, &owner, &terminal_uri, observed_here).await;
     }
     // Reconnecting to (or reclaiming) an existing lease can find a checkout the
     // bookmark advanced past while the executor was disconnected. Refresh to the
@@ -1139,7 +1167,7 @@ async fn restart_terminal_process(
     Ok(Some(session_id))
 }
 
-/// What the executor holding a `restart: never` terminal's environment says,
+/// What the executor holding a terminal's environment says,
 /// asked under the terminal's own fence, about the terminal's process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurvivingProcess {
@@ -1168,6 +1196,13 @@ fn judge_surviving_process(
                     generation: process.generation,
                 }
             }
+            Some(process)
+                if process_generation.is_some_and(|bound| bound != process.generation) =>
+            {
+                // A different generation is not permission to start beside a
+                // process still occupying this terminal's key.
+                SurvivingProcess::Unknown
+            }
             _ => SurvivingProcess::Gone,
         },
         ResidencyResult::Failed {
@@ -1180,77 +1215,30 @@ fn judge_surviving_process(
     }
 }
 
-/// Answer the loss of a `restart: never` terminal without running its command.
-///
-/// The policy forbids a replay, never a survivor: a process the executor proves
-/// still running is re-adopted under its own session and fence and keeps
-/// running, and only a process proven gone settles the terminal, through the
-/// one settlement writer, with the policy as its reason and its last output
-/// kept. An unanswered probe is not a verdict, so the terminal waits for the
-/// next pass.
+/// Settle a `restart: never` terminal after the fenced probe proved it gone.
+/// Keep its last output through the one settlement writer.
 async fn recover_without_restart(
     orch: &Orchestrator,
-    resource: CairnResource,
-    target: TerminalResourceTarget,
-    fence: ResidencyFence,
     row: &RecoveryRow,
     owner: &TerminalOwner,
     terminal_uri: &str,
+    observed_here: bool,
 ) -> Result<Option<String>, String> {
-    let answer = orch
-        .fleet
-        .operate_residency(
-            orch,
-            ResidencyOperation::Renew {
-                fence: fence.clone(),
-            },
-        )
-        .await;
-    let observed_here = orch
-        .pty_state
-        .sessions
-        .lock()
-        .map(|sessions| sessions.contains_key(&row.session_id))
-        .unwrap_or(false);
-    match judge_surviving_process(&answer, &row.session_id, row.process_generation) {
-        // This runner never lost it: nothing to recover.
-        SurvivingProcess::Alive { .. } if observed_here => Ok(None),
-        SurvivingProcess::Alive { generation } => {
-            readopt_terminal_process(orch, resource, target, fence, row, generation).await
-        }
-        SurvivingProcess::Gone => {
-            let cause = if row.status == "recovering" && !observed_here {
-                "the runner restarted"
-            } else {
-                "its executor went away"
-            };
-            let reason = not_restarted_by_policy_reason(cause);
-            if observed_here && row.status == "running" {
-                // A live transcript: the ordinary finalizer keeps its tail and
-                // says in it where and why the terminal stopped.
-                settle_lost_terminal(orch, &row.session_id, None, &reason).await?;
-            } else {
-                settle_terminal_as_lost(
-                    orch,
-                    owner,
-                    &row.slug,
-                    terminal_uri,
-                    &reason,
-                    &row.id,
-                    None,
-                )
-                .await?;
-            }
-            Ok(None)
-        }
-        SurvivingProcess::Unknown => {
-            tracing::info!(
-                terminal = %terminal_uri, result = ?answer,
-                "a restart: never terminal's executor did not say whether its process survives; asking again next pass"
-            );
-            Ok(None)
-        }
+    let cause = if row.status == "recovering" && !observed_here {
+        "the runner restarted"
+    } else {
+        "its executor went away"
+    };
+    let reason = not_restarted_by_policy_reason(cause);
+    if observed_here && row.status == "running" {
+        // A live transcript: the ordinary finalizer keeps its tail and
+        // says in it where and why the terminal stopped.
+        settle_lost_terminal(orch, &row.session_id, None, &reason).await?;
+    } else {
+        settle_terminal_as_lost(orch, owner, &row.slug, terminal_uri, &reason, &row.id, None)
+            .await?;
     }
+    Ok(None)
 }
 
 /// Re-adoption restores everything the runner holds for the process except its
@@ -1260,11 +1248,11 @@ async fn recover_without_restart(
 /// them).
 const READOPTED_NOTICE: &str =
     "\r\nCairn lost sight of this terminal and found its process still running, \
-so it took it back up as it was. It was not started again (restart: never). Cairn commands \
+so it took it back up as it was. It was not started again. Cairn commands \
 run inside it are refused until it is started again, because its callback relay did not \
 survive the runner restart (cairn/5689).\r\n";
 
-/// Take back a `restart: never` terminal whose process its executor kept
+/// Take back a terminal whose process its executor kept
 /// running while this runner could not observe it: the row returns to
 /// `running` under the same session, and the runner-side session, heartbeat
 /// and event handler a spawn would install are installed for the process that
@@ -9447,9 +9435,93 @@ mod terminal_finalize_tests {
         assert_eq!(settled.residency_holder, None);
     }
 
+    #[test]
+    fn recovery_requires_conclusive_process_evidence() {
+        let (_, fence) = test_terminal_target("probe");
+        for generation in [6, 7, 8] {
+            let cell = cell_holding(
+                &fence,
+                "session",
+                fence.cell_epoch,
+                generation,
+                running_status(),
+            );
+            let expected = if generation == 7 {
+                SurvivingProcess::Alive { generation: 7 }
+            } else {
+                SurvivingProcess::Unknown
+            };
+            assert_eq!(
+                judge_surviving_process(&ResidencyResult::State { cell }, "session", Some(7)),
+                expected
+            );
+        }
+        assert_eq!(
+            judge_surviving_process(
+                &ResidencyResult::State {
+                    cell: pre_start_cell(&fence)
+                },
+                "session",
+                Some(7)
+            ),
+            SurvivingProcess::Gone
+        );
+        assert_eq!(
+            judge_surviving_process(
+                &ResidencyResult::Failed {
+                    kind: ResidencyFailureKind::InvalidState,
+                    diagnostic: "renewal refused".into(),
+                    cell_outcome: None,
+                },
+                "session",
+                Some(7)
+            ),
+            SurvivingProcess::Unknown
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_inconclusive_auto_probe_waits_until_a_later_probe_proves_loss() {
+        let db = crate::storage::migrated_test_db("term_auto_probe.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("watch");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session = spawn_node_terminal(&orch, target, "bun test --watch").await;
+        executor.post();
+        restart_the_runner(&orch).await;
+        let lost_at = recovery_state(&orch.db.local, "watch").await.lost_at;
+
+        // The advertisement still matches, but the fresh renewal is refused.
+        // A refusal contains no process-liveness verdict.
+        executor.mutate(|cell| {
+            cell.residency.as_mut().unwrap().phase = ResidencyPhase::AwaitingReclaim;
+        });
+        restart_residency_terminals(&orch, fence.clone(), false)
+            .await
+            .unwrap();
+        let pending = recovery_state(&orch.db.local, "watch").await;
+        assert_eq!(pending.status, "recovering");
+        assert_eq!(pending.session_id, session);
+        assert_eq!(pending.lost_at, lost_at);
+        assert_eq!(executor.cell.lock().unwrap().occupancy.processes.len(), 1);
+
+        executor.mutate(|cell| {
+            cell.residency.as_mut().unwrap().phase = ResidencyPhase::Active;
+            cell.occupancy.processes.remove(&session);
+        });
+        restart_residency_terminals(&orch, fence, false)
+            .await
+            .unwrap();
+        let restarted = recovery_state(&orch.db.local, "watch").await;
+        assert_eq!(restarted.status, "running");
+        assert_ne!(restarted.session_id, session);
+        assert_eq!(executor.cell.lock().unwrap().occupancy.processes.len(), 1);
+    }
+
     /// cairn/7082 required 3. Two terminals share one environment when the
-    /// runner restarts: `auto` is started again, as before; `restart: never`,
-    /// whose process did not survive, is not, and settles with its policy as
+    /// runner restarts and neither process survives: `auto` is started again;
+    /// `restart: never` is not, and settles with its policy as
     /// the reason and its last output still readable.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_never_terminal_whose_process_is_gone_settles_while_its_auto_sibling_restarts() {
@@ -9476,9 +9548,10 @@ mod terminal_finalize_tests {
         ));
 
         restart_the_runner(&orch).await;
-        // The proof's process did not survive while the runner was away.
+        // Neither process survived while the runner was away.
         executor.mutate(|cell| {
             cell.occupancy.processes.remove(&proof_session);
+            cell.occupancy.processes.remove(&watch_session);
         });
         executor.post();
 
@@ -10212,6 +10285,9 @@ mod terminal_finalize_tests {
         proof.restart_policy = RestartPolicy::Never;
         let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
         let session_id = spawn_node_terminal(&orch, proof, "./prove --world shared").await;
+        let (watch, _) = test_terminal_target("watch");
+        let watch_session = spawn_node_terminal(&orch, watch, "bun test --watch").await;
+        let before = executor.cell.lock().unwrap().occupancy.processes.clone();
         executor.post();
 
         restart_the_runner(&orch).await;
@@ -10223,8 +10299,20 @@ mod terminal_finalize_tests {
             crate::terminal_host::reconcile_terminal_lifecycle_with(&orch, false)
                 .await
                 .unwrap(),
-            1
+            2
         );
+        let watch = recovery_state(&orch.db.local, "watch").await;
+        assert_eq!(watch.status, "running");
+        assert_eq!(watch.session_id, watch_session);
+        let after = executor.cell.lock().unwrap().occupancy.processes.clone();
+        assert_eq!(after.len(), 2, "neither survivor was replayed or stopped");
+        for key in [&session_id, &watch_session] {
+            assert_eq!(after[key].generation, before[key].generation);
+            assert!(matches!(
+                after[key].status,
+                ResidentProcessStatus::Running { .. }
+            ));
+        }
 
         let adopted = recovery_state(&orch.db.local, "proof").await;
         assert_eq!(adopted.status, "running");
@@ -10242,7 +10330,7 @@ mod terminal_finalize_tests {
         let processes = executor.cell.lock().unwrap().occupancy.processes.clone();
         assert_eq!(
             processes.len(),
-            1,
+            2,
             "nothing was started: {:?}",
             processes.keys()
         );
@@ -10299,11 +10387,20 @@ mod terminal_finalize_tests {
     /// lands, this call is authorized and this test is flipped to say so.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_re_adopted_terminals_callbacks_are_refused_until_relay_contexts_persist() {
-        let db = crate::storage::migrated_test_db("term_never_relay.db").await;
+        readopted_relay_refusal(RestartPolicy::Never).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auto_survivor_is_re_adopted_without_replay_and_has_the_same_relay_limit() {
+        readopted_relay_refusal(RestartPolicy::Auto).await;
+    }
+
+    async fn readopted_relay_refusal(policy: RestartPolicy) {
+        let db = crate::storage::migrated_test_db("term_readopt_relay.db").await;
         let (orch, _emitter) = test_orchestrator_with_emitter(db);
         seed(&orch.db.local).await;
         let (mut proof, fence) = test_terminal_target("proof");
-        proof.restart_policy = RestartPolicy::Never;
+        proof.restart_policy = policy;
         let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
         let session_id = spawn_node_terminal(&orch, proof, "./prove --world shared").await;
         executor.post();
@@ -10334,6 +10431,26 @@ mod terminal_finalize_tests {
             "running",
             "the survivor is re-adopted"
         );
+
+        let adopted = recovery_state(&orch.db.local, "proof").await;
+        assert_eq!(
+            adopted.session_id, session_id,
+            "the same session is adopted"
+        );
+        assert_eq!(adopted.lost_at, None);
+        let processes = executor.cell.lock().unwrap().occupancy.processes.clone();
+        assert_eq!(processes.len(), 1, "no replacement process was spawned");
+        assert!(matches!(
+            processes[&session_id].status,
+            ResidentProcessStatus::Running { .. }
+        ));
+        assert_eq!(processes[&session_id].generation, generation);
+        assert!(orch
+            .pty_state
+            .sessions
+            .lock()
+            .unwrap()
+            .contains_key(&session_id));
 
         let mut request = crate::mcp::types::McpCallbackRequest {
             cwd: "/".into(),

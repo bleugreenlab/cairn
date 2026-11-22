@@ -183,8 +183,9 @@ async fn delete_closing_terminal(db: &LocalDb, terminal: &RecoverableTerminal) -
 
 /// Reconcile durable recovery/close intents against the fleet's complete
 /// advertised fence. A recovering terminal whose exact fence an executor
-/// advertises is started again (or, under `restart: never`, re-adopted or
-/// settled). One whose fence can provably never match again settles at once.
+/// advertises is probed: a survivor is re-adopted, and only a proven loss
+/// permits a restart (or settlement under `restart: never`). One whose fence
+/// can provably never match again settles at once.
 /// Every other waits out the owner-recovery window, because an executor that
 /// has not re-advertised yet may still bring the process back.
 pub(crate) async fn reconcile_terminal_lifecycle(orch: &Orchestrator) -> Result<u64, String> {
