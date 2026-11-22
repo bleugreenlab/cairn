@@ -50,7 +50,8 @@ async fn insert_project_job_run_turn(db: &LocalDb, turn_state: &str) {
 /// cairn/6205 through the operator Stop entry point: the stop cancels the
 /// run's waits before any batch process has ended, so a batch that can write
 /// the branch is left a `running` detached row that holds it until the batch
-/// settles. A verdict-only batch never held the branch and is not converted.
+/// settles. A verdict-only machine batch keeps its lifecycle row for result
+/// delivery, but never holds the branch.
 #[tokio::test]
 async fn stop_session_keeps_a_committing_batchs_branch_hold() {
     let (_temp, orch) = common::test_orchestrator().await;
@@ -101,14 +102,15 @@ async fn stop_session_keeps_a_committing_batchs_branch_hold() {
         "the committing batch still holds its branch"
     );
     assert_eq!(
-        common::scalar_i64_by_id(
+        common::scalar_text_by_id(
             &orch.db.local,
-            "SELECT COUNT(*) FROM run_batch_detached WHERE request_id = ?1",
+            "SELECT state || '/' || holds_branch FROM run_batch_detached WHERE request_id = ?1",
             "req-verdict",
         )
-        .await,
-        0,
-        "a verdict-only batch is not converted"
+        .await
+        .as_deref(),
+        Some("running/0"),
+        "a verdict-only batch keeps its lifecycle record without holding the branch"
     );
 }
 
