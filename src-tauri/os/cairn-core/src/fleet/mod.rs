@@ -528,6 +528,9 @@ pub(crate) enum CheckCandidateStatus {
     WaitsFor {
         executor_name: String,
         room_seq: u64,
+        /// Remaining milliseconds and reason for the bounded first-room grace;
+        /// absent for the stronger memory-safety hold described above.
+        first_room: Option<(u64, &'static str)>,
     },
     /// Kept off it for the reason placement records.
     NotOffered(PlacementRejectionReason),

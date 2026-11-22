@@ -36,6 +36,8 @@ use cairn_common::executor_protocol::{
     ObservationReuse, PlacementReason, PlacementSelection, PlacementSyncCost, RoomShort,
 };
 use std::hash::{Hash, Hasher};
+#[path = "preference_inputs.rs"]
+mod preference_inputs;
 
 /// What a waiting entry's own task is told.
 #[derive(Debug)]
@@ -51,6 +53,8 @@ pub(super) enum Delivery {
 /// One waiting entry's side of the dispatcher: what `admit` and the offer
 /// read, and where its assignments go.
 struct Pending {
+    restart_dependent: bool,
+    restart: Option<preference_inputs::RestartFigures>,
     request: Arc<CellRequest>,
     plan: Option<Arc<ReservationPlan>>,
     interactive: bool,
@@ -448,6 +452,11 @@ fn account_rows(
                                         (Some(better), _) => CheckCandidateStatus::WaitsFor {
                                             executor_name: name_of(better),
                                             room_seq: seq,
+                                            first_room: core.first_room_wait(
+                                                entry_id,
+                                                executor_id,
+                                                now,
+                                            ),
                                         },
                                         (None, Some(reason)) => {
                                             CheckCandidateStatus::NotOffered(reason)
@@ -533,6 +542,8 @@ fn account_rows(
 /// What one entry needs on the machines it may run on.
 #[derive(Default)]
 struct Figured {
+    restart_dependent: bool,
+    restart: Option<preference_inputs::RestartFigures>,
     candidates: HashMap<String, Candidate>,
     resolved: HashMap<String, resource_profiles::ResolvedResourceProfile>,
     /// Machines whose size can never hold one process of this work.
@@ -1034,6 +1045,20 @@ impl Fleet {
         only: Option<&str>,
     ) -> Figured {
         let now = unix_time_ms();
+        let identity = (request.request_id.clone(), request.attempt_id.clone());
+        let lane = preference_inputs::cadence_lane(&self.purposes.lock().unwrap(), &identity);
+        let entry_id = lane.as_ref().and_then(|_| {
+            self.queue
+                .with_entry_by_identity(&identity, |entry| entry.id.clone())
+        });
+        // The expected run can come from any candidate, not just the machine
+        // whose facts moved.
+        let only = only.filter(|_| lane.is_none());
+        let bound = if lane.is_some() {
+            self.runner_events.placement_restart_bound().await
+        } else {
+            runner_events::RESTART_BOUND_CEILING_MS
+        };
         // Each machine that may run the work, whether it is away for now,
         // and whether that absence ends on its own (an update, not a drain).
         type Snapshot = Vec<(ExecutorConnectionState, bool, bool)>;
@@ -1085,6 +1110,7 @@ impl Fleet {
             }
         }
         let mut figured = Figured {
+            restart_dependent: lane.is_some(),
             seen,
             ..Figured::default()
         };
@@ -1178,12 +1204,127 @@ impl Fleet {
                 Candidate {
                     need,
                     warm,
+                    preference: super::dispatcher::Preference {
+                        restart_demoted: false,
+                        role_affinity: preference_inputs::role_affinity(
+                            request.publication.is_some(),
+                            request.placement_work_class,
+                            machine.machine_role,
+                        ),
+                    },
                     key,
                     away: *away,
                 },
             );
             if let Some(resolved) = resolved {
                 figured.resolved.insert(executor_id, resolved);
+            }
+        }
+        if lane.is_some() {
+            let expected = preference_inputs::expected_exposed_run(
+                machines
+                    .iter()
+                    .filter(|(machine, _, _)| {
+                        figured
+                            .candidates
+                            .contains_key(&machine.identity.executor_id)
+                    })
+                    .map(|(machine, _, _)| {
+                        let duration = figured
+                            .resolved
+                            .get(&machine.identity.executor_id)
+                            .map(|resolved| &resolved.duration);
+                        (machine.colocated, duration)
+                    }),
+                bound,
+            );
+            if let Some(expected) = expected {
+                let colocated = machines.iter().any(|(machine, _, _)| {
+                    machine.colocated
+                        && figured
+                            .candidates
+                            .contains_key(&machine.identity.executor_id)
+                });
+                let remote = machines.iter().any(|(machine, _, _)| {
+                    !machine.colocated
+                        && figured
+                            .candidates
+                            .contains_key(&machine.identity.executor_id)
+                });
+                if colocated {
+                    let (check, platform) = lane.clone().expect("cadence lane");
+                    figured.restart = Some(preference_inputs::RestartFigures {
+                        check,
+                        platform,
+                        expected_run_ms: expected,
+                        bound_ms: bound,
+                        colocated: machines
+                            .iter()
+                            .find(|(machine, _, _)| machine.colocated)
+                            .map(|(machine, _, _)| executor_public_name(machine))
+                            .unwrap_or_default(),
+                        remotes: HashMap::new(),
+                    });
+                }
+                if colocated && remote {
+                    let oracle = preference_inputs::DurationOracle {
+                        db: plan.map(|plan| plan.db.clone()),
+                    };
+                    for (machine, _, _) in &machines {
+                        let id = &machine.identity.executor_id;
+                        let Some(candidate) = figured.candidates.get_mut(id) else {
+                            continue;
+                        };
+                        let context = ReservationPlan::context_for(
+                            &machine.identity.device_id,
+                            id,
+                            &machine.advertisement.capabilities,
+                        );
+                        let held = preference_inputs::posted_queue_hold(
+                            &machine.snapshot,
+                            &machine.health,
+                            &preference_inputs::QueueHoldWork {
+                                project_id: &request.project_id,
+                                request_id: &request.request_id,
+                                entry_id: entry_id.as_deref(),
+                                need: &candidate.need,
+                                class: request.command_class,
+                            },
+                            now,
+                        );
+                        let queue_ms = if machine.colocated || held {
+                            None
+                        } else {
+                            let prices = preference_inputs::QueuePrices::resolve(
+                                &oracle, machine, &context, now,
+                            )
+                            .await;
+                            // The forecast's stall threshold is this machine's own
+                            // predicted run, not the cross-machine restart run.
+                            let run = figured
+                                .resolved
+                                .get(id)
+                                .map(|resolved| resolved.duration.predicted_ms)
+                                .unwrap_or(0);
+                            preference_inputs::forecast_queue_wait(
+                                machine, &prices, request, run, now,
+                            )
+                            .predicted_ms()
+                        };
+                        if !machine.colocated {
+                            if let Some(restart) = &mut figured.restart {
+                                restart
+                                    .remotes
+                                    .insert(id.clone(), (executor_public_name(machine), queue_ms));
+                            }
+                        }
+                        candidate.preference.restart_demoted = preference_inputs::restart_demoted(
+                            machine.colocated,
+                            queue_ms,
+                            expected,
+                        );
+                    }
+                }
             }
         }
         if let Some(plan) = plan {
@@ -1411,6 +1552,8 @@ impl Fleet {
             placing.pending.insert(
                 entry_id.to_string(),
                 Pending {
+                    restart_dependent: figured.restart_dependent,
+                    restart: figured.restart,
                     request: Arc::new(request.clone()),
                     plan,
                     interactive,
@@ -1556,6 +1699,7 @@ impl Fleet {
             _ => row.recorded(now),
         })
         .collect();
+        let restart = pending.restart.clone();
         let resolved = pending.resolved.get(&assignment.executor_id).cloned();
         let headroom = assignment.authorized.then_some(HeadroomAuthorization {
             reserve_from_unix_ms: pending.reserve_from_unix_ms,
@@ -1617,7 +1761,9 @@ impl Fleet {
                 .and_then(|resolved| resolved.memory_fit.ceiling()),
             process_fit_waived: None,
             nested_sandbox_waived: None,
-            restart_exposure: None,
+            restart_exposure: restart.as_ref().map(|restart| {
+                restart.record(machine.colocated, &executor_public_name(machine), &rejected)
+            }),
             process_demand: resolved
                 .as_ref()
                 .and_then(|resolved| process_demand_record(&resolved.process_evidence, machine)),
@@ -1974,11 +2120,13 @@ impl Fleet {
         let nesting = placing
             .pending
             .values()
-            .any(|pending| needs_nesting(&pending.request));
+            .any(|pending| needs_nesting(&pending.request) || pending.restart_dependent);
         drop(placing);
         drop(connections);
+        // A departing candidate may also have supplied a cadence lane's
+        // longest learned run. All waiting lanes must see that departure.
         if nesting {
-            self.spawn_refigure(Some(executor_id.to_string()));
+            self.spawn_dependent_refigure();
         }
     }
 
@@ -2018,9 +2166,22 @@ impl Fleet {
         }
     }
 
+    fn spawn_dependent_refigure(&self) {
+        let fleet = self.clone();
+        let refigure = async move { fleet.refigure(None, false, true).await };
+        match &self.host_runtime {
+            Some(runtime) => {
+                runtime.spawn(refigure);
+            }
+            None => {
+                tokio::spawn(refigure);
+            }
+        }
+    }
+
     fn spawn_refigure(&self, only: Option<String>) {
         let fleet = self.clone();
-        let refigure = async move { fleet.refigure(only.as_deref(), false).await };
+        let refigure = async move { fleet.refigure(only.as_deref(), false, false).await };
         match &self.host_runtime {
             Some(runtime) => {
                 runtime.spawn(refigure);
@@ -2034,13 +2195,13 @@ impl Fleet {
     /// The profile store learned something: work out again the needs of the
     /// entries whose scopes it named, once each.
     async fn refigure_learned(&self) {
-        self.refigure(None, true).await;
+        self.refigure(None, true, false).await;
     }
 
     /// Work out again what waiting entries may do on `only` (or on every
     /// machine), and hand the dispatcher what changed. With `learned`, only
     /// entries whose needs stamp moved are worked out.
-    async fn refigure(&self, only: Option<&str>, learned: bool) {
+    async fn refigure(&self, only: Option<&str>, learned: bool, dependent_only: bool) {
         type Work = (
             String,
             Arc<CellRequest>,
@@ -2052,6 +2213,9 @@ impl Fleet {
             .lock_placing()
             .pending
             .iter()
+            .filter(|(_, pending)| {
+                !dependent_only || pending.restart_dependent || needs_nesting(&pending.request)
+            })
             .filter(|(_, pending)| {
                 !learned
                     || pending
@@ -2099,9 +2263,20 @@ impl Fleet {
                 .filter(|(id, at)| epoch(&connections, &placing.facts, id) == Some(**at))
                 .map(|(id, _)| id)
                 .collect();
+            if figured.restart_dependent
+                && (fresh.len() != figured.seen.len() || connections.len() != figured.seen.len())
+            {
+                drop(placing);
+                drop(connections);
+                // The attach, detach or facts move already started its own
+                // refigure; do not publish any part of this older survey.
+                continue;
+            }
             let Some(pending) = placing.pending.get_mut(&entry_id) else {
                 continue;
             };
+            pending.restart_dependent = figured.restart_dependent;
+            pending.restart = figured.restart;
             if learned {
                 pending.stamp = stamp;
             }

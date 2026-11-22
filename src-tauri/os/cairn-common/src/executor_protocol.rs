@@ -9719,6 +9719,13 @@ pub struct LearnedResourceEstimate {
 /// occupancy even when overcommitted. Older peers derive slots from free cores
 /// and disagree about admission, so mixed versions must not admit together.
 /// Runner rebuild and executor self-update distribute the matching rule.
+///
+/// cairn/7399 does not move the number. Restart exposure, service-role affinity
+/// and publisher affinity only order the runner's eligible machines. Its
+/// bounded wait for an attached preferred machine's first room is runner-local
+/// state. Offers, needs, headroom authorizations and admission keep their shapes
+/// and meanings; an older executor judges each offer exactly as before. A
+/// runner talking to an older executor therefore gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 177;
 
 /// The version `build.rs` derived from the paragraphs above

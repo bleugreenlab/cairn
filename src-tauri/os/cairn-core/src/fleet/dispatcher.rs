@@ -64,6 +64,10 @@ use cairn_common::wire_vocabulary::CellPriority;
 pub(crate) type MachineId = String;
 pub(crate) type EntryId = String;
 
+// Opening room frames race after attachment. Give an attached preferred
+// machine one short opportunity to speak, even for immediately entitled lanes.
+const FIRST_ROOM_PREFERENCE_MS: u64 = 5_000;
+
 /// What one entry needs on one machine it may run on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Candidate {
@@ -71,6 +75,7 @@ pub(crate) struct Candidate {
     /// The machine's warm roots hold the request's base commit: preferred
     /// among machines whose room fits (tenet 1395), never required.
     pub(crate) warm: bool,
+    pub(crate) preference: Preference,
     /// Where the machine stands among the entry's machines on what its
     /// memory can do for this work, before warmth or room.
     pub(crate) key: HardKey,
@@ -80,6 +85,20 @@ pub(crate) struct Candidate {
     /// it; it can still keep a deferred or clamped entry off a machine its
     /// key ranks ahead of, until the entry's reserve-from instant.
     pub(crate) away: bool,
+}
+
+/// Affinities among machines whose room fits. Smaller is better. These do
+/// not authorize waiting for a busy machine, unlike the memory-safety key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Preference {
+    pub(crate) restart_demoted: bool,
+    pub(crate) role_affinity: bool,
+}
+
+impl Preference {
+    fn order(self) -> (bool, bool) {
+        (self.restart_demoted, !self.role_affinity)
+    }
 }
 
 /// The memory-safety order of the machines an entry may run on: a machine
@@ -366,6 +385,7 @@ impl HoldChoice {
 #[derive(Debug, Clone)]
 struct Entry {
     waiting: Waiting,
+    prefer_until_unix_ms: u64,
     standing: Standing,
     /// Machine to the room seq it last refused this entry under. A refusal
     /// belongs to the process that gave it: it is forgotten when that
@@ -552,6 +572,32 @@ impl Dispatcher {
         self.blocker(entry, executor_id, now_unix_ms)
     }
 
+    /// The remaining first-room grace and its reason, when the named blocker
+    /// is an affinity rather than a memory-safety hold.
+    pub(crate) fn first_room_wait(
+        &self,
+        entry_id: &str,
+        executor_id: &str,
+        now_unix_ms: u64,
+    ) -> Option<(u64, &'static str)> {
+        let entry = self.entries.get(entry_id)?;
+        let by = self.blocker(entry, executor_id, now_unix_ms)?;
+        let here = entry.waiting.candidates.get(executor_id)?;
+        let preferred = entry.waiting.candidates.get(by)?;
+        if here.key.order() != preferred.key.order() {
+            return None;
+        }
+        let reason = if here.preference.restart_demoted != preferred.preference.restart_demoted {
+            "surviving runner restarts"
+        } else {
+            "its dedicated service or publication role"
+        };
+        Some((
+            entry.prefer_until_unix_ms.saturating_sub(now_unix_ms),
+            reason,
+        ))
+    }
+
     /// The machine that keeps `entry` off `executor_id`: one ahead of it on
     /// the entry's hard key that could hold the entry. The best such machine
     /// is named, by key and then name. Nothing keeps off work its caller
@@ -610,6 +656,30 @@ impl Dispatcher {
             })
             .min_by(|a, b| a.1.key.order().cmp(&b.1.key.order()).then(a.0.cmp(b.0)))
             .map(|(id, _)| id.as_str())
+            .or_else(|| {
+                // An attached machine gets one bounded opportunity to announce
+                // its first room. Once it speaks, affinity never waits for load.
+                if now_unix_ms >= entry.prefer_until_unix_ms {
+                    return None;
+                }
+                let here = &waiting.candidates[executor_id];
+                waiting
+                    .candidates
+                    .iter()
+                    .filter(|(id, better)| {
+                        !better.away
+                            && better.key.order() == here.key.order()
+                            && better.preference.order() < here.preference.order()
+                            && self.machines.get(*id).is_some_and(|m| m.room.is_none())
+                    })
+                    .min_by(|a, b| {
+                        a.1.preference
+                            .order()
+                            .cmp(&b.1.preference.order())
+                            .then(a.0.cmp(b.0))
+                    })
+                    .map(|(id, _)| id.as_str())
+            })
     }
 
     /// Place again every waiting entry that may run on `executor_id` and on
@@ -630,14 +700,15 @@ impl Dispatcher {
             .flatten()
             .filter_map(|entry_id| {
                 let entry = self.entries.get(entry_id)?;
-                let here = entry.waiting.candidates.get(executor_id)?.key.order();
+                let candidate = entry.waiting.candidates.get(executor_id)?;
+                let here = (candidate.key.order(), candidate.preference.order());
                 (entry.standing == Standing::Waiting
                     && entry.waiting.may_spill
                     && entry
                         .waiting
                         .candidates
                         .values()
-                        .any(|other| other.key.order() > here))
+                        .any(|other| (other.key.order(), other.preference.order()) > here))
                 .then(|| (entry.waiting.rank(now_unix_ms), entry_id.clone()))
             })
             .collect();
@@ -999,11 +1070,21 @@ impl Dispatcher {
         if waiting.entitled(now_unix_ms) {
             self.entitled.insert(entry_id.clone());
         }
+        let prefer_until_unix_ms = now_unix_ms.saturating_add(FIRST_ROOM_PREFERENCE_MS);
+        if waiting
+            .candidates
+            .values()
+            .any(|c| c.preference != Preference::default())
+        {
+            self.deadlines
+                .insert((prefer_until_unix_ms, entry_id.clone()));
+        }
         let machines: Vec<MachineId> = waiting.candidates.keys().cloned().collect();
         self.entries.insert(
             entry_id.clone(),
             Entry {
                 waiting,
+                prefer_until_unix_ms,
                 standing: Standing::Waiting,
                 declined_at: HashMap::new(),
                 turned_away: HashMap::new(),
@@ -1031,6 +1112,16 @@ impl Dispatcher {
         };
         let mut before: Vec<MachineId> = entry.waiting.candidates.keys().cloned().collect();
         entry.waiting.candidates = candidates;
+        if entry.prefer_until_unix_ms > now_unix_ms
+            && entry
+                .waiting
+                .candidates
+                .values()
+                .any(|c| c.preference != Preference::default())
+        {
+            self.deadlines
+                .insert((entry.prefer_until_unix_ms, entry_id.to_string()));
+        }
         // Nothing asks `admit` again on a machine the entry may not run on.
         let now_on = &entry.waiting.candidates;
         entry
@@ -1300,6 +1391,8 @@ impl Dispatcher {
             .remove(&(entry.waiting.horizon_unix_ms, entry_id.to_string()));
         self.deadlines
             .remove(&(entry.waiting.reserve_from_unix_ms, entry_id.to_string()));
+        self.deadlines
+            .remove(&(entry.prefer_until_unix_ms, entry_id.to_string()));
         Some(entry)
     }
 
@@ -1389,6 +1482,19 @@ impl Dispatcher {
             let need = entry.waiting.candidates[executor_id].need.clone();
             let left = &self.machines[executor_id].room.as_ref().unwrap().left;
             if !self.fits_left(entry, executor_id, left, &need, now_unix_ms) {
+                continue;
+            }
+            // Only entries touched by this machine's walk are considered.
+            // If affinity has a choice, use the same fitting-room choice as
+            // join; otherwise announcement order would erase the preference.
+            let here = &entry.waiting.candidates[executor_id];
+            if entry.waiting.candidates.iter().any(|(id, other)| {
+                !other.away
+                    && other.key.order() == here.key.order()
+                    && other.preference.order() < here.preference.order()
+                    && self.machines.contains_key(id)
+            }) {
+                effects.absorb(self.place(&entry_id, now_unix_ms, admit));
                 continue;
             }
             if !admit(&entry_id, executor_id) {
@@ -1528,7 +1634,7 @@ impl Dispatcher {
         }
         type Fitting = (
             (bool, Reverse<Option<Option<u64>>>, bool),
-            bool,
+            (bool, bool, bool),
             u64,
             MachineId,
             u64,
@@ -1559,7 +1665,11 @@ impl Dispatcher {
             ) {
                 fitting.push((
                     candidate.key.order(),
-                    candidate.warm,
+                    (
+                        candidate.preference.restart_demoted,
+                        !candidate.preference.role_affinity,
+                        !candidate.warm,
+                    ),
                     left_after(&announced.left, &candidate.need),
                     executor_id.clone(),
                     machine.generation,
@@ -1568,11 +1678,11 @@ impl Dispatcher {
                 ));
             }
         }
-        // The hard key, then warm first, then the most room left after the
-        // need, then the name only to make the order total.
+        // Safety, restart exposure, role affinity, warmth, room left, name.
+        // Restart exposure must beat even a warm colocated machine.
         fitting.sort_by(|a, b| {
             a.0.cmp(&b.0)
-                .then(b.1.cmp(&a.1))
+                .then(a.1.cmp(&b.1))
                 .then(b.2.cmp(&a.2))
                 .then(a.3.cmp(&b.3))
         });
@@ -2032,6 +2142,7 @@ mod tests {
                         Candidate {
                             need: need.clone(),
                             warm: false,
+                            preference: Preference::default(),
                             key: HardKey::default(),
                             away: false,
                         },
@@ -2040,6 +2151,173 @@ mod tests {
                 .collect(),
             may_spill: true,
         }
+    }
+
+    fn check_preference(favoured: Preference, disfavoured: Preference) {
+        let entry = || {
+            let mut w = waiting(0, &["favoured", "other"], &need(2, 2));
+            w.standing = true;
+            w.reserve_from_unix_ms = 0;
+            w.candidates.get_mut("favoured").unwrap().preference = favoured;
+            let other = w.candidates.get_mut("other").unwrap();
+            other.preference = disfavoured;
+            other.warm = true;
+            w
+        };
+        // Even a warm disfavoured machine loses when both rooms fit at join.
+        let mut d = Dispatcher::default();
+        for id in ["favoured", "other"] {
+            d.attach(id, 1);
+            d.set_room(id, 1, 1, room(8, 8), 0, &mut yes());
+        }
+        assert_eq!(
+            assigned_to(&d.enqueue(entry(), 0, &mut yes())),
+            [("e0", "favoured")]
+        );
+        assert!(d.stranded(0).is_empty());
+
+        // Both rooms fit, but admission initially turns the entry away.
+        // Rewalking only the disfavoured machine still chooses the preferred
+        // fitting room rather than treating the walk as permission to take it.
+        let mut d = Dispatcher::default();
+        for id in ["favoured", "other"] {
+            d.attach(id, 1);
+            d.set_room(id, 1, 1, room(8, 8), 0, &mut yes());
+        }
+        d.enqueue(entry(), 0, &mut |_, _| false);
+        assert!(d.stranded(0).is_empty());
+        assert_eq!(
+            assigned_to(&d.rewalk("other", 1, &mut yes())),
+            [("e0", "favoured")]
+        );
+        assert!(d.stranded(1).is_empty());
+
+        // Opening frames may arrive in either order. The attached preferred
+        // host gets a bounded opportunity to speak, not an indefinite pin.
+        let mut d = Dispatcher::default();
+        d.attach("favoured", 1);
+        d.attach("other", 1);
+        assert!(d.enqueue(entry(), 0, &mut yes()).assigned.is_empty());
+        assert!(d
+            .set_room("other", 1, 1, room(8, 8), 0, &mut yes())
+            .assigned
+            .is_empty());
+        assert!(d.stranded(0).is_empty());
+        assert_eq!(
+            d.first_room_wait("e0", "other", 0)
+                .map(|(remaining, _)| remaining),
+            Some(FIRST_ROOM_PREFERENCE_MS)
+        );
+        assert_eq!(
+            assigned_to(&d.set_room("favoured", 1, 1, room(8, 8), 1, &mut yes())),
+            [("e0", "favoured")]
+        );
+        assert!(d.stranded(1).is_empty());
+
+        // Neither eligibility nor attachment is invented by an affinity.
+        for eligible in [false, true] {
+            let mut d = Dispatcher::default();
+            d.attach("other", 1);
+            d.set_room("other", 1, 1, room(8, 8), 0, &mut yes());
+            let mut w = entry();
+            if !eligible {
+                w.candidates.remove("favoured");
+            }
+            assert_eq!(assigned_to(&d.enqueue(w, 0, &mut yes())), [("e0", "other")]);
+            assert!(d.stranded(0).is_empty());
+        }
+
+        // A silent host's opportunity ends without a post, independently of
+        // standing work's immediate entitlement.
+        let mut d = Dispatcher::default();
+        d.attach("favoured", 1);
+        d.attach("other", 1);
+        d.set_room("other", 1, 1, room(8, 8), 0, &mut yes());
+        assert!(d.enqueue(entry(), 0, &mut yes()).assigned.is_empty());
+        assert_eq!(
+            assigned_to(&d.deadline_reached(FIRST_ROOM_PREFERENCE_MS, &mut yes())),
+            [("e0", "other")]
+        );
+        assert!(d.stranded(FIRST_ROOM_PREFERENCE_MS).is_empty());
+
+        // Detaching during the opening grace releases the entry immediately.
+        let mut d = Dispatcher::default();
+        d.attach("favoured", 1);
+        d.attach("other", 1);
+        d.set_room("other", 1, 1, room(8, 8), 0, &mut yes());
+        assert!(d.enqueue(entry(), 0, &mut yes()).assigned.is_empty());
+        assert_eq!(
+            assigned_to(&d.detach("favoured", 1, 1, &mut yes())),
+            [("e0", "other")]
+        );
+        assert!(d.stranded(1).is_empty());
+
+        // A first room that is too small also releases grace immediately.
+        let mut d = Dispatcher::default();
+        d.attach("favoured", 1);
+        d.attach("other", 1);
+        d.enqueue(entry(), 0, &mut yes());
+        d.set_room("other", 1, 1, room(8, 8), 0, &mut yes());
+        assert_eq!(
+            assigned_to(&d.set_room("favoured", 1, 1, room(1, 1), 1, &mut yes())),
+            [("e0", "other")]
+        );
+        assert!(d.stranded(1).is_empty());
+
+        // A preferred host that has spoken but has no room does not pin work.
+        let mut d = Dispatcher::default();
+        d.attach("favoured", 1);
+        d.attach("other", 1);
+        d.set_room("favoured", 1, 1, busy(8, 8), 0, &mut yes());
+        let mut unentitled = entry();
+        unentitled.standing = false;
+        unentitled.reserve_from_unix_ms = 5 * HOUR;
+        assert!(d.enqueue(unentitled, 0, &mut yes()).assigned.is_empty());
+        assert_eq!(
+            assigned_to(&d.set_room("other", 1, 1, room(8, 8), 1, &mut yes())),
+            [("e0", "other")]
+        );
+        assert!(d.stranded(1).is_empty());
+    }
+
+    #[test]
+    fn restart_exposure_outranks_even_a_warm_colocated_machine() {
+        check_preference(
+            Preference::default(),
+            Preference {
+                restart_demoted: true,
+                role_affinity: false,
+            },
+        );
+        check_preference(
+            Preference::default(),
+            Preference {
+                restart_demoted: true,
+                role_affinity: true,
+            },
+        );
+    }
+
+    #[test]
+    fn services_prefer_the_services_only_machine_without_pinning() {
+        check_preference(
+            Preference {
+                restart_demoted: false,
+                role_affinity: true,
+            },
+            Preference::default(),
+        );
+    }
+
+    #[test]
+    fn publication_legs_prefer_the_publisher_without_pinning() {
+        check_preference(
+            Preference {
+                restart_demoted: false,
+                role_affinity: true,
+            },
+            Preference::default(),
+        );
     }
 
     #[test]
@@ -3246,6 +3524,10 @@ mod tests {
         Candidate {
             need,
             warm: rng.gen_bool(0.3),
+            preference: Preference {
+                restart_demoted: rng.gen_bool(0.3),
+                role_affinity: rng.gen_bool(0.3),
+            },
             key: HardKey {
                 deferred: rng.gen_bool(0.2),
                 unmeasured_capacity: compile

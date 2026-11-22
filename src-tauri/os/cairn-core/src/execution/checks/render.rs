@@ -171,9 +171,16 @@ pub(super) fn describe_placement_account(
             CheckCandidateStatus::WaitsFor {
                 executor_name,
                 room_seq,
-            } => each.push(format!(
-                "{name}: its room #{room_seq} fits, but the work waits for {executor_name}, which could hold it and ranks ahead on memory"
-            )),
+                first_room,
+            } => each.push(match first_room {
+                Some((remaining_ms, reason)) => format!(
+                    "{name}: its room #{room_seq} fits; waiting up to {} s for {executor_name} to announce room, preferred for {reason}",
+                    remaining_ms.div_ceil(1_000),
+                ),
+                None => format!(
+                    "{name}: its room #{room_seq} fits, but the work waits for {executor_name}, which could hold it and ranks ahead on memory"
+                ),
+            }),
             CheckCandidateStatus::NotOffered(PlacementRejectionReason::CadenceTurn { .. }) => {}
             CheckCandidateStatus::NotOffered(reason) => {
                 let why = reason.describe();

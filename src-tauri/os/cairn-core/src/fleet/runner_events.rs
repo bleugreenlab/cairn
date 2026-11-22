@@ -334,6 +334,8 @@ struct Inner {
     /// `runner_started` row is stamped with it rather than with the attach
     /// time, so no event of this incarnation can predate its own start.
     created_at_ms: u64,
+    restart_history: std::sync::OnceLock<(Arc<LocalDb>, u64)>,
+    restart_bound: tokio::sync::OnceCell<u64>,
 }
 
 /// The one sink for runner lifecycle facts. Cheap to clone; every clone feeds
@@ -351,6 +353,8 @@ impl Default for RunnerEvents {
                 mode: Mutex::new(Mode::Unattached(VecDeque::new())),
                 shared: Arc::default(),
                 created_at_ms: super::unix_time_ms(),
+                restart_history: std::sync::OnceLock::new(),
+                restart_bound: tokio::sync::OnceCell::new(),
             }),
         }
     }
@@ -381,6 +385,23 @@ impl Default for Retention {
 }
 
 impl RunnerEvents {
+    /// Read the boot's fixed history once, off the placement lock. Include our
+    /// start even when the journal writer has not stored it yet.
+    pub(super) async fn placement_restart_bound(&self) -> u64 {
+        let Some((db, attached_at)) = self.inner.restart_history.get() else {
+            return RESTART_BOUND_CEILING_MS;
+        };
+        *self.inner.restart_bound.get_or_init(|| async {
+            match load_restart_bound(db, *attached_at, self.inner.created_at_ms).await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    log::warn!("runner starts could not be read; restart bound stays at its ceiling: {error}");
+                    RESTART_BOUND_CEILING_MS
+                }
+            }
+        }).await
+    }
+
     /// A broken query is a boot-scoped fault, not one event per placement,
     /// identity, suite, or machine. Restarting permits one fresh announcement.
     pub(super) fn memory_evidence_unreadable(
@@ -560,6 +581,10 @@ impl RunnerEvents {
         db: Arc<LocalDb>,
         runner_incarnation: &str,
     ) -> Result<(), String> {
+        let _ = self
+            .inner
+            .restart_history
+            .set((db.clone(), super::unix_time_ms()));
         self.attach_with(
             db,
             runner_incarnation,
@@ -1144,6 +1169,57 @@ pub(crate) async fn load_window(db: &LocalDb, since_ms: u64) -> DbResult<RunnerE
         oldest_retained_ms,
         last_gap,
     })
+}
+
+/// The longest a main-cadence lane may be expected to run before placement
+/// treats the runner's next restart as likely to end it on the colocated
+/// executor, whatever the restart history says.
+pub(crate) const RESTART_BOUND_CEILING_MS: u64 = 60 * 60 * 1_000;
+/// How far back the restart interval is measured.
+pub(crate) const RESTART_INTERVAL_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// The restart bound placement weighs a long main-cadence lane against: the
+/// shorter of [`RESTART_BOUND_CEILING_MS`] and the median interval between
+/// successive runner starts. Fewer than two starts have no interval, and the
+/// ceiling stands.
+pub(crate) fn restart_bound_ms(starts_ms: &[u64]) -> u64 {
+    let mut starts = starts_ms.to_vec();
+    starts.sort_unstable();
+    starts.dedup();
+    let mut intervals: Vec<u64> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    if intervals.is_empty() {
+        return RESTART_BOUND_CEILING_MS;
+    }
+    intervals.sort_unstable();
+    let middle = intervals.len() / 2;
+    let median = if intervals.len().is_multiple_of(2) {
+        (intervals[middle - 1] + intervals[middle]) / 2
+    } else {
+        intervals[middle]
+    };
+    median.min(RESTART_BOUND_CEILING_MS)
+}
+
+/// [`restart_bound_ms`] over every `runner_started` row in the last
+/// [`RESTART_INTERVAL_WINDOW_MS`], with this incarnation's own start, which
+/// its writer may not have stored yet.
+pub(crate) async fn load_restart_bound(
+    db: &LocalDb,
+    now_ms: u64,
+    started_at_ms: u64,
+) -> DbResult<u64> {
+    let since = now_ms.saturating_sub(RESTART_INTERVAL_WINDOW_MS) as i64;
+    let mut starts = db
+        .query_all(
+            "SELECT occurred_at_ms FROM runner_events
+             WHERE kind = 'runner_started' AND occurred_at_ms >= ?1
+             ORDER BY occurred_at_ms",
+            (since,),
+            |row| Ok(row.i64(0)?.max(0) as u64),
+        )
+        .await?;
+    starts.push(started_at_ms);
+    Ok(restart_bound_ms(&starts))
 }
 
 #[cfg(test)]
@@ -1809,6 +1885,32 @@ mod tests {
             2
         );
         assert_eq!(events.journal_state().dropped, 0);
+    }
+
+    #[test]
+    fn restart_bound_uses_deduplicated_starts_and_the_even_median() {
+        const M: u64 = 60_000;
+        assert_eq!(restart_bound_ms(&[]), RESTART_BOUND_CEILING_MS);
+        assert_eq!(restart_bound_ms(&[M, M]), RESTART_BOUND_CEILING_MS);
+        assert_eq!(restart_bound_ms(&[85 * M, 0, 40 * M]), 42 * M + M / 2);
+        assert_eq!(
+            restart_bound_ms(&[0, 154 * M, 314 * M]),
+            RESTART_BOUND_CEILING_MS
+        );
+    }
+
+    #[test]
+    fn restart_bound_reads_seven_days_and_includes_the_unwritten_current_start() {
+        const M: u64 = 60_000;
+        let runtime = runtime();
+        let db = test_db(&runtime, "restart-bound");
+        let now = 30 * 24 * 60 * M;
+        runtime.block_on(async {
+            for (id, at) in [("ancient", now - 8*24*60*M), ("first", now - 80*M), ("second", now - 40*M)] {
+                db.execute("INSERT INTO runner_events (id, runner_incarnation, kind, occurred_at_ms, detail_json) VALUES (?1, 'r', 'runner_started', ?2, '{}')", (id, at as i64)).await.unwrap();
+            }
+            assert_eq!(load_restart_bound(&db, now, now).await.unwrap(), 40*M);
+        });
     }
 
     fn kinds(rows: &[(String, Option<String>, Option<i64>, Value)]) -> Vec<&str> {
