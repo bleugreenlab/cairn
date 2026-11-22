@@ -806,6 +806,11 @@ pub(super) async fn read_node_batches(
     match request_id {
         Some(request_id) => match detached::load(db, request_id).await {
             Ok(Some(batch)) if batch.job_id == job_id => {
+                if let Some(wait) = in_flight.iter().find(|wait| {
+                    wait.request_id == request_id && wait.state == "resolving" && wait.resolution.is_some()
+                }) {
+                    return render_in_flight(orch, &home, wait, now_ms);
+                }
                 let mut out = detached::render(&batch, &detached::live_state(orch, &batch));
                 if matches!(
                     batch.state,
@@ -894,12 +899,13 @@ struct OpenBatchWait {
     label: Option<String>,
     created_at: i64,
     state: String,
+    resolution: Option<String>,
 }
 
 /// The job's run batches whose calls are suspended on them, newest first.
 async fn open_batch_waits(db: &LocalDb, job_id: &str) -> Result<Vec<OpenBatchWait>, String> {
     db.query_all(
-        "SELECT json_extract(condition_json, '$.request_id'), json_extract(condition_json, '$.label'), created_at, state
+        "SELECT json_extract(condition_json, '$.request_id'), json_extract(condition_json, '$.label'), created_at, state, resolution_json
            FROM agent_waits
           WHERE job_id = ?1 AND state IN ('pending', 'resolving')
             AND json_extract(condition_json, '$.kind') = 'run_batch'
@@ -911,6 +917,7 @@ async fn open_batch_waits(db: &LocalDb, job_id: &str) -> Result<Vec<OpenBatchWai
                 label: row.opt_text(1)?,
                 created_at: row.get::<i64>(2)?,
                 state: row.text(3)?,
+                resolution: row.opt_text(4)?,
             })
         },
     )
@@ -940,6 +947,16 @@ fn render_in_flight(
     } else {
         format!("in flight, its call suspended on it{since}")
     };
+    if wait.state == "resolving" {
+        return format!(
+            "# Run batch `{}`\n\nLabel: {}\nState: {state}\n\n{}\n",
+            wait.request_id,
+            wait.label.as_deref().unwrap_or("unnamed"),
+            wait.resolution
+                .as_deref()
+                .unwrap_or("Its result is being delivered.")
+        );
+    }
     let progress = match detached::live_progress(orch, &wait.request_id) {
         Some(progress) => format!("Progress: {}.\n", progress.describe(now_ms)),
         None => "Progress: this runner holds no task for it; it settles from its machine's own report.\n".to_string(),

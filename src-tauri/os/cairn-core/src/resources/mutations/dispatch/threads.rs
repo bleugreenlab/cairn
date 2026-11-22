@@ -159,6 +159,31 @@ pub(super) async fn run_thread_id(
         .flatten()
 }
 
+/// The canonical home of the run's own thread, including a task spawned by
+/// its session. An issue's parent thread is deliberately not an acting thread.
+pub(super) async fn run_thread_home(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+) -> Option<String> {
+    let (context, db) = crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request)
+        .await
+        .ok()?;
+    let thread_id = owning_thread_id(&db, &context.job_id).await.ok()??;
+    let (project, name) = db
+        .query_one(
+            "SELECT p.key, t.name FROM threads t
+               JOIN projects p ON p.id = t.project_id WHERE t.id = ?1",
+            (thread_id,),
+            |row| {
+                use crate::storage::RowExt;
+                Ok((row.text(0)?, row.text(1)?))
+            },
+        )
+        .await
+        .ok()?;
+    Some(cairn_uri::build_thread_uri(&project, &name))
+}
+
 /// The thread a queue order is for, and who placed it.
 pub(super) type QueueOrderer = (
     std::sync::Arc<cairn_db::storage::LocalDb>,

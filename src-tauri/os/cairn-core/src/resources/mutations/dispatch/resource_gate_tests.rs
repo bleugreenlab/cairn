@@ -46,7 +46,7 @@ fn gate_accepts_the_batch_cancel_and_the_replay_that_cancels_the_holding_batch()
         let it = item(
             target,
             ChangeMode::Patch,
-            Some(serde_json::json!({"action": "cancel"})),
+            Some(serde_json::json!({"action": "cancel", "reason": "release queued work"})),
         );
         assert!(gate(&it).is_ok(), "{target}");
     }

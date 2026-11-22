@@ -726,39 +726,13 @@ pub(crate) async fn record_snapshot(
     request_id: &str,
     attribution: &super::SnapshotAttribution,
 ) -> Result<(), String> {
-    let id = request_id.to_string();
-    let attribution = attribution.clone();
-    db.write(|c| {
-        let id = id.clone();
-        let attribution = attribution.clone();
-        Box::pin(async move {
-            let mut rows = c
-                .query(
-                    "SELECT settlement_json FROM run_batch_detached WHERE request_id=?1",
-                    params![id.clone()],
-                )
-                .await?;
-            let raw = match rows.next().await? {
-                Some(row) => row.opt_text(0)?,
-                None => None,
-            };
-            drop(rows);
-            if let Some(raw) = raw {
-                let mut settlement: super::PersistedSettlement = serde_json::from_str(&raw)
-                    .map_err(|error| cairn_db::storage::DbError::internal(error.to_string()))?;
-                settlement.snapshot_attribution = Some(attribution);
-                let json = serde_json::to_string(&settlement)
-                    .map_err(|error| cairn_db::storage::DbError::internal(error.to_string()))?;
-                c.execute(
-                    "UPDATE run_batch_detached SET settlement_json=?2 WHERE request_id=?1",
-                    params![id, json],
-                )
-                .await?;
-            }
-            Ok(())
-        })
-    })
+    let attribution = serde_json::to_string(attribution).map_err(|error| error.to_string())?;
+    db.execute(
+        "UPDATE run_batch_detached SET settlement_json=json_set(settlement_json,'$.snapshot_attribution',json(?2)) WHERE request_id=?1 AND settlement_json IS NOT NULL",
+        params![request_id, attribution],
+    )
     .await
+    .map(|_| ())
     .map_err(|error| error.to_string())
 }
 
@@ -1466,6 +1440,18 @@ async fn finish(
         ),
         Finish::Lost { evidence } => ("lost", None, None, None, Some(evidence.to_string())),
     };
+    let output = match output {
+        Some(output) => Some(
+            attributed_result(
+                db,
+                request_id,
+                verdict.as_deref().unwrap_or_default(),
+                &output,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let lost = state == "lost";
     let id = request_id.to_string();
     db.write(|c| {
@@ -1757,6 +1743,51 @@ pub(crate) async fn settle_answered_inline(
     }
 }
 
+/// Runner-only request metadata lives beside the persisted settlement, not in
+/// the detachment reason or the executor protocol. JSON insertion preserves the
+/// first requester and leaves the typed settlement fields unchanged.
+pub(crate) async fn record_cancel_request(
+    db: &LocalDb,
+    request_id: &str,
+    by: &str,
+) -> Result<(), String> {
+    db.execute(
+        "UPDATE run_batch_detached SET settlement_json=json_insert(COALESCE(settlement_json,'{}'),'$.cancel_requested_by',?2) WHERE request_id=?1 AND state IN ('parked','running')",
+        params![request_id, by],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("record run batch cancellation attribution: {error}"))
+}
+
+/// A request is evidence of who asked, not proof the batch was cancelled.
+/// Only an actual cancellation verdict may describe it as the canceller.
+pub(crate) async fn attributed_result(
+    db: &LocalDb,
+    request_id: &str,
+    verdict: &str,
+    text: &str,
+) -> Result<String, String> {
+    if !verdict.starts_with("it was cancelled") && !verdict.starts_with("it was never placed") {
+        return Ok(text.to_string());
+    }
+    let by = db.query_all(
+        "SELECT json_extract(settlement_json,'$.cancel_requested_by') FROM run_batch_detached WHERE request_id=?1",
+        (request_id.to_string(),),
+        |row| row.opt_text(0),
+    ).await.map_err(|error| format!("read run batch cancellation attribution: {error}"))?
+        .into_iter().flatten().next();
+    Ok(match by {
+        Some(by)
+            if !text.contains(&format!("cancelled by {by}"))
+                && !text.contains(&format!("Cancelled by {by}")) =>
+        {
+            format!("{text}\n\nCancelled by {by}.")
+        }
+        _ => text.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1841,6 +1872,45 @@ mod tests {
             output: None,
             ..batch(DetachedState::Running, false, None)
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_request_survives_until_report_without_relabelling_success() {
+        let orch = orch_with_job().await;
+        let db = &orch.db.local;
+        insert(db, &running("cancel-attribution")).await.unwrap();
+        let by = "cairn://p/cairn/execution (reason: stuck placement)";
+        record_cancel_request(db, "cancel-attribution", by)
+            .await
+            .unwrap();
+        record_cancel_request(db, "cancel-attribution", "operator")
+            .await
+            .unwrap();
+        record_snapshot(
+            db,
+            "cancel-attribution",
+            &super::super::SnapshotAttribution {
+                ran_commit: "abc123".into(),
+                branch: "agent/test".into(),
+                current_commit: Some("abc123".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            attributed_result(db, "cancel-attribution", "it passed", "success")
+                .await
+                .unwrap(),
+            "success"
+        );
+        let text = attributed_result(db, "cancel-attribution", "it was cancelled", "stopped")
+            .await
+            .unwrap();
+        assert_eq!(text, format!("stopped\n\nCancelled by {by}."));
+        settle_answered_inline(&orch, db, "cancel-attribution", "it was cancelled", &text).await;
+        let batch = load(db, "cancel-attribution").await.unwrap().unwrap();
+        assert!(render(&batch, &LiveState::Untracked).contains(by));
+        assert!(notices(db).await.is_empty());
     }
 
     async fn notices(db: &LocalDb) -> Vec<String> {

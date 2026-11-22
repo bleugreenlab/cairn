@@ -575,6 +575,17 @@ async fn drive_row(orch: &Orchestrator, db: &Arc<LocalDb>, row: AdoptedRow) {
             return;
         }
     };
+    let text = match detached::attributed_result(db, &row.request_id, &verdict, &text).await {
+        Ok(text) => text,
+        Err(error) => {
+            log::warn!("{error}");
+            let _ = db.execute(
+                "UPDATE run_batch_adopted_outcomes SET state='received',claimed_by_incarnation=NULL WHERE request_id=?1 AND attempt_id=?2 AND state='publishing' AND claimed_by_incarnation=?3",
+                params![row.request_id.as_str(), row.attempt_id.as_str(), incarnation.as_str()],
+            ).await;
+            return;
+        }
+    };
     let commit = super::run_commit_sha(&text);
     let recorded = db
         .execute(
@@ -969,6 +980,20 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
             // any machine is asked: its branch was released, whatever its
             // machine still reports.
             match detached::load(&db, request_id).await {
+                Ok(Some(batch))
+                    if batch.state == detached::DetachedState::Settled
+                        && batch.output.is_some() =>
+                {
+                    deliver_batch_result(
+                        orch,
+                        &db,
+                        request_id,
+                        batch.verdict.as_deref().unwrap_or("finished"),
+                        batch.output.as_deref().expect("checked above"),
+                    )
+                    .await;
+                    continue;
+                }
                 Ok(Some(batch)) if batch.state == detached::DetachedState::Lost => {
                     resolve_wait(
                         orch,
@@ -1037,8 +1062,13 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
             ) {
                 RequestReport::Held { .. } => {}
                 RequestReport::Completed(completion) => {
-                    let (_, output) = detached::completion_result(&completion, *commits);
-                    resolve_wait(orch, &db, &record, request_id, &output).await;
+                    let (verdict, output) = detached::completion_result(&completion, *commits);
+                    match detached::attributed_result(&db, request_id, &verdict, &output).await {
+                        Ok(output) => {
+                            deliver_batch_result(orch, &db, request_id, &verdict, &output).await
+                        }
+                        Err(error) => log::warn!("{error}"),
+                    }
                 }
                 RequestReport::Gone => {
                     // The adoption that commits before its ack and the

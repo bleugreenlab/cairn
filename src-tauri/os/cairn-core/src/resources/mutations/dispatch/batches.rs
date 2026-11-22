@@ -6,10 +6,9 @@
 //! addressed under the wrong node is refused naming the right one, so a
 //! principal never cancels a batch it did not mean.
 //!
-//! The operator may cancel any batch. A run may cancel a batch of its own
-//! job, or of a live job on the same branch (a node and its tasks hold that
-//! branch together at the base-advance boundary). Anyone else is refused,
-//! naming who can.
+//! The operator and any thread (its sessions and their tasks) may cancel any
+//! batch on the install. Other runs may cancel their own job's batch, or one
+//! of a live job on the same branch. Anyone else is refused, naming who can.
 
 use super::super::{build_failure, payload_non_empty_str, ResourceMutationResult};
 use super::Writer;
@@ -98,23 +97,28 @@ pub(super) async fn dispatch(
         )));
     }
     let writer = super::writer(orch, request).await.map_err(fail)?;
-    authorize(&db, &writer, &owner, request_id)
+    let thread = super::threads::run_thread_home(orch, request).await;
+    authorize(&db, &writer, thread.as_deref(), &owner, request_id)
         .await
         .map_err(fail)?;
+    let principal = thread.as_deref().unwrap_or_else(|| writer.principal());
+    let by = match payload.get("reason") {
+        None => principal.to_string(),
+        Some(serde_json::Value::String(reason)) if reason.trim().is_empty() => {
+            principal.to_string()
+        }
+        Some(serde_json::Value::String(reason)) => {
+            format!("{principal} (reason: {})", reason.trim())
+        }
+        Some(_) => return Err(fail("payload.reason must be a string".to_string())),
+    };
     if dry_run {
         return Ok(Some(format!(
             "Would cancel run batch `{request_id}` on behalf of {}",
-            writer.principal()
+            by
         )));
     }
-    let report = cancel::cancel_batch(
-        orch,
-        &db,
-        request_id,
-        writer.principal(),
-        cancel::CANCEL_SETTLE_WAIT,
-    )
-    .await;
+    let report = cancel::cancel_batch(orch, &db, request_id, &by, cancel::CANCEL_SETTLE_WAIT).await;
     if !report.reached() {
         return Err(fail(report.sentence(request_id)));
     }
@@ -166,17 +170,19 @@ async fn not_in_flight(db: &LocalDb, request_id: &str) -> String {
     }
 }
 
-/// The operator, the batch's own job, or a live job on the same branch.
+/// Any thread on the install, the operator, the owner, or a live branch sharer.
 async fn authorize(
     db: &LocalDb,
     writer: &Writer,
+    thread: Option<&str>,
     owner: &str,
     request_id: &str,
 ) -> Result<(), String> {
     let Writer::Run { job_id, .. } = writer else {
         return Ok(());
     };
-    if job_id == owner
+    if thread.is_some()
+        || job_id == owner
         || crate::orchestrator::base_advance::shares_live_branch(db, job_id, owner).await?
     {
         return Ok(());
@@ -187,6 +193,7 @@ async fn authorize(
         .flatten()
         .unwrap_or_else(|| format!("job `{owner}`"));
     Err(format!(
-        "Refused: run batch `{request_id}` belongs to {holder}. Only that node, a node sharing its branch, or the operator may cancel it. Nothing was cancelled."
+        "Refused: run batch `{request_id}` belongs to {holder}. Any thread (its sessions and their tasks), that node, a node sharing its branch, or the operator may cancel it; caller {} acts for no thread and owns neither this batch nor its branch. Nothing was cancelled.",
+        writer.principal()
     ))
 }

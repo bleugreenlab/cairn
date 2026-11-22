@@ -9797,7 +9797,7 @@ impl BatchControl {
         let json = serde_json::to_string(&self.persisted_for_record(fleet))
             .map_err(|error| format!("Could not record run settlement: {error}"))?;
         let changed = db.execute(
-            "UPDATE run_batch_detached SET settlement_json=?2 WHERE request_id=?1 AND state IN ('parked','running')",
+            "UPDATE run_batch_detached SET settlement_json=json_patch(COALESCE(settlement_json,'{}'),?2) WHERE request_id=?1 AND state IN ('parked','running')",
             (self.request_id.clone(), json),
         )
         .await
@@ -10721,6 +10721,22 @@ impl CallAnswer {
     async fn answer(&mut self, answer: BatchAnswer) -> String {
         use crate::mcp::handlers::durable_suspend::{self, HeldDelivery};
 
+        // A cancelled inline call may never have needed a durable wait.
+        // Its answer retains the page using its own original request, so page
+        // creation cannot race past completion and leave a running orphan.
+        if self.control.cancelled_detail().is_some() && self.detached.is_none() {
+            match record_detached(
+                &self.orch,
+                &self.request,
+                &self.control,
+                "its batch was explicitly cancelled",
+            )
+            .await
+            {
+                Ok(record) => self.detached = Some(record),
+                Err(error) => log::warn!("could not retain cancelled batch page: {error}"),
+            }
+        }
         // The call carries the result itself, so a detached row written for
         // it (ahead of need, or by an abandonment that converted its wait)
         // settles without a notice.
@@ -15895,7 +15911,7 @@ pub(crate) mod host_batch_tests {
         assert_eq!(
             count(
                 orch,
-                "SELECT COUNT(*) FROM run_batch_detached WHERE holds_branch=1"
+                "SELECT COUNT(*) FROM run_batch_detached WHERE holds_branch=1 AND state IN ('parked','running')"
             )
             .await,
             0
@@ -16107,10 +16123,24 @@ pub(crate) mod host_batch_tests {
         target: &str,
         dry_run: bool,
     ) -> Result<String, String> {
+        cancel_through_write_with_reason(orch, run_id, target, dry_run, None).await
+    }
+
+    async fn cancel_through_write_with_reason(
+        orch: &Orchestrator,
+        run_id: Option<&str>,
+        target: &str,
+        dry_run: bool,
+        reason: Option<&str>,
+    ) -> Result<String, String> {
+        let mut payload = json!({"action": "cancel"});
+        if let Some(reason) = reason {
+            payload["reason"] = json!(reason);
+        }
         let item = crate::mcp::types::ChangeItem {
             target: target.to_string(),
             mode: crate::mcp::types::ChangeMode::Patch,
-            payload: Some(json!({"action": "cancel"})),
+            payload: Some(payload),
         };
         crate::resources::mutations::dispatch_resource_change(
             orch,
@@ -16398,14 +16428,15 @@ pub(crate) mod host_batch_tests {
         );
     }
 
-    /// Who may cancel: the operator; the owning node; a node sharing its
-    /// branch (a parent and its task); never an unrelated node, which is told
-    /// whose batch it is. A cancel addressed under the wrong node is refused
-    /// naming the right address.
+    /// An issue parented to a thread is still an issue, not a thread session.
+    /// Its unrelated nodes are refused by name; owner, branch sharer and
+    /// operator remain allowed. Misaddressing still names the right address.
     #[tokio::test(flavor = "multi_thread")]
-    async fn only_the_owner_a_branch_sharer_or_the_operator_may_cancel_a_batch() {
+    async fn an_unrelated_issue_node_is_refused_but_owner_branch_sharer_and_operator_can_cancel() {
         let orch = env().await;
         for sql in [
+            "INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES('issue-parent','p','models',1,1)",
+            "UPDATE issues SET parent_thread_id='issue-parent' WHERE id='i'",
             "UPDATE jobs SET branch='agent/cancel' WHERE id='job-1'",
             "INSERT INTO jobs (id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment,branch) VALUES ('job-2','e','i','p','Reviewer','running',1,1,'reviewer','agent/other')",
             "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-2','job-2','open','handle-2',1,1)",
@@ -16425,7 +16456,9 @@ pub(crate) mod host_batch_tests {
             .await
             .unwrap_err();
         assert!(
-            refused.contains(&format!("belongs to {BUILDER}")) && refused.contains("operator"),
+            refused.contains(&format!("belongs to {BUILDER}"))
+                && refused.contains("caller cairn://p/prj/1/1/reviewer")
+                && refused.contains("Any thread"),
             "{refused}"
         );
 
@@ -16454,6 +16487,117 @@ pub(crate) mod host_batch_tests {
             .unwrap_or_else(|refusal| panic!("a node on the same branch may cancel: {refusal}"));
         assert!(sharer.starts_with("Would cancel"), "{sharer}");
         assert!(!control.stop_placement.is_stopped());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thread_or_its_task_cancels_another_threads_child_batch_across_projects() {
+        for (caller_task, owner_task, reason) in [
+            (false, false, Some("idle capacity is available")),
+            (true, false, Some("release the stuck placement")),
+            (false, true, None),
+            (true, true, Some("cancel this task batch only")),
+        ] {
+            let orch = env().await;
+            orch.db.local.execute_script(
+                "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+                   VALUES('q','w','Other','other','/tmp/other',1,1);
+                 INSERT INTO threads(id,project_id,name,created_at,updated_at)
+                   VALUES('thread-caller','q','execution',1,1),('thread-owner','p','models',1,1);
+                 UPDATE issues SET parent_thread_id='thread-owner' WHERE id='i';
+                 UPDATE jobs SET branch='agent/owner' WHERE id='job-1';
+                 INSERT INTO jobs(id,project_id,node_name,status,thread_id,uri_segment,created_at,updated_at)
+                   VALUES('job-thread','q','session','running','thread-caller','thread',1,1);
+                 INSERT INTO jobs(id,project_id,node_name,status,parent_job_id,uri_segment,created_at,updated_at)
+                   VALUES('job-thread-task','q','helper','running','job-thread','helper',1,1);
+                 INSERT INTO runs(id,project_id,job_id,status,created_at,updated_at)
+                   VALUES('run-thread','q','job-thread','live',1,1),
+                         ('run-thread-task','q','job-thread-task','live',1,1);"
+            ).await.unwrap();
+            let home = if owner_task {
+                orch.db.local.execute_script(
+                    "INSERT INTO jobs(id,execution_id,issue_id,project_id,node_name,status,uri_segment,branch,created_at,updated_at)
+                       VALUES('job-parent','e','i','p','Parent','running','parent','agent/owner',1,1);
+                     UPDATE jobs SET parent_job_id='job-parent' WHERE id='job-1';"
+                ).await.unwrap();
+                "cairn://p/prj/1/1/parent/task/builder"
+            } else {
+                BUILDER
+            };
+            let control = BatchControl::new(true);
+            control.set_owner(detached::BatchOwner {
+                job_id: "job-1".into(),
+                home: Some(home.into()),
+            });
+            let _claim = orch
+                .fleet
+                .claim_job_command_for_test(&control.request_id, "job-1", 1);
+            let _finish = park_simulated_batch(&orch, "tool-1", &control).await;
+            let target = format!("{home}/batches/{}", control.request_id);
+            let caller = if caller_task {
+                "run-thread-task"
+            } else {
+                "run-thread"
+            };
+            let answer =
+                cancel_through_write_with_reason(&orch, Some(caller), &target, false, reason)
+                    .await
+                    .unwrap_or_else(|refusal| panic!("{refusal}"));
+            assert!(answer.starts_with("Cancelled run batch"), "{answer}");
+            let principal = "cairn://p/other/execution";
+            let attribution = match reason {
+                Some(reason) => format!("cancelled by {principal} (reason: {reason})"),
+                None => format!("cancelled by {principal}."),
+            };
+            let resumed = eventually(Duration::from_secs(10), || {
+                tool_result_containing(&orch, &attribution)
+            })
+            .await
+            .expect("owner resumes with the cancelling thread and reason");
+            assert!(!resumed.contains("execution/task/helper"), "{resumed}");
+            let page =
+                crate::resources::read_cairn_resource(&orch, &write_request(None), &target).await;
+            assert!(page.contains(&attribution), "{page}");
+            assert_eq!(successor_turns(&orch).await, 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_inline_cancel_retains_its_batch_page_without_a_wait_or_a_notice() {
+        let orch = env().await;
+        let control = BatchControl::new(false);
+        control.set_owner(detached::BatchOwner {
+            job_id: "job-1".into(),
+            home: Some(BUILDER.into()),
+        });
+        let request = call_request(json!({"commands": [{"command": "cargo nextest run"}]}));
+        let deadlines = CallDeadlines::new(
+            tokio::time::Instant::now(),
+            ms(5_000),
+            ms(6_000),
+            ms(10_000),
+            None,
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (_finish, finish_rx) = tokio::sync::oneshot::channel();
+        simulated_routed_batch(control.clone(), tx, finish_rx);
+        let target = format!("{BUILDER}/batches/{}", control.request_id);
+        let (answer, cancelled) = tokio::join!(
+            answer_call(&orch, &request, deadlines, control.clone(), rx),
+            cancel_through_write_with_reason(
+                &orch,
+                Some("run-1"),
+                &target,
+                false,
+                Some("cancel inline work"),
+            ),
+        );
+        assert!(cancelled.unwrap().starts_with("Cancelled run batch"));
+        assert!(answer.contains("cancel inline work"), "{answer}");
+        assert_eq!(count(&orch, "SELECT COUNT(*) FROM agent_waits").await, 0);
+        let page =
+            crate::resources::read_cairn_resource(&orch, &write_request(None), &target).await;
+        assert!(page.contains("cancel inline work"), "{page}");
+        assert_eq!(run_batch_notices(&orch).await, 0);
     }
 
     /// Abandonment retains the identity of work still running, so a reissue is

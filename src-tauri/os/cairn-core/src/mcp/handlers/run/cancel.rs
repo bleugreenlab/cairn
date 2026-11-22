@@ -112,7 +112,38 @@ pub(crate) async fn cancel_batch(
     by: &str,
     settle_wait: std::time::Duration,
 ) -> CancelReport {
-    let Some(control) = detached::live_control(request_id) else {
+    let control = detached::live_control(request_id);
+    if control.as_ref().is_some_and(|control| control.settling()) {
+        return CancelReport::AlreadySettling;
+    }
+    // Publication already owns an adopted result, just as a live settling
+    // control does. Its own result stands; even page creation is too late.
+    if control.is_none() {
+        match adopted::has_open_adoption(db, request_id).await {
+            Ok(true) => return CancelReport::AlreadySettling,
+            Ok(false) => {}
+            Err(error) => {
+                return CancelReport::Unread {
+                    error: error.to_string(),
+                }
+            }
+        }
+    }
+    // A suspended call needs a durable batch page too. Create it before
+    // recording attribution or sending Cancel; a resolving wait is untouched.
+    match crate::mcp::handlers::durable_suspend::pending_run_batch_wait(db, request_id).await {
+        Ok(Some(record)) => {
+            if let Err(error) = convert_wait(db, &record).await {
+                return CancelReport::Unread { error };
+            }
+        }
+        Ok(None) => {}
+        Err(error) => return CancelReport::Unread { error },
+    }
+    if let Err(error) = detached::record_cancel_request(db, request_id, by).await {
+        return CancelReport::Unread { error };
+    }
+    let Some(control) = control else {
         // A batch an earlier runner placed is still the fleet's request: the
         // same `Cancel` ends it, and its machine's report settles its row.
         return match orch.cancel_cell_request(request_id) {
@@ -280,7 +311,7 @@ async fn convert_wait(
                     &record.job_id,
                     &record.run_id,
                     &record.condition,
-                    "its owner cancelled it while no runner task or machine held it",
+                    detached::INLINE_CAPTURE,
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await?;
