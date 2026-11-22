@@ -1,4 +1,32 @@
-use super::*;
+use super::{
+    acquired_residency_holder, applicable_refusal, build_prerequisite_deficiency,
+    containment_deficiency, describe_preparation_rejections, executor_names_match,
+    executor_public_name, github_credential_deficiency, is_preparation_rejection, judge_link,
+    matches_selector, mpsc, needs_build_volume, nested_sandbox_fit, nested_sandbox_preference,
+    nested_sandbox_summary, pipe_floor_work, project_placement_requirements, refused,
+    selector_shortfall, serves_project, setup_toolchain_deficiency, unix_time_ms,
+    ActivePlacementPolicy, AdmissionHoldEvidence, Arc, CacheWarmthEvidence, CellCheckoutKind,
+    CellOutcome, CellRequest, CellUnavailableReason, CheckDispatchPhase, CommandResourceIdentity,
+    DeclineReason, Duration, EnrolledRemote, ExecutionWarmth, ExecutorCapabilities,
+    ExecutorConnectionState, ExecutorMessage, ExecutorSelector, ExecutorSubstrateEvidence,
+    ExecutorSubstrateState, Fleet, FleetSnapshot, HashMap, InventoryAuthorityState,
+    KnownMachinePlatform, MachineMeasurement, MeasurementBlindness, NestedSandboxFit, OfferAnswer,
+    Path, PipeFloorWork, PlacementCounterfactualWinner, PlacementDecision, PlacementMobility,
+    PlacementOutcome, PlacementPolicyEvidence, PlacementReadings, PlacementRejection,
+    PlacementRejectionReason, PlacementWorkClass, ProcessBatch, ProjectPlacementRequirements,
+    PublicationCustody, PublishIsolationEvidence, PublishIsolationVerdict, QueuedCellRequest,
+    QueuedPlacementEvidence, QueuedPlacementRejection, QueuedPlacementTarget, RemoteLinkState,
+    RepositoryLocator, RequestIdentity, ReservationFallback, ReservationRationale, ResidencyHolder,
+    ResourceReservation, ResourceReservationSource, SandboxCapabilityEvidence, SelectorShortfall,
+    WarmthUnknownReason, ENVIRONMENT_LEASE_GRACE_MS, EXECUTOR_PROGRESS_FRESHNESS_MS,
+    EXECUTOR_TELEMETRY_STALE_AFTER_MS, LOCAL_EXECUTOR_NAME, PUBLISH_ISOLATION_STALE_AFTER_MS,
+};
+use super::{
+    drain_projection, link_clock, models, occupancy, profile_reads, queue, reliability,
+    resource_profiles,
+};
+
+use cairn_config::fleet::{MachineRole, PlacementStance, COLOCATED_EXECUTOR_ID};
 
 pub(super) fn queued_placement_evidence(decision: &PlacementDecision) -> QueuedPlacementEvidence {
     let selected = match &decision.outcome {

@@ -1,4 +1,25 @@
-use super::*;
+use super::node_scratch::NodeScratchEvent;
+use super::requirements::project_eligibility;
+use super::residency_routes::{
+    resident_process_label, ResidencyRoute, GRANT_CONFIRMATION_GRACE_MS,
+};
+use super::selection::{missing_wait_reason_is_new, queued_placement_evidence, ReservationPlan};
+use super::{
+    executor_public_name, link_clock, load, rollout, rollout_candidate, service_placement,
+    telemetry, unix_time_ms, warm_roots, ExecutorConnectionState, Fleet,
+    PendingMemoryDiagnosticResult, PendingPolicyResult, RequestIdentity,
+};
+use cairn_common::executor_protocol::{
+    CellRequest, ExecutorAdvertisement, ExecutorHealthSnapshot, ExecutorHealthStatus,
+    ExecutorInspection, ExecutorMessage, ExecutorSubstrateReport, FleetSnapshot, MachineRole,
+    MachineSample, ResidencyFence, ResidentProcessEvent, ResidentProcessEventKind, UpdateReport,
+    EXECUTOR_HEARTBEAT_INTERVAL_MS,
+};
+use cairn_config::fleet::COLOCATED_EXECUTOR_ID;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 /// One executor link's snapshot count, read by [`Fleet::snapshot_receipts`].
 /// Counts restart with each link generation.

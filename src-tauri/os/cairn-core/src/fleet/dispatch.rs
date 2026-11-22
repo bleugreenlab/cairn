@@ -1,4 +1,53 @@
-use super::*;
+use super::coalescing::{CoalescingKey, PlacementDemand};
+use super::colocated::require_colocated_population;
+use super::node_scratch::NodeScratchEvent;
+use super::purpose::{PurposeAdmissionGuard, PurposeGate};
+use super::relay_authority::{RunnerCallbackContext, RunnerContextEntry};
+use super::requirements::runs_project_setup;
+use super::residency_routes::{link_silence_ms, residency_core_failure, residency_queue_entry_id};
+use super::selection::{
+    deadline_evidence, describe_room_taken_first, project_config_refusal, record_command_outcome,
+    AboveMemoryCeiling, Placement, ReservationPlan, SelectedExecutor,
+};
+#[cfg(test)]
+use super::ResultAckProbe;
+use super::{
+    assignments, check_index_from_stream_id, compact_duration, drain_projection,
+    executor_public_name, format_duration_annotation, occupancy, output_guard, placement, purpose,
+    queue, register_manual_check_publications, reliability, resource_profiles,
+    run_item_index_from_stream_id, unix_time_ms, CancelCause, CellAccount, CellPlacement,
+    CheckDispatch, CheckDispatchDecline, CheckDispatchPhase, CoalescedCellOutcome,
+    CoalescedDelivery, CoalescedSubscriber, CoalescedWaitError, DeferredResultAck,
+    ExecutorConnectionState, ExecutorPlatform, Fleet, InFlightExecution, LeaderSettlement,
+    LinkBoundResponse, OfferAnswer, PublicationCoordination, PureVerdictBatchItem, RequestIdentity,
+    UnboundResult, RESIDENCY_RESPONSE_FLOOR_MS,
+};
+use crate::execution::cache::CheckResultIdentity;
+use crate::mcp::handlers::run::{ResolvedRunBatch, RunSpec};
+use crate::orchestrator::Orchestrator;
+use cairn_common::executor_protocol::{
+    CellOutcome, CellRequest, CellUnavailableReason, ClaimedAttemptAccount, ExecutorConfig,
+    ExecutorMessage, ExecutorSubstrateEvidence, ExecutorSubstrateState, FleetSnapshot,
+    MaterializationReadFailureKind, MaterializationReadResult, MutationPolicy,
+    ObjectTransferCoordinate, PlacementOutcome, PlacementWorkClass, ProcessBatch,
+    ProcessBatchExecution, ProcessBatchFile, ProcessBatchItem, ProcessSandboxMode,
+    ProjectCapability, ProjectPlacementRequirements, RepositoryLocator, ResidencyFailureKind,
+    RunnerCallback, RunnerCallbackResult, EXECUTOR_LINK_STALL_REMEDIATION_MS,
+    EXECUTOR_PROGRESS_FRESHNESS_MS, LOCAL_EXECUTOR_NAME, RESIDENCY_ACQUIRE_ATTEMPT_ID,
+};
+use cairn_common::toolchain_requirements::project_placement_requirements;
+use cairn_common::wire_vocabulary::{CellAdmissionKind, CellPriority};
+#[cfg(test)]
+use cairn_config::fleet::{built_in_profile, DEFAULT_PLACEMENT_PROFILE};
+use cairn_config::fleet::{PlacementProfile, COLOCATED_EXECUTOR_ID};
+use cairn_platform::stack::off_frame;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 pub(super) struct CoalescedLeaderCompletionGuard {
     pub(super) pool: Fleet,

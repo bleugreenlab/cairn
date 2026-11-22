@@ -46,8 +46,13 @@ pub mod telemetry;
 pub mod unreturned;
 mod warm_roots;
 
-pub use cairn_config::fleet::*;
+pub use cairn_config::fleet::{
+    ExecutorListenerSettings, FleetConfig, MachineRole, MachineSelection, MachineServiceKey,
+    PlacementProfile, RemoteExecutorConfig, RemoteExecutorDeclaration, RemotePlatform, SetByKind,
+    COLOCATED_EXECUTOR_ID, INTERACTIVE_PLACEMENT_PROFILE,
+};
 
+#[cfg(test)]
 use crate::mcp::handlers::run::{ResolvedRunBatch, RunSpec};
 use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::needs_build_volume;
@@ -55,27 +60,23 @@ use cairn_common::executor_protocol::MachineSample;
 pub(crate) use cairn_common::executor_protocol::PublicationCustody;
 use cairn_common::executor_protocol::SandboxCapabilityEvidence;
 use cairn_common::executor_protocol::{
-    executor_names_match, AdmissionHoldEvidence, ClaimedAttemptAccount, MachineModelResident,
+    executor_names_match, AdmissionHoldEvidence, MachineModelResident,
 };
 use cairn_common::executor_protocol::{
     CacheWarmthEvidence, CellCheckoutKind, CellResidency, DeclineReason, EnrolledRemote,
-    ExecutionWarmth, ExecutorAdvertisement, ExecutorCapabilities, ExecutorConfig,
-    ExecutorHealthSnapshot, ExecutorHealthStatus, ExecutorIdentity, ExecutorInspection,
-    ExecutorListenerAdvertisement, ExecutorMessage, ExecutorSelector, ExecutorSubstrateEvidence,
-    ExecutorSubstrateReport, ExecutorSubstrateState, GenerationEndMemory, InventoryAuthorityState,
-    MachineMeasurement, MaterializationReadFailureKind, MaterializationReadRequest,
-    MaterializationReadResult, ObjectTransferCoordinate, PlacementCounterfactualWinner,
-    PlacementDecision, PlacementMobility, PlacementOutcome, PlacementPolicyEvidence,
-    PlacementReadings, PlacementRejection, PlacementRejectionReason, ProcessBatch,
-    ProcessBatchExecution, ProcessBatchFile, ProcessBatchItem, ProcessSandboxMode,
-    ProcessTelemetry, QueuedPlacementEvidence, QueuedPlacementRejection, QueuedPlacementTarget,
-    RemoteAttachAttempt, RemoteConnectionTransition, RemoteLinkState, RepositoryLocator,
-    ReservationFallback, ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind,
-    ResidencyFence, ResidencyHolder, ResidencyOperation, ResidencyResult, ResidencyRuntimeConfig,
-    ResidentProcessEvent, ResidentProcessEventKind, RunnerCallback, RunnerCallbackResult,
-    UpdateReport, WarmthUnknownReason, EXECUTOR_HEARTBEAT_INTERVAL_MS,
-    EXECUTOR_LINK_STALL_REMEDIATION_MS, EXECUTOR_PROGRESS_FRESHNESS_MS,
-    EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS, LOCAL_EXECUTOR_NAME, RESIDENCY_ACQUIRE_ATTEMPT_ID,
+    ExecutionWarmth, ExecutorAdvertisement, ExecutorCapabilities, ExecutorConfig, ExecutorIdentity,
+    ExecutorMessage, ExecutorSelector, ExecutorSubstrateEvidence, ExecutorSubstrateReport,
+    ExecutorSubstrateState, InventoryAuthorityState, MachineMeasurement,
+    MaterializationReadFailureKind, MaterializationReadRequest, MaterializationReadResult,
+    ObjectTransferCoordinate, PlacementCounterfactualWinner, PlacementDecision, PlacementMobility,
+    PlacementOutcome, PlacementPolicyEvidence, PlacementReadings, PlacementRejection,
+    PlacementRejectionReason, ProcessBatch, ProcessBatchItem, ProcessSandboxMode, ProcessTelemetry,
+    QueuedPlacementEvidence, QueuedPlacementRejection, QueuedPlacementTarget,
+    RemoteConnectionTransition, RemoteLinkState, RepositoryLocator, ReservationFallback,
+    ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence,
+    ResidencyHolder, ResidencyOperation, ResidencyResult, ResidencyRuntimeConfig,
+    ResidentProcessEvent, UpdateReport, WarmthUnknownReason, EXECUTOR_PROGRESS_FRESHNESS_MS,
+    LOCAL_EXECUTOR_NAME, RESIDENCY_ACQUIRE_ATTEMPT_ID,
 };
 #[cfg(test)]
 use cairn_common::executor_protocol::{
@@ -92,36 +93,31 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::Instant;
 
-pub use cairn_common::executor_protocol::{
-    ActiveCellRequest, CellExecutionMeta, CellOutcome, CellRequest, CellUnavailableReason,
-    CommandResourceIdentity, ExecutingCellRequest, FleetSnapshot, MutationDelta, MutationPolicy,
-    PersistentCellLifecycle, PersistentCellState, PlacementWorkClass, ProjectCapability,
-    ProjectPlacementRequirements, QueuedCellRequest, ResourceReservation,
-    ResourceReservationSource,
+pub(crate) use cairn_common::executor_protocol::{
+    CellOutcome, CellRequest, CommandResourceIdentity, MutationDelta, MutationPolicy,
+    PlacementWorkClass,
+};
+use cairn_common::executor_protocol::{
+    CellUnavailableReason, FleetSnapshot, PersistentCellState, ProjectPlacementRequirements,
+    QueuedCellRequest, ResourceReservation, ResourceReservationSource,
 };
 use cairn_common::toolchain_requirements::project_placement_requirements;
-pub use cairn_common::wire_vocabulary::CellPriority;
+pub(crate) use cairn_common::wire_vocabulary::CellPriority;
 use cairn_platform::stack::off_frame;
 
-use crate::mcp::handlers::permission::HandoffClosed;
-
-// The placement facade's responsibilities live in these sibling files. Each
-// item is re-exported below at the reach it had when they were one file, so
-// callers keep naming `fleet::Item`; a new item belongs in the file whose
-// responsibility it serves, re-exported here only if callers outside need it.
+// The facade exposes the types its callers need. Implementation helpers stay
+// private to fleet; each responsibility's imports name its dependencies.
 mod colocated;
 mod dispatch;
 mod health;
 mod listener;
-mod purpose_debts;
 mod relay_authority;
 mod requirements;
 mod residency_routes;
@@ -132,9 +128,8 @@ use colocated::require_colocated_population;
 use colocated::PendingTreeAdoptionResult;
 pub(crate) use colocated::{kernel_wait_diagnostic, NO_COLOCATED_EXECUTOR};
 #[cfg(test)]
-pub(crate) use dispatch::verdict_disagreement;
+use dispatch::verdict_disagreement;
 pub use dispatch::CancelOutcome;
-use dispatch::ItemSettlements;
 #[cfg(test)]
 use dispatch::{
     account_of_claimed_attempt, batch_runs_javascript, cell_build_service_env, outcome_matches,
@@ -143,9 +138,9 @@ use dispatch::{
     CoalescedLeaderCompletionGuard, WithdrawalCause,
 };
 use dispatch::{
-    describe_runner_stop, executor_unavailable, lock_through_poison, runner_stopping,
-    selected_link_dispatch_error, withdraw_claim, ActivePlacementPolicy,
-    ClaimedAttemptSilenceBound, Detachment, EntryDropGuard, LeaderPreparation, RunnerStop,
+    executor_unavailable, lock_through_poison, runner_stopping, selected_link_dispatch_error,
+    withdraw_claim, ActivePlacementPolicy, ClaimedAttemptSilenceBound, Detachment, EntryDropGuard,
+    LeaderPreparation, RunnerStop,
 };
 pub(crate) use dispatch::{
     BatchPace, ExecutedRequest, GrantWithoutResult, PlacementStop, RequestReport,
@@ -153,30 +148,25 @@ pub(crate) use dispatch::{
 pub(crate) use health::{evidence_context, SnapshotReceipt};
 #[cfg(test)]
 use health::{executor_link_status, held_request_key, EXECUTOR_LINK_STALE_AFTER_MS};
-use health::{
-    join_runner_work, snapshot_work, unexplained_facts_frozen_ms,
-    EXECUTOR_TELEMETRY_STALE_AFTER_MS, TELEMETRY_STALL_BOUNCE_SPACING_MS,
-};
+use health::{join_runner_work, snapshot_work, EXECUTOR_TELEMETRY_STALE_AFTER_MS};
 use listener::{EnrolledRemoteRecord, ExecutorListenerPublication};
 pub use listener::{
     ExecutorDisconnectOrigin, LinkRemediation, LinkStallBounds, LinkStallCause,
     ListenerRotationControl, ListenerRotationPendingMachine, ListenerRotationStatus,
     StalledLinkAbandonment,
 };
-pub(crate) use purpose_debts::default_wait_horizon_unix_ms;
-pub use purpose_debts::BlockedQuestion;
-use purpose_debts::{PurposeAdmissionGuard, PurposeDebtsLoaded, PurposeGate, PurposeJoiners};
-#[cfg(test)]
+pub(crate) use purpose::default_wait_horizon_unix_ms;
+pub use purpose::BlockedQuestion;
+use purpose::{PurposeDebtsLoaded, PurposeJoiners};
 #[cfg(test)]
 use relay_authority::{BatchLink, RunnerContextExecutorBinding};
 use relay_authority::{RunnerCallbackContext, RunnerContextEntry};
-pub use requirements::GITHUB_PROBE_REPOSITORY_LIMIT;
 use requirements::{
     applicable_refusal, build_prerequisite_deficiency, containment_deficiency,
     describe_preparation_rejections, github_credential_deficiency, is_preparation_rejection,
     matches_selector, nested_sandbox_fit, nested_sandbox_preference, nested_sandbox_summary,
-    project_eligibility, refused, runs_project_setup, selector_shortfall, serves_project,
-    setup_toolchain_deficiency, stamp_preparation_refusals, NestedSandboxFit, SelectorShortfall,
+    refused, runs_project_setup, selector_shortfall, serves_project, setup_toolchain_deficiency,
+    NestedSandboxFit, SelectorShortfall,
 };
 #[cfg(test)]
 use requirements::{
@@ -184,20 +174,19 @@ use requirements::{
 };
 #[cfg(test)]
 use residency_routes::residency_placement_request;
-use residency_routes::{
-    acquired_residency_holder, judge_link, link_silence_ms, pipe_floor_work,
-    residency_core_failure, resident_process_label, GrantedCell, PreviousHome, ResidencyRoute,
-    GRANT_CONFIRMATION_GRACE_MS,
-};
-pub(crate) use residency_routes::{
-    describe_quiet_ms, residency_queue_entry_id, EnvironmentEviction, EvictionCause, HomePrices,
-    WithdrawnHome, ENVIRONMENT_LEASE_GRACE_MS,
-};
 #[cfg(test)]
+pub(crate) use residency_routes::residency_placement_request_for_test;
+use residency_routes::{
+    acquired_residency_holder, judge_link, pipe_floor_work, GrantedCell, PreviousHome,
+    ResidencyRoute,
+};
 pub(crate) use residency_routes::{
-    residency_placement_request_for_test, MaterializationReadCandidate, HOME_WITHDRAWAL_MS,
+    describe_quiet_ms, residency_queue_entry_id, EnvironmentEviction, EvictionCause,
 };
 pub use residency_routes::{DrainResidents, HeldEnvironment};
+use residency_routes::{HomePrices, WithdrawnHome, ENVIRONMENT_LEASE_GRACE_MS};
+#[cfg(test)]
+use residency_routes::{MaterializationReadCandidate, HOME_WITHDRAWAL_MS};
 #[cfg(test)]
 use selection::{
     absent_enrolled_inventory, account_from_journal, aggregate_batch_learned_estimates,
@@ -207,16 +196,38 @@ use selection::{
     RECENT_PLACEMENT_DECISIONS,
 };
 use selection::{
-    candidate_rejection, deadline_evidence, declared_project_requirements_at, environment_identity,
-    memory_brake_exists, missing_wait_reason_is_new, pipe_health_assessment, placement_decision,
-    presence_cause, process_fit, queued_placement_evidence, record_command_outcome,
-    repository_is_transferable, selected_executor, survey_candidates, waits_on_machine, Placement,
-    PlacementRejectionLog, ProcessFit, ReservationPlan, SelectedExecutor,
+    candidate_rejection, memory_brake_exists, placement_decision, process_fit,
+    queued_placement_evidence, repository_is_transferable, selected_executor, survey_candidates,
+    waits_on_machine, Placement, PlacementRejectionLog, ProcessFit, ReservationPlan,
+    SelectedExecutor,
 };
 pub(crate) use selection::{
-    describe_room_taken_first, project_config_refusal, publication_role_rejection,
-    publisher_ineligibility, AboveMemoryCeiling, PlacementScope, PROJECT_CONFIG_REFUSAL,
+    project_config_refusal, publication_role_rejection, publisher_ineligibility, PlacementScope,
+    PROJECT_CONFIG_REFUSAL,
 };
+
+#[cfg(test)]
+use cairn_common::executor_protocol::{
+    CellExecutionMeta, ClaimedAttemptAccount, ExecutingCellRequest, ExecutorHealthStatus,
+    ExecutorListenerAdvertisement, PersistentCellLifecycle, ProcessBatchExecution,
+    ProjectCapability, RemoteAttachAttempt, ResidentProcessEventKind, RunnerCallback,
+    RunnerCallbackResult, EXECUTOR_LINK_STALL_REMEDIATION_MS,
+    EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS,
+};
+#[cfg(test)]
+use cairn_config::fleet::PlacementStance;
+#[cfg(test)]
+use health::TELEMETRY_STALL_BOUNCE_SPACING_MS;
+#[cfg(test)]
+use purpose::{PurposeAdmissionGuard, PurposeGate};
+#[cfg(test)]
+use requirements::{project_eligibility, stamp_preparation_refusals};
+#[cfg(test)]
+use residency_routes::residency_core_failure;
+#[cfg(test)]
+use selection::{deadline_evidence, environment_identity, presence_cause};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 
 /// `5h57m`, `3m12s`, `41s`: a duration read at a glance in a diagnostic.
 pub(crate) fn compact_duration(ms: u64) -> String {

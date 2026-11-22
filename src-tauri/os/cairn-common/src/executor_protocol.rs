@@ -9691,6 +9691,7 @@ pub struct LearnedResourceEstimate {
 /// already holding room for the entry), which an executor already reads.
 /// What a runner gets wrong talking to a 175 executor built before this:
 /// nothing; that executor decides every offer the same way.
+///
 /// Version 176 (cairn/7415) sizes compile slots net of standing residency
 /// and announces that charge in required `AnnouncedRoom::standing`. Drained
 /// and capacity room retain residency rather than promising it will end.
@@ -9733,6 +9734,12 @@ pub struct LearnedResourceEstimate {
 /// runners already accept excerpt strings and reports, and newer runners
 /// talking to older executors still read the results those executors supply.
 /// This correction rides the next executor publish, not a separate release.
+///
+/// cairn/7185 does not move the number. Fleet responsibilities are folded
+/// into their topical modules and imports and facade exports are made explicit.
+/// Request construction, routing, admission, settlement and frame serialization
+/// are unchanged. Wire-path classification only changes which source edits the
+/// review guard watches; a runner talking to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 177;
 
 /// The version `build.rs` derived from the paragraphs above

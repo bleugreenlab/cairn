@@ -1,4 +1,33 @@
-use super::*;
+use super::coalescing::CoalescingKey;
+use super::health::{unexplained_facts_frozen_ms, TELEMETRY_STALL_BOUNCE_SPACING_MS};
+use super::listener::{
+    ExecutorDisconnectOrigin, LinkRemediation, LinkStallBounds, LinkStallCause,
+    StalledLinkAbandonment,
+};
+use super::residency_routes::{judge_link, link_silence_ms};
+#[cfg(target_os = "macos")]
+use super::resource_profiles;
+use super::selection::{pipe_health_assessment, SelectedExecutor};
+#[cfg(target_os = "macos")]
+use super::selection::{selected_executor, ReservationPlan};
+use super::{
+    compact_duration, link_clock, placement, runner_events, unix_time_ms, CellAccount,
+    CellPlacement, Fleet, LeaderSettlement, RequestIdentity,
+};
+#[cfg(target_os = "macos")]
+use cairn_common::executor_protocol::CommandResourceIdentity;
+use cairn_common::executor_protocol::{
+    executor_names_match, CellExecutionMeta, CellOutcome, CellRequest, CellUnavailableReason,
+    ExecutorConfig, ExecutorMessage, ExecutorSubstrateEvidence, ExecutorSubstrateState,
+    PlacementMobility, RepositoryLocator, EXECUTOR_LINK_STALL_REMEDIATION_MS,
+    EXECUTOR_PROGRESS_FRESHNESS_MS, LOCAL_EXECUTOR_NAME,
+};
+use cairn_common::pipe_health::PipeFloorWork;
+use cairn_config::fleet::COLOCATED_EXECUTOR_ID;
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 /// Why an untargeted request is refused at once when the runner has no
 /// colocated executor and nothing to wait for. The main cadence's stall-window
