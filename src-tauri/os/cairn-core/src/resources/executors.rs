@@ -1607,6 +1607,57 @@ fn advertised_name_line(executor: &ExecutorInspection) -> String {
     )
 }
 
+fn render_cell_target_budget(
+    budget: &cairn_common::executor_protocol::CellTargetBudgetReport,
+) -> String {
+    let divisor = budget.cells.max(1);
+    let cells = if budget.cells == 0 {
+        "1 sizing cell (empty pool)".to_owned()
+    } else {
+        format!(
+            "{divisor} materialized build cell{}",
+            if divisor == 1 { "" } else { "s" }
+        )
+    };
+    let share = if budget.capacity.is_some() {
+        "bounded target share"
+    } else {
+        "reported budget; capacity bounds unreported"
+    };
+    let mut out = format!(
+        "- Cell target budget: {} each ({share} across {cells}; cold-build floor {}, informational)\n",
+        bytes(budget.budget_bytes),
+        bytes(budget.floor_bytes),
+    );
+    if budget.capacity.is_some() && budget.budget_bytes < budget.floor_bytes {
+        out.push_str(&format!(
+            "- Target sizing: volume too small for {divisor} cells at the floor; budget {}\n",
+            bytes(budget.budget_bytes),
+        ));
+    }
+    match &budget.capacity {
+        None => out.push_str("- Target capacity: capacity not yet measured or reported; concurrent-lane fit unknown\n"),
+        Some(capacity) => {
+            out.push_str(&format!(
+                "- Target capacity: {} target share, {} conservative outside-target and unaccounted estimate (last accounting walk)\n",
+                bytes(capacity.target_share_bytes),
+                bytes(capacity.outside_bytes),
+            ));
+            if !capacity.lanes_fit(budget.floor_bytes) {
+                out.push_str(&format!(
+                    "- Target capacity insufficient: volume cannot hold one cold build per concurrent compile lane ({} lanes at {} each, {} target share; configured compile lanes); budget escalation suspended; only stale incremental sessions collected by the budget pass\n",
+                    capacity.concurrent_lanes,
+                    bytes(budget.floor_bytes),
+                    bytes(capacity.target_share_bytes),
+                ));
+            } else {
+                out.push_str("- Budget maintenance: collects stale incremental sessions, then trims cells still over budget\n");
+            }
+        }
+    }
+    out
+}
+
 fn render_planning_memory(budget: Option<u64>) -> String {
     let value = match budget {
         Some(budget) => format!(
@@ -2026,13 +2077,7 @@ pub(crate) fn render_executor_with_kills(
     }
     out.push_str(&render_volume_discards(executor));
     if let Some(budget) = &health.disk.cell_target_budget {
-        out.push_str(&format!(
-            "- Cell target budget: {} each (half of the volume across {} cell{}, never below {}); every idle pass collects stale incremental sessions, then trims cells still over budget\n",
-            bytes(budget.budget_bytes),
-            budget.cells,
-            if budget.cells == 1 { "" } else { "s" },
-            bytes(budget.floor_bytes),
-        ));
+        out.push_str(&render_cell_target_budget(budget));
     }
     out.push('\n');
 
@@ -7811,7 +7856,7 @@ fn render_toolchain_probes(
 #[cfg(test)]
 mod storage_section_tests {
     use super::tests::{cached_slot, inspection};
-    use super::{external_cache_breakdown, render_executor};
+    use super::{external_cache_breakdown, render_cell_target_budget, render_executor};
     use cairn_common::executor_protocol::{
         DiskAccounting, DiskCategoryAccounting, DiskHealthStatus, DiskPathUsage,
         ExternalCacheBreakdown, MachineVolume, OccupiedTreeSkip, PersistentCellLifecycle,
@@ -8572,6 +8617,11 @@ mod storage_section_tests {
         let at = executor.captured_at_unix_ms;
         executor.health.disk.cell_target_budget =
             Some(cairn_common::executor_protocol::CellTargetBudgetReport {
+                capacity: Some(cairn_common::executor_protocol::CellTargetCapacity {
+                    target_share_bytes: 1_800 << 30,
+                    outside_bytes: 100 << 30,
+                    concurrent_lanes: 2,
+                }),
                 budget_bytes: 180 << 30,
                 floor_bytes: 96 << 30,
                 cells: 10,
@@ -8597,7 +8647,7 @@ mod storage_section_tests {
         let rendered = render_executor(&executor);
 
         for expected in [
-            "- Cell target budget: 180.0 GiB each (half of the volume across 10 cells, never below 96.0 GiB)",
+            "- Cell target budget: 180.0 GiB each (bounded target share across 10 materialized build cells; cold-build floor 96.0 GiB, informational)",
             "  - Target: 180.0 GiB, budget 180.0 GiB, measured 2m ago; incremental 32.0 GiB in 5 universes\n",
             "  - Last target trim: 126.0 GiB 3m ago, 3 stale sessions collected, 2 old universes collected\n",
         ] {
@@ -8606,11 +8656,45 @@ mod storage_section_tests {
     }
 
     #[test]
+    fn target_budget_renders_real_divisor_floor_shortfall_and_lane_capacity() {
+        use cairn_common::executor_protocol::{CellTargetBudgetReport, CellTargetCapacity};
+        let mut report = CellTargetBudgetReport {
+            capacity: Some(CellTargetCapacity {
+                target_share_bytes: 192 << 30,
+                outside_bytes: 100 << 30,
+                concurrent_lanes: 2,
+            }),
+            budget_bytes: 24 << 30,
+            floor_bytes: 96 << 30,
+            cells: 8,
+            usages: Vec::new(),
+            trims: Vec::new(),
+        };
+        let rendered = render_cell_target_budget(&report);
+        assert!(rendered.contains("across 8 materialized build cells"));
+        assert!(rendered.contains("volume too small for 8 cells at the floor; budget 24.0 GiB"));
+        assert!(!rendered.contains("budget escalation suspended"));
+        report.capacity.as_mut().unwrap().concurrent_lanes = 3;
+        let rendered = render_cell_target_budget(&report);
+        assert!(rendered.contains("volume cannot hold one cold build per concurrent compile lane (3 lanes at 96.0 GiB each"));
+        assert!(rendered.contains("budget escalation suspended"));
+        report.cells = 0;
+        report.capacity = None;
+        let rendered = render_cell_target_budget(&report);
+        assert!(rendered.contains("across 1 sizing cell (empty pool)"));
+        assert!(rendered.contains("capacity not yet measured"));
+        assert!(!rendered.contains("bounded target share"));
+        assert!(!rendered.contains("volume too small"));
+        assert!(!rendered.contains("never below"));
+    }
+
+    #[test]
     fn target_budget_names_unmeasured_cells_and_does_not_invent_a_trim() {
         let mut executor = tight_local();
         executor.occupancy.cells = vec![cached_slot()];
         executor.health.disk.cell_target_budget =
             Some(cairn_common::executor_protocol::CellTargetBudgetReport {
+                capacity: None,
                 budget_bytes: 180 << 30,
                 floor_bytes: 96 << 30,
                 cells: 1,

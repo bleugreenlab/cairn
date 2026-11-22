@@ -8685,6 +8685,12 @@ pub struct LearnedResourceEstimate {
 /// variant or field changes, and a runner talking to an older executor gets
 /// nothing wrong.
 ///
+/// cairn/6200 does not move the number. The defaulted
+/// `CellTargetBudgetReport::capacity` adds sizing evidence, not admission or
+/// placement policy. An older executor reports no capacity and its page says
+/// it is unmeasured; an older runner ignores the evidence. Neither peer
+/// misreads physical pressure, which remains a separate disk status.
+///
 /// cairn/5996 does not move the number. Under disk pressure the executor now
 /// moves the build output of a cell a residency holds, between its holder's
 /// commands, out of the checkout and deletes it, fenced by the residency
@@ -19832,14 +19838,16 @@ pub enum VolumeDiscardRefusalKind {
 /// The budget each idle cell's build target is held to, and what holding them
 /// to it last took.
 ///
-/// Half the build volume divided by the cells in the pool, never below
-/// `floor_bytes` ([`SLOT_TARGET_MAX_BYTES`] by default). The floor must sit above
-/// a full test build: a smaller budget deletes every completed build
-/// (CAIRN-4349). If the floor exceeds that volume share, pressure reclamation
-/// still governs actual headroom; this is not an aggregate reservation.
+/// The smaller of half the build volume and its accounted target share,
+/// divided by the materialized build cells (at least one sizing cell).
+/// `floor_bytes` is the informational cold-build size, not a budget minimum.
+/// Capacity is sizing evidence, separate from physical disk pressure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CellTargetBudgetReport {
+    /// Sizing evidence from the last accounting walk; absent on older peers.
+    #[serde(default)]
+    pub capacity: Option<CellTargetCapacity>,
     pub budget_bytes: u64,
     pub floor_bytes: u64,
     /// The cells in the pool when the budget was last sized.
@@ -19850,6 +19858,26 @@ pub struct CellTargetBudgetReport {
     /// The last trim of each cell still in the pool, oldest first.
     #[serde(default)]
     pub trims: Vec<CellTargetTrim>,
+}
+
+/// Target room measured by the last accounting walk, not a live reservation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CellTargetCapacity {
+    /// At most half the volume and its total minus pressure headroom and outside bytes.
+    pub target_share_bytes: u64,
+    /// Conservative outside-target estimate, including unaccounted physical bytes.
+    pub outside_bytes: u64,
+    /// Configured compile-lane count, not the lanes currently running.
+    pub concurrent_lanes: usize,
+}
+
+impl CellTargetCapacity {
+    /// Whether the target share holds one cold build per concurrent compile lane.
+    pub fn lanes_fit(&self, floor_bytes: u64) -> bool {
+        self.concurrent_lanes == 0
+            || self.target_share_bytes / self.concurrent_lanes as u64 >= floor_bytes
+    }
 }
 
 /// A target measurement from an idle maintenance pass, not a live estimate.
@@ -33872,6 +33900,19 @@ mod tests {
     }
 
     #[test]
+    fn target_capacity_checks_lanes_without_overflow() {
+        let mut capacity = CellTargetCapacity {
+            target_share_bytes: u64::MAX,
+            outside_bytes: 0,
+            concurrent_lanes: 2,
+        };
+        assert!(!capacity.lanes_fit(u64::MAX));
+        assert!(capacity.lanes_fit(u64::MAX / 2));
+        capacity.concurrent_lanes = 0;
+        assert!(capacity.lanes_fit(u64::MAX));
+    }
+
+    #[test]
     fn cell_target_budget_round_trips_and_older_health_reports_no_budget() {
         let mut health = DiskHealth::default();
         assert!(serde_json::to_value(&health)
@@ -33882,6 +33923,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&health).unwrap()).unwrap();
         assert_eq!(older.cell_target_budget, None);
         health.cell_target_budget = Some(CellTargetBudgetReport {
+            capacity: None,
             budget_bytes: 180,
             floor_bytes: 96,
             cells: 10,
@@ -33905,6 +33947,21 @@ mod tests {
         let round_trip: DiskHealth =
             serde_json::from_value(serde_json::to_value(&health).unwrap()).unwrap();
         assert_eq!(round_trip.cell_target_budget, health.cell_target_budget);
+        let mut value = serde_json::to_value(health.cell_target_budget.unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("capacity");
+        let older: CellTargetBudgetReport = serde_json::from_value(value).unwrap();
+        assert_eq!(older.capacity, None);
+        let capacity = CellTargetCapacity {
+            target_share_bytes: 192,
+            outside_bytes: 100,
+            concurrent_lanes: 2,
+        };
+        let value = serde_json::to_value(&capacity).unwrap();
+        assert_eq!(value["targetShareBytes"], 192);
+        assert_eq!(
+            serde_json::from_value::<CellTargetCapacity>(value).unwrap(),
+            capacity
+        );
     }
 
     #[test]

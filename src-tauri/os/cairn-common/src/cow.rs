@@ -749,7 +749,7 @@ pub fn exclusive_bytes(path: &Path, metadata: &fs::Metadata) -> u64 {
     if !metadata.is_file() {
         return allocated;
     }
-    match platform_exclusive_bytes(path) {
+    match platform_exclusive_bytes(path, false) {
         // Compressed extents report their uncompressed length; the allocation
         // bounds what the file can free.
         Ok(Some(exclusive)) => exclusive.min(allocated),
@@ -757,8 +757,36 @@ pub fn exclusive_bytes(path: &Path, metadata: &fs::Metadata) -> u64 {
     }
 }
 
+/// A conservative exclusive physical byte count, without an allocation fallback.
+/// Unsupported queries return `None`; failures remain errors. Hard-linked
+/// files receive no credit because another tree may retain the same inode.
+pub fn try_exclusive_bytes(path: &Path, metadata: &fs::Metadata) -> io::Result<Option<u64>> {
+    if !metadata.is_file() {
+        return Ok(Some(0));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 {
+            return Ok(Some(0));
+        }
+    }
+    if allocated_bytes(metadata) == 0 {
+        return Ok(Some(0));
+    }
+    platform_exclusive_bytes(path, true)
+        .map(|bytes| bytes.map(|bytes| bytes.min(allocated_bytes(metadata)).min(metadata.len())))
+}
+
 #[cfg(target_os = "linux")]
-fn platform_exclusive_bytes(path: &Path) -> io::Result<Option<u64>> {
+fn fiemap_extent_is_private(flags: u32) -> bool {
+    // LAST describes pagination only. Every other flag (including UNKNOWN,
+    // DELALLOC, ENCODED and SHARED) makes the physical ownership uncertain.
+    flags & !0x0000_0001 == 0
+}
+
+#[cfg(target_os = "linux")]
+fn platform_exclusive_bytes(path: &Path, _strict: bool) -> io::Result<Option<u64>> {
     use std::os::unix::io::AsRawFd;
 
     #[repr(C)]
@@ -804,7 +832,11 @@ fn platform_exclusive_bytes(path: &Path) -> io::Result<Option<u64>> {
         }
         let mut last = false;
         for extent in &request.fm_extents[..mapped] {
-            if extent.fe_flags & FIEMAP_EXTENT_SHARED == 0 {
+            if if _strict {
+                fiemap_extent_is_private(extent.fe_flags)
+            } else {
+                extent.fe_flags & FIEMAP_EXTENT_SHARED == 0
+            } {
                 exclusive = exclusive.saturating_add(extent.fe_length);
             }
             last |= extent.fe_flags & FIEMAP_EXTENT_LAST != 0;
@@ -817,7 +849,7 @@ fn platform_exclusive_bytes(path: &Path) -> io::Result<Option<u64>> {
 }
 
 #[cfg(target_os = "macos")]
-fn platform_exclusive_bytes(path: &Path) -> io::Result<Option<u64>> {
+fn platform_exclusive_bytes(path: &Path, _strict: bool) -> io::Result<Option<u64>> {
     use std::os::unix::ffi::OsStrExt;
     const ATTR_BIT_MAP_COUNT: u16 = 5;
     const FSOPT_NOFOLLOW: u32 = 0x0000_0001;
@@ -865,7 +897,7 @@ fn platform_exclusive_bytes(path: &Path) -> io::Result<Option<u64>> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn platform_exclusive_bytes(_path: &Path) -> io::Result<Option<u64>> {
+fn platform_exclusive_bytes(_path: &Path, _strict: bool) -> io::Result<Option<u64>> {
     Ok(None)
 }
 
@@ -928,6 +960,53 @@ fn metadata_times_ns(metadata: &fs::Metadata) -> (i128, i128) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_exclusive_measurement_never_substitutes_allocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file");
+        fs::write(&path, b"private").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        if let Ok(Some(bytes)) = try_exclusive_bytes(&path, &metadata) {
+            assert!(bytes <= metadata.len());
+            assert!(bytes <= allocated_bytes(&metadata));
+        }
+        assert_eq!(
+            try_exclusive_bytes(&temp.path().join("missing"), &metadata)
+                .ok()
+                .flatten(),
+            (allocated_bytes(&metadata) == 0).then_some(0)
+        );
+        let empty = temp.path().join("empty");
+        fs::write(&empty, b"").unwrap();
+        let empty_metadata = fs::metadata(&empty).unwrap();
+        if allocated_bytes(&empty_metadata) == 0 {
+            fs::remove_file(&empty).unwrap();
+            assert_eq!(
+                try_exclusive_bytes(&empty, &empty_metadata).unwrap(),
+                Some(0)
+            );
+        }
+        #[cfg(unix)]
+        {
+            fs::hard_link(&path, temp.path().join("link")).unwrap();
+            assert_eq!(
+                try_exclusive_bytes(&path, &fs::metadata(&path).unwrap()).unwrap(),
+                Some(0)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_fiemap_credits_only_unflagged_or_last_extents() {
+        assert!(fiemap_extent_is_private(0));
+        assert!(fiemap_extent_is_private(1));
+        for bit in 1..32 {
+            assert!(!fiemap_extent_is_private(1 << bit));
+            assert!(!fiemap_extent_is_private((1 << bit) | 1));
+        }
+    }
 
     fn byte_copy(from: &Path, to: &Path) -> io::Result<()> {
         if to.symlink_metadata().is_ok() {
