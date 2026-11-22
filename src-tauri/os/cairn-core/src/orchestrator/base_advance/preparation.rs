@@ -2164,6 +2164,7 @@ impl Context<'_> {
             compute_allowance_ms: cost.allowance.map(replay_cost::millis),
             outcome,
             failure_phase: cost.failure_phase,
+            diagnostic: None,
         };
         if let Err(error) =
             replay_cost::record_sample(self.db, &request.project_id, &self.store, &evidence).await

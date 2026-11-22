@@ -515,6 +515,10 @@ fn render_request_section(
                         ),
                         false,
                     ),
+                    (_, Some("budget_exhausted_before_step")) => (
+                        "was **closed before replaying**: its budget was exhausted".to_string(),
+                        false,
+                    ),
                     (_, Some("not_attempted")) => {
                         ("was **closed without replaying**".to_string(), true)
                     }
@@ -3318,6 +3322,20 @@ mod tests {
                 && refused.contains("replay cost section below")
                 && !refused.contains("Request it again"),
             "{refused}"
+        );
+
+        let diagnostic = "Assessment of 325 paths used 59.900s. Retrying with the same branch and base will time out again.";
+        let spent_before_start = render_request_section(
+            &served("budget_exhausted_before_step", diagnostic),
+            &Ok(None),
+        );
+        assert!(
+            spent_before_start.contains(diagnostic),
+            "{spent_before_start}"
+        );
+        assert!(
+            !spent_before_start.contains("Request it again"),
+            "{spent_before_start}"
         );
 
         // A transient close still says how to ask again.

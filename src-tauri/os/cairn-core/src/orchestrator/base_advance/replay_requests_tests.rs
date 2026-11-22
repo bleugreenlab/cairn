@@ -885,3 +885,243 @@ async fn benchmark_explicit_replay_requests() {
         }
     }
 }
+
+/// Opt-in wide-conflict measurement, excluding fixture construction and rebase.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn benchmark_pre_rebase_wide_conflicts() {
+    if std::env::var_os("CAIRN_PRE_REBASE_BENCH").is_none() {
+        return;
+    }
+    for n in [325usize, 748] {
+        let h = harness_or_skip!("bench_pre_rebase_wide");
+        let built = Instant::now();
+        for i in 0..n {
+            std::fs::write(h.branch_ws.join(format!("wide{i}.txt")), "own\n").unwrap();
+            std::fs::write(h.main_ws.join(format!("wide{i}.txt")), "incoming\n").unwrap();
+        }
+        h.commit(&h.branch_ws, BRANCH, "shared.txt", "original\n");
+        let base = h.advance_main("shared.txt", "original\n");
+        match h.prepare(PreparationPurpose::OwnerCommit).await {
+            Err(PreparationRefusal::Conflict(_)) => {}
+            other => panic!("expected conflict: {:?}", other.err()),
+        }
+        for i in 0..n {
+            std::fs::write(h.branch_ws.join(format!("wide{i}.txt")), "incoming\nown\n").unwrap();
+        }
+        let tip = h.commit(&h.branch_ws, BRANCH, "shared.txt", "original\n");
+        let mut session = load_active_session(&h.db, BRANCH).await.unwrap().unwrap();
+        assert_eq!(session.conflicting().count(), n);
+        let fixture_s = built.elapsed().as_secs_f64();
+        let started = Instant::now();
+        let assessed_store = h.store.clone();
+        let assessed_session = session.clone();
+        let assessment = conflict_session::bounded_store_assessment(
+            &h.jj,
+            Duration::from_secs(60),
+            AssessmentScope {
+                phase: "take-committed-tip assessment",
+                branch: BRANCH,
+                candidate_paths: n,
+            },
+            move |jj| {
+                Ok(conflict_session::assess_session_tip_exhaustively(
+                    jj,
+                    &assessed_store,
+                    &assessed_session,
+                    None,
+                    conflict_session::ReplayScope::Carry,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(assessment, RestoreProof::Assessed(_)),
+            "{assessment:?}"
+        );
+        let assessment_s = started.elapsed().as_secs_f64();
+        session.replay_requested_tip = Some(tip.clone());
+        let carry_start = Instant::now();
+        let planned_store = h.store.clone();
+        let left = Duration::from_secs(60).saturating_sub(started.elapsed());
+        let plan = conflict_session::bounded_store_assessment(
+            &h.jj,
+            left,
+            AssessmentScope {
+                phase: "resolution carry plan",
+                branch: BRANCH,
+                candidate_paths: n,
+            },
+            move |jj| plan_resolution_carry(jj, &planned_store, &session, &base, &tip),
+        )
+        .await
+        .unwrap();
+        assert!(plan.refused.is_empty());
+        let carry_s = carry_start.elapsed().as_secs_f64();
+        let total_s = started.elapsed().as_secs_f64();
+        let (host, load) = cost::host_context();
+        println!("BENCH pre_rebase paths={n} fixture_s={fixture_s:.6} assessment_s={assessment_s:.6} carry_s={carry_s:.6} total_s={total_s:.6} margin_s={:.6} host={host:?} load1={load:?}", 60.0-total_s);
+        let request_started = Instant::now();
+        let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, true, None)
+            .await
+            .unwrap();
+        let request_s = request_started.elapsed().as_secs_f64();
+        let sample = newest_sample(&h).await;
+        println!(
+            "BENCH full_wide paths={n} request_s={request_s:.6} answer={answer:?} sample={}",
+            serde_json::to_string(&sample).unwrap()
+        );
+        assert!(answer.starts_with("Replayed"), "{answer}");
+    }
+}
+
+#[test]
+fn before_step_exhaustion_attributes_work_on_identical_requests_but_not_lock_waits() {
+    for _ in 0..2 {
+        let mut budget = Budget::start(Duration::from_secs(60), Duration::from_secs(1));
+        budget.deadline = Instant::now();
+        budget.record(
+            "the take-committed-tip assessment",
+            Duration::from_millis(59_900),
+            Some(325),
+            true,
+        );
+        let refusal = budget
+            .admit("agent/budget", "the rebase, export and ancestry heal")
+            .unwrap_err();
+        assert!(refusal.contains("stopped before the rebase"), "{refusal}");
+        assert!(
+            refusal.contains("assessment of 325 paths used 59.900s"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("60.0s explicit budget"), "{refusal}");
+        assert!(
+            refusal.contains("Retrying with the same branch and base will time out again."),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("requested again at once"), "{refusal}");
+    }
+    let mut budget = Budget::start(Duration::from_secs(60), Duration::from_secs(1));
+    budget.deadline = Instant::now();
+    budget.record(
+        "the base resolution (including lock waiting)",
+        Duration::from_secs(59),
+        None,
+        false,
+    );
+    budget.record(
+        "the take-committed-tip assessment",
+        Duration::from_millis(900),
+        Some(325),
+        true,
+    );
+    let refusal = budget.admit("agent/budget", "the rebase").unwrap_err();
+    assert!(refusal.contains("lock waiting) used 59.000s"), "{refusal}");
+    assert!(
+        refusal.contains("assessment of 325 paths used 0.900s"),
+        "{refusal}"
+    );
+    assert!(!refusal.contains("will time out again"), "{refusal}");
+    for completed_work in [None, Some(Duration::from_millis(100))] {
+        let mut queued = Budget::start(Duration::from_secs(60), Duration::from_secs(1));
+        queued.deadline = Instant::now();
+        queued.record_assessment(
+            "the assessment",
+            325,
+            &conflict_session::StoreAssessment {
+                outcome: Ok(()),
+                elapsed: Duration::from_millis(59_900),
+                completed_work,
+            },
+            true,
+        );
+        let refusal = queued.admit("agent/budget", "the rebase").unwrap_err();
+        assert!(
+            refusal.contains("assessment of 325 paths used 59.900s"),
+            "{refusal}"
+        );
+        assert!(
+            !refusal.contains("will time out again"),
+            "queue/grace is not deterministic work: {refusal}"
+        );
+    }
+    *budget.coordinate.lock().unwrap() = Some(("old-head".into(), "old-base".into()));
+    budget.start_attempt();
+    assert!(budget.coordinate.lock().unwrap().is_none());
+    budget.record(
+        "the branch preparation",
+        Duration::from_secs(59),
+        None,
+        false,
+    );
+    let refusal = budget
+        .admit("agent/budget", "the next assessment")
+        .unwrap_err();
+    assert!(
+        refusal.contains("branch preparation used 59.000s"),
+        "{refusal}"
+    );
+    assert!(
+        !refusal.contains("will time out again"),
+        "discarded coordinates: {refusal}"
+    );
+}
+
+fn exhausted_assessments() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static STORES: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    STORES.get_or_init(Default::default)
+}
+
+pub(super) fn after_budgeted_assessment(store: &Path, budget: &Budget) {
+    if exhausted_assessments().lock().unwrap().contains(store) {
+        // Charge the assessment without making the test wait a minute.
+        let mut steps = budget.steps.lock().unwrap();
+        let step = steps.last_mut().unwrap();
+        step.elapsed = Duration::from_millis(59_900);
+        step.deterministic = step.elapsed;
+        *budget.elapsed_offset.lock().unwrap() = Duration::from_secs(60);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn exhausted_assessment_names_work_on_two_identical_replay_requests() {
+    let h = harness_or_skip!("assessment_budget_attribution");
+    h.commit(&h.branch_ws, BRANCH, "shared.txt", "mine\n");
+    let base = h.advance_main("shared.txt", "incoming\n");
+    assert!(matches!(
+        h.prepare(PreparationPurpose::OwnerCommit).await,
+        Err(PreparationRefusal::Conflict(_))
+    ));
+    let head = h.commit(&h.branch_ws, BRANCH, "shared.txt", "incoming\nmine\n");
+    exhausted_assessments()
+        .lock()
+        .unwrap()
+        .insert(h.store.clone());
+    for _ in 0..2 {
+        let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, true, None)
+            .await
+            .unwrap();
+        assert!(
+            answer.contains("stopped before the resolution carry plan"),
+            "{answer}"
+        );
+        assert!(
+            answer.contains("assessment of 1 paths used 59.900s"),
+            "{answer}"
+        );
+        assert!(
+            answer.contains("Retrying with the same branch and base will time out again."),
+            "{answer}"
+        );
+        assert_eq!(h.tip(BRANCH), head);
+        assert_eq!(h.tip("main"), base);
+        assert!(unserved(&h).await.is_empty());
+        let sample = newest_sample(&h).await;
+        assert_eq!(sample.diagnostic.as_deref(), Some(answer.as_str()));
+        assert_eq!(sample.head, head);
+        assert_eq!(sample.base, base);
+    }
+    exhausted_assessments().lock().unwrap().remove(&h.store);
+}

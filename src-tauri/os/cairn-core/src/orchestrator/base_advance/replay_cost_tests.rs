@@ -88,6 +88,7 @@ fn sample(head: &str, base: &str, outcome: CostOutcome) -> ReplayCostEvidence {
         compute_allowance_ms: Some(57_500),
         outcome,
         failure_phase: Some("detached computation (ancestry heal)".into()),
+        diagnostic: None,
     }
 }
 
@@ -594,4 +595,54 @@ fn the_timeout_answer_and_the_refusal_share_the_blocker_guidance() {
     );
     let none = timeout_guidance(None);
     assert!(none.contains("No repeat was blocked"), "{none}");
+}
+
+#[tokio::test]
+async fn preaccept_refusal_is_durable_without_acceptance_or_compute_blocker() {
+    let db = db("preaccept-cost").await;
+    let diagnostic = "Stopped before rebase: resolution assessment of 92 paths used 59.900s. Retrying with the same branch and base will time out again.";
+    record_pre_rebase_refusal(
+        &db,
+        "proj-1",
+        Path::new(STORE),
+        "agent/x",
+        Some(HEAD),
+        "main",
+        Some(BASE),
+        false,
+        &ExplicitCost {
+            started: Instant::now(),
+            budget: Duration::from_secs(60),
+            take_committed_tip: true,
+            drop_incoming: false,
+        },
+        diagnostic,
+    )
+    .await
+    .unwrap();
+    let samples = branch_samples(&db, "proj-1", Path::new(STORE), "agent/x", 1)
+        .await
+        .unwrap();
+    let evidence = samples[0].as_ref().unwrap();
+    assert_eq!(evidence.diagnostic.as_deref(), Some(diagnostic));
+    assert_eq!(evidence.phases.compute_ms, None);
+    assert_eq!(evidence.compute_allowance_ms, None);
+    assert_eq!(evidence.observed, ReplayCostObservation::default());
+    assert!(branch_blockers(&db, "proj-1", Path::new(STORE), "agent/x")
+        .await
+        .unwrap()
+        .is_empty());
+    let page = render(Ok(samples), Ok(vec![]), Ok(vec![]), at(Some(HEAD), BASE));
+    assert!(page.contains(diagnostic), "{page}");
+    assert!(page.contains("compute not reached"), "{page}");
+    assert!(page.contains("current: the branch and base"), "{page}");
+}
+
+#[test]
+fn older_samples_without_diagnostic_remain_readable() {
+    let evidence = sample(HEAD, BASE, CostOutcome::Installed);
+    let mut json = serde_json::to_value(&evidence).unwrap();
+    json.as_object_mut().unwrap().remove("diagnostic");
+    let decoded: ReplayCostEvidence = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded, evidence);
 }

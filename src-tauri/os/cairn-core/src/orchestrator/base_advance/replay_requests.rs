@@ -176,6 +176,17 @@ struct Budget {
     deadline: Instant,
     total: Duration,
     minimum: Duration,
+    steps: std::sync::Mutex<Vec<BudgetStep>>,
+    coordinate: std::sync::Mutex<Option<(String, String)>>,
+    #[cfg(test)]
+    elapsed_offset: std::sync::Mutex<Duration>,
+}
+
+struct BudgetStep {
+    name: &'static str,
+    elapsed: Duration,
+    paths: Option<usize>,
+    deterministic: Duration,
 }
 
 impl Budget {
@@ -184,18 +195,122 @@ impl Budget {
             deadline: Instant::now() + total,
             total,
             minimum,
+            steps: Default::default(),
+            coordinate: Default::default(),
+            #[cfg(test)]
+            elapsed_offset: Default::default(),
+        }
+    }
+
+    fn record(
+        &self,
+        name: &'static str,
+        elapsed: Duration,
+        paths: Option<usize>,
+        deterministic: bool,
+    ) {
+        self.steps.lock().unwrap().push(BudgetStep {
+            name,
+            elapsed,
+            paths,
+            deterministic: if deterministic {
+                elapsed
+            } else {
+                Duration::ZERO
+            },
+        });
+    }
+
+    fn record_assessment<T>(
+        &self,
+        name: &'static str,
+        paths: usize,
+        measured: &conflict_session::StoreAssessment<T>,
+        proven: bool,
+    ) {
+        self.steps.lock().unwrap().push(BudgetStep {
+            name,
+            elapsed: measured.elapsed,
+            paths: Some(paths),
+            deterministic: if proven {
+                measured.completed_work.unwrap_or_default()
+            } else {
+                Duration::ZERO
+            },
+        });
+    }
+
+    fn start_attempt(&self) {
+        // Work on a discarded coordinate cannot prove that repeating the final
+        // head and base would exhaust the budget.
+        for step in self.steps.lock().unwrap().iter_mut() {
+            step.deterministic = Duration::ZERO;
+        }
+        *self.coordinate.lock().unwrap() = None;
+    }
+
+    fn attribution(&self) -> String {
+        let steps = self.steps.lock().unwrap();
+        let mut details = steps
+            .iter()
+            .map(|step| {
+                let paths = step
+                    .paths
+                    .map(|n| format!(" of {n} paths"))
+                    .unwrap_or_default();
+                format!(
+                    "{}{paths} used {:.3}s",
+                    step.name,
+                    step.elapsed.as_secs_f64()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let measured = steps.iter().map(|step| step.elapsed).sum::<Duration>();
+        let elapsed = (self.deadline - self.total).elapsed();
+        let other = elapsed.saturating_sub(measured);
+        if other >= Duration::from_millis(1) {
+            if !details.is_empty() {
+                details.push_str("; ");
+            }
+            details.push_str(&format!(
+                "request setup, coordinate reads and acceptance used {:.3}s",
+                other.as_secs_f64()
+            ));
+        }
+        let deterministic = steps
+            .iter()
+            .map(|step| step.deterministic)
+            .sum::<Duration>();
+        let retry = if !deterministic.is_zero()
+            && deterministic >= self.total.saturating_sub(self.minimum)
+        {
+            " Retrying with the same branch and base will time out again."
+        } else {
+            ""
+        };
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Measured pre-rebase steps: {details} of the {:.1}s explicit budget.{retry}",
+                self.total.as_secs_f64()
+            )
         }
     }
 
     /// What `step` may spend, or the answer that it was not started.
     fn admit(&self, branch: &str, step: &str) -> Result<Duration, String> {
         let left = self.deadline.saturating_duration_since(Instant::now());
+        #[cfg(test)]
+        let left = left.saturating_sub(*self.elapsed_offset.lock().unwrap());
         if left < self.minimum {
             return Err(format!(
                 "Explicit replay of `{branch}` stopped before {step}: its {total:.1}s explicit budget \
                  had {left:.3}s left, less than the {minimum:.3}s the step needs, so the step was \
                  not started. Nothing was installed and `{branch}` is unchanged. No automatic \
-                 cooldown was recorded; the replay can be requested again at once.",
+                 cooldown was recorded.{attribution}",
+                attribution = self.attribution(),
                 total = self.total.as_secs_f64(),
                 left = left.as_secs_f64(),
                 minimum = self.minimum.as_secs_f64(),
@@ -271,6 +386,7 @@ async fn replay(
     // The deadline starts before any wait: base resolution's lock wait, the
     // preparer's reservation and lock waits, and every compute phase draw on it.
     let budget = Budget::start(ask.budget, ask.step_minimum);
+    let base_resolution_started = Instant::now();
     let preamble = match repoint_superseded_base(
         orch,
         db,
@@ -286,6 +402,12 @@ async fn replay(
         Ok(preamble) => preamble,
         Err(refusal) => return Err(refuse(refusal).await),
     };
+    budget.record(
+        "the base resolution (including lock waiting)",
+        base_resolution_started.elapsed(),
+        None,
+        false,
+    );
     let with_preamble = |text: String| format!("{preamble}{text}");
     let mut caveats: Vec<String> = Vec::new();
     let mut last_move = String::new();
@@ -297,11 +419,29 @@ async fn replay(
     // answer, live or recovered, so nothing waits quietly for a trigger that
     // will not come.
     let (store_ref, project_ref) = (&store, &project.id);
+    let budget_ref = &budget;
     let recovered = ask.recovered.is_some();
     let settle = move |marker: Option<PendingReplayRequest>, how: Settle, answer: String| {
         let store = store_ref.to_path_buf();
         let project_id = project_ref.clone();
         async move {
+            if matches!(
+                &how,
+                Settle::Closed {
+                    kind: "budget_exhausted_before_step"
+                }
+            ) {
+                persist_budget_refusal(
+                    db,
+                    &project_id,
+                    &store,
+                    ask,
+                    budget_ref,
+                    merge_mode,
+                    &answer,
+                )
+                .await;
+            }
             if let Some(marker) = marker {
                 let closed = matches!(how, Settle::Closed { .. });
                 settle_marker(db, &project_id, &store, &marker, how, &answer).await;
@@ -315,6 +455,7 @@ async fn replay(
         }
     };
     for attempt in 1..=REPLAY_ATTEMPTS {
+        budget.start_attempt();
         let mut placed: Option<std::collections::BTreeSet<String>> = None;
         let carry = if ask.take_committed_tip {
             let Some(session) = request_session(db, branch, marker.as_ref()).await? else {
@@ -354,13 +495,17 @@ async fn replay(
                     return Ok(settle(
                         marker,
                         Settle::Closed {
-                            kind: "not_attempted",
+                            kind: "budget_exhausted_before_step",
                         },
                         answer,
                     )
                     .await);
                 }
             };
+            *budget.coordinate.lock().unwrap() = Some((
+                planned.plan.carry.expected_pre_tip.clone(),
+                planned.base.clone(),
+            ));
             placed = Some(planned.placed.clone());
             #[cfg(test)]
             tests::after_carry_plan(&store, attempt);
@@ -391,6 +536,7 @@ async fn replay(
                 let base = session_base_ahead(&store, session.as_ref(), &base_branch, &live, &head)
                     .await
                     .unwrap_or(live);
+                *budget.coordinate.lock().unwrap() = Some((head.clone(), base.clone()));
                 marker = Some(
                     accept(db, &project.id, &store, ask, &base_branch, &base, &head)
                         .await
@@ -407,7 +553,7 @@ async fn replay(
                 return Ok(settle(
                     marker,
                     Settle::Closed {
-                        kind: "not_attempted",
+                        kind: "budget_exhausted_before_step",
                     },
                     answer,
                 )
@@ -448,7 +594,14 @@ async fn replay(
             request.carry = Some(Arc::new(planned.plan.carry));
         }
 
+        let preparation_started = Instant::now();
         let outcome = prepare_branch(orch, request).await;
+        budget.record(
+            "the branch preparation (reservation, capture, rebase, export and ancestry heal)",
+            preparation_started.elapsed(),
+            None,
+            false,
+        );
         let (answer, how) = match outcome {
             Ok(prepared) => {
                 let answer = landed(db, branch, session.is_some(), &prepared, merge_mode).await;
@@ -1394,7 +1547,8 @@ async fn plan_take_committed_tip(
     };
     let (assessed_store, assessed_session) = (store.to_path_buf(), session.clone());
     let reason = ask.drop_incoming_reason.map(str::to_string);
-    let proof = conflict_session::bounded_store_assessment(jj, left, scope, move |jj| {
+    let assessment_paths = scope.candidate_paths;
+    let proof = conflict_session::bounded_store_assessment_measured(jj, left, scope, move |jj| {
         Ok(conflict_session::assess_session_tip_exhaustively(
             jj,
             &assessed_store,
@@ -1403,10 +1557,22 @@ async fn plan_take_committed_tip(
             placed,
         ))
     })
-    .await
-    .map_err(|error| {
+    .await;
+    budget.record_assessment(
+        ASSESSMENT,
+        assessment_paths,
+        &proof,
+        matches!(&proof.outcome, Ok(RestoreProof::Assessed(_))),
+    );
+    #[cfg(test)]
+    tests::after_budgeted_assessment(store, budget);
+    let proof = proof.outcome.map_err(|error| {
         if crate::jj::is_jj_timeout_error(&error) {
-            PlanStop::Answer(timed_out_step(branch, ASSESSMENT, &error))
+            PlanStop::Answer(format!(
+                "{}{}",
+                timed_out_step(branch, ASSESSMENT, &error),
+                budget.attribution()
+            ))
         } else {
             PlanStop::Refused(format!(
                 "Refusing this replay: whether your committed tip keeps every incoming change \
@@ -1417,11 +1583,19 @@ async fn plan_take_committed_tip(
     })?;
     if let RestoreProof::Unavailable(why) = &proof {
         if crate::jj::is_jj_timeout_error(why) {
-            return Err(PlanStop::Answer(timed_out_step(branch, ASSESSMENT, why)));
+            return Err(PlanStop::Answer(format!(
+                "{}{}",
+                timed_out_step(branch, ASSESSMENT, why),
+                budget.attribution()
+            )));
         }
     }
     let tip = match &proof {
-        RestoreProof::Assessed(assessment) => Some(assessment.tip.clone()),
+        RestoreProof::Assessed(assessment) => {
+            *budget.coordinate.lock().unwrap() =
+                Some((assessment.tip.clone(), session.destination_commit.clone()));
+            Some(assessment.tip.clone())
+        }
         _ => crate::jj::bookmark_commit(jj, store, branch),
     }
     .ok_or_else(|| {
@@ -1498,6 +1672,7 @@ async fn plan_take_committed_tip(
     // A base rewritten under the session has no recorded commit left to land
     // on: the resolution is judged against the live base, as it always was.
     let base = if exact { recorded } else { live };
+    *budget.coordinate.lock().unwrap() = Some((tip.clone(), base.clone()));
     // What this plan places, and so what a conflict at the same base already
     // accounts for: anything else is an inventory the session did not list.
     let mut placed: std::collections::BTreeSet<String> = session
@@ -1537,13 +1712,19 @@ async fn plan_take_committed_tip(
             .len(),
     };
     let (planned_store, planned_base) = (store.to_path_buf(), base.clone());
-    let plan = conflict_session::bounded_store_assessment(jj, left, scope, move |jj| {
+    let carry_paths = scope.candidate_paths;
+    let plan = conflict_session::bounded_store_assessment_measured(jj, left, scope, move |jj| {
         plan_resolution_carry(jj, &planned_store, &session, &planned_base, &tip)
     })
-    .await
-    .map_err(|error| {
+    .await;
+    budget.record_assessment(CARRY, carry_paths, &plan, plan.outcome.is_ok());
+    let plan = plan.outcome.map_err(|error| {
         if crate::jj::is_jj_timeout_error(&error) {
-            PlanStop::Answer(timed_out_step(branch, CARRY, &error))
+            PlanStop::Answer(format!(
+                "{}{}",
+                timed_out_step(branch, CARRY, &error),
+                budget.attribution()
+            ))
         } else {
             PlanStop::Refused(format!(
                 "Your committed resolution could not be planned onto `{}` at `{base}`: {error}. \
@@ -1561,6 +1742,48 @@ async fn plan_take_committed_tip(
         placed,
         plan,
     })
+}
+
+async fn persist_budget_refusal(
+    db: &LocalDb,
+    project_id: &str,
+    store: &Path,
+    ask: &ExplicitReplay<'_>,
+    budget: &Budget,
+    merge_mode: bool,
+    answer: &str,
+) {
+    let coordinate = budget.coordinate.lock().unwrap().clone();
+    let relationship = load_relationship(db, project_id, ask.branch, Some(ask.job_id), None).await;
+    let base_branch = relationship
+        .as_ref()
+        .map(|r| r.base_branch.as_str())
+        .unwrap_or("unknown");
+    let explicit = super::replay_cost::ExplicitCost {
+        started: budget.deadline - budget.total,
+        budget: budget.total,
+        take_committed_tip: ask.take_committed_tip,
+        drop_incoming: ask.drop_incoming_reason.is_some(),
+    };
+    if let Err(error) = super::replay_cost::record_pre_rebase_refusal(
+        db,
+        project_id,
+        store,
+        ask.branch,
+        coordinate.as_ref().map(|(head, _)| head.as_str()),
+        base_branch,
+        coordinate.as_ref().map(|(_, base)| base.as_str()),
+        merge_mode,
+        &explicit,
+        answer,
+    )
+    .await
+    {
+        log::warn!(
+            "record pre-rebase budget refusal for `{}`: {error}",
+            ask.branch
+        );
+    }
 }
 
 fn placed_scope(merge_mode: bool) -> conflict_session::ReplayScope {
@@ -1651,7 +1874,8 @@ async fn increment_round(
         }
         return Some(format!(
             "{lead} this request's budget is spent, so it is served next on its own; you do \
-             not need to request it. cairn:~/rebase shows its verdict."
+             not need to request it. cairn:~/rebase shows its verdict.{}",
+            budget.attribution()
         ));
     };
     let answer = Box::pin(replay(

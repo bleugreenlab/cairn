@@ -201,6 +201,9 @@ pub(crate) struct ReplayCostEvidence {
     pub(crate) outcome: CostOutcome,
     /// The step that ran out of time, for a timeout.
     pub(crate) failure_phase: Option<String>,
+    /// The exact refusal returned before detached computation, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnostic: Option<String>,
 }
 
 impl ReplayCostEvidence {
@@ -396,6 +399,56 @@ pub(crate) fn millis(duration: Duration) -> u64 {
 
 fn store_key(store: &Path) -> String {
     store.to_string_lossy().into_owned()
+}
+
+/// Record a refusal before detached computation without changing request
+/// acceptance or creating a compute-timeout blocker. Missing coordinates stay unknown.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_pre_rebase_refusal(
+    db: &LocalDb,
+    project_id: &str,
+    store: &Path,
+    branch: &str,
+    head: Option<&str>,
+    base_branch: &str,
+    base: Option<&str>,
+    merge_mode: bool,
+    explicit: &ExplicitCost,
+    diagnostic: &str,
+) -> Result<(), String> {
+    let elapsed = millis(explicit.started.elapsed());
+    let (host, load1) = host_context();
+    let evidence = ReplayCostEvidence {
+        version: EVIDENCE_VERSION,
+        engine_version: REPLAY_ENGINE_VERSION,
+        build: build_identity().await,
+        recorded_at: chrono::Utc::now().timestamp(),
+        host,
+        load1,
+        branch: branch.to_string(),
+        head: head.unwrap_or("unknown").to_string(),
+        base_branch: base_branch.to_string(),
+        base: base.unwrap_or("unknown").to_string(),
+        mode: ReplayMode::of(merge_mode),
+        budget_class: BudgetClass::Explicit,
+        resolution: resolution_fingerprint(
+            explicit.take_committed_tip,
+            explicit.drop_incoming,
+            None,
+        ),
+        observed: ReplayCostObservation::default(),
+        phases: PhaseTimings {
+            proof_ms: Some(elapsed),
+            total_ms: elapsed,
+            ..PhaseTimings::default()
+        },
+        budget_ms: millis(explicit.budget),
+        compute_allowance_ms: None,
+        outcome: CostOutcome::TimedOut,
+        failure_phase: Some("before detached computation".to_string()),
+        diagnostic: Some(diagnostic.to_string()),
+    };
+    record_sample(db, project_id, store, &evidence).await
 }
 
 /// Persist one sample and trim the project's samples to the retention bound.
@@ -714,7 +767,9 @@ pub(crate) fn budgets_line() -> String {
     format!(
         "An explicit replay request has {} in total, shared by the proof, the carry plan, the \
          rebase, the ancestry heal, the install and the export; automatic preparation (a commit, \
-         a check, a landing) has {} for the same work. Neither is widened for a large branch.",
+         a check, a landing) has {} per compute operation, not one cumulative request budget. \
+         A caller-supplied absolute deadline also bounds acquisition and cooperative operations. \
+         Neither is widened for a large branch.",
         seconds(millis(super::replay_requests::EXPLICIT_REPLAY_BUDGET)),
         seconds(millis(crate::jj::BACKGROUND_RECONCILE_BUDGET)),
     )
@@ -856,6 +911,9 @@ fn staleness(
     base_branch: &str,
     live: &LiveCoordinates,
 ) -> &'static str {
+    if evidence_head == "unknown" || evidence_base == "unknown" {
+        return "whether the branch or base has moved since is unknown (coordinates were not captured)";
+    }
     let head_moved = live.head.is_some_and(|head| head != evidence_head);
     let base_moved = (live.base_tip)(base_branch).is_some_and(|tip| tip != evidence_base);
     match (live.head.is_none(), head_moved, base_moved) {
@@ -930,6 +988,9 @@ fn describe_sample(sample: &ReplayCostEvidence, now: i64, live: &LiveCoordinates
              sample. That is part of the request, not its total, and a description, not a \
              prediction.\n"
         ));
+    }
+    if let Some(diagnostic) = &sample.diagnostic {
+        out.push_str(&format!("\n{diagnostic}\n\n"));
     }
     out.push_str(&format!(
         "- Outcome: {}{}.\n",

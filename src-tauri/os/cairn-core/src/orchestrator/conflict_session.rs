@@ -76,11 +76,43 @@ where
     T: Send + 'static,
     F: FnOnce(&JjEnv) -> Result<T, String> + Send + 'static,
 {
+    bounded_store_assessment_measured(jj, budget, scope, work)
+        .await
+        .outcome
+}
+
+pub(crate) struct StoreAssessment<T> {
+    pub(crate) outcome: Result<T, String>,
+    pub(crate) elapsed: std::time::Duration,
+    /// Completed worker time only, excluding blocking-pool queueing and join grace.
+    pub(crate) completed_work: Option<std::time::Duration>,
+}
+
+pub(crate) async fn bounded_store_assessment_measured<T, F>(
+    jj: &JjEnv,
+    budget: std::time::Duration,
+    scope: AssessmentScope<'_>,
+    work: F,
+) -> StoreAssessment<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&JjEnv) -> Result<T, String> + Send + 'static,
+{
     let started = std::time::Instant::now();
     let budgeted = jj.with_operation_budget(budget);
-    let worker = tokio::task::spawn_blocking(move || work(&budgeted));
+    let worker = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let result = work(&budgeted);
+        (result, started.elapsed())
+    });
+    let mut completed_work = None;
     let outcome = match tokio::time::timeout(budget + ASSESSMENT_JOIN_GRACE, worker).await {
-        Ok(Ok(result)) => result,
+        Ok(Ok((result, elapsed))) => {
+            if result.is_ok() {
+                completed_work = Some(elapsed);
+            }
+            result
+        }
         Ok(Err(error)) => Err(format!(
             "{} worker for `{}` failed: {error}",
             scope.phase, scope.branch
@@ -111,7 +143,11 @@ where
             }
         );
     }
-    outcome
+    StoreAssessment {
+        outcome,
+        elapsed,
+        completed_work,
+    }
 }
 
 /// Schema version of the persisted diagnostic. Bumped when the meaning of a
