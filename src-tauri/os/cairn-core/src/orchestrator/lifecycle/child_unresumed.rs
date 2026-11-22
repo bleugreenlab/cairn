@@ -124,15 +124,21 @@ pub(crate) struct UnresumedChild {
     pub(crate) episode: Episode,
     pub(crate) run: Option<RunEvidence>,
     pub(crate) refusals: Refusals,
+    /// Active resume hold identity and its live release description.
+    pub(crate) resume_hold: Option<(String, String)>,
 }
 
 impl UnresumedChild {
     /// One episode is one turn, so repeated sweeps, repeated boots and later
-    /// refused launches all keep this value and wake nobody, while a new orphan
-    /// after a real recovery is a new turn and wakes the parent again. Nothing
-    /// time-derived appears here.
+    /// refused launches keep this value and wake nobody. A hold has its own
+    /// passive identity, so losing it can report the orphan as actionable.
+    /// A new orphan after real recovery is a new turn. Nothing time-derived
+    /// appears here.
     pub(crate) fn fingerprint(&self) -> String {
-        self.episode.turn_id.clone()
+        match &self.resume_hold {
+            Some((id, _)) => format!("{}:held:{id}", self.episode.turn_id),
+            None => self.episode.turn_id.clone(),
+        }
     }
 
     fn key(&self) -> String {
@@ -142,6 +148,12 @@ impl UnresumedChild {
     /// The fact in words, as the parent reads it. `now` is a parameter so the
     /// rendered spans can be pinned in a test.
     pub(crate) fn render(&self, now: i64) -> String {
+        if let Some((_, description)) = &self.resume_hold {
+            return format!(
+                "Child `{}` has unfinished work, and {} is still open. {} Its restart resume is held: {description}",
+                self.node_uri, self.issue_uri, self.turn_sentence(now),
+            );
+        }
         let mut out = format!(
             "Child `{}` has unfinished work that nothing is running, and {} is still open.\n\n{} {}",
             self.node_uri,
@@ -444,6 +456,28 @@ async fn evaluate(
     if !episode.is_restart_cancelled() || in_motion(db, &candidate.job_id, claimed).await? {
         return Ok(None);
     }
+    let resume_hold = crate::orchestrator::wakes::active_supply_hold(db, &candidate.job_id)
+        .await?
+        .filter(|hold| hold.kind == crate::orchestrator::wakes::HoldKind::Resume)
+        .map(|hold| {
+            let description = match hold.boundary_source.as_str() {
+                "thread_focus" if hold.resume_gate.is_none() => "waiting for a thread focus slot; re-entries precede fresh starts. It resumes on its own when a focus slot frees.".to_string(),
+                "thread_open_prs" if hold.resume_gate.is_none() => "waiting for room under the thread's open-PR bound. It resumes on its own when that bound allows it.".to_string(),
+                _ => {
+                    let description = if let Some(gate) = hold.resume_gate.as_deref() {
+                        crate::messages::delivery::Hold::ProviderLimit {
+                            retry_not_before: hold.retry_not_before,
+                            gate: Some(crate::messages::delivery::ProviderLimitGate::from_resume_gate(gate)),
+                        }
+                    } else {
+                        crate::messages::delivery::Hold::no_supply(&hold)
+                            .expect("a resume hold is a supply hold")
+                    };
+                    description.render()
+                }
+            };
+            (hold.id, description)
+        });
     let run = run_evidence(db, &candidate.job_id, &episode).await?;
     let refusals = refusals_since(db, &candidate.job_id, &episode).await?;
     Ok(Some(UnresumedChild {
@@ -453,6 +487,7 @@ async fn evaluate(
         episode,
         run,
         refusals,
+        resume_hold,
     }))
 }
 
@@ -469,6 +504,11 @@ async fn tell_unresumed_watchers(
             node_uri: &child.node_uri,
             key: child.key(),
             fingerprint: child.fingerprint(),
+            wake: if child.resume_hold.is_some() {
+                cairn_attention::push::Wake::Passive
+            } else {
+                cairn_attention::push::Wake::Wake
+            },
         },
     )
     .await

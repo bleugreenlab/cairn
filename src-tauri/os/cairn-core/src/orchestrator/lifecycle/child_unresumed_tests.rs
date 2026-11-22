@@ -950,3 +950,79 @@ async fn this_fact_and_the_stalled_child_fact_do_not_cross() {
     assert!(rows.iter().any(|row| row.1.starts_with("child-stalled:")));
     assert!(rows.iter().any(|row| row.1 == CHILD_KEY));
 }
+
+#[tokio::test]
+async fn a_focus_held_boot_resume_is_passive_until_its_hold_is_withdrawn() {
+    use crate::orchestrator::wakes::{arm_thread_hold, HoldKind};
+
+    let db = migrated_db().await;
+    seed(&db).await;
+    orphan(&db, "turn-e", 2, AFTER_BOOT).await;
+    db.execute(
+        "UPDATE jobs SET current_turn_id='turn-e' WHERE id='child-job'",
+        (),
+    )
+    .await
+    .unwrap();
+    let hold = arm_thread_hold(
+        &db,
+        "child-job",
+        HoldKind::Resume,
+        "thread_focus",
+        "Waiting for a thread focus slot; re-entries precede fresh starts.".into(),
+        "thread_focus".into(),
+        NOW,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        sweep(&db).await.is_empty(),
+        "a held resume must not wake its parent"
+    );
+    let held = standing(&db).await.remove(0);
+    let rendered = held.render(NOW);
+    assert!(rendered.contains(CHILD_NODE), "{rendered}");
+    assert!(
+        rendered.contains("held: waiting for a thread focus slot"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("re-entries precede fresh starts"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("resumes on its own when a focus slot frees"),
+        "{rendered}"
+    );
+    for misleading in [
+        "no account",
+        "15 minutes",
+        "did not take",
+        "nothing will resume",
+        "send the node",
+        "no resume turn was ever minted",
+    ] {
+        assert!(!rendered.contains(misleading), "{rendered}");
+    }
+    let rows = pushes(&db).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].4, "passive");
+    assert!(sweep(&db).await.is_empty());
+
+    // Losing an automatic release path is now an actionable orphan, not the
+    // passive fact already receipted by the parent.
+    db.execute(
+        "UPDATE provider_limit_holds SET state='cancelled' WHERE id=?1",
+        (hold.id,),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sweep(&db).await, vec!["parent-job"]);
+    let orphaned = standing(&db).await.remove(0);
+    assert_ne!(held.fingerprint(), orphaned.fingerprint());
+    assert!(orphaned
+        .render(NOW)
+        .contains("nothing will resume it automatically"));
+    assert_eq!(pushes(&db).await[0].4, "wake");
+}

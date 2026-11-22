@@ -502,6 +502,7 @@ pub(crate) async fn tell_watchers(
             node_uri: &child.node_uri,
             key: format!("{CHILD_STALL_PUSH_PREFIX}:{}", child.issue_uri),
             fingerprint: child.fingerprint(),
+            wake: cairn_attention::push::Wake::Wake,
         },
     )
     .await

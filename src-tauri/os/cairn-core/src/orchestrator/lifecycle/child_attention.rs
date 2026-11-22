@@ -21,6 +21,7 @@ pub(crate) struct ChildFact<'a> {
     /// it, because that is what a parent's mute of the child is matched against.
     pub(crate) key: String,
     pub(crate) fingerprint: String,
+    pub(crate) wake: Wake,
 }
 
 /// Tell the child's watchers, and hand back the ones a wake should rouse.
@@ -38,7 +39,7 @@ pub(crate) async fn tell_child_watchers(
 ) -> Result<Vec<String>, String> {
     let _ = fact.issue_id;
     let fact_kind = child_fact_kind(&fact.key);
-    let mut audience = cairn_attention::wakes::FactAudience::new(fact_kind, Wake::Wake, Wake::Wake);
+    let mut audience = cairn_attention::wakes::FactAudience::new(fact_kind, fact.wake, fact.wake);
     audience.source = Some(cairn_attention::wakes::SourceRef::issue(fact.issue_uri));
     audience.exclude.subject_issue_jobs = true;
     let push = cairn_attention::delivery::AudiencePush {

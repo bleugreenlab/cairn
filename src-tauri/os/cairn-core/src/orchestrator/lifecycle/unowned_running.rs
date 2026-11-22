@@ -455,6 +455,7 @@ async fn tell(db: &LocalDb, job: &UnownedJob, cause: &Cause) -> Result<Vec<Strin
             node_uri,
             key: unowned_push_key(node_uri),
             fingerprint: job.fingerprint(cause),
+            wake: cairn_attention::push::Wake::Wake,
         },
     )
     .await
