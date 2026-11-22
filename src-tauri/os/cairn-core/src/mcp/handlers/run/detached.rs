@@ -1805,15 +1805,16 @@ mod tests {
     /// An orchestrator over [`db_with_job`], for the ending paths that release
     /// a branch hold.
     async fn orch_with_job() -> Orchestrator {
+        orch_with_db(std::sync::Arc::new(db_with_job().await))
+    }
+
+    fn orch_with_db(db: std::sync::Arc<LocalDb>) -> Orchestrator {
         let search = std::sync::Arc::new(
             crate::storage::SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep())
                 .unwrap(),
         );
         crate::orchestrator::OrchestratorBuilder::new(
-            std::sync::Arc::new(crate::db::DbState::new(
-                std::sync::Arc::new(db_with_job().await),
-                search,
-            )),
+            std::sync::Arc::new(crate::db::DbState::new(db, search)),
             std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
             tempfile::tempdir().unwrap().keep(),
         )
@@ -2164,13 +2165,9 @@ mod tests {
     /// for that machine.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restart_detached_batch_is_judged_by_the_machine_that_claimed_it() {
-        let orch = orch_with_job().await;
-        let db = orch.db.local.clone();
-        let _frames = orch
-            .fleet
-            .attach_reported_machine_for_test("bgsrv-mac", &[]);
-        orch.fleet
-            .declare_enrolled_remote("bgsrv-ub2", "bgsrv-ub2", "linux", "x86_64");
+        // Seed the complete previous process before construction starts the
+        // queue journal's incarnation sweep, which also writes closure markers.
+        let db = std::sync::Arc::new(db_with_job().await);
         let placed_on = |executor_id: &str| {
             Some(super::super::PersistedSettlement::for_test(
                 None,
@@ -2225,6 +2222,13 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let orch = orch_with_db(db.clone());
+        let _frames = orch
+            .fleet
+            .attach_reported_machine_for_test("bgsrv-mac", &[]);
+        orch.fleet
+            .declare_enrolled_remote("bgsrv-ub2", "bgsrv-ub2", "linux", "x86_64");
 
         assert_eq!(sweep_unreported(&orch).await, 3);
         for id in ["req-recorded", "req-journal"] {
