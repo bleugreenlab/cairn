@@ -725,14 +725,18 @@ async fn answer_resident(
     ) {
         return (StatusCode::FORBIDDEN, diagnostic).into_response();
     }
-    let DispatchOutput { content, reminders } =
-        dispatch_tool(&relay.orch, &request, &relay.read_cursors)
-            .await
-            .into_inner();
+    let DispatchOutput {
+        content,
+        reminders,
+        refusal,
+    } = dispatch_tool(&relay.orch, &request, &relay.read_cursors)
+        .await
+        .into_inner();
     Json(McpCallbackResponse {
         result: content,
         artifact_uri: None,
         reminders,
+        refusal,
     })
     .into_response()
 }
@@ -777,14 +781,18 @@ async fn answer_batch(
     ) {
         return (StatusCode::FORBIDDEN, diagnostic).into_response();
     }
-    let DispatchOutput { content, reminders } =
-        dispatch_tool(&relay.orch, &request, &relay.read_cursors)
-            .await
-            .into_inner();
+    let DispatchOutput {
+        content,
+        reminders,
+        refusal,
+    } = dispatch_tool(&relay.orch, &request, &relay.read_cursors)
+        .await
+        .into_inner();
     Json(McpCallbackResponse {
         result: content,
         artifact_uri: None,
         reminders,
+        refusal,
     })
     .into_response()
 }

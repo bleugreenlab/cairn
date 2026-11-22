@@ -17,6 +17,10 @@ pub struct CallbackOutcome {
     /// point of failure, so nothing downstream has to recover the class from
     /// rendered text.
     pub failure: Option<CallbackFailure>,
+    /// Set when the host answered with a refusal no handler produced
+    /// ([`cairn_common::protocol::CallbackResponse::refusal`]): nothing the
+    /// call asked for was done, and `result` is the refusal's sentence.
+    pub refusal: Option<cairn_common::protocol::RefusalClass>,
 }
 
 /// The ways a callback can fail to deliver the host's answer.
@@ -383,6 +387,31 @@ pub fn http_status_error_message(status: u16, reason: &str, request_bytes: usize
     message
 }
 
+/// The `_meta` key under which a refused call's tool result names its
+/// [`cairn_common::protocol::RefusalClass`].
+pub const REFUSAL_META_KEY: &str = "cairn/refusal";
+
+/// A call the host refused before any handler ran, as a tool error carrying
+/// the refusal's sentence and, in `_meta`, its class: nothing it asked for was
+/// done, whatever the sentence looks like.
+pub fn refused_callback_result(
+    outcome: CallbackOutcome,
+    class: cairn_common::protocol::RefusalClass,
+) -> CallToolResult {
+    let body = assemble_reminders(outcome.result, &outcome.reminders);
+    let mut result = CallToolResult::error(vec![ContentBlock::text(cap_text_result(&body, 0))]);
+    let mut meta = serde_json::Map::new();
+    meta.insert(REFUSAL_META_KEY.into(), class.word().into());
+    result.meta = Some(rmcp::model::MetaObject(meta));
+    result
+}
+
+/// The refusal class a tool result carries, when the host refused the call.
+pub fn refusal_class(result: &CallToolResult) -> Option<cairn_common::protocol::RefusalClass> {
+    let class = result.meta.as_ref()?.get(REFUSAL_META_KEY)?;
+    serde_json::from_value(class.clone()).ok()
+}
+
 pub fn change_callback_result(
     outcome: CallbackOutcome,
     callback_url: &str,
@@ -390,6 +419,9 @@ pub fn change_callback_result(
 ) -> CallToolResult {
     if !outcome.transport_ok {
         return callback_transport_error_result(&outcome, callback_url, tool);
+    }
+    if let Some(class) = outcome.refusal {
+        return refused_callback_result(outcome, class);
     }
 
     // Parse the change report from the clean handler content first, then
@@ -674,6 +706,36 @@ mod tests {
         assert!(!text.contains("token=secret"));
     }
 
+    /// A refused write is an error carrying its class, even when the refusal's
+    /// sentence is not a change report and names no failure.
+    #[test]
+    fn a_refused_change_is_a_tool_error_naming_its_class() {
+        let outcome = CallbackOutcome {
+            result: "This run is no longer served.".into(),
+            transport_ok: true,
+            refusal: Some(cairn_common::protocol::RefusalClass::JobEnded),
+            ..Default::default()
+        };
+        let result = change_callback_result(outcome, "http://127.0.0.1:3847/api/mcp", "write");
+        assert!(result.is_error.unwrap_or(false));
+        assert_eq!(get_text(&result), "This run is no longer served.");
+        assert_eq!(
+            refusal_class(&result),
+            Some(cairn_common::protocol::RefusalClass::JobEnded)
+        );
+
+        let served = change_callback_result(
+            CallbackOutcome {
+                result: r#"{"applied":[],"failures":[]}"#.into(),
+                transport_ok: true,
+                ..Default::default()
+            },
+            "http://127.0.0.1:3847/api/mcp",
+            "write",
+        );
+        assert_eq!(refusal_class(&served), None);
+    }
+
     #[test]
     fn test_change_report_failure_becomes_tool_error() {
         // Mirrors the real failure shape: empty/null/false fields are omitted,
@@ -810,6 +872,7 @@ mod tests {
                 "[Direct message from planner] hello mid-turn".to_string(),
                 "The worktree has uncommitted changes. Commit them.".to_string(),
             ],
+            refusal: None,
         };
 
         // Content is pure JSON: it deserializes as the envelope with no leftover.

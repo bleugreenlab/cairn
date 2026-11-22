@@ -69,6 +69,7 @@ fn tool_result_renders_reminders_after_content() {
     let rendered = render_tool_result(DispatchOutput {
         content: "ok".into(),
         reminders: vec!["note".into()],
+        refusal: None,
     });
     assert!(rendered.starts_with("ok"));
     assert!(rendered.contains("<system-reminder>"));
@@ -451,6 +452,7 @@ async fn streamed_reasoning_then_tool_call_persists_both_events() {
         &DispatchOutput {
             content: "file body".to_string(),
             reminders: vec![],
+            refusal: None,
         },
         "openrouter",
     )

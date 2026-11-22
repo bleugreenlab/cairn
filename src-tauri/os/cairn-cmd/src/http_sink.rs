@@ -255,6 +255,7 @@ impl CallbackSink for HttpCallbackSink {
                             reminders: r.reminders,
                             transport_ok: http_ok,
                             failure: None,
+                            refusal: r.refusal,
                         },
                         Err(e) => {
                             tracing::error!(
@@ -410,6 +411,38 @@ mod tests {
 
     fn kind(outcome: &CallbackOutcome) -> CallbackFailureKind {
         outcome.failure.expect("a failure").kind
+    }
+
+    /// A refusal answered at 200 is still a refusal: its class rides on the
+    /// outcome beside the sentence, and an answer with none carries none.
+    #[tokio::test]
+    async fn a_refusal_answered_at_200_carries_its_class() {
+        use tokio::io::AsyncWriteExt;
+        for (body, expected) in [
+            (
+                r#"{"result":"This run is no longer served.","refusal":"run_not_served"}"#,
+                Some(cairn_common::protocol::RefusalClass::RunNotServed),
+            ),
+            (r#"{"result":"ok"}"#, None),
+        ] {
+            let url = serving(move |mut stream| {
+                Box::pin(async move {
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                })
+            })
+            .await;
+            let answered = outcome(url, Some(Duration::from_secs(10))).await;
+            assert!(answered.transport_ok, "{}", answered.result);
+            assert_eq!(answered.refusal, expected, "{body}");
+        }
     }
 
     #[tokio::test]

@@ -246,6 +246,9 @@ Partial failures never abort: a failed target stays in place under an `[error]` 
         tracing::info!("read called: {} paths", input.paths.len());
 
         let outcome = self.read_batch(&input, thread_id, standalone_cli).await;
+        if let Some(class) = outcome.refusal {
+            return Ok(crate::output::refused_callback_result(outcome, class));
+        }
 
         // The handler content is the bare envelope JSON — augmentation reminders
         // ride separately, so this parses cleanly with no trailing-text split.
@@ -895,6 +898,7 @@ mod tests {
             reminders: Vec::new(),
             transport_ok: true,
             failure: None,
+            refusal: None,
         });
         let mcp = CairnMcpServer::new(
             sink.clone(),
@@ -932,6 +936,7 @@ mod tests {
             reminders: Vec::new(),
             transport_ok: true,
             failure: None,
+            refusal: None,
         });
         let mcp = CairnMcpServer::new(
             sink.clone(),

@@ -24,7 +24,11 @@
 //! differently:
 //!
 //! - A terminal or REPL presents a per-process capability the runner minted and
-//!   keeps only the SHA-256 of. It speaks for the run that created the process.
+//!   keeps only the SHA-256 of. A job's (a node's, task's or thread's) speaks
+//!   for that job: the
+//!   call is marked as that job's process and the dispatcher resolves the run
+//!   it acts as on every call, so it outlives the turn that created it. A
+//!   project's speaks for no run.
 //! - A project service presents run bearers that change with every call. Each
 //!   is bound to [`crate::mcp::run_bearer::relay_audience`] of the executor the
 //!   service runs on, and the run it verifies to must belong to this
@@ -57,6 +61,14 @@ pub(crate) enum ResidentRelayAuthority {
     /// calls may name neither a run nor a thread.
     RunCapability {
         run_id: Option<String>,
+        capability_digest: [u8; 32],
+    },
+    /// A node's or task's terminal or REPL: the digest of the capability in
+    /// its environment, and the job it speaks for. Its calls are marked
+    /// [`cairn_common::protocol::DispatchOrigin::RelayedJobProcess`] and carry
+    /// no run from here; `dispatch::resolve_job_process_request` resolves one.
+    JobCapability {
+        job_id: String,
         capability_digest: [u8; 32],
     },
     /// One incarnation of a project service.
@@ -184,6 +196,18 @@ impl ResidentRelays {
                 (
                     ResidentRelayAuthority::RunCapability {
                         run_id,
+                        capability_digest: digest(&capability),
+                    },
+                    Some(capability),
+                    guard,
+                )
+            }
+            RegisteredAuthority::Job { job_id } => {
+                let capability = random_token();
+                let guard = register_capability(process_key, &capability);
+                (
+                    ResidentRelayAuthority::JobCapability {
+                        job_id,
                         capability_digest: digest(&capability),
                     },
                     Some(capability),
@@ -353,7 +377,11 @@ impl ResidentRelays {
     }
 
     /// Decide one relayed call. On success `request.run_id` names the run the
-    /// call is dispatched as.
+    /// call is dispatched as, except for a job's process, whose call is marked
+    /// as that job's and whose run the dispatcher resolves.
+    ///
+    /// Every origin set here is set from the context, never from the request:
+    /// a request's own `origin` never deserializes, and this overwrites it.
     ///
     /// `verify_service` verifies a service's bearer against an audience and
     /// says which incarnation its run belongs to.
@@ -410,6 +438,28 @@ impl ResidentRelays {
                     );
                 }
                 run_id.clone()
+            }
+            ResidentRelayAuthority::JobCapability {
+                job_id,
+                capability_digest,
+            } => {
+                if !crate::mcp::run_bearer::constant_time_eq(&digest(token), capability_digest) {
+                    return Err(
+                        "this credential is not the one this process was started with".into(),
+                    );
+                }
+                // Only a pool credential resolves a thread.
+                request.thread_id = None;
+                request.origin = Some(cairn_common::protocol::DispatchOrigin::RelayedJobProcess(
+                    cairn_common::protocol::RelayedJobProcess {
+                        job_id: job_id.clone(),
+                        process: cairn_common::protocol::RelayedProcess {
+                            relay_id: call.relay_id.clone(),
+                            process_key: context.process_key.clone(),
+                        },
+                    },
+                ));
+                return Ok(());
             }
             ResidentRelayAuthority::ServiceBearers(incarnation) => {
                 let audience = crate::mcp::run_bearer::relay_audience(executor_id);
@@ -477,7 +527,15 @@ impl ResidentRelays {
 
 /// Who a new relay context will authorize.
 pub(crate) enum RegisteredAuthority {
-    Run { run_id: Option<String> },
+    /// A process that speaks for one fixed run (a workflow runtime), or for
+    /// none (a project terminal).
+    Run {
+        run_id: Option<String>,
+    },
+    /// A node's or task's terminal or REPL, which speaks for its job.
+    Job {
+        job_id: String,
+    },
     Service(ServiceIncarnation),
 }
 
@@ -880,6 +938,85 @@ mod tests {
         );
         assert!(relays.bind(&minted.grant.relay_id, "machine-c", 1).is_err());
         assert_eq!(relays.len(), 0);
+    }
+
+    /// A node's terminal speaks for its job. Its relay marks the call as that
+    /// job's process from the context alone, sets no run (the dispatcher
+    /// resolves one), keeps the run it claims for the dispatcher to check, and
+    /// drops any thread the caller named.
+    #[test]
+    fn a_job_terminal_is_marked_as_its_jobs_process_from_its_context() {
+        let holder = ResidencyHolder::Job {
+            job_id: "job-1".into(),
+        };
+        let mut relays = ResidentRelays::default();
+        let minted = relays.register(
+            "machine-b",
+            &holder,
+            "shell",
+            RegisteredAuthority::Job {
+                job_id: "job-1".into(),
+            },
+        );
+        let relay_id = minted.grant.relay_id;
+        relays.bind(&relay_id, "machine-b", 7).unwrap();
+        relays.learn_generation(&relay_id, 4);
+        let capability = minted.capability.expect("a terminal gets a capability");
+        fn call<'a>(
+            relay_id: &'a ResidentRelayId,
+            holder: &'a ResidencyHolder,
+            authorization: &'a RelayAuthorization,
+        ) -> ResidentRelayCall<'a> {
+            ResidentRelayCall {
+                relay_id,
+                holder,
+                process_key: "shell",
+                process_generation: 4,
+                authorization,
+            }
+        }
+        let started_with = bearer(&capability);
+        let forged = bearer("not-the-capability");
+
+        for claimed in [None, Some("run-created-it")] {
+            let mut request = McpCallbackRequest {
+                cwd: "/".into(),
+                run_id: claimed.map(str::to_string),
+                thread_id: Some("thread-elsewhere".into()),
+                tool: "write".into(),
+                payload: serde_json::json!({"changes": []}),
+                ..Default::default()
+            };
+            relays
+                .authorize(
+                    "machine-b",
+                    7,
+                    &call(&relay_id, &holder, &started_with),
+                    &mut request,
+                    &no_services,
+                )
+                .unwrap();
+            let process = request.relayed_job_process().expect("marked");
+            assert_eq!(process.job_id, "job-1");
+            assert_eq!(process.process.relay_id, relay_id);
+            assert_eq!(process.process.process_key, "shell");
+            assert_eq!(request.run_id.as_deref(), claimed);
+            assert_eq!(request.thread_id, None);
+            assert!(!request.is_unverified_local());
+        }
+
+        let mut request = McpCallbackRequest::default();
+        let refusal = relays
+            .authorize(
+                "machine-b",
+                7,
+                &call(&relay_id, &holder, &forged),
+                &mut request,
+                &no_services,
+            )
+            .unwrap_err();
+        assert!(refusal.contains("not the one"), "{refusal}");
+        assert_eq!(request.origin, None);
     }
 
     #[test]

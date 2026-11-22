@@ -37,6 +37,7 @@ fn truncated_args_message(verb: &str) -> DispatchOutput {
              a big write), split it into several smaller calls so each fits in the output budget."
         ),
         reminders: Vec::new(),
+        refusal: None,
     }
 }
 
@@ -62,6 +63,7 @@ pub(super) fn prepare_tool_call(
                 "Unsupported OpenRouter tool: {raw_name:?}. Valid tools are: read, write, run."
             ),
             reminders: Vec::new(),
+            refusal: None,
         });
     };
     let side_effecting = matches!(verb, "write" | "run");
@@ -99,6 +101,7 @@ pub(super) fn prepare_tool_call(
                      If the payload is very large (for example a big write), split it into smaller calls."
                 ),
                 reminders: Vec::new(),
+                refusal: None,
             });
         }
     };

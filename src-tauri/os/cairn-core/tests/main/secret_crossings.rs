@@ -42,6 +42,7 @@ fn go_html_safe_json_secret_cannot_cross_the_final_response_guard() {
         cairn_core::internal::dispatch::DispatchOutput {
             content: serialized.to_string(),
             reminders: Vec::new(),
+            refusal: None,
         },
         Crossing::FinalResponse,
     );
@@ -64,6 +65,7 @@ fn json_stringified_secret_cannot_cross_the_final_response_guard() {
         cairn_core::internal::dispatch::DispatchOutput {
             content: serialized.clone(),
             reminders: Vec::new(),
+            refusal: None,
         },
         Crossing::FinalResponse,
     );
@@ -319,6 +321,7 @@ async fn reminders_cross_the_final_response_guard_too() {
         cairn_core::internal::dispatch::DispatchOutput {
             content: "ok".to_string(),
             reminders: vec![format!("a queued message mentioning {SECRET}")],
+            refusal: None,
         },
         Crossing::FinalResponse,
     );

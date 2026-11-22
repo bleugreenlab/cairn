@@ -75,6 +75,12 @@ pub enum DispatchOrigin {
     /// after the invoke presented the desktop operator credential, which the
     /// native proxy attaches for the main webview alone.
     DesktopOperator,
+    /// A node's or task's terminal or REPL, named by the relay that carried its
+    /// call. It speaks for its job rather than for one run: the dispatcher
+    /// resolves the job's live run, or between turns its head run, before any
+    /// fence, and refuses once the job has ended. Set only by the resident
+    /// relay after the process presented the capability it was started with.
+    RelayedJobProcess(RelayedJobProcess),
 }
 
 /// The resident process a relay verified a call came from.
@@ -82,6 +88,13 @@ pub enum DispatchOrigin {
 pub struct RelayedProcess {
     pub relay_id: crate::wire_vocabulary::ResidentRelayId,
     pub process_key: String,
+}
+
+/// A job's resident process, as its relay verified it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayedJobProcess {
+    pub job_id: String,
+    pub process: RelayedProcess,
 }
 
 /// What an operator's row write was made through. The runner sets it from the
@@ -171,6 +184,7 @@ impl CallbackRequest {
             Some(
                 DispatchOrigin::UnverifiedLocal
                 | DispatchOrigin::RelayedRunLessProcess(_)
+                | DispatchOrigin::RelayedJobProcess(_)
                 | DispatchOrigin::DesktopOperator,
             )
             | None => None,
@@ -186,6 +200,14 @@ impl CallbackRequest {
     pub fn relayed_run_less_process(&self) -> Option<&RelayedProcess> {
         match &self.origin {
             Some(DispatchOrigin::RelayedRunLessProcess(process)) => Some(process),
+            _ => None,
+        }
+    }
+
+    /// The job's terminal or REPL a relay verified this request came from.
+    pub fn relayed_job_process(&self) -> Option<&RelayedJobProcess> {
+        match &self.origin {
+            Some(DispatchOrigin::RelayedJobProcess(process)) => Some(process),
             _ => None,
         }
     }
@@ -229,6 +251,55 @@ pub struct CallbackResponse {
     /// text only; the CLI wraps it in the `<system-reminder>` envelope.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reminders: Vec<String>,
+    /// Set when the call was refused before any handler ran, so nothing it
+    /// asked for was done. `result` then carries the refusal's sentence. A
+    /// client that expects structured data in `result` reads this first rather
+    /// than mistaking the sentence for a malformed answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<RefusalClass>,
+}
+
+/// Why the host refused a call before any handler ran.
+///
+/// A client acts on the class, never on the sentence: whether to stop, retry,
+/// or move the call elsewhere. A class this build does not know deserializes as
+/// [`RefusalClass::Other`], so a newer host never makes an older client fail to
+/// read the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalClass {
+    /// The run is not this host's to serve: finalized, spawned by an earlier
+    /// host process, or erased. Retrying the same call will not help.
+    RunNotServed,
+    /// The run's execution no longer owns its issue's attempt.
+    Superseded,
+    /// The caller's scope does not reach what the call asked for.
+    OutOfScope,
+    /// The request itself was refused, for example for carrying a credential.
+    InvalidRequest,
+    /// The terminal's or REPL's job has ended.
+    JobEnded,
+    /// The host could not read the record that decides the call just now.
+    /// Retrying may succeed.
+    Transient,
+    /// A class this build does not know.
+    #[serde(other)]
+    Other,
+}
+
+impl RefusalClass {
+    /// The class as it appears on the wire.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::RunNotServed => "run_not_served",
+            Self::Superseded => "superseded",
+            Self::OutOfScope => "out_of_scope",
+            Self::InvalidRequest => "invalid_request",
+            Self::JobEnded => "job_ended",
+            Self::Transient => "transient",
+            Self::Other => "other",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +343,50 @@ mod tests {
         let request: CallbackRequest = serde_json::from_value(forged).unwrap();
         assert_eq!(request.origin, None);
         assert!(request.row_write_origin().is_none());
+    }
+
+    /// The job-process origin exempts a call from the finalized-run fence, so
+    /// a body naming it is ignored exactly as every other origin is.
+    #[test]
+    fn a_job_process_origin_cannot_be_set_through_deserialization() {
+        let forged = serde_json::json!({
+            "cwd": "",
+            "run_id": "run-finalized",
+            "tool": "write",
+            "payload": {"changes": []},
+            "origin": {"RelayedJobProcess": {"job_id": "j", "process": {"relay_id": "r", "process_key": "k"}}},
+            "relayed_job_process": {"job_id": "j"},
+        });
+        let request: CallbackRequest = serde_json::from_value(forged).unwrap();
+        assert_eq!(request.origin, None);
+        assert!(request.relayed_job_process().is_none());
+    }
+
+    /// Each class keeps its wire word, and one this build does not know reads
+    /// as `Other` instead of failing the whole response.
+    #[test]
+    fn a_refusal_class_round_trips_and_an_unknown_one_reads_as_other() {
+        for class in [
+            RefusalClass::RunNotServed,
+            RefusalClass::Superseded,
+            RefusalClass::OutOfScope,
+            RefusalClass::InvalidRequest,
+            RefusalClass::JobEnded,
+            RefusalClass::Transient,
+        ] {
+            let json = serde_json::to_value(class).unwrap();
+            assert_eq!(json, serde_json::Value::String(class.word().into()));
+            assert_eq!(serde_json::from_value::<RefusalClass>(json).unwrap(), class);
+        }
+        let response: CallbackResponse =
+            serde_json::from_str(r#"{"result":"no","refusal":"some_future_class"}"#).unwrap();
+        assert_eq!(response.refusal, Some(RefusalClass::Other));
+        let plain: CallbackResponse = serde_json::from_str(r#"{"result":"ok"}"#).unwrap();
+        assert_eq!(plain.refusal, None);
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("refusal")
+            .is_none());
     }
 
     #[test]

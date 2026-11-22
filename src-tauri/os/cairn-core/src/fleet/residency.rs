@@ -840,27 +840,65 @@ pub(crate) fn resident_callback(
 const CALLBACK_URL_ENV: &str = "CAIRN_CALLBACK_URL";
 const MCP_SECRET_ENV: &str = "CAIRN_MCP_SECRET";
 
-/// Route a terminal's, REPL's, or workflow's callbacks through the resident
-/// relay of the executor it runs on: any callback address in `env` is taken
-/// out, a capability for this one process speaking for `run_id` (or for no run)
-/// is put in, and the grant the executor relays it under is returned. The
-/// executor supplies the relay's address when it starts the process.
+/// Route a terminal's or REPL's callbacks through the resident relay of the
+/// executor it runs on: any callback address in `env` is taken out, a
+/// capability for this one process is put in, and the grant the executor
+/// relays it under is returned. The executor supplies the relay's address when
+/// it starts the process.
+///
+/// A process `owner_job` owns (a node's, task's or thread's terminal or REPL)
+/// speaks for the job, not for `run_id`: it outlives the turn that created it,
+/// and the dispatcher resolves the job's run on each call. That holds whether
+/// an agent's run or the UI (no run) opened it; a job that has never run is
+/// refused at dispatch. A project terminal (no owner, no run) speaks for no
+/// run.
+///
+/// The owner is passed, never read from `holder`: where a process lives is not
+/// who it speaks for. A branchless job (a thread session) runs in the live
+/// checkout under a `ProjectTerminals` holder and is still its job's.
 ///
 /// Every placement is relayed, this runner's own colocated executor included.
 /// A resident process never carries the machine MCP secret, which speaks for no
-/// run: its capability is what binds its calls to its run.
+/// run: its capability is what binds its calls to its job.
 pub(crate) fn route_resident_callbacks(
     orch: &Orchestrator,
     holder: &ResidencyHolder,
     process_key: &str,
+    owner_job: Option<&str>,
     run_id: Option<&str>,
     env: Vec<(String, String)>,
 ) -> Result<RoutedResidentEnv, String> {
     let placed = orch.fleet.residency_route_executor(holder);
-    route_resident_callbacks_on(orch, placed.as_deref(), holder, process_key, run_id, env)
+    route_resident_callbacks_on(
+        orch,
+        placed.as_deref(),
+        holder,
+        process_key,
+        resident_authority(owner_job, run_id),
+        env,
+    )
 }
 
-/// [`route_resident_callbacks`] for a process placed on `placed`.
+/// Who a terminal's or REPL's calls speak for: its owning job when it has one,
+/// else the run it names, or none.
+fn resident_authority(
+    owner_job: Option<&str>,
+    run_id: Option<&str>,
+) -> crate::fleet::resident_relay::RegisteredAuthority {
+    use crate::fleet::resident_relay::RegisteredAuthority;
+    match owner_job {
+        Some(job_id) => RegisteredAuthority::Job {
+            job_id: job_id.to_string(),
+        },
+        None => RegisteredAuthority::Run {
+            run_id: run_id.map(str::to_string),
+        },
+    }
+}
+
+/// Route a resident process placed on `placed`, whose calls `authority`
+/// decides: a workflow runtime speaks for its one run, a terminal or REPL as
+/// [`route_resident_callbacks`] chooses.
 ///
 /// A process with no placement yet starts on the colocated executor, so that is
 /// whose relay it is given.
@@ -869,7 +907,7 @@ pub(crate) fn route_resident_callbacks_on(
     placed: Option<&str>,
     holder: &ResidencyHolder,
     process_key: &str,
-    run_id: Option<&str>,
+    authority: crate::fleet::resident_relay::RegisteredAuthority,
     mut env: Vec<(String, String)>,
 ) -> Result<RoutedResidentEnv, String> {
     let executor_id = match placed {
@@ -879,14 +917,10 @@ pub(crate) fn route_resident_callbacks_on(
         })?,
     };
     env.retain(|(name, _)| name != CALLBACK_URL_ENV && name != MCP_SECRET_ENV);
-    let minted = orch.fleet.resident_relays().register(
-        &executor_id,
-        holder,
-        process_key,
-        crate::fleet::resident_relay::RegisteredAuthority::Run {
-            run_id: run_id.map(str::to_string),
-        },
-    );
+    let minted =
+        orch.fleet
+            .resident_relays()
+            .register(&executor_id, holder, process_key, authority);
     if let Some(capability) = minted.capability {
         env.push((MCP_SECRET_ENV.to_string(), capability));
     }
@@ -1217,7 +1251,9 @@ mod resident_callback_tests {
                 placed,
                 &holder(),
                 &format!("shell-{index}"),
-                Some("r-1"),
+                crate::fleet::resident_relay::RegisteredAuthority::Run {
+                    run_id: Some("r-1".into()),
+                },
                 runner_env(&orch),
             )
             .unwrap();
@@ -1238,6 +1274,209 @@ mod resident_callback_tests {
         }
     }
 
+    /// Seed one project with `thread-job` and `node-job`, each of which last
+    /// ran under a finalized run (`r-1`, `r-2`), and `fresh-job`, which has
+    /// never run.
+    async fn seed_jobs(orch: &Orchestrator) {
+        orch.db
+            .local
+            .execute_script(
+                "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','p','/tmp',1,1);
+                 INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at) VALUES('thread-job','p','idle','s',1,1);
+                 INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at) VALUES('node-job','p','idle','s2',1,1);
+                 INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at) VALUES('fresh-job','p','idle','s3',1,1);
+                 INSERT INTO runs(id, project_id, job_id, status, started_at, created_at, updated_at) VALUES('r-1','p','thread-job','exited',4000000000,4000000000,4000000000);
+                 INSERT INTO runs(id, project_id, job_id, status, started_at, created_at, updated_at) VALUES('r-2','p','node-job','exited',4000000000,4000000000,4000000000);",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Route a process's callbacks under `authority`, bind its relay as the
+    /// executor would on start, and authorize one `read` it makes with the
+    /// credential it was handed, claiming `claimed_run` as `CAIRN_RUN_ID`.
+    fn relayed_call(
+        orch: &Orchestrator,
+        holder: &ResidencyHolder,
+        key: &str,
+        authority: crate::fleet::resident_relay::RegisteredAuthority,
+        claimed_run: Option<&str>,
+    ) -> Result<crate::mcp::types::McpCallbackRequest, String> {
+        let placed = orch.fleet.residency_route_executor(holder);
+        let routed = route_resident_callbacks_on(
+            orch,
+            placed.as_deref(),
+            holder,
+            key,
+            authority,
+            runner_env(orch),
+        )
+        .unwrap();
+        let capability = routed
+            .env
+            .iter()
+            .find(|(name, _)| name == MCP_SECRET_ENV)
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        let relay_id = routed.relay.relay_id;
+        orch.fleet
+            .resident_relays()
+            .bind(&relay_id, "local", 1)
+            .unwrap();
+        let mut payload = serde_json::json!({ "paths": ["cairn:~/todos"] });
+        cairn_common::protocol::stamp_callback_origin(&mut payload, "cli");
+        let mut request = crate::mcp::types::McpCallbackRequest {
+            cwd: "/tmp".into(),
+            run_id: claimed_run.map(str::to_string),
+            tool: "read_batch".into(),
+            payload,
+            ..Default::default()
+        };
+        let authorization =
+            cairn_common::executor_protocol::RelayAuthorization(format!("Bearer {capability}"));
+        crate::fleet::resident_relay::authorize_resident_relay(
+            orch,
+            "local",
+            1,
+            &crate::fleet::resident_relay::ResidentRelayCall {
+                relay_id: &relay_id,
+                holder,
+                process_key: key,
+                process_generation: 1,
+                authorization: &authorization,
+            },
+            &mut request,
+        )
+        .map(|()| request)
+    }
+
+    async fn dispatched(
+        orch: &Orchestrator,
+        request: &crate::mcp::types::McpCallbackRequest,
+    ) -> crate::dispatch::DispatchOutput {
+        let cursors = std::sync::Mutex::new(std::collections::HashMap::new());
+        crate::dispatch::dispatch_tool(orch, request, &cursors)
+            .await
+            .into_inner()
+    }
+
+    /// cairn/6113 review: a thread session's terminal lives in the live
+    /// checkout under a `ProjectTerminals` holder, yet speaks for its job.
+    /// Through the real door, relay authorization and dispatch, its call
+    /// between turns is marked as the job's and served past the finalized
+    /// fence. The control is the old mechanism in the same composition: a
+    /// capability bound to the finalized run that created the terminal is
+    /// refused as a run no longer served. A project terminal stays run-less.
+    #[tokio::test]
+    async fn a_branchless_jobs_terminal_speaks_for_its_job_between_turns() {
+        let orch = orchestrator().await;
+        attach(&orch, "local", true);
+        seed_jobs(&orch).await;
+        let holder = ResidencyHolder::ProjectTerminals {
+            project_id: "thread-job".into(),
+        };
+
+        let thread_terminal = relayed_call(
+            &orch,
+            &holder,
+            "shell",
+            resident_authority(Some("thread-job"), Some("r-1")),
+            Some("r-1"),
+        )
+        .unwrap();
+        assert_eq!(
+            thread_terminal
+                .relayed_job_process()
+                .map(|process| process.job_id.as_str()),
+            Some("thread-job")
+        );
+        let output = dispatched(&orch, &thread_terminal).await;
+        assert_eq!(output.refusal, None, "{}", output.content);
+
+        let run_bound = relayed_call(
+            &orch,
+            &holder,
+            "old-shell",
+            crate::fleet::resident_relay::RegisteredAuthority::Run {
+                run_id: Some("r-1".into()),
+            },
+            Some("r-1"),
+        )
+        .unwrap();
+        assert!(run_bound.relayed_job_process().is_none());
+        let output = dispatched(&orch, &run_bound).await;
+        assert_eq!(
+            output.refusal,
+            Some(cairn_common::protocol::RefusalClass::RunNotServed),
+            "{}",
+            output.content
+        );
+
+        let project_terminal = relayed_call(
+            &orch,
+            &holder,
+            "project-shell",
+            resident_authority(None, None),
+            None,
+        )
+        .unwrap();
+        assert!(project_terminal.relayed_job_process().is_none());
+        assert!(project_terminal.relayed_run_less_process().is_some());
+    }
+
+    /// cairn/6113 review: a REPL the UI opens or resumes has no caller run,
+    /// yet speaks for its job. Through the real door, relay authorization and
+    /// dispatch, its call is served as the job's last run; a job that has
+    /// never run has no run to act as and is refused as such.
+    #[tokio::test]
+    async fn a_ui_opened_repl_with_no_caller_run_speaks_for_its_job() {
+        let orch = orchestrator().await;
+        attach(&orch, "local", true);
+        seed_jobs(&orch).await;
+
+        let holder = ResidencyHolder::Job {
+            job_id: "node-job".into(),
+        };
+        let ui_repl = relayed_call(
+            &orch,
+            &holder,
+            "repl:ui",
+            resident_authority(Some("node-job"), None),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            ui_repl
+                .relayed_job_process()
+                .map(|process| process.job_id.as_str()),
+            Some("node-job")
+        );
+        assert!(ui_repl.relayed_run_less_process().is_none());
+        let output = dispatched(&orch, &ui_repl).await;
+        assert_eq!(output.refusal, None, "{}", output.content);
+
+        let holder = ResidencyHolder::Job {
+            job_id: "fresh-job".into(),
+        };
+        let never_run = relayed_call(
+            &orch,
+            &holder,
+            "repl:ui",
+            resident_authority(Some("fresh-job"), None),
+            None,
+        )
+        .unwrap();
+        let output = dispatched(&orch, &never_run).await;
+        assert_eq!(
+            output.refusal,
+            Some(cairn_common::protocol::RefusalClass::RunNotServed),
+            "{}",
+            output.content
+        );
+        assert!(output.content.contains("never run"), "{}", output.content);
+    }
+
     /// With no executor connected at all there is no relay to give, so the
     /// start is refused rather than handed the machine secret.
     #[tokio::test]
@@ -1248,7 +1487,9 @@ mod resident_callback_tests {
             None,
             &holder(),
             "shell",
-            Some("r-1"),
+            crate::fleet::resident_relay::RegisteredAuthority::Run {
+                run_id: Some("r-1".into()),
+            },
             runner_env(&orch),
         )
         .err()
@@ -1269,7 +1510,9 @@ mod resident_callback_tests {
                 Some(placed),
                 &holder(),
                 &format!("shell-{index}"),
-                Some("r-1"),
+                crate::fleet::resident_relay::RegisteredAuthority::Run {
+                    run_id: Some("r-1".into()),
+                },
                 runner_env(&orch),
             )
             .unwrap();

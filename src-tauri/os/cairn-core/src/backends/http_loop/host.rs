@@ -136,6 +136,7 @@ impl<A: WireAdapter> TurnEffects for CairnEffects<'_, A> {
             &DispatchOutput {
                 content: SKIPPED_TOOL_RESULT.into(),
                 reminders: Vec::new(),
+                refusal: None,
             },
             &self.backend_key,
         )

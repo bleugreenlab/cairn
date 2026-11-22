@@ -29,10 +29,12 @@ pub(crate) fn default_callback_url() -> String {
 
 /// A check request's answer, from a read of `<request URI>?format=json`. The
 /// read returns the request's object alone; anything around it is tolerated.
+/// An answer with no object in it at all is the runner refusing the read, and
+/// is reported as that refusal, verbatim.
 fn parse_check_run_observation(raw: &str) -> Result<serde_json::Value, String> {
     let body = match (raw.find('{'), raw.rfind('}')) {
         (Some(start), Some(end)) if end > start => &raw[start..=end],
-        _ => raw,
+        _ => return Err(refused_read(raw, None)),
     };
     let value: serde_json::Value = serde_json::from_str(body).map_err(|error| {
         format!(
@@ -150,6 +152,21 @@ fn tool_result_text(result: &CallToolResult) -> (String, bool) {
         })
         .unwrap_or_default();
     (out, is_error)
+}
+
+/// Print a `read` or `write` result and return the exit code: 2 when the
+/// runner refused the call before any handler ran (nothing it asked for was
+/// done), 1 for any other failure, 0 on success. The class is read first, so
+/// refusal prose never passes as an answer.
+fn tool_result_exit_code(result: &CallToolResult) -> i32 {
+    let ok = emit_tool_result(result);
+    if cairn_mcp_server::output::refusal_class(result).is_some() {
+        2
+    } else if ok {
+        0
+    } else {
+        1
+    }
 }
 
 /// Print tool output to the right stream and return success.
@@ -293,11 +310,12 @@ fn parse_change_input(raw: &str) -> Result<ChangeInput, String> {
     }
 }
 
+/// `cairn read`: the exit code [`tool_result_exit_code`] gives.
 pub(crate) async fn run_cli_read(
     targets: &[String],
     offset: Option<usize>,
     limit: Option<usize>,
-) -> bool {
+) -> i32 {
     // --offset/--limit are a single-target human convenience: fold them into the
     // lone target's query string. With multiple targets they are ambiguous, so
     // scope must be expressed per-URI in each target's query.
@@ -305,22 +323,24 @@ pub(crate) async fn run_cli_read(
         Ok(paths) => paths,
         Err(message) => {
             eprintln!("cairn read: {message}");
-            return false;
+            return 1;
         }
     };
 
     let callback_url = cli_callback_url();
     if !ensure_callback_reachable(&callback_url).await {
         print_unreachable_callback(&callback_url);
-        return false;
+        return 1;
     }
-    let client = build_cli_client(callback_url);
-    let input = ReadFileInput { paths };
+    cli_read(&build_cli_client(callback_url), ReadFileInput { paths }).await
+}
+
+async fn cli_read(client: &CairnMcpServer, input: ReadFileInput) -> i32 {
     match client.read_cli(input).await {
-        Ok(result) => emit_tool_result(&result),
+        Ok(result) => tool_result_exit_code(&result),
         Err(e) => {
             eprintln!("cairn read failed: {e}");
-            false
+            1
         }
     }
 }
@@ -386,6 +406,14 @@ pub(crate) async fn run_cli_watch(issue_uri: String, since: Option<i64>) -> bool
         let outcome = client.callback(&request).await;
         if !outcome.transport_ok {
             eprintln!("cairn watch: {}", outcome.result.trim_end());
+            return false;
+        }
+        if let Some(class) = outcome.refusal {
+            eprintln!(
+                "cairn watch: the runner refused this watch ({}):\n{}",
+                class.word(),
+                outcome.result.trim()
+            );
             return false;
         }
         let value: serde_json::Value = match serde_json::from_str(&outcome.result) {
@@ -505,10 +533,46 @@ fn check_request_filing(
     }
 }
 
+/// What a filing answered: the requests it filed, or why it filed none. The
+/// runner's refusal class is read first, so a refusal is never mistaken for a
+/// malformed report.
+fn filing_result(
+    outcome: &cairn_mcp_server::CallbackOutcome,
+) -> Result<Vec<serde_json::Value>, String> {
+    match outcome.refusal {
+        Some(class) => Err(refused_before_filing(&outcome.result, Some(class))),
+        None => filed_requests(&outcome.result),
+    }
+}
+
+/// A filing the runner refused before any handler ran. Every filing answers
+/// with a change report, so an answer that is not one (an older runner's
+/// untyped refusal) means the same thing: nothing was filed.
+fn refused_before_filing(
+    text: &str,
+    class: Option<cairn_common::protocol::RefusalClass>,
+) -> String {
+    let class = class
+        .map(|class| format!(" ({})", class.word()))
+        .unwrap_or_default();
+    format!(
+        "nothing was filed: the runner refused the request{class}, so no check started:\n{}",
+        text.trim()
+    )
+}
+
+/// A read the runner refused, as the line that precedes how to resume.
+fn refused_read(text: &str, class: Option<cairn_common::protocol::RefusalClass>) -> String {
+    let class = class
+        .map(|class| format!(" ({})", class.word()))
+        .unwrap_or_default();
+    format!("the runner refused this read{class}:\n{}", text.trim())
+}
+
 /// The requests a filing's change report names, or why it filed none.
 fn filed_requests(raw: &str) -> Result<Vec<serde_json::Value>, String> {
     let report: serde_json::Value =
-        serde_json::from_str(raw).map_err(|_| raw.trim().to_string())?;
+        serde_json::from_str(raw).map_err(|_| refused_before_filing(raw, None))?;
     if let Some(requests) = report["applied"]
         .as_array()
         .and_then(|applied| applied.first())
@@ -857,7 +921,7 @@ pub(crate) async fn run_cli_check(
         eprintln!("cairn check run: {}", outcome.result.trim_end());
         return 2;
     }
-    match filed_requests(&outcome.result) {
+    match filing_result(&outcome) {
         Ok(requests) => {
             for request in &requests {
                 println!("{}", filed_request_line(request));
@@ -1107,6 +1171,9 @@ async fn watch_check_run(
         if !status.transport_ok {
             return Err(status.result.trim_end().to_string());
         }
+        if let Some(class) = status.refusal {
+            return Err(refused_read(&status.result, Some(class)));
+        }
         let observation = parse_check_run_observation(&status.result)?;
         if let Some(watch) = CheckWatch::from_observation(&observation) {
             let mut last = last
@@ -1226,7 +1293,8 @@ fn describe_elapsed(elapsed_ms: u64) -> String {
     }
 }
 
-pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<String>) -> bool {
+/// `cairn write`: the exit code [`tool_result_exit_code`] gives.
+pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<String>) -> i32 {
     let raw = match json {
         Some(j) => j,
         None => {
@@ -1234,7 +1302,7 @@ pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<Stri
             let mut buf = String::new();
             if std::io::stdin().read_to_string(&mut buf).is_err() {
                 eprintln!("cairn write: failed to read JSON from stdin");
-                return false;
+                return 1;
             }
             buf
         }
@@ -1243,7 +1311,7 @@ pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<Stri
         Ok(input) => input,
         Err(e) => {
             eprintln!("{}", invalid_write_json(&e));
-            return false;
+            return 1;
         }
     };
     if commit_msg.is_some() {
@@ -1252,14 +1320,17 @@ pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<Stri
     let callback_url = cli_callback_url();
     if !ensure_callback_reachable(&callback_url).await {
         print_unreachable_callback(&callback_url);
-        return false;
+        return 1;
     }
-    let client = build_cli_client(callback_url);
+    cli_change(&build_cli_client(callback_url), input).await
+}
+
+async fn cli_change(client: &CairnMcpServer, input: ChangeInput) -> i32 {
     match client.write_cli(Parameters(input)).await {
-        Ok(result) => emit_tool_result(&result),
+        Ok(result) => tool_result_exit_code(&result),
         Err(e) => {
             eprintln!("cairn write failed: {e}");
-            false
+            1
         }
     }
 }
@@ -1525,6 +1596,7 @@ mod tests {
                 transport_ok,
                 reminders: Vec::new(),
                 failure: None,
+                refusal: None,
             }
         }
     }
@@ -1584,6 +1656,7 @@ mod tests {
                     transport_ok: true,
                     reminders: Vec::new(),
                     failure: None,
+                    refusal: None,
                 }
             }
         }
@@ -1778,10 +1851,147 @@ mod tests {
 
     #[test]
     fn check_run_invalid_observation_keeps_the_runner_body() {
-        let body = "Refused: callback context expired";
+        let body = "{ok: maybe}";
         let error = parse_check_run_observation(body).unwrap_err();
         assert!(error.contains("invalid observation response"), "{error}");
         assert!(error.contains(body), "{error}");
+
+        // A body with no object in it is a refusal, and says so verbatim.
+        let refused = "Refused: callback context expired";
+        let error = parse_check_run_observation(refused).unwrap_err();
+        assert!(error.starts_with("the runner refused this read"), "{error}");
+        assert!(error.ends_with(refused), "{error}");
+        assert!(!error.contains("invalid observation"), "{error}");
+    }
+
+    /// The fence's own sentence for a terminal whose run had finalized
+    /// (cairn/5944 on bgsrv-ub2), as an older runner sends it: prose in
+    /// `result`, with no refusal class.
+    const FINALIZED_REFUSAL: &str = "This run is no longer served. This run has already been finalized, so nothing is recording this session's transcript.";
+
+    /// cairn/6113: a filing the runner refused says nothing was filed and no
+    /// check started, then gives the refusal verbatim, never as a parse error.
+    #[test]
+    fn check_run_a_refused_filing_prints_the_refusal_and_says_nothing_started() {
+        let error = filed_requests(FINALIZED_REFUSAL).unwrap_err();
+        assert!(error.starts_with("nothing was filed"), "{error}");
+        assert!(error.contains("no check started"), "{error}");
+        assert!(error.ends_with(FINALIZED_REFUSAL), "{error}");
+        for parse_error in ["invalid", "expected value", "\\\""] {
+            assert!(!error.contains(parse_error), "{error}");
+        }
+    }
+
+    /// The typed class decides, whatever the text looks like, and is named.
+    #[test]
+    fn check_run_a_typed_refusal_is_read_before_the_report() {
+        let outcome = cairn_mcp_server::CallbackOutcome {
+            result: "{\"applied\":[]} looks like a report but is a refusal".into(),
+            transport_ok: true,
+            refusal: Some(cairn_common::protocol::RefusalClass::JobEnded),
+            ..Default::default()
+        };
+        let error = filing_result(&outcome).unwrap_err();
+        assert!(
+            error.starts_with("nothing was filed: the runner refused the request (job_ended)"),
+            "{error}"
+        );
+        assert!(
+            error.ends_with("looks like a report but is a refusal"),
+            "{error}"
+        );
+
+        let filed = cairn_mcp_server::CallbackOutcome {
+            result: serde_json::json!({"applied":[{"index":0,"data":{"requests":[{"uri":"u"}]}}]})
+                .to_string(),
+            transport_ok: true,
+            ..Default::default()
+        };
+        assert_eq!(filing_result(&filed).unwrap().len(), 1);
+    }
+
+    /// A sink that answers every call with one refusal.
+    struct Refusing(Option<cairn_common::protocol::RefusalClass>);
+
+    #[async_trait::async_trait]
+    impl cairn_mcp_server::CallbackSink for Refusing {
+        fn describe(&self) -> &str {
+            "refusing test sink"
+        }
+
+        async fn call(&self, _: &CallbackRequest) -> cairn_mcp_server::CallbackOutcome {
+            cairn_mcp_server::CallbackOutcome {
+                result: FINALIZED_REFUSAL.into(),
+                transport_ok: true,
+                refusal: self.0,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// cairn/6113: a `cairn read` or `cairn write` the runner refused exits 2,
+    /// whatever the refusal's sentence looks like, so a script never takes a
+    /// refused mutation for a done one.
+    #[tokio::test]
+    async fn a_refused_read_or_write_exits_two() {
+        let client = CairnMcpServer::new(
+            std::sync::Arc::new(Refusing(Some(
+                cairn_common::protocol::RefusalClass::RunNotServed,
+            ))),
+            cairn_mcp_server::Caller::Fixed {
+                run_id: Some("run-1".into()),
+                cwd: "/repo".into(),
+            },
+        );
+        let read = ReadFileInput {
+            paths: vec!["cairn:~/todos".into()],
+        };
+        assert_eq!(cli_read(&client, read).await, 2);
+        let change = parse_change_input(
+            r#"{"changes":[{"target":"cairn:~/todos","mode":"append","payload":{"todos":[{"content":"x","status":"pending"}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cli_change(&client, change).await, 2);
+    }
+
+    /// A refused poll ends the wait with the refusal and the way back to the
+    /// check, which a refused read does not stop; typed or not, exit 2.
+    #[tokio::test]
+    async fn check_run_a_refused_poll_keeps_the_handle_and_names_the_watch() {
+        for class in [
+            None,
+            Some(cairn_common::protocol::RefusalClass::RunNotServed),
+        ] {
+            let client = CairnMcpServer::new(
+                std::sync::Arc::new(Refusing(class)),
+                cairn_mcp_server::Caller::Fixed {
+                    run_id: Some("run-1".into()),
+                    cwd: "/repo".into(),
+                },
+            );
+            let mut lines = Vec::new();
+            let code = follow_check_runs_reporting(
+                &client,
+                &[("rust-tests".into(), "request-1".into())],
+                0,
+                &mut std::future::pending::<i32>(),
+                |line| lines.push(line),
+            )
+            .await;
+            assert_eq!(code, 2, "{lines:?}");
+            let report = lines.join("\n");
+            assert!(report.contains("the runner refused this read"), "{report}");
+            assert!(report.contains(FINALIZED_REFUSAL), "{report}");
+            assert!(
+                report.contains("does not stop the check (request request-1)"),
+                "{report}"
+            );
+            assert!(report.contains("cairn check watch request-1"), "{report}");
+            assert!(!report.contains("invalid observation"), "{report}");
+            if class.is_some() {
+                assert!(report.contains("(run_not_served)"), "{report}");
+            }
+        }
     }
 
     #[test]

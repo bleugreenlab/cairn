@@ -398,7 +398,9 @@ pub(crate) fn workflow_runtime_env(
         placed,
         holder,
         run_id,
-        Some(run_id),
+        crate::fleet::resident_relay::RegisteredAuthority::Run {
+            run_id: Some(run_id.to_string()),
+        },
         vec![
             ("CAIRN_RUN_ID".into(), run_id.to_string()),
             ("CAIRN_ENV".into(), cairn_common::paths::env_str().into()),

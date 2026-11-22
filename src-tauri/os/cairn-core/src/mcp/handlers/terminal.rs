@@ -4401,6 +4401,7 @@ async fn spawn_terminal_session(
         orch,
         &fence.holder,
         &session_id,
+        target.job_id.as_deref(),
         target.run_id.as_deref(),
         env,
     ) {

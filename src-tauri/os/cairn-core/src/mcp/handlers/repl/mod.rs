@@ -980,6 +980,7 @@ pub async fn spawn_session(
         orch,
         &fence.holder,
         &key,
+        Some(job_id),
         run_context.map(|ctx| ctx.run_id.as_str()),
         std::mem::take(&mut process.env),
     ) {

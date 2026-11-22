@@ -29066,6 +29066,58 @@ mod tests {
         }
     }
 
+    /// A relayed resident call's request crosses the link as JSON, so an
+    /// `origin` inside it, the job-process one that exempts a call from the
+    /// finalized-run fence included, never survives the frame's decoding:
+    /// only the runner's relay authorization sets one.
+    #[test]
+    fn a_resident_relay_frame_cannot_carry_a_dispatch_origin() {
+        let frame = ExecutorMessage::ResidentRelayRequest {
+            correlation_id: "resident-request".into(),
+            relay_id: ResidentRelayId("relay".into()),
+            holder: ResidencyHolder::Job {
+                job_id: "job".into(),
+            },
+            process_key: "shell".into(),
+            process_generation: 3,
+            authorization: RelayAuthorization("Bearer capability".into()),
+            request: CallbackRequest {
+                cwd: "/tmp".into(),
+                run_id: Some("run-finalized".into()),
+                tool: "write".into(),
+                payload: serde_json::json!({"changes": []}),
+                ..CallbackRequest::default()
+            },
+        };
+        fn forge(value: &mut serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::Object(map)
+                    if map.get("tool") == Some(&serde_json::json!("write")) =>
+                {
+                    map.insert(
+                        "origin".into(),
+                        serde_json::json!({"RelayedJobProcess": {"job_id": "job",
+                            "process": {"relay_id": "relay", "process_key": "shell"}}}),
+                    );
+                    true
+                }
+                serde_json::Value::Object(map) => map.values_mut().any(forge),
+                serde_json::Value::Array(items) => items.iter_mut().any(forge),
+                _ => false,
+            }
+        }
+        let mut wire = serde_json::to_value(&frame).unwrap();
+        assert!(forge(&mut wire), "the frame carries its request");
+        let ExecutorMessage::ResidentRelayRequest { request, .. } =
+            serde_json::from_value::<ExecutorMessage>(wire).unwrap()
+        else {
+            panic!("the frame decodes as itself");
+        };
+        assert_eq!(request.origin, None);
+        assert!(request.relayed_job_process().is_none());
+        assert_eq!(request.run_id.as_deref(), Some("run-finalized"));
+    }
+
     #[test]
     fn every_message_variant_round_trips() {
         let messages = every_message_variant();

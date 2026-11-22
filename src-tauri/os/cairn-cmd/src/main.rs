@@ -458,8 +458,7 @@ async fn async_main() -> Result<()> {
             offset,
             limit,
         }) => {
-            let ok = run_cli_read(targets, *offset, *limit).await;
-            std::process::exit(if ok { 0 } else { 1 });
+            std::process::exit(run_cli_read(targets, *offset, *limit).await);
         }
         Some(Command::Check {
             command:
@@ -494,8 +493,7 @@ async fn async_main() -> Result<()> {
             std::process::exit(auth::run(command.clone()).await);
         }
         Some(Command::Write { json, commit_msg }) => {
-            let ok = run_cli_change(json.clone(), commit_msg.clone()).await;
-            std::process::exit(if ok { 0 } else { 1 });
+            std::process::exit(run_cli_change(json.clone(), commit_msg.clone()).await);
         }
         Some(Command::Watch { issue_uri, since }) => {
             let ok = run_cli_watch(issue_uri.clone(), *since).await;

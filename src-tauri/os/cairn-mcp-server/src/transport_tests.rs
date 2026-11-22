@@ -137,6 +137,7 @@ fn host_answer() -> CallbackOutcome {
         ],
         transport_ok: true,
         failure: None,
+        refusal: None,
     }
 }
 

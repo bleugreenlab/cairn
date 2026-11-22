@@ -22,6 +22,22 @@ use cairn_platform::stack::off_frame;
 pub struct DispatchOutput {
     pub content: String,
     pub reminders: Vec<String>,
+    /// Set when a fence refused the call before any handler ran, so nothing
+    /// it asked for was done; `content` is then the refusal's sentence. It
+    /// rides to the client as
+    /// [`cairn_common::protocol::CallbackResponse::refusal`].
+    pub refusal: Option<cairn_common::protocol::RefusalClass>,
+}
+
+impl DispatchOutput {
+    /// A refusal no handler produced: the sentence, and its class.
+    pub(crate) fn refused(content: String, class: cairn_common::protocol::RefusalClass) -> Self {
+        Self {
+            content,
+            reminders: Vec::new(),
+            refusal: Some(class),
+        }
+    }
 }
 
 /// One delivery of a tool call, shared by the transport waiting on its answer
@@ -250,15 +266,31 @@ pub async fn dispatch_tool(
     let resolved = resolve_pooled_thread_request(orch, request);
     let request = resolved.as_ref().unwrap_or(request);
 
+    // A job's terminal or REPL speaks for its job, and its relay set no run:
+    // the job's own rows decide which run it is dispatched as. Resolved before
+    // anything reads the run, the fences included, so each fence judges the
+    // run the call will act as. A relayed call carries no thread (its relay
+    // cleared it), so pooled resolution above never applies to one.
+    let job_resolved = match resolve_job_process_request(orch, request).await {
+        Ok(resolved) => resolved,
+        Err(refusal) => return ObservedSafe::observe(refusal, Crossing::FinalResponse),
+    };
+    let request = job_resolved.as_ref().unwrap_or(request);
+
     // The provider is waiting on this call whether or not its own event stream
     // announced one (a Codex functions.exec cell does not), so the run's
     // supervisor hears from the host itself, on the pool-resolved run, until
-    // this function returns or its future is dropped.
-    let _serving = request.run_id.as_deref().and_then(|run_id| {
-        orch.process_state
-            .host_calls
-            .serve(run_id, request.tool_use_id.as_deref())
-    });
+    // this function returns or its future is dropped. A job's terminal or REPL
+    // is not the provider: its call is no tool call of whichever turn is live.
+    let _serving = request
+        .run_id
+        .as_deref()
+        .filter(|_| request.relayed_job_process().is_none())
+        .and_then(|run_id| {
+            orch.process_state
+                .host_calls
+                .serve(run_id, request.tool_use_id.as_deref())
+        });
 
     // Ownership fence (CAIRN-3287). Fenced AFTER pooled resolution so a pooled
     // Codex call is judged on the run it actually belongs to, and BEFORE any
@@ -285,10 +317,7 @@ pub async fn dispatch_tool(
     // any handler, for the same reason as the fences above.
     if let Some(refusal) = crate::project_services::authority::refuse(orch, request).await {
         return ObservedSafe::observe(
-            DispatchOutput {
-                content: refusal,
-                reminders: Vec::new(),
-            },
+            DispatchOutput::refused(refusal, cairn_common::protocol::RefusalClass::OutOfScope),
             Crossing::FinalResponse,
         );
     }
@@ -300,10 +329,7 @@ pub async fn dispatch_tool(
         crate::orchestrator::inference_generate::scope::refuse(orch, request).await
     {
         return ObservedSafe::observe(
-            DispatchOutput {
-                content: refusal,
-                reminders: Vec::new(),
-            },
+            DispatchOutput::refused(refusal, cairn_common::protocol::RefusalClass::OutOfScope),
             Crossing::FinalResponse,
         );
     }
@@ -317,10 +343,10 @@ pub async fn dispatch_tool(
         Ok(checked) => checked,
         Err(rejected) => {
             return ObservedSafe::observe(
-                DispatchOutput {
-                    content: rejected.refusal(),
-                    reminders: Vec::new(),
-                },
+                DispatchOutput::refused(
+                    rejected.refusal(),
+                    cairn_common::protocol::RefusalClass::InvalidRequest,
+                ),
                 Crossing::FinalResponse,
             )
         }
@@ -335,7 +361,11 @@ pub async fn dispatch_tool(
     // a new return path cannot forget it: the signature will not allow a bare
     // `DispatchOutput` out of this function.
     let output = ObservedSafe::observe(
-        DispatchOutput { content, reminders },
+        DispatchOutput {
+            content,
+            reminders,
+            refusal: None,
+        },
         Crossing::FinalResponse,
     );
     for report in output.reports(request.run_id.as_deref(), Some(&request.tool)) {
@@ -361,6 +391,234 @@ fn resolve_pooled_thread_request(
     let mut resolved = request.clone();
     resolved.run_id = Some(binding.run_id);
     Some(resolved)
+}
+
+/// Resolve a job's terminal or REPL call to the run it is dispatched as.
+///
+/// The relay verified which process called and that it was started for
+/// `job_id`, and set no run. The job's own rows decide: its live run, the head
+/// turn's first and then one this host holds a process for; between turns,
+/// when it has none, the head turn's run; failing that, its newest run. So a
+/// terminal that outlives the turn that created it keeps acting as its job,
+/// as the current turn while one runs and as the last one between turns.
+///
+/// A run the request claims (the terminal's `CAIRN_RUN_ID`, the run current
+/// when it was started) must be one of the job's own, so a terminal never
+/// speaks for another job. A superseded execution's terminal therefore
+/// resolves only within its own job, whose run the canonical fence refuses.
+///
+/// Refused once the job has ended or has no run at all; a record that cannot
+/// be read refuses only this call, as retryable. `Ok(None)` for any request
+/// that is not a job process's.
+async fn resolve_job_process_request(
+    orch: &crate::orchestrator::Orchestrator,
+    request: &crate::mcp::types::McpCallbackRequest,
+) -> Result<Option<crate::mcp::types::McpCallbackRequest>, DispatchOutput> {
+    use cairn_common::protocol::RefusalClass;
+    let Some(process) = request.relayed_job_process() else {
+        return Ok(None);
+    };
+    let job_id = process.job_id.as_str();
+    let claimed = request.run_id.as_deref().filter(|run| !run.is_empty());
+    let runs = match read_job_runs(orch, job_id, claimed).await {
+        Ok(runs) => runs,
+        Err(unreadable) => return Err(unreadable.refuse("job_process", request, job_id)),
+    };
+    let Some(runs) = runs else {
+        log::warn!(
+            "job_process: refused tool={} job={job_id} — the job no longer exists",
+            request.tool
+        );
+        return Err(DispatchOutput::refused(
+            job_ended_refusal(None),
+            RefusalClass::JobEnded,
+        ));
+    };
+    if let Some(status) = runs.ended() {
+        log::warn!(
+            "job_process: refused tool={} job={job_id} — the job has ended ({status})",
+            request.tool
+        );
+        return Err(DispatchOutput::refused(
+            job_ended_refusal(Some(status)),
+            RefusalClass::JobEnded,
+        ));
+    }
+    if let Some(claimed) = claimed.filter(|_| !runs.claimed_in_job) {
+        log::warn!(
+            "job_process: refused tool={} job={job_id} — it claims run {claimed}, which is not the job's",
+            request.tool
+        );
+        return Err(DispatchOutput::refused(
+            format!(
+                "This call came from a terminal or REPL, which speaks for its own job, and it \
+                 claims run {claimed}, which is not one of that job's runs. Nothing this call \
+                 asked for was done. Leave CAIRN_RUN_ID as the terminal was started with, or \
+                 unset it."
+            ),
+            RefusalClass::OutOfScope,
+        ));
+    }
+    let Some(run_id) = runs.dispatch_run(|run| orch.process_state.has_process(run) == Some(true))
+    else {
+        log::warn!(
+            "job_process: refused tool={} job={job_id} — the job has no run",
+            request.tool
+        );
+        return Err(DispatchOutput::refused(
+            "This call came from a terminal or REPL whose job has never run, so there is no \
+             run for it to act as. Nothing this call asked for was done. Make the call from \
+             an agent turn."
+                .to_string(),
+            RefusalClass::RunNotServed,
+        ));
+    };
+    let mut resolved = request.clone();
+    resolved.run_id = Some(run_id);
+    Ok(Some(resolved))
+}
+
+/// The rows that decide which run a job's terminal or REPL acts as.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct JobRuns {
+    status: Option<String>,
+    /// `starting` or `live` runs, newest first.
+    live: Vec<String>,
+    /// The run of the job's head turn (`jobs.current_turn_id`).
+    head: Option<String>,
+    /// The job's newest run, whatever its status.
+    newest: Option<String>,
+    /// Whether the run the request claimed, if any, is one of the job's.
+    claimed_in_job: bool,
+}
+
+impl JobRuns {
+    /// The job's status, when it is terminal. An absent or unparseable status
+    /// says nothing about the job and does not refuse; the fences that follow
+    /// still judge the run.
+    fn ended(&self) -> Option<crate::models::JobStatus> {
+        self.status
+            .as_deref()
+            .and_then(|status| status.parse::<crate::models::JobStatus>().ok())
+            .filter(crate::models::JobStatus::is_terminal)
+    }
+
+    /// The run to dispatch as, preferring what is serving the job now: the
+    /// head turn's run when it is live or has a process here, then a live run
+    /// with a process here, then any live run; between turns the head turn's
+    /// run, then the newest.
+    fn dispatch_run(&self, has_process: impl Fn(&str) -> bool) -> Option<String> {
+        if let Some(head) = &self.head {
+            if self.live.contains(head) || has_process(head) {
+                return Some(head.clone());
+            }
+        }
+        self.live
+            .iter()
+            .find(|run| has_process(run))
+            .or(self.live.first())
+            .or(self.head.as_ref())
+            .or(self.newest.as_ref())
+            .cloned()
+    }
+}
+
+/// Read [`JobRuns`] from the job's routed database: `Ok(None)` when that
+/// database answered and holds no row for the job.
+async fn read_job_runs(
+    orch: &crate::orchestrator::Orchestrator,
+    job_id: &str,
+    claimed: Option<&str>,
+) -> Result<Option<JobRuns>, UnreadableRunRecord> {
+    use crate::storage::RowExt;
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(UnreadableRunRecord::new)?;
+    let job_id = job_id.to_string();
+    let claimed = claimed.map(str::to_string);
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        let claimed = claimed.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT status, current_turn_id FROM jobs WHERE id = ?1 LIMIT 1",
+                    cairn_db::turso::params![job_id.as_str()],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            let status = row.opt_text(0)?;
+            let head_turn = row.opt_text(1)?;
+            drop(rows);
+            let mut runs = JobRuns {
+                status,
+                ..JobRuns::default()
+            };
+            if let Some(turn) = head_turn {
+                let mut rows = conn
+                    .query(
+                        "SELECT run_id FROM turns WHERE id = ?1 LIMIT 1",
+                        cairn_db::turso::params![turn.as_str()],
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await? {
+                    runs.head = row.opt_text(0)?;
+                }
+            }
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM runs WHERE job_id = ?1 AND status IN ('starting', 'live')
+                     ORDER BY created_at DESC",
+                    cairn_db::turso::params![job_id.as_str()],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                runs.live.push(row.text(0)?);
+            }
+            drop(rows);
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                    cairn_db::turso::params![job_id.as_str()],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                runs.newest = Some(row.text(0)?);
+            }
+            drop(rows);
+            if let Some(claimed) = claimed {
+                let mut rows = conn
+                    .query(
+                        "SELECT 1 FROM runs WHERE id = ?1 AND job_id = ?2 LIMIT 1",
+                        cairn_db::turso::params![claimed.as_str(), job_id.as_str()],
+                    )
+                    .await?;
+                runs.claimed_in_job = rows.next().await?.is_some();
+            }
+            Ok(Some(runs))
+        })
+    })
+    .await
+    .map_err(UnreadableRunRecord::new)
+}
+
+/// What a job's terminal or REPL reads once its job has ended, or when the job
+/// no longer exists (`None`).
+fn job_ended_refusal(status: Option<crate::models::JobStatus>) -> String {
+    match status {
+        Some(status) => format!(
+            "This call came from a terminal or REPL whose job has ended ({status}), so it no \
+             longer speaks for anyone in Cairn. Nothing this call asked for was done. If the \
+             job is resumed, this terminal's calls are served again; until then, make the \
+             call from a live agent turn."
+        ),
+        None => "This call came from a terminal or REPL whose job no longer exists, so it no \
+                 longer speaks for anyone in Cairn. Nothing this call asked for was done. Stop \
+                 the terminal."
+            .to_string(),
+    }
 }
 
 /// Refuse a tool call whose run this runner process does not own, before any
@@ -396,6 +654,16 @@ fn resolve_pooled_thread_request(
 /// A routing failure or a read error is not absence: it refuses only the call it
 /// hit, as an [`UnreadableRunRecord`], and the next call reads again. A request
 /// with no run id (the CLI, the operator) is not fenced.
+///
+/// A job's terminal or REPL ([`resolve_job_process_request`]) is exempt from
+/// [`Disowned::Finalized`] alone. It outlives turns by design, so between turns
+/// it acts as its job's finished head run, and that is no zombie: its relay
+/// context exists only in this runner's memory, only while its process lives,
+/// and only for the holder, process, generation and capability it was started
+/// with. That is a stronger proof that this runner serves the caller than
+/// signal 1 above, and the incident this fence was built for (a process from a
+/// predecessor runner) cannot present one. [`Disowned::PredatesBoot`] and
+/// [`Disowned::Erased`] still refuse it, as does the canonical fence after this.
 async fn refuse_disowned_run(
     orch: &crate::orchestrator::Orchestrator,
     request: &crate::mcp::types::McpCallbackRequest,
@@ -416,7 +684,9 @@ async fn refuse_disowned_run(
             {
                 return None;
             }
-            disowned_reason(&ownership, orch.boot_at)?
+            let relayed_job_process = request.relayed_job_process().is_some();
+            disowned_reason(&ownership, orch.boot_at)
+                .filter(|reason| !(relayed_job_process && *reason == Disowned::Finalized))?
         }
         Err(unreadable) => return Some(unreadable.refuse("run_ownership_fence", request, run_id)),
     };
@@ -428,10 +698,15 @@ async fn refuse_disowned_run(
         request.tool,
         orch.boot_at
     );
-    Some(DispatchOutput {
-        content: reason.refusal(),
-        reminders: Vec::new(),
-    })
+    let content = if request.relayed_job_process().is_some() {
+        reason.relayed_refusal()
+    } else {
+        reason.refusal()
+    };
+    Some(DispatchOutput::refused(
+        content,
+        cairn_common::protocol::RefusalClass::RunNotServed,
+    ))
 }
 
 /// A fence could not read the run's record for this call: the id did not route
@@ -475,10 +750,10 @@ impl UnreadableRunRecord {
             request.tool,
             self.error
         );
-        DispatchOutput {
-            content: self.refusal(),
-            reminders: Vec::new(),
-        }
+        DispatchOutput::refused(
+            self.refusal(),
+            cairn_common::protocol::RefusalClass::Transient,
+        )
     }
 }
 
@@ -535,10 +810,10 @@ async fn refuse_superseded_execution(
         "canonical_fence: refused tool={} run={run_id} — its execution was superseded",
         request.tool
     );
-    Some(DispatchOutput {
-        content: refusal,
-        reminders: Vec::new(),
-    })
+    Some(DispatchOutput::refused(
+        refusal,
+        cairn_common::protocol::RefusalClass::Superseded,
+    ))
 }
 
 /// The `runs` columns that decide whether this runner owns a run.
@@ -595,6 +870,25 @@ impl Disowned {
              starts a fresh session whose transcript is intact."
         )
     }
+
+    /// What a job's terminal or REPL reads instead. Its run was resolved from
+    /// its job, so the remedy is the job's next turn, not a new execution, and
+    /// the same terminal is served again once that turn runs.
+    fn relayed_refusal(self) -> String {
+        let cause = match self {
+            Disowned::PredatesBoot => {
+                "its job last ran under an earlier Cairn runner process, so nothing records \
+                 that run now"
+            }
+            Disowned::Finalized => "its job's run has ended",
+            Disowned::Erased => "its job's run record no longer exists",
+        };
+        format!(
+            "This call came from a terminal or REPL, and {cause}. Nothing this call asked for \
+             was done. Make the call from your current turn; this terminal's calls are served \
+             again while its job runs a turn under this runner."
+        )
+    }
 }
 
 /// Whether a run's own row disowns it, given the host's boot time.
@@ -615,9 +909,12 @@ fn disowned_reason(ownership: &RunOwnership, boot_at: i64) -> Option<Disowned> {
     // it took 15s in the specimen incident while the callback was already being
     // served. Every path that marks a run terminal either kills its process
     // first (`lifecycle::kill_session_with_reason`, `finalize_run` on exit) or is
-    // reconciling a run whose process is already unregistered, so a terminal run
-    // still calling tools is an anomaly by construction. An absent or
-    // unparseable status is not terminal, and fails open.
+    // reconciling a run whose process is already unregistered, so an agent
+    // process still calling tools for a terminal run is an anomaly by
+    // construction. A job's terminal or REPL is not an agent process: it
+    // outlives turns by design, and `refuse_disowned_run` exempts it from this
+    // arm alone. An absent or unparseable status is not terminal, and fails
+    // open.
     ownership
         .status
         .as_deref()
@@ -1498,6 +1795,7 @@ mod placed_image_redaction_tests {
         let mut output = DispatchOutput {
             content: serde_json::to_string(&envelope).unwrap(),
             reminders: Vec::new(),
+            refusal: None,
         };
         let mut sanitizer = crate::security::Sanitizer::with_snapshot(registry.snapshot(), None);
         output.sanitize_observed(&mut sanitizer);
@@ -1554,6 +1852,7 @@ mod placed_image_redaction_tests {
             let mut output = DispatchOutput {
                 content,
                 reminders: Vec::new(),
+                refusal: None,
             };
             output.sanitize_observed(&mut crate::security::Sanitizer::with_snapshot(
                 registry.snapshot(),
@@ -2097,6 +2396,294 @@ mod tests {
             nudge_for(&orch, &req).await.len(),
             1,
             "an unrelated same-shape slug must not suppress via a LIKE wildcard"
+        );
+    }
+}
+
+/// A job's terminal or REPL acts as its job (cairn/6113): the live run, or
+/// between turns the head run, and never past the job's end, its execution's
+/// supersession, or another job's run.
+#[cfg(test)]
+mod job_process_tests {
+    use super::*;
+    use crate::mcp::types::McpCallbackRequest;
+    use cairn_common::protocol::{DispatchOrigin, RefusalClass, RelayedJobProcess, RelayedProcess};
+
+    const BOOT: i64 = 100;
+
+    /// One issue whose execution `e2` superseded `e1`. Job `j` (on `e2`) is
+    /// between turns: both its runs exited, its head turn on `r-2`. Job `j-old`
+    /// (on `e1`) is the superseded execution's builder, its run `r-old`.
+    async fn world() -> crate::orchestrator::Orchestrator {
+        use crate::db::DbState;
+        use crate::orchestrator::Orchestrator;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+
+        let db = crate::storage::migrated_test_db("dispatch_job_process.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','p','/tmp',1,1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',1,'I','active','active','none',1,1);
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle) VALUES('e1','r','i','p','running',1,1,'superseded');
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle) VALUES('e2','r','i','p','running',2,2,'canonical');
+             INSERT INTO jobs(id, project_id, issue_id, execution_id, status, current_session_id, created_at, updated_at) VALUES('j','p','i','e2','blocked','s',1,1);
+             INSERT INTO jobs(id, project_id, issue_id, execution_id, status, current_session_id, created_at, updated_at) VALUES('j-old','p','i','e1','blocked','s-old',1,1);
+             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at) VALUES('s','j','claude','open',1,1,1);
+             INSERT INTO runs(id, project_id, issue_id, job_id, status, started_at, created_at, updated_at) VALUES('r-1','p','i','j','exited',200,200,200);
+             INSERT INTO runs(id, project_id, issue_id, job_id, status, started_at, created_at, updated_at) VALUES('r-2','p','i','j','exited',300,300,300);
+             INSERT INTO runs(id, project_id, issue_id, job_id, status, started_at, created_at, updated_at) VALUES('r-old','p','i','j-old','exited',250,250,250);
+             INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES('t','s','r-2','j',2,'yielded','initial',300,300);
+             UPDATE jobs SET current_turn_id = 't' WHERE id = 'j';",
+        )
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let index = Arc::new(SearchIndex::open_or_create(dir.join("idx.db")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), index));
+        Orchestrator::builder(db_state, Arc::new(TestServicesBuilder::new().build()), dir)
+            .boot_at(BOOT)
+            .build()
+    }
+
+    /// A read from `job`'s terminal, as its relay hands it on: the job-process
+    /// origin, and the run its environment claims, if any.
+    fn relayed(job: &str, claimed: Option<&str>) -> McpCallbackRequest {
+        let mut payload = serde_json::json!({ "paths": ["cairn:~/todos"] });
+        cairn_common::protocol::stamp_callback_origin(&mut payload, "cli");
+        McpCallbackRequest {
+            cwd: "/tmp".into(),
+            run_id: claimed.map(str::to_string),
+            tool: "read_batch".into(),
+            payload,
+            origin: Some(DispatchOrigin::RelayedJobProcess(RelayedJobProcess {
+                job_id: job.into(),
+                process: RelayedProcess {
+                    relay_id: cairn_common::wire_vocabulary::ResidentRelayId("relay".into()),
+                    process_key: "shell".into(),
+                },
+            })),
+            ..Default::default()
+        }
+    }
+
+    async fn dispatch(
+        orch: &crate::orchestrator::Orchestrator,
+        request: &McpCallbackRequest,
+    ) -> DispatchOutput {
+        let cursors = std::sync::Mutex::new(std::collections::HashMap::new());
+        dispatch_tool(orch, request, &cursors).await.into_inner()
+    }
+
+    async fn resolved_run(
+        orch: &crate::orchestrator::Orchestrator,
+        request: &McpCallbackRequest,
+    ) -> Option<String> {
+        resolve_job_process_request(orch, request)
+            .await
+            .unwrap_or_else(|refusal| panic!("refused: {}", refusal.content))
+            .expect("a job process's request is resolved")
+            .run_id
+    }
+
+    #[test]
+    fn the_dispatch_run_prefers_what_serves_the_job_now() {
+        let runs = |live: &[&str], head: Option<&str>, newest: Option<&str>| JobRuns {
+            live: live.iter().map(|run| run.to_string()).collect(),
+            head: head.map(str::to_string),
+            newest: newest.map(str::to_string),
+            ..JobRuns::default()
+        };
+        let none = |_: &str| false;
+        let only = |held: &'static str| move |run: &str| run == held;
+        assert_eq!(
+            runs(&["a", "h"], Some("h"), Some("a")).dispatch_run(none),
+            Some("h".into()),
+            "the head turn's run while it is live"
+        );
+        assert_eq!(
+            runs(&[], Some("h"), Some("n")).dispatch_run(only("h")),
+            Some("h".into()),
+            "the head turn's run while this host holds its process"
+        );
+        assert_eq!(
+            runs(&["a", "b"], Some("h"), Some("a")).dispatch_run(only("b")),
+            Some("b".into()),
+            "a live run with a process here before another"
+        );
+        assert_eq!(
+            runs(&["a", "b"], Some("h"), Some("a")).dispatch_run(none),
+            Some("a".into()),
+            "the newest live run before the head between turns"
+        );
+        assert_eq!(
+            runs(&[], Some("h"), Some("n")).dispatch_run(none),
+            Some("h".into()),
+            "between turns, the head turn's run"
+        );
+        assert_eq!(
+            runs(&[], None, Some("n")).dispatch_run(none),
+            Some("n".into()),
+            "with no head turn, the newest run"
+        );
+        assert_eq!(runs(&[], None, None).dispatch_run(none), None);
+    }
+
+    /// The cairn/5944 case: a terminal whose creating turn has ended files a
+    /// check between turns. It acts as the head run, which has exited, and
+    /// is served; an agent process claiming that same run is still fenced.
+    #[tokio::test]
+    async fn between_turns_a_job_process_acts_as_the_head_run_past_the_finalized_fence() {
+        let orch = world().await;
+        for claimed in [None, Some("r-1"), Some("r-2")] {
+            let request = relayed("j", claimed);
+            assert_eq!(resolved_run(&orch, &request).await.as_deref(), Some("r-2"));
+            let output = dispatch(&orch, &request).await;
+            assert_eq!(output.refusal, None, "{claimed:?}: {}", output.content);
+            assert!(
+                !output.content.contains("no longer served"),
+                "{}",
+                output.content
+            );
+        }
+
+        let mut agent = relayed("j", Some("r-2"));
+        agent.origin = None;
+        let output = dispatch(&orch, &agent).await;
+        assert_eq!(output.refusal, Some(RefusalClass::RunNotServed));
+        assert!(
+            output.content.contains("already been finalized"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("new execution"),
+            "{}",
+            output.content
+        );
+    }
+
+    /// While a turn runs, the terminal acts as that turn's run.
+    #[tokio::test]
+    async fn during_a_turn_a_job_process_acts_as_the_live_run() {
+        let orch = world().await;
+        orch.db
+            .local
+            .execute_script(
+                "INSERT INTO runs(id, project_id, issue_id, job_id, status, started_at, created_at, updated_at) VALUES('r-3','p','i','j','live',400,400,400);
+                 INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES('t3','s','r-3','j',3,'running','initial',400,400);
+                 UPDATE jobs SET current_turn_id = 't3', status = 'running' WHERE id = 'j';",
+            )
+            .await
+            .unwrap();
+        let request = relayed("j", Some("r-1"));
+        assert_eq!(resolved_run(&orch, &request).await.as_deref(), Some("r-3"));
+        assert_eq!(dispatch(&orch, &request).await.refusal, None);
+    }
+
+    /// Once the job has ended its terminal speaks for no one, and is told so.
+    #[tokio::test]
+    async fn a_job_process_of_an_ended_job_is_refused_before_any_handler() {
+        let orch = world().await;
+        for status in ["complete", "failed", "cancelled"] {
+            orch.db
+                .local
+                .execute(
+                    "UPDATE jobs SET status = ?1 WHERE id = 'j'",
+                    cairn_db::turso::params![status],
+                )
+                .await
+                .unwrap();
+            let output = dispatch(&orch, &relayed("j", None)).await;
+            assert_eq!(output.refusal, Some(RefusalClass::JobEnded), "{status}");
+            assert!(
+                output.content.contains(&format!("has ended ({status})")),
+                "{}",
+                output.content
+            );
+            assert!(output
+                .content
+                .contains("Nothing this call asked for was done"));
+        }
+        let output = dispatch(&orch, &relayed("j-erased", None)).await;
+        assert_eq!(output.refusal, Some(RefusalClass::JobEnded));
+        assert!(
+            output.content.contains("no longer exists"),
+            "{}",
+            output.content
+        );
+    }
+
+    /// A superseded execution's terminal resolves only within its own job,
+    /// whose run the canonical fence refuses, and cannot reach its successor
+    /// by claiming the successor's run.
+    #[tokio::test]
+    async fn a_superseded_executions_terminal_cannot_act_for_its_successor() {
+        let orch = world().await;
+        let own = dispatch(&orch, &relayed("j-old", None)).await;
+        assert_eq!(
+            own.refusal,
+            Some(RefusalClass::Superseded),
+            "{}",
+            own.content
+        );
+
+        let successor = dispatch(&orch, &relayed("j-old", Some("r-2"))).await;
+        assert_eq!(successor.refusal, Some(RefusalClass::OutOfScope));
+        assert!(
+            successor.content.contains("claims run r-2"),
+            "{}",
+            successor.content
+        );
+    }
+
+    /// The exemption belongs to the relay's marking alone. A body naming the
+    /// origin, as an agent's HTTP callback could send it, is decoded without
+    /// one and fenced as the agent call it is.
+    #[tokio::test]
+    async fn a_forged_job_process_origin_buys_no_exemption() {
+        let orch = world().await;
+        let forged: McpCallbackRequest = serde_json::from_value(serde_json::json!({
+            "cwd": "/tmp",
+            "run_id": "r-2",
+            "tool": "read_batch",
+            "payload": {"paths": ["cairn:~/todos"]},
+            "origin": {"RelayedJobProcess": {"job_id": "j",
+                "process": {"relay_id": "relay", "process_key": "shell"}}},
+        }))
+        .unwrap();
+        assert_eq!(forged.origin, None);
+        let output = dispatch(&orch, &forged).await;
+        assert_eq!(output.refusal, Some(RefusalClass::RunNotServed));
+    }
+
+    /// A predecessor runner's last turn is still fenced for the terminal, and
+    /// the terminal is told how its calls come back.
+    #[tokio::test]
+    async fn a_job_process_whose_head_run_predates_boot_is_told_to_call_from_its_turn() {
+        let orch = world().await;
+        orch.db
+            .local
+            .execute_script("UPDATE runs SET started_at = 50, created_at = 50 WHERE id = 'r-2';")
+            .await
+            .unwrap();
+        let output = dispatch(&orch, &relayed("j", None)).await;
+        assert_eq!(output.refusal, Some(RefusalClass::RunNotServed));
+        assert!(
+            output.content.contains("terminal or REPL"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("current turn"),
+            "{}",
+            output.content
+        );
+        assert!(
+            !output.content.contains("new execution"),
+            "{}",
+            output.content
         );
     }
 }
