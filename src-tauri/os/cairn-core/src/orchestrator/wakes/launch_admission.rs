@@ -16,8 +16,11 @@
 //! whoever waits on the job. The record is what the job's node page, its task
 //! page, a refused direct message, and a spawn's answer say it is waiting on.
 //!
-//! The record is in memory: a restart loses it, and a job it was re-driving
-//! is then where any claimed-but-unstarted job is after a restart.
+//! The record and timer are in memory. On restart, boot reconciliation recovers
+//! the never-launched job (even if recompute already demoted it to pending),
+//! reprojects its execution and enqueues a durable advance. The new host admits
+//! that launch normally; it does not restore this host's refusal history.
+//! See [`crate::runs::queries::reconcile_stale_runs`].
 //!
 //! [`mark_job_start_failed`]: crate::execution::jobs::mark_job_start_failed
 

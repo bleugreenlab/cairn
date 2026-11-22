@@ -3518,8 +3518,18 @@ fn continue_job_launch_locked_inner(
     let supersede_pending_retry = prompt_resume
         .as_ref()
         .is_some_and(|context| context.supersede_pending_retry);
-    // Read before the follow-up below becomes the job's latest turn.
-    let restart_note = restart_resume_note(&owning_db, job_id);
+    // Capture identity before publishing our successor. Metadata and settlement
+    // text only frame the prompt and can be fetched after reserving the slot.
+    let step_started = std::time::Instant::now();
+    let restart_turn_id = restart_resume_turn_id(&owning_db, job_id);
+    emit_resume_step(
+        "resume_step_restart_target",
+        step_started,
+        resume_id,
+        job_id,
+    );
+    let reservation_started = std::time::Instant::now();
+    let step_started = std::time::Instant::now();
     let precreated_turn_id =
         if preclaimed_successor_turn_id.is_none() && preclaimed_retry_turn_id.is_none() {
             Some(create_followup_turn(
@@ -3532,6 +3542,7 @@ fn continue_job_launch_locked_inner(
         } else {
             None
         };
+    emit_resume_step("resume_step_followup_turn", step_started, resume_id, job_id);
     let mut pending_launch_turn = PendingLaunchTurnGuard {
         orch,
         db: owning_db.clone(),
@@ -3577,8 +3588,22 @@ fn continue_job_launch_locked_inner(
     if matches!(job_runnable, JobRunnable::Attested) {
         admission.release();
     }
+    emit_resume_step(
+        "resume_step_reservation",
+        reservation_started,
+        resume_id,
+        job_id,
+    );
+    log::info!(
+        "continuation admission boundary caller=continue_job_launch_locked_inner cause={cause:?} job={job_id} resume={resume_id} unadmitted={} resume_elapsed_us={}",
+        matches!(admission, LaunchAdmission::Unadmitted),
+        resume_started.elapsed().as_micros(),
+    );
     #[cfg(test)]
     tests::before_session_preparation(orch, job_id);
+    let step_started = std::time::Instant::now();
+    let restart_note = restart_resume_note_for_turn(&owning_db, job_id, restart_turn_id);
+    emit_resume_step("resume_step_restart_note", step_started, resume_id, job_id);
 
     // ---- Host agent snapshot ---------------------------------------------
     // A run's fence and sandbox policy resolve through job → execution →
@@ -4939,17 +4964,43 @@ pub(crate) const ORPHANED_PENDING_RESUME_NOTE: &str = "Cairn restarted before yo
 /// The note frames a prompt and never gates one, so a failed read is logged and
 /// reads as no note.
 fn restart_resume_note(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<String> {
+    restart_resume_note_for_turn(owning_db, job_id, restart_resume_turn_id(owning_db, job_id))
+}
+
+// Only identity is captured under admission; it never decides whether to launch.
+fn restart_resume_turn_id(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<String> {
+    let db = owning_db.clone();
+    let job_id = job_id.to_string();
+    run_db(async move {
+        db.query_opt_text(
+            "SELECT id FROM turns WHERE job_id = ?1
+                AND start_reason != 'memory_review'
+                AND COALESCE(end_reason, '') != 'launch_refused'
+              ORDER BY created_at DESC, sequence DESC LIMIT 1",
+            (job_id,),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    })
+    .unwrap_or_else(|error| {
+        log::warn!("Could not capture restart notice target: {error}");
+        None
+    })
+}
+
+fn restart_resume_note_for_turn(
+    owning_db: &Arc<LocalDb>,
+    job_id: &str,
+    turn_id: Option<String>,
+) -> Option<String> {
+    let turn_id = turn_id?;
     let db = owning_db.clone();
     let job_id_owned = job_id.to_string();
     let latest = run_db(async move {
         db.query_opt(
             "SELECT COALESCE(end_reason, ''), started_at IS NOT NULL, id, run_id FROM turns
-              WHERE job_id = ?1
-                AND start_reason != 'memory_review'
-                AND COALESCE(end_reason, '') != 'launch_refused'
-              ORDER BY created_at DESC, sequence DESC
-              LIMIT 1",
-            (job_id_owned,),
+              WHERE job_id = ?1 AND id = ?2",
+            (job_id_owned, turn_id),
             |row| {
                 Ok((
                     row.text(0)?,
@@ -6798,7 +6849,31 @@ mod tests {
                 }
                 Ok::<_, String>(())
             }).unwrap();
-            let note = super::restart_resume_note(&db, "j");
+            let target = super::restart_resume_turn_id(&db, "j");
+            assert_eq!(target.as_deref(), Some("t"));
+            let setup_db = db.clone();
+            super::run_db(async move {
+                setup_db.execute_script(
+                    "INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+                     VALUES('successor','s','j',2,'pending','followup',3,3);
+                     UPDATE jobs SET current_turn_id='successor' WHERE id='j';"
+                ).await.map_err(|e| e.to_string())?;
+                Ok::<_, String>(())
+            }).unwrap();
+            assert!(super::restart_resume_note(&db, "j").is_none());
+            let note = super::restart_resume_note_for_turn(&db, "j", target);
+            let setup_db = db.clone();
+            super::run_db(async move {
+                setup_db
+                    .execute_script(
+                        "UPDATE jobs SET current_turn_id='t' WHERE id='j';
+                     DELETE FROM turns WHERE id='successor';",
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(())
+            })
+            .unwrap();
             assert_eq!(note.is_some(), expect_note, "{end_reason}/{read_reason}");
             let prompt = assemble_resume_prompt(note.as_deref(), None, "Continue now.", None, None);
             if expect_note {
@@ -7345,7 +7420,7 @@ mod tests {
     type PreparationHook = Arc<dyn Fn(&Orchestrator) + Send + Sync>;
 
     /// Per-job stand-ins for slow session preparation, run where a
-    /// continuation's preparation begins. Keyed by job id, so tests sharing a
+    /// continuation's informational prompt reads and preparation begin. Keyed by job id, so tests sharing a
     /// process only see their own.
     static PREPARATION_HOOKS: std::sync::LazyLock<
         Mutex<std::collections::HashMap<String, PreparationHook>>,

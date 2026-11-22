@@ -3306,3 +3306,186 @@ async fn a_shutdown_kill_leaves_its_calls_to_the_boot_sweep() {
 
     assert!(results_for(&db, "toolu_shut").await.is_empty());
 }
+
+/// Refused admission has not prepared a run. Losing its timer is therefore
+/// recovered by the same boot path as any other never-launched DAG claim.
+/// Branch preparation is outside this test: after reclaim, the fixture supplies
+/// its prepared rows and drives real session admission into RecordingBackend.
+#[test]
+fn a_restart_mid_refused_admission_backoff_launches_once() {
+    use crate::effects::executor::EffectExecutor;
+    use crate::effects::types::{EffectResult, WorkflowEffect};
+    use crate::execution::gates::capacity::AdmissionSite;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct RetryRecorder(AtomicUsize);
+    #[async_trait::async_trait]
+    impl EffectExecutor for RetryRecorder {
+        async fn execute(
+            &self,
+            _: &Orchestrator,
+            effect: WorkflowEffect,
+        ) -> Result<Option<EffectResult>, String> {
+            if matches!(effect, WorkflowEffect::StartAgentJobs { .. }) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(None)
+        }
+    }
+
+    for demote in [false, true] {
+        let old = tokio::runtime::Runtime::new().unwrap();
+        let retried = Arc::new(RetryRecorder::default());
+        let (db, state, services, config) = old.block_on(async {
+            let (orch, db, prompts, _backend) =
+                host(&format!("restart-refused-admission-{demote}.db")).await;
+            seed_node_job(&db, "j", 1, "active").await;
+            // Keep a real execution/node, but cut before first session preparation.
+            db.execute_script(
+                "DELETE FROM runs;
+                 DELETE FROM sessions;
+                 UPDATE jobs SET current_session_id=NULL, started_at=1;
+                 UPDATE executions SET released_at=1;
+                 UPDATE executions SET snapshot=json_set(snapshot,
+                   '$.recipe.nodes[1]',json('{\"id\":\"trigger\",\"nodeType\":\"trigger\",\"name\":\"Start\",\"position\":{\"x\":0,\"y\":0}}'),
+                   '$.recipe.edges',json('[{\"id\":\"start-builder\",\"edgeType\":\"control\",\"sourceNodeId\":\"trigger\",\"sourceHandle\":\"control-out\",\"targetNodeId\":\"builder\",\"targetHandle\":\"control-in\"}]'));",
+            )
+            .await
+            .unwrap();
+            assert!(orch.set_executor(retried.clone()).is_ok());
+            orch.launch_admission_waits
+                .set_backoff(vec![Duration::from_secs(3600)]);
+            orch.admission_lock.set_wait_bound(Duration::from_millis(1));
+            let holder = orch
+                .admission_lock
+                .acquire(AdmissionSite::Release, "restart fixture")
+                .await
+                .unwrap();
+            assert!(crate::orchestrator::wakes::admit_dispatched_launch(
+                &orch,
+                "j",
+                crate::execution::jobs::WakeCause::System,
+                false,
+            )
+            .await
+            .is_none());
+            drop(holder);
+            let wait = orch.launch_admission_waits.get("j").unwrap();
+            assert_eq!(wait.refusals, 1);
+            assert!(wait.next_attempt_unix.is_some());
+            if demote {
+                let sweep = orch.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::execution::advancement::recompute_execution_jobs(&sweep, "exec-j")
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            }
+            assert_eq!(
+                status(&db, "j").await,
+                if demote { "pending" } else { "running" }
+            );
+            assert!(prompts.lock().unwrap().is_empty());
+            assert_eq!(retried.0.load(Ordering::SeqCst), 0);
+            (
+                db,
+                orch.db.clone(),
+                orch.services.clone(),
+                orch.config_dir.clone(),
+            )
+        });
+        // This drops the sleeping retry future and its captured old orchestrator,
+        // not merely the test's foreground clone.
+        old.shutdown_timeout(Duration::from_secs(5));
+
+        let new = tokio::runtime::Runtime::new().unwrap();
+        new.block_on(async {
+            let (tx, mut effects) = tokio::sync::mpsc::unbounded_channel();
+            let orch = Orchestrator::builder(state, services, config)
+                .effect_tx(Some(tx)).boot_at(BOOT_AT).build();
+            assert!(orch.launch_admission_waits.get("j").is_none());
+            let prompts = Arc::new(Mutex::new(Vec::new()));
+            let recorded = prompts.clone();
+            let _backend = crate::orchestrator::session::install_orchestrator_test_session_backend(
+                &orch, move || Box::new(RecordingBackend {
+                    prompts: recorded.clone(), starts: Arc::new(Mutex::new(Vec::new())),
+                }),
+            );
+            reconcile(&orch).await;
+            assert_eq!(status(&db, "j").await, "pending");
+            assert_eq!(db.query_opt_i64(
+                "SELECT COUNT(*) FROM effect_outbox WHERE kind='advance_dag'
+                 AND dedupe_key='exec-j' AND state='pending'", (),
+            ).await.unwrap(), Some(1));
+            assert!(std::iter::from_fn(|| effects.try_recv().ok()).any(|effect|
+                matches!(effect, WorkflowEffect::AdvanceDag { execution_id, .. } if execution_id == "exec-j")
+            ));
+            let reclaimed = crate::execution::advancement::advance_execution_with_actions(
+                &orch, "exec-j",
+            ).await.unwrap();
+            assert_eq!(reclaimed.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(), vec!["j"]);
+            let admission = crate::orchestrator::wakes::admit_dispatched_launch(
+                &orch, "j", crate::execution::jobs::WakeCause::System, false,
+            ).await.expect("the replacement runtime admits the reclaimed job");
+            let now = chrono::Utc::now().timestamp() as i32;
+            let (session_id, session_start, _) =
+                crate::execution::jobs::prepare_session_for_test(db.clone(), "j", now)
+                    .await.unwrap();
+            db.execute(
+                "INSERT INTO runs(id,project_id,issue_id,job_id,session_id,status,start_mode,created_at,updated_at)
+                 VALUES('recovered','p','i-j','j',?1,'starting','fresh',?2,?2)",
+                params![session_id.as_str(), now],
+            ).await.unwrap();
+            db.execute(
+                "INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at)
+                 VALUES('recovered-turn',?1,'recovered','j',1,'pending','initial',?2,?2)",
+                params![session_id.as_str(), now],
+            ).await.unwrap();
+            db.execute("UPDATE jobs SET current_turn_id='recovered-turn' WHERE id='j'", ())
+                .await.unwrap();
+            let prepared = crate::execution::jobs::PreparedJob {
+                resume_json: None, job_id: "j".into(), project_id: "p".into(),
+                run_id: "recovered".into(), session_id, session_start,
+                prompt: "recover the refused launch".into(), job_model: None,
+                agent_config: None, artifact_schema_info: None,
+                execution_id: Some("exec-j".into()), turn_id: "recovered-turn".into(),
+                start_reason: crate::models::TurnStartReason::Initial,
+                origin: crate::storage::LaunchOrigin::Background, launch_claim: None,
+            };
+            let launch = orch.clone();
+            tokio::task::spawn_blocking(move ||
+                crate::execution::jobs::start_prepared_job_session(&launch, prepared, None)
+            ).await.unwrap().unwrap();
+            drop(admission);
+            await_prompts(&prompts, 1).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while orch.process_state.has_process("recovered") != Some(true)
+                    || text(&db, "SELECT state FROM turns WHERE id=?1", "recovered-turn")
+                        .await.as_deref() != Some("running")
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("the backend registers and publishes the recovered turn");
+            // Repeated boot reconciliation, gate passes and duplicate advance
+            // deliveries must not mint a second launch after the first starts.
+            reconcile(&orch).await;
+            crate::execution::gates::sweep::sweep_at(&orch, chrono::Utc::now().timestamp())
+                .await.unwrap();
+            for _ in 0..2 {
+                assert!(crate::execution::advancement::advance_execution_with_actions(
+                    &orch, "exec-j",
+                ).await.unwrap().is_empty());
+            }
+            assert_eq!(launched_runs(&db, "j").await, 1);
+            assert_eq!(launched_turns(&db, "j").await.len(), 1);
+            let prompts = prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1, "one backend start after restart");
+            assert!(prompts[0].ends_with("recover the refused launch"), "{prompts:?}");
+            assert_eq!(retried.0.load(Ordering::SeqCst), 0, "the old runtime cannot redispatch");
+        });
+        new.shutdown_timeout(Duration::from_secs(5));
+    }
+}
