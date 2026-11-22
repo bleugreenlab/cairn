@@ -2102,23 +2102,39 @@ mod tests {
                 .is_err()
         );
     }
-    #[tokio::test]
-    async fn concurrent_filing_and_claims_have_one_winner() {
-        let db = db().await;
-        let a = input(RequestKind::Rebuild, "a", None);
-        let b = input(RequestKind::Rebuild, "b", None);
-        let (first, second) = tokio::join!(file_request(&db, &a, 1), file_request(&db, &b, 1));
-        let first = first.unwrap();
-        let second = second.unwrap();
-        assert_eq!(first.request.id, second.request.id);
-        assert_eq!(count(&db, "requests").await, 1);
-        let a = envelope(&db, &first.request.id).await;
-        let accepted = accept_request(&db, &a).await.unwrap();
-        let (x, y) = tokio::join!(
-            claim_request(&db, &accepted.authorization_event_id, &a, "x", 4),
-            claim_request(&db, &accepted.authorization_event_id, &a, "y", 4)
-        );
-        assert_eq!(usize::from(x.is_ok()) + usize::from(y.is_ok()), 1);
+    /// Two filings of one ask join one request, and two dispatchers claiming
+    /// its acceptance get one claim. Looped, from OS threads, on a fresh
+    /// database each round so every round files and claims from scratch.
+    #[test]
+    fn concurrent_filing_and_claims_have_one_winner() {
+        let runtime = super::super::race_runtime();
+        for round in 0..20 {
+            let db = runtime.block_on(db());
+            let (rt, db) = (&runtime, &db);
+            let filed = super::super::race_on_threads(["a", "b"].map(|origin| {
+                move || {
+                    rt.block_on(file_request(
+                        db,
+                        &input(RequestKind::Rebuild, origin, None),
+                        1,
+                    ))
+                    .unwrap()
+                }
+            }));
+            assert_eq!(filed[0].request.id, filed[1].request.id, "round {round}");
+            assert_eq!(rt.block_on(count(db, "requests")), 1, "round {round}");
+            let a = rt.block_on(envelope(db, &filed[0].request.id));
+            let accepted = rt.block_on(accept_request(db, &a)).unwrap();
+            let (event, a) = (accepted.authorization_event_id.as_str(), &a);
+            let claims = super::super::race_on_threads(
+                ["x", "y"].map(|claim| move || rt.block_on(claim_request(db, event, a, claim, 4))),
+            );
+            assert_eq!(
+                claims.iter().filter(|claim| claim.is_ok()).count(),
+                1,
+                "round {round}"
+            );
+        }
     }
 
     #[tokio::test]

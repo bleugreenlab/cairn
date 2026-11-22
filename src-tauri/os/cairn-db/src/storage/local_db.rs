@@ -1872,6 +1872,19 @@ impl LocalDb {
         })
     }
 
+    /// Run `f` in one transaction that holds the database's single exclusive
+    /// writer slot from `BEGIN` to `COMMIT`, serialised against every other
+    /// writer.
+    ///
+    /// `BEGIN IMMEDIATE`, not a deferred `BEGIN`: a deferred transaction takes
+    /// its snapshot at its first read and asks for the exclusive slot only at
+    /// its first write, and the MVCC engine refuses that upgrade once any
+    /// other transaction has committed after the snapshot. The refusal is
+    /// permanent for the transaction, yet the engine reports it as busy and its
+    /// busy handler retries it for the connection's whole busy timeout before
+    /// the rollback that lets a retry succeed, so every read-then-write that
+    /// lost a race stalled five seconds. Taken at `BEGIN`, the slot is either
+    /// free or held by a writer whose commit the busy wait genuinely awaits.
     #[track_caller]
     pub fn exclusive<'s, T: Send + 's>(
         &'s self,
@@ -1880,7 +1893,7 @@ impl LocalDb {
         let caller = Location::caller();
         let holder = Holder::new(caller, None);
         DbCall::new(holder.clone(), move || async move {
-            self.transaction_with_begin(caller, &holder, "BEGIN", f)
+            self.transaction_with_begin(caller, &holder, "BEGIN IMMEDIATE", f)
                 .await
         })
     }
@@ -4933,6 +4946,57 @@ mod tests {
                 size <= BUDGET,
                 "awaiting `{entry}` costs its caller {size} bytes, over {BUDGET}"
             );
+        }
+    }
+
+    /// Two racing read-then-write `exclusive` transactions both commit without
+    /// either waiting out its busy timeout. Under a deferred `BEGIN` the loser
+    /// read before the winner committed and could then never upgrade, so it
+    /// spun its five-second busy timeout every round; the budget, a fifth of
+    /// that, is what fails. A fresh handle each round also pins that a lost
+    /// race leaves nothing behind that a later database inherits.
+    #[test]
+    fn racing_exclusive_read_then_write_never_waits_out_the_busy_timeout() {
+        const ROUND_BUDGET: Duration = Duration::from_secs(1);
+        let runtime = crate::storage::race_runtime();
+        for round in 0..10 {
+            let db = runtime.block_on(test_db()).unwrap();
+            runtime
+                .block_on(db.execute("INSERT INTO counters(id, value) VALUES ('x', 0)", ()))
+                .unwrap();
+            let (rt, db) = (&runtime, &db);
+            let started = Instant::now();
+            let results = crate::storage::race_on_threads([(); 2].map(|()| {
+                move || {
+                    rt.block_on(db.exclusive(|conn| {
+                        Box::pin(async move {
+                            let mut rows = conn
+                                .query("SELECT value FROM counters WHERE id = 'x'", ())
+                                .await?;
+                            let value: i64 = rows.next().await?.expect("seeded row").get(0)?;
+                            drop(rows);
+                            conn.execute(
+                                "UPDATE counters SET value = ?1 WHERE id = 'x'",
+                                [value + 1],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    }))
+                }
+            }));
+            let elapsed = started.elapsed();
+            for result in results {
+                result.unwrap();
+            }
+            assert!(
+                elapsed < ROUND_BUDGET,
+                "round {round}: two racing exclusive writes took {elapsed:?}"
+            );
+            let value = rt
+                .block_on(query_i64(db, "SELECT value FROM counters WHERE id = 'x'"))
+                .unwrap();
+            assert_eq!(value, 2, "round {round}: an exclusive write was lost");
         }
     }
 
