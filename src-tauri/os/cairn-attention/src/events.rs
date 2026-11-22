@@ -253,37 +253,52 @@ pub fn event_to_watch_json(event: &AttentionEvent) -> serde_json::Value {
     })
 }
 
-type PendingNodeDetailBuilder = fn(&str, i32, i32, &str, &str) -> String;
-
-struct PendingNodeDetail {
+struct PendingQuestion {
     exec_seq: i64,
     node_segment: String,
     parent_segment: Option<String>,
-    detail_segment: String,
+    question_segment: String,
     agent_config_id: Option<String>,
 }
 
-async fn pending_node_detail_uri(
+/// Best-effort: resolve the most recent unanswered question's URI for an issue.
+///
+/// Shared with `mcp::handlers::watch` so the watch handler can fall back to a
+/// synthetic event when waking up from a `Lagged` recovery — the same shape it
+/// uses in the catch-up path. Parent-aware the way a job's home is: a sub-agent
+/// task's question nests under its parent node
+/// (`.../{parent}/task/{task}/questions/{seg}`) so the URI resolves, while a
+/// workflow, a child job addressed as a node, keeps the flat node form.
+async fn pending_question_uri(
     db: &LocalDb,
     project_key: &str,
     number: i32,
     issue_id: &str,
-    query: &'static str,
-    build_detail_uri: PendingNodeDetailBuilder,
 ) -> Option<String> {
     let issue_id = issue_id.to_string();
-    let project_key = project_key.to_string();
-    let resolved: Option<PendingNodeDetail> = db
+    let resolved: Option<PendingQuestion> = db
         .read(|conn| {
             let issue_id = issue_id.clone();
             Box::pin(async move {
-                let mut rows = conn.query(query, (issue_id.as_str(),)).await?;
+                let mut rows = conn
+                    .query(
+                        "SELECT e.seq, j.uri_segment, parent.uri_segment, p.uri_segment, j.agent_config_id
+                         FROM prompts p
+                         JOIN runs r ON p.run_id = r.id
+                         JOIN jobs j ON r.job_id = j.id
+                         JOIN executions e ON j.execution_id = e.id
+                         LEFT JOIN jobs parent ON j.parent_job_id = parent.id
+                         WHERE r.issue_id = ?1 AND p.response IS NULL AND p.withdrawn_at IS NULL
+                         ORDER BY p.created_at DESC LIMIT 1",
+                        (issue_id.as_str(),),
+                    )
+                    .await?;
                 match rows.next().await? {
-                    Some(row) => Ok::<_, DbError>(Some(PendingNodeDetail {
+                    Some(row) => Ok::<_, DbError>(Some(PendingQuestion {
                         exec_seq: row.i64(0)?,
                         node_segment: row.text(1)?,
                         parent_segment: row.opt_text(2)?,
-                        detail_segment: row.text(3)?,
+                        question_segment: row.text(3)?,
                         agent_config_id: row.opt_text(4)?,
                     })),
                     None => Ok(None),
@@ -294,56 +309,26 @@ async fn pending_node_detail_uri(
         .ok()
         .flatten();
 
-    resolved.map(|detail| {
-        match (
-            detail.agent_config_id.as_deref() == Some("workflow"),
-            detail.parent_segment,
-        ) {
-            (false, Some(parent)) => cairn_uri::build_job_base_uri(
-                &project_key,
+    resolved.map(|question| {
+        let is_workflow = question.agent_config_id.as_deref() == Some("workflow");
+        match question.parent_segment.filter(|_| !is_workflow) {
+            Some(parent) => cairn_uri::build_task_question_uri(
+                project_key,
                 number,
-                detail.exec_seq as i32,
-                &detail.node_segment,
-                Some(&parent),
+                question.exec_seq as i32,
+                &parent,
+                &question.node_segment,
+                &question.question_segment,
             ),
-            _ => build_detail_uri(
-                &project_key,
+            None => cairn_uri::build_node_question_uri(
+                project_key,
                 number,
-                detail.exec_seq as i32,
-                &detail.node_segment,
-                &detail.detail_segment,
+                question.exec_seq as i32,
+                &question.node_segment,
+                &question.question_segment,
             ),
         }
     })
-}
-
-/// Best-effort: resolve the most recent unanswered question's URI for an issue.
-///
-/// Shared with `mcp::handlers::watch` so the watch handler can fall back to a
-/// synthetic event when waking up from a `Lagged` recovery — the same shape it
-/// uses in the catch-up path.
-async fn pending_question_uri(
-    db: &LocalDb,
-    project_key: &str,
-    number: i32,
-    issue_id: &str,
-) -> Option<String> {
-    pending_node_detail_uri(
-        db,
-        project_key,
-        number,
-        issue_id,
-        "SELECT e.seq, j.uri_segment, parent.uri_segment, p.uri_segment, j.agent_config_id
-                         FROM prompts p
-                         JOIN runs r ON p.run_id = r.id
-                         JOIN jobs j ON r.job_id = j.id
-                         JOIN executions e ON j.execution_id = e.id
-                         LEFT JOIN jobs parent ON j.parent_job_id = parent.id
-                         WHERE r.issue_id = ?1 AND p.response IS NULL AND p.withdrawn_at IS NULL
-                         ORDER BY p.created_at DESC LIMIT 1",
-        cairn_uri::build_node_question_uri,
-    )
-    .await
 }
 
 /// Best-effort: resolve the most-recent pending permission request's URI for an

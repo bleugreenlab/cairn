@@ -234,6 +234,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     jobs::NODE_PERMISSION_CONTRACT,
     jobs::TASK_PERMISSIONS_CONTRACT,
     jobs::TASK_PERMISSION_CONTRACT,
+    jobs::TASK_QUESTIONS_CONTRACT,
+    jobs::TASK_QUESTION_CONTRACT,
     workspace::BUG_CONTRACT,
     workspace::REBUILDS_CONTRACT,
     workspace::REBUILD_CONTRACT,

@@ -819,6 +819,37 @@ fn parses_node_and_task_resources() {
     );
 }
 
+/// A sub-agent task's question nests under its parent node exactly as its
+/// permission does, and both shapes project to one [`QuestionAddress`].
+#[test]
+fn a_task_question_nests_under_its_parent_node() {
+    let uri = "cairn://p/cairn/42/2/builder/task/probe/questions/q-1";
+    let resource = parse_uri(uri).expect("the nested task question parses");
+    assert_eq!(resource.kind(), ResourceKind::TaskQuestion);
+    assert_eq!(resource.to_uri(), uri);
+    assert_eq!(
+        build_task_question_uri("cairn", 42, 2, "builder", "probe", "q-1"),
+        uri
+    );
+    assert_eq!(
+        resource.as_question(),
+        Some(QuestionAddress {
+            project: "cairn",
+            number: 42,
+            exec_seq: 2,
+            node_id: "builder",
+            task_name: Some("probe"),
+            segment: "q-1",
+        })
+    );
+    let collection = parse_uri("cairn://p/cairn/42/2/builder/task/probe/questions")
+        .expect("the nested task questions collection parses");
+    assert_eq!(collection.kind(), ResourceKind::TaskQuestions);
+    assert_eq!(collection.as_question(), None);
+    let node = parse_uri("cairn://p/cairn/42/2/builder/questions/q-1").unwrap();
+    assert_eq!(node.as_question().and_then(|q| q.task_name), None);
+}
+
 #[test]
 fn parses_and_roundtrips_node_tasks_and_questions() {
     let cases = [

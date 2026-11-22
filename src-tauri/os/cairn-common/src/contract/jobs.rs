@@ -352,6 +352,32 @@ pub(crate) const NODE_PERMISSION_CONTRACT: ResourceContract =
         }],
     };
 
+/// A sub-agent task's questions read and answer exactly as a node's do; only the
+/// address differs, so the projections and mutations are the node contract's.
+pub(crate) const TASK_QUESTIONS_CONTRACT: ResourceContract =
+    ResourceContract {
+        kind: ResourceKind::TaskQuestions,
+        uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/questions",
+        name: "Task questions",
+        description: "Questions asked by a sub-agent task job, newest first, with state (open, lapsed, answered, handled, moot, withdrawn), age, and the condition that closes each (read; ask via change append)",
+        read_projections: NODE_QUESTIONS_CONTRACT.read_projections,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: NODE_QUESTIONS_CONTRACT.mutations,
+    };
+
+pub(crate) const TASK_QUESTION_CONTRACT: ResourceContract =
+    ResourceContract {
+        kind: ResourceKind::TaskQuestion,
+        uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/questions/{segment}",
+        name: "Task question",
+        description: "A single question asked by a sub-agent task job: its state, context, moot_when, and how it was resolved. The asking task may withdraw it; anyone answering may give an answer, handled:true or moot:true",
+        read_projections: NO_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: NODE_QUESTION_CONTRACT.mutations,
+    };
+
 pub(crate) const TASK_PERMISSIONS_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::TaskPermissions,

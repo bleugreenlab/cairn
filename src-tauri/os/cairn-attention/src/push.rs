@@ -119,6 +119,22 @@ async fn resolution_receipt_for_ask(
             node_id,
             segment,
         } => ("prompts", project, number, exec_seq, node_id, None, segment),
+        CairnResource::TaskQuestion {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            segment,
+        } => (
+            "prompts",
+            project,
+            number,
+            exec_seq,
+            node_id,
+            Some(task_name),
+            segment,
+        ),
         CairnResource::NodePermission {
             project,
             number,

@@ -391,25 +391,28 @@ async fn dispatch(orch: &Orchestrator, db: &LocalDb, intent: &Intent) -> Result<
             }
             Ok(json!({"outcome": if outcome.duplicate {"duplicate"} else {"created"}}))
         }
-        (
-            "prompt_response",
-            CairnResource::NodeQuestion {
+        ("prompt_response", ref resource) if resource.as_question().is_some() => {
+            let Some(cairn_uri::QuestionAddress {
                 project,
                 number,
                 exec_seq,
                 node_id,
+                task_name,
                 segment,
-            },
-        ) => {
-            validate_target(db, &intent.execution_id, &project, number, exec_seq).await?;
+            }) = resource.as_question()
+            else {
+                unreachable!("the guard matched a question");
+            };
+            validate_target(db, &intent.execution_id, project, number, exec_seq).await?;
             let payload: PromptPayload = decode(&intent.payload_json)?;
             let outcome = crate::mcp::handlers::planning::answer_node_question_with_provenance(
                 orch,
-                &project,
+                project,
                 number,
                 exec_seq,
-                &node_id,
-                &segment,
+                node_id,
+                task_name,
+                segment,
                 // A phone reply is typed text: the `answer` shorthand parses it
                 // against the prompt's question count.
                 &json!({"answer": payload.response}),

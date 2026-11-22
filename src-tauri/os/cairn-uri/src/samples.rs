@@ -339,6 +339,15 @@ resource_samples! {
         task_name: task(),
         segment: "perm-1".to_string(),
     } => Parser,
+    TaskQuestions { project: project(), number: 42, exec_seq: 2, node_id: node(), task_name: task() } => Parser,
+    TaskQuestion {
+        project: project(),
+        number: 42,
+        exec_seq: 2,
+        node_id: node(),
+        task_name: task(),
+        segment: "q-1".to_string(),
+    } => Parser,
     TaskTerminal {
         project: project(),
         number: 42,

@@ -27,10 +27,10 @@ use super::node::{
 use super::node::{
     read_job_todos, read_node, read_node_artifact, read_node_batches, read_node_calls,
     read_node_chat, read_node_chat_event, read_node_chat_raw, read_node_chat_turn,
-    read_node_checks, read_node_permission, read_node_permissions, read_node_question,
-    read_node_questions, read_node_tasks, read_node_wakes, read_task, read_task_artifact,
-    read_task_chat, read_task_chat_event, read_task_chat_raw, read_task_chat_turn,
-    read_task_checks, read_task_permission, read_task_permissions,
+    read_node_checks, read_node_permission, read_node_permissions, read_node_tasks,
+    read_node_wakes, read_question, read_questions, read_task, read_task_artifact, read_task_chat,
+    read_task_chat_event, read_task_chat_raw, read_task_chat_turn, read_task_checks,
+    read_task_permission, read_task_permissions,
 };
 use super::paging::{paging, RecordPage};
 use super::progress::read_node_progress;
@@ -1328,24 +1328,18 @@ pub(crate) async fn produce_cairn_resource(
     }
     // `?wait` on a question: block until it is answered or withdrawn, then
     // return its state as one line of JSON (the harness `ask()` parses it).
-    if let CairnResource::NodeQuestion {
-        project,
-        number,
-        exec_seq,
-        node_id,
-        segment,
-    } = &resource
-    {
+    if let Some(question) = resource.as_question() {
         if find_query_value(&split.params, "wait").is_some() {
-            let routed = orch.db.for_project(project).await;
+            let routed = orch.db.for_project(question.project).await;
             let body = super::node::wait_for_question(
                 orch,
                 &routed,
-                project,
-                *number,
-                *exec_seq,
-                node_id,
-                segment,
+                question.project,
+                question.number,
+                question.exec_seq,
+                question.node_id,
+                question.task_name,
+                question.segment,
                 request.run_id.as_deref(),
             )
             .await;
@@ -3368,7 +3362,25 @@ async fn render_resource_body(
             number,
             exec_seq,
             node_id,
-        } => read_node_questions(db, &project, number, exec_seq, &node_id, &params).await,
+        } => read_questions(db, &project, number, exec_seq, &node_id, None, &params).await,
+        CairnResource::TaskQuestions {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        } => {
+            read_questions(
+                db,
+                &project,
+                number,
+                exec_seq,
+                &node_id,
+                Some(&task_name),
+                &params,
+            )
+            .await
+        }
         CairnResource::NodeQuestion {
             project,
             number,
@@ -3379,7 +3391,30 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node question", &params) {
                 error
             } else {
-                read_node_question(db, &project, number, exec_seq, &node_id, &segment).await
+                read_question(db, &project, number, exec_seq, &node_id, None, &segment).await
+            }
+        }
+        CairnResource::TaskQuestion {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            segment,
+        } => {
+            if let Some(error) = reject_query_params("task question", &params) {
+                error
+            } else {
+                read_question(
+                    db,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    Some(&task_name),
+                    &segment,
+                )
+                .await
             }
         }
         CairnResource::NodePermissions {

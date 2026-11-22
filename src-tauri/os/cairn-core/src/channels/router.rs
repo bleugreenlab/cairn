@@ -4813,14 +4813,11 @@ async fn run_sweeps(router: &ChannelRouter) {
 /// `LIMIT` here would decide admission by `created_at` ordering, which cannot
 /// separate gates raised within the same second. The router bounds DELIVERIES.
 const QUESTION_GATES_SQL: &str = "SELECT p.id, p.questions, COALESCE(p.job_id, r.job_id),
-                     COALESCE(j.node_name, j.uri_segment, 'agent'), p.uri_segment,
-                     proj.key, i.number, COALESCE(e.seq, 1), j.uri_segment
+                     COALESCE(j.node_name, j.uri_segment, 'agent'), p.uri_segment
                 FROM prompts p
                 JOIN runs r ON r.id = p.run_id
                 LEFT JOIN jobs j ON j.id = COALESCE(p.job_id, r.job_id)
                 LEFT JOIN issues i ON i.id = COALESCE(j.issue_id, r.issue_id)
-                LEFT JOIN projects proj ON proj.id = i.project_id
-                LEFT JOIN executions e ON e.id = j.execution_id
                WHERE p.response IS NULL
                  AND p.withdrawn_at IS NULL
                  AND COALESCE(i.status, 'open') NOT IN ('merged', 'closed', 'failed')
@@ -4837,38 +4834,21 @@ async fn load_questions(db: &LocalDb) -> Result<Vec<Gate>, String> {
                 let job_id = row.opt_text(2)?;
                 let context = format!("[Cairn · {}]", row.text(3)?);
                 let segment = row.opt_text(4)?;
-                // The push creator's own builder, given the creator's own
-                // inputs. Appending `/questions/{segment}` to the job's HOME URI
-                // agrees with it for a top-level node and disagrees for a
-                // sub-agent task, whose home nests under its parent while its
-                // question URI does not -- so deriving it this way is what makes
-                // the ask key match the push by construction rather than by
-                // coincidence. A job with no issue (a thread's session) has no
-                // node URI to build and mints no watcher push either, so it
-                // keeps the home-relative form.
-                let question_uri = match (
-                    row.opt_text(5)?,
-                    row.opt_i64(6)?,
-                    row.opt_text(8)?,
-                    segment.as_deref(),
-                ) {
-                    (Some(project), Some(number), Some(node), Some(segment)) => {
-                        Some(cairn_uri::build_node_question_uri(
-                            &project,
-                            number as i32,
-                            row.i64(7)? as i32,
-                            &node,
-                            segment,
-                        ))
+                // The push creator's own derivation: the question's URI beneath
+                // the asking job's home, which nests a sub-agent task's under
+                // its parent node. One rule for every job shape is what makes
+                // the ask key match the push by construction.
+                let question_uri = match (job_id.as_deref(), segment.as_deref()) {
+                    (Some(job_id), Some(segment)) => {
+                        crate::jobs::queries::home_uri_for_job_conn(conn, job_id)
+                            .await?
+                            .and_then(|home| {
+                                crate::mcp::handlers::planning::question_uri_under_home(
+                                    &home, segment,
+                                )
+                            })
                     }
-                    _ => match (job_id.as_deref(), segment.as_deref()) {
-                        (Some(job_id), Some(segment)) => {
-                            crate::jobs::queries::home_uri_for_job_conn(conn, job_id)
-                                .await?
-                                .map(|home| format!("{home}/questions/{segment}"))
-                        }
-                        _ => None,
-                    },
+                    _ => None,
                 };
                 // Every gate from one prompt renders one option of one ask, and
                 // the watchers were told about it once, under one key.
@@ -5580,12 +5560,11 @@ mod tests {
     /// while every other test in this file still passes. So assert the exact
     /// strings, against the creator's own builders, for every job shape.
     ///
-    /// The task shapes are why this is not a formality. A sub-agent task's
-    /// question URI is FLAT (`.../{task}/questions/{q}`, from the asking job's
-    /// own segment) while its permission URI NESTS under the parent node
-    /// (`.../{node}/task/{task}/permissions/{p}`, issue #143). Deriving either
-    /// by appending to the job's home URI would have produced a key no push
-    /// could ever match.
+    /// The task shapes are why this is not a formality: a sub-agent task's
+    /// question and permission both NEST under the parent node
+    /// (`.../{node}/task/{task}/questions/{q}`, `.../permissions/{p}`), and a
+    /// key built from the task's own segment alone would name a node that does
+    /// not exist, so no push could ever match it.
     #[tokio::test]
     async fn router_ask_keys_match_the_push_creator() {
         let db = migrated_test_db("channel-router-ask-key-parity.db").await;
@@ -5604,7 +5583,7 @@ mod tests {
             key_of(&questions, "task-prompt"),
             format!(
                 "question:{}",
-                cairn_uri::build_node_question_uri("proj", 2, 1, "probe", "q-2")
+                cairn_uri::build_task_question_uri("proj", 2, 1, "builder", "probe", "q-2")
             )
         );
 

@@ -53,7 +53,11 @@ pub(crate) fn blocking_append_kind(item: &ChangeItem) -> Option<BlockingKind> {
     match resource {
         CairnResource::NodeTasks { .. } => Some(BlockingKind::Tasks),
         CairnResource::NodeCalls { .. } => Some(BlockingKind::Calls),
-        CairnResource::NodeQuestions { .. } => Some(BlockingKind::Questions),
+        // A sub-agent task's `cairn:~/questions` resolves beneath its parent
+        // node; the ask itself is raised as the calling run either way.
+        CairnResource::NodeQuestions { .. } | CairnResource::TaskQuestions { .. } => {
+            Some(BlockingKind::Questions)
+        }
         _ => None,
     }
 }
@@ -357,17 +361,22 @@ pub(crate) async fn run_blocking_group(
             }
             // The question is a thing the write created, listed with its
             // address so a transcript renders it from data, never from prose.
-            let applied = match (outcome.uri.clone(), outcome.prompt_id.clone()) {
-                (Some(uri), Some(prompt_id)) => vec![BlockingApplied {
+            // A recorded question is applied even when its asker's home has no
+            // derivable address: the prompt id still names it.
+            let applied = match outcome.prompt_id.clone() {
+                Some(prompt_id) => vec![BlockingApplied {
                     index: indices[0],
-                    summary: format!("Asked question {uri}"),
+                    summary: match outcome.uri.as_deref() {
+                        Some(uri) => format!("Asked question {uri}"),
+                        None => "Asked a question that has no addressable home".to_string(),
+                    },
                     data: serde_json::json!({
-                        "question": uri,
+                        "question": outcome.uri,
                         "promptId": prompt_id,
                         "blocking": mode.blocking,
                     }),
                 }],
-                _ => Vec::new(),
+                None => Vec::new(),
             };
             BlockingGroupOutcome {
                 blocking: Some(BlockingResult::from(outcome)),
@@ -1192,7 +1201,7 @@ mod non_blocking_question_tests {
         .unwrap();
         let waited: serde_json::Value = serde_json::from_str(
             &crate::resources::node::wait_for_question(
-                &orch, &db, "prj", 7, 1, "flow", "q-1", None,
+                &orch, &db, "prj", 7, 1, "flow", None, "q-1", None,
             )
             .await,
         )
@@ -1251,7 +1260,7 @@ mod non_blocking_question_tests {
         .unwrap();
         let waited: serde_json::Value = serde_json::from_str(
             &crate::resources::node::wait_for_question(
-                &orch, &db, "prj", 7, 1, "flow", "q-2", None,
+                &orch, &db, "prj", 7, 1, "flow", None, "q-2", None,
             )
             .await,
         )
@@ -1260,6 +1269,85 @@ mod non_blocking_question_tests {
             waited,
             serde_json::json!({"state": "withdrawn", "cause": "operator_stop"})
         );
+    }
+
+    /// A sub-agent task asks through the real write path, at its explicit home
+    /// and at `cairn:~/questions`: each reply names the question nested under
+    /// the parent node, lists it as applied, and that exact URI reads it back.
+    /// The flat `.../{task}/questions/...` form names no node and resolves to
+    /// nothing.
+    #[tokio::test]
+    async fn a_task_asks_and_reads_its_question_back_at_the_nested_uri_it_was_given() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        for sql in [
+            "INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, created_at, updated_at) VALUES ('j-tk','e','j-ag','i','p','running','review','Review','explore',1,1)",
+            "INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at) VALUES ('tk-run','j-tk','i','live',1,1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        let home = "cairn://p/prj/7/1/agent/task/review";
+        let read = |uri: String| {
+            let orch = orch.clone();
+            async move {
+                let request = McpCallbackRequest {
+                    answer_bound_ms: None,
+                    thread_id: None,
+                    cwd: "/tmp/p".to_string(),
+                    run_id: Some("tk-run".to_string()),
+                    tool: "read_issue_resource".to_string(),
+                    tool_use_id: None,
+                    payload: serde_json::json!({ "uri": uri }),
+                    origin: None,
+                };
+                crate::mcp::handlers::issue_resources::handle_read_issue_resource(&orch, &request)
+                    .await
+            }
+        };
+
+        for (target, segment) in [
+            (format!("{home}/questions"), "q-1"),
+            ("cairn:~/questions".to_string(), "q-2"),
+        ] {
+            let report = write_at(
+                &orch,
+                "tk-run",
+                &target,
+                "append",
+                serde_json::json!({
+                    "questions": [{"question": format!("Which plan for {segment}?"), "options": []}],
+                    "blocking": false,
+                }),
+            )
+            .await;
+            let nested = format!("{home}/questions/{segment}");
+            assert_eq!(
+                report["blocking"]["artifact_uri"].as_str(),
+                Some(nested.as_str()),
+                "{target}: {report}"
+            );
+            assert_eq!(
+                report["applied"][0]["data"]["question"].as_str(),
+                Some(nested.as_str()),
+                "{target}: the recorded question is applied: {report}"
+            );
+            assert_eq!(
+                report["failures"].as_array().map(Vec::len).unwrap_or(0),
+                0,
+                "{report}"
+            );
+
+            let back = read(nested.clone()).await;
+            assert!(
+                back.contains(&format!("Which plan for {segment}?")),
+                "{nested}: {back}"
+            );
+            let flat = read(format!("cairn://p/prj/7/1/review/questions/{segment}")).await;
+            assert!(
+                !flat.contains(&format!("Which plan for {segment}?")),
+                "the flat form resolves to nothing: {flat}"
+            );
+        }
     }
 
     /// A thread `platform` (session job `j-th`, run `th-run` on an open turn)
@@ -1386,7 +1474,7 @@ mod non_blocking_question_tests {
         );
 
         let single =
-            crate::resources::node::read_node_question(&db, "prj", 0, 0, "platform", "q-1").await;
+            crate::resources::node::read_question(&db, "prj", 0, 0, "platform", None, "q-1").await;
         for expected in [
             "Status: open · non-blocking",
             "URI: cairn://p/prj/platform/questions/q-1",
@@ -1500,7 +1588,7 @@ mod non_blocking_question_tests {
         );
         let waited: serde_json::Value = serde_json::from_str(
             &crate::resources::node::wait_for_question(
-                &orch, &db, "prj", 0, 0, "platform", "q-1", None,
+                &orch, &db, "prj", 0, 0, "platform", None, "q-1", None,
             )
             .await,
         )
@@ -1543,12 +1631,13 @@ mod non_blocking_question_tests {
         .await;
         assert!(late.to_string().contains("its asker withdrew it"), "{late}");
 
-        let listing = crate::resources::node::read_node_questions(
+        let listing = crate::resources::node::read_questions(
             &db,
             "prj",
             0,
             0,
             "platform",
+            None,
             &[cairn_common::query::QueryParam {
                 key: "state".into(),
                 value: "handled".into(),

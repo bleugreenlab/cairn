@@ -61,6 +61,19 @@ pub fn is_reserved_node_segment(segment: &str) -> bool {
     RESERVED_NODE_SEGMENTS.contains(&segment)
 }
 
+/// One question's coordinates, borrowed from a `NodeQuestion` or a
+/// `TaskQuestion` (see [`CairnResource::as_question`]). `task_name` is `Some`
+/// when a sub-agent task beneath `node_id` asked it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestionAddress<'a> {
+    pub project: &'a str,
+    pub number: i32,
+    pub exec_seq: i32,
+    pub node_id: &'a str,
+    pub task_name: Option<&'a str>,
+    pub segment: &'a str,
+}
+
 /// How a stored image is addressed.
 ///
 /// The sha256 that keys the blob in the content store is the image's *storage
@@ -639,6 +652,26 @@ pub enum CairnResource {
     /// its stored segment (e.g. `perm-1`); answerable with `{decision, scope}`.
     /// The task analogue of `NodePermission`.
     TaskPermission {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+        segment: String,
+    },
+    /// User questions asked by a sub-agent task job (collection): the task
+    /// analogue of `NodeQuestions`. `node_id` is the parent node, `task_name`
+    /// the task's own segment.
+    TaskQuestions {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+    },
+    /// A single question asked by a sub-agent task job, addressed by its stored
+    /// segment (e.g. `q-1`). The task analogue of `NodeQuestion`.
+    TaskQuestion {
         project: String,
         number: i32,
         exec_seq: i32,
@@ -1372,6 +1405,8 @@ impl CairnResource {
             Self::NodePermission { .. } => ResourceKind::NodePermission,
             Self::TaskPermissions { .. } => ResourceKind::TaskPermissions,
             Self::TaskPermission { .. } => ResourceKind::TaskPermission,
+            Self::TaskQuestions { .. } => ResourceKind::TaskQuestions,
+            Self::TaskQuestion { .. } => ResourceKind::TaskQuestion,
             Self::Db => ResourceKind::Db,
             Self::DbTable { .. } => ResourceKind::DbTable,
             Self::DbRow { .. } => ResourceKind::DbRow,

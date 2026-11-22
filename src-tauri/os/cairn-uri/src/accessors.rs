@@ -1,7 +1,8 @@
 //! Field-projection query methods over `CairnResource`: the project key, issue
-//! number, and node id.
+//! number, and node id, plus [`QuestionAddress`], the one projection of a
+//! question at either a node or a task beneath it.
 
-use super::types::CairnResource;
+use super::types::{CairnResource, QuestionAddress};
 
 impl CairnResource {
     /// The project key this resource is scoped to, if any.
@@ -77,6 +78,8 @@ impl CairnResource {
             | NodePermission { project, .. }
             | TaskPermissions { project, .. }
             | TaskPermission { project, .. }
+            | TaskQuestions { project, .. }
+            | TaskQuestion { project, .. }
             | NodeMessages { project, .. }
             | NodeProgress { project, .. }
             | TaskMessages { project, .. }
@@ -214,6 +217,8 @@ impl CairnResource {
             | Self::NodePermission { project, .. }
             | Self::TaskPermissions { project, .. }
             | Self::TaskPermission { project, .. }
+            | Self::TaskQuestions { project, .. }
+            | Self::TaskQuestion { project, .. }
             | Self::NodeMessages { project, .. }
             | Self::NodeProgress { project, .. }
             | Self::TaskMessages { project, .. }
@@ -405,6 +410,8 @@ impl CairnResource {
             | Self::NodePermission { number, .. }
             | Self::TaskPermissions { number, .. }
             | Self::TaskPermission { number, .. }
+            | Self::TaskQuestions { number, .. }
+            | Self::TaskQuestion { number, .. }
             | Self::NodeMessages { number, .. }
             | Self::NodeProgress { number, .. }
             | Self::TaskMessages { number, .. }
@@ -624,6 +631,8 @@ impl CairnResource {
             | Self::NodePermission { node_id, .. }
             | Self::TaskPermissions { node_id, .. }
             | Self::TaskPermission { node_id, .. }
+            | Self::TaskQuestions { node_id, .. }
+            | Self::TaskQuestion { node_id, .. }
             | Self::NodeMessages { node_id, .. }
             | Self::NodeProgress { node_id, .. }
             | Self::TaskMessages { node_id, .. }
@@ -637,6 +646,43 @@ impl CairnResource {
             | Self::NodePage { node_id, .. }
             | Self::NodePageLog { node_id, .. }
             | Self::NodeSymbols { node_id, .. } => Some(node_id),
+            _ => None,
+        }
+    }
+
+    /// The question this resource names, whether it was asked by a node or by a
+    /// sub-agent task beneath one; `None` for anything that is not one question.
+    pub fn as_question(&self) -> Option<QuestionAddress<'_>> {
+        match self {
+            Self::NodeQuestion {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                segment,
+            } => Some(QuestionAddress {
+                project,
+                number: *number,
+                exec_seq: *exec_seq,
+                node_id,
+                task_name: None,
+                segment,
+            }),
+            Self::TaskQuestion {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                segment,
+            } => Some(QuestionAddress {
+                project,
+                number: *number,
+                exec_seq: *exec_seq,
+                node_id,
+                task_name: Some(task_name),
+                segment,
+            }),
             _ => None,
         }
     }

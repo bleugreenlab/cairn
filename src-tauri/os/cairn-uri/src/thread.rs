@@ -334,6 +334,12 @@ pub fn delegate_thread_descendant(resource: CairnResource) -> Result<CairnResour
             task_name: (*task).to_string(),
             segment: (*segment).to_string(),
         ),
+        ["task", task, "questions"] => at_thread!(TaskQuestions, task_name: (*task).to_string()),
+        ["task", task, "questions", segment] => at_thread!(
+            TaskQuestion,
+            task_name: (*task).to_string(),
+            segment: (*segment).to_string(),
+        ),
         ["task", task, "chat"] => at_thread!(TaskChat, task_name: (*task).to_string()),
         ["task", task, "chat", "raw"] => at_thread!(TaskChatRaw, task_name: (*task).to_string()),
         ["task", task, "chat", "turn", turn] => at_thread!(

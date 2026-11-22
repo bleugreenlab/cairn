@@ -3009,6 +3009,8 @@ fn sample_resource(kind: cairn_uri::ResourceKind, mode: ChangeMode) -> CairnReso
         K::NodePermission => "cairn://p/cairn/1/1/builder/permissions/perm-1",
         K::TaskPermission => "cairn://p/cairn/1/1/builder/task/sub/permissions/perm-1",
         K::TaskPermissions => "cairn://p/cairn/1/1/builder/task/sub/permissions",
+        K::TaskQuestion => "cairn://p/cairn/1/1/builder/task/sub/questions/q-1",
+        K::TaskQuestions => "cairn://p/cairn/1/1/builder/task/sub/questions",
         K::Bug => "cairn://bug",
         K::DevLaunchTicket => "cairn://dev/launch-ticket",
         K::Skills => "cairn://skills",
@@ -4468,12 +4470,13 @@ async fn question_resource_patch_names_the_actual_answering_node() {
     )
     .await
     .unwrap();
-    let rendered = crate::resources::node::read_node_question(
+    let rendered = crate::resources::node::read_question(
         &orch.db.local,
         "cairn",
         number,
         1,
         "builder",
+        None,
         "q-1",
     )
     .await;
@@ -4516,12 +4519,13 @@ async fn question_resource_patch_requires_a_caller_instead_of_impersonating_the_
     )
     .await
     .expect_err("a resource patch needs a caller, not the addressed node's identity");
-    let rendered = crate::resources::node::read_node_question(
+    let rendered = crate::resources::node::read_question(
         &orch.db.local,
         "cairn",
         number,
         1,
         "builder",
+        None,
         "q-1",
     )
     .await;

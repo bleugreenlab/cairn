@@ -731,6 +731,31 @@ pub fn build_task_permission_uri(
     )
 }
 
+fn build_task_questions_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+) -> String {
+    build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "questions")
+}
+
+pub fn build_task_question_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+    segment: &str,
+) -> String {
+    format!(
+        "{}/{}",
+        build_task_questions_uri(project, number, exec_seq, node_id, task_name),
+        segment
+    )
+}
+
 pub fn build_project_terminal_uri(project: &str, slug: &str) -> String {
     format!("{}/terminal/{}", build_project_uri(project), slug)
 }
@@ -1587,6 +1612,21 @@ impl CairnResource {
             } => {
                 build_task_permission_uri(project, *number, *exec_seq, node_id, task_name, segment)
             }
+            Self::TaskQuestions {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => build_task_questions_uri(project, *number, *exec_seq, node_id, task_name),
+            Self::TaskQuestion {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                segment,
+            } => build_task_question_uri(project, *number, *exec_seq, node_id, task_name, segment),
             Self::NodeMessages {
                 project,
                 number,

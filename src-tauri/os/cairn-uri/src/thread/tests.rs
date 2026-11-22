@@ -263,6 +263,7 @@ fn multi_segment_thread_paths_address_what_a_node_does() {
             "task/probe/permissions/perm-1",
             "task/probe/permissions/perm-1",
         ),
+        ("task/probe/questions/q-1", "task/probe/questions/q-1"),
     ] {
         let node = parse_uri(&format!("cairn://p/cairn/1/1/builder/{node_path}"))
             .unwrap_or_else(|| panic!("node path {node_path} must parse"));

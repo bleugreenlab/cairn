@@ -297,9 +297,10 @@ impl GateKind {
 
 /// The tables the question gate source reads.
 ///
-/// `QUESTION_GATES_SQL` joins the prompt to its run, job, issue, project and
-/// execution; a job without an issue builds its question URI through
-/// `home_uri_for_job_conn`, which adds `threads`. Every gate is then stamped
+/// `QUESTION_GATES_SQL` joins the prompt to its run, job and issue; every
+/// question URI is built from the asking job's home through
+/// `home_uri_for_job_conn`, which adds projects, executions, the parent job and
+/// `threads`. Every gate is then stamped
 /// with its holder (`attention_push::asks_held_by_agent`), which reads the push
 /// rows, the holders' jobs and threads, and their `wake_subscriptions`.
 /// Routing a gate to a Discord surface reads issues, projects and threads,

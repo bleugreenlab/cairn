@@ -260,7 +260,9 @@ pub fn change_has_blocking_append(payload: &serde_json::Value) -> bool {
                 .is_some_and(|r| {
                     matches!(
                         r,
-                        CairnResource::NodeTasks { .. } | CairnResource::NodeQuestions { .. }
+                        CairnResource::NodeTasks { .. }
+                            | CairnResource::NodeQuestions { .. }
+                            | CairnResource::TaskQuestions { .. }
                     )
                 })
     })

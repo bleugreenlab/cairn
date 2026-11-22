@@ -156,15 +156,20 @@ pub(super) async fn dispatch(
             }
         }
         (
-            CairnResource::NodeQuestion {
+            CairnResource::NodeQuestion { .. } | CairnResource::TaskQuestion { .. },
+            ChangeMode::Patch | ChangeMode::Append,
+        ) => {
+            let Some(cairn_uri::QuestionAddress {
                 project,
                 number,
                 exec_seq,
                 node_id,
+                task_name,
                 segment,
-            },
-            ChangeMode::Patch | ChangeMode::Append,
-        ) => {
+            }) = resource.as_question()
+            else {
+                return Ok(None);
+            };
             let payload = item
                 .payload
                 .as_ref()
@@ -201,13 +206,17 @@ pub(super) async fn dispatch(
             }
             if dry_run {
                 let verb = if withdraw { "withdraw" } else { "answer" };
+                let asker = match task_name {
+                    Some(task) => format!("{node_id}/task/{task}"),
+                    None => node_id.to_string(),
+                };
                 format!(
                     "Would {verb} question {} for {}-{}/{}/{}",
-                    segment, project, number, exec_seq, node_id
+                    segment, project, number, exec_seq, asker
                 )
             } else if withdraw {
                 planning::withdraw_node_question(
-                    orch, request, project, *number, *exec_seq, node_id, segment,
+                    orch, request, project, number, exec_seq, node_id, task_name, segment,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?
@@ -220,9 +229,10 @@ pub(super) async fn dispatch(
                 let outcome = planning::answer_node_question_with_provenance(
                     orch,
                     project,
-                    *number,
-                    *exec_seq,
+                    number,
+                    exec_seq,
                     node_id,
+                    task_name,
                     segment,
                     payload,
                     crate::turns::queries::ResolutionProvenance::new(
@@ -329,7 +339,10 @@ pub(super) async fn dispatch(
                 permission_receipt(segment, outcome, decision_str)
             }
         }
-        (CairnResource::NodeQuestions { .. }, ChangeMode::Append) => {
+        (
+            CairnResource::NodeQuestions { .. } | CairnResource::TaskQuestions { .. },
+            ChangeMode::Append,
+        ) => {
             let payload = item
                 .payload
                 .as_ref()

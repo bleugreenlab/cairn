@@ -896,6 +896,29 @@ impl CairnResource {
                 Job::task(project, *number, *exec_seq, node_id, task_name),
                 Some("permission".to_string()),
             ),
+            Self::TaskQuestions {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => self.job(
+                ctx,
+                Job::task(project, *number, *exec_seq, node_id, task_name),
+                Some("questions".to_string()),
+            ),
+            Self::TaskQuestion {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                ..
+            } => self.job(
+                ctx,
+                Job::task(project, *number, *exec_seq, node_id, task_name),
+                Some("question".to_string()),
+            ),
             Self::TaskMessages {
                 project,
                 number,

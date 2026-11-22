@@ -800,6 +800,21 @@ fn push_job_coordinate(content_ref: &str) -> Option<PushJobCoordinate> {
             task_name,
             ..
         }
+        | CairnResource::TaskQuestions {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        }
+        | CairnResource::TaskQuestion {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            ..
+        }
         | CairnResource::TaskMessages {
             project,
             number,

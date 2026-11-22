@@ -601,6 +601,8 @@ impl CairnResource {
             | Self::NodePermission { .. }
             | Self::TaskPermissions { .. }
             | Self::TaskPermission { .. }
+            | Self::TaskQuestions { .. }
+            | Self::TaskQuestion { .. }
             | Self::NodeSymbols { .. }
             | Self::NodeRepl { .. }
             | Self::NodeBrowserNetworkRequest { .. }

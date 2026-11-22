@@ -1281,6 +1281,25 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 segment: (*segment).to_string(),
             })
         }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "questions"] => {
+            Some(CairnResource::TaskQuestions {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "questions", segment] => {
+            Some(CairnResource::TaskQuestion {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+                segment: (*segment).to_string(),
+            })
+        }
         // Type-named artifact under a task: a trailing non-reserved segment.
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, name]
             if !is_reserved_node_segment(name) =>

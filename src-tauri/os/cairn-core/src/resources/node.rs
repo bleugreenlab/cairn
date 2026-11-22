@@ -1741,6 +1741,47 @@ pub(crate) enum QuestionRef<'a> {
     Prompt(&'a str),
 }
 
+/// Every question the addressed job asked: the node's own, or, with `task_name`,
+/// those of the sub-agent task beneath it. Both resolve their job first and
+/// then share the one job-keyed loader.
+async fn load_addressed_questions(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: Option<&str>,
+) -> Result<Vec<NodeQuestionRow>, String> {
+    match task_name {
+        None => read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
+            Box::pin(async move { load_node_questions(conn, &job.id).await })
+        })
+        .await
+        .map(|(_, questions)| questions),
+        Some(task_name) => read_task_rows(
+            db,
+            project_key,
+            number,
+            exec_seq,
+            node_name,
+            task_name,
+            |conn, _parent_job, task_job| {
+                Box::pin(async move { load_node_questions(conn, &task_job.id).await })
+            },
+        )
+        .await
+        .map(|(_, _, questions)| questions),
+    }
+}
+
+/// How a question listing names its asker: the node, or `node/task`.
+fn asker_label(node_name: &str, task_name: Option<&str>) -> String {
+    match task_name {
+        Some(task_name) => format!("{node_name}/task/{task_name}"),
+        None => node_name.to_string(),
+    }
+}
+
 /// One question as the operator's surfaces render it (the `get_question`
 /// invoke): the same rows the question resource reads, as JSON.
 pub(crate) async fn question_view(
@@ -1751,22 +1792,21 @@ pub(crate) async fn question_view(
         QuestionRef::Uri(uri) => {
             let resource = cairn_uri::parse_uri(uri)
                 .and_then(|resource| cairn_uri::delegate_thread_descendant(resource).ok());
-            let Some(cairn_uri::CairnResource::NodeQuestion {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                segment,
-            }) = resource
-            else {
+            let Some(question) = resource.as_ref().and_then(|r| r.as_question()) else {
                 return Err(format!("{uri} is not a question's URI"));
             };
-            let db = orch.db.for_project(&project).await;
-            let read = read_node_rows(&db, &project, number, exec_seq, &node_id, |conn, job| {
-                Box::pin(async move { load_node_questions(conn, &job.id).await })
-            });
-            let (_, questions) = read.await?;
-            questions.into_iter().find(|q| q.segment == segment)
+            let db = orch.db.for_project(question.project).await;
+            load_addressed_questions(
+                &db,
+                question.project,
+                question.number,
+                question.exec_seq,
+                question.node_id,
+                question.task_name,
+            )
+            .await?
+            .into_iter()
+            .find(|q| q.segment == question.segment)
         }
         QuestionRef::Prompt(prompt_id) => {
             let db = crate::execution::routing::owning_db_for_prompt(&orch.db, prompt_id)
@@ -1890,25 +1930,26 @@ fn question_state_filter(params: &[QueryParam]) -> Result<Option<String>, String
     }
 }
 
-pub(super) async fn read_node_questions(
+pub(super) async fn read_questions(
     db: &LocalDb,
     project_key: &str,
     number: i32,
     exec_seq: i32,
     node_name: &str,
+    task_name: Option<&str>,
     params: &[QueryParam],
 ) -> String {
     let state = match question_state_filter(params) {
         Ok(state) => state,
         Err(error) => return error,
     };
-    let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
-        Box::pin(async move { load_node_questions(conn, &job.id).await })
-    });
-    let mut questions = match read.await {
-        Ok((_, questions)) => questions,
-        Err(error) => return error,
-    };
+    let mut questions =
+        match load_addressed_questions(db, project_key, number, exec_seq, node_name, task_name)
+            .await
+        {
+            Ok(questions) => questions,
+            Err(error) => return error,
+        };
     let total = questions.len();
     questions.retain(|question| {
         state
@@ -1918,7 +1959,7 @@ pub(super) async fn read_node_questions(
     questions.reverse();
     let now = chrono::Utc::now().timestamp();
 
-    let mut output = format!("# Questions — {}\n\n", node_name);
+    let mut output = format!("# Questions — {}\n\n", asker_label(node_name, task_name));
     if total == 0 {
         output.push_str("No questions asked yet.\n\n");
     } else if questions.is_empty() {
@@ -1972,30 +2013,32 @@ pub(super) async fn read_node_questions(
     output
 }
 
-pub(super) async fn read_node_question(
+pub(super) async fn read_question(
     db: &LocalDb,
     project_key: &str,
     number: i32,
     exec_seq: i32,
     node_name: &str,
+    task_name: Option<&str>,
     segment: &str,
 ) -> String {
-    let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
-        Box::pin(async move { load_node_questions(conn, &job.id).await })
-    });
-    let questions = match read.await {
-        Ok((_, questions)) => questions,
-        Err(error) => return error,
-    };
+    let questions =
+        match load_addressed_questions(db, project_key, number, exec_seq, node_name, task_name)
+            .await
+        {
+            Ok(questions) => questions,
+            Err(error) => return error,
+        };
+    let asker = asker_label(node_name, task_name);
     let Some(question) = questions.into_iter().find(|q| q.segment == segment) else {
         return format!(
-            "Question '{}' not found for node '{}' in issue {}/{}",
-            segment, node_name, project_key, number
+            "Question '{}' not found for '{}' in issue {}/{}",
+            segment, asker, project_key, number
         );
     };
     let now = chrono::Utc::now().timestamp();
 
-    let mut output = format!("# Question {} — {}\n\n", segment, node_name);
+    let mut output = format!("# Question {} — {}\n\n", segment, asker);
     output.push_str(&format!(
         "Status: {} · {}\n",
         question.state(),
@@ -2114,6 +2157,7 @@ pub(super) async fn wait_for_question(
     number: i32,
     exec_seq: i32,
     node_name: &str,
+    task_name: Option<&str>,
     segment: &str,
     reader_run_id: Option<&str>,
 ) -> String {
@@ -2123,11 +2167,10 @@ pub(super) async fn wait_for_question(
     let mut rx = orch.prompt_responses.subscribe();
     let deadline = tokio::time::Instant::now() + CALL_WAIT_BUDGET;
     loop {
-        let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
-            Box::pin(async move { load_node_questions(conn, &job.id).await })
-        });
+        let read =
+            load_addressed_questions(db, project_key, number, exec_seq, node_name, task_name);
         let question = match read.await {
-            Ok((_, questions)) => questions.into_iter().find(|q| q.segment == segment),
+            Ok(questions) => questions.into_iter().find(|q| q.segment == segment),
             Err(error) => {
                 return serde_json::json!({ "state": "error", "error": error }).to_string()
             }
@@ -2135,7 +2178,10 @@ pub(super) async fn wait_for_question(
         let Some(question) = question else {
             return serde_json::json!({
                 "state": "error",
-                "error": format!("question {segment} not found for node {node_name}"),
+                "error": format!(
+                    "question {segment} not found for {}",
+                    asker_label(node_name, task_name)
+                ),
             })
             .to_string();
         };
@@ -4551,7 +4597,7 @@ pub(super) async fn read_node_chat_event(
 #[cfg(test)]
 mod task_permission_tests {
     use super::{
-        read_node_permission, read_node_question, read_node_questions, read_task_permission,
+        read_node_permission, read_question, read_questions, read_task_permission,
         read_task_permissions,
     };
     use crate::storage::LocalDb;
@@ -4607,6 +4653,30 @@ mod task_permission_tests {
         );
     }
 
+    /// A sub-task's question resolves at the same nested shape as its
+    /// permission, and names that address as its own; the flat form built from
+    /// the task's segment names a node that does not exist.
+    #[tokio::test]
+    async fn task_question_resolves_under_parent_and_names_its_nested_uri() {
+        let db = test_db().await;
+        seed(&db).await;
+        db.execute(
+            "INSERT INTO prompts (id, run_id, job_id, questions, created_at, uri_segment) VALUES ('p1','run-task','j-task','[{\"question\":\"Which?\",\"options\":[]}]',1,'q-1')",
+            (),
+        )
+        .await
+        .unwrap();
+        let nested = "cairn://p/prj/2/1/builder/task/review/questions/q-1";
+
+        let single = read_question(&db, "prj", 2, 1, "builder", Some("review"), "q-1").await;
+        assert!(single.contains(&format!("URI: {nested}")), "{single}");
+        let list = read_questions(&db, "prj", 2, 1, "builder", Some("review"), &[]).await;
+        assert!(list.contains(&format!("[q-1]({nested})")), "{list}");
+
+        let flat = read_question(&db, "prj", 2, 1, "review", None, "q-1").await;
+        assert!(flat.contains("not found"), "{flat}");
+    }
+
     /// An answer whose resume was refused says so on the permission row, in the
     /// list and the single read, rather than only in the host log.
     #[tokio::test]
@@ -4644,12 +4714,12 @@ mod task_permission_tests {
             db.execute(sql, ()).await.unwrap();
         }
 
-        let list = read_node_questions(&db, "prj", 2, 1, "builder", &[]).await;
+        let list = read_questions(&db, "prj", 2, 1, "builder", None, &[]).await;
         assert!(
             list.contains("answered, but the resume was refused: session closed"),
             "{list}"
         );
-        let single = read_node_question(&db, "prj", 2, 1, "builder", "q-1").await;
+        let single = read_question(&db, "prj", 2, 1, "builder", None, "q-1").await;
         assert!(
             single.contains("Status: answered")
                 && single.contains("## Resume")

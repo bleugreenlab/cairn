@@ -95,17 +95,22 @@ pub async fn ask_questions_with(
     .await
 }
 
-/// The question's canonical URI beneath its asker's home, when that home has a
-/// questions resource the parser resolves. A sub-agent task's does not yet
-/// (cairn/4772), and a URI nothing resolves is worse than none.
+/// The question's canonical URI beneath its asker's home: a node's or thread's
+/// `.../questions/{segment}`, and a sub-agent task's nested under its parent
+/// (`.../{node}/task/{task}/questions/{segment}`), because the task's home
+/// already is. The creator's push key, the channel router's ask key and every
+/// reader's address are all built here, so they agree by construction rather
+/// than by each restating which job shapes nest. `None` when the home has no
+/// questions resource the parser resolves: a URI nothing resolves is worse
+/// than none.
 pub(crate) fn question_uri_under_home(home_uri: &str, segment: &str) -> Option<String> {
     let uri = format!("{home_uri}/questions/{segment}");
     let resource = cairn_uri::parse_uri(&uri)?;
-    matches!(
-        cairn_uri::delegate_thread_descendant(resource),
-        Ok(cairn_uri::CairnResource::NodeQuestion { .. })
-    )
-    .then_some(uri)
+    let resolves = cairn_uri::delegate_thread_descendant(resource)
+        .ok()?
+        .as_question()
+        .is_some();
+    resolves.then_some(uri)
 }
 
 /// What asking returns to the asking call: the text the agent reads and, when
@@ -348,19 +353,19 @@ async fn ask_questions_owned(
                         + 1;
                     let uri_segment = format!("q-{}", ordinal);
 
-                    // Owning node job + segment: job_id scopes the prompt for the
-                    // unique (job_id, uri_segment) index; node_segment builds the URI.
-                    let mut node_rows = conn
+                    // The asking job scopes the prompt for the unique
+                    // (job_id, uri_segment) index; its home builds the URI.
+                    let mut job_rows = conn
                         .query(
-                            "SELECT j.id, j.uri_segment FROM jobs j JOIN runs r ON r.job_id = j.id \
-                             WHERE r.id = ?1",
+                            "SELECT r.job_id FROM runs r WHERE r.id = ?1",
                             (run_id.as_str(),),
                         )
                         .await?;
-                    let (job_id, node_segment) = match node_rows.next().await? {
-                        Some(row) => (row.opt_text(0)?, row.opt_text(1)?),
-                        None => (None, None),
+                    let job_id = match job_rows.next().await? {
+                        Some(row) => row.opt_text(0)?,
+                        None => None,
                     };
+                    drop(job_rows);
 
                     let inserted = conn
                         .execute(
@@ -462,12 +467,12 @@ async fn ask_questions_owned(
                         }
                     }
 
-                    Ok((yielded_turn, uri_segment, node_segment, question_uri))
+                    Ok((yielded_turn, uri_segment, question_uri))
                 })
             })
             .await;
 
-        let (yielded_turn, uri_segment, node_segment, question_uri) = match insert_result {
+        let (yielded_turn, uri_segment, question_uri) = match insert_result {
             Ok(tuple) => tuple,
             Err(e) => {
                 log::error!("Failed to insert prompt: {}", e);
@@ -489,19 +494,10 @@ async fn ask_questions_owned(
 
         // Typed emit: the question is the actionable fact. Build the event
         // with the full question payload inline so the watch long-poll returns
-        // it without a follow-up read.
-        if let (Some(issue_id), Some(issue_number), Some(node)) = (
-            ctx.issue_id.as_deref(),
-            ctx.issue_number,
-            node_segment.as_deref(),
-        ) {
-            let detail_uri = cairn_uri::build_node_question_uri(
-                &ctx.project_key,
-                issue_number,
-                ctx.exec_seq.unwrap_or(1),
-                node,
-                &uri_segment,
-            );
+        // it without a follow-up read. The detail URI is the question's own,
+        // so a sub-agent task's points at its nested, resolvable address.
+        if let (Some(issue_id), Some(detail_uri)) = (ctx.issue_id.as_deref(), question_uri.clone())
+        {
             if let Ok(issue_ctx) =
                 crate::orchestrator::attention::read_issue_for_attention(&owning_db, issue_id).await
             {
@@ -1217,6 +1213,7 @@ pub async fn answer_node_question(
         issue_number,
         exec_seq,
         node_segment,
+        None,
         prompt_segment,
         payload,
         crate::turns::queries::ResolutionProvenance::new(
@@ -1227,14 +1224,17 @@ pub async fn answer_node_question(
     .await
 }
 
-/// Resolve a node-coordinate question to its prompt, its normalized
+/// Resolve a question addressed by its node coordinate (and, for a sub-agent
+/// task's, the task beneath that node) to its prompt, its normalized
 /// resolution, and the asking job's canonical home URI.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_node_question(
     orch: &Orchestrator,
     project_key: &str,
     issue_number: i32,
     exec_seq: i32,
     node_segment: &str,
+    task_segment: Option<&str>,
     prompt_segment: &str,
     payload: &Value,
 ) -> Result<(String, PromptResolution, Option<String>), String> {
@@ -1244,6 +1244,7 @@ async fn resolve_node_question(
         issue_number,
         exec_seq,
         node_segment,
+        task_segment,
         prompt_segment,
     )
     .await?;
@@ -1259,6 +1260,7 @@ pub async fn answer_node_question_with_provenance(
     issue_number: i32,
     exec_seq: i32,
     node_segment: &str,
+    task_segment: Option<&str>,
     prompt_segment: &str,
     payload: &Value,
     provenance: crate::turns::queries::ResolutionProvenance,
@@ -1269,6 +1271,7 @@ pub async fn answer_node_question_with_provenance(
         issue_number,
         exec_seq,
         node_segment,
+        task_segment,
         prompt_segment,
         payload,
     )
@@ -2015,6 +2018,7 @@ pub async fn get_question(
 /// the asking job may; anyone else closes it with `moot:true`. Nobody is
 /// woken, the operator's entry resolves, and an open `moot_when` latches
 /// cleared on the next sweep. Returns the reply line.
+#[allow(clippy::too_many_arguments)]
 pub async fn withdraw_node_question(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -2022,6 +2026,7 @@ pub async fn withdraw_node_question(
     issue_number: i32,
     exec_seq: i32,
     node_segment: &str,
+    task_segment: Option<&str>,
     prompt_segment: &str,
 ) -> Result<String, String> {
     let (prompt_id, _questions, _home) = lookup_prompt_for_node_question(
@@ -2030,6 +2035,7 @@ pub async fn withdraw_node_question(
         issue_number,
         exec_seq,
         node_segment,
+        task_segment,
         prompt_segment,
     )
     .await?;
@@ -2106,10 +2112,17 @@ async fn lookup_prompt_for_node_question(
     issue_number: i32,
     exec_seq: i32,
     node_segment: &str,
+    task_segment: Option<&str>,
     prompt_segment: &str,
 ) -> Result<(String, String, Option<String>), String> {
     let project_key = project_key.to_string();
     let node_segment = node_segment.to_string();
+    let task_segment = task_segment.map(str::to_string);
+    // How a refusal names the asker: `node` or `node/task/task`.
+    let asker = match task_segment.as_deref() {
+        Some(task) => format!("{node_segment}/task/{task}"),
+        None => node_segment.clone(),
+    };
     let prompt_segment = prompt_segment.to_string();
     // Route the node-URI answer path by project (CAIRN-2229): a team issue's
     // prompt row lives in the synced replica, so resolving the prompt id from its
@@ -2120,6 +2133,8 @@ async fn lookup_prompt_for_node_question(
     db.read(|conn| {
             let project_key = project_key.clone();
             let node_segment = node_segment.clone();
+            let task_segment = task_segment.clone();
+            let asker = asker.clone();
             let prompt_segment = prompt_segment.clone();
             Box::pin(async move {
                 let job_id = crate::jobs::queries::job_id_for_node_coordinate_conn(
@@ -2128,11 +2143,11 @@ async fn lookup_prompt_for_node_question(
                     issue_number,
                     exec_seq,
                     &node_segment,
-                    None,
+                    task_segment.as_deref(),
                 )
                 .await?
                 .ok_or_else(|| DbError::internal(format!(
-                    "node {project_key}-{issue_number}/{exec_seq}/{node_segment} not found"
+                    "{project_key}-{issue_number}/{exec_seq}/{asker} not found"
                 )))?;
                 let mut rows = conn
                     .query(
@@ -2158,7 +2173,7 @@ async fn lookup_prompt_for_node_question(
                     .transpose()?
                     .ok_or_else(|| {
                         DbError::internal(format!(
-                            "question {prompt_segment} not found for {project_key}-{issue_number}/{exec_seq}/{node_segment}"
+                            "question {prompt_segment} not found for {project_key}-{issue_number}/{exec_seq}/{asker}"
                         ))
                     })?;
                 // The job's canonical home, resolved through the same
