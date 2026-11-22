@@ -1002,6 +1002,71 @@ struct TurnCheckOutcomeDelivery {
     wake: Option<attention_push::Wake>,
 }
 
+/// The two identities of one turn-end notice, stored together as the push's
+/// fingerprint under `turn-checks:<uri>`.
+///
+/// `state` ([`turn_check_fingerprint`]) is the sealed tree plus each lane's
+/// actionable verdict: a wave equal to the last notice on it is not delivered
+/// at all. `news` ([`turn_check_news`]) is what the notice tells its node, with
+/// no tree in it: each lane's actionable verdict and, for a red test lane, its
+/// failing test identities with their failure signatures. A notice whose state
+/// moved (a base advance re-runs every lane on a new tree) but whose news did
+/// not is delivered passively, because the node has already read that list.
+///
+/// Whether a red is the branch's own ([`crate::execution::checks_base`]) is
+/// deliberately not an input: a wake's silence must never read as an
+/// attribution claim.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TurnCheckNotice {
+    state: Option<String>,
+    news: Option<String>,
+    /// Whether the notice carried a genuine red, so the next one can tell a
+    /// recovery (which wakes) from green after green (which does not).
+    red: bool,
+}
+
+impl TurnCheckNotice {
+    fn of(tree_hash: &str, outcomes: &[CheckOutcome]) -> Self {
+        Self {
+            state: turn_check_fingerprint(tree_hash, outcomes),
+            news: turn_check_news(outcomes),
+            red: outcomes.iter().any(CheckOutcome::is_genuine_failure),
+        }
+    }
+
+    /// The stored form: `<state|-> news=<news|-> red=<0|1>`. Neither hash
+    /// contains a space.
+    fn stored(&self) -> String {
+        format!(
+            "{} news={} red={}",
+            self.state.as_deref().unwrap_or("-"),
+            self.news.as_deref().unwrap_or("-"),
+            u8::from(self.red)
+        )
+    }
+
+    /// Reads [`Self::stored`]. A fingerprint written before `news` existed is a
+    /// bare state hash; it parses with no news, so the first notice after it
+    /// is treated as changed rather than silently passive.
+    fn parse(stored: Option<&str>) -> Self {
+        let mut notice = Self::default();
+        let Some(stored) = stored else {
+            return notice;
+        };
+        let known = |value: &str| (value != "-" && !value.is_empty()).then(|| value.to_string());
+        for (index, token) in stored.split_whitespace().enumerate() {
+            if let Some(news) = token.strip_prefix("news=") {
+                notice.news = known(news);
+            } else if let Some(red) = token.strip_prefix("red=") {
+                notice.red = red == "1";
+            } else if index == 0 {
+                notice.state = known(token);
+            }
+        }
+        notice
+    }
+}
+
 /// The single seam from a wave's outcomes to its attention delivery. Both the
 /// wake level and the wake identity are derived here, from the same outcomes,
 /// so a test that drives this function exercises exactly the composition a
@@ -1018,19 +1083,11 @@ async fn deliver_turn_check_outcomes(
     // author for one asks them to fix something they have no standing to touch —
     // and because it re-executes on every evaluation, it asks repeatedly. That is
     // the loop this cadence kept generating (CAIRN-3245).
-    let any_genuine_failed = outcomes.iter().any(CheckOutcome::is_genuine_failure);
-    let fingerprint = turn_check_fingerprint(tree_hash, outcomes);
-    let (delivery, wake) = persist_turn_check_delivery(
-        db,
-        recipient,
-        checks_uri,
-        fingerprint.as_deref(),
-        any_genuine_failed,
-    )
-    .await?;
+    let notice = TurnCheckNotice::of(tree_hash, outcomes);
+    let (delivery, wake) = persist_turn_check_delivery(db, recipient, checks_uri, &notice).await?;
     Ok(TurnCheckOutcomeDelivery {
-        fingerprint,
-        any_genuine_failed,
+        any_genuine_failed: notice.red,
+        fingerprint: notice.state,
         delivery,
         wake,
     })
@@ -1040,20 +1097,35 @@ async fn persist_turn_check_delivery(
     db: &LocalDb,
     recipient: &str,
     checks_uri: &str,
-    fingerprint: Option<&str>,
-    any_genuine_failed: bool,
+    notice: &TurnCheckNotice,
 ) -> Result<(TurnCheckDelivery, Option<attention_push::Wake>), String> {
     let key = format!("turn-checks:{checks_uri}");
     let latest = attention_push::latest_push_fingerprint(db, recipient, &key)
         .await
-        .map_err(|error| format!("failed to read turn-check fingerprint: {error}"))?;
+        .map_err(|error| format!("failed to read turn-check fingerprint: {error}"))?
+        .map(|stored| TurnCheckNotice::parse(stored.as_deref()));
     let delivery = turn_check_delivery(
-        latest.as_ref().map(|value| value.as_deref()),
-        fingerprint,
-        any_genuine_failed,
+        latest.as_ref().map(|previous| previous.state.as_deref()),
+        notice.state.as_deref(),
+        notice.red,
     );
     if delivery == TurnCheckDelivery::Suppress {
         return Ok((delivery, None));
+    }
+    let mut wake = notice_wake(latest.as_ref(), notice);
+    // The push supersedes an undelivered same-key row in place, wake level
+    // included. An unchanged notice must not demote a wake the node has not
+    // read yet: it is the same news, still owed.
+    if wake == attention_push::Wake::Passive {
+        let canonical_key = cairn_uri::canonicalize_uri_identity(&key);
+        let pending_wake = attention_push::list_pending(db, recipient)
+            .await
+            .map_err(|error| format!("failed to read pending turn-check push: {error}"))?
+            .into_iter()
+            .any(|push| push.key == canonical_key && push.wake != attention_push::Wake::Passive);
+        if pending_wake {
+            wake = attention_push::Wake::Wake;
+        }
     }
     // CAIRN-4665, and the exact line that caused cairn/4658. A turn-end wave is
     // spawned at a turn boundary and can settle a cold cargo build later — 28
@@ -1078,7 +1150,7 @@ async fn persist_turn_check_delivery(
             );
             attention_push::Wake::Passive
         }
-        Ok(_) => delivery_wake(any_genuine_failed),
+        Ok(_) => wake,
         Err(error) => {
             log::warn!(
                 "canonical_fence: could not read lineage for {}; recording the turn-check verdict \
@@ -1088,6 +1160,7 @@ async fn persist_turn_check_delivery(
             attention_push::Wake::Passive
         }
     };
+    let stored = notice.stored();
     let (_, effective_wake) = attention_push::push_with_fingerprint(
         db,
         recipient,
@@ -1095,7 +1168,7 @@ async fn persist_turn_check_delivery(
         wake,
         attention_push::Boundary::Event,
         &key,
-        fingerprint,
+        Some(&stored),
     )
     .await
     .map_err(|error| format!("failed to queue turn-check results push: {error}"))?;
@@ -2550,10 +2623,10 @@ async fn run_turn_end_checks_inner(
         "turn-end checks for job {}: completed \u{2014} [{}] \u{2192} {}",
         short_id(job_id),
         verdicts.join(", "),
-        if any_genuine_failed {
-            "wake"
-        } else {
-            "passive"
+        match effective_wake {
+            Some(attention_push::Wake::Passive) => "passive",
+            Some(_) => "wake",
+            None => "unchanged",
         }
     );
 
@@ -2571,7 +2644,7 @@ async fn run_turn_end_checks_inner(
             short_id(job_id),
             decision
         );
-        if any_genuine_failed && effective_wake == Some(attention_push::Wake::Wake) {
+        if effective_wake == Some(attention_push::Wake::Wake) {
             if let Err(error) = crate::messages::delivery::nudge_job_for_urgency(
                 orch,
                 job_id,
@@ -2963,10 +3036,25 @@ pub(crate) fn hold_back_suppressed(
 /// the tree alone, so its passive deliveries keep dampening.
 fn turn_check_fingerprint(tree_hash: &str, outcomes: &[CheckOutcome]) -> Option<String> {
     let tree_hash = normalized_salient(tree_hash)?;
+    let canonical: Vec<(String, &str)> = actionable_lanes(outcomes)?
+        .into_iter()
+        .map(|(name, verdict, _)| (name, verdict))
+        .collect();
+    let payload =
+        serde_json::to_vec(&(TURN_CHECK_FINGERPRINT_VERSION, tree_hash, canonical)).ok()?;
+    Some(format!("sha256:{:x}", Sha256::digest(payload)))
+}
+
+/// Every lane with an actionable verdict, `pass` or `fail`, sorted by name;
+/// see [`turn_check_fingerprint`] for why a lane without one is left out and
+/// when identity fails open (`None`).
+fn actionable_lanes(
+    outcomes: &[CheckOutcome],
+) -> Option<Vec<(String, &'static str, &CheckOutcome)>> {
     if outcomes.is_empty() {
         return None;
     }
-    let mut canonical = Vec::with_capacity(outcomes.len());
+    let mut lanes = Vec::with_capacity(outcomes.len());
     for outcome in outcomes {
         let name = normalized_salient(&outcome.name)?;
         let verdict = if outcome.passed {
@@ -2979,20 +3067,70 @@ fn turn_check_fingerprint(tree_hash: &str, outcomes: &[CheckOutcome]) -> Option<
         } else {
             continue;
         };
-        canonical.push((name, verdict));
+        lanes.push((name, verdict, outcome));
     }
-    canonical.sort_by(|left, right| left.0.cmp(&right.0));
-    let payload =
-        serde_json::to_vec(&(TURN_CHECK_FINGERPRINT_VERSION, tree_hash, canonical)).ok()?;
+    lanes.sort_by(|left, right| left.0.cmp(&right.0));
+    Some(lanes)
+}
+
+const TURN_CHECK_NEWS_VERSION: &str = "turn-check-news-v1";
+
+/// What a turn-end notice tells its node, independent of the tree it ran on:
+/// each lane's actionable verdict and, for a red test lane whose run named its
+/// failures, each failing test identity with its failure signature
+/// ([`crate::execution::checks_main::failure_signature`], read through
+/// [`crate::execution::checks_base::failing_outcome_tests`], the same
+/// signature main's cadence and base attribution compare). A test newly red, a
+/// still-red test whose signature moved, a test recovered, and a lane flipping
+/// all move it; a base advance that re-ran the same reds does not. A red lane
+/// whose run named no failures (a lint, a typecheck) is its verdict alone.
+///
+/// Non-verdict lanes are excluded exactly as in [`turn_check_fingerprint`]:
+/// the builder has no standing over infrastructure churn (cairn/4820).
+fn turn_check_news(outcomes: &[CheckOutcome]) -> Option<String> {
+    let canonical: Vec<(String, &str, Option<Vec<(String, String)>>)> = actionable_lanes(outcomes)?
+        .into_iter()
+        .map(|(name, verdict, outcome)| {
+            let failing = (verdict == "fail")
+                .then(|| crate::execution::checks_base::failing_outcome_tests(outcome))
+                .flatten()
+                .map(|failures| {
+                    let mut tests: Vec<(String, String)> = failures
+                        .into_iter()
+                        .map(|failure| (failure.name, failure.signature.unwrap_or_default()))
+                        .collect();
+                    tests.sort();
+                    tests.dedup();
+                    tests
+                });
+            (name, verdict, failing)
+        })
+        .collect();
+    let payload = serde_json::to_vec(&(TURN_CHECK_NEWS_VERSION, canonical)).ok()?;
     Some(format!("sha256:{:x}", Sha256::digest(payload)))
 }
 
-/// The wake level a completed turn-end run is delivered at: a GENUINE failure
-/// ROUSES the idle builder (`Wake`), while a clean run — and a run whose only red
-/// is Cairn's own infrastructure — rides along `Passive`, delivered and recorded
-/// without costing a turn. Pure, so the decision is unit-tested.
-fn delivery_wake(any_genuine_failed: bool) -> attention_push::Wake {
-    if any_genuine_failed {
+/// The wake level a delivered turn-end notice is pushed at. It wakes only
+/// when its news moved since the last notice the node received on this key
+/// and it carries something to act on: a genuine red, or the recovery of one.
+/// An unchanged notice, a green after a green, and a wave whose only red is
+/// Cairn's own infrastructure ride along `Passive`: delivered and recorded on
+/// `/checks` without costing a turn. Unknown news (identity failed open, or a
+/// stored notice older than `news`) counts as changed. Pure, so the decision
+/// is unit-tested.
+fn notice_wake(
+    previous: Option<&TurnCheckNotice>,
+    notice: &TurnCheckNotice,
+) -> attention_push::Wake {
+    let changed = match (
+        previous.and_then(|previous| previous.news.as_deref()),
+        notice.news.as_deref(),
+    ) {
+        (Some(previous), Some(current)) => previous != current,
+        _ => true,
+    };
+    let recovered = previous.is_some_and(|previous| previous.red);
+    if changed && (notice.red || recovered) {
         attention_push::Wake::Wake
     } else {
         attention_push::Wake::Passive
@@ -5066,6 +5204,15 @@ mod tests {
         }
     }
 
+    /// A notice carrying a genuine red, with `state` as its delivery identity.
+    fn red_notice(state: Option<&str>) -> TurnCheckNotice {
+        TurnCheckNotice {
+            state: state.map(str::to_string),
+            news: Some("sha256:red".to_string()),
+            red: true,
+        }
+    }
+
     fn status(name: &str, state: NodeCheckState) -> NodeCheckStatus {
         NodeCheckStatus {
             observation_id: None,
@@ -5269,7 +5416,7 @@ mod tests {
 
         let superseded_uri = "cairn://p/proj/4658/1/builder/checks";
         let (delivery, wake) =
-            persist_turn_check_delivery(&db, "job-1", superseded_uri, Some("red"), true)
+            persist_turn_check_delivery(&db, "job-1", superseded_uri, &red_notice(Some("red")))
                 .await
                 .unwrap();
 
@@ -5298,8 +5445,7 @@ mod tests {
             &db,
             "job-2",
             "cairn://p/proj/4658/2/builder/checks",
-            Some("red"),
-            true,
+            &red_notice(Some("red")),
         )
         .await
         .unwrap();
@@ -5340,7 +5486,7 @@ mod tests {
         );
 
         assert_eq!(
-            persist_turn_check_delivery(&db, "job", uri, first.as_deref(), true)
+            persist_turn_check_delivery(&db, "job", uri, &red_notice(first.as_deref()))
                 .await
                 .unwrap(),
             (
@@ -5349,7 +5495,7 @@ mod tests {
             )
         );
         assert_eq!(
-            persist_turn_check_delivery(&db, "job", uri, second.as_deref(), true)
+            persist_turn_check_delivery(&db, "job", uri, &red_notice(second.as_deref()))
                 .await
                 .unwrap(),
             (TurnCheckDelivery::Suppress, None)
@@ -6909,8 +7055,216 @@ pinBumps:
 
     #[test]
     fn green_rides_along_passively_red_wakes() {
-        assert_eq!(delivery_wake(false), attention_push::Wake::Passive);
-        assert_eq!(delivery_wake(true), attention_push::Wake::Wake);
+        let green = TurnCheckNotice::of("tree", &[outcome("rust", true, None, "")]);
+        let red = TurnCheckNotice::of("tree", &[outcome("rust", false, None, "x")]);
+        assert_eq!(notice_wake(None, &green), attention_push::Wake::Passive);
+        assert_eq!(
+            notice_wake(Some(&green), &green),
+            attention_push::Wake::Passive
+        );
+        assert_eq!(notice_wake(None, &red), attention_push::Wake::Wake);
+        assert_eq!(notice_wake(Some(&red), &red), attention_push::Wake::Passive);
+        assert_eq!(notice_wake(Some(&green), &red), attention_push::Wake::Wake);
+        assert_eq!(
+            notice_wake(Some(&red), &green),
+            attention_push::Wake::Wake,
+            "a recovery is news"
+        );
+        let legacy = TurnCheckNotice::parse(Some("sha256:old"));
+        assert_eq!(
+            notice_wake(Some(&legacy), &red),
+            attention_push::Wake::Wake,
+            "a stored notice without news cannot vouch that this one is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_stored_notice_reads_back_and_a_legacy_fingerprint_is_its_state() {
+        let notice = TurnCheckNotice {
+            state: Some("sha256:a".to_string()),
+            news: Some("sha256:b".to_string()),
+            red: true,
+        };
+        assert_eq!(TurnCheckNotice::parse(Some(&notice.stored())), notice);
+        assert_eq!(
+            TurnCheckNotice::parse(Some(&TurnCheckNotice::default().stored())),
+            TurnCheckNotice::default()
+        );
+        assert_eq!(
+            TurnCheckNotice::parse(Some("sha256:a")),
+            TurnCheckNotice {
+                state: Some("sha256:a".to_string()),
+                ..TurnCheckNotice::default()
+            }
+        );
+        assert_eq!(TurnCheckNotice::parse(None), TurnCheckNotice::default());
+    }
+
+    /// A test lane's complete red naming `failures` as (test, assertion). The
+    /// panic line carries the run's thread id, which the signature skips.
+    fn red_tests(thread: u32, failures: &[(&str, &str)]) -> CheckOutcome {
+        let tests: Vec<_> = failures
+            .iter()
+            .map(|(id, assertion)| {
+                serde_json::json!({
+                    "id": id, "status": "failed",
+                    "failureMessage": format!("thread '{id}' ({thread}) panicked at a.rs:1:\n{assertion}"),
+                })
+            })
+            .collect();
+        let names: Vec<_> = failures
+            .iter()
+            .map(|(id, _)| serde_json::json!({ "name": id }))
+            .collect();
+        let parsed: crate::execution::check_parsers::ParsedCheckResult =
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": 1, "complete": true, "selection": "full",
+                "parser": "nextest", "passed": 5, "failed": failures.len(), "skipped": 0,
+                "tests": tests, "failures": names,
+            }))
+            .unwrap();
+        CheckOutcome {
+            parsed: Some(parsed),
+            ..outcome("rust-tests", false, None, "tail")
+        }
+    }
+
+    /// cairn/6874, through the production seam. Each step is a wave on a new
+    /// tree, as a base advance makes one, and every wake is consumed between
+    /// waves as a roused builder's turn would. A wave whose failing tests and
+    /// signatures match the last notice is delivered passively; a new red test,
+    /// a moved signature, a recovered test and a full recovery each wake.
+    #[tokio::test]
+    async fn a_base_advance_with_the_same_failing_set_is_passive_and_any_change_wakes() {
+        let db = crate::storage::migrated_test_db("turn-check-news.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','proj','/tmp/repo',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+               VALUES('i','p',6874,'I','active','active','none',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,status,node_name,created_at,updated_at)
+               VALUES('job','p','i','complete','builder',1,1);",
+        )
+        .await
+        .unwrap();
+        let uri = "cairn://p/proj/6874/1/builder/checks";
+        let key = format!("turn-checks:{uri}");
+        let lint = || outcome("lint", true, None, "");
+        let green = || outcome("rust-tests", true, None, "");
+
+        let steps: Vec<(&str, Vec<CheckOutcome>, attention_push::Wake)> = vec![
+            (
+                "first red",
+                vec![red_tests(7, &[("a", "left: 1"), ("b", "left: 2")]), lint()],
+                attention_push::Wake::Wake,
+            ),
+            (
+                "base advance, same failing set",
+                vec![red_tests(9, &[("b", "left: 2"), ("a", "left: 1")]), lint()],
+                attention_push::Wake::Passive,
+            ),
+            (
+                "another base advance, still the same",
+                vec![red_tests(11, &[("a", "left: 1"), ("b", "left: 2")]), lint()],
+                attention_push::Wake::Passive,
+            ),
+            (
+                "a test newly red",
+                vec![
+                    red_tests(7, &[("a", "left: 1"), ("b", "left: 2"), ("c", "left: 3")]),
+                    lint(),
+                ],
+                attention_push::Wake::Wake,
+            ),
+            (
+                "a still-red test's signature moved",
+                vec![
+                    red_tests(7, &[("a", "left: 1"), ("b", "left: 9"), ("c", "left: 3")]),
+                    lint(),
+                ],
+                attention_push::Wake::Wake,
+            ),
+            (
+                "a red test recovered",
+                vec![red_tests(7, &[("a", "left: 1"), ("c", "left: 3")]), lint()],
+                attention_push::Wake::Wake,
+            ),
+            (
+                "the lane recovered",
+                vec![green(), lint()],
+                attention_push::Wake::Wake,
+            ),
+            (
+                "green after green",
+                vec![green(), lint()],
+                attention_push::Wake::Passive,
+            ),
+        ];
+
+        let mut trace = Vec::new();
+        for (index, (label, outcomes, expected)) in steps.iter().enumerate() {
+            let tree = format!("tree-{index}");
+            let delivered = deliver_turn_check_outcomes(&db, "job", uri, &tree, outcomes)
+                .await
+                .unwrap();
+            trace.push(format!(
+                "{label}: {:?} / {:?}",
+                delivered.delivery, delivered.wake
+            ));
+            assert_ne!(
+                delivered.delivery,
+                TurnCheckDelivery::Suppress,
+                "{label}: a new tree is always delivered, so /checks' notice stays current"
+            );
+            assert_eq!(
+                delivered.wake,
+                Some(*expected),
+                "{label}; decisions so far:\n{}",
+                trace.join("\n")
+            );
+            for push in attention_push::list_pending(&db, "job").await.unwrap() {
+                assert_eq!(push.key, key);
+                attention_push::stamp_delivered(
+                    &db,
+                    std::slice::from_ref(&push.id),
+                    &format!("turn-{index}"),
+                )
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    /// A notice supersedes an undelivered same-key push in place. An unchanged
+    /// one arriving before the node read the first must not demote its wake.
+    #[tokio::test]
+    async fn an_unchanged_notice_keeps_an_unread_wake() {
+        let db = crate::storage::migrated_test_db("turn-check-unread.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','proj','/tmp/repo',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+               VALUES('i','p',6874,'I','active','active','none',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,status,node_name,created_at,updated_at)
+               VALUES('job','p','i','complete','builder',1,1);",
+        )
+        .await
+        .unwrap();
+        let uri = "cairn://p/proj/6874/1/builder/checks";
+        let red = || vec![red_tests(7, &[("a", "left: 1")])];
+        let first = deliver_turn_check_outcomes(&db, "job", uri, "tree-1", &red())
+            .await
+            .unwrap();
+        assert_eq!(first.wake, Some(attention_push::Wake::Wake));
+        let second = deliver_turn_check_outcomes(&db, "job", uri, "tree-2", &red())
+            .await
+            .unwrap();
+        assert_eq!(second.wake, Some(attention_push::Wake::Wake));
+        let pending = attention_push::list_pending(&db, "job").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].wake, attention_push::Wake::Wake);
     }
 
     /// The wake predicate. Only a red the agent's own change owns counts; an
@@ -6955,7 +7309,7 @@ pinBumps:
         assert!(outcomes.iter().any(|o| !o.passed));
         assert!(!outcomes.iter().any(CheckOutcome::is_genuine_failure));
         assert_eq!(
-            delivery_wake(outcomes.iter().any(CheckOutcome::is_genuine_failure)),
+            notice_wake(None, &TurnCheckNotice::of("tree", &outcomes)),
             attention_push::Wake::Passive
         );
     }
@@ -7163,7 +7517,7 @@ pinBumps:
         assert_eq!(first, turn_check_fingerprint("tree", &capacity));
         assert_ne!(first, turn_check_fingerprint("tree-2", &capacity));
         assert_eq!(
-            delivery_wake(infrastructure.iter().any(CheckOutcome::is_genuine_failure)),
+            notice_wake(None, &TurnCheckNotice::of("tree", &infrastructure)),
             attention_push::Wake::Passive
         );
     }
