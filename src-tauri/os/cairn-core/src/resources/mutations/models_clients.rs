@@ -187,14 +187,44 @@ fn parse_append(payload: &Value) -> Result<ClientChange, String> {
     }
 }
 
-/// The boundary a clients write crosses, for the batch's authority gate.
-pub(crate) fn models_client_authority(
+/// The boundary a clients write crosses, for the batch's authority gate. A
+/// widening change dispatch would refuse is refused here instead, so no card
+/// is raised for it.
+pub(crate) async fn models_client_authority(
+    orch: &Orchestrator,
     item: &ChangeItem,
 ) -> Option<Result<AuthorityRequest, String>> {
-    match parse_client_change(item)? {
-        Ok(change) => change.authority().map(Ok),
-        Err(error) => Some(Err(error)),
+    let change = match parse_client_change(item)? {
+        Ok(change) => change,
+        Err(error) => return Some(Err(error)),
+    };
+    let authority = change.authority()?;
+    Some(widening_refusal(orch, &change).await.map(|()| authority))
+}
+
+/// What refuses a widening change without the operator: a malformed name or
+/// key, remote use with no OpenRouter account to spend, or remote use for a
+/// client that is not live. Dispatch meets each again on the way to the write.
+async fn widening_refusal(orch: &Orchestrator, change: &ClientChange) -> Result<(), String> {
+    let wants_remote = match change {
+        ClientChange::Mint { name, remote } => {
+            clients::validate_name(name)?;
+            *remote
+        }
+        ClientChange::Import { keys, .. } => {
+            clients::validate_import(keys.iter().map(|(key, _)| key))?;
+            keys.iter().any(|(_, remote)| *remote)
+        }
+        ClientChange::SetRemote { id, remote: true } => {
+            live_client(orch, id).await?;
+            true
+        }
+        ClientChange::SetRemote { remote: false, .. } | ClientChange::Revoke { .. } => false,
+    };
+    if wants_remote {
+        remote_account(orch)?;
     }
+    Ok(())
 }
 
 /// What minted a remote grant: a write to the clients resource, already past
@@ -435,14 +465,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn widening_changes_cross_the_served_api_boundary_and_narrowing_ones_do_not() {
+    const HASH: &str = "ab";
+
+    fn key_hash() -> String {
+        HASH.repeat(32)
+    }
+
+    #[tokio::test]
+    async fn widening_changes_cross_the_served_api_boundary_and_narrowing_ones_do_not() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
         let mint = item(
             "cairn://models/clients",
             ChangeMode::Append,
             serde_json::json!({"name": "dig"}),
         );
-        let authority = models_client_authority(&mint).unwrap().unwrap();
+        let authority = models_client_authority(&orch, &mint)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             authority.scope.shorthand(),
             "workspace/default/settings/servedApi:write"
@@ -450,33 +490,79 @@ mod tests {
         let import = item(
             "cairn://models/clients",
             ChangeMode::Append,
-            serde_json::json!({"import": [{"name": "sitrep", "keyHash": "ab", "remote": true}]}),
+            serde_json::json!({"import": [{"name": "sitrep", "keyHash": key_hash()}]}),
         );
-        assert!(models_client_authority(&import).unwrap().is_ok());
-        let remote = item(
-            "cairn://models/clients/cli_1",
-            ChangeMode::Patch,
-            serde_json::json!({"remote": true}),
-        );
-        assert!(models_client_authority(&remote).is_some());
+        assert!(models_client_authority(&orch, &import)
+            .await
+            .unwrap()
+            .is_ok());
         for narrowing in [
             serde_json::json!({"remote": false}),
             serde_json::json!({"revoke": true}),
         ] {
             let change = item("cairn://models/clients/cli_1", ChangeMode::Patch, narrowing);
-            assert!(models_client_authority(&change).is_none());
+            assert!(models_client_authority(&orch, &change).await.is_none());
         }
         let bad = item(
             "cairn://models/clients",
             ChangeMode::Append,
             serde_json::json!({}),
         );
-        assert!(models_client_authority(&bad).unwrap().is_err());
+        assert!(models_client_authority(&orch, &bad).await.unwrap().is_err());
         let unrelated = item(
             "cairn://models/sessions/s1",
             ChangeMode::Patch,
             serde_json::json!({"action": "stop"}),
         );
-        assert!(models_client_authority(&unrelated).is_none());
+        assert!(models_client_authority(&orch, &unrelated).await.is_none());
+    }
+
+    /// A widening change dispatch would refuse is refused while the batch is
+    /// prepared, so no card is raised for it.
+    #[tokio::test]
+    async fn a_widening_change_that_cannot_land_is_refused_before_any_card() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let cases = [
+            (
+                "cairn://models/clients",
+                ChangeMode::Append,
+                serde_json::json!({"name": "bad name!"}),
+                "may use only letters",
+            ),
+            (
+                "cairn://models/clients",
+                ChangeMode::Append,
+                serde_json::json!({"import": [{"name": "sitrep", "keyHash": HASH}]}),
+                "keyHash must be a hex SHA-256 digest",
+            ),
+            (
+                "cairn://models/clients",
+                ChangeMode::Append,
+                serde_json::json!({"import": [
+                    {"name": "sitrep", "keyHash": key_hash()},
+                    {"name": "sitrep", "keyHash": "cd".repeat(32)}
+                ]}),
+                "appears twice in the import",
+            ),
+            (
+                "cairn://models/clients",
+                ChangeMode::Append,
+                serde_json::json!({"name": "dig", "remote": true}),
+                "none is configured",
+            ),
+            (
+                "cairn://models/clients/cli_1",
+                ChangeMode::Patch,
+                serde_json::json!({"remote": true}),
+                "no served-API client cli_1",
+            ),
+        ];
+        for (target, mode, payload, says) in cases {
+            let error = models_client_authority(&orch, &item(target, mode, payload.clone()))
+                .await
+                .expect("a widening change")
+                .expect_err("refused before any card");
+            assert!(error.contains(says), "{payload}: {error}");
+        }
     }
 }

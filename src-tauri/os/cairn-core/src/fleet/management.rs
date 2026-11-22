@@ -2625,16 +2625,8 @@ pub async fn set_machine_services(
             plan.sentences().join("; ")
         ));
     }
-    let projects = project_checkouts(orch).await;
-    for (key, change) in &plan.changes {
-        if let MachineServiceChange::SelectOverride { command } = change {
-            if let Some(place) = agent_writable_place(orch, &plan, command, &projects) {
-                return Err(format!(
-                    "Refused: {command} is inside {place}, which agents can write. An approval binds a path, not the bytes found there, so Cairn will not run {key} from it on {}. Put the binary somewhere only the operator writes (such as /Applications or /usr/local/bin) and name that path; nothing changed",
-                    plan.machine
-                ));
-            }
-        }
+    if let Some(refusal) = agent_writable_override_refusal(orch, &plan).await {
+        return Err(refusal);
     }
     let set_by = authority.set_by(unix_time_ms());
     let setter = describe_setter(Some(&set_by));
@@ -2735,6 +2727,26 @@ pub async fn set_machine_services(
 /// Every project checkout this runner has registered, from every database it
 /// holds. A checkout is where agents' branches land, so an override inside one
 /// is a binary an agent's merge could replace.
+/// The refusal for a plan that would run an override from inside a place an
+/// agent can write, whoever asks. The door checks it before raising a card,
+/// since no approval can make it land, and the writer checks it again.
+pub(crate) async fn agent_writable_override_refusal(
+    orch: &Orchestrator,
+    plan: &MachineServicePlan,
+) -> Option<String> {
+    let projects = project_checkouts(orch).await;
+    plan.changes.iter().find_map(|(key, change)| {
+        let MachineServiceChange::SelectOverride { command } = change else {
+            return None;
+        };
+        let place = agent_writable_place(orch, plan, command, &projects)?;
+        Some(format!(
+            "Refused: {command} is inside {place}, which agents can write. An approval binds a path, not the bytes found there, so Cairn will not run {key} from it on {}. Put the binary somewhere only the operator writes (such as /Applications or /usr/local/bin) and name that path; nothing changed",
+            plan.machine
+        ))
+    })
+}
+
 async fn project_checkouts(orch: &Orchestrator) -> Vec<std::path::PathBuf> {
     let mut roots = Vec::new();
     for db in orch.db.all_dbs().await {

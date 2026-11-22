@@ -126,7 +126,8 @@ const SELECT_ALONE: &str = "Refused: a machineServices change that selects a ser
 ///
 /// A patch that cannot be planned names no authority here; the dispatcher
 /// refuses it with the planner's reason, so no card is raised for a change
-/// that could not be made.
+/// that could not be made. An override inside a place agents can write is
+/// refused here for the same reason: no approval can make it land.
 pub(crate) async fn machine_services_authority(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -151,6 +152,9 @@ pub(crate) async fn machine_services_authority(
     }
     if configure.changes_more_than_machine_services() {
         return Some(Prepared::Refused(SELECT_ALONE.to_string()));
+    }
+    if let Some(refusal) = management::agent_writable_override_refusal(orch, &plan).await {
+        return Some(Prepared::Refused(refusal));
     }
     Some(Prepared::Authority(management::machine_service_request(
         orch, &plan,
@@ -918,6 +922,22 @@ mod machine_service_door_tests {
                 .is_none()
         );
         write(&orch, &run_id, &patch(None)).await.unwrap();
+        assert!(held(&orch).is_none());
+    }
+
+    /// An override inside a place agents can write is refused whoever asks,
+    /// so it is refused while the batch is prepared, before any card.
+    #[tokio::test]
+    async fn an_agent_writable_override_is_refused_before_any_card() {
+        let (orch, run_id, _resources, _link) = fixture().await;
+        let item = patch(Some("/tmp/probe"));
+        match machine_services_authority(&orch, &as_run(&run_id), &item).await {
+            Some(Prepared::Refused(reason)) => assert!(
+                reason.starts_with("Refused: /tmp/probe is inside a temp directory"),
+                "{reason}"
+            ),
+            other => panic!("refused before any card: {other:?}"),
+        }
         assert!(held(&orch).is_none());
     }
 

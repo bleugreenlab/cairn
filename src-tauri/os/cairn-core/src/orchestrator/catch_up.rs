@@ -343,8 +343,7 @@ pub(crate) async fn recent_events(
 
 /// Set (or re-set) a branch's merge mode. The caller has established the
 /// operator's authority, resolved `reviewed_through` to a commit in the
-/// branch's and the default branch's shared history, and refused the default
-/// branch.
+/// default branch's history, and refused the default branch itself.
 pub(crate) async fn set(db: &LocalDb, request: SetCatchUpMode<'_>) -> Result<CatchUpMode, String> {
     validate_review_paths(request.review_paths)?;
     let at = now();
@@ -571,8 +570,8 @@ pub(crate) async fn end_on_landing(
 }
 
 /// Record that the owner reviewed the incoming base changes through `through`.
-/// The caller has proven `through` lies in both the branch's and the default
-/// branch's history and at or after the current mark.
+/// The caller has proven `through` lies in the default branch's history, at or
+/// after the current mark. The branch need not contain it yet.
 pub(crate) async fn mark_reviewed(
     db: &LocalDb,
     mode: &CatchUpMode,

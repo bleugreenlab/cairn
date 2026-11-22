@@ -84,19 +84,25 @@ pub(crate) fn is_workspace_settings_mutation(item: &ChangeItem) -> bool {
 /// exactly the section that matters instead of a whole undifferentiated
 /// "settings write".
 pub(crate) fn workspace_settings_authority(
+    orch: &Orchestrator,
     item: &ChangeItem,
 ) -> Vec<Result<AuthorityRequest, String>> {
     if !is_workspace_settings_mutation(item) {
         return Vec::new();
     }
-    let Some(sections) = item.payload.as_ref().and_then(Value::as_object) else {
+    let Some(payload) = item.payload.as_ref() else {
         return Vec::new();
     };
-    // A key this surface will reject is not a boundary to approve. Validating
-    // first means a typo'd section is refused outright instead of raising an
-    // authority card the operator must answer before dispatch rejects the write
-    // anyway.
-    if let Err(error) = validate_settings_keys(sections.keys().map(String::as_str)) {
+    let Some(sections) = payload.as_object() else {
+        return Vec::new();
+    };
+    // A patch this surface will reject is not a boundary to approve. Checking
+    // first means a typo'd key, a malformed section or a stale revision is
+    // refused outright instead of raising an authority card the operator must
+    // answer before dispatch rejects the write anyway.
+    if let Err(error) = validate_settings_keys(sections.keys().map(String::as_str))
+        .and_then(|()| settings_patch_preflight(orch, payload))
+    {
         return vec![Err(error)];
     }
     sections
@@ -305,252 +311,287 @@ fn parse_served_api(
     Ok(served)
 }
 
+fn settings_object(payload: &Value) -> Result<&serde_json::Map<String, Value>, String> {
+    payload
+        .as_object()
+        .ok_or_else(|| "payload must be an object of settings sections".to_string())
+}
+
+fn expected_revision(obj: &serde_json::Map<String, Value>) -> Result<Option<String>, String> {
+    serde_json::from_value(obj.get("expectedRevision").cloned().unwrap_or(Value::Null))
+        .map_err(|error| format!("invalid expectedRevision: {error}"))
+}
+
+/// Whether a settings patch would land, checked without writing anything:
+/// every section parsed and validated, and the revision compared, as the
+/// write itself does them. Preparation asks it before any card and dispatch
+/// before any grant is consumed, so neither a malformed section nor a stale
+/// revision spends an approval.
+fn settings_patch_preflight(orch: &Orchestrator, payload: &Value) -> Result<(), String> {
+    let obj = settings_object(payload)?;
+    let expected_revision = expected_revision(obj)?;
+    write_settings_sections(orch, obj, payload, expected_revision.as_deref(), true)
+        .0
+        .map(drop)
+}
+
 pub(super) async fn apply_settings_patch(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     payload: &Value,
     dry_run: bool,
 ) -> Result<String, String> {
-    let obj = payload
-        .as_object()
-        .ok_or("payload must be an object of settings sections")?;
-    let expected_revision: Option<String> =
-        serde_json::from_value(obj.get("expectedRevision").cloned().unwrap_or(Value::Null))
-            .map_err(|error| format!("invalid expectedRevision: {error}"))?;
+    let obj = settings_object(payload)?;
+    let expected_revision = expected_revision(obj)?;
 
     // The final authorization check, immediately before anything persists. The
     // write handler's gate decided whether to prompt; this decides whether THIS
     // write may land, re-matching against live grants and atomically consuming a
     // once-grant. Every section is checked, so a patch mixing a preference with
     // a capability cannot smuggle the capability through on the preference's
-    // back.
+    // back. What could refuse the write is asked first, so a refusal never
+    // follows a consumed grant; the write checks it all again under the lock.
     if !dry_run {
+        settings_patch_preflight(orch, payload)?;
         authorize_settings_sections(orch, request, obj.iter()).await?;
     }
 
-    // Keep the revision check and every YAML section write inside one lock.
-    // Dedicated stores still retain their own persistence/rollback semantics.
-    let mut needs_ready = false;
-    let result =
-        settings::with_settings_revision(&orch.config_dir, expected_revision.as_deref(), || {
-            let mut summary: Vec<String> = Vec::new();
-
-            // Compare under the same lock that applies preferences, before any other
-            // store is touched. A separate preflight followed by an unconditional save
-            // would still allow a concurrent whole-key write to be lost.
-            let has_preferences = PREF_KEYS.iter().any(|key| obj.contains_key(*key));
-            if has_preferences {
-                // UpdateSettings ignores unknown keys, so the section objects pass through
-                // harmlessly; only the DTO fields are read.
-                let update: UpdateSettings = serde_json::from_value(payload.clone())
-                    .map_err(|error| format!("invalid settings preferences: {error}"))?;
-                if !dry_run {
-                    orch.update_settings(update)?;
-                }
-                summary.push("app preferences".to_string());
-            }
-
-            // --- Git identities ---
-            if let Some(section) = obj.get("gitIdentities") {
-                let mut count = 0;
-                for item in array(section, "add")? {
-                    let label = require_str(item, "label")?;
-                    let name = require_str(item, "name")?;
-                    let email = require_str(item, "email")?;
-                    if !dry_run {
-                        orch.add_git_identity(label, name, email)?;
-                    }
-                    count += 1;
-                }
-                for item in array(section, "update")? {
-                    let id = require_str(item, "id")?;
-                    if !dry_run {
-                        orch.update_git_identity(
-                            &id,
-                            opt_str(item, "label"),
-                            opt_str(item, "name"),
-                            opt_str(item, "email"),
-                        )?;
-                    }
-                    count += 1;
-                }
-                for id in string_array(section, "remove")? {
-                    if !dry_run {
-                        orch.remove_git_identity(&id)?;
-                    }
-                    count += 1;
-                }
-                let order = string_array(section, "order")?;
-                if !order.is_empty() {
-                    if !dry_run {
-                        orch.reorder_git_identities(&order)?;
-                    }
-                    count += 1;
-                }
-                summary.push(format!("git identities ({count} op(s))"));
-            }
-
-            // --- Provider accounts (non-interactive auth only) ---
-            if let Some(section) = obj.get("accounts") {
-                let mut count = 0;
-                for item in array(section, "add")? {
-                    let provider = parse_provider(&require_str(item, "provider")?)?;
-                    let label = require_str(item, "label")?;
-                    let auth_type = require_str(item, "authType")?;
-                    let auth = parse_auth(&auth_type, opt_str(item, "authValue"))?;
-                    if !dry_run {
-                        orch.add_account(provider, label, auth, None)?;
-                    }
-                    count += 1;
-                }
-                for item in array(section, "update")? {
-                    let id = require_str(item, "id")?;
-                    if !dry_run {
-                        orch.update_account(&id, opt_str(item, "label"))?;
-                    }
-                    count += 1;
-                }
-                for id in string_array(section, "remove")? {
-                    if !dry_run {
-                        orch.remove_account(&id)?;
-                    }
-                    count += 1;
-                }
-                if let Some(order) = section.get("order").filter(|v| !v.is_null()) {
-                    let provider = parse_provider(&require_str(order, "provider")?)?;
-                    let ids = string_array(order, "ids")?;
-                    if !dry_run {
-                        orch.reorder_accounts(provider, &ids)?;
-                    }
-                    count += 1;
-                }
-                summary.push(format!("accounts ({count} op(s))"));
-            }
-
-            // --- Keybinds ---
-            if let Some(section) = obj.get("keybinds") {
-                let mut count = 0;
-                let mut candidate = orch.get_keybinds();
-                for item in array(section, "set")? {
-                    let action = require_str(item, "action")?;
-                    let sequence: KeySequence = match item.get("sequence") {
-                        None | Some(Value::Null) => Vec::new(),
-                        Some(value) => serde_json::from_value(value.clone())
-                            .map_err(|error| format!("invalid key sequence: {error}"))?,
-                    };
-                    candidate.set_keybind(&action, sequence)?;
-                    count += 1;
-                }
-                for action in string_array(section, "reset")? {
-                    candidate.remove_keybind(&action)?;
-                    count += 1;
-                }
-                if section
-                    .get("resetAll")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    candidate.reset();
-                    count += 1;
-                }
-                if !dry_run {
-                    orch.save_keybinds(&candidate)?;
-                }
-                summary.push(format!("keybinds ({count} op(s))"));
-            }
-
-            // --- Build services ---
-            if let Some(section) = obj.get("buildServices") {
-                let mut count = 0;
-                for item in array(section, "upsert")? {
-                    let name = require_str(item, "name")?;
-                    let config_value = item
-                        .get("config")
-                        .ok_or("buildServices.upsert entries require a 'config' object")?;
-                    let config: BuildServiceConfig =
-                        serde_json::from_value(config_value.clone())
-                            .map_err(|error| format!("invalid build service config: {error}"))?;
-                    if !dry_run {
-                        settings::upsert_build_service(&orch.config_dir, &name, &config)?;
-                    }
-                    needs_ready = needs_ready || config.enabled;
-                    count += 1;
-                }
-                for item in array(section, "setEnabled")? {
-                    let name = require_str(item, "name")?;
-                    let enabled = item
-                        .get("enabled")
-                        .and_then(Value::as_bool)
-                        .ok_or("buildServices.setEnabled entries require a boolean 'enabled'")?;
-                    if !dry_run {
-                        settings::set_build_service_enabled(&orch.config_dir, &name, enabled)?;
-                    }
-                    needs_ready = needs_ready || enabled;
-                    count += 1;
-                }
-                for name in string_array(section, "remove")? {
-                    if !dry_run {
-                        settings::delete_build_service(&orch.config_dir, &name)?;
-                    }
-                    count += 1;
-                }
-                summary.push(format!("build services ({count} op(s))"));
-            }
-
-            // --- Inference profile declarations (replaces the section) ---
-            if let Some(section) = obj.get("inference") {
-                let inference = parse_inference(section)?;
-                let dropped_link = settings::load_inference(&orch.config_dir).retired_bginf_link;
-                if !dry_run {
-                    settings::set_inference(&orch.config_dir, &inference)?;
-                }
-                let link = if dropped_link {
-                    "inference (the retired bginf link dropped)"
-                } else {
-                    "inference"
-                };
-                summary.push(if inference.profiles.is_empty() {
-                    format!("{link}; no profile declarations")
-                } else {
-                    format!(
-                        "{link}; profiles declared: {}",
-                        inference
-                            .profiles
-                            .keys()
-                            .map(String::as_str)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                });
-            }
-
-            // --- Served API listener and aliases (replaces the section) ---
-            if let Some(section) = obj.get("servedApi") {
-                let served = parse_served_api(section)?;
-                if !dry_run {
-                    settings::set_served_api(&orch.config_dir, &served)?;
-                }
-                let listener = match &served.bind {
-                    Some(bind) => format!("served API on {bind} (applies at the next orch start)"),
-                    None => "served API off".to_string(),
-                };
-                summary.push(format!(
-                    "{listener}; load wait {}s",
-                    served.load_wait().as_secs()
-                ));
-            }
-
-            if summary.is_empty() {
-                return Err("payload contained no recognized settings sections".to_string());
-            }
-
-            let verb = if dry_run { "Would update" } else { "Updated" };
-            Ok(format!("{verb} workspace settings: {}", summary.join("; ")))
-        });
+    let (result, needs_ready) =
+        write_settings_sections(orch, obj, payload, expected_revision.as_deref(), dry_run);
     if needs_ready && !dry_run {
         orch.ensure_build_services_ready();
     }
     result
+}
+
+/// Every section of a settings patch, checked and, unless `dry_run`, written,
+/// under the settings revision lock. The second value says whether a build
+/// service was enabled, which wants readying even when a later section fails.
+fn write_settings_sections(
+    orch: &Orchestrator,
+    obj: &serde_json::Map<String, Value>,
+    payload: &Value,
+    expected_revision: Option<&str>,
+    dry_run: bool,
+) -> (Result<String, String>, bool) {
+    // Keep the revision check and every YAML section write inside one lock.
+    // Dedicated stores still retain their own persistence/rollback semantics.
+    let mut needs_ready = false;
+    let result = settings::with_settings_revision(&orch.config_dir, expected_revision, || {
+        let mut summary: Vec<String> = Vec::new();
+
+        // Compare under the same lock that applies preferences, before any other
+        // store is touched. A separate preflight followed by an unconditional save
+        // would still allow a concurrent whole-key write to be lost.
+        let has_preferences = PREF_KEYS.iter().any(|key| obj.contains_key(*key));
+        if has_preferences {
+            // UpdateSettings ignores unknown keys, so the section objects pass through
+            // harmlessly; only the DTO fields are read.
+            let update: UpdateSettings = serde_json::from_value(payload.clone())
+                .map_err(|error| format!("invalid settings preferences: {error}"))?;
+            if !dry_run {
+                orch.update_settings(update)?;
+            }
+            summary.push("app preferences".to_string());
+        }
+
+        // --- Git identities ---
+        if let Some(section) = obj.get("gitIdentities") {
+            let mut count = 0;
+            for item in array(section, "add")? {
+                let label = require_str(item, "label")?;
+                let name = require_str(item, "name")?;
+                let email = require_str(item, "email")?;
+                if !dry_run {
+                    orch.add_git_identity(label, name, email)?;
+                }
+                count += 1;
+            }
+            for item in array(section, "update")? {
+                let id = require_str(item, "id")?;
+                if !dry_run {
+                    orch.update_git_identity(
+                        &id,
+                        opt_str(item, "label"),
+                        opt_str(item, "name"),
+                        opt_str(item, "email"),
+                    )?;
+                }
+                count += 1;
+            }
+            for id in string_array(section, "remove")? {
+                if !dry_run {
+                    orch.remove_git_identity(&id)?;
+                }
+                count += 1;
+            }
+            let order = string_array(section, "order")?;
+            if !order.is_empty() {
+                if !dry_run {
+                    orch.reorder_git_identities(&order)?;
+                }
+                count += 1;
+            }
+            summary.push(format!("git identities ({count} op(s))"));
+        }
+
+        // --- Provider accounts (non-interactive auth only) ---
+        if let Some(section) = obj.get("accounts") {
+            let mut count = 0;
+            for item in array(section, "add")? {
+                let provider = parse_provider(&require_str(item, "provider")?)?;
+                let label = require_str(item, "label")?;
+                let auth_type = require_str(item, "authType")?;
+                let auth = parse_auth(&auth_type, opt_str(item, "authValue"))?;
+                if !dry_run {
+                    orch.add_account(provider, label, auth, None)?;
+                }
+                count += 1;
+            }
+            for item in array(section, "update")? {
+                let id = require_str(item, "id")?;
+                if !dry_run {
+                    orch.update_account(&id, opt_str(item, "label"))?;
+                }
+                count += 1;
+            }
+            for id in string_array(section, "remove")? {
+                if !dry_run {
+                    orch.remove_account(&id)?;
+                }
+                count += 1;
+            }
+            if let Some(order) = section.get("order").filter(|v| !v.is_null()) {
+                let provider = parse_provider(&require_str(order, "provider")?)?;
+                let ids = string_array(order, "ids")?;
+                if !dry_run {
+                    orch.reorder_accounts(provider, &ids)?;
+                }
+                count += 1;
+            }
+            summary.push(format!("accounts ({count} op(s))"));
+        }
+
+        // --- Keybinds ---
+        if let Some(section) = obj.get("keybinds") {
+            let mut count = 0;
+            let mut candidate = orch.get_keybinds();
+            for item in array(section, "set")? {
+                let action = require_str(item, "action")?;
+                let sequence: KeySequence = match item.get("sequence") {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(value) => serde_json::from_value(value.clone())
+                        .map_err(|error| format!("invalid key sequence: {error}"))?,
+                };
+                candidate.set_keybind(&action, sequence)?;
+                count += 1;
+            }
+            for action in string_array(section, "reset")? {
+                candidate.remove_keybind(&action)?;
+                count += 1;
+            }
+            if section
+                .get("resetAll")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                candidate.reset();
+                count += 1;
+            }
+            if !dry_run {
+                orch.save_keybinds(&candidate)?;
+            }
+            summary.push(format!("keybinds ({count} op(s))"));
+        }
+
+        // --- Build services ---
+        if let Some(section) = obj.get("buildServices") {
+            let mut count = 0;
+            for item in array(section, "upsert")? {
+                let name = require_str(item, "name")?;
+                let config_value = item
+                    .get("config")
+                    .ok_or("buildServices.upsert entries require a 'config' object")?;
+                let config: BuildServiceConfig = serde_json::from_value(config_value.clone())
+                    .map_err(|error| format!("invalid build service config: {error}"))?;
+                if !dry_run {
+                    settings::upsert_build_service(&orch.config_dir, &name, &config)?;
+                }
+                needs_ready = needs_ready || config.enabled;
+                count += 1;
+            }
+            for item in array(section, "setEnabled")? {
+                let name = require_str(item, "name")?;
+                let enabled = item
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or("buildServices.setEnabled entries require a boolean 'enabled'")?;
+                if !dry_run {
+                    settings::set_build_service_enabled(&orch.config_dir, &name, enabled)?;
+                }
+                needs_ready = needs_ready || enabled;
+                count += 1;
+            }
+            for name in string_array(section, "remove")? {
+                if !dry_run {
+                    settings::delete_build_service(&orch.config_dir, &name)?;
+                }
+                count += 1;
+            }
+            summary.push(format!("build services ({count} op(s))"));
+        }
+
+        // --- Inference profile declarations (replaces the section) ---
+        if let Some(section) = obj.get("inference") {
+            let inference = parse_inference(section)?;
+            let dropped_link = settings::load_inference(&orch.config_dir).retired_bginf_link;
+            if !dry_run {
+                settings::set_inference(&orch.config_dir, &inference)?;
+            }
+            let link = if dropped_link {
+                "inference (the retired bginf link dropped)"
+            } else {
+                "inference"
+            };
+            summary.push(if inference.profiles.is_empty() {
+                format!("{link}; no profile declarations")
+            } else {
+                format!(
+                    "{link}; profiles declared: {}",
+                    inference
+                        .profiles
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
+        }
+
+        // --- Served API listener and aliases (replaces the section) ---
+        if let Some(section) = obj.get("servedApi") {
+            let served = parse_served_api(section)?;
+            if !dry_run {
+                settings::set_served_api(&orch.config_dir, &served)?;
+            }
+            let listener = match &served.bind {
+                Some(bind) => format!("served API on {bind} (applies at the next orch start)"),
+                None => "served API off".to_string(),
+            };
+            summary.push(format!(
+                "{listener}; load wait {}s",
+                served.load_wait().as_secs()
+            ));
+        }
+
+        if summary.is_empty() {
+            return Err("payload contained no recognized settings sections".to_string());
+        }
+
+        let verb = if dry_run { "Would update" } else { "Updated" };
+        Ok(format!("{verb} workspace settings: {}", summary.join("; ")))
+    });
+    (result, needs_ready)
 }
 
 #[cfg(test)]
@@ -802,16 +843,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_settings_patch_names_one_scope_per_section_it_touches() {
-        let item = ChangeItem {
+    fn settings_patch(payload: Value) -> ChangeItem {
+        ChangeItem {
             target: "cairn://settings".to_string(),
             mode: ChangeMode::Patch,
-            payload: Some(serde_json::json!({
-                "keybinds": {}, "models": {}, "expectedRevision": "snapshot"
-            })),
-        };
-        let scopes: Vec<String> = workspace_settings_authority(&item)
+            payload: Some(payload),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_settings_patch_names_one_scope_per_section_it_touches() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let item = settings_patch(serde_json::json!({
+            "keybinds": {}, "models": {}, "expectedRevision": orch.get_settings().revision
+        }));
+        let scopes: Vec<String> = workspace_settings_authority(&orch, &item)
             .into_iter()
             .map(|request| request.unwrap().scope.shorthand())
             .collect();
@@ -820,14 +866,57 @@ mod tests {
         assert!(scopes.contains(&"workspace/default/settings/keybinds:write".to_string()));
     }
 
-    #[test]
-    fn a_non_settings_item_names_no_authority_scope() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_settings_item_names_no_authority_scope() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
         let item = ChangeItem {
             target: "cairn://labels".to_string(),
             mode: ChangeMode::Patch,
             payload: Some(serde_json::json!({"backends": {}})),
         };
-        assert!(workspace_settings_authority(&item).is_empty());
+        assert!(workspace_settings_authority(&orch, &item).is_empty());
+    }
+
+    /// A patch the write would refuse, for a section it cannot parse or a
+    /// revision that has moved, is refused while the batch is prepared, so no
+    /// card is raised for it, and nothing is written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_malformed_or_stale_settings_patch_is_refused_before_any_card() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let settings_path = settings::get_settings_path(&orch.config_dir);
+        let before = std::fs::read(&settings_path).ok();
+        let refusal = |payload: Value| {
+            let mut outcomes = workspace_settings_authority(&orch, &settings_patch(payload));
+            assert_eq!(outcomes.len(), 1, "one refusal, no card");
+            outcomes.remove(0).unwrap_err()
+        };
+        for (payload, says) in [
+            (
+                serde_json::json!({"accounts": {"add": [{"provider": "nope", "label": "x", "authType": "api_key"}]}}),
+                "unknown provider 'nope'",
+            ),
+            (
+                serde_json::json!({"inference": {"bginf": {"url": "http://x"}}}),
+                "retired with bginf",
+            ),
+            (serde_json::json!({"servedApi": {"bind": "lan"}}), ""),
+            (
+                serde_json::json!({"buildServices": {"upsert": [{"name": "x"}]}}),
+                "require a 'config' object",
+            ),
+            (
+                serde_json::json!({"gitIdentities": {"add": [{"label": "x"}]}}),
+                "name",
+            ),
+            (
+                serde_json::json!({"keybinds": {}, "expectedRevision": "stale"}),
+                "",
+            ),
+        ] {
+            let error = refusal(payload.clone());
+            assert!(error.contains(says), "{payload}: {error}");
+        }
+        assert_eq!(std::fs::read(&settings_path).ok(), before);
     }
 
     #[test]

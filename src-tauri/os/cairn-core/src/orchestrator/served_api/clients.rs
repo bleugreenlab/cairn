@@ -79,7 +79,7 @@ fn new_client_id() -> String {
     format!("cli_{}", hex(&rand::random::<[u8; 8]>()))
 }
 
-fn validate_name(name: &str) -> Result<String, String> {
+pub(crate) fn validate_name(name: &str) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() || name.len() > 64 {
         return Err("a client name is 1 to 64 characters".into());
@@ -240,24 +240,36 @@ pub struct ImportedKey {
 
 /// Import clients by key hash, all or none. `origin` names where the keys
 /// were issued (`bgllm`).
+/// Each imported key's validated name and hash, in order: refused when the
+/// import names no key, a name or hash is malformed, or one key appears twice.
+pub(crate) fn validate_import<'k>(
+    keys: impl IntoIterator<Item = &'k ImportedKey>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut validated: Vec<(String, String)> = Vec::new();
+    for key in keys {
+        let name = validate_name(&key.name)?;
+        let hash = imported_hash(&key.key_hash).map_err(|error| format!("{name}: {error}"))?;
+        if validated
+            .iter()
+            .any(|(seen_name, seen_hash)| *seen_hash == hash || *seen_name == name)
+        {
+            return Err(format!("{name} appears twice in the import"));
+        }
+        validated.push((name, hash));
+    }
+    if validated.is_empty() {
+        return Err("import names no key".into());
+    }
+    Ok(validated)
+}
+
 pub async fn import(
     db: &LocalDb,
     origin: &str,
     keys: Vec<ImportedKey>,
 ) -> Result<Vec<ServedApiClient>, String> {
-    if keys.is_empty() {
-        return Err("import names no key".into());
-    }
     let mut clients = Vec::new();
-    for key in keys {
-        let name = validate_name(&key.name)?;
-        let hash = imported_hash(&key.key_hash).map_err(|error| format!("{name}: {error}"))?;
-        if clients
-            .iter()
-            .any(|client: &ServedApiClient| client.key_hash == hash || client.name == name)
-        {
-            return Err(format!("{name} appears twice in the import"));
-        }
+    for (name, hash) in validate_import(&keys)? {
         clients.push(ServedApiClient {
             id: new_client_id(),
             workspace_id: WORKSPACE_ID.to_string(),

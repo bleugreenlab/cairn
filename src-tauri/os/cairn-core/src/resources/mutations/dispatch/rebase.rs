@@ -480,51 +480,143 @@ pub(crate) async fn rebase_authority(
     else {
         return None;
     };
-    Some(catch_up_authority(orch, &project, number, exec_seq, &node_id, payload).await)
+    Some(
+        match resolve_catch_up(orch, &project, number, exec_seq, &node_id, payload).await {
+            Ok(request) => Prepared::Authority(request.authority),
+            Err(CatchUpRefusal::Invalid(error)) => Prepared::Invalid(error),
+            Err(CatchUpRefusal::Refused(error)) => Prepared::Refused(error),
+        },
+    )
+}
+
+/// A `catch-up-mode` request resolved as far as it can be without the
+/// operator. For mode:'merge', `reviewed_through` is the commit the review
+/// mark lands on, already proven to be a default-branch commit, and `authority`
+/// names that commit: the operator approves a mark, not a spelling whose
+/// meaning could move while the card waits.
+struct CatchUpRequest {
+    setting: CatchUpSetting,
+    project_id: String,
+    store: std::path::PathBuf,
+    reviewed_through: Option<String>,
+    authority: cairn_common::authorization::AuthorityRequest,
+}
+
+/// Why a `catch-up-mode` request cannot proceed: `Invalid` when it cannot be
+/// read, `Refused` when no approval could make it succeed.
+enum CatchUpRefusal {
+    Invalid(String),
+    Refused(String),
 }
 
 /// Prepare and dispatch both derive the request here, so they name the same
-/// one. A branch that can never take the mode is refused here, which
-/// preparation turns into a refusal ahead of any card: no approval is spent on
-/// a request that could not succeed. Any read error fails closed as `Invalid`.
-async fn catch_up_authority(
+/// one. Every check that needs no privilege runs here, including resolving
+/// the review mark in the store, and preparation turns a failure into a
+/// refusal ahead of any card: no approval is spent on a request that could
+/// not succeed.
+async fn resolve_catch_up(
     orch: &Orchestrator,
     project: &str,
     number: i32,
     exec_seq: i32,
     node_id: &str,
     payload: &serde_json::Value,
-) -> Prepared {
-    let prepared = async {
-        let setting = parse_catch_up_setting(payload)?;
-        let db = orch.db.for_project(project).await;
-        let rows =
-            crate::resources::NodeRebaseRows::read(&db, project, number, exec_seq, node_id).await?;
-        let branch = rows
-            .branch
-            .clone()
-            .ok_or_else(|| "This node has no branch to set a catch-up mode on.".to_string())?;
-        let project_id = rows
-            .project_id()
-            .ok_or_else(|| "this node's project could not be read".to_string())?;
-        if branch == project_default_branch(&db, project_id).await? {
-            return Ok(Prepared::Refused(format!(
-                "Refused: `{branch}` is the project's default branch, which never catches up with \
-                 anything. Nothing changed."
-            )));
-        }
-        Ok::<_, String>(Prepared::Authority(
-            crate::authorization::normalize::branch_catch_up_request(
-                project_id,
-                &branch,
-                &setting.mode,
-                &setting.review_paths,
-                setting.reviewed_through.as_deref(),
-            ),
-        ))
+) -> Result<CatchUpRequest, CatchUpRefusal> {
+    let setting = parse_catch_up_setting(payload).map_err(CatchUpRefusal::Invalid)?;
+    let db = orch.db.for_project(project).await;
+    let rows = crate::resources::NodeRebaseRows::read(&db, project, number, exec_seq, node_id)
+        .await
+        .map_err(CatchUpRefusal::Invalid)?;
+    let branch = rows.branch.clone().ok_or_else(|| {
+        CatchUpRefusal::Invalid("This node has no branch to set a catch-up mode on.".to_string())
+    })?;
+    let project_id = rows
+        .project_id()
+        .ok_or_else(|| {
+            CatchUpRefusal::Invalid("this node's project could not be read".to_string())
+        })?
+        .to_string();
+    let default_branch = project_default_branch(&db, &project_id)
+        .await
+        .map_err(CatchUpRefusal::Invalid)?;
+    if branch == default_branch {
+        return Err(CatchUpRefusal::Refused(format!(
+            "Refused: `{branch}` is the project's default branch, which never catches up with \
+             anything. Nothing changed."
+        )));
     }
-    .await;
-    prepared.unwrap_or_else(Prepared::Invalid)
+    let store = rows
+        .store_path(orch)
+        .await
+        .map_err(CatchUpRefusal::Invalid)?;
+    let reviewed_through = if setting.mode == "merge" {
+        let mark = review_mark(
+            orch,
+            &store,
+            &branch,
+            &default_branch,
+            setting.reviewed_through.clone(),
+        )
+        .await
+        .map_err(|error| CatchUpRefusal::Refused(format!("Refused: {error}. Nothing changed.")))?;
+        Some(mark)
+    } else {
+        None
+    };
+    let authority = crate::authorization::normalize::branch_catch_up_request(
+        &project_id,
+        &branch,
+        &setting.mode,
+        &setting.review_paths,
+        reviewed_through.as_deref(),
+    );
+    Ok(CatchUpRequest {
+        setting,
+        project_id,
+        store,
+        reviewed_through,
+        authority,
+    })
+}
+
+/// The commit a merge-mode review mark lands on: `revision` when given,
+/// proven to be a default-branch commit, or else the one merge base of the
+/// branch and the default branch. Several merge bases name no one mark, so the
+/// caller must choose.
+async fn review_mark(
+    orch: &Orchestrator,
+    store: &std::path::Path,
+    branch: &str,
+    default_branch: &str,
+    revision: Option<String>,
+) -> Result<String, String> {
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let (store, branch, default_branch) = (
+        store.to_path_buf(),
+        branch.to_string(),
+        default_branch.to_string(),
+    );
+    tokio::task::spawn_blocking(move || match revision {
+        Some(revision) => default_branch_commit(&jj, &store, &default_branch, &revision),
+        None => {
+            let tip = crate::jj::bookmark_commit_checked(&jj, &store, &branch)?
+                .ok_or_else(|| format!("`{branch}` does not resolve in the store"))?;
+            let default_tip = crate::jj::bookmark_commit_checked(&jj, &store, &default_branch)?
+                .ok_or_else(|| format!("`{default_branch}` does not resolve in the store"))?;
+            let bases = crate::jj::merge_bases(&jj, &store, &tip, &default_tip)?;
+            match bases.as_slice() {
+                [base] => Ok(base.clone()),
+                _ => Err(format!(
+                    "`{branch}` and `{default_branch}` share {} merge bases ({}), so there is no \
+                     one default review mark; pass reviewed_through explicitly",
+                    bases.len(),
+                    bases.join(", ")
+                )),
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("review mark worker failed: {error}"))?
 }
 
 /// Who is writing: the run's node home, or `operator` for a write no run makes.
@@ -573,25 +665,26 @@ async fn cancel_holding(
     Ok(format!("{}\n\n", report.sentence(&batch.request_id)))
 }
 
-/// The commit `revision` names, proven to lie in both the branch's and the
-/// default branch's history.
-fn shared_commit(
+/// The commit `revision` names, proven to lie in the default branch's history.
+///
+/// The landing gate is the mark's one reader, and it measures what the default
+/// branch changed from the mark to the tip it lands on, so the mark has to be
+/// a default-branch commit and nothing more. The branch need not contain it:
+/// an owner reviews the base's incoming commits before a merge catch-up
+/// brings them in, and the landing refusal names the target tip to mark.
+fn default_branch_commit(
     jj: &crate::jj::JjEnv,
     store: &std::path::Path,
-    branch: &str,
     default_branch: &str,
     revision: &str,
 ) -> Result<String, String> {
     let commit = crate::jj::revset_commit_checked(jj, store, revision)?
         .ok_or_else(|| format!("`{revision}` does not name one commit in the store"))?;
-    let branch_revset = format!("bookmarks(exact:{branch:?})");
     let default_revset = format!("bookmarks(exact:{default_branch:?})");
-    if !crate::jj::revset_descends_from(jj, store, &branch_revset, &commit)
-        || !crate::jj::revset_descends_from(jj, store, &default_revset, &commit)
-    {
+    if !crate::jj::revset_descends_from(jj, store, &default_revset, &commit) {
         return Err(format!(
-            "{commit} is not in the history of both `{branch}` and `{default_branch}`; a review \
-             mark is a base commit this branch already contains"
+            "{commit} is not in the history of `{default_branch}`; a review mark is a commit of \
+             the default branch, which is what landing measures from"
         ));
     }
     Ok(commit)
@@ -621,23 +714,25 @@ async fn set_catch_up_mode(
     payload: &serde_json::Value,
     dry_run: bool,
 ) -> Result<String, String> {
-    let setting = parse_catch_up_setting(payload)?;
     // Branches cut from this one are unaffected by its mode, finished or live:
     // every consumer keys on the merge-mode bookmark itself, and a child is
     // reconciled under its own name, so it still rebases onto this branch's
     // tip, merge commit or not.
     let (project, number, exec_seq, node_id) = resource;
-    let authority =
-        match catch_up_authority(orch, project, number, exec_seq, node_id, payload).await {
-            Prepared::Authority(authority) => authority,
-            Prepared::Invalid(error) | Prepared::Refused(error) => return Err(error),
-        };
-    let project_id = rows
-        .project_id()
-        .ok_or_else(|| "this node's project could not be read".to_string())?
-        .to_string();
-    let store = rows.store_path(orch).await?;
-    let default_branch = project_default_branch(db, &project_id).await?;
+    // Resolved again here, before the grant is consumed: a branch that moved
+    // while the card waited is refused without spending the approval, and a
+    // default mark that moved names a different act, which the grant does not
+    // cover.
+    let CatchUpRequest {
+        setting,
+        project_id,
+        store,
+        reviewed_through,
+        authority,
+    } = match resolve_catch_up(orch, project, number, exec_seq, node_id, payload).await {
+        Ok(request) => request,
+        Err(CatchUpRefusal::Invalid(error) | CatchUpRefusal::Refused(error)) => return Err(error),
+    };
     if dry_run {
         return Ok(format!("Would {}", authority.summary));
     }
@@ -684,39 +779,8 @@ async fn set_catch_up_mode(
         });
     }
 
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let (read_store, read_branch, read_default, through) = (
-        store.clone(),
-        branch.to_string(),
-        default_branch.clone(),
-        setting.reviewed_through.clone(),
-    );
-    let reviewed_through = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        match through {
-            Some(revision) => {
-                shared_commit(&jj, &read_store, &read_branch, &read_default, &revision)
-            }
-            None => {
-                let tip = crate::jj::bookmark_commit_checked(&jj, &read_store, &read_branch)?
-                    .ok_or_else(|| format!("`{read_branch}` does not resolve in the store"))?;
-                let default_tip =
-                    crate::jj::bookmark_commit_checked(&jj, &read_store, &read_default)?
-                        .ok_or_else(|| format!("`{read_default}` does not resolve in the store"))?;
-                let bases = crate::jj::merge_bases(&jj, &read_store, &tip, &default_tip)?;
-                match bases.as_slice() {
-                    [base] => Ok(base.clone()),
-                    _ => Err(format!(
-                        "`{read_branch}` and `{read_default}` share {} merge bases ({}), so there \
-                         is no one default review mark; pass reviewed_through explicitly",
-                        bases.len(),
-                        bases.join(", ")
-                    )),
-                }
-            }
-        }
-    })
-    .await
-    .map_err(|error| format!("review mark worker failed: {error}"))??;
+    let reviewed_through =
+        reviewed_through.ok_or_else(|| "a merge-mode request names no review mark".to_string())?;
     let mode = crate::orchestrator::catch_up::set(
         db,
         crate::orchestrator::catch_up::SetCatchUpMode {
@@ -769,13 +833,9 @@ async fn mark_reviewed(
     let who = writer(orch, request, &rows.job_id).await?;
     let default_branch = project_default_branch(db, &project_id).await?;
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let (read_store, read_branch, previous) = (
-        store.clone(),
-        branch.to_string(),
-        mode.reviewed_through.clone(),
-    );
+    let (read_store, previous) = (store.clone(), mode.reviewed_through.clone());
     let commit = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let commit = shared_commit(&jj, &read_store, &read_branch, &default_branch, &through)?;
+        let commit = default_branch_commit(&jj, &read_store, &default_branch, &through)?;
         if !crate::jj::revset_descends_from(&jj, &read_store, &commit, &previous) {
             return Err(format!(
                 "{commit} is not at or after the current review mark {previous}; a review mark \
@@ -1437,12 +1497,432 @@ mod tests {
         }
     }
 
+    /// A real project store for the catch-up mode: `agent/one`, the builder's
+    /// branch, one commit past `base`, and `main` one commit past `base` on its
+    /// own line (`main_ahead`, which changes `src/a.rs` and which the branch
+    /// does not contain). The builder has a live run, `run-1`, that can ask
+    /// for the operator's card.
+    struct CatchUpStore {
+        db: Arc<crate::storage::LocalDb>,
+        orch: Orchestrator,
+        store: std::path::PathBuf,
+        base: String,
+        branch_tip: String,
+        main_ahead: String,
+        _dirs: [tempfile::TempDir; 3],
+    }
+
+    async fn catch_up_store(bin: &str, name: &str) -> CatchUpStore {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let workspaces = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::env::git()
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        std::fs::write(repo.path().join("shared.txt"), "original\n").unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "tests@cairn.local"]);
+        git(&["config", "user.name", "Cairn tests"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        let jj = crate::jj::environment(bin, home.path());
+        let store = crate::jj::project_store_dir(home.path(), repo.path());
+        crate::jj::ensure_project_store(&jj, &store, repo.path()).unwrap();
+        let ws = workspaces.path().join("one");
+        crate::jj::add_workspace(&jj, &store, &ws, "agent/one", "main", None).unwrap();
+        std::fs::write(ws.join("shared.txt"), "branch\n").unwrap();
+        crate::jj::seal(&jj, &ws, "edit shared.txt", None).unwrap();
+        let base = crate::jj::bookmark_commit(&jj, &store, "main").unwrap();
+        let branch_tip = crate::jj::bookmark_commit(&jj, &store, "agent/one").unwrap();
+        assert_ne!(base, branch_tip);
+        // `main` then moves one commit on, touching a review path, and the
+        // branch does not contain it: what a merge catch-up would bring in.
+        let next = workspaces.path().join("next");
+        crate::jj::add_workspace(&jj, &store, &next, "agent/next", "main", None).unwrap();
+        std::fs::create_dir_all(next.join("src")).unwrap();
+        std::fs::write(next.join("src/a.rs"), "// a base change\n").unwrap();
+        crate::jj::seal(&jj, &next, "base change", None).unwrap();
+        let main_ahead = crate::jj::bookmark_commit(&jj, &store, "agent/next").unwrap();
+        jj.run(
+            &store,
+            &[
+                "bookmark",
+                "set",
+                "main",
+                "-r",
+                &main_ahead,
+                "--ignore-working-copy",
+            ],
+            "advance main",
+        )
+        .unwrap();
+        assert_ne!(main_ahead, base);
+
+        let db = Arc::new(crate::storage::migrated_test_db(name).await);
+        let repo_sql = repo.path().to_string_lossy().replace('\'', "''");
+        // The builder's agent asks: its fence is what lets the write raise a card.
+        let snapshot = serde_json::json!({
+            "recipe": {
+                "id": "recipe-default", "name": "Recipe", "description": null,
+                "trigger": "manual", "nodes": [], "edges": []
+            },
+            "agents": {
+                "builder": {
+                    "id": "builder", "name": "Builder", "description": "Builder",
+                    "prompt": "prompt", "tools": [], "disallowedTools": null,
+                    "skills": null, "fence": "ask"
+                }
+            },
+            "skills": {},
+            "triggerContext": {
+                "issueId": "issue-1", "projectId": "proj-1", "triggerType": "manual"
+            },
+            "delegatedPackets": [],
+            "createdAt": 1
+        })
+        .to_string()
+        .replace('\'', "''");
+        db.execute_script(format!(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('proj-1', 'default', 'Project', 'proj', '{repo_sql}', 'main', 1, 1);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('issue-1', 'proj-1', 1, 'Issue', 'active', 1, 1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+               VALUES ('exec-1', 'recipe-default', 'issue-1', 'proj-1', 'running', 1, 1, '{snapshot}');
+             INSERT INTO jobs (id, execution_id, recipe_node_id, agent_config_id, issue_id, project_id, status, branch, base_branch, uri_segment, created_at, updated_at)
+               VALUES ('job-1', 'exec-1', 'builder', 'builder', 'issue-1', 'proj-1', 'running', 'agent/one', 'main', 'builder', 1, 1);
+             INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, base_branch, uri_segment, created_at, updated_at)
+               VALUES ('done', 'exec-1', 'issue-1', 'proj-1', 'complete', 'agent/done', 'agent/one', 'done', 1, 1),
+                      ('gone', 'exec-1', 'issue-1', 'proj-1', 'cancelled', 'agent/gone', 'agent/one', 'gone', 1, 1),
+                      ('broke', 'exec-1', 'issue-1', 'proj-1', 'failed', 'agent/broke', 'agent/one', 'broke', 1, 1);
+             INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('run-1', 'issue-1', 'proj-1', 'job-1', 'live', 1, 1);"
+        ))
+        .await
+        .unwrap();
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(home.path().join("search")).unwrap()),
+            )),
+            Arc::new(TestServicesBuilder::new().build()),
+            home.path().to_path_buf(),
+        )
+        .jj_binary_path(bin)
+        .build();
+        CatchUpStore {
+            db,
+            orch,
+            store,
+            base,
+            branch_tip,
+            main_ahead,
+            _dirs: [home, repo, workspaces],
+        }
+    }
+
+    impl CatchUpStore {
+        async fn mode(&self) -> Option<crate::orchestrator::catch_up::CatchUpMode> {
+            crate::orchestrator::catch_up::mode_for(&self.db, "proj-1", &self.store, "agent/one")
+                .await
+                .unwrap()
+        }
+
+        async fn permission_requests(&self) -> i64 {
+            use crate::storage::RowExt;
+            self.db
+                .query_one("SELECT COUNT(*) FROM permission_requests", (), |row| {
+                    row.i64(0)
+                })
+                .await
+                .unwrap()
+        }
+    }
+
+    fn as_run(changes: serde_json::Value) -> McpCallbackRequest {
+        McpCallbackRequest {
+            run_id: Some("run-1".into()),
+            tool_use_id: Some("toolu-catch-up".into()),
+            payload: serde_json::json!({ "changes": changes }),
+            ..run_less_request()
+        }
+    }
+
+    fn catch_up_change(reviewed_through: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "target": "cairn://p/proj/1/1/builder/rebase",
+            "mode": "patch",
+            "payload": {
+                "action": "catch-up-mode",
+                "mode": "merge",
+                "reviewed_through": reviewed_through,
+                "review_paths": ["src/**"],
+            },
+        }])
+    }
+
+    /// A review mark is a default-branch commit, the base the landing gate
+    /// measures from. A branch-only commit, or a name that resolves to
+    /// nothing, is never one whatever the operator approves, so the write is
+    /// refused while the batch is prepared and no card reaches the operator.
+    #[tokio::test]
+    async fn a_review_mark_outside_the_default_branch_is_refused_before_any_card() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let s = catch_up_store(&bin, "catch-up-bad-mark.db").await;
+        let request = as_run(catch_up_change(&s.branch_tip));
+
+        let result = crate::mcp::handlers::write::handle_write(&s.orch, &request).await;
+        assert!(
+            result.contains(&format!(
+                "{} is not in the history of `main`; a review mark is a commit of the default \
+                 branch",
+                s.branch_tip
+            )),
+            "{result}"
+        );
+        assert_eq!(s.permission_requests().await, 0, "no card was raised");
+        assert!(s.mode().await.is_none());
+
+        // A spelling that names no commit is refused the same way.
+        let result =
+            crate::mcp::handlers::write::handle_write(&s.orch, &as_run(catch_up_change("nope")))
+                .await;
+        assert!(result.contains("Refused:"), "{result}");
+        assert_eq!(s.permission_requests().await, 0);
+    }
+
+    /// cairn/5387's case: the owner marks a default-branch commit its branch
+    /// does not contain yet, having reviewed the base's incoming commits
+    /// before merging them. That raises exactly one card, and the operator's
+    /// approval sets the mode with that mark.
+    #[tokio::test]
+    async fn a_main_commit_the_branch_lacks_raises_one_card_and_its_approval_sets_the_mode() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let s = catch_up_store(&bin, "catch-up-ahead-mark.db").await;
+        let jj = crate::jj::environment(&s.orch.jj_binary_path, &s.orch.config_dir);
+        assert!(
+            !crate::jj::revset_descends_from(
+                &jj,
+                &s.store,
+                "bookmarks(exact:\"agent/one\")",
+                &s.main_ahead
+            ),
+            "the branch does not contain the mark"
+        );
+        approve_catch_up(&s, &s.main_ahead).await;
+    }
+
+    /// The control: the merge base, which both histories hold.
+    #[tokio::test]
+    async fn a_merge_base_mark_raises_one_card_and_its_approval_sets_the_mode() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let s = catch_up_store(&bin, "catch-up-good-mark.db").await;
+        approve_catch_up(&s, &s.base).await;
+    }
+
+    /// Drive a `catch-up-mode` write marking `mark` through the real write
+    /// handler: exactly one card, naming the resolved commit, and nothing set
+    /// until the operator's approval sets the mode with that mark.
+    async fn approve_catch_up(s: &CatchUpStore, mark: &str) {
+        use crate::mcp::handlers::permission::{
+            resolve_permission_request, tests::desktop_approval, PermissionAnswer,
+            PermissionDecision,
+        };
+        let request = as_run(catch_up_change(mark));
+
+        let write = {
+            let (orch, request) = (s.orch.clone(), request.clone());
+            tokio::spawn(
+                async move { crate::mcp::handlers::write::handle_write(&orch, &request).await },
+            )
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while s.permission_requests().await == 0 {
+            if write.is_finished() {
+                panic!("the write ended without a card: {}", write.await.unwrap());
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the write never raised its card"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(s.permission_requests().await, 1, "exactly one card");
+        assert!(s.mode().await.is_none(), "nothing is set before approval");
+        let (request_id, tool_input) =
+            s.db.query_one(
+                "SELECT id, tool_input FROM permission_requests",
+                (),
+                |row| {
+                    use crate::storage::RowExt;
+                    Ok((row.text(0)?, row.text(1)?))
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            tool_input.contains(mark),
+            "the card names the resolved mark: {tool_input}"
+        );
+
+        resolve_permission_request(
+            &s.orch,
+            &request_id,
+            PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
+        )
+        .await
+        .unwrap();
+        let mut result = write.await.unwrap();
+        if result.contains("suspended pending authority approval") {
+            // The run parked on the card; its resume re-drives the batch.
+            result = crate::mcp::handlers::write::handle_write(&s.orch, &request).await;
+        }
+        assert!(result.contains("now catches up by merge"), "{result}");
+        let mode = s.mode().await.expect("the approval set the mode");
+        assert_eq!(mode.reviewed_through, mark);
+        assert_eq!(mode.review_paths, vec!["src/**".to_string()]);
+        assert_eq!(s.permission_requests().await, 1, "still the one card");
+    }
+
+    /// The commit a refusal or note tells the owner to mark: its
+    /// `through:"…"`, taken verbatim.
+    fn instructed_mark(message: &str) -> String {
+        let start = message
+            .find("through:\"")
+            .unwrap_or_else(|| panic!("no mark-reviewed instruction: {message}"))
+            + "through:\"".len();
+        let end = message[start..].find('"').unwrap();
+        message[start..start + end].to_string()
+    }
+
+    fn mark_reviewed_change(through: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "target": "cairn://p/proj/1/1/builder/rebase",
+            "mode": "patch",
+            "payload": {"action": "mark-reviewed", "through": through},
+        }])
+    }
+
+    /// The operator's merge mode on `agent/one`, reviewed through `base`.
+    async fn merge_mode(s: &CatchUpStore) -> crate::orchestrator::catch_up::CatchUpMode {
+        crate::orchestrator::catch_up::set(
+            &s.db,
+            crate::orchestrator::catch_up::SetCatchUpMode {
+                project_id: "proj-1",
+                store: &s.store,
+                bookmark: "agent/one",
+                job_id: "job-1",
+                actor: "operator",
+                review_paths: &["src/**".to_string()],
+                reviewed_through: &s.base,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Follow `message`'s mark-reviewed instruction verbatim as the owner, and
+    /// require it to succeed and move the mark to `expected`.
+    async fn follow_mark_instruction(s: &CatchUpStore, message: &str, expected: &str) {
+        let through = instructed_mark(message);
+        assert_eq!(through, expected, "{message}");
+        let result = crate::mcp::handlers::write::handle_write(
+            &s.orch,
+            &as_run(mark_reviewed_change(&through)),
+        )
+        .await;
+        assert!(
+            result.contains(&format!("is marked reviewed through {through}")),
+            "the instruction succeeds as written: {result}"
+        );
+        assert_eq!(s.mode().await.unwrap().reviewed_through, expected);
+    }
+
+    /// cairn/7414: the landing gate refuses a merge whose base changed a
+    /// review path since the mark, and tells the owner to mark through the
+    /// target tip, a commit the branch does not contain. Followed verbatim,
+    /// that instruction succeeds and the gate then passes.
+    #[tokio::test]
+    async fn the_landing_refusals_mark_reviewed_instruction_succeeds_as_written() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let s = catch_up_store(&bin, "catch-up-landing-instruction.db").await;
+        let mode = merge_mode(&s).await;
+        let jj = crate::jj::environment(&s.orch.jj_binary_path, &s.orch.config_dir);
+        let refusal = crate::orchestrator::catch_up::landing_review_gate(
+            &s.orch,
+            &mode,
+            &jj,
+            &s.store,
+            "main",
+            &s.main_ahead,
+        )
+        .await
+        .unwrap_err();
+        assert!(refusal.contains("src/a.rs"), "{refusal}");
+
+        follow_mark_instruction(&s, &refusal, &s.main_ahead).await;
+        let mode = s.mode().await.unwrap();
+        crate::orchestrator::catch_up::landing_review_gate(
+            &s.orch,
+            &mode,
+            &jj,
+            &s.store,
+            "main",
+            &s.main_ahead,
+        )
+        .await
+        .expect("the reviewed base no longer blocks the landing");
+    }
+
+    /// cairn/7414: the note a clean merge catch-up sends names the new base
+    /// to mark, and that instruction succeeds as written.
+    #[tokio::test]
+    async fn the_merge_notes_mark_reviewed_instruction_succeeds_as_written() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let s = catch_up_store(&bin, "catch-up-note-instruction.db").await;
+        merge_mode(&s).await;
+        let merged = crate::jj::MergedCatchUp {
+            merge: s.branch_tip.clone(),
+            old_base: s.base.clone(),
+            new_base: s.main_ahead.clone(),
+            resolved: false,
+        };
+        let note = crate::orchestrator::catch_up::merge_note(
+            "agent/one",
+            "main",
+            &merged,
+            &["src/a.rs".to_string()],
+            &[],
+        );
+        follow_mark_instruction(&s, &note, &s.main_ahead).await;
+    }
+
     /// 4113's case: a branch other jobs were cut from asks for the mode. It is
     /// a question for the operator, never a refusal, whether those children
     /// are long finished or still running.
     #[tokio::test]
     async fn catch_up_mode_is_open_to_a_branch_other_work_was_cut_from() {
-        let (db, orch) = catch_up_fixture("catch-up-with-children.db").await;
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let s = catch_up_store(&bin, "catch-up-with-children.db").await;
+        let (db, orch) = (&s.db, &s.orch);
         let (request, item, resource) = (run_less_request(), catch_up_item(), builder_rebase());
 
         for live in [false, true] {
@@ -1454,19 +1934,21 @@ mod tests {
                 .await
                 .unwrap();
             }
-            match rebase_authority(&orch, &request, &item).await {
+            match rebase_authority(orch, &request, &item).await {
                 Some(Prepared::Authority(authority)) => {
                     assert!(
                         authority.summary.contains("agent/one"),
                         "{}",
                         authority.summary
-                    )
+                    );
+                    // With no reviewed_through, the mark is the one merge base.
+                    assert!(authority.summary.contains(&s.base), "{}", authority.summary);
                 }
                 other => {
                     panic!("preparation names the operator's authority (live={live}): {other:?}")
                 }
             }
-            let preview = dispatch(&orch, &request, 0, &item, true, &resource)
+            let preview = dispatch(orch, &request, 0, &item, true, &resource)
                 .await
                 .unwrap()
                 .unwrap();
@@ -1478,22 +1960,14 @@ mod tests {
 
         // Accepted still means subject to authority: with no run to ask for it,
         // nothing is set.
-        let error = dispatch(&orch, &request, 0, &item, false, &resource)
+        let error = dispatch(orch, &request, 0, &item, false, &resource)
             .await
             .unwrap_err();
         assert!(
             format!("{error:?}").contains("catch-up mode is the operator's to approve"),
             "{error:?}"
         );
-        assert!(crate::orchestrator::catch_up::mode_for(
-            &db,
-            "proj-1",
-            &crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new("/repo")),
-            "agent/one"
-        )
-        .await
-        .unwrap()
-        .is_none());
+        assert!(s.mode().await.is_none());
     }
 
     /// The default branch can never take the mode, so it is refused while the

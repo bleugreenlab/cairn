@@ -100,7 +100,7 @@ pub async fn prepare_batch(
         // widens who may spend this workspace's models: the `servedApi`
         // boundary, whichever carrier reaches it.
         if let Some(request) =
-            crate::resources::mutations::models_clients::models_client_authority(item)
+            crate::resources::mutations::models_clients::models_client_authority(orch, item).await
         {
             prepared.push((
                 index,
@@ -139,7 +139,7 @@ pub async fn prepare_batch(
         {
             prepared.push((index, outcome));
         }
-        for request in crate::resources::mutations::workspace_settings_authority(item) {
+        for request in crate::resources::mutations::workspace_settings_authority(orch, item) {
             prepared.push((
                 index,
                 match request {

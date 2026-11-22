@@ -846,9 +846,19 @@ async fn handle_write_attempt(
     // policy relaxes containment, never authority.
     let prepared =
         crate::authorization::prepare::prepare_batch(orch, request, &payload.changes).await;
+    // Every item's refusal is answered before any card is raised for another:
+    // a batch that cannot succeed must not spend an approval on its way to
+    // failing.
     for (index, outcome) in &prepared {
-        if let crate::authorization::prepare::Prepared::Refused(message) = outcome {
-            return deny_change(&payload.changes, *index, message.clone());
+        match outcome {
+            crate::authorization::prepare::Prepared::Refused(message) => {
+                return deny_change(&payload.changes, *index, message.clone());
+            }
+            // A target with no nameable place cannot be approved at all.
+            crate::authorization::prepare::Prepared::Invalid(error) => {
+                return deny_change(&payload.changes, *index, format!("Refused: {error}"));
+            }
+            crate::authorization::prepare::Prepared::Authority(_) => {}
         }
     }
 
@@ -989,15 +999,13 @@ async fn handle_write_attempt(
     // effects. Each authority-bearing section or server is adjudicated in turn;
     // a suspend re-drives the whole batch on resume, at which point the granted
     // one passes and the next unapproved one prompts.
-    let authority_requests: Vec<(usize, Result<AuthorityRequest, String>)> = prepared
+    let authority_requests: Vec<(usize, AuthorityRequest)> = prepared
         .into_iter()
         .filter_map(|(index, outcome)| match outcome {
-            crate::authorization::prepare::Prepared::Authority(request) => {
-                Some((index, Ok(request)))
-            }
-            crate::authorization::prepare::Prepared::Invalid(error) => Some((index, Err(error))),
+            crate::authorization::prepare::Prepared::Authority(request) => Some((index, request)),
             // Already returned above; nothing reaches here.
-            crate::authorization::prepare::Prepared::Refused(_) => None,
+            crate::authorization::prepare::Prepared::Invalid(_)
+            | crate::authorization::prepare::Prepared::Refused(_) => None,
         })
         .collect();
     let had_authority_request = !authority_requests.is_empty();
@@ -1025,7 +1033,7 @@ async fn handle_write_attempt(
             let message = match first {
                 // A queue act is a thread's to ask for; the operator's own
                 // move and Start now are on the queue page.
-                Ok(first) if first.requires_thread_binding() => format!(
+                first if first.requires_thread_binding() => format!(
                     "Denied: to {} is a named authority boundary, and only a run acting for a \
                      thread can ask the operator for it. The operator moves held work and starts \
                      it now from Settings → Queue.",
@@ -1052,11 +1060,6 @@ async fn handle_write_attempt(
             }
         };
         for (index, authority_request) in authority_requests {
-            let authority_request = match authority_request {
-                Ok(request) => request,
-                // A target with no nameable place cannot be approved at all.
-                Err(error) => return deny(index, format!("Refused: {error}")),
-            };
             match authority::raise_authority(
                 orch,
                 &actor,

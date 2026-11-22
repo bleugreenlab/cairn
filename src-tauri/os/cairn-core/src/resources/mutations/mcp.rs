@@ -123,6 +123,11 @@ pub(crate) async fn workspace_mcp_authority(
         // authorization it could not compute the subject of.
         Err(error) => return Some(Err(format!("could not read the MCP registry: {error}"))),
     };
+    // Dispatch refuses these against the same registry; asking first would
+    // spend an approval on a write that cannot land.
+    if let Some(refusal) = registry_refusal(&existing, &name, mutation) {
+        return Some(Err(refusal));
+    }
 
     let config = match resultant_config(&existing, &name, mutation, payload) {
         Ok(config) => config,
@@ -149,6 +154,26 @@ fn classify_workspace_mcp(
         ChangeMode::Create => Some((AuthorityMutation::Create, require_name(payload).ok()?)),
         ChangeMode::Patch => Some((AuthorityMutation::Update, server?)),
         ChangeMode::Delete => Some((AuthorityMutation::Delete, server?)),
+        _ => None,
+    }
+}
+
+/// Why `mutation` of `name` cannot apply to this registry, in the words
+/// dispatch uses: a create of a name already present, or a patch or delete of
+/// one that is absent.
+fn registry_refusal(
+    existing: &HashMap<String, McpServerConfig>,
+    name: &str,
+    mutation: AuthorityMutation,
+) -> Option<String> {
+    match (mutation, existing.contains_key(name)) {
+        (AuthorityMutation::Create, true) => Some(format!(
+            "MCP server already exists: {name}. Use mode=patch to edit it."
+        )),
+        (AuthorityMutation::Update | AuthorityMutation::Delete, false) => Some(format!(
+            "MCP server not found in {} scope: {name}",
+            scope_label(McpWriteScope::Workspace)
+        )),
         _ => None,
     }
 }
@@ -1014,6 +1039,28 @@ mod tests {
             args: args.iter().map(|arg| arg.to_string()).collect(),
             ..base_config()
         }
+    }
+
+    /// What dispatch would refuse against the registry is refused while the
+    /// batch is prepared, so no card is raised for it.
+    #[test]
+    fn a_registry_mismatch_is_refused_before_any_card() {
+        let existing = HashMap::from([("linear".to_string(), stdio("npx", &[]))]);
+        assert_eq!(
+            registry_refusal(&existing, "linear", AuthorityMutation::Create).as_deref(),
+            Some("MCP server already exists: linear. Use mode=patch to edit it.")
+        );
+        for mutation in [AuthorityMutation::Update, AuthorityMutation::Delete] {
+            assert_eq!(
+                registry_refusal(&existing, "github", mutation).as_deref(),
+                Some("MCP server not found in workspace scope: github")
+            );
+            assert_eq!(registry_refusal(&existing, "linear", mutation), None);
+        }
+        assert_eq!(
+            registry_refusal(&existing, "github", AuthorityMutation::Create),
+            None
+        );
     }
 
     #[test]
