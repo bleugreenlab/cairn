@@ -5465,9 +5465,11 @@ pub(crate) fn render_room(
         room.slots.width
     ));
     out.push_str(&format!(
-        "- Cores: {} of {} free\n",
+        "- Cores: {} of {} free ({} committed, {} by test-phase lanes)\n",
         room.cores.free(),
-        room.cores.limit
+        room.cores.limit,
+        room.cores.committed,
+        room.test_cores
     ));
     out.push_str(&match room.memory {
         Some(memory) => format!(
@@ -15152,6 +15154,7 @@ mod running_now_tests {
                 build_jobs,
                 adopted: None,
                 memory_phase: None,
+                standalone: false,
             }],
             ..FleetSnapshot::default()
         }

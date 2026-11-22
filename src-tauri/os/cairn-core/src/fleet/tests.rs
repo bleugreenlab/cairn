@@ -4470,6 +4470,7 @@ fn colocated_link_with_executing_leader(followers: usize) -> ColocatedLeaderLink
                 build_jobs: None,
                 adopted: None,
                 memory_phase: None,
+                standalone: false,
             }],
             ..FleetSnapshot::default()
         },
@@ -5876,6 +5877,7 @@ async fn live_command_process_disables_subscriber_acquisition_deadline() {
                 build_jobs: None,
                 adopted: None,
                 memory_phase: None,
+                standalone: false,
             }],
             ..FleetSnapshot::default()
         },
@@ -6518,6 +6520,8 @@ impl Fleet {
             seq,
             AnnouncedRoom {
                 slots: CompileSlots::of(64),
+                compiling: 0,
+                test_cores: 0,
                 standing: Default::default(),
                 cores: Allowance {
                     limit: 64,
@@ -7456,6 +7460,8 @@ fn sized_room(total_bytes: u64, free_cores: u64) -> cairn_common::executor_proto
     const GIB: u64 = 1 << 30;
     AnnouncedRoom {
         slots: CompileSlots::of(64),
+        compiling: u32::try_from((64 - free_cores).div_ceil(8)).unwrap(),
+        test_cores: 0,
         standing: Default::default(),
         cores: Allowance {
             limit: 64,
@@ -9847,6 +9853,7 @@ fn the_inspection_projection_is_name_ordered_and_per_machine() {
         build_jobs: None,
         adopted: None,
         memory_phase: None,
+        standalone: false,
     }];
     let mut remote = fleet_entry("remote-a", "linux", 0, &[]).1;
     remote.identity.display_name = "BGLab UB".into();
@@ -9907,6 +9914,7 @@ fn the_telemetry_frame_matches_the_inspection_projection() {
         build_jobs: None,
         adopted: None,
         memory_phase: None,
+        standalone: false,
     }];
     Arc::make_mut(&mut busy.health).machine.memory =
         cairn_common::wire_vocabulary::Measurement::measured(
@@ -10990,6 +10998,7 @@ fn executing(command: &str, upper_duration_ms: u64) -> ExecutingCellRequest {
         build_jobs: None,
         adopted: None,
         memory_phase: None,
+        standalone: false,
     }
 }
 
@@ -12714,6 +12723,7 @@ fn executing_fixture(request_id: &str) -> ExecutingCellRequest {
         build_jobs: None,
         adopted: None,
         memory_phase: None,
+        standalone: false,
     }
 }
 

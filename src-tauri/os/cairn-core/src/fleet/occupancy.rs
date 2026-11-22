@@ -185,6 +185,7 @@ mod tests {
             build_jobs: None,
             adopted: None,
             memory_phase: None,
+            standalone: false,
         }
     }
 

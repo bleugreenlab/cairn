@@ -1969,6 +1969,8 @@ mod tests {
     fn room(cores: u64, memory_gib: u64) -> AnnouncedRoom {
         AnnouncedRoom {
             slots: CompileSlots::of(u32::try_from(cores).unwrap()),
+            compiling: 0,
+            test_cores: 0,
             standing: Default::default(),
             cores: Allowance {
                 limit: cores,
@@ -2068,6 +2070,67 @@ mod tests {
     }
 
     #[test]
+    fn a_standalone_test_phase_releases_a_compile_slot_for_waiting_work() {
+        let mut dispatcher = Dispatcher::default();
+        dispatcher.attach("m", 1);
+        let mut compiling = room(20, 64);
+        compiling.cores.committed = 20;
+        compiling.compiling = 2;
+        assert_eq!(
+            compiling.slots,
+            CompileSlots {
+                slots: 2,
+                width: 10
+            }
+        );
+        assert_eq!(compiling.free_slots(), 0);
+        let compile = Need::of(
+            &ResourceReservation {
+                concurrency_units: 10,
+                memory_bytes: GIB,
+                ..ResourceReservation::default()
+            },
+            CellCommandClass::CargoTest,
+            false,
+            PipeFloorWork::Process,
+            true,
+            None,
+            compiling.slots,
+        );
+        assert!(compile.compile);
+        assert_eq!(compile.cores, 10);
+        dispatcher.set_room("m", 1, 1, compiling.clone(), 0, &mut yes());
+        assert!(dispatcher
+            .enqueue(waiting(0, &["m"], &compile), 0, &mut yes())
+            .assigned
+            .is_empty());
+
+        // One lane still compiles at width 10; the standalone test process
+        // holds one core, but no compile slot.
+        let mut testing = compiling;
+        testing.cores.committed = 11;
+        testing.compiling = 1;
+        testing.test_cores = 1;
+        assert_eq!(testing.free_slots(), 1);
+        let effects = dispatcher.set_room("m", 1, 2, testing.clone(), 1, &mut yes());
+        assert_eq!(offered(&effects), vec!["e0"]);
+        assert!(!effects.assigned[0].reserve);
+        assert_eq!(dispatcher.candidates("e0").unwrap()["m"].need.cores, 10);
+        assert_eq!(dispatcher.room("m").unwrap().2.free_slots(), 0);
+
+        dispatcher.claimed("e0", "m");
+        // The next announcement already includes the claim, so it must
+        // replace the dispatcher's provisional charge rather than add to it.
+        testing.charge(&compile);
+        assert_eq!(testing.compiling, 2);
+        assert_eq!(testing.cores.committed, 21);
+        let effects = dispatcher.set_room("m", 1, 3, testing.clone(), 2, &mut yes());
+        assert!(effects.assigned.is_empty());
+        assert_eq!(dispatcher.room("m").unwrap().2, &testing);
+        assert_eq!(dispatcher.room("m").unwrap().2.free_slots(), 0);
+    }
+
+    #[test]
     fn a_lane_larger_than_resident_net_capacity_never_holds_room() {
         let mut dispatcher = Dispatcher::default();
         dispatcher.attach("mac", 1);
@@ -2095,6 +2158,7 @@ mod tests {
         dispatcher.attach("mac", 1);
         let mut occupied = room(12, 32);
         occupied.cores.committed = 12;
+        occupied.compiling = occupied.slots.slots;
         let mut compile = need(1, 1);
         compile.compile = true;
         compile = compile.with_slots(occupied.slots);
@@ -3312,6 +3376,7 @@ mod tests {
                         let mut r = room(rng.gen_range(1..33), rng.gen_range(1..128));
                         r.standing.cores = rng.gen_range(0..=r.cores.limit as u32);
                         r.slots = CompileSlots::net(r.cores.limit as u32, r.standing.cores);
+                        r.compiling = rng.gen_range(0..=r.slots.slots);
                         r.cores.committed =
                             rng.gen_range(u64::from(r.standing.cores)..=r.cores.limit);
                         match event {

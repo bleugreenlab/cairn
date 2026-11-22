@@ -36,6 +36,8 @@ const GIB: u64 = 1 << 30;
 fn room(free_cores: u64, available_gib: u64) -> AnnouncedRoom {
     AnnouncedRoom {
         slots: CompileSlots::of(8),
+        compiling: u32::from(free_cores < 8),
+        test_cores: 0,
         standing: Default::default(),
         cores: Allowance {
             limit: 8,

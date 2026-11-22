@@ -9693,7 +9693,15 @@ pub struct LearnedResourceEstimate {
 /// read as a machine that adopted everything. What an older runner gets wrong
 /// talking to a newer executor: it ignores the list, and sees a machine that
 /// attached where it used to see none.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 176;
+///
+/// Version 177 (cairn/7435) releases a standalone lane's compile slot at its
+/// observed test boundary, charging one ordinary core unit instead. Room
+/// carries explicit compile occupancy and test core charges; both peers use
+/// the shared phase charge and admission rule. Reversion immediately restores
+/// occupancy even when overcommitted. Older peers derive slots from free cores
+/// and disagree about admission, so mixed versions must not admit together.
+/// Runner rebuild and executor self-update distribute the matching rule.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 177;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -12275,6 +12283,41 @@ pub fn lane_memory_charge(
     }
 }
 
+/// The resources a running lane holds in its observed phase. Memory tracking
+/// is independent of whether the batch is standalone and can release a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneCharge {
+    pub memory_bytes: u64,
+    pub cores: u32,
+    pub compile: bool,
+    pub test: bool,
+}
+
+/// A standalone test phase releases its compile slot but still pays one
+/// ordinary concurrency unit. Phase CPU is not learned: observed test lanes
+/// used 0.7–2.4 cores beside 8–10-wide compile slots. The measured host-stall
+/// brake, not the slot width, bounds their CPU contention.
+pub fn lane_charge(
+    reservation: &ResourceReservation,
+    class: CellCommandClass,
+    phase: Option<LanePhase>,
+    build_jobs: Option<BuildJobs>,
+    standalone: bool,
+) -> LaneCharge {
+    let test =
+        standalone && class.is_compile_class() && matches!(phase, Some(LanePhase::Test { .. }));
+    LaneCharge {
+        memory_bytes: lane_memory_charge(reservation, phase, build_jobs).0,
+        cores: if test {
+            1
+        } else {
+            reservation.concurrency_units
+        },
+        compile: class.is_compile_class() && !test,
+        test,
+    }
+}
+
 /// What a project needs of a machine before that machine can prepare a cell
 /// for it, independent of what any one batch asks for.
 ///
@@ -12852,13 +12895,6 @@ impl CompileSlots {
             width: units / slots,
         }
     }
-
-    /// How many slots `free_cores` hold, never more than the machine has.
-    pub fn free(&self, free_cores: u64) -> u32 {
-        u32::try_from(free_cores / u64::from(self.width.max(1)))
-            .unwrap_or(u32::MAX)
-            .min(self.slots)
-    }
 }
 
 /// Resources held by residency, which ending transient work does not release.
@@ -13178,6 +13214,13 @@ pub const ROOM_ANNOUNCEMENT_INTERVAL_MS: u64 = 250;
 pub struct AnnouncedRoom {
     pub standing: StandingRoom,
     pub slots: CompileSlots,
+    /// Occupied compile slots, including claims and protected compile holds.
+    /// Reversion restores occupancy even beyond the machine's slot count.
+    pub compiling: u32,
+    /// Ordinary units paid by observed standalone test phases. These remain
+    /// in `cores.committed`, but do not consume a compile's core headroom
+    /// while a memory reading or budget bounds accumulation.
+    pub test_cores: u32,
     /// Concurrency units: the machine's budget and what admitted work holds.
     pub cores: Allowance,
     /// `None` while the executor holds no memory reading, which admits as it
@@ -13284,7 +13327,18 @@ pub fn fits(room: &AnnouncedRoom, need: &Need) -> Result<(), RoomShort> {
     {
         return Err(memory_short(need.memory_bytes, None));
     }
-    if !room.cores.holds(u64::from(need.cores))
+    let cores = Allowance {
+        committed: if need.compile && (room.memory.is_some() || room.memory_budget.is_some()) {
+            room.cores
+                .committed
+                .saturating_sub(u64::from(room.test_cores))
+        } else {
+            room.cores.committed
+        },
+        ..room.cores
+    };
+    if (need.compile && room.free_slots() == 0)
+        || !cores.holds(u64::from(need.cores))
         || room
             .memory_budget
             .is_some_and(|budget| !budget.holds(need.budget_memory_bytes))
@@ -13352,6 +13406,7 @@ impl AnnouncedRoom {
     /// claims the work or protects a hold for it: units and the budgets
     /// committed, memory owed, disk reserved.
     pub fn charge(&mut self, need: &Need) {
+        self.compiling = self.compiling.saturating_add(u32::from(need.compile));
         self.cores.committed = self
             .cores
             .committed
@@ -13373,6 +13428,7 @@ impl AnnouncedRoom {
     /// Give back what [`Self::charge`] took for `need`: the room as it was
     /// before, short of a figure that saturated.
     pub fn give_back(&mut self, need: &Need) {
+        self.compiling = self.compiling.saturating_sub(u32::from(need.compile));
         self.cores.committed = self
             .cores
             .committed
@@ -13400,6 +13456,8 @@ impl AnnouncedRoom {
         Self {
             standing: self.standing,
             slots: self.slots,
+            compiling: 0,
+            test_cores: 0,
             cores: Allowance {
                 committed: u64::from(self.standing.cores),
                 ..self.cores
@@ -13459,9 +13517,9 @@ impl AnnouncedRoom {
         }
     }
 
-    /// Compile slots free: the slots the free cores hold.
+    /// Compile slots free, independent of the ordinary units testing pays.
     pub fn free_slots(&self) -> u32 {
-        self.slots.free(self.cores.free())
+        self.slots.slots.saturating_sub(self.compiling)
     }
 
     /// Whether this room is news against `before`, the room last announced.
@@ -13509,6 +13567,8 @@ impl AnnouncedRoom {
             || disk
             || self.standing != before.standing
             || self.slots != before.slots
+            || self.compiling != before.compiling
+            || self.test_cores != before.test_cores
             || self.cores != before.cores
             || self.memory_budget != before.memory_budget
             || self.disk_budget != before.disk_budget
@@ -13553,8 +13613,6 @@ mod room_tests {
             assert!(slots * width <= units, "{units}");
             assert!(width >= COMPILE_SLOT_JOBS.min(units), "{units}");
         }
-        assert_eq!(CompileSlots::of(32).free(17), 2);
-        assert_eq!(CompileSlots::of(32).free(1_000), 4);
     }
 
     fn reservation(memory_bytes: u64) -> ResourceReservation {
@@ -13584,6 +13642,8 @@ mod room_tests {
         AnnouncedRoom {
             standing: StandingRoom::default(),
             slots: CompileSlots::of(32),
+            compiling: 0,
+            test_cores: 0,
             cores: Allowance {
                 limit: 32,
                 committed: 0,
@@ -13695,6 +13755,98 @@ mod room_tests {
     }
 
     #[test]
+    fn test_phase_cores_do_not_consume_slots_but_memory_bounds_accumulation() {
+        let reservation = ResourceReservation {
+            concurrency_units: 10,
+            memory_bytes: 7 * GIB,
+            ..ResourceReservation::default()
+        };
+        let testing = lane_charge(
+            &reservation,
+            CellCommandClass::CargoTest,
+            Some(LanePhase::Test {
+                since_unix_ms: 1,
+                tests: 100,
+            }),
+            Some(BuildJobs::new(10)),
+            true,
+        );
+        let grouped = lane_charge(
+            &reservation,
+            CellCommandClass::CargoTest,
+            Some(LanePhase::Test {
+                since_unix_ms: 1,
+                tests: 100,
+            }),
+            Some(BuildJobs::new(10)),
+            false,
+        );
+        assert!(grouped.compile);
+        assert!(!grouped.test);
+        assert_eq!(grouped.cores, 10);
+        assert!(!testing.compile);
+        assert!(testing.test);
+        assert_eq!(testing.cores, 1);
+        assert_eq!(
+            testing.memory_bytes,
+            7 * GIB,
+            "unmeasured test memory stays whole"
+        );
+        let mut room = idle();
+        room.slots = CompileSlots::of(20);
+        room.cores.limit = 20;
+        room.memory = None;
+        room.memory_budget.as_mut().unwrap().limit = 105 * GIB + GIB / 2;
+        let compile = Need::of(
+            &reservation,
+            CellCommandClass::CargoTest,
+            false,
+            PipeFloorWork::Process,
+            true,
+            None,
+            room.slots,
+        );
+        for _ in 0..15 {
+            assert_eq!(fits(&room, &compile), Ok(()));
+            room.charge(&compile);
+            // The observed boundary changes occupancy and core charge together.
+            room.compiling -= 1;
+            room.cores.committed -= 9;
+            room.test_cores += testing.cores;
+        }
+        assert_eq!(room.free_slots(), 2);
+        assert_eq!(room.cores.committed, 15);
+        assert_eq!(room.memory_budget.unwrap().committed, 105 * GIB);
+        assert_eq!(fits(&room, &compile), Err(RoomShort::Capacity));
+
+        // A reversion is visible even if another compiler took the freed slot.
+        room.memory_budget = None;
+        room.memory = None;
+        assert_eq!(
+            fits(&room, &compile),
+            Err(RoomShort::Capacity),
+            "without either memory bound, ordinary test cores still bound accumulation",
+        );
+        room.memory = Some(MemoryRoom {
+            available_bytes: 120 * GIB,
+            owed_bytes: 105 * GIB,
+            total_bytes: 125 * GIB,
+        });
+        assert_eq!(
+            fits(&room, &compile),
+            Ok(()),
+            "a live reading is also a bound"
+        );
+        room.compiling = 3;
+        room.cores.committed = 45;
+        room.test_cores = 15;
+        assert_eq!(room.free_slots(), 0);
+        assert_eq!(fits(&room, &compile), Err(RoomShort::Capacity));
+        assert_eq!(room.drained().compiling, 0);
+        assert_eq!(room.drained().test_cores, 0);
+    }
+
+    #[test]
     fn a_compile_needs_one_slot_and_its_whole_figure() {
         let mut slot_sized = reservation(30 * GIB);
         slot_sized.concurrency_units = 1;
@@ -13721,13 +13873,15 @@ mod room_tests {
             "every admission leaves the floor"
         );
 
-        // Four slots of eight: the fifth compile has no cores.
+        // Four slots of eight: a fifth compile has no slot.
         let mut room = idle();
         assert_eq!(fits(&room, &compile), Ok(()));
         room.cores.committed = 24;
+        room.compiling = 3;
         assert_eq!(room.free_slots(), 1);
         assert_eq!(fits(&room, &compile), Ok(()));
-        room.cores.committed = 25;
+        room.cores.committed = 32;
+        room.compiling = 4;
         assert_eq!(room.free_slots(), 0);
         assert_eq!(fits(&room, &compile), Err(RoomShort::Capacity));
 
@@ -17092,6 +17246,10 @@ pub struct ExecutingCellRequest {
     /// tests; `None` for every other command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_phase: Option<LanePhase>,
+    /// Whether this lane is a single-command batch whose test boundary can
+    /// release its compile slot, independently of memory phase tracking.
+    #[serde(default)]
+    pub standalone: bool,
 }
 
 impl ExecutingCellRequest {
@@ -27708,6 +27866,7 @@ mod tests {
                 leader_pid: 42,
             }),
             memory_phase: None,
+            standalone: false,
         };
         let wire = serde_json::to_value(&executing).unwrap();
         assert_eq!(wire["adopted"]["leaderPid"], 42);
@@ -28771,6 +28930,8 @@ mod tests {
                 room: AnnouncedRoom {
                     standing: StandingRoom::default(),
                     slots: CompileSlots::of(20),
+                    compiling: 1,
+                    test_cores: 0,
                     cores: Allowance {
                         limit: 20,
                         committed: 10,
@@ -31543,6 +31704,7 @@ mod tests {
                     build_jobs: None,
                     adopted: None,
                     memory_phase: None,
+                standalone: false,
                 }],
                 in_flight_residency_operations: HashMap::new(),
                 recent_completions: vec![CellCompletion {
