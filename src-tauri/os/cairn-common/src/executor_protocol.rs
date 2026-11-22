@@ -7121,6 +7121,12 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/6411 does not move the number. Executor-page attribution joins the
+/// runner's dispatch and check-consumer records to existing request/attempt
+/// identities. Check progress joins those identities to the cached executing
+/// occupancy for its slot. No wire field or meaning changes: an older executor
+/// supplies the same occupancy and the runner names unavailable slots as gaps.
+///
 /// cairn/7165 does not move the number. An executor re-runs its
 /// build-prerequisite script and its `rust` toolchain probe on every Ready
 /// and every tool-refresh interval instead of once per process, and sends

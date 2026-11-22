@@ -1201,7 +1201,7 @@ impl Fleet {
                 queue::EntryState::Claimed {
                     executor_id,
                     at_unix_ms,
-                    ..
+                    generation,
                 },
                 _,
                 _,
@@ -1209,6 +1209,22 @@ impl Fleet {
             )) => (
                 CheckDispatchPhase::Running {
                     executor_name: self.executor_name_for_text(&executor_id),
+                    slot: self
+                        .lock_connections()
+                        .get(&executor_id)
+                        .filter(|entry| entry.generation == generation)
+                        .and_then(|entry| {
+                            entry
+                                .snapshot
+                                .executing_requests
+                                .iter()
+                                .find(|execution| {
+                                    execution.request_id == identity.0
+                                        && execution.attempt_id == identity.1
+                                        && execution.adopted.is_none()
+                                })
+                                .map(|execution| execution.cell_id.clone())
+                        }),
                     since_unix_ms: at_unix_ms,
                 },
                 owner,

@@ -3271,7 +3271,7 @@ fn fleet_waits_line(
     use crate::execution::checks_status::LaneProgress;
     let waits: BTreeSet<String> = progress
         .into_iter()
-        .filter(|progress| matches!(progress, LaneProgress::Dispatching { .. }))
+        .filter(|progress| matches!(progress, LaneProgress::Dispatching { dispatch_phase, .. } if dispatch_phase != "running"))
         .map(|progress| progress.describe(now))
         .collect();
     if waits.is_empty() {
@@ -5689,6 +5689,42 @@ mod tests {
     }
 
     use crate::execution::checks_status::WaveCadence;
+
+    #[test]
+    fn checks_and_pr_lane_lines_keep_machine_and_slot() {
+        use crate::execution::checks_settlement::{ChecksSnapshot, Moving, Settlement};
+        use crate::execution::checks_status::LaneProgress;
+        for slot in ["cell-2", "pending"] {
+            let mut lane = status("rust", NodeCheckState::Running);
+            lane.progress = Some(LaneProgress::Dispatching {
+                dispatch_phase: "running".into(),
+                label: Some("running checks".into()),
+                diagnostic: Some(format!(
+                    "running on [fedora](cairn://executors/fedora), slot {slot} since 09:48:09Z"
+                )),
+                since_unix_ms: Some(9),
+            });
+            let node = format_checks_section(&[lane.clone()], WaveCadence::default()).unwrap();
+            let snapshot = ChecksSnapshot {
+                statuses: vec![lane],
+                settlement: Settlement::Moving(Moving {
+                    running: vec!["rust".into()],
+                    awaiting: vec![],
+                    reason: "executing".into(),
+                }),
+                terminal_reason: None,
+                retired: None,
+            };
+            let pr = snapshot.lane_lines().join("\n");
+            for rendered in [node, pr] {
+                assert!(
+                    rendered.contains("[fedora](cairn://executors/fedora)"),
+                    "{rendered}"
+                );
+                assert!(rendered.contains(&format!("slot {slot}")), "{rendered}");
+            }
+        }
+    }
 
     #[test]
     fn section_is_none_when_no_configured_checks() {

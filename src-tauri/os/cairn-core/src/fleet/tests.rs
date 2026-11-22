@@ -3531,8 +3531,16 @@ fn check_dispatch_phase_reports_running_from_the_claim_and_who_a_joiner_joined()
     );
     let running = CheckDispatchPhase::Running {
         executor_name: "fedora".into(),
+        slot: None,
         since_unix_ms: 2_100,
     };
+    let (_, mut connection) = fleet_entry("fedora", "linux", 0, &[]);
+    connection.generation = 3;
+    let mut execution = executing_fixture(&leader.0);
+    execution.attempt_id = "another-attempt".into();
+    execution.cell_id = "slot-7".into();
+    Arc::make_mut(&mut connection.snapshot).executing_requests = vec![execution];
+    pool.lock_connections().insert("fedora".into(), connection);
     assert_eq!(
         pool.check_dispatch_phase(&own),
         Some(CheckDispatch {
@@ -3548,6 +3556,21 @@ fn check_dispatch_phase_reports_running_from_the_claim_and_who_a_joiner_joined()
         }),
         "a subscriber that coalesced onto another request names whose run it joined"
     );
+    {
+        let mut connections = pool.lock_connections();
+        let connection = connections.get_mut("fedora").unwrap();
+        Arc::make_mut(&mut connection.snapshot).executing_requests[0].attempt_id = leader.1.clone();
+    }
+    assert!(matches!(pool.check_dispatch_phase(&joined).unwrap().phase,
+        CheckDispatchPhase::Running { slot: Some(slot), .. } if slot == "slot-7"));
+    pool.lock_connections()
+        .get_mut("fedora")
+        .unwrap()
+        .generation = 4;
+    assert!(matches!(
+        pool.check_dispatch_phase(&own).unwrap().phase,
+        CheckDispatchPhase::Running { slot: None, .. }
+    ));
 }
 
 /// cairn/6499's specimen: a check lane pinned to one machine that refuses it
@@ -3637,6 +3660,7 @@ fn request_dispatch_phase_reads_a_write_check_batch_by_its_own_identity() {
         pool.request_dispatch_phase(&key),
         Some(CheckDispatchPhase::Running {
             executor_name: "fedora".into(),
+            slot: None,
             since_unix_ms: 3_100,
         })
     );

@@ -411,9 +411,12 @@ pub(crate) enum CheckDispatchPhase {
         /// the machines whose next freed room it takes first.
         turn: Option<String>,
     },
-    /// A machine claimed it at `since_unix_ms`, so it is running there.
+    /// A machine claimed responsibility at `since_unix_ms`; its slot can
+    /// still be pending until executing occupancy names it.
     Running {
         executor_name: String,
+        /// Cached executing occupancy on the claiming connection, not the claim itself.
+        slot: Option<String>,
         since_unix_ms: u64,
     },
 }

@@ -723,7 +723,10 @@ async fn a_pinned_queued_request_names_its_machine_and_its_latest_refusal() {
     assert_eq!(current.held_count, 1, "an unchanged refusal is one refusal");
     let standing = standing(&current);
     assert!(standing.contains("queued since"), "{standing}");
-    assert!(standing.contains("pinned to bgsrv-ub"), "{standing}");
+    assert!(
+        standing.contains("pinned to [bgsrv-ub](cairn://executors/bgsrv-ub)"),
+        "{standing}"
+    );
     assert!(standing.contains(refusal), "{standing}");
     assert!(standing.contains("parity in slot-32"), "{standing}");
     let value = answer(&orch, &id).await;
@@ -1282,4 +1285,30 @@ fn a_threads_request_records_a_verdict_in_the_ledger() {
             "the filing action offers revision as required: {own}"
         );
     });
+}
+
+#[tokio::test]
+async fn requested_checks_keep_the_running_machine_link_and_slot() {
+    let (_root, orch) = row_fixture().await;
+    let id = insert_request(&orch, "running", "").await;
+    let diagnostic = "running on [fedora](cairn://executors/fedora), slot-43 since 09:01:00Z";
+    record_progress(
+        &orch.db.local,
+        &id,
+        &ManualCheckProgressUpdate {
+            state: "running".into(),
+            diagnostic: diagnostic.into(),
+            executor: Some("fedora".into()),
+            since_unix_ms: Some(1),
+            request_id: Some("fleet-request".into()),
+            held_by: None,
+        },
+    )
+    .await
+    .unwrap();
+    let current = row(&orch, &id).await;
+    assert_eq!(standing(&current), diagnostic);
+    let mut awaiting_slot = current;
+    awaiting_slot.diagnostic = None;
+    assert!(standing(&awaiting_slot).contains("[fedora](cairn://executors/fedora), slot pending"));
 }

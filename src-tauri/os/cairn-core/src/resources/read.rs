@@ -2563,9 +2563,11 @@ async fn render_resource_body(
                                 captured_at,
                             )
                             .await;
+                            let attributions = crate::resources::executors::running_attributions(orch, executor).await;
                             let mut rendered = crate::resources::executors::render_executor_with_kills(
                                 executor,
                                 Some(&recorded_kills),
+                                &attributions,
                             );
                             rendered.push_str(&crate::resources::executors::render_room_line(
                                 &orch.fleet.room_line(&executor.health.identity.executor_id, captured_at),

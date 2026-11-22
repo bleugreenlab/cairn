@@ -1,5 +1,9 @@
 use super::*;
 
+fn linked_check_machine(name: &str) -> String {
+    format!("[{name}](cairn://executors/{name})")
+}
+
 pub(super) fn describe_ms(value_ms: u64) -> String {
     let seconds = value_ms / 1_000;
     match (seconds / 60, seconds % 60) {
@@ -112,6 +116,7 @@ pub(super) fn describe_placement_account(
     let mut not_offered: Vec<(String, Vec<&str>)> = Vec::new();
     for machine in &account.machines {
         let name = machine.executor_name.as_str();
+        let placed_name = linked_check_machine(name);
         if let Some(old) = &machine.superseded {
             superseded.push(match old.current_seq {
                 Some(seq) => format!(
@@ -122,7 +127,7 @@ pub(super) fn describe_placement_account(
             });
         }
         match &machine.status {
-            CheckCandidateStatus::Offered => offered.push(format!("offered to {name}, unanswered")),
+            CheckCandidateStatus::Offered => offered.push(format!("offered to {placed_name}, unanswered")),
             CheckCandidateStatus::Declined(decline) => declined.push(decline.clone()),
             CheckCandidateStatus::OfferUndelivered { room_seq } => each.push(format!(
                 "{name}: the offer under its room #{room_seq} did not reach it"
@@ -139,9 +144,9 @@ pub(super) fn describe_placement_account(
                 "{name} refused twice under its current room #{room_seq}; waiting for it to announce"
             )),
             CheckCandidateStatus::HoldingRoom { room_seq, hold } => each.push(match hold {
-                Some(hold) => format!("{name} holding room for it ({hold}; room #{room_seq})"),
+                Some(hold) => format!("{placed_name} holding room for it ({hold}; room #{room_seq})"),
                 None => format!(
-                    "{name} asked to hold room for it, not yet in its announced room #{room_seq}"
+                    "{placed_name} asked to hold room for it, not yet in its announced room #{room_seq}"
                 ),
             }),
             CheckCandidateStatus::RoomNotAnnounced {
@@ -158,7 +163,7 @@ pub(super) fn describe_placement_account(
                 clock_utc(*since_unix_ms)
             )),
             CheckCandidateStatus::Away { sentence, .. } => {
-                each.push(format!("away for now: {sentence}"))
+                each.push(format!("{placed_name}: away for now: {sentence}"))
             }
             CheckCandidateStatus::Fits { room_seq } => each.push(format!(
                 "{name}: its room #{room_seq} fits; offered on its next announcement"
@@ -329,9 +334,15 @@ impl DispatchNarrator {
         match &dispatch.phase {
             CheckDispatchPhase::Running {
                 executor_name,
+                slot,
                 since_unix_ms,
             } => {
                 let at = clock_utc(*since_unix_ms);
+                let machine = linked_check_machine(executor_name);
+                let location = match slot {
+                    Some(slot) => format!("{machine}, slot {slot}"),
+                    None => format!("{machine}, slot pending"),
+                };
                 CheckPhaseStatus {
                     executor: Some(executor_name.clone()),
                     since_unix_ms: Some(*since_unix_ms),
@@ -340,9 +351,9 @@ impl DispatchNarrator {
                         Some("running checks"),
                         Some(match joined {
                             Some(owner) => {
-                                format!("joined {owner}'s run on {executor_name} since {at}")
+                                format!("joined {owner}'s run on {location} since {at}")
                             }
-                            None => format!("running on {executor_name} since {at}"),
+                            None => format!("running on {location} since {at}"),
                         }),
                     )
                 }

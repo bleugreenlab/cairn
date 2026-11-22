@@ -881,7 +881,11 @@ pub(crate) enum LaneProgress {
 impl LaneProgress {
     /// Whether the lane has left the queue.
     fn is_started(&self) -> bool {
-        !matches!(self, Self::Queued { .. } | Self::Dispatching { .. })
+        match self {
+            Self::Queued { .. } => false,
+            Self::Dispatching { dispatch_phase, .. } => dispatch_phase == "running",
+            _ => true,
+        }
     }
 
     /// The lane's line, at `now_unix_ms`.
@@ -963,9 +967,15 @@ pub(crate) fn grouped_lane_progress(
     request_id: Option<&String>,
 ) -> Option<LaneProgress> {
     let progress = wave_lane_progress(&board.lane_snapshot(name), name, request_id)?;
-    if matches!(progress, LaneProgress::Queued { behind: None }) {
+    if matches!(
+        progress,
+        LaneProgress::Queued { behind: None } | LaneProgress::Running { .. }
+    ) {
         let phase = board.lane_phase(name);
-        if let Some(dispatch_phase) = phase.phase.filter(|phase| phase != "running") {
+        if let Some(dispatch_phase) = phase.phase.filter(|dispatch_phase| {
+            !matches!(progress, LaneProgress::Running { .. })
+                || (dispatch_phase == "running" && phase.diagnostic.is_some())
+        }) {
             return Some(LaneProgress::Dispatching {
                 dispatch_phase,
                 label: phase.label,
@@ -2347,6 +2357,14 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
     }
     if status.state == NodeCheckState::Unsupported {
         return status.notice.clone();
+    }
+    if matches!(
+        status.state,
+        NodeCheckState::Running | NodeCheckState::Pending
+    ) {
+        if let Some(progress @ LaneProgress::Dispatching { .. }) = &status.progress {
+            return Some(annotation_with_notice(progress.describe(0), status));
+        }
     }
     let mut parts = Vec::new();
     match status.state {
@@ -5870,6 +5888,9 @@ mod complete_input_projection_tests {
         let mut running = CheckPhaseStatus::default();
         running.phase = Some("running".into());
         running.executor = Some("fedora".into());
+        running.diagnostic = Some(
+            "running on [fedora](cairn://executors/fedora), slot cell-2 since 09:48:09Z".into(),
+        );
         running.since_unix_ms = Some(9);
         lint.show_phase(running);
         lint.transition(1, "running", None);
@@ -5895,6 +5916,14 @@ mod complete_input_projection_tests {
         assert_eq!(lane("fmt").executor, None);
         assert_eq!(lane("lint").state, NodeCheckState::Running);
         assert_eq!(lane("lint").executor.as_deref(), Some("fedora"));
+        let progress = lane("lint").progress.as_ref().unwrap();
+        assert!(progress.is_started());
+        assert!(progress
+            .describe(10)
+            .contains("[fedora](cairn://executors/fedora), slot cell-2"));
+        assert!(format_status_annotation(lane("lint"))
+            .unwrap()
+            .contains("[fedora](cairn://executors/fedora), slot cell-2"));
 
         drop(published);
         assert!(

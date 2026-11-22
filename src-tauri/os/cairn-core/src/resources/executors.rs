@@ -34,6 +34,10 @@ use cairn_common::executor_protocol::{
 };
 use cairn_common::wire_vocabulary::{Measurement, MeasurementReading};
 
+mod attribution;
+pub(crate) use attribution::running_attributions;
+use attribution::RunningAttributions;
+
 /// Questions held back from their next answer because an earlier answer may
 /// still be running, or nothing when none are.
 ///
@@ -1622,7 +1626,7 @@ fn render_planning_memory(budget: Option<u64>) -> String {
 /// Render a fixture without querying the runner's kill history.
 #[cfg(test)]
 pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
-    render_executor_with_kills(executor, None)
+    render_executor_with_kills(executor, None, &RunningAttributions::default())
 }
 
 /// Render one machine's operational status with optional runner kill history.
@@ -1630,6 +1634,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
 pub(crate) fn render_executor_with_kills(
     executor: &ExecutorInspection,
     recorded_kills: Option<&RecordedKills>,
+    attributions: &RunningAttributions,
 ) -> String {
     let health = &executor.health;
     let capabilities = &health.advertisement.capabilities;
@@ -2362,10 +2367,11 @@ pub(crate) fn render_executor_with_kills(
             .map(|value| value.process_count)
             .unwrap_or(0)
     ));
-    out.push_str(&render_running_now(
+    out.push_str(&render_running_now_with_attribution(
         occupancy,
         executor.live_usage_gap,
         executor.captured_at_unix_ms,
+        attributions,
     ));
     out.push('\n');
 
@@ -6788,10 +6794,20 @@ fn render_quarantine_census(
 /// Each running command and live resident process, with what it is using now,
 /// cited with the age of the window it was measured over. The same live usage
 /// the fleet pane reads, from the same join, so the two cannot disagree.
+#[cfg(test)]
 fn render_running_now(
     occupancy: &cairn_common::executor_protocol::FleetSnapshot,
     gap: Option<cairn_common::wire_vocabulary::MeasurementGap>,
     now: u64,
+) -> String {
+    render_running_now_with_attribution(occupancy, gap, now, &RunningAttributions::default())
+}
+
+fn render_running_now_with_attribution(
+    occupancy: &cairn_common::executor_protocol::FleetSnapshot,
+    gap: Option<cairn_common::wire_vocabulary::MeasurementGap>,
+    now: u64,
+    attributions: &RunningAttributions,
 ) -> String {
     let residents: Vec<_> = occupancy
         .cells
@@ -6810,7 +6826,7 @@ fn render_running_now(
     {
         return String::new();
     }
-    let mut out = String::from("\n## Running now\n");
+    let mut out = String::from("\n## Running now\nCPU and resident memory describe sampled process trees, not exhaustive accounting; descendants missed between censuses are not included.\n");
     if let Some(gap) = gap {
         out.push_str(&format!(
             "Live usage: not reported ({}); CPU and memory below are a gap, not zero.\n",
@@ -6870,8 +6886,12 @@ fn render_running_now(
             }
             (_, None) => String::new(),
         };
+        let attribution = attributions
+            .get(&(request.request_id.clone(), request.attempt_id.clone()))
+            .map(attribution::RunningAttribution::render)
+            .unwrap_or_default();
         out.push_str(&format!(
-            "- {place}: `{command}` [{}] ({identity}, started {}): {}{build_jobs}{charge}\n",
+            "- {place}: `{command}`{attribution} [{}] ({identity}, started {}): {}{build_jobs}{charge}\n",
             request.command_class.as_str(),
             age(now.saturating_sub(request.started_at_unix_ms)),
             usage(request.live_usage)
@@ -6881,8 +6901,12 @@ fn render_running_now(
     // so a slow one reads as a slow executor rather than a hung command.
     for finishing in &occupancy.finishing_requests {
         let command: String = finishing.command.chars().take(80).collect();
+        let attribution = attributions
+            .get(&(finishing.request_id.clone(), finishing.attempt_id.clone()))
+            .map(attribution::RunningAttribution::render)
+            .unwrap_or_default();
         out.push_str(&format!(
-            "- {}: `{command}` (request {}): finishing: {} for {} (commands exited {})\n",
+            "- {}: `{command}`{attribution} (request {}): finishing: {} for {} (commands exited {})\n",
             finishing.cell_id,
             finishing.request_id,
             finishing.phase.describe(),
@@ -15131,9 +15155,87 @@ mod running_now_tests {
         BuildJobs, CellCommandClass, ExecutingCellRequest, FleetSnapshot,
     };
 
+    #[test]
+    fn same_suite_lanes_carry_their_own_runner_identities() {
+        use super::attribution::{RunningAttribution, RunningAttributions};
+        let mut snapshot = running(None);
+        let mut other = snapshot.executing_requests[0].clone();
+        other.cell_id = "slot-104".into();
+        other.request_id = "other-request".into();
+        other.attempt_id = "other-attempt".into();
+        snapshot.executing_requests.push(other);
+        let mut attributions = RunningAttributions::new();
+        for (request, attempt, issue, commit, handle) in [
+            ("request", "attempt", 6151, "aaaaaaaaaaaa1111", "check-a"),
+            (
+                "other-request",
+                "other-attempt",
+                6411,
+                "bbbbbbbbbbbb2222",
+                "check-b",
+            ),
+        ] {
+            attributions.insert(
+                (request.into(), attempt.into()),
+                RunningAttribution {
+                    owner: Some(format!("cairn://p/cairn/{issue}/1/builder")),
+                    project: Some("cairn".into()),
+                    commit: Some(commit.into()),
+                    suites: vec!["rust-tests".into()],
+                    handles: vec![handle.into()],
+                },
+            );
+        }
+        let mut executor = super::tests::inspection("fedora", false);
+        executor.occupancy = snapshot.clone();
+        let rendered = super::render_executor_with_kills(&executor, None, &attributions);
+        for (slot, issue, commit, short, handle, other_handle) in [
+            (
+                "slot-103",
+                6151,
+                "aaaaaaaaaaaa1111",
+                "aaaaaaaaaaaa",
+                "check-a",
+                "check-b",
+            ),
+            (
+                "slot-104",
+                6411,
+                "bbbbbbbbbbbb2222",
+                "bbbbbbbbbbbb",
+                "check-b",
+                "check-a",
+            ),
+        ] {
+            let row = rendered
+                .lines()
+                .find(|line| line.starts_with(&format!("- {slot}:")))
+                .unwrap();
+            assert!(row.contains(&format!("[rust-tests@{short}](cairn://p/cairn/check-results/{commit}?suite=rust-tests&environment=current)")), "{row}");
+            let owner = format!("cairn://p/cairn/{issue}/1/builder");
+            assert!(row.contains(&format!("[{owner}]({owner})")), "{row}");
+            assert!(
+                row.contains(&format!(
+                    "[{handle}](cairn://p/cairn/check-requests/{handle})"
+                )),
+                "{row}"
+            );
+            assert!(!row.contains(other_handle), "{row}");
+        }
+        // An old attempt's metadata cannot identify a new attempt of the same request.
+        snapshot.executing_requests[0].attempt_id = "new-attempt".into();
+        let rendered =
+            super::render_running_now_with_attribution(&snapshot, None, 60_000, &attributions);
+        assert!(!rendered
+            .lines()
+            .find(|line| line.starts_with("- slot-103:"))
+            .unwrap()
+            .contains("check-a"));
+    }
+
     const GIB: u64 = 1 << 30;
 
-    fn running(build_jobs: Option<BuildJobs>) -> FleetSnapshot {
+    pub(super) fn running(build_jobs: Option<BuildJobs>) -> FleetSnapshot {
         FleetSnapshot {
             executing_requests: vec![ExecutingCellRequest {
                 executor_id: String::new(),

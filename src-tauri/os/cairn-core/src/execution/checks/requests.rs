@@ -1542,7 +1542,9 @@ pub(crate) fn standing(row: &CheckRequestRow) -> String {
                 clock(row.queued_at_ms.unwrap_or(row.state_since_ms))
             );
             if let Some(machine) = &row.pinned_executor {
-                words.push_str(&format!(", pinned to {machine}"));
+                words.push_str(&format!(
+                    ", pinned to [{machine}](cairn://executors/{machine})"
+                ));
             }
             match &row.held_by {
                 Some(held) => {
@@ -1566,7 +1568,14 @@ pub(crate) fn standing(row: &CheckRequestRow) -> String {
         "granted" | "running" => match (&row.waiting_to_learn, &row.executor) {
             (Some(waiting), _) => waiting.clone(),
             (None, Some(machine)) => {
-                format!("running on {machine} since {}", clock(row.state_since_ms))
+                // A running progress update persists the narrator's linked
+                // machine and cached slot together. Do not discard its slot.
+                match row.diagnostic.as_deref().filter(|text| {
+                    text.starts_with("running on ") || text.starts_with("joined ")
+                }) {
+                    Some(diagnostic) => diagnostic.to_string(),
+                    None => format!("running on [{machine}](cairn://executors/{machine}), slot pending since {}", clock(row.state_since_ms)),
+                }
             }
             (None, None) => format!("running since {}", clock(row.state_since_ms)),
         },

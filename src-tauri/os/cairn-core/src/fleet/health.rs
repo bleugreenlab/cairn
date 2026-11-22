@@ -688,6 +688,13 @@ impl Fleet {
         values
     }
 
+    /// The runner's original request, keyed by its physical attempt, not by
+    /// a display label or an executor-local process.
+    pub(crate) fn inspection_request(&self, identity: &RequestIdentity) -> Option<CellRequest> {
+        self.queue
+            .with_entry_by_identity(identity, |entry| entry.request.clone())
+    }
+
     /// Every executor as an agent inspects it, addressed by public name.
     ///
     /// The whole projection is taken under ONE acquisition of the connections

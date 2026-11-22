@@ -759,7 +759,11 @@ pub async fn census_for_executions_conn(
                 });
         }
     }
-    out.extend(launch_censuses);
+    for (execution, mut census) in launch_censuses {
+        // Launch-side presentation must retain the thread hold's Start now marker.
+        census.job_held = out.remove(&execution).and_then(|prior| prior.job_held);
+        out.insert(execution, census);
+    }
     Ok(out)
 }
 

@@ -645,9 +645,12 @@ async fn an_open_pr_bound_hold_releases_on_the_pass_after_a_merge_without_a_hint
         .execute("UPDATE executions SET released_at=1 WHERE id='se102'", ())
         .await
         .unwrap();
-    let issue = crate::issues::crud::get(&env.db, "si102")
+    let mut issue = crate::issues::crud::get(&env.db, "si102")
         .await
         .unwrap()
+        .unwrap();
+    crate::issues::crud::hydrate_focus_standings(&env.orch, std::slice::from_mut(&mut issue))
+        .await
         .unwrap();
     let standing = issue
         .focus_standing

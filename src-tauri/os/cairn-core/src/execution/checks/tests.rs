@@ -6955,6 +6955,7 @@ fn running_on(
     crate::fleet::CheckDispatch {
         phase: crate::fleet::CheckDispatchPhase::Running {
             executor_name: executor_name.into(),
+            slot: Some("cell-2".into()),
             since_unix_ms,
         },
         joined: joined.map(str::to_string),
@@ -7060,10 +7061,19 @@ fn a_claimed_check_says_where_it_runs_and_whose_run_it_joined() {
     assert_eq!(own.phase.as_deref(), Some("running"));
     assert_eq!(
         own.diagnostic.as_deref(),
-        Some("running on fedora since 09:48:09Z")
+        Some("running on [fedora](cairn://executors/fedora), slot cell-2 since 09:48:09Z")
     );
     assert_eq!(own.executor.as_deref(), Some("fedora"));
     assert_eq!(own.since_unix_ms, Some(PARKED_AT + 9_000));
+    let mut pending = running_on("fedora", PARKED_AT + 9_000, None);
+    if let crate::fleet::CheckDispatchPhase::Running { slot, .. } = &mut pending.phase {
+        *slot = None;
+    }
+    assert!(narrator
+        .render(&pending, PARKED_AT + 10_000)
+        .diagnostic
+        .unwrap()
+        .contains("[fedora](cairn://executors/fedora), slot pending"));
     assert_eq!(
         narrator.next(
             &running_on("fedora", PARKED_AT + 9_000, None),
@@ -7079,7 +7089,7 @@ fn a_claimed_check_says_where_it_runs_and_whose_run_it_joined() {
     );
     assert_eq!(
         joined.diagnostic.as_deref(),
-        Some("joined cairn-5096's run on fedora since 09:48:09Z")
+        Some("joined cairn-5096's run on [fedora](cairn://executors/fedora), slot cell-2 since 09:48:09Z")
     );
 }
 
@@ -7236,14 +7246,14 @@ fn a_parked_check_names_where_it_stands_with_every_machine() {
         held_by,
         format!(
             "placement of request d9e55c03 (attempt 3e18a12d): \
-             offered to win, unanswered; \
+             offered to [win](cairn://executors/win), unanswered; \
              declined by fedora (host pressure: memory short; under its room #41); \
              bbs: no announced room fits: needs 8 unit(s), 2 of 16 free (room #7, since 09:48:02Z); \
              refuser refused twice under its current room #12; waiting for it to announce; \
              mac has not announced room (attached 09:48:01Z); \
              lab: link stale since 09:48:00Z; \
-             away for now: inf-1 drained, refusing new work; \
-             spark holding room for it (8 unit(s), 16.0 GiB memory, 0.0 GiB disk, protected; room #3); \
+             [inf-1](cairn://executors/inf-1): away for now: inf-1 drained, refusing new work; \
+             [spark](cairn://executors/spark) holding room for it (8 unit(s), 16.0 GiB memory, 0.0 GiB disk, protected; room #3); \
              old: its room #9 fits; offered on its next announcement; \
              not offered to bginf-sp1 ({}); \
              not offered to bginf-sp2 ({}); \
@@ -7344,7 +7354,10 @@ fn a_manual_requester_keeps_the_running_diagnostic_and_its_machine() {
             ..check_phase_status(
                 Some("running"),
                 Some("running checks"),
-                Some("running on fedora since 09:48:09Z".into()),
+                Some(
+                    "running on [fedora](cairn://executors/fedora), slot cell-2 since 09:48:09Z"
+                        .into(),
+                ),
             )
         },
         Some("fleet-request".into()),
@@ -7353,7 +7366,8 @@ fn a_manual_requester_keeps_the_running_diagnostic_and_its_machine() {
         update,
         ManualCheckProgressUpdate {
             state: "running".into(),
-            diagnostic: "running on fedora since 09:48:09Z".into(),
+            diagnostic:
+                "running on [fedora](cairn://executors/fedora), slot cell-2 since 09:48:09Z".into(),
             executor: Some("fedora".into()),
             since_unix_ms: Some(PARKED_AT + 9_000),
             request_id: Some("fleet-request".into()),
