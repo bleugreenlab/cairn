@@ -792,6 +792,7 @@ impl Orchestrator {
             &operation,
             class,
         );
+        self.jj_store_lock_queued.notify_waiters();
         let guard = match timeout {
             Some(timeout) => match tokio::time::timeout(timeout, lock.acquire(class)).await {
                 Ok(guard) => guard,
@@ -926,6 +927,39 @@ impl Orchestrator {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Wait until an operation named with `operation_prefix` is queued on
+    /// `store_dir`'s lock, or `within` passes. Woken by every waiter that
+    /// joins a queue, so it rechecks only when the queue changed. `false`
+    /// when no such waiter appeared in time.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_store_lock_waiter(
+        &self,
+        store_dir: &Path,
+        operation_prefix: &str,
+        within: Duration,
+    ) -> bool {
+        let queued = async {
+            loop {
+                // Registered before the check, so a waiter that joins between
+                // the check and the await still wakes this.
+                let joined = self.jj_store_lock_queued.notified();
+                tokio::pin!(joined);
+                joined.as_mut().enable();
+                let present = self.store_lock_status(store_dir).is_some_and(|status| {
+                    status
+                        .waiters
+                        .iter()
+                        .any(|waiter| waiter.operation.starts_with(operation_prefix))
+                });
+                if present {
+                    return;
+                }
+                joined.await;
+            }
+        };
+        tokio::time::timeout(within, queued).await.is_ok()
     }
 
     /// Who holds `store_dir`'s lock and who is queued behind it, in service

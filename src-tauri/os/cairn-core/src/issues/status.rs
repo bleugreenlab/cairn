@@ -1313,7 +1313,7 @@ mod tests {
         );
 
         let resolver = orch.clone();
-        let resolving = tokio::spawn(async move {
+        let mut resolving = tokio::spawn(async move {
             let db = resolver.db.local.clone();
             resolve_terminal(
                 &resolver,
@@ -1324,20 +1324,22 @@ mod tests {
             )
             .await
         });
-        let mut queued = false;
-        for _ in 0..10_000 {
-            tokio::task::yield_now().await;
-            queued = orch.store_lock_status(&store).is_some_and(|status| {
-                status
-                    .waiters
-                    .iter()
-                    .any(|waiter| waiter.operation.starts_with("terminal resolution"))
-            });
-            if queued {
-                break;
+        // The resolver does database work before it reaches the lock, so how
+        // long that takes is the host's business; the bound only turns a hang
+        // into a failure. A resolver that skips the lock finishes instead.
+        let within = std::time::Duration::from_secs(30);
+        tokio::select! {
+            queued = orch.wait_for_store_lock_waiter(&store, "terminal resolution", within) => {
+                assert!(
+                    queued,
+                    "the resolution queues on the store lock within {within:?}; queued instead: {:?}",
+                    orch.jj_store_lock_waiters_for_test(&store)
+                );
+            }
+            finished = &mut resolving => {
+                panic!("the resolution finished without queueing behind the publisher: {finished:?}");
             }
         }
-        assert!(queued, "the resolution queues on the store lock");
         let status = orch
             .db
             .local

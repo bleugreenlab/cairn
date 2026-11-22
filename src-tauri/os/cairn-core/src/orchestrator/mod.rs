@@ -958,6 +958,7 @@ impl OrchestratorBuilder {
             job_launch_claims: Arc::new(Mutex::new(HashMap::new())),
             jj_store_locks: Arc::new(Mutex::new(HashMap::new())),
             jj_store_lock_metrics: Arc::new(Mutex::new(HashMap::new())),
+            jj_store_lock_queued: Arc::default(),
             branch_reservations: Arc::default(),
             base_branch_sync: Arc::default(),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
@@ -2065,6 +2066,9 @@ pub struct Orchestrator {
     /// reconciles from different executions on the same project store serialize.
     jj_store_locks: Arc<Mutex<HashMap<String, Arc<store_lock::PriorityLock>>>>,
     jj_store_lock_metrics: Arc<Mutex<HashMap<String, JjStoreLockMetrics>>>,
+    /// Signalled each time an acquisition joins any store's waiter queue, so
+    /// an observer can wait for a waiter to appear instead of polling.
+    jj_store_lock_queued: Arc<tokio::sync::Notify>,
     /// Bookmarks reserved across network I/O (`store_lock::BranchReservations`):
     /// taken before the store lock, held by every writer that moves them.
     branch_reservations: Arc<BranchReservations>,
