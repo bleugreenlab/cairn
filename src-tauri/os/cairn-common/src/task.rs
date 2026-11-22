@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::panic::Location;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -43,12 +44,23 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    spawn_on(&Handle::current(), future)
+    spawn_boxed_on(&Handle::current(), Box::pin(future))
 }
 
 /// Spawn on an explicit runtime, even when a different runtime is entered.
 #[track_caller]
 pub fn spawn_on<F>(handle: &Handle, future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn_boxed_on(handle, Box::pin(future))
+}
+
+// Box at the public entry points, before forwarding or capturing the future:
+// carrying it inline through those frames multiplies large callers' stack use.
+#[track_caller]
+fn spawn_boxed_on<F>(handle: &Handle, future: Pin<Box<F>>) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -70,6 +82,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
+    let future = Box::pin(future);
     let guard = Guard::new(&Handle::current(), Location::caller());
     tokio::task::spawn_local(async move {
         let _guard = guard;
@@ -142,6 +155,32 @@ mod tests {
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn large_inline_future_fits_in_a_small_spawn_stack() {
+        // Build off the measured stack so this isolates submission and polling,
+        // not the caller's construction of the inline state.
+        let state = [7_u8; 256 * 1024];
+        let future = Box::new(async move {
+            tokio::task::yield_now().await;
+            std::hint::black_box(&state);
+            state[0]
+        });
+        std::thread::Builder::new()
+            .name("large counted spawn within a 1 MiB stack".into())
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let rt = runtime();
+                let _entered = rt.enter();
+                let task = spawn(*future);
+                assert_eq!(snapshot(rt.handle(), 8).total_live, 1);
+                assert_eq!(rt.block_on(task).unwrap(), 7);
+                assert_eq!(snapshot(rt.handle(), 8).total_live, 0);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
