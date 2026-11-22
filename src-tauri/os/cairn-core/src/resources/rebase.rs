@@ -2981,7 +2981,8 @@ mod tests {
         let released = advance_state("279ddbcf", &Ok(Some(deferred_pass())), &Ok(None));
         assert!(
             released.contains("**Deferred.**")
-                && released.contains("nothing holds the boundary any more"),
+                && released.contains("No committing run batch holds this branch")
+                && released.contains("A batch without a commit_msg"),
             "a hold whose batch has ended says what carries the branch from here: {released}"
         );
 

@@ -1847,7 +1847,7 @@ fn not_landed(
             super::replay_cost::merge_catch_up_exit()
         )),
         PreparationRefusal::Busy(BusyReason::RunBatch(batch)) => Err(format!(
-            "{batch} may still commit to `{branch}`, so it is not rewritten under it and no \
+            "Replay of `{branch}` is held by {batch}, so no \
              replay was accepted yet. Cancelling that batch ends the hold now: request the \
              replay with `cancel_holding_batch:true`, which cancels it first, or patch \
              `action:\"cancel\"` on the batch's own address, which cairn:~/rebase names."

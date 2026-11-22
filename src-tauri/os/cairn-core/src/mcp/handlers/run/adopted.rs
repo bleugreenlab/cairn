@@ -778,11 +778,15 @@ pub(crate) async fn deliver_batch_result(
     text: &str,
 ) {
     match durable_suspend::pending_run_batch_wait(db, request_id).await {
-        Ok(Some(record)) => durable_suspend::drive_resolution(orch, db, &record, text, false).await,
-        Ok(None) => {}
+        Ok(Some(record)) => {
+            durable_suspend::drive_resolution(orch, db, &record, text, false).await;
+            detached::settle_after_park(orch, db, request_id, verdict, text).await;
+        }
+        Ok(None) => {
+            detached::settle_and_deliver(orch, db, request_id, verdict, text).await;
+        }
         Err(error) => log::warn!("could not read the wait of run batch {request_id}: {error}"),
     }
-    detached::settle_and_deliver(orch, db, request_id, verdict, text).await;
 }
 
 /// What a host batch's call is told after a restart: it ran inside Cairn.
@@ -857,7 +861,7 @@ pub(super) async fn resolve_wait(
     text: &str,
 ) {
     durable_suspend::drive_resolution(orch, db, record, text, false).await;
-    detached::settle_and_deliver(
+    detached::settle_after_park(
         orch,
         db,
         request_id,

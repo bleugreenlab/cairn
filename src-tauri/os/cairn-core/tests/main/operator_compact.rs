@@ -344,9 +344,9 @@ async fn cold_compact_abandons_parked_wait_and_cancels_batch() {
     let resolution: serde_json::Value = serde_json::from_str(&resolution.unwrap()).unwrap();
     assert_eq!(resolution["outcome"], "abandoned");
     assert_eq!(resolution["cause"], "operator_compact");
-    // Compact asks the executor to cancel the batch, but the batch's process
-    // ends only when that lands: until the batch settles, the row holds its
-    // branch at the replay mutation boundary.
+    // Compact asks the executor to cancel the batch, but its process ends
+    // only when that lands. Its durable lifecycle survives until settlement,
+    // without branch authority: this batch has no commit_msg.
     assert_eq!(
         text(
             &db,
@@ -354,8 +354,8 @@ async fn cold_compact_abandons_parked_wait_and_cancels_batch() {
         )
         .await
         .as_deref(),
-        Some("running/1"),
-        "the cancelled batch keeps holding its branch until it settles"
+        Some("running/0"),
+        "the cancelled commitless batch keeps its lifecycle record, not a branch hold"
     );
     assert_eq!(
         count(

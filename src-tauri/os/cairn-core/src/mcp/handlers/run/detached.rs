@@ -79,8 +79,8 @@ pub(crate) struct DetachedBatch {
     /// The batch's normalized payload, compared by the reissue refusal.
     pub(crate) identity: Option<String>,
     pub(crate) commits: bool,
-    /// Whether it can write the branch or runs in the node's residence. A
-    /// verdict-only or host batch never holds the replay boundary.
+    /// Branch commit authority, derived by the canonical predicate when read.
+    /// The stored cache is not authority for legacy rows.
     pub(crate) holds_branch: bool,
     pub(crate) state: DetachedState,
     pub(crate) verdict: Option<String>,
@@ -124,7 +124,12 @@ fn from_row(row: &cairn_db::turso::Row) -> DbResult<DetachedBatch> {
         label: row.opt_text(3)?,
         identity: row.opt_text(4)?,
         commits: row.i64(5)? != 0,
-        holds_branch: row.i64(6)? != 0,
+        // Host batches cannot carry commit authority. Ignore legacy cached
+        // hold bits, including commitless home batches recorded as holding.
+        holds_branch: super::super::durable_suspend::run_batch_holds_branch(
+            row.i64(5)? != 0,
+            false,
+        ),
         state: DetachedState::parse(&row.text(7)?),
         verdict: row.opt_text(8)?,
         output: row.opt_text(9)?,
@@ -708,6 +713,59 @@ pub(crate) fn reissue_refusal_text(request_id: &str, live: &LiveState) -> String
     )
 }
 
+/// Save the comparison before finishing the row and queuing its notice.
+/// A call that has not detached has no row; its settlement carries the same
+/// value if it detaches later.
+pub(crate) async fn record_snapshot(
+    db: &LocalDb,
+    request_id: &str,
+    attribution: &super::SnapshotAttribution,
+) -> Result<(), String> {
+    let id = request_id.to_string();
+    let attribution = attribution.clone();
+    db.write(|c| {
+        let id = id.clone();
+        let attribution = attribution.clone();
+        Box::pin(async move {
+            let mut rows = c
+                .query(
+                    "SELECT settlement_json FROM run_batch_detached WHERE request_id=?1",
+                    params![id.clone()],
+                )
+                .await?;
+            let raw = match rows.next().await? {
+                Some(row) => row.opt_text(0)?,
+                None => None,
+            };
+            drop(rows);
+            if let Some(raw) = raw {
+                let mut settlement: super::PersistedSettlement = serde_json::from_str(&raw)
+                    .map_err(|error| cairn_db::storage::DbError::internal(error.to_string()))?;
+                settlement.snapshot_attribution = Some(attribution);
+                let json = serde_json::to_string(&settlement)
+                    .map_err(|error| cairn_db::storage::DbError::internal(error.to_string()))?;
+                c.execute(
+                    "UPDATE run_batch_detached SET settlement_json=?2 WHERE request_id=?1",
+                    params![id, json],
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+fn snapshot_phrase(batch: &DetachedBatch) -> Option<String> {
+    batch
+        .settlement
+        .as_ref()?
+        .snapshot_attribution
+        .as_ref()
+        .map(super::SnapshotAttribution::line)
+}
+
 fn label_of(batch: &DetachedBatch) -> &str {
     batch.label.as_deref().unwrap_or("unnamed")
 }
@@ -732,12 +790,35 @@ pub(crate) fn notice_sentence(batch: &DetachedBatch) -> String {
             batch.lost_evidence.as_deref().unwrap_or("no evidence was recorded")
         ),
         _ => format!(
-            "Your run batch '{}' ({handle}) finished: {}, {}.",
+            "Your run batch '{}' ({handle}) finished: {}, {}.{}",
             label_of(batch),
             batch.verdict.as_deref().unwrap_or("finished"),
-            commit_phrase(batch)
+            commit_phrase(batch),
+            snapshot_phrase(batch).map(|line| format!(" {line}")).unwrap_or_default()
         ),
     }
+}
+
+/// A committing batch is recorded before preparation while its call still
+/// owns delivery. This is not a detached-call reason.
+pub(crate) const INLINE_CAPTURE: &str = "its committing call is still waiting inline";
+
+pub(super) async fn detach_inline(
+    db: &LocalDb,
+    request_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    db.execute(
+        "UPDATE run_batch_detached SET reason=?2 WHERE request_id=?1 AND reason=?3",
+        (
+            request_id.to_string(),
+            reason.to_string(),
+            INLINE_CAPTURE.to_string(),
+        ),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 /// The handle's read: state, verdict, label, what it committed, and its output.
@@ -752,16 +833,32 @@ pub(crate) fn render(batch: &DetachedBatch, live: &LiveState) -> String {
         batch.request_id,
         label_of(batch),
     );
-    out.push_str(&format!("Detached because: {}\n", batch.reason));
+    let inline = batch.reason == INLINE_CAPTURE;
+    if inline {
+        out.push_str("Delivery: the call owns its inline answer.\n");
+    } else {
+        out.push_str(&format!("Detached because: {}\n", batch.reason));
+    }
+    let delivery = if inline {
+        "\nIts result returns on the call while it remains connected. Do not re-run it.\n"
+    } else {
+        "\nIts result reaches this job as a notice when it settles. Do not re-run it.\n"
+    };
     match batch.state {
         DetachedState::Parked => {
             out.push_str(&format!(
-                "Waiting: it is {}. No machine has it yet, and it holds no branch until one does.\n",
-                batch.waiting_on.as_deref().unwrap_or("waiting to be placed")
+                "Waiting: it is {}. No machine has it yet.\n",
+                batch
+                    .waiting_on
+                    .as_deref()
+                    .unwrap_or("waiting to be placed")
             ));
-            out.push_str(
-                "\nIts result reaches this job as a notice when it settles. Do not re-run it.\n",
-            );
+            out.push_str(if batch.holds_branch {
+                "Commits: it carries a commit_msg and holds its captured base until settlement, including while queued.\n"
+            } else {
+                "Commits: none; it has no commit_msg, so it cannot commit and does not hold the branch.\n"
+            });
+            out.push_str(delivery);
         }
         DetachedState::Running => {
             out.push_str(&format!("Now: {}.\n", live.sentence()));
@@ -770,11 +867,12 @@ pub(crate) fn render(batch: &DetachedBatch, live: &LiveState) -> String {
             } else {
                 "Commits: none; it has no commit_msg, so it cannot commit.\n"
             });
-            out.push_str(
-                "\nIts result reaches this job as a notice when it settles. Do not re-run it.\n",
-            );
+            out.push_str(delivery);
         }
         DetachedState::Settled => {
+            if let Some(line) = snapshot_phrase(batch) {
+                out.push_str(&format!("{line}\n"));
+            }
             out.push_str(&format!(
                 "Verdict: {}\nCommits: {}\n",
                 batch.verdict.as_deref().unwrap_or("finished"),
@@ -928,6 +1026,13 @@ pub(crate) async fn insert_converted(
             now_ms,
             settlement
         ],
+    )
+    .await?;
+    // An inline capture already owns this request's row. Transfer delivery
+    // with the wait's abandonment, in this same transaction.
+    c.execute(
+        "UPDATE run_batch_detached SET reason=?2 WHERE request_id=?1 AND reason=?3",
+        params![request_id.as_str(), reason, INLINE_CAPTURE],
     )
     .await?;
     Ok(())
@@ -1188,8 +1293,8 @@ pub(crate) async fn for_job(db: &LocalDb, job_id: &str) -> Result<Vec<DetachedBa
     .map_err(|error| error.to_string())
 }
 
-/// A parked batch has been handed to a machine: it runs now, and holds its
-/// branch when `holds_branch`. `false` when the row was not parked.
+/// A parked batch has been submitted to the fleet. Its state changes without
+/// changing commit authority's hold. `false` when the row was not parked.
 pub(crate) async fn mark_admitted(
     db: &LocalDb,
     request_id: &str,
@@ -1268,6 +1373,11 @@ enum Finish<'a> {
     Lost {
         evidence: &'a str,
     },
+    Parked {
+        verdict: &'a str,
+        output: &'a str,
+        commit_id: Option<&'a str>,
+    },
 }
 
 /// Queue Cairn's notice for a finished batch on the connection settling it.
@@ -1331,8 +1441,14 @@ async fn finish(
     finish: Finish<'_>,
     notify: bool,
 ) -> Result<Option<DetachedBatch>, String> {
+    let parked = matches!(finish, Finish::Parked { .. });
     let (state, verdict, output, commit, evidence) = match finish {
         Finish::Settled {
+            verdict,
+            output,
+            commit_id,
+        }
+        | Finish::Parked {
             verdict,
             output,
             commit_id,
@@ -1377,7 +1493,7 @@ async fn finish(
                 None => return Ok(None),
             };
             drop(rows);
-            if notify {
+            if notify && (!parked || batch.reason != INLINE_CAPTURE) {
                 queue_notice(c, &batch.job_id, &id, &notice_sentence(&batch), now / 1000)
                     .await?;
                 c.execute(
@@ -1561,6 +1677,30 @@ async fn wake_job(orch: &Orchestrator, job_id: &str, what: &str) {
     }
 }
 
+/// A parked call delivers through its wait, not a second notice.
+/// Abandonment transfers the inline row's reason in the wait transaction.
+pub(super) async fn settle_after_park(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    request_id: &str,
+    verdict: &str,
+    output: &str,
+) {
+    let commit = super::run_commit_sha(output);
+    let settled = Finish::Parked {
+        verdict,
+        output,
+        commit_id: commit.as_deref(),
+    };
+    match end(orch, db, request_id, settled, true).await {
+        Ok(Some(batch)) if batch.notified_ms.is_some() => {
+            wake_job(orch, &batch.job_id, &batch.request_id).await;
+        }
+        Ok(_) => {}
+        Err(error) => log::warn!("could not settle parked run batch authority: {error}"),
+    }
+}
+
 /// Settle a running batch with its answer, queue its notice in the same
 /// write, and wake its job. This is the one path a batch's result takes to a
 /// job whose call can no longer receive it. Reports whether this call settled
@@ -1615,6 +1755,23 @@ pub(crate) async fn settle_answered_inline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parked_render_names_commit_authority_without_claiming_placement() {
+        for commits in [false, true] {
+            let mut row = batch(DetachedState::Parked, commits, None);
+            row.holds_branch =
+                crate::mcp::handlers::durable_suspend::run_batch_holds_branch(commits, false);
+            let page = render(&row, &LiveState::Untracked);
+            assert!(page.contains("No machine has it yet"), "{page}");
+            assert!(!page.contains("holds no branch until"), "{page}");
+            if commits {
+                assert!(page.contains("holds its captured base"), "{page}");
+            } else {
+                assert!(page.contains("does not hold the branch"), "{page}");
+            }
+        }
+    }
 
     fn batch(state: DetachedState, commits: bool, commit_id: Option<&str>) -> DetachedBatch {
         DetachedBatch {
@@ -1697,7 +1854,19 @@ mod tests {
     async fn finishing_a_batch_queues_its_notice_in_the_same_write() {
         let orch = orch_with_job().await;
         let db: &LocalDb = &orch.db.local;
-        insert(db, &running("req-1")).await.unwrap();
+        let mut row = running("req-1");
+        row.settlement = Some(super::super::PersistedSettlement::for_test(
+            None, None, None,
+        ));
+        insert(db, &row).await.unwrap();
+        let attribution = super::super::SnapshotAttribution {
+            ran_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            branch: "feature".into(),
+            current_commit: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+        };
+        // The row may have been inserted before comparison, or only after
+        // settlement completed and the call's transport closed.
+        record_snapshot(db, "req-1", &attribution).await.unwrap();
         let settled = finish(
             db,
             "req-1",
@@ -1713,6 +1882,19 @@ mod tests {
         .expect("it was running");
         assert!(settled.notified_ms.is_some());
         assert_eq!(notices(db).await, vec![notice_sentence(&settled)]);
+        assert_eq!(
+            settled
+                .settlement
+                .as_ref()
+                .unwrap()
+                .snapshot_attribution
+                .as_ref(),
+            Some(&attribution),
+        );
+        let line = attribution.line();
+        assert!(notice_sentence(&settled).contains(&line));
+        assert!(render(&settled, &LiveState::Untracked).contains(&line));
+        assert_eq!(settled.commit_id, None, "input is not a produced commit");
 
         assert!(finish(db, "req-1", Finish::Lost { evidence: "x" }, true)
             .await
@@ -1730,6 +1912,33 @@ mod tests {
             notices(db).await.len(),
             1,
             "an inline answer owes no notice"
+        );
+
+        let mut inline = running("req-parked-inline");
+        inline.reason = INLINE_CAPTURE.into();
+        insert(db, &inline).await.unwrap();
+        settle_after_park(&orch, db, &inline.request_id, "succeeded", "resumed").await;
+        assert_eq!(
+            notices(db).await.len(),
+            1,
+            "normal park owes no second delivery"
+        );
+        assert_eq!(
+            load(db, &inline.request_id).await.unwrap().unwrap().state,
+            DetachedState::Settled
+        );
+
+        let mut transferred = running("req-parked-transferred");
+        transferred.reason = INLINE_CAPTURE.into();
+        insert(db, &transferred).await.unwrap();
+        detach_inline(db, &transferred.request_id, "its wait was abandoned")
+            .await
+            .unwrap();
+        settle_after_park(&orch, db, &transferred.request_id, "succeeded", "notice").await;
+        assert_eq!(
+            notices(db).await.len(),
+            2,
+            "transferred delivery owes one notice"
         );
 
         insert(db, &running("req-3")).await.unwrap();
@@ -1834,8 +2043,11 @@ mod tests {
             )
             .await
             .unwrap();
-            insert(db, &running("req-settled")).await.unwrap();
-            insert(db, &running("req-lost")).await.unwrap();
+            for request in ["req-settled", "req-lost"] {
+                let mut held = running(request);
+                held.commits = true;
+                insert(db, &held).await.unwrap();
+            }
             let pending = || async {
                 crate::orchestrator::conflict_session::list_pending_replay_requests(db)
                     .await
@@ -2253,10 +2465,15 @@ mod tests {
             ),
             ("run/adopted.rs", production(include_str!("adopted.rs"))),
         ] {
-            assert!(
-                !other.contains("UPDATE run_batch_detached"),
-                "{name} writes a detached row's state outside `finish`"
-            );
+            for update in other.split("UPDATE run_batch_detached SET ").skip(1) {
+                let assignments = update.split(" WHERE ").next().unwrap();
+                assert!(
+                    !assignments.split(',').any(|assignment| {
+                        assignment.split('=').next().unwrap().trim() == "state"
+                    }),
+                    "{name} writes a detached row's state outside `finish`"
+                );
+            }
         }
     }
 }

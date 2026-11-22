@@ -6421,6 +6421,54 @@ fn a_request_is_named_by_the_machine_that_claimed_it_never_by_an_offer() {
 }
 
 impl Fleet {
+    /// A live colocated job home and its executor link, for tests that need to
+    /// observe real residency operations without launching an executor process.
+    pub(crate) fn attach_job_home_for_test(
+        &self,
+        project_id: &str,
+        job_id: &str,
+        repository_path: &Path,
+    ) -> (
+        mpsc::UnboundedReceiver<ExecutorMessage>,
+        u64,
+        cairn_common::executor_protocol::PersistentCellState,
+    ) {
+        let (id, mut connection) = fleet_entry_at(
+            COLOCATED_EXECUTOR_ID,
+            std::env::consts::OS,
+            0,
+            &[],
+            unix_time_ms(),
+        );
+        let (sender, receiver) = mpsc::unbounded_channel();
+        connection.sender = sender;
+        connection.snapshots_received = 1;
+        let mut cell = materialization_read_cell("terminal-refresh-home", job_id);
+        cell.project_id = project_id.into();
+        cell.executor_id = id.clone();
+        let residency = cell.residency.as_mut().unwrap();
+        residency.repository = RepositoryLocator::ColocatedPath {
+            project_id: project_id.into(),
+            repository_id: project_id.into(),
+            absolute_path: repository_path.to_string_lossy().into_owned(),
+        };
+        residency.owner_ref.as_mut().unwrap().project_id = project_id.into();
+        let route = ResidencyRoute {
+            holder: residency.holder.clone(),
+            repository: residency.repository.clone(),
+            executor_id: id.clone(),
+            pending: false,
+        };
+        Arc::make_mut(&mut connection.snapshot).cells = vec![cell.clone()];
+        let generation = connection.generation;
+        self.lock_connections().insert(id.clone(), connection);
+        self.residency_routes
+            .lock()
+            .unwrap()
+            .insert((id, route.holder.storage_key()), route);
+        (receiver, generation, cell)
+    }
+
     /// Attach one test executor whose snapshot reports exactly `cells`, so a
     /// caller outside this module can exercise a decision that reads
     /// [`Fleet::snapshot`].

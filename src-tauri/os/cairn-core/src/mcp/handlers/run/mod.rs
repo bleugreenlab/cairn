@@ -3092,72 +3092,6 @@ pub(crate) mod slot_publication_tests {
             .build()
     }
 
-    /// A further live job on `branch`, created before the fixture's owners so
-    /// it never becomes the branch's owner: a sibling whose in-flight batch
-    /// the owner must not publish under.
-    async fn add_job(orch: &Orchestrator, job_id: &str, branch: &str) {
-        orch.db
-            .local
-            .execute_script(format!(
-                "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
-                   VALUES ('{job_id}', 'exec-1', 'node', 'issue-1', 'project', 'running', '{branch}', NULL, 0, 0);"
-            ))
-            .await
-            .unwrap();
-    }
-
-    /// A pending run-batch suspension of `job_id` under `request_id`: a batch
-    /// that may still commit to the job's branch. The wait hangs off a real
-    /// session, run and turn of that job, as a parked call does.
-    async fn park_run_batch(orch: &Orchestrator, job_id: &str, request_id: &str) {
-        let tag = format!("{job_id}-{request_id}");
-        orch.db
-            .local
-            .execute_script(format!(
-                "INSERT INTO sessions(id, job_id, status, backend_id, created_at, updated_at)
-                   VALUES('session-{tag}', '{job_id}', 'open', 'backend', 1, 1);
-                 INSERT INTO runs(id, project_id, job_id, issue_id, status, session_id, created_at, updated_at)
-                   VALUES('run-{tag}', 'project', '{job_id}', 'issue-1', 'live', 'session-{tag}', 1, 1);
-                 INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason,
-                                   yield_reason, created_at, updated_at)
-                   VALUES('turn-{tag}', 'session-{tag}', 'run-{tag}', '{job_id}', 1, 'yielded',
-                          'initial', 'wait', 1, 1);"
-            ))
-            .await
-            .unwrap();
-        let condition = serde_json::to_string(
-            &crate::mcp::handlers::durable_suspend::Condition::RunBatch {
-                request_id: request_id.into(),
-                commits: true,
-                label: None,
-                host: false,
-                identity: None,
-                verdict_only: false,
-                settlement: None,
-                bound: None,
-            },
-        )
-        .unwrap();
-        orch.db
-            .local
-            .execute(
-                "INSERT INTO agent_waits(id, job_id, run_id, session_id, predecessor_turn_id,
-                                         tool_use_id, condition_json, state, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 1)",
-                (
-                    format!("wait-{tag}"),
-                    job_id.to_string(),
-                    format!("run-{tag}"),
-                    format!("session-{tag}"),
-                    format!("turn-{tag}"),
-                    format!("tool-{tag}"),
-                    condition,
-                ),
-            )
-            .await
-            .unwrap();
-    }
-
     /// The store's writer lock, as a commit barrier takes it.
     async fn lock(orch: &Orchestrator, fx: &Straddle) -> JjStoreGuard {
         acquire_store_lock(
@@ -3681,9 +3615,9 @@ pub(crate) mod slot_publication_tests {
         assert_eq!(fx.bookmark(), fx.base, "the branch was never published");
     }
 
-    /// Nothing about the ordinary path changes. With the bookmark still at the
-    /// commit the batch was routed against, the sealed delta publishes exactly
-    /// as it was sealed and nothing is reported as integrated.
+    /// Concurrent committing captures share an immutable base. The first delta
+    /// waits for the foreign hold; the second publication drains it before
+    /// integrating its own work, without changing the first sealed delta.
     #[tokio::test]
     #[serial_test::serial(jj)]
     async fn an_unmoved_bookmark_publishes_the_sealed_delta_untouched() {
@@ -3692,8 +3626,64 @@ pub(crate) mod slot_publication_tests {
             return;
         };
         let orch = orchestrator(&fx).await;
+        let request = McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: fx.home().to_string_lossy().into_owned(),
+            run_id: Some("run-feature".into()),
+            tool: "run".into(),
+            tool_use_id: None,
+            payload: serde_json::json!({"commands":[{"command":"true"}],"commit_msg":"batch"}),
+            origin: None,
+        };
+        let control = BatchControl::with_request_id(&fx.request.request_id, true);
+        capture_current_for_batch(
+            &orch,
+            &request,
+            &control,
+            true,
+            CallDeadlines::for_request(tokio::time::Instant::now(), &request),
+        )
+        .await
+        .expect("a committing capture needs no resumable tool-call claim");
 
-        let publication = publish_visible_slot_delta(
+        // A distinct job sharing the branch can capture before either batch
+        // publishes. Only the publication, not the immutable capture, waits.
+        orch.db
+            .local
+            .execute(
+                "UPDATE jobs SET branch='feature' WHERE id=?1",
+                (LATER_JOB.to_string(),),
+            )
+            .await
+            .unwrap();
+        let second_callback = McpCallbackRequest {
+            run_id: Some("run-later".into()),
+            ..request.clone()
+        };
+        let (mut second_request, second_delta) =
+            absorbing_delta(&fx, &[("other.rs", "second batch\n")]);
+        second_request.requesting_job_id = Some(LATER_JOB.into());
+        let second_control = BatchControl::with_request_id(&second_request.request_id, true);
+        let second_capture = capture_current_for_batch(
+            &orch,
+            &second_callback,
+            &second_control,
+            true,
+            CallDeadlines::for_request(tokio::time::Instant::now(), &second_callback),
+        )
+        .await
+        .expect("a foreign committing hold does not prevent capture");
+        assert_eq!(second_capture.commit_id, fx.base);
+        assert!(
+            detached::load(&orch.db.local, &second_control.request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .holds_branch
+        );
+
+        let first = publish_visible_slot_delta(
             &orch,
             &fx.target,
             &fx.request,
@@ -3702,26 +3692,92 @@ pub(crate) mod slot_publication_tests {
             None,
             None,
         )
-        .await
-        .expect("an unmoved bookmark publishes");
-        let SlotPublicationOutcome::Published {
-            landed,
-            export,
-            patch,
-            integration,
-            ..
-        } = publication.outcome
-        else {
-            panic!("expected a publication");
-        };
+        .await;
+        assert!(
+            matches!(first, Err(SlotPublicationError::Held { .. })),
+            "{first:?}"
+        );
+        assert_eq!(fx.bookmark(), fx.base);
+        detached::settle_answered_inline(
+            &orch,
+            &orch.db.local,
+            &control.request_id,
+            "ok",
+            "delta held",
+        )
+        .await;
 
-        export.expect("the publication exports its bookmark to the backing checkout");
-        assert!(integration.is_none());
+        let prepared = prepare_slot_publication(
+            &orch,
+            &fx.target,
+            &second_request,
+            &second_delta,
+            "second batch",
+            None,
+        )
+        .await
+        .expect("the second batch prepares");
+        let (drained, second) = delta_barrier(
+            &orch,
+            Some(fx.store()),
+            "second concurrent batch",
+            true,
+            own_delta(
+                &fx,
+                &second_request,
+                &second_delta,
+                "second batch",
+                prepared,
+            ),
+        )
+        .await;
+        assert_eq!(
+            drained
+                .iter()
+                .filter(|entry| matches!(entry, held::Drained::Landed(_)))
+                .count(),
+            1
+        );
+        held::settle_drained(&orch, drained).await;
+        let first_head = landed_head(&orch, &fx.request.attempt_id).await;
+        let SlotPublicationOutcome::Published { landed, .. } = second
+            .expect("second publication drains the first batch")
+            .outcome
+        else {
+            panic!("expected the second publication");
+        };
         assert_eq!(
             git_stdout(&fx.repository, &["rev-parse", &format!("{}^", landed.head)]),
+            first_head
+        );
+        assert_eq!(fx.blob(&landed.head, "mine.rs"), "the batch's work");
+        assert_eq!(fx.blob(&landed.head, "other.rs"), "second batch");
+        detached::settle_answered_inline(
+            &orch,
+            &orch.db.local,
+            &second_control.request_id,
+            "ok",
+            "published",
+        )
+        .await;
+
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", &format!("{first_head}^")]),
             fx.base
         );
-        assert_eq!(published_paths(&patch), ["mine.rs"]);
+        assert_eq!(
+            git_stdout(
+                &fx.repository,
+                &[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    &first_head
+                ]
+            ),
+            "mine.rs"
+        );
     }
 
     /// `commit_msg: "^"` rewrites the commit the bookmark holds, which after a
@@ -4874,12 +4930,47 @@ pub(crate) mod slot_publication_tests {
     /// still holds the landing, and the sealed delta is held exactly as sealed.
     #[tokio::test]
     #[serial_test::serial(jj)]
-    async fn a_batch_that_parks_after_preparation_still_holds_the_landing() {
+    async fn a_captured_committing_batch_holds_actual_writers_before_grace() {
         let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
             eprintln!("skipping a_batch_that_parks_after_preparation: jj not resolvable");
             return;
         };
         let orch = orchestrator(&fx).await;
+        let snapshot = serde_json::json!({
+            "recipe": {
+                "id": "recipe-default", "name": "Publication", "description": null,
+                "trigger": "manual", "nodes": [], "edges": []
+            },
+            "agents": {
+                "publisher": {
+                    "id": "publisher", "name": "Publisher", "description": "Publication",
+                    "prompt": "Publish", "tools": ["read", "write", "run"],
+                    "disallowedTools": null, "skills": null, "fence": "deny"
+                }
+            },
+            "skills": {},
+            "triggerContext": {
+                "issueId": "issue-1", "projectId": "project", "triggerType": "manual"
+            },
+            "delegatedPackets": [],
+            "createdAt": 1
+        });
+        orch.db
+            .local
+            .execute(
+                "UPDATE executions SET snapshot=?1 WHERE id='exec-1'",
+                (snapshot.to_string(),),
+            )
+            .await
+            .unwrap();
+        orch.db
+            .local
+            .execute(
+                "UPDATE jobs SET agent_config_id='publisher' WHERE id=?1",
+                (FEATURE_JOB.to_string(),),
+            )
+            .await
+            .unwrap();
         let prepared =
             prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "the batch", None)
                 .await
@@ -4888,8 +4979,81 @@ pub(crate) mod slot_publication_tests {
             prepared.coordinate.is_ok(),
             "nothing was in flight at preparation"
         );
-        add_job(&orch, "job-sibling", "feature").await;
-        park_run_batch(&orch, "job-sibling", "request-sibling").await;
+        let request = McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: fx.home().to_string_lossy().into_owned(),
+            run_id: Some("run-feature".into()),
+            tool: "run".into(),
+            tool_use_id: Some("capturing-call".into()),
+            payload: serde_json::json!({"commands":[{"command":"true"}],"commit_msg":"batch"}),
+            origin: None,
+        };
+        let deadlines = CallDeadlines::new(
+            tokio::time::Instant::now(),
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(180),
+            None,
+        );
+        let control = BatchControl::new(true);
+        let _live = detached::LiveBatch::claim(&control);
+        let captured = capture_current_for_batch(&orch, &request, &control, true, deadlines)
+            .await
+            .expect("capture and durable admission");
+        assert_eq!(captured.commit_id, fx.base);
+        assert!(tokio::time::Instant::now() < deadlines.grace);
+        let row = detached::load(&orch.db.local, &control.request_id)
+            .await
+            .unwrap()
+            .expect("authority is durable before grace");
+        assert!(row.holds_branch);
+        assert_eq!(
+            detached::sweep_unreported(&orch).await,
+            0,
+            "live preparation has no resolver yet"
+        );
+        assert_eq!(row.reason, detached::INLINE_CAPTURE);
+        assert!(row.settlement.is_none(), "preparation has not run");
+        assert_eq!(
+            capture_current_for_batch(&orch, &request, &control, true, deadlines)
+                .await
+                .expect("its own provisional durable record is reused")
+                .commit_id,
+            captured.commit_id,
+        );
+        let other = BatchControl::new(true);
+        let other_capture = capture_current_for_batch(&orch, &request, &other, true, deadlines)
+            .await
+            .expect("another committing capture moves no bookmark");
+        assert_eq!(other_capture.commit_id, captured.commit_id);
+        assert!(other.recorded_db().is_some());
+        detached::settle_answered_inline(
+            &orch,
+            &orch.db.local,
+            &other.request_id,
+            "ok",
+            "second capture finished",
+        )
+        .await;
+        assert!(
+            !detached::render(&row, &detached::LiveState::InRunner).contains("Detached because:")
+        );
+
+        let mut writer = request.clone();
+        writer.tool = "write".into();
+        writer.tool_use_id = Some("writer-blocked".into());
+        writer.payload = serde_json::json!({
+            "changes":[{"target":"file:writer.txt","mode":"create","payload":{"content":"writer"}}],
+            "commit_msg":"sibling writer"
+        });
+        let refused = crate::mcp::handlers::write::handle_write(&orch, &writer).await;
+        assert!(refused.contains(&control.request_id), "{refused}");
+        assert_eq!(
+            fx.bookmark(),
+            fx.base,
+            "the actual writer was refused before grace"
+        );
 
         let (_, landed) = delta_barrier(
             &orch,
@@ -4904,7 +5068,8 @@ pub(crate) mod slot_publication_tests {
             other => panic!("a batch in flight at landing holds it, got {other:?}"),
         };
         assert!(
-            held.error.contains("may still commit to this branch"),
+            held.error
+                .contains("carries a commit_msg and may commit to this branch"),
             "{}",
             held.error
         );
@@ -4916,6 +5081,137 @@ pub(crate) mod slot_publication_tests {
             fx.delta.delta_commit
         );
         assert_eq!(fx.bookmark(), fx.base, "the branch did not move");
+
+        // A synchronous preparation failure still answers through the ordinary
+        // call tail, retiring the authority without a notice or a turn wake.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(BatchAnswer::from_envelope(run_envelope(
+            "preparation refused".into(),
+            Vec::new(),
+        )))
+        .unwrap_or_else(|_| panic!("the receiver is waiting"));
+        let answer = answer_call(&orch, &request, deadlines, control.clone(), rx).await;
+        assert!(answer.contains("preparation refused"));
+        let row = detached::load(&orch.db.local, &control.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, detached::DetachedState::Settled);
+        assert!(row.notified_ms.is_none(), "inline delivery owes no notice");
+        assert!(
+            crate::messages::side_channel::peek_pending_side_channel_for_job_async(
+                &orch.db.local,
+                FEATURE_JOB
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+
+        // Cancellation may answer before preparation reaches its stop boundary.
+        // A late authority record still has a receiver that retires it quietly.
+        let late = BatchControl::new(true);
+        let (late_tx, late_rx) = tokio::sync::oneshot::channel();
+        let mut cancelled = CallAnswer {
+            orch: orch.clone(),
+            request: request.clone(),
+            control: late.clone(),
+            deadlines,
+            rx: Some(late_rx),
+            held: None,
+            arming: None,
+            detached: None,
+            never_parks: false,
+            answered: false,
+        };
+        cancelled
+            .cancel_in_time("test cancellation before capture returns")
+            .await;
+        record_detached(&orch, &request, &late, detached::INLINE_CAPTURE)
+            .await
+            .expect("a late capture record");
+        let _ = late_tx.send(BatchAnswer::from_envelope(run_envelope(
+            RunFailure::Cancelled(None).text(),
+            Vec::new(),
+        )));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if detached::load(&orch.db.local, &late.request_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == detached::DetachedState::Settled
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancellation's receiver drains the late result");
+        assert!(
+            crate::messages::side_channel::peek_pending_side_channel_for_job_async(
+                &orch.db.local,
+                FEATURE_JOB
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+
+        // A cancellation that loses to settlement still delivers the real
+        // answer through the same authority-retirement path.
+        let settling = BatchControl::new(true);
+        record_detached(&orch, &request, &settling, detached::INLINE_CAPTURE)
+            .await
+            .expect("the settling batch has durable authority");
+        assert!(settling.begin_settling());
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        cancelled.control = settling.clone();
+        cancelled.rx = Some(settled_rx);
+        cancelled.answered = false;
+        let _ = settled_tx.send(BatchAnswer::from_envelope(run_envelope(
+            "settlement completed".into(),
+            Vec::new(),
+        )));
+        let joined = cancelled
+            .cancel_in_time("detachment failed during settlement")
+            .await;
+        assert!(joined.contains("settlement completed"));
+        assert_eq!(
+            detached::load(&orch.db.local, &settling.request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            detached::DetachedState::Settled,
+        );
+        assert!(
+            crate::messages::side_channel::peek_pending_side_channel_for_job_async(
+                &orch.db.local,
+                FEATURE_JOB
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+
+        // The same pause after a commitless capture grants no authority.
+        let commitless = BatchControl::new(false);
+        capture_current_for_batch(&orch, &request, &commitless, true, deadlines)
+            .await
+            .expect("commitless capture");
+        assert!(commitless.recorded_db().is_none());
+        writer.tool_use_id = Some("writer-after-inline".into());
+        let written = crate::mcp::handlers::write::handle_write(&orch, &writer).await;
+        assert!(!written.contains("may commit to this branch"), "{written}");
+        let head = fx.bookmark();
+        assert_ne!(
+            head, fx.base,
+            "writer succeeds after settlement with a commitless batch paused"
+        );
+        assert_eq!(fx.blob(&head, "writer.txt"), "writer");
     }
 
     /// An installed delta whose barrier cannot take the store lock is held
@@ -6254,6 +6550,58 @@ impl BatchCoordinate {
     }
 }
 
+/// Capture commit authority in the same branch/store ordering as a writer.
+/// The first resolution locates the coordinate only; the immutable execution
+/// base is resolved again under the guard and is not released until durable.
+async fn capture_current_for_batch(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    control: &BatchControl,
+    has_process: bool,
+    deadlines: CallDeadlines,
+) -> Result<super::branch::BranchResolution, String> {
+    let location = super::branch::resolve_current_for_read(orch, request).await?;
+    if !super::durable_suspend::run_batch_holds_branch(control.commits, !has_process) {
+        return Ok(location);
+    }
+    let budget = || {
+        deadlines
+            .work
+            .saturating_duration_since(tokio::time::Instant::now())
+    };
+    let _reservation = orch
+        .reserve_branches(
+            &location.repository_path,
+            &[&location.rev],
+            "run batch capture admission",
+            budget(),
+        )
+        .await?;
+    let _guard = acquire_store_lock(
+        orch,
+        Some(&location.repository_path),
+        crate::orchestrator::StoreLockClass::Foreground,
+        "run batch capture admission",
+        budget(),
+    )
+    .await?;
+    // Capture moves no bookmark, so concurrent committing batches may share
+    // this base. Their durable holds exclude actual writers at publication.
+    let captured = super::branch::resolve_current_for_read(orch, request).await?;
+    if captured.repository_path != location.repository_path || captured.rev != location.rev {
+        return Err("The run's branch coordinate changed during capture; nothing ran.".into());
+    }
+    control.set_facts(BatchFacts {
+        store_lock: Some(captured.repository_path.clone()),
+        host: false,
+        may_park: true,
+        verdict_only: false,
+    });
+    control.begin_placement("preparing its captured base".into());
+    record_detached(orch, request, control, detached::INLINE_CAPTURE).await?;
+    Ok(captured)
+}
+
 /// Prepare, place, run, and settle one `run` batch, returning its envelope.
 /// Runs on the batch's own task ([`handle_run`]).
 #[allow(clippy::too_many_arguments)]
@@ -6471,7 +6819,7 @@ async fn prepare_and_run_batch(
     // Authenticated jobs resolve repository identity and the immutable batch base
     // solely from their durable run coordinate. Process cwd is scratch residence.
     let logical_resolution = if coordinate.own_coordinate && run_context.is_some() {
-        match super::branch::resolve_current_for_read(orch, request).await {
+        match capture_current_for_batch(orch, request, control, has_process, deadlines).await {
             Ok(resolution) => Some(resolution),
             Err(error) => return run_envelope(error, Vec::new()),
         }
@@ -6952,6 +7300,7 @@ async fn prepare_and_run_batch(
                 verdict_only: coordinate.verdict_only,
                 revision_label,
                 logical_resolution,
+                snapshot_attribution: control.snapshot_attribution.clone(),
                 store_lock,
                 // Publication reads repository identity off this, which every
                 // attempt shares, so the template answers for all of them.
@@ -6992,6 +7341,7 @@ async fn prepare_and_run_batch(
         verdict_only: coordinate.verdict_only,
         revision_label,
         logical_resolution,
+        snapshot_attribution: control.snapshot_attribution.clone(),
         store_lock,
         routed_request: None,
         cwd,
@@ -7714,6 +8064,7 @@ struct RunBatchSettlement {
     /// For a `branch:` run, the label naming the revision it ran against.
     revision_label: Option<String>,
     logical_resolution: Option<super::branch::BranchResolution>,
+    snapshot_attribution: std::sync::Arc<std::sync::Mutex<Option<SnapshotAttribution>>>,
     store_lock: Option<std::path::PathBuf>,
     routed_request: Option<CellRequest>,
     cwd: String,
@@ -7743,6 +8094,32 @@ struct RunBatchSettlement {
     /// an earlier one may already have published: before landing, look for a
     /// landing recorded under this batch's key since this instant.
     prior_publication_since_ms: Option<i64>,
+}
+
+/// The immutable input and the branch state observed when its result settled.
+/// This is independent of any commit produced by the batch.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SnapshotAttribution {
+    ran_commit: String,
+    branch: String,
+    current_commit: Option<String>,
+}
+
+impl SnapshotAttribution {
+    pub(crate) fn line(&self) -> String {
+        let mut line = format!("Ran against {}.", self.ran_commit);
+        match self.current_commit.as_deref() {
+            Some(current) if current != self.ran_commit => {
+                line = format!(
+                    "Ran against {}; the branch `{}` is now at {}.",
+                    self.ran_commit, self.branch, current
+                );
+            }
+            None => line.push_str(" The branch head at settlement could not be resolved."),
+            _ => {}
+        }
+        line
+    }
 }
 
 /// The machine a batch was placed on when its call suspended, named for the
@@ -7794,6 +8171,8 @@ pub(crate) struct PersistedSettlement {
     #[serde(default)]
     resolution: Option<PersistedResolution>,
     #[serde(default)]
+    snapshot_attribution: Option<SnapshotAttribution>,
+    #[serde(default)]
     store_lock: Option<std::path::PathBuf>,
     /// The placement template, its environment cleared: publication reads
     /// the request's identity and repository from it, never its environment.
@@ -7838,6 +8217,7 @@ impl PersistedSettlement {
             verdict_only: false,
             revision_label: None,
             resolution: None,
+            snapshot_attribution: None,
             store_lock: None,
             routed_request,
             cwd: "/tmp".into(),
@@ -7895,6 +8275,7 @@ impl RunBatchSettlement {
             request: self.request.clone(),
             commit_msg: self.commit_msg.clone(),
             verdict_only: self.verdict_only,
+            snapshot_attribution: self.snapshot_attribution.lock().unwrap().clone(),
             revision_label: self.revision_label.clone(),
             resolution: self
                 .logical_resolution
@@ -7949,6 +8330,9 @@ impl RunBatchSettlement {
             run_context,
             commit_msg: persisted.commit_msg.clone(),
             verdict_only: persisted.verdict_only,
+            snapshot_attribution: std::sync::Arc::new(std::sync::Mutex::new(
+                persisted.snapshot_attribution.clone(),
+            )),
             revision_label: persisted.revision_label.clone(),
             logical_resolution: persisted.resolution.as_ref().map(|resolution| {
                 super::branch::BranchResolution {
@@ -8168,6 +8552,9 @@ impl BatchPlacement {
 /// Why a commitless batch ran on a cell of its own rather than in its job's
 /// home.
 fn hermetic_note(occupant: &str, home_machine: Option<&str>) -> String {
+    if occupant.starts_with("terminal-refresh:") {
+        return "It ran on a cell of its own: the job's working tree was reconciling its terminal checkout, and a batch without `commit_msg` does not wait for it. It read the branch at its committed tip, and its edits were discarded.".into();
+    }
     let on = home_machine
         .map(|machine| format!(" on {machine}"))
         .unwrap_or_default();
@@ -8178,6 +8565,9 @@ fn hermetic_note(occupant: &str, home_machine: Option<&str>) -> String {
 
 /// What a committing batch waiting for its job's home is waiting for.
 fn home_wait_sentence(occupant: &str, home_machine: Option<&str>) -> String {
+    if occupant.starts_with("terminal-refresh:") {
+        return "waiting for the job's residency: reconciling its terminal checkout".into();
+    }
     let on = home_machine
         .map(|machine| format!(" on {machine}"))
         .unwrap_or_default();
@@ -8394,10 +8784,10 @@ async fn run_routed_batch(
         verdict_only: settlement.verdict_only,
     });
     control.set_persisted(settlement.persist(placement.residence));
-    control.begin_placement(
-        "waiting to be placed".to_string(),
-        placement.residence == BatchResidence::Home,
-    );
+    if let Err(error) = control.persist_recorded_settlement(&orch.fleet).await {
+        return run_envelope(error, Vec::new());
+    }
+    control.begin_placement("waiting to be placed".to_string());
     control.phase_done("prepare");
     let task_orch = orch.clone();
     let task_control = control.clone();
@@ -8592,7 +8982,16 @@ async fn place_and_run_attempts(
         None => None,
         Some(job_id) => loop {
             match occupancy::claim(&job_id, &request_id, placement.commit_present) {
-                occupancy::HomeClaim::Tenant(tenancy) => break Some(tenancy),
+                occupancy::HomeClaim::Tenant(tenancy) => {
+                    let refresh_orch = orch.clone();
+                    let refresh_job = job_id.clone();
+                    break Some(tenancy.refresh_on_release(move || {
+                        crate::orchestrator::base_advance::refresh_vacated_job_terminals(
+                            refresh_orch,
+                            refresh_job,
+                        );
+                    }));
+                }
                 occupancy::HomeClaim::Elsewhere(occupant) => {
                     log::info!(
                         "run batch {request_id} has no commit_msg and its job's home is running {}; it runs on a cell of its own",
@@ -8747,6 +9146,9 @@ async fn place_and_run_attempts(
                 name: orch.fleet.executor_name_for_text(&executor_id),
                 executor_id,
             });
+        }
+        if let Err(error) = control.persist_recorded_settlement(&orch.fleet).await {
+            return PlacedBatch::Refused(error);
         }
         control.admit().await;
         let executed = orch
@@ -9010,16 +9412,13 @@ struct BatchFacts {
     verdict_only: bool,
 }
 
-/// Where a batch stands on its way to a machine, which is what its detached
-/// row says and whether that row holds the branch.
+/// Where a batch stands on its way to a machine, as its detached row says.
 struct PlacementStage {
-    /// The fleet has been handed the batch. Until then nothing runs it, and
-    /// its row is parked and holds nothing.
+    /// The fleet has been handed the batch. Until then its row is parked.
+    /// Placement does not decide commit authority's branch hold.
     admitted: bool,
     /// What it waits for while it is not admitted, in a sentence.
     waiting: Option<String>,
-    /// It runs in the job's home rather than on a cell of its own.
-    in_home: bool,
     /// The database of its detached row, once the row is written.
     row: Option<std::sync::Arc<crate::storage::LocalDb>>,
 }
@@ -9046,12 +9445,15 @@ struct BatchControl {
     /// The verdict settlement reached, for a result that reaches its job as a
     /// notice rather than on its call.
     verdict: std::sync::Mutex<Option<String>>,
+    snapshot_attribution: std::sync::Arc<std::sync::Mutex<Option<SnapshotAttribution>>>,
     interrupter: std::sync::Mutex<Option<Interrupter>>,
     phases: std::sync::Mutex<(std::time::Instant, Vec<(&'static str, std::time::Duration)>)>,
     /// What a durable record of this batch carries so a later runner process
     /// can settle it; `None` for a host batch, which cannot outlive one.
     persisted: std::sync::Mutex<Option<PersistedSettlement>>,
     stage: std::sync::Mutex<PlacementStage>,
+    /// Serializes capture admission with a call recording its durable batch.
+    record_gate: tokio::sync::Mutex<()>,
     /// A machine claimed one of the batch's attempts, so it may have run.
     ever_claimed: std::sync::atomic::AtomicBool,
     /// What it was waiting on when it was stopped, taken before the fleet
@@ -9097,6 +9499,7 @@ impl BatchControl {
                 verdict_only: false,
             }),
             verdict: std::sync::Mutex::new(None),
+            snapshot_attribution: Default::default(),
             interrupter: std::sync::Mutex::new(None),
             phases: std::sync::Mutex::new((std::time::Instant::now(), Vec::new())),
             persisted: std::sync::Mutex::new(None),
@@ -9105,9 +9508,9 @@ impl BatchControl {
             stage: std::sync::Mutex::new(PlacementStage {
                 admitted: true,
                 waiting: None,
-                in_home: true,
                 row: None,
             }),
+            record_gate: tokio::sync::Mutex::new(()),
             ever_claimed: std::sync::atomic::AtomicBool::new(false),
             stopped_unplaced: std::sync::Mutex::new(None),
             owner: std::sync::Mutex::new(None),
@@ -9267,6 +9670,17 @@ impl BatchControl {
             .clone()
     }
 
+    /// Copy the settled comparison after a late detachment has written its row.
+    async fn persist_snapshot(&self, db: &crate::storage::LocalDb) {
+        let attribution = self.snapshot_attribution.lock().unwrap().clone();
+        if let Some(attribution) = attribution {
+            if let Err(error) = detached::record_snapshot(db, &self.request_id, &attribution).await
+            {
+                log::warn!("could not persist batch snapshot attribution: {error}");
+            }
+        }
+    }
+
     /// The verdict and output a detached batch's row settles with. A batch
     /// stopped before any machine claimed it settles as never placed, naming
     /// what it waited on, rather than as an unexplained cancellation.
@@ -9284,11 +9698,10 @@ impl BatchControl {
 
     /// The batch starts toward a machine, waiting for `waiting`, in the job's
     /// home or not.
-    fn begin_placement(&self, waiting: String, in_home: bool) {
+    fn begin_placement(&self, waiting: String) {
         let mut stage = self.stage();
         stage.admitted = false;
         stage.waiting = Some(waiting);
-        stage.in_home = in_home;
     }
 
     /// What the batch waits for, while no machine has it.
@@ -9319,7 +9732,6 @@ impl BatchControl {
 
     /// The batch runs on a cell of its own, not in the job's home.
     fn leave_home(&self) {
-        self.stage().in_home = false;
         if let Some(persisted) = self
             .persisted
             .lock()
@@ -9331,7 +9743,7 @@ impl BatchControl {
     }
 
     /// The fleet has the batch now. A row written while it waited becomes
-    /// `running`, and holds the branch only from here.
+    /// `running`; its captured-base commit authority is unchanged.
     async fn admit(&self) {
         let row = {
             let mut stage = self.stage();
@@ -9366,14 +9778,34 @@ impl BatchControl {
         stage.admitted
     }
 
-    /// Whether the batch holds the replay mutation boundary: once a machine
-    /// has it, when it can write its branch or runs in the job's home. A host
-    /// batch holds no tree; a commitless batch on a cell of its own reads the
-    /// branch's committed tip and keeps nothing.
+    fn recorded_db(&self) -> Option<std::sync::Arc<crate::storage::LocalDb>> {
+        self.stage().row.clone()
+    }
+
+    /// Commit authority holds from base capture, not fleet placement.
     fn holds_branch(&self) -> bool {
-        let facts = self.facts();
-        let stage = self.stage();
-        stage.admitted && !facts.host && (self.commits || (!facts.verdict_only && stage.in_home))
+        super::durable_suspend::run_batch_holds_branch(self.commits, self.facts().host)
+    }
+
+    /// Capture precedes preparation and placement. Before an attempt can run,
+    /// enrich its existing authority with the settlement and residence needed
+    /// to adopt a result after a restart; never dispatch without that write.
+    async fn persist_recorded_settlement(&self, fleet: &crate::fleet::Fleet) -> Result<(), String> {
+        let Some(db) = self.recorded_db() else {
+            return Ok(());
+        };
+        let json = serde_json::to_string(&self.persisted_for_record(fleet))
+            .map_err(|error| format!("Could not record run settlement: {error}"))?;
+        let changed = db.execute(
+            "UPDATE run_batch_detached SET settlement_json=?2 WHERE request_id=?1 AND state IN ('parked','running')",
+            (self.request_id.clone(), json),
+        )
+        .await
+        .map_err(|error| format!("Could not record run settlement before placement: {error}"))?;
+        if changed == 0 {
+            return Err("This batch's durable authority was retired before placement; nothing was dispatched.".into());
+        }
+        Ok(())
     }
 
     fn set_persisted(&self, persisted: PersistedSettlement) {
@@ -9594,6 +10026,13 @@ async fn reissue_refusal(orch: &Orchestrator, request: &McpCallbackRequest) -> O
             ctx.run_id,
             twin.request_id
         );
+        if twin.reason == detached::INLINE_CAPTURE {
+            return Some(format!(
+                "This batch is already in flight as request `{}`; its call still owns delivery of the result. Nothing new was started. Do not re-run it: `{}` shows where it stands.",
+                twin.request_id,
+                detached::handle_uri(&twin.request_id),
+            ));
+        }
         return Some(detached::reissue_refusal_text(
             &twin.request_id,
             &detached::live_state(orch, &twin),
@@ -9895,11 +10334,12 @@ fn spawn_parked_resolver(
         // being withdrawn, and its withdrawal hands this row back.
         durable_suspend::await_inner_wait_release(&db, &record).await;
         durable_suspend::drive_resolution(&orch, &db, &record, &answer.resume_text, false).await;
-        // A wait abandoned while its batch ran became a detached batch, and
-        // its result reaches the job as a notice instead. Settling is a no-op
-        // for a wait that resolved normally: no detached row exists for it.
+        // A normal park delivers through its wait, so its capture authority
+        // retires quietly. An abandoned wait transferred delivery to its batch
+        // row and now owes a notice instead.
         let (verdict, output) = control.detached_settlement(&answer.resume_text);
-        detached::settle_and_deliver(&orch, &db, &control.request_id, &verdict, &output).await;
+        control.persist_snapshot(&db).await;
+        detached::settle_after_park(&orch, &db, &control.request_id, &verdict, &output).await;
     });
 }
 
@@ -9925,13 +10365,30 @@ async fn record_detached(
     control: &BatchControl,
     reason: &str,
 ) -> Result<DetachedRecord, String> {
+    let _record_guard = control.record_gate.lock().await;
+    if let Some(db) = control.recorded_db() {
+        return Ok(DetachedRecord { db });
+    }
     if request.run_id.is_none() {
         return Err("it belongs to no agent run".into());
     }
     let (ctx, db) = super::run_context::lookup_run_routed(&orch.db, request)
         .await
         .map_err(|error| format!("its run could not be found ({error})"))?;
-    // A batch no machine has yet is parked and holds nothing; its admission
+    // A cancelled writer can have committed its row just before its future
+    // was dropped. Rejoin that exact durable request rather than inserting a
+    // duplicate or exposing a base without authority.
+    if let Some(existing) = detached::load(&db, &control.request_id).await? {
+        if !matches!(
+            existing.state,
+            detached::DetachedState::Parked | detached::DetachedState::Running
+        ) {
+            return Err("this batch's durable authority was already retired".into());
+        }
+        control.row_written(db.clone());
+        return Ok(DetachedRecord { db });
+    }
+    // A batch no machine has yet is parked; its admission
     // makes the row running (`BatchControl::admit`).
     let waiting_on = control.unplaced();
     let batch = detached::DetachedBatch {
@@ -9978,6 +10435,7 @@ fn spawn_detached_resolver(
         let _live = live;
         let answer = rx.await.unwrap_or_else(|_| BatchAnswer::task_failed());
         let (verdict, output) = control.detached_settlement(&answer.resume_text);
+        control.persist_snapshot(&record.db).await;
         detached::settle_and_deliver(&orch, &record.db, &control.request_id, &verdict, &output)
             .await;
     });
@@ -10042,6 +10500,9 @@ async fn detach_dropped_call(
     };
     match record {
         Ok(record) => {
+            if let Err(error) = detached::detach_inline(&record.db, &control.request_id, TRANSPORT_CLOSED).await {
+                log::warn!("could not record run batch transport loss: {error}");
+            }
             log::warn!(
                 "run answer lost; batch {} keeps running detached",
                 control.request_id
@@ -10225,6 +10686,30 @@ impl CallAnswer {
     }
 
     fn finish(&mut self, outcome: AnswerOutcome, envelope: String) -> String {
+        if matches!(outcome, AnswerOutcome::Cancelled) {
+            // The reply can precede preparation's cancellation boundary. Drain
+            // its real result so a capture row written after this reply still
+            // retires quietly; cancellation already answered the call.
+            if let Some(rx) = self.rx.take() {
+                let (orch, control) = (self.orch.clone(), self.control.clone());
+                let live = detached::LiveResolver::claim(&control.request_id);
+                tokio::spawn(async move {
+                    let _live = live;
+                    let answer = rx.await.unwrap_or_else(|_| BatchAnswer::task_failed());
+                    if let Some(db) = control.recorded_db() {
+                        control.persist_snapshot(&db).await;
+                        detached::settle_answered_inline(
+                            &orch,
+                            &db,
+                            &control.request_id,
+                            &control.verdict_for(&answer.resume_text),
+                            &answer.resume_text,
+                        )
+                        .await;
+                    }
+                });
+            }
+        }
         self.answered = true;
         self.control.record_phases();
         answer_timeline::set_outcome(outcome);
@@ -10243,8 +10728,10 @@ impl CallAnswer {
             .detached
             .take()
             .map(|record| record.db)
-            .or_else(|| self.held.as_ref().map(|held| held.db.clone()));
+            .or_else(|| self.held.as_ref().map(|held| held.db.clone()))
+            .or_else(|| self.control.stage().row.clone());
         if let Some(db) = detached_db {
+            self.control.persist_snapshot(&db).await;
             detached::settle_answered_inline(
                 &self.orch,
                 &db,
@@ -10477,6 +10964,11 @@ impl CallAnswer {
                 return self.cancel_in_time(reason).await;
             }
         };
+        if let Err(error) =
+            detached::detach_inline(&record.db, &self.control.request_id, reason).await
+        {
+            log::warn!("could not record run batch transport handoff: {error}");
+        }
         let text = match self.control.unplaced() {
             Some(waiting) => {
                 log::info!(
@@ -10534,7 +11026,7 @@ impl CallAnswer {
         // Settlement had already begun, so the batch's own result is the
         // truest answer if it arrives in time.
         if let Some(answer) = self.wait_until(self.deadlines.answer).await {
-            return self.finish(AnswerOutcome::Answered, answer.envelope);
+            return self.answer(answer).await;
         }
         let left = if self.control.commits {
             "so it may have committed; read `cairn:@/vcs/log?limit=5` before re-running"
@@ -11305,6 +11797,44 @@ async fn settle_run_batch(
     if let Some(label) = &s.revision_label {
         result.prepend(&format!("{}\n\n", ran_against_line(label, cell_origin)));
     }
+    // Ordinary commitless tree batches retain their call-captured snapshot.
+    // Only a completed machine result can claim the commands ran; explicit
+    // branch runs keep their existing pinned-revision attribution.
+    if !s.verdict_only
+        && s.commit_msg.is_none()
+        && notes.is_some_and(|notes| notes.ran_on.is_some())
+    {
+        if let (Some(captured), Some(request)) =
+            (s.logical_resolution.as_ref(), s.routed_request.as_ref())
+        {
+            let previous = s.snapshot_attribution.lock().unwrap().clone();
+            let attribution = match previous {
+                Some(attribution) => attribution,
+                None => {
+                    let current =
+                        cairn_vcs::resolve_coordinate(&captured.repository_path, &captured.rev)
+                            .await;
+                    if let Err(error) = &current {
+                        log::warn!("could not resolve batch settlement head: {error}");
+                    }
+                    SnapshotAttribution {
+                        ran_commit: request.base_commit.clone(),
+                        branch: captured.rev.clone(),
+                        current_commit: current.ok(),
+                    }
+                }
+            };
+            *s.snapshot_attribution.lock().unwrap() = Some(attribution.clone());
+            if let Ok((_, db)) = super::run_context::lookup_run_routed(&orch.db, &s.request).await {
+                if let Err(error) =
+                    detached::record_snapshot(&db, &request.request_id, &attribution).await
+                {
+                    log::warn!("could not persist batch snapshot attribution: {error}");
+                }
+            }
+            result.prepend(&format!("{}\n\n", attribution.line()));
+        }
+    }
     // Every batch a machine ran opens by naming it, selector or not, so a
     // batch is never somewhere its caller cannot see. Host items (MCP tools,
     // decide, REPL sends) run on the host and carry no line.
@@ -11809,6 +12339,28 @@ pub(crate) async fn job_home_uri(
 mod tests {
     use super::*;
     use cairn_common::executor_protocol::CellCommandClass;
+
+    #[test]
+    fn snapshot_attribution_preserves_input_across_branch_moves() {
+        let captured = "a".repeat(40);
+        let moved = "b".repeat(40);
+        let mut attribution = SnapshotAttribution {
+            ran_commit: captured.clone(),
+            branch: "feature".into(),
+            current_commit: Some(moved.clone()),
+        };
+        let durable = serde_json::to_string(&attribution).unwrap();
+        let restored: SnapshotAttribution = serde_json::from_str(&durable).unwrap();
+        assert_eq!(restored.ran_commit, captured);
+        assert_eq!(restored.current_commit.as_deref(), Some(moved.as_str()));
+        assert!(restored.line().contains(&captured));
+        assert!(restored.line().contains(&moved));
+        attribution.current_commit = Some(captured.clone());
+        assert!(!attribution.line().contains("now"));
+        attribution.current_commit = None;
+        assert!(attribution.line().contains(&captured));
+        assert!(!attribution.line().contains(&moved));
+    }
 
     /// A service's default branch is not a `branch:` the service asked for: it
     /// places a tree-bound batch on the base tip and leaves a host batch (an
@@ -13603,6 +14155,7 @@ pub(crate) mod host_batch_tests {
             verdict_only: true,
             revision_label: None,
             logical_resolution: None,
+            snapshot_attribution: Default::default(),
             store_lock: None,
             routed_request: None,
             cwd: request.cwd.clone(),
@@ -14767,9 +15320,9 @@ pub(crate) mod host_batch_tests {
     /// cairn/6426 (b), the specimens' shape: a Codex nested batch with a
     /// `commit_msg` is still waiting for its job's home, which another batch
     /// occupies, when its call must answer. Its row is parked, names the batch
-    /// it waits behind and the machine, and holds no branch; so does its
-    /// answer. Admission makes it running and holding, and its result settles
-    /// it as usual.
+    /// it waits behind and the machine, and retains its captured-base hold.
+    /// Admission makes it running without changing that hold, and its result
+    /// settles it as usual.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_committing_batch_waiting_for_its_home_detaches_parked_naming_its_predecessor() {
         let orch = env().await;
@@ -14788,7 +15341,7 @@ pub(crate) mod host_batch_tests {
             waiting,
             "waiting for the job's residency on bgsrv-mac: running `batch-1`"
         );
-        control.begin_placement(waiting.clone(), true);
+        control.begin_placement(waiting.clone());
         let (tx, rx) = tokio::sync::oneshot::channel();
         let text =
             envelope_text(&answer_call(&orch, &request, deadlines, control.clone(), rx).await);
@@ -14799,7 +15352,10 @@ pub(crate) mod host_batch_tests {
         assert!(!text.contains("still running"), "{text}");
         let (state, holds, waiting_on) = detached_row(&orch, &control.request_id).await;
         assert_eq!(state, "parked", "never `running` while no machine has it");
-        assert_eq!(holds, 0, "it holds no branch before admission");
+        assert_eq!(
+            holds, 1,
+            "commit authority holds the captured base before admission"
+        );
         assert_eq!(waiting_on.as_deref(), Some(waiting.as_str()));
         let batch = detached::load(&orch.db.local, &control.request_id)
             .await
@@ -14832,7 +15388,7 @@ pub(crate) mod host_batch_tests {
             Some(ms(600_000)),
         );
         let control = BatchControl::new(true);
-        control.begin_placement("waiting to be placed".into(), true);
+        control.begin_placement("waiting to be placed".into());
         let tenancy = match occupancy::claim("job-vacant-control", &control.request_id, true) {
             occupancy::HomeClaim::Tenant(tenancy) => tenancy,
             other => panic!("a vacant home is taken at once: {other:?}"),
@@ -14856,15 +15412,18 @@ pub(crate) mod host_batch_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_commitless_batch_on_its_own_cell_never_holds_its_branch() {
         let control = BatchControl::new(false);
-        control.begin_placement("waiting to be placed".into(), true);
+        control.begin_placement("waiting to be placed".into());
         assert!(!control.holds_branch(), "nothing is held before admission");
         control.leave_home();
         control.admit().await;
         assert!(!control.holds_branch());
         let home = BatchControl::new(false);
-        home.begin_placement("waiting to be placed".into(), true);
+        home.begin_placement("waiting to be placed".into());
         home.admit().await;
-        assert!(home.holds_branch(), "a batch in the home holds it");
+        assert!(
+            !home.holds_branch(),
+            "a commitless batch in the home never holds it"
+        );
     }
 
     /// No phantom rows: a parked row whose batch task is gone (nothing in this
@@ -15099,7 +15658,6 @@ pub(crate) mod host_batch_tests {
         let (control, tx) = a_call_whose_transport_closed(&orch).await;
         control.begin_placement(
             "waiting for the job's residency on bgsrv-mac: running `batch-1`".into(),
-            true,
         );
         crate::project_services::authority::BatchStop::stop(&*control, &orch);
         let _ = tx.send(batch_answer(&RunFailure::Cancelled(None).text()));
@@ -15733,7 +16291,6 @@ pub(crate) mod host_batch_tests {
         let (control, tx) = a_call_whose_transport_closed(&orch).await;
         control.begin_placement(
             "waiting for the job's residency on bgsrv-mac: running `batch-1`".into(),
-            true,
         );
         let (_finish, finish_rx) = tokio::sync::oneshot::channel();
         simulated_routed_batch(control.clone(), tx, finish_rx);
@@ -15973,6 +16530,14 @@ pub(crate) mod host_batch_tests {
                 detached_state(&orch, "req-abandoned").await.as_deref(),
                 Some("running"),
                 "compact: {compact}"
+            );
+            assert!(
+                !detached::load(&orch.db.local, "req-abandoned")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .holds_branch,
+                "commitless reissue exclusion is durable without a branch hold",
             );
             let mut reissue = call_request(payload);
             reissue.tool_use_id = Some("tool-2".into());

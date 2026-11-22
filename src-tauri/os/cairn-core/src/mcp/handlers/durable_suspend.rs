@@ -120,8 +120,8 @@ pub(crate) enum Condition {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         identity: Option<String>,
         /// The batch runs against a pinned revision in a checkout of its own
-        /// (`branch:`), so the branch moving never disturbs it. Defaults to
-        /// false so rows written before this existed keep holding.
+        /// (`branch:`), so the branch moving never disturbs it. This scope
+        /// marker does not determine branch commit authority.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         verdict_only: bool,
         /// What a later runner process needs to settle and publish the batch
@@ -732,21 +732,28 @@ pub(crate) async fn await_inner_wait_release(db: &LocalDb, record: &Record) {
     }
 }
 
+/// A committing batch holds from capture of its immutable base through
+/// settlement, including while queued. A commitless batch never holds the
+/// branch: its checkout is aligned at entry and guarded by the executor's
+/// residency operation lock through all commands. Logical writes do not edit
+/// that checkout, and terminal refresh is deferred while its home is occupied.
+pub(crate) fn run_batch_holds_branch(commits: bool, host: bool) -> bool {
+    commits && !host
+}
+
 impl Condition {
-    /// Whether a run batch can write its branch or runs in the node's
-    /// residence, which is what makes it hold the replay mutation boundary.
-    /// A host batch holds no tree; a verdict-only one without a `commit_msg`
-    /// runs in a checkout of its own. Every other condition holds nothing.
+    /// Whether this condition names a batch with branch commit authority.
     pub(crate) fn holds_branch(&self) -> bool {
         match self {
-            Condition::RunBatch {
-                commits,
-                host,
-                verdict_only,
-                ..
-            } => !host && (*commits || !verdict_only),
+            Condition::RunBatch { commits, host, .. } => run_batch_holds_branch(*commits, *host),
             _ => false,
         }
+    }
+
+    /// A machine batch outlives its call even when it has no commit authority.
+    /// Its durable lifecycle must survive abandonment until its result settles.
+    pub(crate) fn is_tree_run_batch(&self) -> bool {
+        matches!(self, Condition::RunBatch { host: false, .. })
     }
 
     /// Whether an escalated message may answer this call early and resume its
@@ -754,7 +761,7 @@ impl Condition {
     /// machine, which runs on detached. A host batch's items are interrupted
     /// when nobody waits on them, so it holds.
     pub(crate) fn is_steerable(&self) -> bool {
-        self.is_wait_for() || matches!(self, Condition::RunBatch { host: false, .. })
+        self.is_wait_for() || self.is_tree_run_batch()
     }
 
     /// Whether this is a `waitFor` condition, which only observes something,
@@ -1390,7 +1397,7 @@ pub(crate) async fn take_over_run_batch(
     let goal_pause = pause_goal_for_park(orch, &record, turn_owner.as_ref())?;
     let converted = convert_run_batch(db, &record).await;
     let (yielded, parks) = settle_goal_pause(orch, &record, goal_pause, converted)?;
-    // A pending batch row holds the branch; the continuation it became holds
+    // A committing batch row holds the branch; the continuation it became holds
     // nothing and will never resolve as a batch. So this is where that hold
     // ends, and the replay deferred behind it is served from here, as from
     // every other exit of a batch's wait.
@@ -1857,7 +1864,7 @@ async fn mark_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result<b
                     AbandonCause::Superseded => Some(SUPERSEDED_WHILE_RUNNING),
                     AbandonCause::OperatorCompact => condition
                         .as_ref()
-                        .filter(|condition| condition.holds_branch())
+                        .filter(|condition| condition.is_tree_run_batch())
                         .map(|_| COMPACTED_WHILE_RUNNING),
                 };
                 if let (Some(condition), Some(reason)) = (condition, reason) {
@@ -2026,7 +2033,7 @@ pub(crate) const STOPPED_WHILE_RUNNING: &str = "its run was stopped while the ba
 
 /// Cancel every active wait of `run_id` for an external stop (an operator
 /// Stop, a provider change), in one write that first converts each run batch
-/// that holds its branch into a `running` detached row.
+/// on a machine into a `running` detached row.
 ///
 /// Cancelling the wait ends only the call's interest in the batch. Its process
 /// stops later, when the fleet's `Cancel` reaches its machine, and a provider
@@ -2034,8 +2041,9 @@ pub(crate) const STOPPED_WHILE_RUNNING: &str = "its run was stopped while the ba
 /// commit to the old tip, so the detached row keeps the branch held at the
 /// mutation boundary and is settled by the batch's own resolver or, failing
 /// that, by the evidence [`super::run::detached::sweep_unreported`] requires.
-/// A batch that cannot disturb the branch is not converted: its cancelled wait
-/// is its whole record, as before.
+/// Commitless machine batches also keep their row, without holding the branch:
+/// their result delivery and reissue exclusion still outlive the cancelled call.
+/// Host batches end with their process and need no surviving machine record.
 pub(crate) async fn cancel_run_waits_for_stop(db: &LocalDb, run_id: &str) -> Result<(), String> {
     let run_id = run_id.to_string();
     db.write(|c| {
@@ -2048,17 +2056,17 @@ pub(crate) async fn cancel_run_waits_for_stop(db: &LocalDb, run_id: &str) -> Res
                     params![run_id.clone()],
                 )
                 .await?;
-            let mut holding = Vec::new();
+            let mut batches = Vec::new();
             while let Some(row) = rows.next().await? {
                 let job_id = row.text(0)?;
                 if let Ok(condition) = serde_json::from_str::<Condition>(&row.text(1)?) {
-                    if condition.holds_branch() {
-                        holding.push((job_id, condition));
+                    if condition.is_tree_run_batch() {
+                        batches.push((job_id, condition));
                     }
                 }
             }
             drop(rows);
-            for (job_id, condition) in &holding {
+            for (job_id, condition) in &batches {
                 super::run::detached::insert_converted(
                     c,
                     job_id,
@@ -3876,6 +3884,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_commit_authority_holds_a_tree_batchs_branch() {
+        for commits in [false, true] {
+            for host in [false, true] {
+                for verdict_only in [false, true] {
+                    let condition: Condition = serde_json::from_value(serde_json::json!({
+                        "kind": "run_batch",
+                        "request_id": "capability-table",
+                        "commits": commits,
+                        "host": host,
+                        "verdict_only": verdict_only,
+                    }))
+                    .unwrap();
+                    assert_eq!(
+                        condition.holds_branch(),
+                        commits && !host,
+                        "commits={commits}, host={host}, verdict_only={verdict_only}"
+                    );
+                }
+            }
+        }
+        let legacy: Condition = serde_json::from_str(
+            r#"{"kind":"run_batch","request_id":"legacy-commit","commits":true}"#,
+        )
+        .unwrap();
+        assert!(legacy.holds_branch(), "legacy committing rows fail closed");
+    }
+
     fn run_batch_condition(commits: bool, label: Option<&str>) -> Condition {
         Condition::RunBatch {
             request_id: "request-1".into(),
@@ -4484,7 +4520,7 @@ mod tests {
     /// nothing of the batch.
     mod adoption {
         use super::*;
-        use crate::mcp::handlers::run::{adopted, PersistedSettlement, PlacedOn};
+        use crate::mcp::handlers::run::{adopted, detached, PersistedSettlement, PlacedOn};
         use cairn_common::executor_protocol::{
             CellOutcome, ExecutorMessage, MutationDelta, ProcessBatchItemOutcome,
             ReauthorizedTransfer,
@@ -4614,7 +4650,26 @@ mod tests {
         #[tokio::test]
         async fn a_parked_batch_that_survives_a_restart_delivers_its_real_result_once() {
             let (orch, base, _) = durable_env().await;
-            parked(&orch, &run_batch_record(&base, false)).await;
+            let record = run_batch_record(&base, false);
+            parked(&orch, &record).await;
+            orch.db
+                .local
+                .write(|conn| {
+                    let record = record.clone();
+                    Box::pin(async move {
+                        detached::insert_converted(
+                            conn,
+                            &record.job_id,
+                            &record.run_id,
+                            &record.condition,
+                            detached::INLINE_CAPTURE,
+                            record.created,
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap();
             let mut frames = orch
                 .fleet
                 .attach_reported_machine_for_test("exec-a", &[("request-1", "attempt-1")]);
@@ -4654,6 +4709,27 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             assert_eq!(adopted_state(&orch).await.as_deref(), Some("delivered"));
+            assert_eq!(
+                detached::load(&orch.db.local, "request-1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                detached::DetachedState::Settled,
+            );
+            assert_eq!(
+                orch.db
+                    .local
+                    .query_one(
+                        "SELECT COUNT(*) FROM suppressed_wakes WHERE source_kind='run_batch'",
+                        (),
+                        |row| row.i64(0),
+                    )
+                    .await
+                    .unwrap(),
+                0,
+                "the wait delivered the adopted result; its authority row owes no duplicate notice",
+            );
 
             orch.fleet
                 .handle_executor_message("exec-a", 1, result(outcome));
@@ -4759,7 +4835,7 @@ mod tests {
                         label: None,
                         identity: None,
                         commits: false,
-                        holds_branch: true,
+                        holds_branch: false,
                         state: detached::DetachedState::Lost,
                         verdict: None,
                         output: None,
@@ -5253,6 +5329,55 @@ mod tests {
                 !acked_before_asked,
                 "acknowledged only after the delta was asked for"
             );
+
+            // Reuse the real store: the next result was captured at A before
+            // the publication above moved its branch to B. Settlement must
+            // compare the live bookmark, not substitute B for its input.
+            let snapshot = PersistedSettlement::for_test(None, Some(fx.request.clone()), None)
+                .publishing_to_for_test("p", &fx.repository, fx.store(), "feature", &fx.base);
+            let (text, verdict) = crate::mcp::handlers::run::settle_adopted_result(
+                &orch,
+                &snapshot,
+                0,
+                completed(&orch, "snapshot verdict", None),
+                "exec-a",
+            )
+            .await;
+            assert_eq!(verdict, "succeeded");
+            assert!(
+                text.contains(&format!("Ran against {}", fx.request.base_commit)),
+                "{text}"
+            );
+            assert!(text.contains(&format!("is now at {landed}")), "{text}");
+
+            let (cancelled, _) = crate::mcp::handlers::run::settle_adopted_result(
+                &orch,
+                &snapshot,
+                0,
+                CellOutcome::Cancelled {
+                    request_id: fx.request.request_id.clone(),
+                    attempt_id: fx.request.attempt_id.clone(),
+                },
+                "exec-a",
+            )
+            .await;
+            assert!(!cancelled.contains("Ran against"), "{cancelled}");
+
+            let mut pinned = serde_json::to_value(&snapshot).unwrap();
+            pinned["verdict_only"] = serde_json::json!(true);
+            pinned["revision_label"] = serde_json::json!(fx.base.clone());
+            let pinned = serde_json::from_value(pinned).unwrap();
+            let (pinned_text, _) = crate::mcp::handlers::run::settle_adopted_result(
+                &orch,
+                &pinned,
+                0,
+                completed(&orch, "pinned verdict", None),
+                "exec-a",
+            )
+            .await;
+            assert!(pinned_text.contains(&fx.base), "{pinned_text}");
+            assert!(!pinned_text.contains("is now at"), "{pinned_text}");
+            assert_eq!(fx.bookmark(), landed, "comparison never changes the branch");
         }
 
         /// A commit whose delta its machine can no longer upload is reported
@@ -5322,8 +5447,8 @@ mod tests {
 
         /// The bound: a machine that has not reconnected leaves the call parked
         /// until this process has been up for the bound, then releases it into
-        /// a detached row whose branch hold stands. When the machine returns
-        /// with the result, that row settles and its notice is queued.
+        /// a detached lifecycle row. A commitless batch holds no branch, but
+        /// when the machine returns its row still settles and queues its notice.
         #[tokio::test]
         async fn a_machine_that_stays_away_releases_the_call_and_settles_the_row_on_return() {
             let (orch, base, _) = durable_env().await;
@@ -5351,7 +5476,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!((state.as_str(), holds), ("running", 1), "the hold stands");
+            assert_eq!(
+                (state.as_str(), holds),
+                ("running", 0),
+                "the commitless batch survives without holding the branch"
+            );
 
             let mut frames = orch
                 .fleet
@@ -5589,7 +5718,8 @@ mod tests {
     /// An operator Stop or a provider change cancels the run's waits before
     /// any batch process has ended (a provider change never ends it at all).
     /// A batch that can disturb the branch keeps holding it until it settles;
-    /// one that cannot is not converted, and other waits simply end.
+    /// a commitless machine batch also keeps its lifecycle record without a
+    /// branch hold, and other waits simply end.
     #[tokio::test]
     async fn a_stop_keeps_a_running_batchs_branch_hold_until_it_settles() {
         let (orch, base, _) = durable_env().await;
@@ -5627,12 +5757,17 @@ mod tests {
             held.detached_because.as_deref(),
             Some(STOPPED_WHILE_RUNNING)
         );
+        let verdict = super::super::run::detached::load(&orch.db.local, "request-verdict")
+            .await
+            .unwrap()
+            .expect("the verdict-only machine batch keeps its lifecycle record");
         assert!(
-            super::super::run::detached::load(&orch.db.local, "request-verdict")
-                .await
-                .unwrap()
-                .is_none(),
-            "a verdict-only batch is not converted: it never held the branch"
+            !verdict.holds_branch,
+            "a verdict-only batch holds no branch"
+        );
+        assert_eq!(
+            verdict.state,
+            super::super::run::detached::DetachedState::Running
         );
 
         super::super::run::detached::settle_answered_inline(

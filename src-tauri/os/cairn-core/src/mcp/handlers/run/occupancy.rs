@@ -46,6 +46,7 @@ pub(crate) enum HomeClaim {
 }
 
 static HOMES: LazyLock<Mutex<HashMap<String, Occupant>>> = LazyLock::new(Default::default);
+static DEFERRED: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
 static VACATED: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
 
 fn homes() -> std::sync::MutexGuard<'static, HashMap<String, Occupant>> {
@@ -71,6 +72,7 @@ pub(crate) fn claim(job_id: &str, request_id: &str, commits: bool) -> HomeClaim 
             HomeClaim::Tenant(Tenancy {
                 job_id: job_id.to_string(),
                 request_id: request_id.to_string(),
+                on_refresh: None,
             })
         }
     }
@@ -79,6 +81,46 @@ pub(crate) fn claim(job_id: &str, request_id: &str, commits: bool) -> HomeClaim 
 /// The batch in job `job_id`'s home, if any.
 pub(crate) fn occupant(job_id: &str) -> Option<Occupant> {
     homes().get(job_id).cloned()
+}
+
+/// Mark a refresh as deferred atomically with observing the occupant. The
+/// matching tenancy consumes this mark, so a stale drop cannot refresh a new
+/// occupant's home. The homes lock always precedes the deferred lock.
+#[cfg(test)]
+pub(crate) fn defer_terminal_refresh(job_id: &str) -> Option<Occupant> {
+    let homes = homes();
+    let occupant = homes.get(job_id)?.clone();
+    DEFERRED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(job_id.to_string(), occupant.request_id.clone());
+    Some(occupant)
+}
+
+/// Reserve an idle home for checkout reconciliation, or atomically register
+/// a deferred refresh on the batch that currently owns it.
+pub(crate) fn reserve_terminal_refresh(job_id: &str) -> Result<Tenancy, Occupant> {
+    let mut homes = homes();
+    if let Some(occupant) = homes.get(job_id) {
+        DEFERRED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(job_id.to_string(), occupant.request_id.clone());
+        return Err(occupant.clone());
+    }
+    let request_id = format!("terminal-refresh:{}", uuid::Uuid::new_v4());
+    homes.insert(
+        job_id.to_string(),
+        Occupant {
+            request_id: request_id.clone(),
+            executor_id: None,
+        },
+    );
+    Ok(Tenancy {
+        job_id: job_id.to_string(),
+        request_id,
+        on_refresh: None,
+    })
 }
 
 /// Wait until job `job_id`'s home is no longer held by anyone but
@@ -98,6 +140,9 @@ pub(crate) async fn vacancy(job_id: &str, request_id: &str, bound: Duration) {
 /// started. A terminal lives in the home, and acquiring the home waits for the
 /// batch in it, so the create answers now instead of after that batch.
 pub(crate) fn terminal_refusal(slug: &str, occupant: &Occupant) -> String {
+    if occupant.request_id.starts_with("terminal-refresh:") {
+        return format!("Could not start terminal `{slug}`: this job's working tree is reconciling its terminal checkout. Nothing was started. Create the terminal once reconciliation finishes.");
+    }
     format!(
         "Could not start terminal `{slug}`: this job's working tree is running batch `{id}` (`cairn:~/batches/{id}`), and the tree runs one thing at a time. Nothing was started. Create the terminal once that batch settles.",
         id = occupant.request_id
@@ -106,13 +151,27 @@ pub(crate) fn terminal_refusal(slug: &str, occupant: &Occupant) -> String {
 
 /// One batch's hold on its job's home. Dropping it vacates the home and wakes
 /// every batch waiting for it.
-#[derive(Debug)]
 pub(crate) struct Tenancy {
     job_id: String,
     request_id: String,
+    on_refresh: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl std::fmt::Debug for Tenancy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tenancy")
+            .field("job_id", &self.job_id)
+            .field("request_id", &self.request_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Tenancy {
+    pub(crate) fn refresh_on_release(mut self, callback: impl FnOnce() + Send + 'static) -> Self {
+        self.on_refresh = Some(Box::new(callback));
+        self
+    }
+
     /// Record the machine the home is on, which a batch sent elsewhere is
     /// pinned to so it runs beside the home on a cell of its own.
     pub(crate) fn located(&self, executor_id: &str) {
@@ -127,16 +186,29 @@ impl Tenancy {
 
 impl Drop for Tenancy {
     fn drop(&mut self) {
-        {
+        let refresh = {
             let mut homes = homes();
             if homes
                 .get(&self.job_id)
                 .is_some_and(|occupant| occupant.request_id == self.request_id)
             {
                 homes.remove(&self.job_id);
+                DEFERRED
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&self.job_id)
+                    .as_deref()
+                    == Some(self.request_id.as_str())
+            } else {
+                false
+            }
+        };
+        VACATED.notify_waiters();
+        if refresh {
+            if let Some(callback) = self.on_refresh.take() {
+                callback();
             }
         }
-        VACATED.notify_waiters();
     }
 }
 
@@ -194,10 +266,44 @@ mod tests {
         drop(other_job);
     }
 
+    #[test]
+    fn only_a_deferred_matching_tenancy_runs_its_release_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mark = calls.clone();
+        let tenancy =
+            tenant(claim("job-refresh", "batch-1", false)).refresh_on_release(move || {
+                mark.fetch_add(1, Ordering::SeqCst);
+            });
+        assert_eq!(
+            defer_terminal_refresh("job-refresh").unwrap().request_id,
+            "batch-1"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(tenancy);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(defer_terminal_refresh("job-refresh").is_none());
+
+        let mark = calls.clone();
+        let tenancy =
+            tenant(claim("job-refresh", "batch-2", false)).refresh_on_release(move || {
+                mark.fetch_add(1, Ordering::SeqCst);
+            });
+        drop(tenancy);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no deferred lease, no refresh"
+        );
+    }
+
     /// A tenancy that outlives a re-claim by someone else never evicts them.
     #[test]
     fn a_stale_tenancy_does_not_vacate_another_batchs_home() {
-        let first = tenant(claim("job-stale", "batch-1", false));
+        let first = tenant(claim("job-stale", "batch-1", false))
+            .refresh_on_release(|| panic!("a stale tenancy must not refresh"));
+        defer_terminal_refresh("job-stale");
         homes().insert(
             "job-stale".into(),
             Occupant {
@@ -208,5 +314,6 @@ mod tests {
         drop(first);
         assert_eq!(occupant("job-stale").unwrap().request_id, "batch-2");
         homes().remove("job-stale");
+        DEFERRED.lock().unwrap().remove("job-stale");
     }
 }

@@ -268,17 +268,51 @@ async fn logical_write_is_immediately_visible_to_ordinary_read_without_checkout_
         return;
     };
     repo.write("coherent.txt", "before\n");
+    repo.write("retained.txt", "still in use\n");
+    let checkout_head = || {
+        let output = std::process::Command::new(&repo.jj_bin)
+            .args([
+                "--ignore-working-copy",
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ])
+            .current_dir(repo.dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let checkout_before = checkout_head();
     let report = repo
         .change_report(json!({
             "changes": [{
                 "target": "file:coherent.txt",
                 "mode": "patch",
                 "payload": { "old_string": "before", "new_string": "after" }
+            }, {
+                "target": "file:retained.txt",
+                "mode": "delete"
+            }, {
+                "target": "file:created.txt",
+                "mode": "create",
+                "payload": { "content": "new revision only\n" }
             }],
             "commit_msg": "advance logical head"
         }))
         .await;
-    assert_successful_change(&report, 1);
+    assert_successful_change(&report, 3);
+    assert_eq!(checkout_head(), checkout_before);
+    assert_eq!(
+        std::fs::read_to_string(repo.path("retained.txt")).unwrap(),
+        "still in use\n"
+    );
+    assert!(!repo.path("created.txt").exists());
+    assert!(!repo.logical_exists("retained.txt"));
+    assert_eq!(repo.read("created.txt"), "new revision only\n");
 
     assert_eq!(
         std::fs::read_to_string(repo.path("coherent.txt")).unwrap(),

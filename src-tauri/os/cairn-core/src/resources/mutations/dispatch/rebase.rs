@@ -1010,9 +1010,8 @@ async fn rebuild(
             .await?
     {
         return Err(format!(
-            "Rebuild refused while {} can still publish to this branch; let that batch finish or cancel it with {}, then retry.",
-            batch.describe(),
-            crate::orchestrator::base_advance::cancel_action(&batch)
+            "Rebuild refused while {}; let that batch finish or cancel it, then retry.",
+            batch.hold_clause()
         ));
     }
     // Read under the store lock, where a parent's session is opened or

@@ -662,7 +662,7 @@ impl std::fmt::Display for PreparationRefusal {
             ),
             Self::Busy(BusyReason::RunBatch(batch)) => write!(
                 f,
-                "{batch} may still commit to this branch, so it is not rewritten under it"
+                "{batch}"
             ),
             Self::Busy(BusyReason::Regenerating(hold)) => write!(f, "{hold}"),
             Self::RegenerationPending(conflict) => write!(
@@ -3271,8 +3271,8 @@ impl Context<'_> {
     }
 
     /// Lock-free follow-up of an accepted install, each step bounded: refresh
-    /// held checkouts to the captured head (never re-resolving the moving
-    /// name), keep or withdraw review waves by the patch rule, and leave the
+    /// vacant checkouts to the captured head; occupied homes defer until release
+    /// and then resolve the current head. Keep or withdraw review waves and leave the
     /// owner one passive note.
     async fn after_install(
         &self,
@@ -3295,11 +3295,19 @@ impl Context<'_> {
         )
         .await
         {
-            Ok(0) => {}
-            Ok(failed) => warnings.push(format!(
-                "{failed} held checkout(s) of `{branch}` were not refreshed to {}",
-                installed.head
-            )),
+            Ok(refresh) => {
+                for (job, batch) in refresh.deferred {
+                    warnings.push(format!(
+                        "terminal checkout of `{branch}` for job `{job}` will refresh to the branch's then-current head when batch `{batch}` (running in this job's home) settles"
+                    ));
+                }
+                if refresh.failed != 0 {
+                    warnings.push(format!(
+                        "{} held checkout(s) of `{branch}` were not refreshed to {}",
+                        refresh.failed, installed.head
+                    ));
+                }
+            }
             Err(_) => warnings.push(format!(
                 "refreshing held checkouts of `{branch}` exceeded {}s",
                 RESIDENCY_REFRESH_BUDGET.as_secs()
@@ -3870,7 +3878,7 @@ impl Context<'_> {
             Ok(None) => {}
             Ok(Some(batch)) => {
                 return Err(PreparationRefusal::Busy(BusyReason::RunBatch(
-                    batch.describe(),
+                    batch.hold_clause(),
                 )))
             }
             Err(error) => return Err(PreparationRefusal::Repository(error)),

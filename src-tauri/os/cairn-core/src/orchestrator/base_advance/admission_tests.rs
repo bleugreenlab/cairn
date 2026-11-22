@@ -263,6 +263,21 @@ async fn an_in_flight_run_batch_refuses_every_writer_but_its_own_exact_sealed_pu
         !stale.is_for("proj-1", &gone_path, BRANCH),
         "an unresolvable store is never the store it was sealed for"
     );
+    drop(guard);
+    drop(reservation);
+
+    // The same durable wait without commit authority must admit a sibling
+    // writer and must not make preparation Busy.
+    h.db.execute(
+        "UPDATE agent_waits SET condition_json='{\"kind\":\"run_batch\",\"request_id\":\"req-own\",\"commits\":false}' WHERE id='wait-batch'",
+        (),
+    ).await.unwrap();
+    admit(&h.orch, &h, BRANCH)
+        .await
+        .expect("a commitless wait admits sibling writes");
+    h.prepare(super::preparation::PreparationPurpose::OwnerCommit)
+        .await
+        .unwrap_or_else(|refusal| panic!("a commitless wait cannot hold preparation: {refusal}"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -703,4 +718,94 @@ fn every_production_store_wide_mutation_is_admitted_or_named_as_owed() {
          while its owner is wiring it, name it in OWED with that owner; or, if a named writer's \
          admission is real but far from the call, name it in ADMITTED_ELSEWHERE with where"
     );
+}
+
+#[test]
+fn run_batch_branch_fences_share_one_capability_predicate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_files(&root, &mut files);
+    let test_only = test_only_files(&files);
+    let mut definitions = Vec::new();
+    for file in &files {
+        let name = file.file_name().unwrap().to_string_lossy();
+        if name == "tests.rs" || name.ends_with("_tests.rs") || test_only.contains(file) {
+            continue;
+        }
+        let text = std::fs::read_to_string(file).unwrap();
+        let code = production_lines(&text)
+            .into_iter()
+            .filter(|line| !is_inert(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let relative = file
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if code.contains("fn run_batch_holds_branch(") {
+            definitions.push(relative.clone());
+        }
+        if relative != "mcp/handlers/durable_suspend.rs" {
+            for independent in [
+                "commits && !host",
+                "commits || (!verdict_only",
+                "admitted && !host",
+            ] {
+                assert!(
+                    !code.contains(independent),
+                    "{relative} redefines batch hold capability"
+                );
+            }
+        }
+    }
+    assert_eq!(definitions, ["mcp/handlers/durable_suspend.rs"]);
+
+    for (file, reader) in [
+        (
+            "mcp/handlers/run/mod.rs",
+            "run_batch_holds_branch(self.commits, self.facts().host)",
+        ),
+        (
+            "mcp/handlers/durable_suspend.rs",
+            "run_batch_holds_branch(*commits, *host)",
+        ),
+        (
+            "mcp/handlers/run/detached.rs",
+            "durable_suspend::run_batch_holds_branch(",
+        ),
+        ("orchestrator/base_advance.rs", "condition.holds_branch()"),
+        (
+            "orchestrator/base_advance.rs",
+            "durable_suspend::run_batch_holds_branch(",
+        ),
+        (
+            "orchestrator/store_lock.rs",
+            "base_advance::inflight_run_batch_except(",
+        ),
+        (
+            "orchestrator/base_advance/preparation.rs",
+            "super::inflight_run_batch_except(",
+        ),
+        (
+            "orchestrator/base_advance/replay_requests.rs",
+            "super::inflight_run_batch_on_branch(",
+        ),
+        (
+            "resources/mutations/dispatch/rebase.rs",
+            "inflight_run_batch_on_branch(",
+        ),
+        ("resources/rebase.rs", "inflight_run_batch_on_branch("),
+    ] {
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        let code = production_lines(&text)
+            .into_iter()
+            .filter(|line| !is_inert(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains(reader),
+            "{file} must use canonical reader {reader}"
+        );
+    }
 }

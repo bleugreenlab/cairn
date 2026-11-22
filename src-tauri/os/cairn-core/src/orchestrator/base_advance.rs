@@ -1254,10 +1254,13 @@ impl InflightRunBatch {
         };
         let parked = crate::clock::stamp_millis(self.parked_at_ms)
             .map(|stamp| match self.detached_because.as_deref() {
+                Some(crate::mcp::handlers::run::detached::INLINE_CAPTURE) => {
+                    format!(", captured since {stamp}; its call is waiting inline")
+                }
                 Some(reason) => format!(
                     ", running detached since {stamp} because {reason}, so no call is waiting for it"
                 ),
-                None => format!(", parked since {stamp}"),
+                None => format!(", recorded since {stamp}"),
             })
             .unwrap_or_default();
         let progress = self
@@ -1268,6 +1271,15 @@ impl InflightRunBatch {
         format!(
             "run batch `{}`{label}{owner}{parked}{progress}",
             self.request_id
+        )
+    }
+
+    /// The capability behind every branch refusal, with its direct release.
+    pub(crate) fn hold_clause(&self) -> String {
+        format!(
+            "{}, which carries a commit_msg and may commit to this branch; cancel it with {}",
+            self.describe(),
+            cancel_action(self)
         )
     }
 
@@ -1332,8 +1344,11 @@ fn run_batch_from_wait(
 /// A batch that outlived its call and still runs, as the boundary names it.
 fn run_batch_from_detached(
     row: &cairn_db::turso::Row,
-) -> Result<InflightRunBatch, crate::storage::DbError> {
-    Ok(InflightRunBatch {
+) -> Result<Option<InflightRunBatch>, crate::storage::DbError> {
+    if !crate::mcp::handlers::durable_suspend::run_batch_holds_branch(row.i64(5)? != 0, false) {
+        return Ok(None);
+    }
+    Ok(Some(InflightRunBatch {
         job_id: row.text(0)?,
         holder: None,
         request_id: row.text(1)?,
@@ -1341,7 +1356,7 @@ fn run_batch_from_detached(
         parked_at_ms: row.get::<i64>(3)?,
         detached_because: row.opt_text(4)?,
         progress: None,
-    })
+    }))
 }
 
 /// [`inflight_run_batch_except`] as job `job_id` sees it: within that job's
@@ -1369,16 +1384,18 @@ pub(crate) async fn inflight_run_batch_on_branch(
 /// "nothing holds it" to a parent whose child task, sharing the branch, still
 /// has a batch open. This is the one reader every writer admission uses.
 ///
-/// `exempt` is one publication's own `(job, sealed request)`, named only after
-/// that request's immutable sealed delta was captured. Only that exact wait is
-/// skipped and the scan continues, so a child task or a second batch still
-/// prevents branch movement. `prefer_job`'s batch is reported first when
+/// For mutation admission, `exempt` is one publication's own `(job, sealed
+/// request)`, named only after its immutable sealed delta was captured. Pure
+/// run capture also excludes its own provisional durable request, which may
+/// have been recorded by its call before capture; that grants no permission
+/// to move a bookmark. Only that exact request is skipped and the scan
+/// continues, so a child task or a second batch still prevents admission. `prefer_job`'s batch is reported first when
 /// several are open, since that is the one its reader can end itself.
 ///
-/// A batch holds the boundary for as long as a durable row for its request is
-/// unsettled, and only settlement releases it (cairn/6145 and cairn/6205): an
-/// open run-batch wait (`pending` or `resolving`), or a `run_batch_detached`
-/// row still `running` for a batch that can disturb the branch. A wait
+/// A committing batch holds from capture until every durable row settles:
+/// an open run-batch wait (`pending` or `resolving`), or a detached row still
+/// `parked` or `running`. Commitless batches hold nothing, including legacy
+/// detached rows whose cached hold bit says otherwise. A wait
 /// abandoned while its batch ran, or cancelled by a stop of its run, becomes
 /// such a detached row in the same write, so the agent losing interest never
 /// ends the hold; the batch's settlement does. The source is
@@ -1408,12 +1425,12 @@ pub(crate) async fn inflight_run_batch_except(
           ORDER BY (w.job_id = ?3) DESC, w.created_at"
     );
     let detached_sql = format!(
-        "SELECT d.job_id, d.request_id, d.label, d.created_ms, d.reason
+        "SELECT d.job_id, d.request_id, d.label, d.created_ms, d.reason, d.commits
            FROM run_batch_detached d
            JOIN jobs j ON j.id = d.job_id
           WHERE j.project_id = ?1
             AND j.branch = ?2
-            AND d.state = 'running' AND d.holds_branch = 1
+            AND d.state IN ('parked', 'running')
             AND {LIVE_JOB_PREDICATE}
           ORDER BY (d.job_id = ?3) DESC, d.created_ms"
     );
@@ -1457,7 +1474,9 @@ pub(crate) async fn inflight_run_batch_except(
                     )
                     .await?;
                 while let Some(row) = rows.next().await? {
-                    let batch = run_batch_from_detached(&row)?;
+                    let Some(batch) = run_batch_from_detached(&row)? else {
+                        continue;
+                    };
                     if is_exempt(&batch) {
                         continue;
                     }
@@ -1502,22 +1521,22 @@ pub(crate) async fn shares_live_branch(
 pub(crate) fn mutation_boundary_hold(batch: &Result<Option<InflightRunBatch>, String>) -> String {
     match batch {
         Ok(Some(batch)) => format!(
-            "It is held by {}: a branch is never rewritten under a batch that may commit to it. \
-             The hold ends when that batch finishes; when it is cancelled, by its owning node or \
-             the operator, with {}; or when the operator stops the node, which stops every run \
+            "It is held by {}. \
+             The hold ends when that batch finishes or is cancelled by its owning node or \
+             the operator; or when the operator stops the node, which stops every run \
              under it. Ending a turn does not release it: a suspended batch outlives the turn \
              that started it. To cancel it and request the replay in one step: \
              `write({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{action:\"replay\",cancel_holding_batch:true}}}}]}})`. \
              Nothing revisits it on a timer: after that, the branch is carried onto its base at \
              its next commit, requested check or run, or merge, or when the replay is requested \
              again.",
-            batch.describe(),
-            cancel_action(batch)
+            batch.hold_clause()
         ),
-        Ok(None) => "No run batch is in flight on this branch now, on this node or any other \
-                     that shares it, so nothing holds the boundary any more: the branch is \
-                     carried onto its base at its next commit, requested check or run, or \
-                     merge, or when the replay is requested again."
+        Ok(None) => "No committing run batch holds this branch, on this node or any other \
+                     that shares it. A batch without a commit_msg runs on its own captured \
+                     tree and does not hold the branch. The branch is carried onto its base \
+                     at its next commit, requested check or run, or merge, or when the replay \
+                     is requested again."
             .to_string(),
         Err(error) => {
             format!("Whether a run batch on this branch still holds it is unknown: {error}.")
@@ -1967,20 +1986,131 @@ async fn materialize_markers_for_branch(
     }
 }
 
+#[derive(Default)]
+struct ResidencyRefresh {
+    failed: usize,
+    deferred: Vec<(String, String)>,
+}
+
+/// A vacancy refresh deliberately resolves the job's branch again. Multiple
+/// advances can have happened while its batch held the executor operation lock.
+pub(crate) fn refresh_vacated_job_terminals(orch: Orchestrator, job_id: String) {
+    tokio::spawn(async move {
+        let result: Result<(), String> = async {
+            let Some((db, project_id, branch, _)) = vacated_job_head(&orch, &job_id).await? else {
+                return Ok(());
+            };
+            #[cfg(test)]
+            tests::pause_vacancy_after_head(&job_id).await;
+            let refreshed =
+                refresh_terminal_residencies(&orch, &db, &project_id, &branch, Some(&job_id)).await;
+            if refreshed.failed != 0 {
+                return Err(format!(
+                    "{} terminal checkout(s) could not be refreshed",
+                    refreshed.failed
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            log::error!("deferred terminal refresh for job {job_id} failed: {error}");
+        }
+    });
+}
+
+async fn vacated_job_head(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<Option<(Arc<LocalDb>, String, String, String)>, String> {
+    let db = owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let id = job_id.to_string();
+    let coordinates = db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT project_id, branch FROM jobs WHERE id = ?1",
+                        [id.as_str()],
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some((row.text(0)?, row.opt_text(1)?))),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some((project_id, Some(branch))) = coordinates else {
+        return Ok(None);
+    };
+    let Some(repo) = load_project_repo_path(&orch.db, &project_id).await? else {
+        return Err("project has no local repository".into());
+    };
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo));
+    let head = cairn_vcs::resolve_coordinate(&store, &branch)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(Some((db, project_id, branch, head)))
+}
+
 async fn refresh_residencies_for_branch(
     orch: &Orchestrator,
     db: &LocalDb,
     project_id: &str,
     branch: &str,
     new_tip: &str,
-) -> usize {
+) -> ResidencyRefresh {
+    let mut result = refresh_terminal_residencies(orch, db, project_id, branch, None).await;
+    result.failed +=
+        crate::dev_instances::sync_live_branch_instances(orch, project_id, branch, new_tip)
+            .await
+            .len();
+    result
+}
+
+/// All refresh producers share this ordering, including vacancy callbacks.
+/// Weak entries retain no per-home lock after the last active/queued refresh.
+fn terminal_refresh_order(holder: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+        >,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut locks = LOCKS.lock().unwrap_or_else(|p| p.into_inner());
+    locks.retain(|_, lock| lock.strong_count() != 0);
+    if let Some(lock) = locks.get(holder).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(holder.into(), Arc::downgrade(&lock));
+    lock
+}
+
+async fn refresh_terminal_residencies(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    branch: &str,
+    only_job: Option<&str>,
+) -> ResidencyRefresh {
     let rows = load_live_terminal_leases(db, project_id, branch).await;
     let Ok(leases) = rows else {
         log::error!("committed branch advance could not enumerate residencies: {rows:?}");
-        return 1;
+        return ResidencyRefresh {
+            failed: 1,
+            ..Default::default()
+        };
     };
+    let mut refresh = ResidencyRefresh::default();
     let mut failed = 0;
     for (residency_holder, incarnation_id, cell_epoch, job_id) in leases {
+        if only_job.is_some_and(|id| id != job_id) {
+            continue;
+        }
         let Some(holder) =
             cairn_common::executor_protocol::ResidencyHolder::parse_storage_key(&residency_holder)
         else {
@@ -1990,69 +2120,112 @@ async fn refresh_residencies_for_branch(
             );
             continue;
         };
-        let result = orch
-            .fleet
-            .operate_residency(
-                orch,
-                ResidencyOperation::RefreshCheckout {
-                    fence: cairn_common::executor_protocol::ResidencyFence {
-                        holder,
-                        incarnation_id: incarnation_id.clone(),
-                        cell_epoch,
-                    },
-                    base_commit: new_tip.to_string(),
-                    require_clean: false,
-                },
-            )
-            .await;
-        if let ResidencyResult::Failed {
-            kind, diagnostic, ..
-        } = result
-        {
-            if kind == cairn_common::executor_protocol::ResidencyFailureKind::Unavailable {
+        let order = terminal_refresh_order(&residency_holder);
+        #[cfg(test)]
+        let ordered =
+            tests::observe_refresh_order_wait(&residency_holder, order.lock_owned()).await;
+        #[cfg(not(test))]
+        let ordered = order.lock_owned().await;
+        let reservation =
+            if let cairn_common::executor_protocol::ResidencyHolder::Job { job_id } = &holder {
+                match crate::mcp::handlers::run::occupancy::reserve_terminal_refresh(job_id) {
+                    Ok(reservation) => Some(reservation),
+                    Err(occupant) => {
+                        refresh.deferred.push((job_id.clone(), occupant.request_id));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+        // Resolve only after acquiring both ordering and the home reservation.
+        // An older callback must never send its captured head after a newer
+        // refresh, and a batch must not enter between this decision and reply.
+        let (db, current_head) = match vacated_job_head(orch, &job_id).await {
+            Ok(Some((db, _, _, head))) => (db, head),
+            Ok(None) => continue,
+            Err(error) => {
                 failed += 1;
-                log::warn!(
+                log::error!("could not resolve current terminal head for {job_id}: {error}");
+                continue;
+            }
+        };
+        // Dispatch transfers ownership before the first send. Dropping the
+        // observing JoinHandle (for example, after_install's timeout) cannot
+        // release the home or let a newer refresh overtake this remote work.
+        let orch = orch.clone();
+        let completion = tokio::spawn(async move {
+            let _ordered = ordered;
+            let _reservation = reservation;
+            let new_tip = current_head.as_str();
+            // After restart the executor lock also covers previously placed batches
+            // which the process-local occupancy registry cannot see.
+            let result = orch
+                .fleet
+                .operate_residency(
+                    &orch,
+                    ResidencyOperation::RefreshCheckout {
+                        fence: cairn_common::executor_protocol::ResidencyFence {
+                            holder,
+                            incarnation_id: incarnation_id.clone(),
+                            cell_epoch,
+                        },
+                        base_commit: new_tip.to_string(),
+                        require_clean: false,
+                    },
+                )
+                .await;
+            if let ResidencyResult::Failed {
+                kind, diagnostic, ..
+            } = result
+            {
+                if kind == cairn_common::executor_protocol::ResidencyFailureKind::Unavailable {
+                    log::warn!(
                     "terminal lease {residency_holder} could not be refreshed while its executor is disconnected: {diagnostic}"
                 );
-                continue;
-            }
-            // A lease its executor no longer has, or has moved to a newer cell
-            // epoch, holds none of the processes this branch's running
-            // terminals were bound to, so there is no checkout of theirs left to
-            // refresh. Those terminals are not this path's to settle: terminal
-            // liveness reconciliation ends each one through the ordinary exit
-            // with the reason its executor gave, which is what a waiting agent
-            // needs, rather than a blocking note about a refresh that is moot.
-            if matches!(
-                kind,
-                cairn_common::executor_protocol::ResidencyFailureKind::NotFound
-                    | cairn_common::executor_protocol::ResidencyFailureKind::StaleEpoch
-            ) {
-                log::info!(
+                    return 1;
+                }
+                // A lease its executor no longer has, or has moved to a newer cell
+                // epoch, holds none of the processes this branch's running
+                // terminals were bound to, so there is no checkout of theirs left to
+                // refresh. Those terminals are not this path's to settle: terminal
+                // liveness reconciliation ends each one through the ordinary exit
+                // with the reason its executor gave, which is what a waiting agent
+                // needs, rather than a blocking note about a refresh that is moot.
+                if matches!(
+                    kind,
+                    cairn_common::executor_protocol::ResidencyFailureKind::NotFound
+                        | cairn_common::executor_protocol::ResidencyFailureKind::StaleEpoch
+                ) {
+                    log::info!(
                     "terminal lease {residency_holder} at cell epoch {cell_epoch} is no longer current on its executor ({diagnostic}); terminal liveness reconciliation settles the terminals bound to it"
                 );
-                continue;
-            }
-            failed += 1;
-            log::error!("committed branch advance could not refresh terminal lease {residency_holder}: {diagnostic}");
-            if let Some(run_id) = latest_run_for_job(db, &job_id) {
-                let note = format!(
+                    return 0;
+                }
+                log::error!("committed branch advance could not refresh terminal lease {residency_holder}: {diagnostic}");
+                if let Some(run_id) = latest_run_for_job(&db, &job_id) {
+                    let note = format!(
                     "⛔ BLOCKING [Terminal head reconciliation] The branch commit succeeded, but Cairn could not advance terminal lease {residency_holder} to {new_tip}. The committed branch was not rolled back. Exact executor diagnostic: {diagnostic}"
                 );
-                if let Err(error) =
-                    queue_system_direct(orch, &run_id, &note, DeliveryUrgency::Steer)
-                {
-                    log::error!(
+                    if let Err(error) =
+                        queue_system_direct(&orch, &run_id, &note, DeliveryUrgency::Steer)
+                    {
+                        log::error!(
                         "could not notify terminal owner {job_id} after refresh failure: {error}"
                     );
+                    }
                 }
+                return 1;
             }
-        }
+            0
+        });
+        failed += completion.await.unwrap_or_else(|error| {
+            log::error!("terminal refresh completion worker failed: {error}");
+            1
+        });
     }
-    failed += crate::dev_instances::sync_live_branch_instances(orch, project_id, branch, new_tip)
-        .await
-        .len();
-    failed
+    refresh.failed = failed;
+    refresh
 }
 
 async fn load_live_terminal_leases(
@@ -4137,6 +4310,12 @@ mod tests {
         assert!(!said.contains("stopping the turn"), "{said}");
         assert!(!said.contains("or is stopped"), "{said}");
 
+        let mut inline = held().unwrap().unwrap();
+        inline.detached_because = Some(crate::mcp::handlers::run::detached::INLINE_CAPTURE.into());
+        let inline = inline.describe_at(started);
+        assert!(inline.contains("its call is waiting inline"), "{inline}");
+        assert!(!inline.contains("detached"), "{inline}");
+
         let mut task = held().unwrap().unwrap();
         task.holder = Some("cairn://p/cairn/5069/1/builder/task/verify".into());
         assert_eq!(
@@ -4159,10 +4338,70 @@ mod tests {
     fn a_host_run_batch_does_not_hold_the_branch() {
         let host = r#"{"kind":"run_batch","request_id":"r","commits":false,"host":true}"#;
         assert_eq!(run_batch_from_wait("job".into(), host, 1), None);
-        let legacy = r#"{"kind":"run_batch","request_id":"r","commits":false}"#;
+        let legacy = r#"{"kind":"run_batch","request_id":"r","commits":true}"#;
         assert_eq!(
             run_batch_from_wait("job".into(), legacy, 1).map(|batch| batch.request_id),
             Some("r".to_string())
+        );
+    }
+
+    /// Old detached rows can claim a hold even though the batch never had
+    /// commit authority. Neither that cached bit nor a home wait may fence a
+    /// branch on behalf of a commitless check wrapper.
+    #[tokio::test]
+    async fn commitless_waits_and_legacy_detached_holds_leave_the_branch_free() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        for sql in [
+            "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('snapshot-session','job-overlap','open','backend',1,1)",
+            "UPDATE runs SET session_id='snapshot-session' WHERE id='run-job-overlap'",
+            "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('snapshot-turn','snapshot-session','run-job-overlap','job-overlap',1,'yielded','initial',1,1)",
+            r#"INSERT INTO agent_waits (id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES ('snapshot-wait','job-overlap','run-job-overlap','snapshot-session','snapshot-turn','snapshot-tool','{"kind":"run_batch","request_id":"snapshot-request","commits":false,"verdict_only":false,"host":false}','pending',1)"#,
+            "INSERT INTO run_batch_detached(request_id,job_id,run_id,label,commits,holds_branch,state,reason,created_ms) VALUES ('legacy-check-wrapper','job-overlap','run-job-overlap','cairn check run rust-tests',0,1,'running','old cached hold',2)",
+            "INSERT INTO run_batch_detached(request_id,job_id,run_id,label,commits,holds_branch,state,reason,created_ms) VALUES ('parked-check-wrapper','job-overlap','run-job-overlap','cairn check run rust-tests',0,1,'parked','waiting for memory',3)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        for state in ["pending", "resolving", "resolved"] {
+            db.execute(
+                "UPDATE agent_waits SET state=?1 WHERE id='snapshot-wait'",
+                [state],
+            )
+            .await
+            .unwrap();
+            assert!(
+                inflight_run_batch_on_branch(&db, "job-overlap", "agent/overlap")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a commitless wrapper holds nothing, including a {state} wait or legacy cached hold"
+            );
+        }
+        db.execute(
+            "INSERT INTO run_batch_detached(request_id,job_id,run_id,label,commits,holds_branch,state,reason,created_ms) VALUES ('captured-commit','job-overlap','run-job-overlap','generate source',1,0,'parked','waiting for home',4)",
+            (),
+        )
+        .await
+        .unwrap();
+        let committing = inflight_run_batch_on_branch(&db, "job-overlap", "agent/overlap")
+            .await
+            .unwrap()
+            .expect("a parked committing batch already captured its base and holds it");
+        assert_eq!(committing.request_id, "captured-commit");
+        let refusal = mutation_boundary_hold(&Ok(Some(committing)));
+        assert!(refusal.contains("carries a commit_msg"), "{refusal}");
+        assert!(refusal.contains(r#"action:"cancel""#), "{refusal}");
+        db.execute(
+            "UPDATE run_batch_detached SET state='settled' WHERE request_id='captured-commit'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(
+            inflight_run_batch_on_branch(&db, "job-overlap", "agent/overlap")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -4217,7 +4456,7 @@ mod tests {
             "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-parent','job-overlap','open','backend',1,1)",
             "UPDATE runs SET session_id='session-parent' WHERE id='run-job-overlap'",
             "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('turn-parent','session-parent','run-job-overlap','job-overlap',1,'yielded','initial',1,1)",
-            "INSERT INTO agent_waits (id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES ('wait-parent','job-overlap','run-job-overlap','session-parent','turn-parent','tool-parent','{\"kind\":\"run_batch\",\"request_id\":\"request-parent\",\"commits\":false}','pending',5)",
+            "INSERT INTO agent_waits (id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES ('wait-parent','job-overlap','run-job-overlap','session-parent','turn-parent','tool-parent','{\"kind\":\"run_batch\",\"request_id\":\"request-parent\",\"commits\":true}','pending',5)",
         ] {
             db.execute(sql, ()).await.unwrap();
         }
@@ -4881,7 +5120,262 @@ mod tests {
             .expect("a missing job row is logged, not raised");
     }
 
+    type VacancyGate = (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+    static VACANCY_GATES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, VacancyGate>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    static REFRESH_ORDER_WAITERS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    pub(super) async fn observe_refresh_order_wait(
+        holder: &str,
+        lock: impl std::future::Future<Output = tokio::sync::OwnedMutexGuard<()>>,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let mut signal = REFRESH_ORDER_WAITERS.lock().unwrap().remove(holder);
+        tokio::pin!(lock);
+        std::future::poll_fn(|cx| {
+            let result = lock.as_mut().poll(cx);
+            if result.is_pending() {
+                if let Some(signal) = signal.take() {
+                    signal.send(()).unwrap();
+                }
+            }
+            result
+        })
+        .await
+    }
+
+    pub(super) async fn pause_vacancy_after_head(job: &str) {
+        let gate = VACANCY_GATES.lock().unwrap().remove(job);
+        if let Some((captured, resume)) = gate {
+            captured.send(()).unwrap();
+            resume.await.unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
+    async fn tenancy_release_resolves_the_current_head_not_the_deferred_head() {
+        use super::preparation::tests::{harness_or_skip, BRANCH, JOB};
+        use crate::mcp::handlers::run::occupancy::{claim, HomeClaim};
+        let h = harness_or_skip!("vacated-job-current-head.db");
+        let job = "job-vacancy-head";
+        h.db.execute(
+            "INSERT INTO jobs (id, project_id, issue_id, status, branch, created_at, updated_at)
+             SELECT ?1, project_id, issue_id, status, branch, created_at, updated_at FROM jobs WHERE id = ?2",
+            (job, JOB),
+        ).await.unwrap();
+        let old_head = h.tip(BRANCH);
+        let (mut executor, generation, cell) = h
+            .orch
+            .fleet
+            .attach_job_home_for_test("proj-1", job, &h.repo);
+        let residency = cell.residency.as_ref().unwrap();
+        h.db.execute(
+            "INSERT INTO job_terminals (id, job_id, session_id, command, status, created_at, slug,
+                residency_holder, residency_incarnation_id, cell_epoch)
+             VALUES ('vacancy-terminal', ?1, 'session', 'true', 'running', 1, 'live', ?2, ?3, ?4)",
+            params![
+                job,
+                residency.holder.storage_key(),
+                residency.incarnation_id.as_str(),
+                cell.cell_epoch as i64
+            ],
+        )
+        .await
+        .unwrap();
+        let orch = h.orch.clone();
+        let HomeClaim::Tenant(tenancy) = claim(job, "current-head-refresh", false) else {
+            panic!("fixture home is vacant");
+        };
+        let tenancy = tenancy.refresh_on_release(move || {
+            refresh_vacated_job_terminals(orch, job.into());
+        });
+        let deferred =
+            refresh_residencies_for_branch(&h.orch, &h.db, "proj-1", BRANCH, &old_head).await;
+        assert_eq!(deferred.failed, 0);
+        assert_eq!(
+            deferred.deferred,
+            vec![(job.into(), "current-head-refresh".into())]
+        );
+        assert!(
+            executor.try_recv().is_err(),
+            "an occupied home sends no refresh frame"
+        );
+        let (captured, captured_rx) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        VACANCY_GATES
+            .lock()
+            .unwrap()
+            .insert(job.into(), (captured, resume_rx));
+        drop(tenancy);
+        tokio::time::timeout(std::time::Duration::from_secs(10), captured_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The vacancy worker has captured A, but a newer ordinary refresh B
+        // dispatches before that worker is allowed to enumerate leases.
+        let mut newest = h.commit(&h.branch_ws, BRANCH, "newest.txt", "newest head\n");
+        assert_ne!(newest, old_head);
+        let orch = h.orch.clone();
+        let db = h.db.clone();
+        let desired = newest.clone();
+        let mut ordinary = Some(tokio::spawn(async move {
+            refresh_residencies_for_branch(&orch, &db, "proj-1", BRANCH, &desired).await
+        }));
+        let mut resume = Some(resume);
+        use cairn_common::executor_protocol::ExecutorMessage;
+        for round in 0..2 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    match executor.recv().await.unwrap() {
+                        ExecutorMessage::DrainModeRequest { .. }
+                        | ExecutorMessage::WaitingRequests { .. } => continue,
+                        frame => break frame,
+                    }
+                }
+            })
+            .await
+            .expect("the production vacancy worker sends a checkout refresh");
+            let ExecutorMessage::ResidencyRequest {
+                correlation_id,
+                operation:
+                    ResidencyOperation::RefreshCheckout {
+                        fence, base_commit, ..
+                    },
+                ..
+            } = frame
+            else {
+                panic!("expected RefreshCheckout, got {frame:?}");
+            };
+            assert_eq!(
+                base_commit, newest,
+                "neither refresh may restore the captured A head"
+            );
+            assert!(
+                matches!(claim(job, "competing-commit", true), HomeClaim::Wait(_)),
+                "the refresh owns the home until its executor reply"
+            );
+            assert!(matches!(
+                claim(job, "competing-read", false),
+                HomeClaim::Elsewhere(_)
+            ));
+            assert_eq!(fence.holder, residency.holder);
+            assert_eq!(fence.incarnation_id, residency.incarnation_id);
+            assert_eq!(fence.cell_epoch, cell.cell_epoch);
+            if round == 0 {
+                // Abort only the observer after its actual frame was sent, while
+                // the fake executor deliberately withholds completion.
+                let observer = ordinary.take().unwrap();
+                observer.abort();
+                assert!(observer.await.err().unwrap().is_cancelled());
+                assert!(matches!(
+                    claim(job, "cancelled-observer-commit", true),
+                    HomeClaim::Wait(_)
+                ));
+                assert!(matches!(
+                    claim(job, "cancelled-observer-read", false),
+                    HomeClaim::Elsewhere(_)
+                ));
+                assert!(terminal_refresh_order(&residency.holder.storage_key())
+                    .try_lock()
+                    .is_err());
+                newest = h.commit(&h.branch_ws, BRANCH, "after-cancel.txt", "after cancel\n");
+                let (waiting, waiting_rx) = tokio::sync::oneshot::channel();
+                REFRESH_ORDER_WAITERS
+                    .lock()
+                    .unwrap()
+                    .insert(residency.holder.storage_key(), waiting);
+                resume.take().unwrap().send(()).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(10), waiting_rx)
+                    .await
+                    .unwrap()
+                    .expect("the second refresh reaches the pending order lock");
+                assert!(terminal_refresh_order(&residency.holder.storage_key())
+                    .try_lock()
+                    .is_err());
+                while let Ok(frame) = executor.try_recv() {
+                    assert!(
+                        matches!(
+                            frame,
+                            ExecutorMessage::DrainModeRequest { .. }
+                                | ExecutorMessage::WaitingRequests { .. }
+                        ),
+                        "the queued refresh sent before the first remote completion: {frame:?}"
+                    );
+                }
+            }
+            h.orch.fleet.handle_executor_message(
+                &cell.executor_id,
+                generation,
+                ExecutorMessage::ResidencyResponse {
+                    correlation_id,
+                    result: ResidencyResult::State { cell: cell.clone() },
+                },
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let HomeClaim::Tenant(tenancy) = claim(job, "after-refresh-completion", true) {
+                    drop(tenancy);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all refresh ownership releases after the final executor reply");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn occupied_terminal_refresh_is_deferred_without_contacting_the_executor() {
+        use crate::mcp::handlers::run::occupancy::{claim, HomeClaim};
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        db.execute_script(
+            "INSERT INTO job_terminals
+                (id, job_id, session_id, command, status, created_at, slug,
+                 residency_holder, residency_incarnation_id, cell_epoch)
+             VALUES ('occupied-terminal', 'job-overlap', 'session', 'true', 'running', 1,
+                     'live', 'job:job-overlap', 'inc', 7);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let db = owning_db_for_job(&orch.db, "job-overlap").await.unwrap();
+        let HomeClaim::Tenant(tenancy) = claim("job-overlap", "occupied-refresh-batch", false)
+        else {
+            panic!("fixture home is vacant");
+        };
+        let refresh =
+            refresh_residencies_for_branch(&orch, &db, "proj-1", "agent/overlap", "captured-head")
+                .await;
+        assert_eq!(refresh.failed, 0);
+        assert_eq!(
+            refresh.deferred,
+            vec![("job-overlap".into(), "occupied-refresh-batch".into())]
+        );
+        drop(tenancy);
+        // With no executor attached this same operation must fail if attempted.
+        // A zero failure count above therefore witnesses that no operation ran.
+        let refresh = refresh_terminal_residencies(
+            &orch,
+            &db,
+            "proj-1",
+            "agent/overlap",
+            Some("job-overlap"),
+        )
+        .await;
+        assert_eq!(refresh.failed, 1);
+        assert!(refresh.deferred.is_empty());
+    }
+
+    #[tokio::test]
     async fn terminal_lease_enumeration_includes_only_running_terminals() {
         let db = migrated_db().await;
         seed_base_advance_fixture(&db).await;

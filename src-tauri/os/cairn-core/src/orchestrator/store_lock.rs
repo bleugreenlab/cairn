@@ -1771,8 +1771,7 @@ impl std::fmt::Display for BranchAdmissionRefusal {
             ),
             Self::InFlightBatch { branch, batch } => write!(
                 f,
-                "`{branch}` was not moved and nothing was published: {batch} may still commit \
-                 to this branch"
+                "`{branch}` was not moved and nothing was published: {batch}"
             ),
             Self::Regenerating { branch, hold } => write!(
                 f,
@@ -1865,7 +1864,7 @@ impl JjStoreGuard {
             Ok(Some(held)) => {
                 return Err(BranchAdmissionRefusal::InFlightBatch {
                     branch: branch.to_string(),
-                    batch: held.describe(),
+                    batch: held.hold_clause(),
                 })
             }
             Err(error) => {
