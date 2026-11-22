@@ -937,6 +937,7 @@ name = "cairn-channels"
 version = "0.13.7"
 dependencies = [
  "async-trait",
+ "cairn-common",
  "cairn-tls",
  "chrono",
  "futures-util",

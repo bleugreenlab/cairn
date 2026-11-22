@@ -232,7 +232,7 @@ pub(crate) async fn handle_owned_wait(
             };
             let note = terminal_wait_recovery_note(&db, &record.job_id, &record.condition).await;
             let (owned_orch, owned_db, owned_record) = (orch.clone(), db.clone(), record.clone());
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 if !handoff.parked().await {
                     log::warn!(
                         "owned wait {} was never parked; leaving it for startup reconciliation",
@@ -1166,7 +1166,7 @@ mod tests {
 
         let db = orch.db.local.clone();
         let current_event = event("current-provider-id");
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             insert_assistant_event(
                 &db,

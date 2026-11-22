@@ -1306,7 +1306,7 @@ pub async fn load_control_view(orch: &Orchestrator) -> Result<ControlView, Strin
 /// moved. Every deployment Cairn has never acted on is probed once each time
 /// its head attaches, so a model left running is adopted.
 pub fn spawn_deployment_control(orch: Orchestrator) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         // Before the first tick, so a profile generated before ownership was
         // recorded, or a pass a stopped orch did not promote, is settled
         // before anything weighs whether it may start.

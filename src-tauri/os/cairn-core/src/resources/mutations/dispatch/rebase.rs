@@ -1743,9 +1743,9 @@ mod tests {
 
         let write = {
             let (orch, request) = (s.orch.clone(), request.clone());
-            tokio::spawn(
-                async move { crate::mcp::handlers::write::handle_write(&orch, &request).await },
-            )
+            cairn_common::task::spawn(async move {
+                crate::mcp::handlers::write::handle_write(&orch, &request).await
+            })
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while s.permission_requests().await == 0 {

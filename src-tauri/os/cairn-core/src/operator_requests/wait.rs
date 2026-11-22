@@ -280,7 +280,7 @@ async fn park(
         Err(error) => return not_waiting(filed, &error),
     };
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         if !handoff.parked().await {
             log::warn!(
                 "request wait {} was never parked; leaving it for startup reconciliation",
@@ -805,7 +805,7 @@ mod tests {
         let orch = seeded().await;
         let held = {
             let orch = orch.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 hold_inline(&orch, "wait-request", &[], Duration::from_secs(30)).await
             })
         };

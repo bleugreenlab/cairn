@@ -870,7 +870,7 @@ impl Orchestrator {
         let operation = operation.to_string();
         let (held_tx, held_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let holder = tokio::spawn(async move {
+        let holder = cairn_common::task::spawn(async move {
             let guard = orch.acquire_jj_store_lock(&store, class, operation).await;
             let _ = held_tx.send(());
             let _ = release_rx.await;
@@ -2225,7 +2225,7 @@ impl Orchestrator {
         F: FnOnce() -> Result<T, String> + Send + 'static,
     {
         let project_id = project_id.to_string();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let store = guard.store_path().to_path_buf();
             let owed = owed_rows(&db, &project_id, &store).await?;
             let before = read_owed_bookmarks(&store, &owed).await;
@@ -2308,7 +2308,7 @@ mod branch_reservation_tests {
             .unwrap();
         // Another task: re-entrance detection is per task.
         let (registry2, path) = (registry.clone(), store.path().to_path_buf());
-        let refused = tokio::spawn(async move {
+        let refused = cairn_common::task::spawn(async move {
             registry2
                 .reserve(&path, &["agent/a"], "owner write", WAIT)
                 .await
@@ -2332,7 +2332,7 @@ mod branch_reservation_tests {
         let (registry2, path) = (registry.clone(), store.path().to_path_buf());
         let (held_tx, held_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let holder = tokio::spawn(async move {
+        let holder = cairn_common::task::spawn(async move {
             let main = registry2
                 .reserve(&path, &["main"], "import main", WAIT)
                 .await
@@ -2368,7 +2368,7 @@ mod branch_reservation_tests {
             .unwrap();
         assert!(held.covers(&dotted, "main"));
         let (registry2, dotted2) = (registry.clone(), dotted.clone());
-        let refused = tokio::spawn(async move {
+        let refused = cairn_common::task::spawn(async move {
             registry2
                 .reserve(&dotted2, &["main"], "import", WAIT)
                 .await
@@ -2441,7 +2441,7 @@ mod branch_reservation_tests {
             "the existing hold is intact"
         );
         let (registry2, path) = (registry.clone(), store.path().to_path_buf());
-        let still_reserved = tokio::spawn(async move {
+        let still_reserved = cairn_common::task::spawn(async move {
             registry2
                 .reserve(&path, &["main"], "other", WAIT)
                 .await

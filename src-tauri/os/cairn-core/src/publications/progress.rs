@@ -357,7 +357,7 @@ mod tests {
         let path = dir.path().join("publications/pub-1/t.build.log");
         let (tx, rx) = mpsc::unbounded_channel();
         let (done_tx, done_rx) = oneshot::channel();
-        let recorder = tokio::spawn(record(
+        let recorder = cairn_common::task::spawn(record(
             db.clone(),
             LegLog {
                 publication: "pub-1".into(),
@@ -475,7 +475,7 @@ mod tests {
         let done_flag = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::unbounded_channel();
         let (done_tx, done_rx) = oneshot::channel();
-        let recorder = tokio::spawn(record(
+        let recorder = cairn_common::task::spawn(record(
             db.clone(),
             LegLog {
                 publication: "pub-2".into(),

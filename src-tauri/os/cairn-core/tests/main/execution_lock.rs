@@ -193,7 +193,7 @@ async fn concurrent_persist_with_lock_preserves_all_packets() {
     for i in 0..3 {
         let orch = orch.clone();
         let packet_id = format!("packet-{}", i);
-        handles.push(tokio::spawn(async move {
+        handles.push(cairn_common::task::spawn(async move {
             simulated_persist_packet(&orch, exec_id, &packet_id).await;
         }));
     }
@@ -229,7 +229,7 @@ async fn concurrent_persist_without_lock_can_lose_packets() {
         for i in 0..3 {
             let orch = orch.clone();
             let packet_id = format!("packet-{}-{}", iteration, i);
-            handles.push(tokio::spawn(async move {
+            handles.push(cairn_common::task::spawn(async move {
                 simulated_persist_packet_unlocked(&orch, exec_id, &packet_id).await;
             }));
         }

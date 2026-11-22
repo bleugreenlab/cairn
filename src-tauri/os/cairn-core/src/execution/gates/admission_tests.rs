@@ -684,7 +684,7 @@ async fn an_open_pr_bound_hold_releases_on_the_pass_after_a_merge_without_a_hint
     let starts = std::sync::Arc::new(RecordedStarts::default());
     assert!(env.orch.set_executor(starts.clone()).is_ok());
     let (_never_nudged, nudges) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(super::pulse::run_gate_sweep_loop(
+    cairn_common::task::spawn(super::pulse::run_gate_sweep_loop(
         env.orch.clone(),
         nudges,
         super::pulse::SweepLoopConfig {

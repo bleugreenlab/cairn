@@ -200,7 +200,7 @@ where
 {
     let provenance = super::current_provenance();
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mint = match build.await {
             Ok(mint) => mint,
             Err(error) => {

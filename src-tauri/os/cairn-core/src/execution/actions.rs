@@ -2720,7 +2720,7 @@ mod tests {
 
         let open = {
             let (db, orch) = (db.clone(), orch.clone());
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 let record = mr_record(
                     "job-race",
                     "p-race",

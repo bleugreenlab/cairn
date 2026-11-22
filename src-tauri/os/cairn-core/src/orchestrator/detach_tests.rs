@@ -47,7 +47,7 @@ async fn runs_on_the_runtime_it_is_given() {
 /// a turn-end wave that opens a shared execution, or releases a check ref, and
 /// is then cancelled.
 async fn spawns_a_child_that_reports_later(report: mpsc::Sender<()>) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = report.send(());
     });

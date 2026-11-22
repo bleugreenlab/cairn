@@ -318,7 +318,7 @@ pub async fn process_event(
         // the checkout pull and store sync run detached, so a slow fetch can
         // never hold the relay cursor.
         let orch = orch.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             match handle_branch_push(&orch, &push).await {
                 Ok(outcome) => log::debug!(
                     "GitHub relay event {event_id}: push of {} to {} at {}: {outcome:?}",

@@ -207,7 +207,7 @@ impl VoiceProcess {
             .stderr
             .take()
             .ok_or_else(|| VoiceError::Transport("engine stderr was not piped".into()))?;
-        let stderr_task = tokio::spawn(async move {
+        let stderr_task = cairn_common::task::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut tail = Vec::new();
             loop {
@@ -244,7 +244,7 @@ impl VoiceProcess {
         let reader_sink = event_sink.clone();
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let reader_running = running.clone();
-        let reader_task = tokio::spawn(async move {
+        let reader_task = cairn_common::task::spawn(async move {
             let mut revisions = HashMap::<String, u64>::new();
             while let Ok(event) = read_event(&mut stdout).await {
                 if let ProtocolEvent::Partial {
@@ -546,7 +546,7 @@ mod tests {
             .expect_err("Linux refuses to execute a file open for writing");
         assert_eq!(refused.kind(), std::io::ErrorKind::ExecutableFileBusy);
 
-        let release = tokio::spawn(async move {
+        let release = cairn_common::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             drop(writer);
         });

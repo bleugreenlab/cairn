@@ -1132,7 +1132,7 @@ pub(crate) fn on_branch_hold_released(orch: &Orchestrator, job_id: &str) {
         log::warn!("branch hold of job {job_id} released outside a runtime; served at next start");
         return;
     };
-    runtime.spawn(async move { release_hold(&orch, &job_id).await });
+    cairn_common::task::spawn_on(&runtime, async move { release_hold(&orch, &job_id).await });
 }
 
 /// [`on_branch_hold_released`] for the run whose waits were cancelled.
@@ -1142,7 +1142,7 @@ pub(crate) fn on_branch_hold_released_for_run(orch: &Orchestrator, run_id: &str)
         log::warn!("branch hold of run {run_id} released outside a runtime; served at next start");
         return;
     };
-    runtime.spawn(async move {
+    cairn_common::task::spawn_on(&runtime, async move {
         let db = match crate::execution::routing::owning_db_for_run(&orch.db, &run_id).await {
             Ok(db) => db,
             Err(error) => {

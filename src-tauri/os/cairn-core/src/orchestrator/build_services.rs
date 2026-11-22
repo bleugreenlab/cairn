@@ -3747,7 +3747,7 @@ impl Orchestrator {
         /// quicker recovery and fresher numbers for the same work.
         const TICK_INTERVAL: Duration = Duration::from_secs(15);
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let mut reported: Option<CompileCacheHealth> = None;
             loop {
                 tokio::time::sleep(TICK_INTERVAL).await;

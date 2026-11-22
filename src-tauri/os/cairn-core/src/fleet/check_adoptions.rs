@@ -2946,7 +2946,7 @@ mod tests {
         };
         let (delivered, mut delivery_seen) = oneshot::channel();
         let submitting = orch.clone();
-        let caller = tokio::spawn(async move {
+        let caller = cairn_common::task::spawn(async move {
             let delivery = submitting
                 .fleet
                 .submit_pure_verdict_check(&submitting, request, item, None, None, None)
@@ -3067,7 +3067,7 @@ mod tests {
             request.request_id = source.request_id;
             request.attempt_id = source.attempt_id;
             let joining = orch.clone();
-            let task = tokio::spawn(async move {
+            let task = cairn_common::task::spawn(async move {
                 joining
                     .fleet
                     .submit_pure_verdict_check(&joining, request, follower_item, None, None, None)

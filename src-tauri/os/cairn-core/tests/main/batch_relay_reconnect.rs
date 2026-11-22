@@ -99,7 +99,7 @@ async fn a_running_batch_keeps_its_relay_across_link_bounces() {
     }
     let node = Arc::new(node().await);
     let dir = handshake_dir(&node);
-    let mut batch = tokio::spawn({
+    let mut batch = cairn_common::task::spawn({
         let node = node.clone();
         let command = reading_batch(&dir, 3);
         async move { node.shell("r-1", Some(MACHINE_A), &command).await }
@@ -148,7 +148,7 @@ async fn a_batch_whose_executor_never_reattaches_is_told_its_relay_is_detached()
     common::RELAY_GAP_WAIT_MS.store(2_000, Ordering::Relaxed);
     let node = Arc::new(node().await);
     let dir = handshake_dir(&node);
-    let mut batch = tokio::spawn({
+    let mut batch = cairn_common::task::spawn({
         let node = node.clone();
         let command = reading_batch(&dir, 2);
         async move { node.shell("r-1", Some(MACHINE_A), &command).await }

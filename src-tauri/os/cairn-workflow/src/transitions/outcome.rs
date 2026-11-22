@@ -27,32 +27,94 @@ pub struct StatusWrite {
     pub became_terminal: bool,
 }
 
+/// Quiet startup repair of cached success from empty work or historical attempts.
+/// Reuses the live derivation, never resolution writes or completion side effects.
+pub async fn repair_false_completion(db: &crate::storage::LocalDb) -> DbResult<usize> {
+    db.write(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT e.id FROM executions e INDEXED BY idx_executions_hold_facts
+                     WHERE e.status = 'complete'
+               AND NOT EXISTS (SELECT 1 FROM jobs j JOIN runs r ON r.job_id = j.id
+                               WHERE j.execution_id = e.id)
+               AND NOT EXISTS (SELECT 1 FROM action_runs a WHERE a.execution_id = e.id)",
+                    (),
+                )
+                .await?;
+            let mut executions = Vec::new();
+            while let Some(row) = rows.next().await? {
+                executions.push(row.text(0)?);
+            }
+            drop(rows);
+            // Capture issue candidates before changing the execution caches.
+            let mut rows = conn
+                .query(
+                    "SELECT i.id FROM issues i WHERE i.status = 'complete'
+               AND i.closed_at IS NULL AND i.merged_at IS NULL
+               AND EXISTS (SELECT 1 FROM executions e WHERE e.issue_id = i.id
+                           AND e.lifecycle = 'superseded')",
+                    (),
+                )
+                .await?;
+            let mut issues = Vec::new();
+            while let Some(row) = rows.next().await? {
+                issues.push(row.text(0)?);
+            }
+            drop(rows);
+            for execution in executions {
+                recompute_execution_status_conn(conn, &execution).await?;
+                if let Some(issue) = crate::storage::query_opt_text_conn(
+                    conn,
+                    "SELECT issue_id FROM executions WHERE id = ?1",
+                    (execution.as_str(),),
+                )
+                .await?
+                {
+                    if !issues.contains(&issue) {
+                        issues.push(issue);
+                    }
+                }
+            }
+            let mut changed = 0;
+            for issue in issues {
+                changed += usize::from(recompute_issue_status_conn(conn, &issue).await?.changed);
+            }
+            Ok(changed)
+        })
+    })
+    .await
+}
+
 pub async fn recompute_execution_status_conn(
     conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<()> {
-    // FIRST, before any job count: an execution filed with `after:` gates and
-    // not yet released is HELD, whatever its (empty) job set says.
-    //
-    // This has to come first because a held execution has ZERO jobs. Reaching
-    // the counts below with an empty job set falls straight through to the
-    // terminal arms and derives `complete` — an execution that reports finished
-    // successfully before it has started, on an issue the issue projection then
-    // calls done. Ordering is the whole guard.
-    //
-    // `held` belongs here precisely BECAUSE status is a projection: it derives
-    // from "has gates AND not released" exactly as `running` derives from "has
-    // non-terminal jobs". Note that satisfying every gate is not release —
-    // release is the guarded transition on `released_at`, which is also what
-    // mints the jobs — so an execution stays held until that transition lands.
-    //
-    // Deliberately NOT narrowed to `cairn_db::awaiting_release_sql!`. A gated
-    // execution that can never start (superseded, or its issue resolved) still
-    // has zero jobs, and every other arm below would call that never-started
-    // work `complete` or `failed` — and drag the issue roll-up with it. `held`
-    // is the only value here that claims nothing ran. Whether it is WAITING is
-    // the gate census's to say, through the shared predicate, and it renders
-    // such an execution as `won't start`, never as held.
+    // Release and cancellation are scheduling facts, not evidence of work.
+    // Keep lifecycle separate: only a never-run fenced attempt has no outcome
+    // other than supersession; an attempt that really ran retains its outcome.
+    let runless_superseded = count(
+        conn,
+        "SELECT COUNT(*) FROM executions e
+         WHERE e.id = ?1 AND e.lifecycle = 'superseded'
+           AND NOT EXISTS (SELECT 1 FROM jobs j JOIN runs r ON r.job_id = j.id
+                           WHERE j.execution_id = e.id)
+           AND NOT EXISTS (SELECT 1 FROM action_runs a WHERE a.execution_id = e.id)",
+        execution_id,
+    )
+    .await?;
+    if runless_superseded > 0 {
+        conn.execute(
+            "UPDATE executions SET status = 'superseded' WHERE id = ?1",
+            (execution_id,),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Satisfied gates are not release: only the guarded released_at transition
+    // mints jobs. The census separately explains why unreleased work on a
+    // resolved issue cannot start; superseded run-less work returned above.
     let held_gates = count(
         conn,
         "
@@ -161,6 +223,34 @@ pub async fn recompute_execution_status_conn(
         conn.execute(
             "UPDATE executions SET status = 'failed', completed_at = ?1 WHERE id = ?2",
             params![now, execution_id],
+        )
+        .await?;
+    } else if count(
+        conn,
+        "SELECT (SELECT COUNT(*) FROM jobs j JOIN runs r ON r.job_id = j.id
+                 WHERE j.execution_id = ?1)
+              + (SELECT COUNT(*) FROM action_runs WHERE execution_id = ?1 AND status = 'complete')",
+        execution_id,
+    )
+    .await?
+        == 0
+    {
+        let cancelled = count(
+            conn,
+            "SELECT (SELECT COUNT(*) FROM jobs WHERE execution_id = ?1 AND status = 'cancelled')
+                  + (SELECT COUNT(*) FROM executions e JOIN issues i ON i.id = e.issue_id
+                     WHERE e.id = ?1 AND (i.closed_at IS NOT NULL OR i.merged_at IS NOT NULL))",
+            execution_id,
+        )
+        .await?
+            > 0;
+        conn.execute(
+            "UPDATE executions SET status = ?2, completed_at = ?3 WHERE id = ?1",
+            params![
+                execution_id,
+                if cancelled { "cancelled" } else { "running" },
+                if cancelled { Some(now) } else { None }
+            ],
         )
         .await?;
     } else {
@@ -463,31 +553,23 @@ async fn issue_progress_attention(
     } else {
         let mut rows = conn
             .query(
-                "SELECT status FROM executions WHERE issue_id = ?1",
+                "SELECT status FROM executions e WHERE issue_id = ?1
+                   AND (lifecycle = 'canonical'
+                        OR (lifecycle = 'pending' AND NOT EXISTS (
+                            SELECT 1 FROM executions owner
+                            WHERE owner.issue_id = ?1 AND owner.lifecycle = 'canonical')))
+                 ORDER BY seq DESC, started_at DESC, id DESC LIMIT 1",
                 (issue_id,),
             )
             .await?;
-        let mut statuses = Vec::new();
-        while let Some(row) = rows.next().await? {
-            statuses.push(row.text(0)?);
-        }
-        if statuses.is_empty() {
-            IssueProgress::Backlog
-        } else if statuses.iter().all(|status| status == "held") {
-            // Held executions are filed but un-started: no jobs, no admission
-            // request, no slot. An issue whose executions are all held is
-            // exactly as un-started as an issue carrying no execution at all,
-            // so it projects the same way — never Active, and never the
-            // Complete the terminal fall-through would otherwise hand it.
-            // A held execution filed beside a real one does not reach here, so
-            // it cannot drag a finished issue backwards.
-            IssueProgress::Backlog
-        } else if statuses.iter().any(|status| status == "running") {
-            IssueProgress::Active
-        } else if statuses.iter().any(|status| status == "complete") {
-            IssueProgress::Complete
-        } else {
-            IssueProgress::Failed
+        // Lifecycle, not historical success, chooses the one attempt whose
+        // outcome matters. A pending filing owns nothing until release.
+        let status = rows.next().await?.map(|row| row.text(0)).transpose()?;
+        match status.as_deref() {
+            None | Some("held") => IssueProgress::Backlog,
+            Some("running" | "paused" | "pending") => IssueProgress::Active,
+            Some("complete") => IssueProgress::Complete,
+            _ => IssueProgress::Failed,
         }
     };
 
@@ -1066,6 +1148,15 @@ mod tests {
         }
     }
 
+    async fn seed_completed_run(db: &LocalDb) {
+        db.execute_script(
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+               VALUES('j', 'e', 'i', 'p', 'complete', 'builder', 'builder', 1, 1);
+             INSERT INTO runs(id, job_id, issue_id, project_id, status, created_at, updated_at)
+               VALUES('r', 'j', 'i', 'p', 'completed', 1, 1);",
+        ).await.unwrap();
+    }
+
     async fn derived_execution_status(db: &LocalDb) -> String {
         db.query_one("SELECT status FROM executions WHERE id = 'e'", (), |row| {
             row.text(0)
@@ -1118,12 +1209,9 @@ mod tests {
         );
     }
 
-    /// A gated execution fenced before release never ran, so it must not derive
-    /// a terminal status: beside an unstarted successor, `complete` would make
-    /// the whole issue read as done. It stays `held` in the projection; the
-    /// gate census is what renders it as won't-start rather than waiting.
+    /// Fencing an unstarted gated execution ends its attempt without success.
     #[tokio::test]
-    async fn a_superseded_gated_execution_never_derives_terminal() {
+    async fn a_superseded_gated_execution_derives_superseded() {
         let db = migrated_db().await;
         seed_gated_execution(&db, &[("g1", None)], false).await;
         db.execute_script(
@@ -1138,7 +1226,7 @@ mod tests {
 
         recompute_execution_and_issue(&db).await;
 
-        assert_eq!(derived_execution_status(&db).await, "held");
+        assert_eq!(derived_execution_status(&db).await, "superseded");
         assert_eq!(
             db.query_opt_i64("SELECT completed_at FROM executions WHERE id = 'e'", ())
                 .await
@@ -1150,6 +1238,159 @@ mod tests {
             "backlog",
             "nothing on this issue has started"
         );
+    }
+
+    #[tokio::test]
+    async fn superseded_runless_attempt_cannot_complete_or_own_issue_status() {
+        let db = migrated_db().await;
+        seed_gated_execution(&db, &[("g1", Some(50))], true).await;
+        db.execute_script(
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at, completed_at)
+               VALUES('j', 'e', 'i', 'p', 'pending', 'planner', 'planner', 1, 1, NULL);
+             UPDATE issues SET status = 'complete', progress = 'complete', completed_at = 1 WHERE id = 'i';",
+        ).await.unwrap();
+
+        db.write(|conn| Box::pin(async move {
+            crate::canonical::supersede_canonical_conn(
+                conn, "i", "e2", &crate::canonical::SupersessionActor::operator_ui(), 2,
+            ).await?;
+            conn.execute(
+                "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+                 VALUES('e2', 'recipe', 'i', 'p', 'failed', 2, 2)", (),
+            ).await?;
+            recompute_issue_status_conn(conn, "i").await
+        })).await.unwrap();
+
+        assert_eq!(derived_execution_status(&db).await, "superseded");
+        assert_eq!(issue_status_attention(&db).await.0, "failed");
+
+        db.execute_script(
+            "UPDATE executions SET lifecycle = 'superseded' WHERE id = 'e2';
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES('e3', 'recipe', 'i', 'p', 'held', 3, 3);
+             INSERT INTO execution_gates(id, execution_id, seq, predicate_json, created_at)
+               VALUES('g3', 'e3', 0, '{}', 3);",
+        )
+        .await
+        .unwrap();
+        db.write(|conn| Box::pin(async move { recompute_issue_status_conn(conn, "i").await }))
+            .await
+            .unwrap();
+        assert_eq!(issue_status_attention(&db).await.0, "backlog");
+        let resolution = db
+            .query_one(
+                "SELECT closed_at, merged_at FROM issues WHERE id = 'i'",
+                (),
+                |row| Ok((row.opt_i64(0)?, row.opt_i64(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolution, (None, None));
+    }
+
+    #[tokio::test]
+    async fn released_runless_execution_is_not_successful_work() {
+        let db = migrated_db().await;
+        seed_gated_execution(&db, &[("g1", Some(50))], true).await;
+        recompute_execution_and_issue(&db).await;
+        assert_ne!(derived_execution_status(&db).await, "complete");
+        assert_eq!(
+            db.query_opt_i64("SELECT completed_at FROM executions WHERE id = 'e'", ())
+                .await
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_never_run_work_does_not_stay_running_or_claim_success() {
+        for resolved in [false, true] {
+            let db = migrated_db().await;
+            seed_gated_execution(&db, &[], false).await;
+            db.execute_script(
+                "INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+                   VALUES('j', 'e', 'i', 'p', 'cancelled', 'builder', 'builder', 1, 1);",
+            ).await.unwrap();
+            if resolved {
+                db.execute("UPDATE issues SET closed_at = 10 WHERE id = 'i'", ())
+                    .await
+                    .unwrap();
+            }
+            recompute_execution_and_issue(&db).await;
+            assert_eq!(derived_execution_status(&db).await, "cancelled");
+            assert!(db
+                .query_opt_i64("SELECT completed_at FROM executions WHERE id = 'e'", (),)
+                .await
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                issue_status_attention(&db).await.0,
+                if resolved { "closed" } else { "failed" }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_action_is_work_without_an_agent_run() {
+        let db = migrated_db().await;
+        seed_gated_execution(&db, &[], false).await;
+        db.execute_script(
+            "INSERT INTO action_runs(id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, created_at)
+               VALUES('a', 'e', 'node', 'action', 'i', 'p', 'complete', 1);",
+        ).await.unwrap();
+        recompute_execution_and_issue(&db).await;
+        assert_eq!(derived_execution_status(&db).await, "complete");
+        assert_eq!(issue_status_attention(&db).await.0, "complete");
+        assert_eq!(repair_false_completion(&db).await.unwrap(), 0);
+        assert_eq!(derived_execution_status(&db).await, "complete");
+    }
+
+    #[tokio::test]
+    async fn startup_repairs_cached_false_success_without_resolving_or_replaying_it() {
+        let db = migrated_db().await;
+        seed_gated_execution(&db, &[("g1", Some(50))], true).await;
+        db.execute_script(
+            "UPDATE executions SET status = 'complete', lifecycle = 'superseded', completed_at = 10 WHERE id = 'e';
+             UPDATE issues SET status = 'complete', progress = 'complete', completed_at = 10 WHERE id = 'i';
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES('e2', 'recipe', 'i', 'p', 'failed', 2, 2);",
+        ).await.unwrap();
+        assert_eq!(repair_false_completion(&db).await.unwrap(), 1);
+        assert_eq!(derived_execution_status(&db).await, "superseded");
+        assert_eq!(issue_status_attention(&db).await.0, "failed");
+        let resolution = db
+            .query_one(
+                "SELECT closed_at, merged_at FROM issues WHERE id = 'i'",
+                (),
+                |row| Ok((row.opt_i64(0)?, row.opt_i64(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolution, (None, None));
+        assert_eq!(repair_false_completion(&db).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn only_the_canonical_attempt_supplies_issue_progress() {
+        for canonical in ["held", "running", "failed", "complete"] {
+            let db = migrated_db().await;
+            seed_gated_execution(&db, &[], false).await;
+            db.execute_script(format!(
+                "UPDATE executions SET status = '{canonical}' WHERE id = 'e';
+                 INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+                   VALUES('old', 'recipe', 'i', 'p', 'complete', 1, 0, 'superseded'),
+                         ('alternative', 'recipe', 'i', 'p', 'running', 2, 2, 'parallel');",
+            )).await.unwrap();
+            db.write(|conn| Box::pin(async move { recompute_issue_status_conn(conn, "i").await }))
+                .await
+                .unwrap();
+            let expected = match canonical {
+                "held" => "backlog",
+                "running" => "active",
+                other => other,
+            };
+            assert_eq!(issue_status_attention(&db).await.0, expected);
+        }
     }
 
     /// One satisfied gate out of two is still held: `after:` is an AND.
@@ -1170,6 +1411,7 @@ mod tests {
     async fn a_released_execution_derives_from_its_jobs_again() {
         let db = migrated_db().await;
         seed_gated_execution(&db, &[("g1", Some(50))], true).await;
+        seed_completed_run(&db).await;
 
         recompute_execution_and_issue(&db).await;
 
@@ -1187,6 +1429,7 @@ mod tests {
     async fn an_ungated_execution_is_untouched_by_the_held_branch() {
         let db = migrated_db().await;
         seed_gated_execution(&db, &[], false).await;
+        seed_completed_run(&db).await;
 
         recompute_execution_and_issue(&db).await;
 
@@ -1202,11 +1445,9 @@ mod tests {
         let db = migrated_db().await;
         seed_gated_execution(&db, &[("g1", None)], false).await;
         db.execute_script(
-            // Superseded, because the held execution 'e' is the issue's current
-            // attempt — 0230's partial unique index allows exactly one
-            // canonical execution per issue.
-            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
-               VALUES('e0', 'recipe', 'i', 'p', 'complete', 1, 0, 'superseded');",
+            "UPDATE executions SET lifecycle = 'pending' WHERE id = 'e';
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+               VALUES('e0', 'recipe', 'i', 'p', 'complete', 1, 0, 'canonical');",
         )
         .await
         .unwrap();

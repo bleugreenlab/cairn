@@ -17,7 +17,7 @@ use crate::transcripts::stream_store::{insert_event_conn, EventInsert};
 /// Hosts call this once with the other process-lifetime workers. The immediate
 /// first tick recovers committed intents even when no new request is filed.
 pub(crate) fn spawn(orch: Orchestrator) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut passes = 0_u32;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

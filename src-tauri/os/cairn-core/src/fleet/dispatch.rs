@@ -1732,10 +1732,10 @@ impl Fleet {
     ) {
         match &self.host_runtime {
             Some(runtime) => {
-                runtime.spawn(leader);
+                cairn_common::task::spawn_on(runtime, leader);
             }
             None => {
-                tokio::spawn(leader);
+                cairn_common::task::spawn(leader);
             }
         }
     }

@@ -324,17 +324,17 @@ async fn measure(
     let executor_ids: Vec<String> = frames.iter().map(|(id, _)| id.clone()).collect();
     let mut tasks = Vec::new();
     if posting {
-        tasks.push(tokio::spawn(post_each(
+        tasks.push(cairn_common::task::spawn(post_each(
             fleet.clone(),
             executor_ids.clone(),
             Duration::from_secs(30),
             beat_frame,
         )));
     } else {
-        tasks.push(tokio::spawn(keep_links_fresh(fleet.clone())));
+        tasks.push(cairn_common::task::spawn(keep_links_fresh(fleet.clone())));
     }
     for (executor_id, frames) in frames {
-        tasks.push(tokio::spawn(decline_every_offer(
+        tasks.push(cairn_common::task::spawn(decline_every_offer(
             fleet.clone(),
             executor_id,
             frames,
@@ -342,7 +342,7 @@ async fn measure(
     }
     let waits: Vec<_> = (0..parked)
         .map(|n| {
-            tokio::spawn(wait_for_a_machine(
+            cairn_common::task::spawn(wait_for_a_machine(
                 fleet.clone(),
                 db.clone(),
                 parked_request(n, now, identities),
@@ -358,11 +358,11 @@ async fn measure(
         (counts.since(earlier), statements - earlier_statements)
     };
     if posting {
-        tasks.push(tokio::spawn(post_samples(
+        tasks.push(cairn_common::task::spawn(post_samples(
             fleet.clone(),
             executor_ids.clone(),
         )));
-        tasks.push(tokio::spawn(post_each(
+        tasks.push(cairn_common::task::spawn(post_each(
             fleet.clone(),
             executor_ids,
             Duration::from_secs(5),
@@ -512,9 +512,9 @@ async fn parked_requests_read_nothing_and_a_finish_redoes_only_its_own_needs() {
     let db = Arc::new(crate::storage::migrated_test_db("parked-passes-read-nothing.db").await);
     let (fleet, frames) = fleet_of_machines(now);
     let executor_ids: Vec<String> = frames.iter().map(|(id, _)| id.clone()).collect();
-    let mut tasks = vec![tokio::spawn(keep_links_fresh(fleet.clone()))];
+    let mut tasks = vec![cairn_common::task::spawn(keep_links_fresh(fleet.clone()))];
     for (executor_id, frames) in frames {
-        tasks.push(tokio::spawn(decline_every_offer(
+        tasks.push(cairn_common::task::spawn(decline_every_offer(
             fleet.clone(),
             executor_id,
             frames,
@@ -526,14 +526,14 @@ async fn parked_requests_read_nothing_and_a_finish_redoes_only_its_own_needs() {
     let waits: Vec<_> = requests
         .iter()
         .map(|request| {
-            tokio::spawn(wait_for_a_machine(
+            cairn_common::task::spawn(wait_for_a_machine(
                 fleet.clone(),
                 db.clone(),
                 request.clone(),
             ))
         })
         .collect();
-    tasks.push(tokio::spawn(post_samples(
+    tasks.push(cairn_common::task::spawn(post_samples(
         fleet.clone(),
         executor_ids.clone(),
     )));

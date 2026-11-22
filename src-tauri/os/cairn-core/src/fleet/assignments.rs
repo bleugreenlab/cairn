@@ -944,7 +944,7 @@ impl Fleet {
         let fleet = self.clone();
         let supervisor = async move {
             loop {
-                match tokio::spawn(task(fleet.clone())).await {
+                match cairn_common::task::spawn(task(fleet.clone())).await {
                     Ok(()) => return,
                     Err(error) if error.is_panic() => {
                         let panic = error.into_panic();
@@ -966,10 +966,10 @@ impl Fleet {
         };
         match &self.host_runtime {
             Some(runtime) => {
-                runtime.spawn(supervisor);
+                cairn_common::task::spawn_on(runtime, supervisor);
             }
             None => {
-                tokio::spawn(supervisor);
+                cairn_common::task::spawn(supervisor);
             }
         }
     }
@@ -2171,10 +2171,10 @@ impl Fleet {
         let refigure = async move { fleet.refigure(None, false, true).await };
         match &self.host_runtime {
             Some(runtime) => {
-                runtime.spawn(refigure);
+                cairn_common::task::spawn_on(runtime, refigure);
             }
             None => {
-                tokio::spawn(refigure);
+                cairn_common::task::spawn(refigure);
             }
         }
     }
@@ -2184,10 +2184,10 @@ impl Fleet {
         let refigure = async move { fleet.refigure(only.as_deref(), false, false).await };
         match &self.host_runtime {
             Some(runtime) => {
-                runtime.spawn(refigure);
+                cairn_common::task::spawn_on(runtime, refigure);
             }
             None => {
-                tokio::spawn(refigure);
+                cairn_common::task::spawn(refigure);
             }
         }
     }

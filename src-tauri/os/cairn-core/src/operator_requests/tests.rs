@@ -2703,7 +2703,9 @@ mod production_lift_drain {
         let dispatched_orch = orch.clone();
         let event = accepted.attempts[0].authorization_event_id.clone();
         let dispatch =
-            tokio::spawn(async move { dispatch_accepted(&dispatched_orch, &event).await });
+            cairn_common::task::spawn(
+                async move { dispatch_accepted(&dispatched_orch, &event).await },
+            );
         let acting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if state(&orch, &card.id).await.state == RequestState::Acting {

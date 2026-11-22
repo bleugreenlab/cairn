@@ -316,7 +316,7 @@ impl ServiceHost for LeaseHost {
         }
         let (sender, events) = mpsc::unbounded_channel();
         let mut machine_lost = lease.machine_lost_signal();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             loop {
                 // Biased: a report and the stream's closure can arrive together,
                 // and the supervisor stops reading at the exit the closure becomes.

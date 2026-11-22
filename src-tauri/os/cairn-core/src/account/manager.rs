@@ -210,7 +210,7 @@ impl AccountManager {
         let db = self.db.clone();
         let emitter = self.emitter.clone();
         let api_config = self.api_config.clone();
-        tokio::spawn(refresh_loop(db, emitter, cancel_rx, api_config));
+        cairn_common::task::spawn(refresh_loop(db, emitter, cancel_rx, api_config));
     }
 
     /// Start refresh if an account exists. Called on app startup.

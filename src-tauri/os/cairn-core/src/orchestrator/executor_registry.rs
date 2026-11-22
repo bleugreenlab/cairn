@@ -115,7 +115,7 @@ mod tests {
         let waiting = {
             let fleet = fleet.clone();
             let executor_id = executor_id.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 fleet
                     .registry_write_permit(&executor_id, live)
                     .await

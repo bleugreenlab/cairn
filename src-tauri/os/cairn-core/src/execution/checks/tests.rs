@@ -678,7 +678,7 @@ async fn an_admitted_wave_waits_to_the_total_bound() {
     // Paused after the orchestrator is built, so the claim and both bounds
     // share one clock however loaded the host running the test is.
     tokio::time::pause();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         progress.send_replace(running_progress("bgsrv-mac"));
         std::future::pending::<()>().await;
@@ -752,7 +752,7 @@ async fn admission_is_latched() {
     let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
     let (progress, seen) = quiet_progress();
     tokio::time::pause();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         progress.send_replace(running_progress("bgsrv-mac"));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         // The board's next snapshot: preparing the fix re-verification.
@@ -1310,7 +1310,7 @@ async fn a_dropped_call_claims_only_what_its_recording_persisted() {
     let complete = complete_each_member_once(inner);
     let member = || HashMap::from([(4, Err(CheckExecutionFailure::Process("exited".into())))]);
 
-    let abandoned = tokio::spawn({
+    let abandoned = cairn_common::task::spawn({
         let complete = complete.clone();
         async move { complete(&member()).await }
     });
@@ -1318,7 +1318,7 @@ async fn a_dropped_call_claims_only_what_its_recording_persisted() {
     abandoned.abort();
     assert!(abandoned.await.unwrap_err().is_cancelled());
 
-    let retry = tokio::spawn({
+    let retry = cairn_common::task::spawn({
         let complete = complete.clone();
         async move { complete(&member()).await }
     });
@@ -1529,7 +1529,7 @@ async fn an_outcome_buffered_for_a_caller_cancelled_before_reading_it_is_deliver
     let (offer, inline) = tokio::sync::oneshot::channel::<OfferedOutcome>();
     let (delivered_tx, mut delivered) = tokio::sync::mpsc::unbounded_channel::<String>();
     let fold_failure = "Checks: \u{2717} write-check fold (conflict in src/a.rs)";
-    let supervisor = tokio::spawn(hand_off_wave_outcome(
+    let supervisor = cairn_common::task::spawn(hand_off_wave_outcome(
         offer,
         Some(fold_failure.to_string()),
         move |late: String| async move {
@@ -1553,7 +1553,7 @@ async fn an_outcome_buffered_for_a_caller_cancelled_before_reading_it_is_deliver
 async fn a_claimed_outcome_is_not_also_delivered_late() {
     let (offer, inline) = tokio::sync::oneshot::channel::<OfferedOutcome>();
     let (delivered_tx, mut delivered) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let supervisor = tokio::spawn(hand_off_wave_outcome(
+    let supervisor = cairn_common::task::spawn(hand_off_wave_outcome(
         offer,
         Some("Checks: \u{2713} fmt".to_string()),
         move |late: String| async move {
@@ -1625,7 +1625,7 @@ async fn dropping_the_caller_leaves_the_write_check_wave_running() {
         "Checks: \u{2717} write-check fold (non-convergent: verification mutated again)";
 
     let (_progress, seen) = quiet_progress();
-    let caller = tokio::spawn(await_write_check_wave(
+    let caller = cairn_common::task::spawn(await_write_check_wave(
         guard,
         wait_bounds(60_000, 60_000),
         seen,
@@ -2522,7 +2522,7 @@ async fn a_sweep_dropped_mid_batch_hands_its_batch_to_the_next_sweep() {
         .await;
     let sweep = queue_check_ref_retirement(&orch, &store, retirement_of(&repo, first, &commit))
         .expect("a store with no live sweep starts one");
-    let sweep = tokio::spawn(sweep);
+    let sweep = cairn_common::task::spawn(sweep);
     wait_until("the sweep has taken its batch", || {
         pending_check_ref_retirements(&store) == 0
     })
@@ -11646,7 +11646,7 @@ async fn abandoning_a_running_miss_stores_nothing() {
     let task = {
         let db = db.clone();
         let started = started.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let plans = vec![(plan("queued", "run-queued"), "ih-queued".to_string())];
             run_planned_checks(
                 db,
@@ -11958,7 +11958,7 @@ async fn a_fold_onto_a_moved_head_reuses_the_heads_own_verdict_instead_of_runnin
         observation.verdict_environment_hash =
             Some(effective_verdict_environment_hash(&keyed[0].0, &[]));
         let recorder = db.clone();
-        let head_records = tokio::spawn(async move {
+        let head_records = cairn_common::task::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             record_fresh_check_observation(recorder, observation).unwrap();
             drop(head_wave);
@@ -12062,7 +12062,7 @@ async fn a_fold_runs_the_lane_another_wave_left_without_a_verdict() {
     head_wave.claim([lane_key("project-a", &keyed[0])], "commit-h2");
     let mut fold = registry.open_wave("job-a");
     fold.claim([], "commit-h1");
-    let head_ends = tokio::spawn(async move {
+    let head_ends = cairn_common::task::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         drop(head_wave);
     });

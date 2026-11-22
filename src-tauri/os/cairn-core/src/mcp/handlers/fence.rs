@@ -1218,7 +1218,7 @@ mod tests {
             .unwrap();
         let task = {
             let orch = orch.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 raise_fence(
                     &orch,
                     "run-1",

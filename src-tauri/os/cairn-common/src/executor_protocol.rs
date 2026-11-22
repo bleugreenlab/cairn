@@ -9740,6 +9740,13 @@ pub struct LearnedResourceEstimate {
 /// Request construction, routing, admission, settlement and frame serialization
 /// are unchanged. Wire-path classification only changes which source edits the
 /// review guard watches; a runner talking to an older executor gets nothing wrong.
+///
+/// cairn/7320 does not move the number. Counted task spawns only attach
+/// runner-local lifetime counters to the same futures, with their existing
+/// cancellation and completion behavior. The backend-pressure log gains local
+/// diagnostics; no executor frame, field, admission rule, or delivery changes.
+/// A runner talking to an older executor gets nothing wrong: both peers send
+/// and interpret exactly the same messages.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 177;
 
 /// The version `build.rs` derived from the paragraphs above

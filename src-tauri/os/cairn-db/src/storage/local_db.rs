@@ -2355,7 +2355,7 @@ impl LocalDb {
         }
         self.sample_checkpoint_lifecycle("ready");
         let db = Arc::downgrade(self);
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let mut tick = tokio::time::interval_at(
                 tokio::time::Instant::now() + CHECKPOINT_LIFECYCLE_HEARTBEAT,
                 CHECKPOINT_LIFECYCLE_HEARTBEAT,

@@ -503,7 +503,7 @@ where
         files = tracing::field::Empty,
     );
     let recorded = span.clone();
-    let task = tokio::spawn(
+    let task = cairn_common::task::spawn(
         async move {
             // Leaves the table however the task ends, a panic included, so a
             // key can never be stranded behind a flight that will not land.

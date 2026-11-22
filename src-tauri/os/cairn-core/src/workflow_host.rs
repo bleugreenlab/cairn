@@ -154,7 +154,9 @@ impl WorkflowHost for CoreWorkflowHost {
             {
                 let orch = self.0.clone();
                 let issue_id = issue_id.to_string();
-                handle.spawn(async move { orch.wake_for_issue(&issue_id).await });
+                cairn_common::task::spawn_on(&handle, async move {
+                    orch.wake_for_issue(&issue_id).await
+                });
             }
         }
         let condition_ref = format!("{execution_id}/{node_id}");
@@ -357,7 +359,7 @@ fn publish_projection(orch: &Orchestrator, execution_id: &str, outcome: &Recompu
                         );
                         let triage_orch = orch.clone();
                         let confirmed_scopes = completion.confirmed_scopes.clone();
-                        tokio::spawn(async move {
+                        cairn_common::task::spawn(async move {
                             if let Err(error) = crate::memories::triage::maybe_spawn_triage(
                                 triage_orch,
                                 confirmed_scopes,

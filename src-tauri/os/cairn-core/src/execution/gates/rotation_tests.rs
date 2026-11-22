@@ -419,13 +419,13 @@ async fn racing_sweeps_release_each_rotation_turn_once() {
     let mut handles = Vec::new();
     for _ in 0..4 {
         let orch = env.orch.clone();
-        handles.push(tokio::spawn(
-            async move { sweep(&orch).await.unwrap().released },
-        ));
+        handles.push(cairn_common::task::spawn(async move {
+            sweep(&orch).await.unwrap().released
+        }));
     }
     for _ in 0..2 {
         let (orch, id) = (env.orch.clone(), b[0].clone());
-        handles.push(tokio::spawn(async move {
+        handles.push(cairn_common::task::spawn(async move {
             if evaluate_execution(&orch, &id).await.unwrap().released {
                 vec![id]
             } else {

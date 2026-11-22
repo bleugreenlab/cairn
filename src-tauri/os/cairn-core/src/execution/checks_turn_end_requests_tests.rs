@@ -254,7 +254,7 @@ async fn each_missed_suite_is_its_own_request_recorded_as_it_settles_and_deliver
     let fleet = orch.fleet.clone();
     let (grants_tx, mut grants) = mpsc::unbounded_channel::<Grant>();
     let (release_held, held_released) = oneshot::channel::<()>();
-    let machine = tokio::spawn(async move {
+    let machine = cairn_common::task::spawn(async move {
         let answer = |request: &CellRequest, outcome: CellOutcome| {
             fleet.handle_executor_message(
                 crate::fleet::COLOCATED_EXECUTOR_ID,
@@ -317,7 +317,7 @@ async fn each_missed_suite_is_its_own_request_recorded_as_it_settles_and_deliver
     let slot = orch
         .try_begin_turn_end_checks(JOB, &attempt)
         .expect("the slot is free");
-    let wave = tokio::spawn(run_turn_end_checks(orch.clone(), JOB.to_string(), slot));
+    let wave = cairn_common::task::spawn(run_turn_end_checks(orch.clone(), JOB.to_string(), slot));
 
     // 1. Three misses, three separate single-item requests.
     let mut seen = Vec::new();

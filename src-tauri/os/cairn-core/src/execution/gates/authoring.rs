@@ -51,7 +51,7 @@ const SELF_PRODUCIBLE_FACTS: &[&str] = &["artifact_confirmed", "check_verdict"];
 /// nothing.
 const LIVE_PRODUCER_SQL: &str = concat!(
     "SELECT e.id FROM executions e WHERE e.issue_id = ?1 AND e.id != ?2 \
-       AND e.status NOT IN ('complete', 'failed') AND ",
+       AND e.status NOT IN ('complete', 'failed', 'cancelled', 'superseded') AND ",
     cairn_db::live_execution_sql!(),
     " AND NOT (",
     cairn_db::gated_unreleased_sql!(),

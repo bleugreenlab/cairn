@@ -731,6 +731,12 @@ mod tests {
                 seed_project_issue_execution(conn, &snap).await;
                 seed_job(conn, "job-keep", "keep", "complete", None, false).await;
                 seed_job(conn, "job-cancel", "gone", "cancelled", None, false).await;
+                conn.execute(
+                    "INSERT INTO runs(id, job_id, issue_id, project_id, status, created_at, updated_at)
+                     VALUES('run-keep', 'job-keep', 'issue-1', 'proj-1', 'exited', 1, 1)",
+                    (),
+                )
+                .await?;
 
                 crate::transitions::outcome::recompute_execution_status_conn(conn, "exec-1")
                     .await?;

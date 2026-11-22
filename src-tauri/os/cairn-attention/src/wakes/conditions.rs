@@ -67,7 +67,7 @@ pub fn install_evaluator(runtime: AttentionRuntime) {
     if let Ok(mut sender) = notifier().lock() {
         *sender = Some(tx);
     }
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         while let Some(first) = rx.recv().await {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             // Row URIs accumulate per thread across the debounce window, so a

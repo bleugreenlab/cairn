@@ -245,7 +245,7 @@ mod tests {
         // Another job's home is its own.
         let other_job = tenant(claim("job-other", "batch-x", true));
 
-        let waiter = tokio::spawn(async {
+        let waiter = cairn_common::task::spawn(async {
             loop {
                 match claim("job-rule", "batch-3", true) {
                     HomeClaim::Tenant(tenancy) => return tenancy,

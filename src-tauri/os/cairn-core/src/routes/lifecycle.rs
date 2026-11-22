@@ -508,7 +508,7 @@ pub async fn mint_attention(orch: &Orchestrator, event: AttentionEvent) -> Resul
 pub fn spawn_attention_minter(orch: Orchestrator) {
     let (tx, mut rx) = tokio::sync::mpsc::channel(ATTENTION_QUEUE);
     let mut events = orch.attention_changed.subscribe();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         loop {
             match events.recv().await {
                 Ok(event) => match tx.try_send(event) {
@@ -525,7 +525,7 @@ pub fn spawn_attention_minter(orch: Orchestrator) {
             }
         }
     });
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         while let Some(event) = rx.recv().await {
             if let Err(error) = mint_attention(&orch, event).await {
                 log::warn!("attention fact could not be minted: {error}");

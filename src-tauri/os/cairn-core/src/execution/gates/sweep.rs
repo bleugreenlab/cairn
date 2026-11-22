@@ -106,7 +106,7 @@ pub(crate) fn install_sweep_notifier(orch: Orchestrator) {
     // Workflow, session recovery and merge-status writers share one
     // post-commit hint channel when admission evidence changes.
     cairn_db::admission_hint::install(notify_gate_evidence_changed);
-    tokio::spawn(super::pulse::run_gate_sweep_loop(
+    cairn_common::task::spawn(super::pulse::run_gate_sweep_loop(
         orch,
         rx,
         super::pulse::SweepLoopConfig::default(),
@@ -1890,6 +1890,131 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn filing_an_unheld_attempt_refreshes_stale_completion_before_jobs_start() {
+        let env = env("filing-unheld-progress.db").await;
+        env.db
+            .execute_script(
+                "UPDATE issues SET status = 'complete', progress = 'complete', completed_at = 1
+                   WHERE id = 'i2';
+                 INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+                   VALUES('previous', 'recipe', 'i2', 'p', 'complete', 1, 1);",
+            )
+            .await
+            .unwrap();
+
+        let filed = crate::execution::recipe::start_recipe_execution_impl(
+            &env.orch,
+            "i2",
+            Some(RECIPE),
+            "p",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::models::TriggerType::Manual,
+            LaunchIntent::NewAttempt,
+            crate::execution::recipe::Starter::Operator,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(filed.status.to_string(), "running");
+        assert_eq!(
+            count(&env, "SELECT COUNT(*) FROM jobs WHERE issue_id = 'i2'").await,
+            0,
+            "the filing refresh must precede job creation"
+        );
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM issues WHERE id = 'i2'
+                   AND status = 'active' AND progress = 'active'
+                   AND closed_at IS NULL AND merged_at IS NULL"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM executions WHERE id = 'previous' AND lifecycle = 'superseded'"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn filing_a_held_attempt_projects_the_canonical_owner_or_backlog_without_one() {
+        for (owner_status, expected) in [
+            (None, "backlog"),
+            (Some("held"), "backlog"),
+            (Some("running"), "active"),
+            (Some("complete"), "complete"),
+        ] {
+            let env = env("filing-held-progress.db").await;
+            env.db
+                .execute_script(
+                    "UPDATE issues SET status = 'complete', progress = 'complete', completed_at = 1
+                       WHERE id = 'i2';",
+                )
+                .await
+                .unwrap();
+            if let Some(status) = owner_status {
+                env.db
+                    .execute(
+                        "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+                           VALUES('previous', 'recipe', 'i2', 'p', ?1, 1, 1)",
+                        (status,),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            file(&env, 2, merged_after(1)).await.unwrap();
+
+            let (_, status, released_at, jobs) = execution(&env, 2).await;
+            assert_eq!((status.as_str(), released_at, jobs), ("held", None, 0));
+            assert_eq!(
+                count(
+                    &env,
+                    "SELECT COUNT(*) FROM executions WHERE issue_id = 'i2' AND lifecycle = 'pending'"
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                count(
+                    &env,
+                    "SELECT COUNT(*) FROM executions WHERE id = 'previous' AND lifecycle = 'canonical'"
+                )
+                .await,
+                i64::from(owner_status.is_some()),
+                "a held successor must not supersede its owner"
+            );
+            assert_eq!(
+                count(
+                    &env,
+                    &format!(
+                        "SELECT COUNT(*) FROM issues WHERE id = 'i2'
+                           AND status = '{expected}' AND progress = '{expected}'
+                           AND closed_at IS NULL AND merged_at IS NULL"
+                    )
+                )
+                .await,
+                1,
+                "canonical owner: {owner_status:?}"
+            );
+            assert_eq!(
+                count(&env, "SELECT COUNT(*) FROM jobs WHERE issue_id = 'i2'").await,
+                0
+            );
+        }
+    }
+
     /// Plan verification 2: held on creation, released in place on merge.
     #[tokio::test]
     async fn a_held_execution_mints_nothing_until_its_gate_and_then_advances_in_place() {
@@ -2590,14 +2715,16 @@ pub(crate) mod tests {
         let mut handles = Vec::new();
         for _ in 0..4 {
             let orch = env.orch.clone();
-            handles.push(tokio::spawn(
-                async move { sweep(&orch).await.unwrap().released },
-            ));
+            handles.push(cairn_common::task::spawn(async move {
+                sweep(&orch).await.unwrap().released
+            }));
         }
         let racing_release = {
             let orch = env.orch.clone();
             let id = id.clone();
-            tokio::spawn(async move { release(&orch, &id, ReleaseCause::Satisfied).await.unwrap() })
+            cairn_common::task::spawn(async move {
+                release(&orch, &id, ReleaseCause::Satisfied).await.unwrap()
+            })
         };
         let mut released = 0;
         for handle in handles {
@@ -2752,6 +2879,34 @@ pub(crate) mod tests {
         file(&env, 3, own_green).await.unwrap();
         let error = file(&env, 3, merged_after(3)).await.unwrap_err();
         assert!(error.contains("prj/3 after prj/3"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_canonical_attempt_cannot_produce_self_gate_evidence() {
+        let env = env("gate-sweep-cancelled-producer.db").await;
+        env.db.execute_script(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES('cancelled', 'recipe', 'i3', 'p', 'cancelled', 1, 1);",
+        ).await.unwrap();
+        for after in [
+            json!([{"fact": "artifact_confirmed", "issue": "cairn://p/prj/3", "artifact": "plan"}]),
+            json!([{"fact": "check_verdict", "check": "lint", "issue": "cairn://p/prj/3", "verdict": "passed"}]),
+        ] {
+            let error = file(&env, 3, after).await.unwrap_err();
+            assert!(
+                error.contains("no other live execution on prj/3"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM executions WHERE issue_id = 'i3'"
+            )
+            .await,
+            1,
+            "refused filings must leave no held successor",
+        );
     }
 
     /// Plan verification 9: `{release:true}` records the principal, and gates on
@@ -3166,7 +3321,9 @@ pub(crate) mod tests {
         file(&env, 5, merged_after(1)).await.unwrap();
         env.db
             .execute_script(
-                "UPDATE jobs SET status = 'complete' WHERE id = 'live-job';
+                "INSERT INTO runs(id, job_id, project_id, issue_id, status, created_at, updated_at)
+                   VALUES('finished-run', 'live-job', 'p', 'i5', 'exited', 1, 3);
+                 UPDATE jobs SET status = 'complete' WHERE id = 'live-job';
                  UPDATE executions SET status = 'complete', completed_at = 3 WHERE id = 'live';",
             )
             .await

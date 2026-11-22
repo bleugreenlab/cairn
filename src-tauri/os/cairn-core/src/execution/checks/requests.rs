@@ -661,7 +661,7 @@ fn spawn(orch: &Orchestrator, db: Arc<LocalDb>, id: String, drive: Drive) {
     let (start, started) = tokio::sync::oneshot::channel::<()>();
     let task_orch = orch.clone();
     let task_id = id.clone();
-    let task = tokio::spawn(async move {
+    let task = cairn_common::task::spawn(async move {
         let _ = started.await;
         match drive {
             Drive::Fresh(revision) => drive_fresh(&task_orch, db, &task_id, revision).await,
@@ -1007,7 +1007,7 @@ where
     F: std::future::Future<Output = ()> + Send,
 {
     let (tx, mut rx) = tokio::sync::watch::channel::<Option<ManualCheckProgressUpdate>>(None);
-    let writer = tokio::spawn(async move {
+    let writer = cairn_common::task::spawn(async move {
         let mut written: Option<(ProgressKey, tokio::time::Instant)> = None;
         let mut pending: Option<ManualCheckProgressUpdate> = None;
         loop {

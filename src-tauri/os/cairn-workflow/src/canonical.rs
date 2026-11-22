@@ -389,9 +389,8 @@ pub async fn next_seq_conn(conn: &TrackedConnection, issue_id: &str) -> DbResult
 /// already means "removed mid-flight, transcript preserved, excluded from the
 /// DAG", which is exactly right.
 ///
-/// The cascade makes `recompute_execution_status_conn` derive `failed` for the
-/// superseded executions. That is correct, and harmless: `lifecycle` is a column
-/// the recompute does not write.
+/// The outcome projection preserves the separate lifecycle fence. An attempt
+/// fenced before any run or action derives Superseded, never successful work.
 pub async fn supersede_canonical_conn(
     conn: &TrackedConnection,
     issue_id: &str,

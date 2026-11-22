@@ -1032,7 +1032,7 @@ impl OrchestratorBuilder {
             let mut provider_admission_changes =
                 orchestrator.db.local.subscribe_provider_admission_changes();
             let provider_admission_cache = Arc::downgrade(&orchestrator.provider_admission_cache);
-            handle.spawn(async move {
+            cairn_common::task::spawn_on(&handle, async move {
                 while provider_admission_changes.changed().await.is_ok() {
                     let Some(cache) = provider_admission_cache.upgrade() else {
                         break;
@@ -1052,7 +1052,7 @@ impl OrchestratorBuilder {
             let mut pulls = crate::storage::subscribe_team_pull_applied();
             let snapshot = Arc::downgrade(&orchestrator.sidebar_active_issues);
             let generation = Arc::downgrade(&orchestrator.sidebar_active_issues_generation);
-            handle.spawn(async move {
+            cairn_common::task::spawn_on(&handle, async move {
                 while pulls.recv().await.is_ok() {
                     let (Some(snapshot), Some(generation)) =
                         (snapshot.upgrade(), generation.upgrade())
@@ -2283,6 +2283,7 @@ impl Orchestrator {
     /// agent backend's stdout loop firing a turn-end hook) gets one: never a
     /// runtime built for the occasion, which would drop every task the work
     /// spawned for others the moment the work itself returned.
+    #[track_caller]
     pub(crate) fn spawn_detached(
         &self,
         task: impl std::future::Future<Output = ()> + Send + 'static,
@@ -2293,6 +2294,7 @@ impl Orchestrator {
     /// [`Self::spawn_detached`], calling `on_spawn_failure` in place of `task`
     /// when the task cannot be started at all, so a caller holding something the
     /// task would have released (a single-flight slot) can release it.
+    #[track_caller]
     pub(crate) fn spawn_detached_or(
         &self,
         task: impl std::future::Future<Output = ()> + Send + 'static,
@@ -3013,7 +3015,7 @@ impl Orchestrator {
         // regardless of consent; walking back through pre-existing history is
         // what `history_consented` gates.
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let keeper = orch.space_keeper();
             if let Err(error) = keeper.reconcile(Trigger::Startup).await {
                 log::warn!(
@@ -3356,7 +3358,7 @@ impl Orchestrator {
     /// is `type: "device_anon"` and is only ever accepted by `/embed`.
     pub fn start_anon_device(&self) {
         let anon = self.anon_device_manager.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             loop {
                 anon.ensure_registered().await;
                 tokio::time::sleep(tokio::time::Duration::from_secs(12 * 3600)).await;
@@ -3500,7 +3502,7 @@ impl Orchestrator {
     /// [`Self::run_integrity_sweep_when_host_allows`] on its own task.
     pub fn spawn_integrity_sweep(&self, shutdown: tokio::sync::watch::Receiver<bool>) {
         let db = self.db.local.clone();
-        tokio::spawn(async move { integrity_sweep::run(&db, shutdown).await });
+        cairn_common::task::spawn(async move { integrity_sweep::run(&db, shutdown).await });
     }
 
     /// Retire the attention queue's historical backlog once, in the background.
@@ -3512,7 +3514,7 @@ impl Orchestrator {
     /// wait for it.
     pub fn spawn_attention_retirement_backfill(&self) {
         let db = self.db.local.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             if let Err(e) =
                 crate::orchestrator::attention_retirement::run_retirement_backfill(&db).await
             {
@@ -3526,7 +3528,7 @@ impl Orchestrator {
     /// then one every [`crate::scratch::residences::MAINTENANCE_INTERVAL`].
     pub fn spawn_scratch_maintenance(&self) {
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let mut interval =
                 tokio::time::interval(crate::scratch::residences::MAINTENANCE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3548,7 +3550,7 @@ impl Orchestrator {
     /// restarted. The first probe waits a full interval, because startup has
     /// just probed.
     pub fn spawn_toolchain_identity_refresh(&self) {
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let every = cairn_checkenv::HOST_IDENTITY_REFRESH_INTERVAL;
             let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3578,7 +3580,7 @@ impl Orchestrator {
         let offload_setting = std::env::var(OFFLOAD_ENV).ok();
         let offload = crate::archival::switch_enabled(offload_setting.as_deref());
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let mut interval = tokio::time::interval(crate::archival::sweep::SWEEP_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -3598,7 +3600,7 @@ impl Orchestrator {
                 crate::archival::sweep::SWEEP_INTERVAL
             );
             let orch = self.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 let period = crate::archival::sweep::SWEEP_INTERVAL;
                 let mut interval = tokio::time::interval_at(
                     tokio::time::Instant::now() + FIRST_PASS_DELAY,
@@ -3631,7 +3633,7 @@ impl Orchestrator {
                 crate::archival::sweep::SWEEP_INTERVAL.as_secs()
             );
             let orch = self.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 let period = crate::archival::sweep::SWEEP_INTERVAL;
                 let mut interval = tokio::time::interval_at(
                     tokio::time::Instant::now() + PACK_FIRST_PASS_DELAY,
@@ -3665,7 +3667,7 @@ impl Orchestrator {
             cairn_db::storage::retention::EvictorBudget::PRODUCTION.folds_per_pass,
         );
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let period = cairn_db::storage::retention::PASS_INTERVAL;
             let mut interval =
                 tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -3695,7 +3697,7 @@ impl Orchestrator {
 
     pub fn spawn_analytics_rollup_backfill(&self) {
         let db = self.db.local.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             if let Err(e) = cairn_analytics::run_historical_backfill(&db).await {
                 log::warn!("analytics rollup backfill failed: {e}");
             }
@@ -3722,7 +3724,7 @@ impl Orchestrator {
     /// behind.
     pub fn spawn_delegated_packet_backfill(&self) {
         let orch = self.clone();
-        tokio::spawn(async move { orch.run_delegated_packet_backfill().await });
+        cairn_common::task::spawn(async move { orch.run_delegated_packet_backfill().await });
     }
 
     /// Spawn the live recipe scheduler: a detached loop that fires
@@ -3811,6 +3813,15 @@ impl Orchestrator {
     /// revisits this shape; run this once at startup right after it. Idempotent.
     /// Owned by the always-on hosts (runner, non-inert server).
     pub async fn heal_stuck_delegated_children(&self) {
+        for db in self.db.all_dbs().await {
+            match cairn_workflow::transitions::outcome::repair_false_completion(&db).await {
+                Ok(changed) if changed > 0 => {
+                    log::info!("Reprojected {changed} falsely complete issues")
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("Failed to repair completion projections: {error}"),
+            }
+        }
         crate::execution::advancement::heal_stuck_delegated_children(self).await;
     }
 
@@ -3864,7 +3875,7 @@ impl Orchestrator {
     pub fn spawn_approved_merge_reconcile(&self) {
         const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
             loop {
                 interval.tick().await;
@@ -3885,7 +3896,7 @@ impl Orchestrator {
     fn spawn_memory_triage_reconcile_loop(&self, skip_initial: bool) {
         const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
             if skip_initial {
                 interval.tick().await;
@@ -3932,7 +3943,7 @@ impl Orchestrator {
     fn spawn_memory_review_reconcile_loop(&self, skip_initial: bool) {
         const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
             if skip_initial {
                 interval.tick().await;
@@ -3955,12 +3966,12 @@ impl Orchestrator {
     /// `checks_main::arm_at_boot` for why.
     pub fn spawn_main_cadence_boot(&self) {
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             crate::execution::checks_main::arm_at_boot(&orch).await;
         });
         // Every open check request is re-driven or re-adopted beside it.
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             crate::execution::checks::requests::rearm_at_boot(&orch).await;
         });
     }
@@ -3970,7 +3981,7 @@ impl Orchestrator {
     /// outside any maintenance gate: the heartbeat is its only backstop.
     pub fn spawn_publications_boot(&self) {
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             crate::publications::boot(&orch).await;
         });
     }
@@ -3981,7 +3992,7 @@ impl Orchestrator {
     /// default-advance catch-up that project services follow.
     pub fn spawn_services_boot(&self) {
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             crate::project_services::supervisor::start_at_boot(&orch).await;
         });
     }
@@ -3999,7 +4010,7 @@ impl Orchestrator {
     /// Must be called from within a tokio runtime context.
     pub fn spawn_default_advance_reconcile(&self) {
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             crate::projects::crud::reconcile_project_repositories(&orch.db.local).await;
             // One-time at startup, before the catch-up: re-detect and persist each
             // local project's real default branch, correcting any row left on the
@@ -4035,7 +4046,7 @@ impl Orchestrator {
     pub fn spawn_base_advance_upkeep(&self) {
         let orch = self.clone();
         let queue = Arc::new(crate::orchestrator::base_advance::retirement::LegacyQueue::default());
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let mut recovered = false;
             loop {
                 let (pass, queue) = (orch.clone(), queue.clone());
@@ -4062,7 +4073,7 @@ impl Orchestrator {
                 if !recovered && retired.load(std::sync::atomic::Ordering::SeqCst) {
                     recovered = true;
                     let recovery = orch.clone();
-                    tokio::spawn(async move {
+                    cairn_common::task::spawn(async move {
                         // Regenerations the previous process left holding
                         // branches, before the replays those holds deferred.
                         crate::orchestrator::base_advance::regenerate::recover_after_restart(
@@ -4095,7 +4106,7 @@ impl Orchestrator {
             emitter: self.services.emitter.clone(),
             cadence: crate::storage::SyncCadence::default(),
         };
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let authorized = match crate::account::team_sync::read_device_jwt(&db.local).await {
                 Ok(jwt) => jwt.is_some(),
                 Err(error) => {
@@ -4493,7 +4504,7 @@ impl Orchestrator {
             self.services.emitter.clone(),
         ));
         self.spawn_pipe_floor();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             {
                 let orch = orch.clone();
                 tokio::task::spawn_blocking(move || {
@@ -4980,13 +4991,14 @@ impl Orchestrator {
 /// sweep) goes through [`Orchestrator::spawn_detached`], which supplies the
 /// orchestrator's own runtime. If the fallback runtime cannot be built, `task`
 /// never runs and `on_spawn_failure` is called in its place.
+#[track_caller]
 pub(crate) fn spawn_onto(
     runtime: Option<&tokio::runtime::Handle>,
     task: impl std::future::Future<Output = ()> + Send + 'static,
     on_spawn_failure: impl FnOnce() + Send + 'static,
 ) {
     if let Some(runtime) = runtime {
-        runtime.spawn(task);
+        cairn_common::task::spawn_on(runtime, task);
         return;
     }
     std::thread::spawn(move || {
@@ -5462,7 +5474,7 @@ mod tests {
             .await;
         let waiting_orch = orch.clone();
         let waiting_store = store.clone();
-        let waiter = tokio::spawn(async move {
+        let waiter = cairn_common::task::spawn(async move {
             waiting_orch
                 .acquire_jj_store_lock_with_timeout(
                     &waiting_store,
@@ -5526,7 +5538,7 @@ mod tests {
 
         let waiting_orch = orch.clone();
         let waiting_store = store.clone();
-        let preparation = tokio::spawn(async move {
+        let preparation = cairn_common::task::spawn(async move {
             drop(
                 waiting_orch
                     .acquire_jj_store_lock(

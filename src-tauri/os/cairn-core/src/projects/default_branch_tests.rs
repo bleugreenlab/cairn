@@ -160,7 +160,7 @@ async fn default_change_waits_for_a_base_preparation_holding_the_guard() {
 
     let writer = {
         let fixture = fixture.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             change_default(&fixture, declare("develop"), None, Duration::from_secs(30)).await
         })
     };
@@ -189,7 +189,7 @@ async fn held_guard_is_lent_rather_than_reacquired() {
     let fixture = Arc::new(fixture().await);
     let task = {
         let fixture = fixture.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let guard = fixture
                 .orch
                 .acquire_jj_store_lock(
@@ -284,7 +284,7 @@ async fn settings_patch_runs_under_the_write_batch_guard() {
     let fixture = Arc::new(fixture().await);
     let task = {
         let fixture = fixture.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let guard = fixture
                 .orch
                 .acquire_jj_store_lock(

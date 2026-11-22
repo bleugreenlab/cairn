@@ -1270,7 +1270,7 @@ pub(crate) fn complete_each_member_once(complete: CheckGroupCompletion) -> Check
             }
             let members: crate::execution::checks::CheckGroupUnrecorded =
                 fresh.keys().copied().collect();
-            let recording = tokio::spawn(async move {
+            let recording = cairn_common::task::spawn(async move {
                 let unrecorded = complete(&fresh).await;
                 answered.extend(fresh.keys().filter(|index| !unrecorded.contains(*index)));
                 unrecorded

@@ -705,7 +705,7 @@ where
         return;
     };
     let (orch, job_id) = (orch.clone(), job_id.to_string());
-    handle.spawn(async move {
+    cairn_common::task::spawn_on(&handle, async move {
         let id = job_id.clone();
         if let Err(error) = hook(orch, job_id).await {
             log::warn!("inference: settling job {id}'s generation after {what} failed: {error}");

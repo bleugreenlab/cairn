@@ -49,6 +49,7 @@ pub mod scratch;
 pub mod security;
 pub mod service;
 pub mod skip_ledger;
+pub mod task;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_seal;
 pub mod token_meter;

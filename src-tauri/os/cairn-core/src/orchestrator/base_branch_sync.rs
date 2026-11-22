@@ -590,7 +590,7 @@ async fn sync_if_behind(
     // on GitHub, which nothing else notices until its pull request is read.
     {
         let (orch, project_id, branch) = (orch.clone(), project_id.clone(), branch.clone());
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             crate::pr_data::actions::refresh::observe_external_resolutions(
                 &orch,
                 &project_id,
@@ -599,7 +599,7 @@ async fn sync_if_behind(
             .await
         });
     }
-    tokio::spawn(async move { sync(&orch, &project_id, &branch).await });
+    cairn_common::task::spawn(async move { sync(&orch, &project_id, &branch).await });
 }
 
 /// Whether the store's local bookmark for `branch` (the one `?branch=`
@@ -1156,7 +1156,7 @@ fn read_ref(repo: &Path, refname: &str) -> Option<String> {
 pub(crate) fn spawn_base_branch_poll(orch: &Orchestrator) {
     crate::orchestrator::unlanded_default::register(orch);
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut ticks = tokio::time::interval(BASE_BRANCH_POLL_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -1191,7 +1191,7 @@ pub(crate) async fn poll_once(orch: &Orchestrator) {
             continue;
         }
         let orch = orch.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let _polling = Polling {
                 registry: orch.base_branch_sync.clone(),
                 project_id: project.id.clone(),

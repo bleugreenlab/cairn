@@ -34,7 +34,7 @@ pub struct SweepReport {
 /// Run [`sweep_once`] every [`SWEEP_INTERVAL`]. Independent of the Discord
 /// supervisor: the 48-hour checks are due whether or not Discord is up.
 pub fn spawn(orch: Orchestrator) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut interval = tokio::time::interval(SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

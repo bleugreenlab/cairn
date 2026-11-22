@@ -90,7 +90,7 @@ fn a_queued_manual_check_stays_on_its_capture_while_branch_base_and_contract_mov
         let (offered_tx, offered) = oneshot::channel::<()>();
         let (go, go_rx) = oneshot::channel::<()>();
         let (granted_tx, granted) = oneshot::channel();
-        let machine = tokio::spawn(async move {
+        let machine = cairn_common::task::spawn(async move {
             let entry_id = loop {
                 match executor.recv().await {
                     Some(ExecutorMessage::Offer { entry_id, .. }) => break entry_id,
@@ -141,7 +141,7 @@ fn a_queued_manual_check_stays_on_its_capture_while_branch_base_and_contract_mov
             "{revision:?}"
         );
         let check_orch = orch.clone();
-        let check = tokio::spawn(async move {
+        let check = cairn_common::task::spawn(async move {
             run_manual_configured_check_with_progress(
                 &check_orch,
                 "job",

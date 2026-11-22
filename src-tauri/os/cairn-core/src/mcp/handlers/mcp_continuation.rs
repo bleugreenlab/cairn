@@ -641,7 +641,7 @@ async fn drive_and_resolve(
 /// included, is durable state that [`scheduler_tick`] reads, so a trigger that
 /// lands while no host is up is seen on the next tick after one starts.
 fn arm(orch: crate::orchestrator::Orchestrator, db: Arc<LocalDb>, wait_id: String) {
-    tokio::spawn(drive_and_resolve(orch, db, wait_id));
+    cairn_common::task::spawn(drive_and_resolve(orch, db, wait_id));
 }
 
 pub(crate) async fn scheduler_tick(orch: &crate::orchestrator::Orchestrator) {

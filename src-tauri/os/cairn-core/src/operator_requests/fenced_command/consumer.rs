@@ -45,7 +45,7 @@ pub(crate) fn install(orch: &Orchestrator) -> Result<(), String> {
     let consumer = FencedCommandConsumer::new();
     orch.operator_requests.register(consumer.clone())?;
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut interval = tokio::time::interval(RECOVERY_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -440,7 +440,7 @@ impl RequestConsumer for FencedCommandConsumer {
         let running = self.running.clone();
         let orch = orch.clone();
         let context = context.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let outcome = orch.fleet.submit_operator_act(&orch, &act).await;
             let scratch_note = match (&scratch, &outcome) {
                 (

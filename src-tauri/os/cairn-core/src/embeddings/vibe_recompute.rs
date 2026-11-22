@@ -172,7 +172,7 @@ pub fn spawn_vibe_axes_recompute(
     vibes: Arc<VibeState>,
     consented: Arc<dyn Fn() -> bool + Send + Sync>,
 ) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut rng = StdRng::from_entropy();
         loop {
             let wait = step(&keeper, &vibes, consented(), Budget::DEFAULT, &mut rng).await;

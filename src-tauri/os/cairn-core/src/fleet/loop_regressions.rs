@@ -141,7 +141,7 @@ async fn offers_over_the_window(
         ExecutorMessage::Room { seq: 1, room },
     );
     let offers = Arc::new(AtomicUsize::new(0));
-    let machine = tokio::spawn({
+    let machine = cairn_common::task::spawn({
         let fleet = fleet.clone();
         let offers = offers.clone();
         async move {
@@ -162,7 +162,7 @@ async fn offers_over_the_window(
             }
         }
     });
-    let samples = tokio::spawn({
+    let samples = cairn_common::task::spawn({
         let fleet = fleet.clone();
         async move {
             let mut tick = tokio::time::interval(SAMPLE_EVERY);
@@ -174,7 +174,7 @@ async fn offers_over_the_window(
             }
         }
     });
-    let waiting = tokio::spawn({
+    let waiting = cairn_common::task::spawn({
         let orch = orch.clone();
         async move { orch.fleet.submit(&orch, request).await }
     });

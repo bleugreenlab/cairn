@@ -106,7 +106,7 @@ pub fn spawn_embed_worker(
     vibe_state: Option<Arc<VibeState>>,
     emitter: Arc<dyn EventEmitter>,
 ) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut engine = PositionEngine::new(PositionConfig::default());
         let mut idle = interval(Duration::from_secs(IDLE_CHECK_SECS));
         idle.set_missed_tick_behavior(MissedTickBehavior::Delay);

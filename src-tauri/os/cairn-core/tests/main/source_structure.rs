@@ -1210,3 +1210,66 @@ fn coverage_cannot_claim_enforcement_before_the_program_completes() {
     );
     assert!(source.contains("pub const COVERAGE: Coverage = Coverage::SinkGuarded;"));
 }
+
+/// Async tasks on orchestrator runtimes must retain a spawn-site counter.
+/// JoinSet keeps its own abort-on-drop ownership: executor_listener handshakes
+/// and checks_turn_end_lifecycle_tests are intentional exceptions, not detached
+/// tasks. cairn-orch remote_executor_manager also retains its cutover and
+/// retirement JoinSets for the same ownership reason.
+/// Blocking-pool jobs, scoped OS threads and process launches are not
+/// async Tokio spawns and are outside this boundary.
+#[test]
+fn orchestrator_async_spawns_use_counted_task_wrappers() {
+    let root = workspace_root();
+    let direct =
+        regex::Regex::new(r"\btokio\s*::\s*(?:task\s*::\s*)?spawn(?:_local)?\s*\(").unwrap();
+    // Refuse importing Tokio spawn APIs (including aliases and grouped imports),
+    // so shortening a call does not evade the direct-path check.
+    let imports = regex::Regex::new(r"(?s)\buse\s+tokio\b[^;]*\bspawn(?:_local)?\b[^;]*;").unwrap();
+    let handles =
+        regex::Regex::new(r"\b(?:[A-Za-z_]*runtime|handle)\s*\.\s*spawn(?:_local|_on)?\s*\(")
+            .unwrap();
+    for example in [
+        "tokio::spawn(async {})",
+        "tokio :: task :: spawn_local(async {})",
+    ] {
+        assert!(direct.is_match(example), "missed direct spawn: {example}");
+    }
+    assert!(imports.is_match("use tokio::{task::{spawn as launch}};"));
+    assert!(handles.is_match("self.core_runtime.spawn(future)"));
+    assert!(!direct.is_match("tokio::task::spawn_blocking(work)"));
+    let mut violations = Vec::new();
+    for relative in [
+        "os/cairn-core",
+        "cairn-transport",
+        "os/cairn-session",
+        "cairn-orch",
+    ] {
+        let crate_root = root.join(relative);
+        assert!(crate_root.is_dir(), "missing crate {relative}");
+        let mut files = Vec::new();
+        walk_source_files(&crate_root, &mut files);
+        for path in files {
+            // This file contains the forbidden examples as scan patterns.
+            if path.ends_with("tests/main/source_structure.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            let code = source
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for pattern in [&direct, &imports, &handles] {
+                for found in pattern.find_iter(&code) {
+                    violations.push(format!("{}: {}", path.display(), found.as_str()));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "use cairn_common::task counted spawn wrappers:\n{}",
+        violations.join("\n")
+    );
+}

@@ -297,7 +297,7 @@ async fn live_targets_at(store_dir: &std::path::Path, commit: &str) -> Result<Ve
 pub(crate) fn note_base_advance(orch: &Orchestrator, project_id: &str) {
     let orch = orch.clone();
     let project_id = project_id.to_string();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         if let Err(error) = start_on_merge(&orch, &project_id).await {
             log::warn!("publications: the merge trigger for project {project_id}: {error}");
         }
@@ -335,7 +335,7 @@ fn merge_starts_a_publication(live_targets: &[String]) -> bool {
 pub(crate) fn spawn_drive(orch: &Orchestrator, project_id: &str) {
     let orch = orch.clone();
     let project_id = project_id.to_string();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         loop {
             let claimed = match ledger::claim_next(&orch.db.local, &project_id).await {
                 Ok(Some(publication)) => publication,
@@ -348,7 +348,7 @@ pub(crate) fn spawn_drive(orch: &Orchestrator, project_id: &str) {
             let id = claimed.id.clone();
             // Supervised, so a panicking run still settles its publication
             // rather than holding the project's one running slot forever.
-            let run = tokio::spawn({
+            let run = cairn_common::task::spawn({
                 let orch = orch.clone();
                 async move { run_publication(&orch, &claimed).await }
             })
@@ -397,7 +397,7 @@ pub(crate) async fn boot(orch: &Orchestrator) {
 /// manifest included. The first tick waits a full interval.
 fn spawn_heartbeat(orch: &Orchestrator) {
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut ticks =
             tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1228,7 +1228,7 @@ async fn place_leg(
     let split_done = Arc::new(AtomicBool::new(false));
     let (events, received) = tokio::sync::mpsc::unbounded_channel();
     let (finished, done) = tokio::sync::oneshot::channel();
-    let recorder = tokio::spawn(progress::record(
+    let recorder = cairn_common::task::spawn(progress::record(
         actor.db.clone(),
         progress::LegLog {
             publication: publication.id.clone(),

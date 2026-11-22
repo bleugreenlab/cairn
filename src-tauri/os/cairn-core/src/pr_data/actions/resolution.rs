@@ -1251,7 +1251,7 @@ async fn resolve_pr_node_as(
     if matches!(resolution, PrNodeResolution::Merge) {
         if let Some(issue_id) = issue_to_resolve.map(str::to_string) {
             let orch_for_memories = orch.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 let started = std::time::Instant::now();
                 match crate::memories::commands::confirm_and_spawn_drafts_for_merged_issue(
                     orch_for_memories,
@@ -1289,7 +1289,7 @@ async fn resolve_pr_node_as(
         // branch work or wake it causes is attributed to this merge.
         let orch = orch.clone();
         let owner_id = owner_id.to_string();
-        tokio::spawn(super::merge_metrics::downstream(async move {
+        cairn_common::task::spawn(super::merge_metrics::downstream(async move {
             let started = std::time::Instant::now();
             let notified = crate::orchestrator::base_advance::notify_downstream_of_base_advance(
                 &orch, &owner_id,

@@ -462,7 +462,7 @@ async fn replay_after_observation_commit_before_claim_commit_reuses_the_original
     let first_orch = orch.clone();
     let first_db = db.clone();
     let first_contract = contract(&orch, home.path());
-    let first = tokio::spawn(async move {
+    let first = cairn_common::task::spawn(async move {
         execute_check_contract(
             &first_orch,
             first_db,
@@ -1029,7 +1029,7 @@ async fn shared_manual_grant(
     let mut manual_item = batch_item("second", &input, &stream);
     manual_item.process.args = vec![contract.plan.command.clone()];
     let manual_orch = orch.clone();
-    let mut manual = tokio::spawn(async move {
+    let mut manual = cairn_common::task::spawn(async move {
         manual_orch
             .fleet
             .submit_pure_verdict_check(&manual_orch, manual_request, manual_item, None, None, None)
@@ -1108,7 +1108,7 @@ async fn shared_manual_grant(
     let cadence_request = request("cadence-join", "cadence-attempt", "main:p");
     let cadence_orch = orch.clone();
     let cadence_input = input.clone();
-    let cadence = tokio::spawn(async move {
+    let cadence = cairn_common::task::spawn(async move {
         cadence_orch
             .fleet
             .submit_pure_verdict_check(
@@ -1451,11 +1451,11 @@ async fn shared_manual_grant(
         observe_retry(format!("remote-check:{REQUEST}:{ATTEMPT}:second"));
     let driver_orch = restarted.clone();
     let driver_claim = physical.clone();
-    let driver = tokio::spawn(async move {
+    let driver = cairn_common::task::spawn(async move {
         crate::execution::checks_main::adopt_check_batch(&driver_orch, &driver_claim, waiters)
             .await;
     });
-    let request_drivers = tokio::spawn(deliver_recorded_request_waiters(
+    let request_drivers = cairn_common::task::spawn(deliver_recorded_request_waiters(
         restarted.clone(),
         local.clone(),
     ));
@@ -1663,7 +1663,7 @@ async fn direct_write_settlement(withdraw_first: bool, reject_settlement: bool) 
     request.wait_horizon_unix_ms = u64::MAX;
     let submitting = orch.clone();
     let process = batch_item("smoke", "original-input", "write-checks:run:0").process;
-    let mut submission = tokio::spawn(async move {
+    let mut submission = cairn_common::task::spawn(async move {
         submitting
             .fleet
             .submit_write_check_batch(&submitting, request, vec![process], None, None)

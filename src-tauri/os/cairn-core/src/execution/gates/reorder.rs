@@ -2167,13 +2167,13 @@ pub(crate) mod tests {
         let mut handles = Vec::new();
         for _ in 0..4 {
             let orch = w.env.orch.clone();
-            handles.push(tokio::spawn(
-                async move { sweep(&orch).await.unwrap().released },
-            ));
+            handles.push(cairn_common::task::spawn(async move {
+                sweep(&orch).await.unwrap().released
+            }));
         }
         for _ in 0..2 {
             let (orch, id) = (w.env.orch.clone(), w.a3.clone());
-            handles.push(tokio::spawn(async move {
+            handles.push(cairn_common::task::spawn(async move {
                 if evaluate_execution(&orch, &id).await.unwrap().released {
                     vec![id]
                 } else {
@@ -2445,13 +2445,13 @@ pub(crate) mod tests {
         let mut handles = Vec::new();
         for _ in 0..4 {
             let orch = w.env.orch.clone();
-            handles.push(tokio::spawn(
-                async move { sweep(&orch).await.unwrap().released },
-            ));
+            handles.push(cairn_common::task::spawn(async move {
+                sweep(&orch).await.unwrap().released
+            }));
         }
         for _ in 0..2 {
             let (orch, id) = (w.env.orch.clone(), a4.clone());
-            handles.push(tokio::spawn(async move {
+            handles.push(cairn_common::task::spawn(async move {
                 if evaluate_execution(&orch, &id).await.unwrap().released {
                     vec![id]
                 } else {
@@ -2600,13 +2600,13 @@ pub(crate) mod tests {
         let mut handles = Vec::new();
         for _ in 0..4 {
             let orch = w.env.orch.clone();
-            handles.push(tokio::spawn(
-                async move { sweep(&orch).await.unwrap().released },
-            ));
+            handles.push(cairn_common::task::spawn(async move {
+                sweep(&orch).await.unwrap().released
+            }));
         }
         for _ in 0..2 {
             let (orch, id) = (w.env.orch.clone(), a4.clone());
-            handles.push(tokio::spawn(async move {
+            handles.push(cairn_common::task::spawn(async move {
                 if evaluate_execution(&orch, &id).await.unwrap().released {
                     vec![id]
                 } else {

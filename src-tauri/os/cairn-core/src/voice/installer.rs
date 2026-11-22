@@ -432,7 +432,7 @@ impl ComponentInstaller {
             #[cfg(test)]
             gate: self.commit_gate.clone(),
         };
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let result = commit.run().await;
             drop(guard);
             result
@@ -524,7 +524,7 @@ impl ComponentInstaller {
         let gate = self.verification_gate.clone();
         // A cancelled caller must not release admission while its blocking hash
         // still runs. This task owns the guard through hashing and memoization.
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let previous = verified.remove(&component.path);
             let metadata = tokio::fs::metadata(&component.path)
                 .await
@@ -1263,7 +1263,7 @@ mod tests {
             sha256: format!("{:x}", Sha256::digest(b"good")),
             path,
         };
-        let first = tokio::spawn({
+        let first = cairn_common::task::spawn({
             let installer = installer.clone();
             let component = component.clone();
             async move { installer.verify(&component).await }
@@ -1379,7 +1379,7 @@ mod tests {
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/model", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
+        let server = cairn_common::task::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
             let mut received = 0;
@@ -1759,7 +1759,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buffer = [0_u8; 1024];
             let _ = socket.read(&mut buffer).await;

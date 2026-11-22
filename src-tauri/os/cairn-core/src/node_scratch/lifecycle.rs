@@ -84,7 +84,9 @@ pub fn ensure_subscribed(orch: &Orchestrator) {
             };
             let lifecycle = lifecycle.clone();
             let fleet = fleet.clone();
-            runtime.spawn(async move { handle_event(&lifecycle, &fleet, event).await });
+            cairn_common::task::spawn_on(&runtime, async move {
+                handle_event(&lifecycle, &fleet, event).await
+            });
         });
 }
 

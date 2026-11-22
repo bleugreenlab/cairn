@@ -765,7 +765,7 @@ pub fn spawn_resource_sweep(
     consented: Arc<dyn Fn() -> bool + Send + Sync>,
     source: Arc<dyn ResourceSource>,
 ) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut sweep = ResourceSweep::new(keeper.clone(), source);
         loop {
             match keeper.reconcile(Trigger::Sweep).await {

@@ -324,7 +324,7 @@ pub fn spawn_turn_embedding_sweep(
     keeper: Arc<SpaceKeeper>,
     consented: Arc<dyn Fn() -> bool + Send + Sync>,
 ) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let db = keeper.db().clone();
         let embedder = keeper.embedder().clone();
         let embedder = embedder.as_ref();

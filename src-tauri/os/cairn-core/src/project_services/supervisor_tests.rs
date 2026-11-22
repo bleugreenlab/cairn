@@ -86,7 +86,7 @@ impl FakeHost {
             .insert(machine.clone(), exit);
         let (events, receiver) = mpsc::unbounded_channel();
         let (host, ended) = (self.clone(), machine.clone());
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let (code, detail, executor_lost) = loop {
                 tokio::select! {
                     line = input.recv() => match line {
@@ -182,7 +182,7 @@ impl ServiceHost for Arc<FakeHost> {
         let (lines, mut input) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
         let (events, receiver) = mpsc::unbounded_channel();
         let host = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let mut slow: Vec<String> = Vec::new();
             // Calls that answer only once they are cancelled, as a service
             // that ignores cancellation and finishes anyway.
@@ -637,7 +637,10 @@ async fn a_service_holds_a_bearer_for_its_own_run_never_the_machine_secret() {
 async fn a_dropped_caller_still_ends_its_call_and_revokes_its_bearer() {
     let h = harness().await;
     let orch = h.orch.clone();
-    let caller = tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+    let caller =
+        cairn_common::task::spawn(
+            async move { call(&orch, request("echo", "slow", agent())).await },
+        );
     eventually("the slow call", || h.host.frames_of("call").len() == 1).await;
     let (run_id, token) = authority_of(&h.host.frames_of("call")[0]);
     caller.abort();
@@ -735,7 +738,7 @@ async fn a_deadline_after_dispatch_cancels_the_call_and_revokes_its_bearer() {
     let mut linger = request("patient", method, agent());
     linger.timeout = Some(Duration::from_secs(30));
     let orch = h.orch.clone();
-    let mut caller = tokio::spawn(async move { call(&orch, linger).await });
+    let mut caller = cairn_common::task::spawn(async move { call(&orch, linger).await });
     let call_frame = dispatched(&h, method, &mut caller).await;
     let (run_id, token) = authority_of(&call_frame);
     assert!(
@@ -788,7 +791,9 @@ async fn a_live_call_s_bearer_holds_past_its_deadline_until_its_run_ends() {
     let h = harness().await;
     let orch = h.orch.clone();
     let mut caller =
-        tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+        cairn_common::task::spawn(
+            async move { call(&orch, request("echo", "slow", agent())).await },
+        );
     let frame = dispatched(&h, "slow", &mut caller).await;
     let (run_id, token) = authority_of(&frame);
 
@@ -820,7 +825,9 @@ async fn a_call_bearer_past_its_backstop_is_refused_though_its_run_never_ended()
     let h = harness().await;
     let orch = h.orch.clone();
     let mut caller =
-        tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+        cairn_common::task::spawn(
+            async move { call(&orch, request("echo", "slow", agent())).await },
+        );
     let frame = dispatched(&h, "slow", &mut caller).await;
     let (run_id, token) = authority_of(&frame);
 
@@ -851,7 +858,7 @@ async fn an_answer_taken_after_the_deadline_is_recorded_as_the_deadline() {
     let mut brief = request("echo", method, agent());
     brief.timeout = Some(Duration::from_secs(1));
     let orch = h.orch.clone();
-    let mut caller = tokio::spawn(async move { call(&orch, brief).await });
+    let mut caller = cairn_common::task::spawn(async move { call(&orch, brief).await });
     let frame = dispatched(&h, method, &mut caller).await;
     let (_, token) = authority_of(&frame);
 
@@ -915,7 +922,9 @@ async fn a_call_row_carries_its_wait_and_its_run_apart() {
     let orch = h.orch.clone();
     let began = Instant::now();
     let mut caller =
-        tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+        cairn_common::task::spawn(
+            async move { call(&orch, request("echo", "slow", agent())).await },
+        );
     dispatched(&h, "slow", &mut caller).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     h.host.release_slow.notify_waiters();
@@ -948,7 +957,10 @@ async fn a_crash_fails_pending_calls_then_restarts_at_the_next_generation() {
         .await
         .unwrap();
     let orch = h.orch.clone();
-    let pending = tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+    let pending =
+        cairn_common::task::spawn(
+            async move { call(&orch, request("echo", "slow", agent())).await },
+        );
     eventually("the slow call", || h.host.frames_of("call").len() == 2).await;
 
     let crash = call(&h.orch, request("echo", "crash", agent()))
@@ -1054,7 +1066,9 @@ async fn a_source_change_replaces_without_dropping_an_in_flight_call() {
     let first_hash = status(&h, "echo").source_hash.unwrap();
     let orch = h.orch.clone();
     let in_flight =
-        tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+        cairn_common::task::spawn(
+            async move { call(&orch, request("echo", "slow", agent())).await },
+        );
     eventually("the slow call", || h.host.frames_of("call").len() == 2).await;
 
     h.source.put("echo", ECHO, "serve({ v: 2 })");
@@ -1100,7 +1114,9 @@ async fn a_call_that_reaches_a_draining_generation_is_answered_by_the_new_one() 
     // Keep generation 1 alive and draining past the replacement.
     let orch = h.orch.clone();
     let in_flight =
-        tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+        cairn_common::task::spawn(
+            async move { call(&orch, request("echo", "slow", agent())).await },
+        );
     eventually("the slow call", || h.host.frames_of("call").len() == 2).await;
     h.source.put("echo", ECHO, "serve({ v: 2 })");
     apply_source(&h.orch, "p", &ServiceOwner::Project, "base advance", None).await;
@@ -1191,7 +1207,10 @@ async fn outside_a_call_a_service_reaches_only_its_home_and_the_refusal_is_logge
 async fn a_page_call_reaches_only_its_threads_database_and_its_refusals_are_logged() {
     let h = harness().await;
     let orch = h.orch.clone();
-    let in_flight = tokio::spawn(async move { call(&orch, request("echo", "slow", page())).await });
+    let in_flight =
+        cairn_common::task::spawn(
+            async move { call(&orch, request("echo", "slow", page())).await },
+        );
     eventually("the page call", || h.host.frames_of("call").len() == 1).await;
     let frame = &h.host.frames_of("call")[0];
     assert_eq!(frame["caller"]["kind"], "page");
@@ -1575,8 +1594,9 @@ async fn a_thread_service_serves_only_its_thread_and_each_call_acts_for_it() {
 
     // A page of the thread: its call reaches the owner's database and nothing else.
     let orch = h.orch.clone();
-    let in_flight =
-        tokio::spawn(async move { call(&orch, tutor_request("slow", thread_page())).await });
+    let in_flight = cairn_common::task::spawn(async move {
+        call(&orch, tutor_request("slow", thread_page())).await
+    });
     eventually("the page call", || h.host.frames_of("call").len() == 1).await;
     let (run_id, _) = authority_of(&h.host.frames_of("call")[0]);
     let delegated = h.orch.project_services.runs.get(&run_id).unwrap();
@@ -1630,7 +1650,7 @@ async fn a_thread_service_serves_only_its_thread_and_each_call_acts_for_it() {
 
     // A task of the thread calls as an agent whose writable thread is the owner.
     let orch = h.orch.clone();
-    let in_flight = tokio::spawn(async move {
+    let in_flight = cairn_common::task::spawn(async move {
         call(
             &orch,
             tutor_request("slow", thread_agent("cairn://p/cairn/spanish/task/drill")),
@@ -1731,7 +1751,7 @@ async fn a_scheduled_method_runs_as_its_thread_with_no_turn() {
     assert_eq!(run_due(&h.orch, &tutor(), due - 1).await, 0);
 
     let orch = h.orch.clone();
-    let tick = tokio::spawn(async move { run_due(&orch, &tutor(), due).await });
+    let tick = cairn_common::task::spawn(async move { run_due(&orch, &tutor(), due).await });
     eventually("the scheduled call", || h.host.frames_of("call").len() == 1).await;
     let frame = h.host.frames_of("call")[0].clone();
     assert_eq!(frame["method"], "slow");
@@ -2608,7 +2628,7 @@ async fn a_held_owner_at_boot_holds_neither_another_owners_schedule_nor_its_serv
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     *h.source.held.lock().unwrap() = Some(("t-2".into(), gate.clone()));
     let orch = h.orch.clone();
-    let boot = tokio::spawn(async move { start_at_boot(&orch).await });
+    let boot = cairn_common::task::spawn(async move { start_at_boot(&orch).await });
 
     eventually("spanish's due occurrence while french is held", || {
         h.host.frames_of("call").len() == 1
@@ -2788,8 +2808,9 @@ async fn a_page_of_the_thread_gets_no_tool_targets() {
         .await
         .unwrap();
     let orch = h.orch.clone();
-    let in_flight =
-        tokio::spawn(async move { call(&orch, tutor_request("slow", thread_page())).await });
+    let in_flight = cairn_common::task::spawn(async move {
+        call(&orch, tutor_request("slow", thread_page())).await
+    });
     eventually("the page call", || h.host.frames_of("call").len() == 1).await;
     let (run_id, _) = authority_of(&h.host.frames_of("call")[0]);
     let refused = authority::refuse(
@@ -2834,7 +2855,7 @@ async fn a_service_tool_target_reaches_dispatch_without_a_branch() {
         .await
         .unwrap();
     let orch = h.orch.clone();
-    let in_flight = tokio::spawn(async move {
+    let in_flight = cairn_common::task::spawn(async move {
         call(
             &orch,
             tutor_request("slow", thread_agent("cairn://p/cairn/spanish")),
@@ -2926,7 +2947,8 @@ async fn a_prompt_from_a_scheduled_call_fails_closed_and_wakes_the_thread_once()
     for (occurrence, expected_notices) in [(due, 1), (due + 300, 1)] {
         let calls_before = h.host.frames_of("call").len();
         let orch = h.orch.clone();
-        let tick = tokio::spawn(async move { run_due(&orch, &tutor(), occurrence).await });
+        let tick =
+            cairn_common::task::spawn(async move { run_due(&orch, &tutor(), occurrence).await });
         eventually("the scheduled call", || {
             h.host.frames_of("call").len() == calls_before + 1
         })
@@ -4098,7 +4120,10 @@ async fn an_idle_on_demand_service_stops_and_the_next_call_starts_it() {
 
     // A call in flight past the idle stop keeps the process.
     let orch = h.orch.clone();
-    let slow = tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+    let slow =
+        cairn_common::task::spawn(
+            async move { call(&orch, request("echo", "slow", agent())).await },
+        );
     eventually("the slow call", || h.host.frames_of("call").len() == 2).await;
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(status(&h, "echo").state, ServiceState::Running);
@@ -4139,7 +4164,10 @@ async fn a_deadline_before_dispatch_sends_nothing_and_ends_its_delegation() {
         "serve({})",
     );
     let orch = h.orch.clone();
-    let holder = tokio::spawn(async move { call(&orch, request("narrow", "slow", agent())).await });
+    let holder =
+        cairn_common::task::spawn(
+            async move { call(&orch, request("narrow", "slow", agent())).await },
+        );
     let holder_frame = eventually_frame(&h, "slow").await;
     let (holder_run, _) = authority_of(&holder_frame);
     let incarnation = h
@@ -4154,7 +4182,7 @@ async fn a_deadline_before_dispatch_sends_nothing_and_ends_its_delegation() {
     let mut hang = request("narrow", "hang", agent());
     hang.timeout = Some(timeout);
     let orch = h.orch.clone();
-    let caller = tokio::spawn(async move { call(&orch, hang).await });
+    let caller = cairn_common::task::spawn(async move { call(&orch, hang).await });
     eventually("the call to queue behind the held place", || {
         incarnation.waiting.load(Ordering::Acquire) == 1
     })
@@ -4239,7 +4267,7 @@ async fn calls_past_concurrency_and_queue_are_busy() {
     // One in flight, then the queue (twice the concurrency).
     for expected in 1..=3 {
         let orch = h.orch.clone();
-        held.push(tokio::spawn(async move {
+        held.push(cairn_common::task::spawn(async move {
             call(&orch, request("narrow", "slow", agent())).await
         }));
         if expected == 1 {

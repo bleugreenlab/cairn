@@ -873,7 +873,7 @@ mod tests {
         // the command channel and auto-reply to its ClearData so the await
         // resolves promptly rather than waiting out the full bridge timeout.
         let replies = orch.browser_bridge_responses.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             while let Some(command) = rx.recv().await {
                 if let BrowserCommand::ClearData { request_id, .. } = command {
                     let _ = replies.send((request_id, "{\"ok\":true}".to_string()));
@@ -990,7 +990,7 @@ mod tests {
         .unwrap();
         let tx = orch.browser_nav_events.clone();
         let id = browser.id.clone();
-        let waiter = tokio::spawn(async move {
+        let waiter = cairn_common::task::spawn(async move {
             wait_for_navigation(
                 &orch,
                 &browser,

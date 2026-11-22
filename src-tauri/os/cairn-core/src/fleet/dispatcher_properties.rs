@@ -107,7 +107,7 @@ fn answer_offers(
     claim: Arc<AtomicBool>,
 ) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let offers = Arc::new(AtomicUsize::new(0));
-    let task = tokio::spawn({
+    let task = cairn_common::task::spawn({
         let fleet = fleet.clone();
         let id = id.to_string();
         let offers = offers.clone();
@@ -345,7 +345,7 @@ async fn parked_entries_cost_nothing_while_their_machines_post() {
         .map(|n| {
             let request = compile(&format!("parked-{n}"), &format!("test:rust-{n}"));
             let plan = Arc::new(ReservationPlan::new(db.clone(), &request, None));
-            tokio::spawn(wait_for_a_machine(fleet.clone(), request, Some(plan)))
+            cairn_common::task::spawn(wait_for_a_machine(fleet.clone(), request, Some(plan)))
         })
         .collect();
     until("every entry to join", || {
@@ -430,7 +430,7 @@ async fn a_burst_of_profile_writes_refigures_each_named_entry_once_and_no_other(
     {
         let request = compile(&format!("{identity}-{n}"), identity);
         let plan = Arc::new(ReservationPlan::new(db.clone(), &request, None));
-        waits.push(tokio::spawn(wait_for_a_machine(
+        waits.push(cairn_common::task::spawn(wait_for_a_machine(
             fleet.clone(),
             request,
             Some(plan),
@@ -500,7 +500,7 @@ async fn a_change_evaluates_only_the_entries_it_can_affect() {
     let claim = Arc::new(AtomicBool::new(false));
     let (a_offers, _a) = answer_offers(&fleet, "a", a_generation, a_frames, claim.clone());
     let b_offers = refusing(&fleet, "b", "linux", room(0, 400));
-    let mut waits = vec![tokio::spawn(wait_for_a_machine(
+    let mut waits = vec![cairn_common::task::spawn(wait_for_a_machine(
         fleet.clone(),
         movable("either"),
         None,
@@ -508,7 +508,7 @@ async fn a_change_evaluates_only_the_entries_it_can_affect() {
     for n in 0..PINNED {
         let mut request = movable(&format!("pinned-{n}"));
         request.pinned_executor_id = Some("b".into());
-        waits.push(tokio::spawn(wait_for_a_machine(
+        waits.push(cairn_common::task::spawn(wait_for_a_machine(
             fleet.clone(),
             request,
             None,
@@ -587,7 +587,7 @@ async fn an_announcement_offers_what_its_room_fits_whatever_is_waiting() {
         let offers = refusing(&fleet, "m", "linux", room(0, 500));
         let waits: Vec<_> = (0..k)
             .map(|n| {
-                tokio::spawn(wait_for_a_machine(
+                cairn_common::task::spawn(wait_for_a_machine(
                     fleet.clone(),
                     movable(&format!("bound-{k}-{n}")),
                     None,

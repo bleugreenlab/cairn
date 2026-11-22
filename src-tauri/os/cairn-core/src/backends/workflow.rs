@@ -214,7 +214,7 @@ pub(crate) async fn spawn_workflow_process(
                     event_output_name.clone(),
                 );
                 let subscription = event_subscription.clone();
-                tokio::spawn(async move {
+                cairn_common::task::spawn(async move {
                     drop(subscription.lock().unwrap().take());
                     finalize_workflow_run(
                         &orch,
@@ -360,7 +360,7 @@ pub(crate) async fn spawn_workflow_process(
         drop(subscription_slot.lock().unwrap().take());
     }
     let renew_orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         while !finished.load(Ordering::Acquire) {
             tokio::time::sleep(Duration::from_secs(10)).await;
             if finished.load(Ordering::Acquire)

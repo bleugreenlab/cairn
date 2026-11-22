@@ -89,7 +89,10 @@ impl AdmissionRenewal {
         if self.started.swap(true, Ordering::SeqCst) {
             return;
         }
-        handle.spawn(renew_every_interval(Arc::downgrade(self), self.interval));
+        cairn_common::task::spawn_on(
+            handle,
+            renew_every_interval(Arc::downgrade(self), self.interval),
+        );
     }
 
     /// Keep `lease` alive until its renewal misses or, for an ordinary

@@ -92,7 +92,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let pdf = super::super::pdf::text_pdf("remote-pdf-text");
-        let server = tokio::spawn(async move {
+        let server = cairn_common::task::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 4096];
             let _ = socket.read(&mut request).await.unwrap();

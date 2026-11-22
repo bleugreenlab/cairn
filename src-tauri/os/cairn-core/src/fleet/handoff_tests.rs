@@ -110,7 +110,7 @@ async fn raise_denial(
     let task = {
         let orch = orch.clone();
         let path = path.to_string();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             orch.fleet
                 .handle_runner_callback(
                     &orch,
@@ -493,7 +493,7 @@ async fn closure_at_the_budget_boundary_withdraws_instead_of_parking() {
     let orch = fence_orchestrator(true).await;
     let task = raise(&orch).await;
     let fleet = orch.fleet.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         tokio::time::sleep(RELAYED_FENCE_WAIT_BUDGET).await;
         fleet.settle_runner_contexts_for_request("request-1", "attempt-1");
     });

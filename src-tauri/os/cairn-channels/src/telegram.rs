@@ -152,7 +152,7 @@ impl TelegramProvider {
     /// Starts long polling. Aborting the returned task stops the provider.
     pub fn start(self: &Arc<Self>) -> tokio::task::JoinHandle<Result<(), String>> {
         let provider = Arc::clone(self);
-        tokio::spawn(async move { provider.run().await })
+        cairn_common::task::spawn(async move { provider.run().await })
     }
 
     async fn run(self: Arc<Self>) -> Result<(), String> {

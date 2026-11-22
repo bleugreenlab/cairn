@@ -78,7 +78,7 @@ pub(crate) async fn submit_bug_report(
     };
 
     // Fire-and-forget HTTP POST
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let bug_report_url = crate::api::ApiConfig::default().bug_report_url();
         match cairn_tls::client()
             .post(&bug_report_url)

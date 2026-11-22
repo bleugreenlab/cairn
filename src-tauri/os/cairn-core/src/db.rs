@@ -226,7 +226,7 @@ impl ReplicaSearch {
                 let weak = Arc::downgrade(&snapshot);
                 #[cfg(test)]
                 let interleave = self.interleave.lock().await.clone();
-                let task = tokio::spawn(async move {
+                let task = cairn_common::task::spawn(async move {
                     loop {
                         let Some(snapshot) = weak.upgrade() else {
                             return;
@@ -782,8 +782,8 @@ impl DbState {
             team_id: team_id.clone(),
             search: self.replica_search.clone(),
         });
-        let push = tokio::spawn(run_push_task(db.clone(), runtime.cadence.clone()));
-        let pull = tokio::spawn(run_pull_task(
+        let push = cairn_common::task::spawn(run_push_task(db.clone(), runtime.cadence.clone()));
+        let pull = cairn_common::task::spawn(run_pull_task(
             db,
             runtime.emitter.clone(),
             runtime.cadence.clone(),
@@ -1788,7 +1788,7 @@ mod tests {
         *dbs.replica_search.interleave.lock().await = Some(hook.clone());
         let cold = {
             let dbs = dbs.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 dbs.replica_search
                     .request("team", replica, false, true)
                     .await;
@@ -2315,12 +2315,12 @@ mod tests {
         let gate = dbs.team_sync_lifecycle.lock().await;
         let sign_out = {
             let dbs = dbs.clone();
-            tokio::spawn(async move { dbs.set_team_sync_authorized(false).await })
+            cairn_common::task::spawn(async move { dbs.set_team_sync_authorized(false).await })
         };
         tokio::task::yield_now().await;
         let reconnect = {
             let dbs = dbs.clone();
-            tokio::spawn(async move { dbs.set_team_sync_authorized(true).await })
+            cairn_common::task::spawn(async move { dbs.set_team_sync_authorized(true).await })
         };
         drop(gate);
         sign_out.await.unwrap();

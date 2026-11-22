@@ -548,7 +548,7 @@ pub(crate) async fn pass(db: &LocalDb, host: &dyn Host, now: Ms) -> Result<(), S
 /// request, a pin, a deployment report, a room refusal) and every
 /// [`PASS_INTERVAL`] otherwise.
 pub fn spawn(orch: Orchestrator) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut ticks = tokio::time::interval(PASS_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

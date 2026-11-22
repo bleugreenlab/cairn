@@ -1748,7 +1748,7 @@ async fn turn_end_cancel_wakes_a_parked_waiter() {
     let cancel = TurnEndCancel::default();
     let waiter = {
         let cancel = cancel.clone();
-        tokio::spawn(async move { cancel.cancelled().await })
+        cairn_common::task::spawn(async move { cancel.cancelled().await })
     };
     // Let the waiter park on `notified()` before signalling.
     tokio::task::yield_now().await;
@@ -2234,7 +2234,7 @@ async fn a_detached_rearm_converges_and_stays_convergent_across_boots() {
     // Boot one, spawned rather than awaited inline — what the runtime now does.
     let first_waves = {
         let orch = orch.clone();
-        tokio::spawn(async move { super::rearm_review_checks_on_startup(&orch).await })
+        cairn_common::task::spawn(async move { super::rearm_review_checks_on_startup(&orch).await })
     }
     .await
     .expect("the background re-arm task runs to completion");
@@ -2532,7 +2532,7 @@ async fn a_panicking_wave_leaves_the_slot_free_and_the_attempt_failed() {
     let orch = test_orchestrator(db);
     let (id, slot) = claimed_slot(&orch, "j-prod");
 
-    let wave = tokio::spawn(async move {
+    let wave = cairn_common::task::spawn(async move {
         let _slot = slot;
         panic!("the wave panicked mid-flight");
     })

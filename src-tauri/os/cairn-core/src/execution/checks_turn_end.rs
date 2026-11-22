@@ -2805,7 +2805,7 @@ fn launch_pin_bump_lanes(
         target_head: target_head.to_string(),
     };
     let orch = orch.clone();
-    PinBumpLanesTask(tokio::spawn(async move {
+    PinBumpLanesTask(cairn_common::task::spawn(async move {
         let results = futures_util::future::join_all(
             lanes
                 .iter()
@@ -3993,10 +3993,10 @@ impl ReviewGroupRecorder {
             // The supervisor owns the worker and recovery across cancellation.
             // Dropping the callback's JoinHandle detaches this supervisor rather
             // than discarding received results or their failure explanation.
-            let completion = tokio::spawn(async move {
+            let completion = cairn_common::task::spawn(async move {
                 let worker = recorder.clone();
                 let worker_indices = indices.clone();
-                let task = tokio::spawn(async move {
+                let task = cairn_common::task::spawn(async move {
                     worker.record(worker_indices, results, true).await;
                 });
                 if let Err(error) = task.await {
@@ -4066,7 +4066,7 @@ impl ReviewGroupRecorder {
         // not block the independent observation or log operation.
         (
             member,
-            tokio::spawn(async move { recorder.persist_fault(failure).await }),
+            cairn_common::task::spawn(async move { recorder.persist_fault(failure).await }),
         )
     }
 
@@ -4797,7 +4797,7 @@ mod tests {
         let branch: Arc<Mutex<(u32, Option<TurnEndCancel>)>> = Arc::default();
         let advancer = {
             let branch = branch.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 loop {
                     tokio::time::sleep(ADVANCE_EVERY).await;
                     let mut branch = branch.lock().unwrap();
@@ -6652,7 +6652,8 @@ pinBumps:
         };
         let (recorder, _logs) = durability_group_fixture(steps).await;
         let callback = recorder.callback();
-        let task = tokio::spawn(async move { callback(&durability_group_result()).await });
+        let task =
+            cairn_common::task::spawn(async move { callback(&durability_group_result()).await });
         tokio::time::timeout(std::time::Duration::from_secs(120), entered.notified())
             .await
             .expect("fact sink entered");
@@ -6745,7 +6746,7 @@ pinBumps:
         };
         let (recorder, _logs) = durability_group_fixture(steps).await;
         let worker = recorder.clone();
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             worker
                 .record_fault(ReviewDurabilityError {
                     member: "completed".into(),

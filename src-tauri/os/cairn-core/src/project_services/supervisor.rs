@@ -940,7 +940,7 @@ async fn boot_incarnation(
         retiring: AtomicBool::new(false),
         started_at: Instant::now(),
     });
-    tokio::spawn(read_events(
+    cairn_common::task::spawn(read_events(
         orch.clone(),
         cell.clone(),
         incarnation.clone(),
@@ -1127,7 +1127,7 @@ fn install(orch: &Orchestrator, cell: &Arc<Cell>, incarnation: Arc<Incarnation>)
     }
     machine::announce_state(orch, cell);
     if let Some(idle) = idle {
-        tokio::spawn(idle_watch(orch.clone(), cell.clone(), generation, idle));
+        cairn_common::task::spawn(idle_watch(orch.clone(), cell.clone(), generation, idle));
     }
 }
 
@@ -1533,7 +1533,7 @@ async fn record_crash(orch: &Orchestrator, cell: &Arc<Cell>, generation: u64, wh
     }
     if let Some((delay, expected_generation)) = delay {
         let (orch, cell) = (orch.clone(), cell.clone());
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             tokio::time::sleep(delay).await;
             restart_after_backoff(&orch, &cell, expected_generation).await;
         });
@@ -1627,7 +1627,7 @@ fn retry_placement<'a>(
         .await;
         machine::announce_state(orch, cell);
         let (orch, cell) = (orch.clone(), cell.clone());
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             tokio::time::sleep(delay).await;
             restart_after_backoff(&orch, &cell, generation).await;
         });
@@ -1757,7 +1757,7 @@ async fn replace(
                     actor,
                 )
                 .await;
-                tokio::spawn(retire(old));
+                cairn_common::task::spawn(retire(old));
             }
             Ok(())
         }
@@ -1798,12 +1798,14 @@ async fn project_key(orch: &Orchestrator, project_id: &str) -> Result<String, St
 async fn detached<T: Send + 'static>(
     work: impl std::future::Future<Output = Result<T, CallError>> + Send + 'static,
 ) -> Result<T, CallError> {
-    tokio::spawn(work).await.unwrap_or_else(|error| {
-        Err(CallError::new(
-            "service_unavailable",
-            format!("the service task failed: {error}"),
-        ))
-    })
+    cairn_common::task::spawn(work)
+        .await
+        .unwrap_or_else(|error| {
+            Err(CallError::new(
+                "service_unavailable",
+                format!("the service task failed: {error}"),
+            ))
+        })
 }
 
 /// Which service an action is for.
@@ -2157,7 +2159,7 @@ fn wake_schedule(orch: &Orchestrator, cell: &Arc<Cell>) {
         return;
     }
     task.running = true;
-    tokio::spawn(run_schedule(orch.clone(), cell.clone()));
+    cairn_common::task::spawn(run_schedule(orch.clone(), cell.clone()));
 }
 
 /// One cell's cadence: sleep until its next occurrence, run what is due, and
@@ -2494,7 +2496,7 @@ pub(crate) async fn declarations(
 /// The project's base branch advanced; apply its new tip.
 pub(crate) fn note_base_advance(orch: &Orchestrator, project_id: &str) {
     let (orch, project_id) = (orch.clone(), project_id.to_string());
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         apply_source(
             &orch,
             &project_id,
@@ -2536,7 +2538,9 @@ pub(crate) async fn start_at_boot(orch: &Orchestrator) {
         .into_iter()
         .map(|(project_id, owner)| {
             let orch = orch.clone();
-            tokio::spawn(async move { apply_owner_at_boot(&orch, &project_id, &owner).await })
+            cairn_common::task::spawn(async move {
+                apply_owner_at_boot(&orch, &project_id, &owner).await
+            })
         })
         .collect();
     for pass in passes {

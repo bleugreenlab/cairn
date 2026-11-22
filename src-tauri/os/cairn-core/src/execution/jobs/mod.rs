@@ -80,7 +80,7 @@ pub(crate) mod parked_writes {
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let holder = {
             let (db, release) = (db.clone(), release.clone());
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 db.write(move |_conn| {
                     let release = release.clone();
                     Box::pin(async move {

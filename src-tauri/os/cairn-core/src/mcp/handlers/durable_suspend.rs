@@ -511,7 +511,7 @@ pub(crate) fn steer_parked_waits(
     match tokio::runtime::Handle::try_current() {
         Ok(runtime) => {
             let (orch, db) = (orch.clone(), db.clone());
-            runtime.spawn(async move {
+            cairn_common::task::spawn_on(&runtime, async move {
                 // In order, so every sibling but the last stands down and the
                 // last one out drives the turn's single resume.
                 for (record, result) in records {
@@ -657,7 +657,7 @@ pub(crate) async fn supersede_terminal_waits(
         };
         labels.extend(records.iter().map(|(record, _)| record.condition.label()));
         let (orch, db) = (orch.clone(), db.clone());
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             // In order, so every sibling but the last stands down and the
             // last one out drives the turn's single resume.
             for (record, result) in records {
@@ -3407,7 +3407,7 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
                 continue;
             }
             let (owned_orch, owned_db) = (orch.clone(), db.clone());
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 if row_state == "resolving" {
                     redrive_resolving(&owned_orch, &owned_db, &record, stored_result, None).await;
                     return;
@@ -3640,7 +3640,7 @@ pub(crate) async fn sweep_stuck_resolutions(orch: &Orchestrator) -> SweepOutcome
                 continue;
             }
             let (owned_orch, owned_db) = (orch.clone(), db.clone());
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 redrive_resolving(
                     &owned_orch,
                     &owned_db,
@@ -3686,7 +3686,7 @@ async fn stale_resolving(
 /// host spawns this.
 pub(crate) fn spawn_scheduler(orch: Orchestrator) {
     super::run::adopted::start(&orch);
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut mcp = tokio::time::interval(super::mcp_continuation::SCHEDULER_INTERVAL);
         let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -5973,7 +5973,7 @@ mod tests {
     }
 
     async fn leave_prompt_pending_after_host_loss(orch: &Orchestrator, record: &Record) -> String {
-        let driver = tokio::spawn(drive_mcp_until_terminal(
+        let driver = cairn_common::task::spawn(drive_mcp_until_terminal(
             orch.clone(),
             orch.db.local.clone(),
             record.clone(),
@@ -7488,7 +7488,7 @@ mod tests {
         record.deadline = None;
         insert(&orch.db.local, &record).await.unwrap();
 
-        let driver = tokio::spawn(drive_mcp_until_terminal(
+        let driver = cairn_common::task::spawn(drive_mcp_until_terminal(
             orch.clone(),
             orch.db.local.clone(),
             record.clone(),
@@ -8192,7 +8192,7 @@ mod tests {
         insert_foreign_successor(&orch, "pending").await;
         register_warm(&orch);
 
-        let driver = tokio::spawn({
+        let driver = cairn_common::task::spawn({
             let (orch, record) = (orch.clone(), record.clone());
             async move {
                 drive_resolution(&orch, &orch.db.local, &record, ELAPSED, false).await;
@@ -8483,7 +8483,7 @@ mod tests {
             .unwrap();
         insert(&orch.db.local, &record).await.unwrap();
         register_warm(&orch);
-        let parked = tokio::spawn(crate::operator_requests::wait::resolve_parked(
+        let parked = cairn_common::task::spawn(crate::operator_requests::wait::resolve_parked(
             orch.clone(),
             orch.db.local.clone(),
             record.clone(),
@@ -8624,7 +8624,7 @@ mod tests {
         // It starts the foreign successor shortly after the resolver first observes
         // it pending — as a warm reuse would, within the poll budget.
         let db = orch.db.local.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(80)).await;
             db.execute("UPDATE turns SET state='running' WHERE id='foreign'", ())
                 .await
@@ -10805,7 +10805,7 @@ mod tests {
         record.deadline = None;
         insert(&orch.db.local, &record).await.unwrap();
 
-        let driver = tokio::spawn(drive_mcp_until_terminal(
+        let driver = cairn_common::task::spawn(drive_mcp_until_terminal(
             orch.clone(),
             orch.db.local.clone(),
             record,

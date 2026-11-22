@@ -548,7 +548,7 @@ impl TestMcpRelay {
             .with_state(relay.clone());
         let listener =
             tokio::net::TcpListener::from_std(listener).expect("serve the callback relay");
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
         #[cfg(unix)]
@@ -1264,7 +1264,7 @@ fn attach_executor(
         let projects_served = projects_served.clone();
         let warm_roots = warm_roots.clone();
         let generation = generation.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let interval = std::time::Duration::from_millis(EXECUTOR_HEARTBEAT_INTERVAL_MS);
             let mut beat =
                 tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
@@ -1343,7 +1343,7 @@ fn attach_executor(
         // What a real machine's liveness pass does on its own cadence: publish
         // fresh telemetry, so placement can see this machine at all.
         let pool = executor_pool.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             loop {
                 pool.refresh_liveness().await;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -1357,7 +1357,7 @@ fn attach_executor(
     // blocking guard therefore sees here what it sees in production, and the
     // runner's half of each exchange stays on this task.
     let link_generation = generation.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let current = move || link_generation.load(Ordering::Acquire);
         while let Some(message) = rx.recv().await {
             match message {
@@ -1393,7 +1393,7 @@ fn attach_executor(
                     let relay = relay.clone();
                     let warm_roots = warm_roots.clone();
                     let current = current.clone();
-                    tokio::spawn(async move {
+                    cairn_common::task::spawn(async move {
                         let request_id = request.request_id.clone();
                         let attempt_id = request.attempt_id.clone();
                         let context = relay.admit(batch.as_mut(), &request_id, &attempt_id);
@@ -1440,7 +1440,7 @@ fn attach_executor(
                     let pool = executor_pool.clone();
                     let core_pool = core_pool.clone();
                     let current = current.clone();
-                    tokio::spawn(async move {
+                    cairn_common::task::spawn(async move {
                         if pool.delete_node_scratch(&scratch_id).await.is_ok() {
                             core_pool.handle_executor_message(
                                 executor_id,
@@ -1463,7 +1463,7 @@ fn attach_executor(
                     let executor_pool = executor_pool.clone();
                     let core_pool = core_pool.clone();
                     let current = current.clone();
-                    tokio::spawn(async move {
+                    cairn_common::task::spawn(async move {
                         let result = executor_pool
                             .operate_residency(operation, granted_entry_id)
                             .await;
@@ -1512,7 +1512,7 @@ pub fn serve_scratch_routes(orch: &Orchestrator) -> String {
         .expect("read the scratch server address");
     let router = scratch_routes(orch);
     let listener = tokio::net::TcpListener::from_std(listener).expect("serve scratch routes");
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
     format!("http://{address}")

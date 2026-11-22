@@ -1760,7 +1760,7 @@ mod tests {
 
         let first_orch = test.orch.clone();
         let first_sync = synchronization.clone();
-        let first = tokio::spawn(async move {
+        let first = cairn_common::task::spawn(async move {
             super::spawn_triage_for_scope_inner(
                 &first_orch,
                 "project",
@@ -1775,7 +1775,7 @@ mod tests {
 
         let second_orch = test.orch.clone();
         let second_sync = synchronization.clone();
-        let second = tokio::spawn(async move {
+        let second = cairn_common::task::spawn(async move {
             super::spawn_triage_for_scope_inner(
                 &second_orch,
                 "project",
@@ -1879,7 +1879,7 @@ mod tests {
         });
         let spawn_orch = test.orch.clone();
         let spawn_sync = synchronization.clone();
-        let spawning = tokio::spawn(async move {
+        let spawning = cairn_common::task::spawn(async move {
             super::spawn_triage_for_scope_inner(
                 &spawn_orch,
                 "project",

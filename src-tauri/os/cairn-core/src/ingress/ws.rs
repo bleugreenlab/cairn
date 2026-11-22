@@ -406,7 +406,7 @@ mod tests {
             .with_state(relay.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/relay", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        cairn_common::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, relay)
     }
 
@@ -476,7 +476,7 @@ mod tests {
         relay.close_socket.store(true, Ordering::Release);
         let doorbell = Arc::new(Doorbell::default());
         let writes = db.write_transaction_count();
-        let task = tokio::spawn(maintain(orch, url, doorbell.clone()));
+        let task = cairn_common::task::spawn(maintain(orch, url, doorbell.clone()));
         eventually(
             "the first immediate close",
             Duration::from_secs(5),
@@ -540,7 +540,7 @@ mod tests {
         let (url, _) = mock_relay("2026-10-01T00:00:00.000Z").await;
         let doorbell = Arc::new(Doorbell::default());
         let writes = db.write_transaction_count();
-        let task = tokio::spawn(maintain(orch, url, doorbell.clone()));
+        let task = cairn_common::task::spawn(maintain(orch, url, doorbell.clone()));
         tokio::time::timeout(Duration::from_secs(5), doorbell.rung())
             .await
             .unwrap();
@@ -563,7 +563,7 @@ mod tests {
         let (url, _) = mock_relay("2026-10-01T00:00:00.000Z").await;
         let doorbell = Arc::new(Doorbell::default());
         let writes = db.write_transaction_count();
-        let task = tokio::spawn(maintain(orch, url, doorbell.clone()));
+        let task = cairn_common::task::spawn(maintain(orch, url, doorbell.clone()));
         tokio::time::timeout(Duration::from_secs(5), doorbell.rung())
             .await
             .unwrap();
@@ -601,7 +601,7 @@ mod tests {
         let (url, relay) = mock_relay("2026-10-01T00:00:00.000Z").await;
         relay.reject_socket.store(true, Ordering::Release);
         let doorbell = Arc::new(Doorbell::default());
-        tokio::spawn(maintain(orch.clone(), url, doorbell.clone()));
+        cairn_common::task::spawn(maintain(orch.clone(), url, doorbell.clone()));
 
         eventually(
             "the rejection is recorded",
@@ -635,7 +635,7 @@ mod tests {
         let (url, relay) = mock_relay("2026-10-01T00:00:00.000Z").await;
         relay.reject_events.store(true, Ordering::Release);
         let doorbell = Arc::new(Doorbell::default());
-        tokio::spawn(crate::ingress::sync::run(orch.clone(), url, doorbell));
+        cairn_common::task::spawn(crate::ingress::sync::run(orch.clone(), url, doorbell));
         eventually(
             "the rejection is recorded",
             Duration::from_secs(3),
@@ -659,7 +659,7 @@ mod tests {
         let (orch, db, _) = seeded(temp.path(), Some("2026-09-01T00:00:00.000Z|5")).await;
         let (url, relay) = mock_relay("2026-10-01T00:00:00.000Z").await;
         let doorbell = Arc::new(Doorbell::default());
-        tokio::spawn(crate::ingress::sync::run(orch.clone(), url, doorbell));
+        cairn_common::task::spawn(crate::ingress::sync::run(orch.clone(), url, doorbell));
         eventually("a clamped sync", Duration::from_secs(3), async || {
             relay.event_queries.lock().unwrap().len() >= 2
         })
@@ -728,7 +728,7 @@ mod tests {
         let (orch, db, _) = seeded(temp.path(), None).await;
         let (url, relay) = mock_relay("2026-10-01T00:00:00.000Z").await;
         let doorbell = Arc::new(Doorbell::default());
-        tokio::spawn(maintain(orch.clone(), url, doorbell.clone()));
+        cairn_common::task::spawn(maintain(orch.clone(), url, doorbell.clone()));
         eventually(
             "the doorbell connects",
             Duration::from_secs(5),

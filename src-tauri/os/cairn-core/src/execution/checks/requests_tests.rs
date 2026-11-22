@@ -401,7 +401,9 @@ async fn identical_filings_racing_each_other_get_one_request() {
             let db = orch.db.local.clone();
             let same = same.clone();
             let head = head.clone();
-            tokio::spawn(async move { accept(&db, &same, "rust-tests", &head).await.unwrap() })
+            cairn_common::task::spawn(async move {
+                accept(&db, &same, "rust-tests", &head).await.unwrap()
+            })
         })
         .collect();
     let mut ids = std::collections::HashSet::new();
@@ -977,7 +979,7 @@ fn a_filed_request_places_one_lane_and_survives_a_restart_before_its_grant() {
         let (sender, mut machine) = tokio::sync::mpsc::unbounded_channel();
         let generation = second.fleet.attach_announced_executor(sender);
         let fleet = second.fleet.clone();
-        let executor = tokio::spawn(async move {
+        let executor = cairn_common::task::spawn(async move {
             let entry_id = loop {
                 match machine.recv().await {
                     Some(ExecutorMessage::Offer { entry_id, .. }) => break entry_id,
@@ -1197,7 +1199,7 @@ fn a_threads_request_records_a_verdict_in_the_ledger() {
         let (sender, mut machine) = tokio::sync::mpsc::unbounded_channel();
         let generation = orch.fleet.attach_announced_executor(sender);
         let fleet = orch.fleet.clone();
-        let executor = tokio::spawn(async move {
+        let executor = cairn_common::task::spawn(async move {
             let entry_id = loop {
                 match machine.recv().await {
                     Some(ExecutorMessage::Offer { entry_id, .. }) => break entry_id,

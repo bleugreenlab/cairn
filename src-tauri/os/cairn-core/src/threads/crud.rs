@@ -738,7 +738,7 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..LAUNCHES {
             let db = db.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(cairn_common::task::spawn(async move {
                 create(&db, unnamed("project-a")).await
             }));
         }

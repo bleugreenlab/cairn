@@ -19,6 +19,10 @@ pub enum ExecutionStatus {
     /// held execution has ZERO jobs, so without this the job counts fall
     /// through to the terminal arms and call it `Complete`.
     Held,
+    /// Fenced before any agent run or action recorded work; not successful completion.
+    Superseded,
+    /// All work was withdrawn before any run or action completed.
+    Cancelled,
     Complete,
     Failed,
 }
@@ -28,6 +32,8 @@ impl std::fmt::Display for ExecutionStatus {
         match self {
             ExecutionStatus::Running => write!(f, "running"),
             ExecutionStatus::Held => write!(f, "held"),
+            ExecutionStatus::Superseded => write!(f, "superseded"),
+            ExecutionStatus::Cancelled => write!(f, "cancelled"),
             ExecutionStatus::Complete => write!(f, "complete"),
             ExecutionStatus::Failed => write!(f, "failed"),
         }
@@ -41,6 +47,8 @@ impl std::str::FromStr for ExecutionStatus {
         match s {
             "running" => Ok(ExecutionStatus::Running),
             "held" => Ok(ExecutionStatus::Held),
+            "superseded" => Ok(ExecutionStatus::Superseded),
+            "cancelled" => Ok(ExecutionStatus::Cancelled),
             "complete" => Ok(ExecutionStatus::Complete),
             "failed" => Ok(ExecutionStatus::Failed),
             "paused" => Ok(ExecutionStatus::Running),

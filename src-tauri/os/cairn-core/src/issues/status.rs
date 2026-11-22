@@ -308,7 +308,7 @@ pub async fn update_status(
             crate::execution::teardown::TeardownReason::Discarded
         };
 
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             log::info!(
                 "Starting background worktree teardown for issue {} (status: {})",
                 issue_id,
@@ -1313,7 +1313,7 @@ mod tests {
         );
 
         let resolver = orch.clone();
-        let mut resolving = tokio::spawn(async move {
+        let mut resolving = cairn_common::task::spawn(async move {
             let db = resolver.db.local.clone();
             resolve_terminal(
                 &resolver,

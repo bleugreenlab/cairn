@@ -219,7 +219,7 @@ pub(crate) async fn schedule_after_write(
         return;
     }
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let writers = loop {
             match orch
                 .artifact_revisions

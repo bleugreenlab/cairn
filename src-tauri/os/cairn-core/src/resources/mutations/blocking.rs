@@ -1688,7 +1688,7 @@ mod non_blocking_question_tests {
         payload["blocking"] = serde_json::json!(true);
         let asking = {
             let orch = orch.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 write_at(&orch, "th-run", THREAD_QUESTIONS, "append", payload).await
             })
         };

@@ -987,7 +987,7 @@ impl Harness {
         let done = Arc::new(AtomicBool::new(false));
         let finished = done.clone();
         let progress = self.progress_tx.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let callback = recorder.callback();
             callback(&results).await;
             finished.store(true, Ordering::SeqCst);

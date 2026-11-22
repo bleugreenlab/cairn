@@ -207,7 +207,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
     let mut item = batch_item("smoke", &input, &streams[0]);
     item.process.args = vec![ca.plan.command.clone()];
     let ao = orch.clone();
-    let mut raw_a = tokio::spawn(async move {
+    let mut raw_a = cairn_common::task::spawn(async move {
         ao.fleet
             .submit_pure_verdict_check(&ao, request, item, None, None, None)
             .await
@@ -269,7 +269,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
         request.wait_horizon_unix_ms = u64::MAX;
         let item = batch_item("smoke", &input, "main-cadence:p:smoke:linux");
         let co = orch.clone();
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             co.fleet
                 .submit_pure_verdict_check(&co, request, item, None, None, Some(key))
                 .await
@@ -313,7 +313,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
     let bo = orch.clone();
     let bd = db.clone();
     let bstream = streams[1].clone();
-    let live_b = tokio::spawn(async move {
+    let live_b = cairn_common::task::spawn(async move {
         execute_check_contract(
             &bo,
             bd,

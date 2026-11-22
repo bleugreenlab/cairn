@@ -371,7 +371,7 @@ async fn a_failed_pass_records_the_error_and_a_later_success_clears_it() {
 async fn a_panicking_pass_does_not_wedge_the_project() {
     let registry = Arc::new(BaseBranchSyncRegistry::default());
     let panicking = registry.clone();
-    let joined = tokio::spawn(async move {
+    let joined = cairn_common::task::spawn(async move {
         drive(
             &panicking,
             "p",
@@ -611,7 +611,7 @@ async fn fetch_work_starts_only_once_the_lock_is_held() {
     let holder = {
         let orch = orch.clone();
         let store = store.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             with_fetch_lock(&orch, &store, || async move {
                 held_tx.send(()).unwrap();
                 release_rx.await.unwrap();
@@ -626,7 +626,7 @@ async fn fetch_work_starts_only_once_the_lock_is_held() {
         let orch = orch.clone();
         let store = store.clone();
         let started = started.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             with_fetch_lock(&orch, &store, || {
                 tokio::task::spawn_blocking(move || started.store(true, Ordering::SeqCst))
             })

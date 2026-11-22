@@ -67,7 +67,7 @@ pub fn start(orch: &Orchestrator) {
         return;
     }
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now() + std::time::Duration::from_secs(5),
             std::time::Duration::from_secs(5),

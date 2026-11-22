@@ -1466,7 +1466,7 @@ async fn inline_wait_reports_a_failed_codex_tasks_cause_and_home() {
     let (orch, _executor) = parent_fixture("return-followup-inline-fatal.db").await;
     let budget = Duration::from_secs(20);
     let spawn_orch = orch.clone();
-    let spawning = tokio::spawn(async move {
+    let spawning = cairn_common::task::spawn(async move {
         spawn(&spawn_orch, &[explore_payload("map the fleet")], budget).await
     });
     let child = created_child(&orch).await;
@@ -1524,7 +1524,7 @@ async fn inline_wait_releases_a_task_that_returns_and_exits_cleanly() {
     let budget = Duration::from_secs(20);
     let started = std::time::Instant::now();
     let spawn_orch = orch.clone();
-    let spawning = tokio::spawn(async move {
+    let spawning = cairn_common::task::spawn(async move {
         spawn(&spawn_orch, &[explore_payload("map the fleet")], budget).await
     });
     let child = created_child(&orch).await;

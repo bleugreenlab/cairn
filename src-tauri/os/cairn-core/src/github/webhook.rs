@@ -437,7 +437,7 @@ mod tests {
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/relay", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        cairn_common::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
         url
     }
 
@@ -1055,7 +1055,8 @@ mod tests {
         // Started while the channel is rejected, the maintainer mints nothing
         // and settles on its hour-long recheck: only the change signal can
         // bring it back within the wait below.
-        let maintainer = tokio::spawn(maintain(world.orch.clone(), world.relay_url.clone()));
+        let maintainer =
+            cairn_common::task::spawn(maintain(world.orch.clone(), world.relay_url.clone()));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(world
             .bodies("POST", "/relay/channels/ch-2/endpoints")
@@ -1120,7 +1121,8 @@ mod tests {
         let world = World::bare(temp.path()).await;
         world.relay.lock().unwrap().plain_http = true;
         crate::ingress::endpoints::tests::connect_channel(&world.orch).await;
-        let maintainer = tokio::spawn(maintain(world.orch.clone(), world.relay_url.clone()));
+        let maintainer =
+            cairn_common::task::spawn(maintain(world.orch.clone(), world.relay_url.clone()));
 
         connect_app(&world.db, 1, Some(SECRET)).await;
         world.orch.relay.notify_github_app_changed();

@@ -1796,7 +1796,7 @@ pub(crate) fn install(orch: &Orchestrator) -> Result<(), String> {
     let consumer = Arc::new(RebuildConsumer::production(orch));
     orch.operator_requests.register(consumer.clone())?;
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut ticks = tokio::time::interval(RECONCILE_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

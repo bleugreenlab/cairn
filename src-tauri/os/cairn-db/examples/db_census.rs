@@ -580,7 +580,7 @@ async fn history(path: &str, as_of: i64) -> Res<Json> {
     .await?
     {
         let status = text(&r[2]).unwrap_or_default();
-        let finished = status == "complete" || status == "failed";
+        let finished = matches!(status.as_str(), "complete" | "failed" | "cancelled" | "superseded");
         let completed = int(&r[4]);
         let issue = text(&r[1]).and_then(|id| issues.get(&id).copied());
         let entry = match issue {

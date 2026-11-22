@@ -132,7 +132,7 @@ mod tests {
     #[tokio::test]
     async fn waiters_resolve_whether_they_subscribed_before_or_after_the_flip() {
         let latch = StartupReadiness::pending();
-        let early = tokio::spawn({
+        let early = cairn_common::task::spawn({
             let latch = latch.clone();
             async move { latch.wait_ready().await }
         });

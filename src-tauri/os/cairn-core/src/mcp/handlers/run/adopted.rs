@@ -98,7 +98,7 @@ pub(crate) fn start(orch: &Orchestrator) {
     let (sink, mut results) = tokio::sync::mpsc::unbounded_channel::<UnboundResult>();
     orch.fleet.install_unbound_result_sink(sink);
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         while let Some(result) = results.recv().await {
             adopt(&orch, result).await;
         }
@@ -392,7 +392,7 @@ pub(crate) async fn adopt(orch: &Orchestrator, result: UnboundResult) -> Adoptio
                         .send_result_ack(&executor_id, &request_id, &attempt_id);
                 } else {
                     let owned = orch.clone();
-                    tokio::spawn(async move { drive(&owned, &request_id).await });
+                    cairn_common::task::spawn(async move { drive(&owned, &request_id).await });
                 }
                 return Adoption::Adopted;
             }
@@ -932,7 +932,7 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
                 claimed.insert(row.request_id.clone());
                 if !heard_here(orch, &row.request_id) {
                     let owned = orch.clone();
-                    tokio::spawn(async move { drive(&owned, &row.request_id).await });
+                    cairn_common::task::spawn(async move { drive(&owned, &row.request_id).await });
                 }
             }
         }

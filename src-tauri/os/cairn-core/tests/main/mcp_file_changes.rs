@@ -357,7 +357,7 @@ async fn a_write_whose_branch_moves_before_its_seal_is_written_again_under_the_l
     record_write_call(&repo.orch.db.local, id, &request.payload).await;
     request.tool_use_id = Some(id.into());
     let (reached, resume) = cairn_core::internal::mcp::handlers::write::test_pause::before_seal(id);
-    let write = tokio::spawn(async move { handle_write(&orch, &request).await });
+    let write = cairn_common::task::spawn(async move { handle_write(&orch, &request).await });
     tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
         .await
         .expect("the write has prepared its patch without retaining the store lock");
@@ -410,7 +410,8 @@ async fn a_file_seal_checks_acceptance_debt_that_appeared_after_patch_interpreta
             let (reached, resume) =
                 cairn_core::internal::mcp::handlers::write::test_pause::before_seal(&id);
             let orch = repo.orch.clone();
-            let write = tokio::spawn(async move { handle_write(&orch, &request).await });
+            let write =
+                cairn_common::task::spawn(async move { handle_write(&orch, &request).await });
             tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
                 .await
                 .expect("the patch has been interpreted without a writer guard");
@@ -497,7 +498,7 @@ async fn a_locked_write_adopts_three_owner_publications_without_spending_race_re
     let (locked, resume_locked) =
         cairn_core::internal::mcp::handlers::write::test_pause::before_locked_write(id);
     let orch = repo.orch.clone();
-    let write = tokio::spawn(async move { handle_write(&orch, &request).await });
+    let write = cairn_common::task::spawn(async move { handle_write(&orch, &request).await });
     tokio::time::timeout(std::time::Duration::from_secs(60), optimistic.notified())
         .await
         .unwrap();
@@ -570,7 +571,7 @@ async fn an_optimistic_write_restarts_when_only_its_base_coordinate_changes() {
             );
         let (reached, resume) =
             cairn_core::internal::mcp::handlers::write::test_pause::before_seal(tool_use_id);
-        let write = tokio::spawn(async move { handle_write(&orch, &request).await });
+        let write = cairn_common::task::spawn(async move { handle_write(&orch, &request).await });
         tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
             .await
             .expect("the optimistic write has captured its base and prepared its patch");
@@ -685,7 +686,7 @@ async fn a_duplicate_delivery_sealed_inside_the_optimistic_window_replays(atomic
     let mut request = make_request(repo.cwd(), payload.clone());
     request.run_id = Some("run-change".to_string());
     request.tool_use_id = Some(tool_use_id.to_string());
-    let second = tokio::spawn(async move { handle_write(&orch, &request).await });
+    let second = cairn_common::task::spawn(async move { handle_write(&orch, &request).await });
     tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
         .await
         .expect("the second delivery parks after its replay lookup");
@@ -1600,7 +1601,7 @@ async fn a_task_re_acquiring_the_store_lock_it_holds_fails_fast_and_releases_it(
     let store = jj::project_store_dir(repo.config.path(), repo.project.path());
     let orch = repo.orch.clone();
     let task_store = store.clone();
-    let reentrant = tokio::spawn(async move {
+    let reentrant = cairn_common::task::spawn(async move {
         let _outer = orch.hold_jj_store_lock_for_test(&task_store).await;
         let _inner = orch.hold_jj_store_lock_for_test(&task_store).await;
     });
@@ -3969,7 +3970,7 @@ async fn a_write_cut_off_before_its_commit_is_answered_once_as_nothing_applied()
         cairn_core::internal::mcp::handlers::write::test_pause::before_seal(tool_use_id);
     let delivery = Delivery::new();
     let orch = repo.orch.clone();
-    let write = tokio::spawn(serve_delivery(delivery.clone(), async move {
+    let write = cairn_common::task::spawn(serve_delivery(delivery.clone(), async move {
         handle_write(&orch, &request).await
     }));
     tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
@@ -4027,7 +4028,7 @@ async fn a_write_cut_off_after_its_commit_finishes_and_is_answered_once_as_lande
         cairn_core::internal::mcp::handlers::write::test_pause::after_publication(tool_use_id);
     let delivery = Delivery::new();
     let orch = repo.orch.clone();
-    let write = tokio::spawn(serve_delivery(delivery.clone(), async move {
+    let write = cairn_common::task::spawn(serve_delivery(delivery.clone(), async move {
         handle_write(&orch, &request).await
     }));
     tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
@@ -4086,7 +4087,7 @@ async fn a_mixed_write_cut_off_between_items_stops_there_and_is_answered_partial
     let gate = gate_resource_item("run-change", tool_use_id, 3, ItemPhase::BeforeDispatch);
     let delivery = Delivery::new();
     let orch = repo.orch.clone();
-    let write = tokio::spawn(serve_delivery(delivery.clone(), async move {
+    let write = cairn_common::task::spawn(serve_delivery(delivery.clone(), async move {
         handle_write(&orch, &request).await
     }));
     tokio::time::timeout(std::time::Duration::from_secs(60), gate.entered())
@@ -4134,7 +4135,7 @@ async fn an_uncorrelated_resource_write_cut_off_between_items_stops_there() {
     let gate = gate_resource_item("run-change", "", 1, ItemPhase::BeforeDispatch);
     let delivery = Delivery::new();
     let orch = repo.orch.clone();
-    let write = tokio::spawn(serve_delivery(delivery.clone(), async move {
+    let write = cairn_common::task::spawn(serve_delivery(delivery.clone(), async move {
         handle_write(&orch, &request).await
     }));
     tokio::time::timeout(std::time::Duration::from_secs(60), gate.entered())

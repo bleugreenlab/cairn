@@ -1076,7 +1076,7 @@ pub async fn spawn_session(
     let ro = orch.clone();
     let rf = fence;
     let rs = Arc::downgrade(&session);
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut i = tokio::time::interval(Duration::from_secs(60));
         i.tick().await;
         loop {

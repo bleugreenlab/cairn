@@ -3432,7 +3432,7 @@ mod tests {
             let cache = cache.clone();
             let calls = calls.clone();
             let barrier = barrier.clone();
-            readers.push(tokio::spawn(async move {
+            readers.push(cairn_common::task::spawn(async move {
                 barrier.wait().await;
                 cache
                     .get_or_compute_live("job", || {
@@ -3487,7 +3487,7 @@ mod tests {
         for _ in 0..16 {
             let cache = cache.clone();
             let calls = calls.clone();
-            readers.push(tokio::spawn(async move {
+            readers.push(cairn_common::task::spawn(async move {
                 cache
                     .get_or_compute("job", || {
                         let calls = calls.clone();
@@ -3526,7 +3526,7 @@ mod tests {
             let calls = calls.clone();
             let entered = entered.clone();
             let release = release.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 cache
                     .get_or_compute("job", || {
                         let calls = calls.clone();

@@ -120,7 +120,7 @@ async fn scrape_once(orch: &Orchestrator, client: &reqwest::Client) -> Result<()
 }
 
 pub fn spawn_engine_metrics(orch: Orchestrator) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let Ok(client) = cairn_tls::client_builder().timeout(SCRAPE_TIMEOUT).build() else {
             log::warn!("inference: no HTTP client for engine metrics");
             return;

@@ -1251,7 +1251,7 @@ impl Act for Live {
 
 /// Fail what a previous orch left running, once at boot.
 pub fn spawn_recovery(orch: super::Orchestrator) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let Ok(live) = Live::new(orch.clone()) else {
             return;
         };
@@ -1297,7 +1297,7 @@ pub async fn spawn(
     let live = Live::new(orch.clone())?;
     let requested_by = requested_by.to_string();
     let db = orch.db.local.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         if let Err(error) = verify_in_order(
             &db,
             &live,

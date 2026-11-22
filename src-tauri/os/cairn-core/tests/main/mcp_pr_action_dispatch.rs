@@ -668,7 +668,7 @@ async fn pr_rearm_reduction_and_concurrent_packet_writers_neither_deadlock_nor_l
     for writer in 0..WRITERS {
         let orch = fixture.orch.clone();
         let db = fixture.db.clone();
-        writers.push(tokio::spawn(async move {
+        writers.push(cairn_common::task::spawn(async move {
             let lock = orch.execution_lock("exec-1");
             let _guard = lock.lock().await;
             let stored = db
@@ -703,7 +703,7 @@ async fn pr_rearm_reduction_and_concurrent_packet_writers_neither_deadlock_nor_l
         }));
     }
     let orch = fixture.orch.clone();
-    let reduction = tokio::spawn(async move { reduce_pr(&orch).await });
+    let reduction = cairn_common::task::spawn(async move { reduce_pr(&orch).await });
 
     let rearmed = tokio::time::timeout(std::time::Duration::from_secs(120), async {
         for writer in writers {

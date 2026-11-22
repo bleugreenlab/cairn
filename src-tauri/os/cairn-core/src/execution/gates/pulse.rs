@@ -496,7 +496,7 @@ mod tests {
     /// Run the loop on a channel of the test's own.
     fn start_loop(env: &Env, config: SweepLoopConfig) -> mpsc::UnboundedSender<()> {
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_gate_sweep_loop(env.orch.clone(), rx, config));
+        cairn_common::task::spawn(run_gate_sweep_loop(env.orch.clone(), rx, config));
         tx
     }
 

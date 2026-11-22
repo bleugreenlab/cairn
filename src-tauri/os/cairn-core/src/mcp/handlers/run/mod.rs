@@ -615,7 +615,7 @@ mod failure_contract_tests {
     /// one claim it can no longer back.
     #[tokio::test]
     async fn a_placement_task_that_died_does_not_claim_nothing_ran() {
-        let error = tokio::spawn(async { panic!("placement task died") })
+        let error = cairn_common::task::spawn(async { panic!("placement task died") })
             .await
             .unwrap_err();
         let text = placement_task_failure(&error).text();
@@ -3483,7 +3483,7 @@ pub(crate) mod slot_publication_tests {
         let fx = Arc::new(fx);
         let orch = orchestrator(&fx).await;
         let pause = crate::jj::testing::pause_publication_after_landing(fx.store());
-        let caller = tokio::spawn({
+        let caller = cairn_common::task::spawn({
             let (orch, fx) = (orch.clone(), fx.clone());
             async move {
                 publish_visible_slot_delta(
@@ -3524,7 +3524,7 @@ pub(crate) mod slot_publication_tests {
             !caller.is_finished(),
             "the abort cannot end the publishing poll"
         );
-        let queued = tokio::spawn({
+        let queued = cairn_common::task::spawn({
             let orch = orch.clone();
             async move {
                 prepare_publication(&orch, "project", "feature", None, None)
@@ -6394,7 +6394,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // Registered before anything is placed, so no result of this batch is
     // acknowledged before its answer has reached where it was going.
     let result_ack = orch.fleet.defer_result_ack(&control.request_id);
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let _live = live;
         let envelope = prepare_and_run_batch(
             &task_orch,
@@ -7464,7 +7464,7 @@ async fn run_host_items(
         let request = request.clone();
         let interrupt = interrupt.cloned();
         let batch_request_id = batch_request_id.map(str::to_owned);
-        handles.push(AbortOnDrop(tokio::spawn(async move {
+        handles.push(AbortOnDrop(cairn_common::task::spawn(async move {
             if let Some(request_id) = batch_request_id.as_deref() {
                 detached::note_item_started(request_id, index);
             }
@@ -7569,7 +7569,7 @@ async fn run_host_batch(
     let (interrupter, interrupt) = crate::responses::interruption();
     control.set_interrupter(interrupter);
     let (task_orch, request_id) = (orch.clone(), control.request_id.clone());
-    let mut handle = tokio::spawn(async move {
+    let mut handle = cairn_common::task::spawn(async move {
         run_host_items(&task_orch, batch, Some(&interrupt), Some(&request_id)).await
     });
     let ceiling = deadlines.arrival + RUN_BATCH_CEILING;
@@ -7627,7 +7627,7 @@ async fn run_host_batch_declaring(
     let control = BatchControl::new(settlement.commit_msg.is_some());
     let (tx, rx) = tokio::sync::oneshot::channel();
     let (task_orch, task_control) = (orch.clone(), control.clone());
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let envelope = run_host_batch(
             &task_orch,
             settlement,
@@ -8791,7 +8791,7 @@ async fn run_routed_batch(
     control.phase_done("prepare");
     let task_orch = orch.clone();
     let task_control = control.clone();
-    let mut handle = tokio::spawn(async move {
+    let mut handle = cairn_common::task::spawn(async move {
         place_and_run_batch(&task_orch, placement, batch, task_control).await
     });
     let ceiling = deadlines.arrival + RUN_BATCH_CEILING;
@@ -10298,7 +10298,7 @@ fn spawn_parked_resolver(
     // A wait converted to a detached batch while parked is settled by this
     // resolver, so the sweep must not mistake it for one nobody hears.
     let live = detached::LiveResolver::claim(&control.request_id);
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let _live = live;
         let answer = match answer {
             ParkedAnswer::Ready(answer) => *answer,
@@ -10431,7 +10431,7 @@ fn spawn_detached_resolver(
 ) {
     let orch = orch.clone();
     let live = detached::LiveResolver::claim(&control.request_id);
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let _live = live;
         let answer = rx.await.unwrap_or_else(|_| BatchAnswer::task_failed());
         let (verdict, output) = control.detached_settlement(&answer.resume_text);
@@ -10563,7 +10563,7 @@ const HELD_DELIVERY_RETRY: std::time::Duration = std::time::Duration::from_secs(
 /// otherwise resume the turn with a result the agent already has.
 fn retry_held_delivery(orch: &Orchestrator, held: HeldCall) {
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         tokio::time::sleep(HELD_DELIVERY_RETRY).await;
         if let Err(error) = crate::mcp::handlers::durable_suspend::deliver_held_inline(
             &orch,
@@ -10693,7 +10693,7 @@ impl CallAnswer {
             if let Some(rx) = self.rx.take() {
                 let (orch, control) = (self.orch.clone(), self.control.clone());
                 let live = detached::LiveResolver::claim(&control.request_id);
-                tokio::spawn(async move {
+                cairn_common::task::spawn(async move {
                     let _live = live;
                     let answer = rx.await.unwrap_or_else(|_| BatchAnswer::task_failed());
                     if let Some(db) = control.recorded_db() {
@@ -10746,7 +10746,7 @@ impl CallAnswer {
         };
         // On its own task, so a delivery that outlives the answer deadline
         // still lands instead of being dropped mid-write.
-        let delivery = tokio::spawn({
+        let delivery = cairn_common::task::spawn({
             let (orch, db, record) = (self.orch.clone(), held.db.clone(), held.record.clone());
             async move { durable_suspend::deliver_held_inline(&orch, &db, &record).await }
         });
@@ -10797,7 +10797,7 @@ impl CallAnswer {
                 // about to hand it back; settle it then, so a restart never
                 // finds it pending.
                 let orch = self.orch.clone();
-                tokio::spawn(async move {
+                cairn_common::task::spawn(async move {
                     durable_suspend::await_inner_wait_release(&held.db, &held.record).await;
                     let _ =
                         durable_suspend::deliver_held_inline(&orch, &held.db, &held.record).await;
@@ -11062,7 +11062,7 @@ impl Drop for CallAnswer {
                 self.rx.take(),
                 self.request.clone(),
             );
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 let held = match (held, arming) {
                     (Some(held), _) => Some(held),
                     (None, Some(arming)) => match arming.settle().await {
@@ -11085,7 +11085,7 @@ impl Drop for CallAnswer {
         } else {
             // Nobody is left to read the batch's answer on this call, so it
             // keeps running detached and its result reaches the job.
-            tokio::spawn(detach_dropped_call(
+            cairn_common::task::spawn(detach_dropped_call(
                 self.orch.clone(),
                 self.control.clone(),
                 self.request.clone(),
@@ -11160,7 +11160,7 @@ async fn answer_call(
         // log is the time this took.
         let started = std::time::Instant::now();
         let gate = std::sync::Arc::new(ArmGate::default());
-        let task = tokio::spawn({
+        let task = cairn_common::task::spawn({
             let (orch, request, control, gate) = (
                 orch.clone(),
                 request.clone(),
@@ -15093,7 +15093,7 @@ pub(crate) mod host_batch_tests {
         );
         assert!(deadlines.holds_past_grace());
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let batch = tokio::spawn({
+        let batch = cairn_common::task::spawn({
             let orch = orch.clone();
             async move {
                 let held = eventually(Duration::from_secs(3), || held_row(&orch)).await;
@@ -15275,7 +15275,7 @@ pub(crate) mod host_batch_tests {
         assert!(deadlines.holds_past_grace());
         let control = BatchControl::new(true);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let call = tokio::spawn({
+        let call = cairn_common::task::spawn({
             let (orch, control) = (orch.clone(), control.clone());
             async move { answer_call(&orch, &request, deadlines, control, rx).await }
         });
@@ -15473,7 +15473,7 @@ pub(crate) mod host_batch_tests {
         );
         let control = BatchControl::new(false);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             tokio::time::sleep(ms(600)).await;
             let _ = tx.send(batch_answer("done on the socket"));
         });
@@ -15549,7 +15549,7 @@ pub(crate) mod host_batch_tests {
         );
         let control = BatchControl::new(false);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let call = tokio::spawn({
+        let call = cairn_common::task::spawn({
             let (orch, control) = (orch.clone(), control.clone());
             async move { answer_call(&orch, &request, deadlines, control, rx).await }
         });
@@ -15701,7 +15701,7 @@ pub(crate) mod host_batch_tests {
         mut finish: tokio::sync::oneshot::Receiver<String>,
     ) -> tokio::task::JoinHandle<()> {
         let live = detached::LiveBatch::claim(&control);
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let _live = live;
             let text = loop {
                 if control.stop_placement.is_stopped() {
@@ -15816,7 +15816,7 @@ pub(crate) mod host_batch_tests {
         let live = detached::LiveBatch::claim(control);
         let task_orch = orch.clone();
         let task_control = control.clone();
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             let _live = live;
             if let Some(start) = start {
                 start.await.unwrap();
@@ -15909,7 +15909,7 @@ pub(crate) mod host_batch_tests {
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
         let task = park_real_placement(&orch, &control, test_placement(true), Some(start_rx)).await;
         let release_control = control.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             release_control.stop_placement.stopped().await;
             start_tx.send(()).unwrap();
         });
@@ -16677,7 +16677,7 @@ pub(crate) mod host_batch_tests {
         );
         let control = BatchControl::new(false);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             tokio::time::sleep(ms(800)).await;
             let _ = tx.send(batch_answer("the whole suite passed"));
         });
@@ -16728,7 +16728,7 @@ pub(crate) mod host_batch_tests {
             .await
             .unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             tokio::time::sleep(ms(300)).await;
             let _ = tx.send(batch_answer("done while the store was busy"));
         });
@@ -16822,7 +16822,7 @@ pub(crate) mod host_batch_tests {
             Some(ms(600_000)),
         );
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let call = tokio::spawn({
+        let call = cairn_common::task::spawn({
             let orch = orch.clone();
             async move { answer_call(&orch, &request, deadlines, BatchControl::new(false), rx).await }
         });

@@ -2428,7 +2428,7 @@ pub(super) mod unstarted_child_tests {
         let held = lock.lock().await;
         let advancing = {
             let orch = orch.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 crate::execution::advancement::advance_execution_with_actions(&orch, "e").await
             })
         };
@@ -2536,7 +2536,7 @@ pub(super) mod unstarted_child_tests {
         let held = lock.lock().await;
         let running = {
             let orch = orch.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 crate::effects::run::execute_effects(&orch, cascading_advance()).await
             })
         };
@@ -2580,7 +2580,7 @@ pub(super) mod unstarted_child_tests {
         let mut work = Vec::new();
         {
             let orch = orch.clone();
-            work.push(tokio::spawn(async move {
+            work.push(cairn_common::task::spawn(async move {
                 crate::execution::advancement::advance_execution_with_actions(&orch, "e")
                     .await
                     .map(|_| 0)
@@ -2588,7 +2588,7 @@ pub(super) mod unstarted_child_tests {
         }
         for spawner in 0..4 {
             let orch = orch.clone();
-            work.push(tokio::spawn(async move {
+            work.push(cairn_common::task::spawn(async move {
                 let payloads = [
                     explore_payload(&format!("spawner {spawner} first")),
                     explore_payload(&format!("spawner {spawner} second")),

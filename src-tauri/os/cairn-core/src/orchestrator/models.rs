@@ -233,7 +233,7 @@ impl Orchestrator {
     /// install never holds the process open.
     pub fn spawn_managed_tools_follow(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let managed = self.models_runtime().managed.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             while !*shutdown.borrow_and_update() {
                 if shutdown.changed().await.is_err() {
                     break;
@@ -243,7 +243,7 @@ impl Orchestrator {
         });
         for cli in [Cli::Codex, Cli::Claude] {
             let orch = self.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 let mut interval = tokio::time::interval(UPDATE_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
@@ -259,7 +259,7 @@ impl Orchestrator {
     /// "Check again" lands here.
     pub fn kick_managed_install(&self, cli: Cli) {
         let orch = self.clone();
-        tokio::spawn(async move { orch.follow_managed_tool(cli, true).await });
+        cairn_common::task::spawn(async move { orch.follow_managed_tool(cli, true).await });
     }
 
     async fn follow_managed_tool(&self, cli: Cli, retry: bool) {

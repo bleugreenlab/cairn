@@ -177,7 +177,7 @@ fn spawn_terminal_retry(
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    handle.spawn(async move {
+    cairn_common::task::spawn_on(&handle, async move {
         let mut delay = Duration::from_secs(1);
         loop {
             match finish_pending_once(&db, client.as_ref(), &pending).await {
@@ -405,7 +405,7 @@ fn spawn_heartbeat(
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    handle.spawn(async move {
+    cairn_common::task::spawn_on(&handle, async move {
         let mut delay = Duration::from_secs(60);
         loop {
             tokio::time::sleep(delay).await;
@@ -592,7 +592,7 @@ mod tests {
             let client = Arc::new(FakeClient::default());
             pending_team_claim(&process_state, 7);
             client.hold.store(true, Ordering::SeqCst);
-            let confirming = tokio::spawn({
+            let confirming = cairn_common::task::spawn({
                 let (process_state, client) = (process_state.clone(), client.clone());
                 async move {
                     confirm_lease(&process_state, client.as_ref(), "run-1", "request-1", 7).await

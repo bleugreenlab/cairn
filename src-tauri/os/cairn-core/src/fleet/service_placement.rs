@@ -413,7 +413,7 @@ impl ServiceLease {
     /// notification that wakes it out of an otherwise unbounded recovery wait.
     pub(crate) fn spawn_renewal(&self) {
         let core = Arc::clone(&self.core);
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let mut interval = tokio::time::interval(RENEW_INTERVAL);
             interval.tick().await;
             loop {
@@ -1096,7 +1096,7 @@ pub(crate) mod tests {
             );
             true
         });
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 match message {
                     ExecutorMessage::Offer { entry_id, summary } => {
@@ -1128,7 +1128,7 @@ pub(crate) mod tests {
                             offload(move || pool.configure(config)).await;
                         }
                         let (pool, fleet) = (pool.clone(), fleet.clone());
-                        tokio::spawn(async move {
+                        cairn_common::task::spawn(async move {
                             let result = pool.operate_residency(operation, granted_entry_id).await;
                             fleet.handle_executor_message(
                                 EXECUTOR_ID,
@@ -1376,7 +1376,7 @@ pub(crate) mod tests {
         assert!(orch.fleet.disconnect_advertised_executor(LOCAL, link));
         *lease.health.lock().unwrap() = ServicePlacementHealth::ExecutorOffline;
         let core = Arc::clone(&lease.core);
-        let parked = tokio::spawn(async move { core.recover().await });
+        let parked = cairn_common::task::spawn(async move { core.recover().await });
 
         assert!(
             tokio::time::timeout(quiet, lost.changed()).await.is_err(),
@@ -1549,7 +1549,7 @@ pub(crate) mod tests {
         *lease.health.lock().unwrap() = ServicePlacementHealth::ExecutorOffline;
 
         let core = Arc::clone(&lease.core);
-        let parked = tokio::spawn(async move { core.recover().await });
+        let parked = cairn_common::task::spawn(async move { core.recover().await });
         // Let recovery reach its wait. Nothing else can advance it: the executor
         // is gone and only the lease's own release signal is racing that park.
         tokio::time::sleep(Duration::from_millis(100)).await;

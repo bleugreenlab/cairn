@@ -285,7 +285,7 @@ mod tests {
         let mut fold = registry.open_wave("job-a");
         fold.claim([key("migrations", "k1")], "h1");
 
-        let released = tokio::spawn(async move {
+        let released = cairn_common::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
             drop(head);
         });
@@ -312,7 +312,7 @@ mod tests {
         let mut fold = registry.open_wave("job-a");
         fold.claim([], "h1");
 
-        let planned = tokio::spawn(async move {
+        let planned = cairn_common::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
             head.claim([key("migrations", "k2")], "h2");
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -375,12 +375,12 @@ mod tests {
         let mut second = registry.open_wave("job-b");
         second.claim([key("fmt", "b")], "h2");
 
-        let one = tokio::spawn(async move {
+        let one = cairn_common::task::spawn(async move {
             first
                 .await_other_waves(&[key("fmt", "b")], Duration::from_secs(30))
                 .await
         });
-        let two = tokio::spawn(async move {
+        let two = cairn_common::task::spawn(async move {
             second
                 .await_other_waves(&[key("fmt", "a")], Duration::from_secs(30))
                 .await

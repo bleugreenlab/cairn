@@ -637,8 +637,8 @@ where
         total_bound_ms = whole_ms(bounds.total),
     );
     let (offer, mut inline) = tokio::sync::oneshot::channel::<OfferedOutcome>();
-    tokio::spawn(async move {
-        let outcome = tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
+        let outcome = cairn_common::task::spawn(async move {
             let _guard = guard;
             wave.await
         })

@@ -4670,7 +4670,7 @@ mod tests {
         .await;
         let enqueue = {
             let db = db.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 db.execute(
                     "UPDATE runtime_admission_requests SET resource_lane='lane' WHERE request_id='req2'",
                     (),

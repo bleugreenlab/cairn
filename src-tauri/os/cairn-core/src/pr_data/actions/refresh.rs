@@ -565,7 +565,7 @@ async fn settle_observed_resolution(orch: &Orchestrator, snapshot: &PrSnapshot) 
             {
                 let project_id = observed.project_id.clone();
                 let orch = orch.clone();
-                tokio::spawn(async move {
+                cairn_common::task::spawn(async move {
                     crate::orchestrator::base_branch_sync::sync(&orch, &project_id, &target).await;
                 });
             }
@@ -1371,7 +1371,7 @@ pub async fn close_pr_for_job(
     // a live agent's terminals only invites it to open new ones.
     if let Some(issue_id) = load_mr_issue_id(&db, &mr_id).await? {
         let orch_inner = orch.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             if let Err(e) = cleanup_issue_jobs(
                 &orch_inner,
                 TeardownScope::Issue(issue_id),
@@ -2336,7 +2336,7 @@ mod tests {
         for _ in 0..16 {
             let orch = orch.clone();
             let barrier = barrier.clone();
-            readers.push(tokio::spawn(async move {
+            readers.push(cairn_common::task::spawn(async move {
                 barrier.wait().await;
                 refresh_pr_for_job(&orch, "job-c").await.unwrap().state
             }));

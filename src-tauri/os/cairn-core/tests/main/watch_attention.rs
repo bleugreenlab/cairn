@@ -104,7 +104,9 @@ async fn watch_fixture(attention: &str, updated_at: i64) -> WatchFixture {
 
 fn spawn_watch(orch: &Orchestrator, since: i64) -> tokio::task::JoinHandle<String> {
     let orch = orch.clone();
-    tokio::spawn(async move { handle_watch(&orch, &watch_request(WATCH_URI, Some(since))).await })
+    cairn_common::task::spawn(async move {
+        handle_watch(&orch, &watch_request(WATCH_URI, Some(since))).await
+    })
 }
 
 fn parse_watch_json(result: &str) -> Value {
@@ -615,7 +617,7 @@ async fn ask_questions_handler_emits_typed_question_event() {
 
     // Background=true so the handler stores the prompt + emits the typed event
     // without yielding the parent turn (no process state to satisfy in tests).
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         ask_questions(&orch, &request, payload, true, None).await;
     });
 

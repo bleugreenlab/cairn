@@ -430,7 +430,7 @@ async fn pack(path: &str, archive: &str, n: &str) -> Res<Json> {
     let sampling = Arc::new(AtomicBool::new(true));
     let sampler = {
         let (db, peak, sampling) = (db.clone(), sampled_peak.clone(), sampling.clone());
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             while sampling.load(Ordering::Relaxed) {
                 peak.fetch_max(db.logical_log_bytes(), Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(200)).await;

@@ -521,7 +521,7 @@ fn spawn_probe(orch: &Orchestrator, cell: &Arc<Cell>) {
         machine_cell.wake.notify_one();
         return;
     }
-    tokio::spawn(probe_loop(orch.clone(), cell.clone()));
+    cairn_common::task::spawn(probe_loop(orch.clone(), cell.clone()));
 }
 
 /// One cell's probe, for as long as it is selected: keep it started, and ask
@@ -811,7 +811,7 @@ impl PlacedFacade for MachineServiceFacade {
         let (gateway, machine) = tokio::io::duplex(DUPLEX_CAPACITY);
         let (sink, output) = mpsc::unbounded_channel();
         *incarnation.stdout_sink.lock().unwrap() = Some(sink);
-        tokio::spawn(pump(self.orch.clone(), cell, incarnation, output, machine));
+        cairn_common::task::spawn(pump(self.orch.clone(), cell, incarnation, output, machine));
         Ok(Box::new(gateway))
     }
 }
@@ -1647,7 +1647,7 @@ pub(crate) fn spawn_apply(orch: &Orchestrator, reason: &'static str) {
         return;
     }
     let orch = orch.clone();
-    tokio::spawn(async move { apply_machine_services(&orch, reason).await });
+    cairn_common::task::spawn(async move { apply_machine_services(&orch, reason).await });
 }
 
 fn live_state(

@@ -443,7 +443,7 @@ async fn apply_project_action(
     // more often than not, and a half-written archive with no manifest is
     // exactly what this guards against.
     let key = project_key.to_string();
-    let task = tokio::spawn(crate::projects::export::export_project(
+    let task = cairn_common::task::spawn(crate::projects::export::export_project(
         orch.db.local.clone(),
         owning_db,
         key.clone(),

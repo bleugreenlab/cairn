@@ -6,6 +6,7 @@ description = "Channel message contracts and Telegram/Discord transport adapters
 license = "BUSL-1.1"
 
 [dependencies]
+cairn-common = { path = "../cairn-common" }
 async-trait = "0.1"
 chrono = "0.4"
 futures-util = "0.3"

@@ -122,7 +122,7 @@ pub fn maybe_notify(orch: &Orchestrator, event: &AttentionEvent) {
     let api_url = orch.api_config.push_notify_url();
     let event = event.clone();
 
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         {
             let mut seen = dedupe.lock().await;
             if seen.get(&event.issue_id) == Some(&intent.fingerprint) {

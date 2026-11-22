@@ -4732,7 +4732,7 @@ pub fn spawn(
         .expect("route submission slot poisoned")
         .insert(provider_id, route_tx);
     let route_router = router.clone();
-    let route_task = tokio::spawn(async move {
+    let route_task = cairn_common::task::spawn(async move {
         while let Some(submission) = route_rx.recv().await {
             match submission {
                 RouterSubmission::Route(submission) => {
@@ -4757,7 +4757,7 @@ pub fn spawn(
         }
     });
     let sweep = router.clone();
-    let sweep_task = tokio::spawn(async move {
+    let sweep_task = cairn_common::task::spawn(async move {
         // The channel is a live tap: this session carries the asks raised from
         // here on, and the backlog that predates it belongs to the app, not the
         // phone. Sealing it off COMPLETELY is a precondition for sweeping at all,
@@ -4775,7 +4775,7 @@ pub fn spawn(
         run_sweeps(&sweep).await;
     });
     let inbound = router.clone();
-    let inbound_task = tokio::spawn(async move {
+    let inbound_task = cairn_common::task::spawn(async move {
         let mut events = provider.subscribe();
         while let Some(event) = events.recv().await {
             if let Err(error) = inbound.handle_inbound(event).await {
@@ -6469,7 +6469,7 @@ mod tests {
 
     fn spawn_sweeps(router: &Arc<ChannelRouter>) -> tokio::task::JoinHandle<()> {
         let router = router.clone();
-        tokio::spawn(async move { run_sweeps(&router).await })
+        cairn_common::task::spawn(async move { run_sweeps(&router).await })
     }
 
     impl ChannelRouter {
@@ -6869,7 +6869,7 @@ mod tests {
         let notify = wake.notify();
         let reader = {
             let db = db.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 notify.notified().await;
                 ledger::list_due_deliveries(
                     &db,

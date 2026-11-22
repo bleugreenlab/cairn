@@ -335,7 +335,7 @@ async fn fixers_chain_as_requests_and_each_verdict_is_its_own_request_recorded_a
     let machine_repo = repo.clone();
     let (grants_tx, mut grants) = mpsc::unbounded_channel::<Grant>();
     let (release_held, held_released) = oneshot::channel::<()>();
-    let machine = tokio::spawn(async move {
+    let machine = cairn_common::task::spawn(async move {
         let answer = |request: &CellRequest, outcome: CellOutcome| {
             fleet.handle_executor_message(
                 crate::fleet::COLOCATED_EXECUTOR_ID,
@@ -454,7 +454,7 @@ async fn fixers_chain_as_requests_and_each_verdict_is_its_own_request_recorded_a
     let ticket = orch.late_write_checks.open(JOB, "tool-use");
     let ceiling = Duration::from_secs(600);
     let guard = WriteChecksInFlightGuard::new(&orch, JOB);
-    let wave = tokio::spawn(async move {
+    let wave = cairn_common::task::spawn(async move {
         await_write_check_wave(
             guard,
             InlineWaitBounds {

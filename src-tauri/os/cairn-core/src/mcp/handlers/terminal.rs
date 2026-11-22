@@ -3994,7 +3994,7 @@ fn spawn_terminal_heartbeat(orch: &Orchestrator, session_id: &str, fence: &Resid
     let heartbeat_orch = orch.clone();
     let heartbeat_session = session_id.to_string();
     let heartbeat_fence = fence.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         interval.tick().await;
         loop {
@@ -4244,7 +4244,7 @@ async fn install_terminal_event_handler(
                     process_key: event_sid.clone(),
                     process_generation: event.process_generation,
                 };
-                tokio::spawn(async move {
+                cairn_common::task::spawn(async move {
                     if let Err(error) =
                         release_terminal_process(&release_orch, &release_binding).await
                     {
@@ -6392,7 +6392,7 @@ mod terminal_finalize_tests {
         let ops_log = ops.clone();
         let start_process: Arc<Mutex<Option<ResidentProcessSpec>>> = Arc::new(Mutex::new(None));
         let start_process_log = start_process.clone();
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 let ExecutorMessage::ResidencyRequest {
                     correlation_id,
@@ -6652,7 +6652,7 @@ mod terminal_finalize_tests {
         let (stop_ack_tx, mut stop_ack_rx) = oneshot::channel();
         let mut stop_seen_tx = Some(stop_seen_tx);
         let updated_script = script.clone();
-        let executor = tokio::spawn(async move {
+        let executor = cairn_common::task::spawn(async move {
             let mut surviving = replace_existing;
             while let Some(message) = receiver.recv().await {
                 let ExecutorMessage::ResidencyRequest {
@@ -6778,7 +6778,9 @@ mod terminal_finalize_tests {
             replace_existing,
         };
         let mut spawn =
-            tokio::spawn(async move { spawn_workflow_process(&spawn_orch, params).await });
+            cairn_common::task::spawn(
+                async move { spawn_workflow_process(&spawn_orch, params).await },
+            );
         if replace_existing {
             tokio::time::timeout(Duration::from_secs(10), stop_seen_rx)
                 .await
@@ -8855,7 +8857,7 @@ mod terminal_finalize_tests {
             };
             let cell = Arc::new(Mutex::new(cell));
             let state = cell.clone();
-            let task = tokio::spawn(async move {
+            let task = cairn_common::task::spawn(async move {
                 while let Some(message) = receiver.recv().await {
                     let ExecutorMessage::ResidencyRequest {
                         correlation_id,
@@ -9046,7 +9048,7 @@ mod terminal_finalize_tests {
             spawn_node_terminal(&orch, target, "cargo test provider_limit_holds").await;
         executor.post();
 
-        let wait = tokio::spawn(crate::mcp::handlers::owned_wait::trigger(
+        let wait = cairn_common::task::spawn(crate::mcp::handlers::owned_wait::trigger(
             orch.clone(),
             orch.db.local.clone(),
             crate::mcp::handlers::durable_suspend::Record {
@@ -9289,7 +9291,7 @@ mod terminal_finalize_tests {
         on: crate::mcp::handlers::run::TerminalWaitEvent,
         phrase: Option<&str>,
     ) -> tokio::task::JoinHandle<Result<String, String>> {
-        tokio::spawn(crate::mcp::handlers::owned_wait::trigger(
+        cairn_common::task::spawn(crate::mcp::handlers::owned_wait::trigger(
             orch.clone(),
             orch.db.local.clone(),
             crate::mcp::handlers::durable_suspend::Record {

@@ -60,6 +60,7 @@ struct SampleData {
     resources: ResourceReading,
     alloc: AllocSnapshot,
     runtime: RuntimeSnapshot,
+    tasks: cairn_common::task::Snapshot,
     ps_rows: Result<Vec<ProcessRow>, String>,
 }
 
@@ -86,7 +87,7 @@ struct PrevSample {
 /// names the daemon (`"cairn-runner"` / `"cairn-server"`) and rides in each
 /// event's meta so multiple daemons' streams stay distinguishable.
 pub fn spawn_backend_sampler(source_tag: &'static str) {
-    tokio::spawn(async move { run_sampler(source_tag).await });
+    cairn_common::task::spawn(async move { run_sampler(source_tag).await });
 }
 
 async fn run_sampler(source_tag: &'static str) {
@@ -132,6 +133,7 @@ async fn run_sampler(source_tag: &'static str) {
             resources,
             alloc,
             runtime,
+            tasks: cairn_common::task::snapshot(&handle, 12),
             ps_rows,
         };
         emit(build_event(
@@ -215,6 +217,18 @@ fn build_event(
         meta.insert("tokioWorkerBusyRatio".into(), json!(round_2(ratio)));
     }
 
+    // The denominator is sampled from the same runtime as the counted sites.
+    meta.insert("tokioCountedTasks".into(), json!(data.tasks.total_live));
+    meta.insert("tokioTopSpawnSites".into(), json!(data.tasks.top_sites));
+    meta.insert(
+        "tokioCountedRemainder".into(),
+        json!(data.tasks.remainder_live),
+    );
+    meta.insert(
+        "tokioCountedCoverageDenominator".into(),
+        json!(data.tasks.runtime_alive_tasks),
+    );
+
     // Process tree (rooted at this daemon; captures spawned agent CLIs).
     match &data.ps_rows {
         Ok(rows) => {
@@ -297,6 +311,17 @@ mod tests {
                 global_queue_depth: 3,
                 total_worker_busy_nanos: Some(10_000),
             },
+            tasks: cairn_common::task::Snapshot {
+                total_live: 30,
+                top_sites: vec![cairn_common::task::SiteSnapshot {
+                    file: "worker.rs",
+                    line: 10,
+                    column: 5,
+                    live: 25,
+                }],
+                remainder_live: 5,
+                runtime_alive_tasks: 42,
+            },
             ps_rows,
         }
     }
@@ -344,6 +369,15 @@ mod tests {
         assert_eq!(meta["allocatedSinceMb"], 20.0);
         assert_eq!(meta["tokioWorkers"], 8);
         assert_eq!(meta["tokioAliveTasks"], 42);
+        assert_eq!(meta["tokioCountedTasks"], 30);
+        assert_eq!(meta["tokioCountedRemainder"], 5);
+        assert_eq!(meta["tokioCountedCoverageDenominator"], 42);
+        assert_eq!(
+            meta["tokioTopSpawnSites"][0],
+            json!({
+                "file": "worker.rs", "line": 10, "column": 5, "live": 25,
+            })
+        );
         assert_eq!(meta["tokioWorkerBusyRatio"], 0.25);
         // Both processes are in the tree (200 is a child of root 100).
         assert_eq!(meta["processCount"], 2);

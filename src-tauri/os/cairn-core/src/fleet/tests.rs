@@ -231,7 +231,7 @@ async fn a_successor_does_not_run_until_what_it_displaced_is_confirmed_dead() {
     let mut waiting = {
         let fleet = fleet.clone();
         let (key, newer) = (key.clone(), newer.clone());
-        tokio::spawn(async move { fleet.await_purpose_quiescent(&key, &newer).await })
+        cairn_common::task::spawn(async move { fleet.await_purpose_quiescent(&key, &newer).await })
     };
 
     // Winning the key is not permission to dispatch. This also parks the
@@ -288,7 +288,7 @@ async fn an_item_displaced_while_waiting_to_dispatch_settles_instead_of_deadlock
     let mut b_gate = {
         let fleet = fleet.clone();
         let (key, b) = (key.clone(), b.clone());
-        tokio::spawn(async move { fleet.await_purpose_quiescent(&key, &b).await })
+        cairn_common::task::spawn(async move { fleet.await_purpose_quiescent(&key, &b).await })
     };
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(100), &mut b_gate)
@@ -2569,7 +2569,7 @@ async fn residency_responses_are_bounded_by_their_link() {
     let (sender, _executor) = mpsc::unbounded_channel();
     let generation = pool.attach_executor(sender);
     let (tx, rx) = oneshot::channel::<u8>();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         tokio::time::sleep(Duration::from_millis(RESIDENCY_RESPONSE_FLOOR_MS * 6)).await;
         let _ = tx.send(7);
     });
@@ -4719,7 +4719,7 @@ async fn abandoning_a_stalled_link_resolves_started_subscribers_typed() {
 
     // Deadline already in the past: only the `execution_started` latch is
     // keeping this subscriber alive, exactly as in the incident.
-    let waiting = tokio::spawn({
+    let waiting = cairn_common::task::spawn({
         let pool = pool.clone();
         let follower_identity = follower_identity.clone();
         async move {
@@ -5505,7 +5505,7 @@ async fn a_request_waits_out_an_attaching_supervisor_within_its_horizon() {
     pool.declare_colocated_substrate(ExecutorSubstrateState::ProtocolAttaching);
     let attaching = pool.clone();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         tokio::time::sleep(Duration::from_millis(40)).await;
         attaching.attach_executor(tx);
         announce_every_room(&attaching);
@@ -5895,7 +5895,7 @@ async fn a_subscriber_waits_out_its_leaders_preparation() {
         },
     );
     let completion_pool = pool.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         tokio::time::sleep(Duration::from_millis(30)).await;
         completion_pool.complete_coalesced_for_leader(
             &key,
@@ -5983,7 +5983,7 @@ async fn live_command_process_disables_subscriber_acquisition_deadline() {
         );
     }
     let completion_pool = pool.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         tokio::time::sleep(Duration::from_millis(30)).await;
         completion_pool.complete_coalesced_for_leader(
             &key,
@@ -7027,7 +7027,7 @@ async fn immobile_work_waits_out_its_homes_pipe_floor_and_places_on_recovery() {
             now,
         )
         .unwrap();
-    let placing = tokio::spawn({
+    let placing = cairn_common::task::spawn({
         let pool = pool.clone();
         let request = request.clone();
         let entry = entry.clone();
@@ -7265,7 +7265,7 @@ async fn a_terminal_running_across_a_runner_restart_teaches_its_kills_and_refuse
     };
     let fleet = orch.fleet.clone();
     let answered = cell.clone();
-    let machine = tokio::spawn(async move {
+    let machine = cairn_common::task::spawn(async move {
         for expected in ["terminal:again", "terminal:third", "terminal:shell"] {
             let Some(ExecutorMessage::ResidencyRequest {
                 correlation_id,
@@ -7502,7 +7502,7 @@ async fn a_process_whose_only_fitting_machine_is_drained_waits_for_it() {
     let (pool, db, request) = process_fit_fleet("process-fit-drained.db", 125 * GIB, true).await;
     announce_posted_rooms(&pool);
     let plan = Arc::new(ReservationPlan::new(db, &request, None));
-    let placing = tokio::spawn({
+    let placing = cairn_common::task::spawn({
         let pool = pool.clone();
         async move { place_through_dispatcher(&pool, &request, Some(plan)).await }
     });
@@ -8967,7 +8967,7 @@ async fn a_later_generation_attaching_during_the_first_dial_wait_ends_it() {
         "generation 1 is gone"
     );
 
-    let waiting = tokio::spawn({
+    let waiting = cairn_common::task::spawn({
         let fleet = fleet.clone();
         async move {
             fleet
@@ -12023,7 +12023,7 @@ async fn executor_restart_reconfigures_a_reacquired_live_residency() {
         ExecutorSubstrateReport::default(),
     ));
     let answering_fleet = orch.fleet.clone();
-    let answer = tokio::spawn(async move {
+    let answer = cairn_common::task::spawn(async move {
         // Attach states the runner's drain posture before any work arrives,
         // so the re-acquire is not necessarily the first frame. Skipping
         // what attach says keeps this test about atomicity of config with
@@ -12116,7 +12116,7 @@ async fn a_job_whose_machine_is_gone_acquires_again_on_a_live_one() {
     cell.residency.as_mut().unwrap().repository = repository.clone();
     let answering_fleet = orch.fleet.clone();
     let answered = cell.clone();
-    let answer = tokio::spawn(async move {
+    let answer = cairn_common::task::spawn(async move {
         let Some(ExecutorMessage::Offer { entry_id, .. }) = executor.recv().await else {
             panic!("a rebuilt environment must first be offered to the live executor");
         };
@@ -12185,7 +12185,7 @@ async fn executor_restart_configures_a_cell_in_the_submission_that_consumes_it()
     assert!(replacement_generation > first_generation);
 
     let answering_fleet = orch.fleet.clone();
-    let answer = tokio::spawn(async move {
+    let answer = cairn_common::task::spawn(async move {
         // Attach states the runner's drain posture before any work is sent,
         // so the submission is not necessarily the first frame. Skipping
         // what attach says rather than asserting on frame position keeps
@@ -12269,7 +12269,9 @@ async fn a_drain_between_claim_and_grant_releases_the_unstarted_machine_reservat
     request.pinned_executor_id = Some("remote".into());
     let submitting = {
         let orch = orch.clone();
-        tokio::spawn(async move { orch.fleet.submit_execution(&orch, request, None).await })
+        cairn_common::task::spawn(
+            async move { orch.fleet.submit_execution(&orch, request, None).await },
+        )
     };
     let (offered, summary) = loop {
         match tokio::time::timeout(Duration::from_secs(30), remote.recv()).await {
@@ -12496,7 +12498,7 @@ async fn scratch_submission_with_stop(
         .await
         .expect("a scratch request prepares");
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         orch.fleet
             .execute_prepared_accounted(request, Some(batch), prepared, stop.as_deref())
             .await
@@ -13438,7 +13440,7 @@ async fn an_unnamed_placement_waits_only_for_the_first_colocated_attach() {
 
     let waiting = {
         let pool = pool.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             pool.wait_for_first_colocated_attach(std::time::Duration::from_secs(60))
                 .await
         })
@@ -14929,7 +14931,7 @@ async fn a_job_stop_tells_its_waiting_subscriber_why() {
     let lane = ("lane".to_string(), "attempt-1".to_string());
     let (tx, rx) = oneshot::channel();
     register_coalesced(&pool, &lane, vec![(lane.clone(), tx, "job")]);
-    let waiting = tokio::spawn({
+    let waiting = cairn_common::task::spawn({
         let pool = pool.clone();
         let lane = lane.clone();
         async move {
@@ -15307,7 +15309,7 @@ async fn a_subscriber_waits_out_capacity_contention_until_its_leader_completes()
     );
     let completion_pool = pool.clone();
     let completed_identity = identity.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         tokio::time::sleep(Duration::from_millis(30)).await;
         completion_pool.complete_coalesced_for_leader(
             &key,
@@ -15348,7 +15350,7 @@ async fn a_subscriber_waits_out_slot_adoption() {
     );
     let completion_pool = pool.clone();
     let completed_identity = identity.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         tokio::time::sleep(Duration::from_millis(30)).await;
         completion_pool.complete_coalesced_for_leader(
             &key,
@@ -16665,7 +16667,7 @@ async fn a_shared_execution_outlives_the_runtime_of_the_wave_that_opened_it() {
 
     let follower_orch = orch.clone();
     let (request, item) = check("follower");
-    let follower = tokio::spawn(async move {
+    let follower = cairn_common::task::spawn(async move {
         follower_orch
             .fleet
             .submit_pure_verdict_check(&follower_orch, request, item, None, None, None)
@@ -16830,7 +16832,7 @@ async fn an_identity_free_batch_teaches_each_items_suite_and_counts_its_kills() 
         })
         .collect::<Vec<_>>();
     let fleet = orch.fleet.clone();
-    let machine = tokio::spawn(async move {
+    let machine = cairn_common::task::spawn(async move {
         let Some(ExecutorMessage::Offer { entry_id, .. }) = next_work_frame(&mut executor).await
         else {
             panic!("the batch is offered");
@@ -17262,7 +17264,7 @@ async fn work_refused_a_model_s_room_waits_reports_the_refusal_and_places_when_i
         .unwrap();
 
     let waiting = pool.clone();
-    let placing = tokio::spawn({
+    let placing = cairn_common::task::spawn({
         let request = request.clone();
         let entry = entry.clone();
         async move {
@@ -17345,7 +17347,7 @@ async fn unmeasured_work_waits_out_a_loading_model_and_places_once_it_is_healthy
         .unwrap();
 
     let waiting = pool.clone();
-    let placing = tokio::spawn({
+    let placing = cairn_common::task::spawn({
         let request = request.clone();
         let entry = entry.clone();
         async move {
@@ -17388,7 +17390,7 @@ async fn a_horizon_that_arrives_during_a_re_offer_records_the_refusal_it_returns
     let generation = orch.fleet.attach_announced_executor(sender);
     let detail = "project p is provisioning for request holder, 1s ago";
     let fleet = orch.fleet.clone();
-    let machine = tokio::spawn(async move {
+    let machine = cairn_common::task::spawn(async move {
         let Some(ExecutorMessage::Offer { entry_id, .. }) = next_work_frame(&mut executor).await
         else {
             panic!("the request is offered");
@@ -19801,7 +19803,7 @@ async fn an_acquisition_judges_its_home_by_the_current_canonical_setup() {
     ));
 
     let answering_fleet = orch.fleet.clone();
-    let answer = tokio::spawn(async move {
+    let answer = cairn_common::task::spawn(async move {
         let correlation_id = loop {
             match executor.recv().await {
                 Some(ExecutorMessage::DrainModeRequest { .. }) => continue,
@@ -19974,7 +19976,7 @@ async fn a_claim_the_runner_never_grants_leaves_no_object_authority_behind() {
 
     let submitting = {
         let orch = orch.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             orch.fleet
                 .submit_execution(&orch, request, Some(batch))
                 .await

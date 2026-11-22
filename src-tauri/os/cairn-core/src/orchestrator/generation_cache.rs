@@ -1729,7 +1729,7 @@ where
         };
         let cache = self.this.clone();
         let key = key.to_string();
-        runtime.spawn(async move {
+        cairn_common::task::spawn_on(&runtime, async move {
             tokio::time::sleep(delay).await;
             if let Some(cache) = cache.upgrade() {
                 cache.invalidate(&key, reason);
@@ -1809,7 +1809,7 @@ where
             return;
         };
         slot.driving = true;
-        runtime.spawn(Self::drive(self.this.clone(), key.to_string()));
+        cairn_common::task::spawn_on(&runtime, Self::drive(self.this.clone(), key.to_string()));
     }
 
     /// The key's current answer.
@@ -2034,7 +2034,7 @@ mod tests {
             let cache = cache.clone();
             let computations = computations.clone();
             let barrier = barrier.clone();
-            readers.push(tokio::spawn(async move {
+            readers.push(cairn_common::task::spawn(async move {
                 barrier.wait().await;
                 cache
                     .get_or_compute("k", || {
@@ -2093,7 +2093,7 @@ mod tests {
             let cache = cache.clone();
             let value = value.clone();
             let entered = entered.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 cache
                     .get_or_compute("k", || {
                         let value = value.clone();
@@ -2160,7 +2160,7 @@ mod tests {
             let cache = cache.clone();
             let computations = computations.clone();
             let barrier = barrier.clone();
-            readers.push(tokio::spawn(async move {
+            readers.push(cairn_common::task::spawn(async move {
                 barrier.wait().await;
                 cache
                     .refresh_or_compute("k", demanded_at, || {
@@ -2211,7 +2211,7 @@ mod tests {
             let cache = cache.clone();
             let computations = computations.clone();
             let barrier = barrier.clone();
-            readers.push(tokio::spawn(async move {
+            readers.push(cairn_common::task::spawn(async move {
                 barrier.wait().await;
                 // Exactly what an explicit refresh does: replace a settled
                 // value and reserve its replacement flight atomically, or join
@@ -2259,7 +2259,7 @@ mod tests {
                 let cache = cache.clone();
                 let computations = computations.clone();
                 let barrier = barrier.clone();
-                readers.push(tokio::spawn(async move {
+                readers.push(cairn_common::task::spawn(async move {
                     barrier.wait().await;
                     cache
                         .get_or_compute_within("k", window, || {
@@ -2323,7 +2323,7 @@ mod tests {
             let cache = cache.clone();
             let value = value.clone();
             let entered = entered.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 cache
                     .get_or_compute_within("k", window, || {
                         let value = value.clone();
@@ -2427,7 +2427,7 @@ mod tests {
             let cache = cache.clone();
             let computations = computations.clone();
             let barrier = barrier.clone();
-            readers.push(tokio::spawn(async move {
+            readers.push(cairn_common::task::spawn(async move {
                 barrier.wait().await;
                 cache.invalidate_stale("k", "freshness-window-elapsed", |value| *value == 1);
                 cache
@@ -2714,7 +2714,9 @@ mod tests {
         let mut readers = Vec::new();
         for _ in 0..16 {
             let cache = c.cache.clone();
-            readers.push(tokio::spawn(async move { cache.get("k").await }));
+            readers.push(cairn_common::task::spawn(
+                async move { cache.get("k").await },
+            ));
         }
         for reader in readers {
             assert_eq!(reader.await.unwrap(), Ok(1));
@@ -2743,7 +2745,9 @@ mod tests {
         let mut readers = Vec::new();
         for _ in 0..16 {
             let cache = c.cache.clone();
-            readers.push(tokio::spawn(async move { cache.get("k").await }));
+            readers.push(cairn_common::task::spawn(
+                async move { cache.get("k").await },
+            ));
         }
         for reader in readers {
             assert_eq!(reader.await.unwrap(), Ok(1));

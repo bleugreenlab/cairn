@@ -501,7 +501,7 @@ async fn a_check_waits_for_a_sibling_preparation_holding_the_branch() {
         .await
         .unwrap();
     let orch = h.orch.clone();
-    let mut waiting = tokio::spawn(async move {
+    let mut waiting = cairn_common::task::spawn(async move {
         prepare_branch(
             &orch,
             PreparationRequest::for_check("proj-1", BRANCH, Some(JOB.to_string())),

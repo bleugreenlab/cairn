@@ -415,7 +415,7 @@ impl DiscordProvider {
             })?;
         let shard_manager = client.shard_manager.clone();
         let provider = self.clone();
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             let result = client.start_autosharded().await;
             provider.active.store(false, Ordering::Release);
             match result {

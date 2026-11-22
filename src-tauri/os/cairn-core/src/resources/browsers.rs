@@ -724,7 +724,7 @@ async fn bounded_probe(
     // Spawned so a panic inside the probe arrives here as a JoinError instead
     // of unwinding through the read; aborted on timeout so a hung connect does
     // not outlive it.
-    let mut probe = tokio::spawn(probe);
+    let mut probe = cairn_common::task::spawn(probe);
     match tokio::time::timeout(budget, &mut probe).await {
         Ok(Ok(reachability)) => reachability,
         Ok(Err(error)) => Reachability::Unknown {
@@ -2122,7 +2122,7 @@ mod tests {
         // Stand in for the host: when the Capture command arrives, publish a
         // matching-reqId ok reply carrying base64 image data.
         let responses = orch.browser_bridge_responses.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             if let Some(BrowserCommand::Capture { request_id, .. }) = rx.recv().await {
                 let payload =
                     serde_json::json!({ "ok": true, "dataB64": "UE5HX0RBVEE=" }).to_string();
@@ -2137,7 +2137,7 @@ mod tests {
     async fn capture_roundtrip_surfaces_host_error_reply() {
         let (orch, mut rx, _dir) = orch_with_browser_tx().await;
         let responses = orch.browser_bridge_responses.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             if let Some(BrowserCommand::Capture { request_id, .. }) = rx.recv().await {
                 let payload =
                     serde_json::json!({ "ok": false, "error": "no live webview for browser bid" })
@@ -2155,7 +2155,7 @@ mod tests {
     async fn capture_roundtrip_times_out_when_host_never_replies() {
         let (orch, mut rx, _dir) = orch_with_browser_tx().await;
         // Drain the command but never reply, so the awaiter must time out.
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let _ = rx.recv().await;
         });
         let err = browser_capture_roundtrip(&orch, "bid", Duration::from_millis(80))
@@ -2169,7 +2169,7 @@ mod tests {
         let (orch, mut rx, _dir) = orch_with_browser_tx().await;
         // Stand in for the host: confirm the kinds rode the command, then ack.
         let responses = orch.browser_bridge_responses.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             if let Some(BrowserCommand::ClearData {
                 request_id, kinds, ..
             }) = rx.recv().await
@@ -2192,7 +2192,7 @@ mod tests {
     async fn clear_roundtrip_surfaces_host_error_reply() {
         let (orch, mut rx, _dir) = orch_with_browser_tx().await;
         let responses = orch.browser_bridge_responses.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             if let Some(BrowserCommand::ClearData { request_id, .. }) = rx.recv().await {
                 let payload = serde_json::json!({
                     "ok": false,
@@ -2272,7 +2272,7 @@ mod tests {
     async fn read_never_finishing_page(url: &str) -> String {
         let (orch, mut rx, _dir) = orch_with_browser_tx().await;
         orch.set_browser_loading("bid", true);
-        let task = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let task = cairn_common::task::spawn(async move { while rx.recv().await.is_some() {} });
         let browser = browser_with_id("bid", url);
         let res = read_bridge_with_readiness(
             &orch,
@@ -2465,7 +2465,7 @@ mod tests {
         let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
         let collected2 = collected.clone();
         let responses = orch.browser_bridge_responses.clone();
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 if let BrowserCommand::Bridge { ref request_id, .. } = cmd {
                     let _ = responses.send((
@@ -2512,7 +2512,7 @@ mod tests {
         let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
         let collected2 = collected.clone();
         // Drain commands but never reply, so the round-trip times out.
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 collected2.lock().unwrap().push(cmd);
             }
@@ -2574,7 +2574,7 @@ mod tests {
         let (orch, mut rx, _dir) = orch_with_browser_tx().await;
         orch.set_browser_loading("bid", true);
         let responses = orch.browser_bridge_responses.clone();
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 if let BrowserCommand::Bridge { request_id, .. } = cmd {
                     let _ = responses.send((
@@ -2586,7 +2586,7 @@ mod tests {
         });
         // Publish Finished shortly after the helper subscribes.
         let nav = orch.browser_nav_events.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
             let _ = nav.send(BrowserNavEvent {
                 browser_id: "bid".to_string(),
@@ -2622,7 +2622,7 @@ mod tests {
     async fn read_readiness_loaded_but_broken_is_hard() {
         let (orch, mut rx, _dir) = orch_with_browser_tx().await;
         // loading flag false (default). Drain but never reply → bridge times out.
-        let task = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let task = cairn_common::task::spawn(async move { while rx.recv().await.is_some() {} });
         let browser = browser_with_id("bid", "http://x/app");
         let res = read_bridge_with_readiness(
             &orch,
@@ -2657,7 +2657,7 @@ mod tests {
         let (orch, mut rx, _dir) = orch_with_browser_tx().await;
         let responses = orch.browser_bridge_responses.clone();
         let loading = orch.browser_loading.clone();
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             let mut first = true;
             while let Some(cmd) = rx.recv().await {
                 if let BrowserCommand::Bridge { request_id, .. } = cmd {
@@ -2678,7 +2678,7 @@ mod tests {
         // Publish Finished after the first attempt has timed out and the
         // post-failure re-check is awaiting readiness.
         let nav = orch.browser_nav_events.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = nav.send(BrowserNavEvent {
                 browser_id: "bid".to_string(),
@@ -2725,14 +2725,14 @@ mod tests {
         let responses = orch.browser_bridge_responses.clone();
         let nav = orch.browser_nav_events.clone();
         let loading = orch.browser_loading.clone();
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     BrowserCommand::OpenForRead { request_id, .. } => {
                         loading.lock().unwrap().insert("bid".to_string(), true);
                         let _ = responses.send((request_id, "{}".to_string()));
                         let (nav2, loading2) = (nav.clone(), loading.clone());
-                        tokio::spawn(async move {
+                        cairn_common::task::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(40)).await;
                             loading2.lock().unwrap().insert("bid".to_string(), false);
                             let _ = nav2.send(BrowserNavEvent {
@@ -2809,14 +2809,14 @@ mod tests {
         let responses = orch.browser_bridge_responses.clone();
         let nav = orch.browser_nav_events.clone();
         let loading = orch.browser_loading.clone();
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     BrowserCommand::OpenForRead { request_id, .. } => {
                         loading.lock().unwrap().insert("bid".to_string(), true);
                         let _ = responses.send((request_id, "{}".to_string()));
                         let (nav2, loading2) = (nav.clone(), loading.clone());
-                        tokio::spawn(async move {
+                        cairn_common::task::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(40)).await;
                             loading2.lock().unwrap().insert("bid".to_string(), false);
                             let _ = nav2.send(BrowserNavEvent {
@@ -2888,7 +2888,7 @@ mod tests {
         orch.set_browser_loading("bid", true);
 
         let responses = orch.browser_bridge_responses.clone();
-        let task = tokio::spawn(async move {
+        let task = cairn_common::task::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     // Reuse branch: ack without touching the loading flag and

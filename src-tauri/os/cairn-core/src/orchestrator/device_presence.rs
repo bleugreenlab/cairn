@@ -26,7 +26,7 @@ impl Orchestrator {
     /// Spawn the periodic device-presence upsert loop (one row per open team).
     pub fn spawn_device_presence(&self) {
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let device_id = orch.anon_device_manager.device_id();
             let device_name = crate::account::anon_device::machine_device_name();
             let mut interval = tokio::time::interval(PRESENCE_INTERVAL);

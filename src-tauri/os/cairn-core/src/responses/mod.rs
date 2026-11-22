@@ -687,7 +687,7 @@ impl DetachedRequest {
     fn watch(self, response_id: &str, journal_id: Option<&str>) {
         let response_id = response_id.to_owned();
         let journal_id = journal_id.unwrap_or("none").to_owned();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             let (ended, returned_at) = match self.task.await {
                 Ok((Ok(_), returned_at)) => ("result", returned_at),
                 Ok((

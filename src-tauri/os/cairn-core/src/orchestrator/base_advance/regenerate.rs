@@ -1236,7 +1236,7 @@ pub(crate) fn dispatch(orch: &Orchestrator, db: Arc<LocalDb>, project_id: &str, 
         return;
     };
     let (orch, ids, project_id) = (orch.clone(), ids.to_vec(), project_id.to_string());
-    runtime.spawn(async move {
+    cairn_common::task::spawn_on(&runtime, async move {
         for id in &ids {
             run_row(&orch, &db, *id).await;
         }
@@ -1611,7 +1611,7 @@ fn released(orch: &Orchestrator, row: &Regeneration) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    runtime.spawn(async move {
+    cairn_common::task::spawn_on(&runtime, async move {
         let Ok(db) = crate::execution::routing::owning_db_for_project(&orch.db, &project_id).await
         else {
             return;
@@ -1678,7 +1678,7 @@ pub(crate) fn request_owner_preparation(
         return;
     };
     let orch = orch.clone();
-    runtime.spawn(async move {
+    cairn_common::task::spawn_on(&runtime, async move {
         use super::preparation::{prepare_branch, PreparationPurpose, PreparationRequest};
         let (project_id, branch, _) = &key;
         let request = PreparationRequest::new(
@@ -2113,7 +2113,7 @@ mod tests {
         let step = Duration::from_millis(300);
         let settler = {
             let (db, ids) = (db.clone(), ids.clone());
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 for id in ids {
                     tokio::time::sleep(step).await;
                     settle(&db, id, SUCCEEDED, None, None).await.unwrap();

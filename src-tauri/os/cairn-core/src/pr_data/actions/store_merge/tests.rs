@@ -468,7 +468,7 @@ async fn a_local_default_landing_lands_exactly_onto_the_prepared_target() {
     let try_source = || {
         let (orch, store, source) = (fx.orch.clone(), fx.store.clone(), ctx.source_branch.clone());
         async move {
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 orch.reserve_branches(
                     &store,
                     &[&source],
@@ -592,7 +592,7 @@ async fn a_remote_landing_moves_the_store_only_after_origin_accepts_and_blocks_o
     let during = {
         let (orch, store, jj) = (fx.orch.clone(), fx.store.clone(), fx.jj.clone());
         let (source, target) = (ctx.source_branch.clone(), target.clone());
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             tokio::task::spawn_blocking(move || reached_rx.recv())
                 .await
                 .unwrap()

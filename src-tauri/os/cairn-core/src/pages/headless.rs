@@ -440,7 +440,7 @@ fn spawn_writer(
     let (lines, mut outbox) = mpsc::channel::<String>(MAX_READS + 1);
     let queued = Arc::new(AtomicUsize::new(0));
     let drained = queued.clone();
-    let writer = tokio::spawn(async move {
+    let writer = cairn_common::task::spawn(async move {
         while let Some(line) = outbox.recv().await {
             stdin.write_all(line.as_bytes()).await?;
             drained.fetch_sub(line.len(), Ordering::SeqCst);
@@ -548,7 +548,7 @@ async fn run_child(
     let stdin = child.stdin.take().ok_or("the page host has no stdin")?;
     let mut stdout = child.stdout.take().ok_or("the page host has no stdout")?;
     let mut stderr = child.stderr.take().ok_or("the page host has no stderr")?;
-    let stderr_task = tokio::spawn(async move {
+    let stderr_task = cairn_common::task::spawn(async move {
         let mut captured = Vec::new();
         let mut chunk = [0u8; 4096];
         while let Ok(read) = stderr.read(&mut chunk).await {

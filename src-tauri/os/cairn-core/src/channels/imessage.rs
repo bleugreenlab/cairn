@@ -633,7 +633,7 @@ impl IMessageProvider {
 
     pub fn spawn_health_monitor(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let provider = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             loop {
                 provider.refresh_health().await;
                 tokio::time::sleep(HEALTH_INTERVAL).await;
@@ -649,7 +649,7 @@ impl IMessageProvider {
         cursors: mpsc::Sender<i64>,
     ) -> tokio::task::JoinHandle<Result<(), String>> {
         let provider = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             struct ActiveWatch<'a>(&'a AtomicBool);
             impl Drop for ActiveWatch<'_> {
                 fn drop(&mut self) {
@@ -660,7 +660,7 @@ impl IMessageProvider {
             let (line_tx, mut line_rx) = mpsc::channel(128);
             let (started_tx, started_rx) = oneshot::channel();
             let executor = provider.executor.clone();
-            let watch = tokio::spawn(async move {
+            let watch = cairn_common::task::spawn(async move {
                 executor
                     .watch(watch_args(since_rowid), line_tx, started_tx)
                     .await

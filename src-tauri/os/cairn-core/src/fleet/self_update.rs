@@ -58,7 +58,7 @@ pub fn advance(orch: &Orchestrator, now_unix_ms: u64) -> Result<(), String> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             let orch = orch.clone();
-            handle.spawn(async move {
+            cairn_common::task::spawn_on(&handle, async move {
                 for notice in notices {
                     let outcome = deliver_owner_notice(&orch, &notice, unix_now_ms()).await;
                     orch.fleet.note_resident_notice(&notice, outcome);

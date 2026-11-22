@@ -129,7 +129,7 @@ async fn two_machines_with(config: Option<&str>) -> TwoMachines {
         .merge(common::scratch_routes(&orch));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    cairn_common::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let object_url = format!("http://{address}");
     let homes = [temp.path().join("home-a"), temp.path().join("home-b")];
     let pools = [MACHINE_A, MACHINE_B]

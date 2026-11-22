@@ -411,11 +411,11 @@ pub(crate) fn suspend_owned_run_after_handoff_then<F, Fut>(
         .as_ref()
         .is_none_or(|owner| !orch.process_state.is_turn_owner_current(owner))
     {
-        tokio::spawn(after_park(Ok(())));
+        cairn_common::task::spawn(after_park(Ok(())));
         return;
     }
     let mut parked = arm_coalesced_park(orch, run_id, exit_reason, turn_owner);
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let outcome = match parked.recv().await {
             Ok(outcome) => outcome,
             // The park reported nothing at all. Report it as a failed park: a
@@ -465,7 +465,7 @@ fn arm_coalesced_park(
     let orch = orch.clone();
     let run_id = run_id.to_string();
     let exit_reason = exit_reason.to_string();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         tokio::time::sleep(SUSPEND_HANDOFF_GRACE).await;
         // A sibling suspension armed after this one owns the park now.
         if !park_generation_is_current(&orch, &run_id, generation) {
@@ -1296,7 +1296,7 @@ fn stop_session_with_pause_intent(
             // Its check requests end with it, durably, so a restart does not
             // re-drive work the stopped node abandoned.
             let orch = orch.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 crate::execution::checks::requests::cancel_requests_of_stopped_job(&orch, &job_id)
                     .await;
             });

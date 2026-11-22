@@ -671,7 +671,7 @@ pub async fn start(db: std::sync::Arc<LocalDb>, root: PathBuf) {
     if let Err(error) = ingest_with_observation(&db, &root, observe).await {
         tracing::warn!(%error, "rebuild boot ingestion failed");
     }
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

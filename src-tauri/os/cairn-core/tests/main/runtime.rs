@@ -18,7 +18,7 @@ async fn mvcc_allows_read_and_write_overlap() {
 
     let db = Arc::new(db);
     let reader_db = Arc::clone(&db);
-    let reader = tokio::spawn(async move {
+    let reader = cairn_common::task::spawn(async move {
         reader_db
             .read(|conn| {
                 Box::pin(async move {

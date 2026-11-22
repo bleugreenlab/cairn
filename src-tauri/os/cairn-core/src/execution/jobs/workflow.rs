@@ -1464,6 +1464,13 @@ mod redispatch_tests {
         )
         .await
         .unwrap();
+        db.execute(
+            "INSERT INTO runs(id, job_id, project_id, issue_id, session_id, status, created_at, updated_at)
+             VALUES('r-wf', 'j-wf', 'p', 'i', 's', ?1, 1, 1)",
+            (if turn == "running" { "live" } else { "exited" },),
+        )
+        .await
+        .unwrap();
         if with_artifact {
             db.execute(
                 "INSERT INTO artifacts (id, job_id, artifact_type, data, version, output_name, created_at, updated_at) VALUES ('a','j-wf','return','{}',1,'return',1,1)",

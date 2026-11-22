@@ -1034,7 +1034,7 @@ pub async fn enroll(
         .expect("the lifecycle was present a moment ago")
         .clone();
     let emitter = orch.services.emitter.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let outcome = lifecycle.add(declaration, progress.clone()).await;
         match outcome {
             // The lifecycle settled the operation itself, with a cleanup

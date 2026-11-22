@@ -392,7 +392,7 @@ async fn fixture_from(make_repository: fn(&Path) -> String) -> Fixture {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     state.server_url.set(format!("http://{address}")).unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    cairn_common::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
     common::attach_isolated_test_executor(
         &orch,
         executor_home.clone(),

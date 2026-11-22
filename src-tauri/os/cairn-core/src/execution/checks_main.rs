@@ -950,7 +950,7 @@ fn arm(
         return;
     }
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let (mut trigger, mut scope) = (trigger, scope);
         loop {
             let settle = if trigger == Trigger::Startup {
@@ -961,7 +961,7 @@ fn arm(
             tokio::time::sleep(settle).await;
             // Supervised, so a panicking arm still releases the slot and is
             // announced rather than holding the project's cadence forever.
-            let pass = tokio::spawn({
+            let pass = cairn_common::task::spawn({
                 let orch = orch.clone();
                 let project_id = project_id.clone();
                 let repo_path = repo_path.clone();
@@ -1010,12 +1010,12 @@ fn arm(
 /// Run `lane` on `tip`, then on each successor queued for it while it ran.
 fn start_lane(orch: &Orchestrator, tip: Tip, lane: CadenceLane, trigger: Trigger) {
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let (mut tip, mut trigger) = (tip, trigger);
         loop {
             // Supervised, so a panicking run still releases the lane's slot
             // and is announced rather than holding the lane forever.
-            let run = tokio::spawn({
+            let run = cairn_common::task::spawn({
                 let orch = orch.clone();
                 let tip = tip.clone();
                 let lane = lane.clone();
@@ -1356,7 +1356,7 @@ pub(crate) async fn adopt_check_batch(orch: &Orchestrator, claim: &Claim, waiter
         finish_adoption_slots(orch, claim, &indices);
         return;
     }
-    let work = tokio::spawn({
+    let work = cairn_common::task::spawn({
         let orch = orch.clone();
         let claim = claim.clone();
         let indices = indices.clone();
@@ -1595,7 +1595,7 @@ async fn adopt_at_boot(orch: &Orchestrator) {
     // Reserve every old lane before any batch or startup arm can race it.
     for (claim, waiters) in batches {
         let orch = orch.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             adopt_check_batch(&orch, &claim, waiters).await;
         });
     }
@@ -1656,7 +1656,7 @@ pub(crate) async fn origin_observed(orch: &Orchestrator) {
 /// interval: boot already armed every project.
 pub(crate) fn spawn_heartbeat(orch: &Orchestrator) {
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut ticks =
             tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2305,7 +2305,7 @@ fn rearm_on_debt_settlement(orch: &Orchestrator, context: &PassContext<'_>, lane
     let repo_path = context.repo_path.to_string();
     let default_branch = context.default_branch.to_string();
     let scope = LaneScope::lane(lane);
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         orch.fleet.purpose_debt_cleared(&key).await;
         orch.main_cadence.lock().unwrap().debt_settled(&key);
         log::info!(
@@ -7179,7 +7179,7 @@ mod tests {
         let mut cleared = {
             let fleet = fleet.clone();
             let key = key.clone();
-            tokio::spawn(async move { fleet.purpose_debt_cleared(&key).await })
+            cairn_common::task::spawn(async move { fleet.purpose_debt_cleared(&key).await })
         };
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut cleared)
@@ -7884,7 +7884,7 @@ mod tests {
             // A resend of the still-open claim must also yield without ACK.
             assert_eq!(adopt(&orch, result.clone()).await, Adoption::Undecided);
         } else {
-            let mut boot = tokio::spawn({
+            let mut boot = cairn_common::task::spawn({
                 let orch = orch.clone();
                 async move { adopt_at_boot(&orch).await }
             });
@@ -8082,7 +8082,7 @@ mod tests {
             );
         }
         let driver = if pending_bind {
-            let driver = tokio::spawn({
+            let driver = cairn_common::task::spawn({
                 let orch = orch.clone();
                 let db = db.clone();
                 let claim = claim.clone();

@@ -337,12 +337,18 @@ fn render_job_summary_header(
     let mut output = match (status, hold, stopped) {
         _ if never_launched => format!("# {name} [? not launched]\n\n"),
         ("failed", _, _) => format!("# {name} [{icon} Failed]\n\n"),
+        ("cancelled", _, _) => format!("# {name} [Cancelled]\n\n"),
         (_, Some(hold), _) => format!("# {name} [{icon} {}]\n\n", hold.qualifier()),
         (_, None, Some(stopped)) => format!("# {name} [{}]\n\n", stopped.label()),
         (_, None, None) => format!("# {name} [{icon}]\n\n"),
     };
     append_optional_timestamp(&mut output, "Started", started_at);
-    append_optional_timestamp(&mut output, "Completed", completed_at);
+    let terminal_label = if status == "cancelled" {
+        "Cancelled"
+    } else {
+        "Completed"
+    };
+    append_optional_timestamp(&mut output, terminal_label, completed_at);
     output.push('\n');
     if let Some(hold) = hold {
         output.push_str(&format!("Not taking a turn: {}.\n\n", hold.render()));
@@ -5528,6 +5534,15 @@ mod history_parity_tests {
 mod hold_header_tests {
     use super::render_job_summary_header;
     use crate::messages::delivery::{Hold, ProviderLimitGate};
+
+    #[test]
+    fn cancelled_unstarted_node_does_not_claim_completion() {
+        let header =
+            render_job_summary_header("planner", "cancelled", None, Some(10), None, false, None);
+        assert!(header.contains("Cancelled:"));
+        assert!(!header.contains("Completed:"));
+        assert!(!header.contains("Started:"));
+    }
 
     /// `running` alone reads exactly like a node mid-turn, so a held node's
     /// title carries the hold and the summary says what releases it.

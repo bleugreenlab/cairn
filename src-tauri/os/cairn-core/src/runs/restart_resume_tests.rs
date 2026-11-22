@@ -679,7 +679,7 @@ fn attach_answering_executor(
     let operations = Arc::new(Mutex::new(Vec::new()));
     let log = operations.clone();
     let slug = slug.to_string();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         while let Some(message) = receiver.recv().await {
             let ExecutorMessage::ResidencyRequest {
                 correlation_id,

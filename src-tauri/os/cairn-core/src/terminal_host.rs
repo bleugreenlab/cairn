@@ -369,7 +369,7 @@ async fn superseded_fence_loss(
 
 pub fn schedule_terminal_lifecycle_recovery(orch: Orchestrator) {
     start_owner_recovery_clock();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let mut liveness = ProcessLossWatch::default();
         loop {
             if let Err(error) = reconcile_terminal_lifecycle(&orch).await {
@@ -1161,7 +1161,7 @@ pub(crate) fn terminal_owner_recovery_window_elapsed() -> bool {
 /// when the terminal process itself exited.
 pub fn schedule_exited_terminal_lease_recovery(orch: Orchestrator) {
     let started = start_owner_recovery_clock();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let deadline = started + terminal_owner_recovery_duration();
         tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
         let advertised: HashSet<(String, String, u64)> = orch

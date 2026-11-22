@@ -3313,14 +3313,14 @@ pub(crate) mod tests {
         let mut sweeps = Vec::new();
         for _ in 0..4 {
             let orch = env.orch.clone();
-            sweeps.push(tokio::spawn(async move {
+            sweeps.push(cairn_common::task::spawn(async move {
                 sweep(&orch).await.unwrap().released.len()
             }));
         }
         let mut evaluations = Vec::new();
         for _ in 0..2 {
             let (orch, id) = (env.orch.clone(), id.clone());
-            evaluations.push(tokio::spawn(async move {
+            evaluations.push(cairn_common::task::spawn(async move {
                 usize::from(evaluate_execution(&orch, &id).await.unwrap().released)
             }));
         }

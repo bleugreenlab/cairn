@@ -1099,7 +1099,7 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        cairn_common::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://127.0.0.1:{port}/token"), hits)
     }
 

@@ -546,20 +546,20 @@ fn delay_after(
 pub fn spawn(orch: Orchestrator, relay_url: String) {
     let doorbell = Arc::new(Doorbell::default());
     super::ws::publish(doorbell.clone());
-    tokio::spawn({
+    cairn_common::task::spawn({
         let orch = orch.clone();
         async move { super::custody::restore(&orch.db.local).await }
     });
-    tokio::spawn(crate::github::webhook::maintain(
+    cairn_common::task::spawn(crate::github::webhook::maintain(
         orch.clone(),
         relay_url.clone(),
     ));
-    tokio::spawn(super::ws::maintain(
+    cairn_common::task::spawn(super::ws::maintain(
         orch.clone(),
         relay_url.clone(),
         doorbell.clone(),
     ));
-    tokio::spawn(run(orch, relay_url, doorbell));
+    cairn_common::task::spawn(run(orch, relay_url, doorbell));
 }
 
 /// Sync, then wait for the timer, the doorbell, or a repair, forever.
@@ -861,7 +861,8 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let task =
+            cairn_common::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, task)
     }
 

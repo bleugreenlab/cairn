@@ -1119,7 +1119,7 @@ async fn merge_pr_for_job_past_barrier(
     // Background reconciliation, shared with the GitHub webhook merge path. The
     // local fold already advanced the checkout ref, so reconciliation repairs the
     // checkout without an unnecessary network pull.
-    tokio::spawn(reconcile_after_merge(
+    cairn_common::task::spawn(reconcile_after_merge(
         orch.clone(),
         db,
         merge_context,

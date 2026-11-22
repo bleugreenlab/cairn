@@ -1640,10 +1640,10 @@ async fn insert_issue_execution_atomic(
                         .await?;
                     }
                 }
-                // A held filing beside live work must not drag the issue's
-                // projection; one on a fresh issue projects it backlog.
-                crate::transitions::outcome::recompute_issue_status_conn(conn, &issue_id).await?;
             }
+            // Filing changes attempt ownership before preparation or any run.
+            // Publish its projection in this transaction, including held filings.
+            crate::transitions::outcome::recompute_issue_status_conn(conn, &issue_id).await?;
 
             Ok(IssueLaunch {
                 seq,

@@ -520,7 +520,7 @@ pub(crate) fn spawn_refresh(
         return;
     }
     let orch = orch.clone();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let result = refresh(&orch, &project_id, &repo_path, &default_branch).await;
         release(&orch, &project_id);
         if let Err(error) = result {

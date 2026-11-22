@@ -167,7 +167,7 @@ impl EventLogPolicy {
 
 /// Start both lanes and the hourly prune. Started once per runner.
 pub fn spawn_fact_log_worker(orch: Orchestrator) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let policy = EventLogPolicy::load(&orch.config_dir);
         let now = chrono::Utc::now().timestamp_millis();
         match crate::storage::recover_fact_log(
@@ -195,8 +195,8 @@ pub fn spawn_fact_log_worker(orch: Orchestrator) {
             Ok(_) => {}
             Err(error) => log::warn!("fact log recovery failed: {error}"),
         }
-        tokio::spawn(index_loop(orch.clone(), policy.clone()));
-        tokio::spawn(route_loop(orch, policy));
+        cairn_common::task::spawn(index_loop(orch.clone(), policy.clone()));
+        cairn_common::task::spawn(route_loop(orch, policy));
     });
 }
 
@@ -2381,7 +2381,7 @@ mod tests {
         assert_eq!(row(&db, stuck).await.route_state, route_state::QUEUED);
 
         let lane_orch = orch.clone();
-        let lane = tokio::spawn(async move {
+        let lane = cairn_common::task::spawn(async move {
             let policy = EventLogPolicy {
                 dispatch_timeout: Duration::from_secs(3600),
                 ..EventLogPolicy::default()

@@ -235,7 +235,7 @@ impl VoiceService {
             return;
         }
         let voice = self.handle.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             voice.refresh_engine().await;
             voice.warm_dictation_model().await;
         });
@@ -312,7 +312,7 @@ impl VoiceServiceHandle {
     /// [`Self::warm_dictation_model`].
     pub fn prewarm_dictation(&self) {
         let voice = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             voice.warm_dictation_model().await;
         });
     }
@@ -1220,7 +1220,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = requested.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 1024];
@@ -1953,7 +1953,7 @@ done
 
         let transcribing = {
             let voice = voice.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 voice
                     .transcribe_file(Path::new("/tmp/whatever.wav"), VoiceModel::Fast, None)
                     .await
@@ -1998,7 +1998,7 @@ done
 
         let closing = {
             let voice = voice.clone();
-            tokio::spawn(async move { voice.stream_finish(stream).await })
+            cairn_common::task::spawn(async move { voice.stream_finish(stream).await })
         };
         // Inside the second the engine takes to answer the close.
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2100,7 +2100,7 @@ done
         let voice = harness.voice();
         let transcribing = {
             let voice = voice.clone();
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 voice
                     .transcribe_file(Path::new("/tmp/whatever.wav"), VoiceModel::Fast, None)
                     .await

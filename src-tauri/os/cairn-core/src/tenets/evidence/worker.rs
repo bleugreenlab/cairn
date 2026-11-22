@@ -151,7 +151,7 @@ impl EvidenceDeps for OrchestratorDeps {
 /// startup sweep.
 pub fn spawn(orch: Orchestrator) {
     let hint = orch.tenet_evidence_hint();
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let anon = orch.anon_device_manager.clone();
         let device = match tokio::task::spawn_blocking(move || anon.device_id()).await {
             Ok(device) => device,

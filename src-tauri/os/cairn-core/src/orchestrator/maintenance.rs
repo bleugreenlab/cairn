@@ -21,7 +21,7 @@ impl Orchestrator {
     /// [`STEADY_INTERVAL`].
     pub fn spawn_codex_home_retention(&self) {
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             loop {
                 let backlog = orch
                     .run_codex_home_retention()
@@ -80,7 +80,7 @@ impl Orchestrator {
     /// next hour's pass still runs.
     pub fn spawn_ref_store_maintenance(&self) {
         let orch = self.clone();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             loop {
                 let pass = orch.clone();
                 let joined = crate::orchestrator::base_advance::supervised_sweep_pass(async move {

@@ -1167,7 +1167,7 @@ impl Drop for ResourceWriteProgress {
         let (db, call) = (self.db.clone(), self.call.clone());
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(async move {
+                cairn_common::task::spawn_on(&runtime, async move {
                     seal_if_pending(&db, &call.run_id, &call.id, &report).await
                 });
             }
@@ -1682,7 +1682,7 @@ mod tests {
             run_id: call.run_id.clone(),
             id: call.id.clone(),
         };
-        let competing = tokio::spawn(async move {
+        let competing = cairn_common::task::spawn(async move {
             claim_resource_call_with_timeout(
                 &competing_db,
                 &competing_call,

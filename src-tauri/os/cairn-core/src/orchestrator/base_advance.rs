@@ -1995,7 +1995,7 @@ struct ResidencyRefresh {
 /// A vacancy refresh deliberately resolves the job's branch again. Multiple
 /// advances can have happened while its batch held the executor operation lock.
 pub(crate) fn refresh_vacated_job_terminals(orch: Orchestrator, job_id: String) {
-    tokio::spawn(async move {
+    cairn_common::task::spawn(async move {
         let result: Result<(), String> = async {
             let Some((db, project_id, branch, _)) = vacated_job_head(&orch, &job_id).await? else {
                 return Ok(());
@@ -2154,7 +2154,7 @@ async fn refresh_terminal_residencies(
         // observing JoinHandle (for example, after_install's timeout) cannot
         // release the home or let a newer refresh overtake this remote work.
         let orch = orch.clone();
-        let completion = tokio::spawn(async move {
+        let completion = cairn_common::task::spawn(async move {
             let _ordered = ordered;
             let _reservation = reservation;
             let new_tip = current_head.as_str();
@@ -2949,7 +2949,7 @@ pub(crate) async fn supervised_sweep_pass<F>(pass: F) -> Result<(), String>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(pass)
+    cairn_common::task::spawn(pass)
         .await
         .map_err(|error| format!("sweep pass did not complete: {error}"))
 }
@@ -5225,7 +5225,7 @@ mod tests {
         let orch = h.orch.clone();
         let db = h.db.clone();
         let desired = newest.clone();
-        let mut ordinary = Some(tokio::spawn(async move {
+        let mut ordinary = Some(cairn_common::task::spawn(async move {
             refresh_residencies_for_branch(&orch, &db, "proj-1", BRANCH, &desired).await
         }));
         let mut resume = Some(resume);
@@ -5506,7 +5506,7 @@ mod tests {
             });
         let orch = Arc::new(test_orchestrator(db, git));
         let reconcile_orch = orch.clone();
-        let reconcile = tokio::spawn(async move {
+        let reconcile = cairn_common::task::spawn(async move {
             reconcile_default_advance(&reconcile_orch, "proj-1", "integration").await
         });
         entered_rx

@@ -48,8 +48,8 @@ pub fn spawn(orch: Orchestrator, sender: &EraSummarySender) {
     if let Ok(mut slot) = sender.lock() {
         *slot = Some(tx.clone());
     }
-    tokio::spawn(run(orch.clone(), rx));
-    tokio::spawn(async move {
+    cairn_common::task::spawn(run(orch.clone(), rx));
+    cairn_common::task::spawn(async move {
         for job in fallback_eras(&orch).await {
             if tx.send(job).await.is_err() {
                 break;

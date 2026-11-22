@@ -698,7 +698,7 @@ pub(crate) fn spawn_recipe_scheduler(orch: Orchestrator) {
         orch.sweep_pulse.clone(),
         orch.services.clock.clone(),
     );
-    tokio::spawn(run_scheduler_loop(orch));
+    cairn_common::task::spawn(run_scheduler_loop(orch));
 }
 
 #[cfg(test)]
@@ -1140,7 +1140,7 @@ edges:
             .acquire(AdmissionSite::SweepPass, "1 candidates")
             .await
             .unwrap();
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             drop(guard);
         });

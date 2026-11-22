@@ -515,7 +515,7 @@ async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
         let surface_orch = orch.clone();
         let surface_provider: Arc<dyn discord::DiscordApi> = provider.clone();
         let card_provider: Arc<dyn ChannelProvider> = provider.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(cairn_common::task::spawn(async move {
             loop {
                 let now = chrono::Utc::now().timestamp();
                 for db in surface_orch.db.all_dbs().await {
@@ -1523,9 +1523,9 @@ pub use cairn_channels::{
 pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
     crate::routes::spawn_attention_minter(orch.clone());
     crate::routes::feedback::spawn(orch.clone());
-    tokio::spawn(supervise_telegram(orch.clone()));
-    tokio::spawn(supervise_discord(orch.clone()));
-    tokio::spawn(async move {
+    cairn_common::task::spawn(supervise_telegram(orch.clone()));
+    cairn_common::task::spawn(supervise_discord(orch.clone()));
+    cairn_common::task::spawn(async move {
         loop {
             let config = crate::config::settings::load_settings(&orch.config_dir)
                 .channels
@@ -1649,7 +1649,7 @@ async fn spawn_imessage(
     let health_task = provider.spawn_health_monitor();
     let watch_provider = provider.clone();
     let cursor_db = orch.db.local.clone();
-    let watch_task = tokio::spawn(async move {
+    let watch_task = cairn_common::task::spawn(async move {
         loop {
             let since = ledger::get_cursor(&cursor_db, "imessage")
                 .await
@@ -2192,7 +2192,7 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attached = Arc::new(tokio::sync::Notify::new());
         let (attempted_tx, mut attempted_rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(supervise_admission(
+        let task = cairn_common::task::spawn(supervise_admission(
             || Some(()),
             {
                 let attempts = attempts.clone();

@@ -2312,7 +2312,7 @@ async fn claude_launch_during_first_install_completes_its_turn() {
     });
     gate.wait_for_a_download();
 
-    let launch = tokio::spawn({
+    let launch = cairn_common::task::spawn({
         let orch = orch.clone();
         async move { launch_claude(&orch, "run-install", "sess-install").await }
     });
