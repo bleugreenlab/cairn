@@ -1218,6 +1218,7 @@ pub struct TurnEndCancel {
 }
 
 struct TurnEndCancelInner {
+    attempt_id: String,
     reason: AtomicU8,
     notify: tokio::sync::Notify,
     status: Mutex<Option<TurnEndCheckRuntimeStatus>>,
@@ -1262,8 +1263,15 @@ fn now_unix_ms() -> u64 {
 
 impl Default for TurnEndCancel {
     fn default() -> Self {
+        Self::for_attempt("")
+    }
+}
+
+impl TurnEndCancel {
+    fn for_attempt(attempt_id: &str) -> Self {
         Self {
             inner: Arc::new(TurnEndCancelInner {
+                attempt_id: attempt_id.to_string(),
                 reason: AtomicU8::new(NOT_CANCELLED),
                 notify: tokio::sync::Notify::new(),
                 status: Mutex::new(None),
@@ -1274,6 +1282,10 @@ impl Default for TurnEndCancel {
 }
 
 impl TurnEndCancel {
+    pub(crate) fn attempt_id(&self) -> &str {
+        &self.inner.attempt_id
+    }
+
     /// Signal cancellation. Idempotent.
     pub(crate) fn cancel(&self, reason: TurnEndCancelReason) {
         if self
@@ -3140,7 +3152,7 @@ impl Orchestrator {
         // Registration and writes share the generation lock, so an old writer
         // already inside it finishes before the new generation is installed.
         self.register_review_log_generation(job_id, attempt_id);
-        let cancel = TurnEndCancel::default();
+        let cancel = TurnEndCancel::for_attempt(attempt_id);
         map.insert(job_id.to_string(), cancel.clone());
         drop(map);
         if let Ok(mut jobs) = self.recent_turn_end_check_requests.lock() {
@@ -3282,12 +3294,18 @@ impl Orchestrator {
         }
     }
 
-    /// Signal any in-flight turn-end check suite for `job_id` to quit. Best-effort
-    /// and idempotent: a no-op when no suite is in flight for the job. Fired when
-    /// the job's issue reaches a terminal state, its branch advances beyond the
-    /// checked tree, or a user explicitly cancels the suite.
-    /// Signal the job's in-flight turn-end check wave, reporting whether there
-    /// was one to signal.
+    /// Capture a wave's identity and cancellation token together, even before
+    /// it has published a plan. The handle never addresses a later successor.
+    pub(crate) fn turn_end_wave_handle(&self, job_id: &str) -> Option<TurnEndCancel> {
+        self.turn_end_checks_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(job_id)
+            .cloned()
+    }
+
+    /// Signal any in-flight turn-end check suite for `job_id` to quit.
+    /// Best-effort and idempotent; reports whether a wave was present.
     pub fn cancel_turn_end_checks(&self, job_id: &str, reason: TurnEndCancelReason) -> bool {
         let signalled = match self.turn_end_checks_in_flight.lock() {
             Ok(map) => match map.get(job_id) {

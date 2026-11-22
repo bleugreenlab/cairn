@@ -404,6 +404,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("jobs", project_jobs_where!()),
     owned("feed_cursors", &[owner(OwnerSet::Threads, "(home_kind = 'thread' AND home_id IN {ids})"), owner(OwnerSet::Jobs, "(home_kind = 'job' AND home_id IN {ids})")]),
     spec("turn_end_check_attempts", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
+    spec("replay_comparisons", "project_id = ?1"),
     spec("artifact_content", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("artifacts", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("job_artifact_inputs", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),

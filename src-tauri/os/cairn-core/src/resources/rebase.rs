@@ -237,8 +237,28 @@ pub(crate) async fn read_node_rebase(
         }
         None => String::new(),
     };
+    let comparison_section = if matches!(request.view, RebaseView::Summary) {
+        let health = match rows.project_id() {
+            Some(project_id) => {
+                crate::orchestrator::base_advance::replay_comparisons::health(
+                    &db,
+                    project_id,
+                    Some(&branch),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+            }
+            None => Err("This node's project identity could not be read".to_string()),
+        };
+        format!(
+            "\n## Replay comparison health\n\n{}\n",
+            crate::orchestrator::base_advance::replay_comparisons::render(&health)
+        )
+    } else {
+        String::new()
+    };
     let request_section = format!(
-        "{}{cost_section}{regeneration_section}",
+        "{}{cost_section}{regeneration_section}{comparison_section}",
         explicit_request_section(orch, &db, &rows.job_id, &branch).await,
     );
     let session = match load_active_session(&db, &branch).await {

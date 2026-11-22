@@ -945,6 +945,20 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
         "\nManage references: `{}`\n\n",
         build_project_references_uri(&canonical_key)
     ));
+    // Shared comparison evidence is not an executor's ref-maintenance sample.
+    let comparison_health = crate::orchestrator::base_advance::replay_comparisons::health(
+        db,
+        &project_id,
+        None,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await;
+    output.push_str("\n## Store health\n\n");
+    output.push_str("Project-wide, from the owning database, independent of executor or local repository registration.\n\n");
+    output.push_str(
+        &crate::orchestrator::base_advance::replay_comparisons::render(&comparison_health),
+    );
+    output.push('\n');
     if !repo_path.trim().is_empty() {
         let overview = crate::vcs_maintenance::ref_store_overview(
             orch,

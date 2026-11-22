@@ -763,3 +763,63 @@ async fn a_clean_carry_notes_only_the_branch_owner() {
     assert!(to(&all, TASK_RUN).is_empty(), "{all:?}");
     assert!(to(&all, IDLE_TASK_RUN).is_empty(), "{all:?}");
 }
+
+fn patch_compare_budgets() -> &'static Mutex<HashMap<PathBuf, Duration>> {
+    static BUDGETS: OnceLock<Mutex<HashMap<PathBuf, Duration>>> = OnceLock::new();
+    BUDGETS.get_or_init(Default::default)
+}
+
+pub(super) fn patch_compare_budget(store: &Path) -> Option<Duration> {
+    patch_compare_budgets().lock().unwrap().remove(store)
+}
+
+/// Fault the comparison, not the replay: a real accepted branch advance keeps
+/// the in-flight wave and records the failed measurement on its durable row.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn unreadable_replay_comparison_keeps_a_real_wave_and_records_the_row() {
+    let h = harness_or_skip!("prep_unreadable_comparison");
+    h.commit(&h.branch_ws, BRANCH, "own.txt", "mine\n");
+    h.advance_main("incoming.txt", "theirs\n");
+    let attempt =
+        crate::execution::checks_turn_end::request_turn_end_attempt(&h.orch, JOB).unwrap();
+    crate::execution::checks_turn_end::transition_turn_end_attempt(
+        &h.orch, JOB, &attempt, "claimed", None,
+    )
+    .unwrap();
+    let wave = h.orch.try_begin_turn_end_checks(JOB, &attempt).unwrap();
+    patch_compare_budgets()
+        .lock()
+        .unwrap()
+        .insert(h.store.clone(), Duration::ZERO);
+    let prepared = h.prepare(PreparationPurpose::Check).await.unwrap();
+    assert!(prepared.advanced);
+    assert!(
+        !wave.is_cancelled(),
+        "an exhausted comparison budget proves no change"
+    );
+    let row = crate::execution::checks_turn_end::current_turn_end_attempt(&h.db, JOB)
+        .await
+        .unwrap()
+        .unwrap();
+    let reason = row.reason.unwrap_or_default();
+    assert!(
+        reason.contains("replay: comparison unreadable ("),
+        "{reason}"
+    );
+    assert_eq!(
+        row.state, "claimed",
+        "keeping a wave does not terminalize it"
+    );
+
+    // The next advance really compares again instead of caching unreadability.
+    h.advance_main("another.txt", "next\n");
+    assert!(h.prepare(PreparationPurpose::Check).await.unwrap().advanced);
+    assert!(!wave.is_cancelled());
+    let row = crate::execution::checks_turn_end::current_turn_end_attempt(&h.db, JOB)
+        .await
+        .unwrap()
+        .unwrap();
+    let reason = row.reason.unwrap_or_default();
+    assert!(reason.contains("replay: comparison unchanged"), "{reason}");
+}

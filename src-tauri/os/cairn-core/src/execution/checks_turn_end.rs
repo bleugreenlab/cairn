@@ -350,6 +350,102 @@ pub(crate) fn request_turn_end_attempt(
     Ok(attempt_id)
 }
 
+/// Append evidence to the exact wave captured before an advance. Updating both
+/// columns atomically keeps the row self-contained even if it settles while this
+/// write is queued. Lifecycle writes compose their reason with the durable suffix.
+pub(crate) async fn record_branch_advance(
+    db: &LocalDb,
+    job_id: &str,
+    attempt_id: &str,
+    advance: &crate::execution::checks::BranchAdvance,
+) -> Result<(), String> {
+    let disposition = if advance.supersedes_review() {
+        "superseded; cancellation requested"
+    } else {
+        "kept; verdicts remain at the wave's original head, not the advanced head"
+    };
+    let evidence = format!("\nBranch advance: {} — {disposition}", advance.describe());
+    #[cfg(test)]
+    branch_advance_pause::wait(attempt_id).await;
+    let changed = db
+        .execute(
+            "UPDATE turn_end_check_attempts
+            SET branch_advance_reason = branch_advance_reason || ?1,
+                reason = COALESCE(reason,'') || ?1
+          WHERE id = ?2 AND job_id = ?3",
+            (evidence.as_str(), attempt_id, job_id),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err(format!(
+            "turn-end attempt {attempt_id} for job {job_id} was not found"
+        ));
+    }
+    Ok(())
+}
+
+/// A one-shot pause scoped to one attempt, so concurrent tests never block
+/// each other's evidence writes. Dropping the guard always releases the writer.
+#[cfg(test)]
+mod branch_advance_pause {
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    struct Pause {
+        entered: Notify,
+        resume: Notify,
+    }
+
+    static PAUSES: Mutex<Vec<(String, Arc<Pause>)>> = Mutex::new(Vec::new());
+
+    pub(super) struct Guard {
+        attempt: String,
+        pause: Arc<Pause>,
+    }
+
+    pub(super) fn hold(attempt: &str) -> Guard {
+        let pause = Arc::new(Pause {
+            entered: Notify::new(),
+            resume: Notify::new(),
+        });
+        let mut pauses = PAUSES.lock().unwrap();
+        assert!(!pauses.iter().any(|(id, _)| id == attempt));
+        pauses.push((attempt.to_string(), pause.clone()));
+        Guard {
+            attempt: attempt.to_string(),
+            pause,
+        }
+    }
+
+    impl Guard {
+        pub(super) async fn entered(&self) {
+            self.pause.entered.notified().await;
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PAUSES.lock().unwrap().retain(|(id, _)| id != &self.attempt);
+            self.pause.resume.notify_one();
+        }
+    }
+
+    pub(super) async fn wait(attempt: &str) {
+        let pause = {
+            let mut pauses = PAUSES.lock().unwrap();
+            pauses
+                .iter()
+                .position(|(id, _)| id == attempt)
+                .map(|index| pauses.remove(index).1)
+        };
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+}
+
 pub(crate) fn transition_turn_end_attempt(
     orch: &Orchestrator,
     job_id: &str,
@@ -371,7 +467,7 @@ pub(crate) fn transition_turn_end_attempt(
             .await
             .map_err(|e| e.to_string())?;
         db.write(move |conn| { let job=job.clone(); let id=id.clone(); let state=state.clone(); let reason=reason.clone(); Box::pin(async move {
-            let changed=conn.execute("UPDATE turn_end_check_attempts SET state=?1,reason=?2,updated_at=unixepoch()*1000 WHERE id=?3 AND job_id=?4",(state.as_str(),reason.as_deref(),id.as_str(),job.as_str())).await?;
+            let changed=conn.execute("UPDATE turn_end_check_attempts SET state=?1,reason=NULLIF(COALESCE(?2,'') || branch_advance_reason,''),updated_at=unixepoch()*1000 WHERE id=?3 AND job_id=?4",(state.as_str(),reason.as_deref(),id.as_str(),job.as_str())).await?;
             if changed != 1 { return Err(crate::storage::DbError::Row(format!("turn-end attempt {id} for job {job} was not found"))); }
             // The in-memory single-flight winner is not necessarily the first
             // requester. Transfer the durable pointer in the same transaction
@@ -413,7 +509,7 @@ pub(crate) fn abandon_turn_end_attempt(
             .await
             .map_err(|e| e.to_string())?;
         db.execute(
-            "UPDATE turn_end_check_attempts SET state='failed',reason=?1,updated_at=unixepoch()*1000
+            "UPDATE turn_end_check_attempts SET state='failed',reason=?1 || branch_advance_reason,updated_at=unixepoch()*1000
               WHERE id=?2 AND job_id=?3
                 AND state IN ('requested','claimed','runtime_started','deferred','submitted')",
             (reason.as_str(), id.as_str(), job.as_str()),
@@ -488,7 +584,8 @@ pub(crate) const RUNNER_STOP_CANCELLED_REASON: &str = "the runner stopped while 
 pub(crate) fn attempt_interrupted_by_restart(state: &str, reason: Option<&str>) -> bool {
     state == "failed"
         && reason.is_some_and(|reason| {
-            reason == RESTART_INTERRUPTED_REASON || reason.starts_with(RUNNER_STOP_CANCELLED_REASON)
+            reason.split("\nBranch advance: ").next() == Some(RESTART_INTERRUPTED_REASON)
+                || reason.starts_with(RUNNER_STOP_CANCELLED_REASON)
         })
 }
 
@@ -883,7 +980,7 @@ pub(crate) async fn reconcile_turn_end_attempts_on_startup(orch: &Orchestrator) 
     const REASON: &str = RESTART_INTERRUPTED_REASON;
     for db in orch.db.all_dbs().await {
         if let Err(error)=db.write(|conn| Box::pin(async move {
-            conn.execute("UPDATE turn_end_check_attempts SET state='failed',reason=?1,updated_at=unixepoch()*1000 WHERE state IN ('requested','claimed','runtime_started','deferred','submitted')",(REASON,)).await?;
+            conn.execute("UPDATE turn_end_check_attempts SET state='failed',reason=?1 || branch_advance_reason,updated_at=unixepoch()*1000 WHERE state IN ('requested','claimed','runtime_started','deferred','submitted')",(REASON,)).await?;
             Ok::<_,crate::storage::DbError>(())
         })).await { log::warn!("startup turn-end attempt reconciliation failed: {error}"); }
     }
@@ -3176,7 +3273,23 @@ pub(crate) async fn render_turn_end_checks_section(
 ) -> Option<String> {
     if let Some(retired) = crate::execution::checks_status::node_retirement(orch, job_id).await {
         let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await;
-        return Some(format_retired_checks_section(&retired, statuses.as_deref()));
+        let mut section = format_retired_checks_section(&retired, statuses.as_deref());
+        if let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await {
+            if let Ok(Some(evidence)) = db
+                .query_text(
+                    "SELECT a.branch_advance_reason FROM jobs j
+                 JOIN turn_end_check_attempts a ON a.id=j.turn_end_check_attempt_id WHERE j.id=?1",
+                    (job_id.to_string(),),
+                )
+                .await
+            {
+                if !evidence.is_empty() {
+                    section.push_str(&evidence);
+                    section.push('\n');
+                }
+            }
+        }
+        return Some(section);
     }
     let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await;
     let live = orch.turn_end_check_runtime_status(job_id).is_some();
@@ -3294,6 +3407,19 @@ async fn review_progress_header(orch: &Orchestrator, job_id: &str) -> String {
         None => latest_attempt_absence(orch, job_id).await,
     };
     if let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await {
+        if let Some(runtime) = runtime.as_ref() {
+            match db.query_text(
+                "SELECT branch_advance_reason FROM turn_end_check_attempts WHERE id=?1 AND job_id=?2",
+                (runtime.attempt_id.clone(), job_id.to_string()),
+            ).await {
+                Ok(Some(evidence)) if !evidence.is_empty() => {
+                    header.push('\n');
+                    header.push_str(&evidence);
+                }
+                Err(error) => header.push_str(&format!("\n\nBranch-advance evidence unreadable: {error}")),
+                _ => {}
+            }
+        }
         if let Some(line) = recorded_wave_timing(&db, job_id)
             .await
             .as_ref()
@@ -5077,6 +5203,257 @@ mod tests {
         let services =
             std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build());
         crate::orchestrator::OrchestratorBuilder::new(db_state, services, config_dir).build()
+    }
+
+    /// Diagnostic persistence cannot delay cancellation or consume the successor
+    /// owed when a superseded wave releases, even for a sibling not yet recorded.
+    #[tokio::test]
+    async fn branch_advance_evidence_wait_cannot_delay_shared_cancellation_or_successors() {
+        use crate::execution::checks::{cancel_stale_review_on_branch_advance, BranchAdvance};
+        use crate::orchestrator::base_advance::ReplayComparison;
+
+        for advance in [
+            BranchAdvance::Commit,
+            BranchAdvance::BaseReplay {
+                comparison: ReplayComparison::Changed,
+            },
+        ] {
+            let orch = launchability_orchestrator("active", "complete").await;
+            let db = &orch.db.local;
+            db.execute_script(
+                "UPDATE jobs SET branch='shared' WHERE id='j-1';
+                 INSERT INTO jobs(id,project_id,issue_id,execution_id,status,node_name,uri_segment,branch,created_at,updated_at)
+                 VALUES('j-2','p','i','e','complete','task','task','shared',1,1);",
+            ).await.unwrap();
+            let first = request_turn_end_attempt(&orch, "j-1").unwrap();
+            let first_slot = orch.try_begin_turn_end_checks("j-1", &first).unwrap();
+            transition_turn_end_attempt(&orch, "j-1", &first, "claimed", None).unwrap();
+            let sibling = request_turn_end_attempt(&orch, "j-2").unwrap();
+            let sibling_slot = orch.try_begin_turn_end_checks("j-2", &sibling).unwrap();
+            transition_turn_end_attempt(&orch, "j-2", &sibling, "claimed", None).unwrap();
+
+            // The owner is always the first item from jobs_sharing_branch.
+            let pause = branch_advance_pause::hold(&first);
+            let expected = advance.describe();
+            let mut advancing =
+                Box::pin(cancel_stale_review_on_branch_advance(&orch, "j-1", advance));
+            tokio::select! {
+                _ = pause.entered() => {}
+                _ = &mut advancing => panic!("advance completed without reaching its evidence pause"),
+            }
+            assert_eq!(
+                first_slot.cancel().cancel_reason(),
+                Some(TurnEndCancelReason::BranchAdvanced)
+            );
+            assert_eq!(
+                sibling_slot.cancel().cancel_reason(),
+                Some(TurnEndCancelReason::BranchAdvanced)
+            );
+
+            // Finish both waves while the first evidence write is still blocked.
+            // These fixtures have no PR topology: an owed successor creates an
+            // attempt then skips it, providing an observable arm without fleet work.
+            first_slot
+                .finish("completed", "finished during evidence wait")
+                .await;
+            sibling_slot
+                .finish("completed", "finished during evidence wait")
+                .await;
+            let next_first = current_turn_end_attempt(db, "j-1").await.unwrap().unwrap();
+            let next_sibling = current_turn_end_attempt(db, "j-2").await.unwrap().unwrap();
+            assert_ne!(
+                next_first.id, first,
+                "release must arm the owner's successor"
+            );
+            assert_ne!(
+                next_sibling.id, sibling,
+                "release must arm the sibling's successor"
+            );
+            assert_eq!(next_first.state, "skipped");
+            assert_eq!(next_sibling.state, "skipped");
+
+            drop(pause);
+            advancing.await;
+            for (old, next) in [(&first, &next_first.id), (&sibling, &next_sibling.id)] {
+                let reason = db.query_text(
+                    "SELECT reason FROM turn_end_check_attempts WHERE id=?1 AND state='completed'",
+                    (old.clone(),),
+                ).await.unwrap().unwrap();
+                assert!(reason.contains(&expected), "{reason}");
+                assert!(
+                    reason.contains("superseded; cancellation requested"),
+                    "{reason}"
+                );
+                assert!(!reason.contains("withdrawn"), "{reason}");
+                let successor_reason = db
+                    .query_text(
+                        "SELECT reason FROM turn_end_check_attempts WHERE id=?1",
+                        (next.clone(),),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    !successor_reason.contains("Branch advance:"),
+                    "{successor_reason}"
+                );
+            }
+        }
+    }
+
+    /// Sharing waves retain evidence before and after planning, through later
+    /// lifecycle transitions; a kept wave never claims to answer the new head.
+    #[tokio::test]
+    async fn branch_advance_evidence_survives_transitions_and_renders_distinctly() {
+        use crate::execution::checks::{cancel_stale_review_on_branch_advance, BranchAdvance};
+        use crate::orchestrator::base_advance::ReplayComparison;
+        for (advance, expected, withdraws) in [
+            (BranchAdvance::Commit, "commit: branch advanced", true),
+            (
+                BranchAdvance::MergePreserved,
+                "replay: merge mode, own patch kept by construction",
+                false,
+            ),
+            (
+                BranchAdvance::BaseReplay {
+                    comparison: ReplayComparison::Changed,
+                },
+                "replay: comparison changed",
+                true,
+            ),
+            (
+                BranchAdvance::BaseReplay {
+                    comparison: ReplayComparison::Unchanged,
+                },
+                "replay: comparison unchanged",
+                false,
+            ),
+            (
+                BranchAdvance::BaseReplay {
+                    comparison: ReplayComparison::Unreadable {
+                        reason: "comparison budget exhausted".into(),
+                    },
+                },
+                "replay: comparison unreadable (comparison budget exhausted)",
+                false,
+            ),
+        ] {
+            let orch = launchability_orchestrator("active", "complete").await;
+            let db = &orch.db.local;
+            db.execute_script(
+                "UPDATE jobs SET branch='shared' WHERE id='j-1';
+                 INSERT INTO jobs(id,project_id,issue_id,execution_id,status,node_name,uri_segment,branch,created_at,updated_at)
+                 VALUES('j-2','p','i','e','complete','task','task','shared',1,1);",
+            ).await.unwrap();
+            let attempt = request_turn_end_attempt(&orch, "j-1").unwrap();
+            let slot = orch.try_begin_turn_end_checks("j-1", &attempt).unwrap();
+            transition_turn_end_attempt(&orch, "j-1", &attempt, "claimed", None).unwrap();
+            let other = request_turn_end_attempt(&orch, "j-2").unwrap();
+            let other_slot = orch.try_begin_turn_end_checks("j-2", &other).unwrap();
+            transition_turn_end_attempt(&orch, "j-2", &other, "claimed", None).unwrap();
+            cancel_stale_review_on_branch_advance(&orch, "j-2", advance).await;
+            for (job, id, wave) in [
+                ("j-1", &attempt, slot.cancel()),
+                ("j-2", &other, other_slot.cancel()),
+            ] {
+                assert_eq!(
+                    wave.cancel_reason(),
+                    withdraws.then_some(TurnEndCancelReason::BranchAdvanced)
+                );
+                let row = current_turn_end_attempt(db, job).await.unwrap().unwrap();
+                assert!(row.reason.as_deref().unwrap().contains(expected), "{row:?}");
+                transition_turn_end_attempt(&orch, job, id, "deferred", Some("node busy")).unwrap();
+                transition_turn_end_attempt(&orch, job, id, "submitted", None).unwrap();
+                let row = current_turn_end_attempt(db, job).await.unwrap().unwrap();
+                assert!(row.reason.as_deref().unwrap().contains(expected), "{row:?}");
+                let header = review_progress_header(&orch, job).await;
+                assert!(header.contains(expected), "{header}");
+            }
+            let plan = std::sync::Arc::new(WavePlan {
+                capture: None,
+                head: "old-head-0123456789".into(),
+                base: "old-base".into(),
+                tree_hash: "old-tree".into(),
+                checks: Default::default(),
+                applicable_names: Default::default(),
+                input_hashes: Default::default(),
+                expected_toolchain: String::new(),
+                unsupported: Default::default(),
+            });
+            slot.cancel().set_runtime_status(&attempt, plan);
+            let header = review_progress_header(&orch, "j-1").await;
+            assert!(header.contains(expected), "{header}");
+            assert!(header.contains("old-head-012"), "{header}");
+            if !withdraws {
+                assert!(header.contains("not the advanced head"), "{header}");
+            }
+            slot.finish("completed", "finished at original head").await;
+            other_slot.finish("withdrawn", "branch advanced").await;
+            // A withdrawal may arm a successor and move the current pointer.
+            // The evidence still belongs to the wave that actually observed it.
+            let reason = db
+                .query_text(
+                    "SELECT reason FROM turn_end_check_attempts WHERE id=?1",
+                    (attempt,),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(reason.contains(expected), "{reason}");
+            if !withdraws {
+                let header = review_progress_header(&orch, "j-1").await;
+                assert!(header.contains(expected), "{header}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_advance_evidence_is_append_only_across_failure_and_restart() {
+        use crate::execution::checks::BranchAdvance;
+        use crate::orchestrator::base_advance::ReplayComparison;
+        let orch = launchability_orchestrator("active", "complete").await;
+        let attempt = request_turn_end_attempt(&orch, "j-1").unwrap();
+        let evidence = BranchAdvance::BaseReplay {
+            comparison: ReplayComparison::Unreadable {
+                reason: "store timed out".into(),
+            },
+        };
+        for _ in 0..2 {
+            record_branch_advance(&orch.db.local, "j-1", &attempt, &evidence)
+                .await
+                .unwrap();
+        }
+        abandon_turn_end_attempt(&orch, "j-1", &attempt, "guard dropped").unwrap();
+        let row = current_turn_end_attempt(&orch.db.local, "j-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.reason
+                .as_deref()
+                .unwrap()
+                .matches("store timed out")
+                .count(),
+            2
+        );
+        transition_turn_end_attempt(&orch, "j-1", &attempt, "claimed", None).unwrap();
+        reconcile_turn_end_attempts_on_startup(&orch).await;
+        let row = current_turn_end_attempt(&orch.db.local, "j-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(attempt_interrupted_by_restart(
+            &row.state,
+            row.reason.as_deref()
+        ));
+        assert_eq!(
+            row.reason
+                .as_deref()
+                .unwrap()
+                .matches("store timed out")
+                .count(),
+            2
+        );
     }
 
     /// Elapsed debt alone must not paint an orphaned wait as an active deferral.

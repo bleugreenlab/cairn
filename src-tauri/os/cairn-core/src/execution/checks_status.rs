@@ -6035,6 +6035,49 @@ mod complete_input_projection_tests {
     }
 
     #[tokio::test]
+    async fn unreadable_replay_keeps_work_while_reuse_still_requires_complete_input_identity() {
+        use crate::execution::checks::{cancel_stale_review_on_branch_advance, BranchAdvance};
+        use crate::execution::checks_turn_end::request_turn_end_attempt;
+        use crate::orchestrator::base_advance::ReplayComparison;
+        for passed in [false, true] {
+            let f = Fixture::new("migrations").await;
+            let authored = [changed(ADDED)];
+            let old_tree = TreeFixture::new().file(ADDED, "branch");
+            let new_tree = TreeFixture::new()
+                .file(ADDED, "branch")
+                .file("src-tauri/turso_migrations/0293_base.sql", "new base input");
+            let original = f.keys(&old_tree, "original", against(&authored));
+            let current = f.keys(&new_tree, "advanced", against(&authored));
+            f.observe(&original, passed, "old-verdict");
+            f.db.execute_script(
+                "INSERT INTO jobs(id,project_id,status,created_at,updated_at)
+                 VALUES('job-a','project-a','running',1,1);",
+            )
+            .await
+            .unwrap();
+            let attempt = request_turn_end_attempt(&f.orch, "job-a").unwrap();
+            let wave = f.orch.try_begin_turn_end_checks("job-a", &attempt).unwrap();
+            cancel_stale_review_on_branch_advance(
+                &f.orch,
+                "job-a",
+                BranchAdvance::BaseReplay {
+                    comparison: ReplayComparison::Unreadable {
+                        reason: "store budget exhausted".into(),
+                    },
+                },
+            )
+            .await;
+            assert!(!wave.is_cancelled(), "unreadable keeps existing work");
+            assert_ne!(original.input_hashes, current.input_hashes);
+            f.assert_absent(&current);
+            assert_eq!(
+                f.snapshot(Some(&original), false).verdict(),
+                if passed { "passed" } else { "failed" }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn identical_complete_inputs_reuse_across_source_commits_for_gates_and_waits() {
         for passed in [false, true] {
             let f = Fixture::new("migrations").await;

@@ -44,6 +44,7 @@ mod recovery_tests;
 pub(crate) mod regenerate;
 #[cfg(test)]
 mod regenerate_tests;
+pub(crate) mod replay_comparisons;
 pub(crate) mod replay_cost;
 mod replay_requests;
 pub(crate) mod retirement;
@@ -884,29 +885,81 @@ fn branch_fork_point(
     crate::jj::revset_commit(jj, store, &format!("heads(::{pre_tip} & ::{dest})"))
 }
 
-/// Whether replaying a branch from `before` to `after` onto `dest` kept the
-/// branch's own change: its diff from its fork point is the same at both tips.
-/// An unreadable comparison answers no, so doubt withdraws a running wave
-/// exactly as every base advance did before the comparison existed.
-fn replay_kept_patch(
+/// Evidence about a replay's own patch, not about equality of its trees.
+/// Unknown evidence keeps existing work but never authorizes verdict reuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReplayComparison {
+    Unchanged,
+    Changed,
+    Unreadable { reason: String },
+}
+
+impl ReplayComparison {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Unchanged => "replay: comparison unchanged".to_string(),
+            Self::Changed => "replay: comparison changed".to_string(),
+            Self::Unreadable { reason } => format!("replay: comparison unreadable ({reason})"),
+        }
+    }
+}
+
+/// Compare the branch's own diff at both immutable tips. A missing tip or failed
+/// store read is missing evidence, never evidence that the patch changed.
+pub(crate) fn compare_replayed_patch(
     jj: &crate::jj::JjEnv,
     store: &Path,
     before: Option<&String>,
     after: Option<&String>,
     dest: &str,
-) -> bool {
+) -> ReplayComparison {
     let (Some(before), Some(after)) = (before, after) else {
-        return false;
+        return ReplayComparison::Unreadable {
+            reason: "missing before or after tip".to_string(),
+        };
     };
-    match (
-        crate::jj::own_patch_against(jj, store, before, dest),
-        crate::jj::own_patch_against(jj, store, after, dest),
-    ) {
-        (Ok(before), Ok(after)) => before.patch == after.patch,
-        (Err(error), _) | (_, Err(error)) => {
-            log::warn!("replayed patch comparison {before} -> {after} unreadable: {error}");
-            false
+    let result = (|| {
+        let before = crate::jj::own_patch_against(jj, store, before, dest)?;
+        let after = crate::jj::own_patch_against(jj, store, after, dest)?;
+        Ok::<_, String>(before.patch == after.patch)
+    })();
+    match result {
+        Ok(true) => ReplayComparison::Unchanged,
+        Ok(false) => ReplayComparison::Changed,
+        Err(reason) => {
+            log::warn!("replayed patch comparison {before} -> {after} unreadable: {reason}");
+            ReplayComparison::Unreadable { reason }
         }
+    }
+}
+
+/// Run every comparison off-runtime with one absolute cooperative store budget.
+/// Timing out is an observation failure, not a patch change; no result is cached,
+/// so the next advance measures again.
+pub(crate) async fn compare_replayed_patch_bounded(
+    jj: crate::jj::JjEnv,
+    store: std::path::PathBuf,
+    before: String,
+    after: String,
+    dest: String,
+    budget: std::time::Duration,
+) -> ReplayComparison {
+    let jj = jj.with_operation_budget(budget);
+    match tokio::time::timeout(
+        budget,
+        tokio::task::spawn_blocking(move || {
+            compare_replayed_patch(&jj, &store, Some(&before), Some(&after), &dest)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(comparison)) => comparison,
+        Ok(Err(error)) => ReplayComparison::Unreadable {
+            reason: format!("comparison worker failed: {error}"),
+        },
+        Err(_) => ReplayComparison::Unreadable {
+            reason: format!("comparison timed out after {}ms", budget.as_millis()),
+        },
     }
 }
 
@@ -3860,6 +3913,33 @@ pub(crate) async fn load_projects_for_default_reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replay_comparison_missing_tip_read_error_and_exhausted_budget_are_unreadable() {
+        let store = tempfile::tempdir().unwrap();
+        let jj = crate::jj::JjEnv::resolve("jj", store.path());
+        let tip = "missing-tip".to_string();
+        assert_eq!(
+            compare_replayed_patch(&jj, store.path(), None, Some(&tip), &tip),
+            ReplayComparison::Unreadable {
+                reason: "missing before or after tip".to_string()
+            }
+        );
+        let error = compare_replayed_patch(&jj, store.path(), Some(&tip), Some(&tip), &tip);
+        assert!(matches!(error, ReplayComparison::Unreadable { .. }));
+        let timed = compare_replayed_patch_bounded(
+            jj,
+            store.path().to_path_buf(),
+            tip.clone(),
+            tip.clone(),
+            tip,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert!(matches!(timed, ReplayComparison::Unreadable { .. }));
+        assert_ne!(error.describe(), ReplayComparison::Changed.describe());
+        assert_ne!(error.describe(), ReplayComparison::Unchanged.describe());
+    }
 
     use crate::db::DbState;
     use crate::services::testing::{MockGitClient, TestServicesBuilder};

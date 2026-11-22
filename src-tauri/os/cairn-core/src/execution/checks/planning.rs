@@ -1753,15 +1753,17 @@ pub(super) async fn settle_unrecordable_delivery(
 }
 
 /// Why a branch's tip moved, as far as a review wave running on it is concerned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BranchAdvance {
     /// A commit sealed onto the branch: the change the branch claims is a
     /// different change now.
     Commit,
-    /// The branch was replayed onto an advanced base. `patch_unchanged` is
-    /// whether its own diff against its fork point is the same before and after
-    /// the replay ([`crate::jj::own_patch_against`]).
-    BaseReplay { patch_unchanged: bool },
+    /// Merge catch-up without a resolution preserves the authored change by construction.
+    MergePreserved,
+    /// Evidence from comparing the branch's own patch before and after replay.
+    BaseReplay {
+        comparison: crate::orchestrator::base_advance::ReplayComparison,
+    },
 }
 
 impl BranchAdvance {
@@ -1773,13 +1775,24 @@ impl BranchAdvance {
     /// when merges land faster than a long lane runs it guarantees the branch
     /// never records a verdict at all (cairn/4210: four waves withdrawn in
     /// fifteen minutes, zero rows).
-    pub(crate) fn supersedes_review(self) -> bool {
-        !matches!(
+    pub(crate) fn supersedes_review(&self) -> bool {
+        matches!(
             self,
-            Self::BaseReplay {
-                patch_unchanged: true
-            }
+            Self::Commit
+                | Self::BaseReplay {
+                    comparison: crate::orchestrator::base_advance::ReplayComparison::Changed
+                }
         )
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Commit => "commit: branch advanced".to_string(),
+            Self::MergePreserved => {
+                "replay: merge mode, own patch kept by construction".to_string()
+            }
+            Self::BaseReplay { comparison } => comparison.describe(),
+        }
     }
 }
 
@@ -1799,13 +1812,9 @@ impl BranchAdvance {
 /// NEW code; the review cadence relaunches a fresh suite for the advanced tree
 /// at the next turn-end via the normal `spawn_turn_end_checks` path.
 ///
-/// This reuses the CAIRN-2648 [`Orchestrator::cancel_turn_end_checks`] lever, so
-/// it is best-effort and idempotent: a no-op when no review suite is in flight
-/// for the job, hence safe on every commit. Keyed by the committing run's own
-/// `job_id` — the dominant path is the builder committing its own fix, which
-/// cancels exactly its suite. A sub-agent/task that commits into the builder's
-/// inherited worktree under a *different* job id would not hit the builder's
-/// suite; that edge case is deliberately left as-is.
+/// Uses the same cancellation token as explicit cancellation, while recording
+/// evidence on every sharing wave's own attempt, including waves still planning.
+/// A captured token binds cancellation to that wave rather than its successor.
 pub(crate) async fn cancel_stale_review_on_branch_advance(
     orch: &Orchestrator,
     job_id: &str,
@@ -1825,39 +1834,57 @@ pub(crate) async fn cancel_stale_review_on_branch_advance_except(
     advance: BranchAdvance,
     except: Option<&str>,
 ) {
-    if !advance.supersedes_review() {
-        if orch.turn_end_checks_in_flight(job_id) {
-            log::info!(
-                "review wave for job {}: kept across a base advance — the branch's own patch is unchanged",
-                &job_id[..job_id.len().min(8)]
+    let jobs = match crate::execution::routing::owning_db_for_job(&orch.db, job_id).await {
+        Ok(db) => jobs_sharing_branch(&db, job_id).await,
+        Err(error) => {
+            log::error!("review branch owners for job {job_id} could not be read: {error}");
+            vec![job_id.to_string()]
+        }
+    };
+    // Signal every captured wave before the first diagnostic write can wait.
+    // A wave released during that wait must already know it owes a successor.
+    let waves: Vec<_> = jobs
+        .into_iter()
+        .filter_map(|stale| {
+            if except == Some(stale.as_str()) {
+                return None;
+            }
+            let wave = orch.turn_end_wave_handle(&stale)?;
+            if advance.supersedes_review() {
+                wave.cancel(crate::orchestrator::TurnEndCancelReason::BranchAdvanced);
+            }
+            Some((stale, wave))
+        })
+        .collect();
+    for (stale, wave) in waves {
+        let recorded = match crate::execution::routing::owning_db_for_job(&orch.db, &stale).await {
+            Ok(db) => {
+                crate::execution::checks_turn_end::record_branch_advance(
+                    &db,
+                    &stale,
+                    wave.attempt_id(),
+                    &advance,
+                )
+                .await
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = recorded {
+            log::error!(
+                "review branch-advance evidence for job {} attempt {} could not be recorded: {error}",
+                stale, wave.attempt_id()
             );
         }
-        return;
-    }
-    for stale in jobs_sharing_branch(&orch.db.local, job_id).await {
-        if except == Some(stale.as_str()) {
-            continue;
-        }
-        // Name the tree the withdrawn wave was verifying. A supersession logged
-        // as "cancelled" alone leaves a reader unable to tell a wave stopped for
-        // the right reason — the tree it holds is no longer the node's — from
-        // one lost to a fault.
-        if orch.turn_end_checks_in_flight(&stale) {
-            let verifying = orch
-                .turn_end_check_runtime_status(&stale)
-                .map(|status| {
-                    let tree = &status.plan.tree_hash;
-                    format!("tree {}", &tree[..tree.len().min(12)])
-                })
-                .unwrap_or_else(|| "a tree it had not published yet".to_string());
-            log::info!(
-                "review wave for job {}: superseded — the branch advanced past the {verifying} it was verifying",
-                &stale[..stale.len().min(8)]
-            );
-        }
-        orch.cancel_turn_end_checks(
-            &stale,
-            crate::orchestrator::TurnEndCancelReason::BranchAdvanced,
+        orch.invalidate_node_check_status(&stale, "branch-advance-evidence");
+        log::info!(
+            "review wave for job {}: {} — {}",
+            &stale[..stale.len().min(8)],
+            if advance.supersedes_review() {
+                "superseded"
+            } else {
+                "kept"
+            },
+            advance.describe()
         );
     }
 }

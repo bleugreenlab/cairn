@@ -80,12 +80,13 @@ use cairn_db::turso::params;
 use cairn_platform::stack::off_frame;
 
 use super::{
-    advance_sibling_durable_base, append_conflict_diagnostic, branch_owners, load_on_branch_jobs,
-    load_project_default_branch, load_project_repo_path, load_reconcile_quarantine,
-    mark_publication_unconfirmed, materialize_markers_for_branch, persist_reconcile_item,
-    quarantine_blocks_automatic_replay, record_reconcile_timeout, refresh_residencies_for_branch,
-    release_reconcile_quarantine, release_timeout_cooldown_at, replay_kept_patch,
-    ReconcileItemUpdate, DELEGATOR_ON_BRANCH_JOIN, LIVE_JOB_PREDICATE, OWNS_BRANCH,
+    advance_sibling_durable_base, append_conflict_diagnostic, branch_owners,
+    compare_replayed_patch_bounded, load_on_branch_jobs, load_project_default_branch,
+    load_project_repo_path, load_reconcile_quarantine, mark_publication_unconfirmed,
+    materialize_markers_for_branch, persist_reconcile_item, quarantine_blocks_automatic_replay,
+    record_reconcile_timeout, refresh_residencies_for_branch, release_reconcile_quarantine,
+    release_timeout_cooldown_at, ReconcileItemUpdate, DELEGATOR_ON_BRANCH_JOIN, LIVE_JOB_PREDICATE,
+    OWNS_BRANCH,
 };
 use crate::messages::delivery::{latest_run_for_job, queue_system_direct_once};
 use crate::messages::queued::DeliveryUrgency;
@@ -3314,9 +3315,9 @@ impl Context<'_> {
             )),
         }
 
-        // A replay that provably kept the branch's own patch keeps a running
-        // review wave; a changed or unreadable comparison withdraws it.
-        let jj = self.jj.with_operation_budget(PATCH_COMPARE_BUDGET);
+        // Only evidence of a changed patch withdraws an existing review. A
+        // failed comparison keeps its verdicts at the tree it actually ran on.
+        let jj = self.jj.clone();
         let (store, before, after, base) = (
             self.store.clone(),
             installed.coordinate.head.clone(),
@@ -3333,24 +3334,45 @@ impl Context<'_> {
         .ok()
         .flatten()
         .is_some();
-        let patch_unchanged = (merge_mode && request.carry.is_none())
-            || tokio::time::timeout(
-                PATCH_COMPARE_BUDGET,
-                tokio::task::spawn_blocking(move || {
-                    replay_kept_patch(&jj, &store, Some(&before), Some(&after), &base)
-                }),
+        let compare_budget = within_deadline(request, PATCH_COMPARE_BUDGET);
+        #[cfg(test)]
+        let compare_budget = tests::patch_compare_budget(&self.store).unwrap_or(compare_budget);
+        let comparison = if merge_mode && request.carry.is_none() {
+            None
+        } else {
+            Some(
+                compare_replayed_patch_bounded(jj, store, before, after, base, compare_budget)
+                    .await,
             )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(false);
+        };
+        let advance = match &comparison {
+            Some(comparison) => crate::execution::checks::BranchAdvance::BaseReplay {
+                comparison: comparison.clone(),
+            },
+            None => crate::execution::checks::BranchAdvance::MergePreserved,
+        };
         crate::execution::checks::cancel_stale_review_on_branch_advance_except(
             self.orch,
             &relationship.owner_job_id,
-            crate::execution::checks::BranchAdvance::BaseReplay { patch_unchanged },
+            advance,
             request.capturing_review_of.as_deref(),
         )
         .await;
+        if let Some(comparison) = &comparison {
+            if let Err(error) = super::replay_comparisons::record(
+                self.db,
+                &request.project_id,
+                &self.store,
+                branch,
+                Some(&installed.coordinate.head),
+                Some(&installed.head),
+                comparison,
+            )
+            .await
+            {
+                warnings.push(format!("recording replay comparison failed: {error}"));
+            }
+        }
 
         if merge_mode && installed.head != installed.coordinate.base {
             let mut report = crate::jj::ReconcileReport::default();

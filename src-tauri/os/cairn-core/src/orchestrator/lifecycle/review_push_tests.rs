@@ -71,7 +71,7 @@ async fn cancelled_wave_rearms_after_a_dormant_nodes_base_advances() {
         &orch,
         "j-prod",
         crate::execution::checks::BranchAdvance::BaseReplay {
-            patch_unchanged: false,
+            comparison: crate::orchestrator::base_advance::ReplayComparison::Changed,
         },
     )
     .await;
@@ -1861,15 +1861,19 @@ async fn a_base_replay_that_keeps_the_patch_keeps_the_wave_and_a_commit_withdraw
     attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
     let orch = test_orchestrator(db);
     let kept = crate::execution::checks::BranchAdvance::BaseReplay {
-        patch_unchanged: true,
+        comparison: crate::orchestrator::base_advance::ReplayComparison::Unchanged,
     };
 
     let wave = orch
         .try_begin_turn_end_checks("j-prod", "a-kept")
         .expect("claim the wave's single-flight slot");
     for _ in 0..4 {
-        crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod", kept)
-            .await;
+        crate::execution::checks::cancel_stale_review_on_branch_advance(
+            &orch,
+            "j-prod",
+            kept.clone(),
+        )
+        .await;
     }
     assert!(
         !wave.is_cancelled(),
@@ -1885,7 +1889,7 @@ async fn a_base_replay_that_keeps_the_patch_keeps_the_wave_and_a_commit_withdraw
     for advance in [
         crate::execution::checks::BranchAdvance::Commit,
         crate::execution::checks::BranchAdvance::BaseReplay {
-            patch_unchanged: false,
+            comparison: crate::orchestrator::base_advance::ReplayComparison::Changed,
         },
     ] {
         // A fresh node per advance: the successor each withdrawal arms holds
@@ -1897,8 +1901,12 @@ async fn a_base_replay_that_keeps_the_patch_keeps_the_wave_and_a_commit_withdraw
         let wave = orch
             .try_begin_turn_end_checks("j-prod", "a-withdrawn")
             .expect("the slot is free");
-        crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod", advance)
-            .await;
+        crate::execution::checks::cancel_stale_review_on_branch_advance(
+            &orch,
+            "j-prod",
+            advance.clone(),
+        )
+        .await;
         assert!(
             wave.is_cancelled(),
             "{advance:?} changes the patch and withdraws the wave"
@@ -1909,6 +1917,56 @@ async fn a_base_replay_that_keeps_the_patch_keeps_the_wave_and_a_commit_withdraw
             "{advance:?} arms one successor for the tree that replaced the stale one"
         );
     }
+}
+
+/// An unreadable comparison does not supersede even a busy node's wave, and
+/// a later comparison is free to prove that the patch really changed.
+#[tokio::test]
+async fn unreadable_replay_keeps_the_wave_until_a_later_changed_comparison() {
+    use crate::execution::checks::{cancel_stale_review_on_branch_advance, BranchAdvance};
+    use crate::orchestrator::base_advance::ReplayComparison;
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+    let wave = orch
+        .try_begin_turn_end_checks("j-prod", "a-unreadable")
+        .unwrap();
+    for reason in [
+        "store read failed",
+        "comparison timed out after 30000ms",
+        "missing before or after tip",
+    ] {
+        cancel_stale_review_on_branch_advance(
+            &orch,
+            "j-prod",
+            BranchAdvance::BaseReplay {
+                comparison: ReplayComparison::Unreadable {
+                    reason: reason.to_string(),
+                },
+            },
+        )
+        .await;
+        assert!(!wave.is_cancelled(), "{reason} is not evidence of change");
+        assert!(orch.turn_end_checks_in_flight("j-prod"));
+    }
+    drop(wave);
+    assert!(
+        !wave_scheduled(&orch, "j-prod"),
+        "releasing a kept wave must not arm a successor"
+    );
+    let wave = orch
+        .try_begin_turn_end_checks("j-prod", "a-changed")
+        .expect("the kept wave released its slot without a successor");
+    cancel_stale_review_on_branch_advance(
+        &orch,
+        "j-prod",
+        BranchAdvance::BaseReplay {
+            comparison: ReplayComparison::Changed,
+        },
+    )
+    .await;
+    assert!(wave.is_cancelled());
 }
 
 /// Two jobs on one branch and one job on another, so a branch-advance can be

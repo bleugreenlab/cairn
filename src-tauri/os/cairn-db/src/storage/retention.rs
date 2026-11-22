@@ -250,6 +250,8 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     // A few rows per install that takes a declared regenerable path, each a
     // few kilobytes at most (a failure keeps a 4,000-character output tail).
     evict("branch_regenerations", Eviction::SettledRegenerations).budget(16),
+    // Durable measurement history keeps the since-recording health count true.
+    owned("replay_comparisons", "projects"),
     // Pruned by their own owners.
     owned_by(
         "executor_reach_history",
