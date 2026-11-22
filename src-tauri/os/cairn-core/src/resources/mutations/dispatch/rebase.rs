@@ -491,7 +491,7 @@ pub(crate) async fn rebase_authority(
 
 /// A `catch-up-mode` request resolved as far as it can be without the
 /// operator. For mode:'merge', `reviewed_through` is the commit the review
-/// mark lands on, already proven to be a default-branch commit, and `authority`
+/// mark lands on, already proven to be a base-branch commit, and `authority`
 /// names that commit: the operator approves a mark, not a spelling whose
 /// meaning could move while the card waits.
 struct CatchUpRequest {
@@ -550,11 +550,15 @@ async fn resolve_catch_up(
         .await
         .map_err(CatchUpRefusal::Invalid)?;
     let reviewed_through = if setting.mode == "merge" {
+        let base =
+            crate::orchestrator::catch_up::base_branch(&db, &project_id, &branch, &rows.job_id)
+                .await
+                .map_err(CatchUpRefusal::Invalid)?;
         let mark = review_mark(
             orch,
             &store,
             &branch,
-            &default_branch,
+            &base,
             setting.reviewed_through.clone(),
         )
         .await
@@ -580,34 +584,34 @@ async fn resolve_catch_up(
 }
 
 /// The commit a merge-mode review mark lands on: `revision` when given,
-/// proven to be a default-branch commit, or else the one merge base of the
-/// branch and the default branch. Several merge bases name no one mark, so the
+/// proven to be a base-branch commit, or else the one merge base of the
+/// branch and its resolved base. Several merge bases name no one mark, so the
 /// caller must choose.
 async fn review_mark(
     orch: &Orchestrator,
     store: &std::path::Path,
     branch: &str,
-    default_branch: &str,
+    base_branch: &str,
     revision: Option<String>,
 ) -> Result<String, String> {
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let (store, branch, default_branch) = (
+    let (store, branch, base_branch) = (
         store.to_path_buf(),
         branch.to_string(),
-        default_branch.to_string(),
+        base_branch.to_string(),
     );
     tokio::task::spawn_blocking(move || match revision {
-        Some(revision) => default_branch_commit(&jj, &store, &default_branch, &revision),
+        Some(revision) => base_branch_commit(&jj, &store, &base_branch, &revision),
         None => {
             let tip = crate::jj::bookmark_commit_checked(&jj, &store, &branch)?
                 .ok_or_else(|| format!("`{branch}` does not resolve in the store"))?;
-            let default_tip = crate::jj::bookmark_commit_checked(&jj, &store, &default_branch)?
-                .ok_or_else(|| format!("`{default_branch}` does not resolve in the store"))?;
-            let bases = crate::jj::merge_bases(&jj, &store, &tip, &default_tip)?;
+            let base_tip = crate::jj::bookmark_commit_checked(&jj, &store, &base_branch)?
+                .ok_or_else(|| format!("`{base_branch}` does not resolve in the store"))?;
+            let bases = crate::jj::merge_bases(&jj, &store, &tip, &base_tip)?;
             match bases.as_slice() {
                 [base] => Ok(base.clone()),
                 _ => Err(format!(
-                    "`{branch}` and `{default_branch}` share {} merge bases ({}), so there is no \
+                    "`{branch}` and `{base_branch}` share {} merge bases ({}), so there is no \
                      one default review mark; pass reviewed_through explicitly",
                     bases.len(),
                     bases.join(", ")
@@ -665,26 +669,26 @@ async fn cancel_holding(
     Ok(format!("{}\n\n", report.sentence(&batch.request_id)))
 }
 
-/// The commit `revision` names, proven to lie in the default branch's history.
+/// The commit `revision` names, proven to lie in the branch base's history.
 ///
-/// The landing gate is the mark's one reader, and it measures what the default
-/// branch changed from the mark to the tip it lands on, so the mark has to be
-/// a default-branch commit and nothing more. The branch need not contain it:
+/// The landing gate is the mark's one reader, and it measures what the base
+/// changed from the mark to the tip it lands on, so the mark has to be
+/// a base-branch commit and nothing more. The branch need not contain it:
 /// an owner reviews the base's incoming commits before a merge catch-up
 /// brings them in, and the landing refusal names the target tip to mark.
-fn default_branch_commit(
+fn base_branch_commit(
     jj: &crate::jj::JjEnv,
     store: &std::path::Path,
-    default_branch: &str,
+    base_branch: &str,
     revision: &str,
 ) -> Result<String, String> {
     let commit = crate::jj::revset_commit_checked(jj, store, revision)?
         .ok_or_else(|| format!("`{revision}` does not name one commit in the store"))?;
-    let default_revset = format!("bookmarks(exact:{default_branch:?})");
-    if !crate::jj::revset_descends_from(jj, store, &default_revset, &commit) {
+    let base_revset = format!("bookmarks(exact:{base_branch:?})");
+    if !crate::jj::revset_descends_from(jj, store, &base_revset, &commit) {
         return Err(format!(
-            "{commit} is not in the history of `{default_branch}`; a review mark is a commit of \
-             the default branch, which is what landing measures from"
+            "{commit} is not in the history of `{base_branch}`; a review mark is a commit of \
+             this branch's base, which is what landing measures from"
         ));
     }
     Ok(commit)
@@ -831,11 +835,12 @@ async fn mark_reviewed(
             format!("`{branch}` has no catch-up mode, so there is no review mark to move")
         })?;
     let who = writer(orch, request, &rows.job_id).await?;
-    let default_branch = project_default_branch(db, &project_id).await?;
+    let base_branch =
+        crate::orchestrator::catch_up::base_branch(db, &project_id, branch, &rows.job_id).await?;
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let (read_store, previous) = (store.clone(), mode.reviewed_through.clone());
     let commit = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let commit = default_branch_commit(&jj, &read_store, &default_branch, &through)?;
+        let commit = base_branch_commit(&jj, &read_store, &base_branch, &through)?;
         if !crate::jj::revset_descends_from(&jj, &read_store, &commit, &previous) {
             return Err(format!(
                 "{commit} is not at or after the current review mark {previous}; a review mark \
@@ -1647,7 +1652,7 @@ mod tests {
     fn as_run(changes: serde_json::Value) -> McpCallbackRequest {
         McpCallbackRequest {
             run_id: Some("run-1".into()),
-            tool_use_id: Some("toolu-catch-up".into()),
+            tool_use_id: Some(uuid::Uuid::new_v4().to_string()),
             payload: serde_json::json!({ "changes": changes }),
             ..run_less_request()
         }
@@ -1666,7 +1671,7 @@ mod tests {
         }])
     }
 
-    /// A review mark is a default-branch commit, the base the landing gate
+    /// A review mark is a base-branch commit, the base the landing gate
     /// measures from. A branch-only commit, or a name that resolves to
     /// nothing, is never one whatever the operator approves, so the write is
     /// refused while the batch is prepared and no card reaches the operator.
@@ -1681,8 +1686,8 @@ mod tests {
         let result = crate::mcp::handlers::write::handle_write(&s.orch, &request).await;
         assert!(
             result.contains(&format!(
-                "{} is not in the history of `main`; a review mark is a commit of the default \
-                 branch",
+                "{} is not in the history of `main`; a review mark is a commit of \
+                 this branch's base",
                 s.branch_tip
             )),
             "{result}"
@@ -1698,7 +1703,7 @@ mod tests {
         assert_eq!(s.permission_requests().await, 0);
     }
 
-    /// cairn/5387's case: the owner marks a default-branch commit its branch
+    /// cairn/5387's case: the owner marks a base-branch commit its branch
     /// does not contain yet, having reviewed the base's incoming commits
     /// before merging them. That raises exactly one card, and the operator's
     /// approval sets the mode with that mark.
@@ -1887,29 +1892,115 @@ mod tests {
         .expect("the reviewed base no longer blocks the landing");
     }
 
-    /// cairn/7414: the note a clean merge catch-up sends names the new base
-    /// to mark, and that instruction succeeds as written.
+    /// Each review instruction names the declared parent, not main.
     #[tokio::test]
     async fn the_merge_notes_mark_reviewed_instruction_succeeds_as_written() {
         let Some(bin) = crate::jj::tests::jj_bin() else {
             return;
         };
-        let s = catch_up_store(&bin, "catch-up-note-instruction.db").await;
+        let s = catch_up_store(&bin, "catch-up-parent-instruction.db").await;
+        let jj = crate::jj::environment(&s.orch.jj_binary_path, &s.orch.config_dir);
+        // The parent and main have independent incoming changes after the cut.
+        let parent_ws = s._dirs[2].path().join("parent");
+        crate::jj::add_workspace(&jj, &s.store, &parent_ws, "agent/parent", &s.base, None).unwrap();
+        std::fs::create_dir_all(parent_ws.join("src")).unwrap();
+        std::fs::write(parent_ws.join("src/parent.rs"), "// parent change\n").unwrap();
+        crate::jj::seal(&jj, &parent_ws, "parent change", None).unwrap();
+        let parent_tip = crate::jj::bookmark_commit(&jj, &s.store, "agent/parent").unwrap();
+        assert!(!crate::jj::revset_descends_from(
+            &jj,
+            &s.store,
+            "main",
+            &parent_tip
+        ));
+        assert!(!crate::jj::revset_descends_from(
+            &jj,
+            &s.store,
+            &parent_tip,
+            &s.main_ahead
+        ));
+        s.db.execute_script("UPDATE jobs SET base_branch='agent/parent' WHERE id='job-1';")
+            .await
+            .unwrap();
+
         merge_mode(&s).await;
+        let page = crate::resources::read_node_rebase(&s.orch, "proj", 1, 1, "builder", &[]).await;
+        let refusal = crate::orchestrator::catch_up::landing_review_gate(
+            &s.orch,
+            &s.mode().await.unwrap(),
+            &jj,
+            &s.store,
+            "agent/parent",
+            &parent_tip,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(instructed_mark(&refusal), parent_tip);
+
         let merged = crate::jj::MergedCatchUp {
             merge: s.branch_tip.clone(),
             old_base: s.base.clone(),
-            new_base: s.main_ahead.clone(),
+            new_base: parent_tip.clone(),
             resolved: false,
         };
         let note = crate::orchestrator::catch_up::merge_note(
             "agent/one",
-            "main",
+            "agent/parent",
             &merged,
-            &["src/a.rs".to_string()],
+            &["src/parent.rs".to_string()],
             &[],
         );
-        follow_mark_instruction(&s, &note, &s.main_ahead).await;
+        follow_mark_instruction(&s, &note, &parent_tip).await;
+        crate::orchestrator::catch_up::landing_review_gate(
+            &s.orch,
+            &s.mode().await.unwrap(),
+            &jj,
+            &s.store,
+            "agent/parent",
+            &parent_tip,
+        )
+        .await
+        .expect("reviewing the parent clears the landing gate");
+        assert_eq!(instructed_mark(&page), parent_tip, "{page}");
+        let refused = crate::mcp::handlers::write::handle_write(
+            &s.orch,
+            &as_run(mark_reviewed_change(&s.main_ahead)),
+        )
+        .await;
+        assert!(
+            refused.contains("not in the history of `agent/parent`"),
+            "{refused}"
+        );
+        assert_eq!(s.mode().await.unwrap().reviewed_through, parent_tip);
+
+        let backwards = crate::mcp::handlers::write::handle_write(
+            &s.orch,
+            &as_run(mark_reviewed_change(&s.base)),
+        )
+        .await;
+        assert!(backwards.contains("only moves forward"), "{backwards}");
+        crate::orchestrator::catch_up::clear(
+            &s.db,
+            "proj-1",
+            &s.store,
+            "agent/one",
+            "operator",
+            "reset for approval",
+        )
+        .await
+        .unwrap();
+        let refused = crate::mcp::handlers::write::handle_write(
+            &s.orch,
+            &as_run(catch_up_change(&s.main_ahead)),
+        )
+        .await;
+        assert!(
+            refused.contains("not in the history of `agent/parent`"),
+            "{refused}"
+        );
+        assert_eq!(s.permission_requests().await, 0);
+        assert!(s.mode().await.is_none());
+        approve_catch_up(&s, &parent_tip).await;
     }
 
     /// 4113's case: a branch other jobs were cut from asks for the mode. It is

@@ -99,6 +99,19 @@ pub(crate) struct SetCatchUpMode<'a> {
     pub(crate) reviewed_through: &'a str,
 }
 
+/// The same declared base used by demand catch-up preparation.
+pub(crate) async fn base_branch(
+    db: &LocalDb,
+    project_id: &str,
+    branch: &str,
+    job_id: &str,
+) -> Result<String, String> {
+    super::base_advance::preparation::load_relationship(db, project_id, branch, Some(job_id), None)
+        .await
+        .map(|relationship| relationship.base_branch)
+        .map_err(|error| error.to_string())
+}
+
 fn glob_matcher(pattern: &str) -> Result<globset::GlobMatcher, String> {
     globset::GlobBuilder::new(pattern)
         .literal_separator(true)
@@ -343,7 +356,7 @@ pub(crate) async fn recent_events(
 
 /// Set (or re-set) a branch's merge mode. The caller has established the
 /// operator's authority, resolved `reviewed_through` to a commit in the
-/// default branch's history, and refused the default branch itself.
+/// branch base's history, and refused the default branch itself.
 pub(crate) async fn set(db: &LocalDb, request: SetCatchUpMode<'_>) -> Result<CatchUpMode, String> {
     validate_review_paths(request.review_paths)?;
     let at = now();
@@ -570,7 +583,7 @@ pub(crate) async fn end_on_landing(
 }
 
 /// Record that the owner reviewed the incoming base changes through `through`.
-/// The caller has proven `through` lies in the default branch's history, at or
+/// The caller has proven `through` lies in the branch base's history, at or
 /// after the current mark. The branch need not contain it yet.
 pub(crate) async fn mark_reviewed(
     db: &LocalDb,

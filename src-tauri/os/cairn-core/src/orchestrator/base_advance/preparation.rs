@@ -5654,7 +5654,7 @@ fn normalized(name: Option<String>) -> Option<String> {
 }
 
 /// Read the relationship from the owner's declaration and the project default.
-pub(super) async fn load_relationship(
+pub(crate) async fn load_relationship(
     db: &LocalDb,
     project_id: &str,
     branch: &str,

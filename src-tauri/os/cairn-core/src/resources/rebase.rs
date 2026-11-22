@@ -934,24 +934,16 @@ async fn catch_up_section(
         Err(error) => return format!("# Catch-up mode\n\nCould not be read: {error}\n\n"),
     };
     let stamp = |at: i64| crate::clock::stamp(at).unwrap_or_else(|| at.to_string());
-    let default_branch = db
-        .query_opt_text(
-            "SELECT default_branch FROM projects WHERE id = ?1",
-            (project_id.to_string(),),
-        )
+    let pending = crate::orchestrator::catch_up::base_branch(db, project_id, branch, &rows.job_id)
         .await
-        .ok()
-        .flatten();
-    let pending = match default_branch {
-        Some(default_branch) => view.pinned().and_then(|(jj, pinned_store)| {
+        .and_then(|base| {
+            let (jj, pinned_store) = view.pinned()?;
             let tip = view
-                .bookmark_commit(&default_branch)
-                .ok_or_else(|| format!("`{default_branch}` does not resolve"))?;
+                .bookmark_commit(&base)
+                .ok_or_else(|| format!("`{base}` does not resolve"))?;
             crate::orchestrator::catch_up::unreviewed_base_paths(jj, pinned_store, &mode, &tip)
                 .map(|paths| (tip, paths))
-        }),
-        None => Err("the default branch could not be read".to_string()),
-    };
+        });
     let mut out = format!(
         "# Catch-up mode\n\nthis branch catches up by merge (set by {}, {})\n",
         mode.set_by,
