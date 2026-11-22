@@ -3249,10 +3249,21 @@ fn compact_verdict_result(json: Option<&str>) -> Option<String> {
         // The first line says why a producer called itself incomplete.
         compact["report"] = summary
             .report
+            .as_deref()
             .and_then(|report| report.lines().next().map(str::to_string))
             .map_or(serde_json::Value::Null, serde_json::Value::String);
     } else if let Some(ingestion) = summary.ingestion {
         compact["ingestion"] = ingestion;
+    }
+    // Keep transfer losses even for producers without evidence accounting.
+    // Existing compact rows retain their original shape unless they carry one.
+    if let Some(report) = summary.report.as_deref() {
+        if let Some(notice) = report
+            .lines()
+            .find(|line| line.starts_with("Check result transfer: "))
+        {
+            compact["report"] = notice.into();
+        }
     }
     Some(compact.to_string())
 }
@@ -6732,6 +6743,65 @@ pub(crate) mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn check_result_transfer_notice_and_every_outcome_survive_recording() {
+        use crate::execution::check_parsers::parse_check_output;
+        let db = cache_db().await;
+        let notice = "Check result transfer: 1 excerpts truncated; 102400 bytes dropped; result bound 4194304 bytes";
+        // Recording has no size-dependent branch after accepting a result.
+        // Large-population budgeting belongs to the executor's in-memory tests;
+        // this fixture protects row equality and loss reporting at persistence.
+        let tests: Vec<_> = (0..300).map(|index| serde_json::json!({
+            "id": format!("crate case::{index:05}"),
+            "status": if index == 299 { "failed" } else { "passed" },
+            "durationMs": index,
+            "failureMessage": if index == 299 { Some("panic\n… 102400 bytes elided …\nassertion tail") } else { None }
+        })).collect();
+        let artifact = serde_json::json!({
+            "schemaVersion": 1, "parser": "nextest", "complete": true,
+            "selection": "full", "tests": tests, "report": notice
+        });
+        let parsed = parse_check_output(
+            "bun run test:rust",
+            &format!("CAIRN_CHECK_RESULT_JSON={artifact}"),
+        )
+        .unwrap();
+        let mut write = observation("obs-transfer", "commit-transfer", "env-a");
+        write.exit_code = 1;
+        write.verdict = "failed".into();
+        write.target_results_json = Some(serde_json::to_string(&parsed).unwrap());
+        write.tests = parsed.tests.iter().map(CheckTestResultRow::from).collect();
+        let handle = write.public_handle.clone();
+        record_fresh_check_observation(db.clone(), write).unwrap();
+        let loaded = get_check_result_observation_by_handle(db, "project-a", &handle)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.tests.len(), 300);
+        assert_eq!(loaded.persisted_counts.passed, 299);
+        assert_eq!(loaded.persisted_counts.failed, 1);
+        assert_eq!(
+            loaded.verdict_result.as_ref().unwrap().transfer_notice(),
+            Some(notice)
+        );
+        let mut stored: Vec<_> = loaded
+            .tests
+            .iter()
+            .map(|row| (&row.test_id, &row.status, row.duration_ms))
+            .collect();
+        stored.sort();
+        let mut expected: Vec<_> = parsed
+            .tests
+            .iter()
+            .map(|row| (&row.id, &row.status, row.duration_ms.map(|ms| ms as i64)))
+            .collect();
+        expected.sort();
+        assert_eq!(stored, expected);
+        assert!(loaded.tests.iter().any(|row| row
+            .failure_excerpt
+            .as_deref()
+            .is_some_and(|excerpt| excerpt.contains("bytes elided"))));
     }
 
     #[tokio::test]

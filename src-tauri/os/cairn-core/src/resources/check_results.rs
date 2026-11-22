@@ -731,6 +731,13 @@ fn render_observation_page(
         String::new(),
     ]);
     body.extend(evidence.lines());
+    if let Some(notice) = observation
+        .verdict_result
+        .as_ref()
+        .and_then(|p| p.transfer_notice())
+    {
+        body.push(format!("- {notice}"));
+    }
     body.push(String::new());
     if let Some(line) = cell_line(
         observation.execution_warmth.as_deref(),
@@ -2056,6 +2063,11 @@ mod tests {
         observation.tests.clear();
         observation.output_tail =
             "stderr:\n```\nExecutor protocol check could not evaluate\n".into();
+        observation.verdict_result = Some(compact(serde_json::json!({
+            "parser": "nextest", "complete": true, "passed": 2, "failed": 1,
+            "skipped": 0, "failures": [],
+            "report": "Check result transfer: 1 excerpts truncated; 102400 bytes dropped; result bound 4194304 bytes"
+        })));
         let query =
             parse_query(&[param("suite", "rust-tests"), param("environment", "env-1")]).unwrap();
         let body = render_observation(
@@ -2069,6 +2081,9 @@ mod tests {
         );
         assert!(body.contains("## Output (tail)"), "{body}");
         assert!(body.contains("Executor protocol check could not evaluate"));
+        assert!(
+            body.contains("- Check result transfer: 1 excerpts truncated; 102400 bytes dropped")
+        );
         assert!(
             body.contains("````text"),
             "fence must outrun the output's own: {body}"

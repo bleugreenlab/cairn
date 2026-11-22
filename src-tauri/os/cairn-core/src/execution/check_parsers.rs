@@ -530,6 +530,14 @@ fn one_attempt() -> u32 {
 }
 
 impl ParsedCheckResult {
+    /// Transfer loss is diagnostic, not lost enumeration or a changed verdict.
+    pub(crate) fn transfer_notice(&self) -> Option<&str> {
+        self.report
+            .as_deref()?
+            .lines()
+            .find(|line| line.starts_with("Check result transfer: "))
+    }
+
     /// Whether this parse came from a TEST RUNNER (`nextest`/`vitest`), whose
     /// pass/fail counts denote real tests, rather than `tsc`, whose `failed` is a
     /// type-error tally with no "test count" meaning. Verdict surfaces gate the

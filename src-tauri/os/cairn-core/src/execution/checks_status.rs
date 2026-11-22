@@ -2299,7 +2299,10 @@ fn status_from_row(
             .then_some(row.infra_failure_streak),
         executor,
         verified_on: None,
-        notice: None,
+        notice: parsed
+            .as_ref()
+            .and_then(ParsedCheckResult::transfer_notice)
+            .map(str::to_string),
         plan_audit_note: parsed
             .as_ref()
             .and_then(ParsedCheckResult::plan_audit_not_evaluated),

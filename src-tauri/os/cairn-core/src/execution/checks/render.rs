@@ -785,6 +785,13 @@ pub(super) fn summary_annotation(o: &CheckOutcome) -> Option<String> {
             },
         }
     }
+    if let Some(notice) = o
+        .parsed
+        .as_ref()
+        .and_then(ParsedCheckResult::transfer_notice)
+    {
+        parts.push(notice.to_string());
+    }
     if o.cached {
         parts.push("cached".to_string());
     }

@@ -9726,6 +9726,13 @@ pub struct LearnedResourceEstimate {
 /// state. Offers, needs, headroom authorizations and admission keep their shapes
 /// and meanings; an older executor judges each offer exactly as before. A
 /// runner talking to an older executor therefore gets nothing wrong.
+///
+/// cairn/7447 does not move the number. Check-result transfer preserves every
+/// outcome and budgets failure excerpts, reporting any elision in the existing
+/// report string. No frame, field, schema or interpretation changes: older
+/// runners already accept excerpt strings and reports, and newer runners
+/// talking to older executors still read the results those executors supply.
+/// This correction rides the next executor publish, not a separate release.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 177;
 
 /// The version `build.rs` derived from the paragraphs above
