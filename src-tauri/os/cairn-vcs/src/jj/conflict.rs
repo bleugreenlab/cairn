@@ -75,8 +75,7 @@ pub struct ConflictedCommit {
 /// Enumerate the conflicted commits in `range_revset` (e.g. `"a..b"`, or a bare
 /// `bookmarks(exact:...)`) with their conflicted file paths — store-side, no
 /// workspace needed. Returns an empty Vec on no conflicts or any jj error: this
-/// is advisory detail for a diagnostic, never load-bearing (mirrors
-/// [`conflicted_files`]).
+/// is advisory detail for a diagnostic, never a load-bearing conflict check.
 ///
 /// In jj a conflict in an ancestor propagates to every descendant until
 /// resolved, so `<dest>..<branch> & conflicts()` names precisely the offending
@@ -235,63 +234,11 @@ pub fn revset_descends_from(jj: &JjEnv, store: &Path, tip_revset: &str, dest_com
     .unwrap_or(false)
 }
 
-/// True when `branch`'s tip already descends from (or equals) `dest_commit`.
-/// Lets a reconcile skip re-rebasing an already-rebased branch so repeated or
-/// serialized passes never re-rewrite an already-rebased commit (clean or
-/// conflicted) — the structural idempotence that, paired with single-writer
-/// serialization, stops new divergent conflicted copies from accumulating and
-/// keeps a resolved clean bookmark from being dragged back onto a conflicted
-/// twin.
-pub(crate) fn branch_descends_from(
-    jj: &JjEnv,
-    store: &Path,
-    branch: &str,
-    dest_commit: &str,
-) -> bool {
-    revset_descends_from(
-        jj,
-        store,
-        &format!("bookmarks(exact:{branch:?})"),
-        dest_commit,
-    )
-}
-
-/// True when `branch`'s tip is an ancestor of (or equals) `dest_commit`.
-/// A resolve failure falls to `false`, matching [`revset_descends_from`]: callers
-/// should proceed with the normal rebase rather than wrongly classifying a branch
-/// as safely fast-forwardable.
-pub(crate) fn branch_is_ancestor_of(
-    jj: &JjEnv,
-    store: &Path,
-    branch: &str,
-    dest_commit: &str,
-) -> bool {
-    let branch_revset = format!("bookmarks(exact:{branch:?})");
-    let revset = format!("({branch_revset})::{dest_commit}");
-    jj.run(
-        store,
-        &[
-            "log",
-            "-r",
-            &revset,
-            "--no-graph",
-            "-T",
-            "commit_id",
-            "--ignore-working-copy",
-        ],
-        "jj ancestor check",
-    )
-    .ok()
-    .map(|s| !s.trim().is_empty())
-    .unwrap_or(false)
-}
-
 /// True when `commit` is an ancestor of (or equals) `branch`'s tip — that is,
 /// when the branch already carries that commit and a replay onto it would move
 /// nothing.
 ///
-/// The mirror of [`branch_is_ancestor_of`], and it falls the same way on a
-/// resolve failure: `false`, meaning "not known to carry it". Callers use this
+/// A resolve failure answers `false`, meaning "not known to carry it". Callers use this
 /// to skip redundant work, so an unproven answer must send them down the
 /// replay path — a replay that turns out to be a no-op is harmless, while
 /// skipping one that was needed is the failure this exists to prevent.
@@ -407,12 +354,11 @@ pub enum CollapseOutcome {
 }
 
 /// Collapse a *pre-existing* divergent change on `branch` over the shared store.
-/// New divergence is already prevented upstream (the per-store mutex plus the
-/// idempotent [`reconcile_siblings`] skip); this heals a twin that forked BEFORE
-/// that serialization landed, or via an external `jj` op outside Cairn's lock —
-/// the cleanup `reconcile_siblings` never did, because it operates on each
-/// bookmark's single tip and never touches the orphaned twin sharing the
-/// change-id, so [`sealed_commit_is_lost`] keeps firing on every re-seal.
+/// Detached branch preparation computes an unpublished candidate from an exact
+/// head/base snapshot and installs it only while those coordinates still match.
+/// It does not collapse orphaned twins sharing the tip's change-id. This repairs
+/// pre-existing divergence, including twins created by external `jj` operations,
+/// that would otherwise make re-sealing repeatedly report a lost sealed commit.
 ///
 /// Resolves the bookmark tip's change-id, lists every visible commit sharing it,
 /// and:
@@ -428,7 +374,8 @@ pub enum CollapseOutcome {
 /// that could lose work, so those tangles surface to a human instead. There is
 /// deliberately NO descendancy tiebreak among multiple clean twins.
 ///
-/// Mutations use `--ignore-working-copy` (store-driven, like `reconcile_siblings`).
+/// Mutations use `--ignore-working-copy`: like detached branch preparation,
+/// this repairs store history without following or refreshing a workspace.
 /// The caller MUST hold the per-store lock so the collapse cannot itself fork.
 pub fn collapse_divergent_bookmark(
     jj: &JjEnv,

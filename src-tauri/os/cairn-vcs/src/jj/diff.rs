@@ -6,7 +6,7 @@ use std::path::Path;
 /// One changed file derived from the live sealed jj graph: its repo-relative
 /// path, status, and `+`/`-` line counts, plus the previous path for a rename.
 /// The substrate for the node `/changed` projection, which derives the changed
-/// set from the graph ([`node_changed_files`]) rather than the best-effort
+/// set from the graph rather than the best-effort
 /// `file_changes` cache, so a just-sealed commit's file is never omitted the way
 /// the decoupled async cache insert could lag or drop it (CAIRN-2101).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,8 +22,8 @@ pub struct GraphFileChange {
 }
 
 /// The files `head` changed since it last shared history with `base`, between
-/// two immutable logical coordinates. Unlike [`node_changed_files`], this never
-/// consults the workspace `@` commit.
+/// two immutable logical coordinates, without consulting the workspace `@`
+/// commit.
 ///
 /// This is a diff between two trees, from `fork_point(base | head)` to `head`,
 /// and never a diff over the revset `base..head`. jj refuses to diff a revset

@@ -228,7 +228,8 @@ fn fold_into_bookmark(
 /// — which assumes Cairn's reconcile keeps the source on an integration tip — the
 /// default branch advances OUTSIDE the fold chain (another PR merged, or an
 /// external push), so the source is first rebased onto the current target tip,
-/// exactly as the sibling reconcile rebases siblings, then the target FFs to it.
+/// using detached preparation to validate and heal the candidate before
+/// installing it, then the target fast-forwards to it.
 /// A recorded conflict returns a safe, actionable error and NEVER the
 /// `--allow-backwards` hint (which would move the default branch backward and
 /// clobber it). `dest` is the resolved live target tip (`<target>@origin` for a
@@ -809,54 +810,6 @@ pub(crate) fn rebase_branch_onto_with_resolution(
     Ok(RebaseOutcome::Rebased)
 }
 
-/// The fork point of `pre_tip` and `dest` — the base of the three-way merge that
-/// just failed. `None` when it does not resolve; the diagnostic degrades to
-/// missing coordinates rather than failing the rebase that produced it.
-fn merge_base_of(jj: &JjEnv, store: &Path, pre_tip: &str, dest: &str) -> Option<String> {
-    revset_commit(jj, store, &format!("heads(::{pre_tip} & ::({dest}))"))
-}
-
-/// Whether any of `paths` differs in content between two revisions.
-///
-/// This is the whole of the base-drift test. jj records a conflict from the
-/// SHAPE of the history — three-way merge over a stale base — independently of
-/// whether the two sides actually disagree about bytes. When they do not, the
-/// agent has nothing to edit and telling them to merge by hand sends them
-/// looking for a difference that is not there.
-///
-/// Advisory: an unresolvable diff answers `true`, which classifies the conflict
-/// as a content conflict. That is the safe direction — it asks for a human read
-/// of both sides rather than claiming work is already done.
-pub(crate) fn paths_differ_between(
-    jj: &JjEnv,
-    store: &Path,
-    from: &str,
-    to: &str,
-    paths: &[String],
-) -> bool {
-    if paths.is_empty() {
-        return true;
-    }
-    let mut args = vec![
-        "diff",
-        "--ignore-working-copy",
-        "--summary",
-        "--from",
-        from,
-        "--to",
-        to,
-        "--",
-    ];
-    args.extend(paths.iter().map(String::as_str));
-    match jj.run(store, &args, "jj diff --summary (base-drift probe)") {
-        Ok(output) => !output.trim().is_empty(),
-        Err(error) => {
-            log::warn!("conflict diagnostic: base-drift probe failed, assuming a content conflict: {error}");
-            true
-        }
-    }
-}
-
 /// One side of a recorded conflict, recomputed from immutable commits.
 ///
 /// A conflict diagnostic stores coordinates, not patches, precisely so this can
@@ -896,86 +849,6 @@ pub fn merge_side_patch(
         args.push(file);
     }
     jj.run(store, &args, "jj diff --git (conflict merge side)")
-}
-
-/// Assemble the complete conflict diagnostic while the conflict still exists.
-///
-/// Called from inside [`rebase_branch_onto_with_resolution`] between the recorded conflict and
-/// the rollback, under the per-store lock every caller holds. Every step is
-/// advisory in the sense that it degrades to a missing field rather than failing
-/// the rebase: an instrument must never be able to break the machinery it
-/// measures. What it must NOT do is guess — conflict membership comes from jj's
-/// real rebase result (`conflicting`), never from path overlap.
-pub(crate) fn capture_conflict_diagnostic(
-    jj: &JjEnv,
-    store: &Path,
-    branch: &str,
-    dest: &str,
-    pre_tip: Option<&str>,
-    conflicting: Vec<String>,
-) -> ConflictDiagnostic {
-    let theirs = revset_commit(jj, store, dest);
-    let conflicted_tip = bookmark_commit(jj, store, branch);
-    let base = match (pre_tip, theirs.as_deref()) {
-        (Some(ours), Some(theirs)) => merge_base_of(jj, store, ours, theirs),
-        _ => None,
-    };
-
-    // The incoming change's COMPLETE file set: everything `base..theirs` touches,
-    // with jj's own status word so an add, a delete, and a rename are
-    // distinguishable rather than flattened to "changed".
-    let mut incoming: Vec<IncomingFile> = match (base.as_deref(), theirs.as_deref()) {
-        (Some(base), Some(theirs)) => diff_name_status(jj, store, base, theirs)
-            .into_iter()
-            .map(|(status, path)| {
-                let classification = if conflicting.contains(&path) {
-                    IncomingClassification::Conflicting
-                } else {
-                    IncomingClassification::CleanOnRetry
-                };
-                IncomingFile {
-                    path,
-                    status,
-                    classification,
-                }
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    // A conflicting path the inventory did not name is still a conflicting path.
-    // jj's authority over conflict membership is absolute here; the inventory is
-    // only how the SIBLINGS are discovered.
-    for path in &conflicting {
-        if !incoming.iter().any(|file| &file.path == path) {
-            incoming.push(IncomingFile {
-                path: path.clone(),
-                status: "C".to_string(),
-                classification: IncomingClassification::Conflicting,
-            });
-        }
-    }
-    incoming.sort_by(|a, b| a.path.cmp(&b.path));
-
-    let condition = match (pre_tip, theirs.as_deref()) {
-        (Some(ours), Some(theirs))
-            if !paths_differ_between(jj, store, ours, theirs, &conflicting) =>
-        {
-            ConflictCondition::BaseDrift
-        }
-        _ => ConflictCondition::ContentConflict,
-    };
-
-    ConflictDiagnostic {
-        base,
-        ours: pre_tip.map(ToOwned::to_owned),
-        theirs,
-        conflicted_tip,
-        condition,
-        incoming,
-        scaffolding: None,
-        validation: None,
-        heal_refusal: None,
-    }
 }
 
 /// What a clean rebase changed on a branch's tip, and which of those files the
@@ -1109,74 +982,4 @@ fn log_rebase_side_selection(
         selection.overlapping.len(),
         selection.overlapping.join(", ")
     );
-}
-
-/// Fast-forward a branch bookmark to a concrete destination commit over the shared
-/// store, then export the move to git immediately so jj's bookmark and backing git
-/// ref stay in lockstep. This is the no-work sibling analogue of
-/// [`rebase_branch_onto`]: there is no branch commit to rebase, only an idle
-/// bookmark to move onto the advanced base.
-pub(crate) fn fast_forward_bookmark(
-    jj: &JjEnv,
-    store: &Path,
-    branch: &str,
-    dest: &str,
-) -> Result<(), String> {
-    let before = bookmark_commit(jj, store, branch);
-    jj.run(
-        store,
-        &[
-            "bookmark",
-            "set",
-            branch,
-            "-r",
-            dest,
-            "--ignore-working-copy",
-        ],
-        "jj bookmark fast-forward",
-    )?;
-    // `dest` is the exact commit this was asked to land on, so assert that rather
-    // than whatever the bookmark reports afterwards.
-    let Err(error) = export_git_verified(
-        jj,
-        store,
-        true,
-        "jj git export (bookmark fast-forward)",
-        &[(branch, dest)],
-    ) else {
-        return Ok(());
-    };
-    // A refused export (a frozen ref, or a tree carrying conflict scaffolding)
-    // leaves git where it was, so the store goes back too: a bookmark ahead of
-    // its git ref is the drift every later import turns into a conflicted name.
-    let Some(before) = before else {
-        return Err(error);
-    };
-    // Rolled back only from `dest`: a bookmark another writer has moved since is
-    // theirs, and moving it back would drop what they published.
-    let restored = crate::repoint_bookmark_if_unchanged(
-        store,
-        branch,
-        &[dest.to_string()],
-        &before,
-        &format!("roll back fast-forward of `{branch}` to {before}"),
-    )
-    .and_then(|()| {
-        export_git_verified(
-            jj,
-            store,
-            true,
-            "jj git export (fast-forward rolled back)",
-            &[(branch, before.as_str())],
-        )
-    });
-    Err(match restored {
-        Ok(()) => format!("{error}\nThe fast-forward was rolled back to {before}."),
-        Err(rollback) => format!(
-            "{error}\n{}",
-            rollback_incomplete(&format!(
-                "rolling the fast-forward of `{branch}` back to {before} also failed: {rollback}"
-            ))
-        ),
-    })
 }

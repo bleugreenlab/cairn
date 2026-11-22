@@ -1335,15 +1335,19 @@ fn a_whole_file_restore_that_would_drop_incoming_work_is_detected_and_remediable
     );
 
     // And the replay that restore drives lands a file containing both sides.
-    let report = reconcile_resolved_sibling_without_publication(
+    let snapshot = capture_branch_advance(&store, branch, "main").unwrap();
+    let candidate = compute_branch_advance(
         &jj,
-        &store,
-        "main",
-        branch,
-        &ResolutionCarry::from_tip(&resolved_tip, &paths),
+        snapshot,
+        Some(&ResolutionCarry::from_tip(&resolved_tip, &paths)),
+        Duration::from_secs(60),
     )
     .unwrap();
-    assert_eq!(report.rebased_clean, vec![branch.to_string()]);
+    assert_eq!(bookmark_commit(&jj, &store, branch).unwrap(), resolved_tip);
+    install_branch_advance_exported(&jj, candidate)
+        .unwrap()
+        .export
+        .unwrap();
     let landed = String::from_utf8(file_show(&jj, &store, branch, "shared.rs").unwrap()).unwrap();
     assert!(
         landed.contains("header-from-branch"),
@@ -1819,64 +1823,6 @@ fn count_commits(jj: &JjEnv, store: &Path, range: &str) -> usize {
     .count()
 }
 
-/// The other arm of the same specimen: a branch that already sat on its dest,
-/// so this pass rebased nothing and there is nothing to roll back. A lost lock
-/// there used to be filed as a content conflict and steer the agent to
-/// resolve markers that did not exist.
-#[test]
-fn an_unmoved_branch_whose_heal_cannot_run_is_a_retried_failure_not_a_conflict() {
-    let branch = "agent/cairn-4994-builder-0";
-    let mut lock = ReconcileReport::default();
-    record_unmoved_heal_refusal(
-        &mut lock,
-        branch,
-        HealError::Failed(
-            "jj restore (ancestry heal) failed: The lock for the packed-ref file could not be \
-             obtained\npacked-refs lock: contention — held by live process 77 (git) after 30s"
-                .to_string(),
-        ),
-    );
-    assert!(lock.conflicted.is_empty(), "a lock is not a conflict");
-    assert_eq!(lock.failed.len(), 1);
-    assert_eq!(
-        reconcile_failure_kind(&lock.failed[0].error),
-        REF_LOCK_CONTENTION
-    );
-
-    let mut guard = ReconcileReport::default();
-    let refusal = HealRefusal {
-        guard: HealGuard::TipTreeChanged,
-        pre_heal_tip: "1dc97f55".to_string(),
-        pre_heal_tree: "0520dad1".to_string(),
-        healed_tip: Some("920cd1ed".to_string()),
-        healed_tree: Some("b93db1c1".to_string()),
-        paths: vec!["permission.rs".to_string()],
-    };
-    record_unmoved_heal_refusal(
-        &mut guard,
-        branch,
-        HealError::Refused(Box::new(refusal.clone())),
-    );
-    assert_eq!(
-        guard.conflicted,
-        vec![branch.to_string()],
-        "a guard refusal is still a finding about the tree"
-    );
-    assert!(guard.failed.is_empty());
-    let diagnostic = &guard.conflict_diagnostics[branch];
-    assert_eq!(
-        diagnostic.condition,
-        ConflictCondition::HealRefused,
-        "never a content conflict: there is no content to resolve"
-    );
-    assert_eq!(diagnostic.heal_refusal.as_ref(), Some(&refusal));
-    assert_eq!(
-        refusal.to_string(),
-        "ancestry heal guard: the healed tip `920cd1ed` (tree `b93db1c1`) does not hold the tree \
-         `0520dad1` of the pre-heal tip `1dc97f55`; differs in: permission.rs"
-    );
-}
-
 /// A rollback that did not complete outranks the lock that caused it. Such an
 /// error quotes the lock, and filing it as routine contention would tell the
 /// agent and the page that nothing moved when the store may disagree with git.
@@ -1898,32 +1844,6 @@ fn an_incomplete_rollback_outranks_a_nested_lost_lock() {
         ref_lock_deferral(&compound),
         None,
         "it does not defer the pass either"
-    );
-
-    // An unmoved branch whose heal failed and could not be undone is a
-    // reported failure, whatever refused it first.
-    let branch = "agent/cairn-4994-builder-0";
-    let mut report = ReconcileReport::default();
-    record_unmoved_heal_refusal(
-        &mut report,
-        branch,
-        HealError::Failed(format!(
-            "the healed tip carries jj conflict scaffolding\n{}",
-            rollback_incomplete(
-                "the refused heal of `b` could not be undone to operation op1: lock"
-            )
-        )),
-    );
-    assert!(report.conflicted.is_empty(), "{report:?}");
-    assert_eq!(report.failed.len(), 1);
-    assert_eq!(
-        reconcile_failure_kind(&report.failed[0].error),
-        ROLLBACK_FAILED
-    );
-    assert!(
-        !report.failed[0].error.contains("unchanged"),
-        "it claims nothing about the branch: {}",
-        report.failed[0].error
     );
 }
 
@@ -3701,22 +3621,14 @@ fn a_replay_whose_rebased_tree_carries_conflict_scaffolding_is_rolled_back_as_a_
     )
     .unwrap();
 
-    let report =
-        reconcile_siblings_without_publication(&jj, &store, "main", &[branch.to_string()]).unwrap();
-
-    assert!(
-        !report.rebased_clean.contains(&branch.to_string()),
-        "a replay whose tree carries conflict scaffolding is never reported clean: {report:?}"
-    );
-    assert_eq!(
-        report.conflicted,
-        vec![branch.to_string()],
-        "it is a conflict, so the attention layer opens a session: {report:?}"
-    );
-    assert!(
-        report.failed.is_empty(),
-        "not a retried failure: {report:?}"
-    );
+    let before = operation_id(&jj, &store).unwrap();
+    let snapshot = capture_branch_advance(&store, branch, "main").unwrap();
+    let Err(AdvanceComputeError::Conflict(diagnostic)) =
+        compute_branch_advance(&jj, snapshot, None, Duration::from_secs(60))
+    else {
+        panic!("a scaffolded candidate must be refused as a content conflict");
+    };
+    assert_eq!(operation_id(&jj, &store).unwrap(), before);
     assert_eq!(
         bookmark_commit(&jj, &store, branch).unwrap(),
         pre_tip,
@@ -3727,14 +3639,10 @@ fn a_replay_whose_rebased_tree_carries_conflict_scaffolding_is_rolled_back_as_a_
         pre_tip,
         "the git ref never moved onto the scaffolded tree"
     );
-    let diagnostic = report
-        .conflict_diagnostics
-        .get(branch)
-        .expect("the conflict carries a diagnostic");
     assert_eq!(
         diagnostic.conflicting_paths(),
         vec!["shared.rs".to_string()],
-        "the file both sides changed is named, captured before the rollback: {diagnostic:?}"
+        "the file both sides changed is named in the detached refusal: {diagnostic:?}"
     );
     assert_eq!(diagnostic.ours.as_deref(), Some(pre_tip.as_str()));
     assert_eq!(
@@ -4804,7 +4712,7 @@ fn a_base_advance_rebases_a_branch_whose_origin_copy_was_untracked() {
 
     let outcome = rebase_branch_onto(&jj, &store, branch, "main").unwrap();
     assert_eq!(outcome, RebaseOutcome::Rebased);
-    assert!(branch_descends_from(&jj, &store, branch, &new_base));
+    assert!(branch_carries_commit(&jj, &store, branch, &new_base));
     assert_eq!(origin_tracking(&jj, &store, branch), Some(true));
 
     push_bookmark_to_origin(&jj, &store, branch);
@@ -5572,14 +5480,6 @@ fn a_take_committed_tip_replay_heals_a_five_commit_branch_in_place() {
     let replayed = commits_oldest_first(&jj, &store, &range);
     assert_eq!(replayed.len(), 4);
     assert!(conflicted_commits(&jj, &store, &range).is_empty());
-
-    let report =
-        reconcile_siblings_without_publication(&jj, &store, "main", &[branch.to_string()]).unwrap();
-    assert_eq!(report.rebased_clean, vec![branch.to_string()], "{report:?}");
-    assert!(
-        report.conflicted.is_empty() && report.failed.is_empty(),
-        "{report:?}"
-    );
 
     let healed = commits_oldest_first(&jj, &store, &range);
     let subjects: Vec<&str> = healed.iter().map(|(_, subject)| subject.as_str()).collect();

@@ -122,8 +122,8 @@ pub fn bookmark_landed_in(jj: &JjEnv, store: &Path, src: &str, dst: &str) -> boo
 }
 
 /// Local bookmarks pointing exactly at `rev` in this workspace's view of the
-/// store. The single-commit analogue of [`local_bookmarks_in_range`]: the amend
-/// guard in [`seal_paths`] uses it to detect whether `@-` (the commit a `^` amend
+/// store. The amend guard in [`seal_paths`] uses this exact-target lookup to
+/// detect whether `@-` (the commit a `^` amend
 /// would rewrite) is SHARED with a sibling bookmark, in which case the amend is
 /// converted to a child commit rather than rewriting shared history.
 /// `--ignore-working-copy` keeps the read from snapshotting `@` before the seal

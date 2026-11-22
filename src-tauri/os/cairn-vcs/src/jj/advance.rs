@@ -5581,24 +5581,14 @@ mod tests {
                 "{step}: no partial result is exported"
             );
         }
-        // The automatic reconcile adapter must preserve the native timeout,
+        // The live replay adapter must preserve the native timeout,
         // not turn an interrupted ancestry heal into a conflict diagnostic.
         let budget = ReplayBudget::expire_at(&fixture.store, "ancestry heal: commit resolved");
-        let report = reconcile_siblings_without_publication(
-            &fixture.jj,
-            &fixture.store,
-            "main",
-            &["feature".to_string()],
-        )
-        .unwrap();
+        let error =
+            super::super::rebase_branch_onto(&fixture.jj, &fixture.store, "feature", "main")
+                .unwrap_err();
         assert!(budget.reached());
-        let [failure] = report.failed.as_slice() else {
-            panic!("expected one timeout failure: {report:?}")
-        };
-        assert_eq!(failure.branch, "feature");
-        assert_eq!(reconcile_failure_kind(&failure.error), RECONCILE_TIMEOUT);
-        assert!(report.conflicted.is_empty() && report.conflict_diagnostics.is_empty());
-        assert!(report.rebased_clean.is_empty());
+        assert_eq!(reconcile_failure_kind(&error), RECONCILE_TIMEOUT);
         assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
         assert_eq!(
             bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap(),

@@ -325,7 +325,6 @@ fn production_vcs_path_has_no_lock_or_subprocess_edge() {
         "ensure_project_store(",
         "resolve_coordinate_repairing_conflicts(",
         "prepare_branch(",
-        "reconcile_siblings",
     ] {
         assert!(
             !sources.contains(forbidden),
