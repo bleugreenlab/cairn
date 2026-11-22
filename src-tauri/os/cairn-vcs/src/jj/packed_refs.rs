@@ -30,6 +30,31 @@ use std::time::{Duration, Instant};
 /// that is going to win the race usually does so within the first few attempts.
 const RETRY_DELAY: Duration = Duration::from_millis(250);
 
+// A fresh listing should settle a pack/prune race immediately. Do not spend
+// the full lock budget on a persistently disappearing loose reference.
+const VANISHED_REF_MAX_ATTEMPTS: u32 = 4;
+
+/// gix's loose-ref iterator names the file before opening it. pack-refs and
+/// fetch --prune can unlink it in between. Require the read context and its
+/// own NotFound cause together, not an unrelated missing file in the chain.
+fn vanished_ref_error(error: &str) -> bool {
+    error.lines().any(|line| {
+        let Some((_, read)) = line.split_once("ref file ") else {
+            return false;
+        };
+        let Some((_, cause)) = read.split_once(" could not be read in full: ") else {
+            return false;
+        };
+        cause.starts_with("No such file or directory (os error 2)")
+            || cause.starts_with("The system cannot find the file specified. (os error 2)")
+            || cause.starts_with("The system cannot find the path specified. (os error 3)")
+    })
+}
+
+fn ref_store_contention(error: &str) -> bool {
+    packed_refs_lock_error(error) || vanished_ref_error(error)
+}
+
 /// How long into the wait the lock is first probed for abandonment. A routine
 /// writer holds `packed-refs.lock` for milliseconds, and a slow one holds it
 /// open, which `lsof` sees; a lock five seconds old that nobody holds open is
@@ -270,10 +295,28 @@ impl<'a> Patience<'a> {
     /// healing attempt could not clear — patience never converts a real failure
     /// into a different one.
     fn recover(&mut self, error: String) -> Result<Recovery, String> {
-        if !packed_refs_lock_error(&error) {
+        if !ref_store_contention(&error) {
             return Err(error);
         }
         self.contention_ended = Some(Instant::now());
+        if vanished_ref_error(&error) {
+            // A vanished loose ref says nothing about lock abandonment. Never
+            // probe or remove a lock on the strength of this error.
+            if self.attempts >= VANISHED_REF_MAX_ATTEMPTS || self.started.elapsed() >= LOCK_WAIT {
+                return Err(error);
+            }
+            let remaining = self
+                .operation_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(RETRY_DELAY);
+            if remaining.is_zero() {
+                return Err(format!(
+                    "{} timed out: operation budget exhausted",
+                    self.ctx
+                ));
+            }
+            return Ok(Recovery::Wait(RETRY_DELAY.min(remaining)));
+        }
         if let Some(deadline) = self.operation_deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -450,7 +493,7 @@ pub(crate) fn run_store_rewrite(
             Err(error) => error,
         };
         let timed_out = super::is_jj_timeout_error(&error);
-        if !packed_refs_lock_error(&error) && !timed_out {
+        if !ref_store_contention(&error) && !timed_out {
             return Err(error);
         }
         let failure = defuse_lock_phrasing(&error);
@@ -552,8 +595,8 @@ pub(crate) fn reached_step(step: &str) {
 /// phrasing [`packed_refs_lock_error`] keys on. The verbatim text goes to the
 /// log at the call site.
 fn defuse_lock_phrasing(error: &str) -> String {
-    if packed_refs_lock_error(error) {
-        "it too lost the ref-store lock; the full error is in the log".to_string()
+    if ref_store_contention(error) {
+        "it too encountered ref-store contention; the full error is in the log".to_string()
     } else {
         error.to_string()
     }
@@ -670,6 +713,98 @@ mod tests {
             "three lost attempts are attributed to this thread"
         );
         assert!(take_packed_refs_waited().is_zero(), "reading resets it");
+    }
+
+    fn vanished_ref() -> String {
+        "jj git import failed: Failed to import refs: The ref file \"/repo/.git/refs/remotes/origin/pr/677\" could not be read in full: No such file or directory (os error 2)".to_string()
+    }
+
+    #[test]
+    fn a_vanished_ref_that_clears_is_waited_out() {
+        let temp = TempDir::new().unwrap();
+        let _ = take_packed_refs_waited();
+        let mut attempts = 0;
+        with_packed_refs_patience(PackedRefs::Checkout(temp.path()), "unit test", || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(vanished_ref())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert!(take_packed_refs_waited() >= RETRY_DELAY);
+    }
+
+    #[test]
+    fn vanished_ref_classification_requires_a_missing_ref_read() {
+        assert!(vanished_ref_error(&vanished_ref()));
+        for cause in [
+            "Permission denied (os error 13)",
+            "Invalid data",
+            "Is a directory (os error 21)",
+        ] {
+            let error = vanished_ref().replace("No such file or directory (os error 2)", cause);
+            assert!(!vanished_ref_error(&error), "{error}");
+            let temp = TempDir::new().unwrap();
+            let mut attempts = 0;
+            assert_eq!(
+                with_packed_refs_patience::<()>(
+                    PackedRefs::Checkout(temp.path()),
+                    "unit test",
+                    || {
+                        attempts += 1;
+                        Err(error.clone())
+                    }
+                )
+                .unwrap_err(),
+                error
+            );
+            assert_eq!(attempts, 1);
+        }
+        assert!(!vanished_ref_error(
+            "object file missing: No such file or directory (os error 2)"
+        ));
+        assert!(!vanished_ref_error(&vanished_ref().replace(
+            "No such file or directory (os error 2)",
+            "Permission denied (os error 13)\nother file: No such file or directory (os error 2)"
+        )));
+        for cause in [
+            "The system cannot find the file specified. (os error 2)",
+            "The system cannot find the path specified. (os error 3)",
+        ] {
+            assert!(vanished_ref_error(
+                &vanished_ref().replace("No such file or directory (os error 2)", cause)
+            ));
+        }
+    }
+
+    #[test]
+    fn persistent_vanished_refs_are_bounded_without_healing() {
+        let (_temp, checkout, lock) = checkout_with_lock();
+        std::fs::write(&lock, "not evidence of abandonment").unwrap();
+        let mut patience = Patience::new(PackedRefs::Checkout(&checkout), "unit test");
+        patience.started = Instant::now() - STALE_PROBE_AFTER;
+        for _ in 1..VANISHED_REF_MAX_ATTEMPTS {
+            patience.attempting();
+            assert!(matches!(
+                patience.recover(vanished_ref()),
+                Ok(Recovery::Wait(_))
+            ));
+        }
+        patience.attempting();
+        assert_eq!(
+            patience.recover(vanished_ref()).err().unwrap(),
+            vanished_ref()
+        );
+        assert!(!patience.probed);
+        assert!(!patience.healed);
+        assert!(lock.exists());
+        assert!(!ref_store_contention(&unrepeatable_rewrite(
+            "rewrite",
+            &defuse_lock_phrasing(&vanished_ref())
+        )));
     }
 
     #[test]
