@@ -358,8 +358,10 @@ fn refuse_scaffolded_ref_moves(
     expect: &[(&str, &str)],
 ) -> Result<(), ExportError> {
     for (branch, commit) in expect {
-        let current =
-            read_branch_commit(repo, branch).or_else(|| git_ref_commit(git, repo, branch));
+        let current = match read_branch_commit(repo, branch) {
+            Some(commit) => Some(commit),
+            None => git_ref_commit(git, repo, branch)?,
+        };
         if current.as_deref() == Some(*commit) {
             continue;
         }
@@ -517,11 +519,18 @@ fn named_git_bookmark(
 
 /// The commit `refs/heads/<branch>` currently holds in `repo`, or `None` when the
 /// ref does not exist.
-fn git_ref_commit(git: &ScopedGit<'_>, repo: &Path, branch: &str) -> Option<String> {
-    git.rev_parse(repo, vec![format!("refs/heads/{branch}")])
-        .ok()
-        .map(|commit| commit.trim().to_string())
-        .filter(|commit| !commit.is_empty())
+fn git_ref_commit(
+    git: &ScopedGit<'_>,
+    repo: &Path,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    match git.rev_parse(repo, vec![format!("refs/heads/{branch}")]) {
+        Err(error) if is_jj_timeout_error(&error) => Err(error),
+        result => Ok(result
+            .ok()
+            .map(|commit| commit.trim().to_string())
+            .filter(|commit| !commit.is_empty())),
+    }
 }
 
 /// Compare each expectation against the backing checkout and repair a
@@ -539,10 +548,13 @@ fn verify_exported_refs(
 ) -> Result<(), String> {
     let mismatched: Vec<(&str, &str, Option<String>)> = expect
         .iter()
-        .filter_map(|(branch, commit)| {
-            let actual = git_ref_commit(git, repo, branch);
-            (actual.as_deref() != Some(*commit)).then_some((*branch, *commit, actual))
+        .map(|(branch, commit)| {
+            let actual = git_ref_commit(git, repo, branch)?;
+            Ok((actual.as_deref() != Some(*commit)).then_some((*branch, *commit, actual)))
         })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
         .collect();
     if mismatched.is_empty() {
         return Ok(());
@@ -556,7 +568,7 @@ fn verify_exported_refs(
     let mut frozen = Vec::new();
     let mut moved = Vec::new();
     for (branch, expected, actual) in mismatched {
-        match judge_ref_mismatch(jj, export_cwd, repo, branch, expected, actual.as_deref()) {
+        match judge_ref_mismatch(jj, export_cwd, repo, branch, expected, actual.as_deref())? {
             RefMismatch::Frozen => frozen.push((branch, expected, actual)),
             RefMismatch::Superseded { current } => log::info!(
                 "{ctx}: `{branch}` advanced from {expected} to {current} while this export was \
@@ -585,19 +597,23 @@ fn verify_exported_refs(
         );
     }
 
-    repair_frozen_export(jj, export_cwd, ignore_working_copy, ctx, &frozen);
+    repair_frozen_export(jj, export_cwd, ignore_working_copy, ctx, &frozen)?;
+    jj.check_operation_budget(ctx)?;
 
     let still_frozen: Vec<String> = frozen
         .iter()
-        .filter_map(|(branch, expected, _)| {
-            let actual = git_ref_commit(git, repo, branch);
-            (actual.as_deref() != Some(*expected)).then(|| {
+        .map(|(branch, expected, _)| {
+            let actual = git_ref_commit(git, repo, branch)?;
+            Ok((actual.as_deref() != Some(*expected)).then(|| {
                 format!(
                     "`{branch}` bookmark {expected} vs git ref {}",
                     actual.as_deref().unwrap_or("<absent>")
                 )
-            })
+            }))
         })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
         .collect();
     if still_frozen.is_empty() {
         log::info!(
@@ -639,16 +655,17 @@ fn judge_ref_mismatch(
     branch: &str,
     expected: &str,
     actual: Option<&str>,
-) -> RefMismatch {
+) -> Result<RefMismatch, String> {
     let targets = match conflicted_bookmark_targets(jj, store, branch) {
         Ok(targets) => targets,
+        Err(error) if is_jj_timeout_error(&error) => return Err(error),
         Err(error) => {
-            return RefMismatch::Moved(format!(
+            return Ok(RefMismatch::Moved(format!(
             "`{branch}` could not be re-read to tell a frozen ref from a moved bookmark: {error}"
-        ))
+        )))
         }
     };
-    match targets.as_slice() {
+    let mismatch = match targets.as_slice() {
         [current] if current == expected => RefMismatch::Frozen,
         [current]
             if actual == Some(current.as_str()) && git_is_ancestor(jj, repo, expected, current) =>
@@ -667,7 +684,9 @@ fn judge_ref_mismatch(
             },
             actual.unwrap_or("<absent>")
         )),
-    }
+    };
+    jj.check_operation_budget("verify exported bookmark")?;
+    Ok(mismatch)
 }
 
 /// The proven repair for a frozen ref, in the order that actually works.
@@ -685,7 +704,7 @@ fn repair_frozen_export(
     ignore_working_copy: bool,
     ctx: &str,
     frozen: &[(&str, &str, Option<String>)],
-) {
+) -> Result<(), String> {
     let expect: Vec<_> = frozen
         .iter()
         .map(|(branch, expected, _)| (*branch, *expected))
@@ -706,6 +725,7 @@ fn repair_frozen_export(
         })
         .await
         .map_err(|error| error.to_string())?;
+        jj.check_operation_budget(ctx)?;
         if tx.repo().has_changes() {
             tx.commit(format!("{ctx} (import frozen named refs)"))
                 .await
@@ -714,6 +734,9 @@ fn repair_frozen_export(
         Ok::<_, String>(())
     });
     if let Err(error) = imported {
+        if is_jj_timeout_error(&error) {
+            return Err(error);
+        }
         log::warn!("{ctx}: import while repairing a frozen export failed: {error}");
     }
     // The re-point is a compare-and-swap against the targets read after the
@@ -724,6 +747,7 @@ fn repair_frozen_export(
     for (branch, expected, _) in frozen {
         let targets = match conflicted_bookmark_targets(jj, export_cwd, branch) {
             Ok(targets) => targets,
+            Err(error) if is_jj_timeout_error(&error) => return Err(error),
             Err(error) => {
                 log::warn!("{ctx}: re-reading `{branch}` during repair failed: {error}");
                 continue;
@@ -739,6 +763,7 @@ fn repair_frozen_export(
             );
             continue;
         }
+        jj.check_operation_budget(ctx)?;
         if let Err(error) = crate::repoint_bookmark_if_unchanged(
             export_cwd,
             branch,
@@ -752,8 +777,12 @@ fn repair_frozen_export(
     if let Err(error) = with_checkout_head_preserved(jj, export_cwd, || {
         run_export(jj, export_cwd, ignore_working_copy, ctx, &expect)
     }) {
+        if is_jj_timeout_error(&error) {
+            return Err(error);
+        }
         log::warn!("{ctx}: re-export while repairing a frozen ref failed: {error}");
     }
+    Ok(())
 }
 
 /// Export after advancing `branch`, verified against the commit the store now
@@ -1080,6 +1109,65 @@ mod head_reader_tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".git/refs/heads/feature")).unwrap();
         temp
+    }
+
+    #[test]
+    fn exhausted_export_verification_preserves_timeout_without_spawning() {
+        let temp = tempfile::tempdir().unwrap();
+        let jj = JjEnv::resolve("must-not-spawn-jj", temp.path())
+            .with_operation_budget(std::time::Duration::ZERO);
+        let assert_timeout = |error: String| {
+            assert_eq!(reconcile_failure_kind(&error), RECONCILE_TIMEOUT, "{error}");
+            assert!(is_jj_timeout_error(&error), "{error}");
+            assert!(!error.contains(EXPORT_FREEZE_MSG), "{error}");
+            assert_eq!(jj.ledger().spawns, 0, "no forward jj or git subprocess");
+        };
+        // The incident's exact failure: a mismatched Git ref needs a bookmark
+        // re-read, but exhaustion is not evidence that the bookmark moved.
+        assert_timeout(
+            judge_ref_mismatch(&jj, temp.path(), temp.path(), "main", A, Some(B)).unwrap_err(),
+        );
+        // Exhaustion while reading the Git ref must not become an absent ref
+        // and start a bookmark probe or a frozen-export repair.
+        let before = jj.operation_phase_summary();
+        assert_timeout(
+            verify_exported_refs(
+                &jj,
+                &ScopedGit(&jj),
+                temp.path(),
+                temp.path(),
+                true,
+                "jj reconcile: export reconciled bookmark",
+                &[("main", A)],
+                "",
+            )
+            .unwrap_err(),
+        );
+        assert_timeout(
+            repair_frozen_export(
+                &jj,
+                temp.path(),
+                true,
+                "jj reconcile: export reconciled bookmark",
+                &[("main", A, Some(B.to_string()))],
+            )
+            .unwrap_err(),
+        );
+        let phases = jj.operation_phase_summary();
+        assert_eq!(
+            phases
+                .matches("git rev-parse [forward; not spawned]")
+                .count(),
+            1
+        );
+        assert_eq!(
+            phases
+                .matches("jj log (conflicted bookmark targets)")
+                .count(),
+            before
+                .matches("jj log (conflicted bookmark targets)")
+                .count()
+        );
     }
 
     #[test]

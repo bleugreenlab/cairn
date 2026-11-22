@@ -157,9 +157,9 @@ impl BranchAdvanceSnapshot {
     /// range step; expiry is [`AdvanceComputeError::TimedOut`], never `None`.
     pub fn already_prepared(
         &self,
-        budget: Duration,
+        budget: impl Into<ComputeBudget>,
     ) -> Result<Option<String>, AdvanceComputeError> {
-        let deadline = Deadline::for_store(Instant::now() + budget, &self.store);
+        let deadline = Deadline::for_store(Deadline::new(budget, None).expires_at, &self.store);
         deadline.check()?;
         futures::executor::block_on(self.already_prepared_within(&deadline))
     }
@@ -228,9 +228,9 @@ impl BranchAdvanceSnapshot {
     pub fn reachable_from_head(
         &self,
         commits: &[String],
-        budget: Duration,
+        budget: impl Into<ComputeBudget>,
     ) -> Result<Vec<String>, AdvanceComputeError> {
-        let deadline = Deadline::for_store(Instant::now() + budget, &self.store);
+        let deadline = Deadline::for_store(Deadline::new(budget, None).expires_at, &self.store);
         deadline.check()?;
         let head = CommitId::try_from_hex(&self.coordinate.head)
             .ok_or_else(|| compute_error("invalid captured head"))?;
@@ -478,7 +478,7 @@ pub struct BranchAdvanceCandidate {
     healing: super::AncestryHeal,
     dropped_commit_ids: Vec<String>,
     stale_regenerable: Vec<StaleRegenerable>,
-    expires_at: Instant,
+    expires_at: Option<Instant>,
 }
 
 impl BranchAdvanceCandidate {
@@ -618,13 +618,9 @@ pub fn origin_copy_is_superseded_with_accepted(
     local: &str,
     remote: &str,
     accepted: &[AcceptedAdvanceDrops],
-    budget: Duration,
+    budget: impl Into<ComputeBudget>,
 ) -> Result<bool, AdvanceComputeError> {
-    let limit = Instant::now() + budget;
-    let deadline = Deadline::at(
-        jj.operation_deadline
-            .map_or(limit, |outer| outer.min(limit)),
-    );
+    let deadline = Deadline::new(budget, jj.operation_deadline);
     deadline.check()?;
     let git_dir =
         super::store_git_dir(store).ok_or_else(|| compute_error("resolve proof store"))?;
@@ -805,31 +801,72 @@ fn parsed_evidence(
     CommitId::try_from_hex(hex).ok_or_else(unknown)
 }
 
+/// Compute allowance shared by native work and its subprocesses.
+#[derive(Clone, Copy, Debug)]
+pub enum ComputeBudget {
+    Finite(Duration),
+    #[cfg(any(test, feature = "test-utils"))]
+    Unbounded,
+}
+
+impl From<Duration> for ComputeBudget {
+    fn from(duration: Duration) -> Self {
+        Self::Finite(duration)
+    }
+}
+
+impl ComputeBudget {
+    pub fn duration(self) -> Option<Duration> {
+        match self {
+            Self::Finite(duration) => Some(duration),
+            #[cfg(any(test, feature = "test-utils"))]
+            Self::Unbounded => None,
+        }
+    }
+
+    pub fn scope(self, jj: &super::JjEnv) -> super::JjEnv {
+        match self {
+            Self::Finite(duration) => jj.with_operation_budget(duration),
+            #[cfg(any(test, feature = "test-utils"))]
+            Self::Unbounded => jj.with_unbounded_compute(),
+        }
+    }
+}
+
 struct Deadline {
-    expires_at: Instant,
+    expires_at: Option<Instant>,
     #[cfg(any(test, feature = "test-utils"))]
     injected: Option<Arc<super::testing::ReplayBudgetState>>,
 }
 
 impl Deadline {
-    fn at(expires_at: Instant) -> Self {
+    fn new(budget: impl Into<ComputeBudget>, outer: Option<Instant>) -> Self {
+        Self::at(budget.into().duration().map_or(outer, |duration| {
+            let limit = Instant::now() + duration;
+            Some(outer.map_or(limit, |end| end.min(limit)))
+        }))
+    }
+
+    fn at(expires_at: impl Into<Option<Instant>>) -> Self {
         Self {
-            expires_at,
+            expires_at: expires_at.into(),
             #[cfg(any(test, feature = "test-utils"))]
             injected: None,
         }
     }
 
-    fn for_replay(jj: &super::JjEnv, snapshot: &BranchAdvanceSnapshot, budget: Duration) -> Self {
-        let limit = Instant::now() + budget;
+    fn for_replay(
+        jj: &super::JjEnv,
+        snapshot: &BranchAdvanceSnapshot,
+        budget: impl Into<ComputeBudget>,
+    ) -> Self {
         Self::for_store(
-            jj.operation_deadline
-                .map_or(limit, |outer| outer.min(limit)),
+            Self::new(budget, jj.operation_deadline).expires_at,
             &snapshot.store,
         )
     }
 
-    fn for_store(expires_at: Instant, store: &Path) -> Self {
+    fn for_store(expires_at: Option<Instant>, store: &Path) -> Self {
         let deadline = Self::at(expires_at);
         #[cfg(any(test, feature = "test-utils"))]
         let deadline = Self {
@@ -840,16 +877,26 @@ impl Deadline {
         deadline
     }
 
-    fn bounded(&self, jj: &super::JjEnv) -> super::JjEnv {
+    fn scope(&self, jj: &super::JjEnv) -> super::JjEnv {
         #[cfg(any(test, feature = "test-utils"))]
         if self.injected.is_some() {
             // The injected budget, not elapsed host time, admits replay steps.
             // Subprocesses retain their ordinary per-command safety timeout.
-            let mut unbudgeted = jj.clone();
-            unbudgeted.operation_deadline = None;
-            return unbudgeted;
+            return jj.with_injected_operation_budget();
         }
-        jj.with_operation_budget(self.expires_at.saturating_duration_since(Instant::now()))
+        match self.expires_at {
+            Some(end) => jj.with_operation_budget(end.saturating_duration_since(Instant::now())),
+            None => {
+                #[cfg(any(test, feature = "test-utils"))]
+                {
+                    jj.with_unbounded_compute()
+                }
+                #[cfg(not(any(test, feature = "test-utils")))]
+                {
+                    unreachable!("production compute is always finite")
+                }
+            }
+        }
     }
 
     fn reached_step(&self, step: &str) {
@@ -869,7 +916,7 @@ impl Deadline {
                 Ok(())
             };
         }
-        if Instant::now() >= self.expires_at {
+        if self.expires_at.is_some_and(|end| Instant::now() >= end) {
             Err(AdvanceComputeError::TimedOut)
         } else {
             Ok(())
@@ -1092,7 +1139,7 @@ pub fn compute_branch_advance(
     jj: &super::JjEnv,
     snapshot: BranchAdvanceSnapshot,
     resolution: Option<&super::ResolutionCarry>,
-    budget: Duration,
+    budget: impl Into<ComputeBudget>,
 ) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
     compute_branch_advance_with_declared(jj, snapshot, resolution, None, budget)
 }
@@ -1105,7 +1152,7 @@ pub fn compute_branch_advance_with_declared(
     snapshot: BranchAdvanceSnapshot,
     resolution: Option<&super::ResolutionCarry>,
     declared: Option<&DeclaredMergeEdits>,
-    budget: Duration,
+    budget: impl Into<ComputeBudget>,
 ) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
     compute_with_recovery(jj, snapshot, resolution, declared, budget, false)
 }
@@ -1118,7 +1165,7 @@ pub fn compute_branch_merge_advance(
     jj: &super::JjEnv,
     snapshot: BranchAdvanceSnapshot,
     resolution: Option<&super::ResolutionCarry>,
-    budget: Duration,
+    budget: impl Into<ComputeBudget>,
 ) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
     let message = super::catch_up_merge_message(
         &snapshot.coordinate.base_branch,
@@ -1133,15 +1180,11 @@ pub(super) fn compute_branch_merge_with_message(
     snapshot: BranchAdvanceSnapshot,
     resolution: Option<&super::ResolutionCarry>,
     message: &str,
-    budget: Duration,
+    budget: impl Into<ComputeBudget>,
 ) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
-    let limit = Instant::now() + budget;
-    let deadline = Deadline::at(
-        jj.operation_deadline
-            .map_or(limit, |outer| outer.min(limit)),
-    );
+    let deadline = Deadline::new(budget, jj.operation_deadline);
     deadline.check()?;
-    let bounded = deadline.bounded(jj);
+    let bounded = deadline.scope(jj);
     let head = super::packed_refs::with_packed_refs_patience_for(
         &bounded,
         super::PackedRefs::JjStore(&snapshot.store),
@@ -1363,15 +1406,11 @@ pub(super) fn compute_branch_squash(
     jj: &super::JjEnv,
     snapshot: BranchAdvanceSnapshot,
     message: &str,
-    budget: Duration,
+    budget: impl Into<ComputeBudget>,
 ) -> Result<(BranchAdvanceCandidate, usize), AdvanceComputeError> {
-    let limit = Instant::now() + budget;
-    let deadline = Deadline::at(
-        jj.operation_deadline
-            .map_or(limit, |outer| outer.min(limit)),
-    );
+    let deadline = Deadline::new(budget, jj.operation_deadline);
     deadline.check()?;
-    let bounded = deadline.bounded(jj);
+    let bounded = deadline.scope(jj);
     let (head, collapsed) = super::packed_refs::with_packed_refs_patience_for(
         &bounded,
         super::PackedRefs::JjStore(&snapshot.store),
@@ -1482,7 +1521,7 @@ pub(super) fn compute_legacy_replay(
     jj: &super::JjEnv,
     snapshot: BranchAdvanceSnapshot,
     resolution: Option<&super::ResolutionCarry>,
-    budget: Duration,
+    budget: impl Into<ComputeBudget>,
 ) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
     compute_with_recovery(jj, snapshot, resolution, None, budget, true)
 }
@@ -1492,7 +1531,7 @@ fn compute_with_recovery(
     snapshot: BranchAdvanceSnapshot,
     resolution: Option<&super::ResolutionCarry>,
     declared: Option<&DeclaredMergeEdits>,
-    budget: Duration,
+    budget: impl Into<ComputeBudget>,
     legacy: bool,
 ) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
     if declared.is_some_and(|plan| {
@@ -1508,7 +1547,7 @@ fn compute_with_recovery(
     let patience = if legacy {
         jj.clone()
     } else {
-        deadline.bounded(jj)
+        deadline.scope(jj)
     };
     let (head, healing, dropped_commit_ids, stale_regenerable) =
         super::packed_refs::with_packed_refs_patience_for(
@@ -2847,7 +2886,7 @@ async fn compute_candidate(
     } else {
         format!("({rewrite_scope}) ~ ({})", excluded.join(" | "))
     };
-    let bounded = deadline.bounded(jj);
+    let bounded = deadline.scope(jj);
     let query = |expression: &str| {
         bounded.run(
             &snapshot.store,
@@ -3161,7 +3200,7 @@ async fn compute_candidate(
     }
     let backing = super::export::resolve_backing_checkout(&snapshot.store)
         .ok_or_else(|| compute_error("detached advance has no backing Git repository"))?;
-    let bounded_jj = deadline.bounded(jj);
+    let bounded_jj = deadline.scope(jj);
     let entries = super::export::root_conflict_scaffolding(
         Some(&bounded_jj),
         &backing,
@@ -3389,10 +3428,10 @@ pub fn install_branch_advance_local(
     _jj: &super::JjEnv,
     candidate: BranchAdvanceCandidate,
 ) -> Result<LocallyInstalledBranchAdvance, AdvanceInstallError> {
-    let remaining = candidate
+    if candidate
         .expires_at
-        .saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+        .is_some_and(|end| end <= Instant::now())
+    {
         return Err(AdvanceInstallError::Expired);
     }
     let tree = candidate.tree().map_err(AdvanceInstallError::Repository)?;
@@ -3454,7 +3493,10 @@ pub fn install_branch_advance_local(
             // The only publication point. All expensive candidate work happened
             // before this fresh transaction, not in a previously captured view.
             super::reached_step("advance: before install commit");
-            if Instant::now() >= candidate.expires_at {
+            if candidate
+                .expires_at
+                .is_some_and(|end| Instant::now() >= end)
+            {
                 return Ok(Some(None));
             }
             let accepted = transaction
@@ -3466,7 +3508,10 @@ pub fn install_branch_advance_local(
                 .map_err(|error| format!("install detached advance: {error}"))?;
             return Ok(Some(Some(Some(accepted.op_id().hex()))));
         }
-        if Instant::now() >= candidate.expires_at {
+        if candidate
+            .expires_at
+            .is_some_and(|end| Instant::now() >= end)
+        {
             return Ok(Some(None));
         }
         Ok(Some(Some(None)))
@@ -3507,12 +3552,7 @@ fn export_installed(
     let export_env = if legacy {
         jj.clone()
     } else {
-        jj.with_operation_budget(
-            candidate
-                .expires_at
-                .saturating_duration_since(Instant::now()),
-        )
-        .cleanup_env()
+        Deadline::at(candidate.expires_at).scope(jj).cleanup_env()
     };
     let export = export_accepted_branch(
         &export_env,
@@ -5429,7 +5469,7 @@ mod tests {
         /// capture: (milliseconds, jj commands, observation, candidate).
         fn divergent_compute(
             &self,
-            budget: Duration,
+            budget: impl Into<ComputeBudget>,
         ) -> (
             f64,
             usize,
@@ -5866,7 +5906,7 @@ mod tests {
             healing: Default::default(),
             dropped_commit_ids: Vec::new(),
             stale_regenerable: Vec::new(),
-            expires_at: Instant::now() + std::time::Duration::from_secs(60),
+            expires_at: Some(Instant::now() + std::time::Duration::from_secs(60)),
         }
     }
 
@@ -5919,8 +5959,15 @@ mod tests {
         ));
         assert_eq!(bookmark_commit(&jj, &store, "feature").unwrap(), owner);
 
-        let candidate =
+        let mut candidate =
             hidden_candidate(capture_branch_advance(&store, "feature", "main").unwrap());
+        let outer = Instant::now();
+        assert_eq!(
+            Deadline::new(ComputeBudget::Unbounded, Some(outer)).expires_at,
+            Some(outer),
+        );
+        candidate.expires_at = Deadline::new(ComputeBudget::Unbounded, None).expires_at;
+        assert!(candidate.expires_at.is_none());
         let head = candidate.head();
         run(&["bookmark", "set", "other", "-r", &owner]);
         let installed = install_branch_advance_exported(&jj, candidate).unwrap();
@@ -5955,7 +6002,7 @@ mod tests {
 
         let mut candidate =
             hidden_candidate(capture_branch_advance(&store, "feature", "main").unwrap());
-        candidate.expires_at = Instant::now();
+        candidate.expires_at = Some(Instant::now());
         let before = operation_id(&jj, &store).unwrap();
         assert!(matches!(
             install_branch_advance_exported(&jj, candidate),

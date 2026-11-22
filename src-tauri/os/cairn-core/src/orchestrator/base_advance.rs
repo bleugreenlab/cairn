@@ -2468,6 +2468,27 @@ async fn reconcile_store_default_bookmark(
     branch: &str,
     ctx: &str,
 ) -> Result<(), String> {
+    reconcile_store_default_bookmark_with_budget(
+        orch,
+        db,
+        project_id,
+        repo_path,
+        branch,
+        ctx,
+        crate::jj::BACKGROUND_RECONCILE_BUDGET.into(),
+    )
+    .await
+}
+
+async fn reconcile_store_default_bookmark_with_budget(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    repo_path: &Path,
+    branch: &str,
+    ctx: &str,
+    budget: crate::jj::ComputeBudget,
+) -> Result<(), String> {
     if !branch_is_project_default(db, project_id, branch).await {
         log::debug!(
             "{ctx}: `{branch}` is not project {project_id}'s default branch; not reconciling it onto origin"
@@ -2491,7 +2512,7 @@ async fn reconcile_store_default_bookmark(
             format!("default bookmark reconcile: {ctx}"),
         )
         .await;
-    let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
+    let jj = budget.scope(&jj);
     let _phase = guard.phase("default bookmark reconcile");
     orch.refuse_foreign_reservations(&guard, Some(&reservation))?;
     let preserved = crate::orchestrator::branch_recovery::preserved_import_bookmarks(
@@ -2560,6 +2581,21 @@ pub(crate) async fn reconcile_default_advance(
     project_id: &str,
     default_branch: &str,
 ) -> Result<(), String> {
+    reconcile_default_advance_with_budget(
+        orch,
+        project_id,
+        default_branch,
+        crate::jj::BACKGROUND_RECONCILE_BUDGET.into(),
+    )
+    .await
+}
+
+async fn reconcile_default_advance_with_budget(
+    orch: &Orchestrator,
+    project_id: &str,
+    default_branch: &str,
+    budget: crate::jj::ComputeBudget,
+) -> Result<(), String> {
     let db = owning_db_for_project(&orch.db, project_id)
         .await
         .map_err(|error| {
@@ -2627,7 +2663,7 @@ pub(crate) async fn reconcile_default_advance(
                 format!("external import on {default_branch}"),
             )
             .await;
-        let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
+        let jj = budget.scope(&jj);
         let _phase = store_guard.phase("git ref import");
         let preserved = crate::orchestrator::branch_recovery::preserved_import_bookmarks(
             orch,
@@ -2676,13 +2712,14 @@ pub(crate) async fn reconcile_default_advance(
     }
     // A bookmark that did not move is reported after the downstream work, which
     // rebases onto `<default>@origin` and does not need it.
-    let bookmark = reconcile_store_default_bookmark(
+    let bookmark = reconcile_store_default_bookmark_with_budget(
         orch,
         &db,
         project_id,
         repo_path_path,
         default_branch,
         &format!("external advance on {default_branch}"),
+        budget,
     )
     .await;
     bookmark
@@ -5664,6 +5701,13 @@ mod tests {
                     branch,
                 )
             });
+        let expected_repo = proj.path().to_path_buf();
+        git_client
+            .expect_rev_parse()
+            .withf(move |repo, args| repo == expected_repo && args.len() == 1 && args[0] == "main")
+            .returning(
+                |_, _| Err("code-map refresh is outside this reconciliation fixture".into()),
+            );
         let orch = test_orchestrator(db, git_client);
 
         // The store is provisioned and tracking origin, exactly as a live project's is.
@@ -5680,9 +5724,14 @@ mod tests {
         let landed = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
         git(proj.path(), &["push", "-q", "-f", "origin", "HEAD:main"]);
 
-        reconcile_default_advance(&orch, "proj-jj", "main")
-            .await
-            .unwrap();
+        reconcile_default_advance_with_budget(
+            &orch,
+            "proj-jj",
+            "main",
+            crate::jj::ComputeBudget::Unbounded,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             crate::jj::bookmark_commit(&jj, &store, "main").as_deref(),

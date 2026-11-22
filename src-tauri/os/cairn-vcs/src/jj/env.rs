@@ -51,6 +51,7 @@ pub(crate) use cairn_platform::process::{
 #[derive(Clone)]
 pub struct JjEnv {
     pub(super) operation_deadline: Option<Instant>,
+    unbounded_compute: bool,
     cleanup_deadline: Arc<OnceLock<Instant>>,
     is_cleanup: bool,
     operation_phases: Option<Arc<Mutex<Vec<OperationPhase>>>>,
@@ -71,6 +72,25 @@ fn jj_subprocess_lock() -> &'static Mutex<()> {
 }
 
 impl JjEnv {
+    /// Let an injected replay clock govern admission without losing recovery state.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) fn with_injected_operation_budget(&self) -> Self {
+        let mut scoped = self.clone();
+        scoped.operation_deadline = None;
+        scoped.unbounded_compute = false;
+        scoped
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) fn with_unbounded_compute(&self) -> Self {
+        let mut scoped = self.clone();
+        scoped.operation_deadline = None;
+        scoped.unbounded_compute = true;
+        scoped.cleanup_deadline = Default::default();
+        scoped.is_cleanup = false;
+        scoped
+    }
+
     /// Preserve recovery-fenced bookmark names through every nested import.
     /// Callers hold the store lock from fence admission through the mutation.
     pub fn preserving_import_bookmarks(&self, names: Vec<String>) -> Self {
@@ -87,6 +107,7 @@ impl JjEnv {
     pub fn with_operation_budget(&self, budget: Duration) -> Self {
         let mut scoped = self.clone();
         scoped.operation_deadline = Some(Instant::now() + budget);
+        scoped.unbounded_compute = false;
         scoped.cleanup_deadline = Default::default();
         scoped.is_cleanup = false;
         scoped.operation_phases = Some(Default::default());
@@ -356,7 +377,11 @@ impl JjEnv {
             }
             spawned = true;
             self.ledger().spawns += 1;
-            let output = if self.is_budgeted() {
+            let output = if self.unbounded_compute {
+                command
+                    .output()
+                    .map_err(|error| format!("{ctx}: {error}"))?
+            } else if self.is_budgeted() {
                 // A budgeted transaction's timeout starts its cleanup at the
                 // kill, and the reap spends that same allowance: proving the
                 // writer gone is the first step of the undo, not an extra
@@ -423,6 +448,7 @@ impl JjEnv {
             bin: bin.into(),
             config_path: config_dir.join("jj").join("config.toml"),
             operation_deadline: None,
+            unbounded_compute: false,
             cleanup_deadline: Default::default(),
             is_cleanup: false,
             operation_phases: None,
@@ -444,6 +470,7 @@ impl JjEnv {
             bin,
             config_path: config_dir.join("jj").join("config.toml"),
             operation_deadline: None,
+            unbounded_compute: false,
             cleanup_deadline: Default::default(),
             is_cleanup: false,
             operation_phases: None,
@@ -928,9 +955,10 @@ pub(super) fn publish_scoped_import_candidate(
     store: &Path,
     config: String,
     source: String,
-    deadline: Instant,
+    deadline: impl Into<Option<Instant>>,
 ) -> Result<(), String> {
-    if deadline <= Instant::now() {
+    let deadline = deadline.into();
+    if deadline.is_some_and(|end| end <= Instant::now()) {
         return Err(
             "scoped git import timed out: operation budget exhausted before starting candidate preparation".to_string(),
         );
@@ -971,7 +999,13 @@ pub(super) fn publish_scoped_import_candidate(
             }
         })
         .map_err(|error| format!("start scoped import candidate worker: {error}"))?;
-    let candidate = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    let received = match deadline {
+        Some(end) => receiver.recv_timeout(end.saturating_duration_since(Instant::now())),
+        None => receiver
+            .recv()
+            .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+    };
+    let candidate = received
         .map_err(|error| match error {
             std::sync::mpsc::RecvTimeoutError::Timeout =>
                 "scoped git import timed out: operation budget exhausted; unpublished candidate discarded; no view was published".to_string(),
@@ -979,7 +1013,7 @@ pub(super) fn publish_scoped_import_candidate(
                 "scoped git import candidate worker stopped without returning a candidate".to_string(),
         })??;
     jj.check_operation_budget("publish scoped git import")?;
-    if deadline <= Instant::now() {
+    if deadline.is_some_and(|end| end <= Instant::now()) {
         return Err(
             "scoped git import timed out: operation budget exhausted before publishing candidate"
                 .to_string(),
@@ -991,8 +1025,8 @@ pub(super) fn publish_scoped_import_candidate(
                 .to_string(),
         );
     }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining < JJ_FORWARD_SUBPROCESS_MINIMUM {
+    let remaining = deadline.map(|end| end.saturating_duration_since(Instant::now()));
+    if remaining.is_some_and(|remaining| remaining < JJ_FORWARD_SUBPROCESS_MINIMUM) {
         return Err(
             "scoped git import timed out: operation budget exhausted before publishing candidate"
                 .to_string(),
@@ -1002,7 +1036,7 @@ pub(super) fn publish_scoped_import_candidate(
         store,
         &["op", "integrate", &candidate, "--ignore-working-copy"],
         "publish scoped git import",
-        remaining,
+        remaining.unwrap_or(JJ_DEFAULT_TIMEOUT),
     )
     .map(|_| ())
 }
@@ -1026,9 +1060,14 @@ fn import_holding_tracking_refs(
                 "read effective import settings",
             )?;
             jj.check_operation_budget("scoped git import")?;
-            let deadline = jj
-                .operation_deadline
-                .unwrap_or_else(|| Instant::now() + JJ_DEFAULT_TIMEOUT);
+            let deadline = if jj.unbounded_compute {
+                None
+            } else {
+                Some(
+                    jj.operation_deadline
+                        .unwrap_or_else(|| Instant::now() + JJ_DEFAULT_TIMEOUT),
+                )
+            };
             let source = scoped_import_operation(jj, store_dir)?;
             jj.check_operation_budget("scoped git import")?;
             return publish_scoped_import_candidate(jj, store_dir, config, source, deadline);
@@ -1404,6 +1443,7 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let jj = JjEnv {
             operation_deadline: None,
+            unbounded_compute: false,
             cleanup_deadline: Default::default(),
             is_cleanup: false,
             operation_phases: None,
@@ -1449,6 +1489,7 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let jj = JjEnv {
             operation_deadline: None,
+            unbounded_compute: false,
             cleanup_deadline: Default::default(),
             is_cleanup: false,
             operation_phases: None,
@@ -1595,7 +1636,18 @@ mod cleanup_transition_tests {
                 .is_ok(),
             "starting rollback must not retroactively expire the forward deadline"
         );
-        for env in [&forward, &clone] {
+        let injected = forward.with_injected_operation_budget();
+        assert!(Arc::ptr_eq(&forward.ledger, &injected.ledger));
+        assert!(Arc::ptr_eq(
+            forward.operation_phases.as_ref().unwrap(),
+            injected.operation_phases.as_ref().unwrap(),
+        ));
+        assert!(Arc::ptr_eq(
+            &forward.cleanup_deadline,
+            &injected.cleanup_deadline
+        ));
+        assert!(!injected.unbounded_compute);
+        for env in [&forward, &clone, &injected] {
             let error = env.run(temp.path(), &[], "forward retry").unwrap_err();
             assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
             assert!(
