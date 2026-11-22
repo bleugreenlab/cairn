@@ -2,6 +2,80 @@
 use super::*;
 use std::path::Path;
 
+/// A detached replay budget spent at a named algorithm boundary, independent
+/// of elapsed host time. Scope it to one store; dropping it removes injection.
+pub struct ReplayBudget {
+    store: std::path::PathBuf,
+    state: std::sync::Arc<ReplayBudgetState>,
+}
+
+pub(super) struct ReplayBudgetState {
+    step: &'static str,
+    expired: std::sync::atomic::AtomicBool,
+}
+
+impl ReplayBudgetState {
+    pub(super) fn reached_step(&self, step: &str) {
+        if step == self.step {
+            self.expired
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn expired(&self) -> bool {
+        self.expired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+type ReplayBudgets = std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, std::sync::Arc<ReplayBudgetState>>,
+>;
+
+fn replay_budgets() -> &'static ReplayBudgets {
+    static BUDGETS: std::sync::OnceLock<ReplayBudgets> = std::sync::OnceLock::new();
+    BUDGETS.get_or_init(Default::default)
+}
+
+pub(super) fn replay_budget(store: &Path) -> Option<std::sync::Arc<ReplayBudgetState>> {
+    replay_budgets().lock().unwrap().get(store).cloned()
+}
+
+impl ReplayBudget {
+    /// Before this boundary the budget remains available regardless of load.
+    /// At the boundary the real cooperative checks return the typed timeout;
+    /// the computation's result itself is never substituted.
+    pub fn expire_at(store: &Path, step: &'static str) -> Self {
+        let state = std::sync::Arc::new(ReplayBudgetState {
+            step,
+            expired: std::sync::atomic::AtomicBool::new(false),
+        });
+        assert!(
+            replay_budgets()
+                .lock()
+                .unwrap()
+                .insert(store.to_path_buf(), state.clone())
+                .is_none(),
+            "one injected replay budget per store"
+        );
+        Self {
+            store: store.to_path_buf(),
+            state,
+        }
+    }
+
+    /// Proves the replay reached the intended boundary, rather than expiring
+    /// earlier during fixture setup or an unrelated command.
+    pub fn reached(&self) -> bool {
+        self.state.expired()
+    }
+}
+
+impl Drop for ReplayBudget {
+    fn drop(&mut self) {
+        replay_budgets().lock().unwrap().remove(&self.store);
+    }
+}
+
 /// Hold the real maintenance exclusion while an application fixture tries to
 /// read store metadata. Dropping this guard releases maintenance admission.
 pub struct StoreReclamationGuard {

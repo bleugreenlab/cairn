@@ -159,7 +159,7 @@ impl BranchAdvanceSnapshot {
         &self,
         budget: Duration,
     ) -> Result<Option<String>, AdvanceComputeError> {
-        let deadline = Deadline(Instant::now() + budget);
+        let deadline = Deadline::for_store(Instant::now() + budget, &self.store);
         deadline.check()?;
         futures::executor::block_on(self.already_prepared_within(&deadline))
     }
@@ -230,7 +230,7 @@ impl BranchAdvanceSnapshot {
         commits: &[String],
         budget: Duration,
     ) -> Result<Vec<String>, AdvanceComputeError> {
-        let deadline = Deadline(Instant::now() + budget);
+        let deadline = Deadline::for_store(Instant::now() + budget, &self.store);
         deadline.check()?;
         let head = CommitId::try_from_hex(&self.coordinate.head)
             .ok_or_else(|| compute_error("invalid captured head"))?;
@@ -621,7 +621,7 @@ pub fn origin_copy_is_superseded_with_accepted(
     budget: Duration,
 ) -> Result<bool, AdvanceComputeError> {
     let limit = Instant::now() + budget;
-    let deadline = Deadline(
+    let deadline = Deadline::at(
         jj.operation_deadline
             .map_or(limit, |outer| outer.min(limit)),
     );
@@ -805,11 +805,71 @@ fn parsed_evidence(
     CommitId::try_from_hex(hex).ok_or_else(unknown)
 }
 
-struct Deadline(Instant);
+struct Deadline {
+    expires_at: Instant,
+    #[cfg(any(test, feature = "test-utils"))]
+    injected: Option<Arc<super::testing::ReplayBudgetState>>,
+}
 
 impl Deadline {
+    fn at(expires_at: Instant) -> Self {
+        Self {
+            expires_at,
+            #[cfg(any(test, feature = "test-utils"))]
+            injected: None,
+        }
+    }
+
+    fn for_replay(jj: &super::JjEnv, snapshot: &BranchAdvanceSnapshot, budget: Duration) -> Self {
+        let limit = Instant::now() + budget;
+        Self::for_store(
+            jj.operation_deadline
+                .map_or(limit, |outer| outer.min(limit)),
+            &snapshot.store,
+        )
+    }
+
+    fn for_store(expires_at: Instant, store: &Path) -> Self {
+        let deadline = Self::at(expires_at);
+        #[cfg(any(test, feature = "test-utils"))]
+        let deadline = Self {
+            injected: super::testing::replay_budget(store),
+            ..deadline
+        };
+        let _ = store;
+        deadline
+    }
+
+    fn bounded(&self, jj: &super::JjEnv) -> super::JjEnv {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.injected.is_some() {
+            // The injected budget, not elapsed host time, admits replay steps.
+            // Subprocesses retain their ordinary per-command safety timeout.
+            let mut unbudgeted = jj.clone();
+            unbudgeted.operation_deadline = None;
+            return unbudgeted;
+        }
+        jj.with_operation_budget(self.expires_at.saturating_duration_since(Instant::now()))
+    }
+
+    fn reached_step(&self, step: &str) {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(budget) = &self.injected {
+            budget.reached_step(step);
+        }
+        super::reached_step(step);
+    }
+
     fn check(&self) -> Result<(), AdvanceComputeError> {
-        if Instant::now() >= self.0 {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(budget) = &self.injected {
+            return if budget.expired() {
+                Err(AdvanceComputeError::TimedOut)
+            } else {
+                Ok(())
+            };
+        }
+        if Instant::now() >= self.expires_at {
             Err(AdvanceComputeError::TimedOut)
         } else {
             Ok(())
@@ -1076,12 +1136,12 @@ pub(super) fn compute_branch_merge_with_message(
     budget: Duration,
 ) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
     let limit = Instant::now() + budget;
-    let deadline = Deadline(
+    let deadline = Deadline::at(
         jj.operation_deadline
             .map_or(limit, |outer| outer.min(limit)),
     );
     deadline.check()?;
-    let bounded = jj.with_operation_budget(deadline.0.saturating_duration_since(Instant::now()));
+    let bounded = deadline.bounded(jj);
     let head = super::packed_refs::with_packed_refs_patience_for(
         &bounded,
         super::PackedRefs::JjStore(&snapshot.store),
@@ -1113,7 +1173,7 @@ pub(super) fn compute_branch_merge_with_message(
         head,
         dropped_commit_ids: Vec::new(),
         stale_regenerable,
-        expires_at: deadline.0,
+        expires_at: deadline.expires_at,
     })
 }
 
@@ -1306,12 +1366,12 @@ pub(super) fn compute_branch_squash(
     budget: Duration,
 ) -> Result<(BranchAdvanceCandidate, usize), AdvanceComputeError> {
     let limit = Instant::now() + budget;
-    let deadline = Deadline(
+    let deadline = Deadline::at(
         jj.operation_deadline
             .map_or(limit, |outer| outer.min(limit)),
     );
     deadline.check()?;
-    let bounded = jj.with_operation_budget(deadline.0.saturating_duration_since(Instant::now()));
+    let bounded = deadline.bounded(jj);
     let (head, collapsed) = super::packed_refs::with_packed_refs_patience_for(
         &bounded,
         super::PackedRefs::JjStore(&snapshot.store),
@@ -1412,7 +1472,7 @@ pub(super) fn compute_branch_squash(
             head,
             dropped_commit_ids: Vec::new(),
             stale_regenerable: Vec::new(),
-            expires_at: deadline.0,
+            expires_at: deadline.expires_at,
         },
         collapsed,
     ))
@@ -1441,18 +1501,14 @@ fn compute_with_recovery(
     }) {
         return Err(AdvanceComputeError::CoordinatesChanged);
     }
-    let limit = Instant::now() + budget;
-    let deadline = Deadline(
-        jj.operation_deadline
-            .map_or(limit, |outer| outer.min(limit)),
-    );
+    let deadline = Deadline::for_replay(jj, &snapshot, budget);
     // Legacy callers without an operation budget retain the canonical
     // maintenance-owned stale-lock proof. Detached callers always have an
     // absolute bound and never enter that unbounded external proof.
     let patience = if legacy {
         jj.clone()
     } else {
-        jj.with_operation_budget(deadline.0.saturating_duration_since(Instant::now()))
+        deadline.bounded(jj)
     };
     let (head, healing, dropped_commit_ids, stale_regenerable) =
         super::packed_refs::with_packed_refs_patience_for(
@@ -1481,7 +1537,7 @@ fn compute_with_recovery(
         healing,
         dropped_commit_ids,
         stale_regenerable,
-        expires_at: deadline.0,
+        expires_at: deadline.expires_at,
     })
 }
 
@@ -2258,7 +2314,7 @@ async fn heal_branch(
             }
             let tree = replace_paths(old.tree(), head, &paths, deadline).await?;
             let current = write_with_tree(repo, old, parents, tree, deadline).await?;
-            super::reached_step("ancestry heal: commit resolved");
+            deadline.reached_step("ancestry heal: commit resolved");
             note(&|observed| observed.restored_commits += 1);
             let own = own_changes(repo, &current, &paths, deadline).await?;
             if !own.is_empty() {
@@ -2791,7 +2847,7 @@ async fn compute_candidate(
     } else {
         format!("({rewrite_scope}) ~ ({})", excluded.join(" | "))
     };
-    let bounded = jj.with_operation_budget(deadline.0.saturating_duration_since(Instant::now()));
+    let bounded = deadline.bounded(jj);
     let query = |expression: &str| {
         bounded.run(
             &snapshot.store,
@@ -2924,7 +2980,7 @@ async fn compute_candidate(
                 }
                 let current =
                     rewrite_hidden(transaction.repo_mut(), old, parents, deadline).await?;
-                super::reached_step("advance: hidden commit written");
+                deadline.reached_step("advance: hidden commit written");
                 deadline.check()?;
                 candidate = if let Some(parent) =
                     newly_empty(transaction.repo(), old, &current, collapse.as_ref()).await?
@@ -2946,6 +3002,7 @@ async fn compute_candidate(
         observed.rebase_ms = Some(elapsed_ms(rebase_started));
         observed.phase = Some(ComputePhase::Validate);
     });
+    deadline.reached_step("advance: before classification");
     if transaction
         .repo()
         .index()
@@ -3104,7 +3161,7 @@ async fn compute_candidate(
     }
     let backing = super::export::resolve_backing_checkout(&snapshot.store)
         .ok_or_else(|| compute_error("detached advance has no backing Git repository"))?;
-    let bounded_jj = jj.with_operation_budget(deadline.0.saturating_duration_since(Instant::now()));
+    let bounded_jj = deadline.bounded(jj);
     let entries = super::export::root_conflict_scaffolding(
         Some(&bounded_jj),
         &backing,
@@ -3570,7 +3627,7 @@ mod tests {
 
     #[test]
     fn accepted_source_claims_are_exact_sorted_complete_or_typed_refusal() {
-        let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+        let deadline = Deadline::at(Instant::now() + Duration::from_secs(30));
         let proven = (1..=SQUASH_RECEIPT_LIMIT)
             .map(|number| CommitId::try_from_hex(format!("{number:040x}")).unwrap())
             .collect::<HashSet<_>>();
@@ -3587,7 +3644,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            accepted_source_claims(Vec::new(), &proven, &Deadline(Instant::now())),
+            accepted_source_claims(Vec::new(), &proven, &Deadline::at(Instant::now())),
             Err(AdvanceComputeError::TimedOut)
         ));
     }
@@ -3604,7 +3661,7 @@ mod tests {
             .store()
             .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.head).unwrap())
             .unwrap();
-        let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+        let deadline = Deadline::at(Instant::now() + Duration::from_secs(30));
         for claims in [
             accepted_source_claims(vec![head.id().hex()], &HashSet::new(), &deadline).unwrap(),
             accepted_source_claims(
@@ -3765,7 +3822,7 @@ mod tests {
                 .await
                 .unwrap();
             tx.repo_mut().add_head(&base).await.unwrap();
-            let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+            let deadline = Deadline::at(Instant::now() + Duration::from_secs(30));
             for mask in 0..4 {
                 let mut targets = HashSet::new();
                 if mask & 1 != 0 {
@@ -3989,7 +4046,7 @@ mod tests {
         });
         let snapshot = capture_branch_advance(&fixture.store, "source-child", "feature").unwrap();
         futures::executor::block_on(async {
-            let deadline = Deadline(Instant::now() + Duration::from_secs(60));
+            let deadline = Deadline::at(Instant::now() + Duration::from_secs(60));
             let head = snapshot
                 .repo
                 .store()
@@ -4660,7 +4717,7 @@ mod tests {
                 .set_predecessors(
                     rewrite_predecessors(
                         &older,
-                        &Deadline(Instant::now() + Duration::from_secs(60)),
+                        &Deadline::at(Instant::now() + Duration::from_secs(60)),
                     )
                     .unwrap(),
                 )
@@ -4705,7 +4762,7 @@ mod tests {
                     snapshot.repo.as_ref(),
                     head.id(),
                     older.id(),
-                    &Deadline(Instant::now() + Duration::from_secs(30)),
+                    &Deadline::at(Instant::now() + Duration::from_secs(30)),
                     None,
                 )
                 .await
@@ -4715,7 +4772,7 @@ mod tests {
                     &commits,
                     &head,
                     &older,
-                    &Deadline(Instant::now() + Duration::from_secs(30)),
+                    &Deadline::at(Instant::now() + Duration::from_secs(30)),
                 )
                 .await
                 .unwrap();
@@ -4786,7 +4843,7 @@ mod tests {
                     .store()
                     .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.base).unwrap())
                     .unwrap();
-                let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+                let deadline = Deadline::at(Instant::now() + Duration::from_secs(30));
                 let commits = branch_commits(
                     snapshot.repo.as_ref(),
                     original.id(),
@@ -4849,7 +4906,7 @@ mod tests {
                     .set_predecessors(
                         rewrite_predecessors(
                             &current,
-                            &Deadline(Instant::now() + Duration::from_secs(60)),
+                            &Deadline::at(Instant::now() + Duration::from_secs(60)),
                         )
                         .unwrap(),
                     )
@@ -5092,7 +5149,7 @@ mod tests {
                 .set_predecessors(
                     rewrite_predecessors(
                         &candidate.head,
-                        &Deadline(Instant::now() + Duration::from_secs(60)),
+                        &Deadline::at(Instant::now() + Duration::from_secs(60)),
                     )
                     .unwrap(),
                 )
@@ -5303,7 +5360,7 @@ mod tests {
             };
             let head = commit(&snapshot.coordinate.head);
             let base = commit(&snapshot.coordinate.base);
-            let deadline = Deadline(Instant::now() + Duration::from_secs(60));
+            let deadline = Deadline::at(Instant::now() + Duration::from_secs(60));
             let before = futures::executor::block_on(branch_commits(
                 repo.as_ref(),
                 head.id(),
@@ -5486,17 +5543,75 @@ mod tests {
         let Some(fixture) = HealFixture::new(0, 3, 0, 1) else {
             return;
         };
-        let (_, _, observed, outcome) = fixture.divergent_compute(Duration::ZERO);
-        assert!(matches!(outcome, Err(AdvanceComputeError::TimedOut)));
-        assert_eq!(
-            observed.branch_commits, None,
-            "nothing past entry was reached"
-        );
+        let before = operation_id(&fixture.jj, &fixture.store).unwrap();
         let live = bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap();
+        let git_before = git_stdout(fixture.project.path(), &["rev-parse", "feature"]);
+        for (step, phase) in [
+            ("advance: hidden commit written", ComputePhase::Rebase),
+            ("advance: before classification", ComputePhase::Validate),
+            ("ancestry heal: commit resolved", ComputePhase::Heal),
+        ] {
+            let budget = ReplayBudget::expire_at(&fixture.store, step);
+            // Even a zero wall-clock allowance cannot expire before the step:
+            // only the injected budget decides when this computation expires.
+            let (_, _, observed, outcome) = fixture.divergent_compute(Duration::ZERO);
+            assert!(
+                budget.reached(),
+                "the injected boundary was not reached: {step}"
+            );
+            let error = match outcome {
+                Err(AdvanceComputeError::TimedOut) => AdvanceComputeError::TimedOut,
+                Err(other) => panic!("{step}: expected timeout, got {other:?}"),
+                Ok(_) => panic!("{step}: an expired replay must not produce a candidate"),
+            };
+            assert_eq!(
+                reconcile_failure_kind(&error.to_string()),
+                RECONCILE_TIMEOUT
+            );
+            assert_eq!(observed.phase, Some(phase), "{step}");
+            assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+            assert_eq!(
+                bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap(),
+                live,
+                "{step}: no partially replayed or healed tip is installed"
+            );
+            assert_eq!(
+                git_stdout(fixture.project.path(), &["rev-parse", "feature"]),
+                git_before,
+                "{step}: no partial result is exported"
+            );
+        }
+        // The automatic reconcile adapter must preserve the native timeout,
+        // not turn an interrupted ancestry heal into a conflict diagnostic.
+        let budget = ReplayBudget::expire_at(&fixture.store, "ancestry heal: commit resolved");
+        let report = reconcile_siblings_without_publication(
+            &fixture.jj,
+            &fixture.store,
+            "main",
+            &["feature".to_string()],
+        )
+        .unwrap();
+        assert!(budget.reached());
+        let [failure] = report.failed.as_slice() else {
+            panic!("expected one timeout failure: {report:?}")
+        };
+        assert_eq!(failure.branch, "feature");
+        assert_eq!(reconcile_failure_kind(&failure.error), RECONCILE_TIMEOUT);
+        assert!(report.conflicted.is_empty() && report.conflict_diagnostics.is_empty());
+        assert!(report.rebased_clean.is_empty());
+        assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap(),
+            live
+        );
+        assert_eq!(
+            git_stdout(fixture.project.path(), &["rev-parse", "feature"]),
+            git_before
+        );
         assert_eq!(
             conflicted_commits(&fixture.jj, &fixture.store, "prior..feature").len(),
             2,
-            "the live branch at {live} is untouched"
+            "the original history is untouched"
         );
     }
 
@@ -5565,7 +5680,7 @@ mod tests {
         };
         let head = load(&snapshot.coordinate.head);
         let base = load(&snapshot.coordinate.base);
-        let deadline = Deadline(Instant::now() + Duration::from_secs(60));
+        let deadline = Deadline::at(Instant::now() + Duration::from_secs(60));
         let before = futures::executor::block_on(branch_commits(
             repo.as_ref(),
             head.id(),

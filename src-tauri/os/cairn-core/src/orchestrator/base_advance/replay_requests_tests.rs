@@ -2,6 +2,7 @@
 //! migrated database, and an orchestrator pointed at both.
 
 use super::*;
+use crate::orchestrator::base_advance::load_reconcile_quarantine;
 use crate::orchestrator::base_advance::preparation::tests::{
     git, harness_or_skip, Harness, BRANCH, JOB,
 };
@@ -387,17 +388,46 @@ async fn an_explicit_compute_timeout_refuses_an_identical_repeat_before_computin
 #[serial_test::serial(jj)]
 async fn a_background_timeout_never_blocks_an_explicit_replay() {
     let h = harness_or_skip!("background_timeout_explicit");
-    h.commit(&h.branch_ws, BRANCH, "own.txt", "one\n");
+    let head = h.commit(&h.branch_ws, BRANCH, "own.txt", "one\n");
     let base = h.advance_main("incoming.txt", "theirs\n");
-    starve_compute(&h.store, true);
+    let before = crate::jj::operation_id(&h.jj, &h.store).unwrap();
+    let budget =
+        cairn_vcs::jj::testing::ReplayBudget::expire_at(&h.store, "advance: before classification");
     let refusal = h.prepare(PreparationPurpose::Run).await.unwrap_err();
     assert!(
         matches!(refusal, PreparationRefusal::TimedOut { .. }),
         "{refusal}"
     );
+    assert!(
+        budget.reached(),
+        "expiry must occur after the hidden replay"
+    );
+    assert_eq!(h.tip(BRANCH), head);
+    assert_eq!(git(&h.repo, &["rev-parse", BRANCH]), head);
+    assert_eq!(crate::jj::operation_id(&h.jj, &h.store).unwrap(), before);
+    assert!(
+        conflict_session::load_latest_session(&h.db, BRANCH)
+            .await
+            .unwrap()
+            .is_none(),
+        "a timeout must not record a conflict session"
+    );
+    assert!(
+        h.messages().await.is_empty(),
+        "a timeout must not send the BLOCKING conflict notice"
+    );
+    let quarantine = load_reconcile_quarantine(&h.db, "proj-1", &h.store, BRANCH)
+        .await
+        .unwrap()
+        .expect("a background timeout records its cooldown");
+    assert_eq!(quarantine.failure_kind, crate::jj::RECONCILE_TIMEOUT);
     let sample = newest_sample(&h).await;
     assert_eq!(sample.budget_class, BudgetClass::Background);
     assert_eq!(sample.outcome, CostOutcome::ComputeExhausted);
+    assert_eq!(
+        sample.observed.phase,
+        Some(crate::jj::ComputePhase::Validate)
+    );
     assert!(
         branch_blockers(&h.db, "proj-1", &h.store, BRANCH)
             .await
@@ -405,7 +435,7 @@ async fn a_background_timeout_never_blocks_an_explicit_replay() {
             .is_empty(),
         "a background exhaustion records no blocker"
     );
-    starve_compute(&h.store, false);
+    drop(budget);
     let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None)
         .await
         .unwrap();
