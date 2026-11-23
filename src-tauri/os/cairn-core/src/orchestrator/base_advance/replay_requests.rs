@@ -325,6 +325,96 @@ async fn replay(
     db: &LocalDb,
     ask: &ExplicitReplay<'_>,
 ) -> Result<String, String> {
+    let mut receipt = ask.recovered.clone();
+    let result = replay_attempt(orch, db, ask, &mut receipt).await;
+    let header = match receipt.as_ref() {
+        Some(request) => replay_receipt(db, request).await,
+        None => "No replay request was minted; replay_request_id, intent id and served time are unavailable.".to_string(),
+    };
+    match result {
+        Ok(answer) => Ok(format!("{header}\n\n{answer}")),
+        Err(answer) => Err(format!("{header}\n\n{answer}")),
+    }
+}
+
+/// Read only the exact request accepted by this call, never the branch's latest
+/// request: another caller may already have replaced it.
+async fn replay_receipt(db: &LocalDb, request: &PendingReplayRequest) -> String {
+    let (intent, bookmark, id) = (
+        request.intent_id.clone(),
+        request.bookmark.clone(),
+        request.id.clone(),
+    );
+    let row = db
+        .read(move |conn| {
+            let (intent, bookmark, id) = (intent.clone(), bookmark.clone(), id.clone());
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT replay_served_at, replay_result_json FROM jj_reconcile_items
+                 WHERE intent_id = ?1 AND bookmark = ?2 AND replay_request_id = ?3",
+                        params![intent, bookmark, id],
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some((row.opt_i64(0)?, row.opt_text(1)?))),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await;
+    let (outcome, served) = match row {
+        Ok(Some((served, result))) => {
+            let outcome = if served.is_none() {
+                "pending".to_string()
+            } else if let Some(result) = result {
+                match serde_json::from_str::<serde_json::Value>(&result) {
+                    Ok(result) => {
+                        let pass = &result["pass"];
+                        let failure = pass["failure_kind"].as_str();
+                        if failure == Some(crate::jj::RECONCILE_TIMEOUT) {
+                            "timed out".to_string()
+                        } else {
+                            pass["outcome_kind"]
+                                .as_str()
+                                .or(failure)
+                                .unwrap_or("unknown")
+                                .to_string()
+                        }
+                    }
+                    Err(_) => "unknown (unreadable durable result)".to_string(),
+                }
+            } else {
+                "superseded".to_string()
+            };
+            (
+                outcome,
+                served
+                    .map(|time| format!("{time} (Unix seconds)"))
+                    .unwrap_or_else(|| "not served".to_string()),
+            )
+        }
+        Ok(None) => (
+            "superseded (request row replaced or removed)".to_string(),
+            "unavailable".to_string(),
+        ),
+        Err(_) => (
+            "unknown (durable receipt could not be read)".to_string(),
+            "unavailable".to_string(),
+        ),
+    };
+    format!(
+        "replay_request_id: `{}`; intent id: `{}`; outcome: {outcome}; served time: {served}.",
+        request.id, request.intent_id
+    )
+}
+
+async fn replay_attempt(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    ask: &ExplicitReplay<'_>,
+    receipt: &mut Option<PendingReplayRequest>,
+) -> Result<String, String> {
     let branch = ask.branch;
     // A recovered request refused before its attempt is closed with the
     // reason, so recovery does not find it again at every start.
@@ -524,6 +614,9 @@ async fn replay(
                     .map_err(with_preamble)?,
                 );
             }
+            if receipt.is_none() {
+                *receipt = marker.clone();
+            }
             Some(planned)
         } else {
             if marker.is_none() {
@@ -542,6 +635,9 @@ async fn replay(
                         .await
                         .map_err(with_preamble)?,
                 );
+            }
+            if receipt.is_none() {
+                *receipt = marker.clone();
             }
             None
         };

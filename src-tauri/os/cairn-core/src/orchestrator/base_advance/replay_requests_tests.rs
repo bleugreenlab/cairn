@@ -170,7 +170,8 @@ async fn an_explicit_resolved_replay_lands_past_the_bound_session_shortcut_on_it
     let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, true, None)
         .await
         .unwrap();
-    assert!(answer.starts_with("Replayed"), "{answer}");
+    assert_reply_receipt(&h, &answer, "rebased_clean").await;
+    assert!(answer.contains("Replayed"), "{answer}");
     assert!(answer.contains("not a green build"), "{answer}");
     let tip = h.tip(BRANCH);
     assert!(h.is_ancestor(&d1, &tip), "the replay carries D1");
@@ -277,6 +278,7 @@ async fn an_explicit_compute_timeout_refuses_an_identical_repeat_before_computin
     let first = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None)
         .await
         .unwrap();
+    assert_reply_receipt(&h, &first, "timed out").await;
     assert!(first.contains("exceeded"), "{first}");
     assert!(
         first.contains("already exhausted its compute budget")
@@ -339,6 +341,7 @@ async fn an_explicit_compute_timeout_refuses_an_identical_repeat_before_computin
     let second = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None)
         .await
         .unwrap_err();
+    assert_reply_receipt(&h, &second, REPEAT_REFUSED).await;
     for expected in [
         "was not attempted",
         "refused before computing anything",
@@ -370,7 +373,8 @@ async fn an_explicit_compute_timeout_refuses_an_identical_repeat_before_computin
     let third = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None)
         .await
         .unwrap();
-    assert!(third.starts_with("Replayed"), "{third}");
+    assert_reply_receipt(&h, &third, "rebased_clean").await;
+    assert!(third.contains("Replayed"), "{third}");
     assert!(h.is_ancestor(&base, &h.tip(BRANCH)));
     assert!(branch_blockers(&h.db, "proj-1", &h.store, BRANCH)
         .await
@@ -439,7 +443,8 @@ async fn a_background_timeout_never_blocks_an_explicit_replay() {
     let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None)
         .await
         .unwrap();
-    assert!(answer.starts_with("Replayed"), "{answer}");
+    assert_reply_receipt(&h, &answer, "rebased_clean").await;
+    assert!(answer.contains("Replayed"), "{answer}");
     assert!(h.is_ancestor(&base, &h.tip(BRANCH)));
 }
 
@@ -728,8 +733,9 @@ async fn time_lost_to_waits_never_refuses_a_later_attempt_with_that_time_back() 
     let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None)
         .await
         .unwrap();
+    assert_reply_receipt(&h, &answer, "rebased_clean").await;
     assert!(
-        answer.starts_with("Replayed"),
+        answer.contains("Replayed"),
         "the same request with its time back runs: {answer}"
     );
     assert!(branch_blockers(&h.db, "proj-1", &h.store, BRANCH)
@@ -787,7 +793,8 @@ async fn an_unrelated_branch_installs_while_a_detached_computation_runs() {
     let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None)
         .await
         .unwrap();
-    assert!(answer.starts_with("Replayed"), "{answer}");
+    assert_reply_receipt(&h, &answer, "rebased_clean").await;
+    assert!(answer.contains("Replayed"), "{answer}");
     assert_eq!(
         received
             .recv_timeout(Duration::from_secs(5))
@@ -864,7 +871,7 @@ async fn benchmark_explicit_replay_requests() {
             .await;
             let wall_ms = started.elapsed().as_millis();
             let outcome = match &answer {
-                Ok(text) if text.starts_with("Replayed") => "landed".to_string(),
+                Ok(text) if text.contains("Replayed") => "landed".to_string(),
                 Ok(text) | Err(text) => text.lines().next().unwrap_or_default().to_string(),
             };
             let sample = branch_samples(&h.db, "proj-1", &h.store, BRANCH, 1)
@@ -884,6 +891,147 @@ async fn benchmark_explicit_replay_requests() {
             );
         }
     }
+}
+
+async fn assert_reply_receipt(h: &Harness, answer: &str, outcome: &str) {
+    let expected =
+        h.db.query_text(
+            "SELECT replay_request_id || '|' || intent_id || '|' ||
+                COALESCE(CAST(replay_served_at AS TEXT), 'not served')
+         FROM jj_reconcile_items WHERE bookmark = ?1 AND replay_request_id IS NOT NULL
+         ORDER BY replay_requested_at DESC, rowid DESC LIMIT 1",
+            params![BRANCH],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let fields: Vec<_> = expected.split('|').collect();
+    assert_ne!(
+        fields[2], "not served",
+        "the tested outcome must be durable"
+    );
+    assert_eq!(
+        answer.lines().next().unwrap(),
+        format!(
+            "replay_request_id: `{}`; intent id: `{}`; outcome: {outcome}; served time: {} (Unix seconds).",
+            fields[0], fields[1], fields[2]
+        ),
+        "{answer}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn a_conflicted_replay_reply_names_its_durable_request() {
+    let h = harness_or_skip!("conflicted_receipt");
+    h.commit(&h.branch_ws, BRANCH, "shared.txt", "original\nours\n");
+    h.advance_main("shared.txt", "original\ntheirs\n");
+    let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None)
+        .await
+        .unwrap();
+    assert_reply_receipt(&h, &answer, "conflicted").await;
+    assert!(load_active_session(&h.db, BRANCH).await.unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn a_superseded_replay_receipt_keeps_the_original_identity() {
+    let h = harness_or_skip!("superseded_receipt");
+    let head = h.tip(BRANCH);
+    let base = h.tip("main");
+    let first = conflict_session::queue_replay_request(
+        &h.db,
+        "proj-1",
+        &h.store,
+        "main",
+        &base,
+        BRANCH,
+        Some(&head),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let second = conflict_session::queue_replay_request(
+        &h.db,
+        "proj-1",
+        &h.store,
+        "main",
+        &base,
+        BRANCH,
+        Some(&head),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let answer = replay_receipt(&h.db, &first).await;
+    assert!(
+        answer.contains(&first.id) && answer.contains(&first.intent_id),
+        "{answer}"
+    );
+    assert!(!answer.contains(&second.id), "{answer}");
+    assert!(answer.contains("outcome: superseded"), "{answer}");
+    let pending = replay_receipt(&h.db, &second).await;
+    assert!(pending.contains(&second.id), "{pending}");
+    assert!(
+        pending.contains("outcome: pending; served time: not served"),
+        "{pending}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn a_replay_refused_before_acceptance_says_no_request_was_minted() {
+    let h = harness_or_skip!("unminted_receipt");
+    let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, true, None)
+        .await
+        .unwrap_err();
+    assert!(
+        answer.starts_with("No replay request was minted;"),
+        "{answer}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn a_recovered_request_superseded_by_a_tip_move_returns_its_receipt() {
+    let h = harness_or_skip!("moved_receipt");
+    let head = h.tip(BRANCH);
+    let base = h.tip("main");
+    let request = conflict_session::queue_replay_request(
+        &h.db,
+        "proj-1",
+        &h.store,
+        "main",
+        &base,
+        BRANCH,
+        Some(&head),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    h.commit(&h.branch_ws, BRANCH, "own.txt", "new tip\n");
+    let answer = replay(
+        &h.orch,
+        &h.db,
+        &ExplicitReplay {
+            job_id: JOB,
+            branch: BRANCH,
+            expected_fingerprint: None,
+            take_committed_tip: false,
+            drop_incoming_reason: None,
+            budget: EXPLICIT_REPLAY_BUDGET,
+            step_minimum: EXPLICIT_STEP_MINIMUM,
+            recovered: Some(request.clone()),
+            increment_from: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_reply_receipt(&h, &answer, "superseded").await;
+    assert!(answer.lines().next().unwrap().contains(&request.id));
 }
 
 /// Opt-in wide-conflict measurement, excluding fixture construction and rebase.
@@ -972,7 +1120,8 @@ async fn benchmark_pre_rebase_wide_conflicts() {
             "BENCH full_wide paths={n} request_s={request_s:.6} answer={answer:?} sample={}",
             serde_json::to_string(&sample).unwrap()
         );
-        assert!(answer.starts_with("Replayed"), "{answer}");
+        assert_reply_receipt(&h, &answer, "rebased_clean").await;
+        assert!(answer.contains("Replayed"), "{answer}");
     }
 }
 
@@ -1119,7 +1268,12 @@ async fn exhausted_assessment_names_work_on_two_identical_replay_requests() {
         assert_eq!(h.tip("main"), base);
         assert!(unserved(&h).await.is_empty());
         let sample = newest_sample(&h).await;
-        assert_eq!(sample.diagnostic.as_deref(), Some(answer.as_str()));
+        assert!(
+            answer.starts_with("No replay request was minted;"),
+            "{answer}"
+        );
+        let (_, diagnostic) = answer.split_once("\n\n").unwrap();
+        assert_eq!(sample.diagnostic.as_deref(), Some(diagnostic));
         assert_eq!(sample.head, head);
         assert_eq!(sample.base, base);
     }

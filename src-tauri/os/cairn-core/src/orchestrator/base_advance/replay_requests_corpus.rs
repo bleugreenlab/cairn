@@ -316,6 +316,15 @@ async fn a_resolution_against_d1_is_not_restored_over_d2s_same_spot_append() {
     set_main(&r.fx, &d2);
 
     let answer = request_take_committed_tip(&r).await;
+    let child = conflict_session::latest_replay_request(&r.db, JOB, BRANCH)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        answer.contains(&format!("replay_request_id: `{}`;", child.id))
+            && answer.contains("outcome: conflicted; served time:"),
+        "{answer}"
+    );
     assert!(carries(&r, &d1), "the resolution landed on D1: {answer}");
     assert!(!carries(&r, &d2), "no tree landed on D2: {answer}");
     assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nX\n");
@@ -404,7 +413,8 @@ async fn take_committed_tip_lands_over_an_integrated_main_resolution() {
 
     let answer = request_take_committed_tip(&r).await;
     assert!(carries(&r, &main), "the replay landed: {answer}");
-    assert!(answer.starts_with("Replayed"), "{answer}");
+    assert!(answer.starts_with("replay_request_id:"), "{answer}");
+    assert!(answer.contains("Replayed"), "{answer}");
     assert_eq!(
         text_at(&r.fx, BRANCH, FILE),
         integrated,

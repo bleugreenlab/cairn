@@ -1084,6 +1084,43 @@ pub(super) async fn dispatch(
     dry_run: bool,
     resource: &CairnResource,
 ) -> ResourceMutationResult<Option<String>> {
+    let result = dispatch_action(orch, request, index, item, dry_run, resource).await;
+    let replay = item.mode == ChangeMode::Patch
+        && item
+            .payload
+            .as_ref()
+            .is_some_and(|payload| payload_non_empty_str(payload, "action", &[]) == Some("replay"));
+    if !replay {
+        return result;
+    }
+    // Validation, cancellation and preview can finish before the replay
+    // service is called. Only that service can mint a request.
+    let unminted = |text: String| {
+        if text.starts_with("replay_request_id:")
+            || text.starts_with("No replay request was minted;")
+        {
+            text
+        } else {
+            format!("No replay request was minted; replay_request_id, intent id and served time are unavailable.\n\n{text}")
+        }
+    };
+    match result {
+        Ok(summary) => Ok(summary.map(unminted)),
+        Err(mut failure) => {
+            failure.error = unminted(failure.error);
+            Err(failure)
+        }
+    }
+}
+
+async fn dispatch_action(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    index: usize,
+    item: &ChangeItem,
+    dry_run: bool,
+    resource: &CairnResource,
+) -> ResourceMutationResult<Option<String>> {
     let summary = match (resource, item.mode) {
         (
             CairnResource::NodeRebase {
@@ -1273,7 +1310,11 @@ pub(super) async fn dispatch(
                     )
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
-                    format!("{cancelled}{replay}")
+                    if cancelled.is_empty() {
+                        replay
+                    } else {
+                        format!("{replay}\n\n{cancelled}")
+                    }
                 }
             }
         }
