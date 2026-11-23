@@ -2418,6 +2418,10 @@ pub(crate) fn render_executor_with_kills(
         &health.repository_faults,
         executor.captured_at_unix_ms,
     ));
+    out.push_str(&render_removed_cairn_refs(
+        &health.removed_cairn_refs,
+        executor.captured_at_unix_ms,
+    ));
     out.push_str(&render_quarantine_census(
         health.quarantines.as_ref(),
         executor.captured_at_unix_ms,
@@ -6986,6 +6990,36 @@ fn render_repository_faults(
     out
 }
 
+/// Cairn refs the executor deleted because git could not resolve them. The
+/// claim that removes one clears the repository fault it met, so without this
+/// section the only trace of the removal is the executor's journal.
+fn render_removed_cairn_refs(
+    removed: &[cairn_common::executor_protocol::RemovedCairnRefReport],
+    captured_at_unix_ms: u64,
+) -> String {
+    if removed.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n## Cairn refs removed\n");
+    out.push_str(
+        "Refs under `refs/cairn/` git could not resolve, deleted where they lay by the walk that met them. Each preserved nothing, and no slot was quarantined for any. Newest last, since the executor started.\n",
+    );
+    for reference in removed {
+        let met = match &reference.cell_id {
+            Some(cell_id) => format!("met by a claim on {cell_id}"),
+            None => "found by the storage sweep's ref audit".to_string(),
+        };
+        out.push_str(&format!(
+            "- `{}` in `{}`: {} ({met}, {})\n",
+            reference.reference,
+            reference.repository,
+            reference.defect,
+            age(captured_at_unix_ms.saturating_sub(reference.removed_at_unix_ms)),
+        ));
+    }
+    out
+}
+
 /// The quarantines on disk by cause. A slot quarantined out of the pool leaves
 /// every per-slot listing on this page, so without this a machine holding
 /// hundreds of them, all from one cause, rendered nothing at all.
@@ -10505,6 +10539,7 @@ mod tests {
                 unadopted_cells: Vec::new(),
                 busy_declined_cells: Vec::new(),
                 repository_faults: Vec::new(),
+                removed_cairn_refs: Vec::new(),
                 quarantines: None,
                 build_skew: None,
                 stopped_commands: Vec::new(),
@@ -14316,6 +14351,26 @@ mod tests {
             "(met by a claim on slot-601, 1m ago)",
             "refs/heads/foreign",
             "none quarantines a slot",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected:?}:\n{rendered}");
+        }
+        assert!(!rendered.contains("## Cairn refs removed"), "{rendered}");
+
+        // A claim that removed a ref has cleared the fault it met; the
+        // removal is what the page still names.
+        executor.health.removed_cairn_refs =
+            vec![cairn_common::executor_protocol::RemovedCairnRefReport {
+                repository: "/home/dev/.cairn-exec/managed-objects/e2e0/repository.git".into(),
+                reference: "refs/cairn/rescued/slot-14/1795165158818".into(),
+                defect: "holds no object id (an empty file)".into(),
+                cell_id: Some("slot-168".into()),
+                removed_at_unix_ms: at - 600_000,
+            }];
+        let rendered = render_executor(&executor);
+        for expected in [
+            "## Cairn refs removed",
+            "- `refs/cairn/rescued/slot-14/1795165158818` in `/home/dev/.cairn-exec/managed-objects/e2e0/repository.git`: holds no object id (an empty file) (met by a claim on slot-168, 10m ago)",
+            "no slot was quarantined",
         ] {
             assert!(rendered.contains(expected), "missing {expected:?}:\n{rendered}");
         }

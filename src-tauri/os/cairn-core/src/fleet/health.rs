@@ -1372,6 +1372,7 @@ pub(super) fn executor_health_snapshot(
         stopped_commands: entry.health.stopped_commands.clone(),
         memory_record: entry.health.memory_record.clone(),
         repository_faults: entry.health.repository_faults.clone(),
+        removed_cairn_refs: entry.health.removed_cairn_refs.clone(),
         quarantines: entry.health.quarantines.clone(),
         build_volume: entry.health.build_volume.clone(),
         build_skew: expected_build_ids

@@ -5275,6 +5275,7 @@ mod tests {
             unadopted_cells: Vec::new(),
             busy_declined_cells: Vec::new(),
             repository_faults: Vec::new(),
+            removed_cairn_refs: Vec::new(),
             quarantines: None,
             build_skew: None,
             stopped_commands: Vec::new(),

@@ -9795,6 +9795,19 @@ pub struct LearnedResourceEstimate {
 /// A runner talking to an older executor gets no process attribution, and
 /// explicitly reports that absence rather than inferring that Cairn owns all
 /// host CPU.
+///
+/// cairn/7421 does not move the number. The executor's ref census, which a
+/// claim's repository probe and the storage sweep's ref audit both read, now
+/// also counts a loose ref file holding no object id (empty after a power
+/// loss, truncated, garbage), which `for-each-ref` skips while `git switch`
+/// dies on it, and deletes the Cairn ones where they lie, as cairn/5291
+/// already claimed for every ref a claim's walk trips over. Rescue refs are
+/// written with git's ref and loose-object fsync and their directories
+/// synced. [`ExecutorSubstrateReport`] and [`ExecutorHealthSnapshot`] gain a
+/// defaulted `removedCairnRefs` ([`RemovedCairnRefReport`]) that a runner only
+/// renders. What a runner gets wrong talking to an older executor: nothing;
+/// the page omits a section that executor cannot fill, and that executor
+/// still quarantines slots over a broken ref file, as it already does.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 177;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -21458,6 +21471,10 @@ pub struct ExecutorSubstrateReport {
     /// entry per repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repository_faults: Vec<RepositoryFaultReport>,
+    /// Cairn refs this executor deleted because git could not resolve them,
+    /// newest last. Bounded, and cleared by nothing but a restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_cairn_refs: Vec<RemovedCairnRefReport>,
     /// The quarantines on disk, by cause, as the last storage sweep counted
     /// them. `None` until a sweep has counted, and from a peer that predates
     /// the census.
@@ -21535,6 +21552,28 @@ pub struct RepositoryFaultReport {
     #[serde(rename = "slotId", default, skip_serializing_if = "Option::is_none")]
     pub cell_id: Option<String>,
     pub observed_at_unix_ms: u64,
+}
+
+/// A ref under `refs/cairn/` this executor deleted because git could not
+/// resolve it: it named an object the repository no longer holds, or its loose
+/// file held no object id at all, as a ref whose content never reached the
+/// disk before a power loss is left. Either fails every ref walk over the
+/// shared repository, so the walk that met it deleted it where it lay.
+///
+/// The claim that removes one clears the [`RepositoryFaultReport`] it met, so
+/// this is the record that outlives it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemovedCairnRefReport {
+    pub repository: String,
+    pub reference: String,
+    /// Why git could not resolve it, in words.
+    pub defect: String,
+    /// The slot whose claim tripped over it. `None` when the storage sweep's
+    /// audit of the repository's refs found it.
+    #[serde(rename = "slotId", default, skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<String>,
+    pub removed_at_unix_ms: u64,
 }
 
 /// How many distinct causes a [`QuarantineCensus`] lists. The rest are
@@ -21960,6 +21999,8 @@ pub struct ExecutorHealthSnapshot {
     pub memory_record: MemoryRecord,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repository_faults: Vec<RepositoryFaultReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_cairn_refs: Vec<RemovedCairnRefReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quarantines: Option<QuarantineCensus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -32019,6 +32060,7 @@ mod tests {
                 unadopted_cells: Vec::new(),
                 busy_declined_cells: Vec::new(),
                 repository_faults: Vec::new(),
+                removed_cairn_refs: Vec::new(),
                 quarantines: None,
                 build_skew: Some(BuildSkew {
                     runner_build_id: "runner".into(),
