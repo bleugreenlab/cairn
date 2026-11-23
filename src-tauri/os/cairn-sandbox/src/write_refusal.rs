@@ -46,6 +46,9 @@ pub fn out_of_bounds_write_note(
     output: &str,
     recovered: Option<&Path>,
 ) -> Option<String> {
+    if crate::setuid_refusal_note(confinement, exit_code, output).is_some() {
+        return None;
+    }
     exit_code.filter(|code| *code != 0)?;
     let Confinement::Fenced(policy) = confinement else {
         return None;
@@ -103,17 +106,24 @@ fn note(policy: &SandboxPolicy, refused: &Path) -> String {
     format!("{opening} It may write {writable}. {where_caches_go}")
 }
 
-/// Absolute paths named on each denial-signature line and the lines above it,
-/// the denial line's own first.
+/// Absolute paths named by a refusal, excluding diagnostic stack frames.
+/// Only operand-less denials borrow evidence from the preceding lines.
 fn refused_paths_in_output(output: &str) -> Vec<PathBuf> {
     let lines: Vec<&str> = output.lines().collect();
     let mut paths = Vec::new();
     for (index, line) in lines.iter().enumerate() {
-        if !crate::line_has_denial_signature(line) {
+        if !crate::line_has_denial_signature(line) || is_stack_frame(line) {
             continue;
         }
-        let window = &lines[index.saturating_sub(PRECEDING_LINES)..=index];
-        for candidate in window.iter().rev() {
+        // An explicit operand owns this denial, even if it is relative or
+        // inside a writable scope. Earlier paths cannot stand in for it.
+        let start = if denial_has_operand(line) {
+            index
+        } else {
+            index.saturating_sub(PRECEDING_LINES)
+        };
+        let window = &lines[start..=index];
+        for candidate in window.iter().rev().filter(|line| !is_stack_frame(line)) {
             for path in absolute_paths_in(candidate) {
                 if !paths.contains(&path) {
                     paths.push(path);
@@ -122,6 +132,23 @@ fn refused_paths_in_output(output: &str) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+fn is_stack_frame(line: &str) -> bool {
+    static FRAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"^\s*(?:File "[^"]+", line \d+|(?:at\s+|-->\s+).*:\d+(?::\d+)?\)?\s*$)"#,
+        )
+        .expect("valid stack-frame pattern")
+    });
+    FRAME.is_match(line)
+}
+
+fn denial_has_operand(line: &str) -> bool {
+    static QUOTED_OPERAND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"'[^']+'|"[^"]+"|`[^`]+`"#).expect("valid quoted-operand pattern")
+    });
+    absolute_paths_in(line).next().is_some() || QUOTED_OPERAND.is_match(line)
 }
 
 /// Words in `line` that are absolute paths, with the quoting and trailing
@@ -276,6 +303,89 @@ mod tests {
         );
         let note = out_of_bounds_write_note(&fenced(worktree.path()), Some(1), &output, None);
         assert!(note.is_some_and(|note| note.contains(&target.display().to_string())));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_setuid_explanation_wins_even_over_a_recovered_write_path() {
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let recovered = outside.path().join("file");
+        let confinement = fenced(worktree.path());
+        let output = "/bin/sh: /bin/ps: Operation not permitted";
+        assert!(permissions_allow_write(&recovered));
+        assert!(crate::setuid_refusal_note(&confinement, Some(1), output).is_some());
+        assert_eq!(
+            out_of_bounds_write_note(&confinement, Some(1), output, Some(&recovered)),
+            None
+        );
+    }
+
+    #[test]
+    fn python_exec_refusal_does_not_borrow_traceback_source_paths() {
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = outside.path().join("subprocess.py");
+        assert!(permissions_allow_write(&source));
+        let output = format!(
+            "Traceback (most recent call last):\n  File \"{source}\", line 466, in check_output\n    return run(*popenargs, stdout=PIPE, timeout=timeout, check=True)\n  File \"{source}\", line 1955, in _execute_child\n    raise child_exception_type(errno_num, err_msg, err_filename)\nPermissionError: [Errno 1] Operation not permitted: 'ps'\n",
+            source = source.display(),
+        );
+        assert_eq!(
+            out_of_bounds_write_note(&fenced(worktree.path()), Some(1), &output, None),
+            None
+        );
+    }
+
+    #[test]
+    fn stack_frames_are_not_evidence_for_operand_less_denials() {
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = outside.path().join("source");
+        assert!(permissions_allow_write(&source));
+        for frame in [
+            format!(
+                "  File \"{}\", line 1955, in _execute_child",
+                source.display()
+            ),
+            format!("    at run ({}:12:34)", source.display()),
+            format!("    at {}:12:34", source.display()),
+            format!("             at {}:12:34", source.display()),
+            format!("  --> {}:12:34", source.display()),
+        ] {
+            let output = format!("{frame}\nPermission denied (os error 13)");
+            assert_eq!(
+                out_of_bounds_write_note(&fenced(worktree.path()), Some(1), &output, None),
+                None,
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_denials_own_operand_prevents_fallback_to_unrelated_paths() {
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let unrelated = outside.path().join("unrelated");
+        assert!(permissions_allow_write(&unrelated));
+        for denial in [
+            "PermissionError: [Errno 1] Operation not permitted: 'ps'".to_string(),
+            format!(
+                "Permission denied: '{}'",
+                worktree.path().join("inside").display()
+            ),
+            format!(
+                "Permission denied: {}",
+                worktree.path().join("inside").display()
+            ),
+        ] {
+            let output = format!("failed to open: {}\n{denial}", unrelated.display());
+            assert_eq!(
+                out_of_bounds_write_note(&fenced(worktree.path()), Some(1), &output, None),
+                None,
+                "{output}"
+            );
+        }
     }
 
     #[test]

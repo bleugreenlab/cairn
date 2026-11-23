@@ -1759,6 +1759,11 @@ async fn execute_process(
 
         let stdout_str = captured(&stdout_content);
         let stderr_str = captured(&stderr_content);
+        let setuid_refusal = sandbox::setuid_refusal_note(
+            &applied_confinement,
+            None,
+            &format!("{stdout_str}\n{stderr_str}"),
+        );
         return Ok(ExecOutput {
             stdout: stdout_str,
             stderr: stderr_str,
@@ -1766,7 +1771,7 @@ async fn execute_process(
             timed_out: true,
             denial,
             credential_refused,
-            setuid_refusal: None,
+            setuid_refusal,
         });
     }
 

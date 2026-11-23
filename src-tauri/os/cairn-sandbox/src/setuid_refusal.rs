@@ -15,7 +15,10 @@
 //! what every ordinary refused write or read says. Only a launcher's own
 //! exec-failure line naming one of these tools counts, and a bare tool name
 //! (which is also how a shell reports a refused redirect into a file called
-//! `ps`) counts only when the command ended with an exec-failure status.
+//! `ps`) counts only when the command ended with an exec-failure status. An
+//! absolute tool path counts regardless of the final status: a later command
+//! can succeed after the refused exec. Python's exact EPERM `PermissionError`
+//! naming a quoted inspection tool also counts independently of the final status.
 
 use crate::{Confinement, MacosProfile};
 
@@ -43,7 +46,7 @@ const LAUNCHERS: [&str; 10] = [
 
 const EPERM_MESSAGE: &str = "Operation not permitted";
 
-/// The diagnostic to append to a failed command's output when the macOS
+/// The diagnostic to append to a command's output when the macOS
 /// Seatbelt profile this spawn ran under refused it a setuid process-inspection
 /// tool, or `None` for every other outcome.
 ///
@@ -79,19 +82,26 @@ fn refusal_note(tool: &str, profile: MacosProfile) -> String {
     )
 }
 
-/// The canonical path of the setuid inspection tool a failed command's output
+/// The canonical path of the setuid inspection tool a command's output
 /// shows a launcher was refused, if it shows one.
 fn refused_setuid_inspection_tool(exit_code: Option<i32>, output: &str) -> Option<&'static str> {
-    let code = exit_code.filter(|code| *code != 0)?;
-    let ended_on_exec_failure = matches!(code, 126 | 127);
+    let ended_on_exec_failure = matches!(exit_code, Some(126 | 127));
     output.lines().find_map(|line| {
-        let (tool, by_path) = exec_refused_tool(line.trim())?;
-        (by_path || ended_on_exec_failure).then_some(tool)
+        let (tool, unambiguous) = exec_refused_tool(line.trim())?;
+        (unambiguous || ended_on_exec_failure).then_some(tool)
     })
 }
 
-/// The tool one exec-failure line names, and whether it named it by path.
+/// The tool one exec-failure line names, and whether its evidence is independent
+/// of the final status (an absolute launcher path or Python's EPERM exception).
 fn exec_refused_tool(line: &str) -> Option<(&'static str, bool)> {
+    if let Some(operand) = line.strip_prefix("PermissionError: [Errno 1] Operation not permitted: ")
+    {
+        let named = operand.strip_prefix('\'')?.strip_suffix('\'')?;
+        return SETUID_INSPECTION_TOOLS
+            .iter()
+            .find_map(|(name, path)| (named == *name || named == *path).then_some((*path, true)));
+    }
     let segments: Vec<&str> = line.split(": ").collect();
     let (label, rest) = segments.split_first()?;
     if !is_launcher(label) {
@@ -193,6 +203,71 @@ mod tests {
     }
 
     #[test]
+    fn recovered_diagnostic_script_still_reports_the_refused_exec_once() {
+        let stderr = "/bin/sh: /bin/ps: Operation not permitted\n\
+                      /bin/sh: /bin/ps: Operation not permitted\n\
+                      /bin/sh: /bin/ps: Operation not permitted\n\
+                      /bin/sh: /bin/ps: Operation not permitted\n\
+                      /bin/sh: /usr/bin/top: Operation not permitted";
+        let worktree = tempfile::tempdir().unwrap();
+        let fenced = Confinement::Fenced(crate::SandboxPolicy::for_run(
+            worktree.path(),
+            &[],
+            Vec::new(),
+        ));
+        for output in [stderr.to_string(), format!("{stderr}\nprobe done")] {
+            for code in [Some(0), None] {
+                assert_eq!(
+                    refused_setuid_inspection_tool(code, &output),
+                    Some("/bin/ps")
+                );
+                let note = setuid_refusal_note(&fenced, code, &output);
+                assert_eq!(note.is_some(), cfg!(target_os = "macos"));
+                if let Some(note) = note {
+                    assert_eq!(note.matches("Cairn:").count(), 1);
+                }
+                assert!(setuid_refusal_note(&Confinement::Unconfined, code, &output).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn python_eperm_inspection_refusals_are_explained_once() {
+        let worktree = tempfile::tempdir().unwrap();
+        let fenced = Confinement::Fenced(crate::SandboxPolicy::for_run(
+            worktree.path(),
+            &[],
+            Vec::new(),
+        ));
+        for (operand, tool) in [
+            ("ps", "/bin/ps"),
+            ("top", "/usr/bin/top"),
+            ("/bin/ps", "/bin/ps"),
+            ("/usr/bin/top", "/usr/bin/top"),
+        ] {
+            let traceback = format!(
+                "Traceback (most recent call last):\n  File \"/Users/dev/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/subprocess.py\", line 1955, in _execute_child\n    raise child_exception_type(errno_num, err_msg, err_filename)\nPermissionError: [Errno 1] Operation not permitted: '{operand}'"
+            );
+            for code in [Some(1), Some(0), None] {
+                assert_eq!(refused_setuid_inspection_tool(code, &traceback), Some(tool));
+                let note = setuid_refusal_note(&fenced, code, &traceback);
+                assert_eq!(note.is_some(), cfg!(target_os = "macos"));
+                if let Some(note) = note {
+                    assert_eq!(note.matches("Cairn:").count(), 1);
+                    assert!(note.contains(tool));
+                }
+            }
+        }
+        for ordinary in [
+            "PermissionError: [Errno 13] Permission denied: '/Users/x/file'",
+            "PermissionError: [Errno 1] Operation not permitted: '/Users/x/file'",
+            "PermissionError: [Errno 13] Permission denied: 'ps'",
+        ] {
+            assert_eq!(refused_setuid_inspection_tool(Some(1), ordinary), None);
+        }
+    }
+
+    #[test]
     fn ordinary_permission_failures_keep_their_own_meaning() {
         let unrelated: [(&str, Option<i32>); 11] = [
             // A refused write or read named by the tool that attempted it.
@@ -218,9 +293,9 @@ mod tests {
                 "sandbox-exec: sandbox_apply: Operation not permitted",
                 Some(71),
             ),
-            // The command recovered, or was killed rather than refused.
-            ("/bin/sh: /bin/ps: Operation not permitted", Some(0)),
-            ("/bin/sh: /bin/ps: Operation not permitted", None),
+            // Bare names still need an exec-failure status, even after recovery.
+            ("env: ps: Operation not permitted", Some(0)),
+            ("zsh:1: operation not permitted: top", None),
         ];
         for (line, code) in unrelated {
             assert_eq!(
