@@ -236,6 +236,15 @@ pub const HOME_RETENTION: &[HomeEntry] = &[
         )
     },
     dir(
+        "retained-results",
+        "cairn-exec result_retention::RetainedResults",
+        "execution",
+        Budget {
+            enforcer: "retention_bound_bytes with oldest-first eviction, ResultAck and removal; \
+                       startup replay reclaims interrupted transactions",
+        },
+    ),
+    dir(
         crate::executor_paths::MANAGED_OBJECTS_DIR,
         "cairn-exec managed object cache",
         "execution",

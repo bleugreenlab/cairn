@@ -7137,6 +7137,12 @@ pub struct LearnedResourceEstimate {
 /// changes only executor-local logging; an older peer reads identical messages
 /// and fields and gets no wire semantics wrong.
 ///
+/// cairn/6363 does not move the number. Result retention now persists locally
+/// across executor process restarts. Result, ResultAck, and session ordering
+/// are unchanged: an older executor still supplies the process-lifetime
+/// retention a runner already expects, and an older runner consumes replayed
+/// results exactly as it consumes results replayed after a link reconnect.
+///
 /// cairn/7161 does not move the number. Scratch staging retries a vanished-file
 /// race locally before reporting its existing result. No fields or meanings
 /// change; an older executor still reports snapshot failures through the same
