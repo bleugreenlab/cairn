@@ -7137,6 +7137,11 @@ pub struct LearnedResourceEstimate {
 /// changes only executor-local logging; an older peer reads identical messages
 /// and fields and gets no wire semantics wrong.
 ///
+/// cairn/7161 does not move the number. Scratch staging retries a vanished-file
+/// race locally before reporting its existing result. No fields or meanings
+/// change; an older executor still reports snapshot failures through the same
+/// unavailable/write-back outcomes that the runner already understands.
+///
 /// cairn/7165 does not move the number. An executor re-runs its
 /// build-prerequisite script and its `rust` toolchain probe on every Ready
 /// and every tool-refresh interval instead of once per process, and sends
