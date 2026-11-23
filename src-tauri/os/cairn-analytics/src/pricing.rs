@@ -217,6 +217,10 @@ const HAIKU_5_5: ModelPrice =
 const HAIKU_4_5: ModelPrice = ModelPrice::new(1.0, 0.10, 1.25, 5.0); // Haiku 4.5
 
 // GPT / Codex tiers.
+// GPT-6.2 standard rates, with 30-minute cache writes at 1.25x input:
+// https://developers.openai.com/api/docs/pricing (reviewed 2026-11-21).
+const GPT_6_2_ASTRA: ModelPrice = ModelPrice::new(8.0, 0.40, 10.0, 40.0);
+const GPT_6_2_SOL: ModelPrice = ModelPrice::new(2.0, 0.10, 2.50, 10.0);
 const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 1.0, 12.50, 50.0);
 const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 0.10, 2.50, 10.0);
 const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 0.20, 2.50, 10.0);
@@ -283,6 +287,8 @@ const PRICES: &[(&str, ModelPrice)] = &[
     ("claude-haiku-5.5", HAIKU_5_5),
     ("claude-haiku-4.5", HAIKU_4_5),
     ("claude-haiku-3.5", HAIKU_3_5),
+    ("gpt-6.2-astra", GPT_6_2_ASTRA),
+    ("gpt-6.2-sol", GPT_6_2_SOL),
     ("gpt-6-astra", GPT_6_ASTRA),
     ("gpt-6.1-sol", GPT_6_1_SOL),
     ("gpt-6.1-terra", GPT_6_1_TERRA),
@@ -525,6 +531,34 @@ mod tests {
         for model in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
             assert_ne!(price_for("claude", Some(model)), Some(GPT_5_4), "{model}");
         }
+    }
+
+    #[test]
+    fn gpt_six_two_is_not_classified_as_an_earlier_generation() {
+        for (model, expected, rates) in [
+            ("gpt-6.2-astra", GPT_6_2_ASTRA, [8.0, 0.40, 10.0, 40.0]),
+            ("gpt-6.2-sol", GPT_6_2_SOL, [2.0, 0.10, 2.50, 10.0]),
+        ] {
+            assert_eq!(price_for("codex", Some(model)), Some(expected));
+            assert_eq!(
+                price_for("openrouter", Some(&format!("openai/{model}"))),
+                Some(expected)
+            );
+            for (usage, rate) in [
+                (short(1_000_000, 0, 0, 0), rates[0]),
+                (short(0, 1_000_000, 0, 0), rates[1]),
+                (short(0, 0, 1_000_000, 0), rates[2]),
+                (short(0, 0, 0, 1_000_000), rates[3]),
+            ] {
+                assert_eq!(cost_usd("codex", Some(model), &usage), rate);
+            }
+        }
+        assert_ne!(GPT_6_2_ASTRA, GPT_6_ASTRA);
+        assert_ne!(GPT_6_2_SOL, GPT_6_SOL);
+        // Sol 6.1 and 6.2 share rates, but remain distinct canonical rows.
+        assert_eq!(canonical_for("codex", "gpt-6.2-sol"), Some("gpt-6.2-sol"));
+        assert_eq!(price_for("codex", Some("gpt-6-2-sol")), None);
+        assert_eq!(price_for("codex", Some("gpt-6.2")), None);
     }
 
     /// `gpt-6.1-sol` contains `gpt-6`; it must not take GPT-6 Sol's dearer

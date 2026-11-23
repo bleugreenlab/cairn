@@ -583,6 +583,14 @@ mod tests {
         );
         assert_eq!(offer("opencode-go", "kimi-k2.5", None), Some("kimi-k2.5"));
         assert_eq!(offer("codex", "gpt-5.5", None), Some("gpt-5.5"));
+        for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+            assert_eq!(offer("codex", model, None), Some(model));
+            assert_eq!(
+                for_offer("openrouter", &format!("openai/{model}"), None),
+                Some(model)
+            );
+            assert_eq!(canonical(model).unwrap().maker.as_deref(), Some("openai"));
+        }
         for (native, canonical) in [
             ("claude-haiku-5-5", "claude-haiku-5.5"),
             ("claude-sonnet-5-5", "claude-sonnet-5.5"),

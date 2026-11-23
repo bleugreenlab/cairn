@@ -915,6 +915,10 @@ pub(crate) mod tests {
     fn backend_for_model_codex_models() {
         assert_eq!(backend_for_model("gpt-5.4-mini"), Some("codex"));
         assert_eq!(backend_for_model("gpt-6-astra"), Some("codex"));
+        assert_eq!(backend_for_model("gpt-6.2-astra"), Some("codex"));
+        assert_eq!(backend_for_model("gpt-6.2-sol"), Some("codex"));
+        assert_eq!(resolved_backend_for_model("gpt-6.2-sol"), "codex");
+        assert_eq!(backend_for_model("openai/gpt-6.2-sol"), Some("openrouter"));
         assert_eq!(backend_for_model("GPT-6-ASTRA"), Some("codex"));
         assert_eq!(resolved_backend_for_model("gpt-6-astra"), "codex");
         assert_eq!(backend_for_model("openai/gpt-6-astra"), Some("openrouter"));

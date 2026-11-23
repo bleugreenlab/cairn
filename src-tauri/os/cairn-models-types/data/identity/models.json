@@ -265,6 +265,8 @@
     {"id": "gpt-6-sol", "maker": "openai"},
     {"id": "gpt-6.1-sol", "maker": "openai"},
     {"id": "gpt-6.1-terra", "maker": "openai"},
+    {"id": "gpt-6.2-astra", "maker": "openai"},
+    {"id": "gpt-6.2-sol", "maker": "openai"},
     {"id": "gpt-oss-120b", "maker": "openai"},
     {"id": "gpt-oss-20b", "maker": "openai"},
     {"id": "gpt-oss-20b-afterquery-rl", "maker": null},
