@@ -1727,7 +1727,14 @@ fn render_planning_memory(budget: Option<u64>) -> String {
 /// Render a fixture without querying the runner's kill history.
 #[cfg(test)]
 pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
-    render_executor_with_kills(executor, None, &RunningAttributions::default())
+    render_executor_with_kills(executor, None, &[], &RunningAttributions::default())
+}
+
+/// A repository channel read by the runner from the project's default revision.
+pub(crate) struct ProjectRustPin {
+    pub project_id: String,
+    pub project_key: String,
+    pub channel: String,
 }
 
 /// Render one machine's operational status with optional runner kill history.
@@ -1735,6 +1742,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
 pub(crate) fn render_executor_with_kills(
     executor: &ExecutorInspection,
     recorded_kills: Option<&RecordedKills>,
+    rust_pins: &[ProjectRustPin],
     attributions: &RunningAttributions,
 ) -> String {
     let health = &executor.health;
@@ -1769,6 +1777,7 @@ pub(crate) fn render_executor_with_kills(
         capabilities,
         executor.captured_at_unix_ms,
     ));
+    out.push_str(&render_rust_default(executor, rust_pins));
     out.push_str(&format!(
         "- GitHub: {}\n",
         github_credential_summary(capabilities, executor.captured_at_unix_ms)
@@ -7979,6 +7988,78 @@ fn render_cli_build(capabilities: &ExecutorCapabilities) -> String {
     }
 }
 
+/// Rustup's default is diagnostic evidence only, never a placement requirement.
+fn render_rust_default(executor: &ExecutorInspection, pins: &[ProjectRustPin]) -> String {
+    let capabilities = &executor.health.advertisement.capabilities;
+    let probe = capabilities
+        .toolchain_detection
+        .as_ref()
+        .and_then(|detection| {
+            detection
+                .probes
+                .iter()
+                .find(|probe| probe.toolchain == "rust")
+        });
+    let evidence = probe.and_then(|probe| probe.rust_default.as_ref());
+    let Some(default) = evidence.and_then(|evidence| evidence.toolchain.as_deref()) else {
+        let reason = evidence
+            .and_then(|evidence| evidence.not_measured.as_ref())
+            .map(|failure| failure.cause.as_str())
+            .unwrap_or("this executor reported no rustup default evidence");
+        return format!("  - rust default: unmeasured — {reason}\n");
+    };
+    // Rustup appends the host triple to a channel; a pin may name either form.
+    let host = format!("-{}-", capabilities.arch);
+    let channel = default
+        .split_once(&host)
+        .map_or(default, |(channel, _)| channel);
+    let measured = evidence
+        .and_then(|evidence| evidence.measured_at_unix_ms)
+        .map(|at| {
+            format!(
+                ", measured {}",
+                age(executor.captured_at_unix_ms.saturating_sub(at))
+            )
+        })
+        .unwrap_or_default();
+    let mut out = format!("  - rust default: {default} (`rustup default`{measured})\n");
+    let cargo = probe
+        .filter(|probe| probe.detected && probe.not_measured.is_none())
+        .and_then(|probe| probe.detail.strip_prefix("cargo "))
+        .and_then(|detail| detail.split_whitespace().next());
+    for pin in pins {
+        if !executor
+            .project_eligibility
+            .iter()
+            .any(|project| project.project_id == pin.project_id && project.refusals.is_empty())
+        {
+            continue;
+        }
+        if pin.channel == channel || pin.channel == default {
+            out.push_str(&format!(
+                "    - rust default {channel} matches {}'s pinned {}\n",
+                pin.project_key, pin.channel
+            ));
+        } else {
+            let outside = cargo.map_or_else(
+                || "cargo run outside a checkout has an unmeasured version".to_string(),
+                |version| format!("cargo run outside a checkout uses {version}"),
+            );
+            out.push_str(&format!(
+                "    - rust default {channel} differs from {}'s pinned {}: {outside}\n",
+                pin.project_key, pin.channel
+            ));
+        }
+    }
+    if let Some(failure) = evidence.and_then(|evidence| evidence.not_measured.as_ref()) {
+        out.push_str(&format!(
+            "    - Latest rust default probe measured nothing: {}\n",
+            failure.cause
+        ));
+    }
+    out
+}
+
 /// Each probe in one of three states — verified, absent, not measured — with
 /// when its verdict was measured and, beside a verdict, the latest attempt
 /// that measured nothing. A held verdict is what keeps the toolchain
@@ -10634,6 +10715,91 @@ mod tests {
             ),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn rust_default_compares_eligible_project_pins_without_gating() {
+        use cairn_common::executor_protocol::{ProjectEligibility, RustDefaultProbe};
+        let mut executor =
+            with_toolchains("linux", vec!["rust".into()], Some(probed_and_present()));
+        executor.health.advertisement.capabilities.arch = "x86_64".into();
+        executor.project_eligibility = vec![ProjectEligibility {
+            project_id: "cairn".into(),
+            refusals: vec![],
+        }];
+        let pins = [ProjectRustPin {
+            project_id: "cairn".into(),
+            project_key: "cairn".into(),
+            channel: "1.99.1".into(),
+        }];
+        let probe = &mut executor
+            .health
+            .advertisement
+            .capabilities
+            .toolchain_detection
+            .as_mut()
+            .unwrap()
+            .probes[0];
+        probe.detail = "cargo 1.100.0 (abc 2026-11-01)".into();
+        probe.rust_default = Some(RustDefaultProbe {
+            toolchain: Some("1.100.0-x86_64-unknown-linux-gnu".into()),
+            measured_at_unix_ms: Some(CAPTURED_AT),
+            ..Default::default()
+        });
+        let different =
+            render_executor_with_kills(&executor, None, &pins, &RunningAttributions::default());
+        assert!(different.contains("rust default 1.100.0 differs from cairn's pinned 1.99.1: cargo run outside a checkout uses 1.100.0"), "{different}");
+        assert!(different.contains("- Toolchains: rust\n"), "{different}");
+        executor
+            .health
+            .advertisement
+            .capabilities
+            .toolchain_detection
+            .as_mut()
+            .unwrap()
+            .probes[0]
+            .rust_default
+            .as_mut()
+            .unwrap()
+            .toolchain = Some("1.99.1-x86_64-unknown-linux-gnu".into());
+        let equal =
+            render_executor_with_kills(&executor, None, &pins, &RunningAttributions::default());
+        assert!(
+            equal.contains("rust default 1.99.1 matches cairn's pinned 1.99.1"),
+            "{equal}"
+        );
+        assert!(!equal.contains("differs from"), "{equal}");
+    }
+
+    #[test]
+    fn rust_default_without_rustup_or_old_evidence_is_unmeasured() {
+        use cairn_common::executor_protocol::{RustDefaultProbe, ToolchainProbeUnmeasured};
+        let mut executor =
+            with_toolchains("windows", vec!["rust".into()], Some(probed_and_present()));
+        let old = render_executor(&executor);
+        assert!(old.contains("rust default: unmeasured"), "{old}");
+        executor
+            .health
+            .advertisement
+            .capabilities
+            .toolchain_detection
+            .as_mut()
+            .unwrap()
+            .probes[0]
+            .rust_default = Some(RustDefaultProbe {
+            not_measured: Some(ToolchainProbeUnmeasured {
+                at_unix_ms: CAPTURED_AT,
+                cause: "rustup is not on PATH".into(),
+            }),
+            ..Default::default()
+        });
+        let standalone = render_executor(&executor);
+        assert!(
+            standalone.contains("rust default: unmeasured — rustup is not on PATH"),
+            "{standalone}"
+        );
+        assert!(!standalone.contains("matches"), "{standalone}");
+        assert!(standalone.contains("- Toolchains: rust\n"), "{standalone}");
     }
 
     fn npm_probe(
@@ -15726,7 +15892,7 @@ mod running_now_tests {
         }
         let mut executor = super::tests::inspection("fedora", false);
         executor.occupancy = snapshot.clone();
-        let rendered = super::render_executor_with_kills(&executor, None, &attributions);
+        let rendered = super::render_executor_with_kills(&executor, None, &[], &attributions);
         for (slot, issue, commit, short, handle, other_handle) in [
             (
                 "slot-103",

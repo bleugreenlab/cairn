@@ -9780,6 +9780,12 @@ pub struct LearnedResourceEstimate {
 /// A runner talking to an older executor gets nothing wrong: both peers send
 /// and interpret exactly the same messages.
 ///
+/// cairn/7243 does not move the number. ToolchainProbe gains optional,
+/// defaulted rustDefault diagnostic evidence from read-only rustup default.
+/// Older runners ignore it; older executors leave it unmeasured. It changes
+/// neither detected toolchains, advertisements nor admission. Cargo's existing
+/// version evidence supplies numeric resolution, not the rustup alias.
+///
 /// cairn/6513 does not move the number. Machine telemetry and machine samples
 /// gain defaulted outside-process CPU measurements, and CPU-utilization
 /// conditions gain optional diagnostic attribution. Older executors report a
@@ -10963,6 +10969,11 @@ pub struct ToolchainProbe {
     /// the only identity that tells two of them apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_sha256: Option<String>,
+    /// Diagnostic-only rustup default. Missing evidence (including older peers)
+    /// is unmeasured, never a match. Numeric resolution is the cargo version in
+    /// `detail`; a stable/beta/nightly alias alone proves no numeric version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_default: Option<RustDefaultProbe>,
     /// When the verdict in `detected` and `detail` was measured. Absent from
     /// an executor that predates it, and from a record no probe has yet
     /// completed for.
@@ -10973,6 +10984,19 @@ pub struct ToolchainProbe {
     /// Beside a verdict it is news that the verdict is aging, not a new
     /// verdict; with no verdict it is the whole record, and the toolchain is
     /// not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_measured: Option<ToolchainProbeUnmeasured>,
+}
+
+/// The read-only `rustup default` answer, independent of toolchain admission.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RustDefaultProbe {
+    /// Raw identifier, retaining aliases and the host suffix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_at_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_measured: Option<ToolchainProbeUnmeasured>,
 }
@@ -11034,6 +11058,7 @@ impl ToolchainProbe {
         match prior {
             Some(prior) if prior.state() != ToolchainProbeState::NotMeasured => ToolchainProbe {
                 not_measured: fresh.not_measured,
+                rust_default: fresh.rust_default,
                 ..prior.clone()
             },
             _ => fresh,

@@ -57,6 +57,103 @@ use cairn_db::turso::Value;
 use cairn_uri::{parse_uri, CairnResource};
 use std::path::{Path, PathBuf};
 
+// Read repository declarations from the runner store, never an executor checkout.
+async fn executor_rust_pins(
+    orch: &Orchestrator,
+    executor: &cairn_common::executor_protocol::ExecutorInspection,
+) -> (Vec<super::executors::ProjectRustPin>, Vec<String>) {
+    let mut eligible: std::collections::BTreeSet<String> = executor
+        .project_eligibility
+        .iter()
+        .filter(|project| project.refusals.is_empty())
+        .map(|project| project.project_id.clone())
+        .collect();
+    let mut pins = Vec::new();
+    let mut gaps = Vec::new();
+    for db in orch.db.all_dbs().await {
+        let projects = match crate::projects::crud::list_db(&db).await {
+            Ok(projects) => projects,
+            Err(error) => {
+                gaps.push(format!("project registry unavailable: {error}"));
+                continue;
+            }
+        };
+        for project in projects {
+            if !eligible.remove(&project.id) || project.is_workspace != 0 {
+                continue;
+            }
+            let result = async {
+                let branch = project
+                    .default_branch
+                    .as_deref()
+                    .filter(|branch| !branch.trim().is_empty())
+                    .ok_or_else(|| "default revision is not configured".to_string())?;
+                if project.repo_path.is_empty() {
+                    return Err("repository is not configured".to_string());
+                }
+                let repository =
+                    crate::jj::project_store_dir(&orch.config_dir, Path::new(&project.repo_path));
+                let commit = cairn_vcs::resolve_coordinate(&repository, branch)
+                    .await
+                    .map_err(|error| format!("default revision {branch}: {error}"))?;
+                tokio::task::spawn_blocking(move || {
+                    let reader = crate::jj::ObjectReader::open(&repository)?;
+                    let bytes = reader.read_commit_file(&commit, "rust-toolchain.toml")?;
+                    bytes
+                        .as_deref()
+                        .map(parse_repository_rust_channel)
+                        .transpose()
+                        .map(Option::flatten)
+                })
+                .await
+                .map_err(|error| format!("repository pin reader: {error}"))?
+            }
+            .await;
+            match result {
+                Ok(Some(channel)) => pins.push(super::executors::ProjectRustPin {
+                    project_id: project.id,
+                    project_key: project.key,
+                    channel,
+                }),
+                Ok(None) => {}
+                Err(error) => gaps.push(format!("{}: {error}", project.key)),
+            }
+        }
+    }
+    gaps.extend(
+        eligible
+            .into_iter()
+            .map(|id| format!("{id}: project registration unavailable")),
+    );
+    (pins, gaps)
+}
+
+fn parse_repository_rust_channel(bytes: &[u8]) -> Result<Option<String>, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| format!("rust-toolchain.toml is not UTF-8: {error}"))?;
+    let manifest: toml::Value =
+        toml::from_str(text).map_err(|error| format!("invalid rust-toolchain.toml: {error}"))?;
+    let Some(toolchain) = manifest.get("toolchain") else {
+        return Err("rust-toolchain.toml has no toolchain table".into());
+    };
+    let toolchain = toolchain
+        .as_table()
+        .ok_or_else(|| "rust-toolchain.toml toolchain must be a table".to_string())?;
+    match toolchain.get("channel") {
+        None if toolchain
+            .get("path")
+            .and_then(toml::Value::as_str)
+            .is_some() =>
+        {
+            Ok(None)
+        }
+        Some(toml::Value::String(channel)) if !channel.trim().is_empty() => {
+            Ok(Some(channel.clone()))
+        }
+        _ => Err("rust-toolchain.toml toolchain.channel must be a nonempty string".into()),
+    }
+}
+
 // ============================================================================
 // Router
 // ============================================================================
@@ -2573,11 +2670,19 @@ async fn render_resource_body(
                             )
                             .await;
                             let attributions = crate::resources::executors::running_attributions(orch, executor).await;
+                            let (rust_pins, rust_pin_gaps) = executor_rust_pins(orch, executor).await;
                             let mut rendered = crate::resources::executors::render_executor_with_kills(
                                 executor,
                                 Some(&recorded_kills),
+                                &rust_pins,
                                 &attributions,
                             );
+                            if !rust_pin_gaps.is_empty() {
+                                rendered.push_str("\n## Repository Rust pins unavailable\n\n");
+                                for gap in rust_pin_gaps {
+                                    rendered.push_str(&format!("- {}\n", gap.replace(['\n', '\r'], " ")));
+                                }
+                            }
                             match crate::fleet::absence::incident_lines(orch).await {
                                 Ok(incidents) => {
                                     if let Some(incident) = incidents.get(&executor.health.identity.executor_id) {
@@ -4272,6 +4377,31 @@ mod tests {
     use super::*;
     use cairn_common::query::parse_query_params;
     use std::sync::Arc;
+
+    #[test]
+    fn repository_rust_channel_parses_toml_and_distinguishes_unavailable() {
+        assert_eq!(
+            parse_repository_rust_channel(
+                b"[toolchain]\nchannel = 'nightly-2026-11-01'\ncomponents = ['rustfmt']\n"
+            )
+            .unwrap(),
+            Some("nightly-2026-11-01".into())
+        );
+        assert_eq!(
+            parse_repository_rust_channel(b"[toolchain]\npath = '/custom/rust'").unwrap(),
+            None
+        );
+        for invalid in [
+            b"[toolchain".as_slice(),
+            b"[toolchain]\nchannel = 123",
+            b"[toolchain]\nchannel = ' '",
+            b"[toolchain]",
+            b"toolchain = 'stable'",
+            b"\xff",
+        ] {
+            assert!(parse_repository_rust_channel(invalid).is_err());
+        }
+    }
 
     #[test]
     fn raw_artifact_uses_shared_line_and_character_continuations() {
