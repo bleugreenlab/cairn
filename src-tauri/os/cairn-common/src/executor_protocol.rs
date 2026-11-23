@@ -7142,6 +7142,13 @@ pub struct LearnedResourceEstimate {
 /// change; an older executor still reports snapshot failures through the same
 /// unavailable/write-back outcomes that the runner already understands.
 ///
+/// cairn/7203 does not move the number. The executor cancels and drains its
+/// blocking-pool async drivers before destroying its Tokio runtime, retaining
+/// the live runtime until process exit if a synchronous phase exceeds the
+/// existing shutdown budget. No frame, field, capability, ownership format or
+/// peer interpretation changes. A runner talking to an older executor gets
+/// nothing wrong on the wire; that executor still has its local stop-time panic.
+///
 /// cairn/7165 does not move the number. An executor re-runs its
 /// build-prerequisite script and its `rust` toolchain probe on every Ready
 /// and every tool-refresh interval instead of once per process, and sends
