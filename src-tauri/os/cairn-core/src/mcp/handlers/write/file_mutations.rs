@@ -152,13 +152,8 @@ pub(super) fn apply_logical_file_batch(
     snapshot: &std::collections::HashMap<String, Option<String>>,
 ) -> IndexedResult<FileBatchSuccess> {
     let worktree = std::path::Path::new(&request.cwd);
-    let (prepared, summaries) = prepare_file_changes_with_snapshot(
-        worktree,
-        changes,
-        allow_escape,
-        snapshot.clone(),
-        true,
-    )?;
+    let (prepared, summaries) =
+        prepare_file_changes_with_snapshot(worktree, changes, allow_escape, snapshot.clone())?;
     apply_prepared_logical(changes, &prepared, &summaries, snapshot)
 }
 
@@ -706,7 +701,7 @@ fn non_unique_match_diagnostic(
     content: &str,
     old_string: &str,
     count: usize,
-    disk_matches_snapshot: bool,
+    readable_source_matches_snapshot: bool,
 ) -> String {
     let path = target.strip_prefix("file:").unwrap_or(target);
     let line_starts = line_starts(content);
@@ -794,7 +789,7 @@ fn non_unique_match_diagnostic(
     }
 
     if count > shown {
-        if disk_matches_snapshot {
+        if readable_source_matches_snapshot {
             let next_match_start = locations[shown];
             let next_line = line_index_for_byte(&line_starts, next_match_start, content.len());
             let offset = next_line.saturating_sub(AMBIGUOUS_MATCH_CONTEXT_LINES);
@@ -1080,21 +1075,18 @@ fn resolve_mutation_target(
     worktree: &std::path::Path,
     normalized_target: &str,
     allow_escape: bool,
-    logical_snapshot_authoritative: bool,
 ) -> Result<(std::path::PathBuf, bool), String> {
-    if logical_snapshot_authoritative {
-        if let Ok(logical) = resolve_logical_file_target(normalized_target) {
-            // This path is a logical name only. It must never become a host path or
-            // be joined to process cwd; the snapshot and logical-head transaction
-            // supply all content and mutation authority.
-            return Ok((std::path::PathBuf::from(logical.relative_path), false));
-        }
+    if !normalized_target
+        .strip_prefix("file:")
+        .is_some_and(|path| std::path::Path::new(path).is_absolute())
+    {
+        let logical = resolve_logical_file_target(normalized_target)?;
+        // Logical names never acquire content or authority from the host.
+        return Ok((std::path::PathBuf::from(logical.relative_path), false));
     }
 
     let full_path = resolve_change_target(worktree, normalized_target, allow_escape)?;
-    // The legacy preview adapter still reads its supplied projection directory.
-    // It never applies these prepared changes; authoritative apply always takes
-    // the logical branch above and only marks explicit host paths as external.
+    // Only explicit host paths bypass the logical namespace.
     Ok((full_path, true))
 }
 
@@ -1107,7 +1099,6 @@ struct PreparedSinks<'a> {
 struct UnifiedPatchContext<'a> {
     worktree: &'a std::path::Path,
     allow_escape: bool,
-    logical_snapshot_authoritative: bool,
     change_pos: usize,
     change: &'a IndexedChange<'a>,
     item: &'a ChangeItem,
@@ -1144,19 +1135,16 @@ fn prepare_unified_patch_change(
         .strip_prefix("file:")
         .unwrap_or_default()
         .to_string();
-    let (full_path, outside_worktree) = resolve_mutation_target(
-        ctx.worktree,
-        &normalized_target,
-        ctx.allow_escape,
-        ctx.logical_snapshot_authoritative,
-    )
-    .map_err(|e| {
-        build_failure(
-            ctx.change.index,
-            ctx.item,
-            format!("Invalid file target: {e}"),
-        )
-    })?;
+    let (full_path, outside_worktree) =
+        resolve_mutation_target(ctx.worktree, &normalized_target, ctx.allow_escape).map_err(
+            |e| {
+                build_failure(
+                    ctx.change.index,
+                    ctx.item,
+                    format!("Invalid file target: {e}"),
+                )
+            },
+        )?;
     match envelope_change {
         PatchEnvelopeFileChange::Add { content, .. } => {
             let is_new = in_flight_is_new(
@@ -1226,27 +1214,13 @@ fn prepare_unified_patch_change(
     Ok(())
 }
 
-pub(super) fn prepare_file_changes(
-    worktree: &std::path::Path,
-    changes: &[IndexedChange<'_>],
-    allow_escape: bool,
-) -> IndexedResult<PreparedFileChanges> {
-    prepare_file_changes_with_snapshot(
-        worktree,
-        changes,
-        allow_escape,
-        std::collections::HashMap::new(),
-        false,
-    )
-}
-
 pub(super) fn prepare_file_changes_with_snapshot(
     worktree: &std::path::Path,
     changes: &[IndexedChange<'_>],
     allow_escape: bool,
-    mut in_flight: std::collections::HashMap<String, Option<String>>,
-    logical_snapshot_authoritative: bool,
+    snapshot: std::collections::HashMap<String, Option<String>>,
 ) -> IndexedResult<PreparedFileChanges> {
+    let mut in_flight = snapshot.clone();
     let mut prepared: Vec<PreparedChange> = Vec::with_capacity(changes.len());
     let mut summaries: Vec<String> = Vec::with_capacity(changes.len());
 
@@ -1278,15 +1252,10 @@ pub(super) fn prepare_file_changes_with_snapshot(
                         format!("mode={} requires content", mode_name(item.mode)),
                     )
                 })?;
-                let (full_path, outside_worktree) = resolve_mutation_target(
-                    worktree,
-                    &normalized_target,
-                    allow_escape,
-                    logical_snapshot_authoritative,
-                )
-                .map_err(|e| {
-                    build_failure(change.index, item, format!("Invalid file target: {e}"))
-                })?;
+                let (full_path, outside_worktree) =
+                    resolve_mutation_target(worktree, &normalized_target, allow_escape).map_err(
+                        |e| build_failure(change.index, item, format!("Invalid file target: {e}")),
+                    )?;
                 let is_new =
                     in_flight_is_new(&full_path, &normalized_target, &in_flight, outside_worktree);
                 if item.mode == ChangeMode::Create && !is_new {
@@ -1319,15 +1288,10 @@ pub(super) fn prepare_file_changes_with_snapshot(
                 let appended = fp.content.clone().ok_or_else(|| {
                     build_failure(change.index, item, "mode=append requires content")
                 })?;
-                let (full_path, outside_worktree) = resolve_mutation_target(
-                    worktree,
-                    &normalized_target,
-                    allow_escape,
-                    logical_snapshot_authoritative,
-                )
-                .map_err(|e| {
-                    build_failure(change.index, item, format!("Invalid file target: {e}"))
-                })?;
+                let (full_path, outside_worktree) =
+                    resolve_mutation_target(worktree, &normalized_target, allow_escape).map_err(
+                        |e| build_failure(change.index, item, format!("Invalid file target: {e}")),
+                    )?;
                 let is_new =
                     in_flight_is_new(&full_path, &normalized_target, &in_flight, outside_worktree);
                 let content = match read_in_flight_or_disk(
@@ -1356,15 +1320,10 @@ pub(super) fn prepare_file_changes_with_snapshot(
                 summaries.push(format!("~{normalized_target}"));
             }
             ChangeMode::Patch => {
-                let (full_path, outside_worktree) = resolve_mutation_target(
-                    worktree,
-                    &normalized_target,
-                    allow_escape,
-                    logical_snapshot_authoritative,
-                )
-                .map_err(|e| {
-                    build_failure(change.index, item, format!("Invalid file target: {e}"))
-                })?;
+                let (full_path, outside_worktree) =
+                    resolve_mutation_target(worktree, &normalized_target, allow_escape).map_err(
+                        |e| build_failure(change.index, item, format!("Invalid file target: {e}")),
+                    )?;
                 let content = read_in_flight_or_disk(
                     worktree,
                     &normalized_target,
@@ -1420,9 +1379,15 @@ pub(super) fn prepare_file_changes_with_snapshot(
                                     &content,
                                     &literal_old,
                                     matches,
-                                    outside_worktree
-                                        && std::fs::read_to_string(&full_path)
-                                            .is_ok_and(|disk_content| disk_content == content),
+                                    if outside_worktree {
+                                        std::fs::read_to_string(&full_path)
+                                            .is_ok_and(|disk_content| disk_content == content)
+                                    } else {
+                                        snapshot
+                                            .get(&normalized_target)
+                                            .and_then(|value| value.as_deref())
+                                            == Some(content.as_str())
+                                    },
                                 ),
                             ));
                         } else if replace_all {
@@ -1474,7 +1439,6 @@ pub(super) fn prepare_file_changes_with_snapshot(
                 let ctx = UnifiedPatchContext {
                     worktree,
                     allow_escape,
-                    logical_snapshot_authoritative,
                     change_pos,
                     change,
                     item,
@@ -1498,15 +1462,10 @@ pub(super) fn prepare_file_changes_with_snapshot(
                 ));
             }
             ChangeMode::Delete => {
-                let (full_path, outside_worktree) = resolve_mutation_target(
-                    worktree,
-                    &normalized_target,
-                    allow_escape,
-                    logical_snapshot_authoritative,
-                )
-                .map_err(|e| {
-                    build_failure(change.index, item, format!("Invalid file target: {e}"))
-                })?;
+                let (full_path, outside_worktree) =
+                    resolve_mutation_target(worktree, &normalized_target, allow_escape).map_err(
+                        |e| build_failure(change.index, item, format!("Invalid file target: {e}")),
+                    )?;
                 in_flight.insert(normalized_target.clone(), None);
                 prepared.push(PreparedChange::Delete {
                     change_pos,
@@ -1584,8 +1543,8 @@ pub(super) fn parse_rename_spec(
                 return Err("mode=rename: old_name is empty".to_string());
             }
             let normalized = normalize_change_target(&item.target, false)?;
-            let full_path = resolve_change_target(worktree, &normalized, false)
-                .map_err(|e| format!("Invalid file target: {e}"))?;
+            let logical = resolve_logical_file_target(&normalized)?;
+            let full_path = worktree.join(logical.relative_path);
             Ok((
                 full_path,
                 crate::symbols::rename::RenameSpec::Name(old_name),

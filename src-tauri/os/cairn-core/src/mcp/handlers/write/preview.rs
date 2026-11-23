@@ -1,5 +1,8 @@
-use super::file_mutations::{hash_file_target_uri, prepare_file_changes};
-use super::handle_write;
+use super::file_mutations::{
+    hash_file_target_uri, prepare_file_changes_with_snapshot, PreparedChange,
+};
+use super::handle_write_with_expected_hashes;
+use super::logical_snapshot;
 use super::types::{
     build_failure, empty_change_report, mode_name, resource_failure, AppliedChange, ChangeFailure,
     ChangeReport, IndexedChange,
@@ -354,8 +357,34 @@ pub(super) async fn preview_change(
     }
 
     let worktree = std::path::Path::new(&request.cwd);
+    // Resolve only the immutable read coordinate: preview never reserves a write
+    // or prepares/replays the branch, even while a batch owns its projection.
+    let initial_snapshot = if payload
+        .changes
+        .iter()
+        .any(|change| matches!(target_family(&change.target), Ok(TargetFamily::File)))
+    {
+        let resolution = match super::super::branch::resolve_current_for_read(orch, request).await {
+            Ok(resolution) => resolution,
+            Err(error) => return format!("Read authoritative logical head for preview: {error}"),
+        };
+        match logical_snapshot::load(&resolution, request, payload, true) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return format!("Read authoritative logical head for preview: {error}"),
+        }
+    } else {
+        Default::default()
+    };
+    let mut snapshot = initial_snapshot.clone();
+
     let mut applied = Vec::new();
     let mut target_hashes = Vec::new();
+    if payload.changes.iter().any(|item| {
+        item.mode == ChangeMode::Rename
+            && matches!(target_family(&item.target), Ok(TargetFamily::File))
+    }) {
+        target_hashes.push(logical_snapshot::hash_namespace(&initial_snapshot));
+    }
     let mut index = 0;
 
     while index < payload.changes.len() {
@@ -369,8 +398,19 @@ pub(super) async fn preview_change(
             && matches!(target_family(&item.target), Ok(TargetFamily::File))
         {
             let rename_result = match super::file_mutations::parse_rename_spec(worktree, item) {
-                Ok((route_file, spec, new_name)) => {
-                    crate::symbols::rename::compute_plan(worktree, &route_file, spec, &new_name)
+                Ok((_route_file, spec, new_name)) => {
+                    let files = snapshot
+                        .iter()
+                        .filter_map(|(target, content)| {
+                            content.as_ref().map(|content| {
+                                (
+                                    worktree.join(target.strip_prefix("file:").unwrap_or(target)),
+                                    content.clone(),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    crate::symbols::rename::compute_plan_from_files(&files, spec, &new_name)
                 }
                 Err(error) => Err(error),
             };
@@ -396,7 +436,7 @@ pub(super) async fn preview_change(
             };
             for edit in &plan.file_edits {
                 let src_target = format!("file:{}", rel(&edit.path));
-                match hash_file_target_uri(worktree, &src_target) {
+                match hash_preview_target(&initial_snapshot, worktree, &src_target) {
                     Ok(hash) => target_hashes.push(hash),
                     Err(error) => {
                         let failure = build_failure(index, item, error);
@@ -413,7 +453,7 @@ pub(super) async fn preview_change(
                 let (target, summary) = match (&edit.new_content, &edit.move_to) {
                     (Some(_), Some(dest)) => {
                         let dest_target = format!("file:{}", rel(dest));
-                        match hash_file_target_uri(worktree, &dest_target) {
+                        match hash_preview_target(&initial_snapshot, worktree, &dest_target) {
                             Ok(hash) => target_hashes.push(hash),
                             Err(error) => {
                                 let failure = build_failure(index, item, error);
@@ -452,6 +492,9 @@ pub(super) async fn preview_change(
                     data: None,
                 });
             }
+            let (prepared, _, _) =
+                super::file_mutations::prepare_rename_changes(worktree, index, &plan);
+            update_snapshot(&mut snapshot, &prepared);
             index += 1;
             continue;
         }
@@ -525,11 +568,15 @@ pub(super) async fn preview_change(
 
         // Preview never fences: resolve allowing escape so an out-of-worktree
         // crossing is reported in the change report rather than rejected.
-        match prepare_file_changes(worktree, &batch, true) {
+        match prepare_file_changes_with_snapshot(worktree, &batch, true, snapshot.clone()) {
             Ok((prepared, summaries)) => {
                 for prepared_change in &prepared {
                     let change = &batch[prepared_change.change_pos()];
-                    match hash_file_target_uri(worktree, prepared_change.target_uri()) {
+                    match hash_preview_target(
+                        &initial_snapshot,
+                        worktree,
+                        prepared_change.target_uri(),
+                    ) {
                         Ok(hash) => target_hashes.push(hash),
                         Err(error) => {
                             let failure = build_failure(change.index, change.item, error);
@@ -544,6 +591,7 @@ pub(super) async fn preview_change(
                         }
                     }
                 }
+                update_snapshot(&mut snapshot, &prepared);
                 applied.extend(prepared.iter().zip(summaries.iter()).map(
                     |(prepared_change, summary)| {
                         let change = &batch[prepared_change.change_pos()];
@@ -760,10 +808,41 @@ pub(super) async fn handle_apply_change(
     // none (a preview writes nothing).
     original_payload.commit_msg = Some(apply_commit_msg);
 
+    let snapshot = if preview_report
+        .target_hashes
+        .iter()
+        .any(|hash| hash.kind == "file")
+    {
+        let resolution = match super::super::branch::resolve_current_for_read(orch, request).await {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                return Some(format!(
+                    "Read authoritative logical head for apply: {error}"
+                ))
+            }
+        };
+        match logical_snapshot::load(&resolution, request, &original_payload, true) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Some(format!(
+                    "Read authoritative logical head for apply: {error}"
+                ))
+            }
+        }
+    } else {
+        Default::default()
+    };
+
     let mut stale = Vec::new();
     for expected in &preview_report.target_hashes {
-        let actual = if expected.kind == "file" {
-            hash_file_target_uri(std::path::Path::new(&request.cwd), &expected.target)
+        let actual = if expected.kind == "logical-tree" {
+            Ok(logical_snapshot::hash_namespace(&snapshot))
+        } else if expected.kind == "file" {
+            hash_preview_target(
+                &snapshot,
+                std::path::Path::new(&request.cwd),
+                &expected.target,
+            )
         } else {
             let item = original_payload
                 .changes
@@ -805,7 +884,12 @@ pub(super) async fn handle_apply_change(
             ));
         }
     };
-    let result = Box::pin(handle_write(orch, &apply_request)).await;
+    let result = Box::pin(handle_write_with_expected_hashes(
+        orch,
+        &apply_request,
+        &preview_report.target_hashes,
+    ))
+    .await;
     if let Ok(report) = serde_json::from_str::<ChangeReport>(&result) {
         if report.failures.is_empty() {
             let now = chrono::Utc::now().timestamp();
@@ -815,4 +899,46 @@ pub(super) async fn handle_apply_change(
         }
     }
     Some(result)
+}
+
+/// Carry prepared logical effects forward across resource boundaries and renames
+/// without performing the host writes that the apply interpreter may perform.
+fn update_snapshot(snapshot: &mut logical_snapshot::LogicalSnapshot, prepared: &[PreparedChange]) {
+    for change in prepared {
+        match change {
+            PreparedChange::Write {
+                target_uri,
+                content,
+                outside_worktree: false,
+                ..
+            } => {
+                snapshot.insert(target_uri.clone(), Some(content.clone()));
+            }
+            PreparedChange::Delete {
+                target_uri,
+                outside_worktree: false,
+                ..
+            } => {
+                snapshot.insert(target_uri.clone(), None);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn hash_preview_target(
+    snapshot: &logical_snapshot::LogicalSnapshot,
+    worktree: &std::path::Path,
+    target: &str,
+) -> Result<super::types::TargetHash, String> {
+    // Only explicit host capabilities may consult disk, never a relative target
+    // that failed logical validation.
+    if target
+        .strip_prefix("file:")
+        .is_some_and(|path| std::path::Path::new(path).is_absolute())
+    {
+        hash_file_target_uri(worktree, target)
+    } else {
+        logical_snapshot::hash_target(snapshot, target)
+    }
 }

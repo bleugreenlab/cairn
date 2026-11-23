@@ -2,6 +2,7 @@
 
 pub(crate) mod file_mutations;
 mod home_targets;
+mod logical_snapshot;
 mod preview;
 #[cfg_attr(feature = "test-utils", doc(hidden))]
 pub mod replay;
@@ -285,6 +286,14 @@ pub fn handle_write<'a>(
     orch: &'a Orchestrator,
     request: &'a McpCallbackRequest,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
+    handle_write_with_expected_hashes(orch, request, &[])
+}
+
+fn handle_write_with_expected_hashes<'a>(
+    orch: &'a Orchestrator,
+    request: &'a McpCallbackRequest,
+    expected_hashes: &'a [types::TargetHash],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
     Box::pin(async move {
         // Every write a call names is registered for as long as it is served,
         // so a Stop or a teardown can ask it to stop at a boundary and wait for
@@ -300,13 +309,17 @@ pub fn handle_write<'a>(
                 orch.write_stops
                     .enter(run_id, tool_use_id, delivery.clone())
             });
-        crate::dispatch::serve_delivery(delivery, serve_write(orch, request)).await
+        crate::dispatch::serve_delivery(delivery, serve_write(orch, request, expected_hashes)).await
     })
 }
 
-async fn serve_write(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
+async fn serve_write(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    expected_hashes: &[types::TargetHash],
+) -> String {
     let mut drained = Vec::new();
-    let report = handle_write_under_barrier(orch, request, &mut drained).await;
+    let report = handle_write_under_barrier(orch, request, &mut drained, expected_hashes).await;
     if drained.is_empty() {
         return report;
     }
@@ -525,6 +538,7 @@ async fn handle_write_under_barrier(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     drained: &mut Vec<super::run::held::Drained>,
+    expected_hashes: &[types::TargetHash],
 ) -> String {
     let mut epoch = ReplayEpoch::Locked;
     // Off this frame: the attempt carries every preparation and sealing state
@@ -532,7 +546,15 @@ async fn handle_write_under_barrier(
     let report = {
         let (drained, epoch) = (&mut *drained, &mut epoch);
         off_frame(move || {
-            handle_write_attempt(orch, request, drained, WriteLocking::Optimistic, epoch, 0)
+            handle_write_attempt(
+                orch,
+                request,
+                drained,
+                WriteLocking::Optimistic,
+                epoch,
+                0,
+                expected_hashes,
+            )
         })
     }
     .await;
@@ -570,8 +592,18 @@ async fn handle_write_under_barrier(
         return report;
     }
     let epoch = &mut epoch;
-    off_frame(move || handle_write_attempt(orch, request, drained, WriteLocking::Locked, epoch, 0))
-        .await
+    off_frame(move || {
+        handle_write_attempt(
+            orch,
+            request,
+            drained,
+            WriteLocking::Locked,
+            epoch,
+            0,
+            expected_hashes,
+        )
+    })
+    .await
 }
 
 struct PreparedWrite {
@@ -732,6 +764,7 @@ async fn handle_write_attempt(
     locking: WriteLocking,
     epoch: &mut ReplayEpoch,
     preparation_attempt: u32,
+    expected_hashes: &[types::TargetHash],
 ) -> String {
     // Authoritative validation gate, shared with cairn-cmd's pre-flight check so
     // the contract and error text are identical everywhere. Collects every
@@ -1323,6 +1356,7 @@ async fn handle_write_attempt(
                     WriteLocking::Locked,
                     epoch,
                     preparation_attempt + 1,
+                    expected_hashes,
                 ))
                 .await;
             }
@@ -1400,6 +1434,7 @@ async fn handle_write_attempt(
                     WriteLocking::Locked,
                     epoch,
                     preparation_attempt,
+                    expected_hashes,
                 ))
                 .await;
             }
@@ -1448,6 +1483,7 @@ async fn handle_write_attempt(
                             WriteLocking::Locked,
                             epoch,
                             preparation_attempt + 1,
+                            expected_hashes,
                         ))
                         .await;
                     }
@@ -1522,6 +1558,7 @@ async fn handle_write_attempt(
                 WriteLocking::Locked,
                 epoch,
                 preparation_attempt + 1,
+                expected_hashes,
             ))
             .await;
         }
@@ -1534,81 +1571,8 @@ async fn handle_write_attempt(
     let mut logical_snapshot = std::collections::HashMap::new();
     if revert_commit.is_none() {
         if let Some(resolution) = logical_resolution.as_ref() {
-            let has_rename = payload.changes.iter().any(|change| {
-                change.mode == ChangeMode::Rename
-                    && matches!(target_family(&change.target), Ok(TargetFamily::File))
-            });
-            type LogicalSnapshot = Vec<(String, Option<Vec<u8>>)>;
-            let snapshot_result: Result<LogicalSnapshot, String> = if has_rename {
-                super::read::files_at_commit(
-                    resolution.object_repository_path.clone(),
-                    resolution.commit_id.clone(),
-                )
-                .map(|files| {
-                    files
-                        .into_iter()
-                        .map(|(path, bytes)| (path, Some(bytes)))
-                        .collect()
-                })
-            } else {
-                let indexed = payload
-                    .changes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, change)| {
-                        matches!(target_family(&change.target), Ok(TargetFamily::File))
-                    })
-                    .map(|(index, item)| IndexedChange { index, item })
-                    .collect::<Vec<_>>();
-                file_mutations::logical_paths_for_changes(
-                    std::path::Path::new(&request.cwd),
-                    &indexed,
-                    allow_escape,
-                )
-                .and_then(|paths| {
-                    paths
-                        .into_iter()
-                        .map(|path| {
-                            super::read::file_at_commit(
-                                resolution.object_repository_path.clone(),
-                                resolution.commit_id.clone(),
-                                &path,
-                            )
-                            .map(|bytes| (path, bytes))
-                        })
-                        .collect()
-                })
-            };
-            match snapshot_result {
-                Ok(files) => {
-                    for (path, bytes) in files {
-                        let content = bytes
-                            .map(String::from_utf8)
-                            .transpose()
-                            .map_err(|_| format!("File `{path}` is not valid UTF-8"));
-                        match content {
-                            Ok(content) => {
-                                logical_snapshot.insert(format!("file:{path}"), content);
-                            }
-                            Err(error) => {
-                                return serde_json::to_string(&empty_change_report(
-                                Vec::new(),
-                                vec![ChangeFailure {
-                                    index: 0,
-                                    target: format!("file:{path}"),
-                                    mode: "write".to_string(),
-                                    kind: "file".to_string(),
-                                    error,
-                                }],
-                                None,
-                                payload.atomic.unwrap_or(false),
-                                false,
-                            ))
-                            .unwrap_or_else(|serialize_error| format!("Failed to serialize logical-head snapshot failure: {serialize_error}"));
-                            }
-                        }
-                    }
-                }
+            match logical_snapshot::load(resolution, request, &payload, allow_escape) {
+                Ok(snapshot) => logical_snapshot = snapshot,
                 Err(error) => {
                     return serde_json::to_string(&empty_change_report(
                         Vec::new(),
@@ -1639,6 +1603,38 @@ async fn handle_write_attempt(
                     });
                 }
             }
+        }
+    }
+
+    // Preparation may replay or adopt held work after the preview's initial
+    // drift check. Validate the exact snapshot this attempt will interpret;
+    // an optimistic seal retries here if that immutable head moves.
+    for expected in expected_hashes
+        .iter()
+        .filter(|hash| matches!(hash.kind.as_str(), "file" | "logical-tree"))
+    {
+        let actual = if expected.kind == "logical-tree" {
+            Ok(logical_snapshot::hash_namespace(&logical_snapshot))
+        } else if expected
+            .target
+            .strip_prefix("file:")
+            .is_some_and(|path| std::path::Path::new(path).is_absolute())
+        {
+            file_mutations::hash_file_target_uri(
+                std::path::Path::new(&request.cwd),
+                &expected.target,
+            )
+        } else {
+            logical_snapshot::hash_target(&logical_snapshot, &expected.target)
+        };
+        if !actual.is_ok_and(|actual| actual == *expected) {
+            return preparation_failure(
+                &payload,
+                format!(
+                    "Preview is stale; no changes applied: {} changed before interpretation",
+                    expected.target
+                ),
+            );
         }
     }
 
@@ -2229,6 +2225,7 @@ async fn handle_write_attempt(
                 WriteLocking::Locked,
                 epoch,
                 preparation_attempt + 1,
+                expected_hashes,
             ))
             .await;
         }
@@ -3029,12 +3026,42 @@ mod in_sandbox_write_tests {
 #[cfg(test)]
 mod change_preview_tests {
     use super::file_mutations::{
-        hash_file_target, literal_not_found_diagnostic, prepare_file_changes, sha256_hex,
-        PreparedChange,
+        hash_file_target, literal_not_found_diagnostic, prepare_file_changes_with_snapshot,
+        sha256_hex, PreparedChange,
     };
     use super::preview::{find_change_preview_in_assistant_rows, is_change_tool_name};
     use super::*;
     use crate::mcp::types::{ChangeItem, ChangeMode};
+
+    #[derive(Default)]
+    struct SnapshotFixture {
+        files: std::collections::HashMap<String, Option<String>>,
+    }
+
+    impl SnapshotFixture {
+        fn insert(&mut self, path: &str, content: impl AsRef<str>) {
+            self.files
+                .insert(format!("file:{path}"), Some(content.as_ref().to_string()));
+        }
+
+        fn content(&self, path: &str) -> Option<&str> {
+            self.files
+                .get(&format!("file:{path}"))
+                .and_then(|value| value.as_deref())
+        }
+
+        fn prepare(
+            &self,
+            changes: &[IndexedChange<'_>],
+        ) -> super::types::IndexedResult<super::file_mutations::PreparedFileChanges> {
+            prepare_file_changes_with_snapshot(
+                std::path::Path::new("unmaterialized-preview"),
+                changes,
+                false,
+                self.files.clone(),
+            )
+        }
+    }
 
     #[test]
     fn blocking_report_keeps_body_opaque_and_spawn_metadata_structured() {
@@ -3100,16 +3127,16 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_computes_patch_without_writing() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("example.txt");
-        std::fs::write(&file, "hello old world\n").unwrap();
+        let mut snapshot = SnapshotFixture::default();
+        let file = "example.txt";
+        snapshot.insert(file, "hello old world\n");
         let item = patch_item("file:example.txt", "old", "new");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let (prepared, summaries) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, summaries) = snapshot.prepare(&changes).unwrap();
 
         assert_eq!(summaries, vec!["~file:example.txt".to_string()]);
         match &prepared[0] {
@@ -3121,7 +3148,7 @@ mod change_preview_tests {
             }
             _ => panic!("expected write"),
         }
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello old world\n");
+        assert_eq!(snapshot.content(file).unwrap(), "hello old world\n");
     }
 
     #[test]
@@ -3130,10 +3157,10 @@ mod change_preview_tests {
         // (head ends in `{`, tail starts with a non-closer) resolves as a span
         // delete-and-replace, where the old global-balance net produced an
         // unsatisfiable brace constraint.
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("specimen.rs");
+        let mut snapshot = SnapshotFixture::default();
+        let file = "specimen.rs";
         let original = "fn lookup_project_by_cwd() {\n    old_impl();\n}\n\npub async fn handle_read_resource() {\n    body();\n}\n";
-        std::fs::write(&file, original).unwrap();
+        snapshot.insert(file, original);
         let item = patch_item(
             "file:specimen.rs",
             "fn lookup_project_by_cwd() {~~*~~pub async fn handle_read_resource(",
@@ -3144,7 +3171,7 @@ mod change_preview_tests {
             item: &item,
         }];
 
-        let (prepared, _) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, _) = snapshot.prepare(&changes).unwrap();
         match &prepared[0] {
             PreparedChange::Write { content, .. } => {
                 assert_eq!(
@@ -3158,9 +3185,9 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_applies_wildcard_balanced() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("balanced.rs");
-        std::fs::write(&file, "fn main() {\n    if x {\n        y;\n    }\n}\n").unwrap();
+        let mut snapshot = SnapshotFixture::default();
+        let file = "balanced.rs";
+        snapshot.insert(file, "fn main() {\n    if x {\n        y;\n    }\n}\n");
         let item = patch_item(
             "file:balanced.rs",
             "fn main() {~~*~~}",
@@ -3171,7 +3198,7 @@ mod change_preview_tests {
             item: &item,
         }];
 
-        let (prepared, _) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, _) = snapshot.prepare(&changes).unwrap();
         match &prepared[0] {
             PreparedChange::Write { content, .. } => {
                 assert_eq!(content, "fn main() {\n    z;\n}\n");
@@ -3184,16 +3211,16 @@ mod change_preview_tests {
     fn prepare_file_changes_treats_escaped_marker_as_literal() {
         // A single escaped marker is not a wildcard edit — it is a literal
         // find/replace of the text `~~*~~`.
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("escaped.txt");
-        std::fs::write(&file, "keep ~~*~~ here\n").unwrap();
+        let mut snapshot = SnapshotFixture::default();
+        let file = "escaped.txt";
+        snapshot.insert(file, "keep ~~*~~ here\n");
         let item = patch_item("file:escaped.txt", "\\~~*~~", "REPLACED");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let (prepared, _) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, _) = snapshot.prepare(&changes).unwrap();
         match &prepared[0] {
             PreparedChange::Write { content, .. } => {
                 assert_eq!(content, "keep REPLACED here\n");
@@ -3229,9 +3256,13 @@ mod change_preview_tests {
     fn hash_file_target_captures_existing_and_missing() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("existing.txt"), "contents").unwrap();
-        let existing = patch_item("file:existing.txt", "contents", "changed");
+        let existing = patch_item(
+            &format!("file:{}", temp.path().join("existing.txt").display()),
+            "contents",
+            "changed",
+        );
         let missing = ChangeItem {
-            target: "file:missing.txt".to_string(),
+            target: format!("file:{}", temp.path().join("missing.txt").display()),
             mode: ChangeMode::Create,
             payload: Some(serde_json::json!({ "content": "new" })),
         };
@@ -3264,7 +3295,7 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_create_via_payload() {
-        let temp = tempfile::tempdir().unwrap();
+        let snapshot = SnapshotFixture::default();
         let item = create_item(
             "file:created.txt",
             serde_json::json!({ "content": "hello\nworld\n" }),
@@ -3274,7 +3305,7 @@ mod change_preview_tests {
             item: &item,
         }];
 
-        let (prepared, summaries) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, summaries) = snapshot.prepare(&changes).unwrap();
         assert_eq!(summaries, vec!["+file:created.txt".to_string()]);
         match &prepared[0] {
             PreparedChange::Write {
@@ -3289,16 +3320,16 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_replace_via_payload() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("replace.txt");
-        std::fs::write(&file, "old\n").unwrap();
+        let mut snapshot = SnapshotFixture::default();
+        let file = "replace.txt";
+        snapshot.insert(file, "old\n");
         let item = content_item("file:replace.txt", ChangeMode::Replace, "new\n");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let (prepared, summaries) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, summaries) = snapshot.prepare(&changes).unwrap();
         assert_eq!(summaries, vec!["~file:replace.txt".to_string()]);
         match &prepared[0] {
             PreparedChange::Write {
@@ -3313,16 +3344,16 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_append_existing_via_payload() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("append.txt");
-        std::fs::write(&file, "first\n").unwrap();
+        let mut snapshot = SnapshotFixture::default();
+        let file = "append.txt";
+        snapshot.insert(file, "first\n");
         let item = content_item("file:append.txt", ChangeMode::Append, "second\n");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let (prepared, summaries) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, summaries) = snapshot.prepare(&changes).unwrap();
         assert_eq!(summaries, vec!["~file:append.txt".to_string()]);
         match &prepared[0] {
             PreparedChange::Write {
@@ -3337,14 +3368,14 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_append_creates_missing_file() {
-        let temp = tempfile::tempdir().unwrap();
+        let snapshot = SnapshotFixture::default();
         let item = content_item("file:new-append.txt", ChangeMode::Append, "created\n");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let (prepared, summaries) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, summaries) = snapshot.prepare(&changes).unwrap();
         assert_eq!(summaries, vec!["~file:new-append.txt".to_string()]);
         match &prepared[0] {
             PreparedChange::Write {
@@ -3359,7 +3390,7 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_append_uses_in_flight_content() {
-        let temp = tempfile::tempdir().unwrap();
+        let snapshot = SnapshotFixture::default();
         let create = content_item("file:chain.txt", ChangeMode::Create, "one\n");
         let append = content_item("file:chain.txt", ChangeMode::Append, "two\n");
         let changes = vec![
@@ -3373,7 +3404,7 @@ mod change_preview_tests {
             },
         ];
 
-        let (prepared, summaries) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, summaries) = snapshot.prepare(&changes).unwrap();
         assert_eq!(
             summaries,
             vec!["+file:chain.txt".to_string(), "~file:chain.txt".to_string()]
@@ -3391,9 +3422,9 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_patch_via_diff_payload() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("api.txt");
-        std::fs::write(&file, "line one\nline two\nline three\n").unwrap();
+        let mut snapshot = SnapshotFixture::default();
+        let file = "api.txt";
+        snapshot.insert(file, "line one\nline two\nline three\n");
         let item = ChangeItem {
             target: "file:api.txt".to_string(),
             mode: ChangeMode::Patch,
@@ -3406,7 +3437,7 @@ mod change_preview_tests {
             item: &item,
         }];
 
-        let (prepared, _) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, _) = snapshot.prepare(&changes).unwrap();
         match &prepared[0] {
             PreparedChange::Write { content, .. } => {
                 assert_eq!(content, "line one\nline 2\nline three\n");
@@ -3417,9 +3448,9 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_patch_replace_all_via_payload() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("dup.txt");
-        std::fs::write(&file, "x\nx\nx\n").unwrap();
+        let mut snapshot = SnapshotFixture::default();
+        let file = "dup.txt";
+        snapshot.insert(file, "x\nx\nx\n");
         let item = ChangeItem {
             target: "file:dup.txt".to_string(),
             mode: ChangeMode::Patch,
@@ -3434,7 +3465,7 @@ mod change_preview_tests {
             item: &item,
         }];
 
-        let (prepared, _) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, _) = snapshot.prepare(&changes).unwrap();
         match &prepared[0] {
             PreparedChange::Write { content, .. } => {
                 assert_eq!(content, "y\ny\ny\n");
@@ -3448,16 +3479,16 @@ mod change_preview_tests {
         // A literal old_string matching more than one site with replace_all
         // unset is a footgun: silently editing the first match would let the
         // caller believe they edited the unique site they meant. It must error.
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("dup.txt");
-        std::fs::write(&file, "x\nx\nx\n").unwrap();
+        let mut snapshot = SnapshotFixture::default();
+        let file = "dup.txt";
+        snapshot.insert(file, "x\nx\nx\n");
         let item = patch_item("file:dup.txt", "x", "y");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let err = match prepare_file_changes(temp.path(), &changes, false) {
+        let err = match snapshot.prepare(&changes) {
             Ok(_) => panic!("expected failure for non-unique old_string"),
             Err(err) => err,
         };
@@ -3483,27 +3514,26 @@ mod change_preview_tests {
             "error should include line-numbered excerpts, got: {}",
             err.failure.error
         );
-        // prepare_file_changes never writes; the on-disk file is untouched.
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "x\nx\nx\n");
+        // Preparation leaves the source snapshot untouched.
+        assert_eq!(snapshot.content(file).unwrap(), "x\nx\nx\n");
     }
 
     #[test]
     fn prepare_file_changes_non_unique_excerpts_distinguish_similar_fixtures() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("equipment.txt");
-        std::fs::write(
-            &file,
+        let mut snapshot = SnapshotFixture::default();
+        let file = "equipment.txt";
+        snapshot.insert(
+            file,
             "equipment: pump-a\n  document: manual-a\n  enabled: true\n  mode: primary\n\n\
              equipment: pump-b\n  document: manual-b\n  enabled: true\n  mode: backup\n",
-        )
-        .unwrap();
+        );
         let item = patch_item("file:equipment.txt", "  enabled: true", "  enabled: false");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let err = match prepare_file_changes(temp.path(), &changes, false) {
+        let err = match snapshot.prepare(&changes) {
             Ok(_) => panic!("expected failure for non-unique fixture field"),
             Err(err) => err,
         };
@@ -3519,20 +3549,19 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_non_unique_reports_multiline_ranges() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("ranges.txt");
-        std::fs::write(
-            &file,
+        let mut snapshot = SnapshotFixture::default();
+        let file = "ranges.txt";
+        snapshot.insert(
+            file,
             "fixture a\nstart\nmiddle\nend\ntail a\nfixture b\nstart\nmiddle\nend\ntail b\n",
-        )
-        .unwrap();
+        );
         let item = patch_item("file:ranges.txt", "start\nmiddle", "replacement");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let err = match prepare_file_changes(temp.path(), &changes, false) {
+        let err = match snapshot.prepare(&changes) {
             Ok(_) => panic!("expected failure for non-unique multiline text"),
             Err(err) => err,
         };
@@ -3546,17 +3575,17 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_non_unique_distinguishes_matches_on_one_long_line() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("one-line.txt");
+        let mut snapshot = SnapshotFixture::default();
+        let file = "one-line.txt";
         let content = format!("{}needle{}needle\n", "a".repeat(220), "x".repeat(30));
-        std::fs::write(&file, content).unwrap();
+        snapshot.insert(file, content);
         let item = patch_item("file:one-line.txt", "needle", "changed");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let err = match prepare_file_changes(temp.path(), &changes, false) {
+        let err = match snapshot.prepare(&changes) {
             Ok(_) => panic!("expected failure for two matches on one line"),
             Err(err) => err,
         };
@@ -3593,21 +3622,21 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_non_unique_bounds_large_multiline_excerpts() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("large-block.txt");
+        let mut snapshot = SnapshotFixture::default();
+        let file = "large-block.txt";
         let block = (1..=50)
             .map(|index| format!("block line {index:02}"))
             .collect::<Vec<_>>()
             .join("\n");
         let content = format!("fixture a\n{block}\ntail a\nfixture b\n{block}\ntail b\n");
-        std::fs::write(&file, content).unwrap();
+        snapshot.insert(file, content);
         let item = patch_item("file:large-block.txt", &block, "changed");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let err = match prepare_file_changes(temp.path(), &changes, false) {
+        let err = match snapshot.prepare(&changes) {
             Ok(_) => panic!("expected failure for repeated large multiline blocks"),
             Err(err) => err,
         };
@@ -3626,19 +3655,19 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_non_unique_diagnostic_caps_and_continues() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("many.txt");
+        let mut snapshot = SnapshotFixture::default();
+        let file = "many.txt";
         let content = (1..=12)
             .map(|index| format!("fixture {index}\nvalue: repeated\nend {index}\n"))
             .collect::<String>();
-        std::fs::write(&file, content).unwrap();
+        snapshot.insert(file, content);
         let item = patch_item("file:many.txt", "value: repeated", "value: changed");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let err = match prepare_file_changes(temp.path(), &changes, false) {
+        let err = match snapshot.prepare(&changes) {
             Ok(_) => panic!("expected failure for a large non-unique match set"),
             Err(err) => err,
         };
@@ -3653,7 +3682,7 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_in_flight_ambiguity_does_not_emit_stale_continuation_uri() {
-        let temp = tempfile::tempdir().unwrap();
+        let snapshot = SnapshotFixture::default();
         let content = (1..=12)
             .map(|index| format!("fixture {index}\nvalue: repeated\nend {index}\n"))
             .collect::<String>();
@@ -3670,7 +3699,7 @@ mod change_preview_tests {
             },
         ];
 
-        let err = match prepare_file_changes(temp.path(), &changes, false) {
+        let err = match snapshot.prepare(&changes) {
             Ok(_) => panic!("expected failure for ambiguous in-flight content"),
             Err(err) => err,
         };
@@ -3681,22 +3710,22 @@ mod change_preview_tests {
         assert!(diagnostic.contains("in-flight snapshot"));
         assert!(diagnostic.contains("Apply the preceding changes in a separate write"));
         assert!(!diagnostic.contains("file:created.txt?offset="));
-        assert!(!temp.path().join("created.txt").exists());
+        assert!(snapshot.content("created.txt").is_none());
     }
 
     #[test]
     fn prepare_file_changes_patch_single_match_applies() {
         // The unique-match case is unchanged: exactly one occurrence applies.
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("single.txt");
-        std::fs::write(&file, "keep\nunique\nkeep\n").unwrap();
+        let mut snapshot = SnapshotFixture::default();
+        let file = "single.txt";
+        snapshot.insert(file, "keep\nunique\nkeep\n");
         let item = patch_item("file:single.txt", "unique", "changed");
         let changes = vec![IndexedChange {
             index: 0,
             item: &item,
         }];
 
-        let (prepared, _) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        let (prepared, _) = snapshot.prepare(&changes).unwrap();
         match &prepared[0] {
             PreparedChange::Write { content, .. } => {
                 assert_eq!(content, "keep\nchanged\nkeep\n");
@@ -3707,17 +3736,17 @@ mod change_preview_tests {
 
     #[test]
     fn prepare_file_changes_patch_non_unique_after_earlier_item_errors() {
-        // Bug #81: a later item's old_string is unique on disk but becomes
+        // Bug #81: a later item's old_string is unique in the snapshot but becomes
         // non-unique against the in-flight content an earlier item produced.
         // The count runs against the working content the patch operates on, so
         // item B errors with a clear count message instead of failing-and-
         // reverting the whole batch with an empty error.
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("batch.txt");
-        std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+        let mut snapshot = SnapshotFixture::default();
+        let file = "batch.txt";
+        snapshot.insert(file, "alpha\nbeta\ngamma\n");
         // Item A makes a second "beta" appear in the in-flight content.
         let item_a = patch_item("file:batch.txt", "gamma", "beta");
-        // Item B's old_string is unique on disk but non-unique after A.
+        // Item B's old_string is unique in the snapshot but non-unique after A.
         let item_b = patch_item("file:batch.txt", "beta", "delta");
         let changes = vec![
             IndexedChange {
@@ -3730,7 +3759,7 @@ mod change_preview_tests {
             },
         ];
 
-        let err = match prepare_file_changes(temp.path(), &changes, false) {
+        let err = match snapshot.prepare(&changes) {
             Ok(_) => panic!("expected failure for non-unique in-flight old_string"),
             Err(err) => err,
         };
@@ -3747,7 +3776,7 @@ mod change_preview_tests {
         // The flat file shape is gone. A top-level `content` with no `payload`
         // deserializes into an unknown (ignored) field, so create finds no
         // payload.content and fails exactly as an empty create would.
-        let temp = tempfile::tempdir().unwrap();
+        let snapshot = SnapshotFixture::default();
         let item: ChangeItem = serde_json::from_value(serde_json::json!({
             "target": "file:created.txt",
             "mode": "create",
@@ -3760,7 +3789,7 @@ mod change_preview_tests {
             item: &item,
         }];
 
-        let err = match prepare_file_changes(temp.path(), &changes, false) {
+        let err = match snapshot.prepare(&changes) {
             Ok(_) => panic!("expected failure for create without payload.content"),
             Err(err) => err,
         };

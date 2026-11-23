@@ -1241,10 +1241,6 @@ impl ChangeTestRepo {
             .unwrap();
         "issue-change".to_string()
     }
-
-    async fn preview_report(&self, payload: serde_json::Value) -> serde_json::Value {
-        parse_report(&handle_write(&self.orch, &make_preview_request(self.cwd(), payload)).await)
-    }
 }
 
 /// A child issue's builder is how main gets repaired from inside Cairn when the
@@ -3805,106 +3801,135 @@ async fn handler_revert_overlap_failure_leaves_head_and_ledger_unchanged() {
 }
 
 #[tokio::test]
-async fn change_unified_patch_preview_hashes_expanded_targets() {
+async fn change_preview_uses_logical_head_and_applies_without_a_checkout() {
     let Some(repo) = ChangeTestRepo::try_new().await else {
         eprintln!("skipping: jj not resolvable");
         return;
     };
     repo.write("lib.rs", "old();\n");
-    let payload = json!({
-        "changes": [{
-            "target": "file:",
-            "mode": "unified_patch",
-            "payload": { "patch": "*** Begin Patch\n*** Add File: add.rs\n+add();\n*** Update File: lib.rs\n@@ -1,1 +1,1 @@\n-old();\n+new();\n*** End Patch\n" }
-        }],
-        "commit_msg": "add files",
-        "preview": true
-    });
-    insert_preview_event(&repo.orch.db.local, payload.clone()).await;
-
-    let report = repo.preview_report(payload).await;
-
-    assert_successful_change(&report, 2);
-    assert_eq!(repo.read("lib.rs"), "old();\n");
-    assert!(!repo.path("add.rs").exists());
-    let targets = report["target_hashes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|hash| hash["target"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(targets, vec!["file:add.rs", "file:lib.rs"]);
-}
-
-async fn insert_preview_event(db: &LocalDb, input: serde_json::Value) {
-    let project_id = common::create_project(db, "preview").await;
-    db.write(|conn| {
-        let project_id = project_id.clone();
-        let data = json!({
-            "toolUses": [{
-                "id": "toolu-preview",
-                "name": "mcp__cairn__change",
-                "input": input,
-            }]
-        })
-        .to_string();
-        Box::pin(async move {
-            // The preview job has no branch of its own and works on its
-            // project's default branch, which a commit may only do when its
-            // execution declared `branch: base` (cairn/7323).
-            conn.execute(
-                "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
-                 VALUES ('issue-preview', ?1, 1, 'Preview', 'active', 1, 1)",
-                params![project_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
-                 VALUES ('exec-preview', 'recipe', 'issue-preview', ?1, 'running', 1, 1, '{\"branchTarget\":\"base\"}')",
-                params![project_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO jobs(id, execution_id, project_id, status, current_session_id, created_at, updated_at)
-                 VALUES ('job-preview', 'exec-preview', ?1, 'running', 'session-preview', 1, 1)",
-                params![project_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
-                 VALUES ('session-preview', 'job-preview', 'active', 1, 1)",
+    repo.write("stale.rs", "old();\n");
+    std::fs::write(repo.path("asset.png"), [0x89, 0x50, 0xff, 0x00]).unwrap();
+    repo.write("symbols.rs", "fn alpha() {}\nfn call() { alpha(); }\n");
+    assert_successful_change(
+        &repo
+            .change_report(json!({
+                "changes": [{
+                    "target": "file:stale.rs", "mode": "replace",
+                    "payload": { "content": "logical();\n" }
+                }],
+                "commit_msg": "advance past checkout"
+            }))
+            .await,
+        1,
+    );
+    let head = repo.branch_head();
+    let empty = tempfile::tempdir().unwrap();
+    // One cwd has no checkout; the other has deliberately stale file bytes.
+    // Neither is authoritative for the branch's content.
+    for cwd in [empty.path(), repo.dir.path()] {
+        let payload = json!({
+            "changes": [
+                {
+                    "target": "file:", "mode": "unified_patch",
+                    "payload": { "patch": "*** Begin Patch\n*** Add File: add.rs\n+add();\n*** Update File: lib.rs\n@@ -1,1 +1,1 @@\n-old();\n+new();\n*** End Patch\n" }
+                },
+                {
+                    "target": "file:stale.rs", "mode": "patch",
+                    "payload": { "old_string": "logical();", "new_string": "patched();" }
+                },
+                {
+                    "target": "file:symbols.rs", "mode": "rename",
+                    "payload": { "old_name": "alpha", "new_name": "beta" }
+                }
+            ],
+            "preview": true, "atomic": true
+        });
+        repo.orch
+            .db
+            .local
+            .execute("DELETE FROM events WHERE run_id = 'run-change'", ())
+            .await
+            .unwrap();
+        record_write_call(&repo.orch.db.local, "toolu-preview", &payload).await;
+        let mut request = make_request_as_run(cwd.to_str().unwrap(), payload, Some("run-change"));
+        request.tool_use_id = Some("toolu-preview".to_string());
+        let store = jj::project_store_dir(repo.config.path(), repo.project.path());
+        repo.orch.db.local.execute(
+            "INSERT INTO run_batch_detached(request_id,job_id,run_id,label,commits,holds_branch,state,reason,created_ms)
+             VALUES('preview-active-batch','job-change','run-change','read-only batch',0,1,'running','test',1)",
+            (),
+        ).await.unwrap();
+        let held = repo.orch.hold_jj_store_lock_for_test(&store).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            handle_write(&repo.orch, &request),
+        )
+        .await
+        .expect("preview must not wait for a write hold");
+        assert!(repo.orch.jj_store_lock_waiters_for_test(&store).is_empty());
+        drop(held);
+        repo.orch
+            .db
+            .local
+            .execute(
+                "DELETE FROM run_batch_detached WHERE request_id = 'preview-active-batch'",
                 (),
             )
-            .await?;
-            conn.execute(
-                "INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at, start_mode)
-                 VALUES ('run-preview', ?1, 'job-preview', 'live', 'session-preview', 1, 1, 'resume')",
-                params![project_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
-                 VALUES ('event-preview', 'run-preview', 'session-preview', 1, 1, 'assistant', ?1, 1)",
-                params![data.as_str()],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .unwrap();
-}
-
-fn make_preview_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
-    McpCallbackRequest {
-        answer_bound_ms: None,
-        thread_id: None,
-        cwd: cwd.to_string(),
-        run_id: Some("run-preview".to_string()),
-        tool: "write".to_string(),
-        payload,
-        tool_use_id: Some("toolu-preview".to_string()),
-        origin: None,
+            .await
+            .unwrap();
+        let report = parse_report(&result);
+        assert_successful_change(&report, 4);
+        assert_eq!(repo.branch_head(), head);
+        let targets = report["target_hashes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hash| hash["target"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                "file:",
+                "file:add.rs",
+                "file:lib.rs",
+                "file:stale.rs",
+                "file:symbols.rs"
+            ]
+        );
+        assert_eq!(report["target_hashes"][0]["kind"], "logical-tree");
+        assert!(!report["target_hashes"][1]["exists"].as_bool().unwrap());
+        assert!(report["target_hashes"][3]["exists"].as_bool().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(repo.path("stale.rs")).unwrap(),
+            "old();\n"
+        );
+        assert!(!empty.path().join("lib.rs").exists());
+        if cwd == empty.path() {
+            continue;
+        }
+        repo.orch.db.local.execute(
+            "INSERT INTO events(id,run_id,session_id,sequence,timestamp,event_type,data,created_at)
+             VALUES ('preview-result','run-change','session-change',2,1,'tool_result',?1,1)",
+            params![json!({"toolUseId":"toolu-preview","toolResult":result}).to_string()],
+        ).await.unwrap();
+        let apply_request = make_request_as_run(
+            empty.path().to_str().unwrap(),
+            json!({
+                "changes": [{"target":report["apply_uri"],"mode":"apply"}],
+                "commit_msg":"apply logical preview"
+            }),
+            Some("run-change"),
+        );
+        let applied = parse_report(&handle_write(&repo.orch, &apply_request).await);
+        assert_successful_change(&applied, 4);
+        assert_eq!(
+            repo.read("symbols.rs"),
+            "fn beta() {}\nfn call() { beta(); }\n"
+        );
+        assert_eq!(repo.read("lib.rs"), "new();\n");
+        assert_eq!(repo.read("stale.rs"), "patched();\n");
+        assert_eq!(repo.read("add.rs"), "add();");
+        assert!(!empty.path().join("lib.rs").exists());
     }
 }
 
