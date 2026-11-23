@@ -1044,17 +1044,22 @@ pub(crate) mod tests {
         let db_state = Arc::new(DbState::new(Arc::new(db), Arc::new(index)));
         let services = Arc::new(TestServicesBuilder::new().build());
         let orch = Orchestrator::builder(db_state, services, config.path().to_path_buf()).build();
-        let link = attach_executor_runtime(&orch, config.path().join("executor-home"));
+        let link = attach_executor_runtime(&orch, config.path().join("executor-home")).await;
         (orch, config, link)
     }
 
-    fn attach_executor_runtime(orch: &Orchestrator, home: PathBuf) -> u64 {
+    async fn attach_executor_runtime(orch: &Orchestrator, home: PathBuf) -> u64 {
         const EXECUTOR_ID: &str = super::super::COLOCATED_EXECUTOR_ID;
         let fleet = orch.fleet.clone();
         let generation = Arc::new(AtomicU64::new(0));
         let (snapshot_fleet, snapshot_generation) = (fleet.clone(), generation.clone());
         let (event_fleet, event_generation) = (fleet.clone(), generation.clone());
-        let runtime = ExecutorRuntime::new(home)
+        // The binary establishes its kernel lineage at startup, off the
+        // runtime; without it a process the kernel withholds makes every
+        // cell's cleanup unknown.
+        let established =
+            offload(move || ExecutorRuntime::new(home).with_established_occupancy_lineage()).await;
+        let runtime = established
             .with_snapshot_callback(move |_reason, snapshot, health| {
                 snapshot_fleet.handle_executor_message(
                     EXECUTOR_ID,

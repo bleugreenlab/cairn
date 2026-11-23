@@ -2314,6 +2314,10 @@ pub(crate) fn render_executor_with_kills(
             .unwrap_or_default()
     ));
 
+    out.push_str(&render_orphan_census(
+        health.command_processes.orphan_census.as_ref(),
+    ));
+
     // Only when there are any: an eviction is the one place the fleet destroys
     // an owner's uncommitted work, and it should be legible here rather than
     // only in the machine's log, which nobody reads until something is wrong.
@@ -7270,6 +7274,62 @@ fn describe_resident_charge(process: &cairn_common::executor_protocol::ResidentP
         }
     };
     format!("; charged {} ({why})", bytes(charge.memory_bytes))
+}
+
+fn render_orphan_census(
+    report: Option<&cairn_common::executor_protocol::CellOrphanCensusReport>,
+) -> String {
+    let Some(report) = report else {
+        return "- Cell orphan census: not yet measured\n".into();
+    };
+    // Keep process-supplied text on one line and out of Markdown table/code syntax.
+    fn diagnostic(value: &str) -> String {
+        value
+            .chars()
+            .map(|ch| match ch {
+                '\n' | '\r' | '\t' | '|' | '`' => ' ',
+                ch => ch,
+            })
+            .collect()
+    }
+    let mut out = format!(
+        "- Cell orphan census: {} unresolved, {} reaped in pass; observed at {} Unix ms{}\n",
+        report.unresolved_count,
+        report.reaped_count,
+        report.observed_at_unix_ms,
+        report
+            .error
+            .as_ref()
+            .map(|error| format!("; incomplete/failed: {}", diagnostic(error)))
+            .unwrap_or_default(),
+    );
+    for entry in &report.unresolved {
+        out.push_str(&format!(
+            "  - PID {}: {}; executable {}; slot {} ({}); age {}; start token {}; why: {}\n",
+            entry.pid,
+            diagnostic(&entry.command),
+            entry
+                .executable
+                .as_deref()
+                .map(diagnostic)
+                .unwrap_or_else(|| "unknown".into()),
+            diagnostic(&entry.slot),
+            diagnostic(&entry.path),
+            entry
+                .age_ms
+                .map(|age| format!("{age}ms"))
+                .unwrap_or_else(|| "unknown".into()),
+            diagnostic(&entry.start_token),
+            diagnostic(&entry.reason),
+        ));
+    }
+    if report.unresolved_count > report.unresolved.len() {
+        out.push_str(&format!(
+            "  - {} more unresolved processes omitted (bounded report).\n",
+            report.unresolved_count - report.unresolved.len()
+        ));
+    }
+    out
 }
 
 fn age(ms: u64) -> String {
@@ -14849,6 +14909,54 @@ mod tests {
     }
 
     #[test]
+    fn orphan_census_names_unmeasured_empty_failed_and_unresolved_passes() {
+        use cairn_common::executor_protocol::{CellOrphanCensusReport, CellOrphanProcess};
+        let mut executor = inspection("local", true);
+        assert!(render_executor(&executor).contains("Cell orphan census: not yet measured"));
+        let mut report = CellOrphanCensusReport::bounded(1234, 2, Vec::new());
+        executor.health.command_processes.orphan_census = Some(report.clone());
+        let empty = render_executor(&executor);
+        assert!(empty.contains(
+            "Cell orphan census: 0 unresolved, 2 reaped in pass; observed at 1234 Unix ms"
+        ));
+        assert!(!empty.contains("not yet measured"));
+        report.error = Some("enumeration denied".into());
+        executor.health.command_processes.orphan_census = Some(report);
+        assert!(render_executor(&executor).contains("incomplete/failed: enumeration denied"));
+        let entry = CellOrphanProcess {
+            pid: 42,
+            start_token: "kernel-123".into(),
+            command: "cairn-orch run".into(),
+            executable: Some("/bin/cairn-orch".into()),
+            slot: "slot-149".into(),
+            path: "/cells/slot-149.discard".into(),
+            age_ms: Some(9000),
+            reason: "start identity unverifiable".into(),
+        };
+        let mut report = CellOrphanCensusReport::bounded(2345, 0, vec![entry.clone()]);
+        report.unresolved_count = 40;
+        executor.health.command_processes.orphan_census = Some(report);
+        let unresolved = render_executor(&executor);
+        for detail in [
+            "40 unresolved",
+            "PID 42: cairn-orch run",
+            "executable /bin/cairn-orch",
+            "slot slot-149 (/cells/slot-149.discard)",
+            "age 9000ms",
+            "start token kernel-123",
+            "why: start identity unverifiable",
+            "39 more unresolved processes omitted",
+        ] {
+            assert!(unresolved.contains(detail), "{detail}: {unresolved}");
+        }
+        let mut unknown_age = entry;
+        unknown_age.age_ms = None;
+        executor.health.command_processes.orphan_census =
+            Some(CellOrphanCensusReport::bounded(3456, 0, vec![unknown_age]));
+        assert!(render_executor(&executor).contains("age unknown"));
+    }
+
+    #[test]
     fn command_and_resident_ownership_render_as_distinct_health() {
         let mut executor = inspection("bglab-ub", false);
         executor.health.resident_processes.tracked_live_count = 2;
@@ -16258,6 +16366,7 @@ mod running_now_tests {
         };
         const MIB: u64 = 1 << 20;
         let resident = |generation, charge| ResidentProcess {
+            recorded_descendants: Vec::new(),
             generation,
             kind: ResidentProcessKind::Service {
                 name: "channel-imessage".into(),

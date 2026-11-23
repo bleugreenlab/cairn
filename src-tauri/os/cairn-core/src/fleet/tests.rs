@@ -12960,6 +12960,7 @@ fn snapshot_work_names_residents_apart_from_work_and_services() {
     let mut cell = materialization_read_cell("fedora-home", "builder");
     let holder = cell.residency.as_ref().unwrap().holder.clone();
     let running = |kind| ResidentProcess {
+        recorded_descendants: Vec::new(),
         generation: 1,
         kind,
         spec: None,
@@ -13533,6 +13534,7 @@ fn pool_with_a_silent_home(
     cell.occupancy.processes.insert(
         "terminal:dev".into(),
         cairn_common::executor_protocol::ResidentProcess {
+            recorded_descendants: Vec::new(),
             generation: 1,
             kind: cairn_common::executor_protocol::ResidentProcessKind::Terminal {
                 slug: "dev".into(),
@@ -15608,6 +15610,7 @@ fn resident_process_cell(
             processes: std::collections::BTreeMap::from([(
                 "main".into(),
                 cairn_common::executor_protocol::ResidentProcess {
+                    recorded_descendants: Vec::new(),
                     generation: process_generation,
                     kind: cairn_common::executor_protocol::ResidentProcessKind::Terminal {
                         slug: "watch".into(),
@@ -19391,6 +19394,7 @@ fn pool_with_a_drained_home(
         cell.occupancy.processes.insert(
             "live".into(),
             cairn_common::executor_protocol::ResidentProcess {
+                recorded_descendants: Vec::new(),
                 generation: 1,
                 kind,
                 spec: None,
@@ -19542,6 +19546,7 @@ fn drain_residents_count_every_environment_and_name_the_held_ones() {
     terminal.occupancy.processes.insert(
         "terminal:dev".into(),
         cairn_common::executor_protocol::ResidentProcess {
+            recorded_descendants: Vec::new(),
             generation: 1,
             kind: cairn_common::executor_protocol::ResidentProcessKind::Terminal {
                 slug: "dev".into(),

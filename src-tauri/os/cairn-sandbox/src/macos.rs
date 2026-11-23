@@ -188,9 +188,9 @@ pub(crate) fn sbpl_profile(policy: &SandboxPolicy, floor: &OperatorCredentialFlo
         out.push_str(&format!(
             "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
         ));
-        // And the lineage callback socket, by its exact path: the same door,
-        // answered by the same relay, with no capability to carry.
-        if let Some(socket) = &policy.callback_socket {
+        // Executor control endpoints are opened individually, never by their
+        // parent directory: other sockets remain outside the network grant.
+        for socket in &policy.control_sockets {
             out.push_str(&format!(
                 "(allow network-outbound (remote unix-socket (path-literal \"{}\")))\n",
                 escape_sbpl(&canonicalize_best_effort(socket).to_string_lossy())
@@ -1116,7 +1116,7 @@ fn recover_a_canary_denial(stream: &ViolationStream) -> ViolationRecoveryOutcome
         writable_regex: Vec::new(),
         worktree_writable: true,
         socket_resolvable: Vec::new(),
-        callback_socket: None,
+        control_sockets: Vec::new(),
         readable_extra: Vec::new(),
         violation_tag: crate::ViolationTag::fresh(),
         reach: Default::default(),
@@ -1273,6 +1273,29 @@ mod tests {
     use std::process::Command;
     use tempfile::tempdir;
 
+    #[test]
+    fn relay_only_control_sockets_are_exact_endpoint_grants() {
+        let mut policy = SandboxPolicy::for_page_call(Path::new("/job"), &[], 4321);
+        policy.control_sockets = vec![
+            PathBuf::from("/executor/control/callback.sock"),
+            PathBuf::from("/attempt/control/launch.sock"),
+        ];
+        let profile = sbpl_profile(&policy, &test_floor());
+        for path in [
+            "/executor/control/callback.sock",
+            "/attempt/control/launch.sock",
+        ] {
+            assert!(
+                profile.contains(&format!(
+                    "(allow network-outbound (remote unix-socket (path-literal \"{path}\")))"
+                )),
+                "{profile}"
+            );
+        }
+        assert!(!profile.contains("(remote unix-socket (subpath"));
+        assert!(!profile.contains("(path-literal \"/attempt/control/other.sock\")"));
+    }
+
     /// The page-call profile closes reads by default and opens only its roots,
     /// its own directory and `/dev`; it permits one socket, the relay; and the
     /// credential floor still closes it. An ordinary fence does none of that.
@@ -1363,7 +1386,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
-            callback_socket: None,
+            control_sockets: Vec::new(),
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -1428,7 +1451,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
-            callback_socket: None,
+            control_sockets: Vec::new(),
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -1602,7 +1625,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
-            callback_socket: None,
+            control_sockets: Vec::new(),
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -1664,7 +1687,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
-            callback_socket: None,
+            control_sockets: Vec::new(),
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -1714,7 +1737,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
-            callback_socket: None,
+            control_sockets: Vec::new(),
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -1872,7 +1895,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
-            callback_socket: None,
+            control_sockets: Vec::new(),
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -2510,7 +2533,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
-            callback_socket: None,
+            control_sockets: Vec::new(),
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -2597,7 +2620,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
-            callback_socket: None,
+            control_sockets: Vec::new(),
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -3123,7 +3146,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
-            callback_socket: None,
+            control_sockets: Vec::new(),
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -3171,7 +3194,7 @@ mod tests {
             writable_regex: vec![super::super::glob_to_regex(&glob)],
             worktree_writable: true,
             socket_resolvable: vec![],
-            callback_socket: None,
+            control_sockets: Vec::new(),
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),

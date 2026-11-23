@@ -6267,6 +6267,7 @@ mod terminal_finalize_tests {
                 processes: std::collections::BTreeMap::from([(
                     "main".into(),
                     ResidentProcess {
+                        recorded_descendants: Vec::new(),
                         generation: 1,
                         kind: ResidentProcessKind::Terminal {
                             slug: "fast".into(),

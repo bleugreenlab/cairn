@@ -697,6 +697,7 @@ fn attach_answering_executor(
                     cell.occupancy.processes.insert(
                         process_key.clone(),
                         ResidentProcess {
+                            recorded_descendants: Vec::new(),
                             generation: 1,
                             kind: ResidentProcessKind::Terminal { slug: slug.clone() },
                             spec: None,

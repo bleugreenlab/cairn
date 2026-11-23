@@ -5,6 +5,12 @@ use crate::storage::LocalDb;
 ctor::declarative::ctor! {
     #[ctor(unsafe)]
     fn seal_test_process() {
+        // The embedded executor relaunches this binary as its authenticated
+        // helper. Dispatch before the seal changes the workload's environment.
+        #[cfg(unix)]
+        if let Some(exit) = cairn_exec::launch_broker::dispatch_helper() {
+            std::process::exit(if exit == std::process::ExitCode::SUCCESS { 0 } else { 1 });
+        }
         cairn_common::test_seal::seal_process();
         cairn_checkenv::install_test_identity();
     }

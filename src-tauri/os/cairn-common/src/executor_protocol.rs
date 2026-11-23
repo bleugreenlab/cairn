@@ -357,6 +357,79 @@ impl RemoteConnectionPhase {
     }
 }
 
+/// Maximum unresolved process details carried by one census; totals remain exact.
+pub const CELL_ORPHAN_CENSUS_ENTRY_LIMIT: usize = 32;
+/// Maximum UTF-8 bytes per diagnostic text field in an orphan census.
+pub const CELL_ORPHAN_CENSUS_TEXT_LIMIT: usize = 512;
+
+/// The most recent completed cell-orphan pass, not a history of stopped commands.
+/// Producers publish through `bounded` so heartbeat size does not grow with
+/// the number of orphan processes or their command lines.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CellOrphanCensusReport {
+    pub observed_at_unix_ms: u64,
+    pub reaped_count: usize,
+    pub unresolved_count: usize,
+    pub unresolved: Vec<CellOrphanProcess>,
+    /// A failed or partial enumeration is never evidence of an empty tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl CellOrphanCensusReport {
+    pub fn bounded(
+        observed_at_unix_ms: u64,
+        reaped_count: usize,
+        mut unresolved: Vec<CellOrphanProcess>,
+    ) -> Self {
+        let unresolved_count = unresolved.len();
+        unresolved.truncate(CELL_ORPHAN_CENSUS_ENTRY_LIMIT);
+        fn bound(text: &mut String) {
+            let mut end = text.len().min(CELL_ORPHAN_CENSUS_TEXT_LIMIT);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        for entry in &mut unresolved {
+            bound(&mut entry.start_token);
+            bound(&mut entry.command);
+            if let Some(executable) = &mut entry.executable {
+                bound(executable);
+            }
+            bound(&mut entry.slot);
+            bound(&mut entry.path);
+            bound(&mut entry.reason);
+        }
+        Self {
+            observed_at_unix_ms,
+            reaped_count,
+            unresolved_count,
+            unresolved,
+            error: None,
+        }
+    }
+}
+
+/// A process still unresolved at the end of the pass. The kernel start token
+/// distinguishes reuse of a PID; these diagnostic strings are not kill authority.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CellOrphanProcess {
+    pub pid: u32,
+    pub start_token: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    pub slot: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    /// Why reaping was refused, or the error that prevented verified cleanup.
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandProcessHealth {
@@ -372,6 +445,12 @@ pub struct CommandProcessHealth {
     pub survivor_blocked_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_age_ms: Option<u64>,
+    /// None means no census has completed, not a measured zero. This additive,
+    /// defaulted diagnostic changes neither admission nor lifecycle outcomes;
+    /// reporting alone does not bump EXECUTOR_PROTOCOL_VERSION. The behavior
+    /// producing it must independently satisfy docs/executor.md's version rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_census: Option<CellOrphanCensusReport>,
 }
 
 /// What a released cell is still waiting to die.
@@ -7139,6 +7218,17 @@ pub struct LearnedResourceEstimate {
 /// occupancy for its slot. No wire field or meaning changes: an older executor
 /// supplies the same occupancy and the runner names unavailable slots as gaps.
 ///
+/// cairn/6706's orphan census reporting does not move the number. The optional,
+/// defaulted CommandProcessHealth.orphan_census is diagnostic only: an older
+/// executor leaves it unmeasured, not falsely empty, and an older runner ignores
+/// it. Reporting changes no admission, signaling, or lifecycle outcome. The
+/// census implementation's lifecycle semantics require their own version
+/// assessment independently of this additive report. ResidentProcess also gains
+/// defaulted recorded_descendants for executor-local, observed parent ownership;
+/// runner snapshots omit this ledger. This field alone changes no wire demand,
+/// but requiring verified descendant teardown before terminal resident status is
+/// a lifecycle change covered by this issue's separate version assessment.
+///
 /// cairn/6793 does not move the number. Reclamation watchdog classification
 /// changes only executor-local logging; an older peer reads identical messages
 /// and fields and gets no wire semantics wrong.
@@ -9832,7 +9922,15 @@ pub struct LearnedResourceEstimate {
 /// renders. What a runner gets wrong talking to an older executor: nothing;
 /// the page omits a section that executor cannot fill, and that executor
 /// still quarantines slots over a broken ref file, as it already does.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 177;
+///
+/// Version 178 (cairn/6706) requires full cell-holder occupancy before Unix
+/// retirement and verified TERM/KILL settlement of recorded command/resident
+/// identities. Resident descendants retain launch proof until verified death,
+/// and supervised dev launchers preserve executor group ownership. An older
+/// executor can report a resident stopped or move a tree with live holders;
+/// the runner must not treat that lifecycle result as the newer guarantee.
+/// Unattributed holders remain reported blockers, never signal targets.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 178;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -16661,6 +16759,10 @@ pub enum ResidentProcessKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResidentProcess {
+    /// Launch-owned descendants observed while their parent linkage was live.
+    /// Kept until verified teardown, including across executor restarts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recorded_descendants: Vec<CommandPhysicalProcessIdentity>,
     pub generation: u64,
     pub kind: ResidentProcessKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -29563,6 +29665,7 @@ mod tests {
             processes: std::collections::BTreeMap::from([(
                 "shell".to_string(),
                 ResidentProcess {
+                    recorded_descendants: Vec::new(),
                     generation: 2,
                     kind: ResidentProcessKind::Terminal {
                         slug: "tests".into(),
@@ -29725,6 +29828,7 @@ mod tests {
             test_phase: None,
         };
         let process = |status: ResidentProcessStatus| ResidentProcess {
+            recorded_descendants: Vec::new(),
             generation: 1,
             kind: ResidentProcessKind::DevInstance {
                 source_terminal_session_id: None,
@@ -31015,6 +31119,7 @@ mod tests {
     /// reservation that hang off it.
     fn sample_resident_process(kind: ResidentProcessKind) -> ResidentProcess {
         ResidentProcess {
+            recorded_descendants: Vec::new(),
             generation: 4,
             kind,
             spec: Some(ResidentProcessSpec {
@@ -34905,6 +35010,52 @@ mod tests {
         let report: ExecutorSubstrateReport = serde_json::from_value(value).unwrap();
         assert_eq!(report.command_processes, CommandProcessHealth::default());
         assert_eq!(report.resident_processes, ResidentProcessHealth::default());
+    }
+
+    #[test]
+    fn orphan_census_defaults_roundtrips_and_bounds_diagnostics() {
+        let health: CommandProcessHealth = serde_json::from_value(serde_json::json!({
+            "trackedLiveCount": 1, "reapedStaleCount": 0, "unverifiedCount": 0
+        }))
+        .unwrap();
+        assert_eq!(health.orphan_census, None);
+        assert!(serde_json::to_value(&health)
+            .unwrap()
+            .get("orphanCensus")
+            .is_none());
+        let entry = CellOrphanProcess {
+            command: "é".repeat(CELL_ORPHAN_CENSUS_TEXT_LIMIT),
+            reason: "x".repeat(CELL_ORPHAN_CENSUS_TEXT_LIMIT + 20),
+            ..Default::default()
+        };
+        let report = CellOrphanCensusReport::bounded(
+            1234,
+            3,
+            vec![entry; CELL_ORPHAN_CENSUS_ENTRY_LIMIT + 1],
+        );
+        assert_eq!(report.unresolved_count, CELL_ORPHAN_CENSUS_ENTRY_LIMIT + 1);
+        assert_eq!(report.unresolved.len(), CELL_ORPHAN_CENSUS_ENTRY_LIMIT);
+        assert_eq!(
+            report.unresolved[0].command.len(),
+            CELL_ORPHAN_CENSUS_TEXT_LIMIT
+        );
+        assert_eq!(
+            report.unresolved[0].reason.len(),
+            CELL_ORPHAN_CENSUS_TEXT_LIMIT
+        );
+        let mut health = health;
+        health.orphan_census = Some(report);
+        let value = serde_json::to_value(&health).unwrap();
+        assert_eq!(value["orphanCensus"]["observedAtUnixMs"], 1234);
+        assert_eq!(
+            serde_json::from_value::<CommandProcessHealth>(value).unwrap(),
+            health
+        );
+        let empty = CellOrphanCensusReport::bounded(5678, 0, Vec::new());
+        let decoded: CellOrphanCensusReport =
+            serde_json::from_value(serde_json::to_value(empty).unwrap()).unwrap();
+        assert!(decoded.error.is_none());
+        assert_eq!(decoded.unresolved_count, 0);
     }
 
     fn edge_fingerprint(edge: EdgeId) -> Fingerprint {

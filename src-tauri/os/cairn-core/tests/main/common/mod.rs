@@ -1181,7 +1181,16 @@ fn attach_executor(
     let resident_event_generation = generation.clone();
     let relay = TestMcpRelay::start(orch, executor_id, generation.clone());
     let resident_relay = relay.clone();
-    let runtime = ExecutorRuntime::new(executor_home)
+    // The binary establishes its kernel lineage at startup; without it a
+    // process the kernel withholds makes every cell's cleanup unknown. The
+    // record write blocks, and this helper is called from async tests that
+    // cannot await, so it runs on a thread outside the runtime.
+    let established = std::thread::spawn(move || {
+        ExecutorRuntime::new(executor_home).with_established_occupancy_lineage()
+    })
+    .join()
+    .expect("establishing the executor's occupancy lineage");
+    let runtime = established
         .with_resident_relay(move |identity| resident_relay.register_resident(identity))
         .with_snapshot_callback(move |_reason, snapshot, health| {
             snapshot_pool.handle_executor_message(
