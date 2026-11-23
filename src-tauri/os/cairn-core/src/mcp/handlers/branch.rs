@@ -13,7 +13,7 @@ use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BranchResolution {
     pub project_id: String,
     /// Runner-owned jj operation repository used for coordinate mutation.

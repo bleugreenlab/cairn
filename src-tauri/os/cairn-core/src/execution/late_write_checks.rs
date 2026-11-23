@@ -78,9 +78,33 @@ impl LateWriteChecks {
     /// it, which is unique across restarts where the registry's own order is
     /// not, so it is what a delivery is keyed by.
     pub(crate) fn open(self: &Arc<Self>, job_id: &str, wave_id: &str) -> WaveTicket {
+        self.open_ordered(job_id, wave_id, None)
+    }
+
+    /// Recreate ordering evidence without assigning a restarted wave a newer
+    /// place than a wave that already delivered.
+    pub(crate) fn open_recovered(
+        self: &Arc<Self>,
+        job_id: &str,
+        wave_id: &str,
+        order: i64,
+    ) -> WaveTicket {
+        self.open_ordered(job_id, wave_id, Some(order as u64))
+    }
+
+    fn open_ordered(
+        self: &Arc<Self>,
+        job_id: &str,
+        wave_id: &str,
+        restored: Option<u64>,
+    ) -> WaveTicket {
         let mut state = self.lock();
-        let seq = state.next_wave;
-        state.next_wave += 1;
+        let seq = restored.unwrap_or_else(|| {
+            state
+                .next_wave
+                .max(chrono::Utc::now().timestamp_millis() as u64)
+        });
+        state.next_wave = state.next_wave.max(seq + 1);
         state.jobs.entry(job_id.to_string()).or_default().open += 1;
         drop(state);
         WaveTicket {
@@ -88,6 +112,7 @@ impl LateWriteChecks {
             job_id: job_id.to_string(),
             wave_id: wave_id.to_string(),
             seq,
+            opened_at_ms: seq as i64,
             commit: OnceLock::new(),
             failed: Mutex::new(Vec::new()),
         }
@@ -155,6 +180,7 @@ pub(crate) struct WaveTicket {
     job_id: String,
     wave_id: String,
     seq: u64,
+    opened_at_ms: i64,
     commit: OnceLock<String>,
     /// The lanes this wave genuinely failed.
     failed: Mutex<Vec<String>>,
@@ -243,6 +269,20 @@ impl WaveTicket {
     /// The commit the wave evaluated, once it planned.
     pub(crate) fn commit(&self) -> Option<&str> {
         self.commit.get().map(String::as_str)
+    }
+
+    /// A delivered wave remains ordering/verdict evidence, never a delivery task.
+    pub(crate) fn restore_finished(&self) {
+        let mut state = self.registry.lock();
+        if let Some(job) = state.jobs.get_mut(&self.job_id) {
+            if job.newest_planned == Some(self.seq) {
+                job.newest_finished = true;
+            }
+        }
+    }
+
+    pub(crate) fn opened_at_ms(&self) -> i64 {
+        self.opened_at_ms
     }
 
     pub(crate) fn wave_id(&self) -> &str {
@@ -477,5 +517,26 @@ mod tests {
         assert_eq!(newest.settle_late(), LateDisposition::Deliver(None));
         assert_eq!(passing.settle_late(), LateDisposition::Superseded);
         assert_eq!(failing.settle_late(), LateDisposition::Deliver(None));
+    }
+    #[test]
+    fn a_recovered_delivered_pass_covers_an_older_failure_arriving_after_restart() {
+        let registry = Arc::new(LateWriteChecks::default());
+        let old = registry.open_recovered("job", "old", 10);
+        old.planned("old-commit");
+        let newer = registry.open_recovered("job", "new", 20);
+        newer.planned("new-commit");
+        newer.recorded([("suite", LaneVerdict::Passed)]);
+        newer.restore_finished();
+        old.recorded([("suite", LaneVerdict::Failed)]);
+        assert_eq!(old.settle_late(), LateDisposition::Superseded);
+        // Repeated evidence restoration must not move B past a live newer C.
+        let latest = registry.open_recovered("job", "latest", 30);
+        latest.planned("latest-commit");
+        let again = registry.open_recovered("job", "new", 20);
+        again.planned("new-commit");
+        again.recorded([("suite", LaneVerdict::Passed)]);
+        again.restore_finished();
+        latest.recorded([("suite", LaneVerdict::Failed)]);
+        assert!(matches!(latest.settle_late(), LateDisposition::Deliver(_)));
     }
 }

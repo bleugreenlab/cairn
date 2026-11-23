@@ -2450,6 +2450,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("check_result_commit_aliases", TableScope::ProjectScoped),
     ("check_result_observations", TableScope::ProjectScoped),
     ("check_requests", TableScope::ProjectScoped),
+    ("write_check_waves", TableScope::ProjectScoped),
     ("check_observation_relabels", TableScope::ProjectScoped),
     ("check_test_results", TableScope::ProjectScoped),
     ("check_deferred_tests", TableScope::ProjectScoped),
@@ -3363,6 +3364,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "check_result_observations",
         id_columns: &["id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "write_check_waves",
+        id_columns: &["project_id", "job_id", "run_id"],
     },
     RekeyTableManifest {
         table: "check_requests",

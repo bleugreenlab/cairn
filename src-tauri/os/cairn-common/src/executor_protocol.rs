@@ -7206,6 +7206,16 @@ pub struct LearnedResourceEstimate {
 /// nothing from nothing in the runner's eyes, so its results can raise a
 /// figure and never lower one.
 ///
+/// cairn/7334 does not move the number. Write-cadence checks acquire durable
+/// runner-side request and wave continuations, and the runner records explicit
+/// consumer identity instead of reading stream labels. Persisting returned
+/// mutation deltas and recovering their keyed branch publications changes only
+/// runner storage and settlement. The executor already retains these results
+/// until acknowledgement and receives the same single-suite CellRequest, with
+/// the same mutation policy and result fields. Added serialization on runner
+/// evidence types is for local recovery, not a new wire shape; an older executor
+/// interprets every request and acknowledgement exactly as before.
+///
 /// cairn/7322 does not move the number. A check request becomes one durable
 /// runner-side row (`check_requests`) that the runner files, re-drives and
 /// adopts across its own restarts, and the fleet's coalesced-publication

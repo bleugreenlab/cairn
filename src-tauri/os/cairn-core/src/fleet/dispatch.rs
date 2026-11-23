@@ -2486,8 +2486,16 @@ impl Fleet {
         let mut keys = Vec::new();
         let demand = PlacementDemand::of(&request);
         let subscriber = Self::check_subscriber(&request);
-        let manual_handle = crate::execution::checks::manual_check_handle(&item.process.stream_id)
-            .map(str::to_owned);
+        let manual_handle = joining_metadata
+            .as_ref()
+            .and_then(|claim| claim.recording_plans.first())
+            .and_then(|value| {
+                serde_json::from_value::<crate::execution::checks::CheckAdoptionRecordingPlan>(
+                    value.clone(),
+                )
+                .ok()
+            })
+            .and_then(|recording| recording.producer.request_id);
         let check_name = item.result_identity.check_name.clone();
         let (tx, rx) = oneshot::channel();
         let (physical, newly_claimed) = {
@@ -2537,12 +2545,7 @@ impl Fleet {
             armed: !keys.is_empty(),
         };
         if let Some(source) = &joining_metadata {
-            let mut source = source.clone();
-            if source.consumer == "manual" {
-                if let Some(handle) = manual_handle {
-                    source.consumer_ref = handle;
-                }
-            }
+            let source = source.clone();
             self.track_check_consumer(subscriber.clone(), physical.clone(), &check_name, &source);
             if let Err(error) = self
                 .register_check_join_locked(&physical, &check_name, &source)

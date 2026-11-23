@@ -424,6 +424,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     )
     .budget(256),
     owned("check_requests", "projects"),
+    owned("write_check_waves", "jobs"),
     owned("check_test_results", "check_result_observations").budget(1_100),
     owned("check_deferred_tests", "check_result_observations"),
     owned("check_audit_findings", "check_result_observations"),

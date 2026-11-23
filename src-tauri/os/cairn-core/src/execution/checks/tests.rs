@@ -483,7 +483,11 @@ fn manual_producer_uses_the_same_observation_shape_with_manual_provenance() {
         &coordinate,
         &plan,
         "job",
-        "manual-check:run-123:rust-tests",
+        &CheckProducer {
+            consumer: CheckConsumer::Requested,
+            consumer_ref: "request-123".into(),
+            request_id: Some("request-123".into()),
+        },
         0,
         None,
         12,
@@ -497,7 +501,7 @@ fn manual_producer_uses_the_same_observation_shape_with_manual_provenance() {
         Vec::new(),
     );
     assert_eq!(write.cadence, "manual");
-    assert_eq!(write.run_id.as_deref(), Some("run-123"));
+    assert_eq!(write.run_id.as_deref(), Some("request-123"));
     assert_eq!(write.commit_sha, "commit");
     assert_eq!(write.check_name, "rust-tests");
 }
@@ -1346,6 +1350,10 @@ async fn a_runner_lane_marks_its_wave_admitted_as_it_starts() {
     let board = CheckStatusBoard::new(&plans, wave_status_notify(|_, _| {}, progress));
     let temp = TempDir::new().unwrap();
     let request = PlannedCheckBatchRequest {
+        producer: crate::execution::checks::CheckProducer::new(
+            crate::execution::checks::CheckConsumer::Write,
+            "job",
+        ),
         project_id: "project".into(),
         // No repository: the lane fails to materialize, after its start.
         repository: temp.path().join("absent").to_string_lossy().into_owned(),
@@ -6433,6 +6441,7 @@ async fn three_macos_stalls_leave_a_linux_request_runnable() {
             &coordinates,
             std::slice::from_ref(&scopes),
             "turn-checks:job-a",
+            &CheckProducer::new(CheckConsumer::TurnEnd, "test-review-attempt"),
             CheckExecMode::Shared,
             None,
             None,
@@ -8279,6 +8288,7 @@ fn adoption_recording_plan_never_serializes_process_credentials() {
         "job",
         "manual-check:producer",
         &[("MCP_CALLBACK_BEARER".into(), "secret-bearer-value".into())],
+        &CheckProducer::new(CheckConsumer::Requested, "request"),
     );
     let json = serde_json::to_string(&recording).unwrap();
     assert!(!json.contains("secret-bearer-value"));
@@ -10818,6 +10828,7 @@ async fn retry_bypasses_a_reusable_verdict_and_dispatches() {
         &coordinates,
         &head_infra_scopes(plans.len(), "job-a", "commit-target"),
         "manual-check:run-a:frontend",
+        &CheckProducer::new(CheckConsumer::Requested, "run-a"),
         CheckExecMode::Shared,
         None,
         None,
@@ -10931,6 +10942,7 @@ async fn a_lane_no_known_machine_can_take_is_recorded_once_per_commit_until_one_
                 &coordinates,
                 &head_infra_scopes(plans.len(), "job-a", commit.evaluated),
                 "turn-checks:job-a",
+                &CheckProducer::new(CheckConsumer::TurnEnd, "test-review-attempt"),
                 CheckExecMode::Shared,
                 None,
                 None,
@@ -11066,6 +11078,7 @@ async fn a_bounded_fleet_suppression_yields_to_not_placeable_without_losing_its_
                 &coordinates,
                 std::slice::from_ref(&scopes),
                 "turn-checks:job-a",
+                &CheckProducer::new(CheckConsumer::TurnEnd, "test-review-attempt"),
                 CheckExecMode::Shared,
                 None,
                 None,
@@ -11183,6 +11196,7 @@ async fn run_cache_boundary_case(
         &coordinates,
         &head_infra_scopes(plans.len(), "job-a", "commit-target"),
         "turn-checks:job-a",
+        &CheckProducer::new(CheckConsumer::TurnEnd, "test-review-attempt"),
         CheckExecMode::Isolated,
         None,
         None,

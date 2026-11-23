@@ -1,4 +1,38 @@
+mod durable;
+
+pub(super) async fn rearm_at_boot(orch: &Orchestrator) {
+    durable::rearm(orch).await;
+}
+
 use super::*;
+
+#[cfg(test)]
+static CRASH_AFTER_FOLD: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+pub(super) fn crash_after_fold_for_test(id: &str) {
+    CRASH_AFTER_FOLD.lock().unwrap().insert(id.to_string());
+}
+
+#[cfg(test)]
+static CRASH_AFTER_RECORD: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+pub(super) fn crash_after_record_for_test(id: &str) {
+    CRASH_AFTER_RECORD.lock().unwrap().insert(id.to_string());
+}
+
+#[cfg(test)]
+static CRASH_AFTER_RAW: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+pub(super) fn crash_after_raw_for_test(id: &str) {
+    CRASH_AFTER_RAW.lock().unwrap().insert(id.to_string());
+}
 
 /// A wave's summary with its folds attributed once, at wave level: each
 /// fixer's fold is its own commit, and the files are every fold's together.
@@ -208,6 +242,7 @@ pub(super) struct WriteWavePlanning {
 }
 
 /// A write wave's plan, every part of it derived from one commit.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct PlannedWriteWave {
     /// The applicable `when:write` checks, each paired with its cache key on
     /// `sealed_commit`'s tree.
@@ -457,6 +492,17 @@ pub(crate) async fn run_write_checks_after_seal(
     tool_use_id: &str,
     target: WriteCheckTarget<'_>,
 ) -> Option<String> {
+    run_write_checks_after_seal_for_suite(orch, run_context, cwd, tool_use_id, target, None).await
+}
+
+async fn run_write_checks_after_seal_for_suite(
+    orch: &Orchestrator,
+    run_context: Option<&RunContext>,
+    cwd: &str,
+    tool_use_id: &str,
+    target: WriteCheckTarget<'_>,
+    only_suite: Option<String>,
+) -> Option<String> {
     // No run context ⇒ no run id to stream against and no job to anchor the diff.
     let run_context = run_context?.clone();
     let guard = WriteChecksInFlightGuard::new(orch, &run_context.job_id);
@@ -467,6 +513,8 @@ pub(crate) async fn run_write_checks_after_seal(
         orch.late_write_checks
             .open(&run_context.job_id, tool_use_id),
     );
+    let inline_ticket = ticket.clone();
+    let inline_orch = orch.clone();
     let wave_ticket = ticket.clone();
     let late_orch = orch.clone();
     let late_run_id = run_context.run_id.clone();
@@ -474,12 +522,12 @@ pub(crate) async fn run_write_checks_after_seal(
     let cwd = cwd.to_string();
     let sealed_resolution = target.sealed_resolution();
     let (progress, progress_seen) = tokio::sync::watch::channel(WaveProgress::default());
-    await_write_check_wave(
+    let answer = await_write_check_wave(
         guard,
         WRITE_CHECK_INLINE_WAIT_BOUNDS,
         progress_seen,
         async move {
-            run_write_checks_after_seal_inner(
+            run_write_checks_after_seal_filtered(
                 &wave_orch,
                 Some(&run_context),
                 &cwd,
@@ -487,12 +535,107 @@ pub(crate) async fn run_write_checks_after_seal(
                 progress,
                 claims,
                 &wave_ticket,
+                only_suite.as_deref(),
             )
             .await
         },
         move |summary| deliver_late_write_check_summary(late_orch, late_run_id, ticket, summary),
     )
-    .await
+    .await;
+    if let Some(summary) = &answer {
+        if let Ok(db) =
+            crate::execution::routing::owning_db_for_job(&inline_orch.db, inline_ticket.job_id())
+                .await
+        {
+            // A pending response cannot acknowledge a future summary.
+            let id =
+                durable::resolve_key(&db, inline_ticket.job_id(), inline_ticket.wave_id()).await;
+            let acknowledged = db.execute("UPDATE write_check_waves SET delivered=1 WHERE id=?1 AND completed=1 AND summary=?2",
+                cairn_db::turso::params![id.as_str(), summary.as_str()]).await;
+            if matches!(acknowledged, Ok(1)) {
+                durable::retry("inline summary receipt", || durable::delivered(&db, &id)).await;
+            }
+        }
+    }
+    answer
+}
+
+/// Upgrade continuation for a pre-durable fixer whose phase was unknowable.
+/// The imported lane records its old evidence but never publishes its delta;
+/// this ordinary current-head wave owns any new execution and mutation.
+pub(super) fn resume_legacy_write<'a>(
+    orch: &'a Orchestrator,
+    job_id: &'a str,
+    tool_use_id: &'a str,
+    suite: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let existing = db
+            .query_text(
+                "SELECT id FROM write_check_waves WHERE job_id=?1 AND tool_use_id=?2",
+                (job_id.to_string(), tool_use_id.to_string()),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        let active = db.query_opt(
+        "SELECT j.status,j.branch,p.repo_path,i.status FROM jobs j JOIN projects p ON p.id=j.project_id LEFT JOIN issues i ON i.id=j.issue_id WHERE j.id=?1",
+        (job_id.to_string(),), |row| Ok((row.get::<String>(0)?,row.get::<Option<String>>(1)?,
+            row.get::<String>(2)?,row.get::<Option<String>>(3)?))).await.map_err(|e|e.to_string())?
+        .ok_or("superseded: legacy write job is gone")?;
+        if matches!(active.0.as_str(), "complete" | "failed" | "cancelled")
+            || active.1.as_deref().is_none_or(str::is_empty)
+            || active
+                .3
+                .as_deref()
+                .is_some_and(|status| matches!(status, "complete" | "failed" | "merged" | "closed"))
+        {
+            return Err("superseded: legacy write job, issue or branch has resolved".into());
+        }
+        if let Some(reason) = crate::execution::canonical::fence_for_job(&db, job_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .refusal()
+        {
+            return Err(format!("superseded: {reason}"));
+        }
+        let run_id = db
+            .query_text(
+                "SELECT id FROM runs WHERE job_id=?1 ORDER BY created_at DESC,id DESC LIMIT 1",
+                (job_id.to_string(),),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("superseded: legacy write job has no surviving run")?;
+        let run = crate::mcp::handlers::run_context::lookup_run_by_id(&db, &run_id).await?;
+        let answer = run_write_checks_after_seal_for_suite(
+            orch,
+            Some(&run),
+            &active.2,
+            tool_use_id,
+            WriteCheckTarget::CurrentHead,
+            Some(suite.to_string()),
+        )
+        .await;
+        let id = db
+            .query_text(
+                "SELECT id FROM write_check_waves WHERE job_id=?1 AND tool_use_id=?2",
+                (job_id.to_string(), tool_use_id.to_string()),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        match id {
+        Some(id) => Ok(id),
+        None if answer.is_none() && !durable::DriverGuard::active(&db,&durable::key(job_id,tool_use_id)) =>
+            Err("superseded: the current sealed head no longer selects the imported write suite or its branch is gone".into()),
+        None => Err("legacy write successor is still planning; its durable trigger retains custody".into()),
+    }
+    })
 }
 
 /// The commit a write-cadence wave evaluates.
@@ -823,6 +966,13 @@ pub(super) async fn deliver_late_write_check_summary(
     use crate::execution::late_write_checks::LateDisposition;
     use crate::messages::queued::DeliveryUrgency;
     let job_id = ticket.job_id().to_string();
+    let owning_db = crate::execution::routing::owning_db_for_job(&orch.db, &job_id)
+        .await
+        .ok();
+    let durable_id = match &owning_db {
+        Some(db) => durable::resolve_key(db, &job_id, ticket.wave_id()).await,
+        None => durable::key(&job_id, ticket.wave_id()),
+    };
     let superseded = match ticket.settle_late() {
         LateDisposition::Superseded => {
             log::info!(
@@ -830,6 +980,12 @@ pub(super) async fn deliver_late_write_check_summary(
                 ticket.wave_id(),
                 ticket.commit().unwrap_or("unplanned"),
             );
+            if let Some(db) = &owning_db {
+                durable::retry("superseded summary custody", || {
+                    durable::superseded(db, &durable_id)
+                })
+                .await;
+            }
             return;
         }
         LateDisposition::Deliver(superseded) => superseded,
@@ -867,7 +1023,13 @@ pub(super) async fn deliver_late_write_check_summary(
     })
     .await;
     match delivered {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            if let Some(db) = &owning_db {
+                if let Err(error) = durable::delivered(db, &durable_id).await {
+                    log::error!("write-wave {durable_id} delivery checkpoint failed: {error}");
+                }
+            }
+        }
         Ok(Err(error)) => {
             log::warn!("late write-check summary for job {job_id} undeliverable: {error}")
         }
@@ -1034,7 +1196,131 @@ impl Drop for WriteChecksInFlightGuard {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn run_write_checks_after_seal_inner(
+    orch: &Orchestrator,
+    run_context: Option<&RunContext>,
+    cwd: &str,
+    sealed_resolution: Option<&crate::mcp::handlers::branch::BranchResolution>,
+    progress: tokio::sync::watch::Sender<WaveProgress>,
+    // Held until this function returns, which is after every verdict the wave
+    // records has been recorded.
+    claims: WaveClaims,
+    // Its wave id is the committing call's tool_use_id.
+    ticket: &crate::execution::late_write_checks::WaveTicket,
+) -> Option<String> {
+    run_write_checks_after_seal_filtered(
+        orch,
+        run_context,
+        cwd,
+        sealed_resolution,
+        progress,
+        claims,
+        ticket,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_write_checks_after_seal_filtered(
+    orch: &Orchestrator,
+    run_context: Option<&RunContext>,
+    cwd: &str,
+    sealed_resolution: Option<&crate::mcp::handlers::branch::BranchResolution>,
+    progress: tokio::sync::watch::Sender<WaveProgress>,
+    // Held until this function returns, which is after every verdict the wave
+    // records has been recorded.
+    claims: WaveClaims,
+    // Its wave id is the committing call's tool_use_id.
+    ticket: &crate::execution::late_write_checks::WaveTicket,
+    only_suite: Option<&str>,
+) -> Option<String> {
+    let run = run_context?;
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &run.job_id)
+        .await
+        .ok()?;
+    let id = durable::resolve_key(&db, &run.job_id, ticket.wave_id()).await;
+    let _driver = durable::DriverGuard::acquire(&db, &id)?;
+    run_owned_write_wave(
+        orch,
+        run_context,
+        cwd,
+        sealed_resolution,
+        progress,
+        claims,
+        ticket,
+        only_suite,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_owned_write_wave(
+    orch: &Orchestrator,
+    run_context: Option<&RunContext>,
+    cwd: &str,
+    sealed_resolution: Option<&crate::mcp::handlers::branch::BranchResolution>,
+    progress: tokio::sync::watch::Sender<WaveProgress>,
+    // Held until this function returns, which is after every verdict the wave
+    // records has been recorded.
+    claims: WaveClaims,
+    // Its wave id is the committing call's tool_use_id.
+    ticket: &crate::execution::late_write_checks::WaveTicket,
+    only_suite: Option<&str>,
+) -> Option<String> {
+    // Keep the phase driver's large state out of every supervising future.
+    let summary = Box::pin(drive_write_wave(
+        orch,
+        run_context,
+        cwd,
+        sealed_resolution,
+        progress,
+        claims,
+        ticket,
+        only_suite,
+    ))
+    .await;
+    if let Some(run) = run_context {
+        if let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, &run.job_id).await {
+            let id = durable::resolve_key(&db, &run.job_id, ticket.wave_id()).await;
+            if let Ok(Some(snapshot)) = durable::load(&db, &id).await {
+                for index in snapshot.split.fixers {
+                    for phase in ["fixer", "convergence"] {
+                        let key = format!("{id}:{index}:{phase}");
+                        let reason = summary.as_deref().unwrap_or(
+                            "the write wave has completed; this raw phase has no final-tree observation obligation");
+                        durable::retry("terminal fixer custody", || {
+                            requests::supersede_planned_check_request(
+                                orch,
+                                &run.project_id,
+                                &key,
+                                reason,
+                            )
+                        })
+                        .await;
+                    }
+                }
+            }
+            loop {
+                match durable::complete(&db, &id, summary.as_deref()).await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        log::error!("write-wave {id} retains summary pending checkpoint: {error}");
+                        tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
+                    }
+                }
+            }
+            if summary.is_none() {
+                let _ = durable::delivered(&db, &id).await;
+            }
+        }
+    }
+    summary
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn drive_write_wave(
     orch: &Orchestrator,
     run_context: Option<&RunContext>,
     cwd: &str,
@@ -1045,6 +1331,7 @@ pub(super) async fn run_write_checks_after_seal_inner(
     mut claims: WaveClaims,
     // Its wave id is the committing call's tool_use_id.
     ticket: &crate::execution::late_write_checks::WaveTicket,
+    only_suite: Option<&str>,
 ) -> Option<String> {
     let tool_use_id = ticket.wave_id();
     // No run context ⇒ no run id to stream against and no job to anchor the diff.
@@ -1068,8 +1355,17 @@ pub(super) async fn run_write_checks_after_seal_inner(
     // synchronous cache bridge all wait on subprocesses or joined threads, so
     // gather the DB anchors asynchronously and keep the complete synchronous
     // planning unit off Tokio runtime workers.
-    let live_base = live_node_base(orch, &run_context.job_id).await;
-    let logical = match sealed_resolution {
+    let wave_id = durable::resolve_key(&owning_db, &run_context.job_id, tool_use_id).await;
+    let recovered = durable::retry("snapshot", || durable::load(&owning_db, &wave_id)).await;
+    let live_base = match &recovered {
+        Some(snapshot) => Some(snapshot.base.clone()),
+        None => live_node_base(orch, &run_context.job_id).await,
+    };
+    let logical = match recovered
+        .as_ref()
+        .map(|snapshot| &snapshot.logical)
+        .or(sealed_resolution)
+    {
         Some(resolution) => resolution.clone(),
         None => crate::mcp::handlers::branch::resolve_current_for_read(
             orch,
@@ -1120,7 +1416,7 @@ pub(super) async fn run_write_checks_after_seal_inner(
         jj: jj.clone(),
         repository: repository_path.clone(),
         object_repository: object_repository.clone(),
-        head: logical.commit_id,
+        head: logical.commit_id.clone(),
         base: planning_base.clone(),
         contract: ChecksContract {
             checks: checks.clone(),
@@ -1132,11 +1428,14 @@ pub(super) async fn run_write_checks_after_seal_inner(
         job_id: run_context.job_id.clone(),
     };
     let planning_started = std::time::Instant::now();
-    let planned = tokio::task::spawn_blocking(move || plan_write_wave(planning))
-        .await
-        .ok()??;
+    let planned = match &recovered {
+        Some(snapshot) => Ok(snapshot.planned.clone()),
+        None => tokio::task::spawn_blocking(move || plan_write_wave(planning))
+            .await
+            .ok()??,
+    };
     let PlannedWriteWave {
-        keyed,
+        mut keyed,
         tree_hash,
         sealed_commit,
         transport,
@@ -1146,6 +1445,16 @@ pub(super) async fn run_write_checks_after_seal_inner(
             return Some(write_check_planning_infrastructure_failure(&error));
         }
     };
+    let only_suite = recovered
+        .as_ref()
+        .and_then(|snapshot| snapshot.only_suite.as_deref())
+        .or(only_suite);
+    if let Some(suite) = only_suite {
+        keyed.retain(|(plan, _)| plan.name == suite);
+        if keyed.is_empty() {
+            return None;
+        }
+    }
     ticket.planned(&sealed_commit);
 
     // The planning unit above is synchronous and sits on the critical path of
@@ -1179,24 +1488,61 @@ pub(super) async fn run_write_checks_after_seal_inner(
         })
         .collect();
     let cell_env = slot_check_env(jj.shell_env());
+    let saved_transport = transport.clone();
     let mut process_env = write_check_transport_env(&cell_env, transport);
     // Reuse follows the suite's declared trust set, not the environment of the
     // executor that a miss may eventually select. Filter hits before placement so
     // a stored verdict consumes no build-slot capacity.
-    let miss_indices: Vec<usize> = keyed
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (plan, input_hash))| {
-            needs_execution(
-                orch.db.local.clone(),
-                &run_context.project_id,
-                plan,
-                input_hash,
-                &process_env,
-            )
-            .then_some(index)
+    let miss_indices: Vec<usize> = recovered
+        .as_ref()
+        .map(|snapshot| snapshot.misses.clone())
+        .unwrap_or_else(|| {
+            keyed
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (plan, input_hash))| {
+                    (only_suite.is_some()
+                        || needs_execution(
+                            orch.db.local.clone(),
+                            &run_context.project_id,
+                            plan,
+                            input_hash,
+                            &process_env,
+                        ))
+                    .then_some(index)
+                })
+                .collect()
+        });
+    if recovered.is_none() {
+        let snapshot = durable::Snapshot {
+            run: run_context.clone(),
+            cwd: cwd.to_string(),
+            logical: logical.clone(),
+            base: planning_base.clone(),
+            planned: PlannedWriteWave {
+                keyed: keyed.clone(),
+                tree_hash: tree_hash.clone(),
+                sealed_commit: sealed_commit.clone(),
+                transport: saved_transport,
+            },
+            misses: miss_indices.clone(),
+            only_suite: only_suite.map(str::to_string),
+            opened_at_ms: ticket.opened_at_ms(),
+            split: split_write_wave(
+                &keyed,
+                &checks,
+                &miss_indices,
+                crate::execution::check_identity::gating_platform(),
+                &orch
+                    .fleet
+                    .executor_name_for_text(crate::fleet::COLOCATED_EXECUTOR_ID),
+            ),
+        };
+        durable::retry("snapshot", || {
+            durable::save(&owning_db, &wave_id, &snapshot)
         })
-        .collect();
+        .await;
+    }
     claims.claim(
         miss_indices
             .iter()
@@ -1248,15 +1594,20 @@ pub(super) async fn run_write_checks_after_seal_inner(
         }
     }
 
-    let split = split_write_wave(
-        &keyed,
-        &checks,
-        &miss_indices,
-        crate::execution::check_identity::gating_platform(),
-        &orch
-            .fleet
-            .executor_name_for_text(crate::fleet::COLOCATED_EXECUTOR_ID),
-    );
+    let split = recovered
+        .as_ref()
+        .map(|snapshot| snapshot.split.clone())
+        .unwrap_or_else(|| {
+            split_write_wave(
+                &keyed,
+                &checks,
+                &miss_indices,
+                crate::execution::check_identity::gating_platform(),
+                &orch
+                    .fleet
+                    .executor_name_for_text(crate::fleet::COLOCATED_EXECUTOR_ID),
+            )
+        });
     // What each lane already has, by plan index, before the verdicts run: a
     // fixer's own run, and a fixer the write cell cannot run, which is a
     // lane-configuration error whose sentence names the config line to change.
@@ -1308,7 +1659,6 @@ pub(super) async fn run_write_checks_after_seal_inner(
     // rewrite before it, and its own rewrite lands as a commit of its own
     // before the next fixer runs. The verdicts wait for the chain, so every one
     // of them is about the tree that lands, and each check runs once.
-    let mut keyed = keyed;
     let mut tree_hash = tree_hash;
     let mut commit = sealed_commit.clone();
     let mut folds: Vec<crate::mcp::handlers::run::PublishedSlotDelta> = Vec::new();
@@ -1336,64 +1686,142 @@ pub(super) async fn run_write_checks_after_seal_inner(
                 keyed[index].0.command.clone(),
                 crate::mcp::handlers::run::check_stream_id(tool_use_id, index),
             );
+            let phase_key = format!("{wave_id}:{index}:fixer");
             let FixerOutcome {
                 result,
                 delta,
                 cell,
-            } = fixer_outcome(index, submit_planned_fix(orch, request).await);
+            } = fixer_outcome(
+                index,
+                requests::file_planned_check_request(
+                    orch,
+                    &phase_key,
+                    request,
+                    requests::WriteLanePhase::Fixer,
+                )
+                .await,
+            );
             ran.insert(index, result);
             let Some(delta) = delta else {
                 continue;
             };
+            #[cfg(test)]
+            if CRASH_AFTER_RAW.lock().unwrap().remove(&wave_id) {
+                panic!("simulated runner loss after durable raw delta, before publication");
+            }
             let Some((request, store_dir)) = cell else {
                 return Some(
                     "Checks: \u{2717} write-check fold (the slot publication context was lost)"
                         .into(),
                 );
             };
-            let published = match fold_fixer_delta(
-                orch,
-                FixerFold {
-                    run_context,
-                    repo_root,
-                    cwd,
-                    request: &request,
-                    store_dir: &store_dir,
-                    delta: &delta,
-                    fixer: &fixer,
-                },
-            )
-            .await
-            {
+            let prior = durable::retry("fold checkpoint", || {
+                requests::load_planned_fold(orch, &run_context.project_id, &phase_key)
+            })
+            .await;
+            let published = match prior {
+                Some(outcome) => outcome,
+                None => {
+                    let (_, since) = durable::retry("filing timestamp", || {
+                        requests::planned_filing(orch, &run_context.project_id, &phase_key)
+                    })
+                    .await;
+                    let outcome = durable::retry("keyed fold publication", || async {
+                        match fold_fixer_delta(
+                            orch,
+                            FixerFold {
+                                run_context,
+                                repo_root,
+                                cwd,
+                                request: &request,
+                                store_dir: &store_dir,
+                                delta: &delta,
+                                fixer: &fixer,
+                            },
+                            since,
+                        )
+                        .await
+                        {
+                            Ok(published) => Ok(Ok(published)),
+                            Err(FixerFoldFailure::Refused(summary)) => Ok(Err(summary)),
+                            Err(FixerFoldFailure::Retryable(error)) => Err(error),
+                        }
+                    })
+                    .await;
+                    loop {
+                        match requests::record_planned_fold(
+                            orch,
+                            &run_context.project_id,
+                            &phase_key,
+                            &outcome,
+                        )
+                        .await
+                        {
+                            Ok(()) => break,
+                            Err(error) => {
+                                log::error!(
+                                    "write-wave {wave_id} retains fold pending checkpoint: {error}"
+                                );
+                                tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
+                            }
+                        }
+                    }
+                    outcome
+                }
+            };
+            let published = match published {
                 Ok(published) => published,
                 Err(summary) => return Some(summary),
             };
-            let rekeyed = rekey_wave_onto_fix(
-                orch,
-                FoldRekey {
-                    run_context,
-                    checks: &checks,
-                    extra_inputs: &extra_inputs,
-                    keyed: &keyed,
-                    cell_env: &cell_env,
-                    repository: &repository_path,
-                    object_repository: &object_repository,
-                    base: &planning_base,
-                    folded_by: index,
-                },
-                &published,
-                &mut claims,
-            )
+            #[cfg(test)]
+            if CRASH_AFTER_FOLD.lock().unwrap().remove(&wave_id) {
+                panic!("simulated runner loss after a durable fold, before successor planning");
+            }
+            let cached_rekey = durable::retry("post-fold plan", || {
+                durable::rekey(&owning_db, &wave_id, index)
+            })
             .await;
-            let rekeyed = match rekeyed {
-                Ok(rekeyed) => rekeyed,
-                Err(error) => {
-                    let patch = delta_patch_excerpt(repo_root, &delta);
-                    return Some(format!(
-                        "Checks: \u{2717} write-check fold ({error})\n```diff\n{patch}\n```"
-                    ));
-                }
+            let rekeyed = if let Some(cached) = cached_rekey {
+                cached.restore(&cell_env)
+            } else {
+                let rekeyed = rekey_wave_onto_fix(
+                    orch,
+                    FoldRekey {
+                        run_context,
+                        checks: &checks,
+                        extra_inputs: &extra_inputs,
+                        keyed: &keyed,
+                        cell_env: &cell_env,
+                        repository: &repository_path,
+                        object_repository: &object_repository,
+                        base: &planning_base,
+                        folded_by: index,
+                    },
+                    &published,
+                    &mut claims,
+                )
+                .await;
+                let rekeyed = match rekeyed {
+                    Ok(rekeyed) => rekeyed,
+                    Err(error) => {
+                        let patch = delta_patch_excerpt(repo_root, &delta);
+                        return Some(format!(
+                            "Checks: \u{2717} write-check fold ({error})\n```diff\n{patch}\n```"
+                        ));
+                    }
+                };
+                durable::retry("post-fold plan", || {
+                    durable::save_rekey(&owning_db, &wave_id, index, &rekeyed)
+                })
+                .await;
+                rekeyed
             };
+            claims.release(
+                rekeyed
+                    .invalidated
+                    .iter()
+                    .map(|lane| lane_key(&run_context.project_id, &keyed[*lane])),
+            );
             // The fixers after this one and every verdict run on the fold, and
             // a refusal is about no tree, so only an answer already in hand can
             // have gone stale.
@@ -1428,44 +1856,62 @@ pub(super) async fn run_write_checks_after_seal_inner(
     // chain ended at, which the planning-time cache filter never saw, and on a
     // moved head that head's own wave is usually verifying the same lanes at
     // the same keys: wait for those, and run only what is still a miss.
-    let mut rerun_fixers = Vec::new();
+    let saved_convergence = durable::retry("convergence checkpoint", || {
+        durable::convergence(&owning_db, &wave_id)
+    })
+    .await;
+    let mut rerun_fixers = saved_convergence.clone().unwrap_or_default();
     if !folds.is_empty() {
+        if saved_convergence.is_none() {
+            for lane in &stale {
+                ran.remove(lane);
+            }
+            let candidates: Vec<usize> = split
+                .verifiers
+                .iter()
+                .chain(&stale)
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let (left, answered) = lanes_left_to_run(
+                orch.db.local.clone(),
+                &mut claims,
+                &run_context.project_id,
+                &keyed,
+                &candidates,
+                &process_env,
+                FOLD_HANDOFF_WAIT,
+            )
+            .await;
+            answered_elsewhere.extend(answered);
+            claims.claim(
+                left.iter()
+                    .map(|lane| lane_key(&run_context.project_id, &keyed[*lane])),
+                &observation_commit,
+            );
+            rerun_fixers = left
+                .into_iter()
+                .filter(|lane| {
+                    stale.contains(lane)
+                        && checks
+                            .get(&keyed[*lane].0.name)
+                            .is_some_and(|check| check.fixes)
+                })
+                .collect();
+        }
         for lane in &stale {
             ran.remove(lane);
         }
-        let candidates: Vec<usize> = split
-            .verifiers
-            .iter()
-            .chain(&stale)
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let (left, answered) = lanes_left_to_run(
-            orch.db.local.clone(),
-            &mut claims,
-            &run_context.project_id,
-            &keyed,
-            &candidates,
-            &process_env,
-            FOLD_HANDOFF_WAIT,
-        )
-        .await;
-        answered_elsewhere.extend(answered);
-        claims.claim(
-            left.iter()
-                .map(|lane| lane_key(&run_context.project_id, &keyed[*lane])),
-            &observation_commit,
-        );
-        rerun_fixers = left
-            .into_iter()
-            .filter(|lane| {
-                stale.contains(lane)
-                    && checks
-                        .get(&keyed[*lane].0.name)
-                        .is_some_and(|check| check.fixes)
-            })
-            .collect();
+    }
+    loop {
+        match durable::save_convergence(&owning_db, &wave_id, &rerun_fixers).await {
+            Ok(()) => break,
+            Err(error) => {
+                log::error!("write-wave {wave_id} retains convergence plan: {error}");
+                tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
+            }
+        }
     }
 
     // 3. A fixer whose answer a later fold made stale runs once more, on the
@@ -1493,10 +1939,20 @@ pub(super) async fn run_write_checks_after_seal_inner(
                 keyed[index].0.command.clone(),
                 crate::mcp::handlers::run::check_stream_id(tool_use_id, index),
             );
+            let phase_key = format!("{wave_id}:{index}:convergence");
             async move {
                 (
                     index,
-                    fixer_outcome(index, submit_planned_fix(orch, request).await),
+                    fixer_outcome(
+                        index,
+                        requests::file_planned_check_request(
+                            orch,
+                            &phase_key,
+                            request,
+                            requests::WriteLanePhase::Convergence,
+                        )
+                        .await,
+                    ),
                 )
             }
         }))
@@ -1537,7 +1993,49 @@ pub(super) async fn run_write_checks_after_seal_inner(
     // its own request settles. A verdict is reproducible from the commit
     // alone, so what a check that does not declare `fixes` writes is discarded
     // and reported with its result, never folded.
+    if let Some(requests) = requests.as_ref() {
+        let at = LaneAt {
+            commit: &observation_commit,
+            tree_hash: &tree_hash,
+            keyed: &keyed,
+            process_env: &process_env,
+        };
+        for &index in &split.fixers {
+            let original = format!("{wave_id}:{index}:fixer");
+            if stale.contains(&index) {
+                durable::retry("stale fixer custody", || requests::supersede_planned_check_request(
+                    orch, &run_context.project_id, &original,
+                    "a later landed fixer invalidated this result; the convergence phase or a reusable verdict answers the final tree")).await;
+                if !rerun_fixers.contains(&index) {
+                    continue;
+                }
+            }
+            let key = if rerun_fixers.contains(&index) {
+                format!("{wave_id}:{index}:convergence")
+            } else {
+                original
+            };
+            let request = requests.request(
+                index,
+                &at,
+                keyed[index].0.command.clone(),
+                crate::mcp::handlers::run::check_stream_id(tool_use_id, index),
+            );
+            let mut finalized = durable::retry("final fixer recording", || {
+                requests::finalize_planned_check_request(orch, &key, &request)
+            })
+            .await;
+            if let Some(result) = finalized.results.remove(&index) {
+                ran.insert(index, result);
+            }
+        }
+    }
+    #[cfg(test)]
+    if CRASH_AFTER_RECORD.lock().unwrap().remove(&wave_id) {
+        panic!("simulated runner loss after final fixer observations, before verifier successors");
+    }
     let ran = Arc::new(std::sync::Mutex::new(ran));
+    let lane_wave_id = wave_id.clone();
     let lane_orch = orch.clone();
     let lane_commit = observation_commit.clone();
     let lane_tree = tree_hash.clone();
@@ -1568,12 +2066,14 @@ pub(super) async fn run_write_checks_after_seal_inner(
             &observation_commit,
         ),
         tool_use_id,
+        &CheckProducer::new(CheckConsumer::Write, tool_use_id),
         CheckExecMode::Isolated,
         Some(orch),
         Some(status_board),
         &process_env,
-        false,
+        only_suite.is_some(),
         move |index, command, stream_id| {
+            let wave_id = lane_wave_id.clone();
             let ran = ran.clone();
             let orch = lane_orch.clone();
             let requests = requests.clone();
@@ -1595,6 +2095,7 @@ pub(super) async fn run_write_checks_after_seal_inner(
                         "could not resolve repository for the write check",
                     ));
                 };
+                let is_retry = command.starts_with(UNCACHED_RETRY_PREFIX);
                 let request = requests.request(
                     index,
                     &LaneAt {
@@ -1606,19 +2107,25 @@ pub(super) async fn run_write_checks_after_seal_inner(
                     command,
                     stream_id,
                 );
-                submit_planned_check(&orch, request)
-                    .await
-                    .map_err(|error| {
-                        CheckExecutionFailure::substrate(SubstrateFailureShape::Dispatch, error)
-                    })?
-                    .results
-                    .remove(&index)
-                    .ok_or_else(|| {
-                        CheckExecutionFailure::substrate(
-                            SubstrateFailureShape::Result,
-                            format!("missing write-check outcome for plan index {index}"),
-                        )
-                    })?
+                let phase = if is_retry { "retry" } else { "verifier" };
+                requests::file_planned_check_request(
+                    &orch,
+                    &format!("{wave_id}:{index}:{phase}"),
+                    request,
+                    requests::WriteLanePhase::Verifier,
+                )
+                .await
+                .map_err(|error| {
+                    CheckExecutionFailure::substrate(SubstrateFailureShape::Dispatch, error)
+                })?
+                .results
+                .remove(&index)
+                .ok_or_else(|| {
+                    CheckExecutionFailure::substrate(
+                        SubstrateFailureShape::Result,
+                        format!("missing write-check outcome for plan index {index}"),
+                    )
+                })?
             }
         },
         move |_checks| {},
@@ -1634,6 +2141,20 @@ pub(super) async fn run_write_checks_after_seal_inner(
         serde_json::json!({"table": "check_result_cache", "action": "update"}),
     );
 
+    let verdicts: Vec<(String, bool)> = results
+        .iter()
+        .filter(|outcome| outcome.passed || outcome.is_genuine_failure())
+        .map(|outcome| (outcome.name.clone(), outcome.passed))
+        .collect();
+    loop {
+        match durable::save_verdicts(&owning_db, &wave_id, &verdicts).await {
+            Ok(()) => break,
+            Err(error) => {
+                log::error!("write-wave {wave_id} retains verdict aggregation: {error}");
+                tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
+            }
+        }
+    }
     ticket.recorded(results.iter().filter_map(|outcome| {
         use crate::execution::late_write_checks::LaneVerdict;
         let verdict = if outcome.passed {
@@ -1713,6 +2234,7 @@ impl WriteWaveRequests {
             .expect("planned check must retain its configured definition");
         let context = &self.run_context;
         PlannedCheckRequest {
+            producer: CheckProducer::new(CheckConsumer::Write, &self.tool_use_id),
             project_id: context.project_id.clone(),
             repository: self.repository.clone(),
             store_dir: self.store_dir.clone(),
@@ -1741,6 +2263,7 @@ impl WriteWaveRequests {
                     &context.job_id,
                     &self.tool_use_id,
                     at.process_env,
+                    &CheckProducer::new(CheckConsumer::Write, &self.tool_use_id),
                 )),
                 index,
                 name: plan.name.clone(),
@@ -1778,7 +2301,7 @@ impl WriteWaveRequests {
 /// `verdictPlatforms` exclude the write cell's platform is refused with the
 /// config line to change. Every other check is a verdict, reproducible from
 /// the commit alone, placed by its own selector and platforms.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct WriteWaveSplit {
     /// Declared fixers, in plan order: the order they chain in.
     pub(super) fixers: Vec<usize>,
@@ -1869,17 +2392,23 @@ pub(super) struct FixerFold<'a> {
     pub(super) fixer: &'a str,
 }
 
+enum FixerFoldFailure {
+    Refused(String),
+    Retryable(String),
+}
+
 /// Publish one fixer's delta as a commit of its own on the job's branch.
 /// `Err` is the summary the wave returns instead, when it cannot land.
-pub(super) async fn fold_fixer_delta(
+async fn fold_fixer_delta(
     orch: &Orchestrator,
     fold: FixerFold<'_>,
-) -> Result<crate::mcp::handlers::run::PublishedSlotDelta, String> {
+    since: i64,
+) -> Result<crate::mcp::handlers::run::PublishedSlotDelta, FixerFoldFailure> {
     let author = PublicationIdentity::new("Cairn checks", "checks@cairn.local");
     let db = crate::execution::routing::owning_db_for_job(&orch.db, &fold.run_context.job_id)
         .await
         .map_err(|error| {
-            format!("Checks: \u{2717} write-check fold (resolve owning database: {error})")
+            FixerFoldFailure::Retryable(format!("resolve write-check fold database: {error}"))
         })?;
     let job_id = fold.run_context.job_id.clone();
     let branch = match db
@@ -1888,15 +2417,37 @@ pub(super) async fn fold_fixer_delta(
     {
         Ok(Some(branch)) => branch,
         Ok(None) => {
-            return Err("Checks: \u{2717} write-check fold (logical branch is absent)".into())
-        }
-        Err(error) => {
-            return Err(format!(
-                "Checks: \u{2717} write-check fold (resolve logical branch: {error})"
+            return Err(FixerFoldFailure::Refused(
+                "Checks: \u{2717} write-check fold (logical branch is absent)".into(),
             ))
         }
+        Err(error) => {
+            return Err(FixerFoldFailure::Retryable(format!(
+                "resolve write-check logical branch: {error}"
+            )))
+        }
     };
-    let published = crate::mcp::handlers::run::publish_and_seal_slot_delta(
+    // This narrows a retry after a raced retirement; the publisher still makes
+    // the authoritative decision under the store lock immediately before sealing.
+    match crate::mcp::handlers::branch::publication_authority(
+        &orch.db,
+        &fold.run_context.job_id,
+        Some(&fold.run_context.run_id),
+        Some(&branch),
+    )
+    .await
+    {
+        crate::mcp::handlers::branch::PublicationAuthority::Authorized => {}
+        crate::mcp::handlers::branch::PublicationAuthority::Retired(reason) => {
+            return Err(FixerFoldFailure::Refused(format!(
+                "Checks: ✗ write-check fold (job retired before the fold's outcome was recorded; not determined. {reason})"
+            )))
+        }
+        crate::mcp::handlers::branch::PublicationAuthority::Unknown(reason) => {
+            return Err(FixerFoldFailure::Retryable(reason))
+        }
+    }
+    let published = crate::mcp::handlers::run::publish_and_seal_slot_delta_replayable(
         orch,
         fold.store_dir,
         fold.request,
@@ -1904,23 +2455,24 @@ pub(super) async fn fold_fixer_delta(
         &branch,
         &format!("fix: apply {} write-check changes", fold.fixer),
         Some(&author),
+        since,
     )
     .await;
     let published = match published {
         Ok(Some(published)) => published,
         Ok(None) => {
-            return Err(
+            return Err(FixerFoldFailure::Refused(
                 "Checks: \u{22EF} superseded — the branch advanced before this wave's fix landed. \
                  The stale fix was discarded without changing the branch or recording verdicts. \
                  Read cairn:~/checks for the branch's current verdicts."
                     .into(),
-            );
+            ));
         }
         Err(error) => {
             let patch = delta_patch_excerpt(fold.repo_root, fold.delta);
-            return Err(format!(
+            return Err(FixerFoldFailure::Retryable(format!(
                 "Checks: \u{2717} write-check fold ({error})\n```diff\n{patch}\n```"
-            ));
+            )));
         }
     };
     log::info!(
@@ -2206,8 +2758,7 @@ pub(super) struct FoldRekey<'a> {
     pub(super) cell_env: &'a [(String, String)],
     pub(super) repository: &'a Path,
     pub(super) object_repository: &'a Path,
-    /// The base the wave was planned against, when the node's live base
-    /// cannot be read.
+    /// The immutable base the original sealed wave was planned against.
     pub(super) base: &'a str,
     pub(super) folded_by: usize,
 }
@@ -2231,12 +2782,11 @@ pub(super) async fn rekey_wave_onto_fix(
     fix: &crate::mcp::handlers::run::PublishedSlotDelta,
     claims: &mut WaveClaims,
 ) -> Result<FixedWave, String> {
-    let live_base = live_node_base(orch, &fold.run_context.job_id).await;
     let planning = FixReplanning {
         jj: crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
         repository: fold.repository.to_path_buf(),
         object_repository: fold.object_repository.to_path_buf(),
-        base: live_base.unwrap_or_else(|| fold.base.to_string()),
+        base: fold.base.to_string(),
         head: fix.commit.clone(),
         checks: fold.checks.clone(),
         extra_inputs: fold.extra_inputs.clone(),

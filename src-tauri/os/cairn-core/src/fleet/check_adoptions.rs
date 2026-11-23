@@ -78,6 +78,12 @@ pub(crate) struct CheckConsumerGuard {
 }
 
 impl CheckConsumerGuard {
+    /// The durable request driver now owns delivery, even if its current task is dropped.
+    /// This transfers custody without delivering or authorizing an acknowledgement.
+    pub(crate) fn transfer_to_durable_driver(&self) {
+        self.settled.store(true, Ordering::Release);
+    }
+
     pub(crate) async fn deliver(&self, observation_id: &str) -> Result<(), String> {
         self.fleet
             .deliver_check_consumer(
@@ -2018,7 +2024,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_check_adoption_late_cadence_join_preserves_entire_manual_batch() {
-        let mut physical = claim("manual", "running");
+        let mut physical = claim("requested", "running");
         physical.check_names = vec!["a".into(), "b".into(), "c".into()];
         physical.input_hashes = vec!["ha".into(), "hb".into(), "hc".into()];
         physical.recording_plans = vec![serde_json::json!({"fixture": true}); 3];
@@ -2059,7 +2065,7 @@ mod tests {
         assert_eq!(
             consumers
                 .iter()
-                .filter(|w| w.consumer == "manual" && w.state == "recorded")
+                .filter(|w| w.consumer == "requested" && w.state == "recorded")
                 .count(),
             3,
             "a reloaded request's waiter is recorded for its driver to deliver"
@@ -2072,7 +2078,7 @@ mod tests {
             .deliver_check_waiter(cadence, "observation-a")
             .await
             .unwrap();
-        for waiter in consumers.iter().filter(|w| w.consumer == "manual") {
+        for waiter in consumers.iter().filter(|w| w.consumer == "requested") {
             fleet
                 .deliver_check_waiter(waiter, &format!("observation-{}", waiter.check_name))
                 .await
@@ -2156,7 +2162,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_check_adoption_superseded_waiter_does_not_withdraw_new_physical_grant() {
-        let old = claim("manual", "running");
+        let old = claim("requested", "running");
         let (fleet, db, _remote) = fixture(old.clone()).await;
         let old_key = identity(&old);
         let source = claim("main_cadence", "running");
@@ -2210,12 +2216,12 @@ mod tests {
             .any(|w| w.consumer == "main_cadence" && w.state == "cancelled"));
         assert!(waiters
             .iter()
-            .any(|w| w.consumer == "manual" && w.state == "running"));
+            .any(|w| w.consumer == "requested" && w.state == "running"));
     }
 
     #[tokio::test]
     async fn remote_check_live_alias_delivery_does_not_ack_another_consumers_projection() {
-        let mut physical = claim("manual", "running");
+        let mut physical = claim("requested", "running");
         physical.consumer_ref = "caller-a".into();
         let (fleet, db, mut remote) = fixture(physical.clone()).await;
         let key = identity(&physical);
@@ -2243,7 +2249,7 @@ mod tests {
             .await
             .unwrap();
         fleet
-            .deliver_check_consumer(&key, "rust-tests", "manual", "caller-a", "observation")
+            .deliver_check_consumer(&key, "rust-tests", "requested", "caller-a", "observation")
             .await
             .unwrap();
         assert!(!take_frames(&mut remote)
@@ -2259,7 +2265,7 @@ mod tests {
             "recorded"
         );
         fleet
-            .deliver_check_consumer(&key, "rust-tests", "manual", "caller-b", "observation")
+            .deliver_check_consumer(&key, "rust-tests", "requested", "caller-b", "observation")
             .await
             .unwrap();
         assert_eq!(
@@ -2300,7 +2306,7 @@ mod tests {
     async fn live_consumer_guard_withdraws_before_result_and_after_recording_without_pinning_siblings(
     ) {
         for before_result in [true, false] {
-            let mut physical = claim("manual", "running");
+            let mut physical = claim("requested", "running");
             physical.consumer_ref = "caller-a".into();
             let (fleet, db, mut remote) = fixture(physical.clone()).await;
             let key = identity(&physical);
@@ -2435,7 +2441,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_logical_consumers_share_one_delivery_lifetime() {
-        let physical = claim("manual", "running");
+        let physical = claim("requested", "running");
         let (fleet, db, _remote) = fixture(physical.clone()).await;
         let key = identity(&physical);
         let a = ("a".into(), "a".into());
@@ -2464,7 +2470,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_guard_abort_before_grant_does_not_resurrect_cancelled_consumer() {
-        let source = claim("manual", "running");
+        let source = claim("requested", "running");
         let key = identity(&source);
         let db = Arc::new(crate::storage::migrated_test_db("direct-check-guard").await);
         let fleet = Fleet::default();
@@ -2512,50 +2518,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_guard_dropped_after_result_settles_accepted_observation_without_delivery() {
-        let source = claim("manual", "running");
-        let key = identity(&source);
-        let (fleet, db, mut remote) = fixture(source.clone()).await;
-        fleet.check_adoptions.lock().unwrap().reloaded.remove(&key);
-        let guard = fleet.check_consumer_guard_for(&key, "rust-tests", &source);
-        let publication =
-            PublicationCoordination::for_request(key.clone()).with_consumer_guard(guard);
-        fleet.hold_check_adoption(UnboundResult {
-            executor_id: source.executor_id.clone(),
-            machine: source.machine.clone(),
-            request_id: key.0.clone(),
-            attempt_id: key.1.clone(),
-            outcome: outcome(&source),
-        });
-        let _ = fleet.bind_adopted(key.clone(), &source.executor_id).await;
-        fleet
-            .record_check_claim_observation(&key, "rust-tests", "observation")
-            .await
-            .unwrap();
-        assert!(!take_frames(&mut remote)
-            .iter()
-            .any(|frame| matches!(frame, ExecutorMessage::ResultAck { .. })));
-        drop(publication);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if store::lookup(&db, &key.0, &key.1)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .state
-                    == "recorded"
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
+    async fn direct_guard_drop_preserves_durable_custody_or_settles_an_abandoned_observation() {
+        for durable in [false, true] {
+            let source = claim(if durable { "write" } else { "requested" }, "running");
+            let key = identity(&source);
+            let (fleet, db, mut remote) = fixture(source.clone()).await;
+            fleet.check_adoptions.lock().unwrap().reloaded.remove(&key);
+            let guard = fleet.check_consumer_guard_for(&key, "rust-tests", &source);
+            if durable {
+                guard.transfer_to_durable_driver();
             }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            store::waiters(&db, &key.0, &key.1).await.unwrap()[0].state,
-            "recorded_undelivered"
-        );
+            let publication =
+                PublicationCoordination::for_request(key.clone()).with_consumer_guard(guard);
+            fleet.hold_check_adoption(UnboundResult {
+                executor_id: source.executor_id.clone(),
+                machine: source.machine.clone(),
+                request_id: key.0.clone(),
+                attempt_id: key.1.clone(),
+                outcome: outcome(&source),
+            });
+            let _ = fleet.bind_adopted(key.clone(), &source.executor_id).await;
+            if durable {
+                // Drop before any returned-result checkpoint or observation. Let any
+                // withdrawal task queue behind the gate, then cross that same gate.
+                let gate = fleet.check_adoptions.lock().unwrap().mutation.clone();
+                let held = gate.lock().await;
+                drop(publication);
+                tokio::task::yield_now().await;
+                drop(held);
+                let barrier = gate.lock().await;
+                assert_eq!(
+                    store::waiters(&db, &key.0, &key.1).await.unwrap()[0].state,
+                    "running"
+                );
+                assert_eq!(
+                    store::lookup(&db, &key.0, &key.1)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "running"
+                );
+                assert!(fleet
+                    .check_adoptions
+                    .lock()
+                    .unwrap()
+                    .held
+                    .contains_key(&key));
+                assert!(!take_frames(&mut remote)
+                    .iter()
+                    .any(|frame| matches!(frame, ExecutorMessage::ResultAck { .. })));
+                drop(barrier);
+                // Only the durable driver's explicit completion may release custody.
+                fleet
+                    .record_check_claim_observation(&key, "rust-tests", "observation")
+                    .await
+                    .unwrap();
+                assert!(!take_frames(&mut remote)
+                    .iter()
+                    .any(|frame| matches!(frame, ExecutorMessage::ResultAck { .. })));
+                fleet
+                    .deliver_check_consumer(
+                        &key,
+                        "rust-tests",
+                        "write",
+                        &source.consumer_ref,
+                        "observation",
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    take_frames(&mut remote)
+                        .iter()
+                        .filter(|frame| matches!(frame, ExecutorMessage::ResultAck { .. }))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    store::waiters(&db, &key.0, &key.1).await.unwrap()[0].state,
+                    "delivered"
+                );
+            } else {
+                fleet
+                    .record_check_claim_observation(&key, "rust-tests", "observation")
+                    .await
+                    .unwrap();
+                assert!(!take_frames(&mut remote)
+                    .iter()
+                    .any(|frame| matches!(frame, ExecutorMessage::ResultAck { .. })));
+                drop(publication);
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if store::lookup(&db, &key.0, &key.1)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .state
+                            == "recorded"
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    store::waiters(&db, &key.0, &key.1).await.unwrap()[0].state,
+                    "recorded_undelivered"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2900,7 +2973,7 @@ mod tests {
         )
         .build();
         orch.fleet.await_restart_adoptions_loaded().await;
-        let mut physical = claim("manual", "template");
+        let mut physical = claim("requested", "template");
         physical.project_id = "p".into();
         physical.consumer_ref = "sole-manual".into();
         let key = identity(&physical);
@@ -2993,7 +3066,7 @@ mod tests {
             1,
             "no other recorder may mask the sole-consumer case"
         );
-        assert_eq!(initial[0].consumer, "manual");
+        assert_eq!(initial[0].consumer, "requested");
         let ack_count = Arc::new(AtomicUsize::new(0));
         let probe_count = ack_count.clone();
         let probe_db = db.clone();
@@ -3599,7 +3672,7 @@ mod tests {
     fn terminal_undurable_check_attempts_do_not_accumulate_consumer_metadata() {
         let fleet = Fleet::default();
         for index in 0..64 {
-            let mut source = claim("manual", "template");
+            let mut source = claim("requested", "template");
             source.request_id = format!("undurable-{index}");
             let key = identity(&source);
             fleet.register_check_claim(key.clone(), source.clone());

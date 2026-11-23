@@ -2449,6 +2449,15 @@ async fn attempt_lane(
         db.clone(),
         contract,
         CheckRunProducer {
+            identity: crate::execution::checks::CheckProducer::new(
+                crate::execution::checks::CheckConsumer::MainCadence,
+                crate::fleet::purpose::PurposeKey::main_cadence(
+                    context.project_id,
+                    &lane.check,
+                    &lane.platform,
+                )
+                .to_string(),
+            ),
             tool_use_id: format!(
                 "{MAIN_CADENCE_STREAM_PREFIX}{}:{}:{}",
                 context.project_id, lane.check, lane.platform
@@ -7608,7 +7617,7 @@ mod tests {
         let db = crate::storage::migrated_test_db("cadence-live-confirmation").await;
         let lane = linux_lane();
         let mut claim = adoption_claim("running");
-        claim.consumer = "manual".into();
+        claim.consumer = "requested".into();
         let purpose =
             crate::fleet::purpose::PurposeKey::main_cadence("p", &lane.check, &lane.platform)
                 .to_string();
@@ -7632,7 +7641,7 @@ mod tests {
                 ..exact.clone()
             },
             Waiter {
-                consumer: "manual".into(),
+                consumer: "requested".into(),
                 ..exact.clone()
             },
         ] {
@@ -7672,7 +7681,7 @@ mod tests {
     #[test]
     fn cadence_adoption_joined_waiter_selects_its_item_not_the_grants_initiator() {
         let mut claim = adoption_claim("running");
-        claim.consumer = "manual".into();
+        claim.consumer = "requested".into();
         claim.check_names = vec!["lint".into(), "rust-tests".into(), "typecheck".into()];
         claim.input_hashes = vec![
             "lint-inputs".into(),
@@ -8042,6 +8051,10 @@ mod tests {
             "main:p",
             "main-cadence:p:rust-tests:linux",
             &[],
+            &crate::execution::checks::CheckProducer::new(
+                crate::execution::checks::CheckConsumer::MainCadence,
+                &claim.consumer_ref,
+            ),
         ))
         .unwrap()];
         let waiter = Waiter {
@@ -8296,7 +8309,7 @@ mod tests {
             updated_ms: 2 * HOUR,
         };
         let unresolved = Waiter {
-            consumer: "manual".into(),
+            consumer: "requested".into(),
             consumer_ref: "handle".into(),
             state: "running".into(),
             observation_id: None,
@@ -8340,7 +8353,7 @@ mod tests {
         assert_eq!(
             waiters
                 .iter()
-                .find(|w| w.consumer == "manual")
+                .find(|w| w.consumer == "requested")
                 .unwrap()
                 .state,
             "lost"

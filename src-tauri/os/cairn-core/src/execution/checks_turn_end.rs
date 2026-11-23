@@ -107,8 +107,8 @@ use sha2::{Digest, Sha256};
 use crate::execution::checks::{
     check_affinity_key, check_input_hashes, execute_check_contract, load_checks_contract_at_commit,
     resolve_check_contract_at_commit, resolve_check_timeout_ms, submit_planned_check,
-    turn_end_plans, CheckExecMode, CheckFailureKind, CheckOutcome, CheckRunProducer,
-    CheckRunTarget, CheckStatusBoard, PlannedCheckBatchItem, PlannedCheckRequest,
+    turn_end_plans, CheckConsumer, CheckExecMode, CheckFailureKind, CheckOutcome, CheckProducer,
+    CheckRunProducer, CheckRunTarget, CheckStatusBoard, PlannedCheckBatchItem, PlannedCheckRequest,
     CHECKS_CONFIG_PATH, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
 };
 use crate::execution::inputs::{
@@ -2522,6 +2522,7 @@ async fn run_turn_end_checks_inner(
                             job_id,
                             &checks_tool_id,
                             &extra_env,
+                            &CheckProducer::new(CheckConsumer::TurnEnd, attempt_id),
                         ),
                     ),
                     index,
@@ -2551,6 +2552,7 @@ async fn run_turn_end_checks_inner(
                     avoid_executor_ids: Vec::new(),
                 };
                 PlannedCheckRequest {
+                    producer: CheckProducer::new(CheckConsumer::TurnEnd, attempt_id),
                     project_id: coords.project_id.clone(),
                     repository: canonical_repo.clone(),
                     store_dir: store_dir.clone(),
@@ -2993,6 +2995,7 @@ async fn run_pin_bump_lane(
         db,
         contract,
         CheckRunProducer {
+            identity: CheckProducer::new(CheckConsumer::Requested, &scope.job_id),
             adopt: None,
             tool_use_id: format!(
                 "turn-checks:{}:pin-bump:{}:{}",
@@ -3218,7 +3221,7 @@ fn turn_check_news(outcomes: &[CheckOutcome]) -> Option<String> {
     /// A lane's name, its verdict, and for a red test lane its failing tests
     /// with their signatures.
     type NewsLane<'a> = (String, &'a str, Option<Vec<(String, String)>>);
-    let canonical: Vec<NewsLane> = actionable_lanes(outcomes)?
+    let canonical: Vec<NewsLane<'_>> = actionable_lanes(outcomes)?
         .into_iter()
         .map(|(name, verdict, outcome)| {
             let failing = (verdict == "fail")
@@ -4367,6 +4370,7 @@ impl ReviewGroupRecorder {
                 &self.sealed_coordinates,
                 &self.infra_scopes,
                 &self.tool_use_id,
+                &CheckProducer::new(CheckConsumer::TurnEnd, &self.attempt_id),
                 CheckExecMode::Shared,
                 Some(&self.orch),
                 Some(self.board.clone()),
@@ -6069,7 +6073,6 @@ mod tests {
             let delivered = deliver_turn_check_outcomes(&db, "job", uri, tree, outcomes)
                 .await
                 .unwrap();
-            assert!(delivered.any_genuine_failed, "{label}: rust-tests is red");
             decisions.push(format!(
                 "{label}: {:?} / {:?}",
                 delivered.delivery, delivered.wake

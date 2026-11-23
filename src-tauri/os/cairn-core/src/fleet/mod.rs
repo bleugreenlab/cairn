@@ -670,7 +670,7 @@ impl From<CellOutcome> for LeaderSettlement {
 /// than being synthesized into an outcome a reader takes for a lost machine.
 /// Distinct from [`WithdrawalCause`], which is the runner abandoning one queue
 /// entry for reasons of its own.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum CancelCause {
     /// An operator, or a merge's resolution cascade, stopped the job.
     JobStopped,
@@ -735,7 +735,7 @@ pub(crate) struct CellAccount {
     pub left_running: Option<LeftRunningAttempt>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LeftRunningAttempt {
     pub(crate) machine: String,
     pub(crate) request_id: String,
@@ -772,7 +772,7 @@ pub(crate) struct MeasurementBlindness {
 }
 
 /// The machine a request was placed on: the one that claimed it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CellPlacement {
     pub executor_id: String,
     /// The link generation the claim was made on.
@@ -804,7 +804,7 @@ pub(crate) struct KnownMachinePlatform {
 
 /// The operating system and architecture a machine advertises, in the
 /// lowercase vocabulary verdict platforms are recorded in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ExecutorPlatform {
     pub os: String,
     pub arch: String,

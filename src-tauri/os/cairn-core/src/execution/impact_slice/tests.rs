@@ -259,6 +259,10 @@ fn lane_with_env(
         avoid_executor_ids: Vec::new(),
     };
     let batch = PlannedCheckBatchRequest {
+        producer: crate::execution::checks::CheckProducer::new(
+            crate::execution::checks::CheckConsumer::Write,
+            "job",
+        ),
         project_id: "project".into(),
         repository: "/repo".into(),
         store_dir: PathBuf::from("/store"),

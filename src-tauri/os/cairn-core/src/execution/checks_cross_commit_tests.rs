@@ -176,7 +176,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
         .await
         .unwrap();
     }
-    let mut physical = claim("running", "manual");
+    let mut physical = claim("running", "requested");
     physical.request_id = REQUEST.into();
     physical.attempt_id = ATTEMPT.into();
     physical.project_id = "p".into();
@@ -189,6 +189,11 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
         "manual-a",
         &streams[0],
         &[],
+        &CheckProducer {
+            consumer: CheckConsumer::Requested,
+            consumer_ref: handles[0].clone(),
+            request_id: Some(handles[0].clone()),
+        },
     ))
     .unwrap()];
     orch.fleet
@@ -251,6 +256,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
             "main:p",
             "main-cadence:p:smoke:linux",
             &[],
+            &CheckProducer::new(CheckConsumer::MainCadence, key.to_string()),
         ))
         .unwrap()];
         orch.fleet.register_check_claim(
@@ -313,12 +319,18 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
     let bo = orch.clone();
     let bd = db.clone();
     let bstream = streams[1].clone();
+    let bhandle = handles[1].clone();
     let live_b = cairn_common::task::spawn(async move {
         execute_check_contract(
             &bo,
             bd,
             cb,
             CheckRunProducer {
+                identity: CheckProducer {
+                    consumer: CheckConsumer::Requested,
+                    consumer_ref: bhandle.clone(),
+                    request_id: Some(bhandle.clone()),
+                },
                 adopt: None,
                 tool_use_id: bstream,
                 node_kind: "manual-check".into(),
@@ -336,7 +348,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
             if waiters.len() == if crash { 3 } else { 2 } {
                 assert!(waiters
                     .iter()
-                    .any(|w| w.consumer == "manual" && w.consumer_ref == handles[1]));
+                    .any(|w| w.consumer == "requested" && w.consumer_ref == handles[1]));
                 break;
             }
             assert!(!live_b.is_finished(), "B must join the live A grant");
@@ -452,6 +464,11 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
             &[ca.sealed_coordinate],
             &[InfraScopes::head_only("manual-a", &a)],
             &streams[0],
+            &CheckProducer {
+                consumer: CheckConsumer::Requested,
+                consumer_ref: handles[0].clone(),
+                request_id: Some(handles[0].clone()),
+            },
             CheckExecMode::Shared,
             Some(&orch),
             None,
@@ -551,7 +568,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
     for handle in &handles {
         restarted
             .fleet
-            .deliver_check_consumer(&identity, "smoke", "manual", handle, &observation)
+            .deliver_check_consumer(&identity, "smoke", "requested", handle, &observation)
             .await
             .unwrap();
     }

@@ -1741,6 +1741,10 @@ async fn run_in_fleet(orch: &Orchestrator, job: &RegenerationJob) -> BatchOutcom
     let submitted = submit_regeneration_lease(
         orch,
         PlannedCheckBatchRequest {
+            producer: crate::execution::checks::CheckProducer::new(
+                crate::execution::checks::CheckConsumer::Requested,
+                &requester,
+            ),
             project_id: row.project_id.clone(),
             repository: job.repository.to_string_lossy().into_owned(),
             store_dir: job.store.clone(),

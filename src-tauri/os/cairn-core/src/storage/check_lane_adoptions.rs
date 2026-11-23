@@ -207,7 +207,7 @@ impl Waiter {
     /// A check request's waiter (`consumer_ref` is its `check_requests` id):
     /// the request's driver adopts the lane after a restart.
     pub(crate) fn is_request_adopter(&self) -> bool {
-        self.consumer == "manual" && self.owns_adoption()
+        matches!(self.consumer.as_str(), "requested" | "write") && self.owns_adoption()
     }
 
     fn owns_adoption(&self) -> bool {
@@ -253,6 +253,28 @@ pub(crate) async fn insert_waiter(db: &LocalDb, waiter: &Waiter) -> DbResult<()>
         Box::pin(async move { insert_waiter_on(conn, &waiter).await })
     })
     .await
+}
+
+/// Transfer an upgrade-era job-owned waiter to a request-owned waiter without
+/// a commit at which no durable consumer owns the retained execution.
+pub(crate) async fn transfer_legacy_write_waiter(
+    db: &LocalDb,
+    waiter: &Waiter,
+    legacy_ref: &str,
+) -> DbResult<()> {
+    let waiter = waiter.clone();
+    let legacy_ref = legacy_ref.to_string();
+    db.write(move |conn| {
+        let waiter=waiter.clone();
+        let legacy_ref=legacy_ref.clone();
+        Box::pin(async move {
+            insert_waiter_on(conn,&waiter).await?;
+            conn.execute("UPDATE check_lane_adoption_waiters SET state=CASE WHEN state='recorded' THEN 'recorded_undelivered' ELSE 'cancelled' END,evidence=?6,updated_ms=?7 WHERE request_id=?1 AND attempt_id=?2 AND check_name=?3 AND consumer='write' AND consumer_ref=?4 AND consumer_ref<>?5 AND state IN ('running','awaiting_adoption','joined','recorded')",
+                params![waiter.request_id,waiter.attempt_id,waiter.check_name,legacy_ref,waiter.consumer_ref,
+                    "legacy write consumer transferred to its durable check request",waiter.updated_ms]).await?;
+            Ok(())
+        })
+    }).await
 }
 
 async fn insert_waiter_on(conn: &super::TrackedConnection, waiter: &Waiter) -> DbResult<()> {
@@ -439,10 +461,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn requested_migration_preserves_claims_waiters_and_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(&dir.path().join("legacy-adoptions.db"))
+            .await
+            .unwrap();
+        db.execute_script(include_str!(
+            "../../../../turso_migrations/0422_check_lane_adoptions.sql"
+        ))
+        .await
+        .unwrap();
+        db.execute_script(
+            "CREATE TABLE check_requests(id TEXT PRIMARY KEY,consumer TEXT,cadence TEXT,requester_ref TEXT);
+             INSERT INTO check_requests VALUES
+             (\'write\',\'write\',NULL,\'handoff:misleading\'),
+             (\'main\',\'main_cadence\',NULL,\'manual-check:misleading\'),
+             (\'requested\',\'requested\',NULL,\'write:misleading\'),
+             (\'handoff\',\'requested\',\'handoff\',\'write:misleading\'),
+             (\'carried\',\'requested\',\'carried\',\'manual-check:misleading\');",
+        ).await.unwrap();
+        db.execute_script(include_str!(
+            "../../../../turso_migrations/0489_check_request_consumer_cadence.sql"
+        ))
+        .await
+        .unwrap();
+        let cadences = db
+            .query_all(
+                "SELECT id,cadence FROM check_requests ORDER BY id",
+                (),
+                |row| Ok((row.text(0)?, row.opt_text(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cadences,
+            vec![
+                ("carried".into(), Some("carried".into())),
+                ("handoff".into(), Some("handoff".into())),
+                ("main".into(), Some("main_cadence".into())),
+                ("requested".into(), Some("requested".into())),
+                ("write".into(), Some("write".into())),
+            ]
+        );
+        let mut originals = Vec::new();
+        for consumer in ["manual", "write", "turn_end", "main_cadence"] {
+            let mut physical = claim(consumer, "running", 30);
+            physical.consumer = consumer.into();
+            physical.consumer_ref = format!("{consumer}-owner");
+            physical.check_names = vec!["legacy".into(), "absent".into(), "explicit".into()];
+            physical.input_hashes = vec![
+                "legacy-hash".into(),
+                "absent-hash".into(),
+                "explicit-hash".into(),
+            ];
+            physical.recording_plans = vec![
+                serde_json::json!({"selection":"partial","tool_use_id":"deliberately-misleading-label"}),
+                serde_json::Value::Null,
+                serde_json::json!({"producer":{"consumer":"write","consumer_ref":"already-explicit","request_id":"existing-row"},"selection":"whole"}),
+            ];
+            let mut logical = waiter(&physical, 0, consumer, &physical.consumer_ref);
+            logical.state = "recorded_undelivered".into();
+            logical.observation_id = Some("accepted-observation".into());
+            logical.evidence = Some("retained evidence".into());
+            insert_grant(&db, &physical, std::slice::from_ref(&logical))
+                .await
+                .unwrap();
+            originals.push((physical, logical));
+        }
+        db.execute_script(include_str!(
+            "../../../../turso_migrations/0490_requested_check_adoptions.sql"
+        ))
+        .await
+        .unwrap();
+        for (mut physical, mut logical) in originals {
+            let expected = if physical.consumer == "manual" {
+                "requested"
+            } else {
+                &physical.consumer
+            }
+            .to_string();
+            physical.consumer = expected.clone();
+            logical.consumer = expected.clone();
+            physical.recording_plans[0]["producer"] = serde_json::json!({
+                "consumer": expected,
+                "consumer_ref": physical.consumer_ref,
+                "request_id": if expected == "requested" { Some(&physical.consumer_ref) } else { None },
+            });
+            assert_eq!(
+                lookup(&db, &physical.request_id, &physical.attempt_id)
+                    .await
+                    .unwrap(),
+                Some(physical.clone())
+            );
+            assert_eq!(
+                waiters(&db, &physical.request_id, &physical.attempt_id)
+                    .await
+                    .unwrap(),
+                vec![logical.clone()]
+            );
+            assert!(db
+                .query_opt_text(
+                    "SELECT w.request_id FROM check_lane_adoption_waiters w
+                     LEFT JOIN check_lane_adoptions a USING(request_id,attempt_id)
+                     WHERE a.request_id IS NULL LIMIT 1",
+                    (),
+                )
+                .await
+                .unwrap()
+                .is_none());
+            db.execute(
+                "DELETE FROM check_lane_adoptions WHERE request_id=?1 AND attempt_id=?2",
+                (physical.request_id.clone(), physical.attempt_id.clone()),
+            )
+            .await
+            .unwrap();
+            assert!(waiters(&db, &physical.request_id, &physical.attempt_id)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(db.query_all("SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_check_lane_adoptions_state','idx_check_lane_adoption_waiters_state')", (), |r| r.text(0)).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn a_cancelled_consumer_retains_physical_recording_evidence_without_reopening() {
         let db = crate::storage::migrated_test_db("cancelled-physical-receipt").await;
         let physical = claim("cancelled-receipt", "running", 30);
-        let consumer = waiter(&physical, 0, "manual", "handle");
+        let consumer = waiter(&physical, 0, "requested", "handle");
         insert_grant(&db, &physical, std::slice::from_ref(&consumer))
             .await
             .unwrap();
@@ -491,14 +636,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shared-grant.db");
         let mut physical = claim("shared", "running", 30);
-        physical.consumer = "manual".into();
+        physical.consumer = "requested".into();
         physical.check_names = vec!["first".into(), "second".into(), "third".into()];
         physical.input_hashes = vec!["hash1".into(), "hash2".into(), "hash3".into()];
         physical.recording_plans = (0..3)
             .map(|index| serde_json::json!({"item":index,"selection":"partial"}))
             .collect();
         let manual: Vec<_> = (0..3)
-            .map(|index| waiter(&physical, index, "manual", "handle"))
+            .map(|index| waiter(&physical, index, "requested", "handle"))
             .collect();
         let cadence = waiter(&physical, 1, "main_cadence", "purpose-second");
         {
@@ -563,7 +708,7 @@ mod tests {
     async fn failure_settlement_is_atomic_and_preserves_accepted_observations() {
         let db = crate::storage::migrated_test_db("check-adoption-settle-failure").await;
         let physical = claim("failure", "running", 30);
-        let unresolved = waiter(&physical, 0, "manual", "handle");
+        let unresolved = waiter(&physical, 0, "requested", "handle");
         let mut recorded = waiter(&physical, 0, "main_cadence", "purpose");
         recorded.state = "recorded".into();
         recorded.observation_id = Some("observation".into());
@@ -602,7 +747,10 @@ mod tests {
         assert_eq!(recorded.state, "recorded_undelivered");
         assert_eq!(recorded.observation_id.as_deref(), Some("observation"));
         assert_eq!(recorded.evidence.as_deref(), Some("committed"));
-        let unresolved = cancelled.iter().find(|w| w.consumer == "manual").unwrap();
+        let unresolved = cancelled
+            .iter()
+            .find(|w| w.consumer == "requested")
+            .unwrap();
         assert_eq!(unresolved.state, "cancelled");
         assert_eq!(unresolved.evidence.as_deref(), Some("runner stopped"));
         assert!(open_waiters(&db).await.unwrap().is_empty());
@@ -622,7 +770,7 @@ mod tests {
             lost.iter().find(|w| w.consumer == "main_cadence").unwrap(),
             recorded
         );
-        let unresolved = lost.iter().find(|w| w.consumer == "manual").unwrap();
+        let unresolved = lost.iter().find(|w| w.consumer == "requested").unwrap();
         assert_eq!(unresolved.state, "lost");
         assert!(unresolved.observation_id.is_none());
         assert_eq!(
@@ -719,7 +867,7 @@ mod tests {
     async fn invalid_waiter_rolls_back_entire_grant_and_partial_plans_are_rejected() {
         let db = crate::storage::migrated_test_db("check-adoption-atomic").await;
         let physical = claim("atomic", "running", 30);
-        let good = waiter(&physical, 0, "manual", "handle");
+        let good = waiter(&physical, 0, "requested", "handle");
         let mut bad = good.clone();
         bad.item_index = 1;
         assert!(insert_grant(&db, &physical, &[good.clone(), bad])
@@ -737,7 +885,7 @@ mod tests {
     async fn cancelled_refines_to_lost_without_attaching_observation() {
         let db = crate::storage::migrated_test_db("check-adoption-refinement").await;
         let physical = claim("cancelled", "cancelled", 30);
-        let mut consumer = waiter(&physical, 0, "manual", "handle");
+        let mut consumer = waiter(&physical, 0, "requested", "handle");
         consumer.state = "cancelled".into();
         insert_grant(&db, &physical, std::slice::from_ref(&consumer))
             .await

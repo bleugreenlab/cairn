@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 // A short-lived input, built once per check and read by reference to derive a
 // key; boxing the larger variant would buy an allocation and nothing else.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum CheckResourceIdentityInput {
     Configured { name: String, check: CheckCommand },
     Checkpoint { name: String, command: String },

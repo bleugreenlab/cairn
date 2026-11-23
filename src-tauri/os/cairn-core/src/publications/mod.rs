@@ -1259,6 +1259,10 @@ async fn place_leg(
     let outcome = actor
         .placer
         .place(PlannedCheckRequest {
+            producer: crate::execution::checks::CheckProducer::new(
+                crate::execution::checks::CheckConsumer::Requested,
+                &owner_key,
+            ),
             project_id: context.project_id.clone(),
             repository: context.repository.clone(),
             store_dir: context.store_dir.clone(),

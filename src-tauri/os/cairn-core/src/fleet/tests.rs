@@ -6578,7 +6578,19 @@ impl Fleet {
         id: &str,
         granted: &[(&str, &str)],
     ) -> mpsc::UnboundedReceiver<ExecutorMessage> {
+        self.attach_reported_project_machine_for_test(id, "p", granted)
+    }
+
+    pub(crate) fn attach_reported_project_machine_for_test(
+        &self,
+        id: &str,
+        project: &str,
+        granted: &[(&str, &str)],
+    ) -> mpsc::UnboundedReceiver<ExecutorMessage> {
         let (id, mut connection) = fleet_entry_at(id, "linux", 0, &[], unix_time_ms());
+        Arc::make_mut(&mut connection.advertisement)
+            .capabilities
+            .projects_served = vec![project.into()];
         let (sender, receiver) = mpsc::unbounded_channel();
         connection.sender = sender;
         connection.snapshots_received = 1;

@@ -112,6 +112,9 @@ async fn branch_fixture_with(
 
 fn spec(suite: &str, revision: Option<&str>) -> CheckRequestSpec {
     CheckRequestSpec {
+        consumer: super::super::CheckConsumer::Requested,
+        cadence: Some("requested"),
+        priority: cairn_common::wire_vocabulary::CellPriority::ReviewCheck,
         project_id: "p".into(),
         project_key: "proj".into(),
         suite: suite.into(),
@@ -121,7 +124,6 @@ fn spec(suite: &str, revision: Option<&str>) -> CheckRequestSpec {
         retry: false,
         requester_ref: NODE_URI.into(),
         requester_job_id: Some(SUBJECT_JOB.into()),
-        cadence: None,
     }
 }
 
@@ -298,7 +300,7 @@ async fn an_exact_revision_is_resolved_at_acceptance() {
 
 // --- rows without a repository -----------------------------------------------
 
-async fn row_fixture() -> (tempfile::TempDir, Orchestrator) {
+pub(super) async fn row_fixture() -> (tempfile::TempDir, Orchestrator) {
     let db = crate::storage::migrated_test_db("check-request-rows.db").await;
     db.execute_script(
         "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
@@ -880,6 +882,15 @@ async fn old_manual_handles_become_settled_requests() {
 #[test]
 #[serial_test::serial(jj)]
 fn a_filed_request_places_one_lane_and_survives_a_restart_before_its_grant() {
+    for consumer in [
+        super::super::CheckConsumer::Requested,
+        super::super::CheckConsumer::Write,
+    ] {
+        filed_request_restart_before_grant_for(consumer);
+    }
+}
+
+fn filed_request_restart_before_grant_for(consumer: super::super::CheckConsumer) {
     use crate::execution::checks::write_check_stack_headroom::{commit, passed_batch};
     use crate::jj::tests::{init_project, jj_bin};
     use cairn_common::executor_protocol::ExecutorMessage;
@@ -934,9 +945,86 @@ fn a_filed_request_places_one_lane_and_survives_a_restart_before_its_grant() {
         let first = runner("search-1");
         let (sender, mut machine) = tokio::sync::mpsc::unbounded_channel();
         first.fleet.attach_announced_executor(sender);
-        let filed = file_check_request(&first, spec("unit", Some("main")))
+        let filed = if consumer == super::super::CheckConsumer::Requested {
+            file_check_request(&first, spec("unit", Some("main")))
+                .await
+                .unwrap()
+        } else {
+            let contract = super::super::manual::resolve_manual_check_contract_snapshot(
+                &first,
+                SUBJECT_JOB,
+                "unit",
+                accepted_revision(&first, SUBJECT_JOB, Some("main"))
+                    .await
+                    .unwrap(),
+                None,
+            )
             .await
             .unwrap();
+            let producer = super::super::CheckProducer::new(
+                super::super::CheckConsumer::Write,
+                "never-granted-wave",
+            );
+            let mut item = super::super::manual::manual_check_batch_item(
+                "unit",
+                &contract.context.input_hash,
+                &contract.configured_check,
+                &contract.placement,
+                contract.plan.resource_class,
+                contract.timeout_ms,
+                crate::execution::cache::InfraScopes::head_only(
+                    SUBJECT_JOB,
+                    &contract.context.commit_sha,
+                ),
+                Vec::new(),
+            );
+            item.recording_plan = Some(super::super::CheckAdoptionRecordingPlan::new(
+                &contract.plan,
+                &contract.sealed_coordinate,
+                SUBJECT_JOB,
+                "never-granted-write",
+                &[],
+                &producer,
+            ));
+            let planned = super::super::PlannedCheckRequest {
+                producer,
+                project_id: "p".into(),
+                repository: contract.repository_path.clone(),
+                store_dir: crate::jj::project_store_dir(
+                    &first.config_dir,
+                    std::path::Path::new(&contract.repository_path),
+                ),
+                sealed_commit: contract.context.commit_sha.clone(),
+                requesting_job_id: SUBJECT_JOB.into(),
+                owner: cairn_common::executor_protocol::CellOwnerRef {
+                    project_id: "p".into(),
+                    project_key: Some("proj".into()),
+                    issue_number: Some(7),
+                    job_id: Some(SUBJECT_JOB.into()),
+                    execution_seq: Some(1),
+                    node_kind: Some("builder".into()),
+                },
+                affinity_key: Some("j:unit".into()),
+                priority: crate::fleet::CellPriority::WriteCheck,
+                env: Vec::new(),
+                item,
+                run_context: None,
+                status_board: None,
+                on_complete: None,
+                purpose: None,
+                publication: None,
+            };
+            file_check_request(
+                &first,
+                CheckRequestInput::Planned {
+                    key: "never-granted-write".into(),
+                    request: Box::new(planned),
+                    phase: WriteLanePhase::Verifier,
+                },
+            )
+            .await
+            .unwrap()
+        };
         let mut offers = 0;
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
@@ -1314,4 +1402,37 @@ async fn requested_checks_keep_the_running_machine_link_and_slot() {
     let mut awaiting_slot = current;
     awaiting_slot.diagnostic = None;
     assert!(standing(&awaiting_slot).contains("[fedora](cairn://executors/fedora), slot pending"));
+}
+
+#[tokio::test]
+async fn issue_resolution_only_selects_handoff_and_carried_requests() {
+    let db = crate::storage::migrated_test_db("cadence-cancellation.db").await;
+    db.execute_script(
+        "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+         INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+           VALUES('p','w','P','proj','/unused',1,1);
+         INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+           VALUES('i','p',7,'I','active','active','none',1,1);
+         INSERT INTO jobs(id,project_id,issue_id,status,created_at,updated_at)
+           VALUES('j','p','i','running',1,1);",
+    )
+    .await
+    .unwrap();
+    for cadence in ["requested", "write", "main_cadence", "handoff", "carried"] {
+        let mut request = spec("smoke", Some("commit"));
+        request.cadence = Some(cadence);
+        // Attribution deliberately gives no clue to filing cadence.
+        request.requester_ref = "misleading:write".into();
+        accept(&db, &request, "smoke", &Coordinate::Commit("commit".into()))
+            .await
+            .unwrap();
+    }
+    let mut cadences: Vec<_> = open_cadence_requests_of_issue(&db, "i")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.cadence.unwrap())
+        .collect();
+    cadences.sort();
+    assert_eq!(cadences, ["carried", "handoff"]);
 }

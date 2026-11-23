@@ -200,6 +200,9 @@ async fn file(
     let mut filed = Vec::new();
     for suite in suites {
         let spec = CheckRequestSpec {
+            consumer: crate::execution::checks::CheckConsumer::Requested,
+            cadence: Some("requested"),
+            priority: cairn_common::wire_vocabulary::CellPriority::ReviewCheck,
             project_id: project_id.clone(),
             project_key: project.clone(),
             suite,
@@ -209,7 +212,6 @@ async fn file(
             retry: payload.retry,
             requester_ref: requester_ref.clone(),
             requester_job_id: requester_job_id.clone(),
-            cadence: None,
         };
         filed.push(
             requests::file_check_request(orch, spec)

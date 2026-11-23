@@ -651,11 +651,11 @@ pub(crate) struct PublishedSlotDelta {
     pub landed_on_tested_base: bool,
 }
 
-/// Publish an executor delta into a managed workspace and seal it through the
-/// same importer, store lock, cleanliness checks, and commit barrier as `run`.
-/// Returns `None` when the check's input commit is no longer the branch head;
-/// unlike agent edits, stale check output is discarded rather than integrated.
-pub(crate) async fn publish_and_seal_slot_delta(
+/// Publish a durable check's delta, recovering a landing made before its
+/// result checkpoint. The lower bound is the request's persisted acceptance
+/// time, never a fresh timestamp chosen by a restarted driver.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_and_seal_slot_delta_replayable(
     orch: &Orchestrator,
     store_dir: &Path,
     request: &CellRequest,
@@ -663,9 +663,18 @@ pub(crate) async fn publish_and_seal_slot_delta(
     branch: &str,
     message: &str,
     author: Option<&PublicationIdentity>,
+    since_unix_ms: i64,
 ) -> Result<Option<PublishedSlotDelta>, String> {
-    publish_and_seal_slot_delta_within(
-        orch, store_dir, request, delta, branch, message, author, None,
+    publish_and_seal_slot_delta_inner(
+        orch,
+        store_dir,
+        request,
+        delta,
+        branch,
+        message,
+        author,
+        None,
+        Some(since_unix_ms),
     )
     .await
 }
@@ -694,7 +703,7 @@ fn delta_paths_outside(
         .collect())
 }
 
-/// [`publish_and_seal_slot_delta`] for a delta that may change only the paths
+/// Publish a delta that may change only the paths
 /// `admits` accepts. One that changes any other is discarded unlanded, naming
 /// them: what a command was allowed to rewrite is the whole of what it may
 /// publish.
@@ -708,6 +717,24 @@ pub(crate) async fn publish_and_seal_slot_delta_within(
     message: &str,
     author: Option<&PublicationIdentity>,
     admits: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+) -> Result<Option<PublishedSlotDelta>, String> {
+    publish_and_seal_slot_delta_inner(
+        orch, store_dir, request, delta, branch, message, author, admits, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_and_seal_slot_delta_inner(
+    orch: &Orchestrator,
+    store_dir: &Path,
+    request: &CellRequest,
+    delta: &crate::fleet::MutationDelta,
+    branch: &str,
+    message: &str,
+    author: Option<&PublicationIdentity>,
+    admits: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+    prior_since_ms: Option<i64>,
 ) -> Result<Option<PublishedSlotDelta>, String> {
     let repository = request
         .repository
@@ -727,9 +754,10 @@ pub(crate) async fn publish_and_seal_slot_delta_within(
     // head before the lock (I3, I4). The barrier releases the lock before it
     // returns: receipt finalization talks to the object plane and the patch
     // capture reads immutable commits, so neither needs the store.
-    let prepared = prepare_slot_publication(orch, &target, request, delta, message, author)
+    let mut prepared = prepare_slot_publication(orch, &target, request, delta, message, author)
         .await
         .map_err(|error| error.to_string())?;
+    prepared.prior_since_ms = prior_since_ms;
     // Taken before the barrier consumes the slot: the upload is installed by
     // now, so it is finalized whether the fix lands, is superseded, or fails.
     let consume_receipt = prepared.available.consume_receipt;
@@ -812,7 +840,18 @@ pub(crate) async fn publish_and_seal_slot_delta_within(
             export.map_err(|error| {
                 format!("delta {head} was sealed locally but remains unpublished: {error}")
             })?;
-            (head, String::new(), false)
+            let parent = git_output(
+                &target.repository,
+                &["rev-parse", &format!("{head}^1")],
+                "recover the check publication's parent",
+            )?;
+            let patch = git_output(
+                &target.repository,
+                &["diff", "--binary", "--no-ext-diff", &parent, &head],
+                "recover the check publication's patch",
+            )?;
+            let on_base = parent == delta.base_commit;
+            (head, patch, on_base)
         }
     };
     let paths = crate::jj::parse_git_diff(&patch)
@@ -865,18 +904,6 @@ async fn land_prepared_check_delta(
     } = slot;
     let discarded =
         |error: String| SlotPublicationError::Discarded(format!("check output discarded: {error}"));
-    let parent = git_output(
-        &target.repository,
-        &["rev-parse", &format!("{}^1", delta.delta_commit)],
-        "read check fold input commit",
-    )
-    .map_err(discarded)?;
-    if expected_head != request.base_commit
-        || expected_head != delta.base_commit
-        || parent != expected_head
-    {
-        return Err(SlotPublicationError::Superseded);
-    }
     let coordinate = coordinate
         .as_ref()
         .map_err(|reason| discarded(unprepared(reason)))?;
@@ -896,6 +923,42 @@ async fn land_prepared_check_delta(
         run_id.as_deref(),
         prior_since_ms,
     );
+    if coordinate.prepared.branch != target.branch
+        || !reservation.covers(&coordinate.prepared.store, &target.branch)
+    {
+        return Err(discarded(
+            "the check publication lacks its prepared branch reservation".into(),
+        ));
+    }
+    match recover_prior_publication(orch, &publication).await {
+        Ok(Some(outcome)) => {
+            return Ok(SlotPublication {
+                consume_receipt: available.consume_receipt,
+                outcome,
+            })
+        }
+        Ok(None) => {}
+        Err(PublishFailure::Failed(error)) => return Err(discarded(error)),
+        Err(PublishFailure::Retired(retired)) => return Err(discarded(retired.to_string())),
+        Err(PublishFailure::Conflicted { head, paths }) => {
+            return Err(discarded(format!(
+                "branch moved to {head}; conflicting paths: {}",
+                paths.join(", ")
+            )))
+        }
+    }
+    let parent = git_output(
+        &target.repository,
+        &["rev-parse", &format!("{}^1", delta.delta_commit)],
+        "read check fold input commit",
+    )
+    .map_err(discarded)?;
+    if expected_head != request.base_commit
+        || expected_head != delta.base_commit
+        || parent != expected_head
+    {
+        return Err(SlotPublicationError::Superseded);
+    }
     let landed = publish_available_delta(
         orch,
         &publication,
@@ -2343,6 +2406,67 @@ async fn plan_integration(
     }))
 }
 
+/// Check publication authority, then recover the keyed landing under the caller's
+/// store lock. Recovery precedes stale-head rejection: that head may have moved
+/// because this exact request already published before the runner stopped.
+async fn recover_prior_publication(
+    orch: &Orchestrator,
+    publication: &DeltaPublication<'_>,
+) -> Result<Option<SlotPublicationOutcome>, PublishFailure> {
+    let DeltaPublication {
+        store_dir,
+        branch,
+        job_id,
+        run_id,
+        trace,
+        ..
+    } = *publication;
+    if let Some(job_id) = job_id {
+        let _checking = trace.map(|trace| trace.phase("publication authority"));
+        match super::branch::publication_authority(&orch.db, job_id, run_id, Some(branch)).await {
+            super::branch::PublicationAuthority::Authorized => {}
+            super::branch::PublicationAuthority::Retired(retired) => {
+                return Err(PublishFailure::Retired(retired))
+            }
+            super::branch::PublicationAuthority::Unknown(error) => {
+                return Err(PublishFailure::Failed(format!(
+                    "could not confirm that this job may still publish to `{branch}`: {error}"
+                )))
+            }
+        }
+    }
+    let (Some(key), Some(since)) = (publication.key.clone(), publication.prior_since_ms) else {
+        return Ok(None);
+    };
+    let _checking = trace.map(|trace| trace.phase("find prior publication"));
+    let (store, bookmark) = (store_dir.to_path_buf(), branch.to_string());
+    let found = tokio::task::spawn_blocking(move || {
+        cairn_vcs::find_keyed_publication(&store, &bookmark, &key, since)
+    })
+    .await
+    .map_err(|error| format!("publication lookup worker failed: {error}"))?
+    .map_err(|error| {
+        format!(
+            "could not read whether an earlier Cairn process already published this batch: {error}"
+        )
+    })?;
+    match found {
+        Some(head) => {
+            let export = crate::jj::export_branch_head(
+                &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+                store_dir,
+                branch,
+            )
+            .await;
+            Ok(Some(SlotPublicationOutcome::PublishedEarlier {
+                head,
+                export,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Land a delta the project store already holds onto its prepared branch.
 ///
 /// Caller holds `reservation` on the branch and then `guard`, the canonical
@@ -2378,7 +2502,6 @@ async fn publish_available_delta(
         branch,
         author,
         job_id,
-        run_id,
         trace,
         admission,
         ..
@@ -2395,59 +2518,8 @@ async fn publish_available_delta(
              not hold"
         )));
     }
-    let key = publication.key.clone();
-
-    // The authority check belongs here, inside the caller's store-lock hold and
-    // before anything is read or moved: a batch prepared while its issue was
-    // open may reach this lock after the issue resolved, and a batch whose
-    // process outlived its own cancellation still arrives here with a sealed
-    // delta. It is asked before the write permit, so a retired job's delta is
-    // stranded as retired rather than held behind another batch.
-    if let Some(job_id) = job_id {
-        let _checking = trace.map(|trace| trace.phase("publication authority"));
-        match super::branch::publication_authority(&orch.db, job_id, run_id, Some(branch)).await {
-            super::branch::PublicationAuthority::Authorized => {}
-            super::branch::PublicationAuthority::Retired(retired) => {
-                return Err(PublishFailure::Retired(retired))
-            }
-            super::branch::PublicationAuthority::Unknown(error) => {
-                return Err(PublishFailure::Failed(format!(
-                    "could not confirm that this job may still publish to `{branch}`: {error}"
-                )))
-            }
-        }
-    }
-
-    // A runner process that re-drives a batch an earlier process may have
-    // published asks the store first, under this lock: the landing recorded
-    // its key in the same transaction that moved the bookmark, so the answer
-    // survives a process that ended between the two and a landing that
-    // integrated onto a moved head under a commit id nobody recorded.
-    if let (Some(key), Some(since)) = (key.clone(), publication.prior_since_ms) {
-        let _checking = trace.map(|trace| trace.phase("find prior publication"));
-        let (store, bookmark) = (store_dir.to_path_buf(), branch.to_string());
-        let found = tokio::task::spawn_blocking(move || {
-            cairn_vcs::find_keyed_publication(&store, &bookmark, &key, since)
-        })
-        .await
-        .map_err(|error| format!("publication lookup worker failed: {error}"))?;
-        match found {
-            Ok(Some(head)) => {
-                let export = crate::jj::export_branch_head(
-                    &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
-                    store_dir,
-                    branch,
-                )
-                .await;
-                return Ok(SlotPublicationOutcome::PublishedEarlier { head, export });
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return Err(PublishFailure::Failed(format!(
-                    "could not read whether an earlier Cairn process already published this batch: {error}"
-                )))
-            }
-        }
+    if let Some(prior) = recover_prior_publication(orch, publication).await? {
+        return Ok(prior);
     }
 
     let _admission = guard
@@ -4048,13 +4120,14 @@ pub(crate) mod slot_publication_tests {
         let receipt = stage_managed_upload(&orch, &mut fx, staging.path());
         assert!(orch.object_plane.staged_delta(&receipt).is_some());
 
-        let published = publish_and_seal_slot_delta(
+        let published = publish_and_seal_slot_delta_within(
             &orch,
             fx.store(),
             &fx.request,
             &fx.delta,
             "feature",
             "fix: apply write-check changes",
+            None,
             None,
         )
         .await
@@ -4077,40 +4150,99 @@ pub(crate) mod slot_publication_tests {
 
     #[tokio::test]
     #[serial_test::serial(jj)]
-    async fn a_stale_check_fold_never_restores_a_removed_line() {
-        let fx = straddle(
-            Some(&[("mine.rs", "")]),
-            &[("mine.rs", "base\nformatted\n")],
-        )
-        .await
-        .expect("jj is required for the check-fold regression");
+    async fn a_durable_check_fold_recovers_its_publication_before_supersession() {
+        let fx = straddle(None, &[("mine.rs", "formatted\n")])
+            .await
+            .expect("jj is required for durable check publication");
         let orch = orchestrator(&fx).await;
-        assert_eq!(fx.blob(&fx.base, "mine.rs"), "base");
-        assert_eq!(fx.blob(&fx.head, "mine.rs"), "");
-
-        let published = publish_and_seal_slot_delta(
+        let since = chrono::Utc::now().timestamp_millis();
+        let first = publish_and_seal_slot_delta_replayable(
             &orch,
             fx.store(),
             &fx.request,
             &fx.delta,
             "feature",
-            "fix: apply write-check changes",
+            "fix",
             None,
+            since,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the first fold lands");
+        assert_ne!(first.commit, fx.base);
+        assert_eq!(fx.bookmark(), first.commit);
 
-        assert!(published.is_none());
-        assert_eq!(fx.bookmark(), fx.head);
+        let removal = side_commit(&fx, &first.commit, &[("mine.rs", "")]);
+        let moved = crate::jj::publish_logical_head_exported(
+            &fx.jj,
+            fx.store(),
+            "feature",
+            &first.commit,
+            crate::jj::ProposedPublication::DeltaCommit(removal.into()),
+            None,
+            cairn_vcs::PublicationMode::Child {
+                description: "remove formatted line".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .landed
+        .head;
+
+        // Recovery identifies this request's earlier fold without restoring
+        // content a later commit removed.
+        // A restarted caller has no checkpoint, only the same durable request
+        // and delta.
+        let replay = publish_and_seal_slot_delta_replayable(
+            &orch,
+            fx.store(),
+            &fx.request,
+            &fx.delta,
+            "feature",
+            "fix",
+            None,
+            since,
+        )
+        .await
+        .unwrap()
+        .expect("the keyed fold is recovered, not superseded");
+        assert_eq!(replay.commit, first.commit);
+        assert_eq!(replay.patch, first.patch);
+        assert_eq!(replay.paths, first.paths);
+        assert!(replay.landed_on_tested_base);
+        assert_eq!(fx.bookmark(), moved);
+        assert_eq!(fx.blob(&moved, "mine.rs"), "");
         assert_eq!(
-            fx.blob(&fx.bookmark(), "mine.rs"),
-            "",
-            "commit 2's removal survives the late fold of commit 1"
+            git_stdout(
+                &fx.repository,
+                &["rev-parse", &format!("{}^", replay.commit)]
+            ),
+            fx.base,
+            "recovery adds no second fold"
         );
+
+        // An unrelated request cannot adopt an equivalent publication key.
+        let mut unrelated = fx.request.clone();
+        unrelated.request_id.push_str("-unrelated");
+        assert!(publish_and_seal_slot_delta_replayable(
+            &orch,
+            fx.store(),
+            &unrelated,
+            &fx.delta,
+            "feature",
+            "fix",
+            None,
+            since,
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(fx.bookmark(), moved);
+        assert_eq!(fx.blob(&moved, "mine.rs"), "");
         assert_eq!(
             git_stdout(&fx.repository, &["rev-parse", "refs/heads/feature"]),
-            fx.head,
-            "neither the store bookmark nor the exported Git ref moves"
+            moved,
+            "neither keyed recovery nor a stale unrelated fold moves the branch"
         );
     }
 
@@ -4271,13 +4403,14 @@ pub(crate) mod slot_publication_tests {
         let (request, delta) = absorbing_delta(&fx, &[("mine.rs", "formatted\n")]);
         assert_eq!(request.base_commit, fx.head);
         assert_eq!(delta.base_commit, fx.head);
-        let published = publish_and_seal_slot_delta(
+        let published = publish_and_seal_slot_delta_within(
             &orch,
             fx.store(),
             &request,
             &delta,
             "feature",
             "fix",
+            None,
             None,
         )
         .await
@@ -4309,13 +4442,14 @@ pub(crate) mod slot_publication_tests {
             })
             .await
             .unwrap();
-        let error = publish_and_seal_slot_delta(
+        let error = publish_and_seal_slot_delta_within(
             &orch,
             fx.store(),
             &fx.request,
             &fx.delta,
             "feature",
             "fix",
+            None,
             None,
         )
         .await
@@ -5684,13 +5818,14 @@ pub(crate) mod slot_publication_tests {
         let staging = tempfile::tempdir().unwrap();
         let receipt = stage_managed_upload(&orch, &mut fx, staging.path());
 
-        let error = publish_and_seal_slot_delta(
+        let error = publish_and_seal_slot_delta_within(
             &orch,
             fx.store(),
             &fx.request,
             &fx.delta,
             "later",
             "fix: apply write-check changes",
+            None,
             None,
         )
         .await

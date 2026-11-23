@@ -75,6 +75,7 @@ where
         &coordinates,
         &infra_scopes,
         tool_use_id,
+        &CheckProducer::new(CheckConsumer::Write, job_id),
         mode,
         diagnostic_orch,
         effective_env,
@@ -211,6 +212,7 @@ where
         sealed_coordinates,
         infra_scopes,
         tool_use_id,
+        &CheckProducer::new(CheckConsumer::Write, job_id),
         mode,
         diagnostic_orch,
         None,
@@ -233,6 +235,7 @@ pub(super) async fn run_planned_checks_at_commit_with_env_and_coordinates<F, Fut
     sealed_coordinates: &[crate::execution::cache::SealedCheckCoordinate],
     infra_scopes: &[InfraScopes],
     tool_use_id: &str,
+    producer: &CheckProducer,
     mode: CheckExecMode,
     diagnostic_orch: Option<&Orchestrator>,
     effective_env: &[(String, String)],
@@ -255,6 +258,7 @@ where
         sealed_coordinates,
         infra_scopes,
         tool_use_id,
+        producer,
         mode,
         diagnostic_orch,
         None,
@@ -481,6 +485,7 @@ pub(crate) async fn execute_job_verdict(
     let outcome = submit_planned_check(
         orch,
         PlannedCheckRequest {
+            producer: CheckProducer::new(CheckConsumer::Requested, job_id),
             project_id: project_id.clone(),
             repository,
             store_dir,
@@ -1470,18 +1475,8 @@ pub(super) async fn submit_single_planned_check_batch(
     // no authority to turn an unanswered check into a verdict.
     request.waiting_since_unix_ms = patience.waiting_since_unix_ms;
     let items = wire.items;
-    let stream = batch
-        .items
-        .first()
-        .map(|item| item.stream_id.as_str())
-        .unwrap_or("");
-    let (consumer, consumer_ref) = check_consumer_identity(
-        orch,
-        &batch.requesting_job_id,
-        stream,
-        batch.purpose.as_ref(),
-    )
-    .await?;
+    let consumer = batch.producer.consumer.as_str();
+    let consumer_ref = batch.producer.consumer_ref.clone();
     let adoption_claim = crate::storage::check_lane_adoptions::Claim {
         request_id: request.request_id.clone(),
         attempt_id: request.attempt_id.clone(),
@@ -1526,13 +1521,20 @@ pub(super) async fn submit_single_planned_check_batch(
     orch.fleet
         .register_check_claim(identity.clone(), adoption_claim.clone());
     let mutation_policy = request.mutation_policy.clone();
+    let durable_write =
+        batch.producer.consumer == CheckConsumer::Write && batch.producer.request_id.is_some();
     let direct_consumer_guards: Vec<_> = if mutation_policy != MutationPolicy::PureVerdict {
         batch
             .items
             .iter()
             .map(|item| {
-                orch.fleet
-                    .check_consumer_guard_for(&identity, &item.name, &adoption_claim)
+                let guard =
+                    orch.fleet
+                        .check_consumer_guard_for(&identity, &item.name, &adoption_claim);
+                if durable_write {
+                    guard.transfer_to_durable_driver();
+                }
+                guard
             })
             .collect()
     } else {
@@ -1667,7 +1669,9 @@ pub(super) async fn submit_single_planned_check_batch(
         }
         let mut results = indexed.iter().copied().zip(item_outcomes).collect();
         stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
-        settle_unrecordable_delivery(orch, &request, &results).await;
+        if !durable_write {
+            settle_unrecordable_delivery(orch, &request, &results).await;
+        }
         temporary_ref.retire();
         return Ok(PlannedCheckBatchOutcome {
             results,
@@ -1696,9 +1700,22 @@ pub(super) async fn submit_single_planned_check_batch(
         Some(attempt) => Err(CheckExecutionFailure::LeftRunning(attempt)),
         None => check_result_from_delivery(submitted),
     };
+    if durable_write {
+        if let Ok(result) = &result {
+            if let Some(guard) = result
+                .publication
+                .as_ref()
+                .and_then(|publication| publication.consumer_guard())
+            {
+                guard.transfer_to_durable_driver();
+            }
+        }
+    }
     let mut results = HashMap::from([(indexed[0], result)]);
     stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
-    settle_unrecordable_delivery(orch, &request, &results).await;
+    if !durable_write {
+        settle_unrecordable_delivery(orch, &request, &results).await;
+    }
     temporary_ref.retire();
     Ok(PlannedCheckBatchOutcome {
         results,
@@ -1999,6 +2016,7 @@ pub(crate) async fn run_planned_checks_with_board<F, Fut, N, E>(
     sealed_coordinates: &[crate::execution::cache::SealedCheckCoordinate],
     infra_scopes: &[InfraScopes],
     tool_use_id: &str,
+    producer: &CheckProducer,
     mode: CheckExecMode,
     diagnostic_orch: Option<&Orchestrator>,
     status_board: Option<CheckStatusBoard>,
@@ -2023,6 +2041,7 @@ where
         sealed_coordinates,
         infra_scopes,
         tool_use_id,
+        producer,
         mode,
         diagnostic_orch,
         status_board,
@@ -2049,6 +2068,7 @@ pub(crate) async fn run_planned_checks_selected<F, Fut, N, E>(
     sealed_coordinates: &[crate::execution::cache::SealedCheckCoordinate],
     infra_scopes: &[InfraScopes],
     tool_use_id: &str,
+    producer: &CheckProducer,
     mode: CheckExecMode,
     diagnostic_orch: Option<&Orchestrator>,
     status_board: Option<CheckStatusBoard>,
@@ -2151,7 +2171,7 @@ where
         let cached_recorded = record_cached_check_observation(
             db.clone(),
             CachedCheckObservationWrite {
-                manual_handle: manual_check_handle(tool_use_id).map(str::to_string),
+                manual_handle: producer.request_id.clone(),
                 project_id: project_id.to_string(),
                 commit_sha: commit.evaluated.to_string(),
                 // The reused verdict came from another commit's observation, but
@@ -2180,7 +2200,7 @@ where
                 job_id,
                 entry.executor_id.as_deref(),
                 &plan.command,
-                if tool_use_id.starts_with("turn-checks:") {
+                if producer.consumer != CheckConsumer::Write {
                     CellPriority::ReviewCheck
                 } else {
                     CellPriority::WriteCheck
@@ -2495,7 +2515,7 @@ where
                             serde_json::json!({
                                 "jobId": job_id,
                                 "suiteId": tool_use_id,
-                                "cadence": if tool_use_id.starts_with("turn-checks:") { "review" } else { "write" },
+                                "cadence": producer.consumer.cadence(),
                                 "resourceClass": plan.resource_class.as_str(),
                                 "declaredConcurrencyUnits": declared_check_reservation(plan.resource_class).concurrency_units,
                                 "durationMs": duration_ms,
@@ -2546,7 +2566,7 @@ where
                         }
                         Some(crate::fleet::PublicationRole::Published(recorded)) => {
                             let attachment_error =
-                                match (manual_check_handle(tool_use_id), recorded.as_ref()) {
+                                match (producer.request_id.as_deref(), recorded.as_ref()) {
                                     (Some(handle), Some(source)) => {
                                         crate::execution::cache::attach_manual_check_observation(
                                             db,
@@ -2675,7 +2695,7 @@ where
                             &sealed_coordinates[index],
                             plan,
                             job_id,
-                            tool_use_id,
+                            producer,
                             exit_code.unwrap_or(-1),
                             failure_kind,
                             duration_ms,
@@ -2712,6 +2732,13 @@ where
                                         && recording.evaluated_commit == claim.commit_sha)
                                         .then_some(recording)
                                 });
+                            // The durable write finalizer supplies a proven final-wave coordinate
+                            // for its own row. Other subscribers still inherit the physical source.
+                            let physical_plan = physical_plan.filter(|physical| {
+                                !(producer.consumer == CheckConsumer::Write
+                                    && producer.request_id.is_some()
+                                    && physical.producer.request_id == producer.request_id)
+                            });
                             if let Some(physical) = physical_plan {
                                 // Coalesced subscribers may ask from different commits.
                                 // The immutable source describes the physical execution,
@@ -2727,16 +2754,10 @@ where
                                 observation.defined_by_commit_sha = physical.defined_by_commit;
                                 observation.tree_hash = physical.tree_hash;
                                 observation.job_id = Some(physical.job_id);
-                                observation.manual_handle =
-                                    manual_check_handle(&physical.tool_use_id).map(str::to_string);
-                                observation.run_id = physical
-                                    .tool_use_id
-                                    .strip_prefix("manual-check:")
-                                    .and_then(|value| {
-                                        value.split_once(':').map(|(run, _)| run.to_string())
-                                    });
+                                observation.manual_handle = physical.producer.request_id.clone();
+                                observation.run_id = physical.producer.request_id.clone();
                                 observation.cadence =
-                                    observation_cadence(&physical.tool_use_id).to_string();
+                                    physical.producer.consumer.cadence().to_string();
                                 if physical.plan.scope == CheckScope::Partial {
                                     observation.selection = Some("partial".to_string());
                                 }
@@ -2866,7 +2887,7 @@ where
                                     evaluated_at: chrono::Utc::now().timestamp_millis(),
                                 })?;
                             }
-                            if let Some(handle) = manual_check_handle(tool_use_id) {
+                            if let Some(handle) = producer.request_id.as_deref() {
                                 crate::execution::cache::attach_manual_check_observation(
                                     db, project_id, handle, &source.id,
                                     commit.evaluated, tree_hash, input_hash, "fresh",
@@ -2900,21 +2921,22 @@ where
                             // Main cadence delivers only after reporting its lane.
                             // Reloaded batches have their own consumer delivery driver.
                             if !orch.fleet.is_check_adoption_reloaded(request)
-                                && !tool_use_id.starts_with(MAIN_CADENCE_STREAM_PREFIX)
+                                && producer.consumer != CheckConsumer::MainCadence
+                                && !(producer.consumer == CheckConsumer::Write
+                                    && producer.request_id.is_some())
                                 && orch.fleet.check_claim(request).is_some()
                             {
                                 if let Some(guard) = consumer_guard.as_ref() {
                                     guard.deliver(&recorded.id).await?;
                                 } else {
-                                    let (consumer, consumer_ref) =
-                                        check_consumer_identity(orch, job_id, tool_use_id, None)
-                                            .await?;
+                                    let consumer = producer.consumer.as_str();
+                                    let consumer_ref = &producer.consumer_ref;
                                     orch.fleet
                                         .deliver_check_consumer(
                                             request,
                                             &plan.name,
                                             consumer,
-                                            &consumer_ref,
+                                            consumer_ref,
                                             &recorded.id,
                                         )
                                         .await?;
@@ -3405,13 +3427,8 @@ pub(super) async fn submit_review_check(
                 .implicating_build_service(),
         ));
     }
-    let (consumer, consumer_ref) = check_consumer_identity(
-        orch,
-        request.requesting_job_id.as_deref().unwrap_or_default(),
-        &recording_plan.tool_use_id,
-        None,
-    )
-    .await?;
+    let consumer = recording_plan.producer.consumer.as_str();
+    let consumer_ref = recording_plan.producer.consumer_ref.clone();
     recording_plan.result_shape = CheckAdoptionResultShape::Single;
     orch.fleet.register_check_claim(
         (request.request_id.clone(), request.attempt_id.clone()),
@@ -3803,6 +3820,7 @@ pub(super) async fn run_prospective_tree_checks(
                     requesting_job_id,
                     &format!("merge-gate:{requesting_job_id}"),
                     &execution_env,
+                    &CheckProducer::new(CheckConsumer::Requested, requesting_job_id),
                 )
             })
             .collect();
@@ -3816,6 +3834,7 @@ pub(super) async fn run_prospective_tree_checks(
             &sealed_coordinates,
             &infra_scopes,
             &format!("merge-gate:{requesting_job_id}"),
+            &CheckProducer::new(CheckConsumer::Requested, requesting_job_id),
             CheckExecMode::Isolated,
             Some(orch),
             &env,

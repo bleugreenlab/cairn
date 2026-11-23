@@ -1,4 +1,4 @@
-//! `cairn://p/{project}/check-requests/{id}` and the Requested section of a
+//! `cairn://p/{project}/check-requests/{id}` and the check requests section of a
 //! node's `/checks`: check requests rendered from their durable rows
 //! ([`crate::execution::checks::requests`]).
 //!
@@ -55,12 +55,23 @@ fn clock(ms: i64) -> String {
         .unwrap_or_else(|| ms.to_string())
 }
 
+fn consumer_label(consumer: &str) -> &str {
+    match consumer {
+        "requested" => "requested",
+        "write" => "write cadence",
+        "turn_end" => "review cadence",
+        "main_cadence" => "main cadence",
+        other => other,
+    }
+}
+
 fn render(project: &str, row: &CheckRequestRow, value: &serde_json::Value) -> String {
     let uri = requests::request_uri(project, &row.id);
     let mut lines = vec![
         format!("# Check request {}", row.id),
         String::new(),
         format!("- Suite: {}", row.suite),
+        format!("- Consumer: {}", consumer_label(&row.consumer)),
         format!("- Requested by: {}", row.requester_ref),
         format!(
             "- Revision: {}",
@@ -113,7 +124,7 @@ fn render(project: &str, row: &CheckRequestRow, value: &serde_json::Value) -> St
     lines.join("\n")
 }
 
-/// The Requested section of a node's `/checks`: the requests it filed that
+/// The check requests section of a node's `/checks`: the requests it filed that
 /// are still open, then the few most recently settled. `None` when it filed
 /// none.
 pub(super) async fn requested_section(
@@ -127,7 +138,7 @@ pub(super) async fn requested_section(
     if rows.is_empty() {
         return None;
     }
-    let mut out = String::from("\n## Requested\n\n");
+    let mut out = String::from("\n## Check requests\n\n");
     let mut open = false;
     for row in &rows {
         open |= row.is_open();
@@ -137,9 +148,10 @@ pub(super) async fn requested_section(
             .unwrap_or("own head")
             .to_string();
         out.push_str(&format!(
-            "- [{}]({}) on {revision}: {}\n",
+            "- [{}]({}) ({}) on {revision}: {}\n",
             row.suite,
             requests::request_uri(project_key, &row.id),
+            consumer_label(&row.consumer),
             requests::standing(row)
         ));
     }
@@ -175,9 +187,10 @@ pub(crate) async fn pinned_section(orch: &Orchestrator, executor_name: &str) -> 
             .flatten()
             .unwrap_or_else(|| row.project_id.clone());
         out.push_str(&format!(
-            "- {} {} on {} for {}: {}\n",
+            "- {} {} ({}) on {} for {}: {}\n",
             requests::request_uri(&project_key, &row.id),
             row.suite,
+            consumer_label(&row.consumer),
             row.revision_spec
                 .as_deref()
                 .unwrap_or("its node's own head"),

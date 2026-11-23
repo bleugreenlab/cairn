@@ -32,6 +32,28 @@ use cairn_common::executor_protocol::{CheckSelectorSource, ExecutorSelector};
 
 use super::{ManualCheckError, ManualCheckProgressUpdate, ManualCheckRevision};
 
+mod planned;
+#[cfg(test)]
+pub(crate) use planned::install_granted_write_for_test;
+pub(crate) use planned::{
+    file_planned_check_request, finalize_planned_check_request, load_planned_fold, planned_filing,
+    record_planned_fold, supersede_planned_check_request, WriteLanePhase,
+};
+
+pub(crate) enum CheckRequestInput {
+    Requested(Box<CheckRequestSpec>),
+    Planned {
+        key: String,
+        request: Box<super::PlannedCheckRequest>,
+        phase: WriteLanePhase,
+    },
+}
+impl From<CheckRequestSpec> for CheckRequestInput {
+    fn from(spec: CheckRequestSpec) -> Self {
+        Self::Requested(Box::new(spec))
+    }
+}
+
 /// The states a request can still leave.
 pub(crate) const OPEN_STATES: &str = "('accepted','queued','granted','running')";
 
@@ -78,7 +100,7 @@ pub(crate) struct CheckRequestRow {
     pub state_since_ms: i64,
     pub updated_ms: i64,
     pub publication_id: Option<String>,
-    /// The cadence that filed this request ([`CheckRequestSpec::cadence`]).
+    /// The explicit cadence that filed this request.
     pub cadence: Option<String>,
 }
 
@@ -285,6 +307,8 @@ fn answer_from_error(error: ManualCheckError) -> CheckRequestAnswer {
 /// What a requester asks for.
 #[derive(Debug, Clone)]
 pub(crate) struct CheckRequestSpec {
+    pub consumer: super::CheckConsumer,
+    pub priority: cairn_common::wire_vocabulary::CellPriority,
     pub project_id: String,
     pub project_key: String,
     pub suite: String,
@@ -297,9 +321,8 @@ pub(crate) struct CheckRequestSpec {
     /// The authenticated principal that asked: a node URI or `operator`.
     pub requester_ref: String,
     pub requester_job_id: Option<String>,
-    /// The cadence filing it, when a cadence does rather than a requester:
-    /// `handoff` or `carried` ([`super::handoff`]). Stored on the row, and the
-    /// only thing code reads to know which cadence a row belongs to.
+    /// Explicit filing cadence: write, main_cadence, handoff, carried, or requested.
+    /// Requester labels are attribution only, never cadence authority.
     pub cadence: Option<&'static str>,
 }
 
@@ -433,7 +456,8 @@ pub(crate) async fn requests_of_cadence(
     .map_err(|error| format!("read the {cadence} requests of job {requester_job_id}: {error}"))
 }
 
-/// The open requests any cadence filed for one issue's jobs.
+/// The open handoff and carried-head requests for one issue's jobs.
+/// Other cadences retain their own cancellation and wave-completion owners.
 pub(crate) async fn open_cadence_requests_of_issue(
     db: &LocalDb,
     issue_id: &str,
@@ -441,7 +465,7 @@ pub(crate) async fn open_cadence_requests_of_issue(
     db.query_all(
         format!(
             "SELECT {ROW_COLUMNS} FROM check_requests
-              WHERE state IN {OPEN_STATES} AND cadence IS NOT NULL
+              WHERE state IN {OPEN_STATES} AND cadence IN ('handoff','carried')
                 AND requester_job_id IN (SELECT id FROM jobs WHERE issue_id=?1)"
         ),
         (issue_id.to_string(),),
@@ -491,8 +515,16 @@ pub(crate) async fn requests_pinned_to(
 /// returned instead of a second one.
 pub(crate) async fn file_check_request(
     orch: &Orchestrator,
-    spec: CheckRequestSpec,
+    input: impl Into<CheckRequestInput>,
 ) -> Result<FiledRequest, String> {
+    let spec = match input.into() {
+        CheckRequestInput::Requested(spec) => *spec,
+        CheckRequestInput::Planned {
+            key,
+            request,
+            phase,
+        } => return Box::pin(planned::file(orch, key, *request, phase)).await,
+    };
     let suite = spec.suite.trim().to_string();
     if suite.is_empty() {
         return Err("configured suite name must not be empty".into());
@@ -576,6 +608,9 @@ pub(crate) fn open_key(spec: &CheckRequestSpec, suite: &str, coordinate: &Coordi
     };
     serde_json::json!([
         spec.project_id,
+        spec.consumer,
+        spec.cadence,
+        spec.priority,
         spec.requester_ref,
         suite,
         spec.subject_job_id,
@@ -596,7 +631,28 @@ pub(crate) async fn accept(
     suite: &str,
     coordinate: &Coordinate,
 ) -> Result<Accepted, String> {
-    let key = open_key(spec, suite, coordinate);
+    accept_with_context(db, spec, suite, coordinate, None, None).await
+}
+
+async fn accept_with_context(
+    db: &LocalDb,
+    spec: &CheckRequestSpec,
+    suite: &str,
+    coordinate: &Coordinate,
+    stable_id: Option<&str>,
+    context: Option<&str>,
+) -> Result<Accepted, String> {
+    if let Some(id) = stable_id {
+        if load_request_by_id(db, id).await?.is_some() {
+            return Ok(Accepted {
+                id: id.to_string(),
+                joined: true,
+            });
+        }
+    }
+    let key = stable_id
+        .map(|id| format!("planned:{id}"))
+        .unwrap_or_else(|| open_key(spec, suite, coordinate));
     let selector_json = spec.placement.as_ref().map(stored_placement);
     let pinned = spec
         .placement
@@ -609,15 +665,17 @@ pub(crate) async fn accept(
     // The open row can settle between a refused insert and the read of its
     // id, which frees the key; the next insert then takes it.
     for _ in 0..3 {
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = stable_id
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = now_ms();
         let inserted = db
             .execute(
                 "INSERT INTO check_requests(id,project_id,suite,revision_spec,subject_job_id,selector_json,retry,
                     consumer,requester_ref,requester_job_id,priority,state,commit_sha,pinned_executor,
-                    open_key,driven_by,accepted_at_ms,state_since_ms,updated_ms,cadence)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,'requested',?8,?9,'review_check','accepted',?10,?11,?12,?13,?14,?14,?14,?15)
-                 ON CONFLICT(open_key) DO NOTHING",
+                    open_key,driven_by,accepted_at_ms,state_since_ms,updated_ms,context_json,cadence)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?15,?8,?9,?16,'accepted',?10,?11,?12,?13,?14,?14,?14,?17,?18)
+                 ON CONFLICT DO NOTHING",
                 cairn_db::turso::params![
                     id.as_str(),
                     spec.project_id.as_str(),
@@ -633,6 +691,13 @@ pub(crate) async fn accept(
                     key.as_str(),
                     this_runner(),
                     now,
+                    spec.consumer.as_str(),
+                    match spec.priority {
+                        cairn_common::wire_vocabulary::CellPriority::ReviewCheck => "review_check",
+                        cairn_common::wire_vocabulary::CellPriority::WriteCheck => "write_check",
+                        cairn_common::wire_vocabulary::CellPriority::AgentInteractive => "agent_interactive",
+                    },
+                    context.map(str::to_string),
                     spec.cadence,
                 ],
             )
@@ -640,6 +705,9 @@ pub(crate) async fn accept(
             .map_err(|error| format!("persist check request: {error}"))?;
         if inserted > 0 {
             return Ok(Accepted { id, joined: false });
+        }
+        if stable_id.is_some() && load_request_by_id(db, &id).await?.is_some() {
+            return Ok(Accepted { id, joined: true });
         }
         let open = db
             .query_opt_text(
@@ -692,6 +760,7 @@ pub(crate) fn driving_for_test(id: &str) -> bool {
 }
 
 enum Drive {
+    Planned(Option<Box<super::PlannedCheckRequest>>),
     /// Resolve the revision, submit, and record.
     Fresh(Option<ManualCheckRevision>),
     /// Re-bind to a lane an earlier runner granted.
@@ -720,8 +789,11 @@ fn spawn(orch: &Orchestrator, db: Arc<LocalDb>, id: String, drive: Drive) {
     let task = cairn_common::task::spawn(async move {
         let _ = started.await;
         match drive {
-            Drive::Fresh(revision) => drive_fresh(&task_orch, db, &task_id, revision).await,
-            Drive::Adopt(claim) => drive_adopted(&task_orch, db, &task_id, *claim).await,
+            Drive::Planned(live) => Box::pin(planned::drive(&task_orch, db, &task_id, live)).await,
+            Drive::Fresh(revision) => {
+                Box::pin(drive_fresh(&task_orch, db, &task_id, revision)).await
+            }
+            Drive::Adopt(claim) => Box::pin(drive_adopted(&task_orch, db, &task_id, *claim)).await,
         }
         DRIVERS.lock().unwrap().remove(&task_id);
     });
@@ -947,7 +1019,7 @@ async fn deliver_adopted(
     for attempt in 0..5u32 {
         match orch
             .fleet
-            .deliver_check_consumer(&identity, &row.suite, "manual", &row.id, observation)
+            .deliver_check_consumer(&identity, &row.suite, &row.consumer, &row.id, observation)
             .await
         {
             Ok(()) => return,
@@ -1357,6 +1429,7 @@ pub(crate) async fn cancel_requests_of_stopped_job(orch: &Orchestrator, job_id: 
 /// requests other runners drive, and their lanes are theirs.
 pub(crate) async fn rearm_at_boot(orch: &Orchestrator) {
     orch.fleet.await_restart_adoptions_loaded().await;
+    planned::import_legacy(orch).await;
     for db in orch.db.all_dbs().await {
         let rows = match db
             .query_all(
@@ -1379,11 +1452,16 @@ pub(crate) async fn rearm_at_boot(orch: &Orchestrator) {
         for row in rows {
             rearm(orch, &db, row).await;
         }
+        planned::rearm_deliveries(orch, &db).await;
     }
+    super::write_wave::rearm_at_boot(orch).await;
 }
 
 async fn rearm(orch: &Orchestrator, db: &Arc<LocalDb>, row: CheckRequestRow) {
     if driving(&row.id) {
+        return;
+    }
+    if planned::rearm(orch, db, &row).await {
         return;
     }
     if let Some(by) = row.cancel_requested_by.clone() {

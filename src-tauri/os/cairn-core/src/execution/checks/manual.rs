@@ -1306,6 +1306,11 @@ pub(crate) async fn run_manual_configured_check_with_progress(
         db,
         contract,
         CheckRunProducer {
+            identity: CheckProducer {
+                consumer: CheckConsumer::Requested,
+                consumer_ref: check_request.unwrap_or(&job_id).to_string(),
+                request_id: check_request.map(str::to_string),
+            },
             adopt: None,
             tool_use_id: match check_request {
                 Some(handle) => format!("manual-check:{job_id}:handle={handle}:{check_name}"),
@@ -1416,6 +1421,7 @@ pub(crate) async fn execute_adopted_check_item(
             &recording.evaluated_commit,
         )],
         &recording.tool_use_id,
+        &recording.producer,
         CheckExecMode::Shared,
         Some(orch),
         None,
@@ -1474,9 +1480,9 @@ pub(crate) async fn execute_adopted_check_item(
 
 /// The producer a configured check run records itself as.
 pub(crate) struct CheckRunProducer {
+    pub(crate) identity: CheckProducer,
     pub(crate) adopt: Option<AdoptedAttempt>,
-    /// Stream identity. Its prefix decides the observation's `cadence` label
-    /// (see [`observation_cadence`]).
+    /// Diagnostic stream label, without consumer or cadence authority.
     pub(crate) tool_use_id: String,
     /// How the run's build cell names its owner on the Work surface.
     pub(crate) node_kind: String,
@@ -1559,6 +1565,7 @@ pub(crate) async fn execute_check_contract(
     let timeout_ms = contract.timeout_ms;
     let store_dir = crate::jj::project_store_dir(&orch.config_dir, &repository);
     let CheckRunProducer {
+        identity: producer_identity,
         tool_use_id,
         node_kind,
         owner_job_id,
@@ -1610,9 +1617,11 @@ pub(crate) async fn execute_check_contract(
         &job_id,
         &tool_use_id,
         &item_template.env,
+        &producer_identity,
     ));
     let attempts = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
     let submitted_attempts = attempts.clone();
+    let submitted_producer = producer_identity.clone();
     let outcomes = run_planned_checks_with_board(
         db.clone(),
         &project_id,
@@ -1626,6 +1635,7 @@ pub(crate) async fn execute_check_contract(
         &sealed_coordinates,
         &infra_scopes,
         &tool_use_id,
+        &producer_identity,
         CheckExecMode::Shared,
         Some(orch),
         Some(status_board.clone()),
@@ -1646,12 +1656,14 @@ pub(crate) async fn execute_check_contract(
             let owner_job_id = owner_job_id.clone();
             let purpose = purpose.clone();
             let attempts = submitted_attempts.clone();
+            let submitted_producer = submitted_producer.clone();
             async move {
                 require_snapshot_command(&snapshot_command, &command)?;
                 let affinity_key = check_affinity_key(&job_id, &item_template.name);
                 let mut batch_outcome = submit_planned_check(
                     &orch,
                     PlannedCheckRequest {
+                        producer: submitted_producer.clone(),
                         project_id: project_id.clone(),
                         repository,
                         store_dir,

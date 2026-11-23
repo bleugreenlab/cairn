@@ -24,7 +24,7 @@ pub(super) fn substrate_failure_kind(failure: &SubstrateFailure) -> CheckFailure
 /// machine for its toolchain never will, and work whose own environment was torn
 /// down is not a fault at all. Collapsing them into one lead sentence forced
 /// every reader to the operator log to learn which had happened (CAIRN-3345).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Copy)]
 pub(crate) enum SubstrateFailureShape {
     /// Cairn never got the check started, for a reason that is Cairn's own.
     Dispatch,
@@ -672,7 +672,7 @@ pub(super) const CAPACITY_ATTRIBUTION_CHARS: usize = 120;
 /// [`Self::diagnostic`] keeps the complete substrate detail for the operator log.
 /// The agent message carries a bounded copy too: a failure row must name its
 /// failing step without requiring a second log surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SubstrateFailure {
     pub(super) shape: SubstrateFailureShape,
     /// Placement has already exhausted its wait and answered the request.
@@ -807,7 +807,7 @@ impl SubstrateFailure {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum CheckExecutionFailure {
     /// The runner stopped waiting, but the remote lane remains owned.
     LeftRunning(crate::fleet::LeftRunningAttempt),

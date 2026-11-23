@@ -20,7 +20,7 @@ use super::{executor_names_match, executor_public_name, CancelCause, Fleet, Requ
 /// Why a batch was stopped to make room for an inference deployment: what the
 /// deployment needed on the machine and what the measurements said, so the
 /// work's own record says what took its machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Preemption {
     pub deployment: String,
     /// The model the deployment serves.

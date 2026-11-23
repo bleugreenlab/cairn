@@ -42,7 +42,7 @@ pub mod workflows;
 pub mod write;
 
 /// Authenticated identity and project coordinate for one agent run.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunContext {
     pub run_id: String,
     pub job_id: String,

@@ -28,6 +28,10 @@ pub(super) fn claim(state: &str, consumer: &str) -> claims::Claim {
             "original-input",
             "main:project-a",
             "main-cadence:project-a:smoke:linux",
+            &CheckProducer::new(
+                CheckConsumer::MainCadence,
+                "main-cadence:project-a:smoke:linux",
+            ),
         )],
         consumer: consumer.into(),
         consumer_ref: "main-cadence:project-a:smoke:linux".into(),
@@ -199,6 +203,10 @@ fn contract(orch: &Orchestrator, home: &Path) -> CheckContractSnapshot {
 
 fn producer() -> CheckRunProducer {
     CheckRunProducer {
+        identity: CheckProducer::new(
+            CheckConsumer::MainCadence,
+            "main-cadence:project-a:smoke:linux",
+        ),
         adopt: Some(AdoptedAttempt {
             request_id: REQUEST.into(),
             attempt_id: ATTEMPT.into(),
@@ -426,6 +434,11 @@ async fn replay_after_observation_commit_before_claim_commit_reuses_the_original
         "original-input",
         "main:project-a",
         &original_stream,
+        &CheckProducer {
+            consumer: CheckConsumer::Requested,
+            consumer_ref: handle.clone(),
+            request_id: Some(handle.clone()),
+        },
     )];
     let orch = runner(home.path(), &physical).await;
     let mut frames = orch.fleet.attach_unreported_machine_for_test(REMOTE);
@@ -608,7 +621,7 @@ async fn deliver_recorded_request_waiters(orch: Orchestrator, local: Arc<LocalDb
         if let Ok(waiters) = claims::waiters(&local, REQUEST, ATTEMPT).await {
             for waiter in waiters
                 .iter()
-                .filter(|w| w.consumer == "manual" && w.state == "recorded")
+                .filter(|w| w.consumer == "requested" && w.state == "recorded")
             {
                 if let Some(observation) = waiter.observation_id.clone() {
                     let _ = orch.fleet.deliver_check_waiter(waiter, &observation).await;
@@ -623,6 +636,10 @@ async fn deliver_recorded_request_waiters(orch: Orchestrator, local: Arc<LocalDb
 /// granted on `REMOTE`: the request row is `running` and names that fleet
 /// request, and the claim's one waiter is the request.
 async fn requested_lane(home: &Path) -> (Orchestrator, String) {
+    durable_lane(home, CheckConsumer::Requested).await
+}
+
+async fn durable_lane(home: &Path, consumer: CheckConsumer) -> (Orchestrator, String) {
     let local = Arc::new(
         LocalDb::open_migrated_for_test(home.join("runner.db"))
             .await
@@ -637,13 +654,18 @@ async fn requested_lane(home: &Path) -> (Orchestrator, String) {
         .await
         .unwrap();
     let id = uuid::Uuid::new_v4().to_string();
-    let mut physical = claim("running", "manual");
+    let mut physical = claim("running", consumer.as_str());
     physical.consumer_ref = id.clone();
     physical.recording_plans = vec![recording_plan(
         "smoke",
         "original-input",
         "job-a",
         &format!("manual-check:job-a:handle={id}:smoke"),
+        &CheckProducer {
+            consumer,
+            consumer_ref: id.clone(),
+            request_id: Some(id.clone()),
+        },
     )];
     claims::insert_grant(&local, &physical, &[waiter(&physical)])
         .await
@@ -652,12 +674,16 @@ async fn requested_lane(home: &Path) -> (Orchestrator, String) {
         .execute(
             "INSERT INTO check_requests(id,project_id,suite,subject_job_id,consumer,requester_ref,requester_job_id,
                 priority,state,request_id,executor,accepted_at_ms,state_since_ms,updated_ms)
-             VALUES(?1,'project-a','smoke','job-a','requested','cairn://p/PA/1/1/builder','job-a',
+             VALUES(?1,'project-a','smoke','job-a',?4,'cairn://p/PA/1/1/builder','job-a',
                 'review_check','running',?2,?3,1,1,1)",
-            (id.clone(), REQUEST.to_string(), REMOTE.to_string()),
+            (id.clone(), REQUEST.to_string(), REMOTE.to_string(),consumer.as_str().to_string()),
         )
         .await
         .unwrap();
+    if consumer == CheckConsumer::Write {
+        crate::execution::checks::requests::install_granted_write_for_test(&local, &id, &physical)
+            .await;
+    }
     (boot(home, local).await, id)
 }
 
@@ -692,8 +718,17 @@ async fn until_settled(orch: &Orchestrator, id: &str) {
 /// cancelled, and says what it is waiting to learn.
 #[tokio::test]
 async fn a_granted_request_with_no_evidence_stays_running_and_says_what_it_waits_for() {
+    for consumer in [CheckConsumer::Requested, CheckConsumer::Write] {
+        a_granted_request_with_no_evidence_stays_running_and_says_what_it_waits_for_for(consumer)
+            .await;
+    }
+}
+
+async fn a_granted_request_with_no_evidence_stays_running_and_says_what_it_waits_for_for(
+    consumer: CheckConsumer,
+) {
     let home = tempfile::tempdir().unwrap();
-    let (orch, id) = requested_lane(home.path()).await;
+    let (orch, id) = durable_lane(home.path(), consumer).await;
     assert_eq!(
         orch.fleet
             .adoption_owner(&(REQUEST.to_string(), ATTEMPT.to_string())),
@@ -706,7 +741,9 @@ async fn a_granted_request_with_no_evidence_stays_running_and_says_what_it_waits
     let waiting = row.waiting_to_learn.clone().unwrap();
     assert!(waiting.contains(REMOTE), "{waiting}");
     assert!(
-        waiting.contains("waiting for it to report the item or for its link to be superseded"),
+        waiting.contains("waiting for it to report the item or for its link to be superseded")
+            || waiting
+                .contains("waiting for its retained result or explicit executor death evidence"),
         "{waiting}"
     );
     assert_eq!(
@@ -766,8 +803,14 @@ async fn a_runner_shutting_down_leaves_an_adopted_request_running_for_the_next()
 /// last sign of life. It is never a pass.
 #[tokio::test]
 async fn a_granted_request_whose_machine_reports_it_gone_settles_lost() {
+    for consumer in [CheckConsumer::Requested, CheckConsumer::Write] {
+        a_granted_request_whose_machine_reports_it_gone_settles_lost_for(consumer).await;
+    }
+}
+
+async fn a_granted_request_whose_machine_reports_it_gone_settles_lost_for(consumer: CheckConsumer) {
     let home = tempfile::tempdir().unwrap();
-    let (orch, id) = requested_lane(home.path()).await;
+    let (orch, id) = durable_lane(home.path(), consumer).await;
     let _frames = orch.fleet.attach_unreported_machine_for_test(REMOTE);
     crate::execution::checks::requests::rearm_at_boot(&orch).await;
     orch.fleet
@@ -790,8 +833,16 @@ async fn a_granted_request_whose_machine_reports_it_gone_settles_lost() {
 /// adopts it, records exactly one observation, and settles `recorded`.
 #[tokio::test]
 async fn a_granted_request_adopts_its_retained_result_and_records_once() {
+    for consumer in [CheckConsumer::Requested, CheckConsumer::Write] {
+        a_granted_request_adopts_its_retained_result_and_records_once_for(consumer).await;
+    }
+}
+
+async fn a_granted_request_adopts_its_retained_result_and_records_once_for(
+    consumer: CheckConsumer,
+) {
     let home = tempfile::tempdir().unwrap();
-    let (orch, id) = requested_lane(home.path()).await;
+    let (orch, id) = durable_lane(home.path(), consumer).await;
     let mut frames = orch.fleet.attach_unreported_machine_for_test(REMOTE);
     let retained = result(&orch);
     orch.fleet.handle_executor_message(
@@ -830,7 +881,13 @@ async fn a_granted_request_adopts_its_retained_result_and_records_once() {
     );
 }
 
-fn recording_plan(name: &str, input: &str, job: &str, stream: &str) -> serde_json::Value {
+fn recording_plan(
+    name: &str,
+    input: &str,
+    job: &str,
+    stream: &str,
+    producer: &CheckProducer,
+) -> serde_json::Value {
     let plan = CheckPlan {
         name: name.into(),
         applies: true,
@@ -855,6 +912,7 @@ fn recording_plan(name: &str, input: &str, job: &str, stream: &str) -> serde_jso
         job,
         stream,
         &[],
+        producer,
     ))
     .unwrap()
 }
@@ -996,7 +1054,7 @@ async fn shared_manual_grant(
         )
         .await
         .unwrap();
-    let mut physical = claim("running", "manual");
+    let mut physical = claim("running", "requested");
     physical.project_id = "p".into();
     physical.commit_sha = commit.clone();
     physical.check_names = vec!["second".into()];
@@ -1008,6 +1066,11 @@ async fn shared_manual_grant(
         "manual-job",
         &stream,
         &[],
+        &CheckProducer {
+            consumer: CheckConsumer::Requested,
+            consumer_ref: handle.clone(),
+            request_id: Some(handle.clone()),
+        },
     ))
     .unwrap()];
     orch.fleet
@@ -1099,6 +1162,7 @@ async fn shared_manual_grant(
         "main:p",
         "main-cadence:p:second:linux",
         &[],
+        &CheckProducer::new(CheckConsumer::MainCadence, key.to_string()),
     ))
     .unwrap()];
     orch.fleet.register_check_claim(
@@ -1167,7 +1231,7 @@ async fn shared_manual_grant(
         let original = claims::waiters(&local, REQUEST, ATTEMPT).await.unwrap();
         let manuals = original
             .into_iter()
-            .filter(|w| w.consumer == "manual")
+            .filter(|w| w.consumer == "requested")
             .collect::<Vec<_>>();
         assert_eq!(manuals.len(), 1);
         assert_eq!(
@@ -1181,7 +1245,7 @@ async fn shared_manual_grant(
                 let waiters = claims::waiters(&local, REQUEST, ATTEMPT).await.unwrap();
                 if waiters
                     .iter()
-                    .filter(|w| w.consumer == "manual")
+                    .filter(|w| w.consumer == "requested")
                     .all(|w| w.state == "cancelled" && w.observation_id.is_none())
                 {
                     break;
@@ -1210,7 +1274,7 @@ async fn shared_manual_grant(
         let before_result = claims::waiters(&local, REQUEST, ATTEMPT).await.unwrap();
         let manuals = before_result
             .iter()
-            .filter(|w| w.consumer == "manual")
+            .filter(|w| w.consumer == "requested")
             .collect::<Vec<_>>();
         assert_eq!(manuals.len(), 1);
         assert!(
@@ -1410,10 +1474,10 @@ async fn shared_manual_grant(
                     AND verdict='passed'").await?,
                 count("SELECT COUNT(*) FROM check_result_cache WHERE project_id='p' AND passed=1").await?,
                 count(if cancelled_manual {
-                    "SELECT COUNT(*) FROM check_lane_adoption_waiters WHERE consumer='manual'
+                    "SELECT COUNT(*) FROM check_lane_adoption_waiters WHERE consumer='requested'
                      AND state='cancelled' AND observation_id IS NOT NULL"
                 } else {
-                    "SELECT COUNT(*) FROM check_lane_adoption_waiters WHERE consumer='manual'
+                    "SELECT COUNT(*) FROM check_lane_adoption_waiters WHERE consumer='requested'
                      AND state='delivered' AND observation_id IS NOT NULL"
                 }).await?,
                 count("SELECT COUNT(*) FROM check_lane_adoption_waiters WHERE consumer='main_cadence'
@@ -1430,7 +1494,7 @@ async fn shared_manual_grant(
                 ).await.map_err(|e| e.to_string())?, Some(1),
                     "adoption must preserve the original manual cancellation response");
                 let waiters = claims::waiters(&probe_db, REQUEST, ATTEMPT).await.map_err(|e| e.to_string())?;
-                for waiter in waiters.into_iter().filter(|w| w.consumer == "manual") {
+                for waiter in waiters.into_iter().filter(|w| w.consumer == "requested") {
                     assert_eq!(waiter.state, "cancelled");
                     assert_eq!(waiter.observation_id.as_deref(),
                         Some(format!("remote-check:{REQUEST}:{ATTEMPT}:{}", waiter.check_name).as_str()));
@@ -2138,51 +2202,75 @@ pub(super) fn observe_retry(id: String) -> (RetryListener, mpsc::UnboundedReceiv
 }
 
 #[tokio::test]
-async fn consumer_identity_uses_receipt_attempt_and_stream_not_scheduling_priority() {
+async fn explicit_turn_end_producer_ignores_a_misleading_requested_stream_label() {
     let home = tempfile::tempdir().unwrap();
-    let orch = runner(home.path(), &claim("running", "main_cadence")).await;
-    orch.db
-        .local
-        .execute_script(
-            "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
-         VALUES('project-a','default','A','PA','/fixture',1,1);
-         INSERT INTO jobs(id,project_id,branch,status,created_at,updated_at)
-         VALUES('consumer-job','project-a','main','running',1,1);
-         INSERT INTO turn_end_check_attempts(id,job_id,state,created_at,updated_at)
-         VALUES('review-attempt','consumer-job','running',1,1);
-         UPDATE jobs SET turn_end_check_attempt_id='review-attempt' WHERE id='consumer-job';",
+    let db = project_db(home.path()).await;
+    let physical = claim("running", "main_cadence");
+    let recording: CheckAdoptionRecordingPlan =
+        serde_json::from_value(physical.recording_plans[0].clone()).unwrap();
+    let coordinate = crate::execution::cache::SealedCheckCoordinate::new(
+        "head",
+        "head",
+        "tree",
+        "explicit-turn-end-input",
+    );
+    let producer = CheckProducer::new(CheckConsumer::TurnEnd, "existing-review-attempt");
+    let outcomes = run_planned_checks_with_board(
+        db.clone(),
+        "project-a",
+        CheckRunCommit {
+            evaluated: "head",
+            defined_by: "head",
+        },
+        "tree",
+        "job",
+        &[(recording.plan.clone(), "explicit-turn-end-input".into())],
+        &[coordinate],
+        &[InfraScopes::head_only("job", "head")],
+        "manual-check:misleading:handle=not-authority:0",
+        &producer,
+        CheckExecMode::Shared,
+        None,
+        None,
+        &[],
+        true,
+        |_, _, _| {
+            std::future::ready(Ok::<_, String>(CheckExecResult {
+                exit_code: Some(0),
+                output: "ok".into(),
+                timed_out: false,
+                duration_ms: Some(1),
+                provenance: None,
+                publication: None,
+            }))
+        },
+        |_| {},
+    )
+    .await;
+    let observed = outcomes[0].recorded.as_ref().unwrap_or_else(|| {
+        panic!(
+            "producer result was not recorded: {:?}",
+            outcomes[0].not_recorded
+        )
+    });
+    assert_eq!(
+        db.query_opt_text(
+            "SELECT cadence FROM check_result_observations WHERE id=?1",
+            (observed.id.clone(),)
         )
         .await
-        .unwrap();
-    let handle = uuid::Uuid::new_v4().to_string();
-    let manual_stream = format!("manual-check:run:handle={handle}:0");
-    assert_eq!(
-        check_consumer_identity(&orch, "consumer-job", &manual_stream, None)
-            .await
-            .unwrap(),
-        ("manual", handle)
+        .unwrap()
+        .as_deref(),
+        Some("review"),
     );
-    assert_eq!(
-        check_consumer_identity(&orch, "consumer-job", "turn-checks:run:0", None)
-            .await
-            .unwrap(),
-        ("turn_end", "review-attempt".into())
-    );
-    // Merge gates are scheduled at ReviewCheck priority but are not a turn-end
-    // wave. The durable identity boundary deliberately accepts no priority.
-    assert_eq!(
-        check_consumer_identity(&orch, "consumer-job", "merge-gate:consumer-job:0", None)
-            .await
-            .unwrap(),
-        ("write", "consumer-job".into())
-    );
-    let purpose = crate::fleet::purpose::PurposeKey::main_cadence("project-a", "smoke", "linux");
-    assert_eq!(
-        check_consumer_identity(&orch, "consumer-job", &manual_stream, Some(&purpose))
-            .await
-            .unwrap(),
-        ("main_cadence", purpose.to_string())
-    );
+    assert_eq!(producer.consumer.as_str(), "turn_end");
+    assert_eq!(producer.consumer_ref, "existing-review-attempt");
+    assert!(producer.request_id.is_none());
+    assert!(db
+        .query_opt_text("SELECT id FROM check_requests LIMIT 1", ())
+        .await
+        .unwrap()
+        .is_none());
 }
 
 pub(super) async fn next_submission_frame(
@@ -2216,4 +2304,156 @@ pub(super) async fn next_submission_frame(
             .unwrap(),
         )
     })
+}
+
+/// The executor's mutation is authoritative even when the runner crashes before
+/// journaling it. A new runner adopts that exact retained result, not a new fix.
+#[tokio::test]
+async fn write_delta_returned_before_checkpoint_survives_a_fresh_runner_without_regrant() {
+    use crate::execution::checks::requests;
+    let home = tempfile::tempdir().unwrap();
+    let (first, id) = durable_lane(home.path(), CheckConsumer::Write).await;
+    first.db.local.execute(
+        "UPDATE check_requests SET context_json=json_set(context_json,'$.write_lane.phase','fixer') WHERE id=?1",
+        (id.clone(),)).await.unwrap();
+    first
+        .db
+        .local
+        .execute_script(
+            "CREATE TRIGGER reject_returned_delta BEFORE UPDATE OF context_json ON check_requests
+         WHEN json_type(NEW.context_json,'$.returned')='object'
+         BEGIN SELECT RAISE(ABORT,'reject returned delta checkpoint'); END;",
+        )
+        .await
+        .unwrap();
+    let mut frames = first.fleet.attach_unreported_machine_for_test(REMOTE);
+    let mut retained = result(&first);
+    if let CellOutcome::Completed { mutation_delta, .. } = &mut retained.outcome {
+        *mutation_delta = Some(Box::new(crate::fleet::MutationDelta {
+            base_commit: "original-commit".into(),
+            delta_commit: "retained-fixer-delta".into(),
+            upload_receipt: None,
+        }));
+    } else {
+        panic!("retained fixture must carry a completed command");
+    }
+    first.fleet.handle_executor_message(
+        REMOTE,
+        1,
+        ExecutorMessage::Result {
+            request_id: REQUEST.into(),
+            attempt_id: ATTEMPT.into(),
+            outcome: retained.outcome.clone(),
+        },
+    );
+    assert_eq!(adopt(&first, retained).await, Adoption::HeldForCheckLane);
+    requests::rearm_at_boot(&first).await;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let mut changed = requests::subscribe_settlements();
+            if request_row(&first, &id)
+                .await
+                .waiting_to_learn
+                .as_deref()
+                .is_some_and(|why| why.contains("reject returned delta checkpoint"))
+            {
+                break;
+            }
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(200), changed.changed())
+                .await;
+        }
+    })
+    .await
+    .expect("the returned delta reaches the intentionally rejected durability boundary");
+    assert_no_release(&mut frames);
+    let raw = first
+        .db
+        .local
+        .query_text(
+            "SELECT json_extract(context_json,'$.returned') FROM check_requests WHERE id=?1 AND json_type(context_json,'$.returned')='object'",
+            (id.clone(),),
+        )
+        .await
+        .unwrap();
+    assert!(raw.is_none(), "the first runner did not journal the delta");
+    assert!(request_row(&first, &id).await.is_open());
+    let db = first.db.clone();
+    let local = db.local.clone();
+    first.fleet.begin_runner_shutdown();
+    requests::forget_driver_for_test(&id);
+    drop(frames);
+    drop(first);
+    local
+        .execute_script("DROP TRIGGER reject_returned_delta;")
+        .await
+        .unwrap();
+
+    // Search is process-scoped in this fixture; reuse its writer while the
+    // aborted old driver releases its last Orchestrator clone asynchronously.
+    let second = Orchestrator::builder(
+        db,
+        Arc::new(TestServicesBuilder::new().build()),
+        home.path().to_path_buf(),
+    )
+    .jj_binary_path(crate::jj::tests::jj_bin().unwrap_or_else(|| "jj".into()))
+    .build();
+    second.fleet.await_restart_adoptions_loaded().await;
+    let mut frames = second.fleet.attach_unreported_machine_for_test(REMOTE);
+    let mut retained = result(&second);
+    if let CellOutcome::Completed { mutation_delta, .. } = &mut retained.outcome {
+        *mutation_delta = Some(Box::new(crate::fleet::MutationDelta {
+            base_commit: "original-commit".into(),
+            delta_commit: "retained-fixer-delta".into(),
+            upload_receipt: None,
+        }));
+    }
+    second.fleet.handle_executor_message(
+        REMOTE,
+        1,
+        ExecutorMessage::Result {
+            request_id: REQUEST.into(),
+            attempt_id: ATTEMPT.into(),
+            outcome: retained.outcome.clone(),
+        },
+    );
+    assert_eq!(adopt(&second, retained).await, Adoption::HeldForCheckLane);
+    requests::rearm_at_boot(&second).await;
+    let raw=tokio::time::timeout(std::time::Duration::from_secs(20),async {
+        loop {
+            let mut changed=requests::subscribe_settlements();
+            if let Some(raw)=local.query_text(
+                "SELECT json_extract(context_json,'$.returned') FROM check_requests WHERE id=?1 AND json_type(context_json,'$.returned')='object'",(id.clone(),)).await.unwrap() {
+                break serde_json::from_str::<serde_json::Value>(&raw).unwrap();
+            }
+            let _=tokio::time::timeout(std::time::Duration::from_millis(200),changed.changed()).await;
+        }
+    }).await.expect("the fresh runner journals the original retained mutation");
+    assert_eq!(raw["delta"]["deltaCommit"], "retained-fixer-delta");
+    assert_eq!(raw["identity"], serde_json::json!([REQUEST, ATTEMPT]));
+    let row = request_row(&second, &id).await;
+    assert!(
+        row.is_open(),
+        "a fixer is not recorded before its wave proves the final tree"
+    );
+    assert_eq!(row.request_id.as_deref(), Some(REQUEST));
+    assert!(row.observation_id.is_none());
+    assert_eq!(
+        local
+            .query_opt("SELECT COUNT(*) FROM check_requests", (), |r| r.i64(0))
+            .await
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    assert_no_release(&mut frames);
+    assert_eq!(
+        claims::lookup(&local, REQUEST, ATTEMPT)
+            .await
+            .unwrap()
+            .unwrap()
+            .consumer_ref,
+        id
+    );
+    second.fleet.begin_runner_shutdown();
+    requests::forget_driver_for_test(&id);
 }

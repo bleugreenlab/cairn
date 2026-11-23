@@ -331,6 +331,8 @@ pub(crate) async fn file_wave(
                     requests::file_check_request(
                         orch,
                         CheckRequestSpec {
+                            consumer: super::CheckConsumer::Requested,
+                            priority: cairn_common::wire_vocabulary::CellPriority::ReviewCheck,
                             project_id: coords.project_id.clone(),
                             project_key: coords.project_key.clone(),
                             suite: suite.clone(),

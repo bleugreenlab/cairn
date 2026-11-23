@@ -81,6 +81,10 @@ fn manual_check_wire(
         )
     };
     let request = PlannedCheckBatchRequest {
+        producer: crate::execution::checks::CheckProducer::new(
+            crate::execution::checks::CheckConsumer::Write,
+            "job",
+        ),
         project_id: "project".into(),
         repository: "/repo".into(),
         store_dir: PathBuf::from("/store"),

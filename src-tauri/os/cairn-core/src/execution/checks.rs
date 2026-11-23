@@ -1102,10 +1102,59 @@ pub(crate) enum CheckAdoptionResultShape {
     Single,
 }
 
+/// The logical owner of a check, independent of its scheduling priority or log label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CheckConsumer {
+    Requested,
+    Write,
+    TurnEnd,
+    MainCadence,
+}
+
+impl CheckConsumer {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Write => "write",
+            Self::TurnEnd => "turn_end",
+            Self::MainCadence => "main_cadence",
+        }
+    }
+
+    pub(crate) fn cadence(self) -> &'static str {
+        match self {
+            Self::Requested => "manual",
+            Self::Write => "write",
+            Self::TurnEnd => "review",
+            Self::MainCadence => "main",
+        }
+    }
+}
+
+/// Producer authority travels with the immutable plan; diagnostic streams carry none.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CheckProducer {
+    pub(crate) consumer: CheckConsumer,
+    pub(crate) consumer_ref: String,
+    pub(crate) request_id: Option<String>,
+}
+
+impl CheckProducer {
+    pub(crate) fn new(consumer: CheckConsumer, consumer_ref: impl Into<String>) -> Self {
+        Self {
+            consumer,
+            consumer_ref: consumer_ref.into(),
+            request_id: None,
+        }
+    }
+}
+
 /// The immutable recording contract of an item actually granted to a machine.
 /// Recording a retained partial run must not replan it as a whole-suite run.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CheckAdoptionRecordingPlan {
+    pub(crate) producer: CheckProducer,
     #[serde(default)]
     pub(crate) result_shape: CheckAdoptionResultShape,
     pub(crate) plan: CheckPlan,
@@ -1128,8 +1177,10 @@ impl CheckAdoptionRecordingPlan {
         job_id: &str,
         tool_use_id: &str,
         effective_env: &[(String, String)],
+        producer: &CheckProducer,
     ) -> Self {
         Self {
+            producer: producer.clone(),
             result_shape: CheckAdoptionResultShape::Batch,
             plan: plan.clone(),
             evaluated_commit: coordinate.evaluated_commit().to_string(),
@@ -1143,7 +1194,7 @@ impl CheckAdoptionRecordingPlan {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PlannedCheckBatchItem {
     pub recording_plan: Option<CheckAdoptionRecordingPlan>,
     pub index: usize,
@@ -1152,6 +1203,7 @@ pub(crate) struct PlannedCheckBatchItem {
     pub resource_identity: CheckResourceIdentityInput,
     pub command: String,
     pub stream_id: String,
+    #[serde(skip)]
     pub env: Vec<(String, String)>,
     pub verdict_environment_names: Vec<String>,
     pub timeout_ms: u64,
@@ -1203,6 +1255,7 @@ pub(crate) const OBSERVATION_WRITE_FAILED: &str = "the observation write failed:
 /// [`submit_planned_fix`] runs a declared fixer whose changes come back.
 #[derive(Clone)]
 pub(crate) struct PlannedCheckRequest {
+    pub producer: CheckProducer,
     pub project_id: String,
     pub repository: String,
     pub store_dir: std::path::PathBuf,
@@ -1229,6 +1282,7 @@ pub(crate) struct PlannedCheckRequest {
 impl PlannedCheckRequest {
     fn into_batch(self, mutation_policy: MutationPolicy) -> PlannedCheckBatchRequest {
         PlannedCheckBatchRequest {
+            producer: self.producer,
             project_id: self.project_id,
             repository: self.repository,
             store_dir: self.store_dir,
@@ -1265,6 +1319,7 @@ pub(crate) fn check_affinity_key(job_id: &str, suite: &str) -> String {
 /// back. No check caller composes two suites into one of these.
 #[derive(Clone)]
 pub(crate) struct PlannedCheckBatchRequest {
+    pub producer: CheckProducer,
     pub project_id: String,
     pub repository: String,
     pub store_dir: std::path::PathBuf,
@@ -2181,7 +2236,7 @@ fn fresh_observation_write(
     sealed_coordinate: &crate::execution::cache::SealedCheckCoordinate,
     plan: &CheckPlan,
     job_id: &str,
-    tool_use_id: &str,
+    producer: &CheckProducer,
     exit_code: i32,
     failure_kind: Option<CheckFailureKind>,
     duration_ms: i64,
@@ -2238,7 +2293,7 @@ fn fresh_observation_write(
             })
         });
     FreshCheckObservationWrite {
-        manual_handle: manual_check_handle(tool_use_id).map(str::to_string),
+        manual_handle: producer.request_id.clone(),
         publication_id: None,
         sealed_coordinate: sealed_coordinate.clone(),
         id: uuid::Uuid::new_v4().to_string(),
@@ -2279,10 +2334,8 @@ fn fresh_observation_write(
         ran_at: chrono::Utc::now().timestamp_millis(),
         duration_ms,
         job_id: Some(job_id.to_string()),
-        run_id: tool_use_id
-            .strip_prefix("manual-check:")
-            .and_then(|value| value.split_once(':').map(|(run_id, _)| run_id.to_string())),
-        cadence: observation_cadence(tool_use_id).to_string(),
+        run_id: producer.request_id.clone(),
+        cadence: producer.consumer.cadence().to_string(),
         executor_id: observed_on.executor_id(),
         executor_device_id: provenance.map(|meta| meta.executor_device_id.clone()),
         executor_connection_generation: observed_on.connection_generation(),
@@ -2386,62 +2439,6 @@ fn observed_verdict_environment_hash(
 /// `cadence = 'main'` and `job_id = 'main:{project_id}'`; see
 /// [`crate::execution::checks_main`].
 pub(crate) const MAIN_CADENCE_STREAM_PREFIX: &str = "main-cadence:";
-
-/// A manual request's own identity, not its suite or run's reusable coordinate.
-pub(crate) fn manual_check_handle(tool_use_id: &str) -> Option<&str> {
-    let handle = tool_use_id
-        .strip_prefix("manual-check:")?
-        .split(':')
-        .nth(1)?
-        .strip_prefix("handle=")?;
-    uuid::Uuid::parse_str(handle).ok()?;
-    Some(handle)
-}
-
-/// Consumer identity is independent of scheduling priority: a merge gate may
-/// request review priority without being a turn-end review-wave consumer.
-async fn check_consumer_identity(
-    orch: &Orchestrator,
-    job_id: &str,
-    stream: &str,
-    purpose: Option<&crate::fleet::purpose::PurposeKey>,
-) -> Result<(&'static str, String), String> {
-    if let Some(purpose) = purpose {
-        Ok(("main_cadence", purpose.to_string()))
-    } else if stream.starts_with("manual-check:") {
-        Ok((
-            "manual",
-            manual_check_handle(stream).unwrap_or(stream).to_string(),
-        ))
-    } else if stream.starts_with("turn-checks:") {
-        let attempt = orch
-            .db
-            .local
-            .query_opt_text(
-                "SELECT turn_end_check_attempt_id FROM jobs WHERE id=?1",
-                (job_id.to_string(),),
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .unwrap_or_default();
-        Ok(("turn_end", attempt))
-    } else {
-        Ok(("write", job_id.to_string()))
-    }
-}
-
-/// The `cadence` an observation records, decided by its producer's stream prefix.
-fn observation_cadence(tool_use_id: &str) -> &'static str {
-    if tool_use_id.starts_with("turn-checks:") {
-        "review"
-    } else if tool_use_id.starts_with("manual-check:") {
-        "manual"
-    } else if tool_use_id.starts_with(MAIN_CADENCE_STREAM_PREFIX) {
-        "main"
-    } else {
-        "write"
-    }
-}
 
 /// The change a check's verdict is measured against, as its result key sees it.
 ///

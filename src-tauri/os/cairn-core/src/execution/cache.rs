@@ -710,7 +710,7 @@ pub(crate) const INFRA_FLEET_SCOPE_PREFIX: &str = "infra:fleet:";
 /// A domain earns its place only if we can compute an identity that MOVES when
 /// its repair happens, and only if reaching the bound implies the right
 /// consequence. These four do; a fifth would have to prove the same.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Copy)]
 pub(crate) enum InfraRepairDomain {
     /// A new commit. Cell races, lost links, capacity — conditions local to one
     /// attempt at one head, which must stay narrow and retryable elsewhere.
@@ -738,7 +738,7 @@ pub(crate) enum InfraRepairDomain {
 /// Built by the caller that can see the fleet, and consumed by a cache layer
 /// that never decides which domain a failure belongs to — it only learns about
 /// a SET of scopes and reports which of them bounded the check.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InfraScopes {
     pub(crate) head: String,
     /// Present when the fleet's capability identity for this check could be
@@ -1018,7 +1018,7 @@ async fn read_infra_scope_rows(
 }
 
 /// One scope's stored evidence that a triple must not run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SuppressedScope {
     pub(crate) scope: String,
     /// The machine this scope bounds, for an environment-domain row.
@@ -1033,7 +1033,7 @@ pub(crate) struct SuppressedScope {
 /// The rows come back from the same read that took the decision, so a caller
 /// reports the evidence it was refused ON rather than re-deriving a key and
 /// hoping a second lookup finds the row.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SuppressedCheck {
     pub(crate) domain: InfraRepairDomain,
     /// Never empty: a suppression is always some scope's row. The environment
@@ -1877,7 +1877,7 @@ pub fn list_check_results_for_executor_generation(
 }
 
 /// Cached result for one project-declared check at one sealed tree identity.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckResultCacheEntry {
     pub(crate) project_id: String,
