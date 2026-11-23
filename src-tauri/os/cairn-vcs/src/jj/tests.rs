@@ -2949,6 +2949,180 @@ fn import_commits(fx: &TrackedOrigin, commits: &[&str]) {
     export_git_preserving_checkout(&fx.jj, &fx.store, true, "drop fixture bookmarks").unwrap();
 }
 
+const ORIGIN_TAKE_BRANCH: &str = "agent/origin-take";
+
+fn setup_origin_take() -> TrackedOrigin {
+    let fx = setup_tracked_origin(&jj_bin().expect("real jj required"));
+    let local = store_child_of(&fx, &fx.base, "local branch tip");
+    create_bookmark_at(&fx.jj, &fx.store, ORIGIN_TAKE_BRANCH, &local).unwrap();
+    export_bookmark_advance(&fx.jj, &fx.store, true, ORIGIN_TAKE_BRANCH, "fixture").unwrap();
+    push_bookmark_to_origin(&fx.jj, &fx.store, ORIGIN_TAKE_BRANCH);
+    assert_origin_take_at(&fx, &local);
+    fx
+}
+
+fn assert_origin_take_at(fx: &TrackedOrigin, tip: &str) {
+    assert_eq!(
+        bookmark_commit_checked(&fx.jj, &fx.store, ORIGIN_TAKE_BRANCH)
+            .unwrap()
+            .as_deref(),
+        Some(tip)
+    );
+    assert_eq!(tracking_ref(fx, ORIGIN_TAKE_BRANCH), tip);
+    assert_eq!(proj_ref(fx, ORIGIN_TAKE_BRANCH), tip);
+    assert_eq!(
+        crate::recorded_origin_bookmark(&fx.store, ORIGIN_TAKE_BRANCH).unwrap(),
+        (Some(tip.to_string()), true)
+    );
+}
+
+fn observe_origin_take(fx: &TrackedOrigin, tip: &str) -> String {
+    // Fetch into the bare origin rather than pushing from the backing checkout:
+    // a push would opportunistically advance its tracking ref before the action.
+    git(
+        fx._origin.path(),
+        &[
+            "fetch",
+            "-q",
+            &fx.proj.path().to_string_lossy(),
+            &format!("{tip}:refs/heads/{ORIGIN_TAKE_BRANCH}"),
+        ],
+    );
+    fetch_origin_observation(&fx.store, ORIGIN_TAKE_BRANCH)
+        .unwrap()
+        .unwrap()
+}
+
+fn assert_origin_observation_removed(fx: &TrackedOrigin) {
+    let output = cairn_platform::env::git()
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &origin_observation_ref(ORIGIN_TAKE_BRANCH),
+        ])
+        .current_dir(fx.proj.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn origin_take_refuses_scaffolding_before_any_ref_or_store_move() {
+    for entry in ["JJ-CONFLICT-README", ".jjconflict-base-0"] {
+        let fx = setup_origin_take();
+        let local = proj_ref(&fx, ORIGIN_TAKE_BRANCH);
+        let tip = git_commit_on(
+            &fx,
+            &local,
+            entry,
+            "conflict scaffolding\n",
+            "bad origin tree",
+        );
+        let observed = observe_origin_take(&fx, &tip);
+        let operation = operation_id(&fx.jj, &fx.store).unwrap();
+        let error =
+            fast_forward_branch_from_origin(&fx.jj, &fx.store, ORIGIN_TAKE_BRANCH, &observed)
+                .unwrap_err();
+        assert!(error.starts_with(ORIGIN_SCAFFOLDING_REFUSAL), "{error}");
+        for detail in [
+            ORIGIN_TAKE_BRANCH,
+            &tip,
+            entry,
+            "nothing was taken",
+            "Repair the tree on origin",
+        ] {
+            assert!(error.contains(detail), "{error}");
+        }
+        assert_eq!(operation_id(&fx.jj, &fx.store).unwrap(), operation);
+        assert_origin_take_at(&fx, &local);
+        assert_origin_observation_removed(&fx);
+    }
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn origin_take_preserves_a_merge_with_local_as_either_parent() {
+    for local_first in [true, false] {
+        let fx = setup_origin_take();
+        let local = proj_ref(&fx, ORIGIN_TAKE_BRANCH);
+        let other = git_commit_on(&fx, &fx.base, "other.txt", "other\n", "other parent");
+        let tree = git_stdout(fx.proj.path(), &["rev-parse", &format!("{other}^{{tree}}")]);
+        let parents = if local_first {
+            [&local, &other]
+        } else {
+            [&other, &local]
+        };
+        let tip = git_stdout(
+            fx.proj.path(),
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                parents[0],
+                "-p",
+                parents[1],
+                "-m",
+                "origin merge",
+            ],
+        );
+        let observed = observe_origin_take(&fx, &tip);
+        assert_eq!(
+            fast_forward_branch_from_origin(&fx.jj, &fx.store, ORIGIN_TAKE_BRANCH, &observed)
+                .unwrap(),
+            OriginFastForward::Advanced {
+                from: local.clone(),
+                to: tip.clone()
+            }
+        );
+        assert_origin_take_at(&fx, &tip);
+        assert_eq!(
+            git_stdout(
+                fx.proj.path(),
+                &[
+                    "show",
+                    "-s",
+                    "--format=%T%n%P",
+                    &proj_ref(&fx, ORIGIN_TAKE_BRANCH)
+                ]
+            ),
+            format!("{tree}\n{} {}", parents[0], parents[1])
+        );
+        assert_origin_observation_removed(&fx);
+    }
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn origin_take_restores_both_git_refs_after_an_export_failure() {
+    let fx = setup_origin_take();
+    let local = proj_ref(&fx, ORIGIN_TAKE_BRANCH);
+    let tip = git_commit_on(&fx, &local, "clean.txt", "clean\n", "clean origin advance");
+    let observed = observe_origin_take(&fx, &tip);
+    let operation = operation_id(&fx.jj, &fx.store).unwrap();
+    // This fails after importing the commit, staging the bookmark and actually
+    // exporting refs/heads, not before the transaction starts.
+    crate::inject_origin_record_export_failure("injected post-export failure");
+    let error = fast_forward_branch_from_origin(&fx.jj, &fx.store, ORIGIN_TAKE_BRANCH, &observed)
+        .unwrap_err();
+    assert!(error.contains("injected post-export failure"), "{error}");
+    assert!(
+        error.contains("git refs it had moved were restored"),
+        "{error}"
+    );
+    assert_eq!(operation_id(&fx.jj, &fx.store).unwrap(), operation);
+    assert_origin_take_at(&fx, &local);
+    assert_origin_observation_removed(&fx);
+    // The restored record remains retryable.
+    let observed = observe_origin_take(&fx, &tip);
+    assert!(matches!(
+        fast_forward_branch_from_origin(&fx.jj, &fx.store, ORIGIN_TAKE_BRANCH, &observed).unwrap(),
+        OriginFastForward::Advanced { .. }
+    ));
+    assert_origin_take_at(&fx, &tip);
+}
+
 fn tracking_ref(fx: &TrackedOrigin, branch: &str) -> String {
     git_stdout(
         fx.proj.path(),

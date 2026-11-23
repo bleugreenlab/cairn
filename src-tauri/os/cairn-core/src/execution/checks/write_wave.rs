@@ -1803,9 +1803,10 @@ pub(super) fn split_write_wave(
             continue;
         };
         let platforms = crate::execution::check_identity::verdict_platforms(check);
-        if platforms
-            .iter()
-            .any(|platform| platform.eq_ignore_ascii_case(write_cell_platform))
+        if platforms.is_empty()
+            || platforms
+                .iter()
+                .any(|platform| platform.eq_ignore_ascii_case(write_cell_platform))
         {
             split.fixers.push(index);
         } else {

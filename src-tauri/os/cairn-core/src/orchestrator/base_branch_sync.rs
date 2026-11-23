@@ -925,10 +925,7 @@ pub(crate) async fn fast_forward_now(
         .snapshot(project_id, branch)
         .unwrap_or_default();
     if let Some(error) = state.last_error {
-        return Err(format!(
-            "`{branch}` was not fast-forwarded from origin: {}",
-            error.message
-        ));
+        return fast_forward_sync_failure(branch, &error);
     }
     let named = |commit: &Option<String>| {
         commit
@@ -949,6 +946,26 @@ pub(crate) async fn fast_forward_now(
             short(tip)
         ),
     })
+}
+
+/// A content refusal is a completed judgment, not a failed invocation. Keep its
+/// named origin commit and remediation visible to the rebase action caller.
+fn fast_forward_sync_failure(branch: &str, error: &SyncError) -> Result<String, String> {
+    let message = &error.message;
+    if is_origin_take_refusal(error) {
+        Ok(format!("Fast-forward refused: {message}"))
+    } else {
+        Err(format!(
+            "`{branch}` was not fast-forwarded from origin: {message}"
+        ))
+    }
+}
+
+fn is_origin_take_refusal(error: &SyncError) -> bool {
+    error.phase == Phase::Sync
+        && error
+            .message
+            .starts_with(crate::jj::ORIGIN_SCAFFOLDING_REFUSAL)
 }
 
 /// The projects whose shared store is `store`. Publication is addressed by
@@ -1435,6 +1452,11 @@ fn stale_reason(state: &BranchSync, now: DateTime<Utc>) -> String {
     if let Some(started) = state.sync_started_at {
         format!("sync in progress {}", elapsed(since(started)))
     } else if let Some(error) = &state.last_error {
+        if is_origin_take_refusal(error) {
+            // Unlike infrastructure excerpts, this names what must be fixed on
+            // origin; truncating it can hide the entries and the remedy.
+            return format!("fast-forward refused: {}", error.message);
+        }
         let step = match error.phase {
             Phase::Check => "origin check",
             Phase::Sync => "sync",

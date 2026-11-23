@@ -901,6 +901,10 @@ pub fn record_origin_bookmarks(
                     ));
                 }
             }
+            #[cfg(test)]
+            if let Some(error) = INJECTED_ORIGIN_EXPORT_FAILURE.lock().unwrap().take() {
+                return Err(error);
+            }
             Ok::<_, String>(tx)
         };
         let tx = staged.await.map_err(OriginRecordError::BeforeCommit)?;
@@ -951,6 +955,17 @@ async fn commit_origin_record(
         .map(|_| ())
         .map_err(|error| OriginRecordError::AtCommit(format!("commit the origin record: {error}")))
 }
+
+/// Fail after the origin record has staged its bookmark and exported git refs,
+/// but before its transaction commits, so callers must restore both git refs.
+#[cfg(test)]
+pub(crate) fn inject_origin_record_export_failure(error: &str) {
+    *INJECTED_ORIGIN_EXPORT_FAILURE.lock().unwrap() = Some(error.to_string());
+}
+
+#[cfg(test)]
+static INJECTED_ORIGIN_EXPORT_FAILURE: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(test)]
 static INJECTED_ORIGIN_COMMIT_FAILURE: std::sync::Mutex<Option<(bool, String)>> =

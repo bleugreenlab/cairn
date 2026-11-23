@@ -5057,6 +5057,30 @@ fn a_write_wave_splits_fixers_from_verdicts_and_refuses_a_fixer_off_the_write_ce
         }
     );
 
+    // An explicit empty trust set admits either write-cell OS, including
+    // alongside a restricted fixer; an omitted key still trusts only the runner.
+    checks.get_mut("api").unwrap().fixes = true;
+    checks.get_mut("api").unwrap().verdict_platforms = Some(vec![]);
+    checks.get_mut("rust-fmt").unwrap().verdict_platforms = Some(vec!["macos".into()]);
+    for platform in ["macos", "linux"] {
+        let split = split_write_wave(&keyed, &checks, &[0, 3], platform, "write-cell");
+        assert!(split.fixers.contains(&0), "empty trust admits {platform}");
+        if platform == "macos" {
+            assert_eq!(split.fixers, vec![0, 3]);
+            assert!(split.refused.is_empty());
+        } else {
+            assert_eq!(split.fixers, vec![0]);
+            assert_eq!(split.refused, vec![(3, "check `rust-fmt` fixes files but its verdictPlatforms [macos] exclude the write cell on write-cell (linux); a fix folds only from the write cell. Widen verdictPlatforms or drop `fixes` in .cairn/config.yaml".into())]);
+        }
+    }
+    checks.get_mut("rust-fmt").unwrap().verdict_platforms = None;
+    let split = split_write_wave(&keyed, &checks, &[3], elsewhere, "write-cell");
+    assert!(
+        split.fixers.is_empty(),
+        "omitted still excludes the other OS"
+    );
+    assert_eq!(split.refused.len(), 1);
+
     // Several declared fixers chain in plan order.
     checks.get_mut("rust-fmt").unwrap().verdict_platforms = None;
     checks.get_mut("api").unwrap().fixes = true;

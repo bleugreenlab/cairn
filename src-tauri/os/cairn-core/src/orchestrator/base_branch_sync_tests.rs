@@ -1170,3 +1170,95 @@ async fn publishing_takes_an_outside_fast_forward_first() {
     assert_eq!(f.store_tip(), outside);
     assert_eq!(f.origin_tip(PARENT), outside);
 }
+
+#[test]
+fn origin_scaffolding_is_a_named_refusal_not_an_infrastructure_failure() {
+    let message = format!(
+        "{}: origin's `agent/example` at {NEW} carries jj conflict scaffolding \
+         (JJ-CONFLICT-README, .jjconflict-base-0); nothing was taken. \
+         Repair the tree on origin, then retry.",
+        crate::jj::ORIGIN_SCAFFOLDING_REFUSAL,
+    );
+    let error = SyncError {
+        at: at(100),
+        phase: Phase::Sync,
+        message: message.clone(),
+    };
+    assert_eq!(
+        fast_forward_sync_failure("agent/example", &error).unwrap(),
+        format!("Fast-forward refused: {message}")
+    );
+    let state = BranchSync {
+        last_error: Some(error.clone()),
+        ..Default::default()
+    };
+    assert_eq!(
+        stale_reason(&state, at(110)),
+        format!("fast-forward refused: {message}")
+    );
+    for error in [
+        SyncError {
+            phase: Phase::Check,
+            ..error.clone()
+        },
+        SyncError {
+            message: "git could not run".into(),
+            ..error.clone()
+        },
+        SyncError {
+            message: crate::jj::CONFLICT_SCAFFOLDING_EXPORT_REFUSAL.into(),
+            ..error
+        },
+    ] {
+        assert!(fast_forward_sync_failure("agent/example", &error).is_err());
+        let state = BranchSync {
+            last_error: Some(error),
+            ..Default::default()
+        };
+        assert!(!stale_reason(&state, at(110)).starts_with("fast-forward refused:"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_scaffolding_refusal_reaches_the_rebase_action_and_freshness_read() {
+    let f = PublishedParent::new("origin-scaffolding-refusal.db")
+        .await
+        .expect("real jj required");
+    let outside = f.push_outside(PARENT, "JJ-CONFLICT-README");
+    let answer = fast_forward_now(&f.orch, "proj-parent", PARENT)
+        .await
+        .expect("a content refusal must not be an infrastructure error");
+    assert!(answer.starts_with("Fast-forward refused:"), "{answer}");
+    for detail in [
+        PARENT,
+        &outside,
+        "JJ-CONFLICT-README",
+        "nothing was taken",
+        "Repair the tree on origin",
+    ] {
+        assert!(answer.contains(detail), "{answer}");
+    }
+    let label = revision_label(
+        &f.orch,
+        "proj-parent",
+        PARENT,
+        "main",
+        &f.store,
+        &f.published,
+    )
+    .await;
+    assert!(label.contains("STALE"), "{label}");
+    assert!(label.contains("fast-forward refused:"), "{label}");
+    assert!(label.contains("JJ-CONFLICT-README"), "{label}");
+    assert!(label.contains("Repair the tree on origin"), "{label}");
+    assert_eq!(f.store_tip(), f.published);
+    for name in [
+        format!("refs/heads/{PARENT}"),
+        format!("refs/remotes/origin/{PARENT}"),
+    ] {
+        assert_eq!(
+            read_ref(Path::new(&f.repo_path), &name).as_deref(),
+            Some(f.published.as_str())
+        );
+    }
+}

@@ -453,6 +453,10 @@ pub enum OriginFastForward {
     NoBookmark,
 }
 
+/// A preflight content refusal: no tracking ref, bookmark or exported head moved.
+/// Kept distinct from an export refusal after a default-branch import.
+pub const ORIGIN_SCAFFOLDING_REFUSAL: &str = "origin fast-forward refused";
+
 /// Take origin's copy of a STORE-OWNED branch (an agent or integration branch)
 /// when, and only when, it is a pure fast-forward of the store's bookmark.
 ///
@@ -552,7 +556,8 @@ fn judge_and_take_origin_copy(
         })?;
     if !scaffolding.is_empty() {
         return Err(format!(
-            "{CONFLICT_SCAFFOLDING_EXPORT_REFUSAL} (`{branch}`): origin's {observed} carries {}",
+            "{ORIGIN_SCAFFOLDING_REFUSAL}: origin's `{branch}` at {observed} carries \
+             jj conflict scaffolding ({}); nothing was taken. Repair the tree on origin, then retry.",
             scaffolding.join(", ")
         ));
     }

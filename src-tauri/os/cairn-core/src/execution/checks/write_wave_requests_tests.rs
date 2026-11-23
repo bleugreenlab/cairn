@@ -49,7 +49,7 @@ fn commit(repo: &Path, files: &[(&str, &str)], message: &str) -> String {
 fn contract() -> String {
     let mut config = String::from(
         "checks:\n  \
-         fmt-a:\n    command: fix a.txt\n    when: write\n    fixes: true\n    impact:\n      - a.txt\n  \
+         fmt-a:\n    command: fix a.txt\n    when: write\n    fixes: true\n    verdictPlatforms: []\n    impact:\n      - a.txt\n  \
          fmt-b:\n    command: fix b.txt\n    when: write\n    fixes: true\n    impact:\n      - b.txt\n",
     );
     for verdict in VERDICTS {
