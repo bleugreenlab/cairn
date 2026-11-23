@@ -38,7 +38,7 @@ pub(crate) const OPEN_STATES: &str = "('accepted','queued','granted','running')"
 const ROW_COLUMNS: &str = "id,project_id,suite,revision_spec,subject_job_id,selector_json,retry,consumer,
     requester_ref,requester_job_id,state,commit_sha,request_id,executor,diagnostic,held_by,held_at_ms,
     held_count,pinned_executor,waiting_to_learn,observation_id,outcome_json,evidence,cancel_requested_by,
-    accepted_at_ms,queued_at_ms,state_since_ms,updated_ms,publication_id";
+    accepted_at_ms,queued_at_ms,state_since_ms,updated_ms,publication_id,cadence";
 
 /// This runner's identity on the rows it drives, the one the team admission
 /// authority leases ordinary work to.
@@ -78,6 +78,8 @@ pub(crate) struct CheckRequestRow {
     pub state_since_ms: i64,
     pub updated_ms: i64,
     pub publication_id: Option<String>,
+    /// The cadence that filed this request ([`CheckRequestSpec::cadence`]).
+    pub cadence: Option<String>,
 }
 
 impl CheckRequestRow {
@@ -112,6 +114,7 @@ impl CheckRequestRow {
             state_since_ms: row.i64(26)?,
             updated_ms: row.i64(27)?,
             publication_id: row.opt_text(28)?,
+            cadence: row.opt_text(29)?,
         })
     }
 
@@ -216,6 +219,11 @@ pub(crate) enum CheckRequestAnswer {
 }
 
 impl CheckRequestAnswer {
+    /// The answer a settled row recorded, when it recorded one.
+    pub(crate) fn of_settled(row: &CheckRequestRow) -> Option<Self> {
+        serde_json::from_str(row.outcome_json.as_deref()?).ok()
+    }
+
     fn settled_state(&self) -> &'static str {
         match self {
             Self::Complete { .. } => "recorded",
@@ -289,6 +297,10 @@ pub(crate) struct CheckRequestSpec {
     /// The authenticated principal that asked: a node URI or `operator`.
     pub requester_ref: String,
     pub requester_job_id: Option<String>,
+    /// The cadence filing it, when a cadence does rather than a requester:
+    /// `handoff` or `carried` ([`super::handoff`]). Stored on the row, and the
+    /// only thing code reads to know which cadence a row belongs to.
+    pub cadence: Option<&'static str>,
 }
 
 /// A filed request, as its requester is answered.
@@ -394,6 +406,49 @@ async fn requests_of_requester_in(
         .map_err(|error| error.to_string())?,
     );
     Ok(rows)
+}
+
+/// The requests one cadence filed for a job, newest first: what that cadence
+/// reads back to know which head each suite last ran on.
+pub(crate) async fn requests_of_cadence(
+    db: &LocalDb,
+    requester_job_id: &str,
+    cadence: &str,
+    limit: usize,
+) -> Result<Vec<CheckRequestRow>, String> {
+    db.query_all(
+        format!(
+            "SELECT {ROW_COLUMNS} FROM check_requests
+              WHERE requester_job_id=?1 AND cadence=?2
+              ORDER BY accepted_at_ms DESC, updated_ms DESC LIMIT ?3"
+        ),
+        (
+            requester_job_id.to_string(),
+            cadence.to_string(),
+            limit as i64,
+        ),
+        CheckRequestRow::from_row,
+    )
+    .await
+    .map_err(|error| format!("read the {cadence} requests of job {requester_job_id}: {error}"))
+}
+
+/// The open requests any cadence filed for one issue's jobs.
+pub(crate) async fn open_cadence_requests_of_issue(
+    db: &LocalDb,
+    issue_id: &str,
+) -> Result<Vec<CheckRequestRow>, String> {
+    db.query_all(
+        format!(
+            "SELECT {ROW_COLUMNS} FROM check_requests
+              WHERE state IN {OPEN_STATES} AND cadence IS NOT NULL
+                AND requester_job_id IN (SELECT id FROM jobs WHERE issue_id=?1)"
+        ),
+        (issue_id.to_string(),),
+        CheckRequestRow::from_row,
+    )
+    .await
+    .map_err(|error| format!("read the open requests of issue {issue_id}: {error}"))
 }
 
 /// Open requests this runner drives that are pinned to a machine, oldest
@@ -560,8 +615,8 @@ pub(crate) async fn accept(
             .execute(
                 "INSERT INTO check_requests(id,project_id,suite,revision_spec,subject_job_id,selector_json,retry,
                     consumer,requester_ref,requester_job_id,priority,state,commit_sha,pinned_executor,
-                    open_key,driven_by,accepted_at_ms,state_since_ms,updated_ms)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,'requested',?8,?9,'review_check','accepted',?10,?11,?12,?13,?14,?14,?14)
+                    open_key,driven_by,accepted_at_ms,state_since_ms,updated_ms,cadence)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,'requested',?8,?9,'review_check','accepted',?10,?11,?12,?13,?14,?14,?14,?15)
                  ON CONFLICT(open_key) DO NOTHING",
                 cairn_db::turso::params![
                     id.as_str(),
@@ -578,6 +633,7 @@ pub(crate) async fn accept(
                     key.as_str(),
                     this_runner(),
                     now,
+                    spec.cadence,
                 ],
             )
             .await
@@ -1165,7 +1221,7 @@ async fn settle(
         }
     }
     SETTLED.send_modify(|generation| *generation += 1);
-    let _ = orch;
+    super::handoff::on_settled(orch, row, &answer).await;
 }
 
 fn cancelled_answer(row: &CheckRequestRow, by: &str) -> CheckRequestAnswer {

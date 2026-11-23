@@ -110,6 +110,7 @@ use cairn_vcs::PublicationIdentity;
 
 mod board;
 mod failure;
+pub(crate) mod handoff;
 mod manual;
 mod planning;
 mod render;
@@ -1595,7 +1596,8 @@ pub(crate) async fn load_checks_contract_at_commit(
 /// The subset of planned checks that both apply to the change set AND run at the
 /// TURN-END cadence. `when:review` (including the `idle` legacy alias) runs at
 /// every turn-end; `when:write` never runs here (it is the mid-turn cadence),
-/// and neither does `when:main`, which no branch wave runs. An
+/// nor does `when:handoff`, which only a PR-artifact write arms
+/// ([`handoff`]), nor `when:main`, which no branch wave runs. An
 /// impact-scoped check that no changed file matches has `applies == false`. Pure,
 /// so the cadence gate is unit-tested.
 pub(crate) fn applicable_turn_end_checks(
@@ -1621,7 +1623,7 @@ pub(crate) fn turn_end_plans(
                 .get(&plan.name)
                 .is_some_and(|check| match check.when {
                     CheckWhen::Review => true,
-                    CheckWhen::Write | CheckWhen::Main => false,
+                    CheckWhen::Write | CheckWhen::Handoff | CheckWhen::Main => false,
                 })
         })
         .collect()

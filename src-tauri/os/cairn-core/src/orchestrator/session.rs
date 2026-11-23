@@ -1426,6 +1426,17 @@ fn build_project_checks_section(
     );
     if checks
         .values()
+        .any(|check| check.when == crate::config::project_settings::CheckWhen::Handoff)
+    {
+        out.push_str(
+            "- `when: handoff` checks run once per handoff: writing or patching your PR artifact \
+             files one lane per suite at your branch head, and nothing else runs them on your \
+             branch. Until then `/checks` reads them as `runs at handoff`; a check request runs \
+             one sooner.\n",
+        );
+    }
+    if checks
+        .values()
         .any(|check| check.when == crate::config::project_settings::CheckWhen::Main)
     {
         out.push_str(

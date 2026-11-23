@@ -3374,6 +3374,22 @@ impl Context<'_> {
                 warnings.push(format!("recording replay comparison failed: {error}"));
             }
         }
+        // The carried head owes its cheap lanes, never its handoff suites: each
+        // applicable write-cadence suite is filed at it, and one whose inputs
+        // the replay left unchanged is answered from the ledger.
+        {
+            let (orch, job_id) = (self.orch.clone(), relationship.owner_job_id.clone());
+            tokio::spawn(async move {
+                match crate::execution::checks::handoff::file_carried_head_lanes(&orch, &job_id)
+                    .await
+                {
+                    Ok(armed) => {
+                        log::info!("carried-head lanes for job {job_id}: {}", armed.summary())
+                    }
+                    Err(error) => log::warn!("carried-head lanes for job {job_id}: {error}"),
+                }
+            });
+        }
 
         if merge_mode && installed.head != installed.coordinate.base {
             let mut report = crate::jj::ReconcileReport::default();

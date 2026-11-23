@@ -592,6 +592,14 @@ pub enum CheckWhen {
     /// silently disabling every check for that project.
     #[serde(alias = "idle")]
     Review,
+    /// Handoff cadence: planned by no write wave and no turn-end wave. One
+    /// lane per suite is filed when a job whose node ships a pull request
+    /// writes its PR artifact, at the job's head at that moment, and a check
+    /// request answers it on demand. A base-advance replay does not re-arm it.
+    /// Its `mainCadence` block, when it has one, still runs it after merges.
+    /// Validation refuses it with `policy: gate`: before a handoff there is no
+    /// verdict at the tip for a gate to bite through.
+    Handoff,
     /// Main cadence only: never planned into a branch's write or turn-end
     /// wave. The check runs from its `mainCadence` block after merges, and on
     /// demand through a manual run. Validation refuses it without a
@@ -656,6 +664,7 @@ impl CheckWhen {
         match self {
             CheckWhen::Write => "write",
             CheckWhen::Review => "review",
+            CheckWhen::Handoff => "handoff",
             CheckWhen::Main => "main",
         }
     }
@@ -966,7 +975,10 @@ mod check_vocabulary_tests {
         assert_eq!(vocabulary.policy, ["advisory", "gate"]);
         // `idle` is the legacy alias of `review`; the vocabulary must accept
         // exactly what the deserializer does, alias included.
-        assert_eq!(vocabulary.when, ["write", "idle", "review", "main"]);
+        assert_eq!(
+            vocabulary.when,
+            ["write", "idle", "review", "handoff", "main"]
+        );
         assert_eq!(vocabulary.resource_class, ["shared", "exclusive"]);
         assert_eq!(vocabulary.tree, ["full", "impact"]);
         assert_eq!(vocabulary.verdict_platforms, ["macos", "linux", "windows"]);
@@ -1033,11 +1045,14 @@ mod check_vocabulary_tests {
         };
         assert_eq!(unsupported.field, "when");
         assert_eq!(unsupported.value, "landing");
-        assert_eq!(unsupported.known, ["write", "idle", "review", "main"]);
+        assert_eq!(
+            unsupported.known,
+            ["write", "idle", "review", "handoff", "main"]
+        );
         assert_eq!(
             unsupported.notice,
             "needs a newer Cairn: `when: landing` is not understood by this build \
-             (it knows write, idle, review, main)"
+             (it knows write, idle, review, handoff, main)"
         );
         assert_eq!(unsupported.declared, declared);
     }

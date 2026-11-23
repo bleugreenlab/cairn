@@ -450,6 +450,8 @@ pub(crate) async fn resolve_terminal(
     // not keep running against a merged/closed issue (CAIRN-2648).
     crate::execution::checks_turn_end::cancel_turn_end_checks_for_issue(orch, owning_db, issue_id)
         .await;
+    // And its handoff-cadence lanes, which run as check requests.
+    crate::execution::checks::handoff::cancel_for_issue(orch, owning_db, issue_id).await;
 
     settle_work_left_on_closed_sessions(orch, owning_db, &closed_sessions).await;
 

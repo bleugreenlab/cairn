@@ -707,6 +707,19 @@ pub(crate) async fn write_artifact_change(
     )
     .await?;
 
+    // A PR-artifact create or refresh is the handoff: it arms one wave of the
+    // handoff-cadence suites at the job's head now. Off the write's path, so
+    // the write never waits on head resolution or filing.
+    if is_create_pr_write {
+        let (orch, job_id) = (orch.clone(), job_id.clone());
+        tokio::spawn(async move {
+            match crate::execution::checks::handoff::arm_on_pr_artifact(&orch, &job_id).await {
+                Ok(armed) => log::info!("handoff checks for job {job_id}: {}", armed.summary()),
+                Err(error) => log::warn!("handoff checks for job {job_id}: {error}"),
+            }
+        });
+    }
+
     let mut deferred_pr_sync = None;
     let synced_pr_metadata = if let Some((title, body)) = create_pr_artifact_details(
         &effective_payload,

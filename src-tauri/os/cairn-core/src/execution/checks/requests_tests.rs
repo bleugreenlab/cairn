@@ -121,6 +121,7 @@ fn spec(suite: &str, revision: Option<&str>) -> CheckRequestSpec {
         retry: false,
         requester_ref: NODE_URI.into(),
         requester_job_id: Some(SUBJECT_JOB.into()),
+        cadence: None,
     }
 }
 

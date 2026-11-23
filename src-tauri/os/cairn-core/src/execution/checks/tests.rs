@@ -4243,7 +4243,10 @@ fn passing_baseline_delta_replans_changed_files_selector_to_new_file_only() {
 
 // --- the turn-end-cadence gate ----------------------------------------
 
-/// A checks map with one check per cadence, all scoped to `src/**`.
+/// A checks map with one check per cadence, all scoped to `src/**`. Every
+/// branch-wave selection test below therefore also proves that no write wave
+/// and no turn-end wave plans the handoff check `h`: only a PR-artifact write
+/// arms it.
 fn cadence_checks() -> HashMap<String, CheckCommand> {
     let mut checks = HashMap::new();
     checks.insert(
@@ -4253,6 +4256,10 @@ fn cadence_checks() -> HashMap<String, CheckCommand> {
     checks.insert(
         "r".to_string(),
         check("run-r", Some(&["src/**"]), CheckWhen::Review),
+    );
+    checks.insert(
+        "h".to_string(),
+        check("run-h", Some(&["src/**"]), CheckWhen::Handoff),
     );
     checks.insert(
         "m".to_string(),
@@ -4285,7 +4292,7 @@ fn turn_end_gate_runs_review_not_write() {
     assert_eq!(
         names,
         vec!["r"],
-        "review runs at every turn-end; write never runs here"
+        "review runs at every turn-end; write and handoff never run here"
     );
 }
 

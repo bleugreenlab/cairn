@@ -1333,11 +1333,17 @@ async fn live_statuses(
             .contract_at_commit(Path::new(&coords.repository_path), &logical_head)
             .await?;
         clock.lap("contract");
+        let handoff =
+            crate::execution::checks::handoff::handoff_lanes(db, coords, job_id, &logical_head)
+                .await;
         let statuses = assemble_statuses(
             orch,
             job_id,
             &contract.checks,
-            LaneVerdicts::default(),
+            LaneVerdicts {
+                handoff: Some(handoff),
+                ..LaneVerdicts::default()
+            },
             None,
             &orch.recent_turn_end_check_request_ids(job_id),
             cadence,
@@ -1382,6 +1388,8 @@ async fn live_statuses(
     )
     .await;
     clock.lap("base_attribution");
+    let handoff =
+        crate::execution::checks::handoff::handoff_lanes(db, coords, job_id, &plan.head).await;
     let statuses = assemble_statuses(
         orch,
         job_id,
@@ -1390,6 +1398,7 @@ async fn live_statuses(
             rows: rows_by_name(rows),
             verified_on: HashMap::new(),
             attributions,
+            handoff: Some(handoff),
         },
         Some(&plan.applicable_names),
         &status.request_ids,
@@ -1534,6 +1543,7 @@ async fn retired_statuses(
             rows: rows_by_name(rows),
             verified_on: HashMap::new(),
             attributions,
+            handoff: None,
         },
         Some(&applicable),
         &orch.recent_turn_end_check_request_ids(job_id),
@@ -1580,11 +1590,40 @@ fn applicable_check_names(
         .collect()
 }
 
+/// The checks a job's `head` declares, and which of them apply to its change
+/// from the job's live fork point (`None` when that fork point or the change
+/// is unreadable). `None` overall when the contract at `head` is unreadable.
+pub(crate) async fn declared_and_applicable_at(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_id: &str,
+    coords: &JobCoords,
+    head: &str,
+) -> Option<(HashMap<String, CheckCommand>, Option<HashSet<String>>)> {
+    let contract = orch
+        .node_check_status_cache
+        .contract_at_commit(Path::new(&coords.repository_path), head)
+        .await?;
+    let base =
+        crate::diff::live_job_branch_range(db, job_id, &orch.jj_binary_path, &orch.config_dir)
+            .await
+            .inspect_err(|error| log::debug!("node {job_id}: no live fork point ({error})"))
+            .ok()
+            .flatten()
+            .map(|range| range.base)
+            .filter(|base| base != head);
+    let applicable = match base {
+        Some(base) => applicable_names_at(orch, coords, head, &base).await,
+        None => None,
+    };
+    Some((contract.checks.clone(), applicable))
+}
+
 /// Which of the checks `head` declares apply to its change from `base`, as
 /// [`statuses_at_range`] decides it, read from the store by commit so it still
 /// answers once the node's branch has retired. `None` when the contract, either
 /// commit, or the change between them is unreadable.
-async fn applicable_names_at(
+pub(crate) async fn applicable_names_at(
     orch: &Orchestrator,
     coords: &JobCoords,
     head: &str,
@@ -1781,6 +1820,7 @@ async fn statuses_at_range(
     let project_root = std::path::PathBuf::from(&coords.repository_path);
     let logical_repository = crate::jj::project_store_dir(&orch.config_dir, &project_root);
     let live_base = base.clone();
+    let handoff_head = logical_head.clone();
     // The status a node renders must be the suite its own cadences plan, so the
     // contract comes from the node's logical head — the same commit the cadences
     // read it from. Reading the project checkout here would show a node checks
@@ -1930,6 +1970,8 @@ async fn statuses_at_range(
         None => HashMap::new(),
     };
     clock.lap("base_attribution");
+    let handoff =
+        crate::execution::checks::handoff::handoff_lanes(db, coords, job_id, &handoff_head).await;
 
     let recent_request_ids;
     let request_ids = match wave {
@@ -1947,6 +1989,7 @@ async fn statuses_at_range(
             rows: rows_by_name,
             verified_on: HashMap::new(),
             attributions,
+            handoff: Some(handoff),
         },
         applicable_names.as_ref(),
         request_ids,
@@ -1989,6 +2032,10 @@ struct LaneVerdicts {
     rows: HashMap<String, LaneRow>,
     verified_on: HashMap<String, VerifiedHead>,
     attributions: HashMap<String, BaseAttribution>,
+    /// The handoff lanes the job filed, for a projection of its live head;
+    /// `None` for a retired node, whose rowless handoff lane is simply not
+    /// applicable.
+    handoff: Option<crate::execution::checks::handoff::HandoffLanes>,
 }
 
 /// One status row per configured check, in name order, from what the branch
@@ -2011,6 +2058,7 @@ fn assemble_statuses(
         rows: rows_by_name,
         verified_on,
         attributions,
+        handoff,
     } = verdicts;
     let mut names = checks.keys().cloned().collect::<Vec<_>>();
     names.sort();
@@ -2023,9 +2071,23 @@ fn assemble_statuses(
             // from this tree's plan; it will never run, so it is neither
             // running nor pending. No branch wave runs a main-only check, so
             // without a row it is not applicable here either, and says why.
+            // Nor does any wave run a handoff check: without a row it says
+            // when it runs, or which head it last ran on, and like a main-only
+            // lane it neither holds a wait open nor counts as missing.
             let main_only = check.when == CheckWhen::Main;
-            let not_applicable =
-                main_only || applicable_names.is_some_and(|names| !names.contains(&name));
+            let impact_excluded = applicable_names.is_some_and(|names| !names.contains(&name));
+            let handoff_notice = (check.when == CheckWhen::Handoff && !impact_excluded)
+                .then(|| {
+                    handoff.as_ref().map(|lanes| {
+                        crate::execution::checks::handoff::lane_notice(
+                            &name,
+                            lanes.latest.get(&name),
+                            &lanes.head,
+                        )
+                    })
+                })
+                .flatten();
+            let not_applicable = main_only || check.when == CheckWhen::Handoff || impact_excluded;
 
             // `LaneEvidence::Recorded` outranks everything below, and this
             // returns before the `started` probe so a lane that already holds
@@ -2091,7 +2153,9 @@ fn assemble_statuses(
                 .as_ref()
                 .or(wave_board)
                 .and_then(|board| board.lane_phase(&name).executor);
-            let notice = main_only.then(|| main_only_notice(&name));
+            let notice = main_only
+                .then(|| main_only_notice(&name))
+                .or(handoff_notice);
             NodeCheckStatus {
                 observation_id: None,
                 job_id: job_id.to_string(),
@@ -5814,6 +5878,78 @@ mod complete_input_projection_tests {
                 "the waiter must still demand current evidence"
             );
         }
+    }
+
+    /// A handoff suite with no verdict at the head says when it runs before
+    /// the node hands off, and after a base-advance replay moves the head on,
+    /// which head it last ran on and what it said there. Neither reads as
+    /// pending, absent, running or passed, so neither holds a checks wait
+    /// open or counts as a missing verdict, even while a review wave runs.
+    #[tokio::test]
+    async fn a_rowless_handoff_lane_renders_as_runs_at_handoff_or_not_checked_since() {
+        use crate::execution::checks::handoff::{HandoffLanes, HandoffStanding};
+        let mut f = Fixture::new("rust-tests").await;
+        f.checks = HashMap::from([(
+            "rust-tests".to_string(),
+            serde_yaml::from_str("command: cargo test\nwhen: handoff\n").unwrap(),
+        )]);
+        let applicable = HashSet::from(["rust-tests".to_string()]);
+        let render = |handoff: HandoffLanes| {
+            let statuses = assemble_statuses(
+                &f.orch,
+                "job-a",
+                &f.checks,
+                LaneVerdicts {
+                    handoff: Some(handoff),
+                    ..LaneVerdicts::default()
+                },
+                Some(&applicable),
+                &HashMap::new(),
+                WaveCadence::reviewing_for_test(),
+                None,
+            );
+            let lane = &statuses[0];
+            assert_eq!(lane.state, NodeCheckState::NotApplicable);
+            assert_eq!(lane.when, "handoff");
+            assert_eq!(
+                lane_existence(lane, WaveCadence::reviewing_for_test()),
+                None,
+                "never a lane a wait could hold open for"
+            );
+            crate::execution::checks_turn_end::format_checks_section(
+                &statuses,
+                WaveCadence::reviewing_for_test(),
+            )
+            .unwrap()
+        };
+        let head = "cccccccccccccccccccc".to_string();
+
+        let before = render(HandoffLanes {
+            head: head.clone(),
+            latest: HashMap::new(),
+        });
+        assert!(before.contains("- rust-tests: runs at handoff"), "{before}");
+        for word in ["pending", "absent", "running", "\u{2713}"] {
+            assert!(!before.contains(word), "{word}: {before}");
+        }
+
+        let replayed = render(HandoffLanes {
+            head,
+            latest: HashMap::from([(
+                "rust-tests".to_string(),
+                HandoffStanding {
+                    commit: Some("aaaaaaaaaaaaaaaaaaaa".into()),
+                    open: false,
+                    uri: "cairn://p/proj/check-requests/r1".into(),
+                    words: "recorded passed (fresh), cairn://p/proj/check-results/o1".into(),
+                },
+            )]),
+        });
+        assert!(
+            replayed.contains("- rust-tests: not checked since handoff at aaaaaaaaaaaa"),
+            "{replayed}"
+        );
+        assert!(!replayed.contains("\u{2713}"), "{replayed}");
     }
 
     /// cairn/4971's write half. A write wave in flight no longer makes every

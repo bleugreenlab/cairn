@@ -1190,6 +1190,24 @@ async fn deliver_turn_check_outcomes(
     })
 }
 
+/// One handoff lane's verdict, delivered to its node through the same notice
+/// identity and wake rule as a turn-end wave, under a key of its own per
+/// suite (`handoff-checks:<uri>#<suite>`): handoff lanes settle one at a time,
+/// so each is compared with what the node was last told about that suite.
+pub(crate) async fn deliver_handoff_outcome(
+    db: &LocalDb,
+    recipient: &str,
+    checks_uri: &str,
+    suite: &str,
+    tree_hash: &str,
+    outcome: CheckOutcome,
+) -> Result<Option<attention_push::Wake>, String> {
+    let notice = TurnCheckNotice::of(tree_hash, std::slice::from_ref(&outcome));
+    let key = format!("handoff-checks:{checks_uri}#{suite}");
+    let (_, wake) = persist_check_delivery_under(db, recipient, checks_uri, &key, &notice).await?;
+    Ok(wake)
+}
+
 async fn persist_turn_check_delivery(
     db: &LocalDb,
     recipient: &str,
@@ -1197,6 +1215,17 @@ async fn persist_turn_check_delivery(
     notice: &TurnCheckNotice,
 ) -> Result<(TurnCheckDelivery, Option<attention_push::Wake>), String> {
     let key = format!("turn-checks:{checks_uri}");
+    persist_check_delivery_under(db, recipient, checks_uri, &key, notice).await
+}
+
+async fn persist_check_delivery_under(
+    db: &LocalDb,
+    recipient: &str,
+    checks_uri: &str,
+    key: &str,
+    notice: &TurnCheckNotice,
+) -> Result<(TurnCheckDelivery, Option<attention_push::Wake>), String> {
+    let key = key.to_string();
     let latest = attention_push::latest_push_fingerprint(db, recipient, &key)
         .await
         .map_err(|error| format!("failed to read turn-check fingerprint: {error}"))?
@@ -2717,8 +2746,9 @@ async fn run_turn_end_checks_inner(
     } = deliver_turn_check_outcomes(&owning, job_id, &checks_uri, &tree_hash, &outcomes).await?;
 
     log::info!(
-        "turn-end checks for job {}: completed \u{2014} [{}] \u{2192} {}",
+        "turn-end checks for job {}: completed{} \u{2014} [{}] \u{2192} {}",
         short_id(job_id),
+        if any_genuine_failed { " red" } else { "" },
         verdicts.join(", "),
         match effective_wake {
             Some(attention_push::Wake::Passive) => "passive",
@@ -3185,7 +3215,10 @@ const TURN_CHECK_NEWS_VERSION: &str = "turn-check-news-v1";
 /// Non-verdict lanes are excluded exactly as in [`turn_check_fingerprint`]:
 /// the builder has no standing over infrastructure churn (cairn/4820).
 fn turn_check_news(outcomes: &[CheckOutcome]) -> Option<String> {
-    let canonical: Vec<(String, &str, Option<Vec<(String, String)>>)> = actionable_lanes(outcomes)?
+    /// A lane's name, its verdict, and for a red test lane its failing tests
+    /// with their signatures.
+    type NewsLane<'a> = (String, &'a str, Option<Vec<(String, String)>>);
+    let canonical: Vec<NewsLane> = actionable_lanes(outcomes)?
         .into_iter()
         .map(|(name, verdict, outcome)| {
             let failing = (verdict == "fail")
@@ -3540,7 +3573,7 @@ async fn latest_attempt_absence(orch: &Orchestrator, job_id: &str) -> String {
 /// DB or worktree. `cadence` is the waves in flight, which is what separates a
 /// lane still to come (`pending`) from one nothing will produce (`absent`).
 #[cfg(test)]
-fn format_checks_section(
+pub(crate) fn format_checks_section(
     statuses: &[crate::execution::checks_status::NodeCheckStatus],
     cadence: crate::execution::checks_status::WaveCadence,
 ) -> Option<String> {
@@ -3728,6 +3761,16 @@ fn push_check_lines(
                     None => out.push_str(&format!("- {}: pending\n", status.name)),
                 },
             },
+            NodeCheckState::NotApplicable
+                if status.when == crate::config::project_settings::CheckWhen::Handoff.as_str()
+                    && status.notice.is_some() =>
+            {
+                out.push_str(&format!(
+                    "- {}: {}\n",
+                    status.name,
+                    status.notice.as_deref().unwrap_or_default()
+                ));
+            }
             NodeCheckState::NotApplicable
                 if status.when == crate::config::project_settings::CheckWhen::Main.as_str() =>
             {
