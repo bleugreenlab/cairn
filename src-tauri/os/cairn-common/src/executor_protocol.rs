@@ -8486,6 +8486,13 @@ pub struct LearnedResourceEstimate {
 /// derives model pools from it (`fleet::pools`); placement (cairn/5728) reads
 /// those pools to decide where a model runs, which crosses no executor frame.
 ///
+/// cairn/5904 does not move the number. `BuildJobs::js_test_workers` is an
+/// optional defaulted field: an older executor omits it, so the runner shows
+/// no JS ceiling instead of claiming an unapplied policy. An older runner
+/// ignores it. The executor sets CAIRN_JS_TEST_WORKERS and VITEST_MAX_WORKERS
+/// over its own child environment; neither peer decodes an existing field
+/// differently, and this cooperative policy is not required for placement.
+///
 /// cairn/5768 does not move the number. No frame, variant, field or
 /// serialized form changes. The executor now also sets `RUST_TEST_THREADS` in
 /// the environment of the child it spawns, to the build jobs where the command
@@ -12451,6 +12458,15 @@ mod lane_charge_tests {
         }
         .with_test_threads(&lane);
         assert_eq!((narrow.jobs, narrow.test_threads()), (1, 5));
+        assert!(narrow.describe().contains("JS worker ceiling 5"));
+        assert_eq!(narrow.shared_by(2).js_test_workers, Some(2));
+        let legacy: BuildJobs = serde_json::from_str(r#"{"jobs":2,"cpuWidth":4}"#).unwrap();
+        assert_eq!(legacy.js_test_workers, None);
+        assert!(!legacy.describe().contains("JS"));
+        assert_eq!(
+            serde_json::from_str::<BuildJobs>(&serde_json::to_string(&narrow).unwrap()).unwrap(),
+            narrow
+        );
         assert!(narrow.describe().ends_with("; tests 5 at a time"));
 
         // Unmeasured, the tests stay at the build jobs, as their charge stays
@@ -15026,6 +15042,11 @@ pub struct BuildJobs {
     /// The width the command runs at: its compile slot's, or its share of the
     /// slot for an item of a parallel batch.
     pub cpu_width: u32,
+    /// Default ceiling for `CAIRN_JS_TEST_WORKERS` and `VITEST_MAX_WORKERS`.
+    /// Caller-specified smaller values are preserved. Absent on records from
+    /// executors that did not apply a JavaScript worker policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js_test_workers: Option<u32>,
     /// What `NEXTEST_TEST_THREADS` and `RUST_TEST_THREADS` were set to where
     /// the command did not set them ([`Self::with_test_threads`]). `None` on a
     /// record from an executor that predates it, which set them to `jobs`;
@@ -15103,6 +15124,7 @@ impl BuildJobs {
         Self {
             jobs: cpu_width,
             cpu_width,
+            js_test_workers: Some(cpu_width),
             test_threads: None,
             command_sets_jobs: None,
             beside_company: false,
@@ -15158,6 +15180,9 @@ impl BuildJobs {
         shared.test_threads = self
             .test_threads
             .map(|threads| (threads / items).clamp(1, shared.cpu_width));
+        shared.js_test_workers = self
+            .js_test_workers
+            .map(|workers| (workers / items).clamp(1, shared.cpu_width));
         shared.command_sets_jobs = self.command_sets_jobs;
         shared.beside_company = self.beside_company;
         shared
@@ -15178,6 +15203,10 @@ impl BuildJobs {
                 if self.jobs == 1 { "" } else { "s" },
                 self.cpu_width
             )
+        };
+        let jobs = match self.js_test_workers {
+            Some(workers) => format!("{jobs}; JS worker ceiling {workers}"),
+            None => jobs,
         };
         match self.test_threads {
             Some(threads) if threads != self.jobs => format!("{jobs}; tests {threads} at a time"),
@@ -28798,7 +28827,10 @@ mod tests {
     fn build_jobs_are_the_compile_slot_and_split_among_parallel_items() {
         let slot = BuildJobs::new(8);
         assert_eq!((slot.jobs, slot.cpu_width), (8, 8));
-        assert_eq!(slot.describe(), "8 build jobs, the compile slot's width");
+        assert_eq!(
+            slot.describe(),
+            "8 build jobs, the compile slot's width; JS worker ceiling 8"
+        );
         let shared = slot.shared_by(2);
         assert_eq!((shared.cpu_width, shared.jobs), (4, 4));
         assert_eq!(slot.shared_by(16).jobs, 1, "never zero");

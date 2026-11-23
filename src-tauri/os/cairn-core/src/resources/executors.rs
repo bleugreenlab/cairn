@@ -16222,7 +16222,7 @@ mod running_now_tests {
             &crate::fleet::Fleet::default(),
         );
         assert!(
-            rendered.contains("usage not measured yet; 8 build jobs, the compile slot's width\n"),
+            rendered.contains("usage not measured yet; 8 build jobs, the compile slot's width; JS worker ceiling 8\n"),
             "{rendered}"
         );
         // An executor that does not report build jobs leaves the row as it was.
