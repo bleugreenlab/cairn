@@ -64,8 +64,8 @@ use cairn_common::wire_vocabulary::CellPriority;
 pub(crate) type MachineId = String;
 pub(crate) type EntryId = String;
 
-// Opening room frames race after attachment. Give an attached preferred
-// machine one short opportunity to speak, even for immediately entitled lanes.
+// Opening room frames race after attachment. A preference gets one short
+// opportunity, even for immediately entitled lanes, never a wait for load.
 const FIRST_ROOM_PREFERENCE_MS: u64 = 5_000;
 
 /// What one entry needs on one machine it may run on.
@@ -101,9 +101,9 @@ impl Preference {
     }
 }
 
-/// The memory-safety order of the machines an entry may run on: a machine
-/// may take the entry only while no machine ahead of it on this key could
-/// hold it ([`Dispatcher::blocker`]). Each part is a fact about the
+/// The memory-safety order of fitting rooms and headroom choices. A preferred
+/// host's empty capacity does not delay another host's fitting room
+/// ([`Dispatcher::blocker`]). Each part is a fact about the
 /// machine's size against this work, worked out once when the entry's needs
 /// are, never a reading of its load.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -133,7 +133,7 @@ impl HardKey {
     }
 
     /// The machine would run the work at a size it was not measured to hold.
-    /// Such a machine waits for a better one that is away or silent, too.
+    /// Its fitting room may wait briefly for a better host's opening frame.
     fn disfavoured(&self) -> bool {
         self.deferred || self.clamped
     }
@@ -572,22 +572,21 @@ impl Dispatcher {
         self.blocker(entry, executor_id, now_unix_ms)
     }
 
-    /// The remaining first-room grace and its reason, when the named blocker
-    /// is an affinity rather than a memory-safety hold.
+    /// Remaining grace, preference reason, and its fixed end. The same
+    /// deadline governs memory and affinity preferences over fitting room.
     pub(crate) fn first_room_wait(
         &self,
         entry_id: &str,
         executor_id: &str,
         now_unix_ms: u64,
-    ) -> Option<(u64, &'static str)> {
+    ) -> Option<(u64, &'static str, u64)> {
         let entry = self.entries.get(entry_id)?;
         let by = self.blocker(entry, executor_id, now_unix_ms)?;
         let here = entry.waiting.candidates.get(executor_id)?;
         let preferred = entry.waiting.candidates.get(by)?;
-        if here.key.order() != preferred.key.order() {
-            return None;
-        }
-        let reason = if here.preference.restart_demoted != preferred.preference.restart_demoted {
+        let reason = if here.key.order() != preferred.key.order() {
+            "memory capacity"
+        } else if here.preference.restart_demoted != preferred.preference.restart_demoted {
             "surviving runner restarts"
         } else {
             "its dedicated service or publication role"
@@ -595,6 +594,7 @@ impl Dispatcher {
         Some((
             entry.prefer_until_unix_ms.saturating_sub(now_unix_ms),
             reason,
+            entry.prefer_until_unix_ms,
         ))
     }
 
@@ -603,8 +603,13 @@ impl Dispatcher {
     /// is named, by key and then name. Nothing keeps off work its caller
     /// placed (pinned, named, or kept home).
     ///
-    /// A machine that has announced room keeps the entry off only while that
-    /// room's capacity fits the entry's need there. Offered work, it keeps
+    /// Fitting room takes precedence over a full preferred host. During the
+    /// fixed opening grace only a preferred host whose remaining room fits,
+    /// or a silent host for which this entry is next, may keep it off. After
+    /// that grace no preference keeps fitting room idle.
+    ///
+    /// When this machine does not fit, hold choices still respect capacity:
+    /// a preferred host whose capacity fits keeps
     /// the entry off; one that refused the entry under the figures it still
     /// announces does so only until the entry's reserve-from instant (D1), so
     /// a refusal that moves no figures cannot hold the entry to its horizon.
@@ -632,6 +637,26 @@ impl Dispatcher {
         let here = waiting.candidates.get(executor_id)?.key;
         let disfavoured = here.disfavoured();
         let early = now_unix_ms < waiting.reserve_from_unix_ms;
+        let fits_here = self
+            .machines
+            .get(executor_id)
+            .and_then(|m| m.room.as_ref())
+            .is_some_and(|a| {
+                self.fits_left(
+                    entry,
+                    executor_id,
+                    &a.left,
+                    &waiting.candidates[executor_id].need,
+                    now_unix_ms,
+                )
+            });
+        // Capacity describes an empty host, not a promise about when running
+        // work will end. Never spend fitting room waiting for that promise.
+        // Opening-frame races get one fixed grace, never renewed by a frame,
+        // a refusal, a new candidate, or a different preferred machine.
+        if fits_here && now_unix_ms >= entry.prefer_until_unix_ms {
+            return None;
+        }
         waiting
             .candidates
             .iter()
@@ -641,10 +666,26 @@ impl Dispatcher {
                         .machines
                         .get(*id)
                         .is_some_and(|machine| match &machine.room {
-                            None => disfavoured && early,
+                            None => {
+                                disfavoured
+                                    && early
+                                    && (!fits_here || !better.away)
+                                    && self.next_for_opening_room(entry, id, now_unix_ms)
+                            }
                             Some(announced) => {
                                 let silent = better.away
                                     || entry.turned_away_under(id, announced.figures_seq);
+                                if fits_here {
+                                    return !silent
+                                        && !entry.refused_under(id, announced.figures_seq)
+                                        && self.fits_left(
+                                            entry,
+                                            id,
+                                            &announced.left,
+                                            &better.need,
+                                            now_unix_ms,
+                                        );
+                                }
                                 fits(&announced.capacity, &better.need).is_ok()
                                     && if silent {
                                         disfavoured && early
@@ -671,6 +712,7 @@ impl Dispatcher {
                             && better.key.order() == here.key.order()
                             && better.preference.order() < here.preference.order()
                             && self.machines.get(*id).is_some_and(|m| m.room.is_none())
+                            && self.next_for_opening_room(entry, id, now_unix_ms)
                     })
                     .min_by(|a, b| {
                         a.1.preference
@@ -679,6 +721,22 @@ impl Dispatcher {
                             .then(a.0.cmp(b.0))
                     })
                     .map(|(id, _)| id.as_str())
+            })
+    }
+
+    /// A silent host gets grace for only its next waiting entry, not every
+    /// request that could use its eventual room. Standing lanes lead as they
+    /// do in an announced-room walk.
+    fn next_for_opening_room(&self, entry: &Entry, executor_id: &str, now: u64) -> bool {
+        self.eligible
+            .get(executor_id)
+            .into_iter()
+            .flatten()
+            .all(|id| {
+                let other = &self.entries[id];
+                other.standing != Standing::Waiting
+                    || other.waiting.candidates[executor_id].away
+                    || other.waiting.rank(now) <= entry.waiting.rank(now)
             })
     }
 
@@ -1071,14 +1129,10 @@ impl Dispatcher {
             self.entitled.insert(entry_id.clone());
         }
         let prefer_until_unix_ms = now_unix_ms.saturating_add(FIRST_ROOM_PREFERENCE_MS);
-        if waiting
-            .candidates
-            .values()
-            .any(|c| c.preference != Preference::default())
-        {
-            self.deadlines
-                .insert((prefer_until_unix_ms, entry_id.clone()));
-        }
+        // Candidates can arrive after enqueue. Arm the bound now so the
+        // deadline task cannot sleep past it while awaiting the horizon.
+        self.deadlines
+            .insert((prefer_until_unix_ms, entry_id.clone()));
         let machines: Vec<MachineId> = waiting.candidates.keys().cloned().collect();
         self.entries.insert(
             entry_id.clone(),
@@ -1117,7 +1171,7 @@ impl Dispatcher {
                 .waiting
                 .candidates
                 .values()
-                .any(|c| c.preference != Preference::default())
+                .any(|c| c.preference != Preference::default() || c.key != HardKey::default())
         {
             self.deadlines
                 .insert((entry.prefer_until_unix_ms, entry_id.to_string()));
@@ -1397,7 +1451,8 @@ impl Dispatcher {
     }
 
     /// Every deadline at or before `now`: a horizon expires its entry, a
-    /// reserve-from instant makes it entitled to hold room.
+    /// reserve-from instant makes it entitled to hold room, and an opening
+    /// preference deadline places it without that preference.
     pub(crate) fn deadline_reached(
         &mut self,
         now_unix_ms: u64,
@@ -1416,6 +1471,33 @@ impl Dispatcher {
                 effects.absorb(self.withdraw(&entry_id, now_unix_ms, admit));
                 effects.expired.push(entry_id);
             } else {
+                // Ending a preference can only unlock fitting room. Do not
+                // re-place entries whose refusals still stand or whose hosts
+                // are still full; their next room change will place them.
+                let preference_only =
+                    at == entry.prefer_until_unix_ms && at != entry.waiting.reserve_from_unix_ms;
+                if preference_only
+                    && (entry.standing != Standing::Waiting
+                        || !entry.waiting.candidates.iter().any(|(id, candidate)| {
+                            !candidate.away
+                                && self
+                                    .machines
+                                    .get(id)
+                                    .and_then(|m| m.room.as_ref())
+                                    .is_some_and(|a| {
+                                        !entry.refused_under(id, a.figures_seq)
+                                            && self.fits_left(
+                                                entry,
+                                                id,
+                                                &a.left,
+                                                &candidate.need,
+                                                now_unix_ms,
+                                            )
+                                    })
+                        }))
+                {
+                    continue;
+                }
                 if entry.waiting.entitled(now_unix_ms) {
                     self.entitled.insert(entry_id.clone());
                 }
@@ -1485,13 +1567,14 @@ impl Dispatcher {
                 continue;
             }
             // Only entries touched by this machine's walk are considered.
-            // If affinity has a choice, use the same fitting-room choice as
-            // join; otherwise announcement order would erase the preference.
+            // Use the same fitting-room ranking as join, including after
+            // opening grace ends; announcement order must not erase it.
             let here = &entry.waiting.candidates[executor_id];
             if entry.waiting.candidates.iter().any(|(id, other)| {
                 !other.away
-                    && other.key.order() == here.key.order()
-                    && other.preference.order() < here.preference.order()
+                    && (other.key.order() < here.key.order()
+                        || (other.key.order() == here.key.order()
+                            && other.preference.order() < here.preference.order()))
                     && self.machines.contains_key(id)
             }) {
                 effects.absorb(self.place(&entry_id, now_unix_ms, admit));
@@ -2205,7 +2288,7 @@ mod tests {
         assert!(d.stranded(0).is_empty());
         assert_eq!(
             d.first_room_wait("e0", "other", 0)
-                .map(|(remaining, _)| remaining),
+                .map(|(remaining, _, _)| remaining),
             Some(FIRST_ROOM_PREFERENCE_MS)
         );
         assert_eq!(
@@ -2931,6 +3014,11 @@ mod tests {
         busy.cores.committed = 32;
         dispatcher.set_room("m", 1, 1, busy, 0, &mut yes());
         dispatcher.enqueue(waiting(0, &["m"], &need(8, 8)), 0, &mut yes());
+        assert_eq!(dispatcher.next_deadline(), Some(FIRST_ROOM_PREFERENCE_MS));
+        assert!(dispatcher
+            .deadline_reached(FIRST_ROOM_PREFERENCE_MS, &mut yes())
+            .assigned
+            .is_empty());
         assert_eq!(dispatcher.next_deadline(), Some(5 * HOUR));
         let effects = dispatcher.deadline_reached(5 * HOUR, &mut yes());
         assert!(effects.assigned[0].reserve);
@@ -2980,13 +3068,56 @@ mod tests {
             .collect()
     }
 
-    /// A machine on which the work would run deferred on a class prior, or
-    /// clamped below its measured demand, does not take it while a machine
-    /// ahead of it on the hard key could hold it, though that machine is
-    /// busy and the disfavoured one idle. The better machine is offered it
-    /// the moment it announces room that fits.
     #[test]
-    fn a_disfavoured_machine_does_not_take_work_a_busy_better_machine_could_hold() {
+    fn parked_requests_take_fitting_room_instead_of_a_full_memory_preferred_machine() {
+        let mut d = Dispatcher::default();
+        for id in ["big", "small"] {
+            d.attach(id, 1);
+        }
+        d.set_room("big", 1, 1, busy(32, 128), 0, &mut yes());
+        d.set_room("small", 1, 1, busy(32, 64), 0, &mut yes());
+        for id in 0..4 {
+            let mut w = keyed(
+                keyed(
+                    waiting(id, &["big", "small"], &need(8, 8)),
+                    "big",
+                    unmeasured(120),
+                ),
+                "small",
+                unmeasured(12),
+            );
+            w.reserve_from_unix_ms = 0;
+            w.standing = id == 3;
+            let offered = d.enqueue(w, 0, &mut yes());
+            for offer in offered.assigned {
+                d.decline(
+                    &offer.entry_id,
+                    &offer.executor_id,
+                    offer.seq,
+                    0,
+                    &mut yes(),
+                );
+            }
+        }
+        for id in 0..4 {
+            assert_eq!(d.reserved_on(&format!("e{id}")), Some("big"));
+        }
+        // Changed figures retire the refusals, but do not grant any hold.
+        // The sticky reservations must not pin all four entries here again.
+        d.set_room("big", 1, 2, busy(32, 120), 1, &mut yes());
+        let freed = d.set_room("small", 1, 2, room(32, 64), 1, &mut yes());
+        assert_eq!(freed.assigned.len(), 4);
+        assert_eq!(freed.assigned[0].entry_id, "e3");
+        assert!(freed
+            .assigned
+            .iter()
+            .all(|a| a.executor_id == "small" && !a.reserve));
+        assert!(d.stranded(1).is_empty());
+    }
+
+    /// A full preferred host never strands fitting room on a lower-ranked host.
+    #[test]
+    fn a_disfavoured_machine_takes_fitting_room_while_the_better_machine_is_busy() {
         for key in [CLAMPED, DEFERRED] {
             let mut dispatcher = Dispatcher::default();
             dispatcher.attach("big", 1);
@@ -2997,19 +3128,18 @@ mod tests {
             let announced = dispatcher.set_room("small", 1, 1, room(32, 64), 0, &mut yes());
             assert_eq!(
                 (assigned_to(&joined), assigned_to(&announced)),
-                (vec![], vec![]),
-                "{key:?}: the idle small machine waits behind the busy big one"
+                (vec![], vec![("e0", "small")]),
+                "{key:?}: fitting room wins over full capacity"
             );
             assert!(dispatcher.stranded(0).is_empty());
             let freed = dispatcher.set_room("big", 1, 2, room(32, 128), 0, &mut yes());
-            assert_eq!(assigned_to(&freed), vec![("e0", "big")], "{key:?}");
+            assert!(freed.assigned.is_empty());
         }
     }
 
-    /// A Rust compile nothing has measured goes to the machine that can give
-    /// one process the most, not to a smaller one that is idle now.
+    /// Memory capacity ranks fitting hosts, not future availability.
     #[test]
-    fn an_unmeasured_compile_waits_for_the_largest_single_process_capacity() {
+    fn an_unmeasured_compile_takes_fitting_room_without_waiting_for_full_capacity() {
         let mut dispatcher = Dispatcher::default();
         dispatcher.attach("big", 1);
         dispatcher.attach("small", 1);
@@ -3025,10 +3155,10 @@ mod tests {
             unmeasured(12),
         );
         let joined = dispatcher.enqueue(entry, 0, &mut yes());
-        assert_eq!(assigned_to(&joined), vec![]);
+        assert_eq!(assigned_to(&joined), vec![("e0", "small")]);
         assert!(dispatcher.stranded(0).is_empty());
         let freed = dispatcher.set_room("big", 1, 2, room(32, 128), 0, &mut yes());
-        assert_eq!(assigned_to(&freed), vec![("e0", "big")]);
+        assert!(freed.assigned.is_empty());
     }
 
     /// Warmth orders machines only within one hard key: a warm machine that
@@ -3076,7 +3206,6 @@ mod tests {
         let mut dispatcher = Dispatcher::default();
         dispatcher.attach("big", 1);
         dispatcher.attach("small", 1);
-        dispatcher.set_room("big", 1, 1, busy(32, 128), 0, &mut yes());
         dispatcher.set_room("small", 1, 1, room(32, 64), 0, &mut yes());
         let entry = keyed(waiting(0, &["big", "small"], &need(8, 8)), "small", CLAMPED);
         assert_eq!(dispatcher.enqueue(entry, 0, &mut yes()), Effects::default());
@@ -3085,11 +3214,9 @@ mod tests {
         assert!(dispatcher.stranded(0).is_empty());
     }
 
-    /// A better machine that refused the entry under the figures it still
-    /// announces keeps it off the disfavoured machine only until the entry's
-    /// reserve-from instant (D1): then the disfavoured machine takes it.
+    /// A refusal releases a fitting alternative immediately.
     #[test]
-    fn a_refusing_better_machine_holds_the_entry_off_until_its_reserve_from_instant() {
+    fn a_refusing_better_machine_does_not_hold_off_fitting_room() {
         let mut dispatcher = Dispatcher::default();
         dispatcher.attach("big", 1);
         dispatcher.attach("small", 1);
@@ -3099,18 +3226,14 @@ mod tests {
         let joined = dispatcher.enqueue(entry, 0, &mut yes());
         assert_eq!(assigned_to(&joined), vec![("e0", "big")]);
         let declined = dispatcher.decline("e0", "big", 1, 0, &mut yes());
-        assert_eq!(assigned_to(&declined), vec![], "held off small until 5h");
-        assert!(dispatcher.stranded(HOUR).is_empty());
-        let entitled = dispatcher.deadline_reached(5 * HOUR, &mut yes());
-        assert_eq!(assigned_to(&entitled), vec![("e0", "small")]);
-        assert!(!entitled.assigned[0].reserve);
+        assert_eq!(assigned_to(&declined), vec![("e0", "small")]);
+        assert!(!declined.assigned[0].reserve);
+        assert!(dispatcher.stranded(0).is_empty());
     }
 
-    /// What keeps the entry off the disfavoured machine is whether the better
-    /// one could ever hold it: a pressure brake that closes its room now
-    /// does not lift that, and a machine too small for the need never had it.
+    /// Pressure or insufficient capacity on one host does not idle another.
     #[test]
-    fn a_braked_better_machine_holds_the_entry_off_and_a_too_small_one_does_not() {
+    fn a_braked_better_machine_and_a_too_small_one_do_not_hold_off_fitting_room() {
         use cairn_common::executor_protocol::{DeclineReason, RoomClosure, RoomScope};
         let mut braked = room(32, 128);
         braked.closures.push(RoomClosure {
@@ -3120,7 +3243,7 @@ mod tests {
             disk: None,
             conditions: Vec::new(),
         });
-        for (big, held_off) in [(braked, true), (room(32, 16), false)] {
+        for (big, held_off) in [(braked, false), (room(32, 16), false)] {
             let mut dispatcher = Dispatcher::default();
             dispatcher.attach("big", 1);
             dispatcher.attach("small", 1);
@@ -3142,13 +3265,11 @@ mod tests {
         }
     }
 
-    /// A machine away for an update keeps a clamped entry off the machine
-    /// that would clamp it, but not an unmeasured compile off a smaller
-    /// machine: only work that would run unmeasured-for waits on an absence.
+    /// An away host cannot promise to take work next.
     #[test]
-    fn an_away_machine_holds_off_only_disfavoured_work() {
+    fn an_away_machine_never_holds_off_fitting_room() {
         for (key_big, key_small, held_off) in [
-            (HardKey::default(), CLAMPED, true),
+            (HardKey::default(), CLAMPED, false),
             (unmeasured(120), unmeasured(12), false),
         ] {
             let mut dispatcher = Dispatcher::default();
@@ -3195,7 +3316,6 @@ mod tests {
         let mut dispatcher = Dispatcher::default();
         dispatcher.attach("big", 1);
         dispatcher.attach("small", 1);
-        dispatcher.set_room("big", 1, 1, busy(32, 128), 0, &mut yes());
         dispatcher.set_room("small", 1, 1, room(32, 64), 0, &mut yes());
         let entry = keyed(waiting(0, &["big", "small"], &need(8, 8)), "small", CLAMPED);
         assert_eq!(dispatcher.enqueue(entry, 0, &mut yes()), Effects::default());
@@ -3204,13 +3324,9 @@ mod tests {
         assert!(dispatcher.stranded(0).is_empty());
     }
 
-    /// After a rebuild every machine re-attaches and announces in any order.
-    /// While the better machine is attached and silent, a disfavoured machine
-    /// that announces first does not take clamped or deferred work until the
-    /// entry's reserve-from instant; other work is not held off by silence
-    /// (D2 as ruled for this PR).
+    /// Opening-frame ordering gets a fixed five-second grace, not reserve-from.
     #[test]
-    fn a_silent_better_machine_holds_off_disfavoured_work_until_reserve_from() {
+    fn a_silent_better_machine_holds_off_disfavoured_work_only_for_the_opening_grace() {
         let mut dispatcher = Dispatcher::default();
         dispatcher.attach("big", 1);
         dispatcher.attach("small", 1);
@@ -3227,18 +3343,29 @@ mod tests {
         );
         let mut joined = dispatcher.enqueue(clamped, 0, &mut yes());
         joined.absorb(dispatcher.enqueue(compile, 0, &mut yes()));
-        assert_eq!(assigned_to(&joined), vec![("e1", "small")]);
+        let next = keyed(waiting(2, &["big", "small"], &need(8, 8)), "small", CLAMPED);
+        joined.absorb(dispatcher.enqueue(next, 0, &mut yes()));
+        assert_eq!(assigned_to(&joined), vec![("e1", "small"), ("e2", "small")]);
         assert!(dispatcher.stranded(0).is_empty());
-        let entitled = dispatcher.deadline_reached(5 * HOUR, &mut yes());
+        assert_eq!(
+            dispatcher.first_room_wait("e0", "small", 1),
+            Some((
+                FIRST_ROOM_PREFERENCE_MS - 1,
+                "memory capacity",
+                FIRST_ROOM_PREFERENCE_MS
+            ))
+        );
+        assert!(dispatcher
+            .deadline_reached(FIRST_ROOM_PREFERENCE_MS - 1, &mut yes())
+            .assigned
+            .is_empty());
+        let entitled = dispatcher.deadline_reached(FIRST_ROOM_PREFERENCE_MS, &mut yes());
         assert_eq!(assigned_to(&entitled), vec![("e0", "small")]);
     }
 
-    /// A machine away for an update keeps clamped or deferred work off the
-    /// machine that would clamp or defer it only until the entry's
-    /// reserve-from instant, as a silent one does (D2): the deadline then
-    /// places it on the disfavoured machine.
+    /// Known absence is not an opening-frame race.
     #[test]
-    fn an_away_better_machine_holds_off_disfavoured_work_only_until_reserve_from() {
+    fn an_away_better_machine_does_not_delay_clamped_or_deferred_work() {
         for key in [CLAMPED, DEFERRED] {
             let mut dispatcher = Dispatcher::default();
             dispatcher.attach("big", 1);
@@ -3248,16 +3375,9 @@ mod tests {
             let mut entry = keyed(waiting(0, &["big", "small"], &need(8, 8)), "small", key);
             entry.candidates.get_mut("big").unwrap().away = true;
             let joined = dispatcher.enqueue(entry, 0, &mut yes());
-            assert_eq!(assigned_to(&joined), vec![], "{key:?}: held before 5h");
-            assert_eq!(dispatcher.held_off_by("e0", "small", HOUR), Some("big"));
-            assert!(dispatcher.stranded(HOUR).is_empty());
-            let entitled = dispatcher.deadline_reached(5 * HOUR, &mut yes());
-            assert_eq!(
-                assigned_to(&entitled),
-                vec![("e0", "small")],
-                "{key:?}: the away machine holds nothing past reserve-from"
-            );
-            assert!(!entitled.assigned[0].reserve);
+            assert_eq!(assigned_to(&joined), vec![("e0", "small")]);
+            assert!(!joined.assigned[0].reserve);
+            assert_eq!(dispatcher.held_off_by("e0", "small", 0), None);
             assert!(dispatcher.stranded(5 * HOUR).is_empty());
         }
     }
@@ -3267,18 +3387,14 @@ mod tests {
         move |_, executor_id| executor_id != machine
     }
 
-    /// A better machine the runner's last look (`admit`) turns away (a stale
-    /// link, a degraded pipe, room a resident model holds) is treated as a
-    /// silent one: it keeps deferred or clamped work off the machine behind
-    /// it until the entry's reserve-from instant, and nothing else. `stranded`
-    /// agrees: past reserve-from the pair behind it is owed an offer.
+    /// Last-look refusal immediately releases fitting alternatives.
     #[test]
-    fn a_better_machine_admit_turns_away_holds_off_only_disfavoured_work_until_reserve_from() {
-        for (key_big, key_small, may_spill, held) in [
-            (unmeasured(120), unmeasured(12), true, false),
-            (HardKey::default(), CLAMPED, true, true),
-            (HardKey::default(), DEFERRED, true, true),
-            (HardKey::default(), CLAMPED, false, false),
+    fn a_better_machine_admit_turns_away_does_not_delay_fitting_work() {
+        for (key_big, key_small, may_spill) in [
+            (unmeasured(120), unmeasured(12), true),
+            (HardKey::default(), CLAMPED, true),
+            (HardKey::default(), DEFERRED, true),
+            (HardKey::default(), CLAMPED, false),
         ] {
             let case = format!("{key_small:?}, may spill: {may_spill}");
             let mut dispatcher = Dispatcher::default();
@@ -3293,41 +3409,20 @@ mod tests {
             );
             entry.may_spill = may_spill;
             let joined = dispatcher.enqueue(entry, 0, &mut refuses("big"));
-            let now = if held { vec![] } else { vec![("e0", "small")] };
-            assert_eq!(assigned_to(&joined), now, "{case}");
-            assert!(dispatcher.stranded(HOUR).is_empty(), "{case}");
-            if held {
-                assert_eq!(
-                    dispatcher.stranded(5 * HOUR),
-                    vec![("e0".to_string(), "small".to_string())],
-                    "{case}: nothing excuses the pair past reserve-from"
-                );
-                let entitled = dispatcher.deadline_reached(5 * HOUR, &mut refuses("big"));
-                assert_eq!(assigned_to(&entitled), vec![("e0", "small")], "{case}");
-                assert!(dispatcher.stranded(5 * HOUR).is_empty(), "{case}");
-            }
+            assert_eq!(assigned_to(&joined), vec![("e0", "small")], "{case}");
+            assert!(dispatcher.stranded(0).is_empty(), "{case}");
         }
     }
 
-    /// The better machine frees room the entry fits, and `admit` turns the
-    /// entry away there: no longer held off, it is placed on the machine
-    /// behind in the same walk.
+    /// The better machine's first room fits, but `admit` turns the entry
+    /// away there: the opening preference ends in the same walk.
     #[test]
-    fn an_entry_admit_turns_away_on_a_freed_better_machine_goes_to_the_next_at_once() {
+    fn a_newly_announced_better_machine_admit_turns_away_goes_to_the_next_at_once() {
         let mut dispatcher = Dispatcher::default();
         dispatcher.attach("big", 1);
         dispatcher.attach("small", 1);
-        dispatcher.set_room("big", 1, 1, busy(32, 128), 0, &mut yes());
         dispatcher.set_room("small", 1, 1, room(32, 64), 0, &mut yes());
-        let entry = keyed(
-            keyed(
-                waiting(0, &["big", "small"], &need(8, 8)),
-                "big",
-                unmeasured(120),
-            ),
-            "small",
-            unmeasured(12),
-        );
+        let entry = keyed(waiting(0, &["big", "small"], &need(8, 8)), "small", CLAMPED);
         assert_eq!(dispatcher.enqueue(entry, 0, &mut yes()), Effects::default());
         let freed = dispatcher.set_room("big", 1, 2, room(32, 128), 0, &mut refuses("big"));
         assert_eq!(assigned_to(&freed), vec![("e0", "small")]);

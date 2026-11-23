@@ -7707,15 +7707,10 @@ async fn assigned_within(
     }
 }
 
-/// A cold compile, nothing of it measured, in a project whose rust-tests
-/// suite peaked at a 9.9 GB rustc: that class prior is more than bgsrv-ub
-/// (12.1 GiB) can give one process. With the 62 GiB machine busy and
-/// bgsrv-ub idle, the work waits for the large machine rather than being
-/// bgsrv-ub's first measurement of it, and the account says so naming the
-/// machine waited for; the large machine takes it when its cores free.
-/// (Main's ranking queued it on the busy machine; cairn/7339 S3.)
+/// A class prior prices a cold compile but is not a per-process measurement.
+/// A larger busy host does not keep an idle host's fitting room unused.
 #[tokio::test]
-async fn a_cold_compile_waits_for_a_busy_machine_that_holds_its_class_prior() {
+async fn a_cold_compile_takes_fitting_room_while_the_larger_machine_is_busy() {
     const GIB: u64 = 1024 * 1024 * 1024;
     const SMALL: u64 = 12_992_276_070;
     let db = Arc::new(crate::storage::migrated_test_db("process-prior-busy.db").await);
@@ -7779,51 +7774,22 @@ async fn a_cold_compile_waits_for_a_busy_machine_that_holds_its_class_prior() {
     pool.record_room("bgsrv-ub", 1, 1, sized_room(SMALL, 64));
     let plan = Arc::new(ReservationPlan::new(db, &request, None));
     let mut deliveries = joined(&pool, &request, plan).await;
-    assert_eq!(assigned_within(&mut deliveries).await, None);
-
-    let Some(CheckDispatchPhase::Placing {
-        declines,
-        placement: Some(account),
-        turn,
-        ..
-    }) = pool.queued_request_account(&request.request_id)
-    else {
-        panic!("a queued request in the dispatcher has an account");
-    };
-    let ub = account
-        .machines
-        .iter()
-        .find(|machine| machine.executor_name == "bgsrv-ub")
-        .expect("bgsrv-ub is in the account");
-    assert_eq!(status_kind(&ub.status), "waits for");
-    let held =
-        crate::execution::checks::describe_queued_hold(&declines, Some(&account), turn.as_ref())
-            .unwrap();
-    assert!(
-        held.contains("bgsrv-ub: its room #1 fits, but the work waits for bbs"),
-        "{held}"
-    );
-
-    pool.record_room("bbs", 1, 2, sized_room(62 * GIB, 64));
     assert_eq!(
         assigned_within(&mut deliveries).await.as_deref(),
-        Some("bbs")
+        Some("bgsrv-ub")
     );
 }
 
-/// A learned peak above bgsrv-ub's ceiling: placed there it runs at the
-/// clamp. While a busy machine whose budget holds the peak is attached,
-/// work free to move waits for it; pinned to bgsrv-ub it runs there at
-/// once; and with no machine able to hold the peak it runs at the clamp at
-/// once, since waiting buys nothing (cairn/5731; cairn/7339 S3).
+/// A clamped reservation still takes fitting announced room, whether the
+/// larger host is busy, no larger host exists, or the caller pins placement.
 #[tokio::test]
-async fn a_clamped_peak_waits_only_for_a_machine_that_could_hold_it() {
+async fn a_clamped_peak_does_not_wait_for_a_busy_larger_machine() {
     const GIB: u64 = 1024 * 1024 * 1024;
     const UB_BUDGET: u64 = 11_042_782_208;
-    for (case, other_budget, pinned, waits) in [
-        ("holdable elsewhere", 100 * GIB, false, true),
-        ("pinned home", 100 * GIB, true, false),
-        ("nowhere larger", UB_BUDGET, false, false),
+    for (case, other_budget, pinned) in [
+        ("holdable elsewhere", 100 * GIB, false),
+        ("pinned home", 100 * GIB, true),
+        ("nowhere larger", UB_BUDGET, false),
     ] {
         let db = Arc::new(
             crate::storage::migrated_test_db(&format!("ceiling-{}.db", case.replace(' ', "-")))
@@ -7869,17 +7835,7 @@ async fn a_clamped_peak_waits_only_for_a_machine_that_could_hold_it() {
         let plan = Arc::new(ReservationPlan::new(db, &request, None));
         let mut deliveries = joined(&pool, &request, plan).await;
         let first = assigned_within(&mut deliveries).await;
-        if !waits {
-            assert_eq!(first.as_deref(), Some("bgsrv-ub"), "{case}");
-            continue;
-        }
-        assert_eq!(first, None, "{case}");
-        pool.record_room("large", 1, 2, sized_room(128 * GIB, 64));
-        assert_eq!(
-            assigned_within(&mut deliveries).await.as_deref(),
-            Some("large"),
-            "{case}"
-        );
+        assert_eq!(first.as_deref(), Some("bgsrv-ub"), "{case}");
     }
 }
 

@@ -173,9 +173,10 @@ pub(super) fn describe_placement_account(
                 room_seq,
                 first_room,
             } => each.push(match first_room {
-                Some((remaining_ms, reason)) => format!(
-                    "{name}: its room #{room_seq} fits; waiting up to {} s for {executor_name} to announce room, preferred for {reason}",
+                Some((remaining_ms, reason, until_unix_ms)) => format!(
+                    "{name}: its room #{room_seq} fits; waiting up to {} s more for {executor_name}, preferred for {reason}; preference ends at {}",
                     remaining_ms.div_ceil(1_000),
+                    clock_utc(*until_unix_ms),
                 ),
                 None => format!(
                     "{name}: its room #{room_seq} fits, but the work waits for {executor_name}, which could hold it and ranks ahead on memory"

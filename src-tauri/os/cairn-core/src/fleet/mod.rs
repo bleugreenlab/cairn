@@ -529,15 +529,14 @@ pub(crate) enum CheckCandidateStatus {
     /// there for nothing it records, and its next announcement walks it.
     Fits { room_seq: u64 },
     /// Its room fits the request, but the work waits for `executor_name`,
-    /// a machine that could hold it and ranks ahead of this one on what its
-    /// memory can do for this work (deferred on a class prior here, clamped
-    /// here, or less single-process capacity for an unmeasured compile).
+    /// a preferred machine during the fixed opening-room grace. A full
+    /// preferred host never keeps fitting announced room idle.
     WaitsFor {
         executor_name: String,
         room_seq: u64,
-        /// Remaining milliseconds and reason for the bounded first-room grace;
-        /// absent for the stronger memory-safety hold described above.
-        first_room: Option<(u64, &'static str)>,
+        /// Remaining milliseconds, reason, and absolute end of the fixed
+        /// opening-room preference. Fitting room never waits beyond it.
+        first_room: Option<(u64, &'static str, u64)>,
     },
     /// Kept off it for the reason placement records.
     NotOffered(PlacementRejectionReason),
