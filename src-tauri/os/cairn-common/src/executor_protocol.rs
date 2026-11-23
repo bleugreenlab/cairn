@@ -9767,6 +9767,14 @@ pub struct LearnedResourceEstimate {
 /// fields preserve stored outcomes; an older executor receives the same drain
 /// boolean and admission commands and gets nothing wrong.
 ///
+/// cairn/7097 does not move the number. No frame, variant or field changes.
+/// The runner retains upload authority until result settlement and observes
+/// publication at its own object endpoint. The executor decides command-ended
+/// publication against cancellation locally, before scratch, sealing and upload.
+/// Older executors may still discard a delta on a late cancel; the runner reads
+/// their terminal cancellation honestly, rather than inferring completion from
+/// an upload. The executor correction arrives with the normal build rollout.
+///
 /// cairn/7185 does not move the number. Fleet responsibilities are folded
 /// into their topical modules and imports and facade exports are made explicit.
 /// Request construction, routing, admission, settlement and frame serialization

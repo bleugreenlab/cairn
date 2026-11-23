@@ -711,6 +711,9 @@ pub struct ObjectPlaneState {
     refusal_reports: Arc<RefusalReports>,
     authorized: Arc<Mutex<HashMap<(String, String), AuthorizedTransfer>>>,
     staged: Arc<Mutex<HashMap<String, StagedDeltaUpload>>>,
+    /// Bounded causal tombstones survive settlement without retaining authority.
+    request_refusals: Arc<Mutex<VecDeque<(ObjectTransferCoordinate, String)>>>,
+
     /// The node scratch routes' grants and in-flight write-backs, revoked with
     /// the connection that holds them.
     pub scratch: crate::node_scratch::plane::ScratchPlaneState,
@@ -898,6 +901,84 @@ impl ObjectPlaneState {
                 base_commit: request.base_commit.clone(),
             },
         );
+    }
+
+    pub fn note_request_refusal_for_request(&self, request_id: &str, reason: &str) {
+        let authorized = self.authorized.lock().unwrap();
+        let mut refusals = self.request_refusals.lock().unwrap();
+        for transfer in authorized
+            .values()
+            .filter(|transfer| transfer.coordinate.request_id == request_id)
+        {
+            if !refusals
+                .iter()
+                .any(|(coordinate, _)| *coordinate == transfer.coordinate)
+            {
+                refusals.push_back((transfer.coordinate.clone(), reason.to_owned()));
+            }
+        }
+        while refusals.len() > RETIRED_CREDENTIAL_CAP {
+            refusals.pop_front();
+        }
+    }
+
+    pub fn note_executor_refusal(&self, executor_id: &str, generation: u64, reason: &str) {
+        let authorized = self.authorized.lock().unwrap();
+        let mut refusals = self.request_refusals.lock().unwrap();
+        for transfer in authorized.values().filter(|transfer| {
+            transfer.coordinate.executor_id == executor_id
+                && transfer.coordinate.connection_generation == generation
+        }) {
+            // A requested cancel may have lost to publication on the machine.
+            // Removing its holder is the cause that actually retires authority.
+            refusals.retain(|(coordinate, _)| *coordinate != transfer.coordinate);
+            refusals.push_back((transfer.coordinate.clone(), reason.to_owned()));
+        }
+        while refusals.len() > RETIRED_CREDENTIAL_CAP {
+            refusals.pop_front();
+        }
+    }
+
+    pub fn note_request_refusal(
+        &self,
+        request_id: &str,
+        attempt_id: &str,
+        executor_id: &str,
+        generation: u64,
+        reason: &str,
+    ) {
+        let authorized = self.authorized.lock().unwrap();
+        let Some(transfer) = authorized.get(&(request_id.to_owned(), attempt_id.to_owned())) else {
+            return;
+        };
+        if transfer.coordinate.executor_id != executor_id
+            || transfer.coordinate.connection_generation != generation
+        {
+            return;
+        }
+        let mut refusals = self.request_refusals.lock().unwrap();
+        if !refusals
+            .iter()
+            .any(|(coordinate, _)| *coordinate == transfer.coordinate)
+        {
+            refusals.push_back((transfer.coordinate.clone(), reason.to_owned()));
+            while refusals.len() > RETIRED_CREDENTIAL_CAP {
+                refusals.pop_front();
+            }
+        }
+    }
+
+    pub fn request_refusal_reason(&self, coordinate: &ObjectTransferCoordinate) -> String {
+        self.request_refusals
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(retired, _)| retired == coordinate)
+            .map(|(_, reason)| reason.clone())
+            .unwrap_or_else(|| {
+                "its request no longer holds upload authority; its commit was discarded".to_owned()
+            })
     }
 
     pub fn revoke_request(
@@ -1565,8 +1646,29 @@ mod tests {
         malformed_put.operation = CloudObjectOperation::Put;
         assert!(!state.authorizes_cloud_grant(&malformed_put, &request.base_commit));
 
+        let cancelled =
+            "cancelled by cairn://p/cairn/7097/1/builder at 17:20 UTC; its commit was discarded";
+        state.note_request_refusal("request", "attempt", "executor", 1, cancelled);
+        assert!(
+            state.authorizes(&coordinate(1), &request.base_commit),
+            "cancellation evidence alone is not settlement"
+        );
         state.revoke_request("request", "attempt", "executor", 1);
         assert!(!state.authorizes(&coordinate(1), &request.base_commit));
+        assert_eq!(state.request_refusal_reason(&coordinate(1)), cancelled);
+        state.authorize_request(&request, "executor", 2);
+        state.revoke_request("request", "attempt", "executor", 1);
+        assert!(
+            state.authorizes(&coordinate(2), &request.base_commit),
+            "old settlement cannot revoke a reattached generation"
+        );
+        assert_ne!(state.request_refusal_reason(&coordinate(2)), cancelled);
+        state.note_request_refusal("request", "attempt", "executor", 2, cancelled);
+        let removed = "its holder was removed; its commit was discarded";
+        state.note_executor_refusal("executor", 2, removed);
+        assert_eq!(state.request_refusal_reason(&coordinate(2)), removed);
+        assert_eq!(state.request_refusal_reason(&coordinate(1)), cancelled);
+        state.revoke_request("request", "attempt", "executor", 2);
     }
 
     #[test]

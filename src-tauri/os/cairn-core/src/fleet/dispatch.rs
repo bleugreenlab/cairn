@@ -1679,6 +1679,11 @@ impl Fleet {
             .keys()
             .find(|(id, _)| id == request_id)
             .cloned();
+        // A request whose result upload this runner has seen is past its
+        // commands: nothing is left to stop, and its result settles it.
+        if self.request_is_publishing(request_id) {
+            return CancelOutcome::Unknown;
+        }
         if let Some(identity) = subscriber {
             return match self
                 .detach_coalesced_subscriber(&identity, Some(CancelCause::OperatorRetracted))
@@ -3243,7 +3248,9 @@ impl Fleet {
                     }
                 } else if let Some(request_id) = context.run_batch_request_id.as_deref() {
                     if let Some(index) = run_item_index_from_stream_id(&stream_id) {
-                        crate::mcp::handlers::run::detached::note_item_finished(request_id, index);
+                        crate::mcp::handlers::run::detached::note_item_finished(
+                            request_id, index, succeeded,
+                        );
                     }
                 }
                 RunnerCallbackResult::Completed
@@ -3592,6 +3599,13 @@ impl Fleet {
             self.cancelled_leaders.lock().unwrap().remove(&key);
         }
         executed.account.cancel_cause = self.cancel_causes.lock().unwrap().take(&key);
+        if executed.account.left_running.is_none()
+            && !self.deferred_acks.lock().unwrap().contains_key(&key.0)
+        {
+            // A request with no deferred acknowledgement settles here; a run
+            // batch's observed upload is retired by its own acknowledgement.
+            self.settle_request_publication(&key.0);
+        }
         crate::resource_notices::annotate_refusal(orch, &mut executed.outcome).await;
         executed
     }
@@ -4060,8 +4074,21 @@ impl Fleet {
                 (silence.outcome(&key, executor_name), true, Some(abandoned))
             }
         };
-        if !selected.colocated {
-            object_plane.revoke_request(&key.0, &key.1, &selected.executor_id, selected.generation);
+        // An answered wait is not publication: the batch's durable settlement
+        // owns ResultAck, which retires the object grant. Only a wait ending
+        // without an answer has lost the attempt here.
+        if abandoned_grant.is_some() {
+            // A retry runs its commands again under a new attempt; this one's
+            // upload no longer names the request's phase.
+            self.retire_attempt_publication(&key.0, &key.1);
+            if !selected.colocated {
+                object_plane.revoke_request(
+                    &key.0,
+                    &key.1,
+                    &selected.executor_id,
+                    placement.generation,
+                );
+            }
         }
         // The executor names the job, request, and commit it could not
         // materialize; only the runner knows which machine it chose. Completing
@@ -4422,6 +4449,10 @@ impl Fleet {
     }
 
     pub(crate) fn send_result_ack(&self, executor_id: &str, request_id: &str, attempt_id: &str) {
+        // This is settlement on every transport, including the colocated
+        // executor and a disconnected machine that will resend later. Causes
+        // were captured on the durable row and object plane at cancellation.
+        self.retire_attempt_publication(request_id, attempt_id);
         let Some(generation) = self.link_generation(executor_id) else {
             return;
         };

@@ -899,13 +899,14 @@ struct OpenBatchWait {
     label: Option<String>,
     created_at: i64,
     state: String,
+    late_cancel: Option<String>,
     resolution: Option<String>,
 }
 
 /// The job's run batches whose calls are suspended on them, newest first.
 async fn open_batch_waits(db: &LocalDb, job_id: &str) -> Result<Vec<OpenBatchWait>, String> {
     db.query_all(
-        "SELECT json_extract(condition_json, '$.request_id'), json_extract(condition_json, '$.label'), created_at, state, resolution_json
+        "SELECT json_extract(condition_json, '$.request_id'), json_extract(condition_json, '$.label'), created_at, state, json_extract(condition_json, '$.settlement.late_cancel'), resolution_json
            FROM agent_waits
           WHERE job_id = ?1 AND state IN ('pending', 'resolving')
             AND json_extract(condition_json, '$.kind') = 'run_batch'
@@ -917,7 +918,8 @@ async fn open_batch_waits(db: &LocalDb, job_id: &str) -> Result<Vec<OpenBatchWai
                 label: row.opt_text(1)?,
                 created_at: row.get::<i64>(2)?,
                 state: row.text(3)?,
-                resolution: row.opt_text(4)?,
+                late_cancel: row.opt_text(4)?,
+                resolution: row.opt_text(5)?,
             })
         },
     )
@@ -961,8 +963,13 @@ fn render_in_flight(
         Some(progress) => format!("Progress: {}.\n", progress.describe(now_ms)),
         None => "Progress: this runner holds no task for it; it settles from its machine's own report.\n".to_string(),
     };
+    let cancel_note = wait
+        .late_cancel
+        .as_ref()
+        .map(|note| format!("Cancel: {note}.\n"))
+        .unwrap_or_default();
     format!(
-        "# Run batch `{}`\n\nLabel: {}\nState: {state}\n{progress}{}",
+        "# Run batch `{}`\n\nLabel: {}\nState: {state}\n{progress}{cancel_note}{}",
         wait.request_id,
         wait.label.as_deref().unwrap_or("unnamed"),
         cancel_line(home, &wait.request_id)

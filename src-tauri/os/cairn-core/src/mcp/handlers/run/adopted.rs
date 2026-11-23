@@ -586,26 +586,16 @@ async fn drive_row(orch: &Orchestrator, db: &Arc<LocalDb>, row: AdoptedRow) {
             return;
         }
     };
-    let commit = super::run_commit_sha(&text);
-    let recorded = db
-        .execute(
-            "UPDATE run_batch_adopted_outcomes SET state='published',report=?3,published_commit=?4,settled_ms=?5 WHERE request_id=?1 AND attempt_id=?2 AND state='publishing' AND claimed_by_incarnation=?6",
-            params![
-                row.request_id.as_str(),
-                row.attempt_id.as_str(),
-                text.as_str(),
-                commit.as_deref(),
-                chrono::Utc::now().timestamp_millis(),
-                incarnation.as_str()
-            ],
-        )
-        .await;
+    let recorded = record_settlement(db, &row, &incarnation, &text).await;
+    let mut text = text;
     match recorded {
         // The outcome is durable, so its machine may let the result and its
         // delta go.
-        Ok(1) => orch
-            .fleet
-            .send_result_ack(&row.executor_id, &row.request_id, &row.attempt_id),
+        Ok(Some(report)) => {
+            text = report;
+            orch.fleet
+                .send_result_ack(&row.executor_id, &row.request_id, &row.attempt_id);
+        }
         // Delivered anyway, unacknowledged: the result is in hand, its machine
         // keeps it, and a re-drive finds any landing this made by its key
         // rather than landing it twice.
@@ -619,6 +609,53 @@ async fn drive_row(orch: &Orchestrator, db: &Arc<LocalDb>, row: AdoptedRow) {
         ),
     }
     deliver(orch, db, &row, &verdict, &text).await;
+}
+
+/// Seal the report and its first late cancel in one write. Publication may
+/// have awaited a delta or store after reading its claim; that snapshot cannot
+/// supply the note. Once sealed, later cancels do not rewrite the report.
+async fn record_settlement(
+    db: &LocalDb,
+    row: &AdoptedRow,
+    incarnation: &str,
+    text: &str,
+) -> DbResult<Option<String>> {
+    let values = (
+        row.request_id.clone(),
+        row.attempt_id.clone(),
+        incarnation.to_string(),
+        text.to_string(),
+        super::run_commit_sha(text),
+    );
+    db.write(move |c| {
+        let (request_id, attempt_id, incarnation, text, commit) = values.clone();
+        Box::pin(async move {
+            let wait_note = durable_suspend::active_run_batch_wait_conn(c, &request_id)
+                .await?
+                .and_then(|wait| match wait.condition {
+                    Condition::RunBatch {
+                        settlement: Some(settlement),
+                        ..
+                    } => settlement.late_cancel,
+                    _ => None,
+                });
+            let mut rows = c.query(
+                "UPDATE run_batch_adopted_outcomes SET state='published',
+                 report=?3 || COALESCE(char(10) || char(10) || 'Note: ' || COALESCE(?7,
+                   (SELECT json_extract(settlement_json,'$.late_cancel')
+                    FROM run_batch_detached WHERE request_id=?1)) || '.',''),
+                 published_commit=?4,settled_ms=?5
+                 WHERE request_id=?1 AND attempt_id=?2 AND state='publishing' AND claimed_by_incarnation=?6
+                 RETURNING report",
+                params![request_id.as_str(), attempt_id, text, commit.as_deref(),
+                    chrono::Utc::now().timestamp_millis(), incarnation, wait_note.as_deref()],
+            ).await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some(row.text(0)?)),
+                None => Ok(None),
+            }
+        })
+    }).await
 }
 
 /// Publish and compose one adopted result.
@@ -884,35 +921,55 @@ pub(super) async fn resolve_wait(
 
 /// Release a parked call whose machine has not reported: its batch becomes a
 /// detached row that keeps holding its branch, and the call is told so.
+/// `record` was read before this pass awaited its machine; a wait settled since
+/// keeps its answer and gets no row.
 async fn release_wait(orch: &Orchestrator, db: &LocalDb, record: &Record, text: &str) {
-    let (job_id, run_id, condition) = (
-        record.job_id.clone(),
-        record.run_id.clone(),
-        record.condition.clone(),
-    );
+    let record_for_write = record.clone();
     let converted = db
         .write(|c| {
-            let (job_id, run_id, condition) = (job_id.clone(), run_id.clone(), condition.clone());
+            let record = record_for_write.clone();
             Box::pin(async move {
-                detached::insert_converted(
-                    c,
-                    &job_id,
-                    &run_id,
-                    &condition,
-                    "Cairn restarted while the batch ran, and its machine had not reconnected",
-                    chrono::Utc::now().timestamp_millis(),
-                )
-                .await
+                let mut rows = c
+                    .query(
+                        "SELECT 1 FROM agent_waits WHERE id=?1 AND state='pending'",
+                        params![record.id.as_str()],
+                    )
+                    .await?;
+                let pending = rows.next().await?.is_some();
+                drop(rows);
+                if pending {
+                    detached::insert_converted(
+                        c,
+                        &record.id,
+                        &record.job_id,
+                        &record.run_id,
+                        &record.condition,
+                        "Cairn restarted while the batch ran, and its machine had not reconnected",
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
+                }
+                Ok(pending)
             })
         })
         .await;
-    if let Err(error) = converted {
-        // Released only once the batch has a row to settle into.
-        log::warn!(
-            "could not record wait {} as detached before releasing it: {error}",
-            record.id
-        );
-        return;
+    match converted {
+        Ok(true) => {}
+        Ok(false) => {
+            log::info!(
+                "wait {} settled before its unheard batch was released; its answer stands",
+                record.id
+            );
+            return;
+        }
+        Err(error) => {
+            // Released only once the batch has a row to settle into.
+            log::warn!(
+                "could not record wait {} as detached before releasing it: {error}",
+                record.id
+            );
+            return;
+        }
     }
     durable_suspend::drive_resolution(orch, db, record, text, false).await;
 }
@@ -1100,4 +1157,419 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
         }
     }
     orch.fleet.set_adopting(claimed);
+}
+
+#[cfg(test)]
+mod parked_cancel_tests {
+    use super::super::cancel::{cancel_batch, CancelReport};
+    use super::super::{BatchControl, DurableCancel};
+    use super::*;
+
+    async fn fixture(root: &std::path::Path) -> (Orchestrator, Arc<LocalDb>) {
+        let db = Arc::new(
+            LocalDb::open_migrated_for_test(root.join("test.db"))
+                .await
+                .unwrap(),
+        );
+        let search =
+            Arc::new(crate::storage::SearchIndex::open_or_create(root.join("search")).unwrap());
+        let orch = Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(db.clone(), search)),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root.join("config"),
+        )
+        .build();
+        super::super::host_batch_tests::seed_parkable_run(&orch).await;
+        (orch, db)
+    }
+
+    /// A parked call's pending wait on `request_id`, carrying `settlement`.
+    async fn park(db: &LocalDb, wait_id: &str, request_id: &str, settlement: PersistedSettlement) {
+        park_condition(db, wait_id, run_batch(request_id, settlement)).await;
+    }
+
+    fn run_batch(request_id: &str, settlement: PersistedSettlement) -> Condition {
+        Condition::RunBatch {
+            request_id: request_id.into(),
+            commits: settlement.commits(),
+            label: None,
+            host: false,
+            identity: None,
+            verdict_only: false,
+            settlement: Some(Box::new(settlement)),
+            bound: None,
+        }
+    }
+
+    /// `condition` parked by the one establishing write, as `run-1`'s call.
+    async fn park_condition(db: &LocalDb, wait_id: &str, condition: Condition) {
+        let record = Record {
+            id: wait_id.into(),
+            job_id: "job-1".into(),
+            run_id: "run-1".into(),
+            session_id: "session-1".into(),
+            turn_id: "pred-turn".into(),
+            tool_use_id: format!("tool-{wait_id}"),
+            condition,
+            deadline: None,
+            created: 1,
+        };
+        durable_suspend::park_for_test(db, &record).await.unwrap();
+    }
+
+    /// The machine's answer as a later runner adopts it, claimed for sealing.
+    async fn adopted(db: &LocalDb, request_id: &str, outcome: &CellOutcome) -> AdoptedRow {
+        let outcome_json = serde_json::to_string(outcome).unwrap();
+        db.execute(
+            "INSERT INTO run_batch_adopted_outcomes(request_id,attempt_id,job_id,executor_id,machine,outcome_json,state,received_ms,claimed_by_incarnation)
+             VALUES(?1,'attempt-1','job-1','executor','machine',?2,'publishing',1,'incarnation')",
+            params![request_id, outcome_json.as_str()],
+        )
+        .await
+        .unwrap();
+        AdoptedRow {
+            request_id: request_id.into(),
+            attempt_id: "attempt-1".into(),
+            executor_id: "executor".into(),
+            machine: "machine".into(),
+            outcome_json,
+            state: "publishing".into(),
+            report: None,
+        }
+    }
+
+    fn cancelled_outcome(request_id: &str) -> CellOutcome {
+        CellOutcome::Cancelled {
+            request_id: request_id.into(),
+            attempt_id: "attempt-1".into(),
+        }
+    }
+
+    /// A cancel against a parked batch whose task is live in this runner is
+    /// recorded on its wait too, so a restart before the result settles still
+    /// seals it into the adopted report.
+    #[tokio::test]
+    async fn a_live_parked_publication_cancel_survives_a_restart_into_the_adopted_report() {
+        let root = tempfile::tempdir().unwrap();
+        let (orch, db) = fixture(root.path()).await;
+        let id = "adopted-live-parked-note";
+        park(
+            &db,
+            "wait-live",
+            id,
+            PersistedSettlement::for_test(None, None, None),
+        )
+        .await;
+        let control = BatchControl::with_request_id(id, true);
+        let live = detached::LiveBatch::claim(&control);
+        orch.fleet
+            .observe_result_upload(id, "attempt-1", Some(1_000_000));
+        let report = cancel_batch(&orch, &db, id, "operator", Duration::ZERO).await;
+        assert_eq!(report, CancelReport::AlreadySettling);
+        let note = control
+            .late_cancel_note()
+            .expect("the live task holds the note");
+        let durable = db
+            .query_opt_text(
+                "SELECT json_extract(condition_json,'$.settlement.late_cancel') FROM agent_waits WHERE id='wait-live'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(durable.as_deref(), Some(note.as_str()));
+        assert!(detached::load(&db, id).await.unwrap().is_none());
+
+        // A second durable snapshot was taken before cancellation, but its
+        // insert completed after the cancel's own durable patch (and after
+        // the first wait settled: a call has one active wait).
+        db.execute(
+            "UPDATE agent_waits SET state='resolved' WHERE id='wait-live'",
+            (),
+        )
+        .await
+        .unwrap();
+        let stale = run_batch(id, PersistedSettlement::for_test(None, None, None));
+        park_condition(&db, "wait-stale-snapshot", stale.clone()).await;
+        control.persist_cancel_notes(&db).await.unwrap();
+        let copied = db.query_opt_text(
+            "SELECT json_extract(condition_json,'$.settlement.late_cancel') FROM agent_waits WHERE id='wait-stale-snapshot'",
+            (),
+        ).await.unwrap();
+        assert_eq!(copied.as_deref(), Some(note.as_str()));
+        // Converting from the stale snapshot still carries the stored note.
+        db.write(|c| {
+            let stale = stale.clone();
+            Box::pin(async move {
+                detached::insert_converted(
+                    c,
+                    "wait-stale-snapshot",
+                    "job-1",
+                    "run-1",
+                    &stale,
+                    "converted from a stale snapshot",
+                    2,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+        let converted = detached::load(&db, id).await.unwrap().unwrap();
+        assert_eq!(
+            converted.settlement.unwrap().late_cancel.as_deref(),
+            Some(note.as_str())
+        );
+
+        // Cairn restarts before the result settles: no task holds the batch.
+        drop(live);
+        assert!(detached::live_control(id).is_none());
+        let row = adopted(&db, id, &cancelled_outcome(id)).await;
+        let sealed = record_settlement(&db, &row, "incarnation", "completed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sealed, format!("completed\n\nNote: {note}."));
+    }
+
+    /// A cancel against a detached batch no task here holds is written into
+    /// the row's settlement as well as its reason, first cause kept, and sealed
+    /// with the adopted report; once sealed, a later cancel writes nothing.
+    #[tokio::test]
+    async fn a_detached_publication_cancel_is_sealed_with_its_adopted_report() {
+        let root = tempfile::tempdir().unwrap();
+        let (orch, db) = fixture(root.path()).await;
+        let id = "adopted-detached-note";
+        detached::insert(
+            &db,
+            &detached::DetachedBatch {
+                request_id: id.into(),
+                job_id: "job-1".into(),
+                run_id: "run-1".into(),
+                label: Some("the batch".into()),
+                identity: None,
+                commits: false,
+                holds_branch: false,
+                state: detached::DetachedState::Running,
+                verdict: None,
+                output: None,
+                commit_id: None,
+                reason: "its carrier cannot suspend".into(),
+                lost_evidence: None,
+                created_ms: 1,
+                settled_ms: None,
+                notified_ms: None,
+                settlement: Some(PersistedSettlement::for_test(None, None, None)),
+                waiting_on: None,
+                late_report: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(detached::live_control(id).is_none());
+        orch.fleet
+            .observe_result_upload(id, "attempt-1", Some(1_000_000));
+        let report = cancel_batch(&orch, &db, id, "first", Duration::ZERO).await;
+        assert_eq!(report, CancelReport::AlreadySettling);
+        detached::record_publication_cancel(&db, id, "second")
+            .await
+            .unwrap();
+        let batch = detached::load(&db, id).await.unwrap().unwrap();
+        let note = batch.settlement.unwrap().late_cancel.unwrap();
+        assert!(note.contains("by first,"), "{note}");
+        assert!(!note.contains("second"), "{note}");
+        assert!(batch.reason.contains(&note), "{}", batch.reason);
+
+        let row = adopted(&db, id, &cancelled_outcome(id)).await;
+        let sealed = record_settlement(&db, &row, "incarnation", "completed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sealed, format!("completed\n\nNote: {note}."));
+        db.execute(
+            "UPDATE run_batch_detached SET settlement_json=json_remove(settlement_json,'$.late_cancel') WHERE request_id=?1",
+            params![id],
+        )
+        .await
+        .unwrap();
+        detached::record_publication_cancel(&db, id, "after-seal")
+            .await
+            .unwrap();
+        let unchanged = db
+            .query_opt_text(
+                "SELECT json_extract(settlement_json,'$.late_cancel') FROM run_batch_detached WHERE request_id=?1",
+                params![id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged, None);
+    }
+
+    /// A cancel sent to the machine of a batch no task here holds is recorded
+    /// on its durable settlement, first principal kept, and the machine's
+    /// adopted `Cancelled` answer settles naming who, when, and the discard.
+    #[tokio::test]
+    async fn a_no_live_mid_command_cancel_names_its_principal_in_the_adopted_result() {
+        let root = tempfile::tempdir().unwrap();
+        let (orch, db) = fixture(root.path()).await;
+        let id = "adopted-mid-command-cancel";
+        park(
+            &db,
+            "wait-cancel",
+            id,
+            PersistedSettlement::for_test(Some("commit it"), None, None),
+        )
+        .await;
+        let first = DurableCancel {
+            by: "operator".into(),
+            at_ms: 0,
+        };
+        detached::record_cancel(&db, id, &first).await.unwrap();
+        detached::record_cancel(&db, id, &DurableCancel::now("second"))
+            .await
+            .unwrap();
+        let record = durable_suspend::pending_run_batch_wait(&db, id)
+            .await
+            .unwrap()
+            .unwrap();
+        let Condition::RunBatch {
+            settlement: Some(settlement),
+            ..
+        } = record.condition
+        else {
+            panic!("the existing settlement must remain intact");
+        };
+        assert_eq!(settlement.cancelled, Some(first));
+
+        let row = adopted(&db, id, &cancelled_outcome(id)).await;
+        let Ok((text, _)) = settle(&orch, &db, &row).await else {
+            panic!("an adopted cancelled answer settles");
+        };
+        assert!(
+            text.contains("cancelled by operator at 00:00 UTC; its commit was discarded."),
+            "{text}"
+        );
+        assert!(!text.contains("before it finished"), "{text}");
+    }
+
+    /// A live batch cancelled mid-command records the same evidence, so a
+    /// restart before its machine answers still names the cancel.
+    #[tokio::test]
+    async fn a_live_mid_command_cancel_is_recorded_on_its_durable_settlement() {
+        let root = tempfile::tempdir().unwrap();
+        let (orch, db) = fixture(root.path()).await;
+        let id = "adopted-live-mid-command";
+        park(
+            &db,
+            "wait-live-cancel",
+            id,
+            PersistedSettlement::for_test(Some("commit it"), None, None),
+        )
+        .await;
+        let control = BatchControl::with_request_id(id, true);
+        let _live = detached::LiveBatch::claim(&control);
+        let report = cancel_batch(&orch, &db, id, "operator", Duration::ZERO).await;
+        assert_eq!(report, CancelReport::Stopped { settled: false });
+        let record = durable_suspend::pending_run_batch_wait(&db, id)
+            .await
+            .unwrap()
+            .unwrap();
+        let Condition::RunBatch {
+            settlement: Some(settlement),
+            ..
+        } = record.condition
+        else {
+            panic!("the existing settlement must remain intact");
+        };
+        assert_eq!(settlement.cancelled, control.cancelled());
+        assert_eq!(settlement.cancelled.unwrap().by, "operator");
+        assert_eq!(settlement.late_cancel, None);
+    }
+
+    #[tokio::test]
+    async fn a_parked_publication_cancel_is_sealed_with_its_adopted_report() {
+        let root = tempfile::tempdir().unwrap();
+        let (orch, db) = fixture(root.path()).await;
+        let condition = Condition::RunBatch {
+            request_id: "parked-note".into(),
+            commits: false,
+            label: Some("parked publication".into()),
+            host: false,
+            identity: None,
+            verdict_only: false,
+            settlement: Some(Box::new(PersistedSettlement::for_test(None, None, None))),
+            bound: None,
+        };
+        park_condition(&db, "wait-note", condition).await;
+        assert!(detached::live_control("parked-note").is_none());
+        orch.fleet
+            .observe_result_upload("parked-note", "attempt-1", Some(12_000_000));
+        let report =
+            super::super::cancel::cancel_batch(&orch, &db, "parked-note", "first", Duration::ZERO)
+                .await;
+        assert_eq!(report, super::super::cancel::CancelReport::AlreadySettling);
+        // Another principal must not replace the original cause.
+        detached::record_publication_cancel(&db, "parked-note", "second")
+            .await
+            .unwrap();
+        let record = durable_suspend::pending_run_batch_wait(&db, "parked-note")
+            .await
+            .unwrap()
+            .unwrap();
+        let Condition::RunBatch {
+            settlement: Some(settlement),
+            ..
+        } = record.condition
+        else {
+            panic!("the existing settlement must remain intact");
+        };
+        let note = settlement.late_cancel.unwrap();
+        assert!(note.contains("by first,"), "{note}");
+        assert!(!note.contains("second"), "{note}");
+        assert!(detached::load(&db, "parked-note").await.unwrap().is_none());
+        assert!(!orch.fleet.was_retired_for_test("parked-note"));
+        let page = crate::resources::read_cairn_resource(
+            &orch,
+            &Default::default(),
+            "cairn://p/prj/1/1/builder/batches/parked-note",
+        )
+        .await;
+        assert!(page.contains(&format!("Cancel: {note}.")), "{page}");
+        assert!(page.contains("publishing result"), "{page}");
+
+        // The claim predates the cancel; sealing reads the durable note at the
+        // write boundary, not a snapshot captured before publication awaited.
+        db.execute(
+            "INSERT INTO run_batch_adopted_outcomes(request_id,attempt_id,job_id,executor_id,machine,outcome_json,state,received_ms,claimed_by_incarnation)
+             VALUES('parked-note','attempt-1','job-1','executor','machine','{}','publishing',1,'incarnation')",
+            (),
+        ).await.unwrap();
+        let row = AdoptedRow {
+            request_id: "parked-note".into(),
+            attempt_id: "attempt-1".into(),
+            executor_id: "executor".into(),
+            machine: "machine".into(),
+            outcome_json: "{}".into(),
+            state: "publishing".into(),
+            report: None,
+        };
+        let sealed = record_settlement(&db, &row, "incarnation", "completed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sealed, format!("completed\n\nNote: {note}."));
+        assert!(record_settlement(&db, &row, "incarnation", "different")
+            .await
+            .unwrap()
+            .is_none());
+        // A cancel crossing the report's sealing boundary cannot create a
+        // note the immutable report could no longer carry.
+        db.execute("UPDATE agent_waits SET condition_json=json_remove(condition_json,'$.settlement.late_cancel') WHERE id='wait-note'", ()).await.unwrap();
+        detached::record_publication_cancel(&db, "parked-note", "after-seal")
+            .await
+            .unwrap();
+        let unchanged = db.query_opt_text(
+            "SELECT json_extract(condition_json,'$.settlement.late_cancel') FROM agent_waits WHERE id='wait-note'", (),
+        ).await.unwrap();
+        assert_eq!(unchanged, None);
+    }
 }

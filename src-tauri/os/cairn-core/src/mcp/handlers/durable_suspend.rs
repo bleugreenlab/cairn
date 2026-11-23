@@ -564,6 +564,7 @@ async fn claim_parked_waits(
                 // A no-op for every condition but a run batch.
                 super::run::detached::insert_converted(
                     c,
+                    &record.id,
                     &record.job_id,
                     &record.run_id,
                     &record.condition,
@@ -1849,7 +1850,7 @@ async fn mark_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result<b
             let marked = c
                 .execute(
                     "UPDATE agent_waits SET state='resolving',resolution_json=?2,resolving_at=COALESCE(resolving_at,?3) WHERE id=?1 AND state IN ('pending','resolving') AND successor_turn_id IS NULL",
-                    params![id, result, now],
+                    params![id.clone(), result, now],
                 )
                 .await?;
             // Abandoning ends only the wait, never the batch's hold. Supersession
@@ -1870,6 +1871,7 @@ async fn mark_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result<b
                 if let (Some(condition), Some(reason)) = (condition, reason) {
                     super::run::detached::insert_converted(
                         c,
+                        &id,
                         &job_id,
                         &run_id,
                         &condition,
@@ -2052,23 +2054,24 @@ pub(crate) async fn cancel_run_waits_for_stop(db: &LocalDb, run_id: &str) -> Res
             let now = chrono::Utc::now().timestamp_millis();
             let mut rows = c
                 .query(
-                    "SELECT job_id,condition_json FROM agent_waits WHERE run_id=?1 AND state IN ('pending','resolving')",
+                    "SELECT id,job_id,condition_json FROM agent_waits WHERE run_id=?1 AND state IN ('pending','resolving')",
                     params![run_id.clone()],
                 )
                 .await?;
             let mut batches = Vec::new();
             while let Some(row) = rows.next().await? {
-                let job_id = row.text(0)?;
-                if let Ok(condition) = serde_json::from_str::<Condition>(&row.text(1)?) {
+                let (id, job_id) = (row.text(0)?, row.text(1)?);
+                if let Ok(condition) = serde_json::from_str::<Condition>(&row.text(2)?) {
                     if condition.is_tree_run_batch() {
-                        batches.push((job_id, condition));
+                        batches.push((id, job_id, condition));
                     }
                 }
             }
             drop(rows);
-            for (job_id, condition) in &batches {
+            for (id, job_id, condition) in &batches {
                 super::run::detached::insert_converted(
                     c,
+                    id,
                     job_id,
                     &run_id,
                     condition,
@@ -2476,6 +2479,7 @@ async fn divert_to_job(
             let now = chrono::Utc::now().timestamp_millis();
             super::run::detached::insert_converted(
                 c,
+                &id,
                 &job_id,
                 &run_id,
                 &condition,
@@ -3448,6 +3452,37 @@ pub(crate) async fn pending_run_batch_wait(
     )
     .await
     .map_err(|error| error.to_string())
+}
+
+/// Read through `idx_agent_waits_resolving`, whose predicate this spells
+/// exactly, narrowed to run batches.
+const RESOLVING_RUN_BATCH_WAITS: &str = "SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,created_at FROM agent_waits INDEXED BY idx_agent_waits_resolving WHERE state = 'resolving' AND kind = 'run_batch'";
+
+/// The active wait of one run batch inside the caller's transaction: its
+/// pending wait, else the one mid-resolution, which still carries the
+/// settlement its conversion copies. A batch belongs to one tool call, which
+/// has at most one active wait. Its request id lives only in the condition, so
+/// each state is found by walking its own partial index; the pending read is
+/// [`pending_run_batch_wait`]'s statement.
+pub(crate) async fn active_run_batch_wait_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    request_id: &str,
+) -> DbResult<Option<Record>> {
+    for active in [PENDING_RUN_BATCH_WAITS, RESOLVING_RUN_BATCH_WAITS] {
+        let sql = format!("{active} AND json_extract(condition_json,'$.request_id')=?1 LIMIT 1");
+        let mut rows = conn.query(sql.as_str(), params![request_id]).await?;
+        if let Some(row) = rows.next().await? {
+            return record_from_row(&row).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// Park `record` through the one establishing write, for tests outside this
+/// module that need a parked wait with every derived column.
+#[cfg(test)]
+pub(crate) async fn park_for_test(db: &LocalDb, record: &Record) -> Result<bool, String> {
+    insert(db, record).await
 }
 
 /// A suspension's [`Record`] from the first nine columns of an `agent_waits`
@@ -4659,6 +4694,7 @@ mod tests {
                     Box::pin(async move {
                         detached::insert_converted(
                             conn,
+                            &record.id,
                             &record.job_id,
                             &record.run_id,
                             &record.condition,

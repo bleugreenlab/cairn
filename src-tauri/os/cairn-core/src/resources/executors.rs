@@ -1727,7 +1727,13 @@ fn render_planning_memory(budget: Option<u64>) -> String {
 /// Render a fixture without querying the runner's kill history.
 #[cfg(test)]
 pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
-    render_executor_with_kills(executor, None, &[], &RunningAttributions::default())
+    render_executor_with_kills(
+        executor,
+        None,
+        &crate::fleet::Fleet::default(),
+        &[],
+        &RunningAttributions::default(),
+    )
 }
 
 /// A repository channel read by the runner from the project's default revision.
@@ -1742,6 +1748,7 @@ pub(crate) struct ProjectRustPin {
 pub(crate) fn render_executor_with_kills(
     executor: &ExecutorInspection,
     recorded_kills: Option<&RecordedKills>,
+    fleet: &crate::fleet::Fleet,
     rust_pins: &[ProjectRustPin],
     attributions: &RunningAttributions,
 ) -> String {
@@ -2488,6 +2495,7 @@ pub(crate) fn render_executor_with_kills(
         occupancy,
         executor.live_usage_gap,
         executor.captured_at_unix_ms,
+        fleet,
         attributions,
     ));
     out.push('\n');
@@ -7065,14 +7073,16 @@ fn render_running_now(
     occupancy: &cairn_common::executor_protocol::FleetSnapshot,
     gap: Option<cairn_common::wire_vocabulary::MeasurementGap>,
     now: u64,
+    fleet: &crate::fleet::Fleet,
 ) -> String {
-    render_running_now_with_attribution(occupancy, gap, now, &RunningAttributions::default())
+    render_running_now_with_attribution(occupancy, gap, now, fleet, &RunningAttributions::default())
 }
 
 fn render_running_now_with_attribution(
     occupancy: &cairn_common::executor_protocol::FleetSnapshot,
     gap: Option<cairn_common::wire_vocabulary::MeasurementGap>,
     now: u64,
+    fleet: &crate::fleet::Fleet,
     attributions: &RunningAttributions,
 ) -> String {
     let residents: Vec<_> = occupancy
@@ -7092,6 +7102,11 @@ fn render_running_now_with_attribution(
     {
         return String::new();
     }
+    let publication_phase = |request_id: &str| {
+        crate::mcp::handlers::run::detached::live_publication(request_id)
+            .or_else(|| fleet.observed_publication(request_id).map(Into::into))
+            .map(|phase| phase.describe(now as i64))
+    };
     let mut out = String::from("\n## Running now\nCPU and resident memory describe sampled process trees, not exhaustive accounting; descendants missed between censuses are not included.\n");
     if let Some(gap) = gap {
         out.push_str(&format!(
@@ -7156,8 +7171,11 @@ fn render_running_now_with_attribution(
             .get(&(request.request_id.clone(), request.attempt_id.clone()))
             .map(attribution::RunningAttribution::render)
             .unwrap_or_default();
+        let publication = publication_phase(&request.request_id)
+            .map(|phase| format!("; {phase}"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "- {place}: `{command}`{attribution} [{}] ({identity}, started {}): {}{build_jobs}{charge}\n",
+            "- {place}: `{command}`{attribution} [{}] ({identity}, started {}): {}{build_jobs}{charge}{publication}\n",
             request.command_class.as_str(),
             age(now.saturating_sub(request.started_at_unix_ms)),
             usage(request.live_usage)
@@ -7171,6 +7189,13 @@ fn render_running_now_with_attribution(
             .get(&(finishing.request_id.clone(), finishing.attempt_id.clone()))
             .map(attribution::RunningAttribution::render)
             .unwrap_or_default();
+        if let Some(phase) = publication_phase(&finishing.request_id) {
+            out.push_str(&format!(
+                "- {}: `{command}`{attribution} (request {}): {phase}\n",
+                finishing.cell_id, finishing.request_id,
+            ));
+            continue;
+        }
         out.push_str(&format!(
             "- {}: `{command}`{attribution} (request {}): finishing: {} for {} (commands exited {})\n",
             finishing.cell_id,
@@ -10781,8 +10806,13 @@ mod tests {
             measured_at_unix_ms: Some(CAPTURED_AT),
             ..Default::default()
         });
-        let different =
-            render_executor_with_kills(&executor, None, &pins, &RunningAttributions::default());
+        let different = render_executor_with_kills(
+            &executor,
+            None,
+            &crate::fleet::Fleet::default(),
+            &pins,
+            &RunningAttributions::default(),
+        );
         assert!(different.contains("rust default 1.100.0 differs from cairn's pinned 1.99.1: cargo run outside a checkout uses 1.100.0"), "{different}");
         assert!(different.contains("- Toolchains: rust\n"), "{different}");
         executor
@@ -10797,8 +10827,13 @@ mod tests {
             .as_mut()
             .unwrap()
             .toolchain = Some("1.99.1-x86_64-unknown-linux-gnu".into());
-        let equal =
-            render_executor_with_kills(&executor, None, &pins, &RunningAttributions::default());
+        let equal = render_executor_with_kills(
+            &executor,
+            None,
+            &crate::fleet::Fleet::default(),
+            &pins,
+            &RunningAttributions::default(),
+        );
         assert!(
             equal.contains("rust default 1.99.1 matches cairn's pinned 1.99.1"),
             "{equal}"
@@ -15947,7 +15982,13 @@ mod running_now_tests {
         }
         let mut executor = super::tests::inspection("fedora", false);
         executor.occupancy = snapshot.clone();
-        let rendered = super::render_executor_with_kills(&executor, None, &[], &attributions);
+        let rendered = super::render_executor_with_kills(
+            &executor,
+            None,
+            &crate::fleet::Fleet::default(),
+            &[],
+            &attributions,
+        );
         for (slot, issue, commit, short, handle, other_handle) in [
             (
                 "slot-103",
@@ -15983,8 +16024,13 @@ mod running_now_tests {
         }
         // An old attempt's metadata cannot identify a new attempt of the same request.
         snapshot.executing_requests[0].attempt_id = "new-attempt".into();
-        let rendered =
-            super::render_running_now_with_attribution(&snapshot, None, 60_000, &attributions);
+        let rendered = super::render_running_now_with_attribution(
+            &snapshot,
+            None,
+            60_000,
+            &crate::fleet::Fleet::default(),
+            &attributions,
+        );
         assert!(!rendered
             .lines()
             .find(|line| line.starts_with("- slot-103:"))
@@ -16039,7 +16085,7 @@ mod running_now_tests {
             }],
             ..FleetSnapshot::default()
         };
-        let rendered = render_running_now(&snapshot, None, 60_000);
+        let rendered = render_running_now(&snapshot, None, 60_000, &crate::fleet::Fleet::default());
         assert!(rendered.contains("## Running now"), "{rendered}");
         assert!(
             rendered.contains(
@@ -16048,19 +16094,36 @@ mod running_now_tests {
             "{rendered}"
         );
         assert!(rendered.contains("(commands exited "), "{rendered}");
+        let fleet = crate::fleet::Fleet::default();
+        fleet.observe_result_upload("e891a0ee", "53b6178b", Some(12_000_000));
+        let publishing = render_running_now(&snapshot, None, 60_000, &fleet);
+        assert!(
+            publishing.contains("publishing result (delta upload 12.0 MB, since"),
+            "{publishing}"
+        );
     }
 
     /// A compile names its build jobs where the operator reads it: its
     /// compile slot's width.
     #[test]
     fn a_running_row_names_its_build_jobs() {
-        let rendered = render_running_now(&running(Some(BuildJobs::new(8))), None, 60_000);
+        let rendered = render_running_now(
+            &running(Some(BuildJobs::new(8))),
+            None,
+            60_000,
+            &crate::fleet::Fleet::default(),
+        );
         assert!(
             rendered.contains("usage not measured yet; 8 build jobs, the compile slot's width\n"),
             "{rendered}"
         );
         // An executor that does not report build jobs leaves the row as it was.
-        let silent = render_running_now(&running(None), None, 60_000);
+        let silent = render_running_now(
+            &running(None),
+            None,
+            60_000,
+            &crate::fleet::Fleet::default(),
+        );
         assert!(silent.contains("usage not measured yet\n"), "{silent}");
     }
 
@@ -16081,7 +16144,8 @@ mod running_now_tests {
             ..ResourceReservation::default()
         };
         lane.memory_phase = Some(LanePhase::Compile);
-        let compiling = render_running_now(&snapshot, None, 60_000);
+        let compiling =
+            render_running_now(&snapshot, None, 60_000, &crate::fleet::Fleet::default());
         assert!(
             compiling.contains("; 31.0 GiB charged (compile phase)\n"),
             "{compiling}"
@@ -16090,11 +16154,46 @@ mod running_now_tests {
             since_unix_ms: 19 * 3_600_000 + 2 * 60_000,
             tests: 1_000,
         });
-        let testing = render_running_now(&snapshot, None, 60_000);
+        let testing = render_running_now(&snapshot, None, 60_000, &crate::fleet::Fleet::default());
         assert!(
             testing.contains("; 5.0 GiB charged (test phase, since 19:02 UTC)\n"),
             "{testing}"
         );
+        let request_id = "executor-publication-status";
+        let _live = crate::mcp::handlers::run::detached::LiveBatch::claim_for_test(request_id);
+        crate::mcp::handlers::run::detached::note_publishing(
+            request_id,
+            &crate::fleet::ObservedPublication {
+                attempt_id: "attempt".into(),
+                delta_bytes: Some(12_000_000),
+                since_ms: 19 * 3_600_000,
+            },
+        );
+        snapshot.executing_requests[0].request_id = request_id.into();
+        let publishing =
+            render_running_now(&snapshot, None, 60_000, &crate::fleet::Fleet::default());
+        assert!(
+            publishing.contains("publishing result (delta upload 12.0 MB, since"),
+            "{publishing}"
+        );
+    }
+
+    #[test]
+    fn an_adopted_upload_names_publication_without_a_live_batch() {
+        let request_id = "adopted-executor-publication-status";
+        let fleet = crate::fleet::Fleet::default();
+        fleet.observe_result_upload(request_id, "attempt", Some(12_000_000));
+        assert!(crate::mcp::handlers::run::detached::live_publication(request_id).is_none());
+        let mut snapshot = running(None);
+        snapshot.executing_requests[0].request_id = request_id.into();
+        let rendered = render_running_now(&snapshot, None, 60_000, &fleet);
+        assert!(
+            rendered.contains("publishing result (delta upload 12.0 MB, since"),
+            "{rendered}"
+        );
+        fleet.settle_request_publication(request_id);
+        let settled = render_running_now(&snapshot, None, 60_000, &fleet);
+        assert!(!settled.contains("publishing result"), "{settled}");
     }
 
     /// Every running row carries its class; an adopted build reads as what
@@ -16102,7 +16201,12 @@ mod running_now_tests {
     #[test]
     fn running_rows_carry_their_class_and_an_adopted_build_names_its_label() {
         use cairn_common::executor_protocol::{AdoptedTree, LiveUsageSample, MeasurementQuality};
-        let lane = render_running_now(&running(None), None, 60_000);
+        let lane = render_running_now(
+            &running(None),
+            None,
+            60_000,
+            &crate::fleet::Fleet::default(),
+        );
         assert!(
             lane.contains(
                 "- slot-103: `bun run test:rust:tiered` [cargoTest] (request request, started"
@@ -16130,7 +16234,7 @@ mod running_now_tests {
             quiet_window: None,
             scheduling: None,
         });
-        let rendered = render_running_now(&snapshot, None, 60_000);
+        let rendered = render_running_now(&snapshot, None, 60_000, &crate::fleet::Fleet::default());
         assert!(
             rendered.contains(
                 "- computer.cairn.rebuild, pid 4242 (adopted, not a cell): `rebuild build: bun run tauri build --bundles app` [releaseBuild] (attempt attempt-9, started"
@@ -16227,6 +16331,7 @@ mod running_now_tests {
             },
             None,
             60_000,
+            &crate::fleet::Fleet::default(),
         );
         for line in [
             "resident `imsg-watch` (generation 3): usage not measured yet; charged 19.0 MiB (15.0 MiB measured over 1h, plus 25%)\n",

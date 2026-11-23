@@ -10,11 +10,18 @@
 //! a parked call resumes its turn once through the durable resolver, and a
 //! detached batch settles its row and queues its job's notice.
 //!
-//! The settle gate decides whether a cancel can still matter. Before
-//! settlement begins it stops the batch, and nothing from it is published.
-//! Once settlement has begun the batch may already be writing its commit, so
-//! the cancel touches nothing and that result stands; a replay carries the
-//! commit like any other.
+//! A cancel never revokes the batch's object-plane grant: that lives until
+//! the batch's result is acknowledged or the batch is lost. Whether the
+//! cancel ended the commands is decided on the machine, against its own
+//! commands-ended fence. A machine whose cancel killed the commands publishes
+//! nothing and answers `Cancelled`, which settles naming the cancel; one
+//! already past its commands finishes its upload and answers with its result,
+//! and a completed result's commit stands. Once this runner has seen the
+//! batch's result upload arrive at its object server (or settlement has
+//! begun), a cancel is not sent at all: it is recorded on the batch as
+//! having arrived while publishing, and the batch settles at its result. The
+//! observed upload only names that phase; the commit stands only on the
+//! machine's completed result.
 //!
 //! A batch an earlier runner placed has no task here. If this runner's fleet
 //! still binds its request, the same `Cancel` reaches its machine and that
@@ -42,14 +49,17 @@ pub(crate) const CANCEL_SETTLE_WAIT: std::time::Duration = std::time::Duration::
 /// What a cancel did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CancelReport {
-    /// It was stopped before settlement began, so it publishes nothing.
-    /// `settled` when its task and its fleet request both ended within the
-    /// wait, which is when its durable rows release the branch.
+    /// It was told to stop before it was known to be publishing. Whether the
+    /// stop ended its commands is its machine's to decide, so its result says
+    /// what happened. `settled` when its task and its fleet request both ended
+    /// within the wait (with a cancelled result), which is when its durable
+    /// rows release the branch.
     Stopped { settled: bool },
     /// Its commands finished on their own before the cancel reached it, and
     /// it settled with its own result.
     FinishedFirst { verdict: String },
-    /// Settlement had already begun: its result, and any commit, stands.
+    /// Its result upload had been seen, or settlement had begun, so the cancel
+    /// was recorded and not sent; the batch settles at its result.
     AlreadySettling,
     /// No task in this runner holds it, but the fleet did: its machine was
     /// told to cancel it, and that machine's report settles it.
@@ -72,13 +82,13 @@ impl CancelReport {
                 "Cancelled run batch `{request_id}`: it settled as cancelled and committed nothing, and its machine work has ended, so it no longer holds its branch. A call waiting on it resumes once with that result; a detached batch's result reaches its job as a notice."
             ),
             Self::Stopped { settled: false } => format!(
-                "Cancelling run batch `{request_id}`: it was stopped before it began publishing, so it commits nothing, but its task or machine work has not yet finished settling. It holds its branch until that settlement ends."
+                "Cancelling run batch `{request_id}`: its machine was told to stop it, and has not answered yet. If the cancel ended its commands it commits nothing; if its commands had already finished, it publishes its result and any commit stands. Its result says which, and it holds its branch until that result settles."
             ),
             Self::FinishedFirst { verdict } => format!(
                 "Run batch `{request_id}` finished on its own before the cancel reached it ({verdict}); its own result stands, and any commit it made is on the branch."
             ),
             Self::AlreadySettling => format!(
-                "Run batch `{request_id}` was not cancelled: it had already begun publishing its result, so any commit it carries stands, and a replay carries it like any other commit. It releases its branch once it finishes publishing."
+                "Run batch `{request_id}` left to publish; settles at result. Its commands had finished and it was publishing its result when the cancel arrived, so the cancel was recorded on it and not sent to its machine. If that result is a completion, its commit stands. It releases its branch when the result settles."
             ),
             Self::Retracted => format!(
                 "Asked the machine running batch `{request_id}` to cancel it. No task in this runner holds it (an earlier runner placed it), so it settles from that machine's own report."
@@ -113,14 +123,20 @@ pub(crate) async fn cancel_batch(
     settle_wait: std::time::Duration,
 ) -> CancelReport {
     let control = detached::live_control(request_id);
-    if control.as_ref().is_some_and(|control| control.settling()) {
-        return CancelReport::AlreadySettling;
+    // A result already being published stands: the cancel is recorded on it
+    // and not sent, and even a batch page for a suspended call is too late.
+    if control
+        .as_ref()
+        .is_some_and(|control| control.settling() || control.commands_ended())
+        || orch.fleet.request_is_publishing(request_id)
+    {
+        return publication_cancel(db, request_id, by).await;
     }
     // Publication already owns an adopted result, just as a live settling
-    // control does. Its own result stands; even page creation is too late.
+    // control does.
     if control.is_none() {
         match adopted::has_open_adoption(db, request_id).await {
-            Ok(true) => return CancelReport::AlreadySettling,
+            Ok(true) => return publication_cancel(db, request_id, by).await,
             Ok(false) => {}
             Err(error) => {
                 return CancelReport::Unread {
@@ -130,7 +146,8 @@ pub(crate) async fn cancel_batch(
         }
     }
     // A suspended call needs a durable batch page too. Create it before
-    // recording attribution or sending Cancel; a resolving wait is untouched.
+    // recording attribution or sending Cancel, so the cancel's notes reach
+    // that row as well as the wait; a resolving wait is untouched.
     match crate::mcp::handlers::durable_suspend::pending_run_batch_wait(db, request_id).await {
         Ok(Some(record)) => {
             if let Err(error) = convert_wait(db, &record).await {
@@ -140,10 +157,20 @@ pub(crate) async fn cancel_batch(
         Ok(None) => {}
         Err(error) => return CancelReport::Unread { error },
     }
-    if let Err(error) = detached::record_cancel_request(db, request_id, by).await {
-        return CancelReport::Unread { error };
-    }
     let Some(control) = control else {
+        // Recorded before the cancel is sent: with no task here, the durable
+        // settlement is all that names the cancel when its machine's
+        // `Cancelled` answer settles, so a cancel it cannot record is not sent.
+        let cancel = super::DurableCancel::now(by);
+        if let Err(error) = detached::record_cancel(db, request_id, &cancel).await {
+            return CancelReport::Unread { error };
+        }
+        // Read only once the grant is genuinely retired, by an upload that
+        // arrives after settlement.
+        orch.object_plane.note_request_refusal_for_request(
+            request_id,
+            cancel.detail(true, false).trim_end_matches('.'),
+        );
         // A batch an earlier runner placed is still the fleet's request: the
         // same `Cancel` ends it, and its machine's report settles its row.
         return match orch.cancel_cell_request(request_id) {
@@ -151,10 +178,25 @@ pub(crate) async fn cancel_batch(
             _ => CancelReport::Retracted,
         };
     };
-    if control.settling() {
-        return CancelReport::AlreadySettling;
+    // Checked again: publication may have begun during the writes above.
+    if control.settling()
+        || control.commands_ended()
+        || orch.fleet.request_is_publishing(request_id)
+    {
+        return publication_cancel(db, request_id, by).await;
     }
     control.set_cancelled_by(by);
+    if let Some(cause) = control.cancelled_detail() {
+        orch.object_plane
+            .note_request_refusal_for_request(request_id, cause.trim_end_matches('.'));
+    }
+    // A restart before the machine answers hands that answer to a later
+    // runner, which names the cancel from the batch's durable record.
+    if let Some(cancel) = control.cancelled() {
+        if let Err(error) = detached::record_cancel(db, request_id, &cancel).await {
+            log::warn!("run batch {request_id}: {error}");
+        }
+    }
     control.interrupt(Interruption::Cancelled(format!("cancelled by {by}")));
     control.stop(orch);
     log::info!("run batch {request_id} cancelled by {by}");
@@ -181,6 +223,13 @@ pub(crate) async fn cancel_batch(
     }
 }
 
+async fn publication_cancel(db: &LocalDb, request_id: &str, by: &str) -> CancelReport {
+    match detached::record_publication_cancel(db, request_id, by).await {
+        Ok(()) => CancelReport::AlreadySettling,
+        Err(error) => CancelReport::Unread { error },
+    }
+}
+
 /// End the durable records of a batch no task in this runner and no fleet
 /// binding holds: its detached row, and a parked call waiting on it.
 async fn cancel_unheld(
@@ -189,9 +238,12 @@ async fn cancel_unheld(
     request_id: &str,
     by: &str,
 ) -> CancelReport {
+    if orch.fleet.request_is_publishing(request_id) {
+        return publication_cancel(db, request_id, by).await;
+    }
     match adopted::has_open_adoption(db, request_id).await {
         Ok(false) => {}
-        Ok(true) => return CancelReport::AlreadySettling,
+        Ok(true) => return publication_cancel(db, request_id, by).await,
         Err(error) => {
             return CancelReport::Unread {
                 error: error.to_string(),
@@ -248,6 +300,7 @@ async fn cancel_unheld(
         Err(error) => return CancelReport::Unread { error },
     };
     if !unsettled {
+        orch.fleet.settle_request_publication(request_id);
         return CancelReport::NotLive;
     }
     match detached::cancel_unheld(orch, db, request_id, by).await {
@@ -282,6 +335,7 @@ async fn cancel_unheld(
         )
         .await;
     }
+    orch.fleet.settle_request_publication(request_id);
     log::info!("run batch {request_id}, held by nothing, settled as lost on {by}'s cancel");
     CancelReport::SettledUnheld
 }
@@ -308,6 +362,7 @@ async fn convert_wait(
             if pending {
                 detached::insert_converted(
                     c,
+                    &record.id,
                     &record.job_id,
                     &record.run_id,
                     &record.condition,

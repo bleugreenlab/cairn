@@ -245,7 +245,202 @@ pub(crate) fn live_owner(request_id: &str) -> Option<BatchOwner> {
 /// Where a batch whose task runs in this process stands now, in the terms a
 /// reader deciding whether to wait for it needs.
 pub(crate) fn live_progress(orch: &Orchestrator, request_id: &str) -> Option<BatchProgress> {
-    Some(live_control(request_id)?.progress(&orch.fleet))
+    live_control(request_id)
+        .map(|control| control.progress(&orch.fleet))
+        .or_else(|| {
+            orch.fleet
+                .observed_publication(request_id)
+                .map(BatchProgress::from)
+        })
+}
+
+/// The publication phase shared by batch and executor status surfaces, for a
+/// batch whose task runs here. [`live_state`] also reads the fleet's own
+/// observation, which covers a batch an earlier runner placed.
+pub(crate) fn live_publication(request_id: &str) -> Option<BatchProgress> {
+    live_control(request_id)?
+        .publication
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Name the observed upload on a live batch. A record only: whether the
+/// result publishes is decided by the machine's terminal outcome.
+pub(crate) fn note_publishing(request_id: &str, observed: &crate::fleet::ObservedPublication) {
+    if let Some(control) = live_control(request_id) {
+        control.note_publishing(observed);
+    }
+}
+
+/// Record a cancel that was not sent because the batch was already
+/// publishing. It goes where the batch already lives: its live task, whose
+/// result text carries it and whose next attempt honours it if this one is
+/// lost, and its durable settlement (a parked call's wait, a detached row),
+/// from which a later runner that adopts the result seals it into the report.
+/// A detached row's reason names it too, for its batch page. No record is
+/// created for it: a parked call's own resolver delivers that result, and a
+/// row would deliver it a second time.
+pub(crate) async fn record_publication_cancel(
+    db: &LocalDb,
+    request_id: &str,
+    by: &str,
+) -> Result<(), String> {
+    let note = format!(
+        "{LATE_CANCEL_LEAD}; left to publish (by {by}, at {})",
+        chrono::Utc::now().format("%H:%M UTC")
+    );
+    if let Some(control) = live_control(request_id) {
+        control.record_late_cancel(by, note.clone());
+    }
+    let recorded = note_on_settlement(db, request_id, SettlementNote::LateCancel(note.clone()))
+        .await
+        .map_err(|error| format!("record late cancel: {error}"))?;
+    if recorded == 0 {
+        log::info!("run batch {request_id}: {note}; no new durable note recorded (already noted, sealed, or no settlement record)");
+    }
+    Ok(())
+}
+
+/// Record a principal's cancel, about to be sent to the batch's machine, on
+/// its durable settlement: the one durable record of who cancelled a batch.
+/// The machine's `Cancelled` answer may reach a later runner with no task for
+/// it, and that runner names the cancel from this ([`attributed_result`]).
+/// The first cancel is kept. A record whose settlement does not exist yet is
+/// left without one rather than given a partial settlement.
+pub(crate) async fn record_cancel(
+    db: &LocalDb,
+    request_id: &str,
+    cancel: &super::DurableCancel,
+) -> Result<(), String> {
+    note_on_settlement(db, request_id, SettlementNote::Cancelled(cancel.clone()))
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("record cancel: {error}"))
+}
+
+/// How every late-cancel note opens, so a row with no settlement to key it
+/// on can still tell whether its reason already names one.
+const LATE_CANCEL_LEAD: &str = "cancel arrived after its commands finished";
+
+/// What a cancel leaves on a batch's durable settlement.
+#[derive(Clone, Debug)]
+pub(crate) enum SettlementNote {
+    /// A cancel left unsent because the batch was already publishing.
+    LateCancel(String),
+    /// A principal's cancel sent to the batch's machine.
+    Cancelled(super::DurableCancel),
+}
+
+impl SettlementNote {
+    /// Set this note on `settlement` unless it already carries one of its
+    /// kind, reporting whether it did.
+    fn apply(&self, settlement: &mut super::PersistedSettlement) -> bool {
+        match self {
+            Self::LateCancel(note) if settlement.late_cancel.is_none() => {
+                settlement.late_cancel = Some(note.clone());
+                true
+            }
+            Self::Cancelled(cancel) if settlement.cancelled.is_none() => {
+                settlement.cancelled = Some(cancel.clone());
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The adopted outcome that closes a late cancel out: a sealed report.
+const LATE_CANCEL_CLOSED_SQL: &str = "SELECT 1 FROM run_batch_adopted_outcomes WHERE request_id=?1 AND state IN ('published','delivered') LIMIT 1";
+
+/// The adopted outcome that closes a principal's cancel out: any. Its
+/// machine had already answered, so the cancel ended nothing that report
+/// could name.
+const CANCELLED_CLOSED_SQL: &str =
+    "SELECT 1 FROM run_batch_adopted_outcomes WHERE request_id=?1 LIMIT 1";
+
+/// A late cancel on an unsettled row: the first note of its settlement and its
+/// reason, together. A row with no settlement keys first-ness on its reason.
+const LATE_CANCEL_ROW_SQL: &str = "UPDATE run_batch_detached SET reason=reason || char(10) || ?2,
+     settlement_json=CASE WHEN json_type(settlement_json)='object' THEN json_set(settlement_json,'$.late_cancel',?2) ELSE settlement_json END
+     WHERE request_id=?1 AND state IN ('parked','running')
+       AND CASE WHEN json_type(settlement_json)='object' THEN json_extract(settlement_json,'$.late_cancel') IS NULL ELSE instr(reason,?3)=0 END";
+
+/// A principal's cancel on an unsettled row's settlement, first kept.
+const CANCELLED_ROW_SQL: &str =
+    "UPDATE run_batch_detached SET settlement_json=json_set(settlement_json,'$.cancelled',json(?2))
+     WHERE request_id=?1 AND state IN ('parked','running')
+       AND json_type(settlement_json)='object'
+       AND json_extract(settlement_json,'$.cancelled') IS NULL";
+
+/// Set `note` on the durable settlement of each unsettled record of
+/// `request_id`, once, in one write: its active run-batch wait, rewritten
+/// through the canonical condition writer, and its unsettled detached row.
+/// The first note of each kind is kept. Nothing is written once the batch's
+/// adopted outcome closes the note out; the seal reads the note in a write of
+/// its own, so a note lands either before it and is sealed, or after and is
+/// refused.
+pub(crate) async fn note_on_settlement(
+    db: &LocalDb,
+    request_id: &str,
+    note: SettlementNote,
+) -> DbResult<u64> {
+    use crate::mcp::handlers::durable_suspend::{self, Condition, ConditionColumns};
+    let request_id = request_id.to_owned();
+    db.write(move |c| {
+        let (request_id, note) = (request_id.clone(), note.clone());
+        Box::pin(async move {
+            let closed = match note {
+                SettlementNote::LateCancel(_) => LATE_CANCEL_CLOSED_SQL,
+                SettlementNote::Cancelled(_) => CANCELLED_CLOSED_SQL,
+            };
+            let mut rows = c.query(closed, params![request_id.as_str()]).await?;
+            if rows.next().await?.is_some() {
+                return Ok(0);
+            }
+            drop(rows);
+            let mut written = 0;
+            if let Some(mut wait) =
+                durable_suspend::active_run_batch_wait_conn(c, &request_id).await?
+            {
+                if let Condition::RunBatch {
+                    settlement: Some(settlement),
+                    ..
+                } = &mut wait.condition
+                {
+                    if note.apply(settlement) {
+                        let columns = ConditionColumns::of(&wait.condition, wait.deadline)
+                            .map_err(crate::storage::DbError::internal)?;
+                        if durable_suspend::store_columns_conn(c, &wait.id, &columns, wait.deadline)
+                            .await?
+                        {
+                            written += 1;
+                        }
+                    }
+                }
+            }
+            written += match &note {
+                SettlementNote::LateCancel(text) => {
+                    c.execute(
+                        LATE_CANCEL_ROW_SQL,
+                        params![request_id.as_str(), text.as_str(), LATE_CANCEL_LEAD],
+                    )
+                    .await?
+                }
+                SettlementNote::Cancelled(cancel) => {
+                    let json = serde_json::to_string(cancel)
+                        .map_err(|error| crate::storage::DbError::internal(error.to_string()))?;
+                    c.execute(
+                        CANCELLED_ROW_SQL,
+                        params![request_id.as_str(), json.as_str()],
+                    )
+                    .await?
+                }
+            };
+            Ok(written)
+        })
+    })
+    .await
 }
 
 /// Item `index` of a live batch has started. Reached from the host item loop
@@ -257,10 +452,12 @@ pub(crate) fn note_item_started(request_id: &str, index: usize) {
     }
 }
 
-/// Item `index` of a live batch has finished.
-pub(crate) fn note_item_finished(request_id: &str, index: usize) {
+/// Item `index` of a live batch has finished, succeeding or not. Reports come
+/// through the attempt's own runner context, which settles before any retry
+/// begins, so a lost attempt's reports never reach the next one.
+pub(crate) fn note_item_finished(request_id: &str, index: usize, succeeded: bool) {
     if let Some(control) = live_control(request_id) {
-        control.item_finished(index);
+        control.item_finished(index, succeeded);
     }
 }
 
@@ -296,6 +493,20 @@ pub(crate) enum BatchProgress {
     /// Settlement has begun: it is publishing its result, and any commit it
     /// carries is being written.
     Settling,
+    /// Commands ended; the machine is assembling or uploading its result.
+    Publishing {
+        delta_bytes: Option<u64>,
+        since_ms: i64,
+    },
+}
+
+impl From<crate::fleet::ObservedPublication> for BatchProgress {
+    fn from(observed: crate::fleet::ObservedPublication) -> Self {
+        Self::Publishing {
+            delta_bytes: observed.delta_bytes,
+            since_ms: observed.since_ms,
+        }
+    }
 }
 
 impl BatchProgress {
@@ -338,6 +549,21 @@ impl BatchProgress {
             }
             Self::InRunner => {
                 "between placement attempts; no machine holds it right now".to_string()
+            }
+            Self::Publishing {
+                delta_bytes,
+                since_ms,
+            } => {
+                let since = chrono::DateTime::from_timestamp_millis(*since_ms)
+                    .map(|time| time.format("%H:%M").to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                match delta_bytes {
+                    Some(bytes) => format!(
+                        "publishing result (delta upload {:.1} MB, since {since})",
+                        *bytes as f64 / 1_000_000.0
+                    ),
+                    None => format!("publishing result (since {since})"),
+                }
             }
             Self::Settling => {
                 "publishing its result now; a commit it carries is being written".to_string()
@@ -392,19 +618,30 @@ pub(crate) fn has_live_resolver(request_id: &str) -> bool {
 /// settled it, so this asks the fleet's queue whether a machine has it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LiveState {
+    Publishing {
+        phase: String,
+    },
     /// Not yet handed to the fleet; `waiting` is what it waits for.
-    Parked { waiting: String },
+    Parked {
+        waiting: String,
+    },
     /// A machine claimed its attempt and may be running it.
-    Placed { on: String },
+    Placed {
+        on: String,
+    },
     /// In the placement queue, and no machine has claimed it.
-    Unplaced { wait: String },
+    Unplaced {
+        wait: String,
+    },
     /// Its task is alive here but no machine holds it right now: it is
     /// between placement attempts, or is publishing its result.
     InRunner,
     /// Nothing in this runner holds it, and a machine that could hold it has
     /// not reported since Cairn restarted; `machines` names them (empty when
     /// no machine is attached at all).
-    Awaiting { machines: Vec<String> },
+    Awaiting {
+        machines: Vec<String>,
+    },
     /// Nothing in this runner holds it; a batch an earlier runner placed is
     /// settled from its machine's report or from evidence it cannot report.
     Untracked,
@@ -426,6 +663,7 @@ impl LiveState {
     /// The state as a running row's `State:` line and the batch list state it.
     fn headline(&self) -> String {
         match self {
+            Self::Publishing { phase } => phase.clone(),
             Self::Parked { waiting } => format!("parked, {waiting}"),
             Self::Placed { on } => format!("running on `{on}`"),
             Self::Unplaced { .. } => "queued, not yet placed on any machine".to_string(),
@@ -441,6 +679,7 @@ impl LiveState {
     fn sentence(&self) -> String {
         match self {
             Self::Parked { waiting } => format!("it has not started: it is {waiting}, and it holds no branch until a machine has it"),
+            Self::Publishing { phase } => format!("it is {phase}; its branch releases when the result settles"),
             Self::Placed { on } => format!("it is running on `{on}`"),
             Self::Unplaced { wait } => format!("no machine has taken it: it is {wait}"),
             Self::InRunner => "it is between placement attempts or publishing its result; no machine holds it right now".to_string(),
@@ -458,6 +697,15 @@ impl LiveState {
 /// one.
 pub(crate) fn live_state(orch: &Orchestrator, batch: &DetachedBatch) -> LiveState {
     let request_id = batch.request_id.as_str();
+    if let Some(progress) = live_publication(request_id).or_else(|| {
+        orch.fleet
+            .observed_publication(request_id)
+            .map(BatchProgress::from)
+    }) {
+        return LiveState::Publishing {
+            phase: progress.describe(chrono::Utc::now().timestamp_millis()),
+        };
+    }
     if batch.state == DetachedState::Parked {
         return LiveState::Parked {
             waiting: batch
@@ -968,9 +1216,12 @@ pub(crate) fn verdict_from_text(text: &str) -> String {
 /// by the wait's resolver or by its machine's report. Called inside the same
 /// transaction as the wait's abandonment or diversion, and ahead of a
 /// restart's resolution of it, so there is never a moment when a live batch
-/// has no unsettled row. A wait that names no run batch writes nothing.
+/// has no unsettled row. A wait that names no run batch writes nothing. The
+/// settlement is wait `wait_id`'s as stored now, which carries any cancel
+/// noted after `condition` was read.
 pub(crate) async fn insert_converted(
     c: &cairn_db::storage::TrackedConnection,
+    wait_id: &str,
     job_id: &str,
     run_id: &str,
     condition: &crate::mcp::handlers::durable_suspend::Condition,
@@ -992,7 +1243,10 @@ pub(crate) async fn insert_converted(
         .as_ref()
         .and_then(|settlement| serde_json::to_string(settlement).ok());
     c.execute(
-        "INSERT OR IGNORE INTO run_batch_detached(request_id,job_id,run_id,label,identity,commits,holds_branch,state,reason,created_ms,settlement_json) VALUES(?1,?2,?3,?4,?5,?6,?7,'running',?8,?9,?10)",
+        "INSERT OR IGNORE INTO run_batch_detached(request_id,job_id,run_id,label,identity,commits,holds_branch,state,reason,created_ms,settlement_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,'running',?8,?9,
+           COALESCE((SELECT json_extract(condition_json,'$.settlement')
+             FROM agent_waits WHERE id=?11),?10))",
         params![
             request_id.as_str(),
             job_id,
@@ -1003,7 +1257,8 @@ pub(crate) async fn insert_converted(
             condition.holds_branch() as i64,
             reason,
             now_ms,
-            settlement
+            settlement,
+            wait_id
         ],
     )
     .await?;
@@ -1562,7 +1817,10 @@ pub(crate) fn lost_wait_text(batch: &DetachedBatch) -> String {
 
 /// Why a cancel that reached no runner task and no machine settled a batch.
 pub(crate) fn cancel_evidence(by: &str) -> String {
-    format!("cancelled by {by}; no runner task or machine held it, so its outcome is unknown")
+    format!(
+        "cancelled by {by} at {}; no runner task or machine held it, so its outcome is unknown",
+        chrono::Utc::now().format("%H:%M UTC")
+    )
 }
 
 /// Settle as lost, on `by`'s cancel, a parked or running batch that no task in
@@ -1593,7 +1851,22 @@ pub(crate) async fn report_late(
     request_id: &str,
     late: &LateReport,
 ) -> Result<bool, String> {
-    let (id, late) = (request_id.to_string(), late.clone());
+    let mut late = late.clone();
+    if let Some(batch) = load(db, request_id).await? {
+        if batch.state == DetachedState::Lost {
+            if let Some(evidence) = batch.lost_evidence.as_deref() {
+                log::info!(
+                    "late result for run batch {request_id} discarded ({evidence}): {}",
+                    late.verdict
+                );
+                late.verdict = format!(
+                    "{evidence}; its {} was discarded",
+                    if batch.commits { "commit" } else { "result" }
+                );
+            }
+        }
+    }
+    let (id, late) = (request_id.to_string(), late);
     let recorded = db
         .write(|c| {
             let (id, late) = (id.clone(), late.clone());
@@ -1743,49 +2016,61 @@ pub(crate) async fn settle_answered_inline(
     }
 }
 
-/// Runner-only request metadata lives beside the persisted settlement, not in
-/// the detachment reason or the executor protocol. JSON insertion preserves the
-/// first requester and leaves the typed settlement fields unchanged.
-pub(crate) async fn record_cancel_request(
-    db: &LocalDb,
-    request_id: &str,
-    by: &str,
-) -> Result<(), String> {
-    db.execute(
-        "UPDATE run_batch_detached SET settlement_json=json_insert(COALESCE(settlement_json,'{}'),'$.cancel_requested_by',?2) WHERE request_id=?1 AND state IN ('parked','running')",
-        params![request_id, by],
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| format!("record run batch cancellation attribution: {error}"))
-}
-
-/// A request is evidence of who asked, not proof the batch was cancelled.
-/// Only an actual cancellation verdict may describe it as the canceller.
+/// Name the cancel a batch's durable settlement recorded ([`record_cancel`])
+/// in a result composed without the task that took it: a completion a machine
+/// kept past a restart, or an adopted answer. A recorded cancel is evidence of
+/// who asked, not proof the cancel ended the batch, so only a cancellation
+/// verdict names it, and a text that already names it is left alone.
 pub(crate) async fn attributed_result(
     db: &LocalDb,
     request_id: &str,
     verdict: &str,
     text: &str,
 ) -> Result<String, String> {
-    if !verdict.starts_with("it was cancelled") && !verdict.starts_with("it was never placed") {
+    let before_placement = verdict.starts_with("it was never placed");
+    if !before_placement && !verdict.starts_with("it was cancelled") {
         return Ok(text.to_string());
     }
-    let by = db.query_all(
-        "SELECT json_extract(settlement_json,'$.cancel_requested_by') FROM run_batch_detached WHERE request_id=?1",
-        (request_id.to_string(),),
-        |row| row.opt_text(0),
-    ).await.map_err(|error| format!("read run batch cancellation attribution: {error}"))?
-        .into_iter().flatten().next();
-    Ok(match by {
-        Some(by)
-            if !text.contains(&format!("cancelled by {by}"))
-                && !text.contains(&format!("Cancelled by {by}")) =>
-        {
-            format!("{text}\n\nCancelled by {by}.")
+    let Some((cancel, commits)) = recorded_cancel(db, request_id)
+        .await
+        .map_err(|error| format!("read run batch cancellation attribution: {error}"))?
+    else {
+        return Ok(text.to_string());
+    };
+    if text.contains(&format!("cancelled by {}", cancel.by)) {
+        return Ok(text.to_string());
+    }
+    Ok(format!(
+        "{text}\n\nIt was {}",
+        cancel.detail(commits, before_placement)
+    ))
+}
+
+/// The first cancel a batch's durable settlement records, with whether the
+/// batch commits: its detached row's, else its pending wait's. A record whose
+/// settlement does not exist yet carries none; until that settlement is
+/// written, before any attempt is dispatched, its live control holds the
+/// cancel and the settlement write copies it in.
+async fn recorded_cancel(
+    db: &LocalDb,
+    request_id: &str,
+) -> Result<Option<(super::DurableCancel, bool)>, String> {
+    use crate::mcp::handlers::durable_suspend::{self, Condition};
+    if let Some(batch) = load(db, request_id).await? {
+        if let Some(cancel) = batch.settlement.and_then(|settlement| settlement.cancelled) {
+            return Ok(Some((cancel, batch.commits)));
         }
-        _ => text.to_string(),
-    })
+    }
+    Ok(durable_suspend::pending_run_batch_wait(db, request_id)
+        .await?
+        .and_then(|wait| match wait.condition {
+            Condition::RunBatch {
+                commits,
+                settlement: Some(settlement),
+                ..
+            } => settlement.cancelled.map(|cancel| (cancel, commits)),
+            _ => None,
+        }))
 }
 
 #[cfg(test)]
@@ -1874,18 +2159,45 @@ mod tests {
         }
     }
 
+    /// A recorded cancel names a cancellation result composed without its
+    /// task, once, and never relabels a success. A row whose settlement does
+    /// not exist yet takes no partial one from a cancel.
     #[tokio::test(flavor = "current_thread")]
     async fn cancellation_request_survives_until_report_without_relabelling_success() {
         let orch = orch_with_job().await;
         let db = &orch.db.local;
-        insert(db, &running("cancel-attribution")).await.unwrap();
+        let mut row = running("cancel-attribution");
+        row.settlement = Some(super::super::PersistedSettlement::for_test(
+            None, None, None,
+        ));
+        insert(db, &row).await.unwrap();
+        insert(db, &running("captured")).await.unwrap();
         let by = "cairn://p/cairn/execution (reason: stuck placement)";
-        record_cancel_request(db, "cancel-attribution", by)
+        let first = super::super::DurableCancel {
+            by: by.into(),
+            at_ms: 0,
+        };
+        for id in ["cancel-attribution", "captured"] {
+            record_cancel(db, id, &first).await.unwrap();
+            record_cancel(db, id, &super::super::DurableCancel::now("operator"))
+                .await
+                .unwrap();
+        }
+        let bare: Vec<Option<String>> = db
+            .query_all(
+                "SELECT settlement_json FROM run_batch_detached WHERE request_id='captured'",
+                (),
+                |row| row.opt_text(0),
+            )
             .await
             .unwrap();
-        record_cancel_request(db, "cancel-attribution", "operator")
-            .await
-            .unwrap();
+        assert_eq!(bare, vec![None]);
+        assert_eq!(
+            attributed_result(db, "captured", "it was cancelled", "stopped")
+                .await
+                .unwrap(),
+            "stopped"
+        );
         record_snapshot(
             db,
             "cancel-attribution",
@@ -1906,9 +2218,22 @@ mod tests {
         let text = attributed_result(db, "cancel-attribution", "it was cancelled", "stopped")
             .await
             .unwrap();
-        assert_eq!(text, format!("stopped\n\nCancelled by {by}."));
+        assert_eq!(
+            text,
+            format!("stopped\n\nIt was cancelled by {by} at 00:00 UTC.")
+        );
+        assert_eq!(
+            attributed_result(db, "cancel-attribution", "it was cancelled", &text)
+                .await
+                .unwrap(),
+            text
+        );
         settle_answered_inline(&orch, db, "cancel-attribution", "it was cancelled", &text).await;
         let batch = load(db, "cancel-attribution").await.unwrap().unwrap();
+        assert_eq!(
+            batch.settlement.as_ref().and_then(|s| s.cancelled.clone()),
+            Some(first)
+        );
         assert!(render(&batch, &LiveState::Untracked).contains(by));
         assert!(notices(db).await.is_empty());
     }

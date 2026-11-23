@@ -1943,6 +1943,11 @@ pub struct OverlapAuthorized {
 /// debts behind them, would wait for a snapshot that can never come.
 pub fn enrollment_revoked(orch: &Orchestrator, executor_id: &str, device_id: &str) {
     if let Some(generation) = orch.fleet.managed_generation(executor_id, device_id) {
+        orch.object_plane.note_executor_refusal(
+            executor_id,
+            generation,
+            "its holder was removed; its commit was discarded",
+        );
         orch.object_plane.revoke(executor_id, generation);
         orch.fleet.shutdown_advertised_executor(
             executor_id,

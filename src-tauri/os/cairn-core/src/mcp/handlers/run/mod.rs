@@ -3780,6 +3780,139 @@ pub(crate) mod slot_publication_tests {
         );
     }
 
+    /// A cancel that arrives once the result upload is observed is not sent:
+    /// the object grant and the branch hold stay, and the sealed delta
+    /// publishes and settles with its commit, its reason naming the cancel.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_cancel_after_the_upload_is_observed_leaves_the_publication_to_stand() {
+        let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping a_cancel_after_the_upload_is_observed: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator(&fx).await;
+        let control = BatchControl::with_request_id(&fx.request.request_id, true);
+        let _live = detached::LiveBatch::claim(&control);
+        detached::insert(
+            &orch.db.local,
+            &detached::DetachedBatch {
+                request_id: fx.request.request_id.clone(),
+                job_id: FEATURE_JOB.into(),
+                run_id: "run-feature".into(),
+                label: Some("the batch".into()),
+                identity: None,
+                commits: true,
+                holds_branch: true,
+                state: detached::DetachedState::Running,
+                verdict: None,
+                output: None,
+                commit_id: None,
+                reason: "its carrier cannot suspend".into(),
+                lost_evidence: None,
+                created_ms: chrono::Utc::now().timestamp_millis(),
+                settled_ms: None,
+                notified_ms: None,
+                settlement: None,
+                waiting_on: None,
+                late_report: None,
+            },
+        )
+        .await
+        .unwrap();
+        orch.object_plane
+            .authorize_request(&fx.request, "publishing-machine", 1);
+        let coordinate = cairn_common::executor_protocol::ObjectTransferCoordinate {
+            repository: fx.request.repository.identity(),
+            request_id: fx.request.request_id.clone(),
+            attempt_id: fx.request.attempt_id.clone(),
+            executor_id: "publishing-machine".into(),
+            connection_generation: 1,
+        };
+        orch.fleet.observe_result_upload(
+            &fx.request.request_id,
+            &fx.request.attempt_id,
+            Some(12_000_000),
+        );
+        let report = cancel::cancel_batch(
+            &orch,
+            &orch.db.local,
+            &fx.request.request_id,
+            "operator",
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(report, cancel::CancelReport::AlreadySettling);
+        assert!(orch
+            .object_plane
+            .authorizes(&coordinate, &fx.request.base_commit));
+        assert!(
+            crate::orchestrator::base_advance::inflight_run_batch_on_branch(
+                &orch.db.local,
+                FEATURE_JOB,
+                "feature",
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        let publication = publish_visible_slot_delta(
+            &orch,
+            &fx.target,
+            &fx.request,
+            &fx.delta,
+            "the batch",
+            None,
+            None,
+        )
+        .await
+        .expect("an unmoved bookmark publishes");
+        let SlotPublicationOutcome::Published {
+            landed,
+            export,
+            patch,
+            integration,
+            ..
+        } = publication.outcome
+        else {
+            panic!("expected a publication");
+        };
+
+        export.expect("the publication exports its bookmark to the backing checkout");
+        assert!(integration.is_none());
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", &format!("{}^", landed.head)]),
+            fx.base
+        );
+        assert_eq!(published_paths(&patch), ["mine.rs"]);
+        detached::settle_answered_inline(
+            &orch,
+            &orch.db.local,
+            &fx.request.request_id,
+            "succeeded",
+            &format!("✓ Committed changes ({})", landed.head),
+        )
+        .await;
+        let row = detached::load(&orch.db.local, &fx.request.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.commit_id.as_deref(), Some(landed.head.as_str()));
+        assert!(row
+            .reason
+            .contains("cancel arrived after its commands finished; left to publish"));
+        assert!(
+            crate::orchestrator::base_advance::inflight_run_batch_on_branch(
+                &orch.db.local,
+                FEATURE_JOB,
+                "feature",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
     /// `commit_msg: "^"` rewrites the commit the bookmark holds, which after a
     /// move is not the one this batch built on. It becomes a child of the moved
     /// head keeping that head's description, so a sibling's landed commit is
@@ -6815,6 +6948,7 @@ async fn prepare_and_run_batch(
         .filter(|reason| !reason.is_empty())
         .map(ToOwned::to_owned);
     let stop_on_error = payload.stop_on_error.unwrap_or(true);
+    control.set_stops_at_first_failure(sequential && stop_on_error);
 
     // Authenticated jobs resolve repository identity and the immutable batch base
     // solely from their durable run coordinate. Process cwd is scratch residence.
@@ -7438,7 +7572,12 @@ async fn run_host_items(
             })
             .await;
             if let Some(request_id) = batch_request_id {
-                detached::note_item_finished(request_id, index);
+                // A suspension re-runs the call, so it never ends the commands.
+                detached::note_item_finished(
+                    request_id,
+                    index,
+                    outcome.succeeded || outcome.suspended,
+                );
             }
             // A suspend stops the (sequential) batch: the whole call re-runs on
             // resume once the fence is answered.
@@ -7481,7 +7620,7 @@ async fn run_host_items(
             )
             .await;
             if let Some(request_id) = batch_request_id.as_deref() {
-                detached::note_item_finished(request_id, index);
+                detached::note_item_finished(request_id, index, outcome.succeeded);
             }
             outcome
         })));
@@ -7588,8 +7727,11 @@ async fn run_host_batch(
     if !control.begin_settling() {
         return run_envelope(abandoned_batch_text(), Vec::new());
     }
-    let settled =
+    let mut settled =
         off_frame(|| settle_host_batch(orch, &settlement, joined_host_outcomes(joined))).await;
+    if let Some(note) = control.late_cancel_note() {
+        settled.text.push_str(&format!("\n\nNote: {note}."));
+    }
     control.phase_done("settle");
     control.set_verdict(settled.verdict.clone());
     settled_envelope(settled)
@@ -8195,6 +8337,49 @@ pub(crate) struct PersistedSettlement {
     detached: bool,
     #[serde(default)]
     pub(crate) placed_on: Option<PlacedOn>,
+    /// First cancel left unsent because this batch was already publishing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) late_cancel: Option<String>,
+    /// The first principal's cancel sent to the batch's machine while its
+    /// commands may still have been running. A later runner adopting that
+    /// machine's `Cancelled` answer settles naming it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cancelled: Option<DurableCancel>,
+}
+
+/// Who cancelled a batch and when, as its task and its durable settlement
+/// both record it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DurableCancel {
+    pub(crate) by: String,
+    pub(crate) at_ms: i64,
+}
+
+impl DurableCancel {
+    pub(crate) fn now(by: &str) -> Self {
+        Self {
+            by: by.to_owned(),
+            at_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    /// The detail a batch this cancel ended settles with.
+    pub(crate) fn detail(&self, commits: bool, before_placement: bool) -> String {
+        let at = chrono::DateTime::from_timestamp_millis(self.at_ms)
+            .map(|time| time.format("%H:%M UTC").to_string())
+            .unwrap_or_else(|| "an unknown time".to_owned());
+        let placement = if before_placement {
+            " before placement"
+        } else {
+            ""
+        };
+        let discarded = if commits {
+            "; its commit was discarded"
+        } else {
+            ""
+        };
+        format!("cancelled by {}{placement} at {at}{discarded}.", self.by)
+    }
 }
 
 impl PersistedSettlement {
@@ -8229,6 +8414,8 @@ impl PersistedSettlement {
             machine_notes: Vec::new(),
             detached: false,
             placed_on,
+            late_cancel: None,
+            cancelled: None,
         }
     }
 
@@ -8303,6 +8490,8 @@ impl RunBatchSettlement {
             machine_notes: self.machine_notes.clone(),
             detached: residence == BatchResidence::Detached,
             placed_on: None,
+            late_cancel: None,
+            cancelled: None,
         }
     }
 
@@ -8806,11 +8995,18 @@ async fn run_routed_batch(
         }
     };
     control.phase_done("place+run");
+    // Only an abandoned call closes this gate. A principal's cancel leaves it
+    // open: the machine's own fence decided whether that cancel ended the
+    // commands, and its terminal outcome (completed or cancelled) is what
+    // settles here.
     if !control.begin_settling() {
         return run_envelope(abandoned_batch_text(), Vec::new());
     }
-    let settled =
+    let mut settled =
         off_frame(|| settle_joined_batch(orch, &settlement, joined, ceiling_detail)).await;
+    if let Some(note) = control.late_cancel_note() {
+        settled.text.push_str(&format!("\n\nNote: {note}."));
+    }
     control.phase_done("settle");
     control.set_verdict(settled.verdict.clone());
     settled_envelope(settled)
@@ -9116,6 +9312,13 @@ async fn place_and_run_attempts(
             BatchResidence::Detached => None,
         };
         let mut request = placement.attempt(home.as_ref(), fence.is_some(), residence);
+        if let Some(by) = control.begin_attempt(&request.attempt_id) {
+            // A cancel left to the previous attempt's publication still
+            // stands once that attempt was lost: its commands do not run again.
+            control.set_cancelled_by(&by);
+            control.stop(orch);
+            return cancelled_batch(residence);
+        }
         // A batch detached because its home cannot hold it goes where placement
         // said it can be held, by pin. A pin rather than spill mobility keeps a
         // committing batch from ever being replayed on a third machine when the
@@ -9467,7 +9670,19 @@ struct BatchControl {
     items: std::sync::Mutex<ItemProgress>,
     /// The principal that cancelled this one batch ([`cancel::cancel_batch`]),
     /// which its cancelled result names.
-    cancelled_by: std::sync::Mutex<Option<String>>,
+    cancelled_by: std::sync::Mutex<Option<DurableCancel>>,
+    /// What this runner's object server has observed of the batch's result
+    /// upload. It names the phase only: whether a commit stands is the
+    /// machine's terminal outcome's to say.
+    publication: std::sync::Mutex<Option<detached::BatchProgress>>,
+    /// A cancel that arrived once the upload was observed (or settlement had
+    /// begun) and so was not sent, for a batch with no detached row to carry
+    /// it; its result's text says so. The principal is kept so that a retry
+    /// after this attempt is lost is cancelled rather than run.
+    late_cancel: std::sync::Mutex<Option<(String, String)>>,
+    /// The attempt now placed. Publication observed for another attempt is
+    /// not this one's phase.
+    attempt: std::sync::Mutex<Option<String>>,
     /// When the call arrived (unix milliseconds), which its timeouts and the
     /// batch ceiling are measured from.
     arrived_ms: i64,
@@ -9479,6 +9694,13 @@ struct ItemProgress {
     headers: Vec<String>,
     /// Running items: index and start (Unix milliseconds).
     running: Vec<(usize, i64)>,
+    /// Items reported finished. Once every item has, the batch's commands are
+    /// over and only its result publication remains.
+    finished: std::collections::BTreeSet<usize>,
+    /// A sequential batch that stops at its first failure: a failed item is
+    /// its last command, and the skipped items never report. A parallel batch
+    /// runs every item whatever fails, so it waits for all of them.
+    stops_at_first_failure: bool,
 }
 
 impl BatchControl {
@@ -9516,6 +9738,9 @@ impl BatchControl {
             owner: std::sync::Mutex::new(None),
             items: std::sync::Mutex::new(ItemProgress::default()),
             cancelled_by: std::sync::Mutex::new(None),
+            publication: std::sync::Mutex::new(None),
+            late_cancel: std::sync::Mutex::new(None),
+            attempt: std::sync::Mutex::new(None),
             arrived_ms: chrono::Utc::now().timestamp_millis(),
         })
     }
@@ -9539,12 +9764,100 @@ impl BatchControl {
         }
     }
 
-    fn item_finished(&self, index: usize) {
+    fn set_stops_at_first_failure(&self, stops: bool) {
         self.items
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .running
-            .retain(|(running, _)| *running != index);
+            .stops_at_first_failure = stops;
+    }
+
+    /// A new attempt is placed: it runs the commands again, so nothing the
+    /// previous attempt reported about its commands or its upload holds. Returns
+    /// the principal of a cancel that was left to the previous attempt's
+    /// publication, which now cancels this attempt instead.
+    fn begin_attempt(&self, attempt_id: &str) -> Option<String> {
+        let mut attempt = self.attempt.lock().unwrap_or_else(|p| p.into_inner());
+        *attempt = Some(attempt_id.to_owned());
+        *self.publication.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        {
+            let mut items = self.items.lock().unwrap_or_else(|p| p.into_inner());
+            items.running.clear();
+            items.finished.clear();
+        }
+        self.late_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .map(|(by, _)| by)
+    }
+
+    fn item_finished(&self, index: usize, succeeded: bool) {
+        let commands_ended = {
+            let mut items = self.items.lock().unwrap_or_else(|p| p.into_inner());
+            items.running.retain(|(running, _)| *running != index);
+            items.finished.insert(index);
+            !items.headers.is_empty()
+                && items.running.is_empty()
+                && ((items.stops_at_first_failure && !succeeded)
+                    || (0..items.headers.len()).all(|item| items.finished.contains(&item)))
+        };
+        if commands_ended {
+            let mut publication = self.publication.lock().unwrap_or_else(|p| p.into_inner());
+            if publication.is_none() {
+                *publication = Some(detached::BatchProgress::Publishing {
+                    delta_bytes: None,
+                    since_ms: chrono::Utc::now().timestamp_millis(),
+                });
+            }
+        }
+    }
+
+    /// Whether the batch is known to be past its commands: every item reported
+    /// finished, or its result upload was seen.
+    fn commands_ended(&self) -> bool {
+        self.publication
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    /// Record the result upload the object server observed. A record, never a
+    /// gate: it decides nothing about whether the result publishes.
+    fn note_publishing(&self, observed: &crate::fleet::ObservedPublication) {
+        // Keep the attempt pinned until its phase is recorded: a retry must
+        // not reset between the identity check and this publication write.
+        let attempt = self.attempt.lock().unwrap_or_else(|p| p.into_inner());
+        if attempt
+            .as_deref()
+            .is_some_and(|attempt| attempt != observed.attempt_id)
+        {
+            return;
+        }
+        let mut publication = self.publication.lock().unwrap_or_else(|p| p.into_inner());
+        // The phase began when the last command finished, if that was seen.
+        let since_ms = match publication.as_ref() {
+            Some(detached::BatchProgress::Publishing { since_ms, .. }) => *since_ms,
+            _ => observed.since_ms,
+        };
+        *publication = Some(detached::BatchProgress::Publishing {
+            delta_bytes: observed.delta_bytes,
+            since_ms,
+        });
+    }
+
+    fn record_late_cancel(&self, by: &str, note: String) {
+        let mut late = self.late_cancel.lock().unwrap_or_else(|p| p.into_inner());
+        if late.is_none() {
+            *late = Some((by.to_owned(), note));
+        }
+    }
+
+    fn late_cancel_note(&self) -> Option<String> {
+        self.late_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|(_, note)| note.clone())
     }
 
     /// Whether settlement, and with it any commit, has begun.
@@ -9555,24 +9868,23 @@ impl BatchControl {
     fn set_cancelled_by(&self, by: &str) {
         let mut cancelled = self.cancelled_by.lock().unwrap_or_else(|p| p.into_inner());
         if cancelled.is_none() {
-            *cancelled = Some(by.to_string());
+            *cancelled = Some(DurableCancel::now(by));
         }
+    }
+
+    /// The principal's cancel, as a durable record of this batch carries it.
+    fn cancelled(&self) -> Option<DurableCancel> {
+        self.cancelled_by
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// The detail a batch cancelled by a principal settles with, so its call
     /// resumes saying who ended it.
     fn cancelled_detail(&self) -> Option<String> {
-        self.cancelled_by
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_deref()
-            .map(|by| {
-                if self.never_placed().is_some() {
-                    format!("cancelled by {by} before placement.")
-                } else {
-                    format!("cancelled by {by}.")
-                }
-            })
+        self.cancelled()
+            .map(|cancel| cancel.detail(self.commits, self.never_placed().is_some()))
     }
 
     /// The verdict settlement reached, once it has.
@@ -9588,6 +9900,14 @@ impl BatchControl {
     /// reported yet.
     fn progress(&self, fleet: &crate::fleet::Fleet) -> detached::BatchProgress {
         use detached::BatchProgress;
+        if let Some(publishing) = self
+            .publication
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            return publishing;
+        }
         if self.settling() {
             return BatchProgress::Settling;
         }
@@ -9797,7 +10117,7 @@ impl BatchControl {
         let json = serde_json::to_string(&self.persisted_for_record(fleet))
             .map_err(|error| format!("Could not record run settlement: {error}"))?;
         let changed = db.execute(
-            "UPDATE run_batch_detached SET settlement_json=json_patch(COALESCE(settlement_json,'{}'),?2) WHERE request_id=?1 AND state IN ('parked','running')",
+            "UPDATE run_batch_detached SET settlement_json=?2 WHERE request_id=?1 AND state IN ('parked','running')",
             (self.request_id.clone(), json),
         )
         .await
@@ -9805,6 +10125,9 @@ impl BatchControl {
         if changed == 0 {
             return Err("This batch's durable authority was retired before placement; nothing was dispatched.".into());
         }
+        // The rewrite replaced the whole settlement with a snapshot taken
+        // before it, and a cancel in between found no settlement to patch.
+        self.flush_admitted_cancel_notes(&db).await;
         Ok(())
     }
 
@@ -9844,7 +10167,57 @@ impl BatchControl {
                     executor_id,
                 });
         }
+        // Cancels this task already holds belong to a record written after
+        // them, so a later runner adopting the result still names them.
+        if persisted.late_cancel.is_none() {
+            persisted.late_cancel = self.late_cancel_note();
+        }
+        if persisted.cancelled.is_none() {
+            persisted.cancelled = self.cancelled();
+        }
         Some(persisted)
+    }
+
+    // A cancel can arrive after a durable snapshot but before its insert.
+    // Re-read after insertion: earlier cancels are copied here, and later
+    // cancels can already patch the row themselves.
+    async fn persist_cancel_notes(&self, db: &crate::storage::LocalDb) -> Result<(), String> {
+        if let Some(note) = self.late_cancel_note() {
+            detached::note_on_settlement(
+                db,
+                &self.request_id,
+                detached::SettlementNote::LateCancel(note),
+            )
+            .await
+            .map_err(|error| format!("persist late cancel: {error}"))?;
+        }
+        if let Some(cancel) = self.cancelled() {
+            detached::record_cancel(db, &self.request_id, &cancel).await?;
+        }
+        Ok(())
+    }
+
+    /// Flush cancel notes onto records that already admitted this batch. The
+    /// admitting write holds the batch's authority, so a failed flush never
+    /// revokes it: the notes are retried, stay in memory for the live
+    /// settlement, and are re-flushed by the settlement write before placement.
+    /// Only a restart before then loses who cancelled.
+    async fn flush_admitted_cancel_notes(&self, db: &crate::storage::LocalDb) {
+        let mut attempt = 1;
+        loop {
+            let Err(error) = self.persist_cancel_notes(db).await else {
+                return;
+            };
+            if attempt == CANCEL_NOTE_ATTEMPTS {
+                log::error!(
+                    "run batch {} keeps its durable record without its cancellation after {attempt} attempts: {error}",
+                    self.request_id
+                );
+                return;
+            }
+            tokio::time::sleep(CANCEL_NOTE_RETRY * attempt).await;
+            attempt += 1;
+        }
     }
 
     fn facts(&self) -> BatchFacts {
@@ -10237,7 +10610,7 @@ async fn establish_durable_record(
         deadline: None,
         created: chrono::Utc::now().timestamp_millis(),
     };
-    let _bracket_guard = acquire_store_lock(
+    let bracket_guard = acquire_store_lock(
         orch,
         facts.store_lock.as_deref(),
         crate::orchestrator::StoreLockClass::Foreground,
@@ -10258,7 +10631,7 @@ async fn establish_durable_record(
     if gate.is_some_and(|gate| !gate.begin_writing()) {
         return Err("its call answered before the record was written");
     }
-    match durable {
+    let admitted = match durable {
         Durable::Hold => durable_suspend::hold(orch, &db, &record)
             .await
             .map(|()| (record, db, None)),
@@ -10269,7 +10642,11 @@ async fn establish_durable_record(
     .map_err(|error| {
         log::warn!("failed to record run batch for run {}: {error}", ctx.run_id);
         "its durable record could not be written"
-    })
+    })?;
+    // Notes patch only their own keys and need no admission lock.
+    drop(bracket_guard);
+    control.flush_admitted_cancel_notes(&admitted.1).await;
+    Ok(admitted)
 }
 
 /// Where a parked call's resolver gets the batch's answer.
@@ -10357,6 +10734,11 @@ const NO_RESUMABLE_CALL: &str =
 /// Why a call whose transport closed before it answered is detached.
 const TRANSPORT_CLOSED: &str = "its transport closed before it answered";
 
+/// How often a cancel note is written onto an admitted record before the
+/// note is left to the next flush, and the backoff unit between tries.
+const CANCEL_NOTE_ATTEMPTS: u32 = 3;
+const CANCEL_NOTE_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Write the durable row that makes this batch a detached one. Before the call
 /// answers, so there is never a moment when the batch runs with no record.
 async fn record_detached(
@@ -10416,7 +10798,9 @@ async fn record_detached(
         late_report: None,
     };
     detached::insert(&db, &batch).await?;
-    if control.row_written(db.clone()) && waiting_on.is_some() {
+    let admitted = control.row_written(db.clone());
+    control.flush_admitted_cancel_notes(&db).await;
+    if admitted && waiting_on.is_some() {
         control.mark_row_admitted(&db).await;
     }
     Ok(DetachedRecord { db })
@@ -11442,8 +11826,22 @@ pub(crate) async fn settle_adopted_result(
         ran_on: Some(adopted_ran_on(machine)),
         ..PlacementNotes::default()
     };
-    let settled =
-        settle_routed_run_batch(orch, &settlement, residence, outcome, None, None, notes).await;
+    // A machine that answers `Cancelled` was told to by a cancel recorded on
+    // the batch's durable settlement before it was sent.
+    let cancelled = persisted
+        .cancelled
+        .as_ref()
+        .map(|cancel| cancel.detail(persisted.commits(), false));
+    let settled = settle_routed_run_batch(
+        orch,
+        &settlement,
+        residence,
+        outcome,
+        None,
+        cancelled,
+        notes,
+    )
+    .await;
     let verdict = settled.verdict.clone();
     (
         BatchAnswer::from_envelope(settled_envelope(settled)).resume_text,
@@ -16247,7 +16645,7 @@ pub(crate) mod host_batch_tests {
             !orch.fleet.was_retired_for_test(&b.request_id),
             "only the cancelled batch's request is retired"
         );
-        let named = format!("Run cancelled: cancelled by {BUILDER}.");
+        let named = format!("Run cancelled: cancelled by {BUILDER} at ");
         let resumed = eventually(Duration::from_secs(10), || {
             tool_result_containing(&orch, &named)
         })
@@ -16278,18 +16676,17 @@ pub(crate) mod host_batch_tests {
         assert_eq!(run_batch_notices(&orch).await, 0);
     }
 
-    /// A cancel that arrives once settlement has begun touches nothing: the
-    /// batch may already be writing its commit, so it publishes its own result
-    /// and its call resumes with that, never with a cancellation.
+    /// A cancel that arrives once the runner's object server has seen the
+    /// batch's result upload is recorded, not sent: the machine is not told to
+    /// stop, nothing durable is invented for a parked call, and the call
+    /// resumes once with the batch's own result.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_cancel_after_settlement_began_leaves_the_commit_standing() {
+    async fn a_cancel_after_the_upload_was_observed_leaves_the_result_to_settle() {
         let orch = env().await;
         let control = BatchControl::new(true);
         let finish = park_simulated_batch(&orch, "tool-1", &control).await;
-        assert!(
-            control.begin_settling(),
-            "settlement begins: the commit is being written"
-        );
+        orch.fleet
+            .observe_result_upload(&control.request_id, "attempt-1", Some(12_000_000));
 
         let report = cancel::cancel_batch(
             &orch,
@@ -16300,8 +16697,29 @@ pub(crate) mod host_batch_tests {
         )
         .await;
         assert_eq!(report, cancel::CancelReport::AlreadySettling);
+        assert!(report
+            .sentence(&control.request_id)
+            .contains("left to publish; settles at result"));
         assert!(!control.stop_placement.is_stopped());
+        assert!(!orch.fleet.was_retired_for_test(&control.request_id));
         assert_eq!(control.cancelled_detail(), None);
+        assert!(control
+            .late_cancel_note()
+            .is_some_and(|note| note.contains("cancel arrived after its commands finished")));
+        let progress = control.progress(&orch.fleet);
+        assert!(
+            progress
+                .describe(chrono::Utc::now().timestamp_millis())
+                .contains("publishing result (delta upload 12.0 MB, since"),
+            "{progress:?}"
+        );
+        assert!(
+            detached::load(&orch.db.local, &control.request_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a late cancel writes no row for a parked call"
+        );
 
         let _ = finish.send("cargo nextest run: ok\n\n\u{2713} Committed changes (abc1234)".into());
         let resumed = eventually(Duration::from_secs(10), || {
@@ -16310,6 +16728,190 @@ pub(crate) mod host_batch_tests {
         .await
         .expect("the call resumes with the batch's own result");
         assert!(!resumed.contains(RUN_CANCELLED), "{resumed}");
+        assert_eq!(
+            run_batch_notices(&orch).await,
+            0,
+            "the result is delivered once"
+        );
+    }
+
+    /// Every item reporting finished names the publishing phase before any
+    /// upload is seen, an upload then adds its size from the same start, and
+    /// a cancel in that phase is recorded rather than sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_last_finished_item_names_the_publishing_phase() {
+        let orch = env().await;
+        let control = BatchControl::new(true);
+        let _live = detached::LiveBatch::claim(&control);
+        let now = chrono::Utc::now().timestamp_millis();
+        let parallel = BatchControl::new(true);
+        parallel.set_items(vec!["cargo fmt".into(), "cargo test".into()]);
+        parallel.item_started(0, now);
+        parallel.item_started(1, now);
+        parallel.item_finished(0, false);
+        assert!(
+            !parallel.commands_ended(),
+            "a parallel batch runs on past a failure"
+        );
+        let stopping = BatchControl::new(true);
+        stopping.set_items(vec!["cargo fmt".into(), "cargo test".into()]);
+        stopping.set_stops_at_first_failure(true);
+        stopping.item_started(0, now);
+        stopping.item_finished(0, true);
+        assert!(!stopping.commands_ended(), "one item is still to run");
+        stopping.item_started(1, now);
+        stopping.item_finished(1, false);
+        assert!(
+            stopping.commands_ended(),
+            "its failure was its last command"
+        );
+        let early = BatchControl::new(true);
+        early.set_items(vec!["cargo fmt".into(), "cargo test".into()]);
+        early.set_stops_at_first_failure(true);
+        early.item_started(0, now);
+        early.item_finished(0, false);
+        assert!(early.commands_ended(), "the skipped item never reports");
+
+        control.set_items(vec!["cargo fmt".into(), "cargo test".into()]);
+        control.item_started(0, now);
+        control.item_finished(0, true);
+        assert!(!control.commands_ended(), "one item is still to run");
+        control.item_started(1, now);
+        control.item_finished(1, true);
+        let since = match control.progress(&orch.fleet) {
+            detached::BatchProgress::Publishing {
+                delta_bytes: None,
+                since_ms,
+            } => since_ms,
+            other => panic!("{other:?}"),
+        };
+        orch.fleet
+            .observe_result_upload(&control.request_id, "attempt-1", Some(5_000_000));
+        assert_eq!(
+            control.progress(&orch.fleet),
+            detached::BatchProgress::Publishing {
+                delta_bytes: Some(5_000_000),
+                since_ms: since,
+            }
+        );
+        let report = cancel::cancel_batch(
+            &orch,
+            &orch.db.local,
+            &control.request_id,
+            "operator",
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(report, cancel::CancelReport::AlreadySettling);
+        assert!(!control.stop_placement.is_stopped());
+    }
+
+    /// A retried attempt runs its commands again: the lost attempt's finished
+    /// items and upload do not make the retry's commands uncancellable, a late
+    /// report from the lost attempt does not promote it, and a cancel that was
+    /// left to the lost attempt's publication cancels the retry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_attempts_upload_leaves_its_retry_cancellable() {
+        let orch = env().await;
+        let control = BatchControl::new(true);
+        let _live = detached::LiveBatch::claim(&control);
+        control.set_items(vec!["cargo test".into()]);
+        let now = chrono::Utc::now().timestamp_millis();
+        assert_eq!(control.begin_attempt("attempt-1"), None);
+        control.item_started(0, now);
+        control.item_finished(0, true);
+        orch.fleet
+            .observe_result_upload(&control.request_id, "attempt-1", Some(1_000_000));
+        assert!(control.commands_ended());
+        // Its wait ends without an answer: the attempt is lost.
+        orch.fleet
+            .retire_attempt_publication(&control.request_id, "attempt-1");
+
+        assert_eq!(control.begin_attempt("attempt-2"), None);
+        assert!(!control.commands_ended());
+        assert!(!orch.fleet.request_is_publishing(&control.request_id));
+        detached::note_publishing(
+            &control.request_id,
+            &crate::fleet::ObservedPublication {
+                attempt_id: "attempt-1".into(),
+                delta_bytes: Some(1_000_000),
+                since_ms: now,
+            },
+        );
+        assert!(
+            !control.commands_ended(),
+            "a lost attempt's upload is not this one's"
+        );
+        control.item_started(0, now);
+        let report = cancel::cancel_batch(
+            &orch,
+            &orch.db.local,
+            &control.request_id,
+            "operator",
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(report, cancel::CancelReport::Stopped { settled: false });
+        assert!(control.stop_placement.is_stopped());
+
+        control.record_late_cancel("operator", "left to publish".into());
+        assert_eq!(
+            control.begin_attempt("attempt-3").as_deref(),
+            Some("operator"),
+            "a cancel left to a lost attempt cancels its retry"
+        );
+        assert_eq!(control.late_cancel_note(), None);
+    }
+
+    /// The mixed fleet: a cancel reaches a machine before its upload is seen,
+    /// and a machine without the publication fence still uploads and then
+    /// answers Cancelled. The upload names the phase while it runs; the verdict
+    /// comes from the Cancelled result and names the cancel, never a 403.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_seen_after_a_cancel_names_the_phase_and_the_cancelled_result_names_the_cancel(
+    ) {
+        let orch = env().await;
+        let control = BatchControl::new(true);
+        let _live = detached::LiveBatch::claim(&control);
+        let _claimed = orch
+            .fleet
+            .claim_job_command_for_test(&control.request_id, "job-1", 1);
+        let report = cancel::cancel_batch(
+            &orch,
+            &orch.db.local,
+            &control.request_id,
+            "operator",
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(report, cancel::CancelReport::Stopped { settled: false });
+        assert!(control.stop_placement.is_stopped());
+
+        let attempt_id = format!("{}-attempt", control.request_id);
+        orch.fleet
+            .observe_result_upload(&control.request_id, &attempt_id, Some(3_000_000));
+        assert!(control
+            .progress(&orch.fleet)
+            .describe(chrono::Utc::now().timestamp_millis())
+            .contains("publishing result (delta upload 3.0 MB, since"));
+        assert!(
+            control.begin_settling(),
+            "a principal's cancel never closes the settle gate"
+        );
+        let text = settled_failure_text(
+            &CellOutcome::Cancelled {
+                request_id: control.request_id.clone(),
+                attempt_id,
+            },
+            None,
+            control.commits,
+            routed_cancel_detail(&control, false),
+            &PlacementNotes::default(),
+        )
+        .unwrap();
+        assert!(text.contains("cancelled by operator at "), "{text}");
+        assert!(text.contains("its commit was discarded"), "{text}");
+        assert!(!text.contains("403"), "{text}");
     }
 
     /// 4741's case: a batch still queued for admission, cancelled by the
@@ -16381,7 +16983,7 @@ pub(crate) mod host_batch_tests {
         let (verdict, output) = settled_verdict_and_output(&orch, &control.request_id).await;
         assert_eq!(verdict, "it was cancelled");
         assert!(
-            output.starts_with("Run cancelled: cancelled by operator."),
+            output.starts_with("Run cancelled: cancelled by operator at "),
             "{output}"
         );
         assert_eq!(run_batch_notices(&orch).await, 1);
@@ -16544,10 +17146,16 @@ pub(crate) mod host_batch_tests {
                     .unwrap_or_else(|refusal| panic!("{refusal}"));
             assert!(answer.starts_with("Cancelled run batch"), "{answer}");
             let principal = "cairn://p/other/execution";
-            let attribution = match reason {
-                Some(reason) => format!("cancelled by {principal} (reason: {reason})"),
-                None => format!("cancelled by {principal}."),
+            let expected_by = match reason {
+                Some(reason) => format!("{principal} (reason: {reason})"),
+                None => principal.to_owned(),
             };
+            let cancelled = control
+                .cancelled()
+                .expect("the batch records its canceller");
+            assert_eq!(cancelled.by, expected_by);
+            assert!(cancelled.at_ms > 0);
+            let attribution = format!("cancelled by {expected_by} at ");
             let resumed = eventually(Duration::from_secs(10), || {
                 tool_result_containing(&orch, &attribution)
             })

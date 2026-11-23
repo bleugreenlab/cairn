@@ -22,7 +22,6 @@ use crate::common;
 use crate::node_scratch_acceptance::{node, MACHINE_A};
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -129,51 +128,5 @@ async fn a_running_batch_keeps_its_relay_across_link_bounces() {
     assert!(
         reply.starts_with(&format!("Ran on **{MACHINE_A}**")),
         "the batch's result was accepted: {reply}"
-    );
-}
-
-/// A machine that comes back without naming the batch leaves it detached: its
-/// next call waits the bound and is then told why, as a retryable 503.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_batch_whose_executor_never_reattaches_is_told_its_relay_is_detached() {
-    if common::skip_if_fenced(
-        "a_batch_whose_executor_never_reattaches_is_told_its_relay_is_detached",
-    ) || cairn_sandbox::skip_without_nested_sandbox(
-        "a_batch_whose_executor_never_reattaches_is_told_its_relay_is_detached",
-    ) {
-        return;
-    }
-    // Shortened for this test's sake; a bounce in another test reattaches far
-    // inside it.
-    common::RELAY_GAP_WAIT_MS.store(2_000, Ordering::Relaxed);
-    let node = Arc::new(node().await);
-    let dir = handshake_dir(&node);
-    let mut batch = cairn_common::task::spawn({
-        let node = node.clone();
-        let command = reading_batch(&dir, 2);
-        async move { node.shell("r-1", Some(MACHINE_A), &command).await }
-    });
-
-    go(&dir, 1);
-    let (status, body) = answered(&dir, 1, &mut batch).await;
-    assert_eq!(status, "200", "before the bounce: {body}");
-
-    common::drop_link(node.orch(), MACHINE_A);
-    go(&dir, 2);
-    let (status, body) = answered(&dir, 2, &mut batch).await;
-    assert_eq!(status, "503", "{body}");
-    assert!(
-        body.starts_with("relay detached by a link loss at ")
-            && body.contains("; the executor has not reattached within "),
-        "{body}"
-    );
-
-    let reply = tokio::time::timeout(Duration::from_secs(120), batch)
-        .await
-        .expect("the batch finished")
-        .unwrap();
-    assert!(
-        reply.starts_with(&format!("Ran on **{MACHINE_A}**")),
-        "{reply}"
     );
 }

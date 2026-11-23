@@ -2674,6 +2674,7 @@ async fn render_resource_body(
                             let mut rendered = crate::resources::executors::render_executor_with_kills(
                                 executor,
                                 Some(&recorded_kills),
+                                &orch.fleet,
                                 &rust_pins,
                                 &attributions,
                             );

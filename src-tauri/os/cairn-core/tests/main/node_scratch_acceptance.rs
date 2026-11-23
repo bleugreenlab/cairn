@@ -5,9 +5,10 @@
 //! Every machine here is a real, non-colocated `ExecutorRuntime` with its own
 //! home, reaching the runner only over an HTTP object channel. The object
 //! server is a thin HTTP shell around production: the reachable-pack builder
-//! for the repository and cairn-core's own `scratch/*` router, so a test cannot
-//! pass against a second implementation of what the runner serves. Batches go
-//! through the agent-facing `run` tool, terminals through `write`.
+//! for the repository, the object plane's own delta validation and staging, and
+//! cairn-core's own `scratch/*` router, so a test cannot pass against a second
+//! implementation of what the runner serves. Batches go through the
+//! agent-facing `run` tool, terminals through `write`.
 //!
 //! Like the other executor-cell suites these cannot run nested inside a Cairn
 //! worktree fence, and each records a declared skip there (skip-manifest.toml).
@@ -20,18 +21,21 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use cairn_common::executor_protocol::ObjectTransferCoordinate;
+use base64::Engine;
+use cairn_common::executor_protocol::{DeltaUploadReceipt, ObjectTransferCoordinate};
 use cairn_core::internal::db::DbState;
 use cairn_core::internal::mcp::handlers::run::handle_run;
 use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::object_plane::{
-    object_fetch_refusal, open_runner_fetch, RunnerFetchRequest,
+    content_sha256, object_fetch_refusal, open_runner_fetch, validate_pack_bytes,
+    RunnerFetchRequest,
 };
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
@@ -40,6 +44,7 @@ use cairn_core::internal::storage::{LocalDb, SearchIndex};
 use cairn_core::models::{
     AgentSnapshot, ExecutionSnapshot, RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType,
 };
+use cairn_db::storage::RowExt;
 use cairn_db::turso::params;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -56,6 +61,51 @@ const BRANCH: &str = "agent/NSC-1-builder-0";
 struct ObjectServer {
     orch: Orchestrator,
     repository: PathBuf,
+    staging: PathBuf,
+    delta: DeltaGate,
+}
+
+/// The door a delta upload reaches the runner through. Open, it lets every
+/// upload straight on to the object plane; closed by a test, it holds the
+/// upload there, already sent and unanswered, until the test opens it.
+#[derive(Clone)]
+pub(crate) struct DeltaGate {
+    open: Arc<tokio::sync::watch::Sender<bool>>,
+    arrived: Arc<tokio::sync::watch::Sender<Option<ObjectTransferCoordinate>>>,
+}
+
+impl DeltaGate {
+    fn new() -> Self {
+        Self {
+            open: Arc::new(tokio::sync::watch::Sender::new(true)),
+            arrived: Arc::new(tokio::sync::watch::Sender::new(None)),
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.open.send_replace(false);
+    }
+
+    pub(crate) fn open(&self) {
+        self.open.send_replace(true);
+    }
+
+    /// The coordinate of the last upload that reached the door, if any did.
+    pub(crate) fn arrived(&self) -> Option<ObjectTransferCoordinate> {
+        self.arrived.borrow().clone()
+    }
+
+    /// Wait for an upload to reach the door, and name it.
+    pub(crate) async fn reached(&self) -> ObjectTransferCoordinate {
+        let mut arrived = self.arrived.subscribe();
+        let coordinate =
+            tokio::time::timeout(Duration::from_secs(120), arrived.wait_for(Option::is_some))
+                .await
+                .expect("no delta upload reached the runner")
+                .expect("the gate outlives its server")
+                .clone();
+        coordinate.expect("waited for an arrival")
+    }
 }
 
 pub(crate) struct TwoMachines {
@@ -65,6 +115,7 @@ pub(crate) struct TwoMachines {
     pub project_id: String,
     pub repository: PathBuf,
     pub base: String,
+    pub delta: DeltaGate,
     /// Each machine's executor, held so both machines stay attached.
     pub _pools: Vec<cairn_exec::Fleet>,
 }
@@ -122,9 +173,13 @@ async fn two_machines_with(config: Option<&str>) -> TwoMachines {
     let server = ObjectServer {
         orch: orch.clone(),
         repository: repository.clone(),
+        staging: temp.path().join("object-upload-staging"),
+        delta: DeltaGate::new(),
     };
+    let delta = server.delta.clone();
     let app = Router::new()
         .route("/fetch", post(fetch))
+        .route("/delta", post(upload_delta))
         .with_state(server)
         .merge(common::scratch_routes(&orch));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -155,6 +210,7 @@ async fn two_machines_with(config: Option<&str>) -> TwoMachines {
         project_id,
         repository,
         base,
+        delta,
         _pools: pools,
     }
 }
@@ -194,18 +250,7 @@ async fn fetch(
     headers: HeaderMap,
     Json(request): Json<FetchRequest>,
 ) -> Response {
-    let authenticated = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .and_then(|token| {
-            server
-                .orch
-                .object_plane
-                .authenticate(token, common::unix_time_ms())
-                .ok()
-        });
-    if authenticated.is_none()
+    if !authenticated(&server, &headers)
         || !server
             .orch
             .object_plane
@@ -225,6 +270,93 @@ async fn fetch(
     {
         Ok(stream) => stream.into_response(),
         Err(failure) => object_fetch_refusal(&failure),
+    }
+}
+
+fn authenticated(server: &ObjectServer, headers: &HeaderMap) -> bool {
+    headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| {
+            server
+                .orch
+                .object_plane
+                .authenticate(token, common::unix_time_ms())
+                .is_ok()
+        })
+}
+
+/// The runner's delta route in the order the real one runs it: the upload's
+/// credential and its request's grant, then the fleet's observation that the
+/// result is uploading, then the [`DeltaGate`], so a held upload is an
+/// authenticated, observed one in flight, then the content hash and the object
+/// plane's own validation and staging. (The body is already buffered when the
+/// gate holds it; the real route reads it after the observation too.)
+async fn upload_delta(
+    State(server): State<ObjectServer>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let Some(coordinate) = header("x-cairn-coordinate")
+        .and_then(|encoded| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .ok()
+        })
+        .and_then(|bytes| serde_json::from_slice::<ObjectTransferCoordinate>(&bytes).ok())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let (Some(base_commit), Some(delta_commit), Some(content_hash)) = (
+        header("x-cairn-base-commit"),
+        header("x-cairn-delta-commit"),
+        header("x-cairn-content-sha256"),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !authenticated(&server, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let object_plane = &server.orch.object_plane;
+    if !object_plane.authorizes(&coordinate, &base_commit) {
+        let reason = object_plane.request_refusal_reason(&coordinate);
+        return (StatusCode::FORBIDDEN, reason).into_response();
+    }
+    let delta_bytes = header("content-length").and_then(|length| length.parse().ok());
+    server.orch.fleet.observe_result_upload(
+        &coordinate.request_id,
+        &coordinate.attempt_id,
+        delta_bytes,
+    );
+    server.delta.arrived.send_replace(Some(coordinate.clone()));
+    let _ = server.delta.open.subscribe().wait_for(|open| *open).await;
+    if content_sha256(&body) != content_hash {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let Ok(validated) = validate_pack_bytes(body.to_vec()) else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    };
+    let receipt_id = content_sha256(
+        &serde_json::to_vec(&(&coordinate, &base_commit, &delta_commit, &content_hash)).unwrap(),
+    );
+    let receipt = DeltaUploadReceipt {
+        receipt_id,
+        coordinate,
+        base_commit,
+        delta_commit,
+        content_hash,
+        pack_checksum: validated.pack_checksum,
+    };
+    match object_plane.stage_delta(&server.staging, receipt.clone(), &validated.pack) {
+        Ok(_) => Json(receipt).into_response(),
+        Err(_) => StatusCode::CONFLICT.into_response(),
     }
 }
 
@@ -531,5 +663,247 @@ async fn a_scratch_affinity_guess_places_the_batch_and_never_selects_its_home() 
         node.home_acquisition_of("job-1").selector,
         None,
         "the home was acquired under no selector"
+    );
+}
+
+// ── Cancelling a batch around its publication ──────────────────────────────
+
+/// One `run_batch_detached` row, as the branch's hold reads it.
+#[derive(Debug)]
+struct DetachedRow {
+    request_id: String,
+    state: String,
+    verdict: Option<String>,
+    commit_id: Option<String>,
+    reason: String,
+}
+
+async fn detached_rows(db: &LocalDb) -> Vec<DetachedRow> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT request_id, state, verdict, commit_id, reason FROM run_batch_detached ORDER BY created_ms, rowid",
+                    (),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(DetachedRow {
+                    request_id: row.text(0)?,
+                    state: row.text(1)?,
+                    verdict: row.opt_text(2)?,
+                    commit_id: row.opt_text(3)?,
+                    reason: row.text(4)?,
+                });
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// The first detached row matching `ready`, waiting up to a minute for one.
+async fn detached_row(
+    node: &Node,
+    what: &str,
+    ready: impl Fn(&DetachedRow) -> bool,
+) -> DetachedRow {
+    for _ in 0..1_200 {
+        if let Some(row) = detached_rows(&node.machines.db)
+            .await
+            .into_iter()
+            .find(|row| ready(row))
+        {
+            return row;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "timed out waiting for {what}: {:?}",
+        detached_rows(&node.machines.db).await
+    );
+}
+
+/// Cancel a batch at its own address, as its node does.
+async fn cancel_batch(node: &Node, request_id: &str) -> String {
+    handle_write(
+        node.orch(),
+        &McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: String::new(),
+            run_id: Some(OWNER_RUN.to_string()),
+            tool: "write".to_string(),
+            payload: json!({ "changes": [{
+                "target": format!("{OWNER}/batches/{request_id}"),
+                "mode": "patch",
+                "payload": { "action": "cancel" }
+            }]}),
+            tool_use_id: None,
+            origin: None,
+        },
+    )
+    .await
+}
+
+/// A committing batch on [`MACHINE_A`] whose call is dropped once `reached`
+/// says the batch got where the test wants it, so it runs on detached, as
+/// the batch in cairn/7097's specimen did. Returns its detached row.
+async fn detach_once<F: std::future::Future<Output = ()>>(
+    node: &Arc<Node>,
+    command: String,
+    reached: F,
+) -> DetachedRow {
+    let call = tokio::spawn({
+        let node = node.clone();
+        async move {
+            node.run(
+                OWNER_RUN,
+                json!({
+                    "commands": [{ "command": command }],
+                    "commit_msg": "cancellation acceptance",
+                    "executor": { "name": MACHINE_A },
+                }),
+            )
+            .await
+        }
+    });
+    reached.await;
+    assert!(
+        !call.is_finished(),
+        "the batch answered before it was cancelled"
+    );
+    call.abort();
+    let _ = call.await;
+    detached_row(node, "the dropped call's batch to detach", |row| {
+        row.state == "running"
+    })
+    .await
+}
+
+/// A cancel stops a batch whose command is still running and never one whose
+/// result is already on its way to the runner (cairn/7097).
+///
+/// Everything runs for real on an isolated machine: the command, the seal of
+/// its tree into a delta, the managed-object upload over HTTP, the runner's
+/// cancel at the batch's own address, and publication onto the node's branch.
+/// The one seam is the runner's delta route in this suite's object server,
+/// which holds an upload that has reached it ([`DeltaGate`]) and then judges it
+/// by the authority that stands once the cancel has happened.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_stops_a_running_batch_but_not_one_already_uploading_its_result() {
+    if common::skip_if_fenced(
+        "a_cancel_stops_a_running_batch_but_not_one_already_uploading_its_result",
+    ) {
+        return;
+    }
+    let node = Arc::new(node().await);
+    let marks = node.machines.temp.path().join("cancel-marks");
+    std::fs::create_dir_all(&marks).unwrap();
+
+    // Mid-command: the cancel kills the command, and nothing it wrote is sealed
+    // or uploaded.
+    let started = marks.join("started");
+    let running = detach_once(
+        &node,
+        format!(
+            "printf partial > partial.txt && touch {} && sleep 600",
+            started.display()
+        ),
+        async {
+            for _ in 0..2_400 {
+                if started.is_file() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("the command never started");
+        },
+    )
+    .await;
+    let reply = cancel_batch(&node, &running.request_id).await;
+    assert!(reply.contains("Cancelled run batch"), "{reply}");
+    let cancelled = detached_row(&node, "the cancelled batch to settle", |row| {
+        row.request_id == running.request_id && row.state == "settled"
+    })
+    .await;
+    assert_eq!(cancelled.commit_id, None, "{cancelled:?}");
+    assert!(
+        cancelled
+            .verdict
+            .as_deref()
+            .is_some_and(|verdict| verdict.contains("cancel")),
+        "the verdict names the cancel: {cancelled:?}"
+    );
+    assert_eq!(
+        node.machines.delta.arrived(),
+        None,
+        "a batch cancelled mid-command uploads nothing"
+    );
+
+    // Mid-upload: the cancel is recorded and the result lands anyway.
+    node.machines.delta.close();
+    let gate = node.machines.delta.clone();
+    let uploading = detach_once(
+        &node,
+        "printf 'published\\n' > published.txt".to_string(),
+        async move {
+            gate.reached().await;
+        },
+    )
+    .await;
+    let upload = node.machines.delta.arrived().expect("the upload is held");
+    assert_eq!(upload.request_id, uploading.request_id);
+    let reply = cancel_batch(&node, &uploading.request_id).await;
+    assert!(reply.contains("left to publish"), "{reply}");
+    assert!(
+        node.orch()
+            .object_plane
+            .authorizes(&upload, &node.machines.base),
+        "a cancel after the upload began leaves its grant standing"
+    );
+    node.machines.delta.open();
+    let landed = detached_row(&node, "the uploading batch to settle", |row| {
+        row.request_id == uploading.request_id && row.state == "settled"
+    })
+    .await;
+    let commit = landed
+        .commit_id
+        .clone()
+        .unwrap_or_else(|| panic!("its commit stands: {landed:?}"));
+    assert!(
+        landed
+            .reason
+            .contains("cancel arrived after its commands finished; left to publish"),
+        "the row records the late cancel: {landed:?}"
+    );
+    let repository = &node.machines.repository;
+    assert_eq!(
+        git(repository, &["rev-parse", &format!("refs/heads/{BRANCH}")]),
+        commit
+    );
+    assert_eq!(
+        git(repository, &["rev-parse", &format!("{commit}^")]),
+        node.machines.base,
+        "the cancelled batch published nothing before it"
+    );
+    assert_eq!(
+        git(repository, &["show", &format!("{commit}:published.txt")]),
+        "published"
+    );
+    assert!(
+        git(repository, &["ls-tree", "--name-only", &commit])
+            .lines()
+            .all(|path| path != "partial.txt"),
+        "nothing the killed command wrote was sealed"
+    );
+    assert!(
+        detached_rows(&node.machines.db)
+            .await
+            .iter()
+            .all(|row| row.state != "running" && row.state != "parked"),
+        "settlement released the branch"
     );
 }

@@ -200,3 +200,13 @@ statement = "cdcc6743c2f18e92"
 kind = "debt"
 issue = "cairn://p/cairn/6390"
 reason = "Latest CLI version discovery pages wide initialization events until one reports a version; returned pages are bounded but historical scanning is not."
+
+# Active resolution lookup for a batch whose wait id is not known to its cancel.
+[[allow]]
+file = "os/cairn-core/src/mcp/handlers/durable_suspend.rs"
+rule = "wide-scan"
+table = "agent_waits"
+statement = "5c2ac0e198a48d05"
+kind = "deliberate"
+issue = "cairn://p/cairn/7097"
+reason = "Cancellation locates a request inside the partial idx_agent_waits_resolving index, not historical waits. The request id lives in the condition and the independently minted wait id is unknown; resolving waits must retain notes until conversion or report sealing."

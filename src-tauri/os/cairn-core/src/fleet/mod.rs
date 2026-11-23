@@ -175,15 +175,13 @@ use requirements::{
 };
 #[cfg(test)]
 use residency_routes::residency_placement_request;
-#[cfg(test)]
-pub(crate) use residency_routes::residency_placement_request_for_test;
-#[cfg(test)]
-pub(crate) use residency_routes::residency_queue_entry_id;
 use residency_routes::{
     acquired_residency_holder, judge_link, pipe_floor_work, GrantedCell, PreviousHome,
     ResidencyRoute,
 };
 pub(crate) use residency_routes::{describe_quiet_ms, EnvironmentEviction, EvictionCause};
+#[cfg(test)]
+pub(crate) use residency_routes::{residency_placement_request_for_test, residency_queue_entry_id};
 pub use residency_routes::{DrainResidents, HeldEnvironment};
 use residency_routes::{HomePrices, WithdrawnHome, ENVIRONMENT_LEASE_GRACE_MS};
 #[cfg(test)]
@@ -1457,6 +1455,12 @@ pub struct Fleet {
     /// batch's own settlement is done with them, by request id, with each
     /// attempt and machine a result for it arrived from.
     deferred_acks: Arc<Mutex<HashMap<String, DeferredAttempts>>>,
+    /// Result uploads this runner's object server has seen, by request: the
+    /// publishing phase observed first-hand, for requests with or without a
+    /// batch task here. Retired when the request's result is acknowledged or
+    /// the request is lost.
+    request_publication: Arc<Mutex<HashMap<String, ObservedPublication>>>,
+
     #[cfg(test)]
     result_ack_probe: Arc<Mutex<Option<ResultAckProbe>>>,
     /// Reauthorization answers awaited, by attempt.
@@ -1539,6 +1543,11 @@ impl Drop for DeferredResultAck {
             .unwrap()
             .remove(&self.request_id)
             .unwrap_or_default();
+        if delivered.is_empty() {
+            // No result reached the batch, so no acknowledgement retires what
+            // was observed of its upload.
+            self.fleet.settle_request_publication(&self.request_id);
+        }
         for (attempt_id, executor_id) in delivered {
             self.fleet
                 .send_result_ack(&executor_id, &self.request_id, &attempt_id);
@@ -1574,7 +1583,92 @@ enum LinkBoundResponse<T> {
     LinkSilent,
 }
 
+/// A request's result upload as this runner's object server saw it arrive:
+/// its size when the upload declared one, and when it was first seen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedPublication {
+    /// The attempt whose upload this is. A retried request runs its commands
+    /// again under a new attempt, which this observation says nothing about.
+    pub attempt_id: String,
+    pub delta_bytes: Option<u64>,
+    pub since_ms: i64,
+}
+
 impl Fleet {
+    /// An authorized result upload for `request_id` has arrived at this
+    /// runner's object server. The object routes call this once the upload's
+    /// grant is checked and before its body is read. It names the publishing
+    /// phase and keeps a later cancel from being sent to the machine; it never
+    /// decides whether the result publishes, which is the machine's terminal
+    /// outcome's to say.
+    pub fn observe_result_upload(
+        &self,
+        request_id: &str,
+        attempt_id: &str,
+        delta_bytes: Option<u64>,
+    ) {
+        if self.replaced_attempt(request_id, attempt_id) {
+            return;
+        }
+        let fresh = || ObservedPublication {
+            attempt_id: attempt_id.to_owned(),
+            delta_bytes,
+            since_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let observed = {
+            let mut requests = self.request_publication.lock().unwrap();
+            let observed = requests.entry(request_id.to_owned()).or_insert_with(fresh);
+            if observed.attempt_id != attempt_id {
+                *observed = fresh();
+            } else if delta_bytes.is_some() {
+                observed.delta_bytes = delta_bytes;
+            }
+            observed.clone()
+        };
+        crate::mcp::handlers::run::detached::note_publishing(request_id, &observed);
+    }
+
+    /// Whether the queue holds `request_id` under an attempt other than
+    /// `attempt_id`. A request the queue does not hold (adopted after a
+    /// restart) has no attempt to compare against.
+    fn replaced_attempt(&self, request_id: &str, attempt_id: &str) -> bool {
+        self.queue
+            .attempt_identity_of(request_id)
+            .is_some_and(|(_, current)| current != attempt_id)
+    }
+
+    /// The observed upload of the request's current attempt.
+    pub(crate) fn observed_publication(&self, request_id: &str) -> Option<ObservedPublication> {
+        let observed = self
+            .request_publication
+            .lock()
+            .unwrap()
+            .get(request_id)
+            .cloned()?;
+        (!self.replaced_attempt(request_id, &observed.attempt_id)).then_some(observed)
+    }
+
+    pub(crate) fn request_is_publishing(&self, request_id: &str) -> bool {
+        self.observed_publication(request_id).is_some()
+    }
+
+    /// One attempt ended: its result was acknowledged, or it was lost. A
+    /// later attempt's observation is not this one's to retire.
+    pub(crate) fn retire_attempt_publication(&self, request_id: &str, attempt_id: &str) {
+        let mut requests = self.request_publication.lock().unwrap();
+        if requests
+            .get(request_id)
+            .is_some_and(|observed| observed.attempt_id == attempt_id)
+        {
+            requests.remove(request_id);
+        }
+    }
+
+    /// The request itself settled or was lost, whichever attempt it was on.
+    pub(crate) fn settle_request_publication(&self, request_id: &str) {
+        self.request_publication.lock().unwrap().remove(request_id);
+    }
+
     /// Give this fleet's queue a durable journal, and close whatever a previous
     /// runner incarnation left open.
     ///
@@ -2345,6 +2439,65 @@ pub(crate) fn unix_time_ms() -> u64 {
 /// telemetry, and the placement clock reading them all agree.
 #[cfg(test)]
 const NOW: u64 = 1_000_000_000;
+
+#[cfg(test)]
+mod publication_gate_tests {
+    use super::Fleet;
+
+    #[tokio::test]
+    async fn an_observed_upload_lives_until_its_result_is_acknowledged_or_lost() {
+        let fleet = Fleet::default();
+        fleet.observe_result_upload("publishing", "a1", None);
+        let first = fleet.observed_publication("publishing").unwrap();
+        fleet.observe_result_upload("publishing", "a1", Some(12_000_000));
+        let sized = fleet.observed_publication("publishing").unwrap();
+        assert_eq!(sized.delta_bytes, Some(12_000_000));
+        assert_eq!(sized.since_ms, first.since_ms, "since is the first sight");
+        fleet.observe_result_upload("publishing", "a1", None);
+        assert_eq!(
+            fleet
+                .observed_publication("publishing")
+                .unwrap()
+                .delta_bytes,
+            Some(12_000_000)
+        );
+        fleet.settle_request_publication("publishing");
+        assert!(!fleet.request_is_publishing("publishing"));
+
+        // A retry: the lost attempt's observation and acknowledgement never
+        // speak for the attempt that replaced it.
+        fleet.observe_result_upload("retried", "a1", Some(1));
+        fleet.retire_attempt_publication("retried", "a1");
+        assert!(
+            !fleet.request_is_publishing("retried"),
+            "lost with its wait"
+        );
+        fleet.observe_result_upload("retried", "a2", Some(2));
+        fleet.retire_attempt_publication("retried", "a1");
+        fleet.send_result_ack("disconnected", "retried", "a1");
+        assert_eq!(
+            fleet.observed_publication("retried").unwrap().attempt_id,
+            "a2"
+        );
+        fleet.send_result_ack("disconnected", "retried", "a2");
+        assert!(!fleet.request_is_publishing("retried"));
+
+        let settlement = fleet.defer_result_ack("no-result");
+        fleet.observe_result_upload("no-result", "attempt", None);
+        drop(settlement);
+        assert!(fleet.request_publication.lock().unwrap().is_empty());
+
+        fleet.observe_result_upload("offline", "attempt", None);
+        fleet.send_result_ack("disconnected", "offline", "attempt");
+        assert!(fleet.request_publication.lock().unwrap().is_empty());
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        fleet.attach_executor(sender);
+        fleet.observe_result_upload("colocated", "attempt", None);
+        fleet.send_result_ack(super::COLOCATED_EXECUTOR_ID, "colocated", "attempt");
+        assert!(fleet.request_publication.lock().unwrap().is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests;
