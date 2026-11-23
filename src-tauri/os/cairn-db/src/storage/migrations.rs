@@ -2287,6 +2287,16 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "runner_events",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // This runner's absence episodes and undelivered incident transitions.
+    // Persisted across restarts, but meaningful only to this install's fleet.
+    (
+        "executor_absence_incidents",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "executor_absence_notices",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     (
         "executor_reach_history",
         TableScope::Private(PrivateReason::RunnerTransient),

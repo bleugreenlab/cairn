@@ -729,6 +729,14 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("device_presence", TEAM_FLEET),
     keep("remote_intents", TEAM_FLEET),
     keep("executor_registry", TEAM_FLEET),
+    keep(
+        "executor_absence_incidents",
+        "one latest state per machine, preserving absence facts after enrollment removal",
+    ).budget(16),
+    keep(
+        "executor_absence_notices",
+        "durable transition keys prevent notice replay; at most four notices per absence episode",
+    ).budget(16),
 ];
 
 /// The rule for `table`, if it has one.

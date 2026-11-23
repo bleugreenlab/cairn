@@ -2401,6 +2401,7 @@ async fn render_resource_body(
                     let captured_at = crate::fleet::unix_time_ms();
                     let executors = orch.fleet.inspect_executors(captured_at);
                     let warming_up = orch.fleet_warming_up(executors.len(), captured_at);
+                    let incidents = crate::fleet::absence::incident_lines(orch).await;
                     let mut rendered = crate::resources::executors::render_executors(
                         &executors,
                         &orch.fleet.unattached_enrolled_remotes(),
@@ -2411,7 +2412,13 @@ async fn render_resource_body(
                         cairn_common::abnormal_exit::predecessor(),
                         captured_at,
                         warming_up,
+                        incidents.as_ref().unwrap_or(&Default::default()),
                     );
+                    if let Err(error) = incidents {
+                        rendered.push_str(&format!(
+                            "\nAbsence incident history unavailable: {error}\n"
+                        ));
+                    }
                     rendered.push_str(&crate::resources::executors::render_drain_initialization(
                         orch.fleet.drain_initialization_error().as_deref(),
                     ));
@@ -2565,6 +2572,15 @@ async fn render_resource_body(
                                 Some(&recorded_kills),
                                 &attributions,
                             );
+                            match crate::fleet::absence::incident_lines(orch).await {
+                                Ok(incidents) => {
+                                    if let Some(incident) = incidents.get(&executor.health.identity.executor_id) {
+                                        rendered.push_str("\n## Absence incident\n\n");
+                                        rendered.push_str(incident);
+                                    }
+                                }
+                                Err(error) => rendered.push_str(&format!("\nAbsence incident history unavailable: {error}\n")),
+                            }
                             rendered.push_str(&crate::resources::executors::render_room_line(
                                 &orch.fleet.room_line(&executor.health.identity.executor_id, captured_at),
                                 &executor.name,
@@ -2694,7 +2710,12 @@ async fn render_resource_body(
                         // A detached machine is the likeliest holder of a
                         // blocked question, so its page names them.
                         Some(remote) => {
-                            let mut rendered = crate::resources::executors::render_enrolled_remote(remote, captured_at);
+                            let incidents = crate::fleet::absence::incident_lines(orch).await;
+                            let incident = incidents.as_ref().ok().and_then(|rows| rows.get(&remote.executor_id));
+                            let mut rendered = crate::resources::executors::render_enrolled_remote(remote, captured_at, incident.map(String::as_str));
+                            if let Err(error) = incidents {
+                                rendered.push_str(&format!("\nAbsence incident history unavailable: {error}\n"));
+                            }
                             rendered.push_str(&crate::execution::checks_main::render_machine_adoptions(orch, &name));
                             rendered.push_str(&crate::resources::executors::render_blocked_questions(
                                 &orch.fleet.blocked_questions(Some(&remote.executor_id), captured_at),

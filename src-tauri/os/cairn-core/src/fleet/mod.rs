@@ -4,6 +4,7 @@
 //! the cached UI snapshot. Scheduling, workspaces, processes, cancellation, and
 //! mutation sealing exist only in the executor process.
 
+pub(crate) mod absence;
 mod assignments;
 mod check_adoptions;
 pub(crate) use check_adoptions::{CheckConsumerGuard, RETAINED_RESULT_RETRY};
@@ -176,13 +177,13 @@ use requirements::{
 use residency_routes::residency_placement_request;
 #[cfg(test)]
 pub(crate) use residency_routes::residency_placement_request_for_test;
+#[cfg(test)]
+pub(crate) use residency_routes::residency_queue_entry_id;
 use residency_routes::{
     acquired_residency_holder, judge_link, pipe_floor_work, GrantedCell, PreviousHome,
     ResidencyRoute,
 };
-pub(crate) use residency_routes::{
-    describe_quiet_ms, residency_queue_entry_id, EnvironmentEviction, EvictionCause,
-};
+pub(crate) use residency_routes::{describe_quiet_ms, EnvironmentEviction, EvictionCause};
 pub use residency_routes::{DrainResidents, HeldEnvironment};
 use residency_routes::{HomePrices, WithdrawnHome, ENVIRONMENT_LEASE_GRACE_MS};
 #[cfg(test)]
@@ -211,8 +212,7 @@ use cairn_common::executor_protocol::{
     CellExecutionMeta, ClaimedAttemptAccount, ExecutingCellRequest, ExecutorHealthStatus,
     ExecutorListenerAdvertisement, PersistentCellLifecycle, ProcessBatchExecution,
     ProjectCapability, RemoteAttachAttempt, ResidentProcessEventKind, RunnerCallback,
-    RunnerCallbackResult, EXECUTOR_LINK_STALL_REMEDIATION_MS,
-    EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS,
+    RunnerCallbackResult, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS,
 };
 #[cfg(test)]
 use cairn_config::fleet::PlacementStance;
@@ -221,11 +221,9 @@ use health::TELEMETRY_STALL_BOUNCE_SPACING_MS;
 #[cfg(test)]
 use purpose::{PurposeAdmissionGuard, PurposeGate};
 #[cfg(test)]
-use requirements::{project_eligibility, stamp_preparation_refusals};
-#[cfg(test)]
 use residency_routes::residency_core_failure;
 #[cfg(test)]
-use selection::{deadline_evidence, environment_identity, presence_cause};
+use selection::deadline_evidence;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 

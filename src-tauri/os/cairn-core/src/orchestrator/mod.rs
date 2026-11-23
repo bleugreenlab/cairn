@@ -2999,6 +2999,17 @@ impl Orchestrator {
         crate::orchestrator::wakes::conditions::install_evaluator(self.clone());
         crate::orchestrator::inference_control::spawn_deployment_control(self.clone());
         crate::fleet::models::spawn(self.clone());
+        let orch = self.clone();
+        self.spawn_detached(async move {
+            let mut ticks = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                if let Err(error) = crate::fleet::absence::sweep(&orch).await {
+                    log::warn!("executor absence monitor: {error}; retried next pass");
+                }
+            }
+        });
         crate::orchestrator::inference_verify::spawn_recovery(self.clone());
         crate::orchestrator::inference_metrics::spawn_engine_metrics(self.clone());
         // A machine that reconnects holding replicas of closed scratches is

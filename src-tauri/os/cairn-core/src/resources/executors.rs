@@ -435,6 +435,7 @@ pub(crate) fn render_executors(
     replaced_abnormal_exit: Option<&AbnormalExit>,
     captured_at_unix_ms: u64,
     warming_up: bool,
+    incidents: &std::collections::HashMap<String, String>,
 ) -> String {
     if executors.is_empty() && enrolled.is_empty() && enrolling.is_empty() {
         let mut empty = if warming_up {
@@ -504,7 +505,12 @@ pub(crate) fn render_executors(
                 ));
             }
         }
-        out.push_str(&format!("- Link: {}\n", link_summary(executor)));
+        if let Some(incident) = incidents.get(&executor.health.identity.executor_id) {
+            out.push_str(incident);
+            out.push('\n');
+        } else {
+            out.push_str(&format!("- Link: {}\n", link_summary(executor)));
+        }
         out.push_str(&reach_warning(executor.reach_history.as_ref()));
         out.push_str(&pipe_floor_line(&executor_pipe_floor(
             &executor.health.host,
@@ -553,18 +559,25 @@ pub(crate) fn render_executors(
                 captured_at_unix_ms,
             ));
             out.push_str(&format!("- Platform: {} / {}\n", remote.os, remote.arch));
-            out.push_str(&format!(
-                "- Link: {}\n",
-                enrolled_link_summary(remote, captured_at_unix_ms)
-            ));
+            if let Some(incident) = incidents.get(&remote.executor_id) {
+                out.push_str(incident);
+                out.push('\n');
+            } else {
+                out.push_str(&format!(
+                    "- Link: {}\n",
+                    enrolled_link_summary(remote, captured_at_unix_ms)
+                ));
+            }
             if remote.role != MachineRole::General {
                 out.push_str(&machine_role_line(remote.role));
             }
             out.push_str(&owned_drain_lines(&remote.drain_state));
-            out.push_str(&format!(
-                "- Last seen: {}\n",
-                last_seen(remote, captured_at_unix_ms)
-            ));
+            if !incidents.contains_key(&remote.executor_id) {
+                out.push_str(&format!(
+                    "- Last seen: {}\n",
+                    last_seen(remote, captured_at_unix_ms)
+                ));
+            }
             out.push_str(&format!(
                 "- Last attempt: {}\n",
                 last_attempt_age(remote, captured_at_unix_ms)
@@ -1018,7 +1031,11 @@ fn machine_role_line(role: MachineRole) -> String {
     format!("- Role: {} ({})\n", role.label(), role.describe_accepted())
 }
 
-pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_ms: u64) -> String {
+pub(crate) fn render_enrolled_remote(
+    remote: &EnrolledRemote,
+    captured_at_unix_ms: u64,
+    incident: Option<&str>,
+) -> String {
     let mut out = format!("# Executor {}\n\n", remote.name);
     out.push_str("## Identity\n");
     out.push_str(&format!("- Name: {}\n", remote.name));
@@ -1027,10 +1044,15 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
     out.push_str(&format!("- Platform: {} / {}\n\n", remote.os, remote.arch));
 
     out.push_str("## Link\n");
-    out.push_str(&format!(
-        "- Status: {}\n",
-        enrolled_link_summary(remote, captured_at_unix_ms)
-    ));
+    if let Some(incident) = incident {
+        out.push_str(incident);
+        out.push('\n');
+    } else {
+        out.push_str(&format!(
+            "- Status: {}\n",
+            enrolled_link_summary(remote, captured_at_unix_ms)
+        ));
+    }
     out.push_str(&render_reach(
         remote.reach_history.as_ref(),
         captured_at_unix_ms,
@@ -1042,10 +1064,12 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
         out.push_str("- Draining: yes — new admission refused by the runner\n");
     }
     out.push_str(&owned_drain_lines(&remote.drain_state));
-    out.push_str(&format!(
-        "- Last seen: {}\n",
-        last_seen(remote, captured_at_unix_ms)
-    ));
+    if incident.is_none() {
+        out.push_str(&format!(
+            "- Last seen: {}\n",
+            last_seen(remote, captured_at_unix_ms)
+        ));
+    }
     out.push_str(&format!(
         "- Last attempt: {}\n",
         last_attempt_age(remote, captured_at_unix_ms)
@@ -1101,6 +1125,11 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
                 Some(cairn_common::executor_protocol::UpdateRestart { outcome: Some(_), .. }) => "The runner restarted its daemon once over this machine's ssh bootstrap, with the outcome above, and does not try again for this build: bringing it back is the operator's from here.",
             },
         ));
+        out.push_str("\nNo load, admission, or occupancy is reported: those are measured on the machine, and this one is not reporting.\n");
+        return out;
+    }
+    if incident.is_some() {
+        out.push_str("The runner has not heard this machine return. Absence does not show whether the host is off or its network path is down; no reachability probe was made. The next attach clears this incident.\n");
         out.push_str("\nNo load, admission, or occupancy is reported: those are measured on the machine, and this one is not reporting.\n");
         return out;
     }
@@ -10156,7 +10185,7 @@ mod tests {
         ] {
             assert!(rendered.contains(expected), "missing {expected:?} in:\n{rendered}");
         }
-        let fleet = render_executors(&[executor], &[], &[], None, 0, false);
+        let fleet = render_executors(&[executor], &[], &[], None, 0, false, &Default::default());
         assert!(
             fleet.contains("- Build volume: write-saturated (nvme0n1, 93% full)"),
             "{fleet}"
@@ -10398,6 +10427,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(
             rendered.contains(
@@ -10419,6 +10449,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(
             listed.contains("- Toolchains: none advertised\n"),
@@ -10514,7 +10545,15 @@ mod tests {
             page.contains("  - npm: verified — `npm --version` at /home/dev/.cairn-exec/bin/npm — 10.9.2 (manifest), measured 15m ago; the latest probe, 10m ago, measured nothing (did not finish within 30s and was killed), so the verified verdict stands\n"),
             "{page}"
         );
-        let listed = render_executors(&[held], &[], &[], None, CAPTURED_AT, false);
+        let listed = render_executors(
+            &[held],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+            &Default::default(),
+        );
         assert!(
             listed.contains("- Toolchains: npm (npm held verified: latest probe did not finish within 30s and was killed)\n"),
             "{listed}"
@@ -10590,6 +10629,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(rendered.contains("- Toolchains: rust, bun\n"), "{rendered}");
     }
@@ -10628,6 +10668,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(rendered.contains("- Toolchains: rust, bun\n"), "{rendered}");
         assert!(
@@ -10731,6 +10772,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         for line in [
             format!("- GitHub: available as bleugreen (verified against {tm_cards}, 12m ago)\n"),
@@ -10811,6 +10853,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(
             listed.contains(
@@ -10907,6 +10950,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(
             listed.contains("- Not eligible for cairn: Rust work, agents' execution environments included (build prerequisites MISSING)\n"),
@@ -10930,6 +10974,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(!listed.contains("Build prerequisites"), "{listed}");
 
@@ -10959,6 +11004,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(
             listed.contains(
@@ -10980,6 +11026,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(
             listed.contains(
@@ -11020,6 +11067,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(
             listed.contains("- Build prerequisites: not checked — reported as MISSING by a probe that could not run its script: /var/folders/k1/T/cairn-prerequisite-b440083b/setup-self-hosted-runner-macos.sh: line 31:"),
@@ -11644,6 +11692,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(rendered.contains("## bglab-ub"), "{rendered}");
         assert!(rendered.contains("## local"), "{rendered}");
@@ -11679,14 +11728,16 @@ mod tests {
 
     #[test]
     fn an_empty_fleet_renders_an_explanation_not_an_empty_list() {
-        let rendered = render_executors(&[], &[], &[], None, CAPTURED_AT, false);
+        let rendered =
+            render_executors(&[], &[], &[], None, CAPTURED_AT, false, &Default::default());
         assert!(rendered.contains("No executor is attached"), "{rendered}");
         assert!(rendered.contains("local"), "{rendered}");
     }
 
     #[test]
     fn a_fresh_session_with_no_readings_renders_warming_not_failure() {
-        let rendered = render_executors(&[], &[], &[], None, CAPTURED_AT, true);
+        let rendered =
+            render_executors(&[], &[], &[], None, CAPTURED_AT, true, &Default::default());
         assert!(rendered.contains("Status: warming"), "{rendered}");
         assert!(!rendered.contains("No executor is attached"), "{rendered}");
     }
@@ -11696,7 +11747,8 @@ mod tests {
     /// reads as boilerplate.
     #[test]
     fn a_clean_runner_says_nothing_about_a_restart() {
-        let rendered = render_executors(&[], &[], &[], None, CAPTURED_AT, false);
+        let rendered =
+            render_executors(&[], &[], &[], None, CAPTURED_AT, false, &Default::default());
         assert!(!rendered.contains("Runner restarted"), "{rendered}");
     }
 
@@ -11710,7 +11762,15 @@ mod tests {
             pid: 74402,
             reason: "the transport liveness watchdog aborted the runner after 16 consecutive failed loopback probes over 62s (the listener was bound but its accept queue never drained)".to_string(),
         };
-        let rendered = render_executors(&[], &[], &[], Some(&exit), CAPTURED_AT, false);
+        let rendered = render_executors(
+            &[],
+            &[],
+            &[],
+            Some(&exit),
+            CAPTURED_AT,
+            false,
+            &Default::default(),
+        );
         assert!(rendered.contains("Runner restarted"), "{rendered}");
         assert!(
             rendered.contains("transport liveness watchdog"),
@@ -11742,6 +11802,7 @@ mod tests {
             Some(&exit),
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         let restart = rendered.find("Runner restarted").expect("restart section");
         let machine = rendered.find("## local").expect("machine section");
@@ -11822,11 +11883,12 @@ mod tests {
             None,
             REMOTE_CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(fleet.contains(&format!("- Link: {sentence}\n")), "{fleet}");
         assert!(!fleet.contains("executor updating to build"), "{fleet}");
 
-        let page = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let page = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(page.contains(&format!("- Status: {sentence}\n")), "{page}");
         assert!(
             page.contains("did not dial back in within 25 minutes"),
@@ -11852,7 +11914,7 @@ mod tests {
                 ),
             },
         ))));
-        let page = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let page = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(
             page.contains("; restart attempted at 1970-01-01 01:12 UTC: ssh could not reach it, so its daemon was not restarted: ssh unreachable\n"),
             "{page}"
@@ -11865,7 +11927,7 @@ mod tests {
     #[test]
     fn a_machine_with_no_unreturned_update_renders_its_link_as_before() {
         let remote = updating_specimen(None);
-        let page = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let page = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(
             page.contains("- Status: absent — the executor closed this link: executor updating to build content-v2:3ee6fabd\n"),
             "{page}"
@@ -11924,7 +11986,7 @@ mod tests {
             }),
         }];
 
-        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(
             rendered.contains("memory at generation end: resident 9.5 GiB"),
             "the size the kernel killed it at: {rendered}"
@@ -11987,7 +12049,7 @@ mod tests {
             }),
         }];
 
-        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(
             rendered.contains("memory at generation end: unknown"),
             "a stale reading must not be presented as the size at the end: {rendered}"
@@ -12045,7 +12107,7 @@ mod tests {
             memory_at_generation_end: None,
         }];
 
-        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(rendered.contains("remote executor exited"), "{rendered}");
         assert!(rendered.contains("remote process exit 9"), "{rendered}");
         assert!(
@@ -12084,6 +12146,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(listed.contains("- Role: inference only"), "{listed}");
 
@@ -12095,10 +12158,18 @@ mod tests {
             },
         );
         remote.role = MachineRole::InferenceOnly;
-        let detached = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let detached = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(detached.contains("- Attachment: enrolled"), "{detached}");
         assert!(detached.contains("- Role: inference only"), "{detached}");
-        let overview = render_executors(&[], &[remote], &[], None, REMOTE_CAPTURED_AT, false);
+        let overview = render_executors(
+            &[],
+            &[remote],
+            &[],
+            None,
+            REMOTE_CAPTURED_AT,
+            false,
+            &Default::default(),
+        );
         assert!(overview.contains("- Role: inference only"), "{overview}");
     }
 
@@ -12115,6 +12186,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(!general_only.contains("Roles:"), "{general_only}");
 
@@ -12127,7 +12199,15 @@ mod tests {
             },
         );
         sp1.role = MachineRole::InferenceOnly;
-        let listed = render_executors(&[local, ub2], &[sp1], &[], None, CAPTURED_AT, false);
+        let listed = render_executors(
+            &[local, ub2],
+            &[sp1],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+            &Default::default(),
+        );
         assert!(
             listed.contains(
                 "Roles: inference only: sp1 · services only: bgsrv-ub2 · general: local\n"
@@ -12147,10 +12227,10 @@ mod tests {
                 last_reason: String::new(),
             },
         );
-        let ordinary = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let ordinary = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(ordinary.contains("powered off, asleep"), "{ordinary}");
         remote.role = MachineRole::ServicesOnly;
-        let incident = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let incident = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(
             incident.contains("pi1 runs services only and is expected to be always on; its link has been silent since "),
             "{incident}"
@@ -12181,12 +12261,12 @@ mod tests {
             },
         );
         assert!(
-            !render_enrolled_remote(&remote, REMOTE_CAPTURED_AT).contains("Draining"),
+            !render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None,).contains("Draining"),
             "a machine under no drain says nothing about one"
         );
         remote.drained = true;
         remote.drain_state.effective_refusal = true;
-        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(rendered.contains("Draining: yes"), "{rendered}");
         assert!(
             rendered.contains("new admission refused by the runner"),
@@ -12230,10 +12310,11 @@ mod tests {
             None,
             REMOTE_CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(!overview.contains("probe 7"), "{overview}");
         assert!(overview.contains("view=attach-log"), "{overview}");
-        let machine = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let machine = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(
             machine.contains("link lost after 7m of healthy operation"),
             "{machine}"
@@ -12287,7 +12368,7 @@ mod tests {
             },
             "ssh authentication refused (root@host: Permission denied (publickey).)",
         );
-        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(
             rendered.contains("bootstrap failed — ssh authentication"),
             "{rendered}"
@@ -12314,6 +12395,7 @@ mod tests {
             None,
             REMOTE_CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(rendered.contains("### bglab-ub"), "{rendered}");
         assert!(
@@ -12322,6 +12404,35 @@ mod tests {
         );
         assert!(rendered.contains("absent"), "{rendered}");
         assert!(rendered.contains("2h ago"), "{rendered}");
+
+        let remote = enrolled(
+            "bglab-ub",
+            RemoteLinkState::Absent {
+                last_beat_unix_ms: None,
+                last_reason: String::new(),
+            },
+        );
+        let incident = "machine-absence-evidence";
+        let incidents =
+            std::collections::HashMap::from([(remote.executor_id.clone(), incident.to_string())]);
+        let collection = render_executors(
+            &[],
+            std::slice::from_ref(&remote),
+            &[],
+            None,
+            REMOTE_CAPTURED_AT,
+            false,
+            &incidents,
+        );
+        let page = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, Some(incident));
+        for rendered in [&collection, &page] {
+            assert!(rendered.contains(incident), "{rendered}");
+            assert!(
+                !rendered.contains(&enrolled_link_summary(&remote, REMOTE_CAPTURED_AT)),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("- Last seen:"), "{rendered}");
+        }
     }
 
     /// A fleet with no attached machine but live enrollments is NOT the same
@@ -12350,6 +12461,7 @@ mod tests {
             None,
             REMOTE_CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(rendered.contains("### bglab-mac"), "{rendered}");
         assert!(rendered.contains("### bglab-ub"), "{rendered}");
@@ -12403,7 +12515,15 @@ mod tests {
                 },
             ),
         ];
-        let rendered = render_executors(&[], &fleet, &[], None, REMOTE_CAPTURED_AT, false);
+        let rendered = render_executors(
+            &[],
+            &fleet,
+            &[],
+            None,
+            REMOTE_CAPTURED_AT,
+            false,
+            &Default::default(),
+        );
         assert!(
             rendered.contains("3 enrolled machines are stranded"),
             "{rendered}"
@@ -12424,7 +12544,7 @@ mod tests {
         );
         assert!(!rendered.contains("directed to self-update"), "{rendered}");
 
-        let page = render_enrolled_remote(&fleet[2], REMOTE_CAPTURED_AT);
+        let page = render_enrolled_remote(&fleet[2], REMOTE_CAPTURED_AT, None);
         assert!(
             page.contains(
                 "- Status: stranded: this runner has no x86_64-unknown-linux-gnu executor"
@@ -12447,7 +12567,15 @@ mod tests {
             "a stranded machine is not described as an ordinary absence: {page}"
         );
 
-        let healthy = render_executors(&[], &fleet[3..], &[], None, REMOTE_CAPTURED_AT, false);
+        let healthy = render_executors(
+            &[],
+            &fleet[3..],
+            &[],
+            None,
+            REMOTE_CAPTURED_AT,
+            false,
+            &Default::default(),
+        );
         assert!(!healthy.contains("stranded"), "{healthy}");
     }
 
@@ -12470,6 +12598,7 @@ mod tests {
                 },
             ),
             REMOTE_CAPTURED_AT,
+            None,
         );
         assert!(absent.contains("absent — the link went away"), "{absent}");
         assert!(
@@ -12492,7 +12621,7 @@ mod tests {
             REMOTE_CAPTURED_AT - 120_000,
             "ssh authentication refused (root@host: Permission denied (publickey).)",
         ));
-        let failed = render_enrolled_remote(&refused, REMOTE_CAPTURED_AT);
+        let failed = render_enrolled_remote(&refused, REMOTE_CAPTURED_AT, None);
         assert!(
             failed.contains("bootstrap failed — ssh authentication refused ("),
             "{failed}"
@@ -12519,7 +12648,7 @@ mod tests {
             RemoteAttachAttempt::bootstrap_failure(REMOTE_CAPTURED_AT - 120_000, account)
                 .with_artifact_fault(Some(RemoteArtifactFault::Unpublished)),
         );
-        let rendered = render_enrolled_remote(&waiting, REMOTE_CAPTURED_AT);
+        let rendered = render_enrolled_remote(&waiting, REMOTE_CAPTURED_AT, None);
 
         assert!(
             rendered.contains(&format!("Status: {account}")),
@@ -12546,7 +12675,7 @@ mod tests {
             RemoteAttachAttempt::bootstrap_failure(REMOTE_CAPTURED_AT - 120_000, account)
                 .with_artifact_fault(Some(RemoteArtifactFault::Integrity)),
         );
-        let rendered = render_enrolled_remote(&broken, REMOTE_CAPTURED_AT);
+        let rendered = render_enrolled_remote(&broken, REMOTE_CAPTURED_AT, None);
 
         assert!(rendered.contains("once the cause is fixed"), "{rendered}");
         assert!(
@@ -12570,6 +12699,7 @@ mod tests {
                 },
             ),
             REMOTE_CAPTURED_AT,
+            None,
         );
         assert!(
             rendered.contains("No load, admission, or occupancy is reported"),
@@ -12591,7 +12721,7 @@ mod tests {
         );
         remote.last_attempt = None;
         remote.last_seen_unix_ms = None;
-        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(
             rendered.contains("installed; waiting for first dial"),
             "{rendered}"
@@ -12620,7 +12750,7 @@ mod tests {
             },
         );
         remote.last_attempt = None;
-        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT, None);
         assert!(rendered.contains("held by the runner"), "{rendered}");
         assert!(rendered.contains("address in use"), "{rendered}");
         assert!(
@@ -12838,7 +12968,15 @@ mod tests {
         );
         assert!(rendered.contains("bbl.tigon-trout.ts.net:3846 = 100.75.184.96:3846 (tailnet, connection or handshake did not complete within 10 s"), "{rendered}");
         assert!(rendered.contains("single path: this machine reaches the runner only via 10.10.10.51:3846; if that path fails it cannot reattach"), "{rendered}");
-        let overview = render_executors(&[executor], &[], &[], None, CAPTURED_AT, false);
+        let overview = render_executors(
+            &[executor],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+            &Default::default(),
+        );
         assert!(overview.contains("- single path:"), "{overview}");
     }
 
@@ -12853,7 +12991,7 @@ mod tests {
         );
         remote.last_attempt = None;
         remote.reach_history = Some(reach_specimen());
-        let rendered = render_enrolled_remote(&remote, CAPTURED_AT);
+        let rendered = render_enrolled_remote(&remote, CAPTURED_AT, None);
         assert!(
             rendered.contains("- Reach reported: last attach "),
             "{rendered}"
@@ -12865,7 +13003,15 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("- single path:"), "{rendered}");
-        let overview = render_executors(&[], &[remote], &[], None, CAPTURED_AT, false);
+        let overview = render_executors(
+            &[],
+            &[remote],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+            &Default::default(),
+        );
         assert!(
             overview.contains("- Reach reported: last attach "),
             "{overview}"
@@ -13229,6 +13375,7 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert!(
             listed.contains(
@@ -13242,7 +13389,15 @@ mod tests {
 
         let mut mac = inspection("bgsrv-mac", false);
         measured(&mut mac);
-        let quiet = render_executors(&[mac], &[], &[], None, CAPTURED_AT, false);
+        let quiet = render_executors(
+            &[mac],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+            &Default::default(),
+        );
         assert!(!quiet.contains("## Model pools"), "{quiet}");
     }
 
@@ -13521,6 +13676,7 @@ mod tests {
                 None,
                 CAPTURED_AT,
                 false,
+                &Default::default(),
             ),
         ] {
             assert!(!rendered.contains("executor-7b21ce"), "{rendered}");
@@ -14253,11 +14409,12 @@ mod tests {
             None,
             CAPTURED_AT,
             false,
+            &Default::default(),
         );
         assert_eq!(collection.matches("reason: no reason supplied").count(), 2);
         for rendered in [
             render_executor(&executor),
-            render_enrolled_remote(&remote, CAPTURED_AT),
+            render_enrolled_remote(&remote, CAPTURED_AT, None),
             collection,
         ] {
             assert!(!rendered.contains("stable-executor"), "{rendered}");
@@ -14289,7 +14446,8 @@ mod tests {
 
     #[test]
     fn owned_drain_initialization_failure_is_visible_even_with_an_empty_fleet() {
-        let mut rendered = render_executors(&[], &[], &[], None, CAPTURED_AT, false);
+        let mut rendered =
+            render_executors(&[], &[], &[], None, CAPTURED_AT, false, &Default::default());
         rendered.push_str(&render_drain_initialization(Some(
             "unsupported drain schema",
         )));
