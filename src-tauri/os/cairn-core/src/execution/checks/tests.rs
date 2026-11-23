@@ -89,6 +89,7 @@ fn no_matching_executor_classifies_immutable_refusals() {
             .into_iter()
             .enumerate()
             .map(|(i, reason)| PlacementRefusal {
+                drain_blockers: Vec::new(),
                 executor_id: format!("machine-{i}"),
                 executor_name: format!("machine-{i}"),
                 reason,

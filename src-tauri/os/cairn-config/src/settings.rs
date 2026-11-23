@@ -5308,7 +5308,7 @@ mod owned_drain_tests {
             |fleet| {
                 fleet
                     .drains
-                    .impose_operator("machine", &principal(), "repair", 1)
+                    .impose_operator("machine", &principal(), "repair", &[], 1)
             },
             |_| {},
         )
@@ -5341,7 +5341,7 @@ mod owned_drain_tests {
         let mut forged = stale;
         forged
             .drains
-            .impose_operator("other", &principal(), "injected", 1)
+            .impose_operator("other", &principal(), "injected", &[], 1)
             .unwrap();
         set_fleet(dir.path(), &forged).unwrap();
         assert_eq!(load_fleet(dir.path()).drains, cleared.drains);
@@ -5439,7 +5439,7 @@ mod owned_drain_tests {
             |fleet| {
                 fleet
                     .drains
-                    .impose_operator("machine", &principal(), "repair", 1)?;
+                    .impose_operator("machine", &principal(), "repair", &[], 1)?;
                 Err::<(), _>("injected before commit".into())
             },
             |_| panic!("failed mutation must not publish"),
@@ -5460,7 +5460,7 @@ mod owned_drain_tests {
             |fleet| {
                 fleet
                     .drains
-                    .impose_operator("machine", &principal(), "repair", 1)
+                    .impose_operator("machine", &principal(), "repair", &[], 1)
             },
             |_| {},
         )
@@ -5539,7 +5539,7 @@ mod owned_drain_tests {
             |fleet| {
                 fleet
                     .drains
-                    .impose_operator("machine", &principal(), "repair", 1)?;
+                    .impose_operator("machine", &principal(), "repair", &[], 1)?;
                 Ok(17)
             },
             |fleet| {
@@ -5575,6 +5575,7 @@ mod owned_drain_tests {
                                 &format!("thread-{n}"),
                                 &principal(),
                                 "test",
+                                &[],
                                 n,
                             )
                         },

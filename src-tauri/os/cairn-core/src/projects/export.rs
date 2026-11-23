@@ -126,6 +126,7 @@ const EXPORT_ONLY: &[TableCopySpec] = &[
     export_only("tool_analytics_hourly", "project_id = ?1 OR run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
     export_only("run_activity_minutes", "run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
     // Private lineage, naming the project directly.
+    export_only("resource_notices", "project_id = ?1"),
     export_only("config_disables", "project_id = ?1"),
     export_only("execution_queue", "project_id = ?1"),
     export_only("executor_preparation_refusals", "project_id = ?1"),

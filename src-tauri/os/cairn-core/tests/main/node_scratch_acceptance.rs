@@ -411,6 +411,7 @@ impl Node {
                         run_id: Some(OWNER_RUN.into()),
                     },
                     "scratch acceptance fixture",
+                    &[],
                     1,
                 )
             } else {

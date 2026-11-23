@@ -199,8 +199,17 @@ pub(crate) async fn read_node_rebase(
         Ok(rows) => rows,
         Err(error) => return error,
     };
+    let notices = if matches!(request.view, RebaseView::Summary) {
+        crate::resource_notices::render_for(
+            orch,
+            &format!("cairn://p/{project}/{number}/{exec_seq}/{node_id}/rebase"),
+        )
+        .await
+    } else {
+        String::new()
+    };
     let Some(branch) = rows.branch.clone() else {
-        return "This node has no branch, so it cannot have a rebase session.".to_string();
+        return format!("{notices}This node has no branch, so it cannot have a rebase session.");
     };
     // One pinned view of the store for the whole page, so every section
     // describes the same operation and none can settle a split log.
@@ -209,7 +218,7 @@ pub(crate) async fn read_node_rebase(
     // replay can run, so everything below it describes a branch that cannot
     // move until this is settled.
     let name_section = format!(
-        "{}{}{}{}{}",
+        "{notices}{}{}{}{}{}",
         recovery_fence_section(orch, &db, &rows, &branch).await,
         catch_up_section(orch, &db, &rows, &view, &branch).await,
         own_origin_section(orch, &rows, &branch).await,

@@ -1809,11 +1809,11 @@ mod production_lift_drain {
                 .insert(ID.into(), remote("machine-a"));
             config
                 .drains
-                .impose_operator(ID, &human("operator"), "maintenance", 1)?;
+                .impose_operator(ID, &human("operator"), "maintenance", &[], 1)?;
             if with_thread {
                 config
                     .drains
-                    .impose_thread(ID, "thread-a", &human("thread"), "hold", 2)?;
+                    .impose_thread(ID, "thread-a", &human("thread"), "hold", &[], 2)?;
             }
             Ok(())
         })
@@ -1963,7 +1963,7 @@ mod production_lift_drain {
         crate::fleet::management::mutate_fleet(&orch, |config| {
             config
                 .drains
-                .impose_thread(ID, "thread-b", &human("thread"), "new hold", 5)
+                .impose_thread(ID, "thread-b", &human("thread"), "new hold", &[], 5)
                 .map(|_| ())
         })
         .unwrap();
@@ -1988,7 +1988,7 @@ mod production_lift_drain {
         crate::fleet::management::mutate_fleet(&orch, |config| {
             config
                 .drains
-                .impose_thread(ID, "thread-b", &human("thread"), "new hold", 5)
+                .impose_thread(ID, "thread-b", &human("thread"), "new hold", &[], 5)
                 .map(|_| ())
         })
         .unwrap();
@@ -2082,7 +2082,7 @@ mod production_lift_drain {
         crate::fleet::management::mutate_fleet(&orch, |config| {
             config
                 .drains
-                .impose_operator(ID, &human("operator"), "second maintenance", 9)
+                .impose_operator(ID, &human("operator"), "second maintenance", &[], 9)
                 .map(|_| ())
         })
         .unwrap();
@@ -2247,7 +2247,7 @@ mod production_lift_drain {
         crate::fleet::management::mutate_fleet(&orch, |config| {
             config
                 .drains
-                .impose_operator(ID, &human("operator"), "replacement", 3)?;
+                .impose_operator(ID, &human("operator"), "replacement", &[], 3)?;
             Ok(())
         })
         .unwrap();

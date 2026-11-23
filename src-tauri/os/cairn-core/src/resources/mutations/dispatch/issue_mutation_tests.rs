@@ -2964,6 +2964,7 @@ fn sample_resource(kind: cairn_uri::ResourceKind, mode: ChangeMode) -> CairnReso
         K::Post => "cairn://posts/1",
         K::ProjectTenets => "cairn://p/cairn/tenets",
         K::ProjectHeadlines => "cairn://p/cairn/headlines",
+        K::ProjectNotices => "cairn://p/cairn/notices",
         K::ProjectTenet => "cairn://p/cairn/tenets/1",
         K::ProjectCamps => "cairn://p/cairn/camps",
         K::ProjectCamp => "cairn://p/cairn/camps/rebuild",

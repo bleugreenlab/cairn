@@ -127,7 +127,10 @@ impl Fleet {
         let mut request = operator_act_request(act);
         let batch = operator_act_batch(act, runner_context_id.clone());
         let outcome = match self.prepare_execution(orch, &mut request).await {
-            Ok(prepared) => self.execute_prepared(request, Some(batch), prepared).await,
+            Ok(prepared) => {
+                self.execute_prepared(orch, request, Some(batch), prepared)
+                    .await
+            }
             Err(outcome) => outcome,
         };
         output_guard::flush_batch_output(orch, &output, None);

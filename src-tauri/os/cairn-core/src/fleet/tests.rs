@@ -3766,6 +3766,7 @@ fn go_stale(pool: &Fleet, now: u64) {
     let away = connections.get_mut("private-away").unwrap();
     away.drained = true;
     away.drain_blockers = vec![cairn_common::executor_protocol::DrainBlocker {
+        refs: Vec::new(),
         owner: "operator".into(),
         reason: "storage repair".into(),
         generation: 3,
@@ -6371,7 +6372,13 @@ fn published_drains_fixture(entry: &mut ExecutorConnectionState, update: bool, o
     if operator {
         config
             .drains
-            .impose_operator(&entry.identity.executor_id, &principal, "maintenance", 1)
+            .impose_operator(
+                &entry.identity.executor_id,
+                &principal,
+                "maintenance",
+                &[],
+                1,
+            )
             .unwrap();
     }
     if update {
@@ -6388,6 +6395,7 @@ fn published_drains_fixture(entry: &mut ExecutorConnectionState, update: bool, o
                 },
                 &principal,
                 "executor update",
+                &[],
                 2,
             )
             .unwrap();
@@ -9118,6 +9126,16 @@ fn placement_passes_over_a_drained_machine_without_asking_it() {
         .unwrap()
         .colocated = true;
     connections.get_mut("bglab-sp1").unwrap().drained = true;
+    connections.get_mut("bglab-sp1").unwrap().drain_blockers =
+        vec![cairn_common::executor_protocol::DrainBlocker {
+            owner: "thread:maintenance".into(),
+            reason: "repair storage".into(),
+            refs: vec!["cairn://p/cairn/6226".into()],
+            generation: 1,
+            incarnation: None,
+            estimate: None,
+            admission_effect: Default::default(),
+        }];
     let mut request = targeted_request("linux");
     request.executor = Some(ExecutorSelector {
         name: Some("bglab-sp1".into()),
@@ -9129,6 +9147,37 @@ fn placement_passes_over_a_drained_machine_without_asking_it() {
     assert!(refusal.contains("bglab-sp1"), "{refusal}");
     assert!(refusal.contains("drained"), "{refusal}");
     assert!(refusal.contains("Blocking records/fences"), "{refusal}");
+    assert!(refusal.contains("repair storage"), "{refusal}");
+    assert!(refusal.contains("cairn://p/cairn/6226"), "{refusal}");
+    request.pinned_executor_id = Some("bglab-sp1".into());
+    let pinned = place(&connections, &request).unwrap_err();
+    assert!(
+        pinned.contains("repair storage") && pinned.contains("cairn://p/cairn/6226"),
+        "{pinned}"
+    );
+    request.pinned_executor_id = None;
+    let fleet = Fleet::default();
+    *fleet.lock_connections() = connections.clone();
+    let CellOutcome::Unavailable {
+        diagnostic,
+        reason: CellUnavailableReason::NoMatchingExecutor { rejected },
+    } = fleet.wait_horizon_outcome(&request, &[])
+    else {
+        panic!("a drained target must refuse at the horizon");
+    };
+    assert!(
+        diagnostic.contains("repair storage") && diagnostic.contains("cairn://p/cairn/6226"),
+        "{diagnostic}"
+    );
+    let drained = rejected
+        .iter()
+        .find(|row| row.executor_id == "bglab-sp1")
+        .unwrap();
+    assert_eq!(drained.drain_blockers[0].reason, "repair storage");
+    assert_eq!(drained.drain_blockers[0].refs, ["cairn://p/cairn/6226"]);
+    let decoded: cairn_common::executor_protocol::PlacementRefusal =
+        serde_json::from_value(serde_json::to_value(drained).unwrap()).unwrap();
+    assert_eq!(&decoded, drained);
 
     connections.get_mut("bglab-sp1").unwrap().drained = false;
     assert_eq!(
@@ -12500,7 +12549,7 @@ async fn scratch_submission_with_stop(
     let orch = orch.clone();
     cairn_common::task::spawn(async move {
         orch.fleet
-            .execute_prepared_accounted(request, Some(batch), prepared, stop.as_deref())
+            .execute_prepared_accounted(&orch, request, Some(batch), prepared, stop.as_deref())
             .await
     })
 }
@@ -12775,7 +12824,7 @@ async fn a_request_after_the_stop_is_refused_without_being_queued() {
         .expect("a scratch request prepares");
     let executed = orch
         .fleet
-        .execute_prepared_accounted(request, None, prepared, None)
+        .execute_prepared_accounted(&orch, request, None, prepared, None)
         .await;
 
     assert!(matches!(

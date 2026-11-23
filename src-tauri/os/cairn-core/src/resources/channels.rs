@@ -1061,7 +1061,7 @@ async fn set_default_project(
 /// The request the channels door makes its reads and writes with: no run, and
 /// the verified desktop operator as its origin. The door builds it only after
 /// the invoke presented the desktop operator credential.
-fn operator_request(tool: &str) -> McpCallbackRequest {
+pub(super) fn operator_request(tool: &str) -> McpCallbackRequest {
     McpCallbackRequest {
         tool: tool.to_string(),
         origin: Some(cairn_common::protocol::DispatchOrigin::DesktopOperator),

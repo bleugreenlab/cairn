@@ -192,6 +192,7 @@ const TESTING: &str = "cairn://p/cairn/testing";
 /// Every table either lineage creates, with its rule. Proven exhaustive and
 /// free of stale entries by `every_table_has_a_retention_rule`.
 pub const TABLE_RETENTION: &[TableRetention] = &[
+    rule("resource_notices", Retention::Keep("authored standing notices, one row per project/resource/author; authors clear or replace")), 
     owned("main_incident_sources", "projects"),
     owned("main_incident_budget", "projects"),
     owned("main_incidents", "projects"),

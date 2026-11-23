@@ -34,6 +34,8 @@ mod messages;
 pub(crate) mod models;
 pub mod mutations;
 pub(crate) mod node;
+#[cfg(test)]
+mod notice_tests;
 pub(crate) mod operator;
 pub mod packs;
 pub(crate) mod paging;

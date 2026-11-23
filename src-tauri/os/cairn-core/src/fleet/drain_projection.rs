@@ -77,6 +77,7 @@ impl DrainProjection {
         );
         if !self.initialized {
             blockers.push(DrainBlocker {
+                refs: Vec::new(),
                 owner: "initialization".into(),
                 reason: self
                     .initialization_error
@@ -217,6 +218,7 @@ impl Fleet {
                             ),
                         };
                         DrainBlocker {
+                            refs: record.refs,
                             owner,
                             reason: record.reason,
                             generation: record.generation,
@@ -284,6 +286,7 @@ impl Fleet {
             (
                 token.clone(),
                 DrainBlocker {
+                    refs: Vec::new(),
                     owner,
                     reason,
                     generation: 1,
@@ -365,10 +368,7 @@ impl Fleet {
                 selected.executor_id,
                 refusing
                     .iter()
-                    .map(|row| format!(
-                        "{} generation {}: {}",
-                        row.owner, row.generation, row.reason
-                    ))
+                    .map(|row| row.describe())
                     .collect::<Vec<_>>()
                     .join("; ")
             );
@@ -474,6 +474,7 @@ impl Fleet {
                 (
                     id,
                     vec![DrainBlocker {
+                        refs: Vec::new(),
                         owner: "test".into(),
                         reason: "test drain".into(),
                         generation: 1,
@@ -498,6 +499,7 @@ impl Fleet {
             projection.records.insert(
                 executor_id.into(),
                 vec![DrainBlocker {
+                    refs: Vec::new(),
                     owner: "test".into(),
                     reason: "test drain".into(),
                     generation: 1,
@@ -847,6 +849,7 @@ mod tests {
                 },
                 &test_principal(),
                 "self-update to build-b; completion estimate unknown",
+                &[],
                 1,
             )
             .unwrap();
@@ -892,7 +895,13 @@ mod tests {
 
         config
             .drains
-            .impose_operator(COLOCATED_EXECUTOR_ID, &test_principal(), "maintenance", 2)
+            .impose_operator(
+                COLOCATED_EXECUTOR_ID,
+                &test_principal(),
+                "maintenance",
+                &[],
+                2,
+            )
             .unwrap();
         fleet.publish_drain_projection(&config);
         assert_eq!(last_drain(&mut inbox), Some(true));
@@ -1001,7 +1010,13 @@ mod owned_tests {
         let mut config = FleetConfig::default();
         config
             .drains
-            .impose_operator(COLOCATED_EXECUTOR_ID, &principal, "operator reason", 10)
+            .impose_operator(
+                COLOCATED_EXECUTOR_ID,
+                &principal,
+                "operator reason",
+                &[],
+                10,
+            )
             .unwrap();
         config
             .drains
@@ -1010,6 +1025,7 @@ mod owned_tests {
                 "thread-id",
                 &principal,
                 "thread reason",
+                &[],
                 11,
             )
             .unwrap();
@@ -1045,7 +1061,7 @@ mod owned_tests {
         );
         config
             .drains
-            .impose_thread("remote", "thread-id", &principal, "temporary", 12)
+            .impose_thread("remote", "thread-id", &principal, "temporary", &[], 12)
             .unwrap();
         config.drains.clear_thread("remote", "thread-id").unwrap();
         fleet.publish_drain_projection(&config);
@@ -1089,7 +1105,14 @@ mod owned_tests {
         let mut config = FleetConfig::default();
         config
             .drains
-            .impose_thread(COLOCATED_EXECUTOR_ID, "thread", &principal, "repair", 1)
+            .impose_thread(
+                COLOCATED_EXECUTOR_ID,
+                "thread",
+                &principal,
+                "repair",
+                &[],
+                1,
+            )
             .unwrap();
         fleet.publish_drain_projection(&config);
         assert_eq!(drain_frames(&mut inbox), vec![true]);
@@ -1112,6 +1135,7 @@ mod owned_tests {
                 },
                 &principal,
                 "self-update to build-a; completion estimate unknown",
+                &[],
                 2,
             )
             .unwrap();

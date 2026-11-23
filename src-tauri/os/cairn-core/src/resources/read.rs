@@ -2557,7 +2557,13 @@ async fn render_resource_body(
                 let captured_at = crate::fleet::unix_time_ms();
                 let executors = orch.fleet.inspect_executors(captured_at);
                 let enrolled = orch.fleet.unattached_enrolled_remotes();
-                match executors.iter().find(|executor| executor.name == name) {
+                let notices = if view.is_none() {
+                    crate::resource_notices::render_for(orch, &format!("cairn://executors/{name}"))
+                        .await
+                } else {
+                    String::new()
+                };
+                let rendered = match executors.iter().find(|executor| executor.name == name) {
                     Some(executor) => match (view, request_id) {
                         (None, _) => {
                             let recorded_kills = crate::resources::executors::recorded_suite_kills(
@@ -2736,7 +2742,8 @@ async fn render_resource_body(
                             ),
                         },
                     },
-                }
+                };
+                format!("{notices}{rendered}")
             }
         }
         CairnResource::Project { project } => {
@@ -2746,6 +2753,12 @@ async fn render_resource_body(
                 error
             } else {
                 read_project(orch, &project).await
+            }
+        }
+        CairnResource::ProjectNotices { project } => {
+            match reject_query_params("project notices", &params) {
+                Some(error) => error,
+                None => crate::resource_notices::render_project(orch, &project).await,
             }
         }
         CairnResource::ProjectIssues { project } => {

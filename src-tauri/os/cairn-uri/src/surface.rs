@@ -335,6 +335,7 @@ impl CairnResource {
             Self::ProjectCodemap { .. }
             | Self::ProjectMap { .. }
             | Self::ProjectQueue { .. }
+            | Self::ProjectNotices { .. }
             | Self::ProjectCheckResults { .. }
             | Self::ProjectCheckObservation { .. }
             | Self::ProjectCheckRequest { .. }

@@ -592,6 +592,7 @@ fn apply_required_drains(
             self_update_context(hold, boot_id),
             principal,
             &self_update_reason(hold),
+            &[],
             now_unix_ms,
         )?;
         next.insert(hold.executor_id.clone(), token);
@@ -1140,7 +1141,7 @@ mod tests {
         context.turn_id = "stale-turn".into();
         orphaned
             .drains
-            .impose_runtime("other-id", context, &principal, "stale", 2)
+            .impose_runtime("other-id", context, &principal, "stale", &[], 2)
             .unwrap();
         assert!(!exact(&orphaned, &desired("build-a"), &tokens));
 
@@ -1151,7 +1152,7 @@ mod tests {
         let mut shared = config.clone();
         shared
             .drains
-            .impose_thread("remote-id", "thread-a", &principal, "maintenance", 3)
+            .impose_thread("remote-id", "thread-a", &principal, "maintenance", &[], 3)
             .unwrap();
         apply_required_drains(
             &mut shared,
@@ -1185,7 +1186,7 @@ mod tests {
         let principal = principal();
         config
             .drains
-            .impose_thread("remote-id", "thread-a", &principal, "maintenance", 1)
+            .impose_thread("remote-id", "thread-a", &principal, "maintenance", &[], 1)
             .unwrap();
         let tokens = apply_required_drains(
             &mut config,
@@ -1247,6 +1248,7 @@ mod tests {
                 tokens["remote-id"].context.clone(),
                 &principal,
                 "replacement reason",
+                &[],
                 2,
             )
             .unwrap();
@@ -1286,11 +1288,11 @@ mod tests {
         quiesce_context.kind = RuntimeDrainKind::Quiesce;
         let quiesce = config
             .drains
-            .impose_runtime("remote-id", quiesce_context, &principal, "quiesce", 2)
+            .impose_runtime("remote-id", quiesce_context, &principal, "quiesce", &[], 2)
             .unwrap();
         config
             .drains
-            .impose_operator("remote-id", &principal, "operator maintenance", 3)
+            .impose_operator("remote-id", &principal, "operator maintenance", &[], 3)
             .unwrap();
         let mut current = old["remote-id"].context.clone();
         current.runner_boot_id = fleet.self_update_runtime.boot_id.clone();
@@ -1298,7 +1300,14 @@ mod tests {
         current.turn_id = "current-turn".into();
         let current = config
             .drains
-            .impose_runtime("remote-id", current, &principal, "current self-update", 4)
+            .impose_runtime(
+                "remote-id",
+                current,
+                &principal,
+                "current self-update",
+                &[],
+                4,
+            )
             .unwrap();
         recover_orphans(&mut config, &fleet).unwrap();
         let remaining = config.drains.records("remote-id");

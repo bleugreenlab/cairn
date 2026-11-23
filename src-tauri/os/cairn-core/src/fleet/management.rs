@@ -764,7 +764,7 @@ pub fn resolve_executor_reference(orch: &Orchestrator, reference: &str) -> Resul
     let configured = crate::config::settings::load_fleet(&orch.config_dir);
     if let Some(config) = configured.remote_executors.values().find(|config| {
         executor_names_match(&config.display_name, reference)
-            || config.host.eq_ignore_ascii_case(reference)
+            || executor_names_match(&config.host, reference)
             || config.executor_id == reference
     }) {
         return Ok(config.executor_id.clone());
@@ -781,7 +781,7 @@ pub fn resolve_executor_reference(orch: &Orchestrator, reference: &str) -> Resul
     let operations = orch.fleet.management().operations.all();
     if let Some(operation) = operations.iter().rev().find(|operation| {
         executor_names_match(&operation.name, reference)
-            || operation.host.eq_ignore_ascii_case(reference)
+            || executor_names_match(&operation.host, reference)
             || operation.executor_id == reference
     }) {
         return Ok(operation.executor_id.clone());
@@ -1563,7 +1563,7 @@ impl From<&ThreadDrainActor> for RemovalActor {
 
 /// A run's authenticated ancestry, not an owner supplied in a write payload.
 pub struct ThreadDrainActor {
-    thread_id: String,
+    pub(crate) thread_id: String,
     principal: cairn_common::identity::PrincipalRef,
 }
 
@@ -1683,8 +1683,10 @@ pub async fn set_thread_drain(
     reference: &str,
     enabled: bool,
     reason: Option<&str>,
+    refs: &[String],
     request: &crate::mcp::types::McpCallbackRequest,
 ) -> Result<DrainOutcome, String> {
+    cairn_config::drain::validate_drain_refs(refs)?;
     let actor = thread_drain_actor(orch, request).await?;
     let executor_id = resolve_executor_reference(orch, reference)?;
     let reason = drain_reason(reason)?;
@@ -1696,6 +1698,7 @@ pub async fn set_thread_drain(
                 &actor.thread_id,
                 &actor.principal,
                 reason,
+                refs,
                 drain_timestamp_ms(orch.services.clock.now())?,
             )?;
         } else {
@@ -1722,6 +1725,7 @@ pub async fn set_operator_drain(
                 &executor_id,
                 &actor.principal,
                 reason,
+                &[],
                 drain_timestamp_ms(orch.services.clock.now())?,
             )?;
         } else {
@@ -1771,6 +1775,7 @@ pub fn impose_runtime_drain(
             context,
             &principal,
             reason,
+            &[],
             drain_timestamp_ms(orch.services.clock.now())?,
         )
     })
@@ -3433,6 +3438,7 @@ mod tests {
             "local",
             true,
             Some("alpha hold"),
+            &[],
             &drain_request("ra"),
         )
         .await
@@ -3442,11 +3448,12 @@ mod tests {
             "local",
             true,
             Some("beta hold"),
+            &[],
             &drain_request("rb"),
         )
         .await
         .unwrap();
-        let cleared = set_thread_drain(&orch, "local", false, None, &drain_request("ra"))
+        let cleared = set_thread_drain(&orch, "local", false, None, &[], &drain_request("ra"))
             .await
             .unwrap();
         assert!(cleared.enabled);
@@ -3566,6 +3573,7 @@ mod tests {
                 "thread",
                 &operator.principal,
                 "other hold",
+                &[],
                 2,
             )
         })
@@ -3611,7 +3619,7 @@ mod tests {
             config.remote_executors.insert(id.clone(), remote.clone());
             config
                 .drains
-                .impose_operator(&id, &operator.principal, "old hold", 1)?;
+                .impose_operator(&id, &operator.principal, "old hold", &[], 1)?;
             let frozen = config.prepare_removal(&id, &operator.principal)?;
             config.apply_removal(RemovalApplication {
                 install_id: orch.anon_device_manager.device_id().to_string(),
@@ -3627,7 +3635,7 @@ mod tests {
             config.remote_executors.insert(id.clone(), replacement);
             config
                 .drains
-                .impose_operator(&id, &operator.principal, "replacement hold", 2)?;
+                .impose_operator(&id, &operator.principal, "replacement hold", &[], 2)?;
             Ok(())
         })
         .unwrap();
@@ -3729,14 +3737,14 @@ mod tests {
             config.remote_executors.insert(id.clone(), remote.clone());
             config
                 .drains
-                .impose_operator(&id, &operator.principal, "old hold", 1)?;
+                .impose_operator(&id, &operator.principal, "old hold", &[], 1)?;
             apply(config, "cleared")?;
             config.remote_executors.insert(id.clone(), remote.clone());
             apply(config, "plain")?;
             config.remote_executors.insert(id.clone(), remote.clone());
             config
                 .drains
-                .impose_operator(&id, &operator.principal, "standing hold", 2)?;
+                .impose_operator(&id, &operator.principal, "standing hold", &[], 2)?;
             Ok(())
         })
         .unwrap();
@@ -3970,6 +3978,7 @@ mod tests {
             crate::fleet::LOCAL_EXECUTOR_NAME,
             true,
             Some("thread maintenance"),
+            &["cairn://p/cairn/6226".into()],
             &drain_request("ra"),
         )
         .await
@@ -3980,6 +3989,17 @@ mod tests {
             crate::config::settings::load_fleet(&orch.config_dir)
                 .is_machine_drained(crate::fleet::COLOCATED_EXECUTOR_ID),
             "the drain has to be on disk, or the next runner does not know about it"
+        );
+        let records = crate::config::settings::load_fleet(&orch.config_dir)
+            .drains
+            .records(crate::fleet::COLOCATED_EXECUTOR_ID);
+        assert_eq!(records[0].reason, "thread maintenance");
+        assert_eq!(records[0].refs, ["cairn://p/cairn/6226"]);
+        assert_eq!(
+            orch.fleet
+                .drain_blockers(crate::fleet::COLOCATED_EXECUTOR_ID)[0]
+                .refs,
+            records[0].refs
         );
         assert!(orch.fleet.is_drained(crate::fleet::COLOCATED_EXECUTOR_ID));
         assert!(matches!(
@@ -3992,6 +4012,7 @@ mod tests {
             crate::fleet::LOCAL_EXECUTOR_NAME,
             false,
             None,
+            &[],
             &drain_request("ra"),
         )
         .await

@@ -2235,6 +2235,12 @@ impl TableScope {
 /// its projection. `teams` is the team-only root and has no private counterpart,
 /// so it is intentionally absent here and special-cased in the test.
 pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
+    (
+        "resource_notices",
+        TableScope::Private(PrivateReason::AuthoritativeContent {
+            owner: "cairn/6226",
+        }),
+    ),
     // Provider sign-in history, beside the authorization journal: who started a
     // sign-in on this install and how it ended.
     (

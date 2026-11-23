@@ -296,6 +296,8 @@ pub(crate) const EXECUTOR_CONTRACT: ResourceContract =
                     EXECUTOR_RUNTIME_POLICY,
                     EXECUTOR_DRAINING,
                     EXECUTOR_DRAIN_REASON,
+                    KeySpec::new("refs", KeyType::Array, "issue URI references supporting draining:true and its reason"),
+                    KeySpec::new("notice", KeyType::Any, "notice-only patch, mutually exclusive with configuration keys: {text, refs?, until?} sets your standing notice on this executor; null clears only your notice"),
                     EXECUTOR_ROLE,
                     EXECUTOR_MACHINE_SERVICES,
                     EXECUTOR_REPAIRED,

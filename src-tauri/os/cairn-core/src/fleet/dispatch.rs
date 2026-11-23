@@ -2198,6 +2198,7 @@ impl Fleet {
                 request.priority = priority;
             }
             let pool = self.clone();
+            let orch = orch.clone();
             let completion_guard = CoalescedLeaderCompletionGuard {
                 pool: pool.clone(),
                 leader: (request.request_id.clone(), request.attempt_id.clone()),
@@ -2217,7 +2218,7 @@ impl Fleet {
                 }
                 let leader = (request.request_id.clone(), request.attempt_id.clone());
                 let executed = pool
-                    .execute_prepared_accounted(request, None, prepared, None)
+                    .execute_prepared_accounted(&orch, request, None, prepared, None)
                     .await;
                 pool.cancelled_leaders.lock().unwrap().remove(&leader);
                 pool.coalesced_leaders.lock().unwrap().remove(&leader);
@@ -2732,7 +2733,7 @@ impl Fleet {
                                 preparing.last_progress_unix_ms = unix_time_ms();
                             }
                             let executed = pool
-                                .execute_prepared_accounted(request, Some(batch), prepared, None)
+                                .execute_prepared_accounted(&orch, request, Some(batch), prepared, None)
                                 .await;
                             (executed.outcome, executed.account, executed.abandoned_grant)
                         }
@@ -2994,7 +2995,7 @@ impl Fleet {
         // one that keeps the account of a grant without a result.
         let executed = match stop.until(self.prepare_execution(orch, &mut request)).await {
             Some(Ok(prepared)) => {
-                self.execute_prepared_accounted(request, Some(batch), prepared, Some(stop))
+                self.execute_prepared_accounted(orch, request, Some(batch), prepared, Some(stop))
                     .await
             }
             Some(Err(outcome)) => outcome.into(),
@@ -3057,8 +3058,10 @@ impl Fleet {
         let preparing = &mut request;
         let executed = match off_frame(move || self.prepare_execution(orch, preparing)).await {
             Ok(prepared) => {
-                off_frame(|| self.execute_prepared_accounted(request, Some(batch), prepared, None))
-                    .await
+                off_frame(|| {
+                    self.execute_prepared_accounted(orch, request, Some(batch), prepared, None)
+                })
+                .await
             }
             Err(outcome) => outcome.into(),
         };
@@ -3363,7 +3366,7 @@ impl Fleet {
             Ok(prepared) => prepared,
             Err(outcome) => return outcome,
         };
-        self.execute_prepared(request, batch, prepared).await
+        self.execute_prepared(orch, request, batch, prepared).await
     }
 
     /// Resolve what running `request` needs from this runner, and stamp the
@@ -3513,11 +3516,12 @@ impl Fleet {
 
     pub(super) async fn execute_prepared(
         &self,
+        orch: &Orchestrator,
         request: CellRequest,
         batch: Option<ProcessBatch>,
         prepared: PreparedExecution,
     ) -> CellOutcome {
-        self.execute_prepared_accounted(request, batch, prepared, None)
+        self.execute_prepared_accounted(orch, request, batch, prepared, None)
             .await
             .outcome
     }
@@ -3576,6 +3580,7 @@ impl Fleet {
     /// when it sent `Cancel`, and taking it here also clears the record.
     pub(super) async fn execute_prepared_accounted(
         &self,
+        orch: &Orchestrator,
         request: CellRequest,
         batch: Option<ProcessBatch>,
         prepared: PreparedExecution,
@@ -3587,6 +3592,7 @@ impl Fleet {
             self.cancelled_leaders.lock().unwrap().remove(&key);
         }
         executed.account.cancel_cause = self.cancel_causes.lock().unwrap().take(&key);
+        crate::resource_notices::annotate_refusal(orch, &mut executed.outcome).await;
         executed
     }
 

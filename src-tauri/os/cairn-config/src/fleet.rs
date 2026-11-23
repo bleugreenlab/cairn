@@ -1420,7 +1420,7 @@ mod tests {
         };
         config
             .drains
-            .impose_operator("sp1", &principal, "maintenance", 1)
+            .impose_operator("sp1", &principal, "maintenance", &[], 1)
             .unwrap();
         config.set_machine_role("sp1", MachineRole::InferenceOnly);
         config.set_machine_role(COLOCATED_EXECUTOR_ID, MachineRole::BuildsOnly);
@@ -1824,7 +1824,7 @@ mod owned_removal_tests {
         fleet.drains = DrainState::import_legacy(vec!["machine".into()]).unwrap();
         fleet
             .drains
-            .impose_operator("machine", &principal(), "repair", 1)
+            .impose_operator("machine", &principal(), "repair", &[], 1)
             .unwrap();
         let application = application(&fleet);
         assert_eq!(application.frozen.enrollment_device_id, "device");
@@ -1844,7 +1844,7 @@ mod owned_removal_tests {
             .insert("machine".into(), remote("new-device"));
         fleet
             .drains
-            .impose_operator("machine", &principal(), "new enrollment", 2)
+            .impose_operator("machine", &principal(), "new enrollment", &[], 2)
             .unwrap();
         let before = fleet.clone();
         assert_eq!(fleet.apply_removal(application).unwrap(), receipt);
@@ -1862,7 +1862,7 @@ mod owned_removal_tests {
             .insert("machine".into(), remote("device"));
         fleet
             .drains
-            .impose_operator("machine", &principal(), "repair", 1)
+            .impose_operator("machine", &principal(), "repair", &[], 1)
             .unwrap();
         let application = application(&fleet);
         fleet

@@ -943,12 +943,25 @@ impl Fleet {
         };
         let rejected = account_from_journal(surveyed, declined);
         let declines = format!(
-            "{}{}{}",
+            "{}{}{}{}",
             describe_memory_rejections(declined)
                 .map(|memory| format!(" Not placed where it cannot run: {memory}."))
                 .unwrap_or_default(),
             describe_declines(declined),
-            describe_preparation_rejections(&rejected)
+            describe_preparation_rejections(&rejected),
+            rejected
+                .iter()
+                .filter(|row| !row.drain_blockers.is_empty())
+                .map(|row| format!(
+                    " {} Blocking records/fences: {}.",
+                    row.executor_name,
+                    row.drain_blockers
+                        .iter()
+                        .map(|blocker| blocker.describe())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ))
+                .collect::<String>()
         );
         let targeted = request.pinned_executor_id.is_some()
             || request
@@ -3699,7 +3712,7 @@ pub(super) fn describe_exclusions(
 
 /// Why nothing in the fleet can take this request, in the terms the caller used
 /// plus the terms it could have used instead.
-pub(super) fn no_matching_executor_diagnostic(
+fn no_matching_executor_diagnostic_inner(
     connections: &HashMap<String, ExecutorConnectionState>,
     unattached: &[EnrolledRemote],
     request: &CellRequest,
@@ -3762,26 +3775,8 @@ pub(super) fn no_matching_executor_diagnostic(
         matches!(rejection.reason, PlacementRejectionReason::Drained) && would_serve(rejection)
     });
     if let Some(rejection) = drained_target {
-        let blockers = rejection
-            .drain_blockers
-            .iter()
-            .map(|blocker| {
-                format!(
-                    "{} generation {}: {}{}",
-                    blocker.owner,
-                    blocker.generation,
-                    blocker.reason,
-                    blocker
-                        .estimate
-                        .as_ref()
-                        .map(|estimate| format!(" (estimate {estimate})"))
-                        .unwrap_or_default()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
         return format!(
-            "{} is drained, so the runner is refusing new work there. Blocking records/fences: {blockers}. Read cairn://executors for live state.{account}",
+            "{} is drained, so the runner is refusing new work there. Read cairn://executors for live state.{account}",
             rejection.executor_name
         );
     }
@@ -3899,4 +3894,26 @@ pub(super) fn own_label_refusal(
             )
         })
     })
+}
+
+pub(super) fn no_matching_executor_diagnostic(
+    connections: &HashMap<String, ExecutorConnectionState>,
+    unattached: &[EnrolledRemote],
+    request: &CellRequest,
+    rejected: &[PlacementRejection],
+) -> String {
+    let mut diagnostic =
+        no_matching_executor_diagnostic_inner(connections, unattached, request, rejected);
+    for row in rejected.iter().filter(|row| !row.drain_blockers.is_empty()) {
+        diagnostic.push_str(&format!(
+            " {} Blocking records/fences: {}.",
+            row.executor_name,
+            row.drain_blockers
+                .iter()
+                .map(|blocker| blocker.describe())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    diagnostic
 }

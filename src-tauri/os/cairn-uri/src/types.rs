@@ -233,6 +233,10 @@ pub enum CairnResource {
     ProjectHeadlines {
         project: String,
     },
+    /// Standing resource notices published by project threads or the operator.
+    ProjectNotices {
+        project: String,
+    },
     /// Immutable check observations addressed by a revision coordinate.
     ProjectCheckResults {
         project: String,
@@ -1330,6 +1334,7 @@ impl CairnResource {
             Self::ProjectQueue { .. } => ResourceKind::ProjectQueue,
             Self::ProjectHome { .. } => ResourceKind::ProjectHome,
             Self::ProjectHeadlines { .. } => ResourceKind::ProjectHeadlines,
+            Self::ProjectNotices { .. } => ResourceKind::ProjectNotices,
             Self::ProjectCheckResults { .. } => ResourceKind::ProjectCheckResults,
             Self::ProjectVcsDiff { .. } => ResourceKind::ProjectVcsDiff,
             Self::ProjectVcsAncestry { .. } => ResourceKind::ProjectVcsAncestry,

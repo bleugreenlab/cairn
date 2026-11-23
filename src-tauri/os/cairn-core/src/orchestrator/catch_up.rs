@@ -880,6 +880,8 @@ pub(crate) async fn announce_reconcile_outcome(
             let urgency = crate::messages::queued::DeliveryUrgency::Passive;
             let jobs = super::base_advance::load_on_branch_jobs(db, project_id, branch).await?;
             for job in super::base_advance::branch_owners(&jobs) {
+                let notices = crate::resource_notices::render_for_job(orch, db, &job.id).await;
+                let note = format!("{note}\n{notices}");
                 match crate::messages::delivery::latest_run_for_job(db, &job.id) {
                     Some(run_id) => crate::messages::delivery::queue_system_direct_once(
                         orch,
@@ -949,13 +951,14 @@ pub(crate) async fn announce_reconcile_outcome(
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 (branch, reason.as_str()).hash(&mut hasher);
+                let notices = crate::resource_notices::render_for_job(orch, db, &mode.job_id).await;
                 crate::messages::delivery::queue_system_direct_once(
                     orch,
                     &run_id,
                     &format!(
                         "[Base branch update] `{branch}` could not catch up with `{target}`: \
                          {reason}\nThe branch is unchanged and will not be merged again until \
-                         its tip or the base changes. See cairn:~/rebase."
+                         its tip or the base changes. See cairn:~/rebase.\n{notices}"
                     ),
                     crate::messages::queued::DeliveryUrgency::Steer,
                     &format!("catch-up-refused:{:016x}", hasher.finish()),

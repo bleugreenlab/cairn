@@ -140,6 +140,7 @@ mod node_segments;
 mod notify;
 mod orchestrator;
 mod project_services;
+pub(crate) mod resource_notices;
 mod resources;
 mod resume_timing;
 mod services;

@@ -34,6 +34,7 @@ impl CairnResource {
             | ProjectMap { project, .. }
             | ProjectHome { project, .. }
             | ProjectHeadlines { project, .. }
+            | ProjectNotices { project, .. }
             | ProjectCheckResults { project, .. }
             | ProjectVcsDiff { project }
             | ProjectVcsAncestry { project }
@@ -162,6 +163,7 @@ impl CairnResource {
             | Self::ProjectMap { project }
             | Self::ProjectHome { project }
             | Self::ProjectHeadlines { project }
+            | Self::ProjectNotices { project }
             | Self::ProjectCheckResults { project, .. }
             | Self::ProjectCheckObservation { project, .. }
             | Self::ProjectCheckRequest { project, .. }
@@ -460,6 +462,7 @@ impl CairnResource {
             | Self::ProjectMap { .. }
             | Self::ProjectHome { .. }
             | Self::ProjectHeadlines { .. }
+            | Self::ProjectNotices { .. }
             | Self::ProjectCheckResults { .. }
             | Self::ProjectVcsDiff { .. }
             | Self::ProjectVcsAncestry { .. }

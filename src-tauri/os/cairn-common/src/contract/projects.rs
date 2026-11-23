@@ -593,3 +593,26 @@ pub(crate) const PROJECT_BROWSER_NETWORK_REQUEST_CONTRACT: ResourceContract = Re
     cross_actions: NO_CROSS_ACTIONS,
     mutations: &[],
 };
+
+pub(crate) const PROJECT_NOTICES_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectNotices,
+    uri_template: "cairn://p/{project}/notices",
+    name: "Project notices",
+    description: "Standing notices pinned to resources by project threads or the operator. Reads list live notices; patch sets the writer's notice for a resource, replacing their previous notice there. text:null clears only that writer's notice",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[
+            KeySpec::new("resource", KeyType::Str, "canonical URI of the resource this notice concerns"),
+            KeySpec::new("text", KeyType::Any, "notice text, or null to clear the writer's notice"),
+        ],
+        optional: &[
+            KeySpec::new("refs", KeyType::Array, "canonical issue URI references supporting the notice"),
+            KeySpec::new("until", KeyType::Array, "expiry clauses in the after: vocabulary; all true hides the notice (issue_resolution, pr_state, or clock)"),
+        ],
+        label: "set or clear your standing resource notice",
+        example: "write({changes:[{target:\"cairn:@/notices\",mode:\"patch\",payload:{resource:\"cairn://executors/bgsrv-ub\",text:\"Draining for maintenance\"}}]})",
+    }],
+};

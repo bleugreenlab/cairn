@@ -2894,8 +2894,10 @@ async fn notify_on_branch_jobs(
         let Some(run_id) = latest_run_for_job(db, &job.id) else {
             continue;
         };
+        let notices = crate::resource_notices::render_for_job(orch, db, &job.id).await;
+        let note = format!("{note}\n{notices}");
         if let Err(error) =
-            queue_system_direct_once(orch, &run_id, note, urgency, &format!("{key}:{run_id}"))
+            queue_system_direct_once(orch, &run_id, &note, urgency, &format!("{key}:{run_id}"))
         {
             log::warn!("could not notify job {} about `{branch}`: {error}", job.id);
         }
@@ -6292,3 +6294,7 @@ mod real_store_collision_tests {
         assert_eq!(text_at(&fx, branch, "outside.txt"), "branch\n");
     }
 }
+
+#[cfg(test)]
+#[path = "base_advance/notice_tests.rs"]
+mod notice_tests;

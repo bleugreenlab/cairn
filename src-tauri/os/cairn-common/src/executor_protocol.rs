@@ -9756,6 +9756,10 @@ pub struct LearnedResourceEstimate {
 /// runners already accept excerpt strings and reports, and newer runners
 /// talking to older executors still read the results those executors supply.
 /// This correction rides the next executor publish, not a separate release.
+/// cairn/6226 does not move the number. Drain references and refusal blockers
+/// are runner-owned admission evidence, not executor control frames. Defaulted
+/// fields preserve stored outcomes; an older executor receives the same drain
+/// boolean and admission commands and gets nothing wrong.
 ///
 /// cairn/7185 does not move the number. Fleet responsibilities are folded
 /// into their topical modules and imports and facade exports are made explicit.
@@ -23955,6 +23959,9 @@ pub struct ExecutorDrainState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorDrainRecord {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+
     pub owner: ExecutorDrainOwner,
     pub reason: String,
     pub generation: u64,
@@ -24017,6 +24024,9 @@ pub enum ExecutorDrainProvenance {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DrainBlocker {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+
     pub owner: String,
     pub reason: String,
     pub generation: u64,
@@ -24031,11 +24041,32 @@ pub struct DrainBlocker {
     pub admission_effect: ExecutorDrainAdmissionEffect,
 }
 
+impl DrainBlocker {
+    pub fn describe(&self) -> String {
+        let refs = if self.refs.is_empty() {
+            String::new()
+        } else {
+            format!(" (refs: {})", self.refs.join(", "))
+        };
+        let estimate = self
+            .estimate
+            .as_ref()
+            .map(|estimate| format!(" (estimate {estimate})"))
+            .unwrap_or_default();
+        format!(
+            "{} generation {}: {}{refs}{estimate}",
+            self.owner, self.generation, self.reason
+        )
+    }
+}
+
 /// The part of a placement rejection that decides a terminal refusal's repair
-/// domain. Predictions and drain bookkeeping stay in the placement decision.
+/// domain, retaining the drain explanations. Predictions stay in the placement decision.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlacementRefusal {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drain_blockers: Vec<DrainBlocker>,
     pub executor_name: String,
     pub executor_id: String,
     pub reason: PlacementRejectionReason,
@@ -24047,6 +24078,7 @@ impl From<&PlacementRejection> for PlacementRefusal {
             executor_name: rejection.executor_name.clone(),
             executor_id: rejection.executor_id.clone(),
             reason: rejection.reason.clone(),
+            drain_blockers: rejection.drain_blockers.clone(),
         }
     }
 }
@@ -27882,6 +27914,7 @@ mod tests {
         let reason = CellUnavailableReason::NoMatchingExecutor {
             rejected: vec![
                 PlacementRefusal {
+                    drain_blockers: Vec::new(),
                     executor_id: "builder".into(),
                     executor_name: "builder".into(),
                     reason: PlacementRejectionReason::TelemetryStale {
@@ -27891,6 +27924,7 @@ mod tests {
                     },
                 },
                 PlacementRefusal {
+                    drain_blockers: Vec::new(),
                     executor_id: "drained".into(),
                     executor_name: "drained".into(),
                     reason: PlacementRejectionReason::Drained,

@@ -819,8 +819,13 @@ fn owned_drain_lines(state: &cairn_common::executor_protocol::ExecutorDrainState
                     .unwrap_or_else(|| format!("{imposed_at_unix_ms} Unix ms"))
             ),
         };
+        let refs = if record.refs.is_empty() {
+            String::new()
+        } else {
+            format!("; refs: {}", record.refs.join(", "))
+        };
         out.push_str(&format!(
-            "- Drain owner: {owner}; reason: {}; generation: {}; {provenance}; {release}\n",
+            "- Drain owner: {owner}; reason: {}{refs}; generation: {}; {provenance}; {release}\n",
             record.reason, record.generation
         ));
     }
@@ -846,8 +851,15 @@ fn drain_line(executor: &ExecutorInspection) -> String {
         true => String::new(),
         false => format!(" ({})", residents.holders()),
     };
+    let blockers = executor
+        .drain_state
+        .blockers
+        .iter()
+        .map(|blocker| blocker.describe())
+        .collect::<Vec<_>>()
+        .join("; ");
     format!(
-        "yes — {}{holders}. Existing work continues; new admission, including pinned batches, is refused while any owned drain or fence stands",
+        "yes — {}{holders}. Existing work continues; new admission, including pinned batches, is refused while any owned drain or fence stands. {blockers}",
         residents.headline()
     )
 }
@@ -1061,7 +1073,16 @@ pub(crate) fn render_enrolled_remote(
     // saying about a machine that is reporting nothing: it decides what happens
     // when this one comes back.
     if remote.drain_state.effective_refusal {
-        out.push_str("- Draining: yes — new admission refused by the runner\n");
+        out.push_str(&format!(
+            "- Draining: yes — new admission refused by the runner. {}\n",
+            remote
+                .drain_state
+                .blockers
+                .iter()
+                .map(|blocker| blocker.describe())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
     }
     out.push_str(&owned_drain_lines(&remote.drain_state));
     if incident.is_none() {
@@ -4604,7 +4625,12 @@ fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
             out.push_str(&format!("    - {}\n", failure.describe()));
         }
         for blocker in &rejection.drain_blockers {
-            out.push_str(&format!("    - Admission blocker: {}; reason: {}; generation: {}; incarnation: {}; estimate: {}\n", blocker.owner, blocker.reason, blocker.generation, blocker.incarnation.as_deref().unwrap_or("none"), blocker.estimate.as_deref().unwrap_or("not applicable")));
+            let reason = if blocker.refs.is_empty() {
+                blocker.reason.clone()
+            } else {
+                format!("{} (refs: {})", blocker.reason, blocker.refs.join(", "))
+            };
+            out.push_str(&format!("    - Admission blocker: {}; reason: {}; generation: {}; incarnation: {}; estimate: {}\n", blocker.owner, reason, blocker.generation, blocker.incarnation.as_deref().unwrap_or("none"), blocker.estimate.as_deref().unwrap_or("not applicable")));
         }
         // A machine that was actually ranked shows its own numbers here, so
         // "why not that one" is answered by the same record that answered
@@ -14637,7 +14663,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "drainKey":"stable-executor","machineRevision":4,
             "records":records,"effectiveRefusal":true,
-            "blockers":[{"owner":"runtime:self_update","reason":"updating","generation":4,"incarnation":"boot1","estimate":"unknown"}],
+            "blockers":[{"owner":"runtime:self_update","reason":"updating","refs":["cairn://p/cairn/6226"],"generation":4,"incarnation":"boot1","estimate":"unknown"}],
             "removalFences":[{"owner":"removal","reason":"checking occupancy","generation":7,"incarnation":"fence1"}]
         })).unwrap()
     }
@@ -14668,6 +14694,20 @@ mod tests {
             &Default::default(),
         );
         assert_eq!(collection.matches("reason: no reason supplied").count(), 2);
+        for rendered in [
+            render_executor(&executor),
+            render_enrolled_remote(&remote, CAPTURED_AT, None),
+        ] {
+            let line = rendered
+                .lines()
+                .find(|line| line.starts_with("- Draining:"))
+                .unwrap();
+            assert!(
+                line.contains("updating") && line.contains("cairn://p/cairn/6226"),
+                "{line}"
+            );
+        }
+
         for rendered in [
             render_executor(&executor),
             render_enrolled_remote(&remote, CAPTURED_AT, None),
@@ -14730,7 +14770,7 @@ mod tests {
         render_placement_detail(&mut out, &decision);
         assert!(out.contains("runtime:self_update"), "{out}");
         assert!(
-            out.contains("reason: updating; generation: 4; incarnation: boot1; estimate: unknown"),
+            out.contains("reason: updating (refs: cairn://p/cairn/6226); generation: 4; incarnation: boot1; estimate: unknown"),
             "{out}"
         );
         assert!(out.contains("batch-owned-drain"), "{out}");

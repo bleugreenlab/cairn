@@ -3429,7 +3429,7 @@ impl Context<'_> {
                 .await;
             }
         } else {
-            self.notify_clean(jobs, relationship, installed);
+            self.notify_clean(jobs, relationship, installed).await;
         }
     }
 
@@ -5322,6 +5322,9 @@ impl Context<'_> {
             let Some(run_id) = latest_run_for_job(self.db, &job.id) else {
                 continue;
             };
+            let notices =
+                crate::resource_notices::render_for_job(self.orch, self.db, &job.id).await;
+            let message = format!("{message}\n{notices}");
             let key = conflict_delivery_key(&request.project_id, branch, &job.id, &fingerprint);
             if let Err(error) =
                 queue_system_direct_once(self.orch, &run_id, &message, DeliveryUrgency::Steer, &key)
@@ -5369,7 +5372,7 @@ impl Context<'_> {
         Ok(())
     }
 
-    fn notify_clean(
+    async fn notify_clean(
         &self,
         jobs: &[super::SiblingJob],
         relationship: &BaseRelationship,
@@ -5388,6 +5391,9 @@ impl Context<'_> {
             let Some(run_id) = latest_run_for_job(self.db, &job.id) else {
                 continue;
             };
+            let notices =
+                crate::resource_notices::render_for_job(self.orch, self.db, &job.id).await;
+            let note = format!("{note}\n{notices}");
             let key = clean_delivery_key(
                 &request.project_id,
                 &request.branch,

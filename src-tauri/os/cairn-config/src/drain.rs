@@ -103,6 +103,9 @@ pub enum DrainProvenance {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct DrainRecord {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+
     pub owner: DrainOwner,
     pub reason: String,
     pub generation: u64,
@@ -124,6 +127,7 @@ impl DrainRecord {
     fn validate(&self) -> Result<(), String> {
         self.owner.validate()?;
         nonempty(&self.reason, "drain reason")?;
+        validate_drain_refs(&self.refs)?;
         if self.generation == 0 {
             return Err("drain generation must be positive".into());
         }
@@ -453,6 +457,7 @@ impl DrainState {
             let record = DrainRecord {
                 owner: DrainOwner::Legacy,
                 reason: LEGACY_DRAIN_REASON.into(),
+                refs: Vec::new(),
                 generation: 1,
                 provenance: DrainProvenance::LegacyUnknown,
             };
@@ -510,6 +515,7 @@ impl DrainState {
         owner: DrainOwner,
         principal: &PrincipalRef,
         reason: &str,
+        refs: &[String],
         at: i64,
     ) -> Result<bool, String> {
         identity(executor_id, FleetConfig::drain_key(executor_id))?;
@@ -518,6 +524,7 @@ impl DrainState {
             .validate_at(PrincipalPosition::AppearancePrincipal)
             .map_err(|e| e.to_string())?;
         nonempty(reason, "drain reason")?;
+        validate_drain_refs(refs)?;
         if at < 0 {
             return Err("drain timestamp must be nonnegative".into());
         }
@@ -535,7 +542,10 @@ impl DrainState {
                 );
             }
             // The observation time of a retry is not a semantic replacement.
-            if record.reason == reason && record.imposed_by() == Some(principal) {
+            if record.reason == reason
+                && record.refs == refs
+                && record.imposed_by() == Some(principal)
+            {
                 return Ok(false);
             }
         }
@@ -546,6 +556,7 @@ impl DrainState {
         let record = DrainRecord {
             owner,
             reason: reason.into(),
+            refs: refs.to_vec(),
             generation: revision,
             provenance: DrainProvenance::Attributed {
                 imposed_by: principal.clone(),
@@ -563,9 +574,17 @@ impl DrainState {
         executor_id: &str,
         principal: &PrincipalRef,
         reason: &str,
+        refs: &[String],
         at: i64,
     ) -> Result<bool, String> {
-        self.impose(executor_id, DrainOwner::Operator, principal, reason, at)
+        self.impose(
+            executor_id,
+            DrainOwner::Operator,
+            principal,
+            reason,
+            refs,
+            at,
+        )
     }
 
     pub fn impose_thread(
@@ -574,6 +593,7 @@ impl DrainState {
         thread_id: &str,
         principal: &PrincipalRef,
         reason: &str,
+        refs: &[String],
         at: i64,
     ) -> Result<bool, String> {
         self.impose(
@@ -583,6 +603,7 @@ impl DrainState {
             },
             principal,
             reason,
+            refs,
             at,
         )
     }
@@ -593,6 +614,7 @@ impl DrainState {
         context: RuntimeDrainContext,
         principal: &PrincipalRef,
         reason: &str,
+        refs: &[String],
         at: i64,
     ) -> Result<RuntimeDrainToken, String> {
         self.impose(
@@ -602,6 +624,7 @@ impl DrainState {
             },
             principal,
             reason,
+            refs,
             at,
         )?;
         let key = FleetConfig::drain_key(executor_id);
@@ -834,7 +857,7 @@ mod tests {
         let mut refuse_all = context("update");
         refuse_all.admission_effect = AdmissionEffect::RefuseAllNewAdmission;
         assert!(state
-            .impose_runtime("remote", refuse_all, &principal("runner"), "update", 1)
+            .impose_runtime("remote", refuse_all, &principal("runner"), "update", &[], 1)
             .is_err());
         let token = state
             .impose_runtime(
@@ -842,6 +865,7 @@ mod tests {
                 context("update"),
                 &principal("runner"),
                 "update",
+                &[],
                 1,
             )
             .unwrap();
@@ -854,7 +878,7 @@ mod tests {
             AdmissionEffect::RefuseNewEnvironments
         );
         state
-            .impose_operator("remote", &principal("runner"), "maintenance", 2)
+            .impose_operator("remote", &principal("runner"), "maintenance", &[], 2)
             .unwrap();
         let operator = state
             .records("remote")
@@ -869,7 +893,7 @@ mod tests {
         quiesce.kind = RuntimeDrainKind::Quiesce;
         quiesce.admission_effect = AdmissionEffect::RefuseAllNewAdmission;
         state
-            .impose_runtime("remote", quiesce, &principal("runner"), "quiesce", 3)
+            .impose_runtime("remote", quiesce, &principal("runner"), "quiesce", &[], 3)
             .unwrap();
         // An effect this build does not know never decodes into an open machine.
         let mut json = serde_json::to_value(&state).unwrap();
@@ -907,14 +931,18 @@ mod tests {
     fn independent_owners_and_identical_retries_have_exact_revisions() {
         let mut state = DrainState::default();
         let p = principal("a");
-        assert!(state.impose_operator("machine", &p, "repair", 1).unwrap());
-        assert!(!state.impose_operator("machine", &p, "repair", 99).unwrap());
+        assert!(state
+            .impose_operator("machine", &p, "repair", &[], 1)
+            .unwrap());
+        assert!(!state
+            .impose_operator("machine", &p, "repair", &[], 99)
+            .unwrap());
         assert_eq!(state.machine_revision("machine"), 1);
         state
-            .impose_thread("machine", "thread", &p, "investigate", 2)
+            .impose_thread("machine", "thread", &p, "investigate", &[], 2)
             .unwrap();
         let runtime = state
-            .impose_runtime("machine", context("update"), &p, "update", 3)
+            .impose_runtime("machine", context("update"), &p, "update", &[], 3)
             .unwrap();
         assert_eq!(state.records("machine").len(), 3);
         assert!(state.clear_thread("machine", "thread").unwrap());
@@ -935,25 +963,49 @@ mod tests {
     fn operator_cannot_be_taken_over_and_reason_replacement_is_new_generation() {
         let mut state = DrainState::default();
         state
-            .impose_operator("machine", &principal("a"), "repair", 1)
+            .impose_operator("machine", &principal("a"), "repair", &[], 1)
             .unwrap();
         let before = state.clone();
         assert!(state
-            .impose_operator("machine", &principal("b"), "repair", 2)
+            .impose_operator("machine", &principal("b"), "repair", &[], 2)
             .is_err());
         assert_eq!(state, before);
         state
-            .impose_operator("machine", &principal("a"), "new reason", 2)
+            .impose_operator("machine", &principal("a"), "new reason", &[], 2)
             .unwrap();
         assert_eq!(state.machine_revision("machine"), 2);
         assert_eq!(state.records("machine")[0].generation, 2);
+        let refs = vec!["cairn://p/cairn/6226".into()];
+        state
+            .impose_operator("machine", &principal("a"), "new reason", &refs, 3)
+            .unwrap();
+        assert_eq!(state.machine_revision("machine"), 3);
+        assert_eq!(state.records("machine")[0].refs, refs);
+        assert!(!state
+            .impose_operator("machine", &principal("a"), "new reason", &refs, 4)
+            .unwrap());
+        let decoded: DrainState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(decoded, state);
+        state
+            .impose_operator("machine", &principal("a"), "new reason", &[], 5)
+            .unwrap();
+        assert!(state.records("machine")[0].refs.is_empty());
+        assert_eq!(state.machine_revision("machine"), 4);
     }
 
     #[test]
     fn runtime_replacement_and_wrong_identity_cannot_be_released_by_old_token() {
         let mut state = DrainState::default();
         let old = state
-            .impose_runtime("machine", context("update"), &principal("a"), "update", 1)
+            .impose_runtime(
+                "machine",
+                context("update"),
+                &principal("a"),
+                "update",
+                &[],
+                1,
+            )
             .unwrap();
         let new = state
             .impose_runtime(
@@ -961,6 +1013,7 @@ mod tests {
                 context("update"),
                 &principal("a"),
                 "new target",
+                &[],
                 2,
             )
             .unwrap();
@@ -971,7 +1024,14 @@ mod tests {
         assert_eq!(state.records("machine").len(), 1);
         assert!(state.release_runtime(&new).unwrap());
         let next = state
-            .impose_runtime("machine", context("update"), &principal("a"), "update", 3)
+            .impose_runtime(
+                "machine",
+                context("update"),
+                &principal("a"),
+                "update",
+                &[],
+                3,
+            )
             .unwrap();
         assert!(next.generation > new.generation);
         assert!(!state.release_runtime(&new).unwrap());
@@ -991,13 +1051,14 @@ mod tests {
                 context("update"),
                 &principal("a"),
                 "update",
+                &[],
                 10,
             )
             .unwrap();
         state.release_runtime(&token).unwrap();
         assert_eq!(state.records("colocated").len(), 1);
         state
-            .impose_thread("colocated", "t", &principal("a"), "test", 11)
+            .impose_thread("colocated", "t", &principal("a"), "test", &[], 11)
             .unwrap();
         assert!(state.clear_thread("colocated", "t").unwrap());
         assert!(state.records("colocated").is_empty());
@@ -1009,9 +1070,11 @@ mod tests {
     fn lift_replay_is_receipt_first_and_never_clears_replacement() {
         let mut state = DrainState::default();
         let p = principal("a");
-        state.impose_operator("machine", &p, "repair", 1).unwrap();
         state
-            .impose_thread("machine", "thread", &p, "investigate", 2)
+            .impose_operator("machine", &p, "repair", &[], 1)
+            .unwrap();
+        state
+            .impose_thread("machine", "thread", &p, "investigate", &[], 2)
             .unwrap();
         let application = lift(&state, "attempt");
         let receipt = state.apply_lift(application.clone()).unwrap();
@@ -1019,7 +1082,7 @@ mod tests {
         assert_eq!((receipt.before_revision, receipt.after_revision), (2, 3));
         assert_eq!(state.records("machine").len(), 1, "other owner remains");
         state
-            .impose_operator("machine", &p, "replacement", 3)
+            .impose_operator("machine", &p, "replacement", &[], 3)
             .unwrap();
         let before = state.clone();
         assert_eq!(state.apply_lift(application.clone()).unwrap(), receipt);
@@ -1038,9 +1101,13 @@ mod tests {
     fn another_owners_reversed_change_makes_lift_stale_and_records_outcome() {
         let mut state = DrainState::default();
         let p = principal("a");
-        state.impose_operator("machine", &p, "repair", 1).unwrap();
+        state
+            .impose_operator("machine", &p, "repair", &[], 1)
+            .unwrap();
         let application = lift(&state, "attempt");
-        state.impose_thread("machine", "t", &p, "test", 2).unwrap();
+        state
+            .impose_thread("machine", "t", &p, "test", &[], 2)
+            .unwrap();
         state.clear_thread("machine", "t").unwrap();
         let revision = state.machine_revision("machine");
         let receipt = state.apply_lift(application.clone()).unwrap();
@@ -1058,14 +1125,18 @@ mod tests {
     fn removal_checks_principal_other_owners_and_racing_revision() {
         let mut state = DrainState::default();
         let p = principal("a");
-        state.impose_operator("machine", &p, "repair", 1).unwrap();
+        state
+            .impose_operator("machine", &p, "repair", &[], 1)
+            .unwrap();
         assert!(state
             .prepare_removal_records("machine", &principal("b"), "device")
             .is_err());
         let frozen = state
             .prepare_removal_records("machine", &p, "device")
             .unwrap();
-        state.impose_thread("machine", "t", &p, "test", 2).unwrap();
+        state
+            .impose_thread("machine", "t", &p, "test", &[], 2)
+            .unwrap();
         assert!(state
             .prepare_removal_records("machine", &p, "device")
             .is_err());
@@ -1085,7 +1156,9 @@ mod tests {
     fn removal_own_and_legacy_clear_retains_receipt_and_counter_on_reenrollment() {
         let mut state = DrainState::import_legacy(vec!["machine".into()]).unwrap();
         let p = principal("a");
-        state.impose_operator("machine", &p, "repair", 1).unwrap();
+        state
+            .impose_operator("machine", &p, "repair", &[], 1)
+            .unwrap();
         let frozen = state
             .prepare_removal_records("machine", &p, "device")
             .unwrap();
@@ -1104,7 +1177,7 @@ mod tests {
             "removal never fabricates accepted evidence"
         );
         state
-            .impose_operator("machine", &p, "replacement", 4)
+            .impose_operator("machine", &p, "replacement", &[], 4)
             .unwrap();
         assert_eq!(state.apply_removal(application.clone()).unwrap(), receipt);
         assert_eq!(state.records("machine")[0].generation, 4);
@@ -1118,12 +1191,12 @@ mod tests {
     fn checked_overflow_refuses_imposition_and_clear_without_mutation() {
         let mut state = DrainState::default();
         state
-            .impose_thread("machine", "t", &principal("a"), "test", 1)
+            .impose_thread("machine", "t", &principal("a"), "test", &[], 1)
             .unwrap();
         state.machines.get_mut("machine").unwrap().machine_revision = u64::MAX;
         let before = state.clone();
         assert!(state
-            .impose_operator("machine", &principal("a"), "repair", 2)
+            .impose_operator("machine", &principal("a"), "repair", &[], 2)
             .is_err());
         assert!(state.clear_thread("machine", "t").is_err());
         assert_eq!(state, before);
@@ -1133,7 +1206,14 @@ mod tests {
     fn malformed_new_schema_and_unknown_effect_fail_closed() {
         let mut state = DrainState::default();
         state
-            .impose_runtime("machine", context("update"), &principal("a"), "update", 1)
+            .impose_runtime(
+                "machine",
+                context("update"),
+                &principal("a"),
+                "update",
+                &[],
+                1,
+            )
             .unwrap();
         let original = serde_json::to_value(&state).unwrap();
         let mut bad = original.clone();
@@ -1155,13 +1235,65 @@ mod tests {
         record["owner"]["context"]["admissionEffect"] = serde_json::json!("admit_pinned");
         assert!(serde_json::from_value::<DrainState>(bad).is_err());
         assert!(state
-            .impose_thread("machine", "", &principal("a"), "test", 2)
+            .impose_thread("machine", "", &principal("a"), "test", &[], 2)
             .is_err());
         assert!(state
-            .impose_operator("machine", &principal("a"), " ", 2)
+            .impose_operator("machine", &principal("a"), " ", &[], 2)
             .is_err());
         assert!(state
-            .impose_operator("machine", &principal("a"), "test", -1)
+            .impose_operator("machine", &principal("a"), "test", &[], -1)
             .is_err());
+    }
+}
+
+/// Drain references are durable issue identities, not relative addresses or pages.
+pub fn validate_drain_refs(refs: &[String]) -> Result<(), String> {
+    for reference in refs {
+        let Some(cairn_uri::CairnResource::Issue { project, number }) =
+            cairn_uri::parse_uri(reference)
+        else {
+            return Err(format!(
+                "drain refs require canonical issue URIs: {reference}"
+            ));
+        };
+        if number <= 0 || *reference != format!("cairn://p/{project}/{number}") {
+            return Err(format!(
+                "drain refs require canonical issue URIs: {reference}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    #[test]
+    fn references_are_canonical_issues_and_survive_legacy_decode() {
+        for invalid in [
+            "cairn/6226",
+            "cairn:~/6226",
+            "cairn://p/cairn/6226/messages",
+            "cairn://p/cairn/06226",
+            "https://example.com",
+        ] {
+            assert!(validate_drain_refs(&[invalid.into()]).is_err(), "{invalid}");
+        }
+        let mut record = DrainState::import_legacy(vec!["local".into()])
+            .unwrap()
+            .records("local")
+            .remove(0);
+        let old = serde_json::to_value(&record).unwrap();
+        assert!(old.get("refs").is_none());
+        assert!(serde_json::from_value::<DrainRecord>(old)
+            .unwrap()
+            .refs
+            .is_empty());
+        record.refs = vec!["cairn://p/cairn/6226".into()];
+        validate_drain_refs(&record.refs).unwrap();
+        assert_eq!(
+            serde_json::from_value::<DrainRecord>(serde_json::to_value(&record).unwrap()).unwrap(),
+            record
+        );
     }
 }

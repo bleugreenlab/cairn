@@ -25,6 +25,7 @@ struct ConfigureRequest {
     runtime_policy: Option<cairn_common::executor_protocol::ExecutorRuntimePolicy>,
     draining: Option<bool>,
     reason: Option<String>,
+    refs: Option<Vec<String>>,
     /// What the machine is for, one of [`MachineRole::ALL`]. Runner state like
     /// draining, so it is durable and unfenced.
     ///
@@ -63,6 +64,7 @@ impl ConfigureRequest {
             || self.runtime_policy.is_some()
             || self.draining.is_some()
             || self.reason.is_some()
+            || self.refs.is_some()
             || self.role.is_some()
             || self.repaired.is_some()
             || self.build_root.is_some()
@@ -74,6 +76,7 @@ impl ConfigureRequest {
             || self.runtime_policy.is_some()
             || self.draining.is_some()
             || self.reason.is_some()
+            || self.refs.is_some()
             || self.role.is_some()
             || self.machine_services.is_some()
             || self.repaired.is_some()
@@ -342,13 +345,22 @@ pub(super) async fn dispatch(
                 .payload
                 .as_ref()
                 .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
+            if let Some(notice) = payload.get("notice") {
+                if payload.as_object().is_none_or(|object| object.len() != 1) {
+                    return Err(build_failure(index, item, "notice must be supplied alone"));
+                }
+                return super::notices::set_executor_notice(orch, callback, name, notice, dry_run)
+                    .await
+                    .map(Some)
+                    .map_err(|error| build_failure(index, item, error));
+            }
             let request: ConfigureRequest =
                 serde_json::from_value(payload.clone()).map_err(|error| {
                     build_failure(
                         index,
                         item,
                         format!(
-                            "invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, reason, role ({}), machineServices ({{\"<pack>/<service>\": {{}} | {{override:{{command}}}} | null}}), repaired, buildRoot, memoryDiagnostic ({{runId,durationMs}} or null), and expectedGeneration.",
+                            "invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, reason, refs, or notice alone; role ({}), machineServices ({{\"<pack>/<service>\": {{}} | {{override:{{command}}}} | null}}), repaired, buildRoot, memoryDiagnostic ({{runId,durationMs}} or null), and expectedGeneration.",
                             cairn_common::executor_protocol::MachineRole::ALL
                                 .map(cairn_common::executor_protocol::MachineRole::as_str)
                                 .join(", ")
@@ -361,6 +373,13 @@ pub(super) async fn dispatch(
                     item,
                     "reason requires a draining change",
                 ));
+            }
+            if let Some(refs) = &request.refs {
+                if request.draining != Some(true) {
+                    return Err(build_failure(index, item, "refs requires draining:true"));
+                }
+                cairn_config::drain::validate_drain_refs(refs)
+                    .map_err(|error| build_failure(index, item, error))?;
             }
             // Authenticate before any other field of a combined patch can act.
             if request.draining.is_some() {
@@ -502,6 +521,7 @@ pub(super) async fn dispatch(
                         name,
                         draining,
                         request.reason.as_deref(),
+                        request.refs.as_deref().unwrap_or_default(),
                         callback,
                     )
                     .await

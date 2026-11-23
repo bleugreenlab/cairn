@@ -2351,6 +2351,41 @@ fn rebuild_ledger_uris_are_portable_and_replace_legacy() {
 }
 
 #[test]
+fn project_notices_uri_has_project_collection_semantics() {
+    let notices = parse_uri("cairn://p/CAIRN/notices").unwrap();
+    assert_eq!(
+        notices,
+        CairnResource::ProjectNotices {
+            project: "cairn".into()
+        }
+    );
+    assert_eq!(notices.to_uri(), "cairn://p/cairn/notices");
+    assert_eq!(build_project_notices_uri("CAIRN"), notices.to_uri());
+    assert_eq!(notices.kind(), ResourceKind::ProjectNotices);
+    assert_eq!(notices.project_key(), Some("cairn"));
+    assert_eq!(notices.project(), Some("cairn"));
+    assert_eq!(notices.issue_number(), None);
+    assert_eq!(notices.node_id(), None);
+    assert_eq!(notices.label(&LabelContext::default()), "cairn / notices");
+    assert_eq!(
+        notices.surface(),
+        Surface::Read {
+            uri: notices.to_uri()
+        }
+    );
+    assert_eq!(
+        resolve_relative("cairn://p/cairn", "notices").unwrap(),
+        notices.to_uri()
+    );
+    assert_eq!(
+        nearest_ancestor(&notices.to_uri()),
+        Some("cairn://p/cairn".into())
+    );
+    assert!(crate::thread_name::validate_thread_name("notices").is_err());
+    assert!(parse_uri("cairn://p/cairn/notices/extra").is_none());
+}
+
+#[test]
 fn reporter_uris_name_the_machine_notice_senders() {
     let collection = parse_uri("cairn://reporters").expect("reporters collection");
     assert_eq!(collection, CairnResource::Reporters);

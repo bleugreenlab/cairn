@@ -2647,6 +2647,7 @@ pub(super) mod tests {
                     reason: PlacementRejectionReason::Drained,
                     prediction: None,
                     drain_blockers: vec![DrainBlocker {
+                        refs: Vec::new(),
                         owner: "thread:owner".into(),
                         reason: "maintenance".into(),
                         generation: 7,

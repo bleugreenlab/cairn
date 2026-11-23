@@ -168,6 +168,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     projects::PROJECT_MAP_CONTRACT,
     projects::PROJECT_HOME_CONTRACT,
     projects::PROJECT_HEADLINES_CONTRACT,
+    projects::PROJECT_NOTICES_CONTRACT,
     projects::PROJECT_CHECK_RESULTS_CONTRACT,
     projects::PROJECT_CHECK_OBSERVATION_CONTRACT,
     projects::PROJECT_CHECK_REQUEST_CONTRACT,
@@ -398,6 +399,8 @@ mod tests {
                 "runtimePolicy",
                 "draining",
                 "reason",
+                "refs",
+                "notice",
                 "role",
                 "machineServices",
                 "repaired",
@@ -580,6 +583,34 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn project_notices_advertise_writer_scoped_patch_and_clear() {
+        let contract = contract_for(ResourceKind::ProjectNotices).unwrap();
+        assert_eq!(contract.uri_template, "cairn://p/{project}/notices");
+        assert_eq!(contract.mutations.len(), 1);
+        let patch = mutation_spec(ResourceKind::ProjectNotices, ChangeMode::Patch).unwrap();
+        assert_eq!(
+            patch
+                .optional
+                .iter()
+                .find(|key| key.key == "until")
+                .unwrap()
+                .ty,
+            KeyType::Array
+        );
+        assert_eq!(
+            patch.required.iter().map(|key| key.key).collect::<Vec<_>>(),
+            ["resource", "text"]
+        );
+        assert_eq!(
+            patch.optional.iter().map(|key| key.key).collect::<Vec<_>>(),
+            ["refs", "until"]
+        );
+        assert!(matches!(patch.required[1].ty, KeyType::Any));
+        assert!(contract.description.contains("text:null"));
+        assert!(contract.description.contains("only that writer"));
     }
 
     #[test]
