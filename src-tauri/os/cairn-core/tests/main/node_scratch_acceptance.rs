@@ -756,7 +756,7 @@ async fn detach_once<F: std::future::Future<Output = ()>>(
     command: String,
     reached: F,
 ) -> DetachedRow {
-    let call = tokio::spawn({
+    let call = cairn_common::task::spawn({
         let node = node.clone();
         async move {
             node.run(

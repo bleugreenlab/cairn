@@ -3397,7 +3397,7 @@ impl Context<'_> {
         // the replay left unchanged is answered from the ledger.
         {
             let (orch, job_id) = (self.orch.clone(), relationship.owner_job_id.clone());
-            tokio::spawn(async move {
+            cairn_common::task::spawn(async move {
                 match crate::execution::checks::handoff::file_carried_head_lanes(&orch, &job_id)
                     .await
                 {

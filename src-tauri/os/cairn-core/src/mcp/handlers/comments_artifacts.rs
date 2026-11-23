@@ -712,7 +712,7 @@ pub(crate) async fn write_artifact_change(
     // the write never waits on head resolution or filing.
     if is_create_pr_write {
         let (orch, job_id) = (orch.clone(), job_id.clone());
-        tokio::spawn(async move {
+        cairn_common::task::spawn(async move {
             match crate::execution::checks::handoff::arm_on_pr_artifact(&orch, &job_id).await {
                 Ok(armed) => log::info!("handoff checks for job {job_id}: {}", armed.summary()),
                 Err(error) => log::warn!("handoff checks for job {job_id}: {error}"),

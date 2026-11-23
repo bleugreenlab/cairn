@@ -488,7 +488,7 @@ fn a_carried_head_runs_its_changed_write_lane_and_reuses_the_unchanged_one() {
         let offers = Arc::new(AtomicUsize::new(0));
         let counted = runs.clone();
         let offered = offers.clone();
-        let executor = tokio::spawn(async move {
+        let executor = cairn_common::task::spawn(async move {
             while let Some(message) = machine.recv().await {
                 match message {
                     ExecutorMessage::Offer { entry_id, .. } => {
