@@ -1012,7 +1012,10 @@ async fn sweep_and_record(
 /// coordinator's own span for the lane. An observation with no generation is
 /// never attributed. Both `ran_at` and the event times are unix milliseconds.
 ///
-/// Quoted verbatim in the header of `0274_runner_events.sql`.
+/// Attribution semantics are documented in `0274_runner_events.sql`.
+/// The earlier-end probe pins the executor index because the planner otherwise
+/// chooses a kind-only seek over every machine's generation ends. Its explicit
+/// upper time bound is implied by the tie-break clause, but enables a range seek.
 pub(crate) const LANES_LOST_TO_GENERATION_END_SQL: &str = "\
 SELECT e.id, COUNT(o.id) AS lanes_lost
 FROM check_result_observations o
@@ -1033,11 +1036,12 @@ WHERE o.failure_kind = 'infrastructure'
                                         o.ran_at - o.duration_ms)
         AND s.occurred_at_ms <= e.occurred_at_ms)
   AND NOT EXISTS (
-      SELECT 1 FROM runner_events f
+      SELECT 1 FROM runner_events f INDEXED BY idx_runner_events_executor
       WHERE f.kind IN ('executor_detached', 'executor_link_reset')
         AND f.runner_incarnation = e.runner_incarnation
         AND f.executor_id = e.executor_id
         AND f.generation = e.generation
+        AND f.occurred_at_ms <= e.occurred_at_ms
         AND (f.occurred_at_ms < e.occurred_at_ms
              OR (f.occurred_at_ms = e.occurred_at_ms AND f.id < e.id)))
 GROUP BY e.id";

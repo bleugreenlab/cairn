@@ -1589,3 +1589,83 @@ fn first_sighting_cost_probe() {
         );
     }
 }
+
+/// Read the production literal rather than maintaining a second copy of fleet SQL.
+/// These queries have no escaped quotes; Rust's opening line continuation is removed.
+fn fleet_sql(source: &str, anchor: &str) -> String {
+    let literal = source.split_once(anchor).unwrap().1;
+    let literal = literal.split_once('"').unwrap().1;
+    literal.split_once('"').unwrap().0.replace("\\\n", "")
+}
+
+async fn fleet_query_plan(db: &LocalDb, sql: &str) -> Vec<String> {
+    db.query_all(format!("EXPLAIN QUERY PLAN {sql}"), (0_i64,), |row| {
+        row.text(3)
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn fleet_observation_queries_seek_their_windows() {
+    let lanes_lost = fleet_sql(
+        include_str!("../../../../cairn-core/src/fleet/runner_events.rs"),
+        "const LANES_LOST_TO_GENERATION_END_SQL:",
+    );
+    let last_lane = fleet_sql(
+        include_str!("../../../../cairn-core/src/fleet/absence.rs"),
+        "async fn lane_in_db(",
+    );
+    let (_temp, db) = private_db().await;
+    let lost_plan = fleet_query_plan(&db, &lanes_lost).await;
+    let last_plan = fleet_query_plan(&db, &last_lane).await;
+    println!(
+        "lanes lost:\n{}\nlast lane:\n{}",
+        lost_plan.join("\n"),
+        last_plan.join("\n")
+    );
+    for expected in [
+        "SEARCH o USING INDEX idx_check_observations_infrastructure_generation (executor_id=? AND executor_connection_generation=? AND ran_at>=?)",
+        "SEARCH s USING COVERING INDEX idx_runner_events_kind (kind=? AND occurred_at_ms>? AND occurred_at_ms<=?)",
+        "SEARCH f USING INDEX idx_runner_events_executor (executor_id=? AND occurred_at_ms<=?)",
+    ] {
+        assert!(lost_plan.iter().any(|line| line == expected), "{lost_plan:#?}");
+    }
+    assert!(
+        last_plan.iter().any(|line| line ==
+            "SEARCH check_result_observations USING INDEX idx_check_observations_executor_latest (executor_id=?)"),
+        "{last_plan:#?}"
+    );
+    assert!(
+        !last_plan
+            .iter()
+            .any(|line| line.contains("SORT") || line.contains("TEMP B-TREE")),
+        "{last_plan:#?}"
+    );
+    for plan in [&lost_plan, &last_plan] {
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN ")),
+            "{plan:#?}"
+        );
+    }
+
+    // Prove the assertions cover the missing access paths, not just SQL parsing.
+    db.execute_batch(
+        "DROP INDEX idx_check_observations_executor_latest;
+         DROP INDEX idx_check_observations_infrastructure_generation;",
+    )
+    .await
+    .unwrap();
+    for sql in [&lanes_lost, &last_lane] {
+        let plan = fleet_query_plan(&db, sql).await;
+        assert!(
+            plan.iter().any(|line| line.starts_with("SCAN o")
+                || line.starts_with("SCAN check_result_observations")),
+            "{plan:#?}"
+        );
+    }
+
+    // Observations are shared, although runner_events belongs only to private stores.
+    let (_temp, team) = team_db().await;
+    assert_eq!(fleet_query_plan(&team, &last_lane).await, last_plan);
+}
