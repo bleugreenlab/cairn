@@ -271,6 +271,14 @@ async fn sample_count(h: &Harness) -> usize {
 #[serial_test::serial(jj)]
 async fn an_explicit_compute_timeout_refuses_an_identical_repeat_before_computing() {
     let h = harness_or_skip!("explicit_identical_timeout");
+    use crate::orchestrator::base_advance::preparation::tests::{
+        ReplayAdmissionObservation, ReplayAllowances,
+    };
+    crate::orchestrator::base_advance::preparation::tests::trace_replay(&h.store);
+    // Equal wall-clock deadlines can leave materially different compute allowances.
+    // This fixture exercises an identical allowance, not elapsed host time.
+    let allowances =
+        ReplayAllowances::new(&h.store, Duration::from_secs(58), Duration::from_secs(58));
     let head = h.commit(&h.branch_ws, BRANCH, "own.txt", "one\n");
     let base = h.advance_main("incoming.txt", "theirs\n");
     starve_compute(&h.store, true);
@@ -338,9 +346,18 @@ async fn an_explicit_compute_timeout_refuses_an_identical_repeat_before_computin
     );
 
     // The identical request: a newer request record, same coordinates.
-    let second = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None)
-        .await
-        .unwrap_err();
+    let second = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None).await;
+    let trace = crate::orchestrator::base_advance::preparation::tests::replay_trace(&h.store);
+    eprintln!("replay admission: {trace:#?}");
+    let second = second.unwrap_err();
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| matches!(event, ReplayAdmissionObservation::Compute { .. }))
+            .count(),
+        1,
+        "the refused request must not enter detached computation: {trace:#?}"
+    );
     assert_reply_receipt(&h, &second, REPEAT_REFUSED).await;
     for expected in [
         "was not attempted",
@@ -368,6 +385,7 @@ async fn an_explicit_compute_timeout_refuses_an_identical_repeat_before_computin
     );
 
     // A new commit is a different attempt; it installs and clears the record.
+    drop(allowances);
     starve_compute(&h.store, false);
     h.commit(&h.branch_ws, BRANCH, "own.txt", "two\n");
     let third = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None)
@@ -1278,4 +1296,75 @@ async fn exhausted_assessment_names_work_on_two_identical_replay_requests() {
         assert_eq!(sample.base, base);
     }
     exhausted_assessments().lock().unwrap().remove(&h.store);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn replay_allowance_at_capture_controls_whether_a_repeat_is_identical() {
+    use crate::orchestrator::base_advance::preparation::tests::{
+        replay_trace, trace_replay, ReplayAdmissionObservation, ReplayAllowances,
+    };
+    let h = harness_or_skip!("explicit_allowance_boundary");
+    h.commit(&h.branch_ws, BRANCH, "own.txt", "one\n");
+    h.advance_main("incoming.txt", "theirs\n");
+    trace_replay(&h.store);
+    starve_compute(&h.store, true);
+
+    // Charge two seconds between admission and compute, without a sleep.
+    {
+        let _allowances =
+            ReplayAllowances::new(&h.store, Duration::from_secs(58), Duration::from_secs(56));
+        let first = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None)
+            .await
+            .unwrap();
+        assert_reply_receipt(&h, &first, "timed out").await;
+    }
+    let blocked = branch_blockers(&h.db, "proj-1", &h.store, BRANCH)
+        .await
+        .unwrap();
+    assert_eq!(blocked[0].allowance_ms, 56_000);
+    let samples = sample_count(&h).await;
+    for ms in [55_000, 56_000, 57_000] {
+        let _allowances = ReplayAllowances::new(
+            &h.store,
+            Duration::from_millis(ms),
+            Duration::from_millis(ms),
+        );
+        let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None).await;
+        assert!(
+            answer.is_err(),
+            "allowance {ms}: {answer:?}\n{:#?}",
+            replay_trace(&h.store)
+        );
+        assert_eq!(sample_count(&h).await, samples);
+    }
+    assert_eq!(
+        replay_trace(&h.store)
+            .iter()
+            .filter(|event| matches!(event, ReplayAdmissionObservation::Compute { .. }))
+            .count(),
+        1
+    );
+
+    // The strict boundary is exceeded by one millisecond: this must compute
+    // even at unchanged coordinates, and still reports a normal timeout.
+    let _allowances = ReplayAllowances::new(
+        &h.store,
+        Duration::from_millis(57_001),
+        Duration::from_millis(57_001),
+    );
+    let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, false, None).await;
+    let trace = replay_trace(&h.store);
+    eprintln!("controlled replay admission: {trace:#?}");
+    assert!(answer.is_ok(), "{answer:?}\n{trace:#?}");
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| matches!(event, ReplayAdmissionObservation::Compute { .. }))
+            .count(),
+        2,
+        "{trace:#?}"
+    );
+    assert_eq!(sample_count(&h).await, samples + 1);
+    starve_compute(&h.store, false);
 }

@@ -2688,6 +2688,8 @@ impl Context<'_> {
         if request.explicit_replay {
             let key = self.timeout_key(&coordinate, merge_mode);
             let allowance = within_deadline(request, request.compute_budget);
+            #[cfg(test)]
+            let allowance = tests::replay_allowance(&self.store, allowance, false);
             if let Some(blocker) = super::replay_cost::matching_blocker(self.db, &key, allowance)
                 .await
                 .map_err(PreparationRefusal::Repository)?
@@ -2714,6 +2716,8 @@ impl Context<'_> {
         // Only now is a replay certain: the fast path and the bound-session
         // shortcut have both passed, so an up-to-date branch never pays for,
         // or is refused by, the dependent traversal.
+        #[cfg(test)]
+        tests::observe_replay(&self.store, tests::ReplayAdmissionObservation::Dependents);
         let snapshot = snapshot.with_dependent_bookmarks(self.dependents().await?);
         // Drop claims of earlier accepted installs this head descends from
         // travel into this attempt's row, so a chain of local advances keeps
@@ -2733,6 +2737,13 @@ impl Context<'_> {
         let jj = self.jj.clone();
         let carry = request.carry.clone();
         let budget = within_deadline(request, request.compute_budget);
+        #[cfg(test)]
+        let budget = tests::replay_allowance(&self.store, budget, true);
+        #[cfg(test)]
+        tests::observe_replay(
+            &self.store,
+            tests::ReplayAdmissionObservation::Compute { allowance: budget },
+        );
         let probe = crate::jj::ReplayCostProbe::default();
         let snapshot = snapshot.with_cost_probe(probe.clone());
         let snapshot = match &settlement.regenerable {
@@ -2831,6 +2842,13 @@ impl Context<'_> {
                 return Err(PreparationRefusal::Repository(error));
             }
             Err(crate::jj::AdvanceComputeError::TimedOut) => {
+                #[cfg(test)]
+                tests::observe_replay(
+                    &self.store,
+                    tests::ReplayAdmissionObservation::Timeout {
+                        phase: format!("{:?}", TimeoutPhase::Compute),
+                    },
+                );
                 self.with_cost(|cost| cost.compute_exhausted = true);
                 return self
                     .timed_out(&relationship, &coordinate, TimeoutPhase::Compute)

@@ -72,6 +72,7 @@ pub(in crate::orchestrator::base_advance) struct Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         barriers().lock().unwrap().remove(&self.store);
+        replay_observations().lock().unwrap().remove(&self.store);
     }
 }
 
@@ -822,4 +823,121 @@ async fn unreadable_replay_comparison_keeps_a_real_wave_and_records_the_row() {
         .unwrap();
     let reason = row.reason.unwrap_or_default();
     assert!(reason.contains("replay: comparison unchanged"), "{reason}");
+}
+
+#[derive(Clone)]
+pub(in crate::orchestrator::base_advance) enum ReplayAdmissionObservation {
+    Lookup {
+        key: super::super::replay_cost::TimeoutKey,
+        allowance: Duration,
+        candidates: Vec<(
+            super::super::replay_cost::TimeoutBlocker,
+            super::super::replay_cost::Eligibility,
+        )>,
+        unreadable_rows: usize,
+    },
+    Dependents,
+    Compute {
+        allowance: Duration,
+    },
+    Timeout {
+        phase: String,
+    },
+}
+
+impl std::fmt::Debug for ReplayAdmissionObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lookup {
+                key,
+                allowance,
+                candidates,
+                unreadable_rows,
+            } => f
+                .debug_struct("Lookup")
+                .field("key", key)
+                .field("allowance", allowance)
+                .field("candidates", candidates)
+                .field("unreadable_rows", unreadable_rows)
+                .finish(),
+            Self::Dependents => f.write_str("Dependents"),
+            Self::Compute { allowance } => f
+                .debug_struct("Compute")
+                .field("allowance", allowance)
+                .finish(),
+            Self::Timeout { phase } => f.debug_struct("Timeout").field("phase", phase).finish(),
+        }
+    }
+}
+
+fn replay_observations() -> &'static Mutex<HashMap<PathBuf, Vec<ReplayAdmissionObservation>>> {
+    static OBSERVATIONS: OnceLock<Mutex<HashMap<PathBuf, Vec<ReplayAdmissionObservation>>>> =
+        OnceLock::new();
+    OBSERVATIONS.get_or_init(Default::default)
+}
+
+pub(in crate::orchestrator::base_advance) fn observe_replay(
+    store: &Path,
+    observation: ReplayAdmissionObservation,
+) {
+    if let Some(observations) = replay_observations().lock().unwrap().get_mut(store) {
+        observations.push(observation);
+    }
+}
+
+pub(in crate::orchestrator::base_advance) fn trace_replay(store: &Path) {
+    replay_observations()
+        .lock()
+        .unwrap()
+        .insert(store.to_path_buf(), Vec::new());
+}
+
+pub(in crate::orchestrator::base_advance) fn replay_trace(
+    store: &Path,
+) -> Vec<ReplayAdmissionObservation> {
+    replay_observations()
+        .lock()
+        .unwrap()
+        .get(store)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn replay_allowances() -> &'static Mutex<HashMap<PathBuf, (Duration, Duration)>> {
+    static ALLOWANCES: OnceLock<Mutex<HashMap<PathBuf, (Duration, Duration)>>> = OnceLock::new();
+    ALLOWANCES.get_or_init(Default::default)
+}
+
+/// Pins the two measured allowances without sleeping or starving the host.
+/// The worker's starvation hook remains independent of recorded allowance.
+pub(in crate::orchestrator::base_advance) struct ReplayAllowances(PathBuf);
+
+impl ReplayAllowances {
+    pub(in crate::orchestrator::base_advance) fn new(
+        store: &Path,
+        guard: Duration,
+        compute: Duration,
+    ) -> Self {
+        assert!(replay_allowances()
+            .lock()
+            .unwrap()
+            .insert(store.to_path_buf(), (guard, compute))
+            .is_none());
+        Self(store.to_path_buf())
+    }
+}
+
+impl Drop for ReplayAllowances {
+    fn drop(&mut self) {
+        replay_allowances().lock().unwrap().remove(&self.0);
+    }
+}
+
+pub(super) fn replay_allowance(store: &Path, actual: Duration, compute: bool) -> Duration {
+    replay_allowances()
+        .lock()
+        .unwrap()
+        .get(store)
+        .map(|&(guard, capture)| if compute { capture } else { guard })
+        .unwrap_or(actual)
 }

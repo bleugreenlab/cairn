@@ -689,6 +689,27 @@ pub(crate) async fn matching_blocker(
         resolution: Some(&key.resolution),
         allowance: Some(allowance),
     };
+    #[cfg(test)]
+    {
+        use super::preparation::tests::{observe_replay, ReplayAdmissionObservation};
+        let candidates: Vec<_> = rows
+            .iter()
+            .filter_map(|json| serde_json::from_str::<TimeoutBlocker>(json).ok())
+            .map(|blocker| {
+                let eligibility = blocker.eligibility(&attempt);
+                (blocker, eligibility)
+            })
+            .collect();
+        observe_replay(
+            Path::new(&key.store_path),
+            ReplayAdmissionObservation::Lookup {
+                key: key.clone(),
+                allowance,
+                unreadable_rows: rows.len() - candidates.len(),
+                candidates,
+            },
+        );
+    }
     Ok(rows
         .iter()
         .filter_map(|json| serde_json::from_str::<TimeoutBlocker>(json).ok())
