@@ -3,6 +3,7 @@
 //! Consumers own policy, never kernel walks. Registration and cached reads do no
 //! kernel work. Batch observers execute on the sampling thread after the census.
 pub mod census;
+pub mod cpu_detail;
 pub mod fd_census;
 pub mod identity;
 mod membership;

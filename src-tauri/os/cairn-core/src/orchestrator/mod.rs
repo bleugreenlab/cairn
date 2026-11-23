@@ -5204,6 +5204,13 @@ mod tests {
                 ..DiskHealth::default()
             },
             machine: MachineTelemetry {
+                outside_cpu: Measurement::measured(
+                    10,
+                    cairn_common::executor_protocol::OutsideCpu {
+                        window_ms: 5_000,
+                        ..Default::default()
+                    },
+                ),
                 host_temp: None,
                 build_volume: None,
                 build_disk_accounting: None,

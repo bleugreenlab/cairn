@@ -82,6 +82,15 @@ mod tests {
         assert_eq!(row.process.start, process.start);
         assert!(row.resident_bytes.is_some_and(|bytes| bytes > 0));
         assert!(row.cpu_ms.is_some());
+        let split = out
+            .cpu_times
+            .iter()
+            .find(|row| row.process.pid == pid)
+            .expect("own split CPU");
+        assert_eq!(split.process.start, process.start);
+        let detail = crate::cpu_detail::cpu_detail(pid);
+        assert!(detail.command.is_some_and(|command| !command.is_empty()));
+        assert!(detail.nice.is_some());
         assert!(row.storage_io_bytes.is_some());
         assert!(process_rss_bytes(pid).is_some_and(|bytes| bytes > 0));
     }

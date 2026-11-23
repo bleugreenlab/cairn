@@ -204,6 +204,19 @@ pub fn census(out: &mut Census) -> bool {
             }
         };
         let uninterruptible = linux_stat_state_letter(&buffer) == Some("D");
+        if ticks_per_second > 0 {
+            let mut fields = buffer.rsplit_once(')').unwrap().1.split_whitespace();
+            if let (Some(user), Some(system)) = (
+                fields.nth(11).and_then(|s| s.parse::<u64>().ok()),
+                fields.next().and_then(|s| s.parse::<u64>().ok()),
+            ) {
+                out.cpu_times.push(crate::census::CpuTimes {
+                    process,
+                    user_ms: ticks_to_ms(user, ticks_per_second),
+                    system_ms: ticks_to_ms(system, ticks_per_second),
+                });
+            }
+        }
         // A process whose identity read but whose resident size did not is
         // still a row: it is present, only partly measured.
         let resident_bytes = read_into(format!("/proc/{pid}/statm"), &mut buffer)

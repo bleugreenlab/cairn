@@ -9769,6 +9769,16 @@ pub struct LearnedResourceEstimate {
 /// diagnostics; no executor frame, field, admission rule, or delivery changes.
 /// A runner talking to an older executor gets nothing wrong: both peers send
 /// and interpret exactly the same messages.
+///
+/// cairn/6513 does not move the number. Machine telemetry and machine samples
+/// gain defaulted outside-process CPU measurements, and CPU-utilization
+/// conditions gain optional diagnostic attribution. Older executors report a
+/// named not-sampled gap, never zero outside CPU; older runners ignore the
+/// added fields and retain the same pressure verdict and reason. Neither peer
+/// changes priorities, pressure thresholds, admission or placement decisions.
+/// A runner talking to an older executor gets no process attribution, and
+/// explicitly reports that absence rather than inferring that Cairn owns all
+/// host CPU.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 177;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -15326,6 +15336,8 @@ pub enum HostPressureCondition {
         clear_utilization: f64,
         state_since_unix_ms: u64,
         measured_at_unix_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attribution: Option<CpuUtilizationAttribution>,
     },
     /// The CPU instrument's lowered-wait arm holds: lowered work has left at
     /// least the entry share of its demand waiting for a core for the entry
@@ -17866,6 +17878,106 @@ pub struct CpuPressure {
     pub clusters: Option<CpuClusters>,
 }
 
+/// Diagnostic attribution captured beside a CPU hold, never an admission input.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CpuUtilizationAttribution {
+    pub measured_at_unix_ms: u64,
+    pub host_busy_cores: f64,
+    pub outside: OutsideCpu,
+}
+
+impl CpuUtilizationAttribution {
+    pub fn of(
+        cpu: &Measurement<CpuPressure>,
+        outside: &Measurement<OutsideCpu>,
+        now_unix_ms: u64,
+    ) -> Option<Self> {
+        let host = cpu.value()?;
+        let process_window = outside.value()?;
+        if cpu
+            .measured_at_unix_ms
+            .abs_diff(outside.measured_at_unix_ms)
+            > process_window.window_ms
+        {
+            return None;
+        }
+        let attribution = Self {
+            measured_at_unix_ms: cpu.measured_at_unix_ms.min(outside.measured_at_unix_ms),
+            host_busy_cores: host.utilization * host.logical_cores as f64,
+            outside: outside.value()?.clone(),
+        };
+        attribution.describe(now_unix_ms)?;
+        Some(attribution)
+    }
+
+    /// No attribution is better than naming a stale or incomparable consumer.
+    pub fn describe(&self, now_unix_ms: u64) -> Option<String> {
+        let outside = &self.outside;
+        if now_unix_ms.saturating_sub(self.measured_at_unix_ms) > MACHINE_READING_STALE_AFTER_MS
+            || outside.window_ms == 0
+            || !outside.command_accounting_complete
+            || !self.host_busy_cores.is_finite()
+            || self.host_busy_cores <= 0.0
+            || !outside.command_cores.is_finite()
+            || outside.command_cores < 0.0
+            || outside.command_cores >= self.host_busy_cores / 2.0
+            || !outside.total_cores.is_finite()
+            || outside.total_cores < 0.0
+            || !outside.cairn_cores.is_finite()
+            || outside.cairn_cores < 0.0
+        {
+            return None;
+        }
+        let mut text = format!(
+            "of which Cairn's commands {:.1} cores; outside Cairn: {:.1} measured cores",
+            outside.command_cores, outside.total_cores,
+        );
+        if let Some(largest) = outside
+            .top
+            .iter()
+            .filter(|process| process.cores.is_finite() && process.cores > 0.0)
+            .max_by(|a, b| a.cores.total_cmp(&b.cores))
+        {
+            text.push_str(&format!(
+                ", largest {:?} (pid {}, nice {}, {:.1} cores{})",
+                largest.command,
+                largest.pid,
+                largest
+                    .nice
+                    .map(|nice| nice.to_string())
+                    .unwrap_or_else(|| "unreadable".into()),
+                largest.cores,
+                if largest.runner_child {
+                    ", runner child"
+                } else {
+                    ""
+                },
+            ));
+        }
+        let residual = (self.host_busy_cores - outside.cairn_cores - outside.total_cores).max(0.0);
+        if residual >= 0.05 {
+            text.push_str(&format!(
+                "; {:.1} host cores not attributed to readable processes",
+                residual
+            ));
+        }
+        if outside.enumeration_incomplete || outside.unreadable_processes > 0 {
+            text.push_str("; process census incomplete");
+        }
+        Some(text)
+    }
+}
+
+/// Shared suffix for the executor page and placement/refusal evidence.
+pub fn describe_cpu_attribution(
+    cpu: &Measurement<CpuPressure>,
+    outside: &Measurement<OutsideCpu>,
+    now_unix_ms: u64,
+) -> Option<String> {
+    CpuUtilizationAttribution::of(cpu, outside, now_unix_ms)?.describe(now_unix_ms)
+}
+
 /// [`CpuPressure`] by core kind.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -18742,6 +18854,52 @@ impl ExecutorRetainedState {
     }
 }
 
+/// Readable process CPU over one host window, not a subtraction from host busy time.
+/// Processes that exit between endpoints are absent; threads belong to their process.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OutsideCpu {
+    pub window_ms: u64,
+    pub total_cores: f64,
+    pub user_cores: f64,
+    pub system_cores: f64,
+    /// All excluded readable CPU: cells, residents, and the executor itself.
+    pub cairn_cores: f64,
+    /// The subset belonging to command watches, not residents or the executor.
+    pub command_cores: f64,
+    /// False when either endpoint lacks complete command membership accounting.
+    #[serde(default)]
+    pub command_accounting_complete: bool,
+    pub runner_pid: Option<u32>,
+    pub runner_processes: u32,
+    pub runner_cores: f64,
+    pub unreadable_processes: u32,
+    pub enumeration_incomplete: bool,
+    /// Largest eight outside processes; totals above include all readable processes.
+    pub top: Vec<OutsideCpuProcess>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OutsideCpuProcess {
+    pub command: String,
+    pub argv: Option<String>,
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub nice: Option<i32>,
+    pub qos: Option<String>,
+    /// Native process scheduling category, not a per-thread QoS class.
+    #[serde(default)]
+    pub scheduling_class: Option<String>,
+    /// Names unavailable details and the native capability or permission gap.
+    pub detail_unreadable: Vec<String>,
+    pub cores: f64,
+    pub user_cores: f64,
+    pub system_cores: f64,
+    /// An ancestry observation, not a guess based on executable name.
+    pub runner_child: bool,
+}
+
 /// The placement-facing vocabulary every enrolled machine speaks.
 ///
 /// Each reading is independently timestamped and independently able to be a
@@ -18753,6 +18911,8 @@ impl ExecutorRetainedState {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineTelemetry {
+    #[serde(default)]
+    pub outside_cpu: Measurement<OutsideCpu>,
     pub cpu: Measurement<CpuPressure>,
     pub memory: Measurement<MachineMemory>,
     /// The volume the executor's home is on: its database, its machine
@@ -19062,6 +19222,8 @@ impl InterconnectKind {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineSample {
+    #[serde(default)]
+    pub outside_cpu: Measurement<OutsideCpu>,
     pub cpu: Measurement<CpuPressure>,
     pub memory: Measurement<MachineMemory>,
     pub volume: Measurement<MachineVolume>,
@@ -19103,6 +19265,7 @@ impl MachineSample {
     /// The readings `report` carries that a sample carries too.
     pub fn of_report(report: &ExecutorSubstrateReport) -> Self {
         Self {
+            outside_cpu: report.machine.outside_cpu.clone(),
             cpu: report.machine.cpu.clone(),
             memory: report.machine.memory.clone(),
             volume: report.machine.volume.clone(),
@@ -19291,6 +19454,7 @@ impl ExecutorSubstrateReport {
         let machine = &mut self.machine;
         let host = &mut self.host;
         let mut adopted = newer(&mut machine.cpu, &sample.cpu);
+        adopted |= newer(&mut machine.outside_cpu, &sample.outside_cpu);
         adopted |= newer(&mut machine.memory, &sample.memory);
         adopted |= newer(&mut machine.volume, &sample.volume);
         adopted |= match (machine.build_volume.as_mut(), sample.build_volume.as_ref()) {
@@ -31252,6 +31416,7 @@ mod tests {
             ),
         };
         let machine = MachineTelemetry {
+            outside_cpu: Measurement::default(),
             host_temp: None,
             build_volume: None,
             build_disk_accounting: None,
@@ -32943,6 +33108,7 @@ mod tests {
     #[test]
     fn diagnostic_gaps_are_visible_but_are_not_placement_gaps() {
         let windows_shaped = MachineTelemetry {
+            outside_cpu: Measurement::default(),
             host_temp: None,
             build_volume: None,
             build_disk_accounting: None,
@@ -33965,6 +34131,86 @@ mod tests {
     }
 
     #[test]
+    fn cpu_attribution_names_measured_consumers_only_while_fresh_and_commands_are_small() {
+        let now = 100_000;
+        let cpu = Measurement::measured(
+            now,
+            CpuPressure {
+                utilization: 1.0,
+                user: 0.53,
+                system: 0.47,
+                logical_cores: 16,
+                clusters: None,
+            },
+        );
+        let mut outside = Measurement::measured(
+            now,
+            OutsideCpu {
+                window_ms: 5_000,
+                command_cores: 0.3,
+                command_accounting_complete: true,
+                cairn_cores: 1.1,
+                total_cores: 5.7,
+                top: vec![OutsideCpuProcess {
+                    command: "node".into(),
+                    pid: 4812,
+                    nice: Some(0),
+                    cores: 3.1,
+                    runner_child: true,
+                    ..OutsideCpuProcess::default()
+                }],
+                ..OutsideCpu::default()
+            },
+        );
+        let detail = describe_cpu_attribution(&cpu, &outside, now).unwrap();
+        assert!(detail.contains("Cairn's commands 0.3 cores"), "{detail}");
+        assert!(
+            detail.contains("outside Cairn: 5.7 measured cores"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("largest \"node\" (pid 4812, nice 0, 3.1 cores, runner child)"),
+            "{detail}"
+        );
+        assert!(detail.contains("9.2 host cores not attributed"), "{detail}");
+        let captured = CpuUtilizationAttribution::of(&cpu, &outside, now).unwrap();
+        assert!(captured
+            .describe(now + MACHINE_READING_STALE_AFTER_MS + 1)
+            .is_none());
+        assert!(
+            describe_cpu_attribution(&cpu, &outside, now + MACHINE_READING_STALE_AFTER_MS)
+                .is_some()
+        );
+        outside.measured_at_unix_ms = now - MACHINE_READING_STALE_AFTER_MS - 1;
+        assert!(describe_cpu_attribution(&cpu, &outside, now).is_none());
+        outside.measured_at_unix_ms = now - 5_001;
+        assert!(describe_cpu_attribution(&cpu, &outside, now).is_none());
+        outside.measured_at_unix_ms = now;
+        if let MeasurementReading::Measured { value } = &mut outside.reading {
+            value.command_accounting_complete = false;
+        }
+        assert!(describe_cpu_attribution(&cpu, &outside, now).is_none());
+        if let MeasurementReading::Measured { value } = &mut outside.reading {
+            value.command_accounting_complete = true;
+            value.command_cores = 8.0;
+        }
+        assert!(describe_cpu_attribution(&cpu, &outside, now).is_none());
+        let unreadable = Measurement::unavailable(now, MeasurementGap::SamplingFailed);
+        assert!(describe_cpu_attribution(&cpu, &unreadable, now).is_none());
+        let old_condition = serde_json::json!({"cpuUtilization": {
+            "utilization": 0.94, "entryUtilization": 0.90, "clearUtilization": 0.75,
+            "stateSinceUnixMs": 1_000, "measuredAtUnixMs": 2_000
+        }});
+        assert!(matches!(
+            serde_json::from_value::<HostPressureCondition>(old_condition).unwrap(),
+            HostPressureCondition::CpuUtilization {
+                attribution: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn stall_brake_health_and_pressure_evidence_round_trip() {
         let health = StallInstrumentHealth {
             state: StallInstrumentState::Pressured,
@@ -33986,6 +34232,7 @@ mod tests {
             stall
         );
         let condition = HostPressureCondition::CpuUtilization {
+            attribution: None,
             utilization: 0.94,
             entry_utilization: 0.90,
             clear_utilization: 0.75,

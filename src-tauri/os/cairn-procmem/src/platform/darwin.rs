@@ -141,6 +141,13 @@ pub fn census(out: &mut Census) -> bool {
             // A process whose identity read but whose usage did not is still a
             // row: it is present, only unmeasured.
             let task = macos_task_info(pid);
+            if let Some(task) = task {
+                out.cpu_times.push(crate::census::CpuTimes {
+                    process,
+                    user_ms: mach_ticks_to_ms(task.pti_total_user, timebase),
+                    system_ms: mach_ticks_to_ms(task.pti_total_system, timebase),
+                });
+            }
             // One rusage read answers both footprint and storage, so footprint
             // is read for every row rather than only for wanted pids.
             let usage = macos_rusage(pid);

@@ -148,8 +148,19 @@ fn condition_words(condition: &HostPressureCondition) -> String {
         HostPressureCondition::ResidentOccupancy { process_count, .. } => {
             format!("{process_count} resident process(es)")
         }
-        HostPressureCondition::CpuUtilization { utilization, .. } => {
-            format!("cpu at {:.0}%", utilization * 100.0)
+        HostPressureCondition::CpuUtilization {
+            utilization,
+            attribution,
+            ..
+        } => {
+            let mut text = format!("cpu at {:.0}%", utilization * 100.0);
+            if let Some(detail) = attribution
+                .as_ref()
+                .and_then(|value| value.describe(unix_time_ms()))
+            {
+                text.push_str(&format!("; {detail}"));
+            }
+            text
         }
         HostPressureCondition::CpuLoweredWait { wait, .. } => wait.describe(),
         HostPressureCondition::MemoryStall { .. } => "memory stall".into(),

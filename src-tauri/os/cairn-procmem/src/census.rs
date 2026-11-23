@@ -35,10 +35,19 @@ pub struct SchedulingTimes {
     pub performance_cpu_ms: Option<u64>,
 }
 
+/// Split cumulative CPU counters from the same read as a census row.
+#[derive(Clone, Copy, Debug)]
+pub struct CpuTimes {
+    pub process: KernelProcess,
+    pub user_ms: u64,
+    pub system_ms: u64,
+}
+
 /// Reused machine-sized buffers; rows and unreadable PIDs are sorted before folding.
 #[derive(Default)]
 pub struct Census {
     pub rows: Vec<CensusRow>,
+    pub cpu_times: Vec<CpuTimes>,
     pub unreadable: Vec<u32>,
     pub storage_wanted: Vec<u32>,
     /// Pids whose footprint a watch wants. Linux pays a page-table walk per
@@ -54,6 +63,7 @@ pub struct Census {
 impl Census {
     pub fn clear(&mut self) {
         self.rows.clear();
+        self.cpu_times.clear();
         self.unreadable.clear();
         self.storage_wanted.clear();
         self.footprint_wanted.clear();

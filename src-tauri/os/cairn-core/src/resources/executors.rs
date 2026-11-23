@@ -1918,6 +1918,14 @@ pub(crate) fn render_executor_with_kills(
         ))
     ));
     out.push_str(&format!(
+        "- CPU outside Cairn\'s accounting: {}\n",
+        render_outside_cpu(
+            &machine.outside_cpu,
+            &machine.cpu,
+            executor.captured_at_unix_ms
+        )
+    ));
+    out.push_str(&format!(
         "- Lowered work: {}\n",
         render_lowered_work(&health.host.lowered_cpu, executor.captured_at_unix_ms)
     ));
@@ -2182,7 +2190,8 @@ pub(crate) fn render_executor_with_kills(
             ),
             StallInstrument::Cpu => cpu_brake_summary(
                 &health.host,
-                health.machine.cpu.value(),
+                &health.machine.cpu,
+                &health.machine.outside_cpu,
                 &health.applied_policy,
                 executor.captured_at_unix_ms,
             ),
@@ -5205,8 +5214,113 @@ fn stall_brake_summary(
     }
 }
 
-/// What lowered work did over the last window, or why this executor has no
-/// such reading.
+fn outside_cpu_text(value: &str) -> String {
+    value
+        .chars()
+        .take(200)
+        .map(|character| match character {
+            '`' => '\'',
+            character if character.is_control() => ' ',
+            character => character,
+        })
+        .collect()
+}
+
+fn render_outside_cpu(
+    outside: &Measurement<cairn_common::executor_protocol::OutsideCpu>,
+    cpu: &Measurement<cairn_common::executor_protocol::CpuPressure>,
+    captured_at_unix_ms: u64,
+) -> String {
+    match &outside.reading {
+        MeasurementReading::Unavailable { reason, detail } => {
+            let detail = detail
+                .as_deref()
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default();
+            format!("unreadable: {}{detail}", reason.describe())
+        }
+        MeasurementReading::Measured { value } => {
+            let mut out = format!(
+                "{:.1} cores ({:.1} user, {:.1} system) over {:.1}s; measured {}",
+                value.total_cores,
+                value.user_cores,
+                value.system_cores,
+                value.window_ms as f64 / 1_000.0,
+                age(captured_at_unix_ms.saturating_sub(outside.measured_at_unix_ms)),
+            );
+            if cpu
+                .measured_at_unix_ms
+                .abs_diff(outside.measured_at_unix_ms)
+                <= value.window_ms
+            {
+                if let Some(cpu) = cpu.value() {
+                    let residual = cpu.utilization * cpu.logical_cores as f64
+                        - value.cairn_cores
+                        - value.total_cores;
+                    if residual.is_finite() {
+                        out.push_str(&format!(
+                            "; ~{:.1} host cores unattributed (other accounts/kernel, exited processes or window timing)",
+                            residual.max(0.0),
+                        ));
+                    }
+                }
+            }
+            if let Some(pid) = value.runner_pid {
+                out.push_str(&format!(
+                    "; runner descendants (runner pid {pid}): {} processes, {:.1} cores",
+                    value.runner_processes, value.runner_cores,
+                ));
+            }
+            if value.unreadable_processes > 0 || value.enumeration_incomplete {
+                out.push_str(&format!(
+                    "; partial: {} processes unreadable{}",
+                    value.unreadable_processes,
+                    if value.enumeration_incomplete {
+                        ", process enumeration incomplete"
+                    } else {
+                        ""
+                    },
+                ));
+            }
+            out.push_str(". Readable processes only, not host CPU minus Cairn: other accounts and kernel work may be missing. Processes that exited inside the window are not counted; newly observed processes need a baseline; threads are attributed to their process.\n");
+            for process in &value.top {
+                let nice = process
+                    .nice
+                    .map(|nice| nice.to_string())
+                    .unwrap_or_else(|| "unreadable".into());
+                let qos = process
+                    .qos
+                    .as_deref()
+                    .map(|qos| format!(", QoS {qos}"))
+                    .unwrap_or_default();
+                let argv = process
+                    .argv
+                    .as_deref()
+                    .map(|argv| format!("; argv `{}`", outside_cpu_text(argv)))
+                    .unwrap_or_default();
+                let scheduling = process
+                    .scheduling_class
+                    .as_deref()
+                    .map(|class| format!(", scheduling {class}"))
+                    .unwrap_or_default();
+                let gaps = if process.detail_unreadable.is_empty() {
+                    String::new()
+                } else {
+                    format!("; unreadable: {}", process.detail_unreadable.join(", "))
+                };
+                out.push_str(&format!(
+                    "  - `{}` (pid {}, parent {}, nice {nice}{qos}{scheduling}): {:.1} cores ({:.1} user, {:.1} system){}{argv}{gaps}\n",
+                    outside_cpu_text(&process.command), process.pid, process.parent_pid,
+                    process.cores, process.user_cores, process.system_cores,
+                    if process.runner_child { "; runner descendant" } else { "" },
+                ));
+            }
+            out.trim_end().to_string()
+        }
+    }
+}
+
+/// What lowered work did over the last window, or why this executor has no such reading.
 fn render_lowered_work(lowered: &Measurement<LoweredCpu>, captured_at_unix_ms: u64) -> String {
     if let MeasurementReading::Unavailable {
         reason: cairn_common::wire_vocabulary::MeasurementGap::UnsupportedPlatform,
@@ -5247,7 +5361,8 @@ fn render_lowered_work(lowered: &Measurement<LoweredCpu>, captured_at_unix_ms: u
 /// each arm against its own bars.
 fn cpu_brake_summary(
     host: &HostHealth,
-    cpu: Option<&cairn_common::executor_protocol::CpuPressure>,
+    cpu: &Measurement<cairn_common::executor_protocol::CpuPressure>,
+    outside: &Measurement<cairn_common::executor_protocol::OutsideCpu>,
     policy: &ExecutorRuntimePolicy,
     captured_at_unix_ms: u64,
 ) -> String {
@@ -5255,6 +5370,13 @@ fn cpu_brake_summary(
     let combined = arms.combined();
     let blindness = arms.blindness(captured_at_unix_ms);
     let utilization = StallGauge::Cpu(CpuArm::Utilization);
+    let attribution = if arms.holding_arm(captured_at_unix_ms) == Some(CpuArm::Utilization) {
+        cairn_common::executor_protocol::describe_cpu_attribution(cpu, outside, captured_at_unix_ms)
+            .map(|detail| format!("; {detail}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let utilization_line = stall_brake_summary(
         utilization,
         &arms.utilization,
@@ -5263,13 +5385,14 @@ fn cpu_brake_summary(
         captured_at_unix_ms,
     );
     if arms.lowered_wait.state == StallInstrumentState::Unknown {
-        return stall_brake_summary(
+        let summary = stall_brake_summary(
             utilization,
             &combined,
             blindness,
             policy.stall_policy(utilization),
             captured_at_unix_ms,
         );
+        return format!("{summary}{attribution}");
     }
     let lowered_wait = StallGauge::Cpu(CpuArm::LoweredWait);
     let wait_line = stall_brake_summary(
@@ -5290,7 +5413,7 @@ fn cpu_brake_summary(
                     LoweredWaitHold::of(
                         arms.lowered_wait.reading.unwrap_or(0.0),
                         host.lowered_cpu.value(),
-                        cpu,
+                        cpu.value(),
                         policy.stall_policy(lowered_wait),
                     )
                 })
@@ -5308,7 +5431,7 @@ fn cpu_brake_summary(
         }
         _ => "accepting".to_string(),
     };
-    format!("{head}\n  - Utilisation arm: {utilization_line}\n  - Lowered-wait arm: {wait_line}")
+    format!("{head}{attribution}\n  - Utilisation arm: {utilization_line}\n  - Lowered-wait arm: {wait_line}")
 }
 
 /// The build-volume write instrument: its verdict, then each arm against its
@@ -12758,6 +12881,139 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("bootstrap failed"), "{rendered}");
+    }
+
+    #[test]
+    fn outside_cpu_names_cannot_add_page_lines_or_unbounded_arguments() {
+        assert_eq!(outside_cpu_text("node\n\r\t`spoof`"), "node   'spoof'");
+        assert_eq!(outside_cpu_text(&"x".repeat(500)).len(), 200);
+    }
+
+    #[test]
+    fn outside_cpu_page_names_consumers_runner_and_kernel_gap() {
+        use cairn_common::executor_protocol::{OutsideCpu, OutsideCpuProcess};
+        let mut executor = inspection("local", false);
+        measured(&mut executor);
+        executor.health.host.cpu_admission = StallInstrumentHealth {
+            state: StallInstrumentState::Pressured,
+            reading: Some(0.42),
+            state_since_unix_ms: Some(CAPTURED_AT - 60_000),
+            measured_at_unix_ms: Some(CAPTURED_AT - 2_000),
+        };
+        executor.health.machine.outside_cpu = Measurement::measured(
+            CAPTURED_AT - 2_000,
+            OutsideCpu {
+                window_ms: 5_000,
+                total_cores: 4.0,
+                user_cores: 3.0,
+                system_cores: 1.0,
+                cairn_cores: 0.3,
+                command_cores: 0.1,
+                command_accounting_complete: true,
+                runner_pid: Some(10),
+                runner_processes: 2,
+                runner_cores: 3.0,
+                unreadable_processes: 1,
+                enumeration_incomplete: false,
+                top: vec![
+                    OutsideCpuProcess {
+                        command: "codex".into(),
+                        argv: Some("codex app-server".into()),
+                        pid: 42,
+                        parent_pid: 10,
+                        nice: Some(5),
+                        qos: Some("background".into()),
+                        cores: 3.0,
+                        user_cores: 2.0,
+                        system_cores: 1.0,
+                        runner_child: true,
+                        ..Default::default()
+                    },
+                    OutsideCpuProcess {
+                        command: "stranger".into(),
+                        scheduling_class: Some("below-normal".into()),
+                        pid: 43,
+                        parent_pid: 1,
+                        nice: Some(0),
+                        cores: 1.0,
+                        user_cores: 1.0,
+                        detail_unreadable: vec!["argv: permission denied".into()],
+                        ..Default::default()
+                    },
+                ],
+            },
+        );
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "CPU outside Cairn's accounting: 4.0 cores (3.0 user, 1.0 system) over 5.0s"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("~2.4 host cores unattributed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("runner descendants (runner pid 10): 2 processes, 3.0 cores"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("`codex` (pid 42, parent 10, nice 5, QoS background): 3.0 cores"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("; runner descendant; argv `codex app-server`"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("partial: 1 processes unreadable"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Processes that exited inside the window are not counted; newly observed processes need a baseline; threads are attributed to their process"), "{rendered}");
+        assert!(
+            rendered.contains("unreadable: argv: permission denied"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("scheduling below-normal"), "{rendered}");
+        assert!(rendered.find("`codex` (pid").unwrap() < rendered.find("`stranger` (pid").unwrap());
+        let brake = rendered
+            .lines()
+            .find(|line| line.contains("CPU brake:"))
+            .unwrap();
+        assert!(
+            brake.contains("Cairn's commands 0.1 cores; outside Cairn: 4.0 measured cores"),
+            "{brake}"
+        );
+        assert!(brake.contains("pid 42"), "{brake}");
+
+        let before = cpu_brake_summary(
+            &executor.health.host,
+            &executor.health.machine.cpu,
+            &Measurement::default(),
+            &executor.health.applied_policy,
+            CAPTURED_AT,
+        );
+        executor.health.machine.outside_cpu = Measurement {
+            measured_at_unix_ms: CAPTURED_AT,
+            reading: MeasurementReading::Unavailable {
+                reason: MeasurementGap::PermissionDenied,
+                detail: Some("process snapshot refused".into()),
+            },
+        };
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("CPU outside Cairn's accounting: unreadable: permission denied (process snapshot refused)"), "{rendered}");
+        let brake = cpu_brake_summary(
+            &executor.health.host,
+            &executor.health.machine.cpu,
+            &executor.health.machine.outside_cpu,
+            &executor.health.applied_policy,
+            CAPTURED_AT,
+        );
+        assert_eq!(brake, before);
+        executor.health.machine.outside_cpu = Measurement::default();
+        assert!(render_executor(&executor)
+            .contains("CPU outside Cairn's accounting: unreadable: not sampled yet"));
     }
 
     /// Every machine number carries the instant it was taken. An age computed

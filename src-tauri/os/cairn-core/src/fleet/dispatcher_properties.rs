@@ -986,6 +986,7 @@ async fn work_joining_while_its_machine_is_braked_or_provisioning_waits_for_it()
                 detail: None,
                 disk: None,
                 conditions: vec![HostPressureCondition::CpuUtilization {
+                    attribution: None,
                     utilization: 0.97,
                     entry_utilization: 0.9,
                     clear_utilization: 0.8,

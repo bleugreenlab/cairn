@@ -69,6 +69,8 @@ struct Times {
     start: StartKey,
     exited: bool,
     cpu_ms: u64,
+    user_ms: u64,
+    system_ms: u64,
 }
 
 fn times(handle: &OwnedHandle) -> Option<Times> {
@@ -90,6 +92,8 @@ fn times(handle: &OwnedHandle) -> Option<Times> {
         start: StartKey(filetime(creation), 0),
         exited: filetime(exit) != 0,
         cpu_ms: filetime(kernel).saturating_add(filetime(user)) / 10_000,
+        user_ms: filetime(user) / 10_000,
+        system_ms: filetime(kernel) / 10_000,
     })
 }
 
@@ -185,6 +189,11 @@ pub fn census(out: &mut Census) -> bool {
             Ok(handle) => match times(&handle) {
                 Some(observed) if observed.exited => {}
                 Some(observed) if observed.start.0 <= snapshot.before => {
+                    out.cpu_times.push(crate::census::CpuTimes {
+                        process: process(pid, entry.th32ParentProcessID, observed.start),
+                        user_ms: observed.user_ms,
+                        system_ms: observed.system_ms,
+                    });
                     out.rows
                         .push(row(&handle, pid, entry.th32ParentProcessID, &observed));
                 }
@@ -572,6 +581,15 @@ mod tests {
         assert_eq!(observation.process, identity);
         assert!(observation.resident_bytes.unwrap() > 16 * 1024 * 1024);
         assert!(observation.cpu_ms.unwrap() > 0);
+        let split = census_data
+            .cpu_times
+            .iter()
+            .find(|row| row.process.pid == pid)
+            .expect("native split CPU");
+        assert_eq!(split.process.start, identity.start);
+        let detail = crate::cpu_detail::cpu_detail(pid);
+        assert!(detail.command.is_some_and(|command| !command.is_empty()));
+        assert!(detail.scheduling_class.is_some());
         assert_eq!(observation.storage_io_bytes, None);
         assert!(!observation.uninterruptible);
         child.finish();
