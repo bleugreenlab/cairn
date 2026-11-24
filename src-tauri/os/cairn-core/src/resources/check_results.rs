@@ -1999,7 +1999,9 @@ mod tests {
         observation.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(10));
         let body = render(&observation);
         assert!(
-            body.contains("- Build jobs: 10 build jobs, the compile slot's width\n"),
+            body.contains(
+                "- Build jobs: 10 build jobs, the compile slot's width; JS worker ceiling 10\n"
+            ),
             "{body}"
         );
 
