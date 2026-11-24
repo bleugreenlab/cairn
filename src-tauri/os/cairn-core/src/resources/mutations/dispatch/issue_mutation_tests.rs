@@ -3073,6 +3073,7 @@ fn sample_resource(kind: cairn_uri::ResourceKind, mode: ChangeMode) -> CairnReso
         K::ProjectService => "cairn://p/cairn/services/echo",
         K::ProjectPublish => "cairn://p/cairn/publish",
         K::ProjectCheckRequest => "cairn://p/cairn/check-requests/req-1",
+        K::ProjectRequest => "cairn://p/cairn/requests/req-1",
         K::NodeChecks => "cairn://p/cairn/1/1/builder/checks",
         K::TaskChecks => "cairn://p/cairn/1/1/builder/task/sub/checks",
         // Pre-existing gaps, filled here because they sit between this test and

@@ -350,6 +350,10 @@ impl CairnResource {
                 let short = id.get(..8).unwrap_or(id);
                 in_project(project, format!("check request {short}"))
             }
+            Self::ProjectRequest { project, id } => {
+                let short = id.get(..8).unwrap_or(id);
+                in_project(project, format!("request {short}"))
+            }
             Self::ProjectVcsDiff { project } => in_project(project, "vcs diff"),
             Self::ProjectVcsAncestry { project } => in_project(project, "vcs ancestry"),
             Self::ProjectVcsLog { project } => in_project(project, "vcs log"),

@@ -795,6 +795,70 @@ impl ExecutionQueue {
         self.journal(vec![row]);
     }
 
+    /// Journal that a machine's own room is closed to the entries waiting on
+    /// it (a CPU or memory brake, a provisioning hold, a disk floor). Such an
+    /// entry is never offered there, so no decline would ever name the
+    /// closure; without this row a request parked behind a brake left no
+    /// trace of why. One row per entry, machine and kind of closure (its
+    /// scope, reason and number of conditions, never a reading, which moves
+    /// every sample), carrying the closure's own detail or its measured
+    /// conditions. A room announced with no closure re-arms them, so a brake
+    /// that returns is journaled again.
+    ///
+    /// `holds` is, per waiting entry, the machine, its link generation and
+    /// the closures that hold that entry there (filtered by the caller to
+    /// those whose scope covers the entry's need; none re-arms).
+    pub(crate) fn journal_room_closures(
+        &self,
+        holds: &[(
+            EntryId,
+            String,
+            u64,
+            Vec<cairn_common::executor_protocol::RoomClosure>,
+        )],
+        now_unix_ms: u64,
+    ) {
+        let mut rows = Vec::new();
+        let mut state = self.entries.lock().unwrap();
+        for (id, executor_id, generation, closures) in holds {
+            let (executor_id, generation) = (executor_id.as_str(), *generation);
+            let prefix = format!("closure:{executor_id}:");
+            let Some(entry) = state.entries.get_mut(id) else {
+                continue;
+            };
+            if closures.is_empty() {
+                entry
+                    .journaled_signatures
+                    .retain(|signature| !signature.starts_with(&prefix));
+                continue;
+            }
+            for closure in closures {
+                let signature = format!(
+                    "{prefix}{:?}:{:?}:{}",
+                    closure.scope,
+                    closure.reason,
+                    closure.conditions.len()
+                );
+                if entry.journaled_signatures.contains(&signature) {
+                    continue;
+                }
+                if entry.journaled_signatures.len() >= JOURNALED_SIGNATURES {
+                    entry.journaled_signatures.pop_front();
+                }
+                entry.journaled_signatures.push_back(signature);
+                rows.push(journal_row(
+                    entry,
+                    EntryState::Queued.name(),
+                    Some((executor_id, generation)),
+                    Some((closure.reason, Some(closure_detail(closure)))),
+                    now_unix_ms,
+                ));
+            }
+        }
+        drop(state);
+        self.journal(rows);
+    }
+
     /// Retract an offer refused by the runner before any frame reached the
     /// machine. This is not evidence of an executor declining the work.
     pub(crate) fn retract_unsent_offer(
@@ -1638,6 +1702,19 @@ impl ExecutionQueue {
                 "execution queue journal is not being drained: {error}"
             ));
         }
+    }
+}
+
+/// A room closure in its own words, or its measured conditions when it
+/// states none.
+pub(crate) fn closure_detail(closure: &cairn_common::executor_protocol::RoomClosure) -> String {
+    match &closure.detail {
+        Some(detail) => format!("{:?} room closed: {detail}", closure.scope),
+        None => format!(
+            "{:?} room closed: {}",
+            closure.scope,
+            serde_json::to_string(&closure.conditions).unwrap_or_default()
+        ),
     }
 }
 
@@ -3507,6 +3584,63 @@ pub(super) mod tests {
             Some("project p is provisioning for request other")
         );
         assert_eq!(standing.at_unix_ms, 3);
+    }
+
+    /// A request parked behind a machine's brake is never offered there, so
+    /// no decline names the brake. The closure itself is journaled against
+    /// it: once, naming the machine, the hold class and the measured detail;
+    /// not again while the brake stands; and again when it returns after the
+    /// room reopened (cairn/6227's parked specimen).
+    #[test]
+    fn a_brake_closing_a_machines_room_is_journaled_against_what_waits_there() {
+        use cairn_common::executor_protocol::{RoomClosure, RoomScope};
+        let queue = ExecutionQueue::default();
+        let (sender, mut journal) = mpsc::unbounded_channel();
+        queue.attach_journal(sender);
+        let (entry, _waiter) = enqueue(&queue, "r", PlacementMobility::SpillEligible);
+        while journal.try_recv().is_ok() {}
+        let brake = RoomClosure {
+            scope: RoomScope::NonInteractive,
+            reason: DeclineReason::Pressure,
+            detail: Some("measured CPU 94% is over its brake".into()),
+            disk: None,
+            conditions: Vec::new(),
+        };
+        let rows = |journal: &mut mpsc::UnboundedReceiver<QueueJournalBatch>| {
+            let mut rows = Vec::new();
+            while let Ok(batch) = journal.try_recv() {
+                rows.extend(batch);
+            }
+            rows
+        };
+
+        let holds =
+            |closures: Vec<RoomClosure>| vec![(entry.clone(), "sp1".to_string(), 3, closures)];
+        queue.journal_room_closures(&holds(vec![brake.clone()]), 100);
+        let held = rows(&mut journal);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].state, "queued");
+        assert_eq!(held[0].executor_id.as_deref(), Some("sp1"));
+        assert_eq!(held[0].generation, Some(3));
+        assert_eq!(held[0].decline_reason.as_deref(), Some("pressure"));
+        assert_eq!(
+            held[0].detail.as_deref(),
+            Some("NonInteractive room closed: measured CPU 94% is over its brake")
+        );
+
+        queue.journal_room_closures(&holds(vec![brake.clone()]), 200);
+        assert!(
+            rows(&mut journal).is_empty(),
+            "a standing brake is journaled once"
+        );
+
+        queue.journal_room_closures(&holds(Vec::new()), 300);
+        queue.journal_room_closures(&holds(vec![brake]), 400);
+        assert_eq!(
+            rows(&mut journal).len(),
+            1,
+            "a returning brake is journaled again"
+        );
     }
 
     fn journaled_states(receiver: &mut mpsc::UnboundedReceiver<QueueJournalBatch>) -> Vec<String> {

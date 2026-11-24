@@ -728,6 +728,39 @@ impl Fleet {
     /// Cached state only. This answers from what the runner already holds and
     /// never probes an executor or samples the fleet, so reading it costs a
     /// clone rather than a round trip to every machine.
+    /// The live command of `request_id` on whichever attached machine reports
+    /// it, with that machine's latest usage reading joined on. One lookup
+    /// under the connection lock, for a request's ledger sampler.
+    pub(crate) fn executing_command(
+        &self,
+        request_id: &str,
+    ) -> Option<crate::mcp::handlers::run::ledger::Execution> {
+        let found = {
+            let connections = self.lock_connections();
+            connections.values().find_map(|entry| {
+                let request = entry
+                    .snapshot
+                    .executing_requests
+                    .iter()
+                    .find(|request| request.request_id == request_id)?;
+                let mut request = request.clone();
+                request.live_usage = entry.live_usage.get(
+                    &cairn_common::executor_protocol::LiveUsageSubject::Command {
+                        request_id: request.request_id.clone(),
+                        attempt_id: request.attempt_id.clone(),
+                    },
+                );
+                Some((entry.generation, request))
+            })
+        };
+        let (generation, request) = found?;
+        Some(crate::mcp::handlers::run::ledger::Execution::of(
+            self.executor_name_for_text(&request.executor_id),
+            generation,
+            &request,
+        ))
+    }
+
     pub fn inspect_executors(&self, captured_at_unix_ms: u64) -> Vec<ExecutorInspection> {
         let known_projects = self.known_project_requirements.lock().unwrap().clone();
         let connections = self.lock_connections();

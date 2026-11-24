@@ -1595,8 +1595,13 @@ impl Fleet {
             self.dispatch_locked(&connections, &mut placing, |core, mut admit, now| {
                 core.enqueue(waiting, now, &mut admit)
             });
+            // A brake already standing on a machine this entry may run on is
+            // announced no more until it changes: journal it against the
+            // entry now, or it would never be.
+            let holds = entry_holds(&placing.core, entry_id);
             drop(placing);
             drop(connections);
+            self.queue.journal_room_closures(&holds, unix_time_ms());
             self.placing_deadline.notify_one();
             return Ok(receiver);
         }
@@ -2006,7 +2011,40 @@ impl Fleet {
         });
     }
 
+    /// The requests waiting for room that may run on `executor_id`, oldest
+    /// first, each with the closures of that machine's room that hold it (by
+    /// its own need; none when it waits only for room to free). A machine's
+    /// own queue counts only what it has been offered, so this is what waits
+    /// for it that nothing else there shows.
+    pub(crate) fn parked_against(&self, executor_id: &str) -> Vec<ParkedRequest> {
+        let placing = self.lock_placing();
+        let waiting: Vec<_> = placing
+            .core
+            .waiting_on(executor_id)
+            .into_iter()
+            .map(|(id, since)| {
+                let holds = placing.core.holds_on(&id, executor_id);
+                (id, since, holds)
+            })
+            .collect();
+        drop(placing);
+        waiting
+            .into_iter()
+            .filter_map(|(id, since, holds)| {
+                self.queue.with_entry(&id, |entry| ParkedRequest {
+                    request_id: entry.request.request_id.clone(),
+                    project_id: entry.request.project_id.clone(),
+                    since_unix_ms: since,
+                    holds,
+                })
+            })
+            .collect()
+    }
+
     /// A machine announced its room. The caller holds the connection lock.
+    ///
+    /// Each room closure that holds a waiting entry there is journaled
+    /// against it ([`ExecutionQueue::journal_room_closures`]).
     /// When `admit` last turned work away there, the frame takes the place of
     /// the post that would have walked the machine again
     /// ([`Self::machine_facts_posted`]), so a frame repeating its figures,
@@ -2070,7 +2108,17 @@ impl Fleet {
             }
             effects
         });
+        let holds: Vec<_> = placing
+            .core
+            .waiting_on(executor_id)
+            .into_iter()
+            .map(|(id, _)| {
+                let closures = placing.core.holds_on(&id, executor_id);
+                (id, executor_id.to_string(), generation, closures)
+            })
+            .collect();
         drop(placing);
+        self.queue.journal_room_closures(&holds, unix_time_ms());
         if needs_refigure {
             self.spawn_refigure(Some(executor_id.to_string()));
         }
@@ -2321,8 +2369,41 @@ impl Fleet {
             self.dispatch_locked(&connections, &mut placing, |core, mut admit, now| {
                 core.set_candidates(&entry_id, next, now, &mut admit)
             });
+            // A machine newly a candidate may already be braked.
+            let holds = entry_holds(&placing.core, &entry_id);
+            drop(placing);
+            drop(connections);
+            self.queue.journal_room_closures(&holds, unix_time_ms());
         }
     }
+}
+
+/// One request waiting for room on a machine, with the closures of that
+/// machine's room that hold it.
+pub(crate) struct ParkedRequest {
+    pub(crate) request_id: String,
+    pub(crate) project_id: String,
+    pub(crate) since_unix_ms: u64,
+    pub(crate) holds: Vec<cairn_common::executor_protocol::RoomClosure>,
+}
+
+/// The closures holding `entry_id` on each machine it may run on, in the
+/// shape [`super::queue::ExecutionQueue::journal_room_closures`] takes.
+fn entry_holds(
+    core: &super::dispatcher::Dispatcher,
+    entry_id: &str,
+) -> Vec<(
+    String,
+    String,
+    u64,
+    Vec<cairn_common::executor_protocol::RoomClosure>,
+)> {
+    core.holds_of(entry_id)
+        .into_iter()
+        .map(|(executor_id, generation, closures)| {
+            (entry_id.to_string(), executor_id, generation, closures)
+        })
+        .collect()
 }
 
 #[cfg(test)]

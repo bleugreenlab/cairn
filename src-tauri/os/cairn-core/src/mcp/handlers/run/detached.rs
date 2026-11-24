@@ -500,6 +500,20 @@ pub(crate) enum BatchProgress {
     },
 }
 
+impl BatchProgress {
+    /// The stage this names, as the request ledger records a call dropped
+    /// while its batch stood here.
+    pub(crate) fn stage(&self) -> String {
+        match self {
+            Self::Queued { waiting } => format!("admission ({waiting})"),
+            Self::Running { .. } | Self::Parallel { .. } => "running".to_string(),
+            Self::Placed { on } => format!("placed on {on}"),
+            Self::InRunner => "received".to_string(),
+            Self::Settling | Self::Publishing { .. } => "publishing".to_string(),
+        }
+    }
+}
+
 impl From<crate::fleet::ObservedPublication> for BatchProgress {
     fn from(observed: crate::fleet::ObservedPublication) -> Self {
         Self::Publishing {
@@ -940,19 +954,30 @@ pub(crate) fn handle_uri(request_id: &str) -> String {
     format!("cairn:~/batches/{request_id}")
 }
 
+/// The sentence every answer that leaves a batch running ends with: where
+/// its whole lifecycle reads, by any of its ids.
+fn lifecycle_sentence(request_id: &str) -> String {
+    format!(
+        " Its whole lifecycle reads at `{}`.",
+        crate::resources::request_lifecycle::relative_lifecycle_uri(request_id)
+    )
+}
+
 /// What a call that detached answers with.
 pub(crate) fn detach_answer_text(request_id: &str, reason: &str) -> String {
     format!(
-        "This batch is still running. Cairn could not suspend this call ({reason}), so the call answers now instead. Nothing was cancelled. When it settles, Cairn delivers its result to this job as a notice, and you can read it any time at `{}`. Do not re-run it.",
-        handle_uri(request_id)
+        "This batch is still running. Cairn could not suspend this call ({reason}), so the call answers now instead. Nothing was cancelled. When it settles, Cairn delivers its result to this job as a notice, and you can read it any time at `{}`. Do not re-run it.{}",
+        handle_uri(request_id),
+        lifecycle_sentence(request_id)
     )
 }
 
 /// What a call that detached a batch no machine has yet answers with.
 pub(crate) fn detach_answer_parked_text(request_id: &str, reason: &str, waiting: &str) -> String {
     format!(
-        "This batch has not started yet: it is {waiting}. Cairn could not suspend this call ({reason}), so the call answers now instead. Nothing was cancelled, and it holds no branch until it starts. When it settles, Cairn delivers its result to this job as a notice, and `{}` shows where it stands. Do not re-run it.",
-        handle_uri(request_id)
+        "This batch has not started yet: it is {waiting}. Cairn could not suspend this call ({reason}), so the call answers now instead. Nothing was cancelled, and it holds no branch until it starts. When it settles, Cairn delivers its result to this job as a notice, and `{}` shows where it stands. Do not re-run it.{}",
+        handle_uri(request_id),
+        lifecycle_sentence(request_id)
     )
 }
 
@@ -960,9 +985,10 @@ pub(crate) fn detach_answer_parked_text(request_id: &str, reason: &str, waiting:
 /// it is, where that request stands now, and how to wait on it.
 pub(crate) fn reissue_refusal_text(request_id: &str, live: &LiveState) -> String {
     format!(
-        "This batch is already in flight as request `{request_id}`, detached from the call that issued it: {}. Nothing new was started. Wait on that request instead of re-running it: its result reaches this job as a notice when it settles, and `{}` shows where it stands now.",
+        "This batch is already in flight as request `{request_id}`, detached from the call that issued it: {}. Nothing new was started. Wait on that request instead of re-running it: its result reaches this job as a notice when it settles, and `{}` shows where it stands now.{}",
         live.sentence(),
-        handle_uri(request_id)
+        handle_uri(request_id),
+        lifecycle_sentence(request_id)
     )
 }
 
@@ -1056,9 +1082,10 @@ pub(crate) fn render(batch: &DetachedBatch, live: &LiveState) -> String {
         other => other.as_str().to_string(),
     };
     let mut out = format!(
-        "# Run batch `{}`\n\nLabel: {}\nState: {state}\n",
+        "# Run batch `{}`\n\nLabel: {}\nState: {state}\nLifecycle: `{}`\n",
         batch.request_id,
         label_of(batch),
+        crate::resources::request_lifecycle::relative_lifecycle_uri(&batch.request_id),
     );
     let inline = batch.reason == INLINE_CAPTURE;
     if inline {
@@ -2783,7 +2810,7 @@ mod tests {
     fn the_detach_answer_says_nothing_was_cancelled_and_names_the_handle() {
         assert_eq!(
             detach_answer_text("req-1", "the project store was busy past its answer deadline"),
-            "This batch is still running. Cairn could not suspend this call (the project store was busy past its answer deadline), so the call answers now instead. Nothing was cancelled. When it settles, Cairn delivers its result to this job as a notice, and you can read it any time at `cairn:~/batches/req-1`. Do not re-run it."
+            "This batch is still running. Cairn could not suspend this call (the project store was busy past its answer deadline), so the call answers now instead. Nothing was cancelled. When it settles, Cairn delivers its result to this job as a notice, and you can read it any time at `cairn:~/batches/req-1`. Do not re-run it. Its whole lifecycle reads at `cairn:@/requests/req-1`."
         );
         assert!(!crate::mcp::handlers::run::envelope_reports_run_failure(
             &detach_answer_text("req-1", "x")

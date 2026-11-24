@@ -788,6 +788,87 @@ impl Dispatcher {
     }
 
     /// The machines `entry_id` may run on, with its need on each.
+    /// The entries still waiting (not offered) that may run on `executor_id`,
+    /// oldest first, each with when it began waiting.
+    pub(crate) fn waiting_on(&self, executor_id: &str) -> Vec<(EntryId, u64)> {
+        let Some(eligible) = self.eligible.get(executor_id) else {
+            return Vec::new();
+        };
+        let mut waiting: Vec<(EntryId, u64)> = eligible
+            .iter()
+            .filter_map(|id| {
+                let entry = self.entries.get(id)?;
+                (entry.standing == Standing::Waiting)
+                    .then(|| (id.clone(), entry.waiting.queued_at_unix_ms))
+            })
+            .collect();
+        waiting.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        waiting
+    }
+
+    /// The closures of `executor_id`'s announced room that hold `entry_id`:
+    /// those whose scope covers what the entry needs there, exactly as
+    /// admission ([`fits`]) judges them. Empty when none applies, when the
+    /// entry may not run there, or when the machine has announced no room.
+    pub(crate) fn holds_on(
+        &self,
+        entry_id: &str,
+        executor_id: &str,
+    ) -> Vec<cairn_common::executor_protocol::RoomClosure> {
+        let (Some(entry), Some(announced)) = (
+            self.entries.get(entry_id),
+            self.machines
+                .get(executor_id)
+                .and_then(|machine| machine.room.as_ref()),
+        ) else {
+            return Vec::new();
+        };
+        let Some(candidate) = entry.waiting.candidates.get(executor_id) else {
+            return Vec::new();
+        };
+        announced
+            .room
+            .closures
+            .iter()
+            .filter(|closure| closure.scope.covers(&candidate.need))
+            .cloned()
+            .collect()
+    }
+
+    /// For a waiting entry, each machine it may run on that has announced a
+    /// room, with that link's generation and the closures holding the entry
+    /// there (possibly none).
+    pub(crate) fn holds_of(
+        &self,
+        entry_id: &str,
+    ) -> Vec<(
+        MachineId,
+        u64,
+        Vec<cairn_common::executor_protocol::RoomClosure>,
+    )> {
+        let Some(entry) = self
+            .entries
+            .get(entry_id)
+            .filter(|entry| entry.standing == Standing::Waiting)
+        else {
+            return Vec::new();
+        };
+        entry
+            .waiting
+            .candidates
+            .keys()
+            .filter_map(|executor_id| {
+                let machine = self.machines.get(executor_id)?;
+                machine.room.as_ref()?;
+                Some((
+                    executor_id.clone(),
+                    machine.generation,
+                    self.holds_on(entry_id, executor_id),
+                ))
+            })
+            .collect()
+    }
+
     pub(crate) fn candidates(&self, entry_id: &str) -> Option<&HashMap<MachineId, Candidate>> {
         self.entries
             .get(entry_id)
@@ -2857,6 +2938,77 @@ mod tests {
         assert_eq!(offered(&effects), vec!["e0"]);
         assert!(effects.assigned[0].reserve, "{effects:?}");
         assert_eq!(dispatcher.reserved_on("e0"), Some("m"));
+    }
+
+    /// What is parked against a braked machine reads back as waiting there,
+    /// with the closure that holds it; an offered entry is not waiting.
+    #[test]
+    fn a_braked_machine_names_what_waits_on_it_and_why() {
+        use cairn_common::executor_protocol::{DeclineReason, RoomClosure, RoomScope};
+        let mut dispatcher = Dispatcher::default();
+        dispatcher.attach("m", 1);
+        let mut braked = room(32, 128);
+        braked.closures.push(RoomClosure {
+            scope: RoomScope::NonInteractive,
+            reason: DeclineReason::Pressure,
+            detail: Some("cpu 94%".into()),
+            disk: None,
+            conditions: Vec::new(),
+        });
+        braked.cores.committed = 32;
+        dispatcher.set_room("m", 1, 1, braked, 0, &mut yes());
+        dispatcher.enqueue(waiting(0, &["m"], &need(8, 8)), 0, &mut yes());
+        let waiting: Vec<String> = dispatcher
+            .waiting_on("m")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(waiting, vec!["e0".to_string()]);
+        let holds = dispatcher.holds_on("e0", "m");
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].reason, DeclineReason::Pressure);
+        assert_eq!(dispatcher.holds_of("e0"), vec![("m".to_string(), 1, holds)]);
+
+        dispatcher.attach("n", 1);
+        let offered = dispatcher.set_room("n", 1, 1, room(32, 128), 0, &mut yes());
+        let mut placed = offered.assigned.iter().map(|a| a.entry_id.as_str());
+        assert!(
+            placed.all(|id| id != "e0") || dispatcher.waiting_on("m").is_empty(),
+            "an offered entry is no longer waiting"
+        );
+    }
+
+    /// A scoped closure holds only the work its scope covers: a compile brake
+    /// is no cause of a plain request's wait for ordinary capacity, which
+    /// waits on the same full machine with no closure of its own.
+    #[test]
+    fn a_scoped_closure_holds_only_the_work_it_covers() {
+        use cairn_common::executor_protocol::{DeclineReason, RoomClosure, RoomScope};
+        let mut dispatcher = Dispatcher::default();
+        dispatcher.attach("m", 1);
+        let mut full = busy(32, 128);
+        full.closures.push(RoomClosure {
+            scope: RoomScope::NonInteractiveCompile,
+            reason: DeclineReason::Pressure,
+            detail: Some("compile brake".into()),
+            disk: None,
+            conditions: Vec::new(),
+        });
+        dispatcher.set_room("m", 1, 1, full, 0, &mut yes());
+        let mut compile = need(8, 8);
+        compile.compile = true;
+        dispatcher.enqueue(waiting(0, &["m"], &compile), 0, &mut yes());
+        dispatcher.enqueue(waiting(1, &["m"], &need(8, 8)), 0, &mut yes());
+        assert_eq!(dispatcher.waiting_on("m").len(), 2);
+        assert_eq!(
+            dispatcher.holds_on("e0", "m").len(),
+            1,
+            "the compile is braked"
+        );
+        assert!(
+            dispatcher.holds_on("e1", "m").is_empty(),
+            "the plain request waits for capacity, not for the compile brake"
+        );
     }
 
     /// A room no entry fits, and an unchanged room re-announced, cost nothing

@@ -65,6 +65,10 @@ pub fn build_project_check_request_uri(project: &str, id: &str) -> String {
     format!("{}/check-requests/{id}", build_project_uri(project))
 }
 
+pub fn build_project_request_uri(project: &str, id: &str) -> String {
+    format!("{}/requests/{id}", build_project_uri(project))
+}
+
 pub fn build_project_uri(project: &str) -> String {
     format!("cairn://{}/{}", PROJECT_SCOPE, canonical_project(project))
 }
@@ -1269,6 +1273,7 @@ impl CairnResource {
             Self::ProjectCheckRequest { project, id } => {
                 build_project_check_request_uri(project, id)
             }
+            Self::ProjectRequest { project, id } => build_project_request_uri(project, id),
             Self::ProjectImages { project, scope } => build_project_images_uri(project, scope),
             Self::ProjectImage { project, reference } => {
                 build_project_image_uri(project, reference)

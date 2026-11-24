@@ -6,6 +6,7 @@
 
 pub(crate) mod absence;
 mod assignments;
+pub(crate) use assignments::ParkedRequest;
 mod check_adoptions;
 pub(crate) use check_adoptions::{CheckConsumerGuard, RETAINED_RESULT_RETRY};
 mod coalescing;

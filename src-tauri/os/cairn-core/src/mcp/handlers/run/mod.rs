@@ -16,6 +16,7 @@ pub(crate) mod detached;
 mod embed;
 pub(crate) mod held;
 mod hygiene;
+pub(crate) mod ledger;
 mod machine_route;
 mod media;
 pub(crate) mod occupancy;
@@ -6636,6 +6637,13 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // network, so it runs on the batch's own task, through publication. The
     // call's future only waits for it, and always answers by its deadline.
     let control = BatchControl::new(commit_present);
+    control.ledger.open(
+        orch,
+        request,
+        &control.request_id,
+        commit_present,
+        control.arrived_ms,
+    );
     // A service call's batches end with the call: its supervisor stops what
     // is still in flight when the call ends (`project_services::end_run`).
     let held_run = request.run_id.clone().filter(|_| service_branch.is_some());
@@ -7183,13 +7191,28 @@ async fn prepare_and_run_batch(
     if let Some((header, _)) = resolved.first() {
         let redacted = redact_command(header);
         log::info!(
-            "run batch ({} item(s), sequential={}): {} (cwd={})",
+            "run batch {} ({} item(s), sequential={}): {} (cwd={})",
+            control.request_id,
             resolved.len(),
             payload.sequential.unwrap_or(false),
             &redacted[..redacted.len().min(100)],
             cwd
         );
     }
+    let sequential = payload.sequential.unwrap_or(false);
+    let timeouts: Vec<Option<u32>> = payload.commands.iter().map(|item| item.timeout).collect();
+    control.ledger.describe(ledger::Description {
+        label: batch_label(&request.payload),
+        item_count: resolved.len(),
+        sequential,
+        declared_timeout_ms: ledger::declared_timeout_ms(&timeouts, sequential),
+        verdict_branch: payload.branch.clone(),
+        cwd: cwd.clone(),
+        selector_json: payload
+            .executor
+            .as_ref()
+            .and_then(|selector| serde_json::to_string(selector).ok()),
+    });
 
     // The node scratch: this batch's `$TMPDIR` wherever it lands. Resolved
     // before residence, because a live terminal or REPL holding it draws a
@@ -9137,6 +9160,16 @@ async fn run_routed_batch(
     if !control.begin_settling() {
         return run_envelope(abandoned_batch_text(), Vec::new());
     }
+    if let Ok(BatchAttempts {
+        placed:
+            PlacedBatch::Refused(detail)
+            | PlacedBatch::NoEnvironment(detail)
+            | PlacedBatch::NoRoom(detail),
+        ..
+    }) = &joined
+    {
+        control.ledger.note_refusal(detail);
+    }
     let mut settled =
         off_frame(|| settle_joined_batch(orch, &settlement, joined, ceiling_detail)).await;
     if let Some(note) = control.late_cancel_note() {
@@ -9821,6 +9854,8 @@ struct BatchControl {
     /// When the call arrived (unix milliseconds), which its timeouts and the
     /// batch ceiling are measured from.
     arrived_ms: i64,
+    /// The request's durable lifecycle row ([`ledger`]).
+    ledger: ledger::Ledger,
 }
 
 /// What a batch's items are doing, as its own task and its machine report.
@@ -9877,7 +9912,34 @@ impl BatchControl {
             late_cancel: std::sync::Mutex::new(None),
             attempt: std::sync::Mutex::new(None),
             arrived_ms: chrono::Utc::now().timestamp_millis(),
+            ledger: ledger::Ledger::default(),
         })
+    }
+
+    /// How the call ended, as the request ledger records it. A parked call
+    /// has not ended: its resumed turn is the end.
+    fn record_end(&self, outcome: AnswerOutcome, output_bytes: usize) {
+        use ledger::End;
+        let (end, detail) = match outcome {
+            AnswerOutcome::Parked => return,
+            AnswerOutcome::Detached => (End::Detached, None),
+            AnswerOutcome::Cancelled => (
+                End::Cancelled,
+                Some(match self.cancelled() {
+                    Some(cancel) => format!("by {}", cancel.by),
+                    None => "by Cairn, so its call could answer in time".to_string(),
+                }),
+            ),
+            AnswerOutcome::Refused | AnswerOutcome::Error => (End::Refused, self.ledger.refusal()),
+            AnswerOutcome::Answered | AnswerOutcome::Held => {
+                match (self.cancelled(), self.ledger.refusal()) {
+                    (Some(cancel), _) => (End::Cancelled, Some(format!("by {}", cancel.by))),
+                    (None, Some(refusal)) => (End::Refused, Some(refusal)),
+                    (None, None) => (End::Answered, None),
+                }
+            }
+        };
+        self.ledger.end(end, detail, Some(output_bytes));
     }
 
     fn set_owner(&self, owner: detached::BatchOwner) {
@@ -9896,6 +9958,7 @@ impl BatchControl {
         let mut items = self.items.lock().unwrap_or_else(|p| p.into_inner());
         if !items.running.iter().any(|(running, _)| *running == index) {
             items.running.push((index, at_ms));
+            self.ledger.look();
         }
     }
 
@@ -10536,9 +10599,10 @@ async fn reissue_refusal(orch: &Orchestrator, request: &McpCallbackRequest) -> O
         );
         if twin.reason == detached::INLINE_CAPTURE {
             return Some(format!(
-                "This batch is already in flight as request `{}`; its call still owns delivery of the result. Nothing new was started. Do not re-run it: `{}` shows where it stands.",
+                "This batch is already in flight as request `{}`; its call still owns delivery of the result. Nothing new was started. Do not re-run it: `{}` shows where it stands, and `{}` its whole lifecycle.",
                 twin.request_id,
                 detached::handle_uri(&twin.request_id),
+                crate::resources::request_lifecycle::relative_lifecycle_uri(&twin.request_id),
             ));
         }
         return Some(detached::reissue_refusal_text(
@@ -10846,6 +10910,9 @@ fn spawn_parked_resolver(
         // being withdrawn, and its withdrawal hands this row back.
         durable_suspend::await_inner_wait_release(&db, &record).await;
         durable_suspend::drive_resolution(&orch, &db, &record, &answer.resume_text, false).await;
+        control
+            .ledger
+            .end(ledger::End::Resumed, None, Some(answer.resume_text.len()));
         // A normal park delivers through its wait, so its capture authority
         // retires quietly. An abandoned wait transferred delivery to its batch
         // row and now owes a notice instead.
@@ -11231,6 +11298,7 @@ impl CallAnswer {
         }
         self.answered = true;
         self.control.record_phases();
+        self.control.record_end(outcome, envelope.len());
         answer_timeline::set_outcome(outcome);
         envelope
     }
@@ -11585,6 +11653,11 @@ impl Drop for CallAnswer {
         if self.answered || tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+        // The batch lives on (parked or detached below); the call did not.
+        let stage = self.control.progress(&self.orch.fleet).stage();
+        self.control
+            .ledger
+            .end(ledger::End::Dropped, Some(stage), None);
         let (held, arming) = (self.held.take(), self.arming.take());
         if held.is_some() || arming.is_some() {
             // The transport dropped a held call, or one whose hold was still

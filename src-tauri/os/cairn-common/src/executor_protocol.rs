@@ -7200,6 +7200,13 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/6227 does not move the number. The runner's request ledger samples a
+/// batch's own `executingRequests` entry (its cell, `processIds`, start) and
+/// the live usage already joined onto it, and writes them to its own store.
+/// It reads only fields every supported executor already sends; an executor
+/// that leaves usage unmeasured leaves the ledger's peaks unrecorded, which
+/// the lifecycle read states as unmeasured rather than zero.
+///
 /// cairn/7460 does not move the number. The runner stops preferring an empty
 /// host's capacity over another host's fitting announced room, and bounds its
 /// opening-room preference locally. Older executors still judge the same

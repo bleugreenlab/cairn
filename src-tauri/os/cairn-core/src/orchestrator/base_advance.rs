@@ -1321,8 +1321,16 @@ impl InflightRunBatch {
             .as_ref()
             .map(|progress| format!("; {}", progress.describe(now_ms)))
             .unwrap_or_default();
+        let lifecycle = self
+            .holder
+            .as_deref()
+            .and_then(|home| {
+                crate::resources::request_lifecycle::lifecycle_uri_for_home(home, &self.request_id)
+            })
+            .map(|uri| format!(" (lifecycle: {uri})"))
+            .unwrap_or_default();
         format!(
-            "run batch `{}`{label}{owner}{parked}{progress}",
+            "run batch `{}`{label}{owner}{parked}{progress}{lifecycle}",
             self.request_id
         )
     }

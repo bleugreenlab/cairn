@@ -29,6 +29,7 @@ pub const RESERVED_PROJECT_SEGMENTS: &[&str] = &[
     "recipes",
     "references",
     "repl",
+    "requests",
     "home",
     "responses",
     "routes",

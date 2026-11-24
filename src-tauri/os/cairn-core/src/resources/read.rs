@@ -1451,6 +1451,7 @@ pub(crate) async fn produce_cairn_resource(
             | CairnResource::NodePage { .. }
             | CairnResource::ThreadService { .. }
             | CairnResource::ProjectCheckRequest { .. }
+            | CairnResource::ProjectRequest { .. }
     ) && find_query_value(&split.params, "format") == Some("json");
     // A raw artifact read returns the stored JSON and nothing else, so a caller
     // can parse the read result directly: guidance belongs in the Markdown
@@ -2704,6 +2705,14 @@ async fn render_resource_body(
                             {
                                 rendered.push_str(&pinned);
                             }
+                            if let Some(parked) = crate::resources::request_lifecycle::parked_section(
+                                orch,
+                                &executor.health.identity.executor_id,
+                            )
+                            .await
+                            {
+                                rendered.push_str(&parked);
+                            }
                             rendered.push_str(&crate::execution::checks_main::render_machine_adoptions(orch, &executor.name));
                             rendered.push_str(&crate::execution::checks_main::render_machine_restart_streaks(
                                 orch,
@@ -3030,6 +3039,25 @@ async fn render_resource_body(
                     }
                     Some(other) => {
                         format!("Unsupported check request format `{other}`: expected format=json")
+                    }
+                },
+            }
+        }
+        CairnResource::ProjectRequest { project, id } => {
+            match params.iter().find(|param| param.key != "format") {
+                Some(param) => format!("Unsupported query parameter for a request: {}", param.key),
+                None => match find_query_value(&params, "format") {
+                    None | Some("json") => {
+                        crate::resources::request_lifecycle::read_request(
+                            orch,
+                            &project,
+                            &id,
+                            find_query_value(&params, "format").is_some(),
+                        )
+                        .await
+                    }
+                    Some(other) => {
+                        format!("Unsupported request format `{other}`: expected format=json")
                     }
                 },
             }

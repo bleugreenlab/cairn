@@ -4426,9 +4426,14 @@ fn placement_not_found(
 /// The fleet request id of a run batch is the batch's request id.
 fn run_batch_line(request_id: &str) -> String {
     match crate::mcp::handlers::run::detached::live_owner(request_id).and_then(|owner| owner.home) {
-        Some(home) => format!(
-            "  - Run batch: `{home}/batches/{request_id}`; cancel it with `write({{changes:[{{target:\"{home}/batches/{request_id}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`\n"
-        ),
+        Some(home) => {
+            let lifecycle = super::request_lifecycle::lifecycle_uri_for_home(&home, request_id)
+                .map(|uri| format!("; its lifecycle: `{uri}`"))
+                .unwrap_or_default();
+            format!(
+                "  - Run batch: `{home}/batches/{request_id}`; cancel it with `write({{changes:[{{target:\"{home}/batches/{request_id}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`{lifecycle}\n"
+            )
+        }
         None => String::new(),
     }
 }
@@ -7159,7 +7164,14 @@ fn render_running_now_with_attribution(
             ),
             None => (
                 request.cell_id.clone(),
-                format!("request {}", request.request_id),
+                match crate::mcp::handlers::run::detached::live_owner(&request.request_id)
+                    .and_then(|owner| owner.home)
+                    .and_then(|home| {
+                        super::request_lifecycle::lifecycle_uri_for_home(&home, &request.request_id)
+                    }) {
+                    Some(uri) => format!("request [{}]({uri})", request.request_id),
+                    None => format!("request {}", request.request_id),
+                },
             ),
         };
         // A phased test lane names the charge it holds and the phase it is

@@ -53,6 +53,7 @@ mod rebuilds;
 mod recipes;
 pub mod references;
 mod reporters;
+pub(crate) mod request_lifecycle;
 mod requests;
 mod responses;
 mod routes;

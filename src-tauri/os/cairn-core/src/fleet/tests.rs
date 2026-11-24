@@ -634,6 +634,66 @@ async fn cancelling_unclaimed_work_parked_on_an_update_prevents_later_placement(
     assert_eq!(orch.fleet.queue.len(), 0);
 }
 
+/// A request that arrives while a machine's brake already stands is never
+/// offered there and gets no new room frame, so the hold is journaled when
+/// it joins: the brake, by its detail, against that machine (cairn/6227).
+#[tokio::test]
+async fn a_request_arriving_under_a_standing_brake_is_journaled_against_it() {
+    use cairn_common::executor_protocol::{DeclineReason, RoomClosure, RoomScope};
+    let temp = tempfile::tempdir().unwrap();
+    let orch = Arc::new(test_orchestrator(temp.path()).await);
+    let mut journal = journal_rows(&orch);
+    let (sender, _machine) = mpsc::unbounded_channel();
+    let generation = orch.fleet.attach_announced_executor(sender);
+    let held = orch
+        .fleet
+        .lock_connections()
+        .get(COLOCATED_EXECUTOR_ID)
+        .and_then(|entry| entry.room.clone())
+        .expect("the machine announced a room");
+    let mut braked = held.room.clone();
+    braked.closures.push(RoomClosure {
+        scope: RoomScope::Everything,
+        reason: DeclineReason::Pressure,
+        detail: Some("measured CPU 94% is over its brake".into()),
+        disk: None,
+        conditions: Vec::new(),
+    });
+    orch.fleet
+        .record_room(COLOCATED_EXECUTOR_ID, generation, held.seq + 1, braked);
+
+    // Pinned to the braked machine, as the specimen was.
+    let request = provenance_request();
+    let submitting = scratch_submission_with_stop(&orch, None, true).await;
+    let row = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            while let Ok(batch) = journal.try_recv() {
+                if let Some(row) = batch.into_iter().find(|row| {
+                    row.request_id == request.request_id
+                        && row.decline_reason.as_deref() == Some("pressure")
+                }) {
+                    return row;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the standing brake is journaled against the arriving request");
+    assert_eq!(row.executor_id.as_deref(), Some(COLOCATED_EXECUTOR_ID));
+    assert_eq!(
+        row.detail.as_deref(),
+        Some("Everything room closed: measured CPU 94% is over its brake")
+    );
+    let parked = orch.fleet.parked_against(COLOCATED_EXECUTOR_ID);
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].request_id, request.request_id);
+    assert_eq!(parked[0].holds.len(), 1);
+
+    orch.fleet.cancel_request(&request.request_id);
+    let _ = tokio::time::timeout(Duration::from_secs(5), submitting).await;
+}
+
 #[tokio::test]
 async fn a_batch_stop_before_grant_withdraws_but_after_grant_waits_for_the_machine() {
     for grant_first in [false, true] {

@@ -100,6 +100,21 @@ pub(crate) const PROJECT_CHECK_REQUEST_CONTRACT: ResourceContract = ResourceCont
     }],
 };
 
+pub(crate) const PROJECT_REQUEST_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectRequest,
+    uri_template: "cairn://p/{project}/requests/{id}",
+    name: "Request lifecycle",
+    description:
+        "One run batch's whole lifecycle, by any id it was called by: its request id, the tool call id that made it, its run id (which lists every batch the run made), its wait id, or a placement entry or attempt id; a check request id links its check request. Reads, each with its time and the table it came from: the call (job, node, turn), the batch it became (label, items, declared timeout, commits, branch), each placement decision (parked and why, claimed where), where it ran (machine, cell, pid, peak CPU and memory), and its end: delivered to whom, refused and why, cancelled by whom, still running, or lost with the fact that lost it. Not cairn://requests/{id}, which is an operator request",
+    read_projections: &[ProjectionSpec {
+        key: "format",
+        values: "json: the lifecycle as one JSON object",
+    }],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const PROJECT_IMAGES_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectImages,
     uri_template: "cairn://p/{project}/{issue}/images",

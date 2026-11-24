@@ -155,6 +155,13 @@ pub enum CairnResource {
         project: String,
         id: String,
     },
+    /// One request's lifecycle, by any id it was called by: a run-batch
+    /// request id, tool call id, run id, wait id, placement entry or attempt
+    /// id, or check request id.
+    ProjectRequest {
+        project: String,
+        id: String,
+    },
     ProjectIssues {
         project: String,
     },
@@ -1342,6 +1349,7 @@ impl CairnResource {
             Self::ProjectVcsBlame { .. } => ResourceKind::ProjectVcsBlame,
             Self::ProjectCheckObservation { .. } => ResourceKind::ProjectCheckObservation,
             Self::ProjectCheckRequest { .. } => ResourceKind::ProjectCheckRequest,
+            Self::ProjectRequest { .. } => ResourceKind::ProjectRequest,
             Self::ProjectImage { .. } => ResourceKind::ProjectImage,
             Self::ProjectImages { .. } => ResourceKind::ProjectImages,
             Self::ProjectAttachment { .. } => ResourceKind::ProjectAttachment,

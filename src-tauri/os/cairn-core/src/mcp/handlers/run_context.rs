@@ -187,7 +187,10 @@ pub(crate) async fn authenticated_agent_for_run(
     })
 }
 
-async fn lookup_home_uri_by_run_id(db: &LocalDb, run_id: &str) -> Result<String, String> {
+pub(crate) async fn lookup_home_uri_by_run_id(
+    db: &LocalDb,
+    run_id: &str,
+) -> Result<String, String> {
     let run_id = run_id.to_string();
     db.read(|conn| {
         let run_id = run_id.clone();

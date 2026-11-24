@@ -339,6 +339,7 @@ impl CairnResource {
             | Self::ProjectCheckResults { .. }
             | Self::ProjectCheckObservation { .. }
             | Self::ProjectCheckRequest { .. }
+            | Self::ProjectRequest { .. }
             | Self::ProjectVcsDiff { .. }
             | Self::ProjectVcsAncestry { .. }
             | Self::ProjectVcsLog { .. }
