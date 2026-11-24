@@ -717,7 +717,9 @@ async fn render_issue_executions(
             let seq = row.opt_i64(0).ok().flatten().unwrap_or(0);
             // The projection keeps `held` for a gated execution that can never
             // start (it never ran); the census is what says it is not waiting.
+            let withdrawn = row.opt_text(4).ok().flatten().as_deref() == Some("withdrawn");
             let status = match census.as_ref().and_then(|c| c.wont_start.as_ref()) {
+                _ if withdrawn => "withdrawn".to_string(),
                 Some(_) => "won't start".to_string(),
                 None => row.text(1).unwrap_or_default(),
             };
@@ -738,8 +740,8 @@ async fn render_issue_executions(
                 _ => String::new(),
             };
             output.push_str(&format!(
-                "- execution {} [{}] (triggered: {}){}{}",
-                seq, status, triggered_by, standing, census
+                "- execution {} [{}] (triggered: {}){}{} — cairn://p/{}/{}/executions/{}",
+                seq, status, triggered_by, standing, census, project_key, number, seq
             ));
             if let Some(error) = error {
                 let cause = error
@@ -959,6 +961,23 @@ pub(super) async fn read_issue_execution(
     };
 
     let mut output = render_execution_snapshot(project_key, number, exec_seq, &snapshot);
+    let census = db
+        .read(|conn| {
+            let execution_id = execution_id.clone();
+            Box::pin(async move {
+                crate::execution::gates::census::census_for_executions_conn(conn, &[execution_id])
+                    .await
+            })
+        })
+        .await;
+    match census {
+        Ok(mut censuses) => {
+            if let Some(census) = censuses.remove(&execution_id) {
+                output.push_str(&format!("\n## Execution standing\n{}\n", census.summary));
+            }
+        }
+        Err(error) => output.push_str(&format!("\n(execution standing unavailable: {error})\n")),
+    }
     let resolution = db
         .read(|conn| {
             let execution_id = execution_id.clone();
@@ -1565,7 +1584,7 @@ mod execution_snapshot_read_tests {
         let out = read_issue_executions(&db, "cairn", 1).await;
         assert!(
             out.contains(&format!(
-                "- execution 4 [held] (triggered: manual) — {HELD_SUMMARY}\n"
+                "- execution 4 [held] (triggered: manual) — {HELD_SUMMARY} — cairn://p/cairn/1/executions/4\n"
             )),
             "{out}"
         );
@@ -1604,7 +1623,10 @@ mod execution_snapshot_read_tests {
             .find(|line| line.starts_with("- execution 4 "))
             .expect("the gated execution is listed");
         assert!(line.starts_with("- execution 4 [won't start] "), "{line}");
-        assert!(line.ends_with("won't start: superseded"), "{line}");
+        assert!(
+            line.ends_with("won't start: superseded — cairn://p/cairn/1/executions/4"),
+            "{line}"
+        );
         assert!(!out.contains("[held]"), "{out}");
 
         exec(

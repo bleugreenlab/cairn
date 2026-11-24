@@ -254,8 +254,8 @@ const WONT_START_PREFIX: &str = "won't start";
 /// `gates` must be this execution's gates in authored order. `wont_start` is
 /// why a gated, unreleased execution fails [`cairn_db::awaiting_release_sql!`]
 /// — the predicate the sweep releases by — and so can never start (see
-/// [`wont_start_reason`]). It is ignored for an execution that is not gated and
-/// unreleased, which has already started or never waited.
+/// [`wont_start_reason`]). A withdrawn execution may have no gates. The reason
+/// is ignored for a released execution, which has already started.
 pub fn census(
     gates: &[ExecutionGate],
     released_at: Option<i64>,
@@ -281,7 +281,7 @@ pub fn census_with(
     wont_start: Option<&str>,
 ) -> Option<ExecutionGateCensus> {
     let release_override = release_override_json.map(parse_release_override);
-    if gates.is_empty() && release_override.is_none() {
+    if gates.is_empty() && release_override.is_none() && wont_start.is_none() {
         return None;
     }
     let entries: Vec<GateCensusEntry> = gates
@@ -295,7 +295,9 @@ pub fn census_with(
         .map(|gate| super::capacity::capacity_fact(&gate.predicate_json).is_some())
         .collect();
     let gated_unreleased = !gates.is_empty() && released_at.is_none();
-    let wont_start = wont_start.filter(|_| gated_unreleased).map(str::to_string);
+    let wont_start = wont_start
+        .filter(|_| released_at.is_none())
+        .map(str::to_string);
     let held = gated_unreleased && wont_start.is_none();
     let unmet_caps: Vec<&GateCensusEntry> = entries
         .iter()
@@ -587,7 +589,13 @@ const CENSUS_ROW_SQL: &str = concat!(
                JOIN executions successor INDEXED BY idx_executions_hold_facts
                  ON successor.id = supersession.successor_execution_id
               WHERE supersession.superseded_execution_id = e.id),
-            p.key, i.number, i.merged_at, i.closed_at
+            p.key, i.number, i.merged_at, i.closed_at,
+            CASE WHEN e.lifecycle = 'withdrawn' THEN
+              COALESCE((SELECT json_object('kind', actor_kind, 'ref', actor_ref, 'at', created_at)
+                FROM execution_supersessions
+                WHERE issue_id = e.issue_id AND superseded_execution_id = e.id AND reason = 'withdrawn'
+                ORDER BY created_at DESC, id DESC LIMIT 1), '{}')
+            END
        FROM executions e
        LEFT JOIN issues i ON i.id = e.issue_id
        LEFT JOIN projects p ON p.id = i.project_id
@@ -621,7 +629,9 @@ fn census_rows<'a, C: cairn_db::storage::QueryConn + ?Sized>(
         let mut rows = rows.await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            let wont_start = if row.i64(5)? != 0 {
+            let wont_start = if let Some(withdrawal) = row.opt_text(12)? {
+                Some(withdrawal_reason(&withdrawal))
+            } else if row.i64(5)? != 0 {
                 let key = row.opt_text(8)?;
                 let number = row.opt_i64(9)?;
                 let merged = row.opt_i64(10)?.is_some();
@@ -674,7 +684,7 @@ async fn render_rows(
 pub(super) fn executions_census_sql(n: usize) -> String {
     census_rows_sql(&format!(
         "e.id IN ({})
-           AND (e.release_override_json IS NOT NULL
+           AND (e.lifecycle = 'withdrawn' OR e.release_override_json IS NOT NULL
                 OR EXISTS (SELECT 1 FROM execution_gates g WHERE g.execution_id = e.id))",
         placeholders(n)
     ))
@@ -993,7 +1003,7 @@ mod tests {
 
         let db = crate::storage::migrated_test_db("census-tracking.db").await;
         let conn = db.connect().await.unwrap();
-        let sql = "SELECT ?1, 'i', 2, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL, NULL";
+        let sql = "SELECT ?1, 'i', 2, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL";
         let line = line!() + 1;
         let rows = census_rows(&conn, sql, vec![SqlValue::Text("e".into())])
             .await
@@ -2192,4 +2202,18 @@ mod focus_snapshot_tests {
             standing_for_hold("thread_focus", "focus".into(), 1, None, 0, 1, None).view(100);
         assert_eq!(unranked.place, None);
     }
+}
+
+fn withdrawal_reason(record: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(record).unwrap_or_default();
+    let kind = value["kind"].as_str().unwrap_or("unknown actor");
+    let actor = match value["ref"].as_str() {
+        Some(reference) => format!("{kind} {reference}"),
+        None => kind.to_string(),
+    };
+    let at = value["at"]
+        .as_i64()
+        .map(|at| crate::clock::stamp(at).unwrap_or_else(|| at.to_string()))
+        .unwrap_or_else(|| "unknown time".into());
+    format!("withdrawn by {actor} at {at}; never started")
 }

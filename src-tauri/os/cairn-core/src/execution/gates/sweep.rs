@@ -1034,6 +1034,9 @@ pub(crate) async fn release_conn(
     use super::capacity::CapacityHoldExt;
     use cairn_workflow::gates::store;
 
+    if !store::release_eligible_conn(conn, execution_id).await? {
+        return Ok(ConnRelease::NotHeld);
+    }
     let (authored, unsatisfied) = store::gate_counts_conn(conn, execution_id).await?;
     let existing = list_gates_conn(conn, execution_id).await?;
     let authorized = match cause {
@@ -3180,6 +3183,123 @@ pub(crate) mod tests {
             "got: {error}"
         );
         assert!(advanced(&mut env).is_empty());
+    }
+
+    #[tokio::test]
+    async fn latest_held_filing_replaces_pending_without_stale_release() {
+        use super::super::capacity::tests::caps;
+
+        let env = env("gate-sweep-latest-held.db").await;
+        seed_live_attempt(&env).await;
+        // The live coordinator fills the fleet; neither filing has authored gates.
+        caps(&env, 1, 4);
+        file(&env, 5, json!([])).await.unwrap();
+        let (older, _, released, jobs) = execution(&env, 5).await;
+        assert_eq!((released, jobs), (None, 0));
+        file(&env, 5, json!([])).await.unwrap();
+        let (newer, _, released, jobs) = execution(&env, 5).await;
+        assert_ne!(older, newer);
+        assert_eq!((released, jobs), (None, 0));
+        for id in [&older, &newer] {
+            let gates = gates_of(&env.db, id).await.unwrap();
+            assert!(!gates.is_empty());
+            assert!(gates.iter().all(|gate| {
+                super::super::capacity::capacity_fact(&gate.predicate_json)
+                    == Some(super::super::capacity::FLEET_SLOT_FACT)
+                    && !gate.is_satisfied()
+            }));
+        }
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM executions WHERE issue_id = 'i5'
+                   AND lifecycle = 'pending' AND released_at IS NULL"
+            )
+            .await,
+            1,
+            "only the latest filing remains queued"
+        );
+        assert!(sweep_at(&env.orch, now())
+            .await
+            .unwrap()
+            .released
+            .is_empty());
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM jobs WHERE id = 'live-job' AND status = 'running'"
+            )
+            .await,
+            1,
+            "queued successors must not freeze the live attempt"
+        );
+        assert_eq!(lifecycle(&env, &older).await, "superseded");
+        assert_eq!(lifecycle(&env, &newer).await, "pending");
+        assert_eq!(lifecycle(&env, "live").await, "canonical");
+        assert_eq!(
+            count(
+                &env,
+                &format!(
+            "SELECT COUNT(*) FROM execution_supersessions WHERE superseded_execution_id = '{older}'
+             AND successor_execution_id = '{newer}' AND reason = 'successor_created'
+             AND actor_kind IS NOT NULL AND created_at IS NOT NULL"
+        )
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            release(&env.orch, &older, ReleaseCause::Satisfied)
+                .await
+                .unwrap(),
+            ReleaseOutcome::NotHeld
+        );
+        caps(&env, 6, 4);
+        assert_eq!(
+            sweep_at(&env.orch, now()).await.unwrap().released,
+            vec![newer.clone()]
+        );
+        assert_eq!(
+            release(&env.orch, &older, ReleaseCause::Satisfied)
+                .await
+                .unwrap(),
+            ReleaseOutcome::NotHeld
+        );
+        assert_eq!(lifecycle(&env, &newer).await, "canonical");
+        assert_eq!(lifecycle(&env, "live").await, "superseded");
+        assert!(sweep_at(&env.orch, now())
+            .await
+            .unwrap()
+            .released
+            .is_empty());
+        assert_eq!(
+            count(
+                &env,
+                &format!("SELECT COUNT(*) FROM jobs WHERE execution_id = '{newer}' AND status = 'pending'")
+            )
+            .await,
+            execution(&env, 5).await.3,
+            "the stale release did not cancel the newer attempt's jobs"
+        );
+        assert!(execution(&env, 5).await.3 > 0);
+        assert_eq!(
+            count(
+                &env,
+                &format!(
+                    "SELECT COUNT(*) FROM executions WHERE id = '{older}' AND released_at IS NULL"
+                )
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &env,
+                &format!("SELECT COUNT(*) FROM jobs WHERE execution_id = '{older}'")
+            )
+            .await,
+            0
+        );
     }
 
     async fn lifecycle(env: &Env, id: &str) -> String {

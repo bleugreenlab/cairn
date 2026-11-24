@@ -343,9 +343,13 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
         kind: ResourceKind::IssueExecutions,
         uri_template: "cairn://p/{project}/{number}/executions",
         name: "Issue executions",
-        description: "Executions for an issue. Append {recipe?, branch?, continuity?, lifecycle?, overrides?, after?, place?} to start a new execution programmatically. A named recipe is run exactly; with none named Cairn chooses (the workspace setting defaultRecipe until a measured chooser exists; refused, naming the setting, when it is unset). The reply always carries the resolution: `recipe: <id> · <what decided it>`, one line per agent step with what it would pick `now:` (each step selects at its own launch; a single-model allotment is `(exact)`), and the patch and re-append that change it. Starting an ordinary execution IS the decision to supersede whichever execution owns this issue's attempt now: that one is fenced (its nodes take no further turns and its effects are refused) and its agents are stopped. With `after` the execution is filed HELD and starts only when every gate clause is satisfied; a `tenet_verdict` clause holds it on the operator's verdict on a tenet. A thread of this project filing on an issue with no parent adopts it first, so the issue counts against that thread's focus cap and queue and its attention (plan gates, reviews, failures) reaches the thread; an existing parent of either kind, and a start by the operator or by an issue's own agent, are left as they are. A preview names the adoption it would make; a filing refused before launch adopts nothing, and one refused after keeps the adoption and says so.",
+        description: "Executions for an issue. Every listed execution links to its snapshot at cairn://p/PROJECT/NUMBER/executions/SEQ. Withdraw held work there with standalone Patch {cancel:true}; only its authenticated filing node/thread, its actual parent thread, or the verified operator may cancel. Withdrawn history retains who acted and when, even after its gates are removed. Append {recipe?, branch?, continuity?, lifecycle?, overrides?, after?, place?} to start a new execution programmatically. A named recipe is run exactly; with none named Cairn chooses (the workspace setting defaultRecipe until a measured chooser exists; refused, naming the setting, when it is unset). The reply always carries the resolution: `recipe: <id> · <what decided it>`, one line per agent step with what it would pick `now:` (each step selects at its own launch; a single-model allotment is `(exact)`), and the patch and re-append that change it. Every ordinary filing replaces older pending attempts atomically. A held successor leaves current canonical work running until release; an immediate successor, or the held successor's eventual release, supersedes canonical work (its nodes are fenced and its agents stopped). With `after` the execution is filed HELD and starts only when every gate clause is satisfied; a `tenet_verdict` clause holds it on the operator's verdict on a tenet. A thread of this project filing on an issue with no parent adopts it first, so the issue counts against that thread's focus cap and queue and its attention (plan gates, reviews, failures) reaches the thread; an existing parent of either kind, and a start by the operator or by an issue's own agent, are left as they are. A preview names the adoption it would make; a filing refused before launch adopts nothing, and one refused after keeps the adoption and says so.",
         read_projections: NO_PROJECTIONS,
-        related: NO_RELATED,
+        related: &[RelatedSpec {
+            label: "execution snapshot (SEQ from this collection; cancel held work there)",
+            kind: ResourceKind::IssueExecution,
+            actions: true,
+        }],
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[MutationSpec {
             mode: ChangeMode::Append,
@@ -369,7 +373,7 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
                 KeySpec::new(
                     "lifecycle",
                     KeyType::Str,
-                    "canonical|parallel — defaults to canonical, this issue's next attempt, which supersedes and fences the execution that owns the attempt now. `parallel` declares an alternative that runs beside the canonical one, never claims to be the issue's implementation, and is never fenced by a successor",
+                    "canonical|parallel — defaults to canonical, this issue's next attempt. Every ordinary filing replaces older pending attempts. A held successor preserves current canonical work until release; an immediate successor or eventual release supersedes and fences that canonical execution. `parallel` declares an alternative that runs beside the canonical one, never claims to be the issue's implementation, and is never fenced by a successor",
                 ),
                 LAUNCH_OVERRIDES,
                 AFTER_GATES,
@@ -385,7 +389,7 @@ pub(crate) const ISSUE_EXECUTION_CONTRACT: ResourceContract =
         kind: ResourceKind::IssueExecution,
         uri_template: "cairn://p/{project}/{number}/executions/{exec_seq}",
         name: "Execution snapshot",
-        description: "A single execution's frozen snapshot: the recipe (nodes/edges/trigger), every agent snapshot (prompt, tools, model selection, fence, skills), and skills. Read renders it, with how its recipe was resolved and every agent edit since. Patch {agent, snapshot} merges the given snapshot fields over one agent snapshot (send only what changes; a full snapshot replaces every field), mirroring the UI snapshot editor (fence reaches a live session immediately, model on the next turn, prompt on the next session). It is how a step's allotment is changed live: snapshot {models:[...]} is what a step that has not launched yet selects within, and every edit that changes something is recorded. An agent cannot edit its own snapshot, nor change the fence of any agent in its own execution. Read also lists every condition evaluation; Patch {reevaluate} re-runs a condition that blocked and routed nowhere, recording a new routed or blocked row beside the old one.",
+        description: "Standalone Patch {cancel:true} withdraws only live, held, unreleased work (parallel holds included), by its authenticated filing node/thread, its issue\'s actual parent thread, or the verified desktop operator. Preview validates without writes. Unknown legacy filing identity grants no filer authority. Withdrawal records actor/time, removes gates, and never starts or stops a node. Released work must instead be parked through its actual node URI with Patch {action:\"stop\"}. A single execution's frozen snapshot: the recipe (nodes/edges/trigger), every agent snapshot (prompt, tools, model selection, fence, skills), and skills. Read renders it, with how its recipe was resolved and every agent edit since. Patch {agent, snapshot} merges the given snapshot fields over one agent snapshot (send only what changes; a full snapshot replaces every field), mirroring the UI snapshot editor (fence reaches a live session immediately, model on the next turn, prompt on the next session). It is how a step's allotment is changed live: snapshot {models:[...]} is what a step that has not launched yet selects within, and every edit that changes something is recorded. An agent cannot edit its own snapshot, nor change the fence of any agent in its own execution. Read also lists every condition evaluation; Patch {reevaluate} re-runs a condition that blocked and routed nowhere, recording a new routed or blocked row beside the old one.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -417,6 +421,17 @@ pub(crate) const ISSUE_EXECUTION_CONTRACT: ResourceContract =
             optional: &[],
             label: "re-evaluate blocked condition",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions/2\",mode:\"patch\",payload:{reevaluate:\"check-risk\"}}]})",
+        },
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[KeySpec::new(
+                "cancel",
+                KeyType::Bool,
+                "standalone true withdraws live, held, unreleased work; filing node/thread, actual parent thread, or verified operator only. Removes gates and records actor/time; never stops running nodes",
+            )],
+            optional: &[],
+            label: "withdraw held execution",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions/SEQ\",mode:\"patch\",payload:{cancel:true}}]})",
         },
         MutationSpec {
             mode: ChangeMode::Patch,

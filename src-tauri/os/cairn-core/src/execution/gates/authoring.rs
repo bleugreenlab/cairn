@@ -412,6 +412,7 @@ pub struct HoldState {
     pub has_gates: bool,
     pub released_at: Option<i64>,
     pub superseded: bool,
+    pub withdrawn: bool,
     /// The execution's issue has been merged or closed.
     pub issue_resolved: bool,
 }
@@ -428,7 +429,7 @@ async fn hold_state_conn(
                         EXISTS (SELECT 1 FROM issues resolved_issue
                                  WHERE resolved_issue.id = e.issue_id AND ",
                 cairn_db::resolved_issue_sql!(),
-                ")
+                "), e.lifecycle = 'withdrawn'
                    FROM executions e WHERE e.id = ?1"
             ),
             cairn_db::turso::params![execution_id],
@@ -444,6 +445,7 @@ async fn hold_state_conn(
         superseded: row.i64(1)? != 0,
         has_gates: row.i64(2)? != 0,
         issue_resolved: row.i64(3)? != 0,
+        withdrawn: row.i64(4)? != 0,
     })
 }
 
@@ -463,6 +465,9 @@ pub async fn hold_state(
 /// Refuse a gate patch or early release on an execution that is not held,
 /// saying why. `label` names the execution (`execution 2 on cairn://p/x/7`).
 pub fn require_held(state: &HoldState, label: &str) -> Result<(), String> {
+    if state.withdrawn {
+        return Err(format!("{label} was withdrawn and cannot accept gate edits or release. File a new execution instead."));
+    }
     if let Some(released_at) = state.released_at {
         let at = crate::clock::stamp(released_at).unwrap_or_else(|| released_at.to_string());
         return Err(format!(

@@ -94,6 +94,9 @@ pub(super) async fn dispatch(
             }
             let labels = parse_string_array_field(index, item, payload, "labels", &[])?;
             if let Some(spec) = execution.as_mut() {
+                spec.principal = crate::execution::gates::cancellation::filing_actor(orch, request)
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
                 spec.creator = crate::execution::recipe_resolution::ResolutionCreator::of_request(
                     orch, request,
                 )
@@ -501,6 +504,7 @@ fn parse_create_execution_spec(
         ));
     }
     Ok(Some(issues::CreateExecutionSpec {
+        principal: None,
         recipe: str_field("recipe")?,
         creator: Default::default(),
         overrides_filed: obj.get("overrides").cloned(),

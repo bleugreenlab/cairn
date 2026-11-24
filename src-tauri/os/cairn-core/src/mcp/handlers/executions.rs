@@ -163,6 +163,7 @@ fn resolved_issue_refusal(key: &str, number: i32, merged: bool, head: Option<&st
 /// resolved and why, and who filed it with what, for the reply and the
 /// resolution record.
 pub(crate) struct ExecutionFiling {
+    pub(crate) principal: Option<crate::execution::gates::cancellation::Actor>,
     pub(crate) resolution: crate::execution::recipe_resolution::RecipeResolution,
     pub(crate) creator: crate::execution::recipe_resolution::ResolutionCreator,
     /// The `overrides` exactly as the creator wrote them.
@@ -192,6 +193,7 @@ pub(crate) async fn resolve_filing(
     )
     .await?;
     Ok(ExecutionFiling {
+        principal: None,
         resolution,
         creator,
         overrides_filed,
@@ -360,7 +362,7 @@ pub(crate) async fn start_execution_from_collection(
         None
     };
 
-    let launched = crate::execution::recipe::start_recipe_execution_and_advance(
+    let launched = crate::execution::recipe::start_recipe_execution_and_advance_attributed(
         orch,
         &issue_id,
         recipe,
@@ -377,6 +379,7 @@ pub(crate) async fn start_execution_from_collection(
         // file here, so the execution queue's caps apply (cairn/5802).
         crate::execution::recipe::Starter::Capped,
         place.clone(),
+        filing.principal.clone(),
     )
     .await?;
     let execution = launched.execution;
@@ -445,7 +448,21 @@ pub(crate) async fn start_execution_from_collection(
             execution.id
         );
     }
-    let resolved = resolution_lines(&filing, &steps, &issue_uri, seq);
+    let mut resolved = resolution_lines(&filing, &steps, &issue_uri, seq);
+    for replaced in &launched.superseded_execution_ids {
+        let replaced_seq = owning_db
+            .query_opt_i64(
+                "SELECT seq FROM executions WHERE id = ?1",
+                (replaced.clone(),),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(replaced_seq) = replaced_seq {
+            resolved.push_str(&format!(
+                "\nReplaced execution snapshot {issue_uri}/executions/{replaced_seq}; it cannot start or resume."
+            ));
+        }
+    }
     let superseded = superseded.map(|(_, seq)| seq);
 
     if let Some(evaluation) = evaluation.filter(|evaluation| !evaluation.released) {
@@ -731,6 +748,26 @@ pub(crate) async fn patch_execution_gates(
                 .await
         }
     }
+}
+
+/// Withdraw the addressed held execution, using only routed request authority.
+pub(crate) async fn cancel_execution(
+    orch: &Orchestrator,
+    request: &CallbackRequest,
+    project: &str,
+    number: i32,
+    seq: i32,
+    preview: bool,
+) -> Result<String, String> {
+    let actor = crate::execution::gates::cancellation::request_actor(orch, request).await?;
+    let db = orch.db.for_project(project).await;
+    let execution = resolve_execution_id(&db, project, number, seq).await?;
+    let label = format!(
+        "cairn://p/{}/{number}/executions/{seq}",
+        cairn_uri::canonical_project(project)
+    );
+    crate::execution::gates::cancellation::cancel(orch, &db, &execution, actor, &label, preview)
+        .await
 }
 
 /// Who is acting on this request, as a serialized principal: the calling agent

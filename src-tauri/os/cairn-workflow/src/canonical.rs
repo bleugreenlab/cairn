@@ -452,6 +452,65 @@ pub async fn supersede_canonical_conn(
     Ok(written)
 }
 
+/// Replace never-started next attempts without touching the canonical run.
+/// Called before the successor insert in the filing transaction, so insertion
+/// failure rolls back both the fence and its audit evidence.
+pub async fn supersede_pending_conn(
+    conn: &TrackedConnection,
+    issue_id: &str,
+    successor_execution_id: &str,
+    actor: &SupersessionActor,
+    now: i64,
+) -> DbResult<Vec<Supersession>> {
+    let mut rows = conn
+        .query(
+            "SELECT id FROM executions WHERE issue_id = ?1 AND lifecycle = 'pending'",
+            params![issue_id],
+        )
+        .await?;
+    let mut targets = Vec::new();
+    while let Some(row) = rows.next().await? {
+        targets.push(row.text(0)?);
+    }
+    drop(rows);
+    let mut written = Vec::new();
+    for execution_id in targets {
+        conn.execute(
+            "UPDATE executions SET lifecycle = 'superseded' WHERE id = ?1",
+            params![execution_id.as_str()],
+        )
+        .await?;
+        crate::transitions::outcome::recompute_execution_status_conn(conn, &execution_id).await?;
+        let id = cairn_common::ids::mint_child(&execution_id);
+        conn.execute(
+            "INSERT INTO execution_supersessions (
+                id, issue_id, superseded_execution_id, successor_execution_id,
+                reason, actor_kind, actor_ref, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id.as_str(),
+                issue_id,
+                execution_id.as_str(),
+                successor_execution_id,
+                REASON_SUCCESSOR_CREATED,
+                actor.kind,
+                actor.reference.as_deref(),
+                now
+            ],
+        )
+        .await?;
+        written.push(Supersession {
+            id,
+            superseded_execution_id: execution_id,
+            stop_targets: Vec::new(),
+        });
+    }
+    if !written.is_empty() {
+        conn.on_commit(cairn_db::admission_hint::evidence_changed);
+    }
+    Ok(written)
+}
+
 /// Cancel one execution's live jobs, close their sessions, terminalize their
 /// live turns, and return the frozen job ids.
 async fn freeze_execution_conn(

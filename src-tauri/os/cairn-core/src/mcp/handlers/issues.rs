@@ -20,6 +20,7 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 /// (`execution::recipe_resolution`).
 #[derive(Debug, Default, Clone)]
 pub struct CreateExecutionSpec {
+    pub(crate) principal: Option<crate::execution::gates::cancellation::Actor>,
     pub(crate) recipe: Option<String>,
     /// Who files it, for the resolution record.
     pub(crate) creator: crate::execution::recipe_resolution::ResolutionCreator,
@@ -235,6 +236,7 @@ pub async fn create_issue_in_project(
             &ctx.project_key,
             issue.number,
             super::executions::ExecutionFiling {
+                principal: spec.principal,
                 resolution,
                 creator: spec.creator,
                 overrides_filed: spec.overrides_filed,

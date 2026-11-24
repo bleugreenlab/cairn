@@ -183,6 +183,29 @@ pub async fn latch_foreclosure_conn(
     Ok(affected > 0)
 }
 
+/// Eligibility read inside the release transaction, before any gate or queue
+/// mutations. Legacy duplicates cannot let an older candidate defeat a newer
+/// pending filing. Canonical siblings may be independent automatic launches;
+/// they do not replace a held next attempt. Ordering matches the migration.
+pub async fn release_eligible_conn(conn: &TrackedConnection, execution_id: &str) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            concat!(
+                "SELECT 1 FROM executions e WHERE e.id = ?1 AND e.released_at IS NULL AND ",
+                cairn_db::live_execution_sql!(),
+                " AND (e.lifecycle <> 'pending' OR NOT EXISTS (
+                SELECT 1 FROM executions newer
+                WHERE newer.issue_id = e.issue_id AND newer.lifecycle = 'pending'
+                  AND (COALESCE(newer.seq, 0) > COALESCE(e.seq, 0)
+                    OR (COALESCE(newer.seq, 0) = COALESCE(e.seq, 0) AND newer.rowid > e.rowid))
+            ))"
+            ),
+            params![execution_id],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
+}
+
 /// Release a held execution, returning the number of rows affected.
 ///
 /// This is the exactly-once release primitive. The `released_at IS NULL` guard
@@ -206,6 +229,9 @@ pub async fn release_execution_conn(
     released_at: i64,
     override_json: Option<&str>,
 ) -> DbResult<u64> {
+    if !release_eligible_conn(conn, execution_id).await? {
+        return Ok(0);
+    }
     // Not `awaiting_release_sql!`: removing the last gate releases in the same
     // transaction, after the gate rows are gone, so the gate count is the
     // caller's to authorize. Liveness is the shared half.
@@ -667,6 +693,45 @@ pub async fn list_waiting_gate_predicates_conn(
 mod tests {
     use super::*;
     use crate::storage::LocalDb;
+
+    #[tokio::test]
+    async fn legacy_pending_release_respects_sequence_and_rowid_order() {
+        let db = seeded_db().await;
+        // Model pre-migration duplicates, including a sequence tie and NULL.
+        db.execute_script(
+            "DROP INDEX idx_executions_one_pending_per_issue;
+             UPDATE executions SET lifecycle = 'pending', seq = NULL WHERE id = 'e';
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+               VALUES('first', 'recipe', 'i', 'p', 'held', 1, 2, 'pending');
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+               VALUES('latest', 'recipe', 'i', 'p', 'held', 1, 2, 'pending');",
+        )
+        .await
+        .unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                assert!(!release_eligible_conn(conn, "e").await?);
+                assert!(!release_eligible_conn(conn, "first").await?);
+                assert!(release_eligible_conn(conn, "latest").await?);
+                assert_eq!(release_execution_conn(conn, "e", 10, None).await?, 0);
+                assert_eq!(release_execution_conn(conn, "first", 10, None).await?, 0);
+                assert_eq!(release_execution_conn(conn, "latest", 10, None).await?, 1);
+                assert_eq!(release_execution_conn(conn, "latest", 11, None).await?, 0);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM executions WHERE id IN ('e', 'first') AND released_at IS NOT NULL",
+                (),
+            )
+            .await
+            .unwrap(),
+            Some(0)
+        );
+    }
 
     async fn seeded_db() -> LocalDb {
         let db = crate::storage::migrated_test_db("execution-gates-store.db").await;

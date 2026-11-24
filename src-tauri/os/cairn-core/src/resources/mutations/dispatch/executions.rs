@@ -156,7 +156,7 @@ pub(super) async fn dispatch(
             let creator =
                 crate::execution::recipe_resolution::ResolutionCreator::of_request(orch, request)
                     .await;
-            let filing = executions::resolve_filing(
+            let mut filing = executions::resolve_filing(
                 orch,
                 project,
                 *number,
@@ -169,6 +169,9 @@ pub(super) async fn dispatch(
             )
             .await
             .map_err(|error| build_failure(index, item, error))?;
+            filing.principal = crate::execution::gates::cancellation::filing_actor(orch, request)
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
             // An adoption outlives the launch, so a filing that would adopt is
             // refused here, before the edge is written, by every check the
             // launch would make of its configuration.
@@ -312,6 +315,17 @@ pub(super) async fn dispatch(
                 .payload
                 .as_ref()
                 .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
+
+            if payload.get("cancel").is_some() {
+                validate_cancel_payload(payload)
+                    .map_err(|error| build_failure(index, item, error))?;
+                let summary = executions::cancel_execution(
+                    orch, request, project, *number, *exec_seq, dry_run,
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+                return Ok(Some(summary));
+            }
 
             if let Some(patch) = parse_gate_patch(index, item, payload)? {
                 let summary = executions::patch_execution_gates(
@@ -493,4 +507,34 @@ pub(super) fn parse_launch_overrides(
     let deltas = crate::models::LaunchDeltas::parse(value)
         .map_err(|error| build_failure(index, item, format!("payload.{error}")))?;
     Ok((!deltas.is_empty()).then_some(deltas))
+}
+
+fn validate_cancel_payload(payload: &serde_json::Value) -> Result<(), String> {
+    match payload.as_object() {
+        Some(fields) if fields.len() == 1 && fields.get("cancel") == Some(&serde_json::Value::Bool(true)) => Ok(()),
+        _ => Err("Withdrawal takes only standalone {cancel:true}; false, malformed values and mixed actions are refused. Nothing changed.".into()),
+    }
+}
+
+#[cfg(test)]
+mod cancellation_payload_tests {
+    #[test]
+    fn cancellation_is_one_explicit_action() {
+        use serde_json::json;
+        assert!(super::validate_cancel_payload(&json!({"cancel": true})).is_ok());
+        for payload in [
+            json!({"cancel":false}),
+            json!({"cancel":null}),
+            json!({"cancel":"true"}),
+            json!({"cancel":true,"after":[]}),
+            json!({"cancel":true,"agent":"builder"}),
+            json!({"cancel":true,"release":true}),
+            json!({"cancel":true,"start_now":true}),
+        ] {
+            assert!(
+                super::validate_cancel_payload(&payload).is_err(),
+                "{payload}"
+            );
+        }
+    }
 }

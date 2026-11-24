@@ -1,5 +1,19 @@
 use super::*;
 
+/// Stale launch and snapshot-edit callbacks must not mint work after a fence.
+async fn execution_is_fenced_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    execution_id: &str,
+) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM executions WHERE id = ?1 AND lifecycle IN ('superseded', 'withdrawn')",
+            (execution_id,),
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
+}
+
 pub fn create_jobs_for_new_nodes(
     db: Arc<LocalDb>,
     execution_id: &str,
@@ -46,6 +60,9 @@ pub async fn create_jobs_for_execution_conn(
     conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<Vec<Job>> {
+    if execution_is_fenced_conn(conn, execution_id).await? {
+        return Ok(Vec::new());
+    }
     let snapshot = load_execution_snapshot_conn(conn, execution_id).await?;
     let node_ids: HashSet<String> = snapshot
         .recipe
@@ -62,6 +79,9 @@ pub async fn create_jobs_for_new_nodes_conn(
     new_node_ids: &HashSet<String>,
     snapshot: &ExecutionSnapshot,
 ) -> DbResult<Vec<Job>> {
+    if execution_is_fenced_conn(conn, execution_id).await? {
+        return Ok(Vec::new());
+    }
     let issue_id = snapshot.trigger_context.issue_id.as_deref().unwrap_or("");
     let project_id = &snapshot.trigger_context.project_id;
     let db_nodes = snapshot_nodes_to_db(snapshot);
@@ -463,6 +483,31 @@ mod tests {
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("job-creation-test.db").await
+    }
+
+    #[tokio::test]
+    async fn stale_creation_callbacks_cannot_materialize_fenced_work() {
+        let db = migrated_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                for lifecycle in ["superseded", "withdrawn"] {
+                    conn.execute(
+                        "INSERT INTO executions(id, recipe_id, status, started_at, lifecycle)
+                         VALUES (?1, 'r', ?1, 1, ?1)",
+                        (lifecycle,),
+                    )
+                    .await?;
+                    assert!(create_jobs_for_execution_conn(conn, lifecycle)
+                        .await?
+                        .is_empty());
+                }
+                let mut rows = conn.query("SELECT COUNT(*) FROM jobs", ()).await?;
+                assert_eq!(rows.next().await?.unwrap().i64(0)?, 0);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     }
 
     /// A `session: fork` task forks its parent's session whatever provider that

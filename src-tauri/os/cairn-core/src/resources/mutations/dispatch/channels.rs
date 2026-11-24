@@ -565,15 +565,70 @@ mod tests {
     /// operator, so no other path can read or write the channels tree as one.
     #[test]
     fn only_the_channels_door_builds_a_desktop_operator_origin() {
+        fn has_production_origin(source: &str) -> bool {
+            use cairn_symbols::symbols::engine::{parse, SymbolNode};
+            use cairn_symbols::symbols::SupportLang;
+
+            const ORIGIN: &str = concat!("DispatchOrigin::", "DesktopOperator)");
+            if !source.contains(ORIGIN) {
+                return false;
+            }
+            fn test_items(node: &SymbolNode<'_>, ranges: &mut Vec<std::ops::Range<usize>>) {
+                let mut test_only = false;
+                for child in node.children() {
+                    match child.kind().as_ref() {
+                        "attribute_item" => {
+                            let attribute: String = child
+                                .text()
+                                .chars()
+                                .filter(|c| !c.is_whitespace())
+                                .collect();
+                            test_only |= attribute == "#[cfg(test)]";
+                        }
+                        "line_comment" | "block_comment" => {}
+                        _ => {
+                            if test_only {
+                                ranges.push(child.range());
+                            } else {
+                                test_items(&child, ranges);
+                            }
+                            test_only = false;
+                        }
+                    }
+                }
+            }
+            // Attributes are siblings of their item in the Rust grammar. Mask
+            // only that item's range, never the remainder of the source file.
+            let ast = parse(source, SupportLang::Rust);
+            let mut ranges = Vec::new();
+            test_items(&ast.root(), &mut ranges);
+            let mut production = source.as_bytes().to_vec();
+            for range in ranges {
+                production[range].fill(b' ');
+            }
+            production
+                .windows(ORIGIN.len())
+                .any(|part| part == ORIGIN.as_bytes())
+        }
+
+        let construction = concat!("Some(DispatchOrigin::", "DesktopOperator)");
+        assert!(!has_production_origin(&format!(
+            "#[cfg(test)] mod fixtures {{ fn operator() {{ {construction}; }} }}"
+        )));
+        assert!(has_production_origin(&format!(
+            "#[cfg(test)] mod fixtures {{}} fn operator() {{ {construction}; }}"
+        )));
+        assert!(has_production_origin(&format!(
+            "mod nested {{ fn operator() {{ {construction}; }} }}"
+        )));
+
         fn visit(dir: &std::path::Path, found: &mut Vec<String>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     visit(&path, found);
                 } else if path.extension().is_some_and(|ext| ext == "rs")
-                    && std::fs::read_to_string(&path)
-                        .unwrap()
-                        .contains(concat!("DispatchOrigin::", "DesktopOperator)"))
+                    && has_production_origin(&std::fs::read_to_string(&path).unwrap())
                 {
                     found.push(path.display().to_string());
                 }

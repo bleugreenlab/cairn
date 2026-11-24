@@ -90,6 +90,23 @@ pub async fn recompute_execution_status_conn(
     conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<()> {
+    // Withdrawal is authoritative even after its gates have been removed.
+    if count(
+        conn,
+        "SELECT COUNT(*) FROM executions WHERE id = ?1 AND lifecycle = 'withdrawn'",
+        execution_id,
+    )
+    .await?
+        > 0
+    {
+        conn.execute(
+            "UPDATE executions SET status = 'withdrawn' WHERE id = ?1",
+            (execution_id,),
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Release and cancellation are scheduling facts, not evidence of work.
     // Keep lifecycle separate: only a never-run fenced attempt has no outcome
     // other than supersession; an attempt that really ran retains its outcome.
@@ -1174,6 +1191,35 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn withdrawn_outcome_survives_gate_removal_and_recomputation() {
+        let db = migrated_db().await;
+        seed_gated_execution(&db, &[("g1", None)], false).await;
+        db.execute_script(
+            "UPDATE executions SET lifecycle = 'withdrawn', completed_at = 42 WHERE id = 'e';",
+        )
+        .await
+        .unwrap();
+        for remove_gates in [false, true] {
+            if remove_gates {
+                db.execute_script("DELETE FROM execution_gates WHERE execution_id = 'e';")
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..2 {
+                recompute_execution_and_issue(&db).await;
+                assert_eq!(derived_execution_status(&db).await, "withdrawn");
+                assert_eq!(
+                    db.query_opt_i64("SELECT completed_at FROM executions WHERE id = 'e'", ())
+                        .await
+                        .unwrap(),
+                    Some(42)
+                );
+                assert_eq!(issue_status_attention(&db).await.0, "backlog");
+            }
+        }
     }
 
     /// The projection trap. A held execution has zero jobs, and the job counts

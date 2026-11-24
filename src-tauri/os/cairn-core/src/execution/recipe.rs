@@ -150,6 +150,7 @@ pub async fn create_jobs_for_execution(
 pub(crate) struct Launched {
     pub execution: Execution,
     pub held_by: Vec<crate::models::CapacityHold>,
+    pub superseded_execution_ids: Vec<String>,
 }
 
 /// Start a recipe execution, create its jobs, and kick off DAG advancement.
@@ -187,6 +188,43 @@ pub(crate) async fn start_recipe_execution_and_advance(
     starter: Starter,
     place: QueuePlace,
 ) -> Result<Launched, String> {
+    start_recipe_execution_and_advance_attributed(
+        orch,
+        issue_id,
+        recipe_id,
+        project_id,
+        initiated_via,
+        branch_target,
+        continuity,
+        customization,
+        trigger_type,
+        intent,
+        after,
+        starter,
+        place,
+        None,
+    )
+    .await
+}
+
+/// Filing principal is recorded in the insertion transaction, before a hold can release.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_recipe_execution_and_advance_attributed(
+    orch: &Orchestrator,
+    issue_id: &str,
+    recipe_id: Option<&str>,
+    project_id: &str,
+    initiated_via: Option<&str>,
+    branch_target: Option<BranchTarget>,
+    continuity: Option<Continuity>,
+    customization: Option<LaunchCustomization>,
+    trigger_type: TriggerType,
+    intent: LaunchIntent,
+    after: &[crate::routes::TriggerClause],
+    starter: Starter,
+    place: QueuePlace,
+    principal: Option<crate::execution::gates::cancellation::Actor>,
+) -> Result<Launched, String> {
     start_and_advance(
         orch,
         None,
@@ -202,6 +240,7 @@ pub(crate) async fn start_recipe_execution_and_advance(
         after,
         starter,
         place,
+        principal,
     )
     .await
 }
@@ -237,6 +276,7 @@ pub(crate) async fn start_recipe_execution_and_advance_as(
         &[],
         starter,
         QueuePlace::Tail,
+        None,
     )
     .await
 }
@@ -257,6 +297,7 @@ async fn start_and_advance(
     after: &[crate::routes::TriggerClause],
     starter: Starter,
     place: QueuePlace,
+    principal: Option<crate::execution::gates::cancellation::Actor>,
 ) -> Result<Launched, String> {
     let gates = crate::execution::gates::authoring::canonical_predicates(after, "after")?;
     let launched = launch_recipe_execution(
@@ -276,6 +317,7 @@ async fn start_and_advance(
         &gates,
         starter,
         place,
+        principal,
     )
     .await?;
     let execution = &launched.execution;
@@ -368,6 +410,10 @@ pub async fn start_recipe_execution_impl(
         &[],
         starter,
         QueuePlace::Tail,
+        (starter == Starter::Operator).then(|| crate::execution::gates::cancellation::Actor {
+            kind: "operator".into(),
+            id: None,
+        }),
     )
     .await
     .map(|launched| launched.execution)
@@ -408,6 +454,7 @@ async fn launch_recipe_execution(
     gates: &[String],
     starter: Starter,
     place: QueuePlace,
+    principal: Option<crate::execution::gates::cancellation::Actor>,
 ) -> Result<Launched, String> {
     let now = chrono::Utc::now().timestamp() as i32;
     let this_device = orch.anon_device_manager.device_id();
@@ -509,9 +556,22 @@ async fn launch_recipe_execution(
             lifecycle: crate::models::ExecutionLifecycle::Canonical,
         },
         intent,
-        match initiated_via {
-            Some("external") => canonical::SupersessionActor::external(None),
-            _ => canonical::SupersessionActor::operator_ui(),
+        match principal.as_ref() {
+            Some(principal) if principal.kind == "operator" => {
+                canonical::SupersessionActor::operator_ui()
+            }
+            Some(principal) => canonical::SupersessionActor {
+                kind: match principal.kind.as_str() {
+                    "node" => "node",
+                    "thread" => "thread",
+                    _ => "system",
+                },
+                reference: principal.id.clone(),
+            },
+            None if initiated_via == Some("external") => {
+                canonical::SupersessionActor::external(None)
+            }
+            None => canonical::SupersessionActor::system(),
         },
         LaunchGates {
             predicates: gates.to_vec(),
@@ -521,6 +581,7 @@ async fn launch_recipe_execution(
             place,
             turn,
             operator_started: starter == Starter::Operator,
+            principal,
         },
     )
     .await?;
@@ -556,6 +617,11 @@ async fn launch_recipe_execution(
     Ok(Launched {
         execution,
         held_by: caps,
+        superseded_execution_ids: launch
+            .supersessions
+            .into_iter()
+            .map(|event| event.superseded_execution_id)
+            .collect(),
     })
 }
 
@@ -1405,6 +1471,7 @@ pub(crate) async fn file_held_with_observed_satisfaction(
             place: QueuePlace::Tail,
             turn: None,
             operator_started: false,
+            principal: None,
         },
     )
     .await?;
@@ -1438,6 +1505,7 @@ struct LaunchGates {
     place: QueuePlace,
     turn: Option<i64>,
     operator_started: bool,
+    principal: Option<crate::execution::gates::cancellation::Actor>,
 }
 
 /// What starting an issue's execution actually did to its lineage.
@@ -1464,11 +1532,9 @@ struct IssueLaunch {
 /// refusal so two concurrent filings cannot each pass and together close a
 /// cycle, the rows so the execution is never visible without what holds it.
 ///
-/// A held `NewAttempt` supersedes NOTHING here. It is inserted `pending`, outside
-/// the canonical slot, and takes the attempt when it is released — from
-/// whatever owns it then (`gates::sweep::release_conn`). Fencing at filing would
-/// stop the very run a "re-run after X merges" is waiting to follow, and if that
-/// run has finished by release time there is nothing to fence at all.
+/// Every NewAttempt replaces pending siblings here. A held filing leaves the
+/// canonical run alone and takes its slot only at release; otherwise a rerun
+/// waiting for current work could stop the very work it needs to follow.
 async fn insert_issue_execution_atomic(
     db: Arc<LocalDb>,
     dbs: Arc<crate::db::DbState>,
@@ -1486,6 +1552,7 @@ async fn insert_issue_execution_atomic(
         place,
         turn,
         operator_started,
+        principal,
     } = gates;
     if !gates.is_empty() && intent == LaunchIntent::AutomaticTrigger {
         return Err(
@@ -1498,6 +1565,7 @@ async fn insert_issue_execution_atomic(
     db.write(move |conn| {
         let issue_id = issue_id.clone();
         let actor = actor.clone();
+        let principal = principal.clone();
         let gates = gates.clone();
         let satisfied = satisfied.clone();
         let caps = caps.clone();
@@ -1530,7 +1598,15 @@ async fn insert_issue_execution_atomic(
 
             // The fence is published BEFORE the successor exists, so there is
             // never an instant at which two rows read canonical.
-            let supersessions = if intent.supersedes() && !held {
+            let mut supersessions = if intent.supersedes() {
+                crate::execution::canonical::supersede_pending_conn(
+                    conn, &issue_id, execution.id.as_str(), &actor, now,
+                ).await?
+            } else {
+                Vec::new()
+            };
+            if intent.supersedes() && !held {
+                supersessions.extend(
                 crate::execution::canonical::supersede_canonical_conn(
                     conn,
                     &issue_id,
@@ -1538,10 +1614,8 @@ async fn insert_issue_execution_atomic(
                     &actor,
                     now,
                 )
-                .await?
-            } else {
-                Vec::new()
-            };
+                .await?);
+            }
 
             // Resolved AFTER the fence, in the same transaction. An
             // automatic trigger takes the attempt only when the read above
@@ -1565,6 +1639,12 @@ async fn insert_issue_execution_atomic(
             execution.seq = Some(seq);
             execution.lifecycle = lifecycle;
             insert_execution_conn(conn, &execution).await?;
+            if let Some(principal) = principal {
+                conn.execute(
+                    "UPDATE executions SET filing_principal_kind = ?2, filing_principal_id = ?3 WHERE id = ?1",
+                    params![execution.id.as_str(), principal.kind.as_str(), principal.id.as_deref()],
+                ).await?;
+            }
             if operator_started {
                 conn.execute(
                     "UPDATE executions SET release_override_json = ?2 WHERE id = ?1",
@@ -1918,6 +1998,269 @@ mod tests {
     use cairn_config::allotment::NodeConstraints;
     #[allow(unused_imports)]
     use cairn_config::library::{LibraryRoots, Origin};
+
+    async fn pending_filing(
+        env: &crate::execution::gates::sweep::tests::Env,
+        id: &str,
+        intent: LaunchIntent,
+        held: bool,
+    ) -> Result<IssueLaunch, String> {
+        insert_issue_execution_atomic(
+            env.db.clone(),
+            env.orch.db.clone(),
+            "i2".into(),
+            NewExecution {
+                id: id.into(),
+                recipe_id: "recipe".into(),
+                issue_id: Some("i2".into()),
+                project_id: Some("p".into()),
+                status: if held { "held" } else { "running" }.into(),
+                started_at: 1,
+                completed_at: None,
+                snapshot: None,
+                seq: None,
+                initiator: None,
+                triggered_by: TriggerType::Manual.to_string(),
+                runner_device_id: "test-device".into(),
+                lifecycle: crate::models::ExecutionLifecycle::Canonical,
+            },
+            intent,
+            canonical::SupersessionActor {
+                kind: "agent",
+                reference: Some("filing-node".into()),
+            },
+            LaunchGates {
+                predicates: if held {
+                    vec![r#"{"fact":"issue_resolution","issue":"cairn://p/prj/1","resolution":"merged"}"#.into()]
+                } else {
+                    Vec::new()
+                },
+                filed_at: 10,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn pending_state(env: &crate::execution::gates::sweep::tests::Env, id: &str) -> String {
+        env.db
+            .query_opt_text(
+                "SELECT lifecycle FROM executions WHERE id = ?1",
+                params![id],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pending_succession_immediate_filing_replaces_a_held_attempt() {
+        use crate::execution::gates::sweep::tests::{count, env};
+        let env = env("pending-immediate.db").await;
+        pending_filing(&env, "held-a", LaunchIntent::NewAttempt, true)
+            .await
+            .unwrap();
+        let next = pending_filing(&env, "immediate-b", LaunchIntent::NewAttempt, false)
+            .await
+            .unwrap();
+        assert_eq!(next.seq, 2);
+        assert_eq!(next.supersessions.len(), 1);
+        assert!(next.supersessions[0].stop_targets.is_empty());
+        assert_eq!(pending_state(&env, "held-a").await, "superseded");
+        assert_eq!(pending_state(&env, "immediate-b").await, "canonical");
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM execution_gates WHERE execution_id = 'held-a'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM jobs WHERE execution_id = 'held-a'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(count(&env, "SELECT COUNT(*) FROM execution_supersessions WHERE superseded_execution_id = 'held-a' AND successor_execution_id = 'immediate-b' AND reason = 'successor_created' AND actor_kind = 'agent' AND actor_ref = 'filing-node' AND created_at > 0").await, 1);
+    }
+
+    #[tokio::test]
+    async fn pending_succession_concurrent_authored_holds_have_one_winner() {
+        use crate::execution::gates::sweep::tests::{count, env};
+        let env = env("pending-concurrent.db").await;
+        let (a, b) = tokio::join!(
+            pending_filing(&env, "held-a", LaunchIntent::NewAttempt, true),
+            pending_filing(&env, "held-b", LaunchIntent::NewAttempt, true),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a.seq, b.seq);
+        let (older, newer) = if a.seq < b.seq {
+            ("held-a", "held-b")
+        } else {
+            ("held-b", "held-a")
+        };
+        assert_eq!(pending_state(&env, older).await, "superseded");
+        assert_eq!(pending_state(&env, newer).await, "pending");
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM executions WHERE issue_id = 'i2' AND lifecycle = 'pending'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM execution_gates WHERE execution_id IN ('held-a', 'held-b')"
+            )
+            .await,
+            2
+        );
+        let audit = env.db.query_opt_text("SELECT successor_execution_id FROM execution_supersessions WHERE superseded_execution_id = ?1", params![older]).await.unwrap();
+        assert_eq!(audit.as_deref(), Some(newer));
+    }
+
+    #[tokio::test]
+    async fn pending_succession_failed_insert_rolls_back_the_fence_and_audit() {
+        use crate::execution::gates::sweep::tests::{count, env};
+        let env = env("pending-rollback.db").await;
+        pending_filing(&env, "held-a", LaunchIntent::NewAttempt, true)
+            .await
+            .unwrap();
+        // Reusing the primary key fails at insertion, after the pending fence
+        // and its audit have been written inside the transaction.
+        let error = pending_filing(&env, "held-a", LaunchIntent::NewAttempt, false)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_lowercase().contains("unique"), "{error}");
+        assert_eq!(pending_state(&env, "held-a").await, "pending");
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM executions WHERE issue_id = 'i2'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM execution_supersessions WHERE issue_id = 'i2'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM execution_gates WHERE execution_id = 'held-a'"
+            )
+            .await,
+            1
+        );
+        let next = pending_filing(&env, "held-b", LaunchIntent::NewAttempt, true)
+            .await
+            .unwrap();
+        assert_eq!(next.seq, 2, "a failed insertion consumes no sequence");
+        assert_eq!(next.supersessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_succession_parallel_and_automatic_do_not_replace_pending() {
+        use crate::execution::gates::sweep::tests::{count, env};
+        let env = env("pending-independent.db").await;
+        crate::execution::gates::sweep::tests::file(
+            &env,
+            2,
+            serde_json::json!([{"fact":"issue_resolution","issue":"cairn://p/prj/1","resolution":"merged"}]),
+        )
+        .await
+        .unwrap();
+        let held = crate::execution::gates::sweep::tests::execution(&env, 2)
+            .await
+            .0;
+        let parallel = pending_filing(&env, "parallel", LaunchIntent::ParallelAlternative, true)
+            .await
+            .unwrap();
+        let automatic = pending_filing(&env, "automatic", LaunchIntent::AutomaticTrigger, false)
+            .await
+            .unwrap();
+        let automatic_again = pending_filing(
+            &env,
+            "automatic-again",
+            LaunchIntent::AutomaticTrigger,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            parallel.lifecycle,
+            crate::models::ExecutionLifecycle::Parallel
+        );
+        assert_eq!(
+            automatic.lifecycle,
+            crate::models::ExecutionLifecycle::Canonical
+        );
+        assert_eq!(
+            automatic_again.lifecycle,
+            crate::models::ExecutionLifecycle::Parallel
+        );
+        assert!(parallel.supersessions.is_empty());
+        assert!(automatic.supersessions.is_empty());
+        assert!(automatic_again.supersessions.is_empty());
+        assert_eq!(pending_state(&env, &held).await, "pending");
+        assert_eq!(
+            count(
+                &env,
+                "SELECT COUNT(*) FROM execution_supersessions WHERE issue_id = 'i2'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &env,
+                &format!("SELECT COUNT(*) FROM execution_gates WHERE execution_id IN ('{held}', 'parallel')")
+            )
+            .await,
+            2
+        );
+        env.db
+            .execute(
+                "UPDATE execution_gates SET satisfied_at = 20 WHERE execution_id = ?1",
+                params![held.as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::execution::gates::sweep::release(
+                &env.orch,
+                &held,
+                crate::execution::gates::sweep::ReleaseCause::Satisfied,
+            )
+            .await
+            .unwrap(),
+            crate::execution::gates::sweep::ReleaseOutcome::Released,
+            "an independent automatic canonical must not strand the held next attempt"
+        );
+        assert_eq!(pending_state(&env, &held).await, "canonical");
+        assert_eq!(pending_state(&env, "automatic").await, "superseded");
+        assert_eq!(pending_state(&env, "parallel").await, "parallel");
+        assert_eq!(pending_state(&env, "automatic-again").await, "parallel");
+        assert!(
+            count(
+                &env,
+                &format!("SELECT COUNT(*) FROM jobs WHERE execution_id = '{held}'")
+            )
+            .await
+                > 0
+        );
+    }
 
     fn agent_node(id: &str, agent_id: &str) -> RecipeNode {
         RecipeNode {

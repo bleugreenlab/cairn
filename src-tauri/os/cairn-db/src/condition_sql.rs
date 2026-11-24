@@ -24,14 +24,14 @@ macro_rules! resolved_issue_sql {
     };
 }
 
-/// True when execution `e` can still act: not superseded by a newer attempt,
+/// True when execution `e` can still act: neither superseded nor withdrawn,
 /// and its issue (if any) not resolved ([`resolved_issue_sql!`]). Expects an
 /// `executions` row aliased `e`.
 #[macro_export]
 macro_rules! live_execution_sql {
     () => {
         concat!(
-            "e.lifecycle != 'superseded' AND NOT EXISTS (SELECT 1 FROM issues resolved_issue WHERE resolved_issue.id = e.issue_id AND ",
+            "e.lifecycle NOT IN ('superseded', 'withdrawn') AND NOT EXISTS (SELECT 1 FROM issues resolved_issue WHERE resolved_issue.id = e.issue_id AND ",
             $crate::resolved_issue_sql!(),
             ")"
         )
@@ -509,6 +509,10 @@ mod tests {
         // Only a superseded execution, its job never ended.
         child(&db, 5).await;
         started(&db, 5, "superseded", "running").await;
+
+        // A withdrawn execution cannot regain liveness through stale job state.
+        child(&db, 13).await;
+        started(&db, 13, "withdrawn", "running").await;
 
         // A backlog child.
         child(&db, 6).await;

@@ -8,6 +8,7 @@
 mod admission_tests;
 pub mod ask_conditions;
 pub mod authoring;
+pub mod cancellation;
 pub mod capacity;
 pub mod census;
 #[cfg(test)]

@@ -21,6 +21,8 @@ pub enum ExecutionStatus {
     Held,
     /// Fenced before any agent run or action recorded work; not successful completion.
     Superseded,
+    /// Explicitly withdrawn while held, before work started.
+    Withdrawn,
     /// All work was withdrawn before any run or action completed.
     Cancelled,
     Complete,
@@ -33,6 +35,7 @@ impl std::fmt::Display for ExecutionStatus {
             ExecutionStatus::Running => write!(f, "running"),
             ExecutionStatus::Held => write!(f, "held"),
             ExecutionStatus::Superseded => write!(f, "superseded"),
+            ExecutionStatus::Withdrawn => write!(f, "withdrawn"),
             ExecutionStatus::Cancelled => write!(f, "cancelled"),
             ExecutionStatus::Complete => write!(f, "complete"),
             ExecutionStatus::Failed => write!(f, "failed"),
@@ -48,6 +51,7 @@ impl std::str::FromStr for ExecutionStatus {
             "running" => Ok(ExecutionStatus::Running),
             "held" => Ok(ExecutionStatus::Held),
             "superseded" => Ok(ExecutionStatus::Superseded),
+            "withdrawn" => Ok(ExecutionStatus::Withdrawn),
             "cancelled" => Ok(ExecutionStatus::Cancelled),
             "complete" => Ok(ExecutionStatus::Complete),
             "failed" => Ok(ExecutionStatus::Failed),
@@ -423,12 +427,17 @@ pub enum ExecutionLifecycle {
     /// in the same transaction that mints its jobs. "Re-run after X merges"
     /// must not stop the run that is still going.
     Pending,
+    /// Explicitly withdrawn before release. Permanently refuses turns and effects.
+    Withdrawn,
 }
 
 impl ExecutionLifecycle {
     /// Whether this lifecycle refuses turns and effects.
     pub fn is_fenced(self) -> bool {
-        matches!(self, ExecutionLifecycle::Superseded)
+        matches!(
+            self,
+            ExecutionLifecycle::Superseded | ExecutionLifecycle::Withdrawn
+        )
     }
 }
 
@@ -439,6 +448,7 @@ impl std::fmt::Display for ExecutionLifecycle {
             ExecutionLifecycle::Superseded => write!(f, "superseded"),
             ExecutionLifecycle::Parallel => write!(f, "parallel"),
             ExecutionLifecycle::Pending => write!(f, "pending"),
+            ExecutionLifecycle::Withdrawn => write!(f, "withdrawn"),
         }
     }
 }
@@ -452,6 +462,7 @@ impl std::str::FromStr for ExecutionLifecycle {
             "superseded" => Ok(ExecutionLifecycle::Superseded),
             "parallel" => Ok(ExecutionLifecycle::Parallel),
             "pending" => Ok(ExecutionLifecycle::Pending),
+            "withdrawn" => Ok(ExecutionLifecycle::Withdrawn),
             other => Err(format!("unknown execution lifecycle: {}", other)),
         }
     }
@@ -700,6 +711,21 @@ pub struct ExecutionDetail {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn withdrawn_is_fenced_and_roundtrips() {
+        let lifecycle: super::ExecutionLifecycle = "withdrawn".parse().unwrap();
+        assert!(lifecycle.is_fenced());
+        assert_eq!(lifecycle.to_string(), "withdrawn");
+        assert_eq!(serde_json::to_string(&lifecycle).unwrap(), "\"withdrawn\"");
+        assert_eq!(
+            serde_json::from_str::<super::ExecutionLifecycle>("\"withdrawn\"").unwrap(),
+            lifecycle
+        );
+        let status: super::ExecutionStatus = "withdrawn".parse().unwrap();
+        assert_eq!(status.to_string(), "withdrawn");
+        assert_eq!(serde_json::to_string(&status).unwrap(), "\"withdrawn\"");
+    }
+
     #[test]
     fn initiator_serde_roundtrip() {
         let initiator = super::Initiator {

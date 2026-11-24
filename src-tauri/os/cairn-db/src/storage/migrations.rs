@@ -4107,6 +4107,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_withdrawal_migration_deduplicates_deterministically() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("pending-migration.db"))
+            .await
+            .unwrap();
+        db.execute_script(
+            "CREATE TABLE executions(id TEXT PRIMARY KEY, issue_id TEXT, lifecycle TEXT, status TEXT, seq INTEGER);
+             CREATE TABLE projects(id TEXT PRIMARY KEY, key TEXT);
+             CREATE TABLE threads(id TEXT PRIMARY KEY, project_id TEXT, name TEXT, created_at INTEGER);
+             CREATE TABLE recipe_resolutions(execution_id TEXT UNIQUE, project_id TEXT, created_by_kind TEXT, created_by TEXT, created_at INTEGER);
+             CREATE TABLE execution_supersessions(id TEXT PRIMARY KEY, issue_id TEXT, superseded_execution_id TEXT, successor_execution_id TEXT, reason TEXT, actor_kind TEXT, actor_ref TEXT, created_at INTEGER);
+             CREATE TABLE execution_gates(id TEXT PRIMARY KEY, execution_id TEXT);
+             INSERT INTO projects VALUES('p', 'p');
+             INSERT INTO threads VALUES('t', 'p', 'owner', 1), ('recreated', 'p', 'missing', 10);
+             INSERT INTO executions VALUES
+                ('canonical', 'i', 'canonical', 'running', 1),
+                ('parallel', 'i', 'parallel', 'held', 99),
+                ('a', 'i', 'pending', 'held', 2),
+                ('b', 'i', 'pending', 'held', 3),
+                ('c', 'i', 'pending', 'held', 3),
+                ('d', 'j', 'pending', 'held', NULL),
+                ('e', 'j', 'pending', 'held', 0),
+                ('solo', 'k', 'pending', 'held', 1),
+                ('project-a', NULL, 'pending', 'held', 1),
+                ('project-b', NULL, 'pending', 'held', 2);
+             INSERT INTO execution_gates VALUES('ga', 'a'), ('gb', 'b'), ('gc', 'c');
+             INSERT INTO recipe_resolutions VALUES
+                ('a', 'p', 'thread', 'cairn://p/p/owner', 2),
+                ('b', 'p', 'agent', 'cairn://p/p/1/1/builder', 2),
+                ('c', 'p', 'cli', NULL, 2),
+                ('d', 'p', 'thread', 'cairn://p/p/missing', 2);"
+        ).await.unwrap();
+        db.execute_script(include_str!(
+            "../../../../turso_migrations/0493_execution_pending_withdrawal.sql"
+        ))
+        .await
+        .unwrap();
+        let states = db
+            .query_all(
+                "SELECT id || ':' || lifecycle FROM executions ORDER BY rowid",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            states,
+            [
+                "canonical:canonical",
+                "parallel:parallel",
+                "a:superseded",
+                "b:superseded",
+                "c:pending",
+                "d:superseded",
+                "e:pending",
+                "solo:pending",
+                "project-a:pending",
+                "project-b:pending"
+            ]
+        );
+        let audits = db.query_all(
+            "SELECT superseded_execution_id || ':' || successor_execution_id || ':' || reason || ':' || actor_kind || ':' || actor_ref FROM execution_supersessions ORDER BY superseded_execution_id",
+            (), |row| row.text(0)).await.unwrap();
+        assert_eq!(
+            audits,
+            [
+                "a:c:successor_created:system:migration:execution_pending_withdrawal",
+                "b:c:successor_created:system:migration:execution_pending_withdrawal",
+                "d:e:successor_created:system:migration:execution_pending_withdrawal"
+            ]
+        );
+        assert_eq!(
+            db.query_one("SELECT COUNT(*) FROM execution_gates", (), |row| row.i64(0))
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(db.query_one("SELECT filing_principal_kind || ':' || filing_principal_id FROM executions WHERE id='a'", (), |row| row.text(0)).await.unwrap(), "thread:t");
+        assert_eq!(db.query_one("SELECT COUNT(*) FROM executions WHERE id IN ('b','c','d') AND filing_principal_kind IS NULL AND filing_principal_id IS NULL", (), |row| row.i64(0)).await.unwrap(), 3);
+        assert!(db.execute_script("INSERT INTO executions(id,issue_id,lifecycle,status,seq) VALUES('duplicate','i','pending','held',4);").await.is_err());
+    }
+
+    #[tokio::test]
     async fn private_migrations_apply_in_order() {
         let temp = tempdir().unwrap();
         let db = LocalDb::open(temp.path().join("private.turso.db"))
