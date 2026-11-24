@@ -1436,3 +1436,75 @@ async fn issue_resolution_only_selects_handoff_and_carried_requests() {
     cadences.sort();
     assert_eq!(cadences, ["carried", "handoff"]);
 }
+
+/// `<node>/checks/requests` reads and waits on one set: the read lists every
+/// request the node has open, with its link, and a settled wait at that
+/// address arms on exactly those ids, before and after one of them settles.
+/// Another job's open request is in neither.
+#[tokio::test]
+async fn the_open_requests_read_and_the_settled_wait_agree() {
+    use crate::mcp::handlers::durable_suspend::Condition;
+    let (_root, orch) = row_fixture().await;
+    orch.db
+        .local
+        .execute_script(
+            "INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+               VALUES('i','p',7,'I','active','active','none',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+               VALUES('e','r','i','p','running',1,1);
+             UPDATE jobs SET issue_id='i',execution_id='e',node_name='builder',uri_segment='builder' WHERE id='j';",
+        )
+        .await
+        .unwrap();
+    let queued = insert_request(&orch, "queued", "").await;
+    let running = insert_request(&orch, "running", "suite='unit'").await;
+    let foreign = insert_request(&orch, "queued", "requester_job_id='x'").await;
+    let uri = format!("{NODE_URI}/checks/requests");
+
+    async fn waited(orch: &Orchestrator, uri: &str) -> Vec<String> {
+        match crate::mcp::handlers::owned_wait::check_requests_condition(orch, uri, None, None)
+            .await
+        {
+            Ok(Some(Condition::CheckRequests {
+                mut ids,
+                uri: armed,
+                ..
+            })) => {
+                assert_eq!(armed, uri);
+                ids.sort();
+                ids
+            }
+            Ok(_) => panic!("{uri} did not arm a requests wait"),
+            Err(error) => panic!("{uri} refused: {error}"),
+        }
+    }
+    let listed = |body: &str| {
+        let mut ids: Vec<String> = [&queued, &running, &foreign]
+            .into_iter()
+            .filter(|id| body.contains(&format!("(cairn://p/proj/check-requests/{id})")))
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let mut both = vec![queued.clone(), running.clone()];
+    both.sort();
+    let body = read_uri(&orch, &uri).await;
+    assert_eq!(listed(&body), both, "{body}");
+    assert!(body.contains("| unit |"), "{body}");
+    assert_eq!(waited(&orch, &uri).await, both);
+
+    settle(
+        &orch,
+        &orch.db.local,
+        &row(&orch, &queued).await,
+        CheckRequestAnswer::Failed {
+            error: "done".into(),
+        },
+    )
+    .await;
+    let body = read_uri(&orch, &uri).await;
+    assert_eq!(listed(&body), vec![running.clone()], "{body}");
+    assert_eq!(waited(&orch, &uri).await, vec![running]);
+}

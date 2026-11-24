@@ -638,6 +638,15 @@ pub fn build_node_checks_uri(project: &str, number: i32, exec_seq: i32, node_id:
     build_node_subresource_uri(project, number, exec_seq, node_id, "checks")
 }
 
+pub fn build_node_check_requests_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "checks/requests")
+}
+
 pub fn build_node_batches_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "batches")
 }
@@ -685,6 +694,23 @@ pub fn build_task_checks_uri(
     task_name: &str,
 ) -> String {
     build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "checks")
+}
+
+pub fn build_task_check_requests_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+) -> String {
+    build_task_subresource_uri(
+        project,
+        number,
+        exec_seq,
+        node_id,
+        task_name,
+        "checks/requests",
+    )
 }
 
 fn build_node_questions_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
@@ -1545,6 +1571,12 @@ impl CairnResource {
                 exec_seq,
                 node_id,
             } => build_node_checks_uri(project, *number, *exec_seq, node_id),
+            Self::NodeCheckRequests {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_check_requests_uri(project, *number, *exec_seq, node_id),
             Self::NodeBatches {
                 project,
                 number,
@@ -1580,6 +1612,13 @@ impl CairnResource {
                 node_id,
                 task_name,
             } => build_task_checks_uri(project, *number, *exec_seq, node_id, task_name),
+            Self::TaskCheckRequests {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => build_task_check_requests_uri(project, *number, *exec_seq, node_id, task_name),
             Self::NodeQuestions {
                 project,
                 number,

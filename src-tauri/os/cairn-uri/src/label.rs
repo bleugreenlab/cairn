@@ -635,6 +635,19 @@ impl CairnResource {
                 exec_seq,
                 node_id,
             } => self.node_leaf(ctx, project, *number, *exec_seq, node_id, "checks"),
+            Self::NodeCheckRequests {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => self.node_leaf(
+                ctx,
+                project,
+                *number,
+                *exec_seq,
+                node_id,
+                "open check requests",
+            ),
             Self::NodeBatches {
                 project,
                 number,
@@ -877,6 +890,17 @@ impl CairnResource {
                 ctx,
                 Job::task(project, *number, *exec_seq, node_id, task_name),
                 Some("checks".to_string()),
+            ),
+            Self::TaskCheckRequests {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => self.job(
+                ctx,
+                Job::task(project, *number, *exec_seq, node_id, task_name),
+                Some("open check requests".to_string()),
             ),
             Self::TaskPermissions {
                 project,

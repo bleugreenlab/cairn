@@ -249,6 +249,8 @@ fn multi_segment_thread_paths_address_what_a_node_does() {
         ("questions/q-1", "questions/q-1"),
         ("permissions/perm-1", "permissions/perm-1"),
         ("batches/req-1", "batches/req-1"),
+        ("checks/requests", "checks/requests"),
+        ("task/probe/checks/requests", "task/probe/checks/requests"),
         ("task/probe/batches/req-1", "task/probe/batches/req-1"),
         ("terminal/smoke", "terminal/smoke"),
         ("repl/analysis", "repl/analysis"),

@@ -451,7 +451,7 @@ async fn normalize(
 /// A checks wait whose ref names check requests rather than a node's lanes:
 /// one request's URI, or `<node>/checks/requests` for every request that node
 /// has open now. `None` when the ref is a node's or task's checks.
-async fn check_requests_condition(
+pub(crate) async fn check_requests_condition(
     orch: &Orchestrator,
     reference: &str,
     home: Option<&str>,
@@ -494,22 +494,49 @@ async fn check_requests_condition(
             ids: vec![id],
         }));
     }
-    let Some(checks) = canonical.strip_suffix("/requests") else {
-        return Ok(None);
+    // `<job>/checks/requests` as the grammar reads it, a thread's through its
+    // one delegation; anything else is a lanes ref for the caller to resolve.
+    let resolved = cairn_uri::parse_uri(canonical)
+        .and_then(|resource| cairn_uri::delegate_thread_descendant(resource).ok());
+    let (project, number, exec_seq, node_id, task_name) = match resolved {
+        Some(cairn_uri::CairnResource::NodeCheckRequests {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }) => (project, number, exec_seq, node_id, None),
+        Some(cairn_uri::CairnResource::TaskCheckRequests {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        }) => (project, number, exec_seq, node_id, Some(task_name)),
+        _ => return Ok(None),
     };
     if let Some(error) = refuse_suite() {
         return Err(error);
     }
-    let target = resolve_checks_target(orch, checks, home).await?;
-    let open = requests::requests_of_requester(orch, &target.job_id, 0).await?;
-    let open: Vec<_> = open.into_iter().filter(|row| row.is_open()).collect();
+    let db = orch.db.for_project(&project).await;
+    let job_id = crate::resources::resolve_node_or_task_job_id(
+        &db,
+        &project,
+        number,
+        exec_seq,
+        &node_id,
+        task_name.as_deref(),
+    )
+    .await?;
+    let open = requests::open_requests_of_requester(orch, &job_id).await?;
+    // The filing door the refusal points at: this address's parent.
+    let checks = canonical.trim_end_matches("/requests");
     let Some(first) = open.first() else {
         return Err(format!(
             "{checks} has no open check requests, so there is nothing to wait for. File one with write({{changes:[{{target:\"{checks}\",mode:\"append\",payload:{{suite:\"<suite>\"}}}}]}})"
         ));
     };
     Ok(Some(Condition::CheckRequests {
-        uri: format!("{checks}/requests"),
+        uri: canonical.to_string(),
         project_id: first.project_id.clone(),
         ids: open.iter().map(|row| row.id.clone()).collect(),
     }))

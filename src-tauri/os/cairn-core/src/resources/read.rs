@@ -3430,6 +3430,42 @@ async fn render_resource_body(
                 read_node_checks(orch, &project, number, exec_seq, &node_id).await
             }
         }
+        CairnResource::NodeCheckRequests {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => {
+            if let Some(error) = reject_query_params("open check requests", &params) {
+                error
+            } else {
+                crate::resources::check_requests::read_open_check_requests(
+                    orch, &project, number, exec_seq, &node_id, None,
+                )
+                .await
+            }
+        }
+        CairnResource::TaskCheckRequests {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        } => {
+            if let Some(error) = reject_query_params("open check requests", &params) {
+                error
+            } else {
+                crate::resources::check_requests::read_open_check_requests(
+                    orch,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    Some(&task_name),
+                )
+                .await
+            }
+        }
         CairnResource::NodeBatches {
             project,
             number,

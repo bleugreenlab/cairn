@@ -207,6 +207,7 @@ resource_samples! {
     NodeCalls { project: project(), number: 42, exec_seq: 2, node_id: node() } => Parser,
     NodeWakes { project: project(), number: 42, exec_seq: 2, node_id: node() } => Parser,
     NodeChecks { project: project(), number: 42, exec_seq: 2, node_id: node() } => Parser,
+    NodeCheckRequests { project: project(), number: 42, exec_seq: 2, node_id: node() } => Parser,
     NodeBatches { project: project(), number: 42, exec_seq: 2, node_id: node() } => Parser,
     NodeBatch {
         project: project(),
@@ -332,6 +333,7 @@ resource_samples! {
     } => Parser,
     TaskMessages { project: project(), number: 42, exec_seq: 2, node_id: node(), task_name: task() } => Parser,
     TaskChecks { project: project(), number: 42, exec_seq: 2, node_id: node(), task_name: task() } => Parser,
+    TaskCheckRequests { project: project(), number: 42, exec_seq: 2, node_id: node(), task_name: task() } => Parser,
     TaskPermissions { project: project(), number: 42, exec_seq: 2, node_id: node(), task_name: task() } => Parser,
     TaskPermission {
         project: project(),

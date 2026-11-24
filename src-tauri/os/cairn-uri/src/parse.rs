@@ -1000,6 +1000,14 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 node_id: (*node_id).to_string(),
             })
         }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "checks", "requests"] => {
+            Some(CairnResource::NodeCheckRequests {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "batches"] => {
             Some(CairnResource::NodeBatches {
                 project: canonical_project(project),
@@ -1245,6 +1253,15 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "checks"] => {
             Some(CairnResource::TaskChecks {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "checks", "requests"] => {
+            Some(CairnResource::TaskCheckRequests {
                 project: canonical_project(project),
                 number: parse_positive_i32(number)?,
                 exec_seq: parse_positive_i32(exec_seq)?,

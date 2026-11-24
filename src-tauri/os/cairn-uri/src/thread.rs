@@ -255,6 +255,7 @@ pub fn delegate_thread_descendant(resource: CairnResource) -> Result<CairnResour
         // what a thread cannot do is leave the revision out, and filing refuses
         // that (`requests::accepted_revision`), not the address.
         ["checks"] => at_thread!(NodeChecks),
+        ["checks", "requests"] => at_thread!(NodeCheckRequests),
         ["calls"] => at_thread!(NodeCalls),
         // A thread agent's `run` hands back `cairn:~/batches/<id>` like any
         // node's does, so the handle has to resolve from a thread too.
@@ -315,6 +316,9 @@ pub fn delegate_thread_descendant(resource: CairnResource) -> Result<CairnResour
         // mutation the contract does not offer and sent a live task looping
         // through addresses (CAIRN-3874).
         ["task", task, "checks"] => at_thread!(TaskChecks, task_name: (*task).to_string()),
+        ["task", task, "checks", "requests"] => {
+            at_thread!(TaskCheckRequests, task_name: (*task).to_string())
+        }
         ["task", task, "batches"] => at_thread!(TaskBatches, task_name: (*task).to_string()),
         ["task", task, "batches", request_id] => at_thread!(
             TaskBatch,

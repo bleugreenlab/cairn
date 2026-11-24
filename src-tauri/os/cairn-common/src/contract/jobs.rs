@@ -86,6 +86,28 @@ pub(crate) const NODE_CHECKS_CONTRACT: ResourceContract =
         mutations: &[FILE_CHECK_REQUEST],
     };
 
+pub(crate) const NODE_CHECK_REQUESTS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::NodeCheckRequests,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/checks/requests",
+    name: "Node open check requests",
+    description: "The check requests this node filed that are still open: suite, revision, where each stands, how long since it was filed, and a link to each request. Exactly the set run waitFor kind:\"checks\" ref:\"cairn:~/checks/requests\" on:\"settled\" waits on",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const TASK_CHECK_REQUESTS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::TaskCheckRequests,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/checks/requests",
+    name: "Task open check requests",
+    description: "The check requests this sub-agent task filed that are still open, with a link to each. Exactly the set a settled checks wait on this address waits on",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const NODE_BATCHES_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::NodeBatches,
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/batches",

@@ -68,11 +68,13 @@ impl CairnResource {
             | NodeCalls { project, .. }
             | NodeWakes { project, .. }
             | NodeChecks { project, .. }
+            | NodeCheckRequests { project, .. }
             | NodeBatches { project, .. }
             | NodeBatch { project, .. }
             | TaskBatches { project, .. }
             | TaskBatch { project, .. }
             | TaskChecks { project, .. }
+            | TaskCheckRequests { project, .. }
             | NodeQuestions { project, .. }
             | NodeQuestion { project, .. }
             | NodePermissions { project, .. }
@@ -209,11 +211,13 @@ impl CairnResource {
             | Self::NodeCalls { project, .. }
             | Self::NodeWakes { project, .. }
             | Self::NodeChecks { project, .. }
+            | Self::NodeCheckRequests { project, .. }
             | Self::NodeBatches { project, .. }
             | Self::NodeBatch { project, .. }
             | Self::TaskBatches { project, .. }
             | Self::TaskBatch { project, .. }
             | Self::TaskChecks { project, .. }
+            | Self::TaskCheckRequests { project, .. }
             | Self::NodeQuestions { project, .. }
             | Self::NodeQuestion { project, .. }
             | Self::NodePermissions { project, .. }
@@ -402,11 +406,13 @@ impl CairnResource {
             | Self::NodeCalls { number, .. }
             | Self::NodeWakes { number, .. }
             | Self::NodeChecks { number, .. }
+            | Self::NodeCheckRequests { number, .. }
             | Self::NodeBatches { number, .. }
             | Self::NodeBatch { number, .. }
             | Self::TaskBatches { number, .. }
             | Self::TaskBatch { number, .. }
             | Self::TaskChecks { number, .. }
+            | Self::TaskCheckRequests { number, .. }
             | Self::NodeQuestions { number, .. }
             | Self::NodeQuestion { number, .. }
             | Self::NodePermissions { number, .. }

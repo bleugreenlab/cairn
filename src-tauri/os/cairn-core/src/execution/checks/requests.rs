@@ -398,23 +398,44 @@ pub(crate) async fn requests_of_requester(
     Ok(rows)
 }
 
+/// The requests a job filed that are still open, oldest first. This is the
+/// one answer to "what does `<job>/checks/requests` hold": its read renders
+/// it and a `checks` wait `on:"settled"` at that address arms on it, so the
+/// two cannot disagree about what is open.
+pub(crate) async fn open_requests_of_requester(
+    orch: &Orchestrator,
+    requester_job_id: &str,
+) -> Result<Vec<CheckRequestRow>, String> {
+    let mut rows = Vec::new();
+    for db in orch.db.all_dbs().await {
+        rows.extend(open_requests_of_requester_in(&db, requester_job_id).await?);
+    }
+    Ok(rows)
+}
+
+async fn open_requests_of_requester_in(
+    db: &LocalDb,
+    requester_job_id: &str,
+) -> Result<Vec<CheckRequestRow>, String> {
+    db.query_all(
+        format!(
+            "SELECT {ROW_COLUMNS} FROM check_requests
+              WHERE requester_job_id=?1 AND state IN {OPEN_STATES}
+              ORDER BY accepted_at_ms"
+        ),
+        (requester_job_id.to_string(),),
+        CheckRequestRow::from_row,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 async fn requests_of_requester_in(
     db: &LocalDb,
     requester_job_id: &str,
     settled_limit: usize,
 ) -> Result<Vec<CheckRequestRow>, String> {
-    let mut rows = db
-        .query_all(
-            format!(
-                "SELECT {ROW_COLUMNS} FROM check_requests
-                  WHERE requester_job_id=?1 AND state IN {OPEN_STATES}
-                  ORDER BY accepted_at_ms"
-            ),
-            (requester_job_id.to_string(),),
-            CheckRequestRow::from_row,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut rows = open_requests_of_requester_in(db, requester_job_id).await?;
     rows.extend(
         db.query_all(
             format!(

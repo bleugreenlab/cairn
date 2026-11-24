@@ -613,6 +613,7 @@ impl CairnResource {
             | Self::NodeCalls { .. }
             | Self::NodeWakes { .. }
             | Self::NodeChecks { .. }
+            | Self::NodeCheckRequests { .. }
             | Self::NodeBatches { .. }
             | Self::NodeBatch { .. }
             | Self::NodeMessages { .. }
@@ -629,6 +630,7 @@ impl CairnResource {
             | Self::TaskBatches { .. }
             | Self::TaskBatch { .. }
             | Self::TaskChecks { .. }
+            | Self::TaskCheckRequests { .. }
             | Self::TaskMessages { .. }
             | Self::JobTodos { .. }
             | Self::HomeFeed { .. } => self.read(),

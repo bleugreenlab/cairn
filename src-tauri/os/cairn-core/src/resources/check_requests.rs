@@ -163,6 +163,100 @@ pub(super) async fn requested_section(
     Some(out)
 }
 
+/// `<job>/checks/requests`: the requests a node or task filed that are still
+/// open, read from [`requests::open_requests_of_requester`], the same query a
+/// `checks` wait `on:"settled"` at this address arms on.
+pub(super) async fn read_open_check_requests(
+    orch: &Orchestrator,
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: Option<&str>,
+) -> String {
+    let db = orch.db.for_project(project).await;
+    let job_id = match super::node::resolve_node_or_task_job_id_for_read(
+        &db, project, number, exec_seq, node_id, task_name,
+    )
+    .await
+    {
+        Ok(job_id) => job_id,
+        Err(error) => return error,
+    };
+    match requests::open_requests_of_requester(orch, &job_id).await {
+        Ok(rows) => render_open(
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            &rows,
+            now_ms(),
+        ),
+        Err(error) => format!("Unable to read open check requests: {error}"),
+    }
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn age(ms: i64) -> String {
+    let seconds = (ms / 1000).max(0);
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        3600..86400 => format!("{}h {}m", seconds / 3600, seconds % 3600 / 60),
+        _ => format!("{}d {}h", seconds / 86400, seconds % 86400 / 3600),
+    }
+}
+
+fn render_open(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: Option<&str>,
+    rows: &[CheckRequestRow],
+    now: i64,
+) -> String {
+    let (uri, checks, who) = match task_name {
+        Some(task) => (
+            cairn_uri::build_task_check_requests_uri(project, number, exec_seq, node_id, task),
+            cairn_uri::build_task_checks_uri(project, number, exec_seq, node_id, task),
+            task,
+        ),
+        None => (
+            cairn_uri::build_node_check_requests_uri(project, number, exec_seq, node_id),
+            cairn_uri::build_node_checks_uri(project, number, exec_seq, node_id),
+            node_id,
+        ),
+    };
+    let mut out = format!("# Open check requests \u{2014} {who}\n\n`{uri}`\n\n");
+    if rows.is_empty() {
+        out.push_str(&format!(
+            "None open. File one with write({{changes:[{{target:\"{checks}\",mode:\"append\",payload:{{suite:\"<suite>\"}}}}]}}); settled requests and their verdicts are listed at `{checks}`.\n"
+        ));
+        return out;
+    }
+    out.push_str("| Request | Suite | Revision | State | Age |\n|---|---|---|---|---|\n");
+    for row in rows {
+        let link = requests::request_uri(project, &row.id);
+        out.push_str(&format!(
+            "| [{}]({link}) | {} | {} | {} | {} |\n",
+            row.id,
+            row.suite,
+            row.revision_spec.as_deref().unwrap_or("own head"),
+            requests::standing(row),
+            age(now - row.accepted_at_ms),
+        ));
+    }
+    out.push_str(&format!(
+        "\nWait for all of these to settle without holding anything: run({{commands:[{{waitFor:{{kind:\"checks\",ref:\"{uri}\",on:\"settled\"}}}}]}}). For one verdict, wait on its own URI with on:\"verdict\".\n"
+    ));
+    out
+}
+
 /// Requests queued on the runner and pinned to `executor_name`: what waits
 /// for this machine that its own queue does not hold.
 pub(crate) async fn pinned_section(orch: &Orchestrator, executor_name: &str) -> Option<String> {

@@ -307,6 +307,14 @@ fn the_wider_style_holds_for_kinds_the_frontend_never_labelled() {
             "cairn/6241 / builder / checks",
         ),
         (
+            "cairn://p/cairn/6241/1/builder/checks/requests",
+            "cairn/6241 / builder / open check requests",
+        ),
+        (
+            "cairn://p/cairn/6241/1/builder/task/probe/checks/requests",
+            "cairn/6241 / builder / probe / open check requests",
+        ),
+        (
             "cairn://p/cairn/6241/1/builder/tasks",
             "cairn/6241 / builder / tasks",
         ),

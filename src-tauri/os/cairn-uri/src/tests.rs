@@ -1160,6 +1160,46 @@ fn single_execution_does_not_shadow_node() {
     assert_eq!(parse_uri("cairn://p/cairn/42/executions/abc"), None);
 }
 
+/// `<node>/checks/requests` is the address agents are taught to wait on for
+/// every open request, so it must parse at the node and task level; `checks`
+/// alone keeps naming the lanes collection it always did.
+#[test]
+fn check_requests_uri_parses_beside_checks() {
+    let node = "cairn://p/cairn/7322/1/builder/checks/requests";
+    let resource = CairnResource::NodeCheckRequests {
+        project: "cairn".to_string(),
+        number: 7322,
+        exec_seq: 1,
+        node_id: "builder".to_string(),
+    };
+    assert_eq!(parse_uri(node), Some(resource.clone()));
+    assert_eq!(resource.to_uri(), node);
+
+    let task = "cairn://p/cairn/7322/1/builder/task/probe/checks/requests";
+    let resource = CairnResource::TaskCheckRequests {
+        project: "cairn".to_string(),
+        number: 7322,
+        exec_seq: 1,
+        node_id: "builder".to_string(),
+        task_name: "probe".to_string(),
+    };
+    assert_eq!(parse_uri(task), Some(resource.clone()));
+    assert_eq!(resource.to_uri(), task);
+
+    assert!(matches!(
+        parse_uri("cairn://p/cairn/7322/1/builder/checks"),
+        Some(CairnResource::NodeChecks { .. })
+    ));
+    assert!(matches!(
+        parse_uri("cairn://p/cairn/7322/1/builder/task/probe/checks"),
+        Some(CairnResource::TaskChecks { .. })
+    ));
+    assert_eq!(
+        parse_uri("cairn://p/cairn/7322/1/builder/checks/requests/extra"),
+        None
+    );
+}
+
 #[test]
 fn task_checks_uri_parses_and_round_trips() {
     let uri = "cairn://p/cairn/42/2/builder/task/review-rust/checks";

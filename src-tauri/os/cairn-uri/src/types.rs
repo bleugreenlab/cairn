@@ -577,6 +577,14 @@ pub enum CairnResource {
         exec_seq: i32,
         node_id: String,
     },
+    /// The check requests a node job filed that are still open (collection):
+    /// the set a `checks` wait `on:"settled"` at this address waits on.
+    NodeCheckRequests {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
     /// Run batches that outlived their calls, owned by a node job (collection).
     NodeBatches {
         project: String,
@@ -611,6 +619,14 @@ pub enum CairnResource {
     },
     /// Turn-end project check results owned by a sub-agent task job (collection).
     TaskChecks {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+    },
+    /// The check requests a sub-agent task job filed that are still open.
+    TaskCheckRequests {
         project: String,
         number: i32,
         exec_seq: i32,
@@ -1407,11 +1423,13 @@ impl CairnResource {
             Self::NodeCalls { .. } => ResourceKind::NodeCalls,
             Self::NodeWakes { .. } => ResourceKind::NodeWakes,
             Self::NodeChecks { .. } => ResourceKind::NodeChecks,
+            Self::NodeCheckRequests { .. } => ResourceKind::NodeCheckRequests,
             Self::NodeBatches { .. } => ResourceKind::NodeBatches,
             Self::NodeBatch { .. } => ResourceKind::NodeBatch,
             Self::TaskBatches { .. } => ResourceKind::TaskBatches,
             Self::TaskBatch { .. } => ResourceKind::TaskBatch,
             Self::TaskChecks { .. } => ResourceKind::TaskChecks,
+            Self::TaskCheckRequests { .. } => ResourceKind::TaskCheckRequests,
             Self::NodeQuestions { .. } => ResourceKind::NodeQuestions,
             Self::NodeQuestion { .. } => ResourceKind::NodeQuestion,
             Self::NodePermissions { .. } => ResourceKind::NodePermissions,
