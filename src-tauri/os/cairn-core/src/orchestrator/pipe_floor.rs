@@ -18,8 +18,8 @@
 //! Each engagement is also a row (`pipe_floor_engagements`, cairn/6440): a
 //! descriptor census taken as the floor engages ([`census`]), then a bounded
 //! release of idle sessions through the canonical Keep-policy retire
-//! ([`release`]), whose verdict says whether releasing sessions recovers
-//! fresh pipes. A `not_recovered` verdict disables releases for the build
+//! ([`release`]) that keeps releasing until the bar admission reopens on
+//! holds, and whose verdict says whether it did. A `not_recovered` verdict disables releases for the build
 //! that reached it; every engagement still takes its census. All of it runs
 //! on a detached task: the sampler only mints the engagement's id, because
 //! its next sample is what detects recovery.
@@ -28,7 +28,6 @@ mod census;
 mod release;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -491,11 +490,12 @@ pub(crate) fn render_engagement(
 struct FloorRecord {
     /// The open engagement, for its clearance.
     open: Mutex<Option<PipeFloorEngagementOpen>>,
-    /// Release times, so the per-window bound spans engagements.
+    /// Release times, so the per-window bound spans engagements. Held for a
+    /// whole pass, so passes run one at a time: an engagement that opens
+    /// while an earlier pass is still ending waits for it rather than
+    /// releasing nothing, since the floor re-engages one sample after it
+    /// clears when queued launches take the room.
     window: Mutex<VecDeque<u64>>,
-    /// One release pass at a time: an engagement that opens while an
-    /// earlier one's pass still runs takes its census and releases nothing.
-    releasing: AtomicBool,
 }
 
 fn emit_holds(orch: &Orchestrator) {
@@ -585,6 +585,7 @@ fn release_pass(
     open: &PipeFloorEngagementOpen,
     census: Option<Attribution>,
 ) -> (Reclamation, String) {
+    let mut window = floor.window.lock().unwrap_or_else(|e| e.into_inner());
     let db = orch.db.local.clone();
     let (host, build) = (open.host.clone(), open.build_id.clone());
     let disabled = run_db_blocking(move || async move {
@@ -617,12 +618,6 @@ fn release_pass(
             "no census to measure releases against".into(),
         );
     };
-    if floor.releasing.swap(true, Ordering::SeqCst) {
-        return (
-            Reclamation::Skipped,
-            "an earlier engagement's release pass is still running".into(),
-        );
-    }
     store_write("a running pass", || {
         let (db, id) = (orch.db.local.clone(), open.id.clone());
         async move { store::set_reclamation(&db, &id, Reclamation::Running, None).await }
@@ -631,10 +626,7 @@ fn release_pass(
         orch,
         engagement_id: open.id.clone(),
     };
-    let mut window = floor.window.lock().unwrap_or_else(|e| e.into_inner());
     let result = release::run_release_pass(&mut world, census, &mut window);
-    drop(window);
-    floor.releasing.store(false, Ordering::SeqCst);
     (result.verdict, result.detail)
 }
 
@@ -839,6 +831,14 @@ impl ReleaseWorld for LiveWorld<'_> {
         }
     }
 
+    fn active_sessions(&mut self) -> usize {
+        self.orch.process_state.active_process_count()
+    }
+
+    fn wait(&mut self, ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+
     fn now_ms(&mut self) -> u64 {
         unix_ms()
     }
@@ -1013,7 +1013,7 @@ mod tests {
         };
         let page = render_engagement(Some(&(engagement.clone(), vec![release])), None);
         for expected in [
-            "Pipe-driven warm reclamation: enabled (bounded: 3 per engagement, 3 per 15 s)",
+            "Pipe-driven warm reclamation: enabled (bounded: 10 per engagement, 3 per 15 s)",
             "Latest engagement `e1`",
             "at 512 B; still engaged",
             "754 pipe descriptors across 152 processes",
