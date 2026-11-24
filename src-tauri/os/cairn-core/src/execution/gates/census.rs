@@ -720,7 +720,7 @@ pub async fn census_for_executions_conn(
             concat!(
                 "SELECT e.id, COALESCE(j.node_name, j.recipe_node_id, j.id), supply_hold.boundary_source, supply_hold.observed_text,
                         supply_hold.created_at, supply_hold.resume_gate,
-                        supply_hold.launch_attempts, supply_hold.updated_at
+                        supply_hold.launch_failures_json, supply_hold.updated_at
                  FROM executions e JOIN issues i ON i.id = e.issue_id
                  JOIN jobs j ON j.execution_id = e.id
                  JOIN provider_limit_holds supply_hold ON supply_hold.job_id = j.id
@@ -743,7 +743,7 @@ pub async fn census_for_executions_conn(
                 row.opt_text(3)?.unwrap_or_else(|| source.clone()),
                 row.i64(4)?,
                 row.opt_text(5)?,
-                row.i64(6)?,
+                &row.text(6)?,
                 row.i64(7)?,
                 None,
             );
@@ -1714,12 +1714,24 @@ impl FocusStanding {
     }
 }
 
+/// The latest recorded cause, without making historical holds invent a diagnosis.
+pub(crate) fn latest_launch_failure_cause(failures: &str) -> Option<String> {
+    let entries: Vec<serde_json::Value> = serde_json::from_str(failures).ok()?;
+    let cause = entries.last()?.get("cause")?.as_str()?;
+    let cause = cause.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!cause.is_empty()).then_some(cause)
+}
+
 /// What a hold's `resume_gate` asks of the operator.
-fn gate_phrase(gate: &str, attempts: i64) -> String {
+pub(crate) fn gate_phrase(gate: &str, failures: &str) -> String {
     use crate::orchestrator::wakes::{RESUME_GATE_LAUNCH_FAILED, RESUME_GATE_TOOL_IN_FLIGHT};
     match gate {
         RESUME_GATE_LAUNCH_FAILED => {
-            format!("launch failed {attempts} times; Continue or Start now retries it")
+            format!(
+                "launch failed: {}; Continue or Start now retries it",
+                latest_launch_failure_cause(failures)
+                    .unwrap_or_else(|| "cause not recorded".into())
+            )
         }
         RESUME_GATE_TOOL_IN_FLIGHT => {
             "a tool call has no recorded result; Continue resumes it".into()
@@ -1728,18 +1740,22 @@ fn gate_phrase(gate: &str, attempts: i64) -> String {
     }
 }
 
-fn standing_for_hold(
+pub(crate) fn standing_for_hold(
     source: &str,
     reason: String,
     since: i64,
     gate: Option<String>,
-    attempts: i64,
+    failures: &str,
     updated: i64,
     place: Option<usize>,
 ) -> FocusStanding {
+    let reason = match latest_launch_failure_cause(failures) {
+        Some(cause) => format!("{reason} · latest launch failure: {cause}"),
+        None => reason,
+    };
     match (gate, source) {
         (Some(gate), _) => FocusStanding::NeedsOperator {
-            reason: gate_phrase(&gate, attempts),
+            reason: gate_phrase(&gate, failures),
             since: updated,
         },
         (None, "thread_focus") => FocusStanding::Queued {
@@ -1819,7 +1835,7 @@ pub(crate) async fn focus_standings_conn(
         .query(
             concat!(
             "SELECT i.id, supply_hold.boundary_source, supply_hold.observed_text, supply_hold.created_at,
-                    supply_hold.resume_gate, supply_hold.launch_attempts, supply_hold.updated_at
+                    supply_hold.resume_gate, supply_hold.launch_failures_json, supply_hold.updated_at
              FROM issues i INDEXED BY idx_issues_parent_thread_id
              JOIN executions e ON e.issue_id = i.id JOIN jobs j ON j.execution_id = e.id
              JOIN provider_limit_holds supply_hold ON supply_hold.job_id = j.id
@@ -1847,7 +1863,7 @@ pub(crate) async fn focus_standings_conn(
             reason,
             row.i64(3)?,
             row.opt_text(4)?,
-            row.i64(5)?,
+            &row.text(5)?,
             row.i64(6)?,
             Some(place),
         );
@@ -2162,6 +2178,30 @@ mod focus_snapshot_tests {
     use super::*;
 
     #[test]
+    fn launch_failure_reporting_names_the_latest_cause() {
+        let history = r#"[{"at":1,"cause":"old","retryable":true},{"at":2,"cause":"launch mutex\n busy","retryable":true}]"#;
+        let queued =
+            standing_for_hold("thread_focus", "focus".into(), 1, None, history, 2, Some(1));
+        assert!(queued
+            .line(3)
+            .contains("latest launch failure: launch mutex busy"));
+        let stopped = standing_for_hold(
+            "thread_focus",
+            "focus".into(),
+            1,
+            Some("launch_failed".into()),
+            history,
+            2,
+            None,
+        );
+        assert!(stopped.line(3).contains("launch failed: launch mutex busy"));
+        assert!(!stopped.line(3).contains("old"));
+        for absent in ["[]", "not json", r#"[{"cause":""}]"#] {
+            assert!(gate_phrase("launch_failed", absent).contains("cause not recorded"));
+        }
+    }
+
+    #[test]
     fn source_timestamps_do_not_tick_cached_display_text() {
         let standings = [
             FocusStanding::Queued {
@@ -2199,7 +2239,7 @@ mod focus_snapshot_tests {
             assert_eq!(later.observed_at, Some(100_000));
         }
         let unranked =
-            standing_for_hold("thread_focus", "focus".into(), 1, None, 0, 1, None).view(100);
+            standing_for_hold("thread_focus", "focus".into(), 1, None, "[]", 1, None).view(100);
         assert_eq!(unranked.place, None);
     }
 }

@@ -465,16 +465,17 @@ async fn evaluate(
                 "thread_open_prs" if hold.resume_gate.is_none() => "waiting for room under the thread's open-PR bound. It resumes on its own when that bound allows it.".to_string(),
                 _ => {
                     let description = if let Some(gate) = hold.resume_gate.as_deref() {
-                        crate::messages::delivery::Hold::ProviderLimit {
-                            retry_not_before: hold.retry_not_before,
-                            gate: Some(crate::messages::delivery::ProviderLimitGate::from_resume_gate(gate)),
-                        }
+                        return (hold.id, crate::execution::gates::census::gate_phrase(gate, &hold.launch_failures_json));
                     } else {
                         crate::messages::delivery::Hold::no_supply(&hold)
                             .expect("a resume hold is a supply hold")
                     };
                     description.render()
                 }
+            };
+            let description = match crate::execution::gates::census::latest_launch_failure_cause(&hold.launch_failures_json) {
+                Some(cause) => format!("{description} Latest launch failure: {cause}"),
+                None => description,
             };
             (hold.id, description)
         });

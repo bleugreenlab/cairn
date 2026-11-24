@@ -3247,7 +3247,7 @@ fn continue_job_launch_locked(
         admission,
         &mut launch_guard,
     );
-    if result.is_err() {
+    if let Err(ref failure) = result {
         let fallback = orch.job_launch_lock(job_id);
         let _fallback_guard = if launch_guard.is_none() {
             Some(fallback.lock().unwrap_or_else(|p| p.into_inner()))
@@ -3264,6 +3264,7 @@ fn continue_job_launch_locked(
                     &db,
                     &hold_id,
                     orch.services.clock.now(),
+                    failure,
                 )
                 .await
             }) {

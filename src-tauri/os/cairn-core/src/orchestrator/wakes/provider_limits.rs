@@ -81,6 +81,8 @@ pub struct ProviderLimitHold {
     pub observed_text: Option<String>,
     pub observed_count: i64,
     pub launch_attempts: i64,
+    /// Durable launch failures, in observation order: `{at,cause,retryable}`.
+    pub launch_failures_json: String,
     pub state: String,
     pub created_at: i64,
     pub queue_key: Option<i64>,
@@ -100,9 +102,8 @@ pub struct ProviderLimitHold {
 /// that call a second time, so only an explicit continue resumes the work.
 pub const RESUME_GATE_TOOL_IN_FLIGHT: &str = "tool_in_flight";
 
-/// Every automatic launch of the held work failed for a reason supply does
-/// not explain. Re-checking would only fail it again, so only an explicit
-/// continue resumes the work.
+/// A launch cannot be retried without changing durable session state.
+/// Attempt counts alone never establish that a failure is permanent.
 pub const RESUME_GATE_LAUNCH_FAILED: &str = "launch_failed";
 
 /// How long a hold with no declared reset waits before asking again whether
@@ -114,6 +115,24 @@ pub const SUPPLY_RECHECK_SECS: i64 = 900;
 pub const FLEET_SLOT_RECHECK_SECS: i64 = 60;
 
 impl ProviderLimitHold {
+    fn launch_backoff_until(&self) -> Option<i64> {
+        let failures: Vec<serde_json::Value> =
+            serde_json::from_str(&self.launch_failures_json).ok()?;
+        if self.state != "active" {
+            return None;
+        }
+        let Some(last) = failures.last() else {
+            // Count-only gates from older runners have no history timestamp.
+            return (self.launch_attempts > 0)
+                .then_some(self.retry_not_before)
+                .flatten();
+        };
+        last.get("retryable")?
+            .as_bool()?
+            .then(|| last.get("at")?.as_i64()?.checked_add(300))
+            .flatten()
+    }
+
     pub fn queue_order(&self) -> i64 {
         self.queue_key
             .unwrap_or_else(|| self.created_at.saturating_mul(1_000_000))
@@ -186,7 +205,7 @@ pub struct ProviderLimitObservation {
     pub now: i64,
 }
 
-const COLUMNS: &str = "id, job_id, run_id, turn_id, backend, account_id, retry_not_before, boundary_source, observed_text, observed_count, launch_attempts, state, created_at, updated_at, resolved_at, resume_gate, boundary_account_id, kind, subject, queue_key, resume_json";
+const COLUMNS: &str = "id, job_id, run_id, turn_id, backend, account_id, retry_not_before, boundary_source, observed_text, observed_count, launch_attempts, state, created_at, updated_at, resolved_at, resume_gate, boundary_account_id, kind, subject, queue_key, resume_json, launch_failures_json";
 
 fn from_row(row: &Row) -> DbResult<ProviderLimitHold> {
     Ok(ProviderLimitHold {
@@ -211,6 +230,7 @@ fn from_row(row: &Row) -> DbResult<ProviderLimitHold> {
         subject: row.opt_text(18)?,
         queue_key: row.opt_i64(19)?,
         resume_json: row.opt_text(20)?,
+        launch_failures_json: row.text(21)?,
     })
 }
 
@@ -1040,6 +1060,13 @@ async fn thread_facts_by_hold(
     Ok(out)
 }
 
+const FINISHED_THREAD_WAIT_HOLD: &str = "state='active' AND kind='resume' AND boundary_source IN ('thread_focus','thread_open_prs')
+    AND EXISTS (SELECT 1 FROM agent_waits aw WHERE aw.id=json_extract(provider_limit_holds.resume_json,'$.durable_wait')
+      AND (aw.state='cancelled' OR (aw.state='resolved' AND NOT EXISTS (
+        SELECT 1 FROM turns wt JOIN jobs wj ON wj.current_turn_id=wt.id
+         WHERE wt.id=aw.successor_turn_id AND wj.id=provider_limit_holds.job_id
+           AND (wt.state='pending' OR (wt.state='cancelled' AND wt.end_reason='launch_refused'))))))";
+
 /// A process can end after claiming a hold but before reserving a successor.
 /// The ordinary gate pass recovers that durable obligation, not a separate timer.
 async fn recover_undriven_thread_resumes(
@@ -1047,11 +1074,29 @@ async fn recover_undriven_thread_resumes(
     db: &LocalDb,
     now: i64,
 ) -> Result<(), String> {
+    // Older runners could count successful/no-op wait resolutions as failed
+    // launches. Retire those obsolete holds without asking for operator state.
+    let finished = db
+        .query_opt_i64(
+            format!("SELECT 1 FROM provider_limit_holds WHERE {FINISHED_THREAD_WAIT_HOLD} LIMIT 1"),
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if finished.is_some() {
+        db.execute(
+            format!("UPDATE provider_limit_holds SET state='superseded',updated_at=?1 WHERE {FINISHED_THREAD_WAIT_HOLD}"),
+            params![now],
+        ).await.map_err(|error| error.to_string())?;
+    }
     let candidates = db.query_all(
         "SELECT h.id,h.job_id FROM provider_limit_holds h
            JOIN jobs j ON j.id=h.job_id JOIN turns t ON t.id=j.current_turn_id
           WHERE h.state='resolved' AND h.kind='resume' AND h.resume_json IS NOT NULL
             AND h.boundary_source IN ('thread_focus','thread_open_prs')
+            AND NOT EXISTS (SELECT 1 FROM agent_waits aw WHERE aw.id=json_extract(h.resume_json,'$.durable_wait')
+              AND (aw.state='cancelled' OR (aw.state='resolved' AND NOT (
+                aw.successor_turn_id=t.id AND (t.state='pending' OR (t.state='cancelled' AND t.end_reason='launch_refused'))))))
             AND ((t.id=h.turn_id AND t.state NOT IN ('running','pending'))
               OR ((t.id=h.turn_id OR t.predecessor_id=h.turn_id)
                   AND (t.state='pending' OR (t.state='cancelled' AND t.end_reason='launch_refused'))))",
@@ -1132,7 +1177,7 @@ async fn recover_undriven_thread_resumes(
                     .write(move |conn| {
                         let id = id.clone();
                         Box::pin(async move {
-                            restore_resume_claim_conn(conn, &id, now).await?;
+                            restore_resume_claim_conn(conn, &id, now, "Runner recovery found an undriven held continuation without a live or queued launch").await?;
                             Ok(())
                         })
                     })
@@ -1409,7 +1454,7 @@ async fn claim(
         Box::pin(async move {
             let Some(hold) = load_conn(conn, &id).await? else { return Ok(None) };
             let ready = if forced { hold.releasable() } else { hold.due_at(now).is_some() };
-            if !ready { return Ok(None) }
+            if !ready || (override_record.is_none() && hold.launch_backoff_until().is_some_and(|at| at > now)) { return Ok(None) }
             let Some(turn_id) = hold.turn_id.clone() else { return Ok(None) };
             let mut rows = conn.query(
                 "SELECT t.session_id FROM jobs j JOIN turns t ON t.id=j.current_turn_id
@@ -1474,7 +1519,7 @@ async fn claim_supply_hold(
         let override_record = override_record.clone();
         Box::pin(async move {
             let Some(current) = load_conn(conn, &hold.id).await? else { return Ok(false) };
-            if !current.releasable() { return Ok(false) }
+            if !current.releasable() || (override_record.is_none() && current.launch_backoff_until().is_some_and(|at| at > now)) { return Ok(false) }
             let waits = match hold.kind {
                 HoldKind::Launch => {
                     "SELECT 1 FROM jobs WHERE id=?1 AND status='pending' AND ?2 IS NULL"
@@ -1523,12 +1568,15 @@ async fn restore_after_launch_failure(
     hold: &ProviderLimitHold,
     successor: &str,
     now: i64,
+    error: &str,
 ) -> Result<bool, String> {
     let hold = hold.clone();
     let successor = successor.to_string();
+    let error = error.to_owned();
     db.write(move |conn| {
         let hold = hold.clone();
         let successor = successor.clone();
+        let error = error.clone();
         Box::pin(async move {
             let Some(turn_id) = hold.turn_id.clone() else { return Ok(false) };
             let changed = conn.execute(
@@ -1547,19 +1595,72 @@ async fn restore_after_launch_failure(
                 "UPDATE jobs SET current_turn_id=?1, updated_at=?2 WHERE id=?3 AND current_turn_id=?4",
                 params![turn_id.as_str(), now, hold.job_id.as_str(), successor.as_str()],
             ).await?;
-            // A third failed launch is not a supply question any re-check can
-            // answer, so the hold stays visibly gated on the operator.
-            conn.execute(
-                "UPDATE provider_limit_holds SET state='active', resolved_at=NULL,
-                   launch_attempts=launch_attempts+1,
-                   retry_not_before=CASE WHEN launch_attempts+1 >= 3 THEN retry_not_before ELSE ?1 END,
-                   resume_gate=CASE WHEN launch_attempts+1 >= 3 THEN COALESCE(resume_gate, ?4) ELSE resume_gate END,
-                   updated_at=?2 WHERE id=?3 AND state='resolved'",
-                params![now.saturating_add(300), now, hold.id.as_str(), RESUME_GATE_LAUNCH_FAILED],
-            ).await?;
+            restore_failed_hold_conn(conn, &hold.id, now, &error).await?;
             Ok(true)
         })
     }).await.map_err(|error| error.to_string())
+}
+
+/// Record the actual launch error in the same transaction that restores its
+/// owner. Unknown errors remain retryable: repetition is not evidence that a
+/// transient condition needs an operator. Only durable terminal session state
+/// establishes that another automatic launch cannot succeed.
+async fn restore_failed_hold_conn(
+    conn: &crate::storage::TrackedConnection,
+    hold_id: &str,
+    now: i64,
+    error: &str,
+) -> DbResult<()> {
+    let mut rows = conn.query(
+        "SELECT s.status,s.terminal_reason,j.current_session_id,s.id FROM provider_limit_holds h
+         JOIN jobs j ON j.id=h.job_id LEFT JOIN sessions s ON s.id=j.current_session_id WHERE h.id=?1",
+        params![hold_id],
+    ).await?;
+    let terminal_session = if let Some(row) = rows.next().await? {
+        let status = row.opt_text(0)?;
+        let reason = row.opt_text(1)?;
+        if row.opt_text(2)?.is_some() && row.opt_text(3)?.is_none() {
+            Some("the current session is missing".to_string())
+        } else if status.as_deref() == Some("failed")
+            || (status.as_deref() == Some("closed")
+                && reason.as_deref()
+                    != Some(crate::orchestrator::lifecycle::ALREADY_TERMINAL_RECONCILED_REASON))
+        {
+            Some(format!(
+                "the current session is {} ({})",
+                status.unwrap_or_default(),
+                reason.as_deref().unwrap_or("no terminal reason recorded")
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    drop(rows);
+    let permanent = terminal_session.is_some();
+    let cause = match terminal_session {
+        Some(reason) => format!("{error}; {reason}"),
+        None => error.to_string(),
+    };
+    let failure = serde_json::json!({"at":now,"cause":cause,"retryable":!permanent}).to_string();
+    conn.execute(
+        "UPDATE provider_limit_holds SET state='active',resolved_at=NULL,
+           launch_attempts=launch_attempts+1,retry_not_before=?2,
+           resume_gate=CASE WHEN ?3 THEN COALESCE(resume_gate,?4) ELSE resume_gate END,
+           launch_failures_json=json_insert(launch_failures_json,'$[#]',json(?5)),updated_at=?6
+         WHERE id=?1 AND state='resolved'",
+        params![
+            hold_id,
+            now.saturating_add(300),
+            permanent,
+            RESUME_GATE_LAUNCH_FAILED,
+            failure,
+            now
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Restore a refused resume while its caller still holds the job launch lock.
@@ -1570,11 +1671,14 @@ pub(crate) async fn restore_resume_hold_after_launch_failure(
     db: &LocalDb,
     hold_id: &str,
     now: i64,
+    error: &str,
 ) -> Result<bool, String> {
     let hold_id = hold_id.to_owned();
+    let error = error.to_owned();
     db.write(move |conn| {
         let hold_id = hold_id.clone();
-        Box::pin(async move { restore_resume_claim_conn(conn, &hold_id, now).await })
+        let error = error.clone();
+        Box::pin(async move { restore_resume_claim_conn(conn, &hold_id, now, &error).await })
     })
     .await
     .map_err(|error| error.to_string())
@@ -1584,6 +1688,7 @@ async fn restore_resume_claim_conn(
     conn: &crate::storage::TrackedConnection,
     hold_id: &str,
     now: i64,
+    error: &str,
 ) -> DbResult<bool> {
     let Some(hold) = load_conn(conn, hold_id).await? else {
         return Ok(false);
@@ -1609,12 +1714,16 @@ async fn restore_resume_claim_conn(
     let active_id = active.next().await?.map(|row| row.text(0)).transpose()?;
     drop(active);
     if let Some(active_id) = active_id {
+        let failure = serde_json::json!({"at":now,"cause":error,"retryable":true}).to_string();
         conn.execute(
             "UPDATE provider_limit_holds SET resume_json=COALESCE(resume_json,?2),
                boundary_source=CASE WHEN ?3 AND COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN ?4 ELSE boundary_source END,
                queue_key=CASE WHEN ?3 AND COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN ?5 ELSE queue_key END,
                created_at=CASE WHEN ?3 AND COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN ?6 ELSE created_at END,
-               retry_not_before=CASE WHEN ?3 AND COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN NULL ELSE retry_not_before END
+               retry_not_before=CASE WHEN COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN MAX(COALESCE(retry_not_before,0),?7) ELSE retry_not_before END,
+               launch_attempts=launch_attempts+CASE WHEN COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN 1 ELSE 0 END,
+               launch_failures_json=CASE WHEN COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN json_insert(launch_failures_json,'$[#]',json(?8)) ELSE launch_failures_json END,
+               updated_at=CASE WHEN COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN ?9 ELSE updated_at END
              WHERE id=?1",
             params![
                 active_id,
@@ -1624,9 +1733,17 @@ async fn restore_resume_claim_conn(
                 hold.queue_key
                     .unwrap_or_else(|| hold.created_at.saturating_mul(1_000_000)),
                 hold.created_at,
+                now.saturating_add(300),
+                failure.as_str(),
+                now,
             ],
         )
         .await?;
+        conn.execute(
+            "UPDATE provider_limit_holds SET state='superseded',launch_attempts=launch_attempts+1,
+               launch_failures_json=json_insert(launch_failures_json,'$[#]',json(?2)),updated_at=?3 WHERE id=?1 AND state='resolved'",
+            params![hold_id,failure,now],
+        ).await?;
         return Ok(true);
     }
     let Some(original) = hold.turn_id.as_deref() else {
@@ -1657,6 +1774,38 @@ async fn restore_resume_claim_conn(
                 .and_then(|id| id.as_str())
                 .map(str::to_owned)
         });
+    if let Some(wait_id) = durable_wait.as_deref() {
+        let mut waits = conn
+            .query(
+                "SELECT state,successor_turn_id FROM agent_waits WHERE id=?1",
+                params![wait_id],
+            )
+            .await?;
+        let wait = waits
+            .next()
+            .await?
+            .map(|row| Ok::<_, DbError>((row.text(0)?, row.opt_text(1)?)))
+            .transpose()?;
+        drop(waits);
+        if let Some((wait_state, successor)) = wait {
+            if wait_state == "cancelled" {
+                return Ok(false);
+            }
+            if wait_state == "resolved" {
+                // Queued cold admission can fail after the wait resolver has
+                // finished. Only its still-undriven successor justifies replay;
+                // a completed successor or a resolved collision owes no launch.
+                if successor.as_deref() != Some(current.as_str())
+                    || !(state == "pending"
+                        || (state == "cancelled"
+                            && end_reason.as_deref() == Some("launch_refused")))
+                {
+                    return Ok(false);
+                }
+                conn.execute("UPDATE agent_waits SET state='resolving',resolved_at=NULL WHERE id=?1 AND state='resolved'", params![wait_id]).await?;
+            }
+        }
+    }
     let mut resting_head = original.to_owned();
     if current == original && (state == "running" || (state == "pending" && durable_wait.is_none()))
     {
@@ -1709,13 +1858,11 @@ async fn restore_resume_claim_conn(
         }
     }
     conn.execute(
-        "UPDATE provider_limit_holds SET state='active',resolved_at=NULL,turn_id=?2,
-           launch_attempts=launch_attempts+1,
-           retry_not_before=CASE WHEN boundary_source IN ('thread_focus','thread_open_prs') THEN NULL ELSE ?3 END,
-           resume_gate=CASE WHEN launch_attempts+1>=3 THEN COALESCE(resume_gate,?4) ELSE resume_gate END,
-           updated_at=?5 WHERE id=?1 AND state='resolved'",
-        params![hold_id,resting_head,now.saturating_add(300),RESUME_GATE_LAUNCH_FAILED,now],
-    ).await?;
+        "UPDATE provider_limit_holds SET turn_id=?2 WHERE id=?1 AND state='resolved'",
+        params![hold_id, resting_head],
+    )
+    .await?;
+    restore_failed_hold_conn(conn, hold_id, now, error).await?;
     conn.on_commit(cairn_db::admission_hint::evidence_changed);
     Ok(true)
 }
@@ -1729,6 +1876,7 @@ pub(crate) async fn restore_provider_hold_after_admission_failure(
     db: &LocalDb,
     successor: &str,
     now: i64,
+    error: &str,
 ) -> Result<bool, String> {
     let successor_id = successor.to_string();
     let hold = db.read(move |conn| {
@@ -1761,7 +1909,9 @@ pub(crate) async fn restore_provider_hold_after_admission_failure(
         // successor is still the job's head; an operator's newer head wins.
         let (hold_id, job_id, successor) =
             (hold.id.clone(), hold.job_id.clone(), successor.to_owned());
+        let error = error.to_owned();
         db.write(move |conn| {
+            let error = error.clone();
             let (hold_id, job_id, successor) = (hold_id.clone(), job_id.clone(), successor.clone());
             Box::pin(async move {
                 let mut rows = conn
@@ -1773,7 +1923,7 @@ pub(crate) async fn restore_provider_hold_after_admission_failure(
                 let ours = rows.next().await?.is_some();
                 drop(rows);
                 if ours {
-                    restore_resume_claim_conn(conn, &hold_id, now).await?;
+                    restore_resume_claim_conn(conn, &hold_id, now, &error).await?;
                 }
                 Ok(())
             })
@@ -1782,7 +1932,7 @@ pub(crate) async fn restore_provider_hold_after_admission_failure(
         .map_err(|error| error.to_string())?;
         return Ok(true);
     }
-    restore_after_launch_failure(db, &hold, successor, now).await?;
+    restore_after_launch_failure(db, &hold, successor, now, error).await?;
     // A newer head is authoritative too: this stale launch must not fail it.
     Ok(true)
 }
@@ -2084,7 +2234,9 @@ async fn resolve(
         Trigger::Timer => hold.due_at(now).is_some(),
         Trigger::SupplyChanged | Trigger::Operator => hold.releasable(),
     };
-    if !ready {
+    if !ready
+        || (trigger != Trigger::Operator && hold.launch_backoff_until().is_some_and(|at| at > now))
+    {
         return Ok(Decision::Kept);
     }
     if crate::execution::canonical::job_refusal(&db, &hold.job_id).is_some() {
@@ -2308,7 +2460,7 @@ async fn resolve_yield(
         }),
     );
     if let Err(error) = result {
-        restore_after_launch_failure(db, &hold, &successor, now).await?;
+        restore_after_launch_failure(db, &hold, &successor, now, &error).await?;
         crate::execution::advancement::recompute_job(orch, &hold.job_id)?;
         return Err(format!("Provider hold {} resume failed: {error}", hold.id));
     }
@@ -2424,8 +2576,10 @@ async fn resolve_supply_hold(
                 // failure guard runs. This fallback restores only an unchanged
                 // head; it cannot rewind a concurrent addressed continuation.
                 let id = hold.id.clone();
+                let failure = error.clone();
                 db.write(move |conn| {
                     let id = id.clone();
+                    let failure = failure.clone();
                     Box::pin(async move {
                         let mut rows = conn
                             .query(
@@ -2437,7 +2591,7 @@ async fn resolve_supply_hold(
                         let unchanged = rows.next().await?.is_some();
                         drop(rows);
                         if unchanged {
-                            restore_resume_claim_conn(conn, &id, now).await?;
+                            restore_resume_claim_conn(conn, &id, now, &failure).await?;
                         }
                         Ok(())
                     })
@@ -2512,6 +2666,7 @@ mod tests {
             observed_text: None,
             observed_count: 1,
             launch_attempts: 0,
+            launch_failures_json: "[]".into(),
             state: "active".into(),
             created_at: 1,
             updated_at: 1,
@@ -2670,7 +2825,9 @@ mod tests {
         let id = id.to_owned();
         db.write(move |conn| {
             let id = id.clone();
-            Box::pin(async move { restore_resume_claim_conn(conn, &id, NOW + 1).await })
+            Box::pin(async move {
+                restore_resume_claim_conn(conn, &id, NOW + 1, "temporary launch refusal").await
+            })
         })
         .await
         .unwrap()
@@ -2825,9 +2982,16 @@ mod tests {
                 assert_eq!(replacement.queue_key, None);
             } else {
                 assert_eq!(replacement.boundary_source, "thread_focus");
-                assert_eq!(replacement.retry_not_before, None);
+                assert_eq!(replacement.retry_not_before, Some(NOW + 400));
                 assert_eq!(replacement.created_at, hold.created_at);
                 assert_eq!(replacement.queue_key, Some(17));
+                assert_eq!(replacement.launch_backoff_until(), Some(NOW + 301));
+                assert!(!claim_supply_hold(&db, &replacement, NOW + 300, None)
+                    .await
+                    .unwrap());
+                assert!(claim_supply_hold(&db, &replacement, NOW + 301, None)
+                    .await
+                    .unwrap());
             }
             db.execute(
                 "DELETE FROM provider_limit_holds WHERE id='replacement'",
@@ -2836,6 +3000,207 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn finished_waits_never_become_failed_launches() {
+        use crate::db::DbState;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+
+        for (wait_state, successor) in [
+            ("resolved", Some("head")),
+            ("resolved", None),
+            ("cancelled", None),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let db = Arc::new(seeded("finished-focus-wait").await);
+            let state = Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.path().join("search")).unwrap()),
+            ));
+            let orch = Orchestrator::builder(
+                state,
+                Arc::new(TestServicesBuilder::new().build()),
+                root.path().to_path_buf(),
+            )
+            .build();
+            let held = arm_supply_resume_hold(
+                &db,
+                refused("r", HoldKind::Resume, None),
+                r#"{"durable_wait":"wait"}"#.into(),
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at,successor_turn_id,result_stored_at)
+                 VALUES('wait','r','run','session','head','call','{}',?1,1,?2,1)",
+                params![wait_state,successor],
+            ).await.unwrap();
+            db.execute(
+                "UPDATE provider_limit_holds SET state='resolved',boundary_source='thread_focus',queue_key=17 WHERE id=?1",
+                params![held.id.as_str()],
+            ).await.unwrap();
+            for _ in 0..4 {
+                assert!(!restore_resume(&db, &held.id).await);
+                recover_undriven_thread_resumes(&orch, &db, NOW)
+                    .await
+                    .unwrap();
+            }
+            let row = db.query_one(
+                "SELECT state,launch_attempts,launch_failures_json FROM provider_limit_holds WHERE id=?1",
+                params![held.id.as_str()],
+                |row| Ok((row.text(0)?,row.i64(1)?,row.text(2)?)),
+            ).await.unwrap();
+            assert_eq!(
+                row,
+                ("resolved".into(), 0, "[]".into()),
+                "{wait_state} {successor:?}"
+            );
+            // Repair an obsolete attempt-count gate without operator-written state.
+            db.execute("UPDATE provider_limit_holds SET state='active',resume_gate='launch_failed',launch_attempts=3 WHERE id=?1", params![held.id.as_str()]).await.unwrap();
+            recover_undriven_thread_resumes(&orch, &db, NOW)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.query_opt_text(
+                    "SELECT state FROM provider_limit_holds WHERE id=?1",
+                    params![held.id.as_str()]
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                Some("superseded")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_failures_keep_the_queue_and_history_without_a_terminal_gate() {
+        let db = seeded("transient-focus-failures").await;
+        let held = arm_supply_resume_hold(
+            &db,
+            refused("r", HoldKind::Resume, None),
+            r#"{"cause":"system","message":"kept input"}"#.into(),
+        )
+        .await
+        .unwrap();
+        db.execute("UPDATE provider_limit_holds SET boundary_source='thread_focus',queue_key=17 WHERE id=?1",params![held.id.as_str()]).await.unwrap();
+        for (index, cause) in [
+            "launch contention",
+            "capacity unavailable",
+            "runner restarted",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let now = NOW + (index as i64) * 300;
+            let hold = active_supply_hold(&db, "r").await.unwrap().unwrap();
+            assert!(claim_supply_hold(&db, &hold, now, None).await.unwrap());
+            let id = held.id.clone();
+            db.write(move |conn| {
+                let id = id.clone();
+                Box::pin(async move { restore_resume_claim_conn(conn, &id, now, cause).await })
+            })
+            .await
+            .unwrap();
+            let restored = active_supply_hold(&db, "r").await.unwrap().unwrap();
+            assert!(restored.releasable());
+            assert_eq!(restored.resume_gate, None);
+            assert_eq!(restored.launch_attempts, index as i64 + 1);
+            assert_eq!(restored.retry_not_before, Some(now + 300));
+            assert_eq!(restored.launch_backoff_until(), Some(now + 300));
+            assert!(
+                !claim_supply_hold(&db, &hold, now + 299, None)
+                    .await
+                    .unwrap(),
+                "a stale release observation cannot bypass the durable backoff"
+            );
+            assert_eq!(restored.queue_key, Some(17));
+            assert_eq!(restored.created_at, held.created_at);
+            assert_eq!(restored.resume_json, held.resume_json);
+            let failures: Vec<serde_json::Value> =
+                serde_json::from_str(&restored.launch_failures_json).unwrap();
+            assert_eq!(failures.len(), index + 1);
+            assert_eq!(failures.last().unwrap()["cause"], cause);
+            assert_eq!(failures.last().unwrap()["retryable"], true);
+        }
+        let hold = active_supply_hold(&db, "r").await.unwrap().unwrap();
+        assert!(claim_supply_hold(&db, &hold, NOW + 900, None)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_terminal_session_gates_with_its_actual_cause() {
+        let db = seeded("terminal-hold-session").await;
+        let held = arm_supply_hold(&db, refused("r", HoldKind::Resume, None))
+            .await
+            .unwrap();
+        db.execute_script("UPDATE jobs SET current_session_id='session' WHERE id='r'; UPDATE sessions SET status='closed',terminal_reason='node_removed' WHERE id='session';").await.unwrap();
+        assert!(claim_supply_hold(&db, &held, NOW, None).await.unwrap());
+        assert!(restore_resume(&db, &held.id).await);
+        let restored = active_supply_hold(&db, "r").await.unwrap().unwrap();
+        assert_eq!(
+            restored.resume_gate.as_deref(),
+            Some(RESUME_GATE_LAUNCH_FAILED)
+        );
+        let failures: Vec<serde_json::Value> =
+            serde_json::from_str(&restored.launch_failures_json).unwrap();
+        assert_eq!(failures[0]["retryable"], false);
+        assert!(failures[0]["cause"]
+            .as_str()
+            .unwrap()
+            .contains("closed (node_removed)"));
+    }
+
+    #[tokio::test]
+    async fn a_resolved_wait_with_an_unlaunched_successor_remains_retryable() {
+        let db = seeded("resolved-wait-cold-refusal").await;
+        let held = arm_supply_resume_hold(
+            &db,
+            refused("r", HoldKind::Resume, None),
+            r#"{"durable_wait":"wait"}"#.into(),
+        )
+        .await
+        .unwrap();
+        db.execute_script(
+            "INSERT INTO turns(id,session_id,job_id,sequence,predecessor_id,state,start_reason,created_at,updated_at)
+               VALUES('cold','session','r',2,'head','pending','wait_resolved',2,2);
+             UPDATE jobs SET current_turn_id='cold' WHERE id='r';
+             INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at,successor_turn_id,result_stored_at)
+               VALUES('wait','r','run','session','head','call','{}','resolved',1,'cold',1);",
+        ).await.unwrap();
+        db.execute("UPDATE provider_limit_holds SET state='resolved',boundary_source='thread_focus',queue_key=17 WHERE id=?1",params![held.id.as_str()]).await.unwrap();
+        assert!(restore_provider_hold_after_admission_failure(
+            &db,
+            "cold",
+            NOW,
+            "session memory temporarily unavailable"
+        )
+        .await
+        .unwrap());
+        let restored = active_supply_hold(&db, "r").await.unwrap().unwrap();
+        assert_eq!(restored.turn_id.as_deref(), Some("cold"));
+        assert_eq!(restored.resume_gate, None);
+        assert_eq!(restored.retry_not_before, Some(NOW + 300));
+        assert_eq!(
+            db.query_opt_text("SELECT state FROM agent_waits WHERE id='wait'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("resolving")
+        );
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT result_stored_at FROM agent_waits WHERE id='wait'",
+                ()
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
     }
 
     #[tokio::test]

@@ -543,8 +543,20 @@ async fn render_issue_parts(
                 .ok()
                 .flatten()
                 .as_ref()
-                .and_then(crate::messages::delivery::Hold::no_supply)
-                .map(|hold| format!(" {}", hold.qualifier()))
+                .map(|hold| {
+                    let standing = crate::execution::gates::census::standing_for_hold(
+                        &hold.boundary_source,
+                        hold.observed_text
+                            .clone()
+                            .unwrap_or_else(|| hold.boundary_source.clone()),
+                        hold.created_at,
+                        hold.resume_gate.clone(),
+                        &hold.launch_failures_json,
+                        hold.updated_at,
+                        None,
+                    );
+                    format!(" {}", standing.line(chrono::Utc::now().timestamp()))
+                })
                 .unwrap_or_default();
             let status = format!("{}{held}", job_status_icon(&job.status));
 

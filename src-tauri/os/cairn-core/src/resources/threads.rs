@@ -743,11 +743,11 @@ mod children_tests {
         )
         .await;
 
-        // Three failed launches gate the re-entry: it leaves the band and
+        // A non-retryable launch failure gates the re-entry: it leaves the band and
         // reads as stopped, needing the operator, with no place in line.
         env.db
             .execute_script(
-                "UPDATE provider_limit_holds SET resume_gate='launch_failed',launch_attempts=3,updated_at=900 WHERE id='ch100';",
+                "UPDATE provider_limit_holds SET resume_gate='launch_failed',launch_attempts=1,launch_failures_json='[{\"at\":900,\"cause\":\"recipe node missing\",\"retryable\":false}]',updated_at=900 WHERE id='ch100';",
             )
             .await
             .unwrap();
@@ -765,9 +765,14 @@ mod children_tests {
             .await
             .unwrap();
         assert!(
-            matches!(standing.get("ci100"), Some(FocusStanding::NeedsOperator { reason, since: 900 }) if reason.contains("launch failed 3 times")),
+            matches!(standing.get("ci100"), Some(FocusStanding::NeedsOperator { reason, since: 900 }) if reason.contains("launch failed: recipe node missing")),
             "{:?}",
             standing.get("ci100")
+        );
+        let issue = super::super::issue::read_issue(&env.db, &env.db, "prj", 100).await;
+        assert!(
+            issue.contains("launch failed: recipe node missing"),
+            "{issue}"
         );
         let queue = super::read_thread_queue(
             &env.db,

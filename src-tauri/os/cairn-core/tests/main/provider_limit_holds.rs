@@ -1440,26 +1440,39 @@ async fn await_restored(db: &LocalDb, id: &str, attempts: i64) {
     .unwrap_or_else(|_| panic!("hold {id} was not restored for attempt {attempts}"));
 }
 
-/// A held re-entry whose launch really fails three times is gated
-/// `launch_failed`: only the operator releases it, so it leaves the band. A
-/// later re-entry and then a fresh filing on the same thread both still
-/// release when a slot frees, rather than queueing behind it forever.
+/// Move the recorded launch backoff into the past without sleeping. Both the
+/// scheduling deadline and the failure history participate in release checks.
+/// The past is the sweep's: it judges backoff against the services clock, not
+/// the wall clock the admission worker stamps failures with.
+async fn expire_launch_backoff(orch: &Orchestrator, db: &LocalDb, id: &str) {
+    let now = orch.services.clock.now();
+    db.execute(
+        "UPDATE provider_limit_holds SET retry_not_before=?2-1,
+           launch_failures_json=json_set(launch_failures_json,'$[#-1].at',?2-301)
+         WHERE id=?1",
+        params![id, now],
+    )
+    .await
+    .unwrap();
+}
+
+/// Transient cold-start failures preserve the held continuation and its FIFO
+/// place, even after three failures. Recovery needs no operator intervention.
 #[tokio::test]
-async fn a_launch_failed_reentry_leaves_the_band_and_blocks_no_later_work() {
+async fn a_focus_reentry_survives_three_transient_launch_failures() {
     use cairn_core::internal::execution::jobs::WakeCause;
-    use cairn_core::internal::orchestrator::wakes::RESUME_GATE_LAUNCH_FAILED;
     let (temp, db, orch, _recorder) = focus_fixture().await;
     continue_job_impl(
         WakeCause::System,
         &orch,
         "a",
-        Some("gated-marker"),
+        Some("retry-marker"),
         None,
         None,
     )
     .unwrap_err();
-    let gated = only_hold(&db).await;
-    assert_eq!(gated.launch_attempts, 0);
+    let held = only_hold(&db).await;
+    assert_eq!(held.boundary_source, "thread_focus");
     drop(orch);
     let (orch, failing) = orchestrator_with_spawn_failure(
         &temp,
@@ -1478,86 +1491,57 @@ async fn a_launch_failed_reentry_leaves_the_band_and_blocks_no_later_work() {
             .await
             .unwrap();
         promote_private_lanes_for_test(&orch);
-        await_restored(&db, &gated.id, attempt).await;
+        await_restored(&db, &held.id, attempt).await;
         assert_eq!(failing.spawn_count(), attempt as usize);
+        let restored = only_hold(&db).await;
+        assert_eq!(restored.id, held.id);
+        assert_eq!(restored.resume_gate, None);
+        assert_eq!(restored.queue_order(), held.queue_order());
+        assert_eq!(restored.created_at, held.created_at);
+        assert_eq!(restored.resume_json, held.resume_json);
+        let failures: Vec<serde_json::Value> =
+            serde_json::from_str(&restored.launch_failures_json).unwrap();
+        assert_eq!(failures.len(), attempt as usize);
+        let last = failures.last().unwrap();
+        assert_eq!(last["retryable"], true);
+        assert!(last["cause"]
+            .as_str()
+            .unwrap()
+            .contains("fixture cold spawn refused"));
+        let failed_at = last["at"].as_i64().unwrap();
+        assert_eq!(restored.retry_not_before, Some(failed_at + 300));
+        assert!(!release_on_supply_change(&orch, &restored, failed_at + 299)
+            .await
+            .unwrap());
+        cairn_core::internal::execution::gates::sweep::sweep(&orch)
+            .await
+            .unwrap();
+        assert_eq!(
+            failing.spawn_count(),
+            attempt as usize,
+            "backoff prevents an immediate retry"
+        );
+        if attempt < 3 {
+            expire_launch_backoff(&orch, &db, &held.id).await;
+        }
     }
-    let restored = only_hold(&db).await;
-    assert_eq!(
-        restored.resume_gate.as_deref(),
-        Some(RESUME_GATE_LAUNCH_FAILED)
-    );
-    cairn_core::internal::execution::gates::sweep::sweep(&orch)
-        .await
-        .unwrap();
-    assert_eq!(failing.spawn_count(), 3, "a gated hold is not retried");
     drop(orch);
 
-    // Healthy launches from here. The cap fills again and a second child
-    // re-enters behind it.
     let (orch, recorder) = orchestrator(&temp, db.clone());
-    second_parked_child(&db).await;
-    db.execute(
-        "UPDATE turns SET state='running',ended_at=NULL WHERE id='busy-turn'",
-        (),
-    )
-    .await
-    .unwrap();
-    busy_child_serving(&orch);
-    let error = continue_job_impl(
-        WakeCause::System,
-        &orch,
-        "c",
-        Some("later-reentry-marker"),
-        None,
-        None,
-    )
-    .unwrap_err();
-    assert!(error.contains("focus"), "{error}");
-    let later = load_active_provider_limit_holds(&db)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|h| h.job_id == "c")
-        .unwrap();
-    assert!(gated.queue_order() < later.queue_order());
-
-    // The slot frees: the later re-entry releases despite the older gated hold.
-    db.execute(
-        "UPDATE turns SET state='complete',ended_at=4 WHERE id='busy-turn'",
-        (),
-    )
-    .await
-    .unwrap();
     cairn_core::internal::execution::gates::sweep::sweep(&orch)
         .await
         .unwrap();
-    await_admission(&orch, "c", "active").await;
+    assert_eq!(recorder.spawn_count(), 0, "restart preserves backoff");
+    expire_launch_backoff(&orch, &db, &held.id).await;
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    await_admission(&orch, "a", "active").await;
     assert_eq!(recorder.spawn_count(), 1);
-    assert_eq!(marker_deliveries(&db, "c", "later-reentry-marker").await, 1);
-
-    // Its turn ends: a fresh filing on the thread starts at once.
-    db.execute_script("UPDATE turns SET state='complete',ended_at=5 WHERE job_id='c' AND state IN ('pending','running');
-        INSERT INTO issues(id,project_id,number,title,status,parent_thread_id,created_at,updated_at) VALUES('fresh','project',4,'Fresh','active','focus',1,1);
-        INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('fresh-exec','hold','fresh','project','running',1,1);
-        INSERT INTO jobs(id,execution_id,issue_id,project_id,status,node_name,created_at,updated_at) VALUES('fresh','fresh-exec','fresh','project','pending','Fresh',1,1);").await.unwrap();
-    assert!(
-        cairn_core::internal::orchestrator::wakes::admit_thread_launch(
-            &orch,
-            "fresh",
-            WakeCause::System,
-            false
-        )
+    assert!(load_active_provider_limit_holds(&db)
         .await
         .unwrap()
-        .is_some(),
-        "a fresh start is not held behind a gated hold"
-    );
-    let still = load_active_provider_limit_holds(&db).await.unwrap();
-    assert_eq!(still.len(), 1, "{still:?}");
-    assert_eq!(
-        still[0].id, gated.id,
-        "the gated hold waits for the operator"
-    );
+        .is_empty());
     assert_eq!(
         common::scalar_i64_by_id(
             &db,
@@ -1565,9 +1549,23 @@ async fn a_launch_failed_reentry_leaves_the_band_and_blocks_no_later_work() {
             "a"
         )
         .await,
-        0,
-        "the gated child has no live successor"
+        1,
+        "one live successor"
     );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &db,
+            "SELECT COUNT(*) FROM events WHERE turn_id=(SELECT current_turn_id FROM jobs WHERE id=?1) AND data LIKE '%retry-marker%'",
+            "a"
+        )
+        .await,
+        1,
+        "the healthy successor receives the original input once"
+    );
+    cairn_core::internal::execution::gates::sweep::sweep(&orch)
+        .await
+        .unwrap();
+    assert_eq!(recorder.spawn_count(), 1);
 }
 
 /// Plan verification 5 (harness condition 2): an Addressed Continue on a child
@@ -1841,6 +1839,16 @@ async fn a_crash_between_focus_claim_and_launch_is_recovered_with_its_place() {
         )
         .await
         .unwrap();
+        cairn_core::internal::execution::gates::sweep::sweep(&orch)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorder.spawn_count(),
+            0,
+            "recovery backoff survives a free slot"
+        );
+        assert_eq!(only_hold(&db).await.id, held.id);
+        expire_launch_backoff(&orch, &db, &held.id).await;
         cairn_core::internal::execution::gates::sweep::sweep(&orch)
             .await
             .unwrap();

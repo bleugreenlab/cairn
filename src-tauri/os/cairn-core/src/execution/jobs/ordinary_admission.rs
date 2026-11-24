@@ -1278,7 +1278,7 @@ fn terminalize_failed_start(
             let now = chrono::Utc::now().timestamp();
             let held = !preserve_run
                 && crate::orchestrator::wakes::restore_provider_hold_after_admission_failure(
-                    &owning, &turn_id, now,
+                    &owning, &turn_id, now, &error,
                 ).await?;
             let published_turn_id = turn_id.clone();
             owning.write(move |conn| {
