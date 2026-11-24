@@ -816,6 +816,7 @@ impl From<Duration> for ComputeBudget {
 }
 
 impl ComputeBudget {
+    /// No duration means no wall-clock compute deadline, not a large timeout.
     pub fn duration(self) -> Option<Duration> {
         match self {
             Self::Finite(duration) => Some(duration),
@@ -824,6 +825,8 @@ impl ComputeBudget {
         }
     }
 
+    /// Scope subprocess and cooperative merge work to the same allowance.
+    /// Explicit unbounded test work also disables per-command timeout defaults.
     pub fn scope(self, jj: &super::JjEnv) -> super::JjEnv {
         match self {
             Self::Finite(duration) => jj.with_operation_budget(duration),
@@ -1746,8 +1749,8 @@ fn compute_with_recovery(
     }
     let deadline = Deadline::for_replay(jj, &snapshot, budget);
     // Legacy callers without an operation budget retain the canonical
-    // maintenance-owned stale-lock proof. Detached callers always have an
-    // absolute bound and never enter that unbounded external proof.
+    // maintenance-owned stale-lock proof. Finite detached callers always have
+    // an absolute bound; explicit unbounded test work retains maintenance patience.
     let patience = if legacy {
         jj.clone()
     } else {

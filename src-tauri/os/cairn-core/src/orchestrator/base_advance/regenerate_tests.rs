@@ -58,6 +58,8 @@ impl Fake {
             ws: h.branch_ws.clone(),
             store: h.store.clone(),
         });
+        // These fixtures prove settlement, not the production replay deadline.
+        super::preparation::tests::unbound_compute(&h.store);
         regenerate::install_test_runner(&h.store, fake.clone());
         fake
     }
@@ -501,8 +503,21 @@ async fn a_registry_list_and_a_regenerable_pair_settle_in_one_recompute() {
     );
     h.commit(&h.branch_ws, BRANCH, "out.gen", "derived from owner\n");
     let fake = Fake::install(&h, None, vec![Plan::Pass("derived from both\n")]);
+    let computes = Arc::new(AtomicUsize::new(0));
+    let observed = computes.clone();
+    super::preparation::tests::on_compute(
+        &h.store,
+        Box::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
 
     let prepared = h.prepare(PreparationPurpose::OwnerCommit).await.unwrap();
+    assert_eq!(
+        computes.load(Ordering::SeqCst),
+        2,
+        "the initial conflict and one recompute settle both declarations"
+    );
     let registry = show(&h, &prepared.head_after, "registry.rs");
     assert!(
         registry.contains("\"owner\"") && registry.contains("\"incoming\""),

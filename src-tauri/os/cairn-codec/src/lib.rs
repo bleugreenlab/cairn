@@ -18,6 +18,7 @@
 pub mod codec;
 pub mod diff;
 pub mod objects;
+mod pack_index;
 pub mod packfile;
 pub mod scratch_tree;
 pub mod transfer;

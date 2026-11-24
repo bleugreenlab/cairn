@@ -68,7 +68,7 @@ pub(crate) struct AssessmentScope<'a> {
 /// fallback answer.
 pub(crate) async fn bounded_store_assessment<T, F>(
     jj: &JjEnv,
-    budget: std::time::Duration,
+    budget: impl Into<crate::jj::ComputeBudget>,
     scope: AssessmentScope<'_>,
     work: F,
 ) -> Result<T, String>
@@ -90,7 +90,7 @@ pub(crate) struct StoreAssessment<T> {
 
 pub(crate) async fn bounded_store_assessment_measured<T, F>(
     jj: &JjEnv,
-    budget: std::time::Duration,
+    budget: impl Into<crate::jj::ComputeBudget>,
     scope: AssessmentScope<'_>,
     work: F,
 ) -> StoreAssessment<T>
@@ -99,14 +99,19 @@ where
     F: FnOnce(&JjEnv) -> Result<T, String> + Send + 'static,
 {
     let started = std::time::Instant::now();
-    let budgeted = jj.with_operation_budget(budget);
+    let budget = budget.into();
+    let budgeted = budget.scope(jj);
     let worker = tokio::task::spawn_blocking(move || {
         let started = std::time::Instant::now();
         let result = work(&budgeted);
         (result, started.elapsed())
     });
     let mut completed_work = None;
-    let outcome = match tokio::time::timeout(budget + ASSESSMENT_JOIN_GRACE, worker).await {
+    let joined = match budget.duration() {
+        Some(duration) => tokio::time::timeout(duration + ASSESSMENT_JOIN_GRACE, worker).await,
+        None => Ok(worker.await),
+    };
+    let outcome = match joined {
         Ok(Ok((result, elapsed))) => {
             if result.is_ok() {
                 completed_work = Some(elapsed);
@@ -123,7 +128,8 @@ where
             scope.phase,
             scope.branch,
             scope.candidate_paths,
-            (budget + ASSESSMENT_JOIN_GRACE).as_secs_f64()
+            (budget.duration().expect("a timeout has a finite budget") + ASSESSMENT_JOIN_GRACE)
+                .as_secs_f64()
         )),
     };
     let elapsed = started.elapsed();
@@ -135,7 +141,7 @@ where
             scope.branch,
             scope.candidate_paths,
             elapsed.as_secs_f64(),
-            budget.as_secs_f64(),
+            budget.duration().map_or(f64::INFINITY, |duration| duration.as_secs_f64()),
             match &outcome {
                 Ok(_) => "completed",
                 Err(error) if crate::jj::is_jj_timeout_error(error) => "timed out",

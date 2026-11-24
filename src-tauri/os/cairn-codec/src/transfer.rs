@@ -11,6 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::pack_index::{index_pack, IndexBounds, IndexError};
 use crate::packfile::{pack_scratch_dir, ExecutionPack};
 
 const PACK_FRAME_MAGIC: &[u8; 8] = b"CAIRNPK1";
@@ -388,7 +389,7 @@ pub fn validate_pack_file(
         }));
     }
     let index_path = scratch_dir.path().join("incoming.idx");
-    let manifest = index_quarantined_pack(scratch_dir.path(), &pack_path, &index_path, limits)?;
+    let manifest = index_quarantined_pack(&pack_path, &index_path, limits)?;
     Ok(ValidatedPackFile {
         _dir: scratch_dir,
         pack_path,
@@ -397,90 +398,58 @@ pub fn validate_pack_file(
     })
 }
 
-/// Index `pack_path` against an empty object database in `scratch`, writing
-/// `index_path`, and hold the result to `limits`.
+/// Index `pack_path` in process, writing `index_path`, and hold the result to
+/// `limits`. Only objects inside the pack can serve as delta bases, so a thin
+/// pack is refused; commits whose parents an alternate object database
+/// supplies are fine, since indexing never follows links between objects.
 fn index_quarantined_pack(
-    scratch: &Path,
     pack_path: &Path,
     index_path: &Path,
     limits: PackLimits,
 ) -> Result<PackManifest, PackValidationError> {
-    let git_dir = scratch.join("repository.git");
-    // host-default-branch: a throwaway quarantine that validates a pack's
-    // objects; no ref in it is ever read.
-    let init = Command::new("git")
-        .args(["init", "--bare", "--quiet"])
-        .arg(&git_dir)
-        .output()
-        .map_err(|e| format!("initializing quarantine repository: {e}"))?;
-    if !init.status.success() {
-        return Err(format!(
-            "initializing quarantine repository: {}",
-            String::from_utf8_lossy(&init.stderr).trim()
-        )
-        .into());
-    }
-    let objects = git_dir.join("objects");
     let pack_bytes = fs::metadata(pack_path)
         .map_err(|e| format!("reading quarantined pack: {e}"))?
         .len();
-
-    let input = File::open(pack_path).map_err(|e| format!("opening quarantined pack: {e}"))?;
-    let output = Command::new("git")
-        // Indexing against an empty object directory rejects unresolved delta
-        // bases. Do not use `--strict`: a legitimate delta-range pack may carry
-        // a commit whose parent is intentionally supplied by an alternate ODB.
-        .args(["index-pack", "--index-version=2", "-o"])
-        .arg(index_path)
-        .arg("--stdin")
-        .env("GIT_DIR", &git_dir)
-        .env("GIT_OBJECT_DIRECTORY", &objects)
-        .stdin(Stdio::from(input))
-        .output()
-        .map_err(|e| format!("spawning git index-pack: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "invalid or thin pack: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    let objects_manifest = verify_pack_manifest(index_path)?;
-    let object_count = objects_manifest.len() as u64;
-    let canonical_bytes = objects_manifest.iter().try_fold(0u64, |sum, object| {
-        sum.checked_add(object.canonical_bytes)
-            .ok_or_else(|| "canonical object size overflow".to_string())
-    })?;
-    if object_count > limits.max_object_count {
-        return Err(PackValidationError::Limit(LimitViolation {
+    let bounds = IndexBounds {
+        max_objects: limits.max_object_count,
+        max_inflated_bytes: limits.max_inflated_bytes,
+    };
+    let indexed = index_pack(pack_path, bounds).map_err(|error| match error {
+        IndexError::Invalid(detail) => {
+            PackValidationError::Invalid(format!("invalid or thin pack: {detail}"))
+        }
+        IndexError::TooManyObjects { actual } => PackValidationError::Limit(LimitViolation {
             dimension: LimitDimension::ObjectCount,
-            actual: object_count,
+            actual,
             limit: limits.max_object_count,
-        }));
-    }
-    if canonical_bytes > limits.max_inflated_bytes {
-        return Err(PackValidationError::Limit(LimitViolation {
+        }),
+        IndexError::TooLarge { actual } => PackValidationError::Limit(LimitViolation {
             dimension: LimitDimension::InflatedBytes,
-            actual: canonical_bytes,
+            actual,
             limit: limits.max_inflated_bytes,
-        }));
-    }
-    // With `--stdin` Git reports `pack\t<checksum>` rather than the bare
-    // checksum produced by file-based indexing.
-    let checksum_output = String::from_utf8_lossy(&output.stdout);
-    let checksum = checksum_output
-        .split_whitespace()
-        .next_back()
-        .ok_or_else(|| "git index-pack did not report a pack checksum".to_string())?
-        .to_owned();
-    validate_oid(&checksum)?;
+        }),
+    })?;
+    write_synced(index_path, &indexed.index)?;
+    let objects: Vec<ObjectSize> = indexed
+        .objects
+        .into_iter()
+        .map(|object| ObjectSize {
+            oid: object.oid,
+            kind: object.kind.to_owned(),
+            canonical_bytes: object.size,
+        })
+        .collect();
+    let canonical_bytes = objects
+        .iter()
+        .map(|object| object.canonical_bytes)
+        .sum::<u64>();
     Ok(PackManifest {
-        pack_checksum: checksum,
+        pack_checksum: indexed.pack_checksum,
         pack_bytes,
-        index_bytes: fs::metadata(index_path).map_err(|e| e.to_string())?.len(),
-        object_count,
+        index_bytes: indexed.index.len() as u64,
+        object_count: objects.len() as u64,
         canonical_bytes,
-        objects: objects_manifest,
+        objects,
     })
 }
 
@@ -1198,40 +1167,6 @@ fn build_pack_from_oids(repository: &Path, object_ids: &str) -> Result<Execution
     let index = fs::read(scratch.path().join(format!("range-{checksum}.idx")))
         .map_err(|e| e.to_string())?;
     Ok((pack, index))
-}
-
-fn verify_pack_manifest(index_path: &Path) -> Result<Vec<ObjectSize>, String> {
-    let output = Command::new("git")
-        .args(["verify-pack", "-v"])
-        .arg(index_path)
-        .output()
-        .map_err(|e| format!("spawning git verify-pack: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "verifying pack: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let mut objects = Vec::new();
-    let mut seen = BTreeSet::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() < 5 || validate_oid(fields[0]).is_err() {
-            continue;
-        }
-        let canonical_bytes = fields[2]
-            .parse::<u64>()
-            .map_err(|e| format!("invalid verify-pack size: {e}"))?;
-        if !seen.insert(fields[0].to_owned()) {
-            return Err(format!("duplicate object {} in pack manifest", fields[0]));
-        }
-        objects.push(ObjectSize {
-            oid: fields[0].to_owned(),
-            kind: fields[1].to_owned(),
-            canonical_bytes,
-        });
-    }
-    Ok(objects)
 }
 
 /// Copy `from` to a new file at `to`, durable before it is published.

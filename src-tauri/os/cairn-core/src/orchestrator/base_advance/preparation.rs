@@ -2063,6 +2063,15 @@ impl Context<'_> {
         }
     }
 
+    /// All compute phases share the fixture allowance, including spawned requests.
+    fn compute_allowance(&self, bound: Duration) -> crate::jj::ComputeBudget {
+        #[cfg(test)]
+        if self.request.deadline.is_none() && tests::compute_unbounded(&self.store) {
+            return crate::jj::ComputeBudget::Unbounded;
+        }
+        within_deadline(self.request, bound).into()
+    }
+
     /// The budget the whole request was given: the explicit request's, or this
     /// preparation's own compute budget.
     fn request_budget(&self) -> Duration {
@@ -2398,7 +2407,7 @@ impl Context<'_> {
         // the captured index under this same guard, before any repair,
         // cooldown, session or compute work.
         let (guard, (snapshot, prepared)) = {
-            let budget = within_deadline(request, request.compute_budget);
+            let budget = self.compute_allowance(request.compute_budget);
             under_guard(guard, "check already prepared", move || {
                 let prepared = snapshot.already_prepared(budget);
                 (snapshot, prepared)
@@ -2740,9 +2749,14 @@ impl Context<'_> {
         // to completion; its deadline is cooperative and it publishes nothing.
         let jj = self.jj.clone();
         let carry = request.carry.clone();
-        let budget = within_deadline(request, request.compute_budget);
+        let budget = self.compute_allowance(request.compute_budget);
         #[cfg(test)]
-        let budget = tests::replay_allowance(&self.store, budget, true);
+        let budget = match budget {
+            crate::jj::ComputeBudget::Finite(allowance) => {
+                tests::replay_allowance(&self.store, allowance, true).into()
+            }
+            crate::jj::ComputeBudget::Unbounded => budget,
+        };
         #[cfg(test)]
         tests::observe_replay(
             &self.store,
@@ -2765,14 +2779,14 @@ impl Context<'_> {
                 .map(|started| super::replay_cost::millis(started.elapsed()));
             cost.coordinate = Some(coordinate.clone());
             cost.merge_mode = merge_mode;
-            cost.allowance = Some(budget);
+            cost.allowance = budget.duration();
             cost.probe = Some(probe);
         });
         // Fault injection: the computation itself gets no time, while the
         // allowance recorded above stays the real one.
         #[cfg(test)]
         let budget = if tests::compute_starved(&self.store) {
-            Duration::ZERO
+            Duration::ZERO.into()
         } else {
             budget
         };
@@ -4042,7 +4056,7 @@ impl Context<'_> {
             return Ok(Inherited::Claims(guard, Box::new(snapshot), Vec::new()));
         }
         let heads: Vec<String> = anchors.iter().map(|(_, head)| head.clone()).collect();
-        let budget = within_deadline(self.request, DEPENDENT_LOOKUP_BUDGET);
+        let budget = self.compute_allowance(DEPENDENT_LOOKUP_BUDGET);
         let (guard, (snapshot, reachable)) = under_guard(guard, "inherit drop claims", move || {
             let reachable = snapshot.reachable_from_head(&heads, budget);
             (snapshot, reachable)
@@ -4074,7 +4088,7 @@ impl Context<'_> {
         let (guard, snapshot, reset) = match checkpoint {
             None => (guard, snapshot, false),
             Some(published) => {
-                let budget = within_deadline(self.request, DEPENDENT_LOOKUP_BUDGET);
+                let budget = self.compute_allowance(DEPENDENT_LOOKUP_BUDGET);
                 let probe = vec![published.clone()];
                 let (guard, (snapshot, reachable)) =
                     under_guard(guard, "read the publication checkpoint", move || {
@@ -4848,18 +4862,19 @@ impl Context<'_> {
         &self,
         coordinate: &crate::jj::AdvanceCoordinate,
     ) -> Option<crate::orchestrator::landing::RegenerateRules> {
-        let budget = within_deadline(self.request, self.request.compute_budget);
-        let jj = self
-            .jj
-            .at_operation(&coordinate.operation)
-            .with_operation_budget(budget);
+        let budget = self.compute_allowance(self.request.compute_budget);
+        let jj = budget.scope(&self.jj.at_operation(&coordinate.operation));
         let (store, base) = (self.store.clone(), coordinate.base.clone());
         let read = tokio::task::spawn_blocking(move || {
             crate::orchestrator::landing::RegenerateRules::from_settings(
                 &crate::orchestrator::landing::landing_settings_at(&jj, &store, &base),
             )
         });
-        match tokio::time::timeout(budget, read).await {
+        let result = match budget.duration() {
+            Some(duration) => tokio::time::timeout(duration, read).await,
+            None => Ok(read.await),
+        };
+        match result {
             Ok(Ok(rules)) if !rules.is_empty() => Some(rules),
             Ok(Ok(_)) => None,
             Ok(Err(error)) => {
@@ -4913,7 +4928,7 @@ impl Context<'_> {
         // divergent operation heads outside the store guard.
         let planned = bounded_store_assessment(
             &self.jj.at_operation(&coordinate.operation),
-            within_deadline(self.request, self.request.compute_budget),
+            self.compute_allowance(self.request.compute_budget),
             AssessmentScope {
                 phase: "declared merge plan",
                 branch: &self.request.branch,
@@ -5008,7 +5023,7 @@ impl Context<'_> {
         reopened.base = diagnostic.base.clone();
         let assessed = bounded_store_assessment(
             &self.jj.at_operation(&coordinate.operation),
-            within_deadline(self.request, self.request.compute_budget),
+            self.compute_allowance(self.request.compute_budget),
             AssessmentScope {
                 phase: "conflict session basis",
                 branch: &self.request.branch,

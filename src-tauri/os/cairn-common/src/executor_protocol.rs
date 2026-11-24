@@ -9860,6 +9860,10 @@ pub struct LearnedResourceEstimate {
 /// read as a machine that adopted everything. What an older runner gets wrong
 /// talking to a newer executor: it ignores the list, and sees a machine that
 /// attached where it used to see none.
+/// cairn/7186 does not move the number. The prerequisite timeout test observes
+/// its fixture's child readiness before starting its bounded wait. Production
+/// still starts that same wait immediately after spawning; neither verdicts nor
+/// timeout semantics change, so an older executor gets nothing wrong.
 ///
 /// Version 177 (cairn/7435) releases a standalone lane's compile slot at its
 /// observed test boundary, charging one ordinary core unit instead. Room

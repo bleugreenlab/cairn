@@ -72,6 +72,8 @@ pub(in crate::orchestrator::base_advance) struct Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         barriers().lock().unwrap().remove(&self.store);
+        compute_hooks().lock().unwrap().remove(&self.store);
+        unbounded_computes().lock().unwrap().remove(&self.store);
         replay_observations().lock().unwrap().remove(&self.store);
     }
 }
@@ -375,6 +377,24 @@ pub(in crate::orchestrator::base_advance) fn on_compute(store: &Path, hook: Barr
         .lock()
         .unwrap()
         .insert(store.to_path_buf(), hook);
+}
+
+fn unbounded_computes() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static STORES: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    STORES.get_or_init(Default::default)
+}
+
+/// Store-scoped so spawned owner preparations inherit the fixture's allowance.
+/// The harness removes it on drop; other stores keep their production budgets.
+pub(super) fn compute_unbounded(store: &Path) -> bool {
+    unbounded_computes().lock().unwrap().contains(store)
+}
+
+pub(in crate::orchestrator::base_advance) fn unbound_compute(store: &Path) {
+    unbounded_computes()
+        .lock()
+        .unwrap()
+        .insert(store.to_path_buf());
 }
 
 fn starved_computes() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
@@ -838,7 +858,7 @@ pub(in crate::orchestrator::base_advance) enum ReplayAdmissionObservation {
     },
     Dependents,
     Compute {
-        allowance: Duration,
+        allowance: crate::jj::ComputeBudget,
     },
     Timeout {
         phase: String,
