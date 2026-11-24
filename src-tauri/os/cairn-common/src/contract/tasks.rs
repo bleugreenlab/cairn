@@ -242,7 +242,7 @@ pub(crate) const TASK_ARTIFACT_CONTRACT: ResourceContract =
             MutationSpec {
                 mode: ChangeMode::Create,
                 required: &[],
-                optional: &[],
+                optional: &[TITLE, CONTENT],
                 label: "write artifact",
                 example: "write({changes:[{target:\"cairn:~/result\",mode:\"create\",payload:{content:\"...\"}}]})",
             },

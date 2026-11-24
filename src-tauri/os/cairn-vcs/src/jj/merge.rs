@@ -1,18 +1,8 @@
-//! Store-side merge folds, rebases, squashes, and bookmark advancement
-//! primitives the sibling reconcile builds on.
+//! Store-side merge folds, rebases, squashes, and branch-preparation outcomes.
 use super::*;
 use std::path::Path;
 
-// ── Sibling reconcile (auto-rebase onto an advanced integration tip) ─────────
-
-/// Outcome of reconciling in-flight siblings onto an advanced integration tip:
-/// which sibling bookmarks rebased cleanly, which recorded a conflict, and which
-/// were held back untouched. A recorded conflict is STOP-THE-LINE, not a
-/// convenience item: jj refuses to push or merge a conflicted commit, so a
-/// conflicted branch destined for GitHub is wedged until the agent resolves the
-/// markers and re-seals. The reconcile also never hands a conflicted base down to
-/// clean siblings — when the rebase dest itself carries a conflict, every sibling
-/// is `held` on its prior clean commit rather than rebased onto the conflict.
+/// A branch advancement that failed without a conflict diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileFailure {
     pub branch: String,
@@ -25,13 +15,6 @@ pub struct ReconcileReport {
     pub rebased_clean: Vec<String>,
     /// Sibling bookmarks whose rebase recorded a conflict.
     pub conflicted: Vec<String>,
-    /// Trivial bookmark advances that are current but intentionally
-    /// silent because the sibling had no branch work to announce.
-    pub silent: Vec<String>,
-    /// Sibling bookmarks held UNrebased because the rebase dest itself carries
-    /// a recorded conflict — never handed a conflicted base. Cleared on the next
-    /// reconcile once the base re-seals conflict-free.
-    pub held: Vec<String>,
     /// Exact per-branch failures from graph movement, flatten recovery, or publication.
     pub failed: Vec<ReconcileFailure>,
     /// The full three-way conflict diagnostic per branch in `conflicted`,
@@ -225,7 +208,7 @@ fn fold_into_bookmark(
 
 /// Merge a source bookmark into a target whose tip may have advanced out of band
 /// (the project default branch). Unlike `merge_into_bookmark`'s forward-only fold
-/// — which assumes Cairn's reconcile keeps the source on an integration tip — the
+/// — which requires the source to contain the integration tip — the
 /// default branch advances OUTSIDE the fold chain (another PR merged, or an
 /// external push), so the source is first rebased onto the current target tip,
 /// using detached preparation to validate and heal the candidate before

@@ -311,11 +311,6 @@ pub(crate) fn with_checkout_head_preserved<T>(
 pub const CONFLICT_SCAFFOLDING_EXPORT_REFUSAL: &str =
     "export refused: the commit carries jj conflict scaffolding";
 
-/// Whether an export error is the conflict-scaffolding refusal.
-pub fn is_conflict_scaffolding_export_refusal(error: &str) -> bool {
-    error.contains(CONFLICT_SCAFFOLDING_EXPORT_REFUSAL)
-}
-
 /// The jj conflict scaffolding at the root of `commit`'s tree in `repository`,
 /// in listing order. Empty means none.
 ///

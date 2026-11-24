@@ -109,64 +109,6 @@ fn logical_tree_hash_uses_jj_backend_for_agent_only_revision() {
     );
 }
 
-/// A child built on a hub's conflict-flagged commit that carries its OWN
-/// resolution (the CAIRN-2288 topology) must come through the hub's heal with
-/// its tree exactly as it was: its resolution commit, re-conflicted when the
-/// hub's commit below it changes, is restored from its own content rather than
-/// the hub's, and the heal never leaves it newly conflicted.
-#[test]
-#[serial_test::serial(jj)]
-fn healing_a_hub_keeps_a_childs_own_resolution() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping healing_a_hub_keeps_a_childs_own_resolution: jj not resolvable");
-        return;
-    };
-    let hub = setup_wedged_hub(&bin);
-    let child_tip = bookmark_commit(&hub.jj, &hub.store, hub.child).unwrap();
-    let main_tip = bookmark_commit(&hub.jj, &hub.store, "main").unwrap();
-
-    let heal = heal_conflicted_ancestry(&hub.jj, &hub.store, hub.int, &main_tip).unwrap();
-    assert_eq!(heal.healed.len(), 1, "{heal:?}");
-    assert!(conflicted_commits(
-        &hub.jj,
-        &hub.store,
-        &format!("{main_tip}..bookmarks(exact:{:?})", hub.int)
-    )
-    .is_empty());
-    assert!(
-        !branch_has_conflict(&hub.jj, &hub.store, hub.child).unwrap(),
-        "the child is not left conflicted"
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&file_show(&hub.jj, &hub.store, hub.child, "shared.rs").unwrap()),
-        "hub-resolved\n"
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&file_show(&hub.jj, &hub.store, hub.child, "child.rs").unwrap()),
-        "child-work\n"
-    );
-    assert!(
-        hub.jj
-            .run(
-                &hub.store,
-                &[
-                    "diff",
-                    "--from",
-                    &child_tip,
-                    "--to",
-                    &format!("bookmarks(exact:{:?})", hub.child),
-                    "--summary",
-                    "--ignore-working-copy",
-                ],
-                "child tree",
-            )
-            .unwrap()
-            .trim()
-            .is_empty(),
-        "the child's tree is exactly what it was"
-    );
-}
-
 fn is_visible(jj: &JjEnv, store: &Path, commit: &str) -> bool {
     count_commits(jj, store, &format!("{commit} & ::visible_heads()")) == 1
 }
@@ -1232,7 +1174,10 @@ fn merge_sides_read_in_process_match_the_jj_reader() {
 ///
 /// The arc asserted here is the whole remedy: the invariant sees the loss, the
 /// completion candidate carries both sides, committing it satisfies the
-/// invariant, and the replay then lands a file containing both.
+/// invariant, and the replay then lands a file containing both. The branch has
+/// clean commits below the conflict and an unrelated one above it, so the replay
+/// also heals in place: the resolution moves into the commit where the conflict
+/// arose and the emptied resolution commit is dropped and named.
 #[test]
 #[serial_test::serial(jj)]
 fn a_whole_file_restore_that_would_drop_incoming_work_is_detected_and_remediable() {
@@ -1276,8 +1221,15 @@ fn a_whole_file_restore_that_would_drop_incoming_work_is_detected_and_remediable
     let branch = "agent/CAIRN-3627-builder-0";
     let ws = wts.path().join("builder");
     add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-    std::fs::write(ws.join("shared.rs"), OURS).unwrap();
-    seal(&jj, &ws, "branch rewrites the header", None).unwrap();
+    for (file, content, message) in [
+        ("one.rs", "one\n", "first: add one"),
+        ("two.rs", "two\n", "second: add two"),
+        ("shared.rs", OURS, "branch rewrites the header"),
+        ("four.rs", "four\n", "fourth: add four"),
+    ] {
+        std::fs::write(ws.join(file), content).unwrap();
+        seal(&jj, &ws, message, None).unwrap();
+    }
 
     advance_main(THEIRS, "main rewrites the header and appends config");
 
@@ -1357,6 +1309,51 @@ fn a_whole_file_restore_that_would_drop_incoming_work_is_detected_and_remediable
         landed.contains("timeout_secs = 30") && landed.contains("retries = 3"),
         "and the incoming work that used to vanish is still there: {landed}"
     );
+    assert_eq!(
+        landed, dropped.candidate,
+        "the tip holds the committed candidate"
+    );
+
+    // The replay healed in place: four authored commits keep their places and
+    // messages, the resolution lives in the commit where the conflict arose,
+    // and nothing it publishes is conflict-flagged.
+    let dest = bookmark_commit(&jj, &store, "main").unwrap();
+    let range = format!("{dest}..bookmarks(exact:{branch:?})");
+    let replayed = commits_oldest_first(&jj, &store, &range);
+    let subjects: Vec<&str> = replayed
+        .iter()
+        .map(|(_, subject)| subject.as_str())
+        .collect();
+    assert_eq!(
+        subjects,
+        vec![
+            "first: add one",
+            "second: add two",
+            "branch rewrites the header",
+            "fourth: add four"
+        ]
+    );
+    assert!(conflicted_commits(&jj, &store, &range).is_empty());
+    let third = description_of(&jj, &store, &replayed[2].0);
+    assert!(
+        third.starts_with("branch rewrites the header\n\nCairn conflict heal:")
+            && third.contains("`shared.rs`")
+            && third.contains("Commits this left with no changes were dropped:")
+            && third.contains("\"carry the incoming config alongside the resolution\""),
+        "the healed commit names its resolution and the dropped resolution commit: {third}"
+    );
+    assert_eq!(
+        String::from_utf8(file_show(&jj, &store, &replayed[2].0, "shared.rs").unwrap()).unwrap(),
+        dropped.candidate
+    );
+    for (commit, subject) in [&replayed[0], &replayed[1], &replayed[3]] {
+        assert_eq!(
+            description_of(&jj, &store, commit).trim_end(),
+            subject.as_str(),
+            "a commit the heal did not change carries no note"
+        );
+    }
+    assert_eq!(commit_summary(&jj, &store, &replayed[3].0), "A four.rs");
 }
 
 /// The current operation id over the store.
@@ -1689,18 +1686,18 @@ fn collapse_noops_on_healthy_bookmark() {
 /// topology — the child carries its own resolution rather than depending on
 /// the hub's. `main_tip` is the advanced base (the flatten dest); origin holds
 /// the hub at its pre-conflict tip so a post-merge push is a real advance.
-struct WedgedHub {
+pub(super) struct WedgedHub {
     _home: TempDir,
     _proj: TempDir,
     _wts: TempDir,
     _origin: TempDir,
-    jj: JjEnv,
-    store: PathBuf,
-    int: &'static str,
-    child: &'static str,
+    pub(super) jj: JjEnv,
+    pub(super) store: PathBuf,
+    pub(super) int: &'static str,
+    pub(super) child: &'static str,
 }
 
-fn setup_wedged_hub(bin: &str) -> WedgedHub {
+pub(super) fn setup_wedged_hub(bin: &str) -> WedgedHub {
     let home = TempDir::new().unwrap();
     let origin = TempDir::new().unwrap();
     let proj = TempDir::new().unwrap();
@@ -1823,6 +1820,32 @@ fn count_commits(jj: &JjEnv, store: &Path, range: &str) -> usize {
     .count()
 }
 
+/// A heal refusal is a finding about the tree, never a content conflict: it
+/// names both tips and both trees and the paths where they differ.
+#[test]
+fn a_tip_tree_heal_refusal_is_its_own_condition_naming_both_tips_and_trees() {
+    let refusal = HealRefusal {
+        guard: HealGuard::TipTreeChanged,
+        pre_heal_tip: "1dc97f55".to_string(),
+        pre_heal_tree: "0520dad1".to_string(),
+        healed_tip: Some("920cd1ed".to_string()),
+        healed_tree: Some("b93db1c1".to_string()),
+        paths: vec!["permission.rs".to_string()],
+    };
+    let diagnostic = ConflictDiagnostic::heal_refused(refusal.clone());
+    assert_eq!(
+        diagnostic.condition,
+        ConflictCondition::HealRefused,
+        "never a content conflict: there is no content to resolve"
+    );
+    assert_eq!(diagnostic.heal_refusal.as_ref(), Some(&refusal));
+    assert_eq!(
+        refusal.to_string(),
+        "ancestry heal guard: the healed tip `920cd1ed` (tree `b93db1c1`) does not hold the tree \
+         `0520dad1` of the pre-heal tip `1dc97f55`; differs in: permission.rs"
+    );
+}
+
 /// A rollback that did not complete outranks the lock that caused it. Such an
 /// error quotes the lock, and filing it as routine contention would tell the
 /// agent and the page that nothing moved when the store may disagree with git.
@@ -1840,11 +1863,14 @@ fn an_incomplete_rollback_outranks_a_nested_lost_lock() {
     assert_eq!(reconcile_failure_kind(&compound), ROLLBACK_FAILED);
     assert!(!reconcile_failure_is_ref_lock(ROLLBACK_FAILED));
     assert!(!reconcile_failure_is_permanent(ROLLBACK_FAILED));
-    assert_eq!(
-        ref_lock_deferral(&compound),
-        None,
-        "it does not defer the pass either"
+
+    // A refused heal whose undo did not complete is a rollback failure,
+    // whatever refused it first.
+    let refused_heal = format!(
+        "the healed tip carries jj conflict scaffolding\n{}",
+        rollback_incomplete("the refused heal of `b` could not be undone to operation op1: lock")
     );
+    assert_eq!(reconcile_failure_kind(&refused_heal), ROLLBACK_FAILED);
 }
 
 #[test]
@@ -1868,21 +1894,6 @@ fn lost_packed_refs_locks_classify_as_infrastructure_never_permanent() {
         assert!(reconcile_failure_is_ref_lock(kind));
     }
     assert!(!reconcile_failure_is_ref_lock("transient_process"));
-
-    assert_eq!(
-        ref_lock_diagnosis(contention).as_deref(),
-        Some("packed-refs lock: contention — held by live process 77 (git) after 30s")
-    );
-    assert!(ref_lock_diagnosis(bare)
-        .unwrap()
-        .starts_with(CONTENTION_DIAGNOSIS));
-    assert_eq!(ref_lock_diagnosis("Revision main does not exist"), None);
-    let deferral = ref_lock_deferral(stale).unwrap();
-    assert_eq!(
-        reconcile_failure_kind(&deferral),
-        REF_LOCK_STALE,
-        "a deferral classifies as the lock that caused it"
-    );
 }
 
 /// Advance the shared store's `main` bookmark by one commit WITHOUT touching the
@@ -3922,7 +3933,10 @@ fn the_verified_export_refuses_a_bookmark_on_a_tree_carrying_conflict_scaffoldin
         &[(branch, poisoned.as_str())],
     )
     .expect_err("the String form refuses too");
-    assert!(is_conflict_scaffolding_export_refusal(&error), "{error}");
+    assert!(
+        error.contains(CONFLICT_SCAFFOLDING_EXPORT_REFUSAL),
+        "{error}"
+    );
     assert!(error.contains(&poisoned), "{error}");
     assert!(error.contains("JJ-CONFLICT-README"), "{error}");
     assert!(error.contains(".jjconflict-side-0"), "{error}");
@@ -5585,123 +5599,6 @@ fn operation_budget_successor_rejects_cleanup_expiry_and_insufficient_remainder(
     }
 }
 
-/// cairn/5326's specimen in miniature. A take-committed-tip replay restores the
-/// resolution into the TIP, so the commit where the conflict first arose stays
-/// conflict-flagged below it, and the reconcile used to heal that by collapsing
-/// the whole branch into one commit under the tip's message. Five commits, the
-/// third conflicting with main and the fifth the agent's committed resolution:
-/// after the replay and the heal, commits one and two are the very same commits
-/// the rebase produced, the third holds the resolution under its own message
-/// plus a note saying so, the fourth is untouched, and the fifth — left empty
-/// once its content lives in the third — is dropped and named.
-#[test]
-#[serial_test::serial(jj)]
-fn a_take_committed_tip_replay_heals_a_five_commit_branch_in_place() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping a_take_committed_tip_replay_heals_a_five_commit_branch_in_place: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let branch = "agent/cairn-5326-builder-0";
-    let ws = wts.path().join("agent");
-    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-    for (file, content, message) in [
-        ("one.rs", "one\n", "first: add one"),
-        ("two.rs", "two\n", "second: add two"),
-        ("shared.rs", "BRANCH-SIDE\n", "third: reword shared"),
-        ("four.rs", "four\n", "fourth: add four"),
-    ] {
-        std::fs::write(ws.join(file), content).unwrap();
-        seal(&jj, &ws, message, None).unwrap();
-    }
-    advance_main_shared(&jj, &store, wts.path(), "MAIN-SIDE\n");
-
-    // The advance conflicts and is rolled back; the agent commits its
-    // resolution on the old base, as the conflict session asks.
-    let RebaseOutcome::Conflicted { diagnostic } =
-        rebase_branch_onto(&jj, &store, branch, "main").unwrap()
-    else {
-        panic!("precondition: the advance conflicts on the third commit");
-    };
-    let paths = diagnostic.conflicting_paths();
-    assert_eq!(paths, vec!["shared.rs".to_string()]);
-    update_stale(&jj, &ws).unwrap();
-    std::fs::write(ws.join("shared.rs"), "MAIN-SIDE plus branch\n").unwrap();
-    seal(&jj, &ws, "fifth: take main's wording for shared", None).unwrap();
-    let tip = bookmark_commit(&jj, &store, branch).unwrap();
-
-    // Preparation publishes only the fully healed history, never an intermediate conflict.
-    assert!(matches!(
-        rebase_branch_onto_with_resolution(
-            &jj,
-            &store,
-            branch,
-            "main",
-            Some(&ResolutionCarry::from_tip(&tip, &paths)),
-        )
-        .unwrap(),
-        RebaseOutcome::Rebased
-    ));
-    let dest = bookmark_commit(&jj, &store, "main").unwrap();
-    let range = format!("{dest}..bookmarks(exact:{branch:?})");
-    let replayed = commits_oldest_first(&jj, &store, &range);
-    assert_eq!(replayed.len(), 4);
-    assert!(conflicted_commits(&jj, &store, &range).is_empty());
-
-    let healed = commits_oldest_first(&jj, &store, &range);
-    let subjects: Vec<&str> = healed.iter().map(|(_, subject)| subject.as_str()).collect();
-    assert_eq!(
-        subjects,
-        vec![
-            "first: add one",
-            "second: add two",
-            "third: reword shared",
-            "fourth: add four"
-        ],
-        "nothing is collapsed: every commit that still changes something keeps its place and message"
-    );
-    assert_eq!(
-        healed[..2],
-        replayed[..2],
-        "the clean prefix below the conflict is not rewritten at all"
-    );
-    assert!(conflicted_commits(&jj, &store, &range).is_empty());
-
-    let third = description_of(&jj, &store, &healed[2].0);
-    assert!(
-        third.starts_with("third: reword shared\n\nCairn conflict heal:")
-            && third.contains("`shared.rs`")
-            && third.contains("Commits this left with no changes were dropped:")
-            && third.contains("\"fifth: take main's wording for shared\""),
-        "the healed commit says what changed, where it came from, and what was dropped: {third}"
-    );
-    for (commit, subject) in [&healed[0], &healed[1], &healed[3]] {
-        assert_eq!(
-            description_of(&jj, &store, commit).trim_end(),
-            subject.as_str(),
-            "a commit the heal did not change carries no note"
-        );
-    }
-    assert_eq!(
-        String::from_utf8_lossy(&file_show(&jj, &store, &healed[2].0, "shared.rs").unwrap()),
-        "MAIN-SIDE plus branch\n",
-        "the resolution lives in the commit where the conflict arose"
-    );
-    assert_eq!(commit_summary(&jj, &store, &healed[3].0), "A four.rs");
-    assert_eq!(
-        String::from_utf8_lossy(&file_show(&jj, &store, branch, "shared.rs").unwrap()),
-        "MAIN-SIDE plus branch\n",
-        "and the tip holds exactly the tree it held before the heal"
-    );
-}
-
 /// Component A, the pinned failure mode: WITHOUT the target flatten, folding a
 /// child into the conflicted hub would carry a conflicted commit into the
 /// integration branch. That fold now stops at its export — the folded commit's
@@ -5728,7 +5625,7 @@ fn child_merge_push_refused_without_target_flatten() {
 
     let err = merge_into_bookmark(&hub.jj, &hub.store, hub.int, child)
         .expect_err("a fold onto conflicted ancestry never reaches git");
-    assert!(is_conflict_scaffolding_export_refusal(&err), "{err}");
+    assert!(err.contains(CONFLICT_SCAFFOLDING_EXPORT_REFUSAL), "{err}");
     assert!(err.contains("JJ-CONFLICT-README"), "{err}");
     assert_eq!(
         git_stdout(&checkout, &["rev-parse", &int_ref]),
@@ -6122,7 +6019,7 @@ fn child_workspace_bases_off_unsealed_coordinator_branch() {
 
 /// Advance `main` with `shared.rs` set to `content`, through a workspace of
 /// its own, as an out-of-band merge would.
-fn advance_main_shared(jj: &JjEnv, store: &Path, wts: &Path, content: &str) {
+pub(super) fn advance_main_shared(jj: &JjEnv, store: &Path, wts: &Path, content: &str) {
     let oob = "agent/cairn-9-oob-0";
     let ws = wts.join("oob");
     add_workspace(jj, store, &ws, oob, "main", None).unwrap();
@@ -6225,7 +6122,7 @@ fn change_of(fx: &TrackedOrigin, commit: &str) -> String {
 }
 
 /// The paths `commit` changes relative to its parent, as `jj diff --summary`.
-fn commit_summary(jj: &JjEnv, store: &Path, commit: &str) -> String {
+pub(super) fn commit_summary(jj: &JjEnv, store: &Path, commit: &str) -> String {
     jj.run(
         store,
         &["diff", "-r", commit, "--summary", "--ignore-working-copy"],
@@ -6237,7 +6134,7 @@ fn commit_summary(jj: &JjEnv, store: &Path, commit: &str) -> String {
 }
 
 /// `(commit id, subject)` of every commit in `range`, oldest first.
-fn commits_oldest_first(jj: &JjEnv, store: &Path, range: &str) -> Vec<(String, String)> {
+pub(super) fn commits_oldest_first(jj: &JjEnv, store: &Path, range: &str) -> Vec<(String, String)> {
     jj.run(
         store,
         &[
@@ -6260,7 +6157,7 @@ fn commits_oldest_first(jj: &JjEnv, store: &Path, range: &str) -> Vec<(String, S
 }
 
 /// The full description of the single commit `revset` names.
-fn description_of(jj: &JjEnv, store: &Path, revset: &str) -> String {
+pub(super) fn description_of(jj: &JjEnv, store: &Path, revset: &str) -> String {
     jj.run(
         store,
         &[

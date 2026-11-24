@@ -1629,6 +1629,26 @@ mod tests {
     }
 
     #[test]
+    fn generic_and_schema_artifact_offers_do_not_advertise_pr_actions() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "title": { "type": "string" }, "content": { "type": "string" } }
+        });
+        for kind in [ResourceKind::NodeArtifact, ResourceKind::TaskArtifact] {
+            let generic = affordance_for_kind(kind);
+            let plan = artifact_affordance_with_schema(kind, Some("plan"), None, &schema)
+                .expect("plan schema yields an offer");
+            for block in [generic, plan] {
+                let actions = block.split_once("### actions").unwrap().1;
+                assert!(!actions.contains("PR artifact"), "{block}");
+                for action in ["merge", "close", "refresh", "publish"] {
+                    assert!(!block.contains(&format!("action:\"{action}\"")), "{block}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn artifact_affordance_falls_back_without_properties() {
         // A schema with no usable `properties` yields `None`, so the read path
         // falls back to the static contract affordance.

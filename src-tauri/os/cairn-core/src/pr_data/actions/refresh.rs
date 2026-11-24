@@ -2393,7 +2393,15 @@ mod tests {
             divergent.contains("payload:{action:\"publish\"}"),
             "{divergent}"
         );
-        assert!(divergent.contains("[merge]") && divergent.contains("[refresh]"));
+        for action in ["merge", "close", "refresh", "publish"] {
+            assert_eq!(divergent.matches(&format!("- [{action}](")).count(), 1);
+            assert_eq!(
+                divergent
+                    .matches(&format!("payload:{{action:\"{action}\""))
+                    .count(),
+                1
+            );
+        }
 
         let agreed = open_pr_actions("cairn://x/create-pr", false);
         assert!(!agreed.contains("publish"), "{agreed}");

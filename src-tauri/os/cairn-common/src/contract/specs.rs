@@ -337,11 +337,6 @@ pub(crate) const DEFER: KeySpec = KeySpec::new(
     KeyType::Object,
     "{until:[gate clause, ...]} — defer a gated artifact pending on you until every clause holds, in the `after:` vocabulary (issue_resolution, pr_state, artifact_confirmed, check_verdict, clock, tenet_verdict, request); e.g. {until:[{fact:\"request\",request:\"cairn://requests/ID\",outcome:\"done\"}]}; you are woken once when it comes true or can no longer come true. Deferring again replaces the last deferral (mutually exclusive with confirmed and action)",
 );
-pub(crate) const PR_ACTION: KeySpec = KeySpec::new(
-    "action",
-    KeyType::Str,
-    "merge|close|refresh|publish — operate on the PR a PR artifact produced; publish pushes the branch's current head when the PR holds an older one (mutually exclusive with confirmed)",
-);
 pub(crate) const PR_METHOD: KeySpec = KeySpec::new(
     "method",
     KeyType::Str,
@@ -457,7 +452,7 @@ pub(crate) const SKILL_NAME: KeySpec = KeySpec::new("name", KeyType::Str, "");
 
 /// Dedicated to the pack member: `install` materializes an available pack,
 /// `update` re-syncs an installed one. Deliberately not shared with
-/// `NODE_ACTION`/`PR_ACTION`, which no sibling contract can perform.
+/// `NODE_ACTION`, which no sibling contract can perform.
 pub(crate) const PACK_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,

@@ -38,7 +38,7 @@ mod types;
 mod vcs;
 mod workspace;
 
-pub use nodes::PR_ARTIFACT_ACTION_LABEL;
+pub use nodes::ARTIFACT_PATCH_LABEL;
 pub use specs::BROWSER_ACTIONS;
 pub use types::*;
 
@@ -751,23 +751,30 @@ mod tests {
     /// declared keys are what the write gate enforces, so a key in one and not
     /// the other is an affordance that teaches a payload the gate then rejects.
     ///
-    /// Artifact kinds are exempt: their accepted keys come from the addressed
-    /// artifact's schema at write time, not from this table.
+    /// Artifact examples describe the generic fallback; other schema-resolved
+    /// resources have no static payload shape to validate here.
     #[test]
     fn every_example_key_is_a_declared_key() {
         for contract in RESOURCE_CONTRACTS {
-            if payload_keys_are_schema_resolved(contract.kind) {
+            if payload_keys_are_schema_resolved(contract.kind)
+                && !matches!(
+                    contract.kind,
+                    ResourceKind::NodeArtifact | ResourceKind::TaskArtifact
+                )
+            {
                 continue;
             }
             for spec in contract.mutations {
-                for key in example_payload_keys(spec.example) {
-                    assert!(
+                for example in spec.example.split(" | ") {
+                    for key in example_payload_keys(example) {
+                        assert!(
                         spec.accepts_key(&key),
                         "{:?} {} example advertises `{key}`, which the mutation does not accept: {}",
                         contract.kind,
                         spec.label,
                         spec.example
                     );
+                    }
                 }
             }
         }

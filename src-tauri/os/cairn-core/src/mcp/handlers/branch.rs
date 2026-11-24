@@ -1590,6 +1590,7 @@ mod tests {
                 "repair_conflicted_branch_name(",
                 "coordinate_repository(",
                 "ensure_store_initialized(",
+                "reconcile_siblings",
             ] {
                 assert!(!body.contains(forbidden), "{start} gained {forbidden}");
             }

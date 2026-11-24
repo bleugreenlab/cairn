@@ -10,7 +10,7 @@
 //! but erases every commit the branch carried, child-PR landings on an
 //! integration branch included, under a message that describes only the tip.
 //!
-//! The heal here resolves each conflict-flagged commit in place instead. The
+//! The detached engine in `advance` resolves conflict-flagged commits in place. The
 //! commits below the first conflict keep their exact ids, every other path of
 //! every commit keeps its content, and the tip's tree is proven unchanged.
 //! Each commit's tree is built explicitly from its own pre-heal tree rather
@@ -40,13 +40,6 @@ pub enum HealGuard {
     RemainsConflicted { commit: String },
     /// A conflict-flagged commit belongs to another branch's history.
     ForeignConflictedHistory { commit: String },
-    /// The branch does not descend from the base it is healed against.
-    NotDescendedFromBase,
-    /// The tip itself is conflict-flagged, so there is no clean tree to keep.
-    TipConflicted,
-    /// The healed tip's tree root carried jj conflict scaffolding, so its
-    /// verified export refused it.
-    ExportScaffolding { detail: String },
 }
 
 /// A heal refused by one of its guards, with the coordinates that show why.
@@ -116,16 +109,6 @@ impl HealRefusal {
                 "commit `{commit}` below {pre} carries a recorded conflict and belongs to another \
                  branch's history, so this branch cannot heal it"
             ),
-            HealGuard::NotDescendedFromBase => {
-                format!("{pre} does not descend from the base it is healed against")
-            }
-            HealGuard::TipConflicted => format!(
-                "{pre} is itself conflict-flagged, and only a clean tip's history can be healed"
-            ),
-            HealGuard::ExportScaffolding { detail } => format!(
-                "the healed tip {healed} of {pre} carries jj conflict scaffolding, so its export \
-                 was refused: {detail}"
-            ),
         }
     }
 }
@@ -133,24 +116,6 @@ impl HealRefusal {
 impl std::fmt::Display for HealRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{ANCESTRY_HEAL_GUARD} {}", self.sentence())
-    }
-}
-
-/// Why [`heal_conflicted_ancestry`] did not heal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HealError {
-    /// A guard's finding about the tree: the history cannot be healed exactly.
-    Refused(Box<HealRefusal>),
-    /// jj or the store failed to act; nothing was learned about the tree.
-    Failed(String),
-}
-
-impl std::fmt::Display for HealError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Refused(refusal) => refusal.fmt(f),
-            Self::Failed(error) => f.write_str(error),
-        }
     }
 }
 
@@ -163,7 +128,7 @@ pub struct HealedCommit {
     pub paths: Vec<String>,
 }
 
-/// The outcome of [`heal_conflicted_ancestry`].
+/// The detached replay engine's ancestry-heal outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AncestryHeal {
     /// The branch tip after the heal. Its tree equals the tip's tree before it.
@@ -278,19 +243,6 @@ pub(super) fn heal_note(
         ));
     }
     note
-}
-
-/// Heal a clean-tip branch through the canonical detached replay engine.
-/// Only branch-owned history is rewritten; child bookmarks retain their own
-/// coordinates and prepare independently. The caller holds the store writer
-/// lock through capture, compute, installation and verified export.
-pub fn heal_conflicted_ancestry(
-    jj: &JjEnv,
-    store: &Path,
-    branch: &str,
-    dest_commit: &str,
-) -> Result<AncestryHeal, HealError> {
-    super::advance::heal_branch_locked(jj, store, branch, dest_commit)
 }
 
 /// Put the store back where a refused `rewrite` of `branch` found it and prove

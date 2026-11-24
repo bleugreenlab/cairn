@@ -1449,7 +1449,7 @@ pub async fn commit_stamp(
     .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?
 }
 
-/// What a sibling reconcile checks about one bookmark before it rebases it,
+/// The coordinates and divergence state needed before preparing a bookmark,
 /// answered by one read of the store at its operation head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookmarkPrecheck {
@@ -1475,9 +1475,8 @@ impl BookmarkPrecheck {
 /// Read [`BookmarkPrecheck`] for `branch`, and resolve `destination`, from one
 /// repository load and no subprocess.
 ///
-/// The reconcile used to ask the same questions with a `jj` invocation each
-/// (destination, conflicted-name probe, tip, change id, visible twins), every
-/// one inside the store lock and each costing about a second on a loaded host.
+/// Reading these coordinates together avoids subprocess probes for the
+/// destination, conflicted name, tip, change id, and visible twins.
 /// Read-only; a conflicted or divergent answer sends the caller to the existing
 /// repair commands, which do the writing.
 pub async fn bookmark_precheck(
