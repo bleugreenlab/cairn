@@ -909,6 +909,7 @@ impl OrchestratorBuilder {
             models_runtime,
             decision_observations: Arc::default(),
             recipe_chooser: Arc::default(),
+            token_forecaster: Arc::default(),
             mcp_binary_path: self.mcp_binary_path,
             jj_binary_path: self.jj_binary_path,
             config_dir: self.config_dir,
@@ -1761,6 +1762,10 @@ pub struct Orchestrator {
     /// installed until judgment has measured one on the resolution records
     /// (tenets 1222, 1243), so `defaultRecipe` answers.
     recipe_chooser: Arc<std::sync::OnceLock<crate::execution::recipe_resolution::InstalledChooser>>,
+    /// A token forecaster installed in place of the production one. Empty in
+    /// production, where [`Self::token_forecaster`] builds decide's.
+    token_forecaster:
+        Arc<std::sync::OnceLock<Arc<dyn crate::judgment::token_forecast::TokenForecaster>>>,
 
     // === Host-specific paths (set by Tauri or cairn-server) ===
     /// Path to the cairn-cmd binary
@@ -2601,6 +2606,31 @@ impl Orchestrator {
         let _ = self.recipe_chooser.set(chooser);
     }
 
+    /// The token forecaster filing asks (cairn/7356): an installed one, else
+    /// the production decide-score forecaster. Built per call rather than
+    /// held, since the production one holds this orchestrator.
+    #[expect(
+        dead_code,
+        reason = "cairn/6268's filing placement is the consumer; it swaps its no-forecaster state for this"
+    )]
+    pub(crate) fn token_forecaster(
+        &self,
+    ) -> Arc<dyn crate::judgment::token_forecast::TokenForecaster> {
+        match self.token_forecaster.get() {
+            Some(installed) => installed.clone(),
+            None => crate::judgment::token_forecast::production(self),
+        }
+    }
+
+    /// Install a token forecaster in place of the production one. Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn install_token_forecaster_for_test(
+        &self,
+        forecaster: Arc<dyn crate::judgment::token_forecast::TokenForecaster>,
+    ) {
+        let _ = self.token_forecaster.set(forecaster);
+    }
+
     /// Register the OS process id of the desktop UI now attached over the
     /// runner's `/ws` channel and return a generation token identifying THIS
     /// registration. The window-owning Tauri process sends its own
@@ -3006,6 +3036,7 @@ impl Orchestrator {
         crate::orchestrator::wakes::conditions::install_evaluator(self.clone());
         crate::orchestrator::inference_control::spawn_deployment_control(self.clone());
         crate::fleet::models::spawn(self.clone());
+        crate::judgment::token_forecast::worker::spawn(self.clone());
         let orch = self.clone();
         self.spawn_detached(async move {
             let mut ticks = tokio::time::interval(std::time::Duration::from_secs(60));

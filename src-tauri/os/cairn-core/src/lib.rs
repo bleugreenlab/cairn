@@ -32,6 +32,7 @@ pub mod config_disables;
 pub mod db_browser;
 pub mod issues;
 pub mod jobs;
+pub mod judgment;
 pub mod labels;
 pub mod memories;
 pub mod merge_requests;

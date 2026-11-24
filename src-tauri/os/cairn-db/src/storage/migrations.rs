@@ -2674,6 +2674,22 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "command_resource_profiles",
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
+    // The token forecast's decide labels and calibrations (cairn/7356):
+    // derived from this install's issues by its own backfill and refit, and
+    // rebuilt by both from the issues and token rollups if lost.
+    (
+        "token_forecast_labels",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    (
+        "token_forecast_calibrations",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    // The backfill's own spend ledger on this install.
+    (
+        "token_forecast_spend",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // The largest single process and the out-of-memory kills learned per
     // suite and machine context, for memory fit. Machine-local and rebuildable
     // for the same reason as the profiles beside it.

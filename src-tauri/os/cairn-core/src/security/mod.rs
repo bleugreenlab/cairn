@@ -103,6 +103,7 @@
 pub mod broker;
 pub mod crossing;
 pub mod lease;
+pub mod prose_scrub;
 pub mod remediation;
 pub mod sanitize;
 

@@ -537,6 +537,21 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("tenet_ruling_imports", AUTHORED),
     keep("tenet_evidence_events", AUTHORED),
     keep(
+        "token_forecast_labels",
+        "calibration labels: the token forecast refit's reproducible input, one row per issue and answerer version",
+    )
+    .budget(64),
+    keep(
+        "token_forecast_calibrations",
+        "calibration history: one row per weekly refit",
+    )
+    .budget(16),
+    keep(
+        "token_forecast_spend",
+        "the backfill's spend ledger: one small row per model call, bounded by the issues there are to label",
+    )
+    .budget(16),
+    keep(
         "attachments",
         "authored attachments; their bytes live in cas_cache",
     ),

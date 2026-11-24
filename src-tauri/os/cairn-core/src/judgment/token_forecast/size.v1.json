@@ -1,0 +1,31 @@
+{
+  "set": "size",
+  "notes": "Version 1, pre-registered before any test metric was computed. The effort question's axis wording is cairn/5132's rubric verbatim ('deliberation per step (mechanical, up to subtle debugging, algorithms, proofs about state)'); 5132 names only the axis ends, so the five anchor descriptors are this bench's. Scope is a sibling question on how much must change. Both are option-independent (tenet 1328): neither names a recipe, model, tier or project. The predictor reads each question's expected score, sum of level value times probability.",
+  "preamble": "Below is a software task exactly as it was filed for an AI coding agent to carry out. Answer each question from the text alone.",
+  "questions": [
+    {
+      "name": "effort",
+      "type": "score",
+      "instructions": "Effort: deliberation per step (mechanical, up to subtle debugging, algorithms, proofs about state). How much careful thought does each step of this task need?",
+      "levels": [
+        {"label": "0", "description": "Mechanical: every step is obvious once it is found"},
+        {"label": "0.25", "description": "Mostly routine steps with occasional small judgment calls"},
+        {"label": "0.5", "description": "Ordinary engineering judgment at most steps"},
+        {"label": "0.75", "description": "Subtle debugging or non-obvious design at several steps"},
+        {"label": "1", "description": "Algorithms or proofs about state: steps need sustained, careful reasoning"}
+      ]
+    },
+    {
+      "name": "scope",
+      "type": "score",
+      "instructions": "Scope: how much must change or be produced to finish this task, from one small local edit up to many places across several parts of a system?",
+      "levels": [
+        {"label": "0", "description": "One small, local edit"},
+        {"label": "0.25", "description": "A few places close together"},
+        {"label": "0.5", "description": "Several places in one part of the system"},
+        {"label": "0.75", "description": "Many places, or several parts of the system"},
+        {"label": "1", "description": "A broad change across many parts of the system"}
+      ]
+    }
+  ]
+}

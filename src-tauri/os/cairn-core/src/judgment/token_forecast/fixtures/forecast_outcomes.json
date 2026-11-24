@@ -1,0 +1,47 @@
+[
+  {
+    "outcome": "available",
+    "p50_tokens": 4120000,
+    "p90_tokens": 16800000,
+    "target": {
+      "id": "issue_billable_primary_maker.v1",
+      "definition": "billable tokens (input + cache_create + cache_read + output, thinking excluded) of the issue's realised primary maker, over every execution and sub-agent job, through resolution"
+    },
+    "answerer": {
+      "kind": "decide_score",
+      "version": "decide_score.jev-1.14.v1",
+      "model": "typesafe/jev-1.14",
+      "provider": "openrouter",
+      "question_version": "e5a0112ceee9",
+      "measured_by": "native",
+      "zdr_satisfied_by": "openrouter-zdr-routing",
+      "cost_usd": 0.000064,
+      "latency_ms": 1480
+    },
+    "calibration": {
+      "version": "tfc-0123456789abcdef",
+      "as_of": 1792393200,
+      "table_window": [1769932800, 1792393200],
+      "shift_window": [1790578800, 1792393200],
+      "fit_n": 5210,
+      "shift_n": 412,
+      "group": "anthropic"
+    },
+    "flags": {
+      "p90_soft": true,
+      "p90_soft_basis": "top_score_bin"
+    },
+    "input_hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+  },
+  {
+    "outcome": "unavailable",
+    "reason": "deadline_exceeded",
+    "retryable": true,
+    "detail": "the answerer did not answer within 2000 ms"
+  },
+  {
+    "outcome": "not_applicable",
+    "reason": "maker_not_anthropic",
+    "detail": "filed with a openai model; the forecaster is validated on Anthropic-filed issues only"
+  }
+]
