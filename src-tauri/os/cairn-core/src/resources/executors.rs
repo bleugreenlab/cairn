@@ -2918,6 +2918,7 @@ fn render_storage(executor: &ExecutorInspection) -> String {
                 accounting,
                 volume,
                 None,
+                false,
                 captured,
             );
         }
@@ -2952,8 +2953,10 @@ fn render_storage(executor: &ExecutorInspection) -> String {
         &machine.disk_accounting,
         &machine.volume,
         machine.restored_holdings.as_ref(),
+        !machine.former_build_roots.is_empty(),
         captured,
     );
+    render_former_build_roots(&mut out, &machine.former_build_roots, captured);
     out
 }
 
@@ -3315,8 +3318,18 @@ fn render_holdings(
     accounting_reading: &Measurement<cairn_common::executor_protocol::DiskAccounting>,
     volume_reading: &Measurement<cairn_common::executor_protocol::MachineVolume>,
     restored: Option<&cairn_common::executor_protocol::RestoredHoldings>,
+    former_roots_reported: bool,
     captured: u64,
 ) {
+    // An executor that reports each former root gets a line per root from
+    // `render_former_build_roots`; the aggregate is for one that predates it.
+    let aggregate_former_root = |former_build_root_bytes| {
+        if former_roots_reported {
+            String::new()
+        } else {
+            former_build_root_line(former_build_root_bytes)
+        }
+    };
     let on = if on.is_empty() {
         String::new()
     } else {
@@ -3369,7 +3382,7 @@ fn render_holdings(
                 bytes(categories.warm_caches_bytes),
                 bytes(categories.temporary_other_bytes),
             ));
-            out.push_str(&former_build_root_line(categories.former_build_root_bytes));
+            out.push_str(&aggregate_former_root(categories.former_build_root_bytes));
             render_unreclaimable(
                 out,
                 &accounting.unreclaimable,
@@ -3441,7 +3454,7 @@ fn render_holdings(
                         other_top
                     },
                 ));
-                out.push_str(&former_build_root_line(restored.former_build_root_bytes));
+                out.push_str(&aggregate_former_root(restored.former_build_root_bytes));
                 render_unreclaimable(out, &restored.unreclaimable, 0, captured);
             }
         }
@@ -3458,6 +3471,100 @@ fn former_build_root_line(former_build_root_bytes: u64) -> String {
         "- Former build root: {} under the home (its build-slots, managed-objects, dependency-catalog and tool-cache, left when the build root moved), reclaimed by retirement (cairn/6762), not by the storage ladder\n",
         bytes(former_build_root_bytes)
     )
+}
+
+/// Every build root the executor stopped using, one line each, until its
+/// retirement finds none of its derived state left. A root never measured,
+/// or measured only in part, says so rather than reading as empty.
+fn render_former_build_roots(
+    out: &mut String,
+    roots: &[cairn_common::executor_protocol::FormerBuildRootReport],
+    captured: u64,
+) {
+    use cairn_common::executor_protocol::FormerBuildRootState;
+    for root in roots {
+        let name = if root.home {
+            format!("{} (the home; its machine authority stays)", root.root)
+        } else {
+            root.root.clone()
+        };
+        let amount = match root.measured_at_unix_ms {
+            None => "not yet measured".to_string(),
+            Some(at) => {
+                let held = &root.bytes;
+                let parts = [
+                    ("cells", held.cells_bytes),
+                    ("forensic holds", held.quarantines_bytes),
+                    ("catalog", held.catalog_bytes),
+                    ("tool cache", held.tool_cache_bytes),
+                    ("managed objects", held.managed_objects_bytes),
+                    ("warm caches", held.warm_caches_bytes),
+                    ("external caches", held.external_caches_bytes),
+                ]
+                .into_iter()
+                .filter(|(_, size)| *size > 0)
+                .map(|(what, size)| format!("{what} {}", bytes(size)))
+                .collect::<Vec<_>>();
+                format!(
+                    "{}{} awaiting retirement{} (measured {}{})",
+                    if root.measurement_complete {
+                        ""
+                    } else {
+                        "at least "
+                    },
+                    bytes(held.total()),
+                    if parts.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", parts.join(", "))
+                    },
+                    age(captured.saturating_sub(at)),
+                    if root.last_pass_at_unix_ms.is_some_and(|pass| pass > at) {
+                        ", last known"
+                    } else {
+                        ""
+                    },
+                )
+            }
+        };
+        let state = match root.state {
+            FormerBuildRootState::Pending => {
+                "retirement begins with the next storage sweep".to_string()
+            }
+            FormerBuildRootState::Retiring => "retiring".to_string(),
+            FormerBuildRootState::Held => match root.held_until_unix_ms {
+                Some(until) if until > captured => format!(
+                    "held as forensic evidence for {} more",
+                    span(until - captured)
+                ),
+                _ => "held; its window has ended and the next sweep removes it".to_string(),
+            },
+            FormerBuildRootState::Occupied => {
+                "occupied; deferred, and retried each sweep".to_string()
+            }
+            FormerBuildRootState::Unavailable => {
+                "unavailable; nothing under it is touched until it is reachable as itself"
+                    .to_string()
+            }
+            FormerBuildRootState::Retrying => "retrying".to_string(),
+            FormerBuildRootState::Unknown => "in a state this runner does not know".to_string(),
+        };
+        let detail = root
+            .detail
+            .as_deref()
+            .map_or_else(String::new, |detail| format!(" ({detail})"));
+        let reclaimed = if root.reclaimed_bytes > 0 {
+            format!(" · {} reclaimed so far", bytes(root.reclaimed_bytes))
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "- Former build root {name}: {amount}; {state}{detail}{reclaimed}. Reclaimed by retirement (cairn/6762), not by the storage ladder\n"
+        ));
+    }
+    if roots.iter().any(|root| !root.home) {
+        out.push_str("  - A separate former root on a volume other than the home's or the build root's, or any separate former root on Windows, is counted on its line above only: its bytes are in no volume's Cairn total, so those totals are not the whole of what retirement still holds\n");
+    }
 }
 
 /// The home entries holding bytes no retention rule reaches, by name.
@@ -8652,6 +8759,81 @@ mod storage_section_tests {
         let before = render_executor(&tight_local());
         assert!(!before.contains("Unreclaimable holdings"), "{before}");
         assert!(!before.contains("Former build root"), "{before}");
+    }
+
+    /// Each former root reads on its own line, by what it still holds and why
+    /// it is not yet gone, in place of the single aggregate; a root never
+    /// measured never reads as empty.
+    #[test]
+    fn each_former_build_root_is_named_with_where_its_retirement_stands() {
+        use cairn_common::executor_protocol::{
+            FormerBuildRootBytes, FormerBuildRootReport, FormerBuildRootState,
+        };
+        let mut executor = tight_local();
+        let at = executor.captured_at_unix_ms;
+        let mut accounting = executor
+            .health
+            .machine
+            .disk_accounting
+            .value()
+            .unwrap()
+            .clone();
+        accounting.categories.former_build_root_bytes = 12 * GIB;
+        executor.health.machine.disk_accounting = Measurement::measured(at, accounting);
+        executor.health.machine.former_build_roots = vec![
+            FormerBuildRootReport {
+                root: "/Users/m/.cairn".into(),
+                home: true,
+                state: FormerBuildRootState::Held,
+                first_retired_at_unix_ms: at - 10 * 60_000,
+                last_pass_at_unix_ms: Some(at - 5 * 60_000),
+                measured_at_unix_ms: Some(at - 5 * 60_000),
+                measurement_complete: true,
+                bytes: FormerBuildRootBytes {
+                    quarantines_bytes: 3 * GIB,
+                    ..FormerBuildRootBytes::default()
+                },
+                held_until_unix_ms: Some(at + 3 * 86_400_000),
+                detail: None,
+                reclaimed_bytes: 250 * GIB,
+            },
+            FormerBuildRootReport {
+                root: "/Volumes/Old".into(),
+                home: false,
+                state: FormerBuildRootState::Unavailable,
+                first_retired_at_unix_ms: at - 60_000,
+                last_pass_at_unix_ms: Some(at - 60_000),
+                measured_at_unix_ms: None,
+                measurement_complete: false,
+                bytes: FormerBuildRootBytes::default(),
+                held_until_unix_ms: None,
+                detail: Some("/Volumes/Old is not reachable".into()),
+                reclaimed_bytes: 0,
+            },
+        ];
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "- Former build root /Users/m/.cairn (the home; its machine authority stays): 3.0 GiB awaiting retirement: forensic holds 3.0 GiB (measured 5m ago); held as forensic evidence for 3d more · 250.0 GiB reclaimed so far. Reclaimed by retirement (cairn/6762), not by the storage ladder\n"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "- Former build root /Volumes/Old: not yet measured; unavailable; nothing under it is touched until it is reachable as itself (/Volumes/Old is not reachable). Reclaimed"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("- Former build root: 12.0 GiB under the home"),
+            "the aggregate gives way to the per-root lines: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "is counted on its line above only: its bytes are in no volume's Cairn total"
+            ),
+            "{rendered}"
+        );
     }
 
     /// A restarted executor's first walk can be hours away. Until it lands,

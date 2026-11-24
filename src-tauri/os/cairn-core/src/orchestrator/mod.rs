@@ -5222,6 +5222,7 @@ mod tests {
                 build_volume: None,
                 build_disk_accounting: None,
                 restored_holdings: None,
+                former_build_roots: Vec::new(),
                 cpu: Measurement::measured(
                     10,
                     CpuPressure {

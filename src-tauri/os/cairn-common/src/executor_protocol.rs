@@ -9947,6 +9947,15 @@ pub struct LearnedResourceEstimate {
 /// the page omits a section that executor cannot fill, and that executor
 /// still quarantines slots over a broken ref file, as it already does.
 ///
+/// cairn/6762 does not move the number. An executor now retires the derived
+/// state of every build root it stopped using, and [`MachineTelemetry`] gains
+/// a defaulted `formerBuildRoots` ([`FormerBuildRootReport`]) that a runner
+/// only renders; its state enum carries `#[serde(other)]`. Nothing prices,
+/// places or admits on it. What a runner gets wrong talking to an older
+/// executor: nothing; that executor reports no former roots and its page
+/// keeps the single former-root aggregate line. An older runner ignores the
+/// field.
+///
 /// Version 178 (cairn/6706) requires full cell-holder occupancy before Unix
 /// retirement and verified TERM/KILL settlement of recorded command/resident
 /// identities. Resident descendants retain launch proof until verified death,
@@ -19160,6 +19169,12 @@ pub struct MachineTelemetry {
     /// `disk_accounting` has no walk of this process's yet. Display only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restored_holdings: Option<RestoredHoldings>,
+    /// Every build root this executor used before its current one whose
+    /// derived state is not yet retired, from its build-root lifecycle record.
+    /// Display only, and restored across restarts with the measurement it
+    /// last took. Empty from a peer that predates retirement (cairn/6762).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub former_build_roots: Vec<FormerBuildRootReport>,
     /// The host's shared temp filesystem, when it is apart from the home's and
     /// the build root's volumes. `None` when it is one of them (macOS keeps it
     /// on the system volume), when the directory is not there, on a platform
@@ -21859,6 +21874,108 @@ pub struct SuspendedCellReport {
     /// empty for an idle cell.
     #[serde(default)]
     pub holder: String,
+}
+
+/// A build root the executor used before its current one, as its retirement
+/// stands. The root stays reported until a complete, identity-checked pass
+/// finds nothing of its derived state left; empty byte totals alone never
+/// retire it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FormerBuildRootReport {
+    /// The root as recorded when it stopped being active.
+    pub root: String,
+    /// Whether the root is the executor's home, whose machine authority stays.
+    #[serde(default)]
+    pub home: bool,
+    pub state: FormerBuildRootState,
+    /// When the executor first started on another root, which is when this
+    /// one's retirement began.
+    pub first_retired_at_unix_ms: u64,
+    /// When a retirement pass last looked at it. `None` before the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pass_at_unix_ms: Option<u64>,
+    /// When `bytes` was measured. `None` when it never has been. Older than
+    /// `last_pass_at_unix_ms` when the last pass could not reach the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_at_unix_ms: Option<u64>,
+    /// Whether that measurement read everything; otherwise `bytes` is a floor.
+    #[serde(default)]
+    pub measurement_complete: bool,
+    #[serde(default)]
+    pub bytes: FormerBuildRootBytes,
+    /// When the last forensic hold under the root expires, while it holds any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_until_unix_ms: Option<u64>,
+    /// Why the last pass stopped short, in words: what was occupied, what
+    /// failed, or why the root could not be reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Every byte retirement has removed from this root so far.
+    #[serde(default)]
+    pub reclaimed_bytes: u64,
+}
+
+/// Where a former build root's retirement stands.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FormerBuildRootState {
+    /// Recorded, and no pass has looked at it yet.
+    Pending,
+    /// A pass made progress and stopped before finishing (it yielded to work).
+    Retiring,
+    /// Only forensic holds remain, each kept until its window expires.
+    Held,
+    /// Something still uses part of it; that part waits for a later pass.
+    Occupied,
+    /// The root is absent, or is not provably the root that was recorded.
+    /// Nothing under it is touched until it is.
+    Unavailable,
+    /// A removal or measurement failed; the next pass retries it.
+    Retrying,
+    /// A state this reader does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A former build root's remaining derived state, by what it is. The sum is
+/// what its retirement has left to reclaim; it is not added to any volume's
+/// used bytes a second time.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FormerBuildRootBytes {
+    /// Cell trees and their authorities not yet staged as forensic holds.
+    #[serde(default)]
+    pub cells_bytes: u64,
+    /// Forensic holds: cells this retirement staged and quarantines the root
+    /// already held, each inside its window.
+    #[serde(default)]
+    pub quarantines_bytes: u64,
+    /// Dependency-catalog generations and population staging.
+    #[serde(default)]
+    pub catalog_bytes: u64,
+    #[serde(default)]
+    pub tool_cache_bytes: u64,
+    /// Managed objects and the pack scratch beside them.
+    #[serde(default)]
+    pub managed_objects_bytes: u64,
+    #[serde(default)]
+    pub warm_caches_bytes: u64,
+    /// The external caches under a former build root's own cache home.
+    #[serde(default)]
+    pub external_caches_bytes: u64,
+}
+
+impl FormerBuildRootBytes {
+    pub fn total(&self) -> u64 {
+        self.cells_bytes
+            .saturating_add(self.quarantines_bytes)
+            .saturating_add(self.catalog_bytes)
+            .saturating_add(self.tool_cache_bytes)
+            .saturating_add(self.managed_objects_bytes)
+            .saturating_add(self.warm_caches_bytes)
+            .saturating_add(self.external_caches_bytes)
+    }
 }
 
 /// The words a decline or a refusal uses for an absent build volume, so every
@@ -31710,6 +31827,7 @@ mod tests {
             build_volume: None,
             build_disk_accounting: None,
             restored_holdings: None,
+            former_build_roots: Vec::new(),
             cpu: Measurement::measured(
                 40,
                 CpuPressure {
@@ -33186,6 +33304,40 @@ mod tests {
         assert!(disk.get("categories").is_none());
     }
 
+    /// cairn/6762's field is additive: an executor that predates it reports
+    /// no former root, and a state a newer executor adds reads as unknown
+    /// rather than failing the whole telemetry frame.
+    #[test]
+    fn former_build_roots_are_additive_and_tolerate_a_newer_state() {
+        let telemetry = serde_json::to_value(MachineTelemetry::default()).unwrap();
+        assert!(telemetry.get("formerBuildRoots").is_none());
+        let telemetry: MachineTelemetry = serde_json::from_value(telemetry).unwrap();
+        assert!(telemetry.former_build_roots.is_empty());
+
+        let report: FormerBuildRootReport = serde_json::from_value(serde_json::json!({
+            "root": "/Volumes/Old",
+            "state": "somethingNewer",
+            "firstRetiredAtUnixMs": 1
+        }))
+        .unwrap();
+        assert_eq!(report.state, FormerBuildRootState::Unknown);
+        assert_eq!(report.measured_at_unix_ms, None);
+        assert!(!report.measurement_complete);
+        assert_eq!(report.bytes.total(), 0);
+        let round_trip = FormerBuildRootReport {
+            state: FormerBuildRootState::Held,
+            held_until_unix_ms: Some(9),
+            ..report
+        };
+        let value = serde_json::to_value(&round_trip).unwrap();
+        assert_eq!(value["state"], "held");
+        assert_eq!(value["heldUntilUnixMs"], 9);
+        assert_eq!(
+            serde_json::from_value::<FormerBuildRootReport>(value).unwrap(),
+            round_trip
+        );
+    }
+
     /// cairn/6761's fields are additive: an executor that predates them names
     /// nothing, and a holding round-trips under the names the page reads.
     #[test]
@@ -33403,6 +33555,7 @@ mod tests {
             build_volume: None,
             build_disk_accounting: None,
             restored_holdings: None,
+            former_build_roots: Vec::new(),
             cpu: Measurement::measured(
                 1,
                 CpuPressure {

@@ -307,6 +307,17 @@ pub fn machine_authority_dir(home: &Path) -> PathBuf {
     home.join(BUILD_SLOTS_DIR).join(AUTHORITY_DIR)
 }
 
+/// The record of which build root an executor last ran on and which former
+/// roots still owe retirement (`cairn-exec`'s `build_root_retirement`).
+/// Machine authority, so it stays under the home whatever the build root: it
+/// is the only pointer to a root the executor no longer uses.
+pub const BUILD_ROOT_LIFECYCLE_FILE: &str = "build-root-lifecycle.json";
+
+/// See [`BUILD_ROOT_LIFECYCLE_FILE`].
+pub fn build_root_lifecycle_path(home: &Path) -> PathBuf {
+    machine_authority_dir(home).join(BUILD_ROOT_LIFECYCLE_FILE)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutorPaths {
     home: PathBuf,

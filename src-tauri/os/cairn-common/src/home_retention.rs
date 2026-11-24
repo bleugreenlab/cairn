@@ -22,10 +22,10 @@
 //!   cannot be born without a line.
 //!
 //! The registry describes the default layout, where the build root is the home.
-//! When a build root is configured apart, the home's own `build-slots/`,
-//! `managed-objects/`, `dependency-catalog/` and `tool-cache/` are a former
-//! build root's, which no ladder rung reaches; the walk prices them as such
-//! ([`FORMER_BUILD_ROOT_ENTRIES`]) and cairn/6762 retires them.
+//! When a build root is configured apart, the home's own derived entries
+//! ([`FORMER_BUILD_ROOT_ENTRIES`]) are a former build root's, which no ladder
+//! rung reaches; the walk prices them as such and `cairn-exec`'s
+//! `build_root_retirement` retires them (cairn/6762).
 
 use std::path::{Path, PathBuf};
 
@@ -41,13 +41,24 @@ pub const UNRECLAIMABLE_LIMIT: usize = 16;
 /// The home entries that are a former build root's when the build root is
 /// configured apart from the home: everything [`crate::executor_paths::ExecutorPaths`]
 /// derives from the build root, other than the scratch trees (which the home
-/// keeps for its own machine-authority cells).
+/// keeps for its own machine-authority cells), and the legacy `warm-caches/`.
+///
+/// The one inventory of a root's derived state: the storage walk prices these
+/// as a former root's, and `cairn-exec`'s `build_root_retirement` retires
+/// exactly these (plus a separate root's own cache home), so the two cannot
+/// disagree about what a former root holds.
 pub const FORMER_BUILD_ROOT_ENTRIES: &[&str] = &[
     crate::runtime::BUILD_SLOTS_DIR,
     crate::executor_paths::MANAGED_OBJECTS_DIR,
+    crate::executor_paths::PACK_SCRATCH_DIR,
     crate::executor_paths::DEPENDENCY_CATALOG_DIR,
     crate::executor_paths::TOOL_CACHE_DIR,
+    WARM_CACHES_DIR,
 ];
+
+/// A cache directory an older executor wrote under its build root. Nothing
+/// writes it now; a former root's copy is retired with the rest.
+pub const WARM_CACHES_DIR: &str = "warm-caches";
 
 /// What bounds an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +264,15 @@ pub const HOME_RETENTION: &[HomeEntry] = &[
         },
     ),
     dir(
+        crate::executor_paths::PACK_SCRATCH_DIR,
+        "cairn-exec pack validation scratch beside the managed objects",
+        "execution",
+        Window {
+            max_age_secs: DAY_SECS,
+            enforcer: "cleanup_pack_scratch in the storage sweep (DEFAULT_TEMP_MAX_AGE)",
+        },
+    ),
+    dir(
         crate::executor_paths::DEPENDENCY_CATALOG_DIR,
         "cairn-exec dependency catalog",
         "execution",
@@ -290,7 +310,7 @@ pub const HOME_RETENTION: &[HomeEntry] = &[
         )
     },
     dir(
-        "warm-caches",
+        WARM_CACHES_DIR,
         "none in production code",
         "execution",
         Undecided {
