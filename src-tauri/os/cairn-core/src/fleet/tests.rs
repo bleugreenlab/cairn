@@ -19076,6 +19076,79 @@ fn the_executors_page_reports_project_eligibility_as_placement_decides_it() {
     assert!(inspection.project_eligibility[1].refusals.is_empty());
 }
 
+/// Whether a machine's recorded setup refusal applies is one decision, and
+/// the executors page and placement are driven through the same cases. A
+/// refusal that cannot be matched to the setup this runner knows the project
+/// runs (unknown since a restart, or changed) does not exclude the machine.
+#[test]
+fn the_page_and_placement_judge_a_setup_refusal_through_the_same_cases() {
+    // (case, the project's setup identity as this runner knows it, a refusal
+    // is recorded under SETUP, the refusal applies)
+    let cases: [(&str, Option<&str>, bool, bool); 4] = [
+        ("matching identity", Some(SETUP), true, true),
+        ("different identity", Some("setup-changed"), true, false),
+        ("unknown identity", None, true, false),
+        ("no refusal", Some(SETUP), false, false),
+    ];
+    for (case, identity, recorded, applies) in cases {
+        let pool = Fleet::default();
+        let (id, mut entry) = fleet_entry("bgsrv-ub2", "linux", 0, &[]);
+        Arc::make_mut(&mut entry.advertisement)
+            .capabilities
+            .projects_served
+            .clear();
+        pool.lock_connections().insert(id.clone(), entry);
+        if recorded {
+            assert!(record(&pool, &id), "{case}");
+        }
+        // What a request carries when this runner has not resolved the
+        // project's setup: no identity at all.
+        let requirements = ProjectPlacementRequirements {
+            setup_identity: identity.unwrap_or_default().into(),
+            ..ProjectPlacementRequirements::default()
+        };
+        if identity.is_some() {
+            pool.known_project_requirements
+                .lock()
+                .unwrap()
+                .insert("p".into(), requirements.clone());
+        }
+
+        let inspection = pool.inspect_executors(NOW).remove(0);
+        let page = inspection
+            .project_eligibility
+            .iter()
+            .find(|project| project.project_id == "p");
+        let page_refuses = page.is_some_and(|project| {
+            project
+                .refusals
+                .iter()
+                .any(|reason| matches!(reason, PlacementRejectionReason::PreparationRefused { .. }))
+        });
+        let mut request = spillable_request();
+        request.executor = None;
+        *request.project_requirements = requirements;
+        let connections = pool.lock_connections().clone();
+        let placement_refuses = matches!(
+            candidate_rejection(&connections[&id], PlacementScope::of(&request), NOW),
+            Some(PlacementRejectionReason::PreparationRefused { .. })
+        );
+        assert_eq!(
+            (page_refuses, placement_refuses),
+            (applies, applies),
+            "{case}: (page, placement)"
+        );
+        // A recorded refusal that does not apply is still shown, as such.
+        let shown_unapplied = page.is_some_and(|project| {
+            matches!(
+                project.unapplied_refusals.as_slice(),
+                [PlacementRejectionReason::PreparationRefused { .. }]
+            )
+        });
+        assert_eq!(shown_unapplied, recorded && !applies, "{case}: unapplied");
+    }
+}
+
 /// The new wire shapes: the outcome variant round-trips, and a request
 /// from a peer that predates `projectRequirements` decodes as requiring
 /// nothing (and an empty one is not sent).

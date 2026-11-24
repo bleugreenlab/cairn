@@ -9969,6 +9969,15 @@ pub struct LearnedResourceEstimate {
 /// route or sends MutationDeltaUploadRequest. DeltaUploadReceipt keeps its wire
 /// shape and its production raw-pack hash meaning. An older executor therefore
 /// uploads and receives receipts unchanged; staging cleanup is runner-local.
+///
+/// cairn/7498 does not move the number. Placement and the executors page now
+/// read one predicate for whether a recorded preparation refusal applies, and
+/// a refusal whose setup identity is unknown or unmatched no longer reads as
+/// an ineligibility on the page. [`ProjectEligibility`] gains a defaulted
+/// `unappliedRefusals` that a runner fills from its own records and only
+/// renders; it is inspection state and never crosses to an executor. No
+/// executor frame, field, admission rule or placement outcome changes, so a
+/// runner talking to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 178;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -22470,6 +22479,12 @@ pub struct ProjectEligibility {
     /// (Rust work included); empty when the machine is eligible.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refusals: Vec<PlacementRejectionReason>,
+    /// Preparation refusals the machine has recorded for the project that
+    /// placement does not apply, because they were recorded under a setup
+    /// this runner cannot match to the one the project runs now. Shown so the
+    /// page can explain why work still lands here; never a reason it does not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unapplied_refusals: Vec<PlacementRejectionReason>,
 }
 
 /// How far along the one-time SSH ceremony that turns a bare host into a

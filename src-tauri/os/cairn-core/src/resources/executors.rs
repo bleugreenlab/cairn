@@ -1811,7 +1811,10 @@ pub(crate) fn render_executor_with_kills(
         }
     }
     out.push_str(&render_build_prerequisites(capabilities));
-    out.push_str(&render_project_eligibility(&executor.project_eligibility));
+    out.push_str(&render_project_eligibility(
+        &executor.project_eligibility,
+        executor.captured_at_unix_ms,
+    ));
     out.push_str(&render_containment(capabilities, executor.colocated));
     out.push_str(&render_macos_fence(
         capabilities,
@@ -7713,6 +7716,7 @@ fn render_build_prerequisites(capabilities: &ExecutorCapabilities) -> String {
 /// healthy everywhere else still says here why a project never lands on it.
 fn render_project_eligibility(
     eligibility: &[cairn_common::executor_protocol::ProjectEligibility],
+    captured_at_unix_ms: u64,
 ) -> String {
     if eligibility.is_empty() {
         return String::new();
@@ -7721,7 +7725,13 @@ fn render_project_eligibility(
     for project in eligibility {
         if project.refusals.is_empty() {
             out.push_str(&format!("  - {}: eligible\n", project.project_id));
-            continue;
+        }
+        for refusal in &project.unapplied_refusals {
+            out.push_str(&format!(
+                "  - {}: {}\n",
+                project.project_id,
+                unapplied_refusal(&project.project_id, refusal, captured_at_unix_ms)
+            ));
         }
         for refusal in &project.refusals {
             let hint = match refusal {
@@ -7738,6 +7748,27 @@ fn render_project_eligibility(
         }
     }
     out
+}
+
+/// A refusal the machine recorded that placement does not apply, in words
+/// that cannot read as a current ineligibility.
+fn unapplied_refusal(
+    project_id: &str,
+    refusal: &PlacementRejectionReason,
+    captured_at_unix_ms: u64,
+) -> String {
+    match refusal {
+        PlacementRejectionReason::PreparationRefused {
+            command,
+            program,
+            recorded_at_unix_ms,
+            ..
+        } => format!(
+            "setup refusal recorded {} for an earlier setup, not applied: `{command}` failed because `{program}` was not on this machine's PATH, but this runner cannot match that setup to the one {project_id} runs now, so placement still sends {project_id}'s work here. If the fault remains, the next preparation refuses again and records it against the current setup",
+            age(captured_at_unix_ms.saturating_sub(*recorded_at_unix_ms))
+        ),
+        other => format!("recorded, not applied: {}", one_line(&other.describe())),
+    }
 }
 
 /// Whether a machine can authenticate to github.com, as its probe last
@@ -11040,6 +11071,7 @@ mod tests {
         executor.project_eligibility = vec![ProjectEligibility {
             project_id: "cairn".into(),
             refusals: vec![],
+            unapplied_refusals: vec![],
         }];
         let pins = [ProjectRustPin {
             project_id: "cairn".into(),
@@ -11479,10 +11511,12 @@ mod tests {
                         detail: missing_webkit().detail,
                     },
                 ],
+                unapplied_refusals: Vec::new(),
             },
             cairn_common::executor_protocol::ProjectEligibility {
                 project_id: "other".into(),
                 refusals: Vec::new(),
+                unapplied_refusals: Vec::new(),
             },
         ];
         let listed = render_executors(
@@ -11512,6 +11546,44 @@ mod tests {
         );
         assert!(page.contains("Provision bglab-sp1 once with"), "{page}");
         assert!(page.contains("  - other: eligible\n"), "{page}");
+    }
+
+    /// A setup refusal placement does not apply, recorded under a setup this
+    /// runner cannot match to the project's current one, reads beside an
+    /// eligible project as recorded and not applied, never as ineligibility.
+    #[test]
+    fn a_setup_refusal_placement_does_not_apply_reads_as_recorded_not_applied() {
+        let mut executor = with_prerequisites("bgsrv-ub2", None);
+        executor.project_eligibility = vec![cairn_common::executor_protocol::ProjectEligibility {
+            project_id: "cairn".into(),
+            refusals: Vec::new(),
+            unapplied_refusals: vec![PlacementRejectionReason::PreparationRefused {
+                project_id: "cairn".into(),
+                command: "bun install".into(),
+                program: "bun".into(),
+                recorded_at_unix_ms: CAPTURED_AT - 600_000,
+            }],
+        }];
+        let listed = render_executors(
+            std::slice::from_ref(&executor),
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+            &Default::default(),
+        );
+        assert!(!listed.contains("Not eligible for cairn"), "{listed}");
+
+        let page = render_executor(&executor);
+        assert!(page.contains("  - cairn: eligible\n"), "{page}");
+        assert!(
+            page.contains(
+                "  - cairn: setup refusal recorded 10m ago for an earlier setup, not applied: `bun install` failed because `bun` was not on this machine's PATH, but this runner cannot match that setup to the one cairn runs now, so placement still sends cairn's work here. If the fault remains, the next preparation refuses again and records it against the current setup\n"
+            ),
+            "{page}"
+        );
+        assert!(!page.contains("cairn: not eligible"), "{page}");
     }
 
     /// The machine's own page keeps the script's diagnostic intact, line by
@@ -11554,6 +11626,7 @@ mod tests {
                 script: "scripts/setup-self-hosted-runner-windows.ps1".into(),
                 detail: missing_clang_cl.detail,
             }],
+            unapplied_refusals: Vec::new(),
         }];
 
         let page = render_executor(&executor);

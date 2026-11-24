@@ -519,7 +519,9 @@ pub(super) fn build_prerequisite_deficiency(
 /// For every project this runner knows (by a preparation, or by a refusal it
 /// recorded), whether this machine could take the project's work, Rust work
 /// included. Built from the same clauses [`candidate_rejection`] applies, so
-/// the executors page shows exactly what placement enforces.
+/// the executors page shows exactly what placement enforces. A recorded setup
+/// refusal [`refusal_applies`] rejects is carried apart, as recorded and not
+/// applied, so the page can explain why placement still sends work here.
 pub(super) fn project_eligibility(
     entry: &ExecutorConnectionState,
     known: &HashMap<String, ProjectPlacementRequirements>,
@@ -545,16 +547,13 @@ pub(super) fn project_eligibility(
                         &requirements,
                     ))
                     .collect();
-            if let Some(refusal) = entry
-                .preparation_refusals
-                .get(project_id)
-                .filter(|refusal| {
-                    known
-                        .get(project_id)
-                        .is_none_or(|known| known.setup_identity == refusal.setup_identity)
-                })
-            {
-                refusals.push(refused(refusal));
+            let mut unapplied_refusals = Vec::new();
+            if let Some(refusal) = entry.preparation_refusals.get(project_id) {
+                if refusal_applies(refusal, &requirements) {
+                    refusals.push(refused(refusal));
+                } else {
+                    unapplied_refusals.push(refused(refusal));
+                }
             }
             refusals.extend(build_prerequisite_deficiency(
                 capabilities,
@@ -566,6 +565,7 @@ pub(super) fn project_eligibility(
             cairn_common::executor_protocol::ProjectEligibility {
                 project_id: project_id.clone(),
                 refusals,
+                unapplied_refusals,
             }
         })
         .collect()
@@ -595,7 +595,23 @@ pub(super) fn applicable_refusal<'e>(
     entry
         .preparation_refusals
         .get(project_id)
-        .filter(|refusal| refusal.setup_identity == requirements.setup_identity)
+        .filter(|refusal| refusal_applies(refusal, requirements))
+}
+
+/// Whether a machine's recorded preparation refusal applies to work running
+/// the setup `requirements` were derived from: the one definition placement
+/// and the executors page both read. A refusal speaks only for the setup it
+/// was recorded under, so one this runner cannot match does not exclude the
+/// machine, whether the setup changed or this runner has not resolved the
+/// project's setup since it started (an empty identity). Placement proceeds
+/// there, and a fault still present refuses again and is recorded under the
+/// identity then known; an unmatched refusal that excluded would need an
+/// operator's `repaired` to lift.
+pub(super) fn refusal_applies(
+    refusal: &preparation::PreparationRefusal,
+    requirements: &ProjectPlacementRequirements,
+) -> bool {
+    !requirements.setup_identity.is_empty() && refusal.setup_identity == requirements.setup_identity
 }
 
 pub(super) fn refused(refusal: &preparation::PreparationRefusal) -> PlacementRejectionReason {
