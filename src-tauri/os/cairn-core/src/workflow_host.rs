@@ -333,6 +333,7 @@ fn publish_projection(orch: &Orchestrator, execution_id: &str, outcome: &Recompu
                     issue_uri: ctx.issue_uri(),
                     fact: crate::orchestrator::AttentionFact::Resolved {
                         final_status: ctx.status.clone(),
+                        settlement: None,
                     },
                     attention: ctx.attention,
                     status: ctx.status,

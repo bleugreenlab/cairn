@@ -1410,6 +1410,79 @@ fn withdraw_lane(orch: &Orchestrator, request_id: &str) {
     }
 }
 
+/// Settle requests owned by the resolved issue's nodes, including completed
+/// producers. Cancellation remains the request driver's authority; the report
+/// reflects the durable row after asking it to cancel, not the request to stop.
+pub(crate) async fn settle_requests_for_resolution(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_ids: &[String],
+    resolution: crate::transitions::Resolution,
+) -> Result<Vec<crate::issues::status::SettlementResource>, String> {
+    use crate::issues::status::{SettlementOutcome, SettlementResource};
+
+    let mut resources = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for job_id in job_ids {
+        if !seen.insert(job_id) {
+            continue;
+        }
+        let rows = db
+            .query_all(
+                format!(
+                    "SELECT {ROW_COLUMNS} FROM check_requests
+                     WHERE requester_job_id=?1 AND state IN {OPEN_STATES}
+                     ORDER BY accepted_at_ms,id"
+                ),
+                (job_id.clone(),),
+                CheckRequestRow::from_row,
+            )
+            .await
+            .map_err(|error| format!("enumerate check requests of {job_id}: {error}"))?;
+        for row in rows {
+            let key = db
+                .query_opt_text(
+                    "SELECT key FROM projects WHERE id=?1",
+                    (row.project_id.clone(),),
+                )
+                .await
+                .map_err(|error| format!("address check request {}: {error}", row.id))?
+                .ok_or_else(|| format!("project missing for check request {}", row.id))?;
+            let by = match resolution {
+                crate::transitions::Resolution::Merged => "the merge of its requester's issue",
+                crate::transitions::Resolution::Closed => "the closure of its requester's issue",
+            };
+            let cancellation = cancel_check_request(orch, db, &row, by).await;
+            let (outcome, diagnostic) = match load_request_by_id(db, &row.id).await {
+                Ok(Some(current)) if current.state == "cancelled" => {
+                    (SettlementOutcome::Cancelled, current.evidence)
+                }
+                Ok(Some(current)) if !current.is_open() => {
+                    (SettlementOutcome::AlreadySettled, current.evidence)
+                }
+                Ok(Some(_)) => (
+                    SettlementOutcome::CleanupPending,
+                    Some(cancellation.unwrap_or_else(|error| error)),
+                ),
+                Ok(None) => (
+                    SettlementOutcome::CleanupPending,
+                    Some("Check request disappeared before settlement could be observed".into()),
+                ),
+                Err(error) => (
+                    SettlementOutcome::CleanupPending,
+                    Some(format!("Observe check request cancellation: {error}")),
+                ),
+            };
+            resources.push(SettlementResource {
+                uri: request_uri(&key, &row.id),
+                outcome,
+                diagnostic,
+            });
+        }
+    }
+    Ok(resources)
+}
+
 /// A stopped node's own requests end with it: each is cancelled in the name of
 /// the stop, so a restart does not re-drive work its requester abandoned.
 pub(crate) async fn cancel_requests_of_stopped_job(orch: &Orchestrator, job_id: &str) {

@@ -1034,33 +1034,10 @@ mod tests {
         assert!(take.contains("note_bookmark_writes("));
         assert!(take.contains("note_unobserved_writes("));
 
-        // A fold's own bookmark moves are transient: every fold is set aside
-        // under the same guard before the landing is installed, so the fold
-        // needs no report of its own and the install's report is the move the
-        // store keeps.
-        let mut folds = 0;
-        for (at, _) in default_landing.match_indices("fold_validated_default(") {
-            folds += 1;
-            let rest = &default_landing[at..];
-            let installed = ["advance_landing_bookmarks(", "publish_released("]
-                .iter()
-                .filter_map(|writer| rest.find(writer))
-                .min()
-                .expect("every fold is installed by a reporting writer");
-            let set_aside = ["undo_own_operations(", "restore()"]
-                .iter()
-                .filter_map(|undo| rest.find(undo))
-                .min()
-                .expect("every fold is set aside");
-            assert!(
-                set_aside < installed,
-                "a fold in default_landing.rs is installed without being set aside first"
-            );
-        }
-        assert_eq!(
-            folds, 2,
-            "a new fold call site needs the same set-aside proof"
-        );
+        // Prospective work never mutates bookmarks, even transiently.
+        assert!(!default_landing.contains("fold_validated_default("));
+        assert!(!default_landing.contains("undo_own_operations("));
+        assert!(advance.contains("install_default_landing("));
 
         // The canonical preparer reports every preparation.
         let preparer = include_str!("../../orchestrator/base_advance/preparation.rs");

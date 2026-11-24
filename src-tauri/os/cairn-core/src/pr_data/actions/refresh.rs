@@ -32,6 +32,7 @@ use super::context::{
 };
 use super::resolution::{
     provenance_links, render_resolution_provenance, resolve_observed_pr_node, resolve_pr_node,
+    resolve_recorded_pr_node,
 };
 
 /// The mergeability an artifact may publish for a live pull request.
@@ -504,11 +505,13 @@ fn observe_resolution(
         PrState::Open | PrState::Unpublished => return None,
     };
     let recorded = recorded?;
-    let unrecorded = match resolution {
-        PrNodeResolution::Merge => recorded != "merged",
-        PrNodeResolution::Close => recorded == "open",
+    // A terminal row records landing, not completion of its settlement. A
+    // repeated observation repairs a crash between those two operations.
+    let can_settle = match resolution {
+        PrNodeResolution::Merge => true,
+        PrNodeResolution::Close => recorded != "merged",
     };
-    unrecorded.then(|| ObservedResolution {
+    can_settle.then(|| ObservedResolution {
         owner_id: mr_context.job_id.clone(),
         resolution,
         merged_commit: pr_details.merge_commit.clone(),
@@ -826,6 +829,20 @@ pub(crate) async fn pr_snapshot_for_job(
     match snapshot {
         Some(snapshot) => {
             settle_observed_resolution(orch, &snapshot).await;
+            // A local landing has no GitHub observation to replay. Its terminal
+            // MR row can survive a crash before the issue cascade, too.
+            if snapshot.observed.is_none() {
+                let resolution = match snapshot.cache.state {
+                    PrState::Merged => Some(PrNodeResolution::Merge),
+                    PrState::Closed if snapshot.unbound.is_some() => Some(PrNodeResolution::Close),
+                    _ => None,
+                };
+                if let Some(resolution) = resolution {
+                    if let Err(error) = resolve_recorded_pr_node(orch, job_id, resolution).await {
+                        log::warn!("Recorded PR settlement pending for {job_id}: {error}");
+                    }
+                }
+            }
             settle_landing_follow_up(orch, job_id, &snapshot).await;
             Ok(snapshot)
         }
@@ -1939,6 +1956,248 @@ mod tests {
         let joined = pr_snapshot_for_job(&orch, "job-c", None).await.unwrap();
         assert_eq!(orch.pr_refresh_cache.counters().misses, 1);
         assert_eq!(joined.read_at, first.read_at);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refreshing_a_recorded_local_merge_retries_the_issue_cascade() {
+        let db = migrated_db().await;
+        super::super::test_support::seed_pr_node_merge_request_for_artifact_job(&db).await;
+        db.execute_script(
+            "INSERT INTO jobs(id,execution_id,issue_id,project_id,status,uri_segment,created_at,updated_at)
+               VALUES('queued','exec-pr-node','issue-pr-node','proj-pr-node','pending','reviewer',1,1);
+             UPDATE merge_requests SET status='merged',merged_at=42,is_local=1,
+                 github_pr_number=NULL,github_pr_url=NULL WHERE id='mr-pr-node';"
+        ).await.unwrap();
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let first = refresh_pr_for_job(&orch, "builder-job").await.unwrap();
+        assert_eq!(first.state, PrState::Merged);
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text("SELECT status FROM issues WHERE id='issue-pr-node'", (),)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("merged")
+        );
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text("SELECT status FROM jobs WHERE id='queued'", (),)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cancelled")
+        );
+        let completed = orch
+            .db
+            .local
+            .query_opt_i64(
+                "SELECT completed_at FROM issues WHERE id='issue-pr-node'",
+                (),
+            )
+            .await
+            .unwrap();
+        refresh_pr_for_job(&orch, "builder-job").await.unwrap();
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_i64(
+                    "SELECT completed_at FROM issues WHERE id='issue-pr-node'",
+                    (),
+                )
+                .await
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_i64(
+                    "SELECT COUNT(*) FROM pr_node_port_fires WHERE port='merge'",
+                    (),
+                )
+                .await
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    struct ReopenClock(i64);
+
+    impl crate::services::Clock for ReopenClock {
+        fn now(&self) -> i64 {
+            self.0
+        }
+
+        fn now_u64(&self) -> u64 {
+            self.0 as u64
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn historical_artifact_reads_do_not_resolve_reopened_work() {
+        use super::super::resolution::{resolve_observed_pr_node, Landed};
+        use super::super::test_support::seed_pr_node_merge_request_for_artifact_job;
+
+        for bound in [false, true] {
+            for merged in [false, true] {
+                for newer_open in [false, true] {
+                    let db = migrated_db().await;
+                    seed_pr_node_merge_request_for_artifact_job(&db).await;
+                    db.execute(
+                        "UPDATE merge_requests SET is_local=1 WHERE id='mr-pr-node'",
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                    let orch = test_orchestrator(db, MockGitClient::new());
+                    let resolution = if merged {
+                        PrNodeResolution::Merge
+                    } else {
+                        PrNodeResolution::Close
+                    };
+                    if bound {
+                        resolve_observed_pr_node(
+                            &orch,
+                            "builder-job",
+                            resolution,
+                            Landed::default(),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    } else {
+                        resolve_pr_node(&orch, "builder-job", resolution, None, None)
+                            .await
+                            .unwrap();
+                    }
+                    let resolved_at = orch
+                        .db
+                        .local
+                        .query_opt_i64(
+                            "SELECT completed_at FROM issues WHERE id='issue-pr-node'",
+                            (),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    crate::issues::crud::unresolve(
+                        &orch.db.local,
+                        &ReopenClock(resolved_at),
+                        "issue-pr-node",
+                    )
+                    .await
+                    .unwrap();
+                    orch.db.local.execute_script(
+                        "INSERT INTO jobs(id,execution_id,issue_id,project_id,status,node_name,created_at,updated_at)
+                         VALUES('new-queued','exec-pr-node','issue-pr-node','proj-pr-node','pending','queued',1,1),
+                               ('new-running','exec-pr-node','issue-pr-node','proj-pr-node','running','running',1,1);"
+                    ).await.unwrap();
+                    if newer_open {
+                        orch.db.local.execute_script(
+                            "INSERT INTO merge_requests(id,job_id,project_id,issue_id,title,source_branch,target_branch,status,opened_at,updated_at)
+                             VALUES('new-mr','new-running','proj-pr-node','issue-pr-node','New','new-branch','main','open',2,2);"
+                        ).await.unwrap();
+                    }
+                    let before = orch
+                        .db
+                        .local
+                        .query_opt_text("SELECT status FROM issues WHERE id='issue-pr-node'", ())
+                        .await
+                        .unwrap();
+                    assert!(!matches!(before.as_deref(), Some("merged" | "closed")));
+                    // Supply the exact terminal GitHub observation through the
+                    // shared snapshot cache, without network or git processes.
+                    orch.invalidate_pr_refresh("builder-job", "reopen-test");
+                    let mut snapshot = compute_pr_snapshot(&orch, "builder-job").await.unwrap();
+                    if bound {
+                        orch.db
+                            .local
+                            .execute(
+                                "UPDATE merge_requests SET is_local=0,github_pr_number=7,
+                             github_pr_url='https://github.com/example/repo/pull/7'
+                             WHERE id='mr-pr-node'",
+                                (),
+                            )
+                            .await
+                            .unwrap();
+                        snapshot.unbound = None;
+                        snapshot.observed = Some(ObservedResolution {
+                            owner_id: "builder-job".into(),
+                            resolution,
+                            merged_commit: None,
+                            merged_source: None,
+                            project_id: "proj-pr-node".into(),
+                            target_branch: None,
+                            resolved_at: Some(resolved_at),
+                            github_prose: None,
+                        });
+                    }
+                    let snapshot = Arc::new(snapshot);
+                    orch.pr_refresh_cache
+                        .get_or_compute("builder-job", || async { Some(snapshot.clone()) })
+                        .await
+                        .unwrap();
+                    let section =
+                        render_live_pr_section(&orch, "builder-job", "cairn://test/pr", false)
+                            .await
+                            .unwrap();
+                    assert!(
+                        section.contains(if merged { "MERGED" } else { "CLOSED" }),
+                        "{section}"
+                    );
+                    assert_eq!(
+                        orch.db
+                            .local
+                            .query_opt_text(
+                                "SELECT status FROM issues WHERE id='issue-pr-node'",
+                                (),
+                            )
+                            .await
+                            .unwrap(),
+                        before,
+                        "bound={bound} merged={merged} newer={newer_open}"
+                    );
+                    for (job, status) in [("new-queued", "pending"), ("new-running", "running")] {
+                        assert_eq!(
+                            orch.db
+                                .local
+                                .query_opt_text("SELECT status FROM jobs WHERE id=?1", (job,),)
+                                .await
+                                .unwrap()
+                                .as_deref(),
+                            Some(status)
+                        );
+                    }
+                    assert_eq!(
+                        orch.db
+                            .local
+                            .query_opt_i64(
+                                "SELECT resolution_generation FROM issues WHERE id='issue-pr-node'",
+                                (),
+                            )
+                            .await
+                            .unwrap(),
+                        Some(1)
+                    );
+                    if newer_open {
+                        assert_eq!(
+                            orch.db
+                                .local
+                                .query_opt_text(
+                                    "SELECT status FROM merge_requests WHERE id='new-mr'",
+                                    (),
+                                )
+                                .await
+                                .unwrap()
+                                .as_deref(),
+                            Some("open")
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A merged or closed change with no pull request is not probed, so its

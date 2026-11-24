@@ -270,7 +270,7 @@ use super::context::{db_error, resolve_merge_mr_context_for_job, MergeMrContext}
 use super::default_landing::PublishedLanding;
 use super::landing_record::journal_accepted_publication;
 use super::refresh::refresh_pr_for_job;
-use super::resolution::{resolve_pr_node_landed, Landed};
+use super::resolution::{capture_landing_resolution, resolve_pinned_landing, Landed};
 
 /// Resolve a PR owner id to the `jobs.id` used by `file_changes.job_id`.
 async fn resolve_file_change_job_id(
@@ -643,14 +643,71 @@ fn is_remote_default_landing(ctx: &MergeMrContext, resolved_default: &str) -> bo
         && ctx.target_branch == resolved_default
 }
 
-/// Merge a PR, mark the issue merged, and run post-merge reconciliation (file
-/// capture, optional main-repo pull, active-worktree fast-forward, teardown, PR
-/// refresh) in the background via `reconcile_after_merge`.
-///
-/// A merge is a commit barrier on the PR's source branch: commits earlier
-/// batches sealed there but could not publish are republished first, and the
-/// merge is refused while any is still held, because the pull request would
-/// ship without work its author was told is committed.
+tokio::task_local! {
+    static MERGE_RESPONSE_RUN: Option<String>;
+}
+
+pub(crate) fn merge_response_run() -> Option<String> {
+    MERGE_RESPONSE_RUN.try_with(Clone::clone).ok().flatten()
+}
+
+struct MergeResponseGuard<'a> {
+    orch: &'a Orchestrator,
+    run: Option<&'a str>,
+}
+
+impl Drop for MergeResponseGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(run) = self.run {
+            let mut responses = self.orch.resolution_responses.lock().unwrap();
+            // A resolved caller remains protected until its provider handoff or EOF.
+            if responses.get(run) == Some(&None) {
+                responses.remove(run);
+            }
+        }
+    }
+}
+
+/// The caller identity comes from the authenticated callback, never the PR owner.
+pub async fn merge_pr_for_job_preserving_run(
+    orch: &Orchestrator,
+    job_id: &str,
+    merge_method: Option<String>,
+    attribution: Option<super::PrResolutionAttribution>,
+    precondition: Option<MergePrecondition>,
+    response_run_id: Option<&str>,
+) -> Result<String, String> {
+    preserve_merge_response(
+        orch,
+        response_run_id,
+        merge_pr_for_job(orch, job_id, merge_method, attribution, precondition),
+    )
+    .await
+}
+
+pub(super) async fn preserve_merge_response<T>(
+    orch: &Orchestrator,
+    response_run_id: Option<&str>,
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    let _guard = MergeResponseGuard {
+        orch,
+        run: response_run_id,
+    };
+    if let Some(run) = response_run_id {
+        orch.resolution_responses
+            .lock()
+            .unwrap()
+            .entry(run.to_owned())
+            .or_insert(None);
+    }
+    MERGE_RESPONSE_RUN
+        .scope(response_run_id.map(str::to_owned), operation)
+        .await
+}
+
+/// Merge a PR, settle its issue, and reconcile the landing in the background.
+/// Held source-branch commits must be published before landing.
 pub async fn merge_pr_for_job(
     orch: &Orchestrator,
     job_id: &str,
@@ -749,6 +806,7 @@ async fn merge_pr_for_job_past_barrier(
         .await
         .map_err(|e| e.to_string())?;
     let merge_context = resolve_merge_mr_context_for_job(&db, job_id).await?;
+    let resolution_context = capture_landing_resolution(&db, &merge_context).await?;
     let repo_path = merge_context.mr.repo_path.clone();
 
     // Per-phase timing for the synchronous merge path. The downstream sibling
@@ -1042,14 +1100,16 @@ async fn merge_pr_for_job_past_barrier(
     );
     let _bookkeeping = super::merge_metrics::time(super::merge_metrics::Phase::Bookkeeping);
 
-    // Merge postcondition: the fold must have advanced the target bookmark to
-    // contain the source tip. Verify it BEFORE `resolve_pr_node` marks the PR
-    // merged, resolves the issue, or tears anything down — so a fold that
-    // silently no-ops (a future regression) converts to a loud, recoverable
-    // error instead of the silent data loss CAIRN-2287 traces. No commits are
-    // lost on failure: nothing downstream has run, and the source bookmark is
-    // untouched. `store_merge_child` FFs the target onto the (possibly squashed)
-    // source, so on every success path the source is an ancestor of the target.
+    // A local bookmark proves a recorded landing, not whether origin accepted
+    // the push. An accepted publication with incomplete recording is already
+    // landed and must settle the issue while its existing intent drives repair.
+    let recording_pending = published.as_ref().and_then(|landing| landing.recording_pending.as_deref());
+    if let Some(error) = recording_pending {
+        config_notice = merge_journal_detail(&[
+            config_notice.as_deref(),
+            Some(&format!("Merge landed on origin; local recording pending: {error}. Do not retry the merge; publication-intent recovery will finish recording it.")),
+        ]);
+    }
     {
         let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
         if !crate::jj::bookmark_landed_in(
@@ -1057,9 +1117,9 @@ async fn merge_pr_for_job_past_barrier(
             &merge_store,
             &merge_context.source_branch,
             &merge_context.target_branch,
-        ) {
+        ) && recording_pending.is_none() {
             return Err(format!(
-                "Merge postcondition failed: after folding `{source}` into `{target}`, the target bookmark does not contain the source tip. Refusing to mark the PR merged — no commits were lost and the source branch is intact; retry the merge.",
+                "Merge postcondition failed: after folding `{source}` into `{target}`, the target bookmark does not contain the source tip and no accepted origin publication proves a landing. Refusing to mark the PR merged — no commits were lost and the source branch is intact; retry the merge.",
                 source = merge_context.source_branch,
                 target = merge_context.target_branch,
             ));
@@ -1087,9 +1147,11 @@ async fn merge_pr_for_job_past_barrier(
     // commit (a default landing's squash, a child's prepared head), so that
     // commit is the source's exact merged identity.
     let merged_source = landing.as_ref().map(|_| merged_commit.as_str());
-    resolve_pr_node_landed(
+    let settlement_uri = crate::issues::status::settlement_uri_for_job(&db, job_id).await;
+    let settlement = resolve_pinned_landing(
         orch,
         job_id,
+        resolution_context,
         attribution,
         Landed {
             commit: Some(merged_commit.as_str()),
@@ -1098,16 +1160,12 @@ async fn merge_pr_for_job_past_barrier(
         },
     )
     .await
-    .map_err(|error| {
-        log::error!(
-                "Merged git branch but failed to mark merge request merged for job/action {}: {}",
-                job_id,
-                error
-            );
-            error
-        })?;
-    // The merge is recorded: the landing's source reads merged, so the final
-    // check refuses any child still naming it, and its reservation can go.
+    .unwrap_or_else(|error| crate::issues::status::SettlementReport::pending(
+        settlement_uri, crate::transitions::Resolution::Merged, error,
+    ));
+    // The MR record or the still-executing durable publication intent now
+    // denies surviving writers. The latter is recovered by lifecycle maintenance
+    // if the MR claim failed; no in-memory reservation must outlive this call.
     if let Some(landed) = landing.as_mut() {
         landed.reservation = None;
     }
@@ -1131,7 +1189,7 @@ async fn merge_pr_for_job_past_barrier(
         merge_started.elapsed()
     );
         Ok(with_merge_notice(
-            "PR merged successfully".to_string(),
+            format!("PR merged successfully\n\n{settlement}"),
             config_notice.as_deref(),
         ))
     }
@@ -1180,6 +1238,13 @@ async fn journal_merge_outcomes(
     journals_base: bool,
 ) -> Result<String, String> {
     let publication = match (&published, &merge_result) {
+        (Some(published), Ok(_)) if published.recording_pending.is_some() => Err(format!(
+            "origin accepted the landing; local recording pending: {}",
+            published
+                .recording_pending
+                .as_deref()
+                .expect("matched pending recording")
+        )),
         (Some(published), Ok(_)) => {
             journal_accepted_publication(
                 db,
@@ -1196,12 +1261,26 @@ async fn journal_merge_outcomes(
     };
     // Settled, or left unsettled for recovery: no longer driven here.
     drop(published);
-    if journals_base {
-        journal_merge_attempt_outcome(db, attempt, &merge_result, success_detail.as_deref())
-            .await?;
+    let base = if journals_base {
+        journal_merge_attempt_outcome(db, attempt, &merge_result, success_detail.as_deref()).await
+    } else {
+        Ok(())
+    };
+    match merge_result {
+        Ok(mut reply) => {
+            for error in [publication.err(), base.err()].into_iter().flatten() {
+                log::error!("Merge landed; journal cleanup pending: {error}");
+                reply.push_str(&format!("\n\n⚠️ Merge landed; cleanup pending: {error}"));
+            }
+            Ok(reply)
+        }
+        Err(error) => {
+            if let Err(journal_error) = base {
+                log::error!("Failed to journal refused merge: {journal_error}");
+            }
+            Err(error)
+        }
     }
-    publication?;
-    merge_result
 }
 
 /// What the successful landing of a merge request recorded beyond an ordinary
@@ -1428,7 +1507,14 @@ mod tests {
             _driving: super::super::default_landing::PublicationInFlight::enter(&publication_id)
                 .unwrap(),
             attempt_id: publication_id,
+            recording_pending: None,
         };
+        db.execute(
+            "UPDATE merge_requests SET status = 'merged', merged_commit = ?1 WHERE id = 'mr'",
+            params![landing],
+        )
+        .await
+        .unwrap();
         (attempt_id, published)
     }
 
@@ -1491,6 +1577,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_accepted_origin_landing_with_pending_recording_keeps_its_intent() {
+        let db = merge_journal_test_db().await;
+        let landing = "l".repeat(40);
+        let (attempt_id, mut published) = landed_attempt(&db, &landing).await;
+        let publication_id = published.attempt_id.clone();
+        published.recording_pending = Some("store recording unavailable".to_string());
+        let reply = journal_merge_outcomes(
+            &db,
+            attempt_journal(&attempt_id),
+            Some(published),
+            Ok("PR merged successfully".to_string()),
+            None,
+            true,
+        )
+        .await
+        .expect("accepted origin landing cannot become a refusal");
+        assert!(reply.contains("Merge landed"), "{reply}");
+        assert!(reply.contains("store recording unavailable"), "{reply}");
+        assert_eq!(
+            states(&journal_rows(&db, &publication_id).await),
+            [(1, "executing")]
+        );
+        assert_eq!(
+            states(&journal_rows(&db, &attempt_id).await),
+            [(0, "policy_disabled"), (1, "succeeded")]
+        );
+        assert!(super::super::default_landing::PublicationInFlight::enter(&publication_id).is_ok());
+    }
+
     /// Recovery settled the publication as the same landing before the
     /// command journaled it: one fact, recorded once. The merge still answers
     /// success and its attempt still gets its terminal outcome.
@@ -1543,8 +1659,9 @@ mod tests {
             true,
         )
         .await
-        .unwrap_err();
+        .expect("journal disagreement cannot undo a landed merge");
 
+        assert!(error.contains("cleanup pending"), "{error}");
         assert!(error.contains(&landing), "{error}");
         assert!(error.contains(&other), "{error}");
         assert_eq!(

@@ -912,6 +912,7 @@ mod tests {
                     issue_uri: CHILD_URI.into(),
                     fact: AttentionFact::Resolved {
                         final_status: final_status.clone(),
+                        settlement: None,
                     },
                     attention: IssueAttention::None,
                     status: final_status,
@@ -950,6 +951,7 @@ mod tests {
                 issue_uri: CHILD_URI.into(),
                 fact: AttentionFact::Resolved {
                     final_status: IssueStatus::Merged,
+                    settlement: None,
                 },
                 attention: IssueAttention::None,
                 status: IssueStatus::Merged,
@@ -1164,6 +1166,7 @@ mod tests {
                 issue_uri: CHILD_URI.into(),
                 fact: AttentionFact::Resolved {
                     final_status: IssueStatus::Merged,
+                    settlement: None,
                 },
                 attention: IssueAttention::None,
                 status: IssueStatus::Merged,
@@ -1217,6 +1220,7 @@ mod tests {
                 issue_uri: CHILD_URI.into(),
                 fact: AttentionFact::Resolved {
                     final_status: IssueStatus::Merged,
+                    settlement: None,
                 },
                 attention: IssueAttention::None,
                 status: IssueStatus::Merged,
@@ -1252,6 +1256,7 @@ mod tests {
                 issue_uri: CHILD_URI.into(),
                 fact: AttentionFact::Resolved {
                     final_status: IssueStatus::Failed,
+                    settlement: None,
                 },
                 attention: IssueAttention::None,
                 status: IssueStatus::Failed,
@@ -1288,6 +1293,7 @@ mod tests {
                 issue_uri: CHILD_URI.into(),
                 fact: AttentionFact::Resolved {
                     final_status: IssueStatus::Failed,
+                    settlement: None,
                 },
                 attention: IssueAttention::None,
                 status: IssueStatus::Failed,
@@ -1324,6 +1330,7 @@ mod tests {
                 issue_uri: CHILD_URI.into(),
                 fact: AttentionFact::Resolved {
                     final_status: IssueStatus::Failed,
+                    settlement: None,
                 },
                 attention: IssueAttention::None,
                 status: IssueStatus::Failed,

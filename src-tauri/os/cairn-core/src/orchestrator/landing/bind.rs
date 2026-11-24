@@ -6,9 +6,9 @@
 //! it lands: any number it chooses earlier is a guess that another branch may
 //! land first. So it authors the provisional spelling (`NEXT_name.sql`, `///
 //! Version NEXT (cairn/N)`), and the landing, which is serialized by the store
-//! lock, allocates against the tip it lands on and rewrites the branch in one
-//! sealed commit: `Bind landing identifiers: migration 0284_x, executor-protocol
-//! 158`. Two branches that both say NEXT land as consecutive values in landing
+//! lock, allocates against the tip it lands on and plans edits to the detached
+//! landing tree. Preserve mode records a hidden bind child; squash mode includes
+//! the edits in its one landing commit. Two branches that both say NEXT land as consecutive values in landing
 //! order. A branch that numbered by hand is bound the same way, so a number
 //! another branch took first is rebound rather than refused.
 //!
@@ -45,70 +45,13 @@ const PROVISIONAL: &str = "NEXT";
 /// reference lives in source and prose, not in a generated blob.
 const REWRITE_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 
-/// One file mutation applied to a materialized tree.
+/// One file mutation planned for a detached landing tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileEdit {
     /// Move a file, carrying its content untouched.
     Rename { from: String, to: String },
     /// Replace a file's whole content.
     Rewrite { path: String, content: String },
-}
-
-impl FileEdit {
-    fn paths(&self) -> Vec<String> {
-        match self {
-            Self::Rename { from, to } => vec![from.clone(), to.clone()],
-            Self::Rewrite { path, .. } => vec![path.clone()],
-        }
-    }
-}
-
-/// Every path `edits` write, deduplicated, for a path-scoped commit.
-pub(crate) fn touched_paths(edits: &[FileEdit]) -> Vec<String> {
-    edits
-        .iter()
-        .flat_map(FileEdit::paths)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-/// Apply `edits` on `tip` and seal them onto `bookmark` as one commit with
-/// `message`. Renames are applied before rewrites, in order.
-pub(crate) fn seal_edits(
-    jj: &crate::jj::JjEnv,
-    store: &Path,
-    bookmark: &str,
-    tip: &str,
-    edits: &[FileEdit],
-    message: &str,
-) -> Result<(), String> {
-    if edits.is_empty() {
-        return Ok(());
-    }
-    crate::jj::with_transient_workspace(jj, store, tip, |workspace| {
-        for edit in edits {
-            match edit {
-                FileEdit::Rename { from, to } => {
-                    let target = workspace.join(to);
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|error| format!("create `{}`: {error}", parent.display()))?;
-                    }
-                    std::fs::rename(workspace.join(from), &target)
-                        .map_err(|error| format!("rename `{from}` to `{to}`: {error}"))?;
-                }
-                FileEdit::Rewrite { path, content } => {
-                    std::fs::write(workspace.join(path), content)
-                        .map_err(|error| format!("rewrite `{path}`: {error}"))?;
-                }
-            }
-        }
-        let paths = touched_paths(edits);
-        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
-        crate::jj::seal_paths(jj, workspace, message, None, &path_refs, Some(bookmark))?;
-        Ok(())
-    })
 }
 
 /// One value a landing allocated.
@@ -512,15 +455,6 @@ pub(crate) fn numbered_invariant(
 
 // ── The store side ───────────────────────────────────────────────────────────────
 
-/// A branch bound against one destination tip.
-#[derive(Debug, Clone)]
-pub(crate) struct BoundLanding {
-    /// The head that lands: the bind commit, or the (replayed) branch tip when
-    /// nothing needed binding.
-    pub head: String,
-    pub plan: BindPlan,
-}
-
 /// The names directly inside `directory` at `rev`.
 fn names_in(
     jj: &crate::jj::JjEnv,
@@ -596,11 +530,9 @@ pub(crate) fn touches_identifiers(
         }))
 }
 
-/// Bind `branch` at exactly `expected_head`, which must already descend from
-/// `target` (the tip of `target_branch`), and seal the bind commit onto it when
-/// there is anything to bind. A rule that refuses the branch is reported as a
-/// landing refusal. The caller holds the store lock.
-pub(crate) fn bind_onto(
+/// Plan identifier binding at the exact prepared coordinate without installing
+/// a commit or changing any bookmark. The caller holds the store lock.
+pub(crate) fn plan_onto(
     jj: &crate::jj::JjEnv,
     store: &Path,
     branch: &str,
@@ -608,7 +540,7 @@ pub(crate) fn bind_onto(
     target: &str,
     target_branch: &str,
     rules: &[(String, IdentifierRule)],
-) -> Result<BoundLanding, String> {
+) -> Result<BindPlan, String> {
     let targets = cairn_vcs::local_bookmark_targets(store, branch)?;
     let [tip] = targets.as_slice() else {
         return Err(format!("bookmark `{branch}` did not resolve to one commit"));
@@ -656,16 +588,7 @@ pub(crate) fn bind_onto(
             }
         }
     }
-    if plan.edits.is_empty() {
-        return Ok(BoundLanding { head: tip, plan });
-    }
-    seal_edits(jj, store, branch, &tip, &plan.edits, &plan.commit_message())?;
-    let head = crate::jj::bookmark_commit(jj, store, branch)
-        .ok_or_else(|| format!("the bind commit left `{branch}` unresolved"))?;
-    if head == tip {
-        return Err(format!("the bind commit did not move `{branch}`"));
-    }
-    Ok(BoundLanding { head, plan })
+    Ok(plan)
 }
 
 /// Every text file `head` changed against `target`, with its content at `head`.

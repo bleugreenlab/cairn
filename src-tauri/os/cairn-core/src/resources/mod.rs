@@ -67,6 +67,7 @@ pub(crate) mod tenets;
 pub(crate) mod thread_seed;
 mod threads;
 mod transcript;
+pub(crate) mod usage_capacity;
 mod vcs;
 mod workflows;
 

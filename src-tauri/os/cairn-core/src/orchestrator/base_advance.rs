@@ -1472,6 +1472,20 @@ pub(crate) async fn inflight_run_batch_except(
     prefer_job: Option<&str>,
     exempt: Option<(&str, &str)>,
 ) -> Result<Option<InflightRunBatch>, String> {
+    inflight_run_batch_for_landing(db, project_id, branch, prefer_job, exempt, None).await
+}
+
+/// A reserved landing consumes committed store state without touching executor
+/// cells. Other writers and other issues retain their durable batch holds.
+pub(crate) async fn inflight_run_batch_for_landing(
+    db: &LocalDb,
+    project_id: &str,
+    branch: &str,
+    prefer_job: Option<&str>,
+    exempt: Option<(&str, &str)>,
+    landing_issue: Option<&str>,
+) -> Result<Option<InflightRunBatch>, String> {
+    let landing_issue = landing_issue.map(str::to_string);
     let exempt = exempt.map(|(job, request)| (job.to_string(), request.to_string()));
     let (project_id, branch) = (project_id.to_string(), branch.to_string());
     let prefer_job = prefer_job.unwrap_or_default().to_string();
@@ -1481,6 +1495,7 @@ pub(crate) async fn inflight_run_batch_except(
            JOIN jobs j ON j.id = w.job_id
           WHERE j.project_id = ?1
             AND j.branch = ?2
+            AND (?4 IS NULL OR j.issue_id IS NULL OR j.issue_id != ?4)
             AND w.state IN ('pending', 'resolving')
             AND {LIVE_JOB_PREDICATE}
           ORDER BY (w.job_id = ?3) DESC, w.created_at"
@@ -1491,6 +1506,7 @@ pub(crate) async fn inflight_run_batch_except(
            JOIN jobs j ON j.id = d.job_id
           WHERE j.project_id = ?1
             AND j.branch = ?2
+            AND (?4 IS NULL OR j.issue_id IS NULL OR j.issue_id != ?4)
             AND d.state IN ('parked', 'running')
             AND {LIVE_JOB_PREDICATE}
           ORDER BY (d.job_id = ?3) DESC, d.created_ms"
@@ -1505,6 +1521,7 @@ pub(crate) async fn inflight_run_batch_except(
                 detached_sql.clone(),
             );
             let exempt = exempt.clone();
+            let landing_issue = landing_issue.clone();
             let is_exempt = move |batch: &InflightRunBatch| {
                 exempt.as_ref().is_some_and(|(job, request)| {
                     batch.job_id == *job && batch.request_id == *request
@@ -1514,7 +1531,12 @@ pub(crate) async fn inflight_run_batch_except(
                 let mut rows = conn
                     .query(
                         &sql,
-                        params![project_id.as_str(), branch.as_str(), prefer_job.as_str()],
+                        params![
+                            project_id.as_str(),
+                            branch.as_str(),
+                            prefer_job.as_str(),
+                            landing_issue.as_deref()
+                        ],
                     )
                     .await?;
                 while let Some(row) = rows.next().await? {
@@ -1531,7 +1553,12 @@ pub(crate) async fn inflight_run_batch_except(
                 let mut rows = conn
                     .query(
                         &detached_sql,
-                        params![project_id.as_str(), branch.as_str(), prefer_job.as_str()],
+                        params![
+                            project_id.as_str(),
+                            branch.as_str(),
+                            prefer_job.as_str(),
+                            landing_issue.as_deref()
+                        ],
                     )
                     .await?;
                 while let Some(row) = rows.next().await? {

@@ -228,6 +228,29 @@ pub(super) fn live_control(request_id: &str) -> Option<std::sync::Arc<super::Bat
         .cloned()
 }
 
+/// Snapshot admitted mutating batches, including calls that never detached.
+pub(crate) fn live_mutating_owners() -> Vec<(String, BatchOwner)> {
+    LIVE_BATCHES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(_, control)| control.commits)
+        .filter_map(|(id, control)| control.owner().map(|owner| (id.clone(), owner)))
+        .collect()
+}
+
+/// Snapshot batches still holding their owner's environment, including read-only
+/// batches admitted into the home rather than a disposable cell.
+pub(crate) fn live_environment_owners() -> Vec<(String, BatchOwner)> {
+    LIVE_BATCHES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(_, control)| control.holds_branch())
+        .filter_map(|(id, control)| control.owner().map(|owner| (id.clone(), owner)))
+        .collect()
+}
+
 /// Who a live batch belongs to: its job, and that job's home URI (the
 /// node or task whose `batches/<request_id>` addresses it).
 #[derive(Clone, Debug, PartialEq, Eq)]

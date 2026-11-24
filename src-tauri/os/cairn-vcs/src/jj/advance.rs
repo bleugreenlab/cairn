@@ -1396,6 +1396,210 @@ async fn compute_merge_candidate(
     Ok((candidate, stale))
 }
 
+/// An edit to a detached landing tree. Renames retain the complete tree value,
+/// including executable mode and copy identity.
+pub enum LandingTreeEdit {
+    Rename { from: String, to: String },
+    Rewrite { path: String, content: String },
+}
+
+pub struct DetachedLanding {
+    pub commit: String,
+    /// An immutable index for validation, never published as an operation head.
+    pub operation: String,
+}
+
+/// Compute a landing using the canonical squash factory, without installing its
+/// source, target, descendants, working copies, or operation head. The caller
+/// retains its object lease through validation and publication.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_default_landing(
+    jj: &super::JjEnv,
+    store: &Path,
+    branch: &str,
+    expected_source: &str,
+    target: &str,
+    message: &str,
+    squash: bool,
+    edits: &[LandingTreeEdit],
+) -> Result<DetachedLanding, String> {
+    let budget = jj
+        .operation_deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(super::JJ_DEFAULT_TIMEOUT);
+    let deadline = Deadline::new(budget, jj.operation_deadline);
+    let snapshot = capture_replay(store, branch, target, false)?;
+    if snapshot.coordinate.head != expected_source {
+        return Err("landing source moved; prepare the landing again".into());
+    }
+    let source_id = CommitId::try_from_hex(expected_source)
+        .ok_or_else(|| "invalid landing source".to_string())?;
+    let target_id =
+        CommitId::try_from_hex(target).ok_or_else(|| "invalid landing target".to_string())?;
+    if !snapshot
+        .repo
+        .index()
+        .is_ancestor(&target_id, &source_id)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("landing source does not contain its exact target".into());
+    }
+    let (repo, head) = if squash && (expected_source != target || !edits.is_empty()) {
+        let (candidate, _) = compute_branch_squash(jj, snapshot, message, budget)
+            .map_err(|error| error.to_string())?;
+        (candidate.snapshot.repo, candidate.head)
+    } else {
+        let head = snapshot
+            .repo
+            .store()
+            .get_commit(&source_id)
+            .map_err(|error| error.to_string())?;
+        (snapshot.repo, head)
+    };
+    futures::executor::block_on(async {
+        deadline.check().map_err(|error| error.to_string())?;
+        let mut tree = head.tree();
+        for edit in edits {
+            deadline.check().map_err(|error| error.to_string())?;
+            let mut builder = MergedTreeBuilder::new(tree.clone());
+            match edit {
+                LandingTreeEdit::Rename { from, to } => {
+                    let from = RepoPathBuf::from_internal_string(from.clone())
+                        .map_err(|error| error.to_string())?;
+                    let to = RepoPathBuf::from_internal_string(to.clone())
+                        .map_err(|error| error.to_string())?;
+                    let value = tree
+                        .path_value(&from)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if !value.is_resolved() || value.as_resolved() == Some(&None) {
+                        return Err("landing rename source is absent or conflicted".into());
+                    }
+                    if tree
+                        .path_value(&to)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .as_resolved()
+                        != Some(&None)
+                    {
+                        return Err("landing rename destination already exists".into());
+                    }
+                    builder.set_or_remove(from, Merge::absent());
+                    builder.set_or_remove(to, value);
+                }
+                LandingTreeEdit::Rewrite { path, content } => {
+                    let path = RepoPathBuf::from_internal_string(path.clone())
+                        .map_err(|error| error.to_string())?;
+                    let current = tree
+                        .path_value(&path)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let (executable, copy_id) = match current.as_resolved() {
+                        Some(Some(TreeValue::File {
+                            executable,
+                            copy_id,
+                            ..
+                        })) => (*executable, copy_id.clone()),
+                        Some(None) => (false, CopyId::placeholder()),
+                        _ => return Err("landing rewrite path is not a regular file".into()),
+                    };
+                    let id = repo
+                        .store()
+                        .write_file(&path, &mut futures::io::Cursor::new(content.as_bytes()))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    builder.set_or_remove(
+                        path,
+                        Merge::resolved(Some(TreeValue::File {
+                            id,
+                            executable,
+                            copy_id,
+                        })),
+                    );
+                }
+            }
+            tree = builder
+                .write_tree()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let mut tx = repo.start_transaction();
+        let head = if edits.is_empty() {
+            head
+        } else if squash {
+            // Preserve the squash factory's exact predecessors and one-parent
+            // shape; binding changes its tree, not its causal receipts.
+            tx.repo_mut()
+                .rewrite_commit(&head)
+                .set_tree(tree)
+                .set_predecessors(head.store_commit().predecessors.clone())
+                .detach()
+                .write_hidden()
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            tx.repo_mut()
+                .new_commit(vec![head.id().clone()], tree)
+                .set_description(message)
+                .detach()
+                .write_hidden()
+                .await
+                .map_err(|error| error.to_string())?
+        };
+        tx.repo_mut()
+            .add_head(&head)
+            .await
+            .map_err(|error| error.to_string())?;
+        deadline.check().map_err(|error| error.to_string())?;
+        let unpublished = tx
+            .write("compute default landing")
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = DetachedLanding {
+            commit: head.id().hex(),
+            operation: unpublished.operation().id().hex(),
+        };
+        unpublished.leave_unpublished();
+        Ok(result)
+    })
+}
+
+/// Install all exact landing coordinates in one live view, including objects
+/// that previously existed only in the detached validation index. The caller
+/// has durably recorded publication intent and holds the canonical writer guard.
+pub fn install_default_landing(store: &Path, moves: &[(&str, &str, &str)]) -> Result<(), String> {
+    futures::executor::block_on(async {
+        let repo = crate::load_repo_at_head(store)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut tx = repo.start_transaction();
+        for (name, expected, landing) in moves {
+            let current = repo.view().get_local_bookmark(RefName::new(name));
+            if current.as_normal().map(|id| id.hex()).as_deref() != Some(*expected) {
+                return Err(format!(
+                    "landing bookmark `{name}` moved; publication recovery is required"
+                ));
+            }
+            let id = CommitId::try_from_hex(landing)
+                .ok_or_else(|| "invalid landing object".to_string())?;
+            let commit = repo
+                .store()
+                .get_commit(&id)
+                .map_err(|error| error.to_string())?;
+            tx.repo_mut()
+                .add_head(&commit)
+                .await
+                .map_err(|error| error.to_string())?;
+            tx.repo_mut()
+                .set_local_bookmark_target(RefName::new(name), RefTarget::normal(id));
+        }
+        tx.commit("install default landing")
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })
+}
+
 const SQUASH_RECEIPT_LIMIT: usize = 4096;
 
 /// Construct a fresh squash object without rewriting any existing commit or view.
@@ -3774,6 +3978,10 @@ mod tests {
         assert!(factory.contains(".set_predecessors("));
         assert!(factory.contains(".write_hidden()"));
         assert!(!factory.contains(".commit("));
+        let landing = body(advance, "pub fn compute_default_landing(");
+        assert!(landing.contains("leave_unpublished()"));
+        assert!(!landing.contains("tx.commit("));
+        assert!(!landing.contains("set_local_bookmark_target("));
         let install = body(advance, "pub fn install_branch_advance_local(");
         assert!(install.contains("snapshot.matches_repo(&repo)"));
         assert_eq!(install.matches(".set_local_bookmark_target(").count(), 1);

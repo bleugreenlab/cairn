@@ -951,6 +951,7 @@ async fn a_merge_made_on_github_resolves_on_refresh_exactly_once() {
     .await
     .unwrap();
     let mr = create_merge_request(&db, &job, &project, &issue, 43).await;
+    let (task, queued) = attach_merge_live_work(&db, &project, &issue, &job).await;
 
     let http = MockHttpClient::new()
         .respond_to("access_tokens", token_response())
@@ -1019,6 +1020,7 @@ async fn a_merge_made_on_github_resolves_on_refresh_exactly_once() {
     .await;
     assert!(merged_at.is_some());
     assert_eq!(issue_status(db, &issue).await, "merged");
+    assert_merge_live_work_settled(db, &job, &task, &queued).await;
     assert_eq!(
         text_column(
             db,
@@ -1054,6 +1056,7 @@ async fn a_merge_made_on_github_resolves_on_refresh_exactly_once() {
         merged_at,
         "a second refresh moves nothing"
     );
+    assert_merge_live_work_settled(db, &job, &task, &queued).await;
 }
 
 #[tokio::test]
@@ -1287,6 +1290,7 @@ async fn merge_pr_for_job_remote_default_branch_lands_by_a_leased_push_to_origin
     insert_execution(&db, "exec-gh", &project, &issue).await;
     let job = create_job_with_execution(&db, &project, &issue, Some("exec-gh")).await;
     let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
+    let (task, queued) = attach_merge_live_work(&db, &project, &issue, &job).await;
 
     let http = MockHttpClient::new()
         .respond_to("access_tokens", token_response())
@@ -1301,9 +1305,15 @@ async fn merge_pr_for_job_remote_default_branch_lands_by_a_leased_push_to_origin
     provision_jj_merge(&config_dir, repo.path());
     let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
-    actions::merge_pr_for_job(&orch, &job, None, None, None)
+    let reply = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
-        .unwrap();
+        .expect("live work must not refuse a GitHub-backed public landing");
+    assert!(reply.contains("PR merged successfully"), "{reply}");
+    assert!(reply.contains("Resolution settlement:"), "{reply}");
+    assert!(reply.contains("cleanup pending"), "{reply}");
+    assert!(reply.contains("github-merge-mutating"), "{reply}");
+    assert!(reply.contains("/terminal/watch"), "{reply}");
+    assert_merge_live_work_settled(&orch.db.local, &job, &task, &queued).await;
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
     assert_eq!(issue_status(&orch.db.local, &issue).await, "merged");
     let landed = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
@@ -1315,6 +1325,15 @@ async fn merge_pr_for_job_remote_default_branch_lands_by_a_leased_push_to_origin
         git_rev_parse(&origin, "main"),
         landed,
         "origin's `main` took the store's landing"
+    );
+    let cache = actions::refresh_pr_for_job(&orch, &job).await.unwrap();
+    assert_eq!(cache.state.to_string(), "MERGED");
+    assert_merge_live_work_settled(&orch.db.local, &job, &task, &queued).await;
+    assert_eq!(git_rev_parse(&origin, "main"), landed);
+    assert_eq!(
+        jj_bookmark_commit(&bin, &config_dir, repo.path(), "main"),
+        landed,
+        "refresh retries cleanup without landing a second time",
     );
 }
 
@@ -2051,5 +2070,723 @@ async fn merge_pr_for_job_advances_producing_execution() {
     assert!(
         !entries.is_empty(),
         "in-app merge must persist an advance_dag outbox row"
+    );
+}
+
+/// Persist the live-work mix without supplying executor exit evidence.
+async fn attach_merge_live_work(
+    db: &LocalDb,
+    project: &str,
+    issue: &str,
+    producer: &str,
+) -> (String, String) {
+    let task = create_job_with_execution(db, project, issue, Some("exec-gh")).await;
+    let queued = create_job_with_execution(db, project, issue, Some("exec-gh")).await;
+    for (job, parent, segment, status) in [
+        (task.as_str(), producer, "mutator", "running"),
+        (queued.as_str(), task.as_str(), "queued", "pending"),
+    ] {
+        db.execute(
+            "UPDATE jobs SET status=?1, parent_job_id=?2, uri_segment=?3 WHERE id=?4",
+            params![status, parent, segment, job],
+        )
+        .await
+        .unwrap();
+    }
+    db.execute(
+        "UPDATE jobs SET uri_segment='builder' WHERE id=?1",
+        params![producer],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO run_batch_detached
+         (request_id,job_id,run_id,commits,holds_branch,state,reason,created_ms)
+         VALUES ('github-merge-mutating',?1,'old-run',1,1,'running','runner restarted',1)",
+        params![task.as_str()],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO job_terminals
+         (id,job_id,project_id,session_id,command,status,created_at,slug)
+         VALUES ('github-merge-terminal',?1,?2,'unconfirmed-terminal','watch','running',1,'watch')",
+        params![producer, project],
+    )
+    .await
+    .unwrap();
+    for job in [producer, task.as_str(), queued.as_str()] {
+        db.execute(
+            "INSERT INTO sessions
+             (id,job_id,backend,status,sequence,created_at,updated_at)
+             VALUES (?1,?1,'claude','open',1,1,1)",
+            params![job],
+        )
+        .await
+        .unwrap();
+    }
+    (task, queued)
+}
+
+async fn assert_merge_live_work_settled(db: &LocalDb, producer: &str, task: &str, queued: &str) {
+    for job in [producer, task, queued] {
+        assert_eq!(
+            text_column(
+                db,
+                "SELECT status || ':' || terminal_reason FROM sessions WHERE job_id=?1",
+                job,
+            )
+            .await
+            .as_deref(),
+            Some("closed:issue_merged"),
+            "all affected sessions retain the typed merge terminal cause",
+        );
+    }
+    for job in [task, queued] {
+        assert_eq!(
+            text_column(db, "SELECT status FROM jobs WHERE id=?1", job)
+                .await
+                .as_deref(),
+            Some("cancelled"),
+        );
+    }
+    assert_eq!(
+        text_column(db, "SELECT status FROM jobs WHERE id=?1", producer)
+            .await
+            .as_deref(),
+        Some("complete"),
+        "terminal cleanup preserves the producer's completed work",
+    );
+    assert_eq!(
+        text_column(
+            db,
+            "SELECT state FROM run_batch_detached WHERE request_id=?1",
+            "github-merge-mutating",
+        )
+        .await
+        .as_deref(),
+        Some("running"),
+        "requesting cancellation is not proof the admitted mutator exited",
+    );
+    assert_eq!(
+        text_column(
+            db,
+            "SELECT status || ':' || restart_policy || ':' || exit_reason
+             FROM job_terminals WHERE id=?1",
+            "github-merge-terminal",
+        )
+        .await
+        .as_deref(),
+        Some("running:never:issue resolved: merged"),
+        "retain the merge resolution cause without inventing terminal exit evidence",
+    );
+}
+
+/// Durable admitted work must not turn a public merge into a live-work refusal.
+/// The missing executor deliberately supplies no exit proof: landing succeeds,
+/// cancellation is requested, and the response must still report cleanup pending.
+#[tokio::test]
+async fn public_local_merge_lands_before_settling_an_admitted_mutating_batch() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!("skipping public_local_merge_lands_before_settling_an_admitted_mutating_batch: jj not resolvable");
+        return;
+    };
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_jj_project();
+    let project = create_project(&db, "live-merge", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    insert_execution(&db, "exec-live-merge", &project, &issue).await;
+    let producer = create_job_with_execution(&db, &project, &issue, Some("exec-live-merge")).await;
+    let task = create_job_with_execution(&db, &project, &issue, Some("exec-live-merge")).await;
+    let queued = create_job_with_execution(&db, &project, &issue, Some("exec-live-merge")).await;
+    let mr = create_local_merge_request(&db, &producer, &project, &issue).await;
+    db.execute(
+        "UPDATE jobs SET status='running', parent_job_id=?1, uri_segment='mutator'
+         WHERE id=?2",
+        params![producer.as_str(), task.as_str()],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE jobs SET status='pending', parent_job_id=?1, uri_segment='queued'
+         WHERE id=?2",
+        params![task.as_str(), queued.as_str()],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE jobs SET uri_segment='builder' WHERE id=?1",
+        params![producer.as_str()],
+    )
+    .await
+    .unwrap();
+    // The runner may have restarted while its admitted executor still works.
+    // This durable row, not a fabricated held-publication row, owns the branch.
+    db.execute(
+        "INSERT INTO run_batch_detached
+         (request_id,job_id,run_id,commits,holds_branch,state,reason,created_ms)
+         VALUES ('public-merge-mutating',?1,'old-run',1,1,'running','runner restarted',1)",
+        params![task.as_str()],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO job_terminals
+         (id,job_id,project_id,session_id,command,status,created_at,slug)
+         VALUES ('public-merge-terminal',?1,?2,'unconfirmed-terminal','watch','running',1,'watch')",
+        params![producer.as_str(), project.as_str()],
+    )
+    .await
+    .unwrap();
+
+    let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
+    let config_dir = cfg.path().join("config");
+    provision_jj_merge(&config_dir, repo.path());
+    let before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
+
+    let reply = actions::merge_pr_for_job(&orch, &producer, None, None, None)
+        .await
+        .expect(
+            "admitted mutating work must be settled after landing, not refuse the public merge",
+        );
+    let landed = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
+    assert_ne!(landed, before, "the public command actually advanced main");
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
+    assert_eq!(issue_status(&orch.db.local, &issue).await, "merged");
+    assert_eq!(
+        text_column(
+            &orch.db.local,
+            "SELECT merged_commit FROM merge_requests WHERE id=?1",
+            &mr
+        )
+        .await,
+        Some(landed),
+    );
+    for job in [&task, &queued] {
+        assert_eq!(
+            text_column(&orch.db.local, "SELECT status FROM jobs WHERE id=?1", job).await,
+            Some("cancelled".to_string()),
+        );
+    }
+    assert_eq!(
+        text_column(
+            &orch.db.local,
+            "SELECT status FROM jobs WHERE id=?1",
+            &producer
+        )
+        .await,
+        Some("complete".to_string()),
+        "settling the producer's terminal does not rewrite its completed work",
+    );
+    assert!(reply.contains("PR merged successfully"), "{reply}");
+    assert!(reply.contains("cleanup pending"), "{reply}");
+    assert!(reply.contains("public-merge-mutating"), "{reply}");
+    assert!(reply.contains("/terminal/watch"), "{reply}");
+    assert_eq!(
+        text_column(
+            &orch.db.local,
+            "SELECT state FROM run_batch_detached WHERE request_id=?1",
+            "public-merge-mutating",
+        )
+        .await,
+        Some("running".to_string()),
+        "cancellation without an executor report is not proof the mutating work exited",
+    );
+    assert_eq!(
+        text_column(
+            &orch.db.local,
+            "SELECT status || ':' || restart_policy || ':' || exit_reason
+             FROM job_terminals WHERE id=?1",
+            "public-merge-terminal",
+        )
+        .await,
+        Some("running:never:issue resolved: merged".to_string()),
+        "the resolution cause is retained without inventing terminal exit evidence",
+    );
+}
+
+/// A failed record cannot undo a target installation or erase its recovery intent.
+#[tokio::test]
+async fn public_local_merge_recovers_after_its_mr_record_fails() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!(
+            "skipping public_local_merge_recovers_after_its_mr_record_fails: jj not resolvable"
+        );
+        return;
+    };
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_jj_project();
+    let project = create_project(&db, "record-merge", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    insert_execution(&db, "exec-record-merge", &project, &issue).await;
+    let producer =
+        create_job_with_execution(&db, &project, &issue, Some("exec-record-merge")).await;
+    let child = create_job_with_execution(&db, &project, &issue, Some("exec-record-merge")).await;
+    let queued = create_job_with_execution(&db, &project, &issue, Some("exec-record-merge")).await;
+    let mr = create_local_merge_request(&db, &producer, &project, &issue).await;
+    for (job, parent, segment) in [(&child, &producer, "child"), (&queued, &child, "queued")] {
+        db.execute(
+            "UPDATE jobs SET status='pending', parent_job_id=?1, uri_segment=?2 WHERE id=?3",
+            params![parent.as_str(), segment, job.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+    db.execute_script(
+        "CREATE TRIGGER fail_public_landing_record BEFORE UPDATE OF status ON merge_requests
+         WHEN NEW.status = 'merged' BEGIN SELECT RAISE(FAIL, 'injected public MR write failure'); END;",
+    )
+    .await
+    .unwrap();
+
+    let mut git = MockGitClient::new();
+    git.expect_current_branch()
+        .returning(|_| Ok("main".to_string()));
+    git.expect_run()
+        .withf(|_, args| {
+            args.len() == 3
+                && args[0] == "update-ref"
+                && args[1] == "-d"
+                && args[2].starts_with("refs/cairn/landing/")
+        })
+        .times(1)
+        .returning(|repo, args| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .map_err(|error| error.to_string())?;
+            Ok(cairn_core::internal::services::GitOutput {
+                success: output.status.success(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        });
+    let (cfg, orch) = orchestrator_with_http_and_git(db, MockHttpClient::new(), git).await;
+    let config_dir = cfg.path().join("config");
+    provision_jj_merge(&config_dir, repo.path());
+    let before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
+    let reply = actions::merge_pr_for_job(&orch, &producer, None, None, None)
+        .await
+        .expect("failure to record an actual landing must not refuse the merge");
+    let landed = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
+    assert_ne!(landed, before, "the public route installed the target");
+    assert!(reply.contains("PR merged successfully"), "{reply}");
+    assert!(reply.contains("pending"), "{reply}");
+    assert!(
+        reply.contains("injected public MR write failure"),
+        "{reply}"
+    );
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
+    assert_eq!(issue_status(&orch.db.local, &issue).await, "active");
+    assert_eq!(
+        text_column(
+            &orch.db.local,
+            "SELECT merged_commit FROM merge_requests WHERE id=?1",
+            &mr
+        )
+        .await,
+        None,
+    );
+    let intent = orch
+        .db
+        .local
+        .query_one(
+            "SELECT attempt_id FROM merge_attempt_events
+         WHERE merge_request_id=?1 AND state='executing' AND json_extract(detail, '$.local')=1",
+            params![mr.as_str()],
+            |row| row.text(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        text_column(
+            &orch.db.local,
+            "SELECT state FROM merge_attempt_events WHERE attempt_id=?1 ORDER BY sequence DESC LIMIT 1",
+            &intent,
+        ).await.as_deref(),
+        Some("executing"),
+        "the existing publication intent must remain unsettled",
+    );
+
+    // Retry against the same immutable target while the record is still broken.
+    assert!(actions::reconcile_pending_landings(&orch).await.is_empty());
+    assert_eq!(
+        text_column(
+            &orch.db.local,
+            "SELECT state FROM merge_attempt_events WHERE attempt_id=?1 ORDER BY sequence DESC LIMIT 1",
+            &intent,
+        ).await.as_deref(),
+        Some("executing"),
+    );
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
+    for job in [&child, &queued] {
+        assert_eq!(
+            text_column(&orch.db.local, "SELECT status FROM jobs WHERE id=?1", job)
+                .await
+                .as_deref(),
+            Some("pending"),
+            "a failed MR claim leaves descendants for the recovery cascade",
+        );
+    }
+    orch.db
+        .local
+        .execute_script("DROP TRIGGER fail_public_landing_record;")
+        .await
+        .unwrap();
+    let outcomes = actions::reconcile_pending_landings(&orch).await;
+    assert!(
+        outcomes.contains(&actions::LandingRecovery::Recorded(landed.clone())),
+        "{outcomes:?}",
+    );
+    assert_eq!(
+        jj_bookmark_commit(&bin, &config_dir, repo.path(), "main"),
+        landed
+    );
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
+    assert_eq!(issue_status(&orch.db.local, &issue).await, "merged");
+    assert_eq!(
+        text_column(
+            &orch.db.local,
+            "SELECT merged_commit FROM merge_requests WHERE id=?1",
+            &mr
+        )
+        .await,
+        Some(landed),
+    );
+    assert_eq!(
+        text_column(
+            &orch.db.local,
+            "SELECT state FROM merge_attempt_events WHERE attempt_id=?1 ORDER BY sequence DESC LIMIT 1",
+            &intent,
+        ).await.as_deref(),
+        Some("succeeded"),
+    );
+    for job in [&child, &queued] {
+        assert_eq!(
+            text_column(&orch.db.local, "SELECT status FROM jobs WHERE id=?1", job)
+                .await
+                .as_deref(),
+            Some("cancelled"),
+            "recovery must run the canonical descendant settlement",
+        );
+    }
+}
+
+/// The composed public merge: the PR artifact's `action:merge` patch, through
+/// the same write handler an agent or the operator calls. Origin accepts the
+/// landing, and the store then refuses to record it, so the store's `main` is
+/// left stale. That fault comes from an origin `post-receive` hook, which runs
+/// only after receive-pack accepted the update: it writes an unreadable
+/// unrecorded-recovery marker, and the post-push writer admission refuses on
+/// it. The caller must still be told the merge LANDED, and the issue must
+/// settle. That settlement covers the full live-work mix and an open check
+/// request the producer filed. The request is cancelled and reported by its
+/// canonical URI, and the caller and the issue's `Resolved` attention fact
+/// receive the one same report. The control is an open request filed from
+/// another issue's node: the settlement census never enumerates it, so it
+/// stays queued and uncancelled, and neither copy of the report names it.
+#[cfg(unix)]
+#[tokio::test]
+async fn public_merge_artifact_settles_an_open_check_request_when_origin_lands_but_local_recording_fails(
+) {
+    composed_public_merge(false).await;
+}
+
+/// The control for the composed merge: the same fixture, merge and fault with
+/// the producer's request made uncancellable by a test-only trigger that
+/// ignores every update to its row. Each detector the composed test relies on
+/// must see the missing cancellation independently: the row stays queued with
+/// no cancel recorded, and neither the caller's report nor the resolution
+/// fact's carries the `cancelled` entry. Both name the request as cleanup
+/// pending instead.
+#[cfg(unix)]
+#[tokio::test]
+async fn public_merge_artifact_control_detects_a_disabled_check_request_cancellation() {
+    composed_public_merge(true).await;
+}
+
+#[cfg(unix)]
+async fn composed_public_merge(disable_cancel: bool) {
+    use cairn_core::internal::mcp::handlers::write::handle_write;
+    use cairn_core::internal::mcp::types::McpCallbackRequest;
+    use cairn_core::internal::orchestrator::AttentionFact;
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(bin) = common::jj_bin() else {
+        eprintln!("skipping the composed public merge (disable_cancel={disable_cancel}): jj not resolvable");
+        return;
+    };
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_jj_project();
+    let (_origin_dir, origin) = add_fetchable_github_origin(repo.path());
+    insert_github_app(&db).await;
+    let project = create_project(&db, "gh", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    insert_execution(&db, "exec-gh", &project, &issue).await;
+    let job = create_job_with_execution(&db, &project, &issue, Some("exec-gh")).await;
+    let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
+    let (task, queued) = attach_merge_live_work(&db, &project, &issue, &job).await;
+    // The completed producer is the requester: it is never stopped, so only
+    // the resolution's own request settlement can cancel its request.
+    let other_issue = create_issue(&db, &project, 2).await;
+    let other_job = create_job(&db, &project, &other_issue).await;
+    for (id, requester) in [
+        ("merge-open-check", job.as_str()),
+        ("other-issue-check", other_job.as_str()),
+    ] {
+        db.execute(
+            "INSERT INTO check_requests(id,project_id,suite,subject_job_id,consumer,requester_ref,
+                requester_job_id,priority,state,accepted_at_ms,state_since_ms,updated_ms)
+             VALUES(?1,?2,'rust-tests',?3,'requested','operator',?3,'review_check','queued',1,1,1)",
+            params![id, project.as_str(), requester],
+        )
+        .await
+        .unwrap();
+    }
+    if disable_cancel {
+        db.execute_script(
+            "CREATE TRIGGER disable_merge_check_cancel BEFORE UPDATE ON check_requests
+             WHEN OLD.id = 'merge-open-check' BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .await
+        .unwrap();
+    }
+    let request_uri = "cairn://p/gh/check-requests/merge-open-check";
+    let control_uri = "cairn://p/gh/check-requests/other-issue-check";
+
+    let http = MockHttpClient::new()
+        .respond_to("access_tokens", token_response())
+        .respond_to("/git/refs/heads/feature", merge_response(200))
+        .respond_to("/pulls/5/files", files_response())
+        .respond_to("/pulls/5/reviews", empty_array_response())
+        .respond_to("/check-runs", check_runs_response())
+        .respond_to("/pulls/5", pr_response("closed", true));
+    // Recovery releases the landing pin once it records the landing.
+    let mut git = MockGitClient::new();
+    git.expect_run()
+        .withf(|_, args| {
+            args.len() == 3
+                && args[0] == "update-ref"
+                && args[1] == "-d"
+                && args[2].starts_with("refs/cairn/landing/")
+        })
+        .times(1)
+        .returning(|repo, args| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .map_err(|error| error.to_string())?;
+            Ok(cairn_core::internal::services::GitOutput {
+                success: output.status.success(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        });
+    let (cfg, orch) = orchestrator_with_http_and_git(db, http, git).await;
+    let config_dir = cfg.path().join("config");
+    provision_jj_merge(&config_dir, repo.path());
+    let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
+    assert_eq!(git_rev_parse(&origin, "main"), base_before);
+
+    let marker = jj::project_store_dir(&config_dir, repo.path())
+        .join(".jj")
+        .join("cairn-unrecorded-recoveries.json");
+    let hook = origin.join("hooks").join("post-receive");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif grep -q ' refs/heads/main$'; then printf 'not a recovery record' > '{}'; fi\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut attention = orch.attention_changed.subscribe();
+    let request = McpCallbackRequest {
+        answer_bound_ms: None,
+        thread_id: None,
+        cwd: std::env::temp_dir().to_string_lossy().to_string(),
+        run_id: None,
+        tool: "write".to_string(),
+        payload: serde_json::json!({
+            "changes": [{
+                "target": "cairn://p/gh/1/1/builder/create-pr",
+                "mode": "patch",
+                "payload": {"action": "merge"}
+            }]
+        }),
+        tool_use_id: None,
+        origin: None,
+    };
+    let raw = handle_write(&orch, &request).await;
+    let written: serde_json::Value = serde_json::from_str(&raw).expect(&raw);
+    assert!(
+        written["failures"].as_array().is_none_or(Vec::is_empty),
+        "a landing origin accepted is never refused: {raw}"
+    );
+    let reply = written["applied"][0]["summary"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the merge answers its caller: {raw}"));
+
+    // Origin took the landing; the store's own `main` was never moved to it.
+    assert!(marker.exists(), "the fault fired after origin's acceptance");
+    let landed = git_rev_parse(&origin, "main");
+    assert_ne!(landed, base_before, "origin's `main` holds the landing");
+    assert_eq!(
+        jj_bookmark_commit(&bin, &config_dir, repo.path(), "main"),
+        base_before,
+        "the store's `main` is stale: recording the landing locally failed"
+    );
+    assert!(reply.contains("PR merged successfully"), "{reply}");
+    assert!(
+        reply.contains("Merge landed on origin; local recording pending"),
+        "the caller is told the merge LANDED: {reply}"
+    );
+    assert!(
+        reply.contains("Do not retry the merge"),
+        "the caller is warned off a second landing: {reply}"
+    );
+    assert!(!reply.contains("Merge postcondition failed"), "{reply}");
+    assert!(
+        !reply.contains("source branch is intact; retry the merge"),
+        "{reply}"
+    );
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
+    assert_eq!(issue_status(&orch.db.local, &issue).await, "merged");
+    assert_eq!(
+        text_column(
+            &orch.db.local,
+            "SELECT merged_commit FROM merge_requests WHERE id=?1",
+            &mr
+        )
+        .await,
+        Some(landed.clone()),
+        "the merge is recorded at the commit origin accepted"
+    );
+    assert_merge_live_work_settled(&orch.db.local, &job, &task, &queued).await;
+
+    // The producer's request settled; the other issue's did not.
+    let settled = if disable_cancel {
+        "queued:0"
+    } else {
+        "cancelled:1"
+    };
+    for (id, expected) in [
+        ("merge-open-check", Some(settled)),
+        ("other-issue-check", Some("queued:0")),
+    ] {
+        assert_eq!(
+            text_column(
+                &orch.db.local,
+                "SELECT state || ':' || (cancel_requested_by IS NOT NULL)
+                 FROM check_requests WHERE id=?1",
+                id,
+            )
+            .await
+            .as_deref(),
+            expected,
+            "{id}"
+        );
+    }
+    let entry_line = |report: &str, outcome: &str| {
+        let entry = format!("- {request_uri}: {outcome}");
+        report
+            .lines()
+            .any(|line| line == entry || line.starts_with(&format!("{entry} (")))
+    };
+    let (reported, unreported) = if disable_cancel {
+        ("cleanup pending", "cancelled")
+    } else {
+        ("cancelled", "cleanup pending")
+    };
+    assert_eq!(
+        (entry_line(reply, reported), entry_line(reply, unreported)),
+        (true, false),
+        "the caller's report names the request by its canonical URI as {reported}: {reply}"
+    );
+    assert!(!reply.contains(control_uri), "{reply}");
+
+    // The issue's resolution attention fact carries the very same report.
+    let mut settlement = None;
+    loop {
+        match attention.try_recv() {
+            Ok(event) if event.issue_id == issue => {
+                if let AttentionFact::Resolved {
+                    final_status,
+                    settlement: report,
+                } = event.fact
+                {
+                    assert_eq!(final_status.to_string(), "merged");
+                    assert!(settlement.is_none(), "the resolution is announced once");
+                    settlement = Some(report.expect("the resolution carries its settlement"));
+                }
+            }
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => break,
+        }
+    }
+    let settlement = settlement.expect("the merge announces its resolution");
+    assert_eq!(
+        (
+            entry_line(&settlement, reported),
+            entry_line(&settlement, unreported)
+        ),
+        (true, false),
+        "the resolution fact names the request as {reported}: {settlement}"
+    );
+    assert!(!settlement.contains(control_uri), "{settlement}");
+    assert!(
+        reply.contains(settlement.trim_end()),
+        "the caller and the resolution fact receive one report:\ncaller: {reply}\nfact: {settlement}"
+    );
+
+    // Recording is left to publication-intent recovery: the intent origin
+    // accepted stays executing until the store records the landing.
+    let intent = orch
+        .db
+        .local
+        .query_one(
+            "SELECT attempt_id FROM merge_attempt_events
+             WHERE merge_request_id=?1 AND state='executing'
+               AND json_extract(detail, '$.local')=0
+               AND json_extract(detail, '$.publication.landingCommit')=?2",
+            params![mr.as_str(), landed.as_str()],
+            |row| row.text(0),
+        )
+        .await
+        .unwrap();
+    let intent_state = || {
+        text_column(
+            &orch.db.local,
+            "SELECT state FROM merge_attempt_events WHERE attempt_id=?1
+             ORDER BY sequence DESC LIMIT 1",
+            &intent,
+        )
+    };
+    assert_eq!(
+        intent_state().await.as_deref(),
+        Some("executing"),
+        "an accepted publication the store has not recorded is not journaled accepted"
+    );
+    std::fs::remove_file(&marker).unwrap();
+    let outcomes = actions::reconcile_pending_landings(&orch).await;
+    assert_eq!(
+        jj_bookmark_commit(&bin, &config_dir, repo.path(), "main"),
+        landed,
+        "recovery records origin's landing in the store: {outcomes:?}"
+    );
+    assert_eq!(
+        intent_state().await.as_deref(),
+        Some("succeeded"),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        git_rev_parse(&origin, "main"),
+        landed,
+        "nothing landed twice"
     );
 }

@@ -389,3 +389,105 @@ pub(crate) fn unheld_cancel_text(request_id: &str, by: &str, commits: bool) -> S
 fn cancelled_verdict(verdict: &str) -> bool {
     verdict.starts_with("it was cancelled") || verdict.starts_with("it was never placed")
 }
+
+/// Cancel all admitted mutating work of these owners, not just detached calls.
+pub(crate) async fn settle_owned_batches(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_ids: &[String],
+    resolution: crate::transitions::Resolution,
+    fallback_uri: &str,
+) -> Vec<crate::issues::status::SettlementResource> {
+    use crate::issues::status::{SettlementOutcome, SettlementResource};
+    let mut requests = std::collections::BTreeMap::new();
+    for (id, owner) in detached::live_mutating_owners() {
+        if job_ids.contains(&owner.job_id) {
+            requests.insert(id, owner.job_id);
+        }
+    }
+    let mut reports = Vec::new();
+    match detached::all_running(db).await {
+        Ok(rows) => {
+            for row in rows {
+                if row.commits && job_ids.contains(&row.job_id) {
+                    requests.insert(row.request_id, row.job_id);
+                }
+            }
+        }
+        Err(error) => reports.push(SettlementResource {
+            uri: fallback_uri.into(),
+            outcome: SettlementOutcome::CleanupPending,
+            diagnostic: Some(error),
+        }),
+    }
+    // A parked batch from an earlier runner may have no detached row yet.
+    for job in job_ids {
+        match db.query_all(
+            "SELECT condition_json FROM agent_waits WHERE job_id=?1 AND state IN ('pending','resolving') AND kind='run_batch'",
+            (job.clone(),), |row| Ok(row.get::<String>(0)?),
+        ).await {
+            Ok(rows) => for json in rows {
+                if let Ok(crate::mcp::handlers::durable_suspend::Condition::RunBatch {
+                    request_id, commits: true, ..
+                }) = serde_json::from_str(&json) { requests.insert(request_id, job.clone()); }
+            },
+            Err(error) => reports.push(SettlementResource {
+                uri: fallback_uri.into(), outcome: SettlementOutcome::CleanupPending,
+                diagnostic: Some(error.to_string()),
+            }),
+        }
+    }
+    for (id, job) in requests {
+        let home = crate::jobs::queries::home_uri_for_job(db, &job)
+            .await
+            .ok()
+            .flatten();
+        let cause = match resolution {
+            crate::transitions::Resolution::Merged => crate::fleet::CancelCause::IssueMerged,
+            crate::transitions::Resolution::Closed => crate::fleet::CancelCause::IssueClosed,
+        };
+        orch.fleet.cancel_request_with_cause(&id, cause);
+        let by = match resolution {
+            crate::transitions::Resolution::Merged => "issue resolution (merged)",
+            crate::transitions::Resolution::Closed => "issue resolution (closed)",
+        };
+        // An unbound request is not proof that an earlier executor stopped.
+        // Preserve its running row until that executor's report proves absence.
+        let report = if detached::live_control(&id).is_none() {
+            match orch.fleet.request_report(&id, None) {
+                crate::fleet::RequestReport::Held { .. } => {
+                    orch.fleet.cancel_reported_attempts(&id);
+                    CancelReport::Retracted
+                }
+                crate::fleet::RequestReport::Unknown { .. } => CancelReport::Unread {
+                    error: "waiting for its executor to report whether work has ended".into(),
+                },
+                crate::fleet::RequestReport::Completed(_) => CancelReport::AlreadySettling,
+                crate::fleet::RequestReport::Gone => {
+                    cancel_batch(orch, db, &id, by, std::time::Duration::ZERO).await
+                }
+            }
+        } else {
+            cancel_batch(orch, db, &id, by, std::time::Duration::ZERO).await
+        };
+        let outcome = match report {
+            CancelReport::Stopped { settled: true } | CancelReport::SettledUnheld => {
+                SettlementOutcome::Cancelled
+            }
+            CancelReport::FinishedFirst { .. } | CancelReport::NotLive => {
+                SettlementOutcome::AlreadySettled
+            }
+            _ => SettlementOutcome::CleanupPending,
+        };
+        let diagnostic =
+            (outcome == SettlementOutcome::CleanupPending).then(|| report.sentence(&id));
+        reports.push(SettlementResource {
+            uri: home
+                .map(|home| format!("{home}/batches/{id}"))
+                .unwrap_or_else(|| fallback_uri.into()),
+            outcome,
+            diagnostic,
+        });
+    }
+    reports
+}

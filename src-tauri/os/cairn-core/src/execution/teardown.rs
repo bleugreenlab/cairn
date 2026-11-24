@@ -105,6 +105,516 @@ async fn issue_targets(
     Ok((job_ids, targets))
 }
 
+/// Settle processes independently of the producing job's projected status.
+/// Terminal rows live on the runner; job coordinates and durable batches belong
+/// to the issue's metadata database. A stop acknowledgement is not an exit event.
+pub(crate) async fn settle_issue_resources(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    issue_id: &str,
+    resolution: crate::transitions::Resolution,
+) -> Vec<crate::issues::status::SettlementResource> {
+    use crate::issues::status::{SettlementOutcome, SettlementResource};
+    let issue_uri = db
+        .query_opt_text(
+            "SELECT 'cairn://p/' || p.key || '/' || i.number FROM issues i
+         JOIN projects p ON p.id=i.project_id WHERE i.id=?1",
+            (issue_id.to_string(),),
+        )
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "cairn://".into());
+    let job_ids = match issue_resource_jobs(db, issue_id).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            return vec![SettlementResource {
+                uri: issue_uri.clone(),
+                outcome: SettlementOutcome::CleanupPending,
+                diagnostic: Some(error),
+            }]
+        }
+    };
+    let mut resources = Vec::new();
+    let retention = match issue_output_jobs(db, issue_id).await {
+        Ok(output_jobs) => {
+            retain_terminal_outputs(
+                orch,
+                &output_jobs,
+                OutputRetention::Resolved {
+                    resolved_at: issue_resolved_at(db, issue_id).await,
+                },
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = retention {
+        resources.push(SettlementResource {
+            uri: issue_uri.clone(),
+            outcome: SettlementOutcome::CleanupPending,
+            diagnostic: Some(format!("terminal output retention pending: {error}")),
+        });
+    }
+    for job_id in &job_ids {
+        let home = crate::jobs::queries::home_uri_for_job(db, job_id)
+            .await
+            .ok()
+            .flatten();
+        let terminals = orch
+            .db
+            .local
+            .query_all(
+                "SELECT session_id, COALESCE(slug,id), status FROM job_terminals WHERE job_id=?1",
+                (job_id.clone(),),
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+            )
+            .await;
+        match terminals {
+            Ok(rows) => {
+                for (session, slug, status) in rows {
+                    let uri = match &home {
+                        Some(home) => format!("{home}/terminal/{slug}"),
+                        None => issue_uri.clone(),
+                    };
+                    let already_exited = status == "exited";
+                    let result = if already_exited {
+                        Ok(crate::mcp::handlers::terminal::StopOutcome::AlreadyEnded)
+                    } else {
+                        crate::mcp::handlers::terminal::stop_terminal_for_resolution(
+                            orch, &session, resolution,
+                        )
+                        .await
+                    };
+                    // Only the exit event (or liveness reconciliation) finalizes output.
+                    let ended = orch
+                        .db
+                        .local
+                        .query_opt(
+                            "SELECT status FROM job_terminals WHERE session_id=?1",
+                            (session.clone(),),
+                            |row| row.text(0),
+                        )
+                        .await;
+                    let proven = matches!(ended, Ok(Some(ref state)) if state == "exited");
+                    let (outcome, diagnostic) = if proven {
+                        match crate::mcp::handlers::terminal::finalize_exited_terminal_capture(
+                            orch, &session,
+                        )
+                        .await
+                        {
+                            Ok(note) => (
+                                if already_exited {
+                                    SettlementOutcome::AlreadySettled
+                                } else {
+                                    SettlementOutcome::Stopped
+                                },
+                                note,
+                            ),
+                            Err(error) => (SettlementOutcome::CleanupPending, Some(error)),
+                        }
+                    } else {
+                        (
+                            SettlementOutcome::CleanupPending,
+                            Some(result.err().unwrap_or_else(|| {
+                                "stop requested; waiting for process exit and final output".into()
+                            })),
+                        )
+                    };
+                    resources.push(SettlementResource {
+                        uri,
+                        outcome,
+                        diagnostic,
+                    });
+                }
+            }
+            Err(error) => resources.push(SettlementResource {
+                uri: home.clone().unwrap_or_else(|| issue_uri.clone()),
+                outcome: SettlementOutcome::CleanupPending,
+                diagnostic: Some(error.to_string()),
+            }),
+        }
+    }
+    resources.extend(
+        crate::mcp::handlers::run::cancel::settle_owned_batches(
+            orch, db, &job_ids, resolution, &issue_uri,
+        )
+        .await,
+    );
+    match crate::execution::checks::requests::settle_requests_for_resolution(
+        orch, db, &job_ids, resolution,
+    )
+    .await
+    {
+        Ok(checks) => resources.extend(checks),
+        Err(error) => resources.push(SettlementResource {
+            uri: issue_uri.clone(),
+            outcome: SettlementOutcome::CleanupPending,
+            diagnostic: Some(format!("check-request settlement pending: {error}")),
+        }),
+    }
+    resources.extend(release_settled_job_environments(orch, db, &job_ids, &issue_uri).await);
+    resources
+}
+
+/// Stopping branch-dependent work does not resolve its owning issue or start
+/// the expiry clock for that other issue's retained output.
+async fn issue_output_jobs(db: &LocalDb, issue_id: &str) -> Result<Vec<String>, String> {
+    db.query_all(
+        "WITH RECURSIVE owned(id) AS (
+             SELECT id FROM jobs WHERE issue_id=?1
+             UNION SELECT j.id FROM jobs j JOIN owned o ON j.parent_job_id=o.id
+                 WHERE j.issue_id IS NULL OR j.issue_id=?1
+         ) SELECT id FROM owned",
+        (issue_id.to_string(),),
+        |row| row.text(0),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn issue_resource_jobs(db: &LocalDb, issue_id: &str) -> Result<Vec<String>, String> {
+    db.query_all(
+        "WITH RECURSIVE owned(id) AS (
+             SELECT j.id FROM jobs j WHERE j.issue_id=?1 OR (
+                 j.issue_id IS NOT NULL AND EXISTS (
+                     SELECT 1 FROM jobs source WHERE source.issue_id=?1
+                         AND source.project_id=j.project_id AND source.branch=j.base_branch
+                 )
+             )
+             UNION SELECT j.id FROM jobs j JOIN owned o ON j.parent_job_id=o.id
+         ) SELECT id FROM owned",
+        (issue_id.to_string(),),
+        |row| row.text(0),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Release only environments whose output and execution owners have settled.
+/// The residency remains the retry evidence while any boundary is unconfirmed.
+pub(crate) async fn release_settled_job_environments(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_ids: &[String],
+    fallback_uri: &str,
+) -> Vec<crate::issues::status::SettlementResource> {
+    use crate::issues::status::{SettlementOutcome, SettlementResource};
+    use cairn_common::executor_protocol::ResidencyHolder;
+    let mut resources = Vec::new();
+    for job_id in job_ids {
+        let holder = ResidencyHolder::Job {
+            job_id: job_id.clone(),
+        };
+        let pending = job_environment_pending(orch, db, job_id).await;
+        let diagnostic = match pending {
+            Ok(Some(reason)) => Some(reason),
+            Err(error) => Some(error),
+            Ok(None) => {
+                if let Some(fence) = orch.fleet.residency_fence(&holder) {
+                    if let Some(occupancy) = orch.fleet.residency_occupancy(&holder) {
+                        if !occupancy.is_quiet() {
+                            Some("execution environment still has in-flight work or resident processes".into())
+                        } else {
+                            crate::fleet::residency::release(orch, &fence).await.err()
+                        }
+                    } else {
+                        Some("execution environment occupancy is not confirmed".into())
+                    }
+                } else if orch.fleet.residency_route_executor(&holder).is_some() {
+                    Some("execution environment is not currently answering".into())
+                } else {
+                    continue;
+                }
+            }
+        };
+        let home = crate::jobs::queries::home_uri_for_job(db, job_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fallback_uri.to_string());
+        resources.push(SettlementResource {
+            uri: home,
+            outcome: if diagnostic.is_some() {
+                SettlementOutcome::CleanupPending
+            } else {
+                SettlementOutcome::Stopped
+            },
+            diagnostic,
+        });
+    }
+    resources
+}
+
+async fn job_environment_pending(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<String>, String> {
+    if !resolution_calls_pending(db, Some(job_id)).await?.is_empty() {
+        return Ok(Some(
+            "cancelled turn tool-call settlement is not confirmed".into(),
+        ));
+    }
+    let runs = db
+        .query_all(
+            "SELECT id, status FROM runs WHERE job_id=?1",
+            (job_id.to_string(),),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    {
+        let responses = orch.resolution_responses.lock().unwrap();
+        if runs.iter().any(|(id, _)| responses.contains_key(id)) {
+            return Ok(Some(
+                "waiting for the resolution tool response transport".into(),
+            ));
+        }
+    }
+    let retained = orch.process_state.run_ids();
+    if runs
+        .iter()
+        .any(|(id, status)| status == "starting" || status == "live" || retained.contains(id))
+    {
+        return Ok(Some("agent process cleanup is not confirmed".into()));
+    }
+    let terminal_pending = orch
+        .db
+        .local
+        .query_opt(
+            "SELECT 1 FROM job_terminals WHERE job_id=?1 AND status!='exited'
+         UNION ALL SELECT 1 FROM terminal_outputs WHERE job_id=?1 AND capture='capturing'
+         LIMIT 1",
+            (job_id.to_string(),),
+            |row| row.i64(0),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some();
+    if terminal_pending {
+        return Ok(Some(
+            "terminal exit or output capture is not finalized".into(),
+        ));
+    }
+    let batches = crate::mcp::handlers::run::detached::all_running(db).await?;
+    if batches
+        .iter()
+        .any(|batch| batch.job_id == job_id && batch.holds_branch)
+        || crate::mcp::handlers::run::detached::live_environment_owners()
+            .iter()
+            .any(|(_, owner)| owner.job_id == job_id)
+    {
+        return Ok(Some("batch cleanup is not confirmed".into()));
+    }
+    let parked = db
+        .query_all(
+            "SELECT condition_json FROM agent_waits WHERE job_id=?1
+         AND state IN ('pending','resolving') AND kind='run_batch'",
+            (job_id.to_string(),),
+            |row| row.text(0),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    for json in parked {
+        let condition: crate::mcp::handlers::durable_suspend::Condition =
+            serde_json::from_str(&json).map_err(|error| error.to_string())?;
+        if condition.holds_branch() {
+            return Ok(Some("parked batch cleanup is not confirmed".into()));
+        }
+    }
+    Ok(None)
+}
+
+/// Existing cancelled turns and unanswered transcript calls survive process
+/// finalization. Scope retries to those turns, never to the job that may have
+/// acquired a new session after reopening.
+async fn resolution_calls_pending(
+    db: &LocalDb,
+    job_id: Option<&str>,
+) -> Result<Vec<(String, String, String)>, String> {
+    let turns = db
+        .query_all(
+            "SELECT id,run_id,end_reason FROM turns
+         WHERE state='cancelled' AND end_reason IN ('issue_merged','issue_closed')
+           AND run_id IS NOT NULL AND (?1 IS NULL OR job_id=?1)",
+            (job_id.map(str::to_string),),
+            |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut pending = Vec::new();
+    for (turn, run, reason) in turns {
+        if !crate::orchestrator::lifecycle::open_call_names(db, &run, &turn)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_empty()
+        {
+            pending.push((turn, run, reason));
+        }
+    }
+    Ok(pending)
+}
+
+/// Reuse the terminal lifecycle sweep to retry resolved owners. The rows and
+/// admitted controls are the retry evidence; there is no separate cleanup queue.
+pub(crate) async fn reconcile_resolved_resources(orch: &Orchestrator) {
+    use crate::mcp::handlers::run::detached;
+    let mut owners: std::collections::BTreeSet<String> = detached::live_mutating_owners()
+        .into_iter()
+        .map(|(_, owner)| owner.job_id)
+        .collect();
+    owners.extend(
+        detached::live_environment_owners()
+            .into_iter()
+            .map(|(_, owner)| owner.job_id),
+    );
+    // An idle environment can outlive both its final terminal and response
+    // guard. Its holder must keep resolution discoverable after those disappear.
+    for executor in orch
+        .fleet
+        .inspect_executors(chrono::Utc::now().timestamp_millis().max(0) as u64)
+    {
+        for cell in executor.occupancy.cells {
+            if let Some(residency) = cell.residency {
+                if let cairn_common::executor_protocol::ResidencyHolder::Job { job_id } =
+                    residency.holder
+                {
+                    owners.insert(job_id);
+                }
+            }
+        }
+    }
+    if let Ok(jobs) = orch.db.local.query_all(
+        "SELECT DISTINCT job_id FROM job_terminals WHERE status != 'exited' AND job_id IS NOT NULL",
+        (), |row| row.text(0),
+    ).await { owners.extend(jobs); }
+    if let Ok(jobs) = orch
+        .db
+        .local
+        .query_all(
+            "SELECT DISTINCT job_id FROM terminal_outputs
+         WHERE expiry_basis='resolution' AND (resolved_at IS NULL OR capture='capturing') AND job_id IS NOT NULL",
+            (),
+            |row| row.text(0),
+        )
+        .await
+    {
+        owners.extend(jobs);
+    }
+    let retained_runs =
+        serde_json::to_string(&orch.process_state.run_ids()).unwrap_or_else(|_| "[]".into());
+    for db in orch.db.all_dbs().await {
+        match resolution_calls_pending(&db, None).await {
+            Ok(turns) => {
+                for (turn, run, reason) in turns {
+                    if orch.resolution_responses.lock().unwrap().contains_key(&run) {
+                        continue;
+                    }
+                    if let Err(error) = crate::orchestrator::lifecycle::settle_unanswered_calls(
+                        orch,
+                        &run,
+                        &turn,
+                        crate::orchestrator::lifecycle::InterruptCause::Resolution {
+                            exit_reason: reason,
+                        },
+                    ) {
+                        log::warn!("Resolution call cleanup pending for turn {turn}: {error}");
+                    }
+                }
+            }
+            Err(error) => log::warn!("Could not census cancelled resolution calls: {error}"),
+        }
+        let process_owners = db
+            .query_all(
+                "SELECT DISTINCT job_id FROM runs WHERE job_id IS NOT NULL
+             AND (status IN ('starting','live') OR id IN (SELECT value FROM json_each(?1)))",
+                (retained_runs.clone(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap_or_default();
+        owners.extend(process_owners.iter().cloned());
+        if let Ok(batches) = detached::all_running(&db).await {
+            owners.extend(
+                batches
+                    .into_iter()
+                    .filter(|b| b.commits || b.holds_branch)
+                    .map(|b| b.job_id),
+            );
+        }
+        if let Ok(requesters) = db
+            .query_all(
+                format!(
+                    "SELECT DISTINCT requester_job_id FROM check_requests
+                     WHERE requester_job_id IS NOT NULL AND state IN {}",
+                    crate::execution::checks::requests::OPEN_STATES
+                ),
+                (),
+                |row| row.text(0),
+            )
+            .await
+        {
+            owners.extend(requesters);
+        }
+        let mut issues = BTreeMap::new();
+        for job in &owners {
+            match resolved_resource_issues(&db, job).await {
+                Ok(found) => {
+                    if !found.is_empty() && process_owners.contains(job) {
+                        let resolution = if found.iter().any(|(_, status)| status == "merged") {
+                            crate::transitions::Resolution::Merged
+                        } else {
+                            crate::transitions::Resolution::Closed
+                        };
+                        if let Err(error) = crate::orchestrator::lifecycle::stop_job_for_resolution(
+                            orch, job, resolution,
+                        ) {
+                            log::warn!("Resolution process cleanup pending for {job}: {error}");
+                        }
+                    }
+                    issues.extend(found);
+                }
+                Err(error) => {
+                    log::warn!("Could not identify resolved resource owner {job}: {error}")
+                }
+            }
+        }
+        for (issue, status) in issues {
+            let resolution = if status == "merged" {
+                crate::transitions::Resolution::Merged
+            } else {
+                crate::transitions::Resolution::Closed
+            };
+            let _ = settle_issue_resources(orch, &db, &issue, resolution).await;
+        }
+    }
+}
+
+/// A delegated child may have no issue, and branch-dependent work may belong
+/// to a different, still-open issue. Both retain their source resolution.
+async fn resolved_resource_issues(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    db.query_all(
+        "WITH RECURSIVE ancestors(id,issue_id,parent_job_id,project_id,base_branch) AS (
+             SELECT id,issue_id,parent_job_id,project_id,base_branch FROM jobs WHERE id=?1
+             UNION SELECT j.id,j.issue_id,j.parent_job_id,j.project_id,j.base_branch
+                 FROM jobs j JOIN ancestors a ON j.id=a.parent_job_id
+         ), sources(issue_id) AS (
+             SELECT issue_id FROM ancestors
+             UNION SELECT j.issue_id FROM jobs j JOIN ancestors a
+                 ON j.project_id=a.project_id AND j.branch=a.base_branch
+         ) SELECT DISTINCT i.id,i.status FROM issues i JOIN sources s ON s.issue_id=i.id
+             WHERE i.status IN ('merged','closed')",
+        (job_id.to_string(),),
+        |row| Ok((row.text(0)?, row.text(1)?)),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 pub(crate) async fn cleanup_issue_jobs(
     orch: &Orchestrator,
     scope: TeardownScope,
@@ -125,14 +635,22 @@ pub(crate) async fn cleanup_issue_jobs(
         orch.invalidate_node_check_status(job_id, "issue-resolution");
     }
 
-    let retention = if archive {
-        OutputRetention::Resolved {
-            resolved_at: issue_resolved_at(&db, &issue_id).await,
-        }
-    } else {
-        OutputRetention::Deleted
+    let resolution = match reason {
+        TeardownReason::Merged => crate::transitions::Resolution::Merged,
+        TeardownReason::Discarded => crate::transitions::Resolution::Closed,
     };
-    kill_terminals_for_jobs(orch, &db, &job_ids, retention).await;
+    let resources = if archive {
+        settle_issue_resources(orch, &db, &issue_id, resolution).await
+    } else {
+        kill_terminals_for_jobs(orch, &db, &job_ids, OutputRetention::Deleted).await;
+        Vec::new()
+    };
+    let cleanup_pending = resources.iter().any(|resource| {
+        resource.outcome == crate::issues::status::SettlementOutcome::CleanupPending
+    });
+    if archive {
+        close_browsers_for_jobs(orch, &db, &job_ids).await;
+    }
     kill_repls_for_jobs(orch, &job_ids).await;
     let mut dev_targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for target in &targets {
@@ -145,12 +663,27 @@ pub(crate) async fn cleanup_issue_jobs(
         crate::dev_instances::release_issue_instances(orch, &project_id, &job_ids, &branches)
             .await?;
     }
-    for job_id in &job_ids {
-        crate::scratch::remove_job_scratch_dir(job_id);
+    // Retained terminal output is independent of scratch, but an unconfirmed
+    // exit or an in-flight batch may still own capture state or a recoverable delta.
+    let has_terminals = match orch
+        .db
+        .local
+        .query_all(
+            "SELECT DISTINCT job_id FROM job_terminals WHERE job_id IS NOT NULL AND status != 'exited'",
+            (),
+            |row| row.text(0),
+        )
+        .await
+    {
+        Ok(owners) => owners.iter().any(|owner| job_ids.contains(owner)),
+        Err(_) => true,
+    };
+    if !cleanup_pending && !has_terminals {
+        for job_id in &job_ids {
+            crate::scratch::remove_job_scratch_dir(job_id);
+        }
+        crate::node_scratch::lifecycle::close_for_issue(orch, &issue_id).await;
     }
-    // Each of the issue's nodes owned a portable scratch; it ends with them,
-    // on the runner and on every machine that held a replica.
-    crate::node_scratch::lifecycle::close_for_issue(orch, &issue_id).await;
 
     // The issue's agents were stopped before teardown, so its transcripts are
     // now immutable. Archive them while their branches still resolve; the
@@ -949,19 +1482,13 @@ async fn kill_repls_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
     }
 }
 
-/// What happens to the retained output of the jobs a teardown releases.
+/// Retained output is runner-local even when the issue belongs to a team.
 #[derive(Debug, Clone, Copy)]
 enum OutputRetention {
-    /// The issue resolved at `resolved_at`: each record is kept seven days past
-    /// the later of its exit and this.
     Resolved { resolved_at: i64 },
-    /// The issue or project is being deleted, which is destructive: the records
-    /// expire now and go at the next prune.
     Deleted,
 }
 
-/// When the issue's resolution was recorded (`completed_at`, Unix seconds), or
-/// now if the row cannot say: a later stamp only keeps output longer.
 async fn issue_resolved_at(db: &LocalDb, issue_id: &str) -> i64 {
     db.query_opt(
         "SELECT completed_at FROM issues WHERE id = ?1",
@@ -975,14 +1502,31 @@ async fn issue_resolved_at(db: &LocalDb, issue_id: &str) -> i64 {
     .unwrap_or_else(|| chrono::Utc::now().timestamp())
 }
 
-/// Kill running PTY sessions for the given jobs and delete their terminal rows,
-/// keeping their retained output under `retention`.
-///
-/// Uses the runner's terminal bindings to issue fenced executor stop/release
-/// operations before clearing durable rows. A terminal's output does not live
-/// in its row or its job's scratch, so releasing both loses nothing: its
-/// retained record (`crate::terminal_output`) outlives them, and an exit that
-/// arrives after the row is gone still finalizes that record and notifies.
+async fn retain_terminal_outputs(
+    orch: &Orchestrator,
+    job_ids: &[String],
+    retention: OutputRetention,
+) -> Result<(), String> {
+    match retention {
+        OutputRetention::Resolved { resolved_at } => {
+            crate::terminal_output::record_resolution(&orch.db.local, job_ids, resolved_at)
+                .await
+                .map(|_| ())
+        }
+        OutputRetention::Deleted => {
+            crate::terminal_output::expire_for_jobs(
+                &orch.db.local,
+                job_ids,
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+        }
+    }
+    .map_err(|error| error.to_string())
+}
+
+/// Destructive deletion stops PTYs and expires retained output. Normal issue
+/// resolution uses `settle_issue_resources` and preserves pending exit evidence.
 async fn kill_terminals_for_jobs(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -994,7 +1538,7 @@ async fn kill_terminals_for_jobs(
     }
 
     // Stop live executor-hosted PTYs before releasing their lease authority.
-    match load_running_terminals_for_jobs(db, job_ids).await {
+    match load_running_terminals_for_jobs(&orch.db.local, job_ids).await {
         Ok(running) => {
             for (terminal_id, session_id) in &running {
                 if let Err(error) =
@@ -1011,63 +1555,25 @@ async fn kill_terminals_for_jobs(
         }
     }
 
-    // A job's terminals are processes inside the job's own execution
-    // environment, so there is no separate terminal-owned thing to release: the
-    // shells were stopped above, and releasing the job's residency gives back
-    // the cell, its checkout, and its footprint in one move. A job holds that
-    // residency for as long as it runs, whether or not it ever opened a
-    // terminal, so this releases by job identity rather than by what the
-    // terminal table happens to record.
+    // Explicit deletion is destructive, unlike normal resolution: the rows
+    // below disappear and cannot serve as evidence for a deferred release.
     for job_id in job_ids {
         let holder = cairn_common::executor_protocol::ResidencyHolder::Job {
             job_id: job_id.clone(),
         };
-        let Some(fence) = orch.fleet.residency_fence(&holder) else {
-            continue;
-        };
-        let result = orch
-            .fleet
-            .operate_residency(
-                orch,
-                cairn_common::executor_protocol::ResidencyOperation::Release { fence },
-            )
-            .await;
-        if let cairn_common::executor_protocol::ResidencyResult::Failed { diagnostic, .. } = result
-        {
-            log::warn!(
-                "Teardown: failed to release the execution environment for {job_id}: {diagnostic}"
-            );
+        if let Some(fence) = orch.fleet.residency_fence(&holder) {
+            if let Err(error) = crate::fleet::residency::release(orch, &fence).await {
+                log::warn!("Teardown: failed to release deleted job {job_id}: {error}");
+            }
         }
     }
 
-    // Retained records are this runner's, in its own database whichever
-    // database holds the issue.
-    let retained = match retention {
-        OutputRetention::Resolved { resolved_at } => {
-            crate::terminal_output::record_resolution(&orch.db.local, job_ids, resolved_at)
-                .await
-                .map(|_| ())
-        }
-        OutputRetention::Deleted => {
-            crate::terminal_output::expire_for_jobs(
-                &orch.db.local,
-                job_ids,
-                chrono::Utc::now().timestamp(),
-            )
-            .await
-        }
-    };
-    if let Err(error) = retained {
+    if let Err(error) = retain_terminal_outputs(orch, job_ids, retention).await {
         log::warn!("Teardown: failed to set retained terminal output deadlines: {error}");
     }
-
-    // Delete every terminal row for these jobs — the running ones we just
-    // stopped and the exited ones. Their output stays readable at the retained
-    // URIs their exit notifications gave.
-    if let Err(e) = delete_all_terminal_rows_for_jobs(db, job_ids).await {
-        log::warn!("Teardown: failed to delete terminal rows: {}", e);
+    if let Err(error) = delete_all_terminal_rows_for_jobs(&orch.db.local, job_ids).await {
+        log::warn!("Teardown: failed to delete terminal rows: {error}");
     }
-
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "job_terminals", "action": "delete"}),
@@ -1157,12 +1663,231 @@ async fn delete_all_terminal_rows_for_jobs(db: &LocalDb, job_ids: &[String]) -> 
         })
     })
     .await
-    .map_err(|e| format!("Failed to delete job terminals during teardown: {e}"))
+    .map_err(|error| format!("Failed to delete job terminals during teardown: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completed_producers_keep_pending_terminal_and_batch_cleanup_retryable() {
+        use crate::issues::status::SettlementOutcome;
+        use crate::transitions::Resolution;
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::storage::migrated_test_db("resource-settlement-retry.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','p','',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,completed_at,created_at,updated_at)
+               VALUES('i','p',1,'I','merged',100,1,100);
+             INSERT INTO executions(id,recipe_id,project_id,issue_id,status,seq,started_at)
+               VALUES('e','r','p','i','complete',1,1);
+             INSERT INTO jobs(id,execution_id,project_id,issue_id,uri_segment,status,created_at,updated_at)
+               VALUES('producer','e','p','i','builder','complete',1,1);
+             INSERT INTO job_terminals(id,job_id,project_id,session_id,command,status,created_at,slug)
+               VALUES('terminal','producer','p','session','sleep 100','running',1,'watch');
+             INSERT INTO terminal_outputs(id,terminal_id,job_id,project_id,slug,terminal_uri,expiry_basis,created_at,updated_at)
+               VALUES('output','terminal','producer','p','watch',
+                      'cairn://p/p/1/1/builder/terminal/watch','resolution',1,1);
+             INSERT INTO run_batch_detached(request_id,job_id,run_id,commits,holds_branch,state,reason,created_ms)
+               VALUES('mutating','producer','run',1,1,'running','detached',1),
+                     ('verdict-only','producer','run',0,0,'running','detached',1);
+             CREATE TRIGGER retention_unavailable BEFORE UPDATE ON terminal_outputs
+               BEGIN SELECT RAISE(ABORT,'retention unavailable'); END;"
+        ).await.unwrap();
+        let search = std::sync::Arc::new(
+            crate::storage::SearchIndex::open_or_create(root.path().join("search")).unwrap(),
+        );
+        let orch = Orchestrator::builder(
+            std::sync::Arc::new(crate::db::DbState::new(std::sync::Arc::new(db), search)),
+            std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root.path().to_path_buf(),
+        )
+        .build();
+        let first = settle_issue_resources(&orch, &orch.db.local, "i", Resolution::Merged).await;
+        assert!(first.iter().any(|r| r
+            .diagnostic
+            .as_deref()
+            .is_some_and(|d| d.contains("retention unavailable"))));
+        for suffix in ["/terminal/watch", "/batches/mutating"] {
+            let resource = first
+                .iter()
+                .find(|r| r.uri.ends_with(suffix))
+                .expect(suffix);
+            assert_eq!(resource.outcome, SettlementOutcome::CleanupPending);
+        }
+        assert!(!first
+            .iter()
+            .any(|r| r.uri.ends_with("/batches/verdict-only")));
+        let terminal = orch
+            .db
+            .local
+            .query_one(
+                "SELECT status,restart_policy,exit_reason FROM job_terminals WHERE id='terminal'",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal,
+            (
+                "running".into(),
+                "never".into(),
+                "issue resolved: merged".into()
+            )
+        );
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text(
+                    "SELECT state FROM run_batch_detached WHERE request_id='mutating'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("running"),
+            "an absent executor is not death evidence"
+        );
+        orch.db
+            .local
+            .execute_script("DROP TRIGGER retention_unavailable;")
+            .await
+            .unwrap();
+        reconcile_resolved_resources(&orch).await;
+        let output = crate::terminal_output::load(&orch.db.local, "output")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.resolved_at, Some(100));
+        assert_eq!(output.expires_at, Some(100 + 7 * 24 * 60 * 60));
+        assert!(
+            output.is_capturing(),
+            "retry never fabricates an exit or output barrier"
+        );
+        // Model an authoritative exit arriving between settlement attempts.
+        orch.db
+            .local
+            .execute(
+                "UPDATE job_terminals SET status='exited',exited_at=150 WHERE id='terminal'",
+                (),
+            )
+            .await
+            .unwrap();
+        orch.db
+            .local
+            .execute_script(
+                "CREATE TRIGGER capture_unavailable BEFORE UPDATE ON terminal_outputs
+             WHEN NEW.capture != OLD.capture
+             BEGIN SELECT RAISE(ABORT,'capture unavailable'); END;",
+            )
+            .await
+            .unwrap();
+        let pending = settle_issue_resources(&orch, &orch.db.local, "i", Resolution::Merged).await;
+        let terminal = pending
+            .iter()
+            .find(|r| r.uri.ends_with("/terminal/watch"))
+            .unwrap();
+        assert_eq!(terminal.outcome, SettlementOutcome::CleanupPending);
+        assert!(terminal
+            .diagnostic
+            .as_deref()
+            .unwrap()
+            .contains("capture unavailable"));
+        assert!(crate::terminal_output::load(&orch.db.local, "output")
+            .await
+            .unwrap()
+            .unwrap()
+            .is_capturing());
+        orch.db
+            .local
+            .execute_script("DROP TRIGGER capture_unavailable;")
+            .await
+            .unwrap();
+        orch.db.local.execute_script(
+            "UPDATE issues SET status='active',resolution_generation=resolution_generation+1,
+                 merged_at=NULL,completed_at=NULL WHERE id='i';
+             INSERT INTO jobs(id,execution_id,project_id,issue_id,uri_segment,status,created_at,updated_at)
+                 VALUES('fresh','e','p','i','fresh','pending',200,200);"
+        ).await.unwrap();
+        crate::terminal_host::reconcile_terminal_lifecycle_with(&orch, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text("SELECT status FROM jobs WHERE id='fresh'", (),)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("pending"),
+            "capture retry must not stop reopened work"
+        );
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text("SELECT status FROM issues WHERE id='i'", (),)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("active")
+        );
+        let capture = crate::terminal_output::load(&orch.db.local, "output")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            capture.capture, "incomplete",
+            "a lost live capture must not become complete"
+        );
+        assert_eq!(capture.exit_code, None, "no synthetic exit code");
+        assert_eq!(capture.exited_at, Some(150));
+        crate::mcp::handlers::terminal::finalize_exited_terminal_capture(&orch, "session")
+            .await
+            .expect("capture finalization is idempotent");
+        assert_eq!(
+            crate::terminal_output::load(&orch.db.local, "output")
+                .await
+                .unwrap()
+                .unwrap()
+                .resolved_at,
+            Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_finds_resolved_source_of_branch_dependent_descendants() {
+        let db = crate::storage::migrated_test_db("dependent-resource-retry.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','p','',1,1),('other','w','O','other','',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+               VALUES('source','p',1,'S','merged',1,1),('dependent','p',2,'D','active',1,1),
+                     ('unrelated','other',1,'O','closed',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,parent_job_id,branch,base_branch,status,created_at,updated_at)
+               VALUES('producer','p','source',NULL,'agent/source','main','complete',1,1),
+                     ('reviewer','p','dependent',NULL,'agent/reviewer','agent/source','cancelled',1,1),
+                     ('child','p',NULL,'reviewer',NULL,NULL,'cancelled',1,1),
+                     ('foreign','other','unrelated',NULL,'agent/source','main','complete',1,1);"
+        ).await.unwrap();
+        assert_eq!(
+            resolved_resource_issues(&db, "child").await.unwrap(),
+            vec![("source".into(), "merged".into())]
+        );
+        assert!(issue_resource_jobs(&db, "source")
+            .await
+            .unwrap()
+            .contains(&"child".into()));
+        assert_eq!(
+            issue_output_jobs(&db, "source").await.unwrap(),
+            vec!["producer".to_string()],
+            "dependent issue output must not expire before its own issue resolves"
+        );
+    }
 
     #[tokio::test]
     async fn project_process_ids_include_thread_and_project_runs() {
@@ -1259,7 +1984,10 @@ mod tests {
              INSERT INTO jobs(id, execution_id, project_id, issue_id, branch, base_branch, status, created_at, updated_at)
                VALUES ('job','exec','proj','issue','{branch}','main','complete',1,1);
              INSERT INTO runs(id, job_id, project_id, status, created_at, updated_at)
-               VALUES ('run','job','proj','exited',1,1);",
+               VALUES ('run','job','proj','exited',1,1);
+             INSERT INTO job_browsers(id,job_id,project_id,slug,webview_label,status,created_at,last_active_at)
+               VALUES('node-browser','job','proj','node','node-view','running',1,1),
+                     ('project-browser',NULL,'proj','project','project-view','running',1,1);",
             repo = project.path().display(),
         ))
         .await
@@ -1307,6 +2035,14 @@ mod tests {
         .unwrap();
 
         let db = &orch.db.local;
+        assert_eq!(
+            db.query_all("SELECT id FROM job_browsers ORDER BY id", (), |row| row
+                .text(0))
+                .await
+                .unwrap(),
+            vec!["project-browser".to_string()],
+            "normal issue resolution closes only node-scoped browsers"
+        );
         assert_eq!(
             event_columns(db, "a-w1").await,
             (Some("gitcoord".to_string()), Some(sealed.clone())),

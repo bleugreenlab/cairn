@@ -203,11 +203,33 @@ pub(crate) async fn reconcile_terminal_lifecycle_with(
     orch: &Orchestrator,
     window_elapsed: bool,
 ) -> Result<u64, String> {
+    crate::execution::teardown::reconcile_resolved_resources(orch).await;
     let rows = recoverable_terminals(&orch.db.local)
         .await
         .map_err(|error| error.to_string())?;
     let snapshot = orch.fleet.snapshot();
     let mut changed = 0;
+    // A later issue reopen must not strand capture metadata for a terminal
+    // whose exit was already proven. This retries output only, never job stops.
+    let captures = orch
+        .db
+        .local
+        .query_all(
+            "SELECT DISTINCT t.session_id FROM job_terminals t
+         JOIN terminal_outputs o ON o.terminal_id=t.id
+         WHERE t.status='exited' AND o.capture='capturing'",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    for session in captures {
+        match crate::mcp::handlers::terminal::finalize_exited_terminal_capture(orch, &session).await
+        {
+            Ok(_) => changed += 1,
+            Err(error) => log::warn!("Terminal capture cleanup pending for {session}: {error}"),
+        }
+    }
     for row in rows {
         let advertised = snapshot.cells.iter().find_map(|cell| {
             let residency = cell.residency.as_ref()?;

@@ -673,3 +673,48 @@ async fn pipe_pressure_release_is_the_owner_test_plus_the_collector_protection()
     );
     assert!(orch.process_state.is_warm("run"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_lifetime_resolution_retry_keeps_unconfirmed_child_and_typed_cause() {
+    for reason in ["issue_merged", "issue_closed"] {
+        let orch = fixture("lifetime-resolution-retry", "other", "closed", "cancelled").await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE runs SET exit_reason = ?1 WHERE id = 'run'",
+                (reason,),
+            )
+            .await
+            .unwrap();
+        let mut handle = RunHandle::test_handle(Some("session"), Some("job"));
+        handle.transition_to_warm();
+        let child = handle.child.clone();
+        let poison = child.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("injected unavailable child handle");
+        })
+        .join()
+        .is_err());
+        orch.process_state
+            .processes
+            .lock()
+            .unwrap()
+            .register("run".into(), handle);
+
+        assert!(matches!(
+            retire_unowned_idle(&orch, "run", RetireGrounds::Lifetime { now: 100 }),
+            Err(NotRetired::TeardownFailed(_))
+        ));
+        assert_eq!(orch.process_state.has_process("run"), Some(true));
+        assert_eq!(run_state(&orch).await, ("live".into(), Some(reason.into())));
+
+        child.clear_poison();
+        assert!(retire_unowned_idle(&orch, "run", RetireGrounds::Lifetime { now: 100 }).is_ok());
+        assert_eq!(
+            run_state(&orch).await,
+            ("exited".into(), Some(reason.into()))
+        );
+        assert_ne!(orch.process_state.has_process("run"), Some(true));
+    }
+}

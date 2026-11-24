@@ -673,10 +673,10 @@ impl From<CellOutcome> for LeaderSettlement {
 /// entry for reasons of its own.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum CancelCause {
-    /// An operator, or a merge's resolution cascade, stopped the job.
+    /// An operator stopped the job.
     JobStopped,
-    /// The job's issue resolved and its session closed.
-    SessionClosed,
+    IssueMerged,
+    IssueClosed,
     /// The operator compacted the job's session. Ends the session's own work
     /// only; see [`CancelCause::ends_job_work_at`].
     OperatorCompact,
@@ -698,7 +698,8 @@ impl CancelCause {
     pub(crate) fn sentence(&self) -> String {
         match self {
             Self::JobStopped => "job stopped".into(),
-            Self::SessionClosed => "its issue resolved and closed the job's session".into(),
+            Self::IssueMerged => "its issue was merged".into(),
+            Self::IssueClosed => "its issue was closed".into(),
             Self::OperatorCompact => "the operator compacted the job".into(),
             Self::OperatorRetracted => "the operator cancelled this request".into(),
             Self::Superseded => "a newer request for the same answer replaced it".into(),

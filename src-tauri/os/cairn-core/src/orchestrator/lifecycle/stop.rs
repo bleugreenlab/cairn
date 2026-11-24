@@ -946,6 +946,210 @@ pub fn stop_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Stable interruption cause for work ended by issue resolution.
+pub fn resolution_exit_reason(resolution: crate::transitions::Resolution) -> &'static str {
+    match resolution {
+        crate::transitions::Resolution::Merged => "issue_merged",
+        crate::transitions::Resolution::Closed => "issue_closed",
+    }
+}
+
+/// Irreversibly end a job and its delegated descendants for issue resolution.
+/// Unlike an operator Stop, this closes sessions and cancels queued turns before
+/// stopping processes, so a delayed exit cannot resume the cancelled work.
+pub fn stop_job_for_resolution(
+    orch: &Orchestrator,
+    job_id: &str,
+    resolution: crate::transitions::Resolution,
+) -> Result<(), String> {
+    stop_job_for_resolution_preserving_run(orch, job_id, resolution, None)
+}
+
+/// Settle resolution without cutting off the run delivering its own merge result.
+/// The caller must invoke `finish_resolution_run` after its response handoff.
+/// Cancellation authority is revoked immediately even for that preserved run.
+pub fn stop_job_for_resolution_preserving_run(
+    orch: &Orchestrator,
+    job_id: &str,
+    resolution: crate::transitions::Resolution,
+    response_run_id: Option<&str>,
+) -> Result<(), String> {
+    let reason = resolution_exit_reason(resolution);
+    let (jobs, turns, runs) = run_db_blocking({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            db.write(|conn| {
+                let job_id = job_id.clone();
+                Box::pin(async move {
+                    let mut jobs = find_descendant_job_ids(conn, &job_id).await?;
+                    jobs.push(job_id);
+                    let mut turns = Vec::new();
+                    let mut runs = Vec::new();
+                    let now = chrono::Utc::now().timestamp();
+                    for job in &jobs {
+                        let mut rows = conn.query(
+                            "SELECT id, run_id FROM turns WHERE job_id = ?1 AND (state = 'running' OR (state = 'cancelled' AND end_reason = ?2))",
+                            (job.as_str(), reason),
+                        ).await?;
+                        while let Some(row) = rows.next().await? {
+                            if let Some(run) = row.opt_text(1)? {
+                                turns.push((row.text(0)?, run));
+                            }
+                        }
+                        drop(rows);
+                        let mut rows = conn.query(
+                            "SELECT id FROM runs WHERE job_id = ?1 AND status IN ('starting', 'live')",
+                            (job.as_str(),),
+                        ).await?;
+                        while let Some(row) = rows.next().await? { runs.push(row.text(0)?); }
+                        drop(rows);
+                        crate::mcp::handlers::planning::withdraw_job_prompts_conn(
+                            conn, job,
+                            match resolution {
+                                crate::transitions::Resolution::Merged => crate::mcp::handlers::permission::WithdrawalCause::IssueMerged,
+                                crate::transitions::Resolution::Closed => crate::mcp::handlers::permission::WithdrawalCause::IssueClosed,
+                            }, now,
+                        ).await?;
+                        conn.execute(
+                            "UPDATE turns SET state = 'cancelled', end_reason = ?2, ended_at = ?3, updated_at = ?3
+                             WHERE job_id = ?1 AND state IN ('pending', 'running', 'yielded')",
+                            (job.as_str(), reason, now),
+                        ).await?;
+                        let mut rows = conn.query(
+                            "SELECT DISTINCT run_id FROM agent_waits WHERE job_id = ?1
+                             AND state IN ('pending', 'resolving')",
+                            (job.as_str(),),
+                        ).await?;
+                        let mut waiting_runs = Vec::new();
+                        while let Some(row) = rows.next().await? {
+                            waiting_runs.push(row.text(0)?);
+                        }
+                        drop(rows);
+                        for run in waiting_runs {
+                            crate::mcp::handlers::durable_suspend::cancel_run_waits_conn(
+                                conn, &run, reason, chrono::Utc::now().timestamp_millis(),
+                            ).await?;
+                        }
+                        conn.execute(
+                            "UPDATE sessions SET status = 'closed', terminal_reason = ?2, closed_at = ?3, updated_at = ?3
+                             WHERE job_id = ?1 AND status != 'closed'",
+                            (job.as_str(), match resolution { crate::transitions::Resolution::Merged => "issue_merged", crate::transitions::Resolution::Closed => "issue_closed" }, now),
+                        ).await?;
+                        conn.execute(
+                            "UPDATE jobs SET status = 'cancelled', completed_at = ?2, updated_at = ?2
+                             WHERE id = ?1 AND status NOT IN ('complete', 'completed', 'failed', 'cancelled', 'skipped')",
+                            (job.as_str(), now),
+                        ).await?;
+                        conn.execute(
+                            "UPDATE runs SET exit_reason = ?2 WHERE job_id = ?1 AND status IN ('starting', 'live')",
+                            (job.as_str(), reason),
+                        ).await?;
+                    }
+                    conn.on_commit(cairn_db::admission_hint::evidence_changed);
+                    Ok((jobs, turns, runs))
+                })
+            }).await.map_err(|error| error.to_string())
+        }
+    })?;
+    let mut errors = Vec::new();
+    for job in &jobs {
+        if let Err(error) = cancel_provider_holds(orch, job) {
+            errors.push(error);
+        }
+        orch.fleet.cancel_job_requests(
+            job,
+            match resolution {
+                crate::transitions::Resolution::Merged => crate::fleet::CancelCause::IssueMerged,
+                crate::transitions::Resolution::Closed => crate::fleet::CancelCause::IssueClosed,
+            },
+        );
+    }
+    for (turn, run) in turns {
+        if response_run_id == Some(run.as_str())
+            || orch.resolution_responses.lock().unwrap().contains_key(&run)
+        {
+            continue;
+        }
+        orch.write_stops.raise(&run);
+        if let Err(error) = settle_unanswered_calls(
+            orch,
+            &run,
+            &turn,
+            InterruptCause::Resolution {
+                exit_reason: reason.to_string(),
+            },
+        ) {
+            errors.push(error);
+        }
+    }
+    // Include retained warm processes even when their run projection is terminal.
+    let mut runs = runs;
+    for run in orch.process_state.run_ids() {
+        if job_id_for_run(orch, &run).is_some_and(|job| jobs.contains(&job)) && !runs.contains(&run)
+        {
+            runs.push(run);
+        }
+    }
+    for run in runs {
+        if response_run_id == Some(run.as_str())
+            || orch.resolution_responses.lock().unwrap().contains_key(&run)
+        {
+            orch.resolution_responses
+                .lock()
+                .unwrap()
+                .insert(run.clone(), Some(resolution));
+            // The provider acknowledges tool results at its terminal-tool boundary.
+            // Until then the cancelled run retains only its response transport.
+            orch.process_state.arm_terminal_tool(&run);
+            continue;
+        }
+        if let Err(error) = finish_resolution_run(orch, &run, resolution) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Called only at the provider's acknowledged terminal-tool boundary. Resolution
+/// already revoked authority; the typed cause retained with its transport now
+/// determines final cleanup.
+pub(crate) fn finish_resolution_response(orch: &Orchestrator, run_id: &str) -> bool {
+    let Some(Some(resolution)) = orch.resolution_responses.lock().unwrap().remove(run_id) else {
+        return false;
+    };
+    if let Err(error) = finish_resolution_run(orch, run_id, resolution) {
+        log::warn!("Resolution response cleanup pending for {run_id}: {error}");
+    }
+    true
+}
+
+/// Finish the process retained only to deliver a resolution response. Call after
+/// the response is handed off, never from inside the resolving write itself.
+pub fn finish_resolution_run(
+    orch: &Orchestrator,
+    run_id: &str,
+    resolution: crate::transitions::Resolution,
+) -> Result<(), String> {
+    orch.resolution_responses.lock().unwrap().remove(run_id);
+    orch.write_stops.raise(run_id);
+    cleanup_inline_commands(orch, run_id);
+    set_exit_reason(orch, run_id, resolution_exit_reason(resolution))?;
+    kill_session_with_reason(
+        orch,
+        run_id,
+        resolution_exit_reason(resolution),
+        TerminalPolicy::Keep,
+    )
+}
+
 /// Running (`starting`/`live`) run ids for every descendant job of `job_id`. The
 /// job-level analogue of [`child_run_ids_for_run`], resolved from a job id rather
 /// than a run id (a suspended job may have no run of its own).
@@ -1503,11 +1707,33 @@ pub(super) fn teardown_process(
                 &run_id[..run_id.len().min(8)]
             );
         }
-        if let Ok(mut child_guard) = handle.child.lock() {
-            if let Some(mut child) = child_guard.take() {
-                crate::agent_process::process::graceful_stop(&mut *child);
-                log::info!("Killed process for run {}", &run_id[..run_id.len().min(8)]);
+        let resolution = matches!(exit_reason, "issue_merged" | "issue_closed");
+        let pending = match handle.child.lock() {
+            Ok(mut child_guard) => {
+                if let Some(mut child) = child_guard.take() {
+                    crate::agent_process::process::graceful_stop(&mut *child);
+                    if resolution && !matches!(child.try_wait(), Ok(Some(_))) {
+                        *child_guard = Some(child);
+                        true
+                    } else {
+                        log::info!("Killed process for run {}", &run_id[..run_id.len().min(8)]);
+                        false
+                    }
+                } else {
+                    false
+                }
             }
+            Err(_) => resolution,
+        };
+        if pending {
+            orch.process_state
+                .processes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .register(run_id.to_string(), handle);
+            return Err(format!(
+                "process exit not confirmed for run {run_id}; cleanup pending"
+            ));
         }
     }
 
@@ -1634,6 +1860,8 @@ pub(crate) fn kill_cut_off_reason(exit_reason: &str) -> Option<TurnEndReason> {
         // A provider change is the operator's edit; its stop settles the live
         // turn `user_stop` before the kill, and a turn started since ends so too.
         "user_stop" | "provider_change" => Some(TurnEndReason::UserStop),
+        "issue_merged" => Some(TurnEndReason::IssueMerged),
+        "issue_closed" => Some(TurnEndReason::IssueClosed),
         // Agrees with the boot sweep's writer, which settled the run's turns
         // `host_restart` before this kill began.
         RUNNER_SHUTDOWN_EXIT_REASON => Some(TurnEndReason::HostRestart),

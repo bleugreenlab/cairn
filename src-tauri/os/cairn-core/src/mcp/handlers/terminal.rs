@@ -837,6 +837,7 @@ async fn terminal_slugs_for_lease(
                 .query(
                     "SELECT slug, status, session_id FROM job_terminals
                  WHERE residency_holder = ?1 AND residency_incarnation_id = ?2 AND cell_epoch = ?3
+                   AND COALESCE(exit_reason,'') NOT LIKE 'issue resolved:%'
                  ORDER BY created_at, slug",
                     (
                         fence.holder.storage_key().as_str(),
@@ -1827,6 +1828,30 @@ pub(crate) enum StopOutcome {
     Stopped,
     /// The terminal had already ended; there was nothing to stop.
     AlreadyEnded,
+}
+
+/// Record the typed resolution before asking the executor to stop. Keep the
+/// row running until the exit event or liveness reconciliation finalizes it.
+pub(crate) async fn stop_terminal_for_resolution(
+    orch: &Orchestrator,
+    session_id: &str,
+    resolution: crate::transitions::Resolution,
+) -> Result<StopOutcome, String> {
+    let reason = match resolution {
+        crate::transitions::Resolution::Merged => "issue resolved: merged",
+        crate::transitions::Resolution::Closed => "issue resolved: closed",
+    };
+    orch.db
+        .local
+        .execute(
+            "UPDATE job_terminals SET exit_reason=?2, restart_policy='never',
+             status=CASE WHEN status='recovering' THEN 'running' ELSE status END
+         WHERE session_id=?1 AND status IN ('running','recovering')",
+            (session_id.to_string(), reason.to_string()),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    stop_terminal_by_session(orch, session_id).await
 }
 
 /// Stop a terminal's process. Stopping one that has already ended is not an
@@ -3087,6 +3112,7 @@ where
 /// runtime) and, for a nonzero exit on a job-owned terminal, the injection
 /// target (the owning job's current session + the exit code).
 struct TerminalExitContext {
+    exit_reason: Option<String>,
     created_at: Option<i64>,
     injection: Option<(String, i32)>,
 }
@@ -3121,7 +3147,7 @@ async fn mark_terminal_exited_and_load_context(
                 .execute(
                     "UPDATE job_terminals
                  SET status = 'exited', exit_code = ?2, exited_at = ?3, output_tail = ?4,
-                     exit_reason = ?5
+                     exit_reason = COALESCE(exit_reason, ?5)
                  WHERE session_id = ?1 AND status = 'running'",
                     params![
                         terminal_session_id.as_str(),
@@ -3138,11 +3164,13 @@ async fn mark_terminal_exited_and_load_context(
 
             let mut rows = conn
                 .query(
-                    "SELECT created_at FROM job_terminals WHERE session_id = ?1 LIMIT 1",
+                    "SELECT created_at, exit_reason FROM job_terminals WHERE session_id = ?1 LIMIT 1",
                     params![terminal_session_id.as_str()],
                 )
                 .await?;
-            let created_at = rows.next().await?.map(|row| row.i64(0)).transpose()?;
+            let row = rows.next().await?;
+            let created_at = row.as_ref().map(|row| row.i64(0)).transpose()?;
+            let exit_reason = row.as_ref().map(|row| row.opt_text(1)).transpose()?.flatten();
             drop(rows);
 
             // Nonzero-exit injection target: the owning job's current session.
@@ -3165,6 +3193,7 @@ async fn mark_terminal_exited_and_load_context(
             };
 
             Ok(Some(TerminalExitContext {
+                exit_reason,
                 created_at,
                 injection,
             }))
@@ -3481,6 +3510,10 @@ fn finalize_terminal_session(
         serde_json::json!({"table": "job_terminals", "action": "update"}),
     );
 
+    let exit_reason = context
+        .as_ref()
+        .and_then(|context| context.exit_reason.as_deref())
+        .or(exit_reason);
     let runtime_secs = context
         .as_ref()
         .and_then(|context| context.created_at)
@@ -3542,6 +3575,67 @@ fn live_capture(
 
 /// Finalize the record `session_id` captures into: from its live capture when
 /// attached, otherwise found through its row and marked incomplete.
+/// Retry metadata finalization after the terminal's exit was recorded but its
+/// capture write failed. Reuse the capture finalizer; no exit code or complete
+/// output claim is inferred from a stop acknowledgement.
+pub(crate) async fn finalize_exited_terminal_capture(
+    orch: &Orchestrator,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    let exit = orch
+        .db
+        .local
+        .query_opt(
+            "SELECT exit_code,exit_reason,exited_at FROM job_terminals
+         WHERE session_id=?1 AND status='exited'",
+            (session_id.to_string(),),
+            |row| Ok((row.opt_i64(0)?, row.opt_text(1)?, row.opt_i64(2)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Terminal {session_id} has no confirmed exit"))?;
+    let Some(mut record) = crate::terminal_output::load_for_session(&orch.db.local, session_id)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    if record.is_capturing() {
+        let summary = live_capture(orch, session_id)
+            .filter(|(id, _)| *id == record.id)
+            .map(|(_, summary)| summary);
+        if let Some(finalized) = crate::terminal_output::finalize(
+            &orch.db.local,
+            &record.id,
+            crate::terminal_output::CaptureEnd {
+                exit_code: exit.0.map(|code| code as i32),
+                exit_reason: exit.1,
+                summary,
+            },
+            exit.2.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        {
+            record = finalized;
+        } else {
+            record = crate::terminal_output::load(&orch.db.local, &record.id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "Retained terminal output disappeared during finalization".to_string()
+                })?;
+        }
+    }
+    if record.is_capturing() {
+        return Err(format!(
+            "Terminal output {} is still awaiting finalization",
+            record.retained_uri()
+        ));
+    }
+    Ok(record.disclosure())
+}
+
 async fn finalize_session_capture(
     db: Arc<LocalDb>,
     session_id: String,
@@ -3556,6 +3650,15 @@ async fn finalize_session_capture(
             None => return Ok(None),
         },
     };
+    let exit_reason = db
+        .query_opt(
+            "SELECT exit_reason FROM job_terminals WHERE session_id=?1",
+            (session_id,),
+            |row| row.opt_text(0),
+        )
+        .await?
+        .flatten()
+        .or(exit_reason);
     let end = crate::terminal_output::CaptureEnd {
         exit_code,
         exit_reason,
@@ -5602,6 +5705,35 @@ mod terminal_finalize_tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_capture_preserves_resolution_cause_from_terminal_row() {
+        for reason in ["issue resolved: merged", "issue resolved: closed"] {
+            let db =
+                Arc::new(crate::storage::migrated_test_db("capture-resolution-cause.db").await);
+            seed(&db).await;
+            db.execute(
+                "UPDATE job_terminals SET exit_reason=?1 WHERE id='t'",
+                (reason.to_string(),),
+            )
+            .await
+            .unwrap();
+            db.execute_script(
+                "INSERT INTO terminal_outputs(id,terminal_id,job_id,project_id,slug,terminal_uri,expiry_basis,created_at,updated_at)
+                 VALUES('output','t','j','p','run-1','cairn://p/p/7/2/builder/terminal/run-1','resolution',1,1);"
+            ).await.unwrap();
+            let record = finalize_session_capture(db, "s1".into(), None, Some(143), None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.exit_reason.as_deref(), Some(reason));
+            assert_eq!(record.exit_code, Some(143));
+            assert_eq!(
+                record.capture, "incomplete",
+                "no live capture is not complete output"
+            );
+        }
     }
 
     async fn seed_terminal_fence(orch: &Orchestrator, fence: Fence) {
@@ -9910,8 +10042,8 @@ mod terminal_finalize_tests {
     /// terminal is running. The resolution teardown stops it, and the stop's
     /// reply comes back ahead of the final output and the exit, as it can on a
     /// real link where replies and process events travel on separate queues.
-    /// Teardown then deletes the row and the scratch. The final output and exit
-    /// that arrive afterwards still land in the retained record, and the URI
+    /// Teardown retains the pending capture until exit is proven. The final output
+    /// and exit still land in the retained record, and the URI
     /// the exit notification names reads the final sentinel.
     ///
     /// The subscriber is a node on another, still-active issue: a resolved
@@ -9981,14 +10113,22 @@ mod terminal_finalize_tests {
             .db
             .local
             .query_opt(
-                "SELECT COUNT(*) FROM job_terminals WHERE job_id = 'j'",
-                (),
+                "SELECT COUNT(*) FROM job_terminals WHERE job_id = 'j' AND session_id = ?1 AND status != 'exited'",
+                (session.clone(),),
                 |row| row.i64(0),
             )
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(rows, 0, "teardown released the terminal's rows");
+        assert!(
+            rows > 0,
+            "teardown retains the terminal until exit is proven"
+        );
+        let capturing = crate::terminal_output::load_newest_for_uri(&orch.db.local, &uri)
+            .await
+            .unwrap()
+            .expect("the pending output is retained");
+        assert_eq!(capturing.capture, "capturing");
 
         deliver(
             &orch,

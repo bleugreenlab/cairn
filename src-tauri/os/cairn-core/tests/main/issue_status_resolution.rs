@@ -330,16 +330,16 @@ async fn confirmed_close_stops_running_work_and_cancels_queued_work() {
         "cancelled"
     );
 
-    // Running work goes through the canonical node stop: the turn is
-    // interrupted and the run exits as a user stop, not an unresumable kill.
+    // Terminal resolution cancels the turn and exits the run with the issue's
+    // typed cause rather than leaving resumable operator-stop work.
     assert_eq!(
         common::scalar_text_by_id(
             &orch.db.local,
-            "SELECT state FROM turns WHERE id = ?1",
+            "SELECT state || '/' || end_reason FROM turns WHERE id = ?1",
             "turn-1"
         )
         .await,
-        Some("interrupted".to_string())
+        Some("cancelled/issue_closed".to_string())
     );
     assert_eq!(
         common::scalar_text_by_id(
@@ -357,7 +357,7 @@ async fn confirmed_close_stops_running_work_and_cancels_queued_work() {
             "run-1"
         )
         .await,
-        Some("user_stop".to_string())
+        Some("issue_closed".to_string())
     );
 
     // No process is left executing against the closed issue, and nothing that

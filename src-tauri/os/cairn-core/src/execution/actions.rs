@@ -1375,13 +1375,9 @@ fn base_needs_publication(vcs: &PrVcs, base_branch: &str) -> bool {
     base_branch != default_branch
 }
 
-/// Refuse a recipe-driven terminal resolution while the resolved issue still has
-/// live work — e.g. a reviewer still running on a child issue a coordinator is
-/// about to merge. This stays a hard refusal: the coordinator's own next step
-/// reads that reviewer's result, so resolving out from under it is a mistake no
-/// confirmation makes right. A person or agent deciding to stop the work and
-/// close the issue anyway does so through `issues::status::update_status`, whose
-/// confirmation stops it cleanly.
+/// A recipe's close-issue action must not discard work it may still need to
+/// read. Explicit status patches can confirm a close; merges instead always
+/// proceed and settle live work through the canonical merge boundary.
 async fn ensure_resolution_not_blocked(
     orch: &Orchestrator,
     issue_id: &str,
@@ -1406,13 +1402,6 @@ async fn handle_merge_pr(
     orch: &Orchestrator,
     action_run: &ActionRun,
 ) -> Result<Option<serde_json::Value>, String> {
-    // Block a premature merge before touching GitHub: if the issue still has
-    // active reviewers/jobs, fail the action rather than resolve it out from
-    // under them.
-    if let Some(ref issue_id) = action_run.issue_id {
-        ensure_resolution_not_blocked(orch, issue_id, "merged").await?;
-    }
-
     let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
 
     // The recipe merge is the in-app merge: one call into the canonical merge
@@ -1421,7 +1410,7 @@ async fn handle_merge_pr(
     // so a conflicted intermediate commit the merge can heal is not refused
     // here on a policy the in-app merge does not share. Passing `None` selects
     // the default `squash` shape, one commit per PR.
-    crate::pr_data::actions::merge_pr_for_job(
+    let result = crate::pr_data::actions::merge_pr_for_job(
         orch,
         &mr_job_id,
         None,
@@ -1432,7 +1421,9 @@ async fn handle_merge_pr(
         None,
     )
     .await?;
-    Ok(Some(serde_json::json!({ "merged": true })))
+    Ok(Some(
+        serde_json::json!({ "merged": true, "result": result }),
+    ))
 }
 
 /// Handle the close_pr action through the canonical PR boundary.
@@ -2832,6 +2823,7 @@ mod tests {
             "source_conflict_report",
             "conflict_recovery_hint",
             "Refusing to merge",
+            "ensure_resolution_not_blocked",
         ] {
             assert!(
                 !body.contains(probe),

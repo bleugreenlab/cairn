@@ -201,6 +201,9 @@ pub(crate) struct PreparationRequest {
     /// guard under which it would mutate: bounded for an owner's commit or
     /// merge, a single try for a check or run (busy, never a wait or a wake).
     pub(crate) reservation: Option<Arc<crate::orchestrator::BranchReservation>>,
+    /// Reserved landing of committed store state. Executor cells must not be
+    /// refreshed or receive conflict markers while their admitted batches run.
+    pub(crate) landing_issue: Option<String>,
     /// The write whose replay this preparation serves. Checked under every
     /// mutating guard before any mutation: an already-published write
     /// installs, exports and repairs nothing.
@@ -250,6 +253,7 @@ impl PreparationRequest {
             carry_base: None,
             exact_destination: None,
             reservation: None,
+            landing_issue: None,
             write_replay: None,
             deadline: None,
             expected_head: None,
@@ -3303,35 +3307,38 @@ impl Context<'_> {
     ) {
         let request = self.request;
         let branch = request.branch.as_str();
-        match tokio::time::timeout(
-            RESIDENCY_REFRESH_BUDGET,
-            refresh_residencies_for_branch(
-                self.orch,
-                self.db,
-                &request.project_id,
-                branch,
-                &installed.head,
-            ),
-        )
-        .await
-        {
-            Ok(refresh) => {
-                for (job, batch) in refresh.deferred {
-                    warnings.push(format!(
-                        "terminal checkout of `{branch}` for job `{job}` will refresh to the branch's then-current head when batch `{batch}` (running in this job's home) settles"
-                    ));
+        // Landing must not rewrite a cell under its admitted process.
+        if request.landing_issue.is_none() {
+            match tokio::time::timeout(
+                RESIDENCY_REFRESH_BUDGET,
+                refresh_residencies_for_branch(
+                    self.orch,
+                    self.db,
+                    &request.project_id,
+                    branch,
+                    &installed.head,
+                ),
+            )
+            .await
+            {
+                Ok(refresh) => {
+                    for (job, batch) in refresh.deferred {
+                        warnings.push(format!(
+                            "terminal checkout of `{branch}` for job `{job}` will refresh to the branch's then-current head when batch `{batch}` (running in this job's home) settles"
+                        ));
+                    }
+                    if refresh.failed != 0 {
+                        warnings.push(format!(
+                            "{} held checkout(s) of `{branch}` were not refreshed to {}",
+                            refresh.failed, installed.head
+                        ));
+                    }
                 }
-                if refresh.failed != 0 {
-                    warnings.push(format!(
-                        "{} held checkout(s) of `{branch}` were not refreshed to {}",
-                        refresh.failed, installed.head
-                    ));
-                }
+                Err(_) => warnings.push(format!(
+                    "refreshing held checkouts of `{branch}` exceeded {}s",
+                    RESIDENCY_REFRESH_BUDGET.as_secs()
+                )),
             }
-            Err(_) => warnings.push(format!(
-                "refreshing held checkouts of `{branch}` exceeded {}s",
-                RESIDENCY_REFRESH_BUDGET.as_secs()
-            )),
         }
 
         // Only evidence of a changed patch withdraws an existing review. A
@@ -3923,12 +3930,24 @@ impl Context<'_> {
             .as_ref()
             .filter(|sealed| sealed.is_for(&request.project_id, &self.store, &request.branch))
             .map(|sealed| (sealed.job_id(), sealed.request_id()));
-        match super::inflight_run_batch_except(
+        if request.landing_issue.is_some()
+            && (request.purpose != PreparationPurpose::OwnerMerge
+                || !request
+                    .reservation
+                    .as_ref()
+                    .is_some_and(|reservation| reservation.covers(&self.store, &request.branch)))
+        {
+            return Err(PreparationRefusal::Repository(
+                "landing preparation requires the owner's merge and branch reservation".to_string(),
+            ));
+        }
+        match super::inflight_run_batch_for_landing(
             self.db,
             &request.project_id,
             &request.branch,
             Some(&relationship.owner_job_id),
             exempt,
+            request.landing_issue.as_deref(),
         )
         .await
         {
@@ -5287,7 +5306,7 @@ impl Context<'_> {
     ) -> Result<(), PreparationRefusal> {
         let request = self.request;
         let branch = request.branch.as_str();
-        let marker_state = if already_open {
+        let marker_state = if already_open || request.landing_issue.is_some() {
             load_active_session(self.db, branch)
                 .await
                 .ok()

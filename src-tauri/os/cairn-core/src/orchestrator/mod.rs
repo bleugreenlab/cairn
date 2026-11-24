@@ -79,9 +79,7 @@ use store_lock::JJ_STORE_LOCK_SAMPLE_CAPACITY;
 pub(crate) use store_lock::{
     branch_preparation_operation, describe_preparation_wait, StoreLockStatus,
 };
-pub(crate) use store_lock::{
-    BranchReservation, BranchReservations, GuardOperation, ReservedElsewhere,
-};
+pub(crate) use store_lock::{BranchReservation, BranchReservations, ReservedElsewhere};
 pub use store_lock::{
     EdgeHold, JjStoreGuard, JjStoreLockMetrics, JjStoreOperationTrace, JjStorePhaseTimer,
     StoreLockClass,
@@ -173,6 +171,7 @@ pub struct OrchestratorBuilder {
     host_memory: Arc<dyn crate::agent_process::memory::MemoryProbe>,
     provider_usage_snapshots: ProviderUsageSnapshots,
     provider_usage_captures: ProviderUsageCaptures,
+    drain_book: Arc<cairn_models::usage::drain::DrainBook>,
     reconciled_subscriptions: subscription_periods::ReconciledSubscriptions,
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
     team_attention_sender: Arc<dyn team_attention_push::TeamAttentionSender>,
@@ -509,6 +508,7 @@ impl OrchestratorBuilder {
             host_memory: default_host_memory(),
             provider_usage_snapshots: Arc::new(cairn_models::usage::book::UsageBook::new()),
             provider_usage_captures: Arc::new(Mutex::new(HashSet::new())),
+            drain_book: Arc::new(cairn_models::usage::drain::DrainBook::new()),
             reconciled_subscriptions: Arc::default(),
             context_token_snapshots: Arc::new(RwLock::new(HashMap::new())),
             team_attention_sender: Arc::new(team_attention_push::HttpTeamAttentionSender::default()),
@@ -876,6 +876,7 @@ impl OrchestratorBuilder {
                 crate::mcp::handlers::read::overlay::ProjectOverlayRegistry::default(),
             ),
             park_slots: Arc::new(crate::orchestrator::lifecycle::ParkSlots::default()),
+            resolution_responses: Arc::default(),
             approval_keys: Arc::default(),
             page_renders: Arc::default(),
             host_scratch: Arc::default(),
@@ -945,6 +946,7 @@ impl OrchestratorBuilder {
             host_memory: self.host_memory,
             provider_usage_snapshots: self.provider_usage_snapshots,
             provider_usage_captures: self.provider_usage_captures,
+            drain_book: self.drain_book,
             reconciled_subscriptions: self.reconciled_subscriptions,
             sidebar_active_issues: Arc::new(std::sync::RwLock::new(None)),
             sidebar_active_issues_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1635,6 +1637,9 @@ pub struct Orchestrator {
     /// several of its calls at once is interrupted once, after the last of them
     /// has had its handoff grace. Shared across clones behind the `Arc`.
     pub(crate) park_slots: Arc<crate::orchestrator::lifecycle::ParkSlots>,
+    /// Physical response transports retained until the provider acknowledges their result.
+    pub(crate) resolution_responses:
+        Arc<Mutex<HashMap<String, Option<crate::transitions::Resolution>>>>,
     /// The approval service's signing keys, kept across the clients each merge
     /// builds. See [`crate::approvals_client::ApprovalKeys`].
     pub approval_keys: Arc<crate::approvals_client::ApprovalKeys>,
@@ -2001,6 +2006,8 @@ pub struct Orchestrator {
     /// Account probes are single-flight so concurrent session starts cannot
     /// duplicate provider traffic or race health writes for one account.
     pub(crate) provider_usage_captures: ProviderUsageCaptures,
+    /// The served window-drain fit; see `usage_readings::refit_drain`.
+    pub(crate) drain_book: Arc<cairn_models::usage::drain::DrainBook>,
     /// What the credential store held when `subscription_periods` was last
     /// reconciled.
     pub(crate) reconciled_subscriptions: subscription_periods::ReconciledSubscriptions,

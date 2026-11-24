@@ -9944,6 +9944,11 @@ pub struct LearnedResourceEstimate {
 /// executor can report a resident stopped or move a tree with live holders;
 /// the runner must not treat that lifecycle result as the newer guarantee.
 /// Unattributed holders remain reported blockers, never signal targets.
+///
+/// cairn/6260 does not move the number. Resolution cancellation causes and turn
+/// end reasons are runner-owned accounting; the executor still receives the
+/// existing Cancel message and no new wire payload. An older peer gets nothing
+/// wrong because process cancellation semantics are unchanged.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 178;
 
 /// The version `build.rs` derived from the paragraphs above

@@ -833,6 +833,23 @@ impl CodexHost for CodexReaderHost {
         identity: &crate::agent_process::process::ProcessIdentity,
         owner: Option<&crate::agent_process::process::ProcessTurnOwner>,
     ) -> bool {
+        if identity.run_id() == self.session.run_id
+            && self
+                .session
+                .orch
+                .process_state
+                .is_process_identity_current(identity)
+            && owner.is_none_or(|owner| {
+                owner.process_identity() == identity
+                    && self.session.orch.process_state.is_turn_owner_current(owner)
+            })
+            && crate::orchestrator::lifecycle::finish_resolution_response(
+                &self.session.orch,
+                &self.session.run_id,
+            )
+        {
+            return true;
+        }
         crate::orchestrator::lifecycle::transition_owned_completion_to_warm(
             &self.session.orch,
             identity,
@@ -883,6 +900,27 @@ impl CodexHost for CodexReaderHost {
         )
     }
     fn complete(&self, completion: SessionTurnCompletion, mut context: CodexTurnContext) {
+        if !context.accounting_only
+            && context.process_identity.run_id() == self.session.run_id
+            && self
+                .session
+                .orch
+                .process_state
+                .is_process_identity_current(&context.process_identity)
+            && context.owner.as_ref().is_none_or(|owner| {
+                owner.process_identity() == &context.process_identity
+                    && !owner.accounting_only()
+                    && self.session.orch.process_state.is_turn_owner_current(owner)
+            })
+            && crate::orchestrator::lifecycle::finish_resolution_response(
+                &self.session.orch,
+                &self.session.run_id,
+            )
+        {
+            // Resolution already settled this turn. Its acknowledged response still
+            // owes the bound result and usage, but must publish no lifecycle effects.
+            context.accounting_only = true;
+        }
         // Cairn's account-scoped refusal explains an opaque provider auth error.
         // Retired bindings may account usage, but cannot give another turn a cause.
         let failed = !context.accounting_only
@@ -1888,6 +1926,128 @@ mod tests {
         );
         assert_eq!(turn_row(&db).await.as_deref(), Some("complete/"));
         assert_eq!(interrupted_record(&db).await, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolution_response_completion_accounts_cancelled_turn_once() {
+        let (db, orch) = persistent_codex_turn("codex-resolution-accounting", "").await;
+        orch.resolution_responses
+            .lock()
+            .unwrap()
+            .insert("r".into(), Some(crate::transitions::Resolution::Merged));
+        crate::orchestrator::lifecycle::stop_job_for_resolution(
+            &orch,
+            "j",
+            crate::transitions::Resolution::Merged,
+        )
+        .unwrap();
+        assert_eq!(
+            turn_row(&db).await.as_deref(),
+            Some("cancelled/issue_merged")
+        );
+        let terminal =
+            json!({"method":"turn/completed","params":{"turn":{"id":"p1","status":"completed"}}});
+        read_through(
+            &orch,
+            &db,
+            Arc::new(AppServerClient::for_test_scripted(vec![], Arc::default())),
+            // The resolving response belongs to the already accepted p1 binding.
+            // A fresh start after cancellation correctly fails watchdog admission.
+            vec![
+                json!({"method":"thread/tokenUsage/updated","params":{"turnId":"p1","tokenUsage":{
+                    "last":{"inputTokens":37,"outputTokens":3,"totalTokens":40},
+                    "total":{"inputTokens":37,"outputTokens":3}
+                }}}),
+                terminal.clone(),
+                terminal,
+            ],
+        );
+        assert!(!orch.resolution_responses.lock().unwrap().contains_key("r"));
+        assert_eq!(
+            turn_row(&db).await.as_deref(),
+            Some("cancelled/issue_merged")
+        );
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE turn_id='t' AND event_type LIKE 'result:%'",
+                (),
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(db.query_opt_i64(
+            "SELECT COUNT(*) FROM events WHERE turn_id='t' AND event_type='result:success' AND input_tokens=37 AND output_tokens=3",
+            (),
+        ).await.unwrap(), Some(1));
+        assert_eq!(
+            text(
+                &db,
+                "SELECT status || '/' || exit_reason FROM runs WHERE id='r'"
+            )
+            .await
+            .as_deref(),
+            Some("exited/issue_merged"),
+        );
+        assert_ne!(orch.process_state.has_process("r"), Some(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolution_response_stale_callback_cannot_consume_successor_guard() {
+        let (db, orch) = persistent_codex_turn("codex-resolution-stale", "").await;
+        let identity = orch.process_state.capture_process_identity("r").unwrap();
+        let owner = orch.process_state.capture_turn_owner("r", "t").unwrap();
+        assert!(orch.process_state.transition_to_warm_if_owned(&owner));
+        orch.process_state.begin_turn("r", "successor");
+        let successor = orch
+            .process_state
+            .capture_turn_owner("r", "successor")
+            .unwrap();
+        orch.resolution_responses
+            .lock()
+            .unwrap()
+            .insert("r".into(), Some(crate::transitions::Resolution::Merged));
+        let host = CodexReaderHost {
+            session: super::super::super::transcript_host::SessionTranscriptHost {
+                orch: orch.clone(),
+                emitter: orch.services.emitter.clone(),
+                run_id: "r".into(),
+                session_id: Some("s".into()),
+                run_db: db.clone(),
+            },
+            client: None,
+            oauth_state: None,
+            cleanup: Mutex::new(None),
+        };
+        host.complete(
+            SessionTurnCompletion {
+                outcome: SessionTurnOutcome::Completed,
+                usage: Default::default(),
+                session_lifetime: crate::agent_process::completion::SessionLifetime::Persistent,
+            },
+            CodexTurnContext {
+                accounting_only: false,
+                owner: Some(owner.clone()),
+                process_identity: identity.clone(),
+                failure_disposition: TurnFailureDisposition::Unhandled,
+                fatal_cause: None,
+            },
+        );
+        assert!(orch.resolution_responses.lock().unwrap().contains_key("r"));
+        assert!(orch.process_state.is_turn_owner_current(&successor));
+        assert_eq!(
+            orch.process_state.get_current_turn_id("r").as_deref(),
+            Some("successor")
+        );
+        assert!(!host.artifact_handoff(&identity, Some(&owner)));
+        assert!(orch.resolution_responses.lock().unwrap().contains_key("r"));
+        assert!(orch.process_state.is_turn_owner_current(&successor));
+        assert_eq!(
+            text(&db, "SELECT status FROM runs WHERE id='r'")
+                .await
+                .as_deref(),
+            Some("live")
+        );
     }
 
     /// An abort Cairn never asked for is the provider's own: the turn is cut

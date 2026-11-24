@@ -70,7 +70,11 @@ pub enum AttentionFact {
         content: ExternalMessageReplyContent,
     },
     /// The issue reached a terminal status (merged, closed, or failed).
-    Resolved { final_status: IssueStatus },
+    Resolved {
+        final_status: IssueStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settlement: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -181,7 +185,13 @@ impl AttentionFact {
             AttentionFact::ExternalMessageReply { content, .. } => {
                 format!("{} replied: {}", content.sender, content.body)
             }
-            AttentionFact::Resolved { final_status } => format!("Resolved as {final_status}"),
+            AttentionFact::Resolved {
+                final_status,
+                settlement,
+            } => match settlement {
+                Some(report) => format!("Resolved as {final_status}\n{report}"),
+                None => format!("Resolved as {final_status}"),
+            },
         }
     }
 
@@ -717,6 +727,7 @@ pub async fn idle_fact_for_issue(
         return Some(IdleFact {
             fact: AttentionFact::Resolved {
                 final_status: ctx.status.clone(),
+                settlement: None,
             },
             updated_at: ctx.updated_at,
         });
@@ -961,6 +972,7 @@ mod tests {
         assert_eq!(
             (AttentionFact::Resolved {
                 final_status: IssueStatus::Complete,
+                settlement: None,
             })
             .urgency(),
             DeliveryUrgency::Queue
@@ -1048,6 +1060,7 @@ mod tests {
             issue_uri: "cairn://p/cairn/1".into(),
             fact: AttentionFact::Resolved {
                 final_status: IssueStatus::Merged,
+                settlement: None,
             },
             attention: IssueAttention::None,
             status: IssueStatus::Merged,
@@ -1060,6 +1073,17 @@ mod tests {
         assert_eq!(json["updated_at"], 42);
         assert_eq!(json["issue_uri"], "cairn://p/cairn/1");
         assert_eq!(json["fact"]["kind"], "resolved");
+        let mut reported = event.clone();
+        reported.fact = AttentionFact::Resolved {
+            final_status: IssueStatus::Merged,
+            settlement: Some("cleanup pending: cairn://p/cairn/1/1/builder/terminal/dev".into()),
+        };
+        let json = event_to_watch_json(&reported);
+        assert_eq!(
+            json["fact"]["settlement"],
+            "cleanup pending: cairn://p/cairn/1/1/builder/terminal/dev"
+        );
+        assert!(reported.fact.summary().contains("cleanup pending"));
     }
 
     #[test]

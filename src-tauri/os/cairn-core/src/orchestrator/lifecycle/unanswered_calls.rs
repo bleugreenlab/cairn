@@ -40,7 +40,12 @@ pub(crate) enum InterruptCause {
     /// The agent process serving the turn ended while its host lived, for the
     /// run's `exit_reason`: a kill (watchdog recovery, a stop, a provider
     /// change), a crash, or a reap of a run with no process behind it.
-    ProcessLost { exit_reason: String },
+    ProcessLost {
+        exit_reason: String,
+    },
+    Resolution {
+        exit_reason: String,
+    },
 }
 
 /// What a restart's answer knows about a call's effect, recorded as
@@ -284,6 +289,8 @@ pub(crate) fn process_end_opening(exit_reason: &str) -> String {
         PROVIDER_SILENCE_RECOVERY_EXIT_REASON => stopped_by_cairn("provider-silence recovery"),
         WATCHDOG_ARM_FAILED_EXIT_REASON => stopped_by_cairn("its watchdog could not be armed"),
         "user_stop" => stopped_by_cairn("an operator stop"),
+        "issue_merged" => stopped_by_cairn("its issue was merged"),
+        "issue_closed" => stopped_by_cairn("its issue was closed"),
         "provider_change" => stopped_by_cairn("a provider change"),
         crate::runs::reap::STALE_RUN_EXIT_REASON => ended("it was no longer running"),
         depleted if depleted == crate::models::TurnEndReason::ProviderDepleted.to_string() => {
@@ -637,14 +644,23 @@ async fn lost_call_results(
         .filter(|call| !closed.contains(&call.tool.id) && seen.insert(call.tool.id.clone()))
         .collect();
     let (reason, exit_reason, opening) = match cause {
-        InterruptCause::ProcessLost { exit_reason } => {
+        InterruptCause::ProcessLost { exit_reason }
+        | InterruptCause::Resolution { exit_reason } => {
             // The host outlives the process, so its writes are still being
             // served: stop each at its next boundary and wait for it there,
             // so its ledger row is what decides the answer.
             orch.write_stops.raise(run_id);
             drain_open_writes(orch, run_id, &open).await;
             (
-                PROCESS_LOST_REASON,
+                if matches!(cause, InterruptCause::Resolution { .. }) {
+                    if exit_reason == "issue_merged" {
+                        "issue_merged"
+                    } else {
+                        "issue_closed"
+                    }
+                } else {
+                    PROCESS_LOST_REASON
+                },
                 Some(exit_reason.clone()),
                 Some(process_end_opening(exit_reason)),
             )
@@ -663,7 +679,7 @@ async fn lost_call_results(
             None => Loss::HostRestart,
         };
         let ledger = if is_write {
-            write_ledger_row(&orch.db.local, run_id, &tool.id)
+            write_ledger_row(db, run_id, &tool.id)
                 .await
                 .map_err(|e| e.to_string())?
         } else {
@@ -725,7 +741,9 @@ fn pending_tool_results(
                 .map_err(|e| e.to_string())?;
             match cause {
                 InterruptCause::UserStop => user_stop_results(&orch, &db, &run_id, &turn_id).await,
-                InterruptCause::HostRestart | InterruptCause::ProcessLost { .. } => {
+                InterruptCause::HostRestart
+                | InterruptCause::ProcessLost { .. }
+                | InterruptCause::Resolution { .. } => {
                     lost_call_results(&orch, &db, &run_id, &turn_id, &cause).await
                 }
             }

@@ -113,7 +113,7 @@ impl std::fmt::Display for ResolutionRefusal {
                 let listed: Vec<String> = live_work.iter().map(LiveJob::summary).collect();
                 write!(
                     f,
-                    "This issue still has live work: {}. Marking it {status} stops that work — anything running is stopped so it can be resumed later, and anything that never started is cancelled. Send the same write again with confirm: true to go ahead.",
+                    "This issue still has live work: {}. Marking it {status} stops that work — running work is stopped and cancelled, and anything that never started is cancelled. Send the same write again with confirm: true to go ahead.",
                     listed.join(", ")
                 )
             }
@@ -217,7 +217,7 @@ pub async fn update_status(
                 Resolution::Merged,
                 StopFailure::Refuses,
             )
-            .await?
+            .await?;
         }
         "closed" => {
             resolve_terminal(
@@ -227,7 +227,7 @@ pub async fn update_status(
                 Resolution::Closed,
                 StopFailure::Refuses,
             )
-            .await?
+            .await?;
         }
         "backlog" => {
             crud::unresolve(&owning_db, &*orch.services.clock, id)
@@ -330,6 +330,89 @@ pub async fn update_status(
     Ok(())
 }
 
+/// The observed outcome of settling a resource, not merely its job projection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SettlementOutcome {
+    Stopped,
+    Cancelled,
+    AlreadySettled,
+    CleanupPending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SettlementResource {
+    pub uri: String,
+    pub outcome: SettlementOutcome,
+    pub diagnostic: Option<String>,
+}
+
+/// What resolution settled and what reconciliation still owes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SettlementReport {
+    pub resolution: Resolution,
+    pub resources: Vec<SettlementResource>,
+}
+
+impl SettlementReport {
+    pub(crate) fn new(resolution: Resolution) -> Self {
+        Self {
+            resolution,
+            resources: Vec::new(),
+        }
+    }
+
+    pub(crate) fn pending(
+        uri: impl Into<String>,
+        resolution: Resolution,
+        diagnostic: impl Into<String>,
+    ) -> Self {
+        Self {
+            resolution,
+            resources: vec![SettlementResource {
+                uri: uri.into(),
+                outcome: SettlementOutcome::CleanupPending,
+                diagnostic: Some(diagnostic.into()),
+            }],
+        }
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        self.resources
+            .iter()
+            .any(|resource| resource.outcome == SettlementOutcome::CleanupPending)
+    }
+
+    fn refusal(&self) -> ResolutionRefusal {
+        ResolutionRefusal::Rejected(format!(
+            "This issue was left unresolved because its live work could not be stopped: {self}. Nothing was resolved; work that stopped successfully may already be archived. Send the same write again once the remaining work can stop."
+        ))
+    }
+}
+
+impl std::fmt::Display for SettlementReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.resources.is_empty() {
+            return write!(f, "No live work required settlement.");
+        }
+        writeln!(f, "Resolution settlement:")?;
+        for resource in &self.resources {
+            let outcome = match resource.outcome {
+                SettlementOutcome::Stopped => "stopped",
+                SettlementOutcome::Cancelled => "cancelled",
+                SettlementOutcome::AlreadySettled => "already settled",
+                SettlementOutcome::CleanupPending => "cleanup pending",
+            };
+            write!(f, "- {}: {outcome}", resource.uri)?;
+            if let Some(diagnostic) = &resource.diagnostic {
+                write!(f, " ({diagnostic})")?;
+            }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+}
+
 /// How a failed stop is handled when an issue is going terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StopFailure {
@@ -359,11 +442,9 @@ pub(crate) enum StopFailure {
 ///
 /// The order is the substance:
 ///
-/// 1. **Stop the live work first**, through [`stop_live_work`]: the canonical
-///    node stop for anything started (parked warm and resumable, cascading to
-///    child runs and cancelling the executor's in-flight batches) and a cancel
-///    for anything that never started. Stopping before the rows move is what
-///    keeps a session from being closed over a running turn.
+/// 1. Stop live jobs with the typed resolution cause, cascading to descendants
+///    and cancelling their executor work. Queued jobs are cancelled without
+///    starting them. Unlike an operator Stop, resolution is not resumable.
 /// 2. Resolve the issue row and close its sessions.
 /// 3. Drop the warm processes those sessions held, so their capacity frees.
 /// 4. Quit any in-flight turn-end review suite (CAIRN-2648).
@@ -372,110 +453,274 @@ pub(crate) enum StopFailure {
 ///    recorded (Complete or Failed) or to Cancelled — never Running, Pending,
 ///    Idle, or Blocked on a resolved issue.
 ///
-/// It deliberately does NOT tear down worktrees, release dependent executions,
-/// or emit — those differ per caller and stay with them. Teardown in particular
-/// must run *after* this: killing an agent's terminals while the agent itself is
-/// still running only invites it to open new ones, which is why the live
-/// specimen still had a terminal running post-merge.
+/// Process and output settlement and the resolution announcement belong here.
+/// Branch retirement, archival, and dependent-execution release remain with
+/// callers and run afterwards, outside the publication-revocation store lock.
 pub(crate) async fn resolve_terminal(
     orch: &Orchestrator,
     owning_db: &LocalDb,
     issue_id: &str,
     resolution: Resolution,
     on_stop_failure: StopFailure,
-) -> Result<(), ResolutionRefusal> {
-    let live_work = live_work_for_issue(orch, issue_id).await?;
-    if !live_work.is_empty() {
-        if let Err(refusal) = stop_live_work(orch, issue_id, &live_work, resolution).await {
-            match on_stop_failure {
-                StopFailure::Refuses => return Err(refusal),
-                StopFailure::Escalates => log::warn!(
-                    "Terminal resolution of issue {issue_id} could not stop all of its work cleanly ({refusal}); the resolution has already landed elsewhere, so recording it anyway and settling what is left"
-                ),
-            }
-        }
-    }
-
-    if let Err(error) =
-        crate::execution::teardown::release_issue_dev_instances(orch, issue_id).await
-    {
-        match on_stop_failure {
-            StopFailure::Refuses => {
-                return Err(ResolutionRefusal::Rejected(format!(
-                    "Refusing terminal resolution because dev-instance teardown was not verified: {error}"
-                )))
-            }
-            StopFailure::Escalates => log::warn!(
-                "Terminal resolution of issue {issue_id} could not verify dev-instance teardown ({error}); the resolution already landed elsewhere, so recording it and leaving startup reconciliation to retry"
-            ),
-        }
-    }
-
-    // Recording the resolution revokes publication to the issue's branches, so
-    // it is recorded under the project store's lock: every seal and bookmark
-    // advance asks `mcp::handlers::branch::publication_authority` under that
-    // lock, and a write either finishes before this edge or is refused after
-    // it. Only the row write sits inside the hold; stopping processes above and
-    // teardown afterwards never do.
-    let revocation = match revocation_store_lock(orch, owning_db, issue_id).await {
-        Ok(revocation) => revocation,
-        // Not recorded: an unordered resolution is the state this hold exists
-        // to prevent. The resolution's own retries (the confirmed write sent
-        // again, the next PR refresh observing the merge) record it once the
-        // project can be read.
-        Err(error) => {
-            return Err(ResolutionRefusal::Rejected(format!(
-                "The resolution was not recorded because its project could not be read to order it \
-                 against in-flight commits ({error}). Send the same write again."
-            )))
-        }
-    };
-    let resolved = crud::resolve(
+) -> Result<SettlementReport, ResolutionRefusal> {
+    let response_run = crate::pr_data::actions::merge_response_run();
+    resolve_terminal_preserving_run(
+        orch,
         owning_db,
-        &*orch.services.clock,
         issue_id,
         resolution,
-        &orch.anon_device_manager.device_id(),
+        on_stop_failure,
+        response_run.as_deref(),
     )
-    .await;
-    drop(revocation);
-    let crud::ResolveOutcome {
-        closed_sessions,
-        became_terminal,
-    } = resolved.map_err(|e| ResolutionRefusal::Rejected(e.to_string()))?;
+    .await
+}
 
-    crate::orchestrator::lifecycle::stop_processes_for_sessions(orch, &closed_sessions);
+// PR reads can reach this cascade through refresh. Erase its future at the
+// shared boundary so callers do not inherit the entire cleanup layout.
+pub(crate) fn resolve_terminal_preserving_run<'a>(
+    orch: &'a Orchestrator,
+    owning_db: &'a LocalDb,
+    issue_id: &'a str,
+    resolution: Resolution,
+    on_stop_failure: StopFailure,
+    response_run_id: Option<&'a str>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<SettlementReport, ResolutionRefusal>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        let guard = crud::lock_resolution(owning_db, issue_id).await;
+        resolve_terminal_locked(
+            orch,
+            owning_db,
+            issue_id,
+            resolution,
+            on_stop_failure,
+            response_run_id,
+            None,
+            &guard,
+        )
+        .await
+    })
+}
 
-    // The issue is resolved — quit any in-flight turn-end review suite so it does
-    // not keep running against a merged/closed issue (CAIRN-2648).
-    crate::execution::checks_turn_end::cancel_turn_end_checks_for_issue(orch, owning_db, issue_id)
+/// The caller may retain this guard through PR-specific cleanup as well. A
+/// generation check without the shared reopen hold cannot protect a census.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_terminal_locked<'a>(
+    orch: &'a Orchestrator,
+    owning_db: &'a LocalDb,
+    issue_id: &'a str,
+    resolution: Resolution,
+    on_stop_failure: StopFailure,
+    response_run_id: Option<&'a str>,
+    expected_generation: Option<i64>,
+    guard: &'a crud::IssueResolutionGuard,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<SettlementReport, ResolutionRefusal>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        assert!(guard.covers(owning_db, issue_id));
+        if let Some(expected) = expected_generation {
+            let current = owning_db
+                .query_opt_i64(
+                    "SELECT resolution_generation FROM issues WHERE id = ?1",
+                    params![issue_id],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if current != Some(expected) {
+                return Ok(SettlementReport::new(resolution));
+            }
+        }
+        let issue_uri = owning_db
+            .query_opt_text(
+                "SELECT 'cairn://p/' || p.key || '/' || i.number FROM issues i
+         JOIN projects p ON p.id = i.project_id WHERE i.id = ?1",
+                params![issue_id],
+            )
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "cairn://".to_string());
+        let mut report = SettlementReport::new(resolution);
+        let live_work = match live_work_for_issue(orch, issue_id).await {
+            Ok(live_work) => live_work,
+            Err(error) => {
+                report.resources.extend(
+                    SettlementReport::pending(
+                        issue_uri.clone(),
+                        resolution,
+                        format!("Live-work census failed: {error}"),
+                    )
+                    .resources,
+                );
+                if on_stop_failure == StopFailure::Refuses {
+                    return Err(report.refusal());
+                }
+                Vec::new()
+            }
+        };
+        report.resources.extend(
+            settle_live_jobs_with(orch, owning_db, &live_work, resolution, |orch, job_id| {
+                crate::orchestrator::lifecycle::stop_job_for_resolution_preserving_run(
+                    orch,
+                    job_id,
+                    resolution,
+                    response_run_id,
+                )
+            })
+            .await
+            .resources,
+        );
+        if report.has_pending() && on_stop_failure == StopFailure::Refuses {
+            return Err(report.refusal());
+        }
+
+        if let Err(error) =
+            crate::execution::teardown::release_issue_dev_instances(orch, issue_id).await
+        {
+            report.resources.extend(
+                SettlementReport::pending(
+                    issue_uri.clone(),
+                    resolution,
+                    format!("Dev-instance teardown was not verified: {error}"),
+                )
+                .resources,
+            );
+            if on_stop_failure == StopFailure::Refuses {
+                return Err(report.refusal());
+            }
+        }
+
+        // Recording the resolution revokes publication to the issue's branches, so
+        // it is recorded under the project store's lock: every seal and bookmark
+        // advance asks `mcp::handlers::branch::publication_authority` under that
+        // lock, and a write either finishes before this edge or is refused after
+        // it. Only the row write sits inside the hold; stopping processes above and
+        // teardown afterwards never do.
+        let revocation = match revocation_store_lock(orch, owning_db, issue_id).await {
+            Ok(revocation) => revocation,
+            // Not recorded: an unordered resolution is the state this hold exists
+            // to prevent. The resolution's own retries (the confirmed write sent
+            // again, the next PR refresh observing the merge) record it once the
+            // project can be read.
+            Err(error) => {
+                report.resources.extend(SettlementReport::pending(
+                issue_uri.clone(), resolution,
+                format!("Resolution recording pending: could not order publication revocation: {error}"),
+            ).resources);
+                return if on_stop_failure == StopFailure::Refuses {
+                    Err(report.refusal())
+                } else {
+                    Ok(report)
+                };
+            }
+        };
+        let resolved = crud::resolve(
+            owning_db,
+            &*orch.services.clock,
+            issue_id,
+            resolution,
+            &orch.anon_device_manager.device_id(),
+        )
         .await;
-    // And its handoff-cadence lanes, which run as check requests.
-    crate::execution::checks::handoff::cancel_for_issue(orch, owning_db, issue_id).await;
+        drop(revocation);
+        let crud::ResolveOutcome {
+            closed_sessions,
+            became_terminal,
+        } = match resolved {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                report.resources.extend(
+                    SettlementReport::pending(
+                        issue_uri.clone(),
+                        resolution,
+                        format!("Resolution recording pending: {error}"),
+                    )
+                    .resources,
+                );
+                return if on_stop_failure == StopFailure::Refuses {
+                    Err(report.refusal())
+                } else {
+                    Ok(report)
+                };
+            }
+        };
 
-    settle_work_left_on_closed_sessions(orch, owning_db, &closed_sessions).await;
+        for session in &closed_sessions {
+            let Some(run) = orch.process_state.find_process_by_session(session) else {
+                continue;
+            };
+            if response_run_id == Some(run.as_str())
+                || orch.resolution_responses.lock().unwrap().contains_key(&run)
+            {
+                continue;
+            }
+            if let Err(error) =
+                crate::orchestrator::lifecycle::finish_resolution_run(orch, &run, resolution)
+            {
+                report.resources.extend(
+                    SettlementReport::pending(
+                        issue_uri.clone(),
+                        resolution,
+                        format!("Process cleanup pending for run {run}: {error}"),
+                    )
+                    .resources,
+                );
+            }
+        }
 
-    settle_job_projection_for_issue(orch, owning_db, issue_id).await;
+        // The issue is resolved — quit any in-flight turn-end review suite so it does
+        // not keep running against a merged/closed issue (CAIRN-2648).
+        crate::execution::checks_turn_end::cancel_turn_end_checks_for_issue(
+            orch, owning_db, issue_id,
+        )
+        .await;
+        // And its handoff-cadence lanes, which run as check requests.
+        crate::execution::checks::handoff::cancel_for_issue(orch, owning_db, issue_id).await;
 
-    // A profile generation on the issue ends with it, keeping its draft only
-    // if verification already passed it.
-    if let Err(error) =
-        crate::orchestrator::inference_generate::issue_resolved(orch, issue_id).await
-    {
-        log::warn!("Ending the profile generations of resolved issue {issue_id} failed: {error}");
-    }
+        report.resources.extend(
+            settle_work_left_on_closed_sessions(
+                orch,
+                owning_db,
+                &closed_sessions,
+                &issue_uri,
+                resolution,
+                response_run_id,
+            )
+            .await,
+        );
 
-    if became_terminal {
-        announce_resolution(orch, owning_db, issue_id).await;
-    }
+        settle_job_projection_for_issue(orch, owning_db, issue_id).await;
 
-    // Every terminal resolution comes through here — the status patch, a PR
-    // merge or close, the recipe action — so this is where `issue_resolution`
-    // and `pr_state` gates hear about it.
-    crate::execution::gates::sweep::notify_gate_evidence_changed();
-    orch.notify_tenet_evidence();
+        // A profile generation on the issue ends with it, keeping its draft only
+        // if verification already passed it.
+        if let Err(error) =
+            crate::orchestrator::inference_generate::issue_resolved(orch, issue_id).await
+        {
+            log::warn!(
+                "Ending the profile generations of resolved issue {issue_id} failed: {error}"
+            );
+        }
 
-    Ok(())
+        report.resources.extend(
+            crate::execution::teardown::settle_issue_resources(
+                orch, owning_db, issue_id, resolution,
+            )
+            .await,
+        );
+        if became_terminal {
+            announce_resolution(orch, owning_db, issue_id, &report).await;
+        }
+
+        // Every terminal resolution comes through here — the status patch, a PR
+        // merge or close, the recipe action — so this is where `issue_resolution`
+        // and `pr_state` gates hear about it.
+        crate::execution::gates::sweep::notify_gate_evidence_changed();
+        orch.notify_tenet_evidence();
+
+        Ok(report)
+    })
 }
 
 /// How many times the project lookup behind the revocation hold is tried
@@ -556,7 +801,12 @@ where
 /// runs, which leaves the sweep nothing to announce: the door that crossed the
 /// edge has to. Runs after the job projection settles, so a watcher roused by
 /// it reads the issue's work already at rest.
-async fn announce_resolution(orch: &Orchestrator, db: &LocalDb, issue_id: &str) {
+async fn announce_resolution(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    issue_id: &str,
+    report: &SettlementReport,
+) {
     let ctx = match crate::orchestrator::attention::read_issue_for_attention(db, issue_id).await {
         Ok(ctx) => ctx,
         Err(error) => {
@@ -573,6 +823,7 @@ async fn announce_resolution(orch: &Orchestrator, db: &LocalDb, issue_id: &str) 
         issue_uri: ctx.issue_uri(),
         fact: crate::orchestrator::AttentionFact::Resolved {
             final_status: ctx.status.clone(),
+            settlement: Some(report.to_string()),
         },
         attention: ctx.attention,
         status: ctx.status,
@@ -660,33 +911,70 @@ async fn settle_work_left_on_closed_sessions(
     orch: &Orchestrator,
     db: &LocalDb,
     closed_sessions: &[String],
-) {
-    for job_id in jobs_with_live_turns(db, closed_sessions).await {
+    issue_uri: &str,
+    resolution: Resolution,
+    response_run_id: Option<&str>,
+) -> Vec<SettlementResource> {
+    let mut resources = Vec::new();
+    let mut jobs = Vec::new();
+    for session in closed_sessions {
+        match jobs_with_live_turns(db, std::slice::from_ref(session)).await {
+            Ok(found) => {
+                for job in found {
+                    if !jobs.contains(&job) {
+                        jobs.push(job);
+                    }
+                }
+            }
+            Err(error) => resources.push(SettlementResource {
+                uri: issue_uri.to_string(),
+                outcome: SettlementOutcome::CleanupPending,
+                diagnostic: Some(format!("Closed-session live-work census failed: {error}")),
+            }),
+        }
+    }
+    for job_id in jobs {
         log::warn!(
             "Job {job_id} still held a turn in flight after a terminal resolution closed its session; stopping it now"
         );
-        if let Err(error) = crate::orchestrator::lifecycle::stop_job(orch, &job_id) {
-            log::warn!("Failed to stop job {job_id} after its session closed: {error}");
-        }
+        let diagnostic = crate::orchestrator::lifecycle::stop_job_for_resolution_preserving_run(
+            orch,
+            &job_id,
+            resolution,
+            response_run_id,
+        )
+        .err();
+        resources.push(SettlementResource {
+            uri: settlement_uri_for_job(db, &job_id).await,
+            outcome: if diagnostic.is_some() {
+                SettlementOutcome::CleanupPending
+            } else {
+                SettlementOutcome::Cancelled
+            },
+            diagnostic,
+        });
         // The run-scoped branch of `stop_job` cancels the executor's in-flight
         // batches itself; the branch for a job with no live run to attach to does
         // not, so cancel explicitly here as well. Both are idempotent.
-        let cancelled = orch
-            .fleet
-            .cancel_job_requests(&job_id, crate::fleet::CancelCause::SessionClosed);
+        let cancelled = orch.fleet.cancel_job_requests(
+            &job_id,
+            match resolution {
+                Resolution::Merged => crate::fleet::CancelCause::IssueMerged,
+                Resolution::Closed => crate::fleet::CancelCause::IssueClosed,
+            },
+        );
         if cancelled > 0 {
             log::info!(
                 "Cancelled {cancelled} in-flight batch(es) for job {job_id} after its session closed"
             );
         }
     }
+    resources
 }
 
 /// Jobs holding a live (`pending`/`running`/`yielded`) turn on any of
-/// `session_ids`. A read failure logs and contributes nothing: this is a
-/// postcondition sweep, and failing to run it must not fail a resolution that
-/// has already been recorded.
-async fn jobs_with_live_turns(db: &LocalDb, session_ids: &[String]) -> Vec<String> {
+/// `session_ids`. A failed census is unconfirmed settlement, not an empty census.
+async fn jobs_with_live_turns(db: &LocalDb, session_ids: &[String]) -> Result<Vec<String>, String> {
     let mut job_ids: Vec<String> = Vec::new();
     for session_id in session_ids {
         let found = db
@@ -719,12 +1007,10 @@ async fn jobs_with_live_turns(db: &LocalDb, session_ids: &[String]) -> Vec<Strin
                     }
                 }
             }
-            Err(error) => {
-                log::warn!("Failed to check for live turns on closed session {session_id}: {error}")
-            }
+            Err(error) => return Err(format!("session {session_id}: {error}")),
         }
     }
-    job_ids
+    Ok(job_ids)
 }
 
 /// The `(project_key, issue_number)` of an issue's OPEN merge request, or `None`
@@ -765,14 +1051,12 @@ async fn open_merge_request_for_issue(
 
 /// Stop everything still live on an issue heading into a terminal state.
 ///
-/// Started work goes through the canonical node stop
-/// ([`crate::orchestrator::lifecycle::stop_job`]) — the same path the Stop
-/// button takes, which parks the process warm, leaves the session resumable,
-/// and cascades to child runs, then is archived because a terminal issue cannot
-/// resume it. Work that never started (a `pending`/`blocked`
-/// DAG entry) is cancelled exactly as a removed snapshot node is archived: the
-/// row flips to the sticky `cancelled` status with its transcript intact, in one
-/// transaction so the queued set moves together or not at all.
+/// Started work goes through the canonical terminal resolution stop
+/// ([`crate::orchestrator::lifecycle::stop_job_for_resolution`]), which closes
+/// sessions, cancels turns and executor work, and cascades to descendants with
+/// the typed issue-resolution cause. Work that never started (a
+/// `pending`/`blocked` DAG entry) is cancelled without starting it, retaining
+/// its transcript.
 ///
 /// This fails closed. Any job that cannot be stopped — a stop that errors, a
 /// cancel transaction that fails, or a queued row that did not actually reach
@@ -781,13 +1065,13 @@ async fn open_merge_request_for_issue(
 /// are idempotent (stopping a stopped job and cancelling a cancelled one are
 /// no-ops), so the caller can simply send the confirmed write again.
 ///
-/// Archival is verified by re-reading every row. A terminal resolution first
-/// uses warm stop as the process-level interrupt mechanism, then deliberately
-/// replaces its resumable row state with the sticky cancelled state.
+/// Archival is verified by re-reading every row. The cancelled state revokes
+/// resumption authority independently of process-exit reconciliation.
 ///
 /// Every archived job's sessions close with `resolution`'s reason, the jobs of
 /// dependent issues included: the resolution is what ended their work, and the
 /// reason is what tells the operator that reopening the issue picks it back up.
+#[cfg(test)]
 async fn stop_live_work(
     orch: &Orchestrator,
     issue_id: &str,
@@ -795,11 +1079,12 @@ async fn stop_live_work(
     resolution: Resolution,
 ) -> Result<(), ResolutionRefusal> {
     stop_live_work_with(orch, issue_id, live_work, resolution, |orch, job_id| {
-        crate::orchestrator::lifecycle::stop_job(orch, job_id)
+        crate::orchestrator::lifecycle::stop_job_for_resolution(orch, job_id, resolution)
     })
     .await
 }
 
+#[cfg(test)]
 async fn stop_live_work_with(
     orch: &Orchestrator,
     issue_id: &str,
@@ -807,78 +1092,109 @@ async fn stop_live_work_with(
     resolution: Resolution,
     stop_started: impl Fn(&Orchestrator, &str) -> Result<(), String>,
 ) -> Result<(), ResolutionRefusal> {
-    let (started, queued): (Vec<&LiveJob>, Vec<&LiveJob>) =
-        live_work.iter().partition(|job| job.is_started());
-    let mut failures: Vec<String> = Vec::new();
-    let mut stopped: Vec<&LiveJob> = Vec::new();
-
-    for job in &started {
-        match stop_started(orch, &job.id) {
-            Ok(()) => stopped.push(job),
-            Err(error) => {
-                log::warn!(
-                    "Failed to stop job {} for terminal issue {issue_id}: {error}",
-                    job.id
-                );
-                failures.push(format!("{} could not be stopped ({error})", job.name));
-            }
-        }
+    let db = crud::owning_db_for_issue(&orch.db, issue_id)
+        .await
+        .map_err(|error| ResolutionRefusal::Rejected(error.to_string()))?;
+    let report = settle_live_jobs_with(orch, &db, live_work, resolution, stop_started).await;
+    if report.has_pending() {
+        Err(report.refusal())
+    } else {
+        Ok(())
     }
+}
 
-    // A normal Stop parks a job warm and leaves its row running/idle so it can
-    // resume. That is wrong at this lifecycle boundary: merged and closed issues
-    // cannot resume work. Once the process is stopped, archive every job in one
-    // transaction so no Builder remains falsely running on a terminal issue.
-    let jobs_to_cancel: Vec<&LiveJob> = stopped.into_iter().chain(queued).collect();
-    if !jobs_to_cancel.is_empty() {
-        let job_ids: Vec<String> = jobs_to_cancel.iter().map(|job| job.id.clone()).collect();
+async fn settle_live_jobs_with(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    live_work: &[LiveJob],
+    resolution: Resolution,
+    stop_started: impl Fn(&Orchestrator, &str) -> Result<(), String>,
+) -> SettlementReport {
+    let mut report = SettlementReport::new(resolution);
+    for job in live_work {
+        let uri = settlement_uri_for_job(db, &job.id).await;
+        let stopped = if job.is_started() {
+            stop_started(orch, &job.id)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = stopped {
+            report.resources.push(SettlementResource {
+                uri,
+                outcome: SettlementOutcome::CleanupPending,
+                diagnostic: Some(format!("{} could not be stopped: {error}", job.name)),
+            });
+            continue;
+        }
         let now = chrono::Utc::now().timestamp();
-        let cancelled = orch
-            .db
-            .local
+        let job_id = job.id.clone();
+        let cancelled = db
             .write(|conn| {
-                let job_ids = job_ids.clone();
+                let job_id = job_id.clone();
                 Box::pin(async move {
-                    for job_id in &job_ids {
-                        crate::execution::advancement::cancel_job_conn(
-                            conn,
-                            job_id,
-                            now,
-                            resolution.into(),
-                        )
-                        .await?;
-                    }
-                    Ok(())
+                    crate::execution::advancement::cancel_job_conn(
+                        conn,
+                        &job_id,
+                        now,
+                        resolution.into(),
+                    )
+                    .await
                 })
             })
             .await;
-        match cancelled {
-            Err(error) => {
-                log::warn!("Failed to cancel queued jobs for terminal issue {issue_id}: {error}");
-                for job in &jobs_to_cancel {
-                    failures.push(format!("{} could not be cancelled ({error})", job.name));
-                }
+        let diagnostic = match cancelled {
+            Err(error) => Some(format!("{} could not be cancelled: {error}", job.name)),
+            Ok(()) if !job_is_cancelled(db, &job.id).await => {
+                Some(format!("{} did not reach a cancelled state", job.name))
             }
-            Ok(()) => {
-                // The write reporting success is not the same as the rows having
-                // moved: a job that vanished between the enumeration and the
-                // cancel updates zero rows and reports Ok.
-                for job in &jobs_to_cancel {
-                    if !job_is_cancelled(orch, &job.id).await {
-                        failures.push(format!("{} did not reach a cancelled state", job.name));
-                    }
-                }
-            }
-        }
+            Ok(()) => None,
+        };
+        report.resources.push(SettlementResource {
+            uri,
+            outcome: if diagnostic.is_some() {
+                SettlementOutcome::CleanupPending
+            } else {
+                // The lifecycle resolution stop must verify its process work;
+                // the cancelled row is only the non-resumption boundary.
+                SettlementOutcome::Cancelled
+            },
+            diagnostic,
+        });
     }
+    report
+}
 
-    if failures.is_empty() {
-        return Ok(());
+pub(crate) async fn settlement_uri_for_job(db: &LocalDb, job_id: &str) -> String {
+    match crate::jobs::queries::home_uri_for_job(db, job_id).await {
+        Ok(Some(uri)) => uri,
+        _ => issue_uri_for_job(db, job_id).await,
     }
-    Err(ResolutionRefusal::Rejected(format!(
-        "This issue was left unresolved because its live work could not be stopped: {}. Nothing was resolved; work that stopped successfully may already be archived. Send the same write again once the remaining work can stop.",
-        failures.join("; ")
-    )))
+}
+
+pub(crate) async fn pending_for_job(
+    orch: &Orchestrator,
+    job_id: &str,
+    resolution: Resolution,
+    error: String,
+) -> SettlementReport {
+    let uri = match crate::execution::routing::routing_db_for_id(&orch.db, job_id).await {
+        Ok(db) => settlement_uri_for_job(&db, job_id).await,
+        Err(_) => "cairn://".to_string(),
+    };
+    SettlementReport::pending(uri, resolution, error)
+}
+
+async fn issue_uri_for_job(db: &LocalDb, job_id: &str) -> String {
+    db.query_opt_text(
+        "SELECT 'cairn://p/' || p.key || '/' || i.number
+         FROM jobs j JOIN issues i ON i.id = j.issue_id
+         JOIN projects p ON p.id = i.project_id WHERE j.id = ?1",
+        params![job_id],
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "cairn://".to_string())
 }
 
 /// The refusal for a status a caller cannot set by hand — `active`, `waiting`,
@@ -891,27 +1207,25 @@ fn unsettable_status_refusal(status: &str) -> ResolutionRefusal {
 
 /// Whether a job row now reads `cancelled`. A missing row answers `false`: the
 /// cancel had nothing to move, which is exactly the case the caller must catch.
-async fn job_is_cancelled(orch: &Orchestrator, job_id: &str) -> bool {
+async fn job_is_cancelled(db: &LocalDb, job_id: &str) -> bool {
     let job_id = job_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let job_id = job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT status FROM jobs WHERE id = ?1",
-                        params![job_id.as_str()],
-                    )
-                    .await?;
-                match rows.next().await? {
-                    Some(row) => Ok(row.text(0)? == "cancelled"),
-                    None => Ok(false),
-                }
-            })
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT status FROM jobs WHERE id = ?1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(row.text(0)? == "cancelled"),
+                None => Ok(false),
+            }
         })
-        .await
-        .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// The work still live on `issue_id`: its own non-terminal jobs plus jobs of
@@ -924,44 +1238,53 @@ async fn job_is_cancelled(orch: &Orchestrator, job_id: &str) -> bool {
 ///
 /// Three consumers share this one enumeration: the confirmation refusal in
 /// [`update_status`], the work [`stop_live_work`] stops once confirmed, and the
-/// recipe merge/close guard in `execution::actions`, which stays a hard refusal
-/// so a coordinator never resolves a child issue out from under a reviewer it
-/// is about to read. Recipe action nodes are not job rows and the implementation
+/// recipe close-issue guard in `execution::actions`. Recipe merges proceed
+/// through the same canonical settlement as every other merge. Recipe action
+/// nodes are not job rows and the implementation
 /// job is `complete` by merge time, so the action performing a resolution never
 /// counts itself here.
 pub async fn live_work_for_issue(
     orch: &Orchestrator,
     issue_id: &str,
 ) -> Result<Vec<LiveJob>, String> {
+    let owning_db = crud::owning_db_for_issue(&orch.db, issue_id)
+        .await
+        .map_err(|error| error.to_string())?;
     let issue_id = issue_id.to_string();
-    orch.db
-        .local
+    let retained_runs =
+        serde_json::to_string(&orch.process_state.run_ids()).map_err(|error| error.to_string())?;
+    owning_db
         .read(|conn| {
             let issue_id = issue_id.clone();
+            let retained_runs = retained_runs.clone();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT j.id,
+                        "WITH RECURSIVE related(id) AS (
+                            SELECT j.id FROM jobs j WHERE j.issue_id = ?1 OR (
+                                j.issue_id IS NOT NULL AND EXISTS (
+                                    SELECT 1 FROM jobs source WHERE source.issue_id = ?1
+                                        AND source.project_id = j.project_id
+                                        AND source.branch = j.base_branch
+                                )
+                            )
+                            UNION
+                            SELECT child.id FROM jobs child JOIN related parent ON child.parent_job_id = parent.id
+                         ), census AS (
+                            SELECT j.*,
+                                EXISTS(SELECT 1 FROM runs r WHERE r.job_id = j.id AND (
+                                    r.status IN ('starting', 'live') OR r.id IN (SELECT value FROM json_each(?2))
+                                )) AS has_process_work
+                            FROM jobs j JOIN related ON related.id = j.id
+                         )
+                         SELECT j.id,
                                 COALESCE(NULLIF(j.node_name, ''), NULLIF(j.agent_config_id, ''), 'agent work'),
-                                j.status,
+                                CASE WHEN has_process_work THEN 'running' ELSE j.status END,
                                 CASE WHEN j.issue_id = ?1 THEN 0 ELSE 1 END AS from_dependent
-                         FROM jobs j
-                         WHERE j.status NOT IN ('complete', 'failed', 'cancelled')
-                           AND (
-                               j.issue_id = ?1
-                               OR (
-                                   j.issue_id IS NOT NULL
-                                   AND j.issue_id <> ?1
-                                   AND j.base_branch IN (
-                                       SELECT DISTINCT parent.branch
-                                       FROM jobs parent
-                                       WHERE parent.issue_id = ?1
-                                         AND parent.branch IS NOT NULL
-                                   )
-                               )
-                           )
+                         FROM census j
+                         WHERE j.status NOT IN ('complete', 'failed', 'cancelled') OR has_process_work
                          ORDER BY from_dependent, j.created_at",
-                        params![issue_id.as_str()],
+                        params![issue_id.as_str(), retained_runs.as_str()],
                     )
                     .await?;
                 let mut live_work = Vec::new();
@@ -1169,6 +1492,217 @@ mod tests {
         .is_empty());
     }
 
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn resolution_census_and_cancellation_use_the_owning_team_replica() {
+        let orch = orch_with_queued_job().await;
+        let team = Arc::new(crate::storage::migrated_test_db("resolution-team.db").await);
+        orch.db.insert_team_db_for_test("team1", team.clone()).await;
+        let issue_id = "team1~00000000-0000-4000-8000-000000000001";
+        let job_id = "team1~00000000-0000-4000-8000-000000000002";
+        team.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p', 'w', 'Team', 'team', '', 1, 1);",
+        )
+        .await
+        .unwrap();
+        team.execute(
+            "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES(?1, 'p', 1, 'Issue', 'active', 'idle', 'none', 1, 1)",
+            params![issue_id],
+        ).await.unwrap();
+        team.execute(
+            "INSERT INTO jobs(id, project_id, issue_id, node_name, status, created_at, updated_at)
+             VALUES(?1, 'p', ?2, 'reviewer', 'pending', 1, 1)",
+            params![job_id, issue_id],
+        )
+        .await
+        .unwrap();
+
+        let live = live_work_for_issue(&orch, issue_id).await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, job_id);
+        stop_live_work(&orch, issue_id, &live, Resolution::Merged)
+            .await
+            .unwrap();
+        assert!(job_is_cancelled(&team, job_id).await);
+        assert!(!job_is_cancelled(&orch.db.local, "job-queued").await);
+        assert!(live_work_for_issue(&orch, issue_id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    async fn postcondition_fixture() -> Orchestrator {
+        let orch = orch_with_queued_job().await;
+        orch.db.local.execute_script(
+            "UPDATE jobs SET status='complete' WHERE id='job-queued';
+             INSERT INTO sessions(id,job_id,backend,status,created_at,updated_at)
+               VALUES('s-post','job-queued','claude','closed',1,1);
+             INSERT INTO runs(id,job_id,session_id,project_id,issue_id,status,created_at,updated_at)
+               VALUES('r-post','job-queued','s-post','p-1','issue-1','live',1,1);
+             INSERT INTO turns(id,session_id,job_id,run_id,sequence,state,start_reason,created_at,updated_at)
+               VALUES('t-post','s-post','job-queued','r-post',1,'running','initial',1,1);"
+        ).await.unwrap();
+        orch
+    }
+
+    #[tokio::test]
+    async fn postcondition_only_cancellation_reports_success_and_census_failure() {
+        let orch = postcondition_fixture().await;
+        let resources = settle_work_left_on_closed_sessions(
+            &orch,
+            &orch.db.local,
+            &["s-post".into()],
+            "cairn://p/proj/1",
+            Resolution::Merged,
+            None,
+        )
+        .await;
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].outcome, SettlementOutcome::Cancelled);
+        assert!(resources[0].diagnostic.is_none());
+
+        let broken = crate::storage::migrated_test_db("postcondition-census.db").await;
+        broken
+            .execute_script("ALTER TABLE turns RENAME TO unavailable_turns;")
+            .await
+            .unwrap();
+        let resources = settle_work_left_on_closed_sessions(
+            &orch,
+            &broken,
+            &["s-post".into()],
+            "cairn://p/proj/1",
+            Resolution::Merged,
+            None,
+        )
+        .await;
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].outcome, SettlementOutcome::CleanupPending);
+        assert!(resources[0]
+            .diagnostic
+            .as_deref()
+            .unwrap()
+            .contains("census"));
+    }
+
+    #[tokio::test]
+    async fn postcondition_only_call_failure_survives_finalization_and_retries_after_reopen() {
+        let orch = postcondition_fixture().await;
+        let db = &orch.db.local;
+        db.execute(
+            "INSERT INTO events(id,run_id,turn_id,sequence,timestamp,event_type,data,created_at)
+               VALUES('call-post','r-post','t-post',1,1,'assistant',?1,1)",
+            (serde_json::json!({
+                "eventType":"assistant", "sessionId":"s-post", "isError":false,
+                "toolUses":[{"id":"read-post","name":"read","input":{"paths":["file:a"]}}]
+            })
+            .to_string(),),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::orchestrator::lifecycle::open_call_names(db, "r-post", "t-post")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        db.execute_script(
+            "CREATE TRIGGER fail_post_result BEFORE INSERT ON events
+             WHEN NEW.event_type='tool_result'
+             BEGIN SELECT RAISE(ABORT,'postcondition persistence unavailable'); END;",
+        )
+        .await
+        .unwrap();
+        let resources = settle_work_left_on_closed_sessions(
+            &orch,
+            db,
+            &["s-post".into()],
+            "cairn://p/proj/1",
+            Resolution::Merged,
+            None,
+        )
+        .await;
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].outcome, SettlementOutcome::CleanupPending);
+        assert!(resources[0]
+            .diagnostic
+            .as_deref()
+            .unwrap()
+            .contains("postcondition persistence unavailable"));
+        assert!(orch.process_state.run_ids().is_empty());
+        assert_eq!(
+            db.query_opt_text("SELECT status FROM runs WHERE id='r-post'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("exited")
+        );
+        let pending = crate::execution::teardown::settle_issue_resources(
+            &orch,
+            db,
+            "issue-1",
+            Resolution::Merged,
+        )
+        .await;
+        assert!(pending.iter().any(|resource| resource.outcome
+            == SettlementOutcome::CleanupPending
+            && resource
+                .diagnostic
+                .as_deref()
+                .is_some_and(|reason| reason.contains("tool-call settlement"))));
+        assert_eq!(
+            db.query_opt_text("SELECT state FROM turns WHERE id='t-post'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cancelled")
+        );
+        crate::execution::teardown::reconcile_resolved_resources(&orch).await;
+        assert_eq!(
+            crate::orchestrator::lifecycle::open_call_names(db, "r-post", "t-post")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        db.execute_script(
+            "DROP TRIGGER fail_post_result;
+             UPDATE issues SET status='active',resolution_generation=resolution_generation+1 WHERE id='issue-1';
+             INSERT INTO sessions(id,job_id,backend,status,created_at,updated_at)
+               VALUES('s-new','job-queued','claude','open',2,2);
+             INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+               VALUES('t-new','s-new','job-queued',1,'pending','initial',2,2);"
+        ).await.unwrap();
+        crate::execution::teardown::reconcile_resolved_resources(&orch).await;
+        assert!(
+            crate::orchestrator::lifecycle::open_call_names(db, "r-post", "t-post")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.query_opt_text("SELECT state FROM turns WHERE id='t-new'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("pending")
+        );
+        crate::execution::teardown::reconcile_resolved_resources(&orch).await;
+        assert_eq!(
+            db.query_opt(
+                "SELECT COUNT(*) FROM events WHERE run_id='r-post' AND event_type='tool_result'",
+                (),
+                |row| row.i64(0)
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+    }
+
     #[tokio::test]
     async fn stopping_queued_work_cancels_it() {
         let orch = orch_with_queued_job().await;
@@ -1182,7 +1716,7 @@ mod tests {
         .await
         .expect("a real queued job cancels");
 
-        assert!(job_is_cancelled(&orch, "job-queued").await);
+        assert!(job_is_cancelled(&orch.db.local, "job-queued").await);
     }
 
     #[tokio::test]
@@ -1288,6 +1822,76 @@ mod tests {
             status.as_deref(),
             Some("active"),
             "the issue stays open when its work could not be stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_reopen_and_generation_pinned_cascade_share_one_order() {
+        let orch = orch_with_queued_job().await;
+        let db = orch.db.local.clone();
+        let hold = crud::lock_resolution(&db, "issue-1").await;
+        let reopen = crud::unresolve(&db, &*orch.services.clock, "issue-1");
+        tokio::pin!(reopen);
+        // Poll to the mutex barrier, rather than infer ordering from a delay.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reopen.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        resolve_terminal_locked(
+            &orch,
+            &db,
+            "issue-1",
+            Resolution::Merged,
+            StopFailure::Escalates,
+            None,
+            Some(0),
+            &hold,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.query_opt_text("SELECT status FROM issues WHERE id = 'issue-1'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("merged"),
+        );
+        drop(hold);
+        reopen.await.unwrap();
+
+        // Reopen won this ordering: the old generation must never census or
+        // cancel the queued successor that reopen just made runnable again.
+        let hold = crud::lock_resolution(&db, "issue-1").await;
+        let before = db
+            .query_opt_text("SELECT status FROM jobs WHERE id = 'job-queued'", ())
+            .await
+            .unwrap();
+        let report = resolve_terminal_locked(
+            &orch,
+            &db,
+            "issue-1",
+            Resolution::Merged,
+            StopFailure::Escalates,
+            None,
+            Some(0),
+            &hold,
+        )
+        .await
+        .unwrap();
+        assert!(report.resources.is_empty());
+        assert_eq!(
+            db.query_opt_text("SELECT status FROM jobs WHERE id = 'job-queued'", ())
+                .await
+                .unwrap(),
+            before,
+        );
+        assert_ne!(
+            db.query_opt_text("SELECT status FROM issues WHERE id = 'issue-1'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("merged"),
         );
     }
 

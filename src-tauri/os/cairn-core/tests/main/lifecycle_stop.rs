@@ -341,7 +341,7 @@ async fn insert_issue_job_run_turn(db: &LocalDb, project_id: &str) {
 }
 
 /// A user marking an issue terminal must not be refused while an agent runs:
-/// the issue reaches its terminal state and the live run's turn is interrupted
+/// the issue reaches its terminal state and the live run's turn is cancelled
 /// so teardown can clean up without stranding the agent.
 #[tokio::test]
 async fn marking_issue_closed_stops_active_runs() {
@@ -362,11 +362,11 @@ async fn marking_issue_closed_stops_active_runs() {
     assert_eq!(
         common::scalar_text_by_id(
             &orch.db.local,
-            "SELECT state FROM turns WHERE id = ?1",
+            "SELECT state || '/' || end_reason FROM turns WHERE id = ?1",
             "turn-1"
         )
         .await,
-        Some("interrupted".to_string())
+        Some("cancelled/issue_closed".to_string())
     );
     assert_eq!(
         common::scalar_text_by_id(
@@ -705,4 +705,176 @@ async fn host_shutdown_with_no_agents_is_a_silent_no_op() {
         lifecycle::stop_agents_for_host_shutdown(&orch, std::time::Duration::from_secs(1)).await;
 
     assert_eq!(stops, lifecycle::HostShutdownStops::default());
+}
+
+#[tokio::test]
+async fn resolution_stop_cancels_queued_descendants_with_typed_causes() {
+    use cairn_core::transitions::Resolution;
+    for resolution in [Resolution::Merged, Resolution::Closed] {
+        let (_temp, orch) = common::test_orchestrator().await;
+        insert_project_job_run_turn(&orch.db.local, "running").await;
+        insert_pending_write_tool_event(&orch.db.local, None).await;
+        orch.db.local.write(|conn| Box::pin(async move {
+            conn.execute(
+                "INSERT INTO jobs(id, project_id, parent_job_id, status, created_at, updated_at)
+                 SELECT 'child', project_id, id, 'pending', 1, 1 FROM jobs WHERE id = 'job-1'", (),
+            ).await?;
+            conn.execute("INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+                          VALUES ('child-session', 'child', 'open', 1, 1)", ()).await?;
+            conn.execute("INSERT INTO turns(id, session_id, job_id, sequence, state, created_at, updated_at)
+                          VALUES ('child-turn', 'child-session', 'child', 1, 'pending', 1, 1)", ()).await?;
+            Ok(())
+        })).await.unwrap();
+
+        lifecycle::stop_job_for_resolution(&orch, "job-1", resolution).unwrap();
+        lifecycle::stop_job_for_resolution(&orch, "job-1", resolution).unwrap();
+        let reason = lifecycle::resolution_exit_reason(resolution);
+        for turn in ["turn-1", "child-turn"] {
+            assert_eq!(
+                common::scalar_text_by_id(
+                    &orch.db.local,
+                    "SELECT state FROM turns WHERE id = ?1",
+                    turn
+                )
+                .await
+                .as_deref(),
+                Some("cancelled")
+            );
+            assert_eq!(
+                common::scalar_text_by_id(
+                    &orch.db.local,
+                    "SELECT end_reason FROM turns WHERE id = ?1",
+                    turn
+                )
+                .await
+                .as_deref(),
+                Some(reason)
+            );
+        }
+        assert_eq!(
+            common::scalar_text_by_id(
+                &orch.db.local,
+                "SELECT terminal_reason FROM sessions WHERE id = ?1",
+                "child-session"
+            )
+            .await
+            .as_deref(),
+            Some(reason)
+        );
+        assert_eq!(
+            common::scalar_text_by_id(
+                &orch.db.local,
+                "SELECT status FROM jobs WHERE id = ?1",
+                "child"
+            )
+            .await
+            .as_deref(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            common::scalar_text_by_id(
+                &orch.db.local,
+                "SELECT exit_reason FROM runs WHERE id = ?1",
+                "run-1"
+            )
+            .await
+            .as_deref(),
+            Some(reason)
+        );
+        assert_eq!(
+            common::scalar_text_by_id(
+                &orch.db.local,
+                "SELECT status FROM runs WHERE id = ?1",
+                "run-1"
+            )
+            .await
+            .as_deref(),
+            Some("exited")
+        );
+        let event = common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT data FROM events WHERE run_id = ?1 AND event_type = 'tool_result'",
+            "run-1",
+        )
+        .await
+        .unwrap();
+        assert!(event.contains(reason), "{event}");
+        assert!(!event.contains("user_stop"), "{event}");
+        assert_eq!(
+            common::scalar_i64_by_id(
+                &orch.db.local,
+                "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type = 'tool_result'",
+                "run-1"
+            )
+            .await,
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolution_stop_preserves_merge_call_until_response_handoff() {
+    use cairn_core::transitions::Resolution;
+    let (_temp, orch) = common::test_orchestrator().await;
+    insert_project_job_run_turn(&orch.db.local, "running").await;
+    insert_pending_write_tool_event(&orch.db.local, None).await;
+
+    lifecycle::stop_job_for_resolution_preserving_run(
+        &orch,
+        "job-1",
+        Resolution::Merged,
+        Some("run-1"),
+    )
+    .unwrap();
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT status FROM sessions WHERE id = ?1",
+            "session-1"
+        )
+        .await
+        .as_deref(),
+        Some("closed")
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT state FROM turns WHERE id = ?1",
+            "turn-1"
+        )
+        .await
+        .as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &orch.db.local,
+            "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type = 'tool_result'",
+            "run-1"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT status FROM runs WHERE id = ?1",
+            "run-1"
+        )
+        .await
+        .as_deref(),
+        Some("live")
+    );
+
+    lifecycle::finish_resolution_run(&orch, "run-1", Resolution::Merged).unwrap();
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT status FROM runs WHERE id = ?1",
+            "run-1"
+        )
+        .await
+        .as_deref(),
+        Some("exited")
+    );
 }

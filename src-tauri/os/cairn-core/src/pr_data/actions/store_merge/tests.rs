@@ -355,13 +355,15 @@ fn parents_of(fx: &MergeFixture, commit: &str) -> Vec<String> {
 #[test]
 fn a_default_fold_never_replays_or_treats_unknown_history_as_clean() {
     let source = include_str!("mod.rs")
-        .split_once("async fn fold_onto_exact_target(")
+        .split_once("async fn prospective_default_landing(")
         .unwrap()
         .1;
     assert!(!source.contains("rebase_branch_onto("));
     assert!(!source.contains("unwrap_or(false)"));
     assert!(!source.contains("falling back to tip"));
-    assert!(source.contains("source_head != exact.source"));
+    assert!(source.contains("compute_default_landing("));
+    assert!(!source.contains("undo_own_operations("));
+    assert!(!source.contains("squash_branch_onto("));
 }
 
 /// The final comparison before publication catches an owner commit and a
@@ -442,6 +444,7 @@ async fn a_prepared_landing_stops_holding_when_its_source_or_target_moves() {
 async fn a_local_default_landing_lands_exactly_onto_the_prepared_target() {
     let Some(bin) = jj_bin() else { return };
     let fx = setup_clean_merge(&bin).await;
+    let origin_before = git_stdout(&fx.origin_path, &["rev-parse", "main"]);
     let target = advance_main(&fx, "incoming.rs", "incoming\n");
     retarget(&fx, "main").await;
     let mut ctx = fx.ctx.clone();
@@ -494,9 +497,17 @@ async fn a_local_default_landing_lands_exactly_onto_the_prepared_target() {
         "released once the caller lets go"
     );
     let commit = landed.landed_commit.expect("the fold names its commit");
-    assert!(
-        landed.published.is_none(),
-        "a local project publishes nothing"
+    let intent = landed.published.expect("a local installation is journaled");
+    assert_eq!(intent.publication.landing_commit, commit);
+    assert_eq!(intent.publication.target_before, target);
+    assert_eq!(
+        git_stdout(&fx.origin_path, &["rev-parse", "main"]),
+        origin_before,
+        "a local landing never publishes to origin"
+    );
+    assert_eq!(
+        journal_events(&fx).await,
+        "attempt-publication-1:1:executing"
     );
     assert_eq!(
         crate::jj::bookmark_commit(&fx.jj, &fx.store, "main").as_deref(),
@@ -767,8 +778,6 @@ async fn a_publishing_landing_attributes_its_time_to_named_phases() {
         Phase::ConfigPreflight,
         Phase::Recheck,
         Phase::Admission,
-        Phase::Fold,
-        Phase::SetAside,
         Phase::Publish,
         Phase::Install,
         Phase::RecordPublication,
@@ -1016,3 +1025,162 @@ async fn a_landing_onto_a_target_owing_an_unknown_acceptance_is_refused_before_a
 }
 
 // ── Landing acceptance: refusal, external movement, conflict wakes ────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn detached_landing_keeps_live_coordinates_until_journaled_install() {
+    use crate::pr_data::actions::default_landing::{advance_landing_bookmarks, store_of};
+    use crate::pr_data::actions::landing_record::{
+        begin_landing_publication, Publication, PublicationShape,
+    };
+    let Some(bin) = jj_bin() else { return };
+    let fx = setup_clean_merge(&bin).await;
+    let reservation = reserve_landing_shared(&fx).await;
+    let prepared = prepare_landing_source(&fx.orch, "job-src", &fx.ctx, &reservation)
+        .await
+        .unwrap();
+    let guard = fx
+        .orch
+        .acquire_jj_store_lock(
+            &fx.store,
+            crate::orchestrator::StoreLockClass::Foreground,
+            "detached landing test",
+        )
+        .await;
+    let store = store_of(&fx.orch, &fx.ctx);
+    let before = cairn_vcs::read_local_bookmark_view(&fx.store).unwrap();
+    let git_dir = crate::jj::store_git_dir(&fx.store).unwrap();
+    // Detached computation retains its new objects under refs/jj/keep;
+    // every other Git ref must remain unchanged before installation.
+    let live_refs = || {
+        git_stdout(&git_dir, &["show-ref"])
+            .lines()
+            .filter(|line| {
+                !line
+                    .split_whitespace()
+                    .nth(1)
+                    .is_some_and(|name| name.starts_with("refs/jj/keep/"))
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let refs_before = live_refs();
+    for method in ["merge", "squash"] {
+        let edits = [
+            crate::jj::LandingTreeEdit::Rename {
+                from: "shared.rs".into(),
+                to: "bound.rs".into(),
+            },
+            crate::jj::LandingTreeEdit::Rewrite {
+                path: "bound.rs".into(),
+                content: "fn bound() {}\n".into(),
+            },
+        ];
+        let prospect = prospective_default_landing(
+            &fx.orch,
+            &fx.ctx,
+            method,
+            &prepared.base_commit,
+            &prepared.head_after,
+            &guard,
+            &reservation,
+            &edits,
+            "bound landing",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cairn_vcs::read_local_bookmark_view(&fx.store)
+                .unwrap()
+                .state(&fx.ctx.source_branch),
+            before.state(&fx.ctx.source_branch),
+        );
+        assert_eq!(
+            cairn_vcs::read_local_bookmark_view(&fx.store)
+                .unwrap()
+                .state(&fx.ctx.target_branch),
+            before.state(&fx.ctx.target_branch),
+        );
+        assert_eq!(live_refs(), refs_before);
+        assert_eq!(
+            cairn_vcs::read_local_bookmark_view(&fx.store).unwrap(),
+            before
+        );
+        let read = fx.jj.at_operation(&prospect.operation);
+        assert_eq!(
+            crate::jj::text_at_revision(&read, &fx.store, &prospect.commit_id, "bound.rs").unwrap(),
+            Some("fn bound() {}\n".into()),
+        );
+        assert!(
+            crate::jj::text_at_revision(&read, &fx.store, &prospect.commit_id, "shared.rs",)
+                .unwrap()
+                .is_none()
+        );
+        if method == "squash" {
+            let publication = Publication {
+                target_branch: fx.ctx.target_branch.clone(),
+                expected_old: prepared.base_commit.clone(),
+                target_before: prepared.base_commit.clone(),
+                landing_commit: prospect.commit_id.clone(),
+                landing_tree: prospect.tree_hash.clone(),
+                source_branch: fx.ctx.source_branch.clone(),
+                source_before: prepared.head_after.clone(),
+                source_after: prospect.commit_id.clone(),
+                shape: PublicationShape::Squash,
+            };
+            let published =
+                begin_landing_publication(&fx.orch.db.local, &JOURNAL, publication, true)
+                    .await
+                    .unwrap();
+            assert!(journal_events(&fx).await.contains(":executing"));
+            assert_eq!(
+                crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.target_branch),
+                Some(prepared.base_commit.clone()),
+            );
+            advance_landing_bookmarks(
+                &store,
+                &[
+                    (
+                        &fx.ctx.target_branch,
+                        &prepared.base_commit,
+                        &prospect.commit_id,
+                    ),
+                    (
+                        &fx.ctx.source_branch,
+                        &prepared.head_after,
+                        &prospect.commit_id,
+                    ),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.target_branch),
+                Some(prospect.commit_id.clone()),
+            );
+            assert_eq!(
+                crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch),
+                Some(prospect.commit_id),
+            );
+            drop(published);
+            break;
+        }
+    }
+}
+
+#[test]
+fn default_and_approval_install_only_after_durable_intent() {
+    let source = include_str!("../default_landing.rs");
+    assert!(!source.contains("fold_validated_default("));
+    assert!(!source.contains("undo_own_operations("));
+    assert!(!source.contains("seal_edits("));
+    assert!(source.contains("prospect.merge.tree_hash == approved.result_tree_oid"));
+    for signature in ["async fn land_if_unchanged(", "async fn execute("] {
+        let body = source.split_once(signature).expect(signature).1;
+        let intent = body.find("begin_landing_publication(").unwrap();
+        let install = body.find("advance_landing_bookmarks(").unwrap();
+        assert!(
+            intent < install,
+            "{signature}: durable intent must precede install"
+        );
+    }
+}

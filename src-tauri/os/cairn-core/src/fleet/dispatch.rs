@@ -1671,6 +1671,14 @@ impl Fleet {
     }
 
     pub(crate) fn cancel_request(&self, request_id: &str) -> CancelOutcome {
+        self.cancel_request_with_cause(request_id, CancelCause::OperatorRetracted)
+    }
+
+    pub(crate) fn cancel_request_with_cause(
+        &self,
+        request_id: &str,
+        cause: CancelCause,
+    ) -> CancelOutcome {
         let subscriber = self
             .in_flight
             .lock()
@@ -1685,9 +1693,7 @@ impl Fleet {
             return CancelOutcome::Unknown;
         }
         if let Some(identity) = subscriber {
-            return match self
-                .detach_coalesced_subscriber(&identity, Some(CancelCause::OperatorRetracted))
-            {
+            return match self.detach_coalesced_subscriber(&identity, Some(cause.clone())) {
                 Detachment::Retired { leader } => {
                     // Retiring, not retired: the key stays owed until this
                     // leader's terminal outcome lands, so a fresh answer to the
@@ -1720,7 +1726,7 @@ impl Fleet {
         // just recorded; either way the row stays until evidence says the work
         // ended. Reporting "unknown" over a debt the runner now holds would
         // hide the one thing the operator needs to know.
-        self.retire_item(&identity, CancelCause::OperatorRetracted);
+        self.retire_item(&identity, cause);
         CancelOutcome::Stopping
     }
 

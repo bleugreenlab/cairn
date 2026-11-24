@@ -2051,45 +2051,53 @@ pub(crate) async fn cancel_run_waits_for_stop(db: &LocalDb, run_id: &str) -> Res
     db.write(|c| {
         let run_id = run_id.clone();
         Box::pin(async move {
-            let now = chrono::Utc::now().timestamp_millis();
-            let mut rows = c
-                .query(
-                    "SELECT id,job_id,condition_json FROM agent_waits WHERE run_id=?1 AND state IN ('pending','resolving')",
-                    params![run_id.clone()],
-                )
-                .await?;
-            let mut batches = Vec::new();
-            while let Some(row) = rows.next().await? {
-                let (id, job_id) = (row.text(0)?, row.text(1)?);
-                if let Ok(condition) = serde_json::from_str::<Condition>(&row.text(2)?) {
-                    if condition.is_tree_run_batch() {
-                        batches.push((id, job_id, condition));
-                    }
-                }
-            }
-            drop(rows);
-            for (id, job_id, condition) in &batches {
-                super::run::detached::insert_converted(
-                    c,
-                    id,
-                    job_id,
-                    &run_id,
-                    condition,
-                    STOPPED_WHILE_RUNNING,
-                    now,
-                )
-                .await?;
-            }
-            c.execute(
-                "UPDATE agent_waits SET state='cancelled', resolved_at=?2 WHERE run_id=?1 AND state IN ('pending','resolving')",
-                params![run_id, now],
+            cancel_run_waits_conn(
+                c,
+                &run_id,
+                STOPPED_WHILE_RUNNING,
+                chrono::Utc::now().timestamp_millis(),
             )
-            .await?;
-            Ok(())
+            .await
         })
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Preserve each machine batch's retry evidence in the same transaction that
+/// ends its owner's interest in the result, regardless of the stop's cause.
+pub(crate) async fn cancel_run_waits_conn(
+    c: &cairn_db::storage::TrackedConnection,
+    run_id: &str,
+    reason: &str,
+    now: i64,
+) -> DbResult<()> {
+    let mut rows = c
+        .query(
+            "SELECT id,job_id,condition_json FROM agent_waits WHERE run_id=?1 AND state IN ('pending','resolving')",
+            params![run_id],
+        )
+        .await?;
+    let mut batches = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let (id, job_id) = (row.text(0)?, row.text(1)?);
+        if let Ok(condition) = serde_json::from_str::<Condition>(&row.text(2)?) {
+            if condition.is_tree_run_batch() {
+                batches.push((id, job_id, condition));
+            }
+        }
+    }
+    drop(rows);
+    for (id, job_id, condition) in &batches {
+        super::run::detached::insert_converted(c, id, job_id, run_id, condition, reason, now)
+            .await?;
+    }
+    c.execute(
+        "UPDATE agent_waits SET state='cancelled', resolved_at=?2 WHERE run_id=?1 AND state IN ('pending','resolving')",
+        params![run_id, now],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Answer a suspended call, and — if it is the last of its turn's parked calls

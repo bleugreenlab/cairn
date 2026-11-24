@@ -58,7 +58,7 @@ const INDEX: &[(&str, &str)] = &[
     ),
     (
         "cairn://models/usage",
-        "each provider's capacity per account and pooled, as Settings → Analytics shows it; ?history=<account> lists that account's recorded window readings over time",
+        "each provider's capacity per account and pooled, as Settings → Analytics shows it; ?history=<account> lists that account's recorded window readings over time; ?capacity is what each subscription window has left per account and model, in list dollars and tokens with intervals (?capacity=fit for the drain fit report)",
     ),
     (
         "cairn://models/spend",
@@ -102,7 +102,7 @@ fn unsupported(uri: &str, params: &[QueryParam], allowed: &[&str]) -> Option<Str
     })
 }
 
-fn when(ts: i64) -> String {
+pub(super) fn when(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| ts.to_string())
@@ -424,7 +424,10 @@ fn unknown_provider<'a>(
     })
 }
 
-fn sorted_accounts(facet: &dyn Models, scope: &ModelScope) -> Result<Vec<Value>, String> {
+pub(super) fn sorted_accounts(
+    facet: &dyn Models,
+    scope: &ModelScope,
+) -> Result<Vec<Value>, String> {
     let mut accounts: Vec<Value> = facet
         .accounts(scope)?
         .iter()
@@ -2511,6 +2514,10 @@ mod tests {
         "cairn://models/usage?provider=claude",
         "cairn://models/usage?view=requests",
         "cairn://models/usage?history=nobody",
+        "cairn://models/usage?capacity",
+        "cairn://models/usage?capacity&format=json",
+        "cairn://models/usage?capacity=fit",
+        "cairn://models/usage?capacity&model=opus&cacheRead=400000000&output=2000000&cacheWrite=10000000",
         "cairn://models/spend",
         "cairn://models/spend?window=all&format=json",
         "cairn://models/embeddings",

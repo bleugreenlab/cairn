@@ -326,6 +326,60 @@ fn price_for(backend: &str, model: Option<&str>) -> Option<ModelPrice> {
         .find_map(|(id, price)| (*id == canonical).then_some(*price))
 }
 
+/// The canonical model id a stored model name is priced as, resolving a bare
+/// Claude alias to the generation [`ALIAS_GENERATIONS`] names.
+pub(crate) fn canonical_model(backend: &str, model: &str) -> Option<&'static str> {
+    canonical_for(backend, model)
+}
+
+/// The base list rates of a canonical model, USD per million tokens, in the
+/// order input, cache read, cache write, output.
+pub(crate) fn base_rates(canonical: &str) -> Option<[f64; 4]> {
+    PRICES.iter().find_map(|(id, price)| {
+        (*id == canonical).then_some([
+            price.base.input,
+            price.base.cache_read,
+            price.base.cache_write,
+            price.base.output,
+        ])
+    })
+}
+
+/// The list-price USD of each of `usage`'s components on `model` (input,
+/// cache read, cache write, output), each at its prompt-length tier, so they
+/// sum to [`cost_usd`]. `None` when the model is unpriced.
+pub(crate) fn component_costs_usd(
+    backend: &str,
+    model: Option<&str>,
+    usage: &TieredUsage,
+) -> Option<[f64; 4]> {
+    let price = price_for(backend, model)?;
+    let only = |pick: fn(&Components) -> Components| {
+        price.cost(&TieredUsage {
+            all: pick(&usage.all),
+            long_prompt: pick(&usage.long_prompt),
+        })
+    };
+    Some([
+        only(|c| Components {
+            input: c.input,
+            ..Components::default()
+        }),
+        only(|c| Components {
+            cache_read: c.cache_read,
+            ..Components::default()
+        }),
+        only(|c| Components {
+            cache_create: c.cache_create,
+            ..Components::default()
+        }),
+        only(|c| Components {
+            output: c.output,
+            ..Components::default()
+        }),
+    ])
+}
+
 /// List-price USD cost of `usage` on `model`, `0.0` when the model is
 /// unpriced. Persisted components are disjoint for every backend, so the math
 /// is componentwise, with each request's prompt-length tier already split out

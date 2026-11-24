@@ -224,12 +224,13 @@ pub(super) async fn dispatch(
                                 .unwrap_or_default();
                             format!("Would merge PR for {node_id}/{artifact_label}{suffix}{gate}")
                         } else {
-                            crate::pr_data::actions::merge_pr_for_job(
+                            crate::pr_data::actions::merge_pr_for_job_preserving_run(
                                 orch,
                                 &job_id,
                                 method,
                                 resolution_attribution(orch, request).await,
                                 precondition,
+                                request.run_id.as_deref(),
                             )
                             .await
                             .map_err(|error| build_failure(index, item, error))?

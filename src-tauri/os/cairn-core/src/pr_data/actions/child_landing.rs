@@ -340,6 +340,7 @@ fn fast_forward_prospect(
         source_tip: head.to_string(),
         target_tip: base.to_string(),
         commit_id: head.to_string(),
+        operation: cairn_vcs::operation_indexing(&store.path, &[head, base])?,
         tree_hash: crate::jj::sealed_tree_hash_via_git(&store.jj, &store.path, head)?,
         tree_entries: crate::jj::tree_entries(&store.jj, &store.path, head)?,
         changed_files: crate::jj::parse_git_diff(&patch),
@@ -447,6 +448,27 @@ async fn land_if_unchanged(
     let Some(origin_target) = origin_target else {
         // The store is the only copy: the integration branch moves to the
         // prepared head, and only from the prepared target.
+        let db =
+            crate::execution::routing::owning_db_for_project(&orch.db, &merge_context.project_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        let published = super::landing_record::begin_landing_publication(
+            &db,
+            journal,
+            Publication {
+                target_branch: target.to_string(),
+                expected_old: base.to_string(),
+                target_before: base.to_string(),
+                landing_commit: head.to_string(),
+                landing_tree: prospect.tree_hash.clone(),
+                source_branch: source.to_string(),
+                source_before: head.to_string(),
+                source_after: head.to_string(),
+                shape: PublicationShape::FastForward,
+            },
+            true,
+        )
+        .await?;
         guard.blocking_phase("land child on integration branch", || {
             advance_landing_bookmarks(store, &[(target, base, head)])
         })?;
@@ -455,7 +477,7 @@ async fn land_if_unchanged(
         }
         return Ok(Attempt::Landed(Box::new(Landed {
             commit: Some(head.to_string()),
-            published: None,
+            published: Some(published),
         })));
     };
 

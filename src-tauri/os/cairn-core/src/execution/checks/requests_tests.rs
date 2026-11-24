@@ -1379,6 +1379,74 @@ fn a_threads_request_records_a_verdict_in_the_ledger() {
 }
 
 #[tokio::test]
+async fn resolution_cancels_completed_producers_queued_requests_idempotently() {
+    use crate::issues::status::SettlementOutcome;
+    use crate::transitions::Resolution;
+
+    let (_root, orch) = row_fixture().await;
+    orch.db
+        .local
+        .execute("UPDATE jobs SET status='completed' WHERE id='j'", ())
+        .await
+        .unwrap();
+    let queued = insert_request(&orch, "queued", "").await;
+    let unrelated = insert_request(&orch, "queued", "requester_job_id='x'").await;
+    let jobs = vec!["j".to_string(), "j".to_string()];
+    let report = settle_requests_for_resolution(&orch, &orch.db.local, &jobs, Resolution::Merged)
+        .await
+        .unwrap();
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0].uri, request_uri("proj", &queued));
+    assert_eq!(report[0].outcome, SettlementOutcome::Cancelled);
+    let cancelled = row(&orch, &queued).await;
+    assert_eq!(cancelled.state, "cancelled");
+    assert!(cancelled
+        .cancel_requested_by
+        .as_deref()
+        .unwrap()
+        .contains("merge"));
+    let other = row(&orch, &unrelated).await;
+    assert_eq!(other.state, "queued");
+    assert_eq!(other.cancel_requested_by, None);
+    assert!(
+        settle_requests_for_resolution(&orch, &orch.db.local, &jobs, Resolution::Merged)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(row(&orch, &queued).await, cancelled);
+    assert_eq!(row(&orch, &unrelated).await, other);
+}
+
+#[tokio::test]
+async fn resolution_reports_pending_until_the_request_driver_closes_its_lane() {
+    use crate::issues::status::SettlementOutcome;
+    use crate::transitions::Resolution;
+
+    let (_root, orch) = row_fixture().await;
+    let id = insert_request(&orch, "running", "request_id='resolution-lane'").await;
+    let driver = tokio::spawn(std::future::pending::<()>());
+    DRIVERS
+        .lock()
+        .unwrap()
+        .insert(id.clone(), driver.abort_handle());
+    let jobs = vec!["j".to_string()];
+    let report = settle_requests_for_resolution(&orch, &orch.db.local, &jobs, Resolution::Closed)
+        .await
+        .unwrap();
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0].outcome, SettlementOutcome::CleanupPending);
+    assert!(row(&orch, &id).await.is_open());
+    forget_driver_for_test(&id);
+    let report = settle_requests_for_resolution(&orch, &orch.db.local, &jobs, Resolution::Closed)
+        .await
+        .unwrap();
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0].outcome, SettlementOutcome::Cancelled);
+    assert_eq!(row(&orch, &id).await.state, "cancelled");
+}
+
+#[tokio::test]
 async fn requested_checks_keep_the_running_machine_link_and_slot() {
     let (_root, orch) = row_fixture().await;
     let id = insert_request(&orch, "running", "").await;

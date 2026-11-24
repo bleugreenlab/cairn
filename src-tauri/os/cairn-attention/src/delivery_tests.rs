@@ -579,6 +579,7 @@ fn failed_event() -> crate::events::AttentionEvent {
         issue_uri: "cairn://p/proj/2".into(),
         fact: crate::events::AttentionFact::Resolved {
             final_status: cairn_domain::IssueStatus::Failed,
+            settlement: None,
         },
         attention: cairn_domain::IssueAttention::None,
         status: cairn_domain::IssueStatus::Failed,

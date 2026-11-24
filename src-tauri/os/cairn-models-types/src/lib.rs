@@ -13,6 +13,7 @@
 //! a usage window can depend on it alone.
 pub mod benchmarks;
 pub mod catalog;
+pub mod drain;
 pub mod embedding;
 pub mod identity;
 pub mod image;

@@ -2438,22 +2438,30 @@ async fn render_resource_body(
             }
         }
         CairnResource::ModelsUsage => {
-            match crate::resources::models::usage_history_query(&params) {
-                None => crate::resources::models::render_usage(orch, &params),
+            match crate::resources::usage_capacity::capacity_query(&params) {
                 Some(Err(error)) => error,
                 Some(Ok(query)) => {
-                    match cairn_db::storage::usage_readings::list_usage_readings(
-                        &orch.db.local,
-                        &query.account,
-                        query.window.as_deref(),
-                        query.since(chrono::Utc::now().timestamp()),
-                    )
-                    .await
-                    {
-                        Ok(rows) => crate::resources::models::render_usage_history(&query, &rows),
-                        Err(error) => format!("Usage history is unavailable: {error}"),
-                    }
+                    crate::resources::usage_capacity::read_capacity(orch, &query).await
                 }
+                None => match crate::resources::models::usage_history_query(&params) {
+                    None => crate::resources::models::render_usage(orch, &params),
+                    Some(Err(error)) => error,
+                    Some(Ok(query)) => {
+                        match cairn_db::storage::usage_readings::list_usage_readings(
+                            &orch.db.local,
+                            &query.account,
+                            query.window.as_deref(),
+                            query.since(chrono::Utc::now().timestamp()),
+                        )
+                        .await
+                        {
+                            Ok(rows) => {
+                                crate::resources::models::render_usage_history(&query, &rows)
+                            }
+                            Err(error) => format!("Usage history is unavailable: {error}"),
+                        }
+                    }
+                },
             }
         }
         CairnResource::ModelsSpend => crate::resources::spend::read_spend(orch, &params).await,

@@ -46,7 +46,9 @@ use super::human_approval::{
     LandingEvidence,
 };
 use super::merge::{journal_merge_attempt_event, JournalEntry, MergeAttemptJournal};
-use super::resolution::{resolve_pr_node, resolve_pr_node_landed, Landed, PrResolutionAttribution};
+#[cfg(test)]
+use super::resolution::resolve_pr_node_landed;
+use super::resolution::{Landed, PrResolutionAttribution};
 use crate::github::api;
 use crate::github::credentials::{get_owner_repo, get_owner_repo_for_pr};
 use crate::orchestrator::Orchestrator;
@@ -150,10 +152,16 @@ pub(crate) enum PublicationShape {
 }
 
 /// The `executing` event's detail. `publication` must stay its first and only
-/// key: the journal queries recognise an intent by that prefix.
+/// key in legacy records; it remains first when routing and issue-generation
+/// metadata follows, because journal queries recognise that prefix.
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PublicationDetail {
     publication: Publication,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issue_generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,9 +182,12 @@ fn short(oid: &str) -> &str {
     &oid[..oid.len().min(12)]
 }
 
+#[cfg(test)]
 fn intent_detail(publication: &Publication) -> Result<String, String> {
     serde_json::to_string(&PublicationDetail {
         publication: publication.clone(),
+        local: None,
+        issue_generation: None,
     })
     .map_err(|error| format!("the publication intent is unserializable: {error}"))
 }
@@ -195,17 +206,61 @@ pub(super) async fn journal_publication_intent(
     attempt: &MergeAttemptJournal<'_>,
     publication: &Publication,
 ) -> Result<(), String> {
+    journal_publication_intent_at(db, attempt, publication, false).await
+}
+
+async fn journal_publication_intent_at(
+    db: &LocalDb,
+    attempt: &MergeAttemptJournal<'_>,
+    publication: &Publication,
+    local: bool,
+) -> Result<(), String> {
+    let generation = db
+        .query_opt(
+            "SELECT i.resolution_generation FROM merge_requests m
+           JOIN issues i ON i.id = m.issue_id WHERE m.id = ?1",
+            params![attempt.merge_request_id],
+            |row| row.i64(0),
+        )
+        .await
+        .map_err(|error| format!("landing generation is unreadable: {error}"))?;
+    // Keep publication first: the existing recovery census recognises this prefix.
+    let detail = serde_json::to_string(&PublicationDetail {
+        publication: publication.clone(),
+        local: Some(local),
+        issue_generation: generation,
+    })
+    .map_err(|error| error.to_string())?;
     journal_merge_attempt_event(
         db,
         attempt,
         INTENT_SEQUENCE,
         "executing",
         &JournalEntry {
-            detail: Some(intent_detail(publication)?),
+            detail: Some(detail),
             ..JournalEntry::default()
         },
     )
     .await
+}
+
+/// Use the existing publication recovery protocol for a store-only install or
+/// an approval's exact execution. The durable intent, not the reservation,
+/// fences surviving writers if recording the merge later fails.
+pub(super) async fn begin_landing_publication(
+    db: &LocalDb,
+    attempt: &MergeAttemptJournal<'_>,
+    publication: Publication,
+    local: bool,
+) -> Result<super::default_landing::PublishedLanding, String> {
+    let driving = super::default_landing::PublicationInFlight::enter(attempt.attempt_id)?;
+    journal_publication_intent_at(db, attempt, &publication, local).await?;
+    Ok(super::default_landing::PublishedLanding {
+        publication,
+        attempt_id: attempt.attempt_id.to_string(),
+        recording_pending: None,
+        _driving: driving,
+    })
 }
 
 /// Journal how the push of `publication` ended.
@@ -264,6 +319,14 @@ pub(super) async fn journal_accepted_publication(
     publication: &Publication,
     detail: Option<String>,
 ) -> Result<(), String> {
+    // A successful transport is not a successful MR record. Leaving the
+    // executing intent alive is both the publication fence and recovery handle.
+    if recorded_landing(db, attempt.merge_request_id)
+        .await?
+        .is_none_or(|landing| landing.commit != publication.landing_commit)
+    {
+        return Err("landing is accepted but its merge-request record is pending".to_string());
+    }
     let outcome = PublicationOutcome::Accepted { detail };
     let Err(error) = journal_publication_outcome(db, attempt, publication, &outcome).await else {
         return Ok(());
@@ -566,6 +629,55 @@ async fn remote_publication_evidence(
     }
 }
 
+/// Store-only installations have the same immutable intent as origin pushes.
+/// Judge the exact target history under its store lock, never an executor cell.
+async fn local_publication_evidence(
+    orch: &Orchestrator,
+    repo_path: &str,
+    publication: &Publication,
+) -> LandingEvidence {
+    let store = super::default_landing::Store {
+        jj: crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+        path: crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(repo_path)),
+    };
+    let _guard = orch
+        .acquire_jj_store_lock(
+            &store.path,
+            crate::orchestrator::StoreLockClass::Foreground,
+            "recover local landing",
+        )
+        .await;
+    let _lease = match crate::jj::StoreObjectLease::for_store(&store.path) {
+        Ok(lease) => lease,
+        Err(error) => return LandingEvidence::Unknown(error),
+    };
+    let mut commit = match crate::jj::revset_commit_checked(
+        &store.jj,
+        &store.path,
+        &format!("bookmarks(exact:{:?})", publication.target_branch),
+    ) {
+        Ok(Some(commit)) => commit,
+        Ok(None) => {
+            return LandingEvidence::Unknown("landing target bookmark is missing".to_string())
+        }
+        Err(error) => return LandingEvidence::Unknown(error),
+    };
+    if let Some(evidence) = unmoved_target(&commit, &publication.expected_old) {
+        return evidence;
+    }
+    for _ in 0..MAX_REMOTE_HISTORY_STEPS {
+        let shape = match super::default_landing::store_commit_shape(&store, &commit) {
+            Ok(shape) => shape,
+            Err(error) => return LandingEvidence::Unknown(error),
+        };
+        match fast_forward_step(commit, shape, publication) {
+            HistoryStep::Next(parent) => commit = parent,
+            HistoryStep::Done(evidence) => return evidence,
+        }
+    }
+    history_too_long()
+}
+
 /// One first-parent step down origin's history for a fast-forward
 /// publication, whose landing commit is the prepared head itself (a stack of
 /// the owner's commits above the expected old target), so the first commit
@@ -651,6 +763,8 @@ struct PendingPublication {
     policy_json: String,
     next_sequence: i64,
     publication: Publication,
+    local: bool,
+    generation: Option<i64>,
 }
 
 async fn pending_publications(
@@ -711,7 +825,17 @@ async fn pending_publications(
                         "publication {attempt_id} is unsettled but its intent is unreadable"
                     );
                 }
+                let metadata = detail
+                    .as_deref()
+                    .and_then(|detail| serde_json::from_str::<PublicationDetail>(detail).ok());
+                let local = metadata
+                    .as_ref()
+                    .and_then(|value| value.local)
+                    .unwrap_or(false);
+                let generation = metadata.as_ref().and_then(|value| value.issue_generation);
                 Some(PendingPublication {
+                    local,
+                    generation,
                     attempt_id,
                     project_id,
                     merge_request_id: mr,
@@ -796,9 +920,22 @@ async fn settle_publication(
         .map_err(|error| format!("the project is unreadable: {error}"))?
         .ok_or_else(|| format!("project {} is gone", pending.project_id))?;
 
+    let current = super::context::resolve_merge_mr_context_for_job(db, &pending.job_id).await?;
+    if current.mr.mr_id != pending.merge_request_id {
+        return Ok(LandingRecovery::Undetermined(
+            "publication's merge request is no longer the owner's current request".to_string(),
+        ));
+    }
     // The row was recorded and only the journal's outcome was lost.
     if let Some(landing) = recorded_landing(db, &pending.merge_request_id).await? {
         if landing.commit == publication.landing_commit {
+            recover_recorded_bookmarks(orch, db, pending, &current).await?;
+            super::resolution::resolve_recorded_pr_node(
+                orch,
+                &pending.job_id,
+                PrNodeResolution::Merge,
+            )
+            .await?;
             settle(
                 "succeeded",
                 serde_json::json!({"reconciled": true, "landedCommit": landing.commit}),
@@ -810,7 +947,27 @@ async fn settle_publication(
         }
     }
 
-    let evidence = remote_publication_evidence(orch, &repo_path, publication).await;
+    let generation = db
+        .query_opt(
+            "SELECT i.resolution_generation FROM merge_requests m
+           JOIN issues i ON i.id = m.issue_id WHERE m.id = ?1",
+            params![pending.merge_request_id.as_str()],
+            |row| row.i64(0),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if generation.is_some_and(|generation| generation != pending.generation.unwrap_or(0)) {
+        // Reopening ends the old issue lifetime. Do not claim a fresh terminal
+        // edge for it, even when immutable evidence proves its old landing.
+        return Ok(LandingRecovery::Undetermined(
+            "landing belongs to a superseded issue resolution generation".to_string(),
+        ));
+    }
+    let evidence = if pending.local {
+        local_publication_evidence(orch, &repo_path, publication).await
+    } else {
+        remote_publication_evidence(orch, &repo_path, publication).await
+    };
     match evidence {
         LandingEvidence::Landed { commit, .. } => {
             // The source stays reserved, and the store's objects leased, from
@@ -838,11 +995,18 @@ async fn settle_publication(
                     )))
                 }
             };
+            if context.mr.mr_id != pending.merge_request_id {
+                return Ok(LandingRecovery::Undetermined(
+                    "publication's owner now has a different merge request".to_string(),
+                ));
+            }
             repoint_reserved_children(orch, db, &context, &store).await?;
-            resolve_pr_node_landed(
+            super::resolution::resolve_recovered_landing(
                 orch,
                 &pending.job_id,
-                Some(recovery_attribution(db, &pending.attempt_id).await),
+                &pending.merge_request_id,
+                pending.generation,
+                recovery_attribution(db, &pending.attempt_id).await,
                 Landed {
                     commit: Some(&commit),
                     source: Some(source),
@@ -850,6 +1014,12 @@ async fn settle_publication(
                 },
             )
             .await?;
+            if recorded_landing(db, &pending.merge_request_id)
+                .await?
+                .is_none_or(|landing| landing.commit != commit)
+            {
+                return Err("landing's merge-request record is still pending".to_string());
+            }
             settle(
                 "succeeded",
                 serde_json::json!({"reconciled": true, "landedCommit": commit}),
@@ -870,6 +1040,98 @@ async fn settle_publication(
         }
         LandingEvidence::Unknown(reason) => Ok(LandingRecovery::Undetermined(reason)),
     }
+}
+
+/// Finish an accepted origin landing whose MR was recorded before its local
+/// bookmarks. Only unchanged prepared coordinates move; newer source work and
+/// target descendants keep their own heads. Explicit reopen owns its coordinates.
+async fn recover_recorded_bookmarks(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    pending: &PendingPublication,
+    context: &super::context::MergeMrContext,
+) -> Result<(), String> {
+    if pending.local {
+        return Ok(());
+    }
+    let store = super::default_landing::store_of(orch, context);
+    if !crate::jj::is_jj_dir(&store.path) {
+        return Ok(());
+    }
+    let publication = &pending.publication;
+    let reservation = orch
+        .reserve_branches(
+            &store.path,
+            &[
+                publication.source_branch.as_str(),
+                publication.target_branch.as_str(),
+            ],
+            "record accepted landing bookmarks",
+            crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+        )
+        .await?;
+    let _lease = crate::jj::StoreObjectLease::for_store(&store.path)?;
+    let _resolution = match context.issue_id.as_deref() {
+        Some(issue) => Some(crate::issues::crud::lock_resolution(db, issue).await),
+        None => None,
+    };
+    if let Some(issue) = context.issue_id.as_deref() {
+        let generation = db
+            .query_opt_i64(
+                "SELECT resolution_generation FROM issues WHERE id=?1",
+                params![issue],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if generation != Some(pending.generation.unwrap_or(0)) {
+            return Ok(());
+        }
+    }
+    let guard = orch
+        .acquire_jj_store_lock_with_timeout(
+            &store.path,
+            crate::orchestrator::StoreLockClass::Foreground,
+            "record accepted landing bookmarks",
+            Some(crate::mcp::vcs::STORE_LOCK_TIMEOUT),
+        )
+        .await
+        .map_err(|()| "store busy while recording accepted landing".to_string())?;
+    super::default_landing::admit_landing_writers(orch, &guard, &reservation, context).await?;
+    guard.blocking_phase("recover accepted landing bookmarks", || {
+        let mut moves = Vec::new();
+        for (branch, before, after) in [
+            (
+                publication.target_branch.as_str(),
+                publication.target_before.as_str(),
+                publication.landing_commit.as_str(),
+            ),
+            (
+                publication.source_branch.as_str(),
+                publication.source_before.as_str(),
+                publication.source_after.as_str(),
+            ),
+        ] {
+            let current = crate::jj::read_local_branch_state(&store.path, branch)?.bookmark;
+            if current.as_deref() == Some(before) && before != after {
+                moves.push((branch, before, after));
+            } else if branch == publication.target_branch && current.as_deref() != Some(after) {
+                let contains = crate::jj::revset_commit_checked(
+                    &store.jj,
+                    &store.path,
+                    &format!("{after} & ::bookmarks(exact:{branch:?})"),
+                )?;
+                if contains.is_none() {
+                    return Err(format!(
+                        "accepted landing target `{branch}` moved to an unrelated head"
+                    ));
+                }
+            }
+        }
+        if !moves.is_empty() {
+            super::default_landing::advance_landing_bookmarks(&store, &moves)?;
+        }
+        Ok(())
+    })
 }
 
 /// Point the work cut from a recovered landing's source (child jobs' declared
@@ -1006,28 +1268,39 @@ fn recovered_source<'a>(
 async fn proven_unrecorded_landings(
     db: &LocalDb,
     mr_id: Option<&str>,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String, i64, String)>, String> {
     let route = format!("%\"route\":\"{ORIGIN_ROUTE}\"%");
     let rows = db
         .query_all(
-            "SELECT e.job_id, e.detail
+            "SELECT e.job_id, e.detail, m.id, COALESCE(m.issue_resolution_generation, 0)
                FROM merge_attempt_events e
                JOIN merge_requests m ON m.id = e.merge_request_id
               WHERE e.state = 'succeeded'
                 AND m.status IN ('open', 'closed')
                 AND (?1 IS NULL OR m.id = ?1)
                 AND e.detail LIKE ?2
-                AND e.detail LIKE '%\"landedCommit\":\"%'",
+                AND e.detail LIKE '%\"landedCommit\":\"%'
+                AND NOT EXISTS (SELECT 1 FROM merge_attempt_events publication
+                     WHERE publication.merge_request_id = m.id
+                       AND publication.state = 'executing'
+                       AND publication.detail LIKE '{\"publication\":%')
+                AND NOT EXISTS (SELECT 1 FROM issues i WHERE i.id = m.issue_id
+                     AND i.resolution_generation <> COALESCE(m.issue_resolution_generation, 0))",
             params![mr_id.map(str::to_string), route],
-            |row| Ok((row.text(0)?, row.text(1)?)),
+            |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?, row.i64(3)?)),
         )
         .await
         .map_err(|error| format!("proven landings are unreadable: {error}"))?;
     Ok(rows
         .into_iter()
-        .filter_map(|(job_id, detail)| {
+        .filter_map(|(job_id, detail, mr_id, generation)| {
             let value = serde_json::from_str::<serde_json::Value>(&detail).ok()?;
-            Some((job_id, value["landedCommit"].as_str()?.to_string()))
+            Some((
+                job_id,
+                mr_id,
+                generation,
+                value["landedCommit"].as_str()?.to_string(),
+            ))
         })
         .collect())
 }
@@ -1099,22 +1372,27 @@ async fn reconcile(
             outcomes.push(outcome);
         }
     }
-    for (job_id, commit) in proven_unrecorded_landings(db, mr_id).await? {
+    for (job_id, exact_mr, generation, commit) in proven_unrecorded_landings(db, mr_id).await? {
         if let Err(error) = repoint_landed_children(orch, db, &job_id).await {
             log::warn!("landing recovery: proven landing of {job_id} left unrecorded: {error}");
             continue;
         }
         let attribution = PrResolutionAttribution::internal(RECOVERY_SURFACE, job_id.clone());
-        match resolve_pr_node(
+        match super::resolution::resolve_recovered_landing(
             orch,
             &job_id,
-            PrNodeResolution::Merge,
-            Some(attribution),
-            Some(&commit),
+            &exact_mr,
+            Some(generation),
+            attribution,
+            Landed {
+                commit: Some(&commit),
+                source: None,
+                resolved_at: None,
+            },
         )
         .await
         {
-            Ok(()) => {
+            Ok(_) => {
                 settle_github_best_effort(orch, &job_id).await;
                 outcomes.push(LandingRecovery::Recorded(commit));
             }
@@ -1141,13 +1419,14 @@ async fn reconcile(
 /// every proven landing whose row was never moved. Runs at startup and on a
 /// slow timer; an attempt still being driven in this process is left alone.
 pub async fn reconcile_pending_landings(orch: &Orchestrator) -> Vec<LandingRecovery> {
-    match reconcile(orch, &orch.db.local, None).await {
-        Ok(outcomes) => outcomes,
-        Err(error) => {
-            log::warn!("landing recovery: {error}");
-            Vec::new()
+    let mut outcomes = Vec::new();
+    for db in orch.db.all_dbs().await {
+        match reconcile(orch, &db, None).await {
+            Ok(recovered) => outcomes.extend(recovered),
+            Err(error) => log::warn!("landing recovery: {error}"),
         }
     }
+    outcomes
 }
 
 /// [`reconcile_pending_landings`] for one merge request, as its refresh runs it.
@@ -1835,6 +2114,124 @@ mod tests {
         );
     }
 
+    /// The target accepted the immutable publication, but the MR claim itself
+    /// fails (not merely its issue cascade). The durable intent must survive
+    /// both the merge tail and a failed recovery pass, fencing admitted writers
+    /// until lifecycle maintenance can record it on a writable database.
+    #[tokio::test]
+    async fn an_accepted_landing_with_a_failed_mr_claim_fences_publication_until_recovery() {
+        use crate::mcp::handlers::branch::{publication_authority_in, PublicationAuthority};
+        let fx = fixture("landing-claim-fence.db").await;
+        let (old, landing, tree) = (sha('t'), sha('l'), sha('e'));
+        let publication = Publication {
+            expected_old: old.clone(),
+            landing_commit: landing.clone(),
+            landing_tree: tree.clone(),
+            source_after: landing.clone(),
+            ..publication()
+        };
+        fx.journal_intent(&publication).await;
+        let github = World {
+            pr_state: "open",
+            pr_merged: false,
+            comments: Vec::new(),
+            origin_main: Some(landing.clone()),
+            commits: vec![(landing.clone(), vec![old], tree)],
+        }
+        .github();
+        let orch = fx.orch(&github);
+        fx.db.execute_script(
+            "CREATE TRIGGER fail_landing_record BEFORE UPDATE OF status ON merge_requests
+               WHEN NEW.status = 'merged' BEGIN SELECT RAISE(FAIL, 'injected MR write failure'); END;".to_string(),
+        ).await.unwrap();
+        // Same post-publication resolver as the production merge tail: it
+        // honestly returns a pending report instead of refusing an actual merge.
+        let report = resolve_pr_node_landed(
+            &orch,
+            fx.job,
+            None,
+            Landed {
+                commit: Some(&landing),
+                source: Some(&landing),
+                resolved_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(report.to_string().contains("injected MR write failure"));
+        let attempt = MergeAttemptJournal {
+            attempt_id: "attempt-1",
+            project_id: "proj-gh",
+            merge_request_id: "mr-gh",
+            job_id: fx.job,
+            target_ref: "main",
+            source_ref: "feature",
+            policy_json: "{}",
+        };
+        assert!(
+            journal_accepted_publication(&fx.db, &attempt, &publication, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(fx.mr().await.0, "open");
+        assert_eq!(fx.issue().await, "active");
+        assert!(matches!(
+            publication_authority_in(&fx.db, fx.job, None, Some("feature")).await,
+            PublicationAuthority::Retired(_)
+        ));
+        assert!(reconcile_pending_landings(&orch).await.is_empty());
+        assert_eq!(fx.journal_states().await, ["executing"]);
+        assert!(matches!(
+            publication_authority_in(&fx.db, fx.job, None, Some("feature")).await,
+            PublicationAuthority::Retired(_)
+        ));
+        fx.db
+            .execute_script("DROP TRIGGER fail_landing_record;".to_string())
+            .await
+            .unwrap();
+        let outcomes = reconcile_pending_landings(&orch).await;
+        assert!(
+            outcomes.contains(&LandingRecovery::Recorded(landing.clone())),
+            "{outcomes:?}"
+        );
+        assert_eq!(fx.mr().await, ("merged".to_string(), Some(landing)));
+        assert_eq!(fx.issue().await, "merged");
+        assert_eq!(fx.journal_states().await, ["executing", "succeeded"]);
+        assert!(matches!(
+            publication_authority_in(&fx.db, fx.job, None, Some("feature")).await,
+            PublicationAuthority::Retired(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unrecorded_intent_cannot_retire_or_resolve_a_reopened_generation() {
+        use crate::mcp::handlers::branch::{publication_authority_in, PublicationAuthority};
+        let fx = fixture("landing-intent-reopen.db").await;
+        fx.journal_intent(&publication()).await;
+        fx.db.execute("UPDATE issues SET resolution_generation = resolution_generation + 1 WHERE id = 'issue-gh'", ()).await.unwrap();
+        let github = World {
+            pr_state: "open",
+            pr_merged: false,
+            comments: Vec::new(),
+            origin_main: Some(publication().landing_commit),
+            commits: Vec::new(),
+        }
+        .github();
+        let orch = fx.orch(&github);
+        assert_eq!(
+            publication_authority_in(&fx.db, fx.job, None, None).await,
+            PublicationAuthority::Authorized
+        );
+        let outcomes = reconcile_pending_landings(&orch).await;
+        assert!(matches!(
+            outcomes.as_slice(),
+            [LandingRecovery::Undetermined(_)]
+        ));
+        assert_eq!(fx.mr().await.0, "open");
+        assert_eq!(fx.issue().await, "active");
+        assert_eq!(fx.journal_states().await, ["executing"]);
+    }
+
     /// A workspace pull request's landing keeps its own commits F and L above
     /// the old target T. Its record failed after origin accepted it, and the
     /// PR is closed on GitHub. Journaled as the fast-forward it was, the proof
@@ -2172,6 +2569,8 @@ mod tests {
     fn an_intent_without_a_shape_is_a_squash() {
         let mut value = serde_json::to_value(PublicationDetail {
             publication: publication(),
+            local: None,
+            issue_generation: None,
         })
         .unwrap();
         let legacy = value["publication"].as_object_mut().unwrap();

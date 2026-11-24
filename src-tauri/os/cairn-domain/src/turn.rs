@@ -148,6 +148,8 @@ impl std::str::FromStr for TurnYieldReason {
 pub enum TurnEndReason {
     ArtifactHandoff,
     UserStop,
+    IssueMerged,
+    IssueClosed,
     Crash,
     OrphanedPending,
     /// The provider account serving the turn was depleted. The turn produced
@@ -204,6 +206,8 @@ impl std::fmt::Display for TurnEndReason {
         match self {
             TurnEndReason::ArtifactHandoff => write!(f, "artifact_handoff"),
             TurnEndReason::UserStop => write!(f, "user_stop"),
+            TurnEndReason::IssueMerged => write!(f, "issue_merged"),
+            TurnEndReason::IssueClosed => write!(f, "issue_closed"),
             TurnEndReason::Crash => write!(f, "crash"),
             TurnEndReason::OrphanedPending => write!(f, "orphaned_pending"),
             TurnEndReason::ProviderDepleted => write!(f, "provider_depleted"),
@@ -227,6 +231,8 @@ impl std::str::FromStr for TurnEndReason {
         match s {
             "artifact_handoff" => Ok(TurnEndReason::ArtifactHandoff),
             "user_stop" => Ok(TurnEndReason::UserStop),
+            "issue_merged" => Ok(TurnEndReason::IssueMerged),
+            "issue_closed" => Ok(TurnEndReason::IssueClosed),
             "crash" => Ok(TurnEndReason::Crash),
             "orphaned_pending" => Ok(TurnEndReason::OrphanedPending),
             "provider_depleted" => Ok(TurnEndReason::ProviderDepleted),

@@ -297,6 +297,14 @@ pub(crate) fn retire_unowned_idle(
     let Ok(guard) = launch_lock.try_lock() else {
         return Err(NotRetired::LaunchHeld);
     };
+    if orch
+        .resolution_responses
+        .lock()
+        .unwrap()
+        .contains_key(run_id)
+    {
+        return Err(NotRetired::WorkInProcess);
+    }
     if !orch.process_state.is_warm(run_id) {
         return Err(NotRetired::NotIdle);
     }
@@ -342,6 +350,37 @@ pub(crate) fn retire_unowned_idle(
             RetireCause::PipePressure
         }
     };
+    let exit_reason = run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            db.query_opt_text("SELECT exit_reason FROM runs WHERE id = ?1", (run_id,))
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .map_err(|_| NotRetired::FactsUnknown)?;
+    let resolution = match exit_reason.as_deref() {
+        Some("issue_merged") => Some(crate::transitions::Resolution::Merged),
+        Some("issue_closed") => Some(crate::transitions::Resolution::Closed),
+        _ => None,
+    };
+    if let Some(resolution) = resolution {
+        // A resolution's retained handle is retry evidence, not an ordinary
+        // idle process. Only its verified teardown may release that evidence.
+        drop(guard);
+        super::finish_resolution_run(orch, run_id, resolution)
+            .map_err(NotRetired::TeardownFailed)?;
+        return Ok(Retired {
+            cause,
+            session_id: facts.session_id,
+            job_id: facts.job_id,
+            backend: facts.backend,
+        });
+    }
     if let Err(error) = teardown_process(orch, run_id, TerminalPolicy::Keep, cause.exit_reason()) {
         return Err(NotRetired::TeardownFailed(error.to_string()));
     }

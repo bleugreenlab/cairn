@@ -47,15 +47,17 @@ pub use default_landing::reconcile_approved_merges;
 pub use landing_record::{
     reconcile_pending_landings, settle_github_after_landing, GitHubSettlement, LandingRecovery,
 };
+pub(crate) use merge::merge_response_run;
 pub use merge::{
-    merge_pr_for_job, parse_merge_precondition, reconcile_after_merge, CheckoutReconciliation,
-    MergePrecondition,
+    merge_pr_for_job, merge_pr_for_job_preserving_run, parse_merge_precondition,
+    reconcile_after_merge, CheckoutReconciliation, MergePrecondition,
 };
 pub use refresh::{
     close_pr_for_job, refresh_pr_for_job, refresh_pr_for_job_live, render_live_pr_section,
 };
+#[cfg(test)]
+pub(crate) use resolution::resolve_pr_node_landed;
 pub use resolution::{
     advance_producing_execution_after_pr_resolution, latest_resolution_attribution,
-    resolution_actor_label, resolve_pr_node, resolve_pr_node_landed, Landed,
-    PrResolutionAttribution,
+    resolution_actor_label, resolve_pr_node, Landed, PrResolutionAttribution,
 };

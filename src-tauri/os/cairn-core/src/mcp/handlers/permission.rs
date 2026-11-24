@@ -108,6 +108,8 @@ pub enum WithdrawalCause {
     OperatorCompact,
     /// The operator stopped the job whose turn raised the ask.
     OperatorStop,
+    IssueMerged,
+    IssueClosed,
     /// A newer ask replaced it: what it asked about changed before anyone
     /// answered.
     Superseded,
@@ -145,6 +147,8 @@ impl WithdrawalCause {
                 "the operator compacted the session that raised it, which stopped that session"
             }
             Self::OperatorStop => "the operator stopped the work that raised it",
+            Self::IssueMerged => "its issue was merged",
+            Self::IssueClosed => "its issue was closed",
             Self::Superseded => {
                 "what it asked about changed before it was answered, and a newer question replaced it"
             }

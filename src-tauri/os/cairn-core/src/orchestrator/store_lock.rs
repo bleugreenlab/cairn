@@ -1714,6 +1714,9 @@ pub(crate) enum BatchAdmission<'a> {
     /// and branch it was sealed for, so another batch, or a child task's batch
     /// on the same branch, still refuses.
     Sealed(&'a crate::mcp::handlers::run::SealedPublication),
+    /// Reserved landing from committed store state, never an executor checkout.
+    /// Held through merge recording, after which resolution revokes publication.
+    LandingIssue(&'a str),
 }
 
 /// Why a branch writer was not admitted. In every case nothing was moved.
@@ -1852,11 +1855,22 @@ impl JjStoreGuard {
             BatchAdmission::Sealed(sealed) if sealed.is_for(project_id, store, branch) => {
                 Some((sealed.job_id(), sealed.request_id()))
             }
-            BatchAdmission::Sealed(_) | BatchAdmission::None => None,
+            BatchAdmission::Sealed(_) | BatchAdmission::None | BatchAdmission::LandingIssue(_) => {
+                None
+            }
         };
         let started = Instant::now();
-        match crate::orchestrator::base_advance::inflight_run_batch_except(
-            db, project_id, branch, None, exempt,
+        let landing_issue = match batch {
+            BatchAdmission::LandingIssue(issue) => Some(issue),
+            _ => None,
+        };
+        match crate::orchestrator::base_advance::inflight_run_batch_for_landing(
+            db,
+            project_id,
+            branch,
+            None,
+            exempt,
+            landing_issue,
         )
         .await
         {
@@ -1921,63 +1935,6 @@ impl JjStoreGuard {
                 error,
             }),
         }
-    }
-}
-
-/// The store's operation as one guard hold captured it, so that hold, and only
-/// that hold, may restore it. Minted by [`JjStoreGuard::capture_operation`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GuardOperation {
-    operation: String,
-    hold: Arc<str>,
-}
-
-impl JjStoreGuard {
-    /// Capture the store's current operation under this hold, for
-    /// [`Self::undo_own_operations`].
-    ///
-    /// Read in process from the operation heads, never through jj, which
-    /// would settle a split log as a side effect: a split has no single
-    /// operation to return to and is refused.
-    pub(crate) fn capture_operation(
-        &self,
-        _jj: &crate::jj::JjEnv,
-    ) -> Result<GuardOperation, String> {
-        match cairn_vcs::settled_operation(self.store_path())? {
-            cairn_vcs::SettledOperation::Single(operation) => Ok(GuardOperation {
-                operation,
-                hold: self.trace.correlation_id.clone(),
-            }),
-            cairn_vcs::SettledOperation::Split(heads) => Err(format!(
-                "the operation log of {} is split ({}), so there is no single operation this \
-                 hold could return to",
-                self.trace.store,
-                heads.join(", ")
-            )),
-        }
-    }
-
-    /// Restore the operation `captured` by this same hold, undoing only what
-    /// this hold did since. The guard excludes every other Cairn writer for
-    /// the whole hold, so no other branch's move or acceptance can lie between
-    /// the capture and the restore, and neither a foreign reservation nor an
-    /// owed acceptance stops it: refusing would leave this hold's own partial
-    /// work installed. A capture from any other hold (including an earlier
-    /// hold of this same store) is refused, since other writers may have run
-    /// in between.
-    pub(crate) fn undo_own_operations(
-        &self,
-        jj: &crate::jj::JjEnv,
-        captured: &GuardOperation,
-    ) -> Result<(), String> {
-        if captured.hold != self.trace.correlation_id {
-            return Err(format!(
-                "refusing to restore operation {} of {}: it was captured under another store \
-                 lock hold, so other writers may have run since",
-                captured.operation, self.trace.store
-            ));
-        }
-        crate::jj::restore_operation(jj, self.store_path(), &captured.operation)
     }
 }
 

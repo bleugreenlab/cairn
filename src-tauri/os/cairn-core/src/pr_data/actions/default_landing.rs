@@ -10,7 +10,7 @@
 //!    from, and the declared relationship. For a project with a remote, origin's
 //!    copy of the target is fetched into the store first, and the coordinate
 //!    holds only while the store's target and origin's are the same commit.
-//! 2. **Prospect**, under the lock, then undone: the merge result as it would
+//! 2. **Prospect**, under the lock, in an unpublished index: the result as it would
 //!    land on exactly that coordinate. A branch that changed a declared
 //!    identifier site (`landing.identifiers`) is bound there
 //!    (`orchestrator::landing::bind`); any other branch is folded prospectively.
@@ -20,10 +20,10 @@
 //!    and every bound identifier holds its invariant (no NEXT, the next numbers
 //!    and no others, at most one new protocol version).
 //! 4. **Land if unchanged**, under the lock: the prepared coordinate is
-//!    revalidated (source, target and relationship), with origin's target
-//!    fetched again. Any movement restarts preparation, binding and validation;
-//!    otherwise the bind is redone for real, its tree is proven to be the one
-//!    validated, and it lands.
+//!    revalidated (source, target and relationship). Origin's target is protected
+//!    by the exact publication lease. Movement restarts preparation and validation;
+//!    otherwise the exact immutable candidate that was validated lands. Its
+//!    publication intent is durable before any live coordinate changes.
 //!
 //! Holding the lock from the recheck through the landing is what serializes
 //! binding: a second landing that bound against the same tip finds it moved
@@ -51,6 +51,7 @@ use crate::orchestrator::landing::{self, bind};
 use crate::orchestrator::{BranchReservation, JjStoreGuard, Orchestrator};
 use crate::security::broker::github::installation_authority;
 use crate::storage::LocalDb;
+use cairn_db::turso::params;
 
 use super::context::MergeMrContext;
 use super::human_approval::{
@@ -63,8 +64,7 @@ use super::landing_record::{
 };
 use super::merge::MergeAttemptJournal;
 use super::store_merge::{
-    fold_validated_default, prepare_landing_source, prepared_landing_holds,
-    prospective_default_landing, ExactTarget, ProspectiveMerge,
+    prepare_landing_source, prepared_landing_holds, prospective_default_landing, ProspectiveMerge,
 };
 
 /// How long a landing waits for its source and target to be free of another
@@ -89,8 +89,8 @@ pub(super) struct DefaultLanding {
     /// What the running build says of the `.cairn/config.yaml` this landing
     /// puts on the default branch, judged on the exact merge result.
     pub config_notice: Option<String>,
-    /// The publication to origin's target that landed it, with the journal
-    /// attempt holding its intent; `None` for a project with no remote.
+    /// The journaled landing intent for the remote publication or local
+    /// installation. Its outcome is recorded by the caller.
     pub published: Option<PublishedLanding>,
     /// The landing's reservation of its source and target, handed to the
     /// caller so it is still held while the merge is recorded. Until the
@@ -106,6 +106,9 @@ pub(super) struct DefaultLanding {
 pub(super) struct PublishedLanding {
     pub publication: Publication,
     pub attempt_id: String,
+    /// Origin accepted the landing, but local recording or read-back remains unconfirmed.
+    /// Its durable intent must stay executing until existing recovery completes it.
+    pub recording_pending: Option<String>,
     /// Keeps the attempt in flight until the last copy is dropped, which the
     /// merge command does only after it has journaled the outcome.
     pub _driving: PublicationInFlight,
@@ -318,7 +321,9 @@ pub(super) fn reservation_covers(
 /// Admit the landing's writers of its source and its target under `guard`:
 /// neither may be under a branch recovery fence (nor the store), and each must
 /// be reserved by the landing and owe no acceptance
-/// (`JjStoreGuard::branch_write_permit`). Required before the landing moves
+/// (`JjStoreGuard::branch_write_permit`). Only this issue's live batches are
+/// exempt: landing consumes committed store state, not their executor cells.
+/// Required before the landing moves
 /// either bookmark or publishes, and again under every re-taken guard, so a
 /// fence laid after the landing prepared or validated still refuses it.
 pub(super) async fn admit_landing_writers(
@@ -359,7 +364,10 @@ pub(super) async fn admit_landing_writers(
                 reservation,
                 &merge_context.project_id,
                 branch,
-                crate::orchestrator::BatchAdmission::None,
+                merge_context.issue_id.as_deref().map_or(
+                    crate::orchestrator::BatchAdmission::None,
+                    crate::orchestrator::BatchAdmission::LandingIssue,
+                ),
             )
             .await?;
         permits.push(format!(
@@ -800,21 +808,7 @@ pub(super) fn advance_landing_bookmarks(
         }
     }
     let moved = (|| -> Result<(), String> {
-        for (name, _, landing) in moves {
-            store.jj.run(
-                &store.path,
-                &[
-                    "bookmark",
-                    "set",
-                    name,
-                    "-r",
-                    landing,
-                    "--allow-backwards",
-                    "--ignore-working-copy",
-                ],
-                "advance landing bookmark",
-            )?;
-        }
+        crate::jj::install_default_landing(&store.path, moves)?;
         let exported: Vec<(&str, &str)> = moves
             .iter()
             .map(|(name, _, landing)| (*name, *landing))
@@ -1029,11 +1023,9 @@ async fn validate_prospect(
     );
     // Off the store lock, so every read is pinned to an operation that indexes
     // both commits: an unpinned jj read would merge a split operation log behind
-    // the writer. The undone prospect stays indexed, and the caller's object
-    // lease keeps it from reclamation.
-    let jj = store
-        .jj
-        .pin_immutable_read(&store.path, &[head.as_str(), tip.as_str()])?;
+    // the writer. The unpublished prospect owns its immutable index, and the
+    // caller's object lease keeps its objects from reclamation.
+    let jj = store.jj.at_operation(&prospect.merge.operation);
     let path = store.path.clone();
     let (target, source) = (
         merge_context.target_branch.clone(),
@@ -1280,7 +1272,10 @@ pub(super) async fn judge_origin_target(
             reservation,
             &merge_context.project_id,
             target,
-            crate::orchestrator::BatchAdmission::None,
+            merge_context.issue_id.as_deref().map_or(
+                crate::orchestrator::BatchAdmission::None,
+                crate::orchestrator::BatchAdmission::LandingIssue,
+            ),
         )
         .await
         .map_err(|refusal| refuse(refusal.to_string()))?;
@@ -1345,16 +1340,15 @@ pub(super) fn coordinate_moved(
     None
 }
 
-/// Bind the prepared source against its prepared target. Preparation already
-/// carried it onto that target, so nothing is replayed here: a source that does
-/// not descend from it is refused. The caller holds the store lock and has
-/// checked that the source bookmark is at the prepared head.
+/// Plan binding against the prepared target without installing a bind commit.
+/// Preparation already carried the source onto that target. The caller holds
+/// the store lock and has checked the source bookmark at the prepared head.
 fn bind_prepared(
     store: &Store,
     merge_context: &MergeMrContext,
     prepared: &PreparedBranch,
     rules: &[(String, IdentifierRule)],
-) -> Result<bind::BoundLanding, String> {
+) -> Result<bind::BindPlan, String> {
     let descends = crate::jj::revset_commit(
         &store.jj,
         &store.path,
@@ -1370,7 +1364,7 @@ fn bind_prepared(
             prepared.base_commit
         ));
     }
-    bind::bind_onto(
+    bind::plan_onto(
         &store.jj,
         &store.path,
         &merge_context.source_branch,
@@ -1381,8 +1375,8 @@ fn bind_prepared(
     )
 }
 
-/// The merge result as it would land on exactly `prepared`, built in the store
-/// and undone. The caller holds the store lock.
+/// The merge result as it would land on exactly `prepared`, computed without
+/// publishing a live operation or changing refs. The caller holds the store lock.
 async fn build_prospect(
     orch: &Orchestrator,
     merge_context: &MergeMrContext,
@@ -1421,88 +1415,56 @@ async fn build_prospect(
     ))?;
     let binds = mode.is_some()
         || bind::touches_identifiers(&store.jj, &store.path, &source_tip, &target_tip, &rules)?;
-    if !binds {
-        let merge = prospective_default_landing(
-            orch,
-            merge_context,
-            method,
-            &target_tip,
-            &source_tip,
-            guard,
-            reservation,
-        )
-        .await?;
-        if merge.source_tip != source_tip || merge.target_tip != target_tip {
-            return Ok(Built::Moved(format!(
-                "the merge result was built from {} onto {}, not the prepared {source_tip} onto \
-                 {target_tip}",
-                merge.source_tip, merge.target_tip
-            )));
-        }
-        return Ok(Built::Ready(Box::new(Prospect {
-            prepared,
-            merge,
-            binds,
-            rules,
-            plan: bind::BindPlan::default(),
-        })));
-    }
-
-    let operation = guard.capture_operation(&store.jj)?;
-    let built = (|| -> Result<(ProspectiveMerge, bind::BindPlan), String> {
-        let bound = bind_prepared(store, merge_context, &prepared, &rules)?;
-        let tree_hash = crate::jj::sealed_tree_hash_via_git(&store.jj, &store.path, &bound.head)?;
-        let patch = store.jj.run(
-            &store.path,
-            &[
-                "diff",
-                "--ignore-working-copy",
-                "--git",
-                "--from",
-                &target_tip,
-                "--to",
-                &bound.head,
-            ],
-            "jj diff bound landing",
-        )?;
-        Ok((
-            ProspectiveMerge {
-                source_tip: source_tip.clone(),
-                target_tip: target_tip.clone(),
-                tree_entries: crate::jj::tree_entries(&store.jj, &store.path, &bound.head)?,
-                commit_id: bound.head,
-                tree_hash,
-                changed_files: crate::jj::parse_git_diff(&patch),
+    let plan = if binds {
+        bind_prepared(store, merge_context, &prepared, &rules)?
+    } else {
+        bind::BindPlan::default()
+    };
+    let edits = plan
+        .edits
+        .iter()
+        .map(|edit| match edit {
+            bind::FileEdit::Rename { from, to } => crate::jj::LandingTreeEdit::Rename {
+                from: from.clone(),
+                to: to.clone(),
             },
-            bound.plan,
-        ))
-    })();
-    let restored = guard.undo_own_operations(&store.jj, &operation);
-    match (built, restored) {
-        (Ok((merge, plan)), Ok(())) => Ok(Built::Ready(Box::new(Prospect {
-            prepared,
-            merge,
-            binds,
-            rules,
-            plan,
-        }))),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(format!(
-            "failed to restore the prospective landing operation: {error}"
-        )),
-        (Err(error), Err(restore)) => Err(format!(
-            "{error} (also failed to restore the prospective landing operation: {restore})"
-        )),
+            bind::FileEdit::Rewrite { path, content } => crate::jj::LandingTreeEdit::Rewrite {
+                path: path.clone(),
+                content: content.clone(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let message = if method == "squash" {
+        merge_context.title.clone()
+    } else {
+        plan.commit_message()
+    };
+    let merge = prospective_default_landing(
+        orch,
+        merge_context,
+        method,
+        &target_tip,
+        &source_tip,
+        guard,
+        reservation,
+        &edits,
+        &message,
+    )
+    .await?;
+    if merge.source_tip != source_tip || merge.target_tip != target_tip {
+        return Ok(Built::Moved(
+            "detached landing does not match its prepared coordinate".into(),
+        ));
     }
+    Ok(Built::Ready(Box::new(Prospect {
+        prepared,
+        merge,
+        binds,
+        rules,
+        plan,
+    })))
 }
 
-/// Land the validated prospect if its prepared coordinate still holds: `Some`
-/// with what landed, `None` when the source, the target or the declared
-/// relationship moved, or origin's target was no longer the prepared one,
-/// which restarts preparation. `guard` is the store lock for the local recheck,
-/// bind and fold; it is released for the network push and re-taken to record
-/// it, while `reservation` keeps the source and target still.
-#[allow(clippy::too_many_arguments)]
 /// The shape a default landing publishes, as its fold produces it: `squash`
 /// mints one commit on the target; any other method (a workspace pull
 /// request's forced `merge`) fast-forwards the target to the prepared head,
@@ -1516,6 +1478,8 @@ fn publication_shape(method: &str) -> PublicationShape {
     }
 }
 
+/// Revalidate the prepared coordinate, then journal and install or publish the
+/// exact judged candidate. The reservation outlives any network lock release.
 #[allow(clippy::too_many_arguments)] // the eight are one landing's coordinate set; bundling them would churn the import's hottest file
 async fn land_if_unchanged(
     orch: &Orchestrator,
@@ -1540,58 +1504,31 @@ async fn land_if_unchanged(
     // Both branches are admitted before anything is folded or pushed; the
     // reservation keeps the admission true while the guard is free.
     admit_landing_writers(orch, &guard, reservation, merge_context).await?;
-    let operation = guard.capture_operation(&store.jj)?;
-    let rollback = |error: String| -> String {
-        match guard.undo_own_operations(&store.jj, &operation) {
-            Ok(()) => error,
-            Err(restore) => format!("{error} (also failed to roll the landing back: {restore})"),
-        }
-    };
-    // The bind commit lands on the source bookmark, which the fold reads.
-    let source_head = if prospect.binds {
-        let bound = bind_prepared(store, merge_context, &prospect.prepared, &prospect.rules)
-            .map_err(rollback)?;
-        let tree = crate::jj::sealed_tree_hash_via_git(&store.jj, &store.path, &bound.head)
-            .map_err(rollback)?;
-        if tree != prospect.merge.tree_hash {
-            log::warn!(
-                "landing: binding `{}` again produced tree {tree}, not the judged {}; judging again",
-                merge_context.source_branch,
-                prospect.merge.tree_hash
-            );
-            guard
-                .undo_own_operations(&store.jj, &operation)
-                .map_err(|error| {
-                    format!("failed to roll back a landing whose tree changed: {error}")
-                })?;
-            return Ok(Attempt::StoreMoved);
-        }
-        bound.head
-    } else {
-        prospect.prepared.head_after.clone()
-    };
-
-    let exact = ExactTarget {
-        target: &prospect.prepared.base_commit,
-        source: &source_head,
-        tree: Some(&prospect.merge.tree_hash),
-    };
     drop(recheck);
-    let fold = super::merge_metrics::time(super::merge_metrics::Phase::Fold);
-    let commit = fold_validated_default(orch, merge_context, method, exact, &guard, reservation)
-        .await
-        .map_err(rollback)?;
-    drop(fold);
+    let commit = prospect.merge.commit_id.clone();
     if merge_context.mr.is_local {
-        // Only the two bookmarks move. The fold rewrote the source's commits
-        // and jj rebased everything descending from them, another branch cut
-        // from the source included; so the fold is set aside and the landing
-        // installed by compare-and-swap, exactly as an accepted remote one is.
-        let set_aside = super::merge_metrics::time(super::merge_metrics::Phase::SetAside);
-        guard
-            .undo_own_operations(&store.jj, &operation)
-            .map_err(|error| format!("the folded landing could not be set aside: {error}"))?;
-        drop(set_aside);
+        // The immutable candidate has not moved either live coordinate.
+        let db =
+            crate::execution::routing::owning_db_for_project(&orch.db, &merge_context.project_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        let published = super::landing_record::begin_landing_publication(
+            &db,
+            journal,
+            Publication {
+                target_branch: merge_context.target_branch.clone(),
+                expected_old: prospect.prepared.base_commit.clone(),
+                target_before: prospect.prepared.base_commit.clone(),
+                landing_commit: commit.clone(),
+                landing_tree: prospect.merge.tree_hash.clone(),
+                source_branch: merge_context.source_branch.clone(),
+                source_before: prospect.prepared.head_after.clone(),
+                source_after: commit.clone(),
+                shape: publication_shape(method),
+            },
+            true,
+        )
+        .await?;
         let install = super::merge_metrics::time(super::merge_metrics::Phase::Install);
         guard.blocking_phase("install local landing", || {
             advance_landing_bookmarks(
@@ -1617,22 +1554,13 @@ async fn land_if_unchanged(
         }
         return Ok(Attempt::Landed(Box::new(Landed {
             commit: Some(commit),
-            published: None,
+            published: Some(published),
         })));
     }
 
-    // The landing commit exists; pin it, then the store goes back to the
-    // prepared target and source until origin accepts it.
+    // Pin the detached object for transport; live coordinates remain prepared.
     let repo_path = merge_context.mr.repo_path.as_str();
-    let set_aside = super::merge_metrics::time(super::merge_metrics::Phase::SetAside);
-    pin_landing(repo_path, journal.attempt_id, &commit).map_err(rollback)?;
-    if let Err(error) = guard.undo_own_operations(&store.jj, &operation) {
-        unpin_landing(repo_path, journal.attempt_id);
-        return Err(format!(
-            "the folded landing could not be set aside: {error}"
-        ));
-    }
-    drop(set_aside);
+    pin_landing(repo_path, journal.attempt_id, &commit)?;
     let publication = Publication {
         target_branch: merge_context.target_branch.clone(),
         expected_old: prospect.prepared.base_commit.clone(),
@@ -1744,7 +1672,7 @@ pub(super) async fn publish_pinned(
         }
         Err(unconfirmed) => {
             unpin_landing(repo_path, journal.attempt_id);
-            if let Some(error) = unconfirmed {
+            if let Some(error) = unconfirmed.as_deref() {
                 log::warn!(
                     "landing: origin accepted {commit} for `{}`, but recording it in the store \
                      did not complete: {error}",
@@ -1758,6 +1686,7 @@ pub(super) async fn publish_pinned(
                 published: Some(PublishedLanding {
                     publication,
                     attempt_id: journal.attempt_id.to_string(),
+                    recording_pending: unconfirmed,
                     _driving: driving,
                 }),
             })))
@@ -1915,7 +1844,7 @@ fn jj_log(store: &Store, revset: &str, template: &str, label: &str) -> Result<St
     )
 }
 
-fn store_commit_shape(store: &Store, commit: &str) -> Result<LandedShape, String> {
+pub(super) fn store_commit_shape(store: &Store, commit: &str) -> Result<LandedShape, String> {
     let parents = jj_log(
         store,
         commit,
@@ -1958,8 +1887,8 @@ impl LandingWorld for GatedLanding<'_> {
             )
             .await?;
         let reservation = Arc::new(reservation);
-        // For the prospect's own fold-and-undo; execute builds the landing
-        // again under a lease of its own.
+        // Protect only this computation. Approval waiting retains neither a
+        // reclamation lease nor writer authority; execute computes again.
         let _lease = object_lease(&self.store, self.merge_context)?;
         let mut prospect = None;
         for attempt in 0..MAX_LANDING_ATTEMPTS {
@@ -2053,7 +1982,8 @@ impl LandingWorld for GatedLanding<'_> {
             source_message,
             source_commit_count,
             merge_base_oid,
-            // The landing commit is minted at landing, with fresh dates.
+            // Approval binds the tree. Execution recomputes detached objects
+            // after the wait, without retaining a reclamation lease through it.
             candidate_oid: None,
             result_tree_oid: prospect.merge.tree_hash.clone(),
             strategy,
@@ -2126,84 +2056,108 @@ impl LandingWorld for GatedLanding<'_> {
                 }),
             };
         }
-        // Both branches are admitted before anything is folded or pushed.
-        if let Err(error) =
-            admit_landing_writers(self.orch, &guard, &reservation, self.merge_context).await
-        {
-            return Execution::Refused(error);
-        }
-        let operation = match guard.capture_operation(&store.jj) {
-            Ok(operation) => operation,
-            Err(error) => return Execution::Refused(error),
-        };
-        let restore = || guard.undo_own_operations(&store.jj, &operation);
-        let head = if prospect.binds {
-            let bound = match bind_prepared(
-                store,
-                self.merge_context,
-                &prospect.prepared,
-                &prospect.rules,
-            ) {
-                Ok(bound) => bound,
-                Err(error) => {
-                    let _ = restore();
-                    return Execution::Refused(error);
-                }
-            };
-            let tree = crate::jj::sealed_tree_hash_via_git(&store.jj, &store.path, &bound.head);
-            if tree.as_deref() != Ok(approved.result_tree_oid.as_str()) {
-                let _ = restore();
-                return Execution::BoundStateChanged {
-                    observed: serde_json::json!({ "resultTreeOid": tree.ok() }),
-                };
-            }
-            bound.head
-        } else {
-            approved.source_oid.clone()
-        };
-        let exact = ExactTarget {
-            target: &approved.target_oid,
-            source: &head,
-            tree: Some(&approved.result_tree_oid),
-        };
-        let fold = super::merge_metrics::time(super::merge_metrics::Phase::Fold);
-        let commit = match fold_validated_default(
+        // The approval wait owns no reclamation lease. Recompute from the
+        // still-exact prepared source, on another unpublished index, rather
+        // than depending on an unattached object surviving that wait.
+        let prospect = match build_prospect(
             self.orch,
             self.merge_context,
             self.method,
-            exact,
+            store,
+            prospect.prepared.clone(),
             &guard,
             &reservation,
         )
         .await
         {
-            Ok(commit) => commit,
+            Ok(Built::Ready(prospect)) if prospect.merge.tree_hash == approved.result_tree_oid => {
+                prospect
+            }
+            Ok(Built::Ready(prospect)) => {
+                return Execution::BoundStateChanged {
+                    observed: serde_json::json!({ "resultTreeOid": prospect.merge.tree_hash }),
+                }
+            }
+            Ok(Built::Moved(moved)) => {
+                return Execution::BoundStateChanged {
+                    observed: serde_json::json!({ "moved": moved }),
+                }
+            }
+            Err(error) => return Execution::Refused(error),
+        };
+        let head = approved.source_oid.clone();
+        let commit = prospect.merge.commit_id.clone();
+        let publication = Publication {
+            target_branch: target.to_string(),
+            expected_old: approved.target_oid.clone(),
+            target_before: approved.target_oid.clone(),
+            landing_commit: commit.clone(),
+            landing_tree: approved.result_tree_oid.clone(),
+            source_branch: source.to_string(),
+            source_before: prospect.prepared.head_after.clone(),
+            source_after: commit.clone(),
+            shape: publication_shape(self.method),
+        };
+        let db = match crate::execution::routing::owning_db_for_project(
+            &self.orch.db,
+            &self.merge_context.project_id,
+        )
+        .await
+        {
+            Ok(db) => db,
             Err(error) => {
-                let _ = restore();
+                return Execution::Refused(error.to_string());
+            }
+        };
+        let publication_id = format!("{}-publication-1", self.attempt_id);
+        let policy = match db.query_opt_text(
+            "SELECT policy_json FROM merge_attempt_events WHERE attempt_id = ?1 ORDER BY sequence LIMIT 1",
+            params![self.attempt_id],
+        ).await {
+            Ok(Some(policy)) => policy,
+            Ok(None) => { return Execution::Refused("approval policy event is missing".to_string()); }
+            Err(error) => { return Execution::Refused(error.to_string()); }
+        };
+        let publication_journal = MergeAttemptJournal {
+            attempt_id: &publication_id,
+            project_id: &self.merge_context.project_id,
+            merge_request_id: &self.merge_context.mr.mr_id,
+            job_id: self.job_id,
+            target_ref: target,
+            source_ref: source,
+            policy_json: &policy,
+        };
+        let published = match super::landing_record::begin_landing_publication(
+            &db,
+            &publication_journal,
+            publication.clone(),
+            !self.remote(),
+        )
+        .await
+        {
+            Ok(published) => published,
+            Err(error) => {
                 return Execution::Refused(error);
             }
         };
-        drop(fold);
-        let landed = |commit: String, reservation: Arc<BranchReservation>| Execution::Landed {
+        let landed = |commit: String,
+                      reservation: Arc<BranchReservation>,
+                      recording_pending: Option<String>| Execution::Landed {
             commit: commit.clone(),
             approved_head: head.clone(),
             landing: DefaultLanding {
                 landed_commit: Some(commit),
                 plan: prospect.plan.clone(),
                 config_notice: config_notice.clone(),
-                published: None,
+                published: Some(PublishedLanding {
+                    recording_pending,
+                    ..published.clone()
+                }),
                 reservation: Some(reservation),
             },
         };
         if !self.remote() {
-            // Only the two bookmarks move (see land_if_unchanged): the fold
-            // is set aside and the landing installed by compare-and-swap, so
-            // no branch descending from the source is rebased.
-            if let Err(error) = restore() {
-                return Execution::Refused(format!(
-                    "the folded landing could not be set aside: {error}"
-                ));
-            }
+            // The durable intent precedes the first live coordinate change.
             let installed = guard.blocking_phase("install local landing", || {
                 advance_landing_bookmarks(
                     store,
@@ -2224,33 +2178,15 @@ impl LandingWorld for GatedLanding<'_> {
             {
                 log::warn!("approval landing: {error}");
             }
-            return landed(commit, reservation);
+            return landed(commit, reservation, None);
         }
-        // The landing commit exists; pin it, then the store goes back to the
-        // prepared target and source until origin accepts it.
+        // Pin the immutable candidate; both live refs still name preparation.
         let repo_path = self.merge_context.mr.repo_path.as_str();
         if let Err(error) = pin_landing(repo_path, self.attempt_id, &commit) {
-            let _ = restore();
             return Execution::Refused(error);
         }
-        if let Err(error) = restore() {
-            unpin_landing(repo_path, self.attempt_id);
-            return Execution::Refused(format!(
-                "the folded landing could not be set aside: {error}"
-            ));
-        }
-        // The ceremony's own `executing` event is this publication's intent.
-        let publication = Publication {
-            target_branch: target.to_string(),
-            expected_old: approved.target_oid.clone(),
-            target_before: approved.target_oid.clone(),
-            landing_commit: commit.clone(),
-            landing_tree: approved.result_tree_oid.clone(),
-            source_branch: source.to_string(),
-            source_before: prospect.prepared.head_after.clone(),
-            source_after: commit.clone(),
-            shape: publication_shape(self.method),
-        };
+        // The exact publication intent also keeps recording failure recoverable
+        // after the ceremony itself has truthfully settled the transport.
         if let Err(error) = reservation_covers(&reservation, store, self.merge_context) {
             unpin_landing(repo_path, self.attempt_id);
             return Execution::Refused(error);
@@ -2272,21 +2208,39 @@ impl LandingWorld for GatedLanding<'_> {
         }
         let execution = match publish {
             Publish::Accepted { unconfirmed } => {
-                if let Some(error) = unconfirmed {
+                if let Some(error) = unconfirmed.as_deref() {
                     log::warn!(
                         "approval landing: origin accepted {commit} for `{target}`, but \
                          recording it in the store did not complete: {error}"
                     );
                 }
-                landed(commit, reservation)
+                landed(commit, reservation, unconfirmed)
             }
             Publish::TargetMoved { observed, error } => {
+                let _ = super::landing_record::journal_publication_outcome(
+                    &db,
+                    &publication_journal,
+                    &publication,
+                    &PublicationOutcome::TargetMoved {
+                        observed: observed.clone(),
+                    },
+                )
+                .await;
                 log::info!("approval landing: {error}");
                 Execution::BoundStateChanged {
                     observed: serde_json::json!({ "targetOid": observed }),
                 }
             }
-            Publish::Refused(error) => Execution::Refused(error),
+            Publish::Refused(error) => {
+                let _ = super::landing_record::journal_publication_outcome(
+                    &db,
+                    &publication_journal,
+                    &publication,
+                    &PublicationOutcome::Refused(error.clone()),
+                )
+                .await;
+                Execution::Refused(error)
+            }
             Publish::Unknown(reason) => Execution::Unknown {
                 reason,
                 approved_head: Some(head),

@@ -908,7 +908,22 @@ pub(crate) async fn publication_authority_in(
 ) -> PublicationAuthority {
     let found = db
         .query_opt(
-            "SELECT j.status, i.status, p.key, i.number, COALESCE(j.branch, j.base_branch)
+            "SELECT j.status, i.status, p.key, i.number, COALESCE(j.branch, j.base_branch),
+                    EXISTS(SELECT 1 FROM merge_requests mr
+                            WHERE mr.project_id = j.project_id AND mr.issue_id = j.issue_id
+                              AND mr.status = 'merged'
+                              AND mr.issue_resolution_generation = i.resolution_generation)
+                    OR EXISTS(SELECT 1 FROM merge_attempt_events e
+                         JOIN merge_requests mr ON mr.id = e.merge_request_id
+                        WHERE mr.project_id = j.project_id AND mr.issue_id = j.issue_id
+                          AND e.state = 'executing'
+                          AND e.detail LIKE '{\"publication\":%'
+                          AND COALESCE(json_extract(e.detail, '$.issueGeneration'), 0)
+                              = i.resolution_generation
+                          AND (SELECT l.state FROM merge_attempt_events l
+                                WHERE l.attempt_id = e.attempt_id
+                                ORDER BY l.sequence DESC LIMIT 1)
+                              IN ('executing', 'indeterminate'))
                FROM jobs j
                JOIN projects p ON p.id = j.project_id
                LEFT JOIN issues i ON i.id = j.issue_id
@@ -921,11 +936,12 @@ pub(crate) async fn publication_authority_in(
                     row.text(2)?,
                     row.opt_i64(3)?,
                     row.opt_text(4)?,
+                    row.i64(5)? != 0,
                 ))
             },
         )
         .await;
-    let (job_status, issue_status, project_key, issue_number, job_branch) = match found {
+    let (job_status, issue_status, project_key, issue_number, job_branch, landed) = match found {
         Ok(Some(found)) => found,
         Ok(None) => return PublicationAuthority::Authorized,
         Err(error) => return PublicationAuthority::Unknown(error.to_string()),
@@ -933,6 +949,11 @@ pub(crate) async fn publication_authority_in(
     let mut cause = match issue_status.as_deref() {
         Some("merged") => Some(RetirementCause::IssueMerged),
         Some("closed") => Some(RetirementCause::IssueClosed),
+        // The durable publication intent precedes the target move; the merged
+        // MR supersedes it once recording succeeds. Neither a failed MR claim
+        // nor a failed issue cascade can reauthorize surviving batches after
+        // the reservation releases. Historical generations leave reopened work alone.
+        _ if landed => Some(RetirementCause::IssueMerged),
         _ if job_status == "cancelled" => Some(RetirementCause::JobCancelled),
         _ => None,
     };
@@ -1479,6 +1500,38 @@ mod tests {
             assert!(text.contains("Nothing was committed"), "{text}");
             assert!(text.contains("agent/proj-7-builder-0"), "{text}");
         }
+    }
+
+    /// Merge recording revokes publication even when the issue cascade has not
+    /// finished. A later reopen has a new generation and is not that landing.
+    #[tokio::test]
+    async fn a_recorded_landing_retires_only_its_issue_generation() {
+        let db = authority_db("active", "running").await;
+        db.execute_script(
+            "INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch,
+                status, opened_at, updated_at, issue_resolution_generation)
+             SELECT 'mr-landed', 'job-1', 'p-1', 'issue-1', 'Landed',
+                    'agent/proj-7-builder-0', 'main', 'merged', 1, 1, resolution_generation
+               FROM issues WHERE id = 'issue-1';"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            publication_authority_in(&db, "job-1", None, None).await,
+            PublicationAuthority::Retired(retired) if retired.cause == RetirementCause::IssueMerged
+        ));
+        db.execute(
+            "UPDATE issues SET resolution_generation = resolution_generation + 1 WHERE id = 'issue-1'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            publication_authority_in(&db, "job-1", None, None).await,
+            PublicationAuthority::Authorized
+        );
     }
 
     /// An archived job on an open issue is refused: archival is how a

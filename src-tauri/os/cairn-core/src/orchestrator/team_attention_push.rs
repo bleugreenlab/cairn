@@ -77,7 +77,7 @@ fn notification_intent(event: &AttentionEvent) -> Option<NotificationIntent> {
         .as_deref()
         .is_some_and(|detail| detail.ends_with("/pr"));
     let (kind, need) = match (&event.fact, &event.attention, &event.status) {
-        (AttentionFact::Resolved { final_status }, _, _)
+        (AttentionFact::Resolved { final_status, .. }, _, _)
             if *final_status == IssueStatus::Failed =>
         {
             ("blocked", "failed and needs attention")

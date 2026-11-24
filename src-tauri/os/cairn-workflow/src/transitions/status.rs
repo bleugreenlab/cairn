@@ -13,7 +13,8 @@ use cairn_platform::services::emitter::EventEmitter;
 pub use crate::models::ExecutionStatus;
 
 /// Resolution type for issue merge/close.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Resolution {
     Merged,
     Closed,

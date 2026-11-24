@@ -194,6 +194,29 @@ async fn an_in_flight_run_batch_refuses_every_writer_but_its_own_exact_sealed_pu
         "an ordinary writer is held by the batch: {ordinary:?}"
     );
 
+    // Landing alone consumes committed store state while this issue's cells
+    // run. A different issue is not an exemption, and ordinary writers remain
+    // held even after a landing permit has been minted under this guard.
+    for (issue, admitted) in [("issue-1", true), ("another-issue", false)] {
+        let result = guard
+            .branch_write_permit(
+                &h.db,
+                &reservation,
+                "proj-1",
+                BRANCH,
+                BatchAdmission::LandingIssue(issue),
+            )
+            .await
+            .map(|_| ());
+        assert_eq!(result.is_ok(), admitted, "{issue}: {result:?}");
+    }
+    assert!(matches!(
+        guard
+            .branch_write_permit(&h.db, &reservation, "proj-1", BRANCH, BatchAdmission::None)
+            .await,
+        Err(BranchAdmissionRefusal::InFlightBatch { .. })
+    ));
+
     // Only the exact job and request, sealed for this project, store and
     // branch, are exempt; the same store under a dotted spelling is the same.
     for (admitted, capability, why) in [
@@ -346,6 +369,7 @@ const NAMED_WRITERS: &[&str] = &[
     "repair_conflicted_bookmark_name(",
     "collapse_divergent_bookmark(",
     "install_branch_advance_local(",
+    "install_default_landing(",
     // Moves only its branch: the local bookmark, its tracked remote and git
     // ref by compare-and-swap, and exports that branch alone. It never imports.
     "fast_forward_branch_from_origin(",
@@ -354,8 +378,7 @@ const NAMED_WRITERS: &[&str] = &[
 /// What admits a store-wide mutation; each entry admits only when every one of
 /// its tokens is in reach. Never a branch permit: a mutation that can move
 /// bookmarks it does not name is safe for every other owed branch only inside
-/// the bracket, or as `undo_own_operations(`, which restores an operation its
-/// own guard hold captured, so nothing foreign lies between.
+/// the bracket.
 ///
 /// `bracket_admitted_store_mutation(` is the bracket without its
 /// foreign-reservation refusal, so it never admits alone: the pair admits,
@@ -363,7 +386,6 @@ const NAMED_WRITERS: &[&str] = &[
 /// names the import then preserves.
 const STORE_WIDE_ADMISSION: &[&[&str]] = &[
     &["bracket_store_mutation("],
-    &["undo_own_operations("],
     &["admit_store_import(", "bracket_admitted_store_mutation("],
 ];
 
@@ -388,6 +410,14 @@ const NAMED_WINDOW: usize = 50;
 /// call, each with where it happens. Re-verify an entry before keeping it.
 const ADMITTED_ELSEWHERE: &[(&str, &str, &str)] = &[
     (
+        "pr_data/actions/default_landing.rs",
+        "install_default_landing(",
+        "advance_landing_bookmarks is the shared publication installer: local ordinary and \
+         approval paths admit both coordinates before journaling; remote publish_released \
+         admits again after reacquiring the guard. Every caller retains that guard and \
+         reservation through this native CAS and named export",
+    ),
+    (
         "mcp/handlers/run/mod.rs",
         "publish_logical_head_exported(",
         "publish_available_delta mints the branch permit on its held guard before \
@@ -400,12 +430,6 @@ const ADMITTED_ELSEWHERE: &[(&str, &str, &str)] = &[
         "finalize_file_commit mints the prepared managed branch permit and revalidates its \
          coordinate under the write guard before the authority and recovery-fence checks; \
          the caller retains the guard through publication",
-    ),
-    (
-        "pr_data/actions/store_merge/mod.rs",
-        "squash_branch_onto(",
-        "fold_onto_exact_target calls admit_landing_writers for source and target before \
-         checking their exact coordinates; the same guard owns the squash and rollback",
     ),
     (
         "execution/jobs/lifecycle.rs",
@@ -712,7 +736,7 @@ fn every_production_store_wide_mutation_is_admitted_or_named_as_owed() {
     assert_eq!(
         unadmitted, expected,
         "a production bookmark writer runs unadmitted: a store-wide mutation needs \
-         `bracket_store_mutation` (or the same-hold `undo_own_operations`, or \
+         `bracket_store_mutation` (or \
          `admit_store_import` paired with `bracket_admitted_store_mutation`), never just a \
          branch permit; a named writer needs its branch's permit or the bracket. Admit it; or, only \
          while its owner is wiring it, name it in OWED with that owner; or, if a named writer's \

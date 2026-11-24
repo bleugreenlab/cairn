@@ -955,7 +955,7 @@ pub async fn resolve(
                         "UPDATE issues
                          SET merged_at = ?1, completed_at = ?2, progress = 'merged',
                              attention = 'none', status = 'merged', updated_at = ?3
-                         WHERE id = ?4",
+                         WHERE id = ?4 AND status IS NOT 'merged'",
                         params![now, now, now, id.as_str()],
                     )
                     .await?;
@@ -965,7 +965,7 @@ pub async fn resolve(
                         "UPDATE issues
                          SET closed_at = ?1, completed_at = ?2, progress = 'closed',
                              attention = 'none', status = 'closed', updated_at = ?3
-                         WHERE id = ?4",
+                         WHERE id = ?4 AND status IS NOT 'closed'",
                         params![now, now, now, id.as_str()],
                     )
                     .await?;
@@ -1047,7 +1047,44 @@ pub async fn resolve(
     .map_err(CairnError::from)
 }
 
+/// Orders an issue's terminal cascade against explicit reopen. This is not a
+/// database transaction or a store lock: process stops may await while it is held.
+pub(crate) struct IssueResolutionGuard {
+    _hold: tokio::sync::OwnedMutexGuard<()>,
+    key: (std::path::PathBuf, String),
+}
+
+impl IssueResolutionGuard {
+    pub(crate) fn covers(&self, db: &LocalDb, id: &str) -> bool {
+        self.key.0 == db.path() && self.key.1 == id
+    }
+}
+
+pub(crate) async fn lock_resolution(db: &LocalDb, id: &str) -> IssueResolutionGuard {
+    type Key = (std::path::PathBuf, String);
+    type Locks = std::collections::HashMap<Key, std::sync::Weak<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<Locks>> = std::sync::OnceLock::new();
+    let key = (db.path().to_path_buf(), id.to_string());
+    let mutex = {
+        let mut locks = LOCKS.get_or_init(Default::default).lock().unwrap();
+        locks.retain(|_, mutex| mutex.strong_count() > 0);
+        match locks.get(&key).and_then(std::sync::Weak::upgrade) {
+            Some(mutex) => mutex,
+            None => {
+                let mutex = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key.clone(), Arc::downgrade(&mutex));
+                mutex
+            }
+        }
+    };
+    IssueResolutionGuard {
+        _hold: mutex.lock_owned().await,
+        key,
+    }
+}
+
 pub async fn unresolve(db: &LocalDb, clock: &dyn Clock, id: &str) -> Result<(), CairnError> {
+    let _resolution = lock_resolution(db, id).await;
     let id = id.to_string();
     let now = clock.now();
     db.write(|conn| {
@@ -1208,6 +1245,63 @@ mod tests {
         Address, AppearanceEvidence, AppearanceTransport, VerificationMethod, VerificationRecord,
         VerificationStatus, VerificationStrength,
     };
+
+    #[tokio::test]
+    async fn repeated_resolution_preserves_its_timestamp_and_evidence() {
+        let db = crate::storage::migrated_test_db("resolution-retry.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','p','',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+               VALUES('i','p',1,'I','active',1,1);",
+        )
+        .await
+        .unwrap();
+        let mut clock = crate::services::testing::MockClock::new();
+        clock.expect_now().times(1).return_const(100_i64);
+        assert!(
+            resolve(&db, &clock, "i", Resolution::Merged, "device")
+                .await
+                .unwrap()
+                .became_terminal
+        );
+        let before = db
+            .query_one(
+                "SELECT merged_at,completed_at,updated_at FROM issues WHERE id='i'",
+                (),
+                |row| Ok((row.i64(0)?, row.i64(1)?, row.i64(2)?)),
+            )
+            .await
+            .unwrap();
+        let mut later = crate::services::testing::MockClock::new();
+        later.expect_now().times(1).return_const(200_i64);
+        assert!(
+            !resolve(&db, &later, "i", Resolution::Merged, "device")
+                .await
+                .unwrap()
+                .became_terminal
+        );
+        let after = db
+            .query_one(
+                "SELECT merged_at,completed_at,updated_at FROM issues WHERE id='i'",
+                (),
+                |row| Ok((row.i64(0)?, row.i64(1)?, row.i64(2)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before, (100, 100, 100));
+        assert_eq!(after, before);
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM tenet_evidence_events WHERE source_uri='cairn://p/p/1'",
+                (),
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+    }
 
     fn authorship(author: PrincipalRef) -> IssueAuthorship {
         let verification = VerificationRecord::new(

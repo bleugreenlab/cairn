@@ -18,6 +18,9 @@ pub(crate) fn apply_claude_turn_completion(
     outcome: ClaudeTurnOutcome,
     context: ClaudeTurnContext,
 ) {
+    if context.terminal_tool_completed && super::super::finish_resolution_response(orch, run_id) {
+        return;
+    }
     // A committed terminal tool is authoritative even when its cleanup Result
     // reports an error. This precedes the delayed-ack path, matching the reader.
     if !context.terminal_tool_completed {
@@ -58,6 +61,9 @@ pub(crate) fn apply_claude_artifact_handoff(
     emitter: &Arc<dyn EventEmitter>,
     run_id: &str,
 ) {
+    if super::super::finish_resolution_response(orch, run_id) {
+        return;
+    }
     warm_and_emit(orch, emitter, run_id, Some(TurnEndReason::ArtifactHandoff));
 }
 

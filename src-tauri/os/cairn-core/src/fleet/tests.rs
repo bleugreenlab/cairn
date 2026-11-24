@@ -15086,13 +15086,10 @@ fn a_job_stop_records_its_cause_for_a_dispatched_request() {
         Some("job"),
     );
 
-    assert_eq!(
-        pool.cancel_job_requests("job", CancelCause::SessionClosed),
-        1
-    );
+    assert_eq!(pool.cancel_job_requests("job", CancelCause::IssueMerged), 1);
     assert_eq!(
         pool.cancel_causes.lock().unwrap().take(&request),
-        Some(CancelCause::SessionClosed)
+        Some(CancelCause::IssueMerged)
     );
 }
 
@@ -20314,4 +20311,86 @@ async fn residency_stop_refusal(orch: &Orchestrator, cell: &PersistentCellState)
         } => diagnostic,
         other => panic!("an unroutable operation is refused Unavailable: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn resolved_environment_retries_after_response_guard_and_resident_exit() {
+    use crate::execution::teardown::{
+        reconcile_resolved_resources, release_settled_job_environments,
+    };
+    use crate::issues::status::SettlementOutcome;
+    use cairn_common::executor_protocol::{
+        ResidentProcess, ResidentProcessKind, ResidentProcessStatus,
+    };
+    residency_queue_scenario(async {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        orch.db.local.execute_script(
+            "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','default','P','p','',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,completed_at,created_at,updated_at)
+               VALUES('i','p',1,'I','merged',10,1,10);
+             INSERT INTO jobs(id,project_id,issue_id,status,created_at,updated_at)
+               VALUES('job','p','i','complete',1,1);
+             INSERT INTO runs(id,project_id,job_id,status,created_at,updated_at)
+               VALUES('response','p','job','exited',1,1);"
+        ).await.unwrap();
+        let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
+        let mut cell = residency_grant_on_remote(&orch, &mut remote, generation, "job").await;
+        let holder = cell.residency.as_ref().unwrap().holder.clone();
+        orch.resolution_responses.lock().unwrap().insert("response".into(), Some(crate::transitions::Resolution::Merged));
+        let pending = release_settled_job_environments(&orch, &orch.db.local, &["job".into()], "cairn://").await;
+        assert_eq!(pending[0].outcome, SettlementOutcome::CleanupPending);
+        assert!(pending[0].diagnostic.as_deref().unwrap().contains("response transport"));
+        orch.resolution_responses.lock().unwrap().remove("response");
+        cell.occupancy.processes.insert("terminal:watch".into(), ResidentProcess {
+            generation: 1,
+            kind: ResidentProcessKind::Terminal { slug: "watch".into() },
+            spec: None,
+            recorded_descendants: Vec::new(),
+            status: ResidentProcessStatus::Starting,
+            reservation: None,
+            live_usage: None,
+            charge: None,
+        });
+        let report = |cell: PersistentCellState| {
+            orch.fleet.handle_executor_message("remote", generation, ExecutorMessage::SnapshotUpdated {
+                snapshot: FleetSnapshot { cells: vec![cell], ..Default::default() },
+                health: ExecutorSubstrateReport::default(),
+            });
+        };
+        report(cell.clone());
+        let pending = release_settled_job_environments(&orch, &orch.db.local, &["job".into()], "cairn://").await;
+        assert_eq!(pending[0].outcome, SettlementOutcome::CleanupPending);
+        assert!(pending[0].diagnostic.as_deref().unwrap().contains("resident processes"));
+        cell.occupancy.processes.get_mut("terminal:watch").unwrap().status = ResidentProcessStatus::Exited {
+            finished_at_unix_ms: 20, exit_code: Some(0), restartable: false, executor_lost: false,
+        };
+        assert!(!cell.occupancy.is_empty());
+        assert!(cell.occupancy.is_quiet());
+        report(cell.clone());
+        // No live run, terminal row, batch or response guard remains. Only the
+        // fleet's Job residency can rediscover this resolved owner.
+        let ((), ()) = tokio::join!(
+            reconcile_resolved_resources(&orch),
+            async {
+                let correlation_id = match residency_queue_frame(&mut remote).await {
+                    ExecutorMessage::ResidencyRequest {
+                        correlation_id,
+                        operation: ResidencyOperation::Release { fence },
+                        ..
+                    } => {
+                        assert_eq!(fence, residency_fence_of(&cell));
+                        correlation_id
+                    }
+                    other => panic!("expected deferred release, got {other:?}"),
+                };
+                orch.fleet.handle_executor_message("remote", generation, ExecutorMessage::ResidencyResponse {
+                    correlation_id,
+                    result: ResidencyResult::Released { holder: holder.clone(), cell_epoch: cell.cell_epoch },
+                });
+            }
+        );
+        assert!(orch.fleet.residency_fence(&holder).is_none());
+    }).await;
 }

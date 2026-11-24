@@ -9,6 +9,7 @@
 mod attribution;
 mod backfill;
 mod cost;
+pub mod drain_inputs;
 mod economics;
 mod roles;
 mod spend;

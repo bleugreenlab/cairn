@@ -122,7 +122,9 @@ impl<A: WireAdapter> TurnEffects for CairnEffects<'_, A> {
             meta.model,
             meta.total_cost,
             &self.backend_key,
-        )
+        )?;
+        crate::orchestrator::lifecycle::finish_resolution_response(self.orch, &self.config.run_id);
+        Ok(())
     }
 
     fn skipped_tool_result(&mut self, call_id: &str) -> Result<(), String> {

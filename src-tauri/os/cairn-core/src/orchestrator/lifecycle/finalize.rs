@@ -218,6 +218,14 @@ fn finish_warm_transition(orch: &Orchestrator, run_id: &str) -> bool {
 /// The handle is the only in-memory carrier for its generation-fenced provider
 /// claim, so release must always precede removal.
 pub(crate) fn release_and_stop_process(orch: &Orchestrator, run_id: &str) -> bool {
+    if orch
+        .resolution_responses
+        .lock()
+        .unwrap()
+        .contains_key(run_id)
+    {
+        return false;
+    }
     // Do not remove the handle carrying the only retryable copy of a claim
     // until its terminal obligation is durably recorded. A later teardown
     // callback can retry after a transient database/journal failure.
@@ -225,23 +233,6 @@ pub(crate) fn release_and_stop_process(orch: &Orchestrator, run_id: &str) -> boo
         return false;
     }
     orch.process_state.stop_and_remove(run_id)
-}
-
-/// Stop processes retained by closed sessions, releasing admission before removal.
-/// This only releases and stops the provider; callers own run exit bookkeeping.
-pub(crate) fn stop_processes_for_sessions(orch: &Orchestrator, session_ids: &[String]) {
-    for session_id in session_ids {
-        let Some(run_id) = orch.process_state.find_process_by_session(session_id) else {
-            continue;
-        };
-        if release_and_stop_process(orch, &run_id) {
-            log::info!("Stopped process {run_id} for closed session {session_id}");
-        } else {
-            log::warn!(
-                "Could not stop process {run_id} for closed session {session_id}; the lifetime sweep will retry"
-            );
-        }
-    }
 }
 
 pub(crate) fn release_process_admission(orch: &Orchestrator, run_id: &str) -> bool {
@@ -1255,6 +1246,7 @@ fn finalize_run_inner(
     claim: Option<TerminalCompletionClaim<'_>>,
     locked_job_id: Option<&str>,
 ) -> Result<(), String> {
+    orch.resolution_responses.lock().unwrap().remove(run_id);
     let claimed = claim.is_some();
     let mut first_error = None;
     // A finalized run's agent must not keep acting through the HTTP MCP

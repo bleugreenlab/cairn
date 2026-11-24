@@ -50,7 +50,7 @@ pub(crate) use finalize::{
     current_session_closed, finalize_owned_completion, finalize_run_for_operator_compact,
     finalize_run_for_recovery, interrupt_run_for_provider_depletion, memory_review_turn_ended,
     record_run_cause_if_active, record_run_failure_if_active, release_and_stop_process,
-    release_owned_completion, stop_processes_for_sessions, transition_owned_completion_to_warm,
+    release_owned_completion, transition_owned_completion_to_warm,
     LAUNCH_ATTACH_FAILED_EXIT_REASON,
 };
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state, warm_provider_held_run};
@@ -67,6 +67,7 @@ pub use review_push::{
     create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_bounded_failed_review,
     rearm_review_checks_on_startup,
 };
+pub(crate) use stop::finish_resolution_response;
 #[cfg(test)]
 pub(crate) use stop::park_owned_turn;
 pub(crate) use stop::suspend_owned_run_after_handoff_then;
@@ -76,11 +77,12 @@ pub(crate) use stop::{
     WATCHDOG_ARM_FAILED_EXIT_REASON,
 };
 pub use stop::{
-    interrupt_turn_for_message, kill_session, kill_session_with_reason, live_run_id_for_job,
-    operator_stop_job, operator_stop_run, stop_active_turn_for_run, stop_agents_for_host_shutdown,
-    stop_call, stop_job, stop_session, stop_workflow, suspend_run_for_durable_wait,
-    suspend_run_for_durable_wait_after_handoff, HostShutdownStops, ParkSlots, TerminalPolicy,
-    RUNNER_SHUTDOWN_EXIT_REASON, SUSPEND_HANDOFF_GRACE,
+    finish_resolution_run, interrupt_turn_for_message, kill_session, kill_session_with_reason,
+    live_run_id_for_job, operator_stop_job, operator_stop_run, resolution_exit_reason,
+    stop_active_turn_for_run, stop_agents_for_host_shutdown, stop_call, stop_job,
+    stop_job_for_resolution, stop_job_for_resolution_preserving_run, stop_session, stop_workflow,
+    suspend_run_for_durable_wait, suspend_run_for_durable_wait_after_handoff, HostShutdownStops,
+    ParkSlots, TerminalPolicy, RUNNER_SHUTDOWN_EXIT_REASON, SUSPEND_HANDOFF_GRACE,
 };
 #[cfg(test)]
 pub(crate) use unanswered_calls::{

@@ -59,7 +59,7 @@ pub(crate) async fn create_resolved_push_async(
     event: &AttentionEvent,
 ) -> Result<usize, String> {
     let final_status = match &event.fact {
-        AttentionFact::Resolved { final_status } => final_status.clone(),
+        AttentionFact::Resolved { final_status, .. } => final_status.clone(),
         _ => return Ok(0),
     };
     let db = runtime.host.database_for_issue(&event.issue_id).await?;
@@ -422,6 +422,7 @@ pub async fn rearm_failed_resolutions(
             route_provenance: None,
             fact: AttentionFact::Resolved {
                 final_status: crate::models::IssueStatus::Failed,
+                settlement: None,
             },
         };
         match create_resolved_push_async(runtime, &event).await {
