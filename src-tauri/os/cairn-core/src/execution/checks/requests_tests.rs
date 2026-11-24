@@ -1425,7 +1425,7 @@ async fn resolution_reports_pending_until_the_request_driver_closes_its_lane() {
 
     let (_root, orch) = row_fixture().await;
     let id = insert_request(&orch, "running", "request_id='resolution-lane'").await;
-    let driver = tokio::spawn(std::future::pending::<()>());
+    let driver = cairn_common::task::spawn(std::future::pending::<()>());
     DRIVERS
         .lock()
         .unwrap()

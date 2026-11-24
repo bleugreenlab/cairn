@@ -2665,7 +2665,7 @@ mod tests {
                 .unwrap();
             let (published, publication) = tokio::sync::oneshot::channel();
             let resolver = orch.clone();
-            let settling = tokio::spawn(async move {
+            let settling = cairn_common::task::spawn(async move {
                 publication.await.unwrap();
                 resolve_pinned_landing(
                     &resolver,

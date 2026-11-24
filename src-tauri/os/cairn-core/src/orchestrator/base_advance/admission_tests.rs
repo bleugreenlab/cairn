@@ -799,17 +799,22 @@ fn run_batch_branch_fences_share_one_capability_predicate() {
             "durable_suspend::run_batch_holds_branch(",
         ),
         ("orchestrator/base_advance.rs", "condition.holds_branch()"),
+        // Ordinary admission delegates to the same landing-aware reader.
+        (
+            "orchestrator/base_advance.rs",
+            "inflight_run_batch_for_landing(db, project_id, branch, prefer_job, exempt, None).await",
+        ),
         (
             "orchestrator/base_advance.rs",
             "durable_suspend::run_batch_holds_branch(",
         ),
         (
             "orchestrator/store_lock.rs",
-            "base_advance::inflight_run_batch_except(",
+            "base_advance::inflight_run_batch_for_landing(",
         ),
         (
             "orchestrator/base_advance/preparation.rs",
-            "super::inflight_run_batch_except(",
+            "super::inflight_run_batch_for_landing(",
         ),
         (
             "orchestrator/base_advance/replay_requests.rs",

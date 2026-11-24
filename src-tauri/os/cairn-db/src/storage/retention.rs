@@ -202,6 +202,8 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("issues", SKELETON),
     keep("jobs", SKELETON),
     keep("runs", SKELETON),
+    // Inline and refused batches have no other durable lifecycle record.
+    keep("run_batch_requests", SKELETON),
     keep("sessions", SKELETON),
     keep("turns", SKELETON),
     keep("threads", SKELETON),
