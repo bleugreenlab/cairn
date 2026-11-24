@@ -62,8 +62,8 @@ fn runtime_assets(spec: &LaunchSpec) -> Result<Vec<ResidentRuntimeAsset>, String
             data: data.clone(),
         })
         .collect();
-    crate::runtime::collect_package_assets(
-        &crate::runtime::runtime_package("sdk")?,
+    crate::runtime::collect_runtime_package(
+        "sdk",
         Path::new("service/node_modules/@cairn/sdk"),
         &mut assets,
     )?;

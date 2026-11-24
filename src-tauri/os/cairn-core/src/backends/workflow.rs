@@ -413,13 +413,13 @@ pub(crate) fn workflow_runtime_env(
 fn workflow_runtime_assets(package: &Path) -> Result<Vec<ResidentRuntimeAsset>, String> {
     let mut assets = Vec::new();
     crate::runtime::collect_package_assets(package, Path::new("workflow"), &mut assets)?;
-    crate::runtime::collect_package_assets(
-        &crate::runtime::runtime_package("harness")?,
+    crate::runtime::collect_runtime_package(
+        "harness",
         Path::new("workflow/node_modules/@cairn/harness"),
         &mut assets,
     )?;
-    crate::runtime::collect_package_assets(
-        &crate::runtime::runtime_package("sdk")?,
+    crate::runtime::collect_runtime_package(
+        "sdk",
         Path::new("workflow/node_modules/@cairn/sdk"),
         &mut assets,
     )?;

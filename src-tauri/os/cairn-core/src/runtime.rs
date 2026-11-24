@@ -125,19 +125,110 @@ fn checkout_page_render_bundle(repo: &Path) -> Result<PathBuf, String> {
     Ok(out)
 }
 
-/// Read every file of `source` into runtime assets addressed under `destination`.
+/// Which files of a Cairn-owned runtime package run, shared with release
+/// staging (`scripts/stage-workflow-runtime.ts`) so a development build ships
+/// exactly the files a release does.
+const RUNTIME_FILES: &str = include_str!("../../../../packages/runtime-files.json");
+
+struct RuntimeFileRule {
+    include: globset::GlobSet,
+    exclude: globset::GlobSet,
+}
+
+impl RuntimeFileRule {
+    fn selects(&self, relative: &str) -> bool {
+        self.include.is_match(relative) && !self.exclude.is_match(relative)
+    }
+}
+
+fn runtime_file_rule() -> Result<&'static RuntimeFileRule, String> {
+    static RULE: std::sync::OnceLock<Result<RuntimeFileRule, String>> = std::sync::OnceLock::new();
+    RULE.get_or_init(|| parse_runtime_file_rule(RUNTIME_FILES))
+        .as_ref()
+        .map_err(|error| format!("packages/runtime-files.json: {error}"))
+}
+
+fn parse_runtime_file_rule(text: &str) -> Result<RuntimeFileRule, String> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        include: Vec<String>,
+        exclude: Vec<String>,
+    }
+    let raw: Raw = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    // `*` stays inside one path segment, as it does for `Bun.Glob` in the
+    // staging script; the cross-check test holds the two engines to one set.
+    let set = |patterns: &[String]| {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in patterns {
+            let glob = globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|e| format!("{pattern}: {e}"))?;
+            builder.add(glob);
+        }
+        builder.build().map_err(|e| e.to_string())
+    };
+    Ok(RuntimeFileRule {
+        include: set(&raw.include)?,
+        exclude: set(&raw.exclude)?,
+    })
+}
+
+/// Read every file of `source` into runtime assets addressed under
+/// `destination`. For a package someone else authored (a workflow's own
+/// package), shipped as written; a Cairn-owned runtime package goes through
+/// [`collect_runtime_package`] instead.
 pub fn collect_package_assets(
     source: &Path,
     destination: &Path,
     out: &mut Vec<ResidentRuntimeAsset>,
 ) -> Result<(), String> {
+    collect_selected(source, destination, "", &|_| true, out)
+}
+
+/// Resolve the Cairn-owned runtime package `name` (see [`runtime_package`]) and
+/// read the files `packages/runtime-files.json` selects into runtime assets
+/// addressed under `destination`.
+///
+/// The rule applies whichever tree resolved: a development checkout carries
+/// tests, READMEs and tsconfig that must not travel, and a provisioned release
+/// runtime is already the rule's output, so it selects every file there.
+pub fn collect_runtime_package(
+    name: &str,
+    destination: &Path,
+    out: &mut Vec<ResidentRuntimeAsset>,
+) -> Result<(), String> {
+    let rule = runtime_file_rule()?;
+    let source = runtime_package(name)?;
+    collect_selected(
+        &source,
+        destination,
+        "",
+        &|relative| rule.selects(relative),
+        out,
+    )
+}
+
+fn collect_selected(
+    source: &Path,
+    destination: &Path,
+    relative: &str,
+    keep: &dyn Fn(&str) -> bool,
+    out: &mut Vec<ResidentRuntimeAsset>,
+) -> Result<(), String> {
     for entry in std::fs::read_dir(source).map_err(|e| format!("read {}: {e}", source.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let entry_relative = if relative.is_empty() {
+            name
+        } else {
+            format!("{relative}/{name}")
+        };
         let target = destination.join(entry.file_name());
         let ty = entry.file_type().map_err(|e| e.to_string())?;
         if ty.is_dir() {
-            collect_package_assets(&entry.path(), &target, out)?;
-        } else if ty.is_file() {
+            collect_selected(&entry.path(), &target, &entry_relative, keep, out)?;
+        } else if ty.is_file() && keep(&entry_relative) {
             out.push(ResidentRuntimeAsset {
                 path: target.to_string_lossy().replace('\\', "/"),
                 data: std::fs::read(entry.path()).map_err(|e| e.to_string())?,
@@ -151,11 +242,7 @@ pub fn collect_package_assets(
 /// to travel to whichever machine runs the batch.
 pub fn sdk_packages() -> Result<Vec<ResidentRuntimeAsset>, String> {
     let mut assets = Vec::new();
-    collect_package_assets(
-        &runtime_package("sdk")?,
-        Path::new(SCOPE).join("sdk").as_path(),
-        &mut assets,
-    )?;
+    collect_runtime_package("sdk", Path::new(SCOPE).join("sdk").as_path(), &mut assets)?;
     cairn_common::runtime::validate_runtime_assets(&assets)?;
     Ok(assets)
 }
@@ -214,6 +301,71 @@ mod tests {
                 .any(|asset| asset.path == "@cairn/sdk/src/client.ts"),
             "the shipped assets must be the checkout's SDK source"
         );
+    }
+
+    /// A development build ships each Cairn runtime package from its checkout,
+    /// which also holds tests, a README and a tsconfig. Those never run, so they
+    /// must not travel, and the files that do travel must be exactly the ones
+    /// release staging copies for the same checkout: otherwise a debug launch
+    /// pays bytes a release does not and exercises a different asset set.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_development_build_ships_the_runtime_files_release_stages() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let staged = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(crate::env::resolve_sidecar("bun"))
+            .arg(repo.join("scripts/stage-workflow-runtime.ts"))
+            .arg("--out")
+            .arg(staged.path())
+            .current_dir(&repo)
+            .output()
+            .expect("bun runs the staging script");
+        assert!(
+            output.status.success(),
+            "staging failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        for name in ["sdk", "harness"] {
+            let mut assets = Vec::new();
+            collect_runtime_package(name, Path::new(name), &mut assets).unwrap();
+            let mut shipped: Vec<String> = assets
+                .iter()
+                .map(|a| a.path.strip_prefix(&format!("{name}/")).unwrap().to_owned())
+                .collect();
+            shipped.sort();
+            for path in &shipped {
+                let file = path.rsplit('/').next().unwrap();
+                assert!(
+                    !file.ends_with(".test.ts")
+                        && !file.eq_ignore_ascii_case("README.md")
+                        && !file.starts_with("tsconfig"),
+                    "@cairn/{name} ships {path}, which never runs"
+                );
+            }
+            assert!(shipped.iter().any(|p| p == "package.json"));
+
+            let mut released = Vec::new();
+            collect_package_assets(&staged.path().join(name), Path::new(""), &mut released)
+                .unwrap();
+            let mut released: Vec<String> = released.into_iter().map(|a| a.path).collect();
+            released.sort();
+            assert_eq!(
+                shipped, released,
+                "@cairn/{name}: dev and release file sets differ"
+            );
+        }
+    }
+
+    #[test]
+    fn the_runtime_file_rule_keeps_source_and_drops_tests_and_docs() {
+        let rule = runtime_file_rule().unwrap();
+        assert!(rule.selects("package.json"));
+        assert!(rule.selects("src/client.ts"));
+        assert!(!rule.selects("src/client.test.ts"));
+        assert!(!rule.selects("README.md"));
+        assert!(!rule.selects("tsconfig.json"));
+        assert!(!rule.selects("src/nested/deep.ts"));
     }
 
     /// A directory without a `package.json` is not a package. Accepting one would
