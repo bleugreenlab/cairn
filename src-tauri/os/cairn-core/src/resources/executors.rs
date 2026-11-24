@@ -2317,6 +2317,20 @@ pub(crate) fn render_executor_with_kills(
             .unwrap_or_default()
     ));
 
+    match &health.command_processes.decisions {
+        None => out.push_str("- Process decisions: unmeasured\n"),
+        Some(decisions) => {
+            out.push_str("- Process decisions: executor process-lifetime totals; omitted rules are unmeasured\n\n");
+            out.push_str("| Rule | Certified | Unknown | Held |\n|---|---:|---:|---:|\n");
+            for (rule, counts) in decisions {
+                out.push_str(&format!(
+                    "| {rule:?} | {} | {} | {} |\n",
+                    counts.certified, counts.unknown, counts.held
+                ));
+            }
+            out.push('\n');
+        }
+    }
     out.push_str(&render_orphan_census(
         health.command_processes.orphan_census.as_ref(),
     ));
@@ -15180,6 +15194,18 @@ mod tests {
         use cairn_common::executor_protocol::{CellOrphanCensusReport, CellOrphanProcess};
         let mut executor = inspection("local", true);
         assert!(render_executor(&executor).contains("Cell orphan census: not yet measured"));
+        assert!(render_executor(&executor).contains("Process decisions: unmeasured"));
+        executor.health.command_processes.decisions = Some(std::collections::BTreeMap::from([(
+            cairn_common::executor_protocol::ProcessDecisionRule::TreeSurvivor,
+            cairn_common::executor_protocol::ProcessDecisionCounts {
+                certified: 2,
+                unknown: 3,
+                held: 4,
+            },
+        )]));
+        let decisions = render_executor(&executor);
+        assert!(decisions.contains("| TreeSurvivor | 2 | 3 | 4 |"));
+        assert!(decisions.contains("omitted rules are unmeasured"));
         let mut report = CellOrphanCensusReport::bounded(1234, 2, Vec::new());
         executor.health.command_processes.orphan_census = Some(report.clone());
         let empty = render_executor(&executor);

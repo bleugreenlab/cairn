@@ -806,41 +806,25 @@ pub(super) async fn read_node_batches(
     match request_id {
         Some(request_id) => match detached::load(db, request_id).await {
             Ok(Some(batch)) if batch.job_id == job_id => {
-                if let Some(wait) = in_flight.iter().find(|wait| {
-                    wait.request_id == request_id && wait.state == "resolving" && wait.resolution.is_some()
-                }) {
-                    return render_in_flight(orch, &home, wait, now_ms);
-                }
-                let mut out = detached::render(&batch, &detached::live_state(orch, &batch));
-                if matches!(
+                let cancellable = matches!(
                     batch.state,
                     detached::DetachedState::Parked | detached::DetachedState::Running
-                ) {
-                    if let Some(progress) = detached::live_progress(orch, request_id) {
-                        out.push_str(&format!("Progress: {}.\n", progress.describe(now_ms)));
-                    }
-                    out.push_str(&cancel_line(&home, request_id));
-                }
-                out
+                ) && !in_flight.iter().any(|wait| {
+                    wait.request_id == request_id && wait.state == "resolving"
+                });
+                render_batch(orch, project_key, &home, request_id, cancellable).await
             }
             Ok(None) if in_flight.iter().any(|wait| wait.request_id == request_id) => {
-                let wait = in_flight
-                    .iter()
-                    .find(|wait| wait.request_id == request_id)
-                    .expect("checked above");
-                render_in_flight(orch, &home, wait, now_ms)
+                let cancellable = in_flight.iter().any(|wait| {
+                    wait.request_id == request_id && wait.state == "pending"
+                });
+                render_batch(orch, project_key, &home, request_id, cancellable).await
             }
             Ok(None)
                 if detached::live_owner(request_id)
                     .is_some_and(|owner| owner.job_id == job_id) =>
             {
-                let progress = detached::live_progress(orch, request_id)
-                    .map(|progress| format!("Progress: {}.\n", progress.describe(now_ms)))
-                    .unwrap_or_default();
-                format!(
-                    "# Run batch `{request_id}`\n\nState: running; its call is still waiting on it inline.\n{progress}{}",
-                    cancel_line(&home, request_id)
-                )
+                render_batch(orch, project_key, &home, request_id, true).await
             }
             Ok(Some(batch)) => {
                 match crate::jobs::queries::home_uri_for_job(db, &batch.job_id).await {
@@ -897,16 +881,13 @@ pub(super) async fn read_node_batches(
 struct OpenBatchWait {
     request_id: String,
     label: Option<String>,
-    created_at: i64,
     state: String,
-    late_cancel: Option<String>,
-    resolution: Option<String>,
 }
 
 /// The job's run batches whose calls are suspended on them, newest first.
 async fn open_batch_waits(db: &LocalDb, job_id: &str) -> Result<Vec<OpenBatchWait>, String> {
     db.query_all(
-        "SELECT json_extract(condition_json, '$.request_id'), json_extract(condition_json, '$.label'), created_at, state, json_extract(condition_json, '$.settlement.late_cancel'), resolution_json
+        "SELECT json_extract(condition_json, '$.request_id'), json_extract(condition_json, '$.label'), state
            FROM agent_waits
           WHERE job_id = ?1 AND state IN ('pending', 'resolving')
             AND json_extract(condition_json, '$.kind') = 'run_batch'
@@ -916,10 +897,7 @@ async fn open_batch_waits(db: &LocalDb, job_id: &str) -> Result<Vec<OpenBatchWai
             Ok(OpenBatchWait {
                 request_id: row.text(0)?,
                 label: row.opt_text(1)?,
-                created_at: row.get::<i64>(2)?,
-                state: row.text(3)?,
-                late_cancel: row.opt_text(4)?,
-                resolution: row.opt_text(5)?,
+                state: row.text(2)?,
             })
         },
     )
@@ -927,53 +905,26 @@ async fn open_batch_waits(db: &LocalDb, job_id: &str) -> Result<Vec<OpenBatchWai
     .map_err(|error| error.to_string())
 }
 
-fn cancel_line(home: &str, request_id: &str) -> String {
+pub(super) fn cancel_line(home: &str, request_id: &str) -> String {
     format!(
         "\nCancel this batch only: `write({{changes:[{{target:\"{home}/batches/{request_id}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`. A call waiting on it resumes with a cancelled result, and it releases its branch; a commit it is already writing stands. One that no runner task or machine holds (an earlier runner placed it) is settled as lost, with its outcome unknown.\n"
     )
 }
 
-/// The page of a batch whose call is suspended on it.
-fn render_in_flight(
+/// Ownership and mutation affordances belong to the node handle; lifecycle
+/// facts are rendered identically to the project-scoped request resource.
+async fn render_batch(
     orch: &crate::orchestrator::Orchestrator,
+    project: &str,
     home: &str,
-    wait: &OpenBatchWait,
-    now_ms: i64,
+    request_id: &str,
+    cancellable: bool,
 ) -> String {
-    use crate::mcp::handlers::run::detached;
-    let since = crate::clock::stamp_millis(wait.created_at)
-        .map(|stamp| format!(" since {stamp}"))
-        .unwrap_or_default();
-    let state = if wait.state == "resolving" {
-        "settled; its result is being delivered to its call".to_string()
-    } else {
-        format!("in flight, its call suspended on it{since}")
-    };
-    if wait.state == "resolving" {
-        return format!(
-            "# Run batch `{}`\n\nLabel: {}\nState: {state}\n\n{}\n",
-            wait.request_id,
-            wait.label.as_deref().unwrap_or("unnamed"),
-            wait.resolution
-                .as_deref()
-                .unwrap_or("Its result is being delivered.")
-        );
+    let mut out = super::request_lifecycle::read_request(orch, project, request_id, false).await;
+    if cancellable {
+        out.push_str(&cancel_line(home, request_id));
     }
-    let progress = match detached::live_progress(orch, &wait.request_id) {
-        Some(progress) => format!("Progress: {}.\n", progress.describe(now_ms)),
-        None => "Progress: this runner holds no task for it; it settles from its machine's own report.\n".to_string(),
-    };
-    let cancel_note = wait
-        .late_cancel
-        .as_ref()
-        .map(|note| format!("Cancel: {note}.\n"))
-        .unwrap_or_default();
-    format!(
-        "# Run batch `{}`\n\nLabel: {}\nState: {state}\n{progress}{cancel_note}{}",
-        wait.request_id,
-        wait.label.as_deref().unwrap_or("unnamed"),
-        cancel_line(home, &wait.request_id)
-    )
+    out
 }
 
 /// Deliveries owed to this node's recipient that have waited past their bound:

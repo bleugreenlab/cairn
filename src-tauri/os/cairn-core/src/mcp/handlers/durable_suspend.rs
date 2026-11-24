@@ -5381,6 +5381,7 @@ mod tests {
                 .publishing_to_for_test("p", &fx.repository, fx.store(), "feature", &fx.base);
             let (text, verdict) = crate::mcp::handlers::run::settle_adopted_result(
                 &orch,
+                &fx.request.request_id,
                 &snapshot,
                 0,
                 completed(&orch, "snapshot verdict", None),
@@ -5396,6 +5397,7 @@ mod tests {
 
             let (cancelled, _) = crate::mcp::handlers::run::settle_adopted_result(
                 &orch,
+                &fx.request.request_id,
                 &snapshot,
                 0,
                 CellOutcome::Cancelled {
@@ -5413,6 +5415,7 @@ mod tests {
             let pinned = serde_json::from_value(pinned).unwrap();
             let (pinned_text, _) = crate::mcp::handlers::run::settle_adopted_result(
                 &orch,
+                &fx.request.request_id,
                 &pinned,
                 0,
                 completed(&orch, "pinned verdict", None),

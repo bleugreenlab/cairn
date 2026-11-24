@@ -77,7 +77,8 @@ pub(crate) enum CancelReport {
 impl CancelReport {
     /// The cancel's answer, for the principal that asked.
     pub(crate) fn sentence(&self, request_id: &str) -> String {
-        match self {
+        let lifecycle = crate::resources::request_lifecycle::relative_lifecycle_uri(request_id);
+        let sentence = match self {
             Self::Stopped { settled: true } => format!(
                 "Cancelled run batch `{request_id}`: it settled as cancelled and committed nothing, and its machine work has ended, so it no longer holds its branch. A call waiting on it resumes once with that result; a detached batch's result reaches its job as a notice."
             ),
@@ -102,7 +103,8 @@ impl CancelReport {
             Self::NotLive => format!(
                 "Nothing was cancelled: no task in this runner holds run batch `{request_id}`, no machine holds its request, and nothing durable waits on it."
             ),
-        }
+        };
+        format!("{sentence}\n\nLifecycle: `{lifecycle}`.")
     }
 
     /// Whether the cancel reached a batch at all.
@@ -381,7 +383,11 @@ async fn convert_wait(
 /// What a parked call waiting on a batch nothing held is told when the batch
 /// is cancelled.
 pub(crate) fn unheld_cancel_text(request_id: &str, by: &str, commits: bool) -> String {
-    detached::lost_text_for_wait(request_id, &detached::cancel_evidence(by), commits)
+    format!(
+        "{}\n\nLifecycle: `{}`.",
+        detached::lost_text_for_wait(request_id, &detached::cancel_evidence(by), commits),
+        crate::resources::request_lifecycle::relative_lifecycle_uri(request_id),
+    )
 }
 
 /// Whether a settled verdict is a cancellation's (or a stop before any
@@ -490,4 +496,38 @@ pub(crate) async fn settle_owned_batches(
         });
     }
     reports
+}
+
+#[cfg(test)]
+mod lifecycle_link_tests {
+    use super::*;
+
+    #[test]
+    fn every_cancel_answer_links_its_request_lifecycle() {
+        let reports = [
+            CancelReport::Stopped { settled: true },
+            CancelReport::Stopped { settled: false },
+            CancelReport::FinishedFirst {
+                verdict: "completed".into(),
+            },
+            CancelReport::AlreadySettling,
+            CancelReport::Retracted,
+            CancelReport::SettledUnheld,
+            CancelReport::Unread {
+                error: "unreadable".into(),
+            },
+            CancelReport::NotLive,
+        ];
+        for report in reports {
+            let text = report.sentence("cancel-link");
+            assert!(
+                text.contains("`cairn:@/requests/cancel-link`"),
+                "{report:?}: {text}"
+            );
+        }
+        for commits in [false, true] {
+            let text = unheld_cancel_text("unheld-link", "operator", commits);
+            assert!(text.contains("`cairn:@/requests/unheld-link`"), "{text}");
+        }
+    }
 }

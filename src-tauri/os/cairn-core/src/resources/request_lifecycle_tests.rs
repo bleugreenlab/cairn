@@ -148,6 +148,206 @@ async fn a_parked_then_placed_batch_renders_every_stage_with_its_time() {
     assert_eq!(json["execution"]["pid"], 4242);
     assert_eq!(json["ids"]["toolUseId"], "toolu_happy");
     assert_eq!(json["unplacedMs"], 1_800_100);
+
+    // Read both public surfaces from these same receipt/placement/execution rows.
+    db.execute_script(
+        "INSERT INTO threads (id, project_id, name, jurisdiction, created_at, updated_at)
+         VALUES ('thread', 'p', 'builder', 'test', 1, 1);
+         UPDATE jobs SET thread_id='thread', uri_segment='thread', node_name='thread' WHERE id='job';
+         INSERT INTO run_batch_detached (request_id, job_id, run_id, label, commits, holds_branch, state, reason, created_ms, output, commit_id)
+         VALUES ('472b219b-3852-4a74-867a-df41db86dfa2', 'job', 'run', 'cargo test', 1, 1, 'settled', 'call could not suspend', 1000000, 'batch output', 'abcdef1234567890');",
+    ).await.unwrap();
+    let db = std::sync::Arc::new(db);
+    let search = std::sync::Arc::new(
+        crate::storage::SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap(),
+    );
+    let orch = crate::orchestrator::OrchestratorBuilder::new(
+        std::sync::Arc::new(crate::db::DbState::new(db.clone(), search)),
+        std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+        tempfile::tempdir().unwrap().keep(),
+    )
+    .build();
+    for state in ["parked", "running", "settled", "lost"] {
+        db.execute(
+            "UPDATE run_batch_requests SET \"end\"=NULL, ended_ms=NULL WHERE request_id=?1",
+            (REQUEST,),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE run_batch_detached SET state=?1, waiting_on='waiting for room', lost_evidence='machine enrolment gone' WHERE request_id=?2",
+            (state, REQUEST),
+        ).await.unwrap();
+        let request_page = read_request(&orch, "prj", REQUEST, false).await;
+        let batch_page = super::super::node::read_node_batches(
+            &orch,
+            &db,
+            "prj",
+            0,
+            0,
+            "builder",
+            None,
+            Some(REQUEST),
+        )
+        .await;
+        let expected = if matches!(state, "parked" | "running") {
+            format!(
+                "{request_page}{}",
+                super::super::node::cancel_line("cairn://p/prj/builder", REQUEST)
+            )
+        } else {
+            request_page.clone()
+        };
+        assert_eq!(batch_page, expected, "{state}");
+        for stage in [
+            "## Call",
+            "## Batch",
+            "## Placement",
+            "## Execution",
+            "## End",
+            "## Delivery",
+        ] {
+            assert!(
+                batch_page.contains(stage),
+                "{state}: missing {stage}: {batch_page}"
+            );
+        }
+        if matches!(state, "parked" | "running") {
+            assert!(batch_page.contains("action:\"cancel\""), "{batch_page}");
+        }
+        if state == "settled" {
+            assert!(
+                batch_page.contains("## Output\n\nbatch output"),
+                "{batch_page}"
+            );
+            assert!(batch_page.contains("commit abcdef123456"), "{batch_page}");
+        }
+    }
+    db.execute_script(
+        "INSERT INTO threads (id, project_id, name, jurisdiction, created_at, updated_at)
+         VALUES ('other', 'p', 'other', 'test', 1, 1);
+         INSERT INTO jobs (id, project_id, thread_id, status, node_name, uri_segment, created_at, updated_at)
+         VALUES ('other-job', 'p', 'other', 'running', 'thread', 'thread', 1, 1);",
+    ).await.unwrap();
+    let redirect = super::super::node::read_node_batches(
+        &orch,
+        &db,
+        "prj",
+        0,
+        0,
+        "other",
+        None,
+        Some(REQUEST),
+    )
+    .await;
+    assert!(
+        redirect.contains("belongs to a different job"),
+        "{redirect}"
+    );
+    assert!(
+        redirect.contains(&format!("cairn://p/prj/builder/batches/{REQUEST}")),
+        "{redirect}"
+    );
+    assert!(!redirect.contains("batch output"), "{redirect}");
+
+    db.execute(
+        "UPDATE run_batch_detached SET state='running', output=NULL WHERE request_id=?1",
+        (REQUEST,),
+    )
+    .await
+    .unwrap();
+    {
+        let live = crate::mcp::handlers::run::detached::LiveBatch::claim_for_test(REQUEST);
+        live.begin_settling_for_test();
+        crate::mcp::handlers::run::detached::note_publishing(
+            REQUEST,
+            &crate::fleet::ObservedPublication {
+                attempt_id: "attempt-1".into(),
+                delta_bytes: Some(1_000_000),
+                since_ms: 2_900_000,
+            },
+        );
+        let request_page = read_request(&orch, "prj", REQUEST, false).await;
+        let batch_page = super::super::node::read_node_batches(
+            &orch,
+            &db,
+            "prj",
+            0,
+            0,
+            "builder",
+            None,
+            Some(REQUEST),
+        )
+        .await;
+        assert!(batch_page.starts_with(&request_page), "{batch_page}");
+        assert!(batch_page.contains("publishing"), "{batch_page}");
+        assert!(
+            batch_page.contains("branch releases when the result settles"),
+            "{batch_page}"
+        );
+    }
+    db.execute_script(format!(
+        r#"INSERT INTO agent_waits (id, job_id, run_id, session_id, predecessor_turn_id, tool_use_id, condition_json, state, resolution_json, created_at)
+           VALUES ('wait-delivery', 'job', 'run', 'sess', 'turn', 'toolu_happy', '{{"kind":"run_batch","request_id":"{REQUEST}","commits":true,"settlement":{{"late_cancel":"cancel arrived while publishing"}}}}', 'resolving', 'durable result', 1000);"#
+    )).await.unwrap();
+    let project_page = read_request(&orch, "prj", REQUEST, false).await;
+    let batch_page = super::super::node::read_node_batches(
+        &orch,
+        &db,
+        "prj",
+        0,
+        0,
+        "builder",
+        None,
+        Some(REQUEST),
+    )
+    .await;
+    assert_eq!(batch_page, project_page);
+    assert!(
+        batch_page.contains("result is being delivered"),
+        "{batch_page}"
+    );
+    assert!(batch_page.contains("durable result"), "{batch_page}");
+    assert!(!batch_page.contains("action:\"cancel\""), "{batch_page}");
+    for has_detached in [true, false] {
+        if !has_detached {
+            db.execute(
+                "DELETE FROM run_batch_detached WHERE request_id=?1",
+                (REQUEST,),
+            )
+            .await
+            .unwrap();
+        }
+        db.execute(
+            "UPDATE agent_waits SET state='pending', resolution_json=NULL WHERE id='wait-delivery'",
+            (),
+        )
+        .await
+        .unwrap();
+        let project_page = read_request(&orch, "prj", REQUEST, false).await;
+        let batch_page = super::super::node::read_node_batches(
+            &orch,
+            &db,
+            "prj",
+            0,
+            0,
+            "builder",
+            None,
+            Some(REQUEST),
+        )
+        .await;
+        assert_eq!(
+            batch_page,
+            format!(
+                "{project_page}{}",
+                super::super::node::cancel_line("cairn://p/prj/builder", REQUEST)
+            )
+        );
+        assert!(
+            batch_page.contains("Cancel: cancel arrived while publishing."),
+            "{batch_page}"
+        );
+    }
 }
 
 #[tokio::test]

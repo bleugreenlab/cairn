@@ -284,10 +284,15 @@ impl BatchWithoutResult {
 /// attempt of it was ever granted to a machine, and the dispatched account when
 /// one was.
 fn unexecuted_failure(
+    request_id: &str,
     detail: String,
     grant_without_result: Option<crate::fleet::GrantWithoutResult>,
     commits: bool,
 ) -> RunFailure {
+    let detail = format!(
+        "{detail}\n\nLifecycle: `{}`.",
+        crate::resources::request_lifecycle::relative_lifecycle_uri(request_id),
+    );
     match grant_without_result {
         Some(grant) => {
             log::warn!(
@@ -311,6 +316,7 @@ fn unexecuted_failure(
 /// that ends without a result goes through [`unexecuted_failure`] and with it
 /// the account of any attempt that was granted.
 fn failure_without_result(
+    request_id: &str,
     outcome: &CellOutcome,
     grant_without_result: Option<crate::fleet::GrantWithoutResult>,
     commits: bool,
@@ -324,6 +330,7 @@ fn failure_without_result(
         CellOutcome::Unavailable { reason, diagnostic } => {
             log::warn!("run batch ended without a result ({reason:?}): {diagnostic}");
             Some(unexecuted_failure(
+                request_id,
                 format!("{diagnostic}."),
                 grant_without_result,
                 commits,
@@ -341,7 +348,7 @@ fn failure_without_result(
             log::warn!("run batch failed on executor storage ({stage:?}/{kind:?}): {diagnostic}");
             let detail = format!("{diagnostic}.");
             Some(match grant_without_result {
-                Some(grant) => unexecuted_failure(detail, Some(grant), commits),
+                Some(grant) => unexecuted_failure(request_id, detail, Some(grant), commits),
                 None => RunFailure::Unaccounted(detail),
             })
         }
@@ -570,9 +577,10 @@ mod failure_contract_tests {
             diagnostic: "cache checkpoint callback: runner refused".into(),
         };
         for outcome in [storage_failure(), spawn] {
-            let text = failure_without_result(&outcome, Some(specimen_grant(None)), false, None)
-                .expect("an outcome without a result is a failure")
-                .text();
+            let text =
+                failure_without_result("r", &outcome, Some(specimen_grant(None)), false, None)
+                    .expect("an outcome without a result is a failure")
+                    .text();
             assert!(text.starts_with(RUN_OUTCOME_UNKNOWN), "{outcome:?}: {text}");
             assert!(!text.contains("No commands ran"), "{text}");
         }
@@ -583,7 +591,7 @@ mod failure_contract_tests {
     /// tell it otherwise.
     #[test]
     fn a_storage_failure_never_claims_nothing_ran() {
-        let text = failure_without_result(&storage_failure(), None, false, None)
+        let text = failure_without_result("r", &storage_failure(), None, false, None)
             .expect("a storage failure is a failure")
             .text();
         assert!(envelope_reports_run_failure(&text), "{text}");
@@ -595,11 +603,13 @@ mod failure_contract_tests {
     /// of the batch was granted to a machine that never answered for it.
     #[test]
     fn a_refusal_says_nothing_ran_only_when_no_machine_was_left_holding_the_batch() {
-        let refused = unexecuted_failure("no executor matches.".into(), None, false).text();
+        let refused = unexecuted_failure("r", "no executor matches.".into(), None, false).text();
         assert!(refused.starts_with(RUN_NOT_EXECUTED), "{refused}");
         assert!(refused.contains("No commands ran"), "{refused}");
+        assert!(refused.contains("`cairn:@/requests/r`"), "{refused}");
 
         let lost = unexecuted_failure(
+            "r",
             "executor did not return request r attempt a.".into(),
             Some(specimen_grant(None)),
             false,
@@ -607,6 +617,7 @@ mod failure_contract_tests {
         .text();
         assert!(lost.starts_with(RUN_OUTCOME_UNKNOWN), "{lost}");
         assert!(lost.contains("**bgsrv-ub**"), "{lost}");
+        assert!(lost.contains("`cairn:@/requests/r`"), "{lost}");
         assert!(!lost.contains("No commands ran"), "{lost}");
         assert!(envelope_reports_run_failure(&lost), "{lost}");
     }
@@ -5333,9 +5344,15 @@ pub(crate) mod slot_publication_tests {
             "second capture finished",
         )
         .await;
-        assert!(
-            !detached::render(&row, &detached::LiveState::InRunner).contains("Detached because:")
-        );
+        let page = crate::resources::request_lifecycle::read_request(
+            &orch,
+            "proj",
+            &row.request_id,
+            false,
+        )
+        .await;
+        assert!(page.contains("The call owns its inline answer."), "{page}");
+        assert!(!page.contains("Detached because:"), "{page}");
 
         let mut writer = request.clone();
         writer.tool = "write".into();
@@ -9057,13 +9074,15 @@ impl PlacementNotes {
 /// above-ceiling note after any claim. The failure itself, and whether it may
 /// say nothing ran, is [`failure_without_result`]'s to decide.
 fn settled_failure_text(
+    request_id: &str,
     outcome: &CellOutcome,
     grant_without_result: Option<crate::fleet::GrantWithoutResult>,
     commits: bool,
     ceiling: Option<String>,
     notes: &PlacementNotes,
 ) -> Option<String> {
-    let text = failure_without_result(outcome, grant_without_result, commits, ceiling)?.text();
+    let text =
+        failure_without_result(request_id, outcome, grant_without_result, commits, ceiling)?.text();
     let note = match outcome {
         CellOutcome::FailedAfterExecution { .. } | CellOutcome::Completed { .. } => {
             [notes.ran_on.clone(), notes.executed()]
@@ -9157,8 +9176,16 @@ async fn run_routed_batch(
     {
         control.ledger.note_refusal(detail);
     }
-    let mut settled =
-        off_frame(|| settle_joined_batch(orch, &settlement, joined, ceiling_detail)).await;
+    let mut settled = off_frame(|| {
+        settle_joined_batch(
+            orch,
+            &control.request_id,
+            &settlement,
+            joined,
+            ceiling_detail,
+        )
+    })
+    .await;
     if let Some(note) = control.late_cancel_note() {
         settled.text.push_str(&format!("\n\nNote: {note}."));
     }
@@ -9237,8 +9264,9 @@ impl CapacityWait {
             let elapsed = self.started.elapsed();
             if elapsed >= budget {
                 return Err(format!(
-                    "the machine had no room to run it, and the {}s this batch's own item timeouts allow for waiting elapsed while it queued ({diagnostic}).",
-                    budget.as_secs()
+                    "the machine had no room to run it, and the {}s this batch's own item timeouts allow for waiting elapsed while it queued ({diagnostic}). Lifecycle: `{}`.",
+                    budget.as_secs(),
+                    crate::resources::request_lifecycle::relative_lifecycle_uri(request_id)
                 ));
             }
         }
@@ -11608,7 +11636,8 @@ impl CallAnswer {
     async fn cancel_in_time(&mut self, reason: &str) -> String {
         if self.control.abandon(&self.orch) {
             let text = RunFailure::Cancelled(Some(format!(
-                "Cairn could not park this call ({reason}) or record it to finish on its own, so it cancelled the batch; nothing from it was committed."
+                "Cairn could not park this call ({reason}) or record it to finish on its own, so it cancelled the batch; nothing from it was committed. Lifecycle: `{}`.",
+                crate::resources::request_lifecycle::relative_lifecycle_uri(&self.control.request_id),
             )))
             .text();
             return self.finish(AnswerOutcome::Cancelled, run_envelope(text, Vec::new()));
@@ -11624,7 +11653,8 @@ impl CallAnswer {
             "but it had no commit_msg, so it committed nothing"
         };
         let text = RunFailure::Cancelled(Some(format!(
-            "Cairn could not park this call ({reason}), and the batch was already publishing its result when the call had to answer, {left}."
+            "Cairn could not park this call ({reason}), and the batch was already publishing its result when the call had to answer, {left}. Lifecycle: `{}`.",
+            crate::resources::request_lifecycle::relative_lifecycle_uri(&self.control.request_id),
         )))
         .text();
         self.finish(AnswerOutcome::Cancelled, run_envelope(text, Vec::new()))
@@ -11786,6 +11816,7 @@ async fn answer_call(
 
 async fn settle_joined_batch(
     orch: &Orchestrator,
+    request_id: &str,
     settlement: &RunBatchSettlement,
     joined: Result<BatchAttempts, tokio::task::JoinError>,
     ceiling: Option<String>,
@@ -11805,7 +11836,7 @@ async fn settle_joined_batch(
         };
         let detail = selector::with_default_suffix(settlement.node_default.as_ref(), detail);
         SettledRunBatch::failure(
-            unexecuted_failure(detail, grant_without_result.clone(), commits).text(),
+            unexecuted_failure(request_id, detail, grant_without_result.clone(), commits).text(),
         )
     };
     let mut settled = match placed {
@@ -11817,6 +11848,7 @@ async fn settle_joined_batch(
             off_frame(|| {
                 settle_routed_run_batch(
                     orch,
+                    request_id,
                     settlement,
                     residence,
                     *outcome,
@@ -11887,8 +11919,10 @@ mod no_environment_detail_tests {
 /// Convert a routed cell outcome into item outcomes and settle it. Every routed
 /// batch — fast or suspended — lands here, so there is exactly one publication
 /// path and no second one to drift from it.
+#[allow(clippy::too_many_arguments)]
 async fn settle_routed_run_batch(
     orch: &Orchestrator,
+    request_id: &str,
     settlement: &RunBatchSettlement,
     residence: BatchResidence,
     outcome: CellOutcome,
@@ -11908,6 +11942,7 @@ async fn settle_routed_run_batch(
         );
     }
     if let Some(text) = settled_failure_text(
+        request_id,
         &outcome,
         grant_without_result,
         settlement.commit_msg.is_some(),
@@ -12010,6 +12045,7 @@ fn adopted_ran_on(machine: &str) -> String {
 /// resumed call carries, and the verdict a notice states.
 pub(crate) async fn settle_adopted_result(
     orch: &Orchestrator,
+    request_id: &str,
     persisted: &PersistedSettlement,
     started_ms: i64,
     outcome: CellOutcome,
@@ -12029,6 +12065,7 @@ pub(crate) async fn settle_adopted_result(
         .map(|cancel| cancel.detail(persisted.commits(), false));
     let settled = settle_routed_run_batch(
         orch,
+        request_id,
         &settlement,
         residence,
         outcome,
@@ -12048,6 +12085,7 @@ pub(crate) async fn settle_adopted_result(
 /// under its machine's line, opened by `unpublished` when the batch carried a
 /// commit that cannot be published, saying why. The batch is never dropped.
 pub(crate) fn compose_adopted_result(
+    request_id: &str,
     outcome: &CellOutcome,
     machine: &str,
     unpublished: Option<&str>,
@@ -12056,7 +12094,14 @@ pub(crate) fn compose_adopted_result(
         ran_on: Some(adopted_ran_on(machine)),
         ..PlacementNotes::default()
     };
-    if let Some(text) = settled_failure_text(outcome, None, unpublished.is_some(), None, &notes) {
+    if let Some(text) = settled_failure_text(
+        request_id,
+        outcome,
+        None,
+        unpublished.is_some(),
+        None,
+        &notes,
+    ) {
         let verdict = detached::verdict_from_text(&text);
         return (text, verdict);
     }
@@ -12160,7 +12205,8 @@ mod refusal_under_default_tests {
                 .into(),
         };
         let text =
-            settled_failure_text(&drained, None, false, None, &PlacementNotes::default()).unwrap();
+            settled_failure_text("r", &drained, None, false, None, &PlacementNotes::default())
+                .unwrap();
         let text = refusal_under_default(&drained, Some(&default), text);
         assert!(text.contains("This run could not execute"), "{text}");
         assert!(text.contains("bbs is drained by an operator"), "{text}");
@@ -13147,6 +13193,7 @@ mod tests {
             Some("placed beside terminal `dev`")
         );
         let unavailable = settled_failure_text(
+            "r",
             &CellOutcome::Unavailable {
                 reason: cairn_common::executor_protocol::CellUnavailableReason::Preparation,
                 diagnostic: "could not materialize commit 276e9702".into(),
@@ -13203,6 +13250,7 @@ mod tests {
             ..PlacementNotes::default()
         };
         let failed = settled_failure_text(
+            "r",
             &CellOutcome::FailedAfterExecution {
                 request_id: "r".into(),
                 attempt_id: "a".into(),
@@ -13216,6 +13264,7 @@ mod tests {
         .unwrap();
         assert!(failed.contains("Ran on **bgsrv-ub** (linux)."), "{failed}");
         let refused = settled_failure_text(
+            "r",
             &CellOutcome::Unavailable {
                 reason:
                     cairn_common::executor_protocol::CellUnavailableReason::NoMatchingExecutor {
@@ -13516,6 +13565,7 @@ mod tests {
     #[test]
     fn a_claimed_oversized_batch_that_fails_after_execution_still_says_it_was_oversized() {
         let text = settled_failure_text(
+            "r",
             &CellOutcome::FailedAfterExecution {
                 request_id: "r".into(),
                 attempt_id: "a".into(),
@@ -13539,6 +13589,7 @@ mod tests {
     #[test]
     fn a_cancelled_oversized_batch_keeps_the_ceiling_note_but_never_claims_it_ran() {
         let text = settled_failure_text(
+            "r",
             &CellOutcome::Cancelled {
                 request_id: "r".into(),
                 attempt_id: "a".into(),
@@ -13556,6 +13607,7 @@ mod tests {
         assert!(!text.contains("Ran on"), "{text}");
 
         let storage = settled_failure_text(
+            "r",
             &CellOutcome::StorageFailure {
                 request_id: "r".into(),
                 attempt_id: "a".into(),
@@ -13856,6 +13908,13 @@ mod tests {
     /// is the same class of disagreement that lost the original suite's output.
     fn payload(value: serde_json::Value) -> RunPayload {
         serde_json::from_value(value).expect("a run payload")
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_capacity_budget_links_its_request_lifecycle() {
+        let mut wait = CapacityWait::new(Some(std::time::Duration::ZERO));
+        let text = wait.hold("budget-link", "full").await.unwrap_err();
+        assert!(text.contains("`cairn:@/requests/budget-link`"), "{text}");
     }
 
     #[test]
@@ -15971,12 +16030,17 @@ pub(crate) mod host_batch_tests {
             "commit authority holds the captured base before admission"
         );
         assert_eq!(waiting_on.as_deref(), Some(waiting.as_str()));
-        let batch = detached::load(&orch.db.local, &control.request_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let rendered = detached::render(&batch, &detached::live_state(&orch, &batch));
-        assert!(rendered.contains("State: parked"), "{rendered}");
+        let rendered = crate::resources::request_lifecycle::read_request(
+            &orch,
+            "prj",
+            &control.request_id,
+            false,
+        )
+        .await;
+        assert!(
+            rendered.contains("detached and not yet started"),
+            "{rendered}"
+        );
         assert!(rendered.contains("running `batch-1`"), "{rendered}");
 
         control.admit().await;
@@ -16320,6 +16384,7 @@ pub(crate) mod host_batch_tests {
             let text = loop {
                 if control.stop_placement.is_stopped() {
                     break failure_without_result(
+                        "r",
                         &CellOutcome::Cancelled {
                             request_id: control.request_id.clone(),
                             attempt_id: String::new(),
@@ -17099,6 +17164,7 @@ pub(crate) mod host_batch_tests {
             "a principal's cancel never closes the settle gate"
         );
         let text = settled_failure_text(
+            "r",
             &CellOutcome::Cancelled {
                 request_id: control.request_id.clone(),
                 attempt_id,
@@ -17564,6 +17630,10 @@ pub(crate) mod host_batch_tests {
             "{text}"
         );
         assert!(
+            text.contains(&format!("`cairn:@/requests/{}`", control.request_id)),
+            "{text}"
+        );
+        assert!(
             !control.begin_settling(),
             "the abandoned batch can no longer publish"
         );
@@ -17572,6 +17642,48 @@ pub(crate) mod host_batch_tests {
             0,
             "nothing was parked"
         );
+    }
+
+    #[tokio::test]
+    async fn a_park_failure_during_publication_links_its_request_lifecycle() {
+        let orch = env().await;
+        for commits in [false, true] {
+            let control = BatchControl::new(commits);
+            assert!(control.begin_settling());
+            let (_tx, rx) = tokio::sync::oneshot::channel();
+            let mut call = CallAnswer {
+                orch: orch.clone(),
+                request: call_request(json!({"commands": [{"command": "cargo build"}]})),
+                control: control.clone(),
+                deadlines: CallDeadlines::new(
+                    tokio::time::Instant::now(),
+                    ms(0),
+                    ms(0),
+                    ms(0),
+                    None,
+                ),
+                rx: Some(rx),
+                held: None,
+                arming: None,
+                detached: None,
+                never_parks: false,
+                answered: false,
+            };
+            let text = call.cancel_in_time("cannot park").await;
+            assert!(text.contains("already publishing its result"), "{text}");
+            assert!(
+                text.contains(&format!("`cairn:@/requests/{}`", control.request_id)),
+                "{text}"
+            );
+            assert!(
+                text.contains(if commits {
+                    "may have committed"
+                } else {
+                    "committed nothing"
+                }),
+                "{text}"
+            );
+        }
     }
 
     /// A client that states no answer bound is an older one whose socket was

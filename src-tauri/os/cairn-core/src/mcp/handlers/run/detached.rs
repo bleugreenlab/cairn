@@ -50,7 +50,7 @@ pub(crate) enum DetachedState {
 }
 
 impl DetachedState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Parked => "parked",
             Self::Running => "running",
@@ -713,7 +713,7 @@ impl LiveState {
     }
 
     /// One sentence for a reader deciding whether to wait.
-    fn sentence(&self) -> String {
+    pub(crate) fn sentence(&self) -> String {
         match self {
             Self::Parked { waiting } => format!("it has not started: it is {waiting}, and it holds no branch until a machine has it"),
             Self::Publishing { phase } => format!("it is {phase}; its branch releases when the result settles"),
@@ -1033,7 +1033,7 @@ pub(crate) async fn record_snapshot(
     .map_err(|error| error.to_string())
 }
 
-fn snapshot_phrase(batch: &DetachedBatch) -> Option<String> {
+pub(crate) fn snapshot_phrase(batch: &DetachedBatch) -> Option<String> {
     batch
         .settlement
         .as_ref()?
@@ -1048,7 +1048,7 @@ fn label_of(batch: &DetachedBatch) -> &str {
 
 /// How the notice and the handle state what the batch committed. A batch with
 /// no `commit_msg` cannot have committed, and says so plainly.
-fn commit_phrase(batch: &DetachedBatch) -> String {
+pub(crate) fn commit_phrase(batch: &DetachedBatch) -> String {
     match (batch.commits, batch.commit_id.as_deref()) {
         (true, Some(commit)) => format!("commit {}", &commit[..commit.len().min(12)]),
         _ => "committed nothing".to_string(),
@@ -1095,96 +1095,6 @@ pub(super) async fn detach_inline(
     .await
     .map(|_| ())
     .map_err(|error| error.to_string())
-}
-
-/// The handle's read: state, verdict, label, what it committed, and its output.
-/// `live` is where a running batch stands now; other states ignore it.
-pub(crate) fn render(batch: &DetachedBatch, live: &LiveState) -> String {
-    let state = match batch.state {
-        DetachedState::Running => live.headline(),
-        other => other.as_str().to_string(),
-    };
-    let mut out = format!(
-        "# Run batch `{}`\n\nLabel: {}\nState: {state}\nLifecycle: `{}`\n",
-        batch.request_id,
-        label_of(batch),
-        crate::resources::request_lifecycle::relative_lifecycle_uri(&batch.request_id),
-    );
-    let inline = batch.reason == INLINE_CAPTURE;
-    if inline {
-        out.push_str("Delivery: the call owns its inline answer.\n");
-    } else {
-        out.push_str(&format!("Detached because: {}\n", batch.reason));
-    }
-    let delivery = if inline {
-        "\nIts result returns on the call while it remains connected. Do not re-run it.\n"
-    } else {
-        "\nIts result reaches this job as a notice when it settles. Do not re-run it.\n"
-    };
-    match batch.state {
-        DetachedState::Parked => {
-            out.push_str(&format!(
-                "Waiting: it is {}. No machine has it yet.\n",
-                batch
-                    .waiting_on
-                    .as_deref()
-                    .unwrap_or("waiting to be placed")
-            ));
-            out.push_str(if batch.holds_branch {
-                "Commits: it carries a commit_msg and holds its captured base until settlement, including while queued.\n"
-            } else {
-                "Commits: none; it has no commit_msg, so it cannot commit and does not hold the branch.\n"
-            });
-            out.push_str(delivery);
-        }
-        DetachedState::Running => {
-            out.push_str(&format!("Now: {}.\n", live.sentence()));
-            out.push_str(if batch.commits {
-                "Commits: not yet; it carries a commit_msg, so it may commit when it settles.\n"
-            } else {
-                "Commits: none; it has no commit_msg, so it cannot commit.\n"
-            });
-            out.push_str(delivery);
-        }
-        DetachedState::Settled => {
-            if let Some(line) = snapshot_phrase(batch) {
-                out.push_str(&format!("{line}\n"));
-            }
-            out.push_str(&format!(
-                "Verdict: {}\nCommits: {}\n",
-                batch.verdict.as_deref().unwrap_or("finished"),
-                commit_phrase(batch)
-            ));
-            out.push_str(&format!(
-                "\n## Output\n\n{}\n",
-                batch.output.as_deref().unwrap_or("(no output)")
-            ));
-        }
-        DetachedState::Lost => {
-            out.push_str(&format!(
-                "Lost because: {}\nIts outcome is unknown. {}\n",
-                batch
-                    .lost_evidence
-                    .as_deref()
-                    .unwrap_or("no evidence was recorded"),
-                if batch.commits {
-                    "It carried a commit_msg; read `cairn:@/vcs/log?limit=5` before re-running it."
-                } else {
-                    "It had no commit_msg, so it committed nothing."
-                }
-            ));
-            if let Some(late) = batch.late_report.as_ref() {
-                out.push_str(&format!(
-                    "Reported afterwards: {} reported at {}: {}. {}\n",
-                    late.machine,
-                    at(late.received_ms),
-                    late.verdict,
-                    late_publication_sentence(batch, late)
-                ));
-            }
-        }
-    }
-    out
 }
 
 /// What became of a late result's changes.
@@ -2127,14 +2037,17 @@ async fn recorded_cancel(
 mod tests {
     use super::*;
 
-    #[test]
-    fn parked_render_names_commit_authority_without_claiming_placement() {
+    #[tokio::test]
+    async fn parked_render_names_commit_authority_without_claiming_placement() {
+        let orch = orch_with_job().await;
         for commits in [false, true] {
             let mut row = batch(DetachedState::Parked, commits, None);
             row.holds_branch =
                 crate::mcp::handlers::durable_suspend::run_batch_holds_branch(commits, false);
-            let page = render(&row, &LiveState::Untracked);
-            assert!(page.contains("No machine has it yet"), "{page}");
+            row.request_id = format!("parked-{commits}");
+            insert(&orch.db.local, &row).await.unwrap();
+            let page = page(&orch, &row.request_id).await;
+            assert!(page.contains("detached and not yet started"), "{page}");
             assert!(!page.contains("holds no branch until"), "{page}");
             if commits {
                 assert!(page.contains("holds its captured base"), "{page}");
@@ -2142,6 +2055,10 @@ mod tests {
                 assert!(page.contains("does not hold the branch"), "{page}");
             }
         }
+    }
+
+    async fn page(orch: &Orchestrator, request_id: &str) -> String {
+        crate::resources::request_lifecycle::read_request(orch, "p", request_id, false).await
     }
 
     fn batch(state: DetachedState, commits: bool, commit_id: Option<&str>) -> DetachedBatch {
@@ -2284,7 +2201,7 @@ mod tests {
             batch.settlement.as_ref().and_then(|s| s.cancelled.clone()),
             Some(first)
         );
-        assert!(render(&batch, &LiveState::Untracked).contains(by));
+        assert!(page(&orch, &batch.request_id).await.contains(by));
         assert!(notices(db).await.is_empty());
     }
 
@@ -2344,7 +2261,7 @@ mod tests {
         );
         let line = attribution.line();
         assert!(notice_sentence(&settled).contains(&line));
-        assert!(render(&settled, &LiveState::Untracked).contains(&line));
+        assert!(page(&orch, &settled.request_id).await.contains(&line));
         assert_eq!(settled.commit_id, None, "input is not a produced commit");
 
         assert!(finish(db, "req-1", Finish::Lost { evidence: "x" }, true)
@@ -2716,11 +2633,9 @@ mod tests {
                 machines: vec!["bgsrv-ub2".into()]
             }
         );
-        let read = render(&away, &live);
-        assert!(
-            read.contains("State: waiting for `bgsrv-ub2` to report"),
-            "{read}"
-        );
+        let read = page(&orch, &away.request_id).await;
+        assert!(read.contains("**still running**"), "{read}");
+        assert!(read.contains("bgsrv-ub2"), "{read}");
         assert!(read.contains("releases its branch"), "{read}");
     }
 
@@ -2770,20 +2685,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_commitless_batch_says_it_cannot_have_committed() {
-        let running = render(
-            &batch(DetachedState::Running, false, None),
-            &LiveState::Untracked,
-        );
+    #[tokio::test]
+    async fn a_commitless_batch_says_it_cannot_have_committed() {
+        let orch = orch_with_job().await;
+        insert(&orch.db.local, &batch(DetachedState::Running, false, None))
+            .await
+            .unwrap();
+        let running = page(&orch, "req-1").await;
         assert!(
             running.contains("it has no commit_msg, so it cannot commit"),
             "{running}"
         );
-        let settled = render(
-            &batch(DetachedState::Settled, true, Some("abcdef1234567")),
-            &LiveState::Untracked,
-        );
+        let mut row = batch(DetachedState::Settled, true, Some("abcdef1234567"));
+        row.request_id = "settled".into();
+        insert(&orch.db.local, &row).await.unwrap();
+        let settled = page(&orch, "settled").await;
         assert!(
             settled.contains("Commits: commit abcdef123456"),
             "{settled}"
@@ -2800,26 +2716,20 @@ mod tests {
             wait: "waiting to be placed since 2026-11-07T03:46:44Z (360s); `local` declined it (ProjectProvisioning): project p is provisioning for request holder".into(),
         };
         let row = running("req-1");
-        let read = render(&row, &queued);
-        assert!(
-            read.contains("State: queued, not yet placed on any machine"),
-            "{read}"
-        );
-        assert!(!read.contains("State: running"), "{read}");
-        assert!(read.contains("provisioning for request holder"), "{read}");
         assert!(summary_line(&row, "cairn://p/x/1/1/builder", &queued)
             .ends_with("queued, not yet placed on any machine"));
         let refusal = reissue_refusal_text("req-1", &queued);
         assert!(refusal.contains("request `req-1`"), "{refusal}");
         assert!(refusal.contains("ProjectProvisioning"), "{refusal}");
         assert!(refusal.contains("cairn:~/batches/req-1"), "{refusal}");
-        assert!(render(
+        assert!(summary_line(
             &row,
+            "cairn://p/x/1/1/builder",
             &LiveState::Placed {
                 on: "bgsrv-ub".into()
             }
         )
-        .contains("State: running on `bgsrv-ub`"));
+        .ends_with("running on `bgsrv-ub`"));
         let parked = LiveState::Parked {
             waiting: "waiting for the job's residency on bgsrv-mac: running `batch-1`".into(),
         };

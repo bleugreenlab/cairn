@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use cairn_db::turso::params;
 use serde::Serialize;
 
+use crate::mcp::handlers::run::detached;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 
@@ -134,7 +135,7 @@ pub(crate) fn relative_lifecycle_uri(request_id: &str) -> String {
 }
 
 /// Read one request's lifecycle as Markdown or (`json`) as one JSON object.
-pub(super) async fn read_request(
+pub(crate) async fn read_request(
     orch: &Orchestrator,
     project: &str,
     id: &str,
@@ -477,6 +478,38 @@ struct DetachedRow {
     settled_ms: Option<i64>,
     notified_ms: Option<i64>,
     waiting_on: Option<String>,
+    holds_branch: bool,
+    output: Option<String>,
+    commit: String,
+    snapshot: Option<String>,
+    late_report: Option<String>,
+}
+
+impl From<detached::DetachedBatch> for DetachedRow {
+    fn from(row: detached::DetachedBatch) -> Self {
+        Self {
+            holds_branch: row.holds_branch,
+            commit: detached::commit_phrase(&row),
+            snapshot: detached::snapshot_phrase(&row),
+            late_report: row
+                .late_report
+                .as_ref()
+                .map(|late| detached::late_notice_sentence(&row, late)),
+            job_id: row.job_id,
+            run_id: row.run_id,
+            label: row.label,
+            commits: row.commits,
+            state: row.state.as_str().to_owned(),
+            verdict: row.verdict,
+            reason: row.reason,
+            lost_evidence: row.lost_evidence,
+            created_ms: row.created_ms,
+            settled_ms: row.settled_ms,
+            notified_ms: row.notified_ms,
+            waiting_on: row.waiting_on,
+            output: row.output,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -493,6 +526,7 @@ struct WaitRow {
     successor_turn_id: Option<String>,
     created_ms: i64,
     resolved_ms: Option<i64>,
+    late_cancel: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -555,7 +589,7 @@ struct LaneRow {
 struct Facts {
     lanes: Vec<LaneRow>,
     ledger: Option<LedgerRow>,
-    detached: Option<DetachedRow>,
+    detached: Option<detached::DetachedBatch>,
     wait: Option<WaitRow>,
     adopted: Vec<AdoptedRow>,
     journal: Vec<JournalRow>,
@@ -627,6 +661,16 @@ const WAIT_COLUMNS: &str = "id, job_id, run_id, session_id, predecessor_turn_id,
      state, resolution_json, successor_turn_id, created_at, resolved_at, condition_json";
 
 fn wait_of(row: &cairn_db::turso::Row) -> DbResult<(WaitRow, String)> {
+    let condition = row.text(11)?;
+    let late_cancel = serde_json::from_str::<serde_json::Value>(&condition)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("settlement")?
+                .get("late_cancel")?
+                .as_str()
+                .map(str::to_owned)
+        });
     Ok((
         WaitRow {
             id: row.text(0)?,
@@ -640,8 +684,9 @@ fn wait_of(row: &cairn_db::turso::Row) -> DbResult<(WaitRow, String)> {
             successor_turn_id: row.opt_text(8)?,
             created_ms: row.i64(9)?,
             resolved_ms: row.opt_i64(10)?,
+            late_cancel,
         },
-        row.text(11)?,
+        condition,
     ))
 }
 
@@ -697,30 +742,7 @@ async fn gather(
     wait_hint: Option<&str>,
 ) -> Result<Facts, String> {
     let ledger = ledger_row(db, request_id).await?;
-    let detached = db
-        .query_opt(
-            "SELECT job_id, run_id, label, commits, state, verdict, reason, lost_evidence, \
-             created_ms, settled_ms, notified_ms, waiting_on FROM run_batch_detached WHERE request_id=?1",
-            params![request_id.to_owned()],
-            |row| {
-                Ok(DetachedRow {
-                    job_id: row.text(0)?,
-                    run_id: row.text(1)?,
-                    label: row.opt_text(2)?,
-                    commits: row.i64(3)? != 0,
-                    state: row.text(4)?,
-                    verdict: row.opt_text(5)?,
-                    reason: row.text(6)?,
-                    lost_evidence: row.opt_text(7)?,
-                    created_ms: row.i64(8)?,
-                    settled_ms: row.opt_i64(9)?,
-                    notified_ms: row.opt_i64(10)?,
-                    waiting_on: row.opt_text(11)?,
-                })
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    let detached = detached::load(db, request_id).await?;
     let run_id = ledger
         .as_ref()
         .map(|row| row.run_id.clone())
@@ -881,6 +903,8 @@ struct Context {
     incarnation: Option<String>,
     in_flight: bool,
     live: Option<Live>,
+    status: Option<String>,
+    progress: Option<String>,
     node: Option<String>,
     machines: BTreeMap<String, String>,
 }
@@ -888,6 +912,13 @@ struct Context {
 impl Context {
     async fn live(orch: &Orchestrator, db: &LocalDb, request_id: &str, facts: &Facts) -> Self {
         let now_ms = chrono::Utc::now().timestamp_millis();
+        let status = facts
+            .detached
+            .as_ref()
+            .filter(|batch| batch.state == detached::DetachedState::Running)
+            .map(|batch| detached::live_state(orch, batch).sentence());
+        let progress =
+            detached::live_progress(orch, request_id).map(|progress| progress.describe(now_ms));
         let executing = orch.fleet.executing_command(request_id);
         let in_flight = executing.is_some()
             || orch.fleet.is_request_in_flight(request_id)
@@ -932,6 +963,8 @@ impl Context {
             incarnation: orch.fleet.runner_incarnation().map(str::to_owned),
             in_flight,
             live,
+            status,
+            progress,
             node,
             machines,
         }
@@ -1010,6 +1043,7 @@ struct RequestLifecycle {
     lanes: Vec<LaneRow>,
     execution: Option<Execution>,
     live: Option<Live>,
+    progress: Option<String>,
     run: Option<RunRow>,
     actions: Vec<String>,
 }
@@ -1149,6 +1183,21 @@ fn derive_end(facts: &Facts, context: &Context) -> EndFact {
             _ => {}
         }
     }
+    if let Some(wait) = facts
+        .wait
+        .as_ref()
+        .filter(|wait| wait.state == "resolving" && wait.resolution_json.is_some())
+    {
+        return ended(
+            "open",
+            format!(
+                "its result is being delivered to job `{}` through wait `{}`",
+                wait.job_id, wait.id
+            ),
+            None,
+            "agent_waits",
+        );
+    }
     if let Some(detached) = &facts.detached {
         let at = detached.settled_ms;
         return match detached.state.as_str() {
@@ -1192,11 +1241,12 @@ fn derive_end(facts: &Facts, context: &Context) -> EndFact {
                     .and_then(|row| row.machine.clone())
                     .or_else(|| context.live.as_ref().map(|live| live.machine.clone()));
                 still_running(
-                    match on {
-                        Some(machine) => {
+                    match (&context.status, on) {
+                        (Some(status), _) => status.clone(),
+                        (None, Some(machine)) => {
                             format!("still running on {machine}, detached from its call")
                         }
-                        None => "still running, detached from its call".to_string(),
+                        (None, None) => "still running, detached from its call".to_string(),
                     },
                     "run_batch_detached",
                 )
@@ -1430,7 +1480,7 @@ fn build(
     }
     let ledger = facts.ledger;
     let wait = facts.wait;
-    let detached = facts.detached;
+    let detached = facts.detached.map(DetachedRow::from);
     let ids = Ids {
         request_id: request_id.to_owned(),
         tool_use_id: ledger
@@ -1528,6 +1578,7 @@ fn build(
         lanes,
         execution,
         live: context.live.clone(),
+        progress: context.progress.clone(),
         run: facts.run,
         actions,
     }
@@ -1811,12 +1862,74 @@ fn render(lifecycle: &RequestLifecycle) -> String {
         ));
     }
 
+    if let Some(progress) = &lifecycle.progress {
+        lines.push(format!("Progress: {progress}."));
+    }
+
     if let Some(run) = &lifecycle.run {
         heading(&mut lines, "Run (`runs`)");
         lines.push(format!(
             "- {}",
             run_exit(run).unwrap_or_else(|| format!("run `{}` {}", run.id, run.status))
         ));
+    }
+
+    if let Some(row) = &lifecycle.detached {
+        heading(&mut lines, "Delivery (`run_batch_detached`)");
+        let inline = row.reason == crate::mcp::handlers::run::detached::INLINE_CAPTURE;
+        lines.push(if inline {
+            "- The call owns its inline answer.".to_string()
+        } else {
+            format!("- Detached because: {}", row.reason)
+        });
+        match row.state.as_str() {
+            "parked" | "running" => {
+                if !row.commits {
+                    lines.push("- Commits: none; it has no commit_msg, so it cannot commit and does not hold the branch.".to_string());
+                } else if row.holds_branch {
+                    lines.push("- Commits: it carries a commit_msg and holds its captured base until settlement, including while queued.".to_string());
+                }
+                lines.push(if inline {
+                    "- Its result returns on the call while it remains connected. Do not re-run it."
+                        .to_string()
+                } else {
+                    "- Its result reaches this job as a notice when it settles. Do not re-run it."
+                        .to_string()
+                });
+            }
+            "settled" => {
+                lines.push(format!(
+                    "- Verdict: {}",
+                    row.verdict.as_deref().unwrap_or("finished")
+                ));
+                lines.push(format!("- Commits: {}", row.commit));
+                if let Some(snapshot) = &row.snapshot {
+                    lines.push(snapshot.clone());
+                }
+                heading(&mut lines, "Output");
+                lines.push(row.output.as_deref().unwrap_or("(no output)").to_string());
+            }
+            "lost" => {
+                lines.push(if row.commits {
+                    "Its outcome is unknown. It carried a commit_msg; read `cairn:@/vcs/log?limit=5` before re-running it.".to_string()
+                } else {
+                    "Its outcome is unknown. It had no commit_msg, so it committed nothing.".to_string()
+                });
+            }
+            _ => {}
+        }
+        if let Some(late) = &row.late_report {
+            lines.push(late.clone());
+        }
+    }
+    if let Some(wait) = &lifecycle.wait {
+        if let Some(note) = &wait.late_cancel {
+            lines.push(format!("Cancel: {note}."));
+        }
+        if let Some(resolution) = &wait.resolution_json {
+            heading(&mut lines, "Wait result (`agent_waits`)");
+            lines.push(resolution.clone());
+        }
     }
 
     if !lifecycle.actions.is_empty() {

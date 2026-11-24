@@ -412,6 +412,51 @@ impl CellOrphanCensusReport {
     }
 }
 
+/// Fixed-cardinality diagnostic rules; these do not grant signal authority.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub enum ProcessDecisionRule {
+    CensusComplete,
+    CandidateSettled,
+    ResidentOwnershipMissing,
+    ResidentOwnershipChanged,
+    ResidentTeardown,
+    CensusIncomplete,
+    UnstableGeneration,
+    WorkloadUidUnknown,
+    CellMissing,
+    CensusUnresolved,
+    BuildVolumeAbsent,
+    ExecutorHolder,
+    NoRecordedLaunch,
+    CleanupBudget,
+    SettlementFailed,
+    SettlementSurvivor,
+    FinalCensusHolder,
+    TreeQuiescent,
+    TreeSurvivor,
+    TreeUnverified,
+    Vacant,
+    Cwd,
+    Executable,
+    OpenFile,
+    WithheldInLineage,
+    WithheldContainerUnreadable,
+    ReadFailed,
+    LineageUnknown,
+    ProcessTableUnreadable,
+    PlatformUnsupported,
+}
+
+/// Saturating totals, split by evidence outcome rather than treating unknown as vacant.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessDecisionCounts {
+    pub certified: u64,
+    pub unknown: u64,
+    pub held: u64,
+}
+
 /// A process still unresolved at the end of the pass. The kernel start token
 /// distinguishes reuse of a PID; these diagnostic strings are not kill authority.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -433,6 +478,10 @@ pub struct CellOrphanProcess {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandProcessHealth {
+    /// Process-lifetime decision totals. Absence (including a missing rule)
+    /// means unmeasured, not zero. Keys are a closed rule set, never PID/path text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisions: Option<std::collections::BTreeMap<ProcessDecisionRule, ProcessDecisionCounts>>,
     pub tracked_live_count: usize,
     pub reaped_stale_count: usize,
     pub unverified_count: usize,
@@ -7219,6 +7268,14 @@ pub struct LearnedResourceEstimate {
 /// identities. Check progress joins those identities to the cached executing
 /// occupancy for its slot. No wire field or meaning changes: an older executor
 /// supplies the same occupancy and the runner names unavailable slots as gaps.
+///
+/// cairn/7506 does not move the number. CommandProcessHealth.decisions adds
+/// optional, defaulted process-lifetime counters over a closed set of rules.
+/// An older executor leaves them unmeasured; an older runner ignores them.
+/// Structured events and counters change no admission, signal authority, or
+/// lifecycle decision. Mixed peers disagree on no capacity or placement fact.
+/// The same change also reaps a macOS command leader after settling its group,
+/// not before: executor-local behavior, with nothing a runner sends or reads changed.
 ///
 /// cairn/6706's orphan census reporting does not move the number. The optional,
 /// defaulted CommandProcessHealth.orphan_census is diagnostic only: an older
@@ -35243,6 +35300,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(health.orphan_census, None);
+        assert_eq!(health.decisions, None);
+        assert!(serde_json::to_value(&health)
+            .unwrap()
+            .get("decisions")
+            .is_none());
         assert!(serde_json::to_value(&health)
             .unwrap()
             .get("orphanCensus")
@@ -35269,7 +35331,17 @@ mod tests {
         );
         let mut health = health;
         health.orphan_census = Some(report);
+        health.decisions = Some(std::collections::BTreeMap::from([(
+            ProcessDecisionRule::NoRecordedLaunch,
+            ProcessDecisionCounts {
+                certified: 0,
+                unknown: 1,
+                held: u64::MAX,
+            },
+        )]));
         let value = serde_json::to_value(&health).unwrap();
+        assert_eq!(value["decisions"]["noRecordedLaunch"]["unknown"], 1);
+        assert_eq!(value["decisions"]["noRecordedLaunch"]["held"], u64::MAX);
         assert_eq!(value["orphanCensus"]["observedAtUnixMs"], 1234);
         assert_eq!(
             serde_json::from_value::<CommandProcessHealth>(value).unwrap(),
