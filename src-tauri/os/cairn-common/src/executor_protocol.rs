@@ -5727,17 +5727,6 @@ pub mod object_fetch_stream {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct MutationDeltaUploadRequest {
-    pub coordinate: ObjectTransferCoordinate,
-    pub base_commit: String,
-    pub delta_commit: String,
-    pub content_hash: String,
-    pub byte_count: u64,
-    pub pack_checksum: String,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CellExecutionStage {
@@ -9974,6 +9963,12 @@ pub struct LearnedResourceEstimate {
 /// end reasons are runner-owned accounting; the executor still receives the
 /// existing Cancel message and no new wire payload. An older peer gets nothing
 /// wrong because process cancellation semantics are unchanged.
+///
+/// cairn/5362 does not move the number. Managed executors upload raw delta
+/// packs directly to the runner; none calls the removed cloud delta-completion
+/// route or sends MutationDeltaUploadRequest. DeltaUploadReceipt keeps its wire
+/// shape and its production raw-pack hash meaning. An older executor therefore
+/// uploads and receives receipts unchanged; staging cleanup is runner-local.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 178;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -14814,6 +14809,7 @@ pub struct DeltaUploadReceipt {
     pub coordinate: ObjectTransferCoordinate,
     pub base_commit: String,
     pub delta_commit: String,
+    /// SHA-256 of the raw pack bytes exactly as uploaded to the runner.
     pub content_hash: String,
     pub pack_checksum: String,
 }

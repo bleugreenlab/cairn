@@ -18,8 +18,8 @@ use base64::Engine;
 use cairn_common::executor_protocol::{
     CatalogFetchResponse, CatalogPackDescriptor, CellCommandClass, CellOutcome, CellRequest,
     CloudObjectGrant, CloudObjectGrantRequest, CloudObjectOperation, DeltaUploadReceipt,
-    MutationDeltaUploadRequest, MutationPolicy, ObjectFetchFailure, ObjectFetchFailureCode,
-    ObjectTransferCoordinate, RepositoryLocator, CLOUD_OBJECT_GRANT_VERSION,
+    MutationPolicy, ObjectFetchFailure, ObjectFetchFailureCode, ObjectTransferCoordinate,
+    RepositoryLocator, CLOUD_OBJECT_GRANT_VERSION,
 };
 use cairn_common::wire_vocabulary::CellPriority;
 use cairn_core::internal::orchestrator::object_plane::{
@@ -249,65 +249,6 @@ async fn cloud_put(
     StatusCode::OK.into_response()
 }
 
-async fn delta_complete(
-    State(state): State<ObjectServerState>,
-    headers: HeaderMap,
-    Json(request): Json<MutationDeltaUploadRequest>,
-) -> Response {
-    if !authenticated(&state, &headers)
-        || !state
-            .orch
-            .object_plane
-            .authorizes(&request.coordinate, &request.base_commit)
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let Some(framed) = state
-        .cloud
-        .lock()
-        .unwrap()
-        .get(&request.content_hash)
-        .cloned()
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if framed.len() as u64 != request.byte_count || content_sha256(&framed) != request.content_hash
-    {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
-    }
-    let (pack, index) = cairn_codec::transfer::unframe_pack(&framed).unwrap();
-    let validated = cairn_codec::transfer::validate_pack(
-        &pack,
-        cairn_codec::transfer::PackLimits::default(),
-        &std::env::temp_dir(),
-    )
-    .unwrap();
-    if validated.index != index
-        || validated.manifest.pack_checksum != request.pack_checksum
-        || !validated
-            .manifest
-            .objects
-            .iter()
-            .any(|object| object.oid == request.delta_commit)
-    {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
-    }
-    let receipt = DeltaUploadReceipt {
-        receipt_id: format!("cloud-receipt-{}", request.coordinate.request_id),
-        coordinate: request.coordinate,
-        base_commit: request.base_commit,
-        delta_commit: request.delta_commit,
-        content_hash: request.content_hash,
-        pack_checksum: request.pack_checksum,
-    };
-    state
-        .orch
-        .object_plane
-        .stage_delta(&state.staging, receipt.clone(), &pack)
-        .unwrap();
-    Json(receipt).into_response()
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FetchRequest {
@@ -385,7 +326,6 @@ async fn fixture_from(make_repository: fn(&Path) -> String) -> Fixture {
         .route("/fetch", post(fetch))
         .route("/catalog", post(catalog))
         .route("/cloud-grant", post(cloud_grant))
-        .route("/delta/complete", post(delta_complete))
         .route("/delta", post(upload))
         .route("/s3/{hash}", get(cloud_get).put(cloud_put))
         .with_state(state.clone());

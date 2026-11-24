@@ -53,21 +53,6 @@ pub fn validate_pack_bytes(pack: Vec<u8>) -> Result<ValidatedObjectPack, String>
     })
 }
 
-pub fn validate_framed_pack(framed: Vec<u8>) -> Result<ValidatedObjectPack, String> {
-    let expected_hash = content_sha256(&framed);
-    let (pack, supplied_index) = cairn_codec::transfer::unframe_pack(&framed)
-        .map_err(|error| format!("unframe object pack: {error}"))?;
-    let validated = validate_pack_bytes(pack)?;
-    if validated.index != supplied_index {
-        return Err("object pack index disagrees with independent validation".into());
-    }
-
-    if validated.content_hash != expected_hash {
-        return Err("object pack framing changed during validation".into());
-    }
-    Ok(validated)
-}
-
 /// Put validated bytes before publishing their catalog owner reference. An
 /// absent content store is a complete local-only mode, not an error.
 pub(crate) async fn publish_validated_pack(
@@ -91,8 +76,7 @@ pub(crate) async fn publish_validated_pack(
 }
 
 /// Publish a reference for bytes already durably present in the content store.
-/// This is the completion seam for direct executor uploads: callers must first
-/// fetch and validate the addressed bytes.
+/// Callers must store the validated pack before publishing its owner reference.
 pub(crate) async fn publish_validated_reference(
     db: &LocalDb,
     pack: &ValidatedObjectPack,
@@ -1424,9 +1408,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_validator_rejects_unframed_and_corrupt_pack_bytes() {
+    fn canonical_validator_rejects_corrupt_pack_bytes() {
         assert!(validate_pack_bytes(b"not a git pack".to_vec()).is_err());
-        assert!(validate_framed_pack(b"not framed".to_vec()).is_err());
     }
 
     fn coordinate(generation: u64) -> ObjectTransferCoordinate {

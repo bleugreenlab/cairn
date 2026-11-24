@@ -8,7 +8,6 @@ use crate::storage::content_store::content_hash;
 pub enum PackKind {
     Reachable,
     ExecutionRange,
-    MutationDelta,
 }
 
 /// Incrementally reconstruct catalog truth for legacy execution_history pointers.
@@ -133,7 +132,6 @@ impl PackKind {
         match self {
             Self::Reachable => "reachable",
             Self::ExecutionRange => "execution_range",
-            Self::MutationDelta => "mutation_delta",
         }
     }
 }

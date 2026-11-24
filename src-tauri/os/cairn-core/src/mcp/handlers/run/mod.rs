@@ -753,8 +753,8 @@ async fn publish_and_seal_slot_delta_inner(
     };
     // Installed, pinned, its branch prepared, and integrated onto the prepared
     // head before the lock (I3, I4). The barrier releases the lock before it
-    // returns: receipt finalization talks to the object plane and the patch
-    // capture reads immutable commits, so neither needs the store.
+    // returns: receipt finalization releases staging files and patch capture
+    // reads immutable commits, so neither needs the store.
     let mut prepared = prepare_slot_publication(orch, &target, request, delta, message, author)
         .await
         .map_err(|error| error.to_string())?;
@@ -778,8 +778,14 @@ async fn publish_and_seal_slot_delta_inner(
             // Dropping the slot releases its pin: the delta is discarded.
             drop(prepared);
             if consume_receipt {
-                if let Err(error) = finalize_delta_receipt(orch, &target, delta).await {
-                    log::warn!("refused delta upload was not finalized: {error}");
+                if let Err(error) = finalize_delta_receipt(orch, delta) {
+                    log::warn!(
+                        "refused delta upload {:?} staging cleanup failed: {error}",
+                        delta
+                            .upload_receipt
+                            .as_ref()
+                            .map(|receipt| &receipt.receipt_id)
+                    );
                 }
             }
             return Err(refused);
@@ -802,8 +808,14 @@ async fn publish_and_seal_slot_delta_inner(
     )
     .await;
     if consume_receipt {
-        if let Err(error) = finalize_delta_receipt(orch, &target, delta).await {
-            log::warn!("check delta upload was not finalized: {error}");
+        if let Err(error) = finalize_delta_receipt(orch, delta) {
+            log::warn!(
+                "check delta upload {:?} staging cleanup failed: {error}",
+                delta
+                    .upload_receipt
+                    .as_ref()
+                    .map(|receipt| &receipt.receipt_id)
+            );
         }
     }
     let mut outcome = match landed {
@@ -2093,12 +2105,8 @@ async fn delta_barrier(
     (barrier.drained, landed)
 }
 
-/// A routed publication's outcome and the target it went to, which the
-/// settlement arms finalize and push.
-type RoutedPublication = Result<
-    (SlotPublication, RunnerPublicationTarget),
-    (SlotPublicationError, Option<RunnerPublicationTarget>),
->;
+/// A routed publication's outcome, with the successful target needed to push.
+type RoutedPublication = Result<(SlotPublication, RunnerPublicationTarget), SlotPublicationError>;
 
 fn not_in_store(delta: &crate::fleet::MutationDelta, error: String) -> SlotPublicationError {
     SlotPublicationError::NotInStore {
@@ -2159,24 +2167,18 @@ async fn logical_commit_barrier(
                         slot.prior_since_ms = s.prior_publication_since_ms;
                         Ok((target, slot, request))
                     }
-                    Err(error) => Err((error, Some(target))),
+                    Err(error) => Err(error),
                 }
             }
-            Err(error) => Err((not_in_store(delta, error), None)),
+            Err(error) => Err(not_in_store(delta, error)),
         },
-        (None, _) => Err((
-            not_in_store(
-                delta,
-                "build-slot publication has no resolved shared-store lock path".to_string(),
-            ),
-            None,
+        (None, _) => Err(not_in_store(
+            delta,
+            "build-slot publication has no resolved shared-store lock path".to_string(),
         )),
-        (Some(_), None) => Err((
-            not_in_store(
-                delta,
-                "the routed request that sealed this delta is missing".to_string(),
-            ),
-            None,
+        (Some(_), None) => Err(not_in_store(
+            delta,
+            "the routed request that sealed this delta is missing".to_string(),
         )),
     };
     match prepared {
@@ -2199,7 +2201,7 @@ async fn logical_commit_barrier(
             .await;
             let routed = match landed {
                 Ok(publication) => Ok((publication, target)),
-                Err(error) => Err((error, Some(target))),
+                Err(error) => Err(error),
             };
             (Some(routed), drained)
         }
@@ -4062,9 +4064,7 @@ pub(crate) mod slot_publication_tests {
         )
         .unwrap()
         .expect("the delta is packable");
-        // Staged bytes are the raw pack; the receipt's content hash is over the
-        // framed envelope. Reframed from the independently derived index, which
-        // is what the upload route validates against.
+        // The receipt hashes the raw pack exactly as uploaded to the runner.
         let validated = cairn_codec::transfer::validate_pack(
             &pack,
             cairn_codec::transfer::PackLimits::default(),
@@ -4075,7 +4075,6 @@ pub(crate) mod slot_publication_tests {
             validated.index, index,
             "the delta pack index is deterministic"
         );
-        let framed = cairn_codec::transfer::frame_pack(&pack, &validated.index);
         let receipt = cairn_common::executor_protocol::DeltaUploadReceipt {
             receipt_id: format!("receipt-{}", request.attempt_id),
             coordinate: cairn_common::executor_protocol::ObjectTransferCoordinate {
@@ -4087,7 +4086,7 @@ pub(crate) mod slot_publication_tests {
             },
             base_commit: fx.base.clone(),
             delta_commit: fx.delta.delta_commit.clone(),
-            content_hash: crate::orchestrator::object_plane::content_sha256(&framed),
+            content_hash: crate::orchestrator::object_plane::content_sha256(&pack),
             pack_checksum: validated.manifest.pack_checksum.clone(),
         };
         let now = std::time::SystemTime::now()
@@ -4100,6 +4099,34 @@ pub(crate) mod slot_publication_tests {
             .stage_delta(staging, receipt.clone(), &pack)
             .unwrap();
         receipt
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn managed_delta_cleanup_survives_executor_link_rotation() {
+        let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping managed_delta_cleanup: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator(&fx).await;
+        let staging = tempfile::tempdir().unwrap();
+        let receipt = stage_managed_upload(&orch, &mut fx, staging.path());
+        let staged_path = orch.object_plane.staged_delta(&receipt).unwrap().path;
+        orch.object_plane.issue_credential(
+            &receipt.coordinate.executor_id,
+            "device",
+            "runner",
+            receipt.coordinate.connection_generation + 1,
+            chrono::Utc::now().timestamp_millis() as u64,
+        );
+        assert!(orch.object_plane.staged_delta(&receipt).is_none());
+        assert!(
+            staged_path.exists(),
+            "rotation does not delete staged bytes"
+        );
+        finalize_delta_receipt(&orch, &fx.delta).unwrap();
+        assert!(orch.object_plane.staged_delta(&receipt).is_none());
+        assert!(!staged_path.exists());
     }
 
     /// A superseded check upload is fully handled even when the newer head
@@ -4119,7 +4146,8 @@ pub(crate) mod slot_publication_tests {
         let orch = orchestrator(&fx).await;
         let staging = tempfile::tempdir().unwrap();
         let receipt = stage_managed_upload(&orch, &mut fx, staging.path());
-        assert!(orch.object_plane.staged_delta(&receipt).is_some());
+        let staged_path = orch.object_plane.staged_delta(&receipt).unwrap().path;
+        assert!(staged_path.exists());
 
         let published = publish_and_seal_slot_delta_within(
             &orch,
@@ -4147,6 +4175,7 @@ pub(crate) mod slot_publication_tests {
             orch.object_plane.staged_delta(&receipt).is_none(),
             "the upload was installed and fully handled, so its receipt must not be left staged"
         );
+        assert!(!staged_path.exists());
     }
 
     #[tokio::test]
@@ -5818,6 +5847,7 @@ pub(crate) mod slot_publication_tests {
         let orch = orchestrator(&fx).await;
         let staging = tempfile::tempdir().unwrap();
         let receipt = stage_managed_upload(&orch, &mut fx, staging.path());
+        let staged_path = orch.object_plane.staged_delta(&receipt).unwrap().path;
 
         let error = publish_and_seal_slot_delta_within(
             &orch,
@@ -5834,6 +5864,7 @@ pub(crate) mod slot_publication_tests {
 
         assert!(error.contains("check output discarded"), "{error}");
         assert!(orch.object_plane.staged_delta(&receipt).is_none());
+        assert!(!staged_path.exists());
         assert_eq!(fx.bookmark(), fx.head);
         assert!(held::held_rows(&orch.db.local, "project", "later")
             .await
@@ -6082,59 +6113,15 @@ mod publication_mode_tests {
     }
 }
 
-async fn finalize_delta_receipt(
+fn finalize_delta_receipt(
     orch: &Orchestrator,
-    target: &RunnerPublicationTarget,
     delta: &crate::fleet::MutationDelta,
 ) -> Result<(), String> {
     let receipt = delta
         .upload_receipt
         .as_ref()
         .ok_or_else(|| "managed delta receipt disappeared before consumption".to_string())?;
-    let staged = orch.object_plane.staged_delta(receipt).ok_or_else(|| {
-        "managed delta receipt disappeared before catalog publication".to_string()
-    })?;
-    let pack = std::fs::read(&staged.path)
-        .map_err(|error| format!("read installed delta for catalog: {error}"))?;
-    let validated = crate::orchestrator::object_plane::validate_pack_bytes(pack)
-        .map_err(|error| format!("validate installed delta for catalog: {error}"))?;
-    if validated.content_hash != receipt.content_hash {
-        return Err("installed delta no longer matches its cloud object".into());
-    }
-    let db =
-        match orch
-            .db
-            .team_id_for_project(&target.project_id)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            Some(team_id) => orch.db.team_db(&team_id).await.ok_or_else(|| {
-                "team database closed before delta catalog publication".to_string()
-            })?,
-            None => orch.db.local.clone(),
-        };
-    crate::orchestrator::object_plane::publish_validated_reference(
-        &db,
-        &validated,
-        crate::storage::pack_catalog::PackCatalogPublication {
-            content_hash: String::new(),
-            project_id: target.project_id.clone(),
-            repository_id: target.repository_identity.repository_id.clone(),
-            object_format: "sha1".into(),
-            byte_count: 0,
-            pack_checksum: String::new(),
-            object_count: 0,
-            kind: crate::storage::pack_catalog::PackKind::MutationDelta,
-            base_commit: Some(delta.base_commit.clone()),
-            tip_commit: delta.delta_commit.clone(),
-            owner_kind: "mutation_delta".into(),
-            owner_id: receipt.receipt_id.clone(),
-        },
-    )
-    .await
-    .map_err(|error| format!("publish mutation delta catalog: {error}"))?;
-    orch.object_plane.consume_staged_delta(receipt)?;
-    Ok(())
+    orch.object_plane.consume_staged_delta(receipt)
 }
 
 use hygiene::check_cd_commands;
@@ -12543,8 +12530,8 @@ async fn settle_run_batch(
     let barrier = match s.logical_resolution.as_ref() {
         // A managed publication lands through the prepared barrier, which
         // releases the store lock before it returns: everything the arms below
-        // do — receipt finalization, the patch capture, the origin push — is
-        // network I/O or a read of immutable commits (I6).
+        // do — staging cleanup, patch capture, origin push — needs no store
+        // writer guard: local housekeeping, immutable reads, or network I/O (I6).
         Some(resolution) => {
             let routed = match s.commit_msg.as_deref() {
                 Some(message) => {
@@ -12588,13 +12575,16 @@ async fn settle_run_batch(
                     outcome.capture_patch(&target.repository);
                     // The upload was validated and installed before either
                     // outcome was reached, so it is finalized on both.
-                    let mut notes = String::new();
                     if consume_receipt {
                         if let Some(delta) = routed_delta.as_ref() {
-                            if let Err(error) = finalize_delta_receipt(orch, &target, delta).await {
-                                notes.push_str(&format!(
-                                    " — ⚠️ the delta upload was not finalized: {error}"
-                                ));
+                            if let Err(error) = finalize_delta_receipt(orch, delta) {
+                                log::warn!(
+                                    "delta upload {:?} staging cleanup failed: {error}",
+                                    delta
+                                        .upload_receipt
+                                        .as_ref()
+                                        .map(|receipt| &receipt.receipt_id)
+                                );
                             }
                         }
                     }
@@ -12604,7 +12594,7 @@ async fn settle_run_batch(
                     match outcome {
                         SlotPublicationOutcome::AlreadyLanded { head } => CommitBarrierOutcome {
                             message: format!(
-                                "The branch already carries this batch's changes at {head}, so nothing new was committed.{notes}"
+                                "The branch already carries this batch's changes at {head}, so nothing new was committed."
                             ),
                             worktree_changed: false,
                             committed: false,
@@ -12641,7 +12631,6 @@ async fn settle_run_batch(
                                 ),
                             };
                             message.push_str(&rungs.warnings);
-                            message.push_str(&notes);
                             CommitBarrierOutcome {
                                 message,
                                 worktree_changed: false,
@@ -12713,7 +12702,6 @@ async fn settle_run_batch(
                                 }
                             };
                             message.push_str(&rungs.warnings);
-                            message.push_str(&notes);
                             CommitBarrierOutcome {
                                 message,
                                 worktree_changed: false,
@@ -12722,8 +12710,8 @@ async fn settle_run_batch(
                         }
                     }
                 }
-                Some(Err((error, target))) => {
-                    let mut message = format!("⚠️ {error}");
+                Some(Err(error)) => {
+                    let message = format!("⚠️ {error}");
                     // A held delta was installed like a published one, so its
                     // upload is spent the same way.
                     if let (
@@ -12731,14 +12719,17 @@ async fn settle_run_batch(
                             consume_receipt: true,
                             ..
                         },
-                        Some(target),
                         Some(delta),
-                    ) = (&error, target.as_ref(), routed_delta.as_ref())
+                    ) = (&error, routed_delta.as_ref())
                     {
-                        if let Err(error) = finalize_delta_receipt(orch, target, delta).await {
-                            message.push_str(&format!(
-                                " — ⚠️ the delta upload was not finalized: {error}"
-                            ));
+                        if let Err(error) = finalize_delta_receipt(orch, delta) {
+                            log::warn!(
+                                "held delta upload {:?} staging cleanup failed: {error}",
+                                delta
+                                    .upload_receipt
+                                    .as_ref()
+                                    .map(|receipt| &receipt.receipt_id)
+                            );
                         }
                     }
                     CommitBarrierOutcome {
@@ -14354,9 +14345,10 @@ mod tests {
 mod barrier_lock_scope_tests {
     /// The prepared barrier releases the store lock as soon as a routed
     /// publication has landed, been held, or been stranded, and the settlement
-    /// arms that finalize a receipt or push run only after it returned: those
-    /// are network I/O (I6). Pinned in source order because the barrier lives
-    /// inside the run handler, which has no harness of its own.
+    /// arms that release staging files or push run only after it returned:
+    /// housekeeping and network I/O stay outside the lock (I6). Pinned in source
+    /// order because the barrier lives inside the run handler, which has no
+    /// harness of its own.
     #[test]
     fn the_barrier_releases_the_store_lock_before_any_routed_arm_finalizes() {
         let source = include_str!("mod.rs");
