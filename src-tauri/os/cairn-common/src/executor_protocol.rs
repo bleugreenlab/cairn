@@ -500,6 +500,47 @@ pub struct CommandProcessHealth {
     /// producing it must independently satisfy docs/executor.md's version rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphan_census: Option<CellOrphanCensusReport>,
+    /// Resident leaders held unreaped and the settlements still running on
+    /// them. None means an executor that does not report it: unmeasured, not
+    /// a measured "nothing settling".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_settlement: Option<ResidentSettlementHealth>,
+}
+
+/// Resident leaders the executor holds unreaped, so their process groups
+/// stay attributable, and the settlements that have not finished with them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentSettlementHealth {
+    /// Leaders held unreaped right now: running residents included.
+    pub held_count: usize,
+    /// Settlements under way, parked, or failed, exactly.
+    pub settling_count: usize,
+    /// The oldest of those, bounded.
+    #[serde(default)]
+    pub settling: Vec<ResidentSettlementEntry>,
+}
+
+/// One resident leader whose settlement has not released it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentSettlementEntry {
+    pub pid: u32,
+    pub slot: String,
+    pub process_key: String,
+    /// Since settlement began, or since the child was parked.
+    pub age_ms: u64,
+    /// Its supervisor ended before settling, and the executor's own settler
+    /// owns the unreaped child.
+    #[serde(default)]
+    pub parked: bool,
+    /// How long the current persistence callback has run, once past the
+    /// executor's stall threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_blocked_ms: Option<u64>,
+    /// Why a parked settlement failed; the leader stays pinned until exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 /// What a released cell is still waiting to die.
@@ -7268,6 +7309,14 @@ pub struct LearnedResourceEstimate {
 /// identities. Check progress joins those identities to the cached executing
 /// occupancy for its slot. No wire field or meaning changes: an older executor
 /// supplies the same occupancy and the runner names unavailable slots as gaps.
+///
+/// cairn/7536 does not move the number. CommandProcessHealth.resident_settlement
+/// is optional and defaulted diagnostic evidence: an older executor leaves it
+/// unmeasured and an older runner ignores it. Its decision events reuse
+/// existing ProcessDecisionRule variants, so no peer meets an unknown key. Parking
+/// a resident child whose supervisor ended before settling, and signalling its
+/// still-pinned group at executor exit, are executor-local lifecycle changes:
+/// nothing a runner sends, reads, or decides about capacity or placement changes.
 ///
 /// cairn/7506 does not move the number. CommandProcessHealth.decisions adds
 /// optional, defaulted process-lifetime counters over a closed set of rules.

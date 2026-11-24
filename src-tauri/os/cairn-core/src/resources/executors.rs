@@ -2334,6 +2334,9 @@ pub(crate) fn render_executor_with_kills(
     out.push_str(&render_orphan_census(
         health.command_processes.orphan_census.as_ref(),
     ));
+    out.push_str(&render_resident_settlement(
+        health.command_processes.resident_settlement.as_ref(),
+    ));
 
     // Only when there are any: an eviction is the one place the fleet destroys
     // an owner's uncommitted work, and it should be legible here rather than
@@ -7410,6 +7413,42 @@ fn describe_resident_charge(process: &cairn_common::executor_protocol::ResidentP
         }
     };
     format!("; charged {} ({why})", bytes(charge.memory_bytes))
+}
+
+/// Resident leaders the executor holds unreaped, and any settlement that has
+/// not let one go: parked after its supervisor ended, failed, or stuck in a
+/// persistence callback. Each of those keeps a zombie and a cell held.
+fn render_resident_settlement(
+    report: Option<&cairn_common::executor_protocol::ResidentSettlementHealth>,
+) -> String {
+    let Some(report) = report else {
+        return "- Resident settlement: unmeasured\n".into();
+    };
+    let mut out = format!(
+        "- Resident settlement: {} leader(s) held unreaped, {} settling\n",
+        report.held_count, report.settling_count
+    );
+    for entry in &report.settling {
+        let mut state = if entry.parked {
+            "parked (supervisor ended first)".to_string()
+        } else {
+            "settling".to_string()
+        };
+        if let Some(blocked) = entry.callback_blocked_ms {
+            state.push_str(&format!("; persistence callback blocked {}", age(blocked)));
+        }
+        if let Some(failure) = &entry.failure {
+            state.push_str(&format!("; failed: {failure}"));
+        }
+        out.push_str(&format!(
+            "  - PID {} `{}` in {}: {state}, for {}\n",
+            entry.pid,
+            entry.process_key,
+            entry.slot,
+            age(entry.age_ms)
+        ));
+    }
+    out
 }
 
 fn render_orphan_census(
@@ -15195,6 +15234,28 @@ mod tests {
         let mut executor = inspection("local", true);
         assert!(render_executor(&executor).contains("Cell orphan census: not yet measured"));
         assert!(render_executor(&executor).contains("Process decisions: unmeasured"));
+        assert!(render_executor(&executor).contains("Resident settlement: unmeasured"));
+        executor.health.command_processes.resident_settlement =
+            Some(cairn_common::executor_protocol::ResidentSettlementHealth {
+                held_count: 3,
+                settling_count: 1,
+                settling: vec![cairn_common::executor_protocol::ResidentSettlementEntry {
+                    pid: 77,
+                    slot: "slot-4".into(),
+                    process_key: "dev".into(),
+                    age_ms: 12_000,
+                    parked: true,
+                    callback_blocked_ms: Some(11_000),
+                    failure: None,
+                }],
+            });
+        let settling = render_executor(&executor);
+        for detail in [
+            "Resident settlement: 3 leader(s) held unreaped, 1 settling",
+            "PID 77 `dev` in slot-4: parked (supervisor ended first); persistence callback blocked",
+        ] {
+            assert!(settling.contains(detail), "{detail}: {settling}");
+        }
         executor.health.command_processes.decisions = Some(std::collections::BTreeMap::from([(
             cairn_common::executor_protocol::ProcessDecisionRule::TreeSurvivor,
             cairn_common::executor_protocol::ProcessDecisionCounts {
