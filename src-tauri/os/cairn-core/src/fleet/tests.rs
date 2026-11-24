@@ -20316,6 +20316,251 @@ async fn residency_stop_refusal(orch: &Orchestrator, cell: &PersistentCellState)
 }
 
 #[tokio::test]
+async fn oversized_launch_callers_refuse_without_disturbing_existing_state() {
+    use cairn_common::executor_protocol::{
+        AdmissionRejectionReason, ResidentProcessKind, ResidentProcessSpec, ResidentProcessStream,
+        ResidentStreamFraming, LINK_FRAME_BYTE_LIMIT,
+    };
+
+    residency_queue_scenario(async {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (generation, mut remote) = residency_queue_attach_on(&orch.fleet, "remote", "macos");
+        let cell = residency_grant_on_remote(&orch, &mut remote, generation, "existing").await;
+        let routes = orch.fleet.residency_routes.lock().unwrap().clone();
+        let (pending_tx, mut pending_rx) = oneshot::channel();
+        orch.fleet.pending_residency.lock().unwrap().insert(
+            "unrelated".into(),
+            PendingLifetimeResult {
+                executor_id: "remote".into(),
+                generation,
+                waiter: pending_tx,
+                granted_entry_id: None,
+            },
+        );
+        let holder_key = cell.residency.as_ref().unwrap().holder.storage_key();
+        orch.fleet
+            .resident_output
+            .lock()
+            .unwrap()
+            .declare_stdout_framing(
+                "remote",
+                &holder_key,
+                "existing",
+                ResidentStreamFraming::Lines,
+            );
+        // A declaration on the refused start must not change this byte stream
+        // into a line-buffered stream. The existing declaration must survive.
+        orch.object_plane
+            .scratch
+            .authorize("remote", generation, "existing-scratch");
+        let holder = &cell.residency.as_ref().unwrap().holder;
+        let existing_relay = orch.fleet.resident_relays().register(
+            "remote",
+            holder,
+            "existing",
+            resident_relay::RegisteredAuthority::Job {
+                job_id: "existing".into(),
+            },
+        );
+        orch.fleet
+            .resident_relays()
+            .bind(&existing_relay.grant.relay_id, "remote", generation)
+            .unwrap();
+        let refused_relay = orch.fleet.resident_relays().register(
+            "remote",
+            holder,
+            "oversized",
+            resident_relay::RegisteredAuthority::Job {
+                job_id: "existing".into(),
+            },
+        );
+        let mut process: ResidentProcessSpec = serde_json::from_value(serde_json::json!({
+            "program": "/bin/sh",
+            "args": ["x".repeat(LINK_FRAME_BYTE_LIMIT)],
+            "stdoutFraming": "lines",
+        }))
+        .unwrap();
+        process.relay = Some(refused_relay.grant.clone());
+        process.node_scratch = Some(cairn_common::executor_protocol::NodeScratchGrant {
+            scratch_id: "refused-scratch".into(),
+            owner_uri: "cairn://p/p/1/1/builder".into(),
+            head_commit: None,
+            head_seq: 0,
+            ceiling_bytes: 1024,
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            orch.fleet.operate_residency(
+                &orch,
+                ResidencyOperation::StartProcess {
+                    fence: residency_fence_of(&cell),
+                    process_key: "oversized".into(),
+                    kind: ResidentProcessKind::Terminal {
+                        slug: "oversized".into(),
+                    },
+                    reservation: None,
+                    process,
+                },
+            ),
+        )
+        .await
+        .expect("an oversized start refuses without waiting for the executor");
+        assert!(
+            matches!(result, ResidencyResult::Failed {
+            kind: ResidencyFailureKind::InvalidDeclaration, ref diagnostic, ..
+        } if diagnostic.contains("frame")),
+            "{result:?}"
+        );
+        while let Ok(frame) = remote.try_recv() {
+            assert!(
+                matches!(frame, ExecutorMessage::DrainModeRequest { .. }),
+                "an oversized resident start must not reach the executor: {frame:?}"
+            );
+        }
+        assert_eq!(orch.fleet.queue.len(), 0);
+        assert_eq!(*orch.fleet.residency_routes.lock().unwrap(), routes);
+        assert_eq!(orch.fleet.pending_residency.lock().unwrap().len(), 1);
+        assert!(matches!(
+            pending_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        {
+            use crate::security::{registry, SecretCategory, SecretId, SecretMaterial};
+            // Ordinary text settles immediately in either mode. A registered
+            // newline prefix makes an NDJSON terminator distinguish the modes.
+            let _secret = registry()
+                .register(
+                    SecretId::new("launch-refusal-framing"),
+                    SecretCategory::BatchCapability,
+                    "unit test",
+                    SecretMaterial::from_bytes(b"\nQ7m2Zx9-launch-framing"),
+                )
+                .unwrap();
+            let frame = b"{\"ok\":true}\n";
+            let mut output = orch.fleet.resident_output.lock().unwrap();
+            assert_eq!(
+                output.settle_resident_bytes(
+                    "remote",
+                    &holder_key,
+                    "oversized",
+                    1,
+                    ResidentProcessStream::Stdout,
+                    frame
+                ),
+                &frame[..frame.len() - 1],
+                "a refused start must not install line framing"
+            );
+            assert_eq!(
+                output.settle_resident_bytes(
+                    "remote",
+                    &holder_key,
+                    "existing",
+                    1,
+                    ResidentProcessStream::Stdout,
+                    frame
+                ),
+                frame,
+                "the unrelated line-framed start stays line-framed"
+            );
+        }
+
+        let mut request = provenance_request();
+        request.repository = RepositoryLocator::ScratchOnly {
+            owner_id: "p".into(),
+        };
+        request.pinned_executor_id = Some("remote".into());
+        let coordinate = ObjectTransferCoordinate {
+            repository: request.repository.identity(),
+            request_id: request.request_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            executor_id: "remote".into(),
+            connection_generation: generation,
+        };
+        let batch = ProcessBatch {
+            files: Vec::new(),
+            runtime_packages: Vec::new(),
+            sequential: true,
+            stop_on_error: true,
+            sandbox_mode: ProcessSandboxMode::Unconfined,
+            timeout_bases: Vec::new(),
+            items: vec![ProcessBatchItem {
+                stdin: Some("x".repeat(LINK_FRAME_BYTE_LIMIT)),
+                ..cache_batch_item(Vec::new())
+            }],
+            runner_context_id: None,
+            execution_residency: None,
+            containment: None,
+            node_scratch: None,
+        };
+        let (outcome, ()) = tokio::join!(
+            orch.fleet.submit_execution(&orch, request, Some(batch)),
+            async {
+                let offered = match residency_queue_frame(&mut remote).await {
+                    ExecutorMessage::Offer { entry_id, .. } => entry_id,
+                    other => panic!("expected batch offer, got {other:?}"),
+                };
+                orch.fleet.handle_executor_message(
+                    "remote",
+                    generation,
+                    ExecutorMessage::Claim {
+                        entry_id: offered.clone(),
+                    },
+                );
+                assert!(matches!(residency_queue_frame(&mut remote).await,
+                    ExecutorMessage::Lost { entry_id } if entry_id == offered));
+            }
+        );
+        assert!(
+            matches!(outcome, CellOutcome::Unavailable {
+            reason: CellUnavailableReason::AdmissionRejected {
+                reason: AdmissionRejectionReason::RequestTooLarge,
+            }, ref diagnostic,
+        } if diagnostic.contains("frame")),
+            "{outcome:?}"
+        );
+        assert!(
+            remote.try_recv().is_err(),
+            "no launch grant follows an oversized batch claim"
+        );
+        assert_eq!(
+            orch.fleet.queue.len(),
+            0,
+            "the refused batch leaves no queue claim"
+        );
+        assert!(!orch.object_plane.authorizes(&coordinate, "base"));
+        assert_eq!(*orch.fleet.residency_routes.lock().unwrap(), routes);
+        assert_eq!(orch.fleet.pending_residency.lock().unwrap().len(), 1);
+        assert!(matches!(
+            pending_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(orch.fleet.runner_contexts.lock().unwrap().is_empty());
+        assert_eq!(orch.fleet.resident_relays().len(), 2);
+        assert!(orch
+            .fleet
+            .resident_relays()
+            .is_live(&existing_relay.grant.relay_id));
+        assert!(
+            !orch
+                .fleet
+                .resident_relays()
+                .is_live(&refused_relay.grant.relay_id),
+            "preflight must not bind the refused start's relay"
+        );
+        assert!(orch
+            .object_plane
+            .scratch
+            .authorizes("remote", generation, "existing-scratch"));
+        assert!(!orch
+            .object_plane
+            .scratch
+            .authorizes("remote", generation, "refused-scratch"));
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn resolved_environment_retries_after_response_guard_and_resident_exit() {
     use crate::execution::teardown::{
         reconcile_resolved_resources, release_settled_job_environments,

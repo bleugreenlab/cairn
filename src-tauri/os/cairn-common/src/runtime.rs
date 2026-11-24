@@ -95,8 +95,10 @@ pub fn installed_package_dir(parent: &Path, scope: &str, name: &str) -> PathBuf 
     parent.join(NODE_MODULES).join(scope).join(name)
 }
 
-/// Validate runner-supplied runtime assets against the transport limits and the
-/// path policy: relative, non-empty, no parent escape, no duplicates.
+/// Validate runner-supplied runtime assets against decoded-payload limits and
+/// the path policy: relative, non-empty, no parent escape, no duplicates.
+/// These security caps do not bound encoded JSON size. The runner additionally
+/// admits the complete serialized launch frame against the link frame limit.
 ///
 /// Shared by every carrier of runtime assets, so runner-supplied bytes have one
 /// security policy rather than one per call site.

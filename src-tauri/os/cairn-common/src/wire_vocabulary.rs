@@ -132,7 +132,10 @@ impl ResidentRelayId {
     }
 }
 
+/// Decoded payload bytes per file, independent of its JSON wire representation.
 pub const MAX_RESIDENT_RUNTIME_ASSET_BYTES: usize = 4 * 1024 * 1024;
+/// Decoded payload bytes per collection. Full launch-frame admission is an
+/// additional requirement; a collection within this cap may not fit the link.
 pub const MAX_RESIDENT_RUNTIME_ASSETS_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RESIDENT_RUNTIME_ASSETS: usize = 256;
 

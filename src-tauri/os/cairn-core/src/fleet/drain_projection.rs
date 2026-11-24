@@ -173,7 +173,99 @@ pub(super) fn rejection(entry: &ExecutorConnectionState) -> PlacementRejectionRe
     }
 }
 
+/// Counts the same complete JSON value the link encoder sends, without copying assets.
+#[derive(Default)]
+struct FrameByteCount(usize);
+
+impl std::io::Write for FrameByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("launch frame byte count overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_frame_bytes(value: &impl serde::Serialize) -> Result<usize, String> {
+    let mut count = FrameByteCount::default();
+    // Do not include serializer errors: a custom serializer may expose input.
+    serde_json::to_writer(&mut count, value).map_err(|_| {
+        "cannot measure launch frame; serialization or byte counting failed".to_string()
+    })?;
+    Ok(count.0)
+}
+
+/// Escaped, bounded display only; never copy a whole untrusted path to truncate it.
+fn launch_asset_path(path: &str) -> String {
+    let mut display = String::new();
+    for character in path.chars() {
+        let escaped = character.escape_default().to_string();
+        if display.len() + escaped.len() > 240 {
+            display.push_str("...");
+            break;
+        }
+        display.push_str(&escaped);
+    }
+    display
+}
+
+fn validate_launch_frame_limit(message: &ExecutorMessage, limit: usize) -> Result<(), String> {
+    use cairn_common::executor_protocol::ResidencyOperation;
+    use cairn_common::wire_vocabulary::ResidentRuntimeAsset;
+    let (assets, packages): (&[ResidentRuntimeAsset], &[ResidentRuntimeAsset]) = match message {
+        ExecutorMessage::Granted { batch, .. } => (
+            &[],
+            batch
+                .as_ref()
+                .map_or(&[], |batch| batch.runtime_packages.as_slice()),
+        ),
+        ExecutorMessage::ResidencyRequest {
+            operation: ResidencyOperation::StartProcess { process, .. },
+            ..
+        } => (&process.runtime_assets, &process.runtime_packages),
+        _ => return Ok(()),
+    };
+    let bytes = serialized_frame_bytes(message)?;
+    if bytes <= limit {
+        return Ok(());
+    }
+    let largest = assets
+        .iter()
+        .chain(packages.iter())
+        .max_by_key(|asset| asset.data.len());
+    let asset = largest.map_or_else(
+        || "no runtime assets".to_string(),
+        |asset| {
+            format!(
+                "largest runtime asset \"{}\": {} decoded payload bytes",
+                launch_asset_path(&asset.path),
+                asset.data.len()
+            )
+        },
+    );
+    Err(format!(
+        "launch frame is {bytes} serialized bytes ({:.2} MiB), exceeding the {limit} byte ({:.2} MiB) link frame limit; {asset}",
+        bytes as f64 / (1 << 20) as f64,
+        limit as f64 / (1 << 20) as f64,
+    ))
+}
+
+/// Preflight the final immutable launch before granting authority or binding relays.
+/// The common send gate repeats this outside fleet locks to enforce the invariant.
+pub(super) fn validate_launch_frame(message: &ExecutorMessage) -> Result<(), String> {
+    validate_launch_frame_limit(
+        message,
+        cairn_common::executor_protocol::LINK_FRAME_BYTE_LIMIT,
+    )
+}
+
 pub(super) struct AdmissionSendError {
+    pub(super) invalid_launch: bool,
     pub(super) diagnostic: String,
     pub(super) blockers: Vec<DrainBlocker>,
     pub(super) reason: PlacementRejectionReason,
@@ -349,6 +441,18 @@ impl Fleet {
         resident: bool,
         message: ExecutorMessage,
     ) -> Result<(), Box<AdmissionSendError>> {
+        if let Err(diagnostic) = validate_launch_frame(&message) {
+            return Err(Box::new(AdmissionSendError {
+                invalid_launch: true,
+                reason: PlacementRejectionReason::Declined {
+                    reason: cairn_common::executor_protocol::DeclineReason::Constraint,
+                    detail: Some(diagnostic.clone()),
+                    declined_at_unix_ms: unix_time_ms(),
+                },
+                diagnostic,
+                blockers: Vec::new(),
+            }));
+        }
         let projection = self.drain_projection.lock().unwrap();
         let blockers = projection.blockers(&selected.executor_id);
         let refusing = refusing(&blockers, resident);
@@ -395,6 +499,7 @@ impl Fleet {
             self.queue.record_unqueued_refusal(request, &decision);
             self.record_placement_decision(decision);
             return Err(Box::new(AdmissionSendError {
+                invalid_launch: false,
                 diagnostic,
                 blockers,
                 reason,
@@ -406,6 +511,7 @@ impl Fleet {
             .is_some_and(|entry| entry.generation == selected.generation)
         {
             return Err(Box::new(AdmissionSendError {
+                invalid_launch: false,
                 diagnostic: "selected executor connection generation changed before admission"
                     .into(),
                 blockers: Vec::new(),
@@ -414,6 +520,7 @@ impl Fleet {
         }
         selected.sender.send(message).map_err(|_| {
             Box::new(AdmissionSendError {
+                invalid_launch: false,
                 diagnostic: "executor link closed before admission".into(),
                 blockers: Vec::new(),
                 reason: PlacementRejectionReason::Drained,
@@ -521,6 +628,232 @@ impl Fleet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn launch_frames() -> Vec<ExecutorMessage> {
+        use cairn_common::executor_protocol::*;
+        use cairn_common::wire_vocabulary::ResidentRuntimeAsset;
+        let asset = || ResidentRuntimeAsset {
+            path: "@cairn/sdk/quoted\"\\\n✓.js".into(),
+            data: vec![0, 1, 9, 10, 99, 100, 255],
+        };
+        let config = ExecutorConfig {
+            project_id: "p".into(),
+            project_key: "quoted\"\\\n✓".into(),
+            default_timeout_seconds: 30,
+            setup_commands: Vec::new(),
+            populate: Default::default(),
+            population_source_root: None,
+        };
+        let grant = ExecutorMessage::Granted {
+            entry_id: "entry".into(),
+            config,
+            request: super::super::tests::targeted_request("macos"),
+            batch: Some(ProcessBatch {
+                files: Vec::new(),
+                sequential: true,
+                stop_on_error: true,
+                sandbox_mode: ProcessSandboxMode::ReadOnlyCheckout,
+                containment: None,
+                timeout_bases: Vec::new(),
+                items: Vec::new(),
+                runtime_packages: vec![asset()],
+                runner_context_id: None,
+                execution_residency: None,
+                node_scratch: None,
+            }),
+        };
+        let mut process: ResidentProcessSpec =
+            serde_json::from_value(serde_json::json!({"program": "bun"})).unwrap();
+        process.runtime_assets.push(ResidentRuntimeAsset {
+            path: "service/main.js".into(),
+            data: vec![0],
+        });
+        process.runtime_packages.push(asset());
+        let resident = ExecutorMessage::ResidencyRequest {
+            correlation_id: "quoted\"\\\n✓".into(),
+            config: ResidencyRuntimeConfig::NotRequired,
+            operation: ResidencyOperation::StartProcess {
+                fence: ResidencyFence {
+                    holder: ResidencyHolder::Service {
+                        service_id: "test".into(),
+                    },
+                    incarnation_id: "incarnation".into(),
+                    cell_epoch: 1,
+                },
+                process_key: "main".into(),
+                kind: ResidentProcessKind::Service {
+                    name: "test".into(),
+                    role: "main".into(),
+                },
+                process,
+                reservation: None,
+            },
+            granted_entry_id: None,
+        };
+        vec![grant, resident]
+    }
+
+    #[test]
+    fn launch_frame_count_matches_wire_and_exact_boundaries() {
+        for message in launch_frames() {
+            let bytes = serde_json::to_vec(&message).unwrap().len();
+            assert_eq!(serialized_frame_bytes(&message).unwrap(), bytes);
+            assert_eq!(
+                cairn_common::executor_protocol::encode_executor_message(&message)
+                    .unwrap()
+                    .len(),
+                bytes
+            );
+            assert!(validate_launch_frame(&message).is_ok());
+            assert!(validate_launch_frame_limit(&message, bytes).is_ok());
+            let diagnostic = validate_launch_frame_limit(&message, bytes - 1).unwrap_err();
+            assert!(diagnostic.contains(&format!("{bytes} serialized bytes")));
+            assert!(diagnostic.contains("@cairn/sdk/quoted"));
+            assert!(diagnostic.contains("7 decoded payload bytes"));
+            assert!(!diagnostic.contains('\n'));
+        }
+    }
+
+    #[test]
+    fn launch_frame_envelope_without_assets_still_counts() {
+        let mut message = launch_frames().remove(0);
+        if let ExecutorMessage::Granted { batch, .. } = &mut message {
+            *batch = None;
+        }
+        let bytes = serde_json::to_vec(&message).unwrap().len();
+        assert!(validate_launch_frame_limit(&message, bytes).is_ok());
+        let diagnostic = validate_launch_frame_limit(&message, bytes - 1).unwrap_err();
+        assert!(diagnostic.contains("no runtime assets"));
+        assert!(diagnostic.contains(&format!("{bytes} serialized bytes")));
+    }
+
+    #[test]
+    fn launch_frame_measurement_fails_closed_and_paths_are_bounded() {
+        use std::io::Write;
+        let mut count = FrameByteCount(usize::MAX);
+        assert!(count.write(&[0]).is_err());
+        assert_eq!(count.0, usize::MAX);
+        struct Unserializable;
+        impl serde::Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("secret must not escape"))
+            }
+        }
+        let diagnostic = serialized_frame_bytes(&Unserializable).unwrap_err();
+        assert!(diagnostic.contains("cannot measure launch frame"));
+        assert!(!diagnostic.contains("secret"));
+        let path = launch_asset_path(&format!("@pkg/\n\"\\{}", "✓".repeat(1_000)));
+        assert!(path.len() <= 243);
+        assert!(!path.contains('\n'));
+        assert!(path.starts_with("@pkg/\\n\\\"\\\\"));
+        assert!(path.ends_with("..."));
+    }
+
+    #[test]
+    fn oversized_launch_never_enters_admission_channel() {
+        use cairn_common::executor_protocol::LINK_FRAME_BYTE_LIMIT;
+        let fleet = Fleet::default();
+        let (sender, mut inbox) = mpsc::unbounded_channel();
+        fleet.attach_executor(sender);
+        while inbox.try_recv().is_ok() {}
+        let selected =
+            selected_executor(fleet.lock_connections().get(COLOCATED_EXECUTOR_ID).unwrap());
+        let request = super::super::tests::targeted_request("macos");
+        for mut message in launch_frames() {
+            match &mut message {
+                ExecutorMessage::Granted { entry_id, .. } => {
+                    *entry_id = "x".repeat(LINK_FRAME_BYTE_LIMIT);
+                }
+                ExecutorMessage::ResidencyRequest { correlation_id, .. } => {
+                    *correlation_id = "x".repeat(LINK_FRAME_BYTE_LIMIT);
+                }
+                _ => unreachable!(),
+            }
+            let error = fleet
+                .send_new_admission(&selected, &request, true, message)
+                .err()
+                .unwrap();
+            assert!(error.invalid_launch);
+            assert!(error.blockers.is_empty());
+            assert!(matches!(
+                error.reason,
+                PlacementRejectionReason::Declined {
+                    reason: cairn_common::executor_protocol::DeclineReason::Constraint,
+                    ..
+                }
+            ));
+            assert!(error.diagnostic.contains("16777216 byte (16.00 MiB)"));
+            assert!(inbox.try_recv().is_err());
+        }
+        for message in launch_frames() {
+            let expected = serde_json::to_vec(&message).unwrap();
+            assert!(fleet
+                .send_new_admission(&selected, &request, true, message)
+                .is_ok());
+            assert_eq!(
+                serde_json::to_vec(&inbox.try_recv().unwrap()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn launch_frame_payload_cap_is_not_a_wire_budget() {
+        use cairn_common::executor_protocol::ResidencyOperation;
+        use cairn_common::wire_vocabulary::{
+            ResidentRuntimeAsset, MAX_RESIDENT_RUNTIME_ASSETS_BYTES,
+            MAX_RESIDENT_RUNTIME_ASSET_BYTES,
+        };
+        for mut message in launch_frames() {
+            let assets: Vec<_> = (0..MAX_RESIDENT_RUNTIME_ASSETS_BYTES
+                / MAX_RESIDENT_RUNTIME_ASSET_BYTES)
+                .map(|index| ResidentRuntimeAsset {
+                    path: format!("@cairn/sdk/bundle-{index}.js"),
+                    data: vec![255; MAX_RESIDENT_RUNTIME_ASSET_BYTES],
+                })
+                .collect();
+            assert_eq!(
+                assets.iter().map(|asset| asset.data.len()).sum::<usize>(),
+                MAX_RESIDENT_RUNTIME_ASSETS_BYTES
+            );
+            match &mut message {
+                ExecutorMessage::Granted {
+                    batch: Some(batch), ..
+                } => batch.runtime_packages = assets,
+                ExecutorMessage::ResidencyRequest {
+                    operation: ResidencyOperation::StartProcess { process, .. },
+                    ..
+                } => {
+                    process.runtime_assets.clear();
+                    process.runtime_packages = assets;
+                }
+                _ => unreachable!(),
+            }
+            let diagnostic = validate_launch_frame(&message).unwrap_err();
+            assert!(diagnostic.contains("@cairn/sdk/bundle-"));
+            assert!(diagnostic.contains("4194304 decoded payload bytes"));
+            assert!(diagnostic.contains("16777216 byte (16.00 MiB)"));
+        }
+    }
+
+    #[test]
+    fn launch_frame_assets_fit_but_envelope_does_not() {
+        for message in launch_frames() {
+            let assets = match &message {
+                ExecutorMessage::Granted {
+                    batch: Some(batch), ..
+                } => &batch.runtime_packages,
+                ExecutorMessage::ResidencyRequest {
+                    operation: ResidencyOperation::StartProcess { process, .. },
+                    ..
+                } => &process.runtime_packages,
+                _ => unreachable!(),
+            };
+            let limit = serialized_frame_bytes(assets).unwrap();
+            assert!(serialized_frame_bytes(&message).unwrap() > limit);
+            assert!(validate_launch_frame_limit(&message, limit).is_err());
+        }
+    }
 
     fn last_drain(inbox: &mut mpsc::UnboundedReceiver<ExecutorMessage>) -> Option<bool> {
         let mut last = None;

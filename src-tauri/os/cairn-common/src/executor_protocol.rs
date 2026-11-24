@@ -7200,6 +7200,12 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/7111 does not move the number. The runner refuses a launch whose
+/// complete serialized JSON exceeds the existing link frame limit, before
+/// issuing launch authority or enqueueing it. Admitted frames, runtime asset
+/// number arrays, and refusal vocabulary are unchanged; an older executor
+/// receives exactly the same representation and has nothing new to interpret.
+///
 /// cairn/6227 does not move the number. The runner's request ledger samples a
 /// batch's own `executingRequests` entry (its cell, `processIds`, start) and
 /// the live usage already joined onto it, and writes them to its own store.

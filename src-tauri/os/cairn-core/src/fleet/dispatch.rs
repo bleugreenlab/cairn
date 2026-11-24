@@ -3883,13 +3883,38 @@ impl Fleet {
             name: self.executor_name_for_text(&selected.executor_id),
             platform: Some(ExecutorPlatform::advertised(&selected.capabilities)),
         };
+        let admission_request = request.clone();
+        let message = ExecutorMessage::Granted {
+            entry_id: entry_id.clone(),
+            config: executor_config,
+            request,
+            batch,
+        };
+        if let Err(diagnostic) = drain_projection::validate_launch_frame(&message) {
+            withdraw_claim(&selected, &entry_id);
+            self.queue
+                .take(&key, queue::TerminalState::Cancelled, unix_time_ms());
+            guard.disarm();
+            return CellOutcome::Unavailable {
+                reason: CellUnavailableReason::AdmissionRejected {
+                    reason:
+                        cairn_common::executor_protocol::AdmissionRejectionReason::RequestTooLarge,
+                },
+                diagnostic,
+            }
+            .into();
+        }
+        let (request, batch) = match &message {
+            ExecutorMessage::Granted { request, batch, .. } => (request, batch),
+            _ => unreachable!("the preflighted grant is immutable"),
+        };
         // The claim is the binding, so it is the moment every grant is issued:
         // the runner context and the purpose registry's record that this item
         // has actually been dispatched. An offer conferred neither, which is
         // what let it be declined for free.
         if let Err(diagnostic) = self.bind_runner_context(
             batch.as_ref(),
-            &request,
+            request,
             &selected.executor_id,
             selected.generation,
         ) {
@@ -3937,7 +3962,7 @@ impl Fleet {
         // here means the only exit between the grant and its revocation is the
         // send below, which revokes on failure.
         if !selected.colocated {
-            object_plane.authorize_request(&request, &selected.executor_id, selected.generation);
+            object_plane.authorize_request(request, &selected.executor_id, selected.generation);
         }
         // A node scratch is reached over the object channel from every machine,
         // colocated or not, and only by the connection this batch was granted to.
@@ -3948,17 +3973,11 @@ impl Fleet {
                 &grant.scratch_id,
             );
         }
-        let admission_request = request.clone();
         let admission = self.send_new_admission(
             &selected,
             &admission_request,
             drain_projection::resident_work(&admission_request, &selected.executor_id),
-            ExecutorMessage::Granted {
-                entry_id: entry_id.clone(),
-                config: executor_config,
-                request,
-                batch,
-            },
+            message,
         );
         let sent = admission.is_ok();
         if sent {
@@ -4004,7 +4023,18 @@ impl Fleet {
                 );
             }
             guard.disarm();
-            let mut executed: ExecutedRequest = executor_unavailable(refusal.diagnostic).into();
+            let outcome = if refusal.invalid_launch {
+                CellOutcome::Unavailable {
+                    reason: CellUnavailableReason::AdmissionRejected {
+                        reason:
+                            cairn_common::executor_protocol::AdmissionRejectionReason::RequestTooLarge,
+                    },
+                    diagnostic: refusal.diagnostic,
+                }
+            } else {
+                executor_unavailable(refusal.diagnostic)
+            };
+            let mut executed: ExecutedRequest = outcome.into();
             executed.account.placement = Some(placement);
             return executed;
         }

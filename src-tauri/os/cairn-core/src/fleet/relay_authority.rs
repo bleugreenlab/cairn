@@ -385,6 +385,28 @@ impl Fleet {
         }
     }
 
+    /// Drive the production admission boundary from a transport integration
+    /// fixture, without replacing its connected sender with a test channel.
+    #[cfg(feature = "test-utils")]
+    pub fn send_linked_launch_for_test(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        request: &CellRequest,
+        message: cairn_common::executor_protocol::ExecutorMessage,
+    ) -> Result<(), String> {
+        let selected = {
+            let connections = self.lock_connections();
+            let entry = connections.get(executor_id).ok_or("executor missing")?;
+            if entry.generation != generation {
+                return Err("executor generation changed".into());
+            }
+            super::selection::selected_executor(entry)
+        };
+        self.send_new_admission(&selected, request, true, message)
+            .map_err(|error| error.diagnostic)
+    }
+
     /// Admit a batch context bound to `generation` of `executor_id`, as a
     /// dispatched batch's would be, for tests that drive a link directly.
     #[cfg(any(test, feature = "test-utils"))]

@@ -2029,6 +2029,23 @@ impl Fleet {
             }
         }
         let correlation_id = uuid::Uuid::new_v4().to_string();
+        let message = ExecutorMessage::ResidencyRequest {
+            correlation_id: correlation_id.clone(),
+            config: executor_config,
+            operation,
+            granted_entry_id: None,
+        };
+        if let Err(diagnostic) = drain_projection::validate_launch_frame(&message) {
+            return residency_core_failure(
+                ResidencyFailureKind::InvalidDeclaration,
+                diagnostic,
+                None,
+            );
+        }
+        let operation = match &message {
+            ExecutorMessage::ResidencyRequest { operation, .. } => operation,
+            _ => unreachable!("the preflighted residency operation is immutable"),
+        };
         let (tx, rx) = oneshot::channel();
         self.pending_residency.lock().unwrap().insert(
             correlation_id.clone(),
@@ -2128,12 +2145,6 @@ impl Fleet {
             &operation,
             ResidencyOperation::Acquire { .. } | ResidencyOperation::StartProcess { .. }
         );
-        let message = ExecutorMessage::ResidencyRequest {
-            correlation_id: correlation_id.clone(),
-            config: executor_config,
-            operation,
-            granted_entry_id: None,
-        };
         let sent = if new_admission {
             // The refusal's own words reach the caller: a standing drain names
             // its owner, reason and generation, which "connection closed"
@@ -2148,19 +2159,29 @@ impl Fleet {
                 true,
                 message,
             )
-            .map_err(|refusal| refusal.diagnostic)
+            .map_err(|refusal| {
+                let kind = if refusal.invalid_launch {
+                    ResidencyFailureKind::InvalidDeclaration
+                } else {
+                    ResidencyFailureKind::Admission
+                };
+                (kind, refusal.diagnostic)
+            })
         } else {
             // Inputs, renewals and cleanup keep already admitted work alive.
             selected.sender.send(message).map_err(|_| {
-                "executor connection closed while sending residency operation".to_string()
+                (
+                    ResidencyFailureKind::Admission,
+                    "executor connection closed while sending residency operation".to_string(),
+                )
             })
         };
-        if let Err(diagnostic) = sent {
+        if let Err((kind, diagnostic)) = sent {
             self.pending_residency
                 .lock()
                 .unwrap()
                 .remove(&correlation_id);
-            return residency_core_failure(ResidencyFailureKind::Admission, diagnostic, None);
+            return residency_core_failure(kind, diagnostic, None);
         }
         let result = match self
             .await_link_bound_response(rx, &selected.executor_id, selected.generation)
