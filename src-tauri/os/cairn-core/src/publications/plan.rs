@@ -580,33 +580,36 @@ mod tests {
             machine("fedora", "linux", "x86_64", Some(&["rust"])),
             publisher.clone(),
         ];
-        let spec = target_spec("x86_64-unknown-linux-gnu").unwrap();
-        let unmeasured = builders_for(spec, &fleet, custody_for(true), now);
-        assert!(unmeasured.eligible.is_empty());
-        let reason = no_builder_reason(spec, &unmeasured);
-        assert!(
-            reason.contains("fedora is not a publisher executor (role general)")
-                && reason
-                    .contains("cairn-publish is not a publisher executor (isolation unmeasured"),
-            "{reason}"
-        );
-        publisher.publish_isolation = Some(PublishIsolationEvidence {
-            verdict: PublishIsolationVerdict::Pass,
-            measured_at_unix_ms: now - 60_000,
-            lines: Vec::new(),
-        });
-        let fleet = [
-            machine("fedora", "linux", "x86_64", Some(&["rust"])),
-            publisher,
-        ];
-        let measured = builders_for(spec, &fleet, custody_for(true), now);
-        assert_eq!(measured.eligible, ["cairn-publish"]);
-        assert_eq!(measured.avoid, ["fedora"]);
-        assert_eq!(
-            builders_for(spec, &fleet, custody_for(false), now).eligible,
-            ["fedora", "cairn-publish"],
-            "a shadow build may go to either"
-        );
+        for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let spec = target_spec(triple).unwrap();
+            let unmeasured = builders_for(spec, &fleet, custody_for(true), now);
+            assert!(unmeasured.eligible.is_empty());
+            let reason = no_builder_reason(spec, &unmeasured);
+            assert!(
+                reason.contains("fedora is not a publisher executor (role general)")
+                    && reason.contains(
+                        "cairn-publish is not a publisher executor (isolation unmeasured"
+                    ),
+                "{reason}"
+            );
+            publisher.publish_isolation = Some(PublishIsolationEvidence {
+                verdict: PublishIsolationVerdict::Pass,
+                measured_at_unix_ms: now - 60_000,
+                lines: Vec::new(),
+            });
+            let fleet = [
+                machine("fedora", "linux", "x86_64", Some(&["rust"])),
+                publisher.clone(),
+            ];
+            let measured = builders_for(spec, &fleet, custody_for(true), now);
+            assert_eq!(measured.eligible, ["cairn-publish"]);
+            assert_eq!(measured.avoid, ["fedora"]);
+            assert_eq!(
+                builders_for(spec, &fleet, custody_for(false), now).eligible,
+                ["fedora", "cairn-publish"],
+                "a shadow build may go to either"
+            );
+        }
     }
 
     #[test]

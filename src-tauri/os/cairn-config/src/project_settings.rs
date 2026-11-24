@@ -1764,12 +1764,13 @@ mod tests {
 
     #[test]
     fn publish_parses_strictly() {
-        let (parsed, _) =
-            parse_project_settings("publish:\n  liveTargets: [x86_64-unknown-linux-gnu]\n")
-                .unwrap();
+        let (parsed, _) = parse_project_settings(
+            "publish:\n  liveTargets: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]\n",
+        )
+        .unwrap();
         assert_eq!(
             parsed.publish.unwrap().live_targets,
-            ["x86_64-unknown-linux-gnu"]
+            ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
         );
         assert!(parse_project_settings("publish:\n  liveTarget: []\n").is_err());
         let (absent, _) = parse_project_settings("checks: {}\n").unwrap();

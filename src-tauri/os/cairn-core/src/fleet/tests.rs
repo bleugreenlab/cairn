@@ -9384,9 +9384,11 @@ fn publication_leg(publisher_required: bool) -> CellRequest {
 #[test]
 fn a_secret_bearing_leg_goes_only_to_a_freshly_measured_publisher() {
     let stale = PUBLISH_ISOLATION_STALE_AFTER_MS + 60_000;
-    let cases: [(MachineRole, Option<PublishIsolationEvidence>, Option<&str>); 7] = [
+    let cases: [(MachineRole, Option<PublishIsolationEvidence>, Option<&str>); 9] = [
         (MachineRole::General, None, Some("role general")),
         (MachineRole::BuildsOnly, None, Some("role buildsOnly")),
+        (MachineRole::InferenceOnly, None, Some("role inferenceOnly")),
+        (MachineRole::ServicesOnly, None, Some("role servicesOnly")),
         (
             MachineRole::PublishOnly,
             None,

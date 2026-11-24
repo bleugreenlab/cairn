@@ -49,7 +49,7 @@ mod progress;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use cairn_common::executor_protocol::{CellOwnerRef, ExecutorSelector, PublicationCustody};
@@ -72,9 +72,16 @@ use plan::{LegVerdict, TargetSpec, ALL_TARGETS};
 
 pub use cairn_db::storage::publications::{Publication, PublicationLeg, Started, TargetState};
 
-/// How often the heartbeat starts a publication, matching the workflow's
-/// cron.
-const HEARTBEAT: Duration = Duration::from_secs(12 * 60 * 60);
+/// Shared with the combine leg's bounded in-flight publication window.
+static HEARTBEAT: LazyLock<Duration> = LazyLock::new(|| {
+    let config: Value =
+        serde_json::from_str(include_str!("heartbeat.json")).expect("valid publication heartbeat");
+    let seconds = config["seconds"]
+        .as_u64()
+        .filter(|seconds| *seconds > 0)
+        .expect("positive publication heartbeat seconds");
+    Duration::from_secs(seconds)
+});
 /// A build leg compiles release binaries; past this it is not progressing.
 /// Phase A's bound, which a live build-and-publish batch keeps: the upload is
 /// minutes beside the compile, and this is no new kill rule (tenet 292).
@@ -399,7 +406,7 @@ fn spawn_heartbeat(orch: &Orchestrator) {
     let orch = orch.clone();
     cairn_common::task::spawn(async move {
         let mut ticks =
-            tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
+            tokio::time::interval_at(tokio::time::Instant::now() + *HEARTBEAT, *HEARTBEAT);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticks.tick().await;
@@ -1923,6 +1930,52 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn a_merge_publishes_both_linux_targets_in_publisher_batches() {
+            const ARM: &str = "aarch64-unknown-linux-gnu";
+            let h = harness(
+                fleet(),
+                Box::new(|name: &str| match name {
+                    "publish all plan" => (
+                        0,
+                        plan_output(&[(LINUX, true), (ARM, true), (MAC, true)], true),
+                    ),
+                    "publish x86_64-unknown-linux-gnu build" => publisher_output(true),
+                    "publish aarch64-unknown-linux-gnu build" => {
+                        let (exit, output) = publisher_output(true);
+                        (exit, output.replace(LINUX, ARM))
+                    }
+                    "publish all combine" => (0, combined_output()),
+                    _ => (0, result(json!({"leg": "verify"}))),
+                }),
+            )
+            .await;
+            let (_, legs) = h.run("merge", &[LINUX, ARM]).await;
+            assert!(legs.iter().all(|row| row.target != MAC));
+            let placed = h.placed();
+            for target in [LINUX, ARM] {
+                for leg in ["build", "publish", "verify"] {
+                    assert_eq!(row(&legs, target, leg).state, "succeeded");
+                }
+                let batch = placed
+                    .iter()
+                    .find(|batch| batch.name == format!("publish {target} build"))
+                    .unwrap();
+                assert_eq!(batch.custody, Some(plan::custody_for(true)));
+                assert!(batch
+                    .command
+                    .contains(&format!("publish-leg.ts publish --target {target}")));
+                let builders = plan::builders_for(
+                    plan::target_spec(target).unwrap(),
+                    &h.actor.machines,
+                    batch.custody.unwrap(),
+                    now_unix_ms(),
+                );
+                assert_eq!(builders.eligible, ["cairn-publish"]);
+                assert_eq!(row(&legs, target, "publish").assets.len(), 1);
+            }
+        }
+
         /// A publish that fails leaves its build succeeded and defers its
         /// verify; with nothing published and the combined manifest current,
         /// no combine is laid out.
@@ -1962,34 +2015,40 @@ mod tests {
         #[tokio::test]
         async fn without_a_publisher_live_rows_defer_with_nothing_queued() {
             use crate::fleet::MachineRole;
+            const ARM: &str = "aarch64-unknown-linux-gnu";
             let h = harness(
                 vec![
                     machine("fedora", "linux", MachineRole::General),
                     machine("mac", "macos", MachineRole::General),
                 ],
                 Box::new(|name: &str| match name {
-                    "publish all plan" => (0, plan_output(&[(LINUX, true), (MAC, true)], false)),
+                    "publish all plan" => (
+                        0,
+                        plan_output(&[(LINUX, true), (ARM, true), (MAC, true)], false),
+                    ),
                     other => panic!("{other} must not be placed"),
                 }),
             )
             .await;
-            let (_, legs) = h.run("merge", &[LINUX]).await;
+            let (_, legs) = h.run("merge", &[LINUX, ARM]).await;
             assert!(
                 legs.iter().all(|row| row.target != MAC),
                 "a merge lays out no shadow rows"
             );
             assert!(legs.iter().all(PublicationLeg::is_terminal), "{legs:#?}");
-            for leg in ["build", "publish"] {
-                let row = row(&legs, LINUX, leg);
-                assert_eq!(row.state, "deferred", "{leg}");
-                let reason = row.reason.as_deref().unwrap();
-                assert!(
-                    reason.contains("fedora is not a publisher executor (role general)")
-                        && reason.contains("release secrets go only to publishOnly executors"),
-                    "{reason}"
-                );
+            for target in [LINUX, ARM] {
+                for leg in ["build", "publish"] {
+                    let row = row(&legs, target, leg);
+                    assert_eq!(row.state, "deferred", "{target} {leg}");
+                    let reason = row.reason.as_deref().unwrap();
+                    assert!(
+                        reason.contains("fedora is not a publisher executor (role general)")
+                            && reason.contains("release secrets go only to publishOnly executors"),
+                        "{reason}"
+                    );
+                }
+                assert_eq!(row(&legs, target, "verify").state, "deferred");
             }
-            assert_eq!(row(&legs, LINUX, "verify").state, "deferred");
             assert_eq!(row(&legs, "all", "combine").state, "deferred");
             assert_eq!(row(&legs, "all", "verify").state, "deferred");
             assert_eq!(h.placed().len(), 1, "only the plan was placed");
@@ -2021,6 +2080,37 @@ mod tests {
                     "all verify succeeded"
                 ]
             );
+        }
+
+        #[tokio::test]
+        async fn a_heartbeat_records_a_deferred_combine_with_no_target_to_publish() {
+            let reason = "publication in flight: per-target manifests disagree";
+            let h = harness(
+                fleet(),
+                Box::new(move |name: &str| match name {
+                    "publish all plan" => (0, plan_output(&[(LINUX, false)], false)),
+                    "publish all combine" => (
+                        plan::EXIT_DEFERRED,
+                        result(json!({"leg": "combine", "target": "all", "deferred": reason})),
+                    ),
+                    other => panic!("{other} must not be placed"),
+                }),
+            )
+            .await;
+            let (summary, legs) = h.run("heartbeat", &[LINUX]).await;
+            assert!(!summary.contains("already serves"), "{summary}");
+            assert_eq!(legs.len(), 3, "{legs:#?}");
+            assert_eq!(row(&legs, "all", "plan").state, "succeeded");
+            let combine = row(&legs, "all", "combine");
+            assert_eq!(combine.state, "deferred");
+            assert_eq!(combine.reason.as_deref(), Some(reason));
+            let verify = row(&legs, "all", "verify");
+            assert_eq!(verify.state, "deferred");
+            assert_eq!(
+                verify.reason.as_deref(),
+                Some("deferred: combine did not succeed")
+            );
+            assert_eq!(h.placed().len(), 2, "only plan and combine are placed");
         }
 
         /// With no live targets nothing here changes: no publish rows, no

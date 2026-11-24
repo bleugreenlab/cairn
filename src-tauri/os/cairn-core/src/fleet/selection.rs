@@ -1350,15 +1350,15 @@ pub(crate) fn publication_role_rejection(
             },
         ),
         Some(custody) => {
-            if !role.takes_publication_legs() && !pinned_here {
+            if custody.publisher_required {
+                publisher_ineligibility(role, publish_isolation, now_unix_ms)
+                    .map(|why| PlacementRejectionReason::NotPublishEligible { why })
+            } else if !role.takes_publication_legs() && !pinned_here {
                 Some(PlacementRejectionReason::RoleExcluded {
                     role,
                     work_class,
                     publication_leg: true,
                 })
-            } else if custody.publisher_required {
-                publisher_ineligibility(role, publish_isolation, now_unix_ms)
-                    .map(|why| PlacementRejectionReason::NotPublishEligible { why })
             } else {
                 None
             }

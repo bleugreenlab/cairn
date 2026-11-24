@@ -9481,6 +9481,12 @@ pub struct LearnedResourceEstimate {
 /// not before. What a runner gets wrong talking to an older executor: nothing;
 /// no frame changes and an adopted tree never carried a census.
 ///
+/// cairn/7466 does not move the number. Publisher custody now reports
+/// NotPublishEligible before ordinary role exclusion for every non-publisher
+/// role. This is runner-only placement and diagnostics; no request, frame or
+/// executor capability changes. An older executor decodes the same publication
+/// batch and the runner still requires fresh publisher isolation PASS.
+///
 /// cairn/7074 does not move the number. [`MachineRole::PublishOnly`] is a
 /// runner-only role like every other: no frame, advertisement or executor
 /// config carries it, and the executor is never told it. A publication leg is
