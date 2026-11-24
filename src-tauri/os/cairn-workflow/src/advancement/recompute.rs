@@ -1898,6 +1898,17 @@ pub async fn reduce_delegated_child_job_conn(
     conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<JobStatus>> {
+    reduce_delegated_child_job_with_caller_gone_conn(conn, job_id, false).await
+}
+
+/// Reduce a delegated child after the caller's liveness has been established.
+/// `caller_gone` is positive proof supplied by the host, never an age heuristic.
+/// It permits settlement of packet-backed calls that never acquired a run.
+pub async fn reduce_delegated_child_job_with_caller_gone_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+    caller_gone: bool,
+) -> DbResult<Option<JobStatus>> {
     let row = {
         let mut rows = conn
             .query(
@@ -1960,45 +1971,47 @@ pub async fn reduce_delegated_child_job_conn(
         .await?
         .is_some();
     let turn = turn_facts(conn, job_id).await?;
-    // Only an ephemeral call completes without a turn, and every call is its
-    // packet's result target. Any other turn-less child has no outcome to read
-    // yet, so it stays as it is.
-    if turn.work_state.is_none() && !is_standalone_workflow {
-        let is_packet_result = match execution_id.as_deref() {
-            Some(execution_id) => {
-                crate::delegated_packets::find_by_result_job(conn, execution_id, job_id)
-                    .await?
-                    .is_some()
-            }
-            None => false,
-        };
-        if !is_packet_result {
-            return Ok(None);
+    let packet = match execution_id.as_deref() {
+        Some(execution_id) => {
+            crate::delegated_packets::find_by_result_job(conn, execution_id, job_id).await?
         }
+        None => None,
+    };
+    // Work-turn filtering excludes memory review and refused launches. Neither
+    // makes a job turnless: this rule requires the absence of every turn row.
+    let no_turn = {
+        let mut rows = conn
+            .query("SELECT 1 FROM turns WHERE job_id = ?1 LIMIT 1", (job_id,))
+            .await?;
+        rows.next().await?.is_none()
+    };
+    if turn.work_state.is_none() && !no_turn {
+        return Ok(None);
+    }
+    if no_turn && !is_standalone_workflow && packet.is_none() {
+        return Ok(None);
     }
     let output_abandoned = output_abandoned_fact(conn, job_id).await?;
-    // A node-less ephemeral CALL establishes no DB turn (unlike a workflow or a
-    // task, which both run a real turn), so its completion cannot be read from
-    // turn facts — the job would spin `running` forever after its run finalizes,
-    // and the monitoring panel would show a stuck call even when it succeeded
-    // (CAIRN-2677 bug 2). For a turn-less child, derive from the completion
-    // CONTRACT instead: the return artifact IS the call's result, so its presence
-    // means Complete regardless of how the CLI stream ended — a clean exit, a
-    // stream that crashed AFTER the artifact landed, or a warm-parked run that
-    // never formally exited (CAIRN-2677 bug 1, applied to the job projection).
-    // Only a turn-less child that reached a terminal RUN with no artifact is a
-    // Failure; one whose latest run is still live is left running.
-    let facts = if turn.work_state.is_none() {
-        let run_terminal = latest_run_status_conn(conn, job_id)
-            .await?
-            .map(|s| is_terminal_run_status_str(&s))
-            .unwrap_or(false);
+    // Turnless calls settle by their owed artifact, but only once every run is
+    // inactive. An older live run must not be hidden by a newer terminal run.
+    let facts = if no_turn {
+        if has_active_run_conn(conn, job_id).await? {
+            return Ok(None);
+        }
+        let run_status = latest_run_status_conn(conn, job_id).await?;
+        let run_terminal = run_status
+            .as_deref()
+            .is_some_and(is_terminal_run_status_str);
+        let unstarted_caller_gone = run_status.is_none() && caller_gone && packet.is_some();
+        if !run_terminal && !unstarted_caller_gone {
+            return Ok(None);
+        }
         JobFacts {
             dag_ready: true,
             upstream_failed: false,
-            live_turn: !artifact_present && !run_terminal,
-            turn_failed: !artifact_present && run_terminal,
-            turn_complete: artifact_present,
+            live_turn: false,
+            turn_failed: unstarted_caller_gone || !artifact_present,
+            turn_complete: !unstarted_caller_gone && artifact_present,
             turn_truncated: false,
             checkpoint: CheckpointGate::None,
             resolution: Resolution::Pending,
@@ -2034,7 +2047,44 @@ pub async fn reduce_delegated_child_job_conn(
         return Ok(None);
     }
     check_reachable(&current, &derived, job_id);
+    if no_turn && derived == JobStatus::Failed {
+        let run = {
+            let mut rows = conn.query(
+                "SELECT id, status FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (job_id,),
+            ).await?;
+            rows.next()
+                .await?
+                .map(|row| Ok::<_, DbError>((row.text(0)?, row.text(1)?)))
+                .transpose()?
+        };
+        if let Some((run_id, status)) = run {
+            // Only fixed stored statuses enter this prose, never provider text.
+            let cause = if status == "crashed" {
+                "never started a turn; its run crashed"
+            } else {
+                "never started a turn; its run ended without its required result"
+            };
+            cairn_db::storage::record_run_failure_conn(conn, &run_id, None, cause, false).await?;
+        }
+    }
     write_job_status(conn, job_id, &current, &derived).await?;
+    if let (Some(execution_id), Some(packet)) = (execution_id.as_deref(), packet.as_ref()) {
+        crate::delegated_packets::update(
+            conn,
+            execution_id,
+            &packet.id,
+            &crate::delegated_packets::PacketChange {
+                status: Some(if derived == JobStatus::Complete {
+                    crate::models::DelegatedStatus::Completed
+                } else {
+                    crate::models::DelegatedStatus::Failed
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     // A standalone workflow's terminal status must roll up into its OWN execution
     // + issue anchor. A delegated child's execution is recomputed by the resuming
     // caller's turn-end sweep instead; a standalone workflow has no caller, so
@@ -2158,7 +2208,7 @@ pub fn reduce_delegated_child_job(
 }
 
 /// Startup safety net for the CAIRN-2559 stuck shape: a node-less delegated
-/// child (call/workflow) that finalized its run but whose job status was never
+/// child with a turn that finalized its run but whose job status was never
 /// terminalized — run terminal, job `running`, caller `blocked`. The forward fix
 /// (reduce at finalize) prevents this going forward, but a host that crashed
 /// under the old code is left holding it, and `redispatch_crashed_workflows`
@@ -2173,7 +2223,8 @@ pub fn reduce_delegated_child_job(
 /// `owning_db_for_job(parent_job_id)`), so a local-only scan would miss a stuck
 /// team child entirely. `reduce`/`resume` already route by job id, so only the
 /// candidate discovery has to fan out across databases. Errors are logged, never
-/// fatal.
+/// fatal. Turnless packet calls belong to the host's liveness-guarded sweep
+/// and restart reduction, not this parked-parent recovery path.
 pub async fn heal_stuck_delegated_children(runtime: &WorkflowRuntime) {
     // A job lives in exactly one database, so fan the candidate scan out across
     // every open replica and route the repair per job id.
@@ -2209,6 +2260,7 @@ pub async fn heal_stuck_delegated_children(runtime: &WorkflowRuntime) {
                              WHERE j.parent_job_id IS NOT NULL
                                AND j.recipe_node_id IS NULL
                                AND j.status IN ('running', 'pending', 'blocked')
+                               AND EXISTS (SELECT 1 FROM turns t WHERE t.job_id = j.id)
                                AND EXISTS (
                                    SELECT 1 FROM runs r
                                    WHERE r.job_id = j.id
@@ -2940,5 +2992,149 @@ mod gate_tests {
         };
         // A checkpoint node is a command gate regardless of confirm policy.
         assert_eq!(gate_for(Some(&node), None), CheckpointGate::Command);
+    }
+}
+
+#[cfg(test)]
+mod turnless_settlement_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn packet_calls_settle_atomically_only_after_work_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open_migrated_for_test(dir.path().join("calls.db"))
+            .await
+            .unwrap();
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','proj','/tmp/p',1,1);
+             INSERT INTO executions(id,recipe_id,project_id,status,started_at,seq,snapshot)
+               VALUES('e','r','p','running',1,1,'{}');
+             INSERT INTO jobs(id,project_id,execution_id,status,created_at,updated_at)
+               VALUES('parent','p','e','idle',1,1);",
+        )
+        .await
+        .unwrap();
+        // One migrated DB, no repository or process fixture. Each case gets its
+        // own child and packet so the assertions also exercise replay.
+        for (index, runs, turn, artifact, caller_gone, expected) in [
+            (
+                0,
+                vec!["crashed"],
+                None,
+                false,
+                false,
+                Some(JobStatus::Failed),
+            ),
+            (
+                1,
+                vec!["crashed"],
+                None,
+                true,
+                false,
+                Some(JobStatus::Complete),
+            ),
+            (
+                2,
+                vec!["exited"],
+                None,
+                false,
+                false,
+                Some(JobStatus::Failed),
+            ),
+            (3, vec![], None, false, false, None),
+            (4, vec![], None, false, true, Some(JobStatus::Failed)),
+            (10, vec![], None, true, true, Some(JobStatus::Failed)),
+            (
+                11,
+                vec!["crashed"],
+                None,
+                false,
+                false,
+                Some(JobStatus::Failed),
+            ),
+            (5, vec!["live", "crashed"], None, true, true, None),
+            (6, vec!["starting", "exited"], None, false, true, None),
+            (
+                7,
+                vec!["crashed"],
+                Some(("memory_review", "complete")),
+                true,
+                true,
+                None,
+            ),
+            (
+                8,
+                vec!["crashed"],
+                Some(("initial", "interrupted")),
+                true,
+                true,
+                None,
+            ),
+            (
+                9,
+                vec!["live"],
+                Some(("initial", "complete")),
+                true,
+                false,
+                Some(JobStatus::Complete),
+            ),
+        ] {
+            let job = format!("child-{index}");
+            let packet_id = format!("packet-{index}");
+            let packet: crate::models::DelegatedWorkPacket =
+                serde_json::from_value(serde_json::json!({
+                    "id": packet_id, "parentJobId": "parent", "origin": "task_tool",
+                    "title": "Call", "agentConfigId": "Explore", "ownership": {"cwd": "/tmp"},
+                    "outputContract": {"schemaType": "return"}, "status": "running",
+                    "resultArtifactJobId": job, "createdAt": 1
+                }))
+                .unwrap();
+            db.write(move |conn| {
+                let job = job.clone();
+                let packet = packet.clone();
+                let runs = runs.clone();
+                let expected = expected.clone();
+                Box::pin(async move {
+                    conn.execute("INSERT INTO jobs(id,project_id,execution_id,parent_job_id,status,created_at,updated_at)
+                        VALUES(?1,'p','e','parent','running',1,1)", (job.as_str(),)).await?;
+                    crate::delegated_packets::insert(conn, "e", &packet).await?;
+                    for (n, status) in runs.iter().enumerate() {
+                        conn.execute("INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES(?1,?2,?3,?4,1)",
+                            params![format!("{job}-run-{n}"), job.as_str(), *status, n as i64]).await?;
+                    }
+                    if index == 11 {
+                        conn.execute("UPDATE runs SET error_message='original cause' WHERE job_id=?1", (job.as_str(),)).await?;
+                    }
+                    if let Some((reason, state)) = turn {
+                        conn.execute("INSERT INTO turns(id,job_id,state,start_reason,sequence,created_at,updated_at,session_id)
+                            VALUES(?1,?2,?3,?4,1,1,1,?2)", params![format!("{job}-turn"), job.as_str(), state, reason]).await?;
+                    }
+                    if artifact {
+                        conn.execute("INSERT INTO artifacts(id,job_id,artifact_type,output_name,data,version,confirmed,created_at,updated_at)
+                            VALUES(?1,?2,'return','return','{}',1,1,1,1)", params![format!("{job}-artifact"), job.as_str()]).await?;
+                    }
+                    assert_eq!(reduce_delegated_child_job_with_caller_gone_conn(conn, &job, caller_gone).await?, expected, "case {index}");
+                    let stored = crate::delegated_packets::find_by_result_job(conn, "e", &job).await?.unwrap();
+                    let expected_packet = match expected {
+                        Some(JobStatus::Complete) => crate::models::DelegatedStatus::Completed,
+                        Some(JobStatus::Failed) => crate::models::DelegatedStatus::Failed,
+                        _ => crate::models::DelegatedStatus::Running,
+                    };
+                    assert_eq!(stored.status, expected_packet, "packet case {index}");
+                    let mut rows = conn.query("SELECT status FROM jobs WHERE id=?1", (job.as_str(),)).await?;
+                    let status = rows.next().await?.unwrap().text(0)?;
+                    assert_eq!(status, expected.as_ref().map(ToString::to_string).unwrap_or_else(|| "running".into()), "job case {index}");
+                    drop(rows);
+                    if index == 0 || index == 11 {
+                        let mut rows = conn.query("SELECT error_message FROM runs WHERE job_id=?1", (job.as_str(),)).await?;
+                        assert_eq!(rows.next().await?.unwrap().text(0)?, if index == 11 { "original cause" } else { "never started a turn; its run crashed" });
+                    }
+                    assert_eq!(reduce_delegated_child_job_with_caller_gone_conn(conn, &job, caller_gone).await?, None, "replay case {index}");
+                    Ok(())
+                })
+            }).await.unwrap();
+        }
     }
 }

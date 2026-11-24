@@ -538,11 +538,25 @@ async fn assert_active_legacy_successor(
     let stopped_request = stopped.request.as_ref().unwrap();
     assert_eq!(attempt.attempt_id, stopped_request.attempt_id);
     assert_eq!(attempt.executor_id, REMOTE);
-    let claim = crate::storage::check_lane_adoptions::latest_for_request(db, &old_grant.0)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(claim.state, "running");
+    // The withdrawn request records its shutdown on a spawned write that the
+    // caller's answer does not wait for; reading before it lands races it, and
+    // a late landing would overwrite the recovered runner's own transitions.
+    let claim = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let claim = crate::storage::check_lane_adoptions::latest_for_request(db, &old_grant.0)
+                .await
+                .unwrap()
+                .unwrap();
+            if claim.state != "running" {
+                break claim;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("shutdown records the adoptable claim as awaiting adoption");
+    assert_eq!(claim.state, "awaiting_adoption");
+    assert!(claim.stopped_at_ms.is_some());
     assert_eq!(claim.consumer, "write");
     assert_eq!(claim.consumer_ref, JOB);
     assert_eq!(claim.attempt_id, attempt.attempt_id);

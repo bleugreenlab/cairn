@@ -4611,6 +4611,7 @@ impl Orchestrator {
                 crate::orchestrator::lifecycle::sweep_stalled_children(&orch).await;
                 // A parent parked on children that have all finished has no
                 // edge left to wake it, and declines steering while parked.
+                crate::execution::advancement::sweep_turnless_calls(&orch).await;
                 crate::execution::advancement::heal_parked_parents(&orch).await;
                 // Likewise a child whose one restart resume did not take: some of
                 // those refusals leave no row to fire from.

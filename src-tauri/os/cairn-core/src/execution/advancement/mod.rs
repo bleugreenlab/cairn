@@ -8,6 +8,7 @@ use crate::orchestrator::Orchestrator;
 
 mod actions;
 mod recompute;
+mod turnless_calls;
 pub(crate) use actions::settle_advance;
 pub use actions::{
     advance_execution_with_actions, block_job, mark_job_failed, rearm_failed_pr_actions,
@@ -28,3 +29,4 @@ pub use recompute::{
     heal_parked_parents, heal_stuck_delegated_children, recompute_execution_jobs, recompute_job,
     reduce_delegated_child_job, settle_stranded_jobs,
 };
+pub(crate) use turnless_calls::sweep_turnless_calls;

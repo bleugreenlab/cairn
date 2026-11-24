@@ -97,6 +97,15 @@ pub fn reconcile_stale_runs(
                 log::warn!("Failed to re-derive job status for {job_id}: {error}");
             }
         }
+        // Calls without turns are invisible to the execution DAG projection.
+        // Use the same liveness-gated reducer as the periodic recovery sweep.
+        let recovery_orch = orch.clone();
+        if let Err(error) = crate::execution::advancement::run_advancement_db(async move {
+            crate::execution::advancement::sweep_turnless_calls(&recovery_orch).await;
+            Ok::<_, String>(())
+        }) {
+            log::warn!("Startup turnless call recovery failed: {error}");
+        }
         relaunch_never_launched_jobs(orch, result.never_launched_job_ids, &swept);
     }
 }

@@ -13,6 +13,8 @@ mod posts;
 mod response_invocations;
 mod route_firings;
 mod row;
+mod run_failures;
+pub use run_failures::record_run_failure_conn;
 mod runtime_admission;
 mod search_index;
 #[cfg(any(test, feature = "test-utils"))]

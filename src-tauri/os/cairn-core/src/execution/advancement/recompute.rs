@@ -44,6 +44,7 @@ pub fn reduce_delegated_child_job(
 /// candidate discovery has to fan out across databases. Errors are logged, never
 /// fatal.
 pub async fn heal_stuck_delegated_children(orch: &Orchestrator) {
+    super::sweep_turnless_calls(orch).await;
     let runtime = crate::workflow_host::runtime(orch);
     cairn_workflow::advancement::recompute::heal_stuck_delegated_children(&runtime).await;
     // Then any parent still parked on children that all finished, whichever

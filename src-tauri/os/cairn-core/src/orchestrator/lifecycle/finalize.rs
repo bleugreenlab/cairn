@@ -853,25 +853,14 @@ pub(crate) fn record_run_failure_if_active(
                 let exit_reason = exit_reason.clone();
                 let error_message = error_message.clone();
                 Box::pin(async move {
-                    let changed = conn
-                        .execute(
-                            "UPDATE runs
-                             SET exit_reason = COALESCE(?1, exit_reason),
-                                 error_message = COALESCE(error_message, ?2),
-                                 updated_at = ?3
-                             WHERE id = ?4
-                               AND status IN (?5, ?6)",
-                            (
-                                exit_reason.as_deref(),
-                                error_message.as_str(),
-                                chrono::Utc::now().timestamp(),
-                                run_id.as_str(),
-                                RunStatus::Starting.to_string(),
-                                RunStatus::Live.to_string(),
-                            ),
-                        )
-                        .await?;
-                    Ok(changed > 0)
+                    cairn_db::storage::record_run_failure_conn(
+                        conn,
+                        &run_id,
+                        exit_reason.as_deref(),
+                        &error_message,
+                        true,
+                    )
+                    .await
                 })
             })
             .await

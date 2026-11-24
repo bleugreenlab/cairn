@@ -258,6 +258,86 @@ impl WorkObserver {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_processes(mut self, processes: Arc<ProcessState>) -> Self {
+        self.processes = Some(processes);
+        self
+    }
+
+    /// Read a job's process, launch and run evidence in the caller's snapshot.
+    /// A launch claim is busy work even before its run exists. Missing jobs
+    /// cannot prove a caller dead.
+    pub(crate) async fn job_conn(
+        &self,
+        conn: &crate::storage::TrackedConnection,
+        job_id: &str,
+    ) -> crate::storage::DbResult<Liveness> {
+        let mut rows = conn
+            .query(
+                "SELECT j.current_session_id, j.status, j.started_at, j.execution_id,
+                        j.created_at,
+                        EXISTS (SELECT 1 FROM turns t WHERE t.job_id = j.id),
+                        NOT EXISTS (SELECT 1 FROM jobs started_job
+                          WHERE started_job.execution_id = j.execution_id
+                            AND started_job.current_turn_id IS NOT NULL)
+                 FROM jobs j WHERE j.id = ?1",
+                (job_id,),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(Liveness::Busy);
+        };
+        let session_id = row.opt_text(0)?;
+        let status = row.text(1)?;
+        let claimed_at = row.opt_i64(2)?;
+        let execution_id = row.opt_text(3)?;
+        let began_at = row.opt_i64(4)?;
+        let no_turn = row.i64(5)? == 0;
+        let execution_unstarted = row.i64(6)? != 0;
+        drop(rows);
+        let mut rows = conn
+            .query(
+                "SELECT id, status, updated_at FROM runs WHERE job_id = ?1",
+                (job_id,),
+            )
+            .await?;
+        let mut runs = Vec::new();
+        let mut live_since = None;
+        let mut launch_ended = false;
+        while let Some(row) = rows.next().await? {
+            runs.push(row.text(0)?);
+            let updated_at = row.i64(2)?;
+            if matches!(row.text(1)?.as_str(), "starting" | "live") {
+                live_since =
+                    Some(live_since.map_or(updated_at, |previous: i64| previous.max(updated_at)));
+            } else if claimed_at.is_some_and(|at| updated_at >= at) {
+                launch_ended = true;
+            }
+        }
+        if no_turn
+            && execution_id.as_deref().is_some_and(|execution| {
+                self.placed_for_launch(
+                    &status,
+                    claimed_at,
+                    launch_ended,
+                    execution,
+                    execution_unstarted,
+                    began_at,
+                )
+            })
+        {
+            return Ok(Liveness::Busy);
+        }
+        let runs: Vec<_> = runs.iter().map(|run| Some(run.as_str())).collect();
+        if self.launch_in_flight(job_id, &runs) {
+            return Ok(Liveness::Busy);
+        }
+        Ok(liveness(
+            &self.process(session_id.as_deref(), &runs),
+            live_since,
+        ))
+    }
+
     /// Whether a job with no turn is still owned on its way to a launch:
     ///
     /// - `pending`: its execution's advance is owed in the outbox, or the job

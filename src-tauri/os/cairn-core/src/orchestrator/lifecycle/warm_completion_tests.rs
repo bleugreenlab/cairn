@@ -1519,13 +1519,10 @@ async fn node_backed_task_woken_after_its_result_settles_at_turn_end() {
     );
 }
 
-/// A packet-less task an earlier build stranded — result written, turn
-/// complete, run exited, job still `running`, parent not parked on it — is
-/// settled by the startup heal, since no later turn end will come. A
-/// packet-backed child whose parent is not parked (a turn-less child of a
-/// caller that moved on) is not the heal's to touch.
+/// Startup settles both a completed packet-less task and a packet-backed call
+/// whose run ended without a result, even though their parent is not parked.
 #[tokio::test]
-async fn startup_heal_settles_a_stranded_packetless_task_only() {
+async fn startup_heal_settles_packetless_tasks_and_turnless_calls() {
     let db = test_db().await;
     db.write(|conn| {
             Box::pin(async move {
@@ -1560,8 +1557,27 @@ async fn startup_heal_settles_a_stranded_packetless_task_only() {
         scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "j-child")
             .await
             .as_deref(),
-        Some("running"),
+        Some("failed"),
     );
+    assert_eq!(
+        scalar_text(
+            &orch,
+            "SELECT error_message FROM runs WHERE id = ?1",
+            "run-child"
+        )
+        .await
+        .as_deref(),
+        Some("never started a turn; its run crashed"),
+    );
+    let packet = cairn_workflow::delegated_packets::find_by_result_job_db(
+        &orch.db.local,
+        "e-warm",
+        "j-child",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(packet.status, crate::models::DelegatedStatus::Failed);
 }
 
 /// Only a packet-backed ephemeral call completes without a turn. A packet-less
