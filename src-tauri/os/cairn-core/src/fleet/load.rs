@@ -277,6 +277,7 @@ pub(super) mod tests {
             measured_at_unix_ms: 9,
             quality: MeasurementQuality::Sampled,
             quiet_window: None,
+            windows_quiet_tree: None,
             scheduling: None,
         };
         let mut index = LiveUsageIndex::default();

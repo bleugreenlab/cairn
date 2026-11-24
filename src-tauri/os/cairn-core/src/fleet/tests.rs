@@ -12953,6 +12953,7 @@ fn snapshot_work_carries_each_running_attempts_stall_window() {
             resident_bytes: None,
             measured_at_unix_ms: 40,
             quality: MeasurementQuality::Sampled,
+            windows_quiet_tree: None,
             quiet_window: Some(QuietWindow {
                 quiet_ms: 120_000,
                 silence_bound_ms: Fleet::REVIEW_CHECK_SILENCE_BOUND_MS,

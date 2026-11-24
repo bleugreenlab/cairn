@@ -24,7 +24,10 @@ use windows_sys::Win32::{
             CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
             TH32CS_SNAPPROCESS,
         },
-        JobObjects::{IsProcessInJob, JobObjectBasicProcessIdList, QueryInformationJobObject},
+        JobObjects::{
+            IsProcessInJob, JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+            QueryInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        },
         ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         SystemInformation::GetSystemTimeAsFileTime,
         SystemServices::JOB_OBJECT_QUERY,
@@ -293,6 +296,7 @@ pub fn process_rss_bytes(pid: u32) -> Option<u64> {
 
 /// Read-only capability for one caller-owned process-tree job. Never inferred
 /// from the supervisor's current job, and never used to assign or kill processes.
+#[derive(Debug)]
 pub struct TreeJob {
     handle: OwnedHandle,
     buffer: Mutex<Vec<usize>>,
@@ -332,6 +336,30 @@ impl TreeJob {
             handle: owned(duplicate)?,
             buffer: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Cumulative job CPU TIME (100 ns ticks) and process births/exits, including
+    /// members that began and ended between process censuses. No disk-I/O claim.
+    pub fn accounting(&self) -> Option<(u64, u32, u32)> {
+        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
+        // SAFETY: this capability holds a live, query-only job handle and the
+        // buffer has the exact size and alignment required by this info class.
+        if unsafe {
+            QueryInformationJobObject(
+                self.handle.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                null_mut(),
+            )
+        } == 0
+        {
+            return None;
+        }
+        let ticks = u64::try_from(accounting.TotalUserTime)
+            .ok()?
+            .checked_add(u64::try_from(accounting.TotalKernelTime).ok()?)?;
+        Some((ticks, accounting.TotalProcesses, accounting.ActiveProcesses))
     }
 
     /// Appends verified job rows to a dedicated tree census. The caller merges

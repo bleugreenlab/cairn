@@ -46,7 +46,7 @@
 //! when no path was recovered. Either answers with one generic refusal when the
 //! path is a write to git's staging records or refs ([`is_git_internal_write`]).
 
-use crate::mcp::handlers::shell_words::{
+use cairn_common::shell_words::{
     command_for_classification, is_reserved_prefix, simple_commands, Piece, Word,
 };
 

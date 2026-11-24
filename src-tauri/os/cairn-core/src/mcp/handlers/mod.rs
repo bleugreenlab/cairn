@@ -29,7 +29,6 @@ pub(crate) mod run_context;
 pub mod search;
 pub(crate) mod search_translate;
 pub mod search_web;
-pub(crate) mod shell_words;
 pub mod skills_resources;
 pub mod slug;
 pub(crate) mod target;
@@ -80,9 +79,9 @@ where
 }
 
 /// Normalize a command for matching: read through a whole-line shell launcher
-/// ([`shell_words::command_for_classification`]), then collapse whitespace.
+/// ([`cairn_common::shell_words::command_for_classification`]), then collapse whitespace.
 pub(crate) fn normalize_command(cmd: &str) -> String {
-    shell_words::command_for_classification(cmd)
+    cairn_common::shell_words::command_for_classification(cmd)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -247,5 +246,23 @@ mod suspension_markers {
         for marker in HANDOFF_MARKERS {
             assert_ne!(&USER_STOP_TOOL_RESULT, marker);
         }
+    }
+}
+
+#[cfg(test)]
+mod command_normalization_tests {
+    use super::normalize_command;
+
+    #[test]
+    fn normalize_command_reads_through_only_a_whole_line_launcher() {
+        assert_eq!(
+            normalize_command("bash -lc 'git status --short'"),
+            normalize_command("git status --short")
+        );
+        let chained = "bash -c 'echo a' && echo 'b   c'";
+        assert_eq!(
+            normalize_command(chained),
+            chained.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
     }
 }

@@ -99,7 +99,10 @@ fn render(project: &str, row: &CheckRequestRow, value: &serde_json::Value) -> St
                 clock(row.held_at_ms.unwrap_or(row.updated_ms))
             ));
         }
-        if let Some(diagnostic) = row.diagnostic.as_ref().filter(|_| row.held_by.is_none()) {
+        if let Some(diagnostic) = value["observation"]["diagnostic"]
+            .as_str()
+            .filter(|_| row.held_by.is_none())
+        {
             lines.push(format!("- Progress: {diagnostic}"));
         }
         if let Some(waiting) = &row.waiting_to_learn {

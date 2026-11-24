@@ -2,10 +2,10 @@
 //! live-checkout regime and the jj workspace-refresh carveout.
 
 use crate::mcp::handlers::fence::descriptor_grant;
-use crate::mcp::handlers::shell_words::command_for_classification;
 use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
 use crate::services::sandbox;
+use cairn_common::shell_words::command_for_classification;
 
 // The fence dial is the only gate on whether a fence profile exists: `allow`,
 // or a spawn with no agent run behind it, has none. What the dial does not

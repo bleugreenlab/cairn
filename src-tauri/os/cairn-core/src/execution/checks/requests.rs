@@ -1701,7 +1701,49 @@ pub(crate) async fn request_answer(
             });
         }
     }
-    let diagnostic = row.diagnostic.clone();
+    let mut diagnostic = row.diagnostic.clone();
+    if row.state == "running" {
+        if let Some(request_id) = &row.request_id {
+            let item_id = format!("{request_id}:check-0");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    duration.as_millis().min(u128::from(u64::MAX)) as u64
+                });
+            let snapshot = orch.fleet.snapshot();
+            let evidence: Vec<_> = snapshot
+                .executing_requests
+                .iter()
+                .filter(|attempt| {
+                    attempt.request_id == *request_id || attempt.request_id == item_id
+                })
+                .filter_map(|attempt| {
+                    attempt
+                        .live_usage
+                        .as_ref()
+                        .and_then(|sample| sample.windows_quiet_description(now))
+                        .map(|detail| format!("attempt {}: {detail}", attempt.attempt_id))
+                })
+                .collect();
+            let windows = row.executor.as_ref().is_some_and(|machine| {
+                orch.fleet.executor_health(now).iter().any(|executor| {
+                    (executor.public_name == *machine || executor.identity.executor_id == *machine)
+                        && executor.advertisement.capabilities.os == "windows"
+                })
+            });
+            let detail = if evidence.is_empty() && windows {
+                "quiet-tree evidence not reported (unknown, never zero); stall stop disabled on Windows: disk I/O unmeasured".to_string()
+            } else {
+                evidence.join("; ")
+            };
+            if !detail.is_empty() {
+                diagnostic = Some(match diagnostic {
+                    Some(progress) => format!("{progress}; {detail}"),
+                    None => detail,
+                });
+            }
+        }
+    }
     let since = Some(row.state_since_ms.max(0) as u64);
     Ok(match row.state.as_str() {
         "accepted" => CheckRequestAnswer::Queued {

@@ -8,7 +8,6 @@ use super::types::{
 };
 use crate::config::mcp_servers::McpServerConfigExt;
 use crate::mcp::gateway::{McpCallOutcome, McpResourceDef};
-use crate::mcp::handlers::shell_words::command_for_classification;
 use crate::mcp::handlers::{normalize_command, RunContext};
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
@@ -16,6 +15,7 @@ use crate::orchestrator::Orchestrator;
 use crate::services::{sandbox, SpawnConfig};
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::executor_protocol::{CrossingAccess, CrossingRerun};
+use cairn_common::shell_words::command_for_classification;
 use cairn_uri::CairnResource;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};

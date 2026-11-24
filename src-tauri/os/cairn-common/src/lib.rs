@@ -48,6 +48,7 @@ pub mod runtime;
 pub mod scratch;
 pub mod security;
 pub mod service;
+pub mod shell_words;
 pub mod skip_ledger;
 pub mod task;
 #[cfg(any(test, feature = "test-utils"))]

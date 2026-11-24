@@ -32,11 +32,11 @@ use crate::mcp::handlers::read::{self, view, Composed, FenceAsk, ReadOptions};
 use crate::mcp::handlers::search_translate::{
     translate_search_invocation, SearchTranslationError, TranslatedSearch,
 };
-use crate::mcp::handlers::shell_words::{
-    command_for_classification, command_line, Element, Operator, Piece, Word,
-};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
+use cairn_common::shell_words::{
+    command_for_classification, command_line, Element, Operator, Piece, Word,
+};
 
 /// The log target every machine reason is recorded under, as
 /// `machine reason=<code> command=<redacted>`.

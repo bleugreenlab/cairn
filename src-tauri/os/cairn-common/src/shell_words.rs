@@ -1,32 +1,30 @@
-//! Reading a shell command line as the shell would split it.
+//! Shared shell-word parsing for classification and literal argv extraction.
 //!
-//! One splitter serves every place Cairn *reads* an agent's command without
-//! running it: the fence's git-write recognizer and the classification view
-//! that grants, carveouts and read-equivalent routing consult. Nothing here
-//! rewrites what executes; a `run` command item always runs exactly as the
-//! agent wrote it.
+//! This is a conservative reader, not a shell interpreter. Classification callers
+//! inspect words and operators; execution callers must use `literal_argv` and
+//! separately enforce executable resolution and launch policy.
 
 use std::borrow::Cow;
 
 /// One shell word, with its quoting removed.
 #[derive(Debug)]
-pub(crate) struct Word {
-    pub(crate) text: String,
+pub struct Word {
+    pub text: String,
     /// Written without quoting, escaping, or substitution, so the shell can
     /// read it as a reserved word.
-    pub(crate) plain: bool,
+    pub plain: bool,
     /// Contains a command substitution, whose expansion is unknown.
-    pub(crate) substituted: bool,
+    pub substituted: bool,
     /// The shell hands `text` to the program unchanged, as this one argument.
     /// False when anything outside single quotes and escapes could rewrite or
     /// split it first: a parameter, command or arithmetic expansion, a glob,
     /// brace or tilde expansion, or a redirection operator.
-    pub(crate) literal: bool,
+    pub literal: bool,
 }
 
 /// One element of a command, in the order the shell meets it.
 #[derive(Debug)]
-pub(crate) enum Piece {
+pub enum Piece {
     /// The words of one simple command.
     Command(Vec<Word>),
     /// `(`: a subshell begins. A `cd` inside it lasts until the matching `)`.
@@ -36,7 +34,7 @@ pub(crate) enum Piece {
 
 /// A control operator between two simple commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Operator {
+pub enum Operator {
     /// `|`
     Pipe,
     /// `|&`: stdout and stderr both feed the next command.
@@ -54,7 +52,7 @@ pub(crate) enum Operator {
 /// One element of a command line, operators included, in the order the shell
 /// meets it.
 #[derive(Debug)]
-pub(crate) enum Element {
+pub enum Element {
     Piece(Piece),
     Operator(Operator),
 }
@@ -66,7 +64,7 @@ const RESERVED_PREFIXES: &[&str] = &[
     "if", "then", "elif", "else", "while", "until", "do", "!", "{", "time",
 ];
 
-pub(crate) fn is_reserved_prefix(word: &Word) -> bool {
+pub fn is_reserved_prefix(word: &Word) -> bool {
     word.plain && RESERVED_PREFIXES.contains(&word.text.as_str())
 }
 
@@ -83,7 +81,7 @@ const LAUNCHERS: &[&str] = &["bash", "sh", "zsh", "/bin/bash", "/bin/sh", "/bin/
 /// would otherwise rewrite it before the launcher saw it, and a grant or
 /// exemption must never match text the launcher does not receive. One level
 /// only: a launcher inside the inner command is not read through.
-pub(crate) fn launcher_inner(command: &str) -> Option<String> {
+pub fn launcher_inner(command: &str) -> Option<String> {
     let mut pieces = simple_commands(command)?;
     let [Piece::Command(words)] = pieces.as_mut_slice() else {
         return None;
@@ -98,9 +96,129 @@ pub(crate) fn launcher_inner(command: &str) -> Option<String> {
 
 /// What classifiers read: a whole-line launcher's inner command, or the
 /// command itself.
-pub(crate) fn command_for_classification(command: &str) -> Cow<'_, str> {
+pub fn command_for_classification(command: &str) -> Cow<'_, str> {
     launcher_inner(command).map_or(Cow::Borrowed(command), Cow::Owned)
 }
+
+/// Extract one literal external-program invocation, removing shell quoting.
+///
+/// Rejects operators, assignment programs, builtins and reserved words (even quoted),
+/// expansions, redirections and malformed syntax. Comments and whitespace other
+/// than ASCII space/tab are conservatively refused, including inside quotes.
+/// Empty arguments are preserved; an empty program is not.
+///
+/// This proves only lexical argv shape. The caller owns executable resolution,
+/// environment policy, and platform-specific argument conversion.
+pub fn literal_argv(command: &str) -> Option<Vec<String>> {
+    if command.contains(['\0', '#'])
+        || command
+            .chars()
+            .any(|c| c.is_whitespace() && !matches!(c, ' ' | '\t'))
+    {
+        return None;
+    }
+    let mut elements = command_line(command)?;
+    let [Element::Piece(Piece::Command(words))] = elements.as_mut_slice() else {
+        return None;
+    };
+    let program = &words.first()?.text;
+    if program.is_empty()
+        || program.contains('=')
+        || SHELL_PROGRAMS.contains(&program.as_str())
+        || words.iter().any(|word| !word.literal)
+    {
+        return None;
+    }
+    Some(words.drain(..).map(|word| word.text).collect())
+}
+
+/// Bash builtins (including platform-specific ones) and reserved words.
+/// Quote removal does not disable builtin lookup.
+const SHELL_PROGRAMS: &[&str] = &[
+    ".",
+    ":",
+    "[",
+    "alias",
+    "bg",
+    "bind",
+    "break",
+    "builtin",
+    "caller",
+    "cd",
+    "command",
+    "compgen",
+    "complete",
+    "compopt",
+    "continue",
+    "declare",
+    "dirs",
+    "disown",
+    "echo",
+    "enable",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "false",
+    "fc",
+    "fg",
+    "getopts",
+    "hash",
+    "help",
+    "history",
+    "jobs",
+    "kill",
+    "let",
+    "local",
+    "logout",
+    "mapfile",
+    "popd",
+    "printf",
+    "pushd",
+    "pwd",
+    "read",
+    "readarray",
+    "readonly",
+    "return",
+    "set",
+    "shift",
+    "shopt",
+    "source",
+    "suspend",
+    "test",
+    "times",
+    "trap",
+    "true",
+    "type",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unset",
+    "wait",
+    "if",
+    "then",
+    "else",
+    "elif",
+    "fi",
+    "case",
+    "esac",
+    "for",
+    "select",
+    "while",
+    "until",
+    "do",
+    "done",
+    "in",
+    "function",
+    "time",
+    "coproc",
+    "!",
+    "{",
+    "}",
+    "[[",
+    "]]",
+];
 
 /// The word being built, started on its first character.
 fn word_at(word: &mut Option<Word>) -> &mut Word {
@@ -131,7 +249,7 @@ type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 /// process substitution, a heredoc, a parenthesis that does not open a
 /// command (an array, a function definition, a `case` pattern), or unbalanced
 /// quoting, substitution, or parentheses.
-pub(crate) fn simple_commands(command: &str) -> Option<Vec<Piece>> {
+pub fn simple_commands(command: &str) -> Option<Vec<Piece>> {
     Some(
         command_line(command)?
             .into_iter()
@@ -146,7 +264,7 @@ pub(crate) fn simple_commands(command: &str) -> Option<Vec<Piece>> {
 /// [`simple_commands`] with the control operators between them kept, for a
 /// reader that must know how the commands are joined: whether a stage is piped,
 /// chained on success, or merely sequenced.
-pub(crate) fn command_line(command: &str) -> Option<Vec<Element>> {
+pub fn command_line(command: &str) -> Option<Vec<Element>> {
     let mut pieces = Vec::new();
     let mut words: Vec<Word> = Vec::new();
     let mut word: Option<Word> = None;
@@ -203,7 +321,9 @@ pub(crate) fn command_line(command: &str) -> Option<Vec<Element>> {
                 .is_some_and(|word| word.text.ends_with(['>', '<']))
                 || chars.peek() == Some(&'>') =>
             {
-                word_at(&mut word).text.push(c);
+                let word = word_at(&mut word);
+                word.literal = false;
+                word.text.push(c);
             }
             '(' => {
                 if word.is_some() || !words.iter().all(is_reserved_prefix) {
@@ -359,7 +479,6 @@ fn backquoted(chars: &mut Chars<'_>, word: &mut Word) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::handlers::normalize_command;
 
     #[test]
     fn a_whole_line_launcher_has_its_literal_script_as_inner_command() {
@@ -452,15 +571,87 @@ mod tests {
     }
 
     #[test]
-    fn normalize_command_reads_through_only_a_whole_line_launcher() {
-        assert_eq!(
-            normalize_command("bash -lc 'git status --short'"),
-            normalize_command("git status --short")
-        );
-        let chained = "bash -c 'echo a' && echo 'b   c'";
-        assert_eq!(
-            normalize_command(chained),
-            chained.split_whitespace().collect::<Vec<_>>().join(" ")
-        );
+    fn literal_argv_preserves_arguments() {
+        for (command, expected) in [
+            ("cargo check", vec!["cargo", "check"]),
+            (" \tcargo\tcheck ", vec!["cargo", "check"]),
+            (
+                "\"my program\" 'two words' \"\" ''",
+                vec!["my program", "two words", "", ""],
+            ),
+            (
+                "cargo a\\ b \"c\\qd\" 'a*b?$HOME' \"\\$HOME\"",
+                vec!["cargo", "a b", "c\\qd", "a*b?$HOME", "$HOME"],
+            ),
+            ("cargo --config=x=y", vec!["cargo", "--config=x=y"]),
+        ] {
+            assert_eq!(
+                literal_argv(command),
+                Some(expected.into_iter().map(String::from).collect()),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_argv_refuses_shell_behavior() {
+        for command in [
+            "",
+            " ",
+            "'' x",
+            "X=y cargo",
+            "'X=y' cargo",
+            "cargo $HOME",
+            "cargo ${X}",
+            "cargo $(date)",
+            "cargo `date`",
+            "cargo $((1+2))",
+            "cargo *.rs",
+            "cargo a?b",
+            "cargo [ab]",
+            "cargo {a,b}",
+            "cargo ~/src",
+            "cargo >out",
+            "cargo 2>&1",
+            "cargo &>out",
+            "cargo <in",
+            "cargo <<EOF",
+            "cargo <(ls)",
+            "cargo >(ls)",
+            "cargo &",
+            "cargo ;",
+            "cargo &&",
+            "cargo ||",
+            "cargo |",
+            "cargo |&",
+            "cargo\n",
+            "(cargo)",
+            "cargo ()",
+            "cargo 'oops",
+            "cargo \"oops",
+            "cargo \\",
+            "cargo # comment",
+            "cargo\0check",
+            "cargo\rcheck",
+            "cargo\u{b}check",
+            "cargo\u{c}check",
+            "cargo check",
+            "cargo 'a\nb'",
+            "cargo $'text'",
+            "cargo $\"text\"",
+            "cargo '>'&",
+        ] {
+            assert_eq!(literal_argv(command), None, "{command:?}");
+        }
+        for program in SHELL_PROGRAMS {
+            for command in [
+                format!("{program} x"),
+                format!("'{program}' x"),
+                format!("\"{program}\" x"),
+            ] {
+                assert_eq!(literal_argv(&command), None, "{command}");
+            }
+        }
+        assert_eq!(literal_argv(r"e\cho x"), None);
     }
 }

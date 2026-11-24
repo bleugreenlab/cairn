@@ -6634,7 +6634,7 @@ fn render_stopped_commands(
     let mut out = String::from("\n## Stopped commands\n");
     if !stall_detection {
         out.push_str(
-            "- Stall detection: unavailable on this platform (it cannot read a command tree's CPU, and output silence alone is not evidence of a stall); only cancellation stops a command here\n",
+            "- Stall stop disabled on this platform: disk I/O unmeasured. Windows CPU TIME and observed identities are reported separately when available; missing evidence is unknown, never zero. Only cancellation stops an unbounded command here\n",
         );
     }
     for stop in stopped.iter().rev() {
@@ -7252,7 +7252,7 @@ fn render_running_now_with_attribution(
     }
     let usage = |sample: Option<cairn_common::executor_protocol::LiveUsageSample>| match sample {
         Some(sample) => format!(
-            "{} CPU, {} resident, over {} measured {}",
+            "{} CPU, {} resident, over {} measured {}{}",
             sample.cores().map_or_else(
                 || "unmeasured".to_string(),
                 |cores| format!("{cores:.1} cores")
@@ -7261,7 +7261,11 @@ fn render_running_now_with_attribution(
                 .resident_bytes
                 .map_or_else(|| "unread".to_string(), bytes),
             duration_ms(sample.window_ms),
-            age(now.saturating_sub(sample.measured_at_unix_ms))
+            age(now.saturating_sub(sample.measured_at_unix_ms)),
+            sample
+                .windows_quiet_description(now)
+                .map(|detail| format!("; {detail}"))
+                .unwrap_or_default()
         ),
         None if gap.is_some() => "usage not reported".to_string(),
         None => "usage not measured yet".to_string(),
@@ -15222,7 +15226,7 @@ mod tests {
     fn a_platform_without_stall_detection_says_so() {
         let rendered = render_stopped_commands(&[], "windows", CAPTURED_AT);
         assert!(
-            rendered.contains("Stall detection: unavailable"),
+            rendered.contains("Stall stop disabled on this platform: disk I/O unmeasured"),
             "{rendered}"
         );
         assert!(render_stopped_commands(&[], "macos", CAPTURED_AT).is_empty());
@@ -16694,6 +16698,7 @@ mod running_now_tests {
             measured_at_unix_ms: 58_000,
             quality: MeasurementQuality::Sampled,
             quiet_window: None,
+            windows_quiet_tree: None,
             scheduling: None,
         });
         let rendered = render_running_now(&snapshot, None, 60_000, &crate::fleet::Fleet::default());

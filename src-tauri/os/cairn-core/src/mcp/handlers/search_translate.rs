@@ -1,6 +1,6 @@
 //! Translating an `rg` or `grep` argv into the read grep it asks for.
 //!
-//! The shell has already been read by [`super::shell_words`], so this sees only
+//! The shell has already been read by [`cairn_common::shell_words`], so this sees only
 //! the program and the argument words that would reach it. Every flag accepted
 //! here maps onto a read `?grep=` modifier or folds into the pattern (`-F`,
 //! `-w`, basic-regex conversion); any other flag declines naming itself, and
@@ -419,7 +419,7 @@ fn bre_to_ere(pattern: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::handlers::shell_words::{simple_commands, Piece};
+    use cairn_common::shell_words::{simple_commands, Piece};
 
     /// The invocation a one-command shell line hands its program.
     fn translate(command: &str) -> Result<TranslatedSearch, SearchTranslationError> {

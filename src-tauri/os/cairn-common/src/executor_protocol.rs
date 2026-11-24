@@ -10034,6 +10034,11 @@ pub struct LearnedResourceEstimate {
 /// A runner talking to an older executor gets no process attribution, and
 /// explicitly reports that absence rather than inferring that Cairn owns all
 /// host CPU.
+/// cairn/7462 adds optional Windows quiet-tree evidence to live usage, without
+/// changing admission, placement, or stop authority. Older executors omit it
+/// (unknown, never idle); older runners ignore it. This telemetry-only addition
+/// does not require a version fence under tenet 541. Windows disk I/O remains
+/// unmeasured and automatic stall termination remains disabled.
 ///
 /// cairn/7421 does not move the number. The executor's ref census, which a
 /// claim's repository probe and the storage sweep's ref audit both read, now
@@ -19733,11 +19738,59 @@ pub struct LiveUsageSample {
     /// reading. An absent window is never evidence of a stall.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet_window: Option<QuietWindow>,
+    /// Measured Windows check-tree evidence, never a stall-policy window.
+    /// Absent on older peers, incomplete censuses, or output backpressure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_quiet_tree: Option<WindowsQuietTreeEvidence>,
     /// What the scheduler accounted to the tree across the window, where the
     /// platform reads it (macOS). Absent elsewhere, and for a window in which
     /// some member's accounting could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduling: Option<SchedulingWindow>,
+}
+
+/// Sampled check-tree evidence. Process identities include creation time, so
+/// PID reuse is a composition change. Processes born and dead between censuses
+/// are not observed; this is evidence, never permission to terminate a command.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsQuietTreeEvidence {
+    /// True only for successful, tree-scoped job accounting, which includes
+    /// exited processes and churn between identity censuses.
+    pub whole_tree_accounting: bool,
+    pub output_silent_ms: u64,
+    /// Difference of cumulative CPU TIME across the last published interval;
+    /// job accounting includes exited work. Positive sub-ms changes round up.
+    pub cpu_time_delta_ms: u64,
+    pub cpu_window_ms: u64,
+    pub zero_cpu_ms: u64,
+    pub tree_unchanged_ms: u64,
+}
+
+impl WindowsQuietTreeEvidence {
+    pub fn describe(&self) -> String {
+        let quiet = self
+            .output_silent_ms
+            .min(self.zero_cpu_ms)
+            .min(self.tree_unchanged_ms);
+        let headline =
+            if self.whole_tree_accounting && self.cpu_time_delta_ms == 0 && quiet >= 60_000 {
+                format!(
+                    "silent, zero CPU time, tree unchanged for {} minutes; ",
+                    quiet / 60_000
+                )
+            } else {
+                String::new()
+            };
+        format!(
+            "{headline}output silence {} ms; {}CPU TIME delta {} ms over {} ms; {} unchanged {} ms; stall stop disabled on Windows: disk I/O unmeasured",
+            self.output_silent_ms,
+            if self.whole_tree_accounting { "cumulative tree " } else { "sampled per-process (exited work may be missed) " },
+            self.cpu_time_delta_ms, self.cpu_window_ms,
+            if self.whole_tree_accounting { "tree" } else { "observed identities (between-census churn unmeasured)" },
+            self.tree_unchanged_ms,
+        )
+    }
 }
 
 /// One tree's scheduler accounting across a live window, every figure from
@@ -19759,6 +19812,17 @@ pub struct SchedulingWindow {
 }
 
 impl LiveUsageSample {
+    /// Evidence ages with its sample, never extrapolated through missing reports.
+    pub fn windows_quiet_description(&self, now: u64) -> Option<String> {
+        self.windows_quiet_tree.map(|evidence| {
+            if self.measured_at_unix_ms > now
+                || now.saturating_sub(self.measured_at_unix_ms) > MACHINE_SAMPLE_BLIND_AFTER_MS
+            {
+                "quiet-tree evidence stale (unknown, not zero); stall stop disabled on Windows: disk I/O unmeasured".into()
+            } else { evidence.describe() }
+        })
+    }
+
     /// Cores kept busy across the window, or `None` for an empty window.
     pub fn cores(&self) -> Option<f64> {
         (self.window_ms > 0).then(|| self.window_cpu_ms as f64 / self.window_ms as f64)
