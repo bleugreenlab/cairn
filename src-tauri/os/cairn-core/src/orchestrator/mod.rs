@@ -45,6 +45,7 @@ pub mod inference_metrics;
 pub mod inference_models;
 pub mod inference_overview;
 pub mod inference_pins;
+pub mod inference_reverify;
 pub mod inference_route;
 pub mod inference_verify;
 mod integrity_sweep;

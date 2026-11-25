@@ -201,9 +201,12 @@ pub struct ModelProfile {
     /// works on now: a fresh generation may regenerate it in place.
     pub regenerable: bool,
     /// The engine it runs, when that is not its template's current engine
-    /// pin: a newer release new profiles would start from. Information only:
-    /// the profile keeps running, and is measured as, the engine it embeds.
+    /// pin: a newer release new profiles would start from. The profile keeps
+    /// running, and is measured as, the engine it embeds until a re-verify
+    /// moves it.
     pub behind_pin: Option<cairn_inference::engine_pins::PinLag>,
+    /// Re-verifying it onto that pin, when it is behind one.
+    pub reverify: Option<super::inference_reverify::ReverifyOffer>,
     /// Its measured fit per pool; empty when nothing is measured yet.
     pub fit: Vec<ProfileFit>,
     pub loadable: Vec<ProfileLoadable>,
@@ -389,6 +392,11 @@ pub(crate) struct Sources<'a> {
     pub regenerable: &'a BTreeSet<String>,
     /// The engine pins new profiles start from now.
     pub pins: &'a cairn_inference::engine_pins::EnginePins,
+    /// What re-verifying each profile behind its pin would be, by profile id.
+    pub reverify: &'a BTreeMap<String, super::inference_reverify::ReverifyOffer>,
+    /// Re-verify candidates: records only their re-verify runs, not
+    /// profiles the page lists.
+    pub candidates: &'a BTreeSet<String>,
     pub now: i64,
 }
 
@@ -650,7 +658,12 @@ impl Sources<'_> {
             entry.name = model.name.trim().to_string();
             entry.record = Some(model);
         }
-        for profile in self.inventory.profiles.values() {
+        for profile in self
+            .inventory
+            .profiles
+            .values()
+            .filter(|profile| !self.candidates.contains(profile.id.as_str()))
+        {
             groups
                 .entry(profile.model.name.trim().to_ascii_lowercase())
                 .or_insert_with(|| ModelGroup {
@@ -1111,6 +1124,7 @@ impl Sources<'_> {
                             edited: self.edited.contains(profile.id.as_str()),
                             regenerable: self.regenerable.contains(profile.id.as_str()),
                             behind_pin: self.pins.lag(profile),
+                            reverify: self.reverify.get(profile.id.as_str()).cloned(),
                             fit: self.profile_fit(profile),
                             loadable: self
                                 .models
@@ -1205,6 +1219,20 @@ async fn with_sources<T>(
     let unpromoted = gate.unpromoted_profiles(&records);
     let regenerable = gate.regenerable_profiles(&records);
     let pins = super::inference_pins::current();
+    let candidates: BTreeSet<String> = super::inference_reverify::load_moves(db)
+        .await?
+        .into_iter()
+        .map(|m| m.candidate)
+        .collect();
+    let reverify: BTreeMap<String, super::inference_reverify::ReverifyOffer> = records
+        .profiles
+        .values()
+        .filter(|profile| !candidates.contains(profile.id.as_str()))
+        .filter_map(|profile| {
+            super::inference_reverify::offer(&gate, &pins, profile)
+                .map(|offer| (profile.id.to_string(), offer))
+        })
+        .collect();
     Ok(with(&Sources {
         inventory: &inventory,
         phases: &phases,
@@ -1218,6 +1246,8 @@ async fn with_sources<T>(
         unpromoted: &unpromoted,
         regenerable: &regenerable,
         pins: &pins,
+        reverify: &reverify,
+        candidates: &candidates,
         now: crate::fleet::unix_time_ms() as i64,
     }))
 }
@@ -1613,6 +1643,19 @@ pub async fn verify_profile(
     ))
 }
 
+/// Re-verify `profile` on `pool` onto its template's current engine pin, in
+/// the background; `surface` is the candidate the page showed. For a
+/// generated profile this, the operator's own act, approves the engine
+/// change.
+pub async fn reverify_profile(
+    orch: &Orchestrator,
+    profile: &str,
+    pool: &str,
+    surface: &str,
+) -> Result<String, String> {
+    super::inference_reverify::start(orch, profile, pool, surface, OPERATOR).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1801,6 +1844,9 @@ deployments:
         }
 
         fn sources(&self) -> Sources<'_> {
+            static NO_REVERIFY: BTreeMap<String, super::super::inference_reverify::ReverifyOffer> =
+                BTreeMap::new();
+            static NO_CANDIDATES: BTreeSet<String> = BTreeSet::new();
             Sources {
                 inventory: &self.inventory,
                 phases: &self.phases,
@@ -1814,6 +1860,8 @@ deployments:
                 unpromoted: &self.unpromoted,
                 regenerable: &self.regenerable,
                 pins: cairn_inference::engine_pins::EnginePins::embedded(),
+                reverify: &NO_REVERIFY,
+                candidates: &NO_CANDIDATES,
                 now: 600_000,
             }
         }

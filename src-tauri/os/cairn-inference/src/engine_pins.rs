@@ -15,7 +15,8 @@
 //! existing profile: each profile embeds the exact image or artifact it was
 //! verified with, so its measured speed, fit and quality stay that engine's,
 //! and a deployment renders from its profile. [`EnginePins::lag`] reports a
-//! profile whose engine is not the current pin, as information only.
+//! profile whose engine is not the current pin, which the operator may
+//! re-verify onto it.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -283,8 +284,9 @@ impl EnginePins {
     }
 
     /// Whether `profile` runs an engine other than its template's current
-    /// pin, and which. Information only: nothing moves a profile onto a new
-    /// pin but a change to the profile itself.
+    /// pin, and which. Nothing moves a profile onto a new pin but the
+    /// operator's re-verify (cairn-core's `inference_reverify`), which moves
+    /// it only once a verification of the new engine passes.
     pub fn lag(&self, profile: &InferenceProfile) -> Option<PinLag> {
         let template = self.template_of(profile)?;
         let pin = self.pin(&template.id)?;

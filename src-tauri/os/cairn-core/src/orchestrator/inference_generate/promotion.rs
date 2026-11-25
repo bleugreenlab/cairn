@@ -23,6 +23,9 @@
 //! for them, and [`reconcile`] records that once at boot. Profiles the retired
 //! template matcher wrote (generated, with no run) were never written by an
 //! agent and are not governed.
+//!
+//! A re-verify's candidate (`inference_reverify`) is governed too, and never
+//! promoted: the one verification its re-verify admits is all that starts it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,6 +37,7 @@ use serde_json::Value;
 
 use super::{list_generations, runnable_surface, surface_digest, GenerationRow};
 use crate::orchestrator::inference::{load_inventory, INVENTORY};
+use crate::orchestrator::inference_reverify::{self, PinMove};
 use crate::orchestrator::inference_verify::{digest, load_verifications, VerificationRow};
 use crate::storage::{DbResult, LocalDb, RowExt};
 
@@ -105,6 +109,9 @@ pub enum Admission {
     Draft(Binding),
     /// That revision's one claim already runs; a repeated start returns it.
     Replay(Box<VerificationRow>),
+    /// A re-verify's candidate: claiming it must still find the re-verify
+    /// under way, and (for a governed profile's) not yet claimed.
+    Reverify(String),
 }
 
 /// The generation state a draft's verification claim is bound to.
@@ -125,6 +132,8 @@ pub struct Gate {
     /// Profiles any generation row names as its draft.
     drafted: BTreeSet<String>,
     verifications: Vec<VerificationRow>,
+    /// Every re-verify, newest first.
+    moves: Vec<PinMove>,
 }
 
 /// Whether `generation` is bound to `owned` exactly: the same draft, revision
@@ -140,11 +149,13 @@ fn bound(generation: &GenerationRow, owned: &Owned) -> bool {
 
 impl Gate {
     pub async fn load(db: &LocalDb) -> Result<Self, String> {
-        Ok(Self::of(
+        let mut gate = Self::of(
             load_owned(db).await?,
             list_generations(db).await?,
             load_verifications(db).await?,
-        ))
+        );
+        gate.moves = inference_reverify::load_moves(db).await?;
+        Ok(gate)
     }
 
     pub fn of(
@@ -164,11 +175,109 @@ impl Gate {
                 .collect(),
             drafted,
             verifications,
+            moves: Vec::new(),
         }
     }
 
     fn verification(&self, id: &str) -> Option<&VerificationRow> {
         self.verifications.iter().find(|row| row.id == id)
+    }
+
+    /// The ownership row of profile `id`.
+    pub fn owned(&self, id: &str) -> Option<&Owned> {
+        self.owned.get(id)
+    }
+
+    /// The re-verify whose candidate is profile `id`, whatever its state.
+    fn reverify_of_candidate(&self, id: &str) -> Option<&PinMove> {
+        self.moves.iter().find(|m| m.candidate == id)
+    }
+
+    /// The re-verifies of profile `id`, newest first.
+    pub fn moves_of<'s>(&'s self, id: &'s str) -> impl Iterator<Item = &'s PinMove> + 's {
+        self.moves.iter().filter(move |m| m.profile == id)
+    }
+
+    /// What is working on profile `id` now, so neither a regeneration nor a
+    /// re-verify may start on it: an open generation naming it (as its draft,
+    /// or as the owner `owner`), a pending cleanup, a running verification,
+    /// or a re-verify under way.
+    fn busy(&self, id: &str, owner: Option<&str>) -> Option<String> {
+        let naming = |generation: &&GenerationRow| {
+            Some(generation.id.as_str()) == owner || generation.draft_profile.as_deref() == Some(id)
+        };
+        if let Some(open) = self
+            .generations
+            .values()
+            .filter(naming)
+            .find(|generation| generation.is_open())
+        {
+            return Some(format!(
+                "generation {} is still working on profile {id}",
+                open.id
+            ));
+        }
+        if let Some(pending) = self
+            .generations
+            .values()
+            .filter(naming)
+            .find(|generation| generation.cleanup_pending)
+        {
+            return Some(format!(
+                "generation {}'s cleanup of profile {id} is still pending",
+                pending.id
+            ));
+        }
+        if let Some(running) = self
+            .verifications
+            .iter()
+            .find(|row| row.profile == id && row.outcome == "running")
+        {
+            return Some(format!(
+                "verification {} of profile {id} is still running",
+                running.id
+            ));
+        }
+        if let Some(m) = self
+            .moves_of(id)
+            .find(|m| m.state == inference_reverify::VERIFYING)
+        {
+            return Some(format!(
+                "re-verify {} of profile {id} onto {} is still running on pool {}",
+                m.id, m.to, m.pool
+            ));
+        }
+        None
+    }
+
+    /// Why `profile` may not be re-verified onto its template's current pin
+    /// now; `None` when it may. A generated profile moves only while it is
+    /// promoted as it stands (one that is not is regenerated instead), and
+    /// nothing may be working on the profile.
+    pub fn reverify_refusal(&self, profile: &InferenceProfile) -> Option<String> {
+        let id = profile.id.as_str();
+        if let Some(m) = self.reverify_of_candidate(id) {
+            return Some(format!(
+                "profile {id} is the candidate of re-verify {} of profile {}",
+                m.id, m.profile
+            ));
+        }
+        if self.governs(profile) {
+            if let Some(why) = self.unpromoted(profile) {
+                return Some(format!(
+                    "{why}; a generated profile moves onto a new engine only while it is promoted as it stands"
+                ));
+            }
+            if !self.owned.contains_key(id) {
+                return Some(format!(
+                    "no generation's ownership of profile {id} is recorded yet, so its promotion could not be carried onto the new engine"
+                ));
+            }
+        }
+        self.busy(
+            id,
+            self.owned.get(id).map(|owned| owned.generation.as_str()),
+        )
     }
 
     /// Whether the promotion rule applies to `profile`: a generation owns or
@@ -178,6 +287,7 @@ impl Gate {
         let id = profile.id.as_str();
         self.owned.contains_key(id)
             || self.drafted.contains(id)
+            || self.reverify_of_candidate(id).is_some()
             || matches!(
                 profile.origin,
                 ProfileOrigin::Generated { run: Some(_), .. }
@@ -187,6 +297,12 @@ impl Gate {
     /// Why `profile`, as it stands, is not promoted; `None` when it is.
     fn unpromoted(&self, profile: &InferenceProfile) -> Option<String> {
         let id = profile.id.as_str();
+        if let Some(m) = self.reverify_of_candidate(id) {
+            return Some(format!(
+                "profile {id} is the candidate engine of re-verify {} of profile {}, which only that re-verify's own verification runs",
+                m.id, m.profile
+            ));
+        }
         let current = digest(profile);
         let Some(owned) = self.owned.get(id) else {
             let vouched = self.verifications.iter().any(|row| {
@@ -221,6 +337,9 @@ impl Gate {
         deployment: &Deployment,
     ) -> Option<&VerificationRow> {
         let id = profile.id.as_str();
+        if let Some(m) = self.reverify_of_candidate(id) {
+            return self.reverify_claim(m, profile, deployment);
+        }
         let owned = self.owned.get(id).filter(|owned| owned.active)?;
         let current = digest(profile);
         if owned.profile_digest != current || owned.surface_digest != surface_of(profile) {
@@ -235,6 +354,33 @@ impl Gate {
             && claim.profile == id
             && claim.profile_digest == current
             && claim.pool == generation.pool
+            && claim.deployment == deployment.id.as_str())
+        .then_some(claim)
+    }
+
+    /// The running verification `deployment` belongs to, when it is the claim
+    /// re-verify `m` admitted of its candidate `profile` as it stands, on the
+    /// re-verify's pool. A governed profile's candidate must still be exactly
+    /// what the operator approved.
+    fn reverify_claim(
+        &self,
+        m: &PinMove,
+        profile: &InferenceProfile,
+        deployment: &Deployment,
+    ) -> Option<&VerificationRow> {
+        if m.state != inference_reverify::VERIFYING {
+            return None;
+        }
+        let current = digest(profile);
+        if m.governed && (m.candidate_digest != current || m.surface_digest != surface_of(profile))
+        {
+            return None;
+        }
+        let claim = self.verification(m.verification.as_deref()?)?;
+        (claim.outcome == "running"
+            && claim.profile == m.candidate
+            && claim.profile_digest == current
+            && claim.pool == m.pool
             && claim.deployment == deployment.id.as_str())
         .then_some(claim)
     }
@@ -297,42 +443,7 @@ impl Gate {
                 "profile {id} is promoted as it stands and needs no regeneration"
             ));
         }
-        let naming = |generation: &&GenerationRow| {
-            generation.id == owned.generation || generation.draft_profile.as_deref() == Some(id)
-        };
-        if let Some(open) = self
-            .generations
-            .values()
-            .filter(naming)
-            .find(|generation| generation.is_open())
-        {
-            return Some(format!(
-                "generation {} is still working on profile {id}",
-                open.id
-            ));
-        }
-        if let Some(pending) = self
-            .generations
-            .values()
-            .filter(naming)
-            .find(|generation| generation.cleanup_pending)
-        {
-            return Some(format!(
-                "generation {}'s cleanup of profile {id} is still pending",
-                pending.id
-            ));
-        }
-        if let Some(running) = self
-            .verifications
-            .iter()
-            .find(|row| row.profile == id && row.outcome == "running")
-        {
-            return Some(format!(
-                "verification {} of profile {id} is still running",
-                running.id
-            ));
-        }
-        None
+        self.busy(id, Some(owned.generation.as_str()))
     }
 
     /// The profiles of `inventory` a fresh generation may regenerate in place.
@@ -357,6 +468,41 @@ impl Gate {
         }
         let id = profile.id.as_str();
         let refuse = |why: String| Err(format!("profile {id} cannot be verified: {why}"));
+        if let Some(m) = self.reverify_of_candidate(id) {
+            if m.state != inference_reverify::VERIFYING {
+                return refuse(format!(
+                    "it is the candidate of re-verify {} of profile {}, which {}",
+                    m.id, m.profile, m.state
+                ));
+            }
+            if m.pool != pool {
+                return refuse(format!(
+                    "it is the candidate of re-verify {} of profile {}, which verifies it on pool {}, not {pool}",
+                    m.id, m.profile, m.pool
+                ));
+            }
+            if m.governed {
+                if m.candidate_digest != digest(profile) || m.surface_digest != surface_of(profile)
+                {
+                    return refuse(format!(
+                        "it has changed since the operator approved re-verify {} of profile {}",
+                        m.id, m.profile
+                    ));
+                }
+                if let Some(claimed) = m.verification.as_deref() {
+                    return match self.verification(claimed) {
+                        Some(row) if row.outcome == "running" => {
+                            Ok(Admission::Replay(Box::new(row.clone())))
+                        }
+                        _ => refuse(format!(
+                            "re-verify {} already had its one verification, {claimed}",
+                            m.id
+                        )),
+                    };
+                }
+            }
+            return Ok(Admission::Reverify(m.id.clone()));
+        }
         let Some(owned) = self.owned.get(id) else {
             return refuse(
                 "it was generated, and no generation owns it as it stands, so nothing the operator approved covers what it runs; generate a profile for its model anew".into(),
@@ -672,7 +818,14 @@ fn backfill_rows(gate: &Gate, inventory: &Inventory) -> Vec<Owned> {
     inventory
         .profiles
         .values()
-        .filter(|profile| !gate.owned.contains_key(profile.id.as_str()) && gate.governs(profile))
+        .filter(|profile| {
+            let id = profile.id.as_str();
+            // A re-verify's candidate is governed by its re-verify, and is
+            // nobody's to own.
+            !gate.owned.contains_key(id)
+                && gate.reverify_of_candidate(id).is_none()
+                && gate.governs(profile)
+        })
         .map(|profile| {
             let id = profile.id.as_str();
             let current = digest(profile);

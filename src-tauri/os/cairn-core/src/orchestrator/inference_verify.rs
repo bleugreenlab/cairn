@@ -305,6 +305,8 @@ struct Claim {
     started_at: i64,
     changes: Vec<RowChange>,
     binding: Option<Binding>,
+    /// The re-verify whose candidate this claim verifies.
+    reverify: Option<String>,
 }
 
 /// What claiming a pool came to.
@@ -314,7 +316,8 @@ enum Claimed {
     Busy(String),
     /// The draft revision's one claim was taken first; this is it.
     Replay(String),
-    /// The generation is no longer bound as it was checked.
+    /// The generation, or the re-verify, is no longer bound as it was
+    /// checked.
     Unbound,
 }
 
@@ -372,6 +375,27 @@ async fn claim_pool(db: &LocalDb, claim: Claim) -> Result<Claimed, String> {
                         None => None,
                     };
                     return Ok(existing.map_or(Claimed::Unbound, Claimed::Replay));
+                }
+            }
+            // A re-verify's candidate is verified only while its re-verify is
+            // under way, and a governed profile's re-verify admits one claim.
+            if let Some(reverify) = &claim.reverify {
+                let bound = conn
+                    .execute(
+                        "UPDATE inference_pin_moves SET verification_id = ?1
+                          WHERE id = ?2 AND candidate_id = ?3 AND pool_id = ?4
+                            AND state = 'verifying'
+                            AND (governed = 0 OR verification_id IS NULL)",
+                        params![
+                            claim.id.clone(),
+                            reverify.clone(),
+                            claim.profile.clone(),
+                            claim.pool.clone()
+                        ],
+                    )
+                    .await?;
+                if bound == 0 {
+                    return Ok(Claimed::Unbound);
                 }
             }
             save_rows_in(conn, claim.changes.clone(), claim.started_at, None).await?;
@@ -477,12 +501,13 @@ pub async fn begin(
             pool.members.len()
         ));
     }
-    let binding = match Gate::load(db)
+    let (binding, reverify) = match Gate::load(db)
         .await?
         .verification_admission(&profile, pool_id.as_str())?
     {
-        Admission::Ordinary => None,
-        Admission::Draft(binding) => Some(binding),
+        Admission::Ordinary => (None, None),
+        Admission::Draft(binding) => (Some(binding), None),
+        Admission::Reverify(id) => (None, Some(id)),
         Admission::Replay(claim) => return replayed(&inventory, &claim, network),
     };
     let id = uuid::Uuid::new_v4().to_string();
@@ -552,6 +577,7 @@ pub async fn begin(
         started_at: now,
         changes,
         binding,
+        reverify,
     };
     match claim_pool(db, claim).await? {
         Claimed::New => {}
@@ -574,7 +600,7 @@ pub async fn begin(
         }
         Claimed::Unbound => {
             return Err(format!(
-                "profile {profile_id} cannot be verified: its generation changed while the verification was being claimed; nothing was written"
+                "profile {profile_id} cannot be verified: its generation or re-verify changed while the verification was being claimed; nothing was written"
             ))
         }
     }
@@ -705,11 +731,14 @@ async fn keep(db: &LocalDb, act: &dyn Act, plan: &Planned, requester: &str) -> V
 /// A generation's draft is never revised by its own verification: clamping its
 /// context would change the revision the operator approved and this claim is
 /// for. A draft whose context does not fit its cache fails, naming the cache
-/// it measured, so the generation can write a revision that fits.
+/// it measured, so the generation can write a revision that fits. The same
+/// holds for the candidate of a generated profile's re-verify, which is
+/// exactly the surface the operator approved.
 pub async fn run(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Outcome, String> {
     let generated = promotion::load_owned(db)
         .await?
-        .contains_key(plan.profile.as_str());
+        .contains_key(plan.profile.as_str())
+        || super::inference_reverify::approved_candidate(db, plan.profile.as_str()).await?;
     set_stage(db, &plan.id, Stage::Start).await?;
     if let Err(why) = act.pin(plan.deployment.to_string(), holder(&plan.id)).await {
         finish(db, &plan.id, false, Some(why.clone()), act.now_ms()).await?;
@@ -1294,6 +1323,9 @@ pub fn spawn_recovery(orch: super::Orchestrator) {
             ),
             Ok(_) => {}
             Err(error) => log::warn!("inference: verification recovery failed: {error}"),
+        }
+        if let Err(error) = super::inference_reverify::recover(&orch.db.local).await {
+            log::warn!("inference: re-verify recovery failed: {error}");
         }
     });
 }
