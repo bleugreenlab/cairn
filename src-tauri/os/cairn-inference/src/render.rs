@@ -29,10 +29,12 @@
 //! with its dependencies into an environment of its own by the `uv` Cairn
 //! provisions, resolving them only to releases published before the pin's
 //! cutoff. It then stops any server left under the deployment's name, starts
-//! the server detached with its pid in `~/.cairn/inference/run/<name>.pid`,
-//! and waits for health, failing with the server's error lines if it exits
-//! first. Stop signals that pid, and only while it is still the artifact's
-//! process. The server runs offline (`HF_HUB_OFFLINE=1`). Unlike a
+//! the server detached with its pid and start time in
+//! `~/.cairn/inference/run/<name>.pid`, and waits for health, failing with
+//! the server's error lines if it exits first. Stop sends that pid TERM, only
+//! while it is still the process that start launched, and waits for it to
+//! exit; it never kills it (see [`STOP_GRACE_SECS`]). The server runs offline
+//! (`HF_HUB_OFFLINE=1`). Unlike a
 //! container it can read whatever its account can, the machine's Hugging Face
 //! token included, which is why its artifact is pinned by hash and its
 //! runnable surface approved before a generated profile runs. The scripts
@@ -52,8 +54,8 @@ use crate::deployment::Deployment;
 use crate::inventory::ValidationError;
 use crate::machine::MachineName;
 use crate::profile::{
-    placeholders, secret_references, AcceleratorFamily, AcceleratorRuntime, Container, Engine,
-    InferenceProfile, MountSource, Native, Packaging, Server, WeightFile,
+    is_folder_name, placeholders, secret_references, AcceleratorFamily, AcceleratorRuntime,
+    Container, Engine, InferenceProfile, MountSource, Native, Packaging, Server, WeightFile,
 };
 
 /// What the head runs for one deployment.
@@ -182,11 +184,34 @@ pub fn render(
                     profile.id
                 )));
             }
-            if native.server == Server::MlxLm && profile.model.config_files.is_empty() {
+            if native.server.is_mlx() && profile.model.config_files.is_empty() {
                 return Err(Refusal(format!(
-                    "profile {} runs MLX on the pinned weights alone: it pins none of its repository's configuration, tokenizer and chat-template files (model.configFiles), and MLX loads the snapshot directory they belong in. Generate the profile again, which pins them",
-                    profile.id
+                    "profile {} runs {label} on the pinned weights alone: it pins none of its repository's configuration, tokenizer and chat-template files (model.configFiles), and {label} loads the snapshot directory they belong in. Generate the profile again, which pins them",
+                    profile.id,
+                    label = native.server.label(),
                 )));
+            }
+            if native.server == Server::Omlx {
+                if !is_folder_name(&profile.served_name) {
+                    return Err(Refusal(
+                        ValidationError::ServedNameNotAFolder {
+                            profile: profile.id.clone(),
+                            served_name: profile.served_name.clone(),
+                        }
+                        .to_string(),
+                    ));
+                }
+                if deployment.health_path != Server::Omlx.health_path() {
+                    return Err(Refusal(
+                        ValidationError::HealthBeforeLoad {
+                            deployment: deployment.id.clone(),
+                            server: Server::Omlx.label(),
+                            path: deployment.health_path.clone(),
+                            expected: Server::Omlx.health_path(),
+                        }
+                        .to_string(),
+                    ));
+                }
             }
             let ranks = Ranks::of(profile, deployment, machines)?;
             let start = native_start_script(profile, native, deployment, &ranks)?;
@@ -198,10 +223,11 @@ pub fn render(
             })
         }
         Engine::Container(container) => {
-            if container.server == Server::MlxLm {
+            if container.server.is_mlx() {
                 return Err(Refusal(format!(
-                    "profile {} runs MLX in a container; MLX runs natively, on Apple silicon",
-                    profile.id
+                    "profile {} runs {} in a container; MLX runs natively, on Apple silicon",
+                    profile.id,
+                    container.server.label()
                 )));
             }
             if container.server == Server::Vllm
@@ -742,10 +768,33 @@ fn native_word(value: &str) -> String {
     }
 }
 
-/// `$art`, `$run` and `$name`, which a native start and stop share, and
-/// `stop_server`, which stops what runs under `$name` if it is still the
-/// artifact's process: a pid whose process has since exited may have been
-/// reused by something else of the account's.
+/// How long a native stop waits for its server to exit after TERM before it
+/// gives up, leaves the server running and fails. It never sends KILL: a
+/// process killed while it holds a large wired Metal allocation can leave
+/// that memory wired in the kernel until a reboot (oMLX issue 2184: 414 GiB
+/// stayed wired with no process left, where a TERM of the same healthy
+/// server released 424 GiB within seconds). Exit itself is quick: a process
+/// holding 2, 4 and 8 GiB of wired MLX arrays exited 0.06, 0.07 and 0.08 s
+/// after TERM on an M4 Pro. What takes long is the server's own graceful
+/// shutdown, which oMLX 0.8.3 (through uvicorn, with no shutdown timeout)
+/// holds open until its in-flight requests finish. So the grace is as long
+/// as the executor lets a stop run ([`crate::control::STOP_TIMEOUT_SECS`]),
+/// less a minute for the rest of the script, and a stop that runs out
+/// fails rather than reporting a server stopped that still holds its
+/// memory, which a new server started beside it would find taken.
+pub const STOP_GRACE_SECS: u64 = 540;
+const _: () = assert!(STOP_GRACE_SECS + 60 <= crate::control::STOP_TIMEOUT_SECS);
+
+/// `$art`, `$run` and `$name`, which a native start and stop share;
+/// `launched_at`, a process's start time; and `stop_server`, which stops what
+/// runs under `$name` if it is still the process start launched: a pid whose
+/// process has since exited may have been reused by something else of the
+/// account's. Start records the process's start time beside its pid, since a
+/// server may retitle itself (oMLX's shows as `omlx-server`) so its command
+/// line no longer names the artifact. A pid file with no start time is
+/// matched by that command line. Where `ps` is refused (a sandboxed
+/// account), there is nothing to compare, and the pid is taken as the
+/// server's.
 fn native_prelude(out: &mut String, native: &Native, deployment: &Deployment) {
     let _ = writeln!(
         out,
@@ -753,24 +802,36 @@ fn native_prelude(out: &mut String, native: &Native, deployment: &Deployment) {
         quote(&native.artifact.sha256),
         quote(&container_name(deployment.id.as_str(), 0)),
     );
-    out.push_str(
-        r#"stop_server() {
+    let _ = write!(
+        out,
+        r#"launched_at() {{ LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ' || true; }}
+stop_server() {{
   if [ ! -f "$run/$name.pid" ]; then return 0; fi
-  pid="$(cat "$run/$name.pid")"
+  pid="$(sed -n 1p "$run/$name.pid")"
+  launched="$(sed -n 2p "$run/$name.pid")"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    case "$command" in
-      ""|*"$art"*)
-        kill -TERM "$pid" 2>/dev/null || true
-        waited=0
-        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
-        kill -KILL "$pid" 2>/dev/null || true
-        ;;
-      *) echo "pid $pid is no longer $name, so it was left running" ;;
-    esac
+    if [ -n "$launched" ]; then
+      case "$(launched_at "$pid")" in ""|"$launched") ours=yes ;; *) ours=no ;; esac
+    else
+      case "$(ps -p "$pid" -o command= 2>/dev/null || true)" in ""|*"$art"*) ours=yes ;; *) ours=no ;; esac
+    fi
+    if [ "$ours" = no ]; then
+      echo "pid $pid is no longer $name, so it was left running"
+    else
+      kill -TERM "$pid" 2>/dev/null || true
+      waited=0
+      while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge {STOP_GRACE_SECS} ]; then
+          echo "server $name (pid $pid) had not exited {STOP_GRACE_SECS}s after TERM, so it was left running, still holding its memory, rather than killed: killing a process that holds a large wired model can strand that memory until a reboot. Stop it once its requests finish" >&2
+          return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+      done
+    fi
   fi
   rm -f "$run/$name.pid"
-}
+}}
 "#,
     );
 }
@@ -876,6 +937,22 @@ fn native_start_script(
     for arg in &native.args {
         command.push(native_word(&fill(arg)?));
     }
+    let mut setup = String::new();
+    if native.server == Server::Omlx {
+        omlx_setup(&mut setup, &profile.served_name, &fill("{snapshot}")?);
+        // Without --no-hf-cache oMLX also offers, and loads on request,
+        // every model in the machine's Hugging Face cache.
+        command.extend(
+            [
+                "'--model-dir'",
+                "\"$models\"",
+                "'--base-path'",
+                "\"$base\"",
+                "'--no-hf-cache'",
+            ]
+            .map(String::from),
+        );
+    }
     no_newline(profile, &deployment.health_path)?;
     let health = quote(&format!(
         "http://127.0.0.1:{}{}",
@@ -883,14 +960,51 @@ fn native_start_script(
     ));
     let _ = writeln!(
         out,
-        "stop_server\nmkdir -p \"$run\"\ncd \"$run\"\n{} >\"$run/$name.log\" 2>&1 </dev/null &\npid=$!\necho \"$pid\" >\"$run/$name.pid\"",
+        "stop_server\nmkdir -p \"$run\"\ncd \"$run\"\n{setup}{} >\"$run/$name.log\" 2>&1 </dev/null &\npid=$!\nprintf '%s\\n%s\\n' \"$pid\" \"$(launched_at \"$pid\")\" >\"$run/$name.pid\"",
         command.join(" "),
+    );
+    let answered = match native.server {
+        // oMLX's health answers once its startup load has finished, whether
+        // or not the model loaded (a 507 when it does not fit is logged, not
+        // fatal), so the answer must count the model in.
+        Server::Omlx => format!(
+            "if health=\"$(curl -fsS --max-time 5 {health})\"; then\n    if printf '%s' \"$health\" | grep -Eq '\"loaded_count\": *[1-9]'; then exit 0; fi\n    echo \"server $name answers its health check with no model loaded, so its load failed; its last errors:\"\n    {ERROR_LINES}\n    stop_server || true\n    exit 1\n  fi"
+        ),
+        _ => format!("if curl -fsS -o /dev/null --max-time 5 {health}; then exit 0; fi"),
+    };
+    let _ = writeln!(
+        out,
+        "while true; do\n  {answered}\n  if ! kill -0 \"$pid\" 2>/dev/null; then\n    echo \"server $name exited before it was healthy; its last errors:\"\n    {ERROR_LINES}\n    rm -f \"$run/$name.pid\"\n    exit 1\n  fi\n  sleep {HEALTH_POLL_SECS}\ndone"
+    );
+    Ok(out)
+}
+
+/// The server's last error lines from its log, else its last lines.
+const ERROR_LINES: &str = r#"grep -E 'Error|error|ERROR|Exception' "$run/$name.log" | tail -n 6 || tail -n 10 "$run/$name.log""#;
+
+/// What an oMLX start makes before the server starts: `$models`, the folder
+/// given as `--model-dir`, whose one entry is the served name linked to the
+/// pinned snapshot (oMLX names a model by its folder), and `$base`, the
+/// deployment's own `--base-path` (oMLX keeps its settings, logs and caches
+/// there, never in the account's `~/.omlx`), whose model settings pin that
+/// model. A pinned model is loaded at startup and `/health` answers 503
+/// until the load has finished, so the executor, which polls health while
+/// start runs, cannot see the server healthy before its model is in memory,
+/// as it would one loaded through `POST /v1/models/{id}/load` after the
+/// server answers. The settings file is the pinned release's (`version` 3 is
+/// oMLX 0.8.3's), so a profile pinning another release is verified before
+/// it is trusted, like any change.
+fn omlx_setup(out: &mut String, served: &str, snapshot: &str) {
+    let settings = format!(
+        r#"{{"version":3,"models":{{"{served}":{{"is_pinned":true,"is_default":true}}}}}}"#
     );
     let _ = writeln!(
         out,
-        "while true; do\n  if curl -fsS -o /dev/null --max-time 5 {health}; then exit 0; fi\n  if ! kill -0 \"$pid\" 2>/dev/null; then\n    echo \"server $name exited before it was healthy; its last errors:\"\n    grep -E 'Error|error|Exception' \"$run/$name.log\" | tail -n 6 || tail -n 10 \"$run/$name.log\"\n    rm -f \"$run/$name.pid\"\n    exit 1\n  fi\n  sleep {HEALTH_POLL_SECS}\ndone"
+        "models=\"$run/$name.models\"\nbase=\"$run/$name.omlx\"\nrm -rf \"$models\"\nmkdir -p \"$models\" \"$base\"\nln -s {} \"$models\"/{}\nprintf '%s\\n' {} >\"$base/model_settings.json\"",
+        native_word(snapshot),
+        quote(served),
+        quote(&settings),
     );
-    Ok(out)
 }
 
 fn native_stop_script(native: &Native, deployment: &Deployment) -> String {
@@ -899,7 +1013,7 @@ fn native_stop_script(native: &Native, deployment: &Deployment) -> String {
         deployment.id
     );
     native_prelude(&mut out, native, deployment);
-    out.push_str("stop_server\nexit 0\n");
+    out.push_str("stop_server || exit 1\nexit 0\n");
     out
 }
 
@@ -939,7 +1053,7 @@ mod tests {
     use super::*;
     use crate::profile::{
         Accelerator, Artifact, ConfigFile, HostOptions, ModelRef, Mount, ProfileOrigin,
-        Requirements, SourcePin, MLX_PROGRAM,
+        Requirements, SourcePin, MLX_PROGRAM, OMLX_PROGRAM,
     };
     use crate::record::RecordSource;
 
@@ -1811,7 +1925,9 @@ mod tests {
             "the server inherits nothing of the executor's environment, its token included"
         );
         assert!(start.contains("name='cairn-embed-r0'"));
-        assert!(start.contains("echo \"$pid\" >\"$run/$name.pid\""));
+        assert!(start.contains(
+            "printf '%s\\n%s\\n' \"$pid\" \"$(launched_at \"$pid\")\" >\"$run/$name.pid\""
+        ));
         assert!(
             start.contains("curl -fsS -o /dev/null --max-time 5 'http://127.0.0.1:8090/v1/models'")
         );
@@ -1820,6 +1936,11 @@ mod tests {
             "a server left under the name is stopped first"
         );
         assert!(stop.contains("kill -TERM \"$pid\"") && stop.contains("*\"$art\"*)"));
+        assert!(
+            !stop.contains("KILL"),
+            "a server holding a wired model is never killed"
+        );
+        assert!(stop.contains("stop_server || exit 1\n"));
         assert!(
             !start.contains("[@]"),
             "no arrays: macOS's bash 3.2 refuses an empty one under set -u"
@@ -1852,6 +1973,148 @@ mod tests {
             "{start}"
         );
         assert!(!start.contains("tar -xzf"));
+    }
+
+    /// DeepSeek V4.1 Flash from mlx-community's oQ2e build, served by oMLX.
+    fn omlx_chat() -> InferenceProfile {
+        let mut profile = mlx_chat();
+        profile.id = "deepseek-v4.1-flash-1017-oq2e-mtp-omlx-metal-x1".into();
+        let repo = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ2e-mtp";
+        profile.model.name = "deepseek-ai/DeepSeek-V4.1-Flash-1017".into();
+        profile.model.weights = vec![weight(repo, "model-00001-of-00002.safetensors")];
+        profile.model.config_files[0].repo = repo.into();
+        profile.served_name = "DeepSeek-V4.1-Flash-1017".into();
+        profile.engine = Engine::Native(Native {
+            server: Server::Omlx,
+            artifact: Artifact {
+                url: "https://github.com/jundot/omlx/releases/download/v0.8.3/omlx-0.8.3-cp312-cp312-macosx_15_0_universal2.whl".into(),
+                version: "0.8.3".into(),
+                sha256: SHA.into(),
+                packaging: Packaging::Wheel {
+                    python: "3.12".into(),
+                    resolved_before: "2026-11-23T00:00:00Z".into(),
+                },
+            },
+            program: OMLX_PROGRAM.into(),
+            args: ["serve", "--host", "0.0.0.0", "--port", "{port}", "--headless"]
+                .map(String::from)
+                .to_vec(),
+            env: BTreeMap::new(),
+        });
+        profile
+    }
+
+    fn omlx_deployment() -> Deployment {
+        let mut deployment = deployment("chat", &["studio"], 8000);
+        deployment.health_path = "/health".into();
+        deployment
+    }
+
+    #[test]
+    fn an_omlx_server_serves_its_pinned_snapshot_by_its_served_name_and_is_healthy_once_loaded() {
+        let rendered = render(&omlx_chat(), &omlx_deployment(), &studio()).unwrap();
+        let start = &rendered.start;
+        snapshot("omlx-metal-start.sh", start);
+        #[cfg(unix)]
+        parses(&[start, rendered.stop.as_deref().unwrap()]);
+        assert!(start.contains("curl -fsSL --retry 3 -o \"$art\"/'omlx-0.8.3-cp312-cp312-macosx_15_0_universal2.whl' 'https://github.com/jundot/omlx/releases/download/v0.8.3/omlx-0.8.3-cp312-cp312-macosx_15_0_universal2.whl'"));
+        assert!(start.contains("\"$uv\" venv -q --python '3.12' \"$art/env\""));
+        assert!(
+            start.contains("ln -s \"$hf\"'/hub/models--mlx-community--DeepSeek-V4.1-Flash-1017-oQ2e-mtp/snapshots/6821d6ad3681a4b137b066b76094fa82ebd0a380' \"$models\"/'DeepSeek-V4.1-Flash-1017'"),
+            "the served name is the model folder oMLX serves: {start}"
+        );
+        assert!(
+            start.contains(r#"'{"version":3,"models":{"DeepSeek-V4.1-Flash-1017":{"is_pinned":true,"is_default":true}}}' >"$base/model_settings.json""#),
+            "the model is pinned, so oMLX loads it before /health answers: {start}"
+        );
+        assert!(
+            start.contains("\"$art/env/bin\"/'omlx' 'serve' '--host' '0.0.0.0' '--port' '8000' '--headless' '--model-dir' \"$models\" '--base-path' \"$base\" '--no-hf-cache' >\"$run/$name.log\""),
+            "{start}"
+        );
+        assert!(start.contains(
+            "if health=\"$(curl -fsS --max-time 5 'http://127.0.0.1:8000/health')\"; then"
+        ));
+        assert!(
+            start.contains("grep -Eq '\"loaded_count\": *[1-9]'"),
+            "a health answer with nothing loaded is a failed load"
+        );
+        assert!(!start.contains("import sys"), "oMLX needs no launcher");
+        assert!(start.find("ln -s").unwrap() < start.find("nohup env").unwrap());
+    }
+
+    #[test]
+    fn omlx_refuses_a_served_name_that_is_no_folder_and_a_health_check_before_load() {
+        let mut owned = omlx_chat();
+        owned.served_name = "deepseek-ai/DeepSeek-V4.1-Flash-1017".into();
+        let refusal = render(&owned, &omlx_deployment(), &studio()).unwrap_err();
+        assert_eq!(
+            refusal.0,
+            "profile deepseek-v4.1-flash-1017-oq2e-mtp-omlx-metal-x1 serves \"deepseek-ai/DeepSeek-V4.1-Flash-1017\" on oMLX, which names a model by its folder in --model-dir: its servedName is one folder name of letters, digits, ., _ and -, with no /"
+        );
+
+        let early = deployment("chat", &["studio"], 8000);
+        let refusal = render(&omlx_chat(), &early, &studio()).unwrap_err();
+        assert_eq!(
+            refusal.0,
+            "deployment chat checks health at /v1/models, which oMLX answers before its model is loaded; its healthPath is /health"
+        );
+        let mut inventory = crate::inventory::Inventory::default();
+        inventory.insert_profile(omlx_chat());
+        let mut placed = early.clone();
+        placed.profile = omlx_chat().id;
+        inventory.insert_deployment(placed);
+        assert!(inventory.problems().iter().any(|problem| matches!(
+            problem,
+            ValidationError::HealthBeforeLoad {
+                expected: "/health",
+                ..
+            }
+        )));
+
+        let mut contained = embedder();
+        if let Engine::Container(container) = &mut contained.engine {
+            container.server = Server::Omlx;
+        }
+        let refusal = render(
+            &contained,
+            &deployment("embed", &["fedora"], 8090),
+            &fedora(),
+        )
+        .unwrap_err();
+        assert!(refusal.0.contains("oMLX in a container"), "{}", refusal.0);
+    }
+
+    /// The rendered stop against a real process: it sends the server start
+    /// recorded TERM and returns only once that process has exited.
+    #[cfg(unix)]
+    #[test]
+    fn a_native_stop_returns_once_its_server_has_exited() {
+        let home = std::env::temp_dir().join(format!("cairn-native-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let stop = render(&omlx_chat(), &omlx_deployment(), &studio())
+            .unwrap()
+            .stop
+            .unwrap();
+        // The server stands in as an orphaned sleep, as start's nohup leaves
+        // it, recorded the way start records it.
+        let script = stop.replace(
+            "stop_server || exit 1\n",
+            "mkdir -p \"$run\"\n( sleep 300 </dev/null >/dev/null 2>&1 & echo $! >\"$run/sleeper\" )\npid=\"$(cat \"$run/sleeper\")\"\nprintf '%s\\n%s\\n' \"$pid\" \"$(launched_at \"$pid\")\" >\"$run/$name.pid\"\nstop_server || exit 1\nif kill -0 \"$pid\" 2>/dev/null; then echo still running; fi\nif [ -f \"$run/$name.pid\" ]; then echo pid file left; fi\n",
+        );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     }
 
     #[test]

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Rendered by Cairn from profile deepseek-v4.1-flash-1017-oq2e-mtp-omlx-metal-x1 for deployment chat: oMLX 0.8.3, run natively.
+set -euo pipefail
+hf="${HF_HOME:-$HOME/.cache/huggingface}"
+hf_get() { if [ -z "${HF_TOKEN:-}" ] && [ -s "$hf/token" ]; then HF_TOKEN="$(cat "$hf/token")"; fi; if [ -n "${HF_TOKEN:-}" ]; then curl -fsSL --retry 3 -H @<(printf 'Authorization: Bearer %s\n' "$HF_TOKEN") -o "$2" "$1"; else curl -fsSL --retry 3 -o "$2" "$1"; fi; }
+f="$hf"/'hub/models--mlx-community--DeepSeek-V4.1-Flash-1017-oQ2e-mtp/snapshots/6821d6ad3681a4b137b066b76094fa82ebd0a380/config.json'
+if [ ! -f "$f" ]; then mkdir -p "$(dirname "$f")"; hf_get 'https://huggingface.co/mlx-community/DeepSeek-V4.1-Flash-1017-oQ2e-mtp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/config.json' "$f.part"; [ "$({ printf 'blob %d\0' "$(wc -c <"$f.part")"; cat "$f.part"; } | sha1sum | cut -d ' ' -f 1)" = '8b4b87fc69023e7a224eb6563753aaf3223d8b98' ] || { echo "$f.part does not match its pinned git blob" >&2; exit 1; }; mv "$f.part" "$f"; fi
+f="$hf"/'hub/models--mlx-community--DeepSeek-V4.1-Flash-1017-oQ2e-mtp/snapshots/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00001-of-00002.safetensors'
+if [ ! -f "$f" ]; then mkdir -p "$(dirname "$f")"; hf_get 'https://huggingface.co/mlx-community/DeepSeek-V4.1-Flash-1017-oQ2e-mtp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00001-of-00002.safetensors' "$f.part"; echo '0000000000000000000000000000000000000000000000000000000000000000'"  $f.part" | sha256sum -c --quiet -; mv "$f.part" "$f"; fi
+mkdir -p "$hf"/'hub/models--mlx-community--DeepSeek-V4.1-Flash-1017-oQ2e-mtp'
+art="$HOME/.cairn/inference/artifacts"/'a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8'
+run="$HOME/.cairn/inference/run"
+name='cairn-chat-r0'
+launched_at() { LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ' || true; }
+stop_server() {
+  if [ ! -f "$run/$name.pid" ]; then return 0; fi
+  pid="$(sed -n 1p "$run/$name.pid")"
+  launched="$(sed -n 2p "$run/$name.pid")"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    if [ -n "$launched" ]; then
+      case "$(launched_at "$pid")" in ""|"$launched") ours=yes ;; *) ours=no ;; esac
+    else
+      case "$(ps -p "$pid" -o command= 2>/dev/null || true)" in ""|*"$art"*) ours=yes ;; *) ours=no ;; esac
+    fi
+    if [ "$ours" = no ]; then
+      echo "pid $pid is no longer $name, so it was left running"
+    else
+      kill -TERM "$pid" 2>/dev/null || true
+      waited=0
+      while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge 540 ]; then
+          echo "server $name (pid $pid) had not exited 540s after TERM, so it was left running, still holding its memory, rather than killed: killing a process that holds a large wired model can strand that memory until a reboot. Stop it once its requests finish" >&2
+          return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+      done
+    fi
+  fi
+  rm -f "$run/$name.pid"
+}
+if [ ! -f "$art/.complete" ]; then
+  rm -rf "$art"
+  mkdir -p "$art"
+  curl -fsSL --retry 3 -o "$art"/'omlx-0.8.3-cp312-cp312-macosx_15_0_universal2.whl' 'https://github.com/jundot/omlx/releases/download/v0.8.3/omlx-0.8.3-cp312-cp312-macosx_15_0_universal2.whl'
+  echo 'a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8'"  ""$art"/'omlx-0.8.3-cp312-cp312-macosx_15_0_universal2.whl' | sha256sum -c --quiet -
+  if [ -x "${CAIRN_HOME:-$HOME/.cairn}/bin/uv" ]; then uv="${CAIRN_HOME:-$HOME/.cairn}/bin/uv"; elif command -v uv >/dev/null 2>&1; then uv=uv; else echo "uv is not installed on $(hostname): Cairn provisions it with the executor, so update the executor" >&2; exit 1; fi
+  "$uv" venv -q --python '3.12' "$art/env"
+  VIRTUAL_ENV="$art/env" "$uv" pip install -q --exclude-newer '2026-11-23T00:00:00Z' "$art"/'omlx-0.8.3-cp312-cp312-macosx_15_0_universal2.whl'
+  touch "$art/.complete"
+fi
+stop_server
+mkdir -p "$run"
+cd "$run"
+models="$run/$name.models"
+base="$run/$name.omlx"
+rm -rf "$models"
+mkdir -p "$models" "$base"
+ln -s "$hf"'/hub/models--mlx-community--DeepSeek-V4.1-Flash-1017-oQ2e-mtp/snapshots/6821d6ad3681a4b137b066b76094fa82ebd0a380' "$models"/'DeepSeek-V4.1-Flash-1017'
+printf '%s\n' '{"version":3,"models":{"DeepSeek-V4.1-Flash-1017":{"is_pinned":true,"is_default":true}}}' >"$base/model_settings.json"
+nohup env -i 'HOME='"$HOME" 'PATH=/usr/bin:/bin:/usr/sbin:/sbin' 'TMPDIR='"${TMPDIR:-/tmp}" 'HF_HOME='"$hf" 'HF_HUB_OFFLINE=1' "$art/env/bin"/'omlx' 'serve' '--host' '0.0.0.0' '--port' '8000' '--headless' '--model-dir' "$models" '--base-path' "$base" '--no-hf-cache' >"$run/$name.log" 2>&1 </dev/null &
+pid=$!
+printf '%s\n%s\n' "$pid" "$(launched_at "$pid")" >"$run/$name.pid"
+while true; do
+  if health="$(curl -fsS --max-time 5 'http://127.0.0.1:8000/health')"; then
+    if printf '%s' "$health" | grep -Eq '"loaded_count": *[1-9]'; then exit 0; fi
+    echo "server $name answers its health check with no model loaded, so its load failed; its last errors:"
+    grep -E 'Error|error|ERROR|Exception' "$run/$name.log" | tail -n 6 || tail -n 10 "$run/$name.log"
+    stop_server || true
+    exit 1
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "server $name exited before it was healthy; its last errors:"
+    grep -E 'Error|error|ERROR|Exception' "$run/$name.log" | tail -n 6 || tail -n 10 "$run/$name.log"
+    rm -f "$run/$name.pid"
+    exit 1
+  fi
+  sleep 5
+done

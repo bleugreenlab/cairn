@@ -507,7 +507,11 @@ pub async fn begin(
         machines: machines.clone(),
         api_port: port_for(&profile),
         api_path: "/v1".into(),
-        health_path: "/v1/models".into(),
+        health_path: profile
+            .engine
+            .server()
+            .map_or(Server::Vllm.health_path(), Server::health_path)
+            .into(),
     };
     let mut records = Inventory::default();
     records.insert_deployment(deployment.clone());

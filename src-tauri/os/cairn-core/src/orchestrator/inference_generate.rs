@@ -932,9 +932,7 @@ async fn write_generated_held(
             }
         }
         Engine::Native(native) => {
-            if native.server == cairn_inference::Server::MlxLm
-                && profile.model.config_files.is_empty()
-            {
+            if native.server.is_mlx() && profile.model.config_files.is_empty() {
                 return Err("a generated MLX profile pins its repository's configuration, tokenizer and chat-template files (model.configFiles), as its starting profile does: MLX loads the snapshot directory they are in".into());
             }
         }

@@ -350,7 +350,7 @@ pub struct Native {
     pub artifact: Artifact,
     /// The serving program: a path inside an unpacked archive
     /// (`llama-b12283/llama-server`), or a console script of an installed
-    /// wheel (`mlx_lm.server`).
+    /// wheel (`mlx_lm.server`, `omlx`).
     pub program: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
@@ -445,6 +445,9 @@ impl Artifact {
             {
                 Some("a wheel's python is a version like 3.12")
             }
+            Packaging::Wheel { python, .. } if !wheel_runs_on(name, python) => Some(
+                "a wheel built for one CPython (its cpXY tag) installs only on that python, so python must match it",
+            ),
             Packaging::Wheel {
                 resolved_before, ..
             } if !is_cutoff(resolved_before) => Some(
@@ -453,6 +456,20 @@ impl Artifact {
             _ => None,
         }
     }
+}
+
+/// Whether a wheel named `name` installs on `python` (`3.12`), by its python
+/// tag: `py3` or another interpreter-neutral tag runs on any, a CPython tag
+/// (`cp312`, or a compressed `cp311.cp312`) only on the versions it names.
+/// A name without the five wheel fields is left to the installer.
+fn wheel_runs_on(name: &str, python: &str) -> bool {
+    let fields: Vec<&str> = name.trim_end_matches(".whl").split('-').collect();
+    if fields.len() < 5 {
+        return true;
+    }
+    let tags = fields[fields.len() - 3];
+    let wanted = format!("cp{}", python.replace('.', ""));
+    !tags.split('.').any(|tag| tag.starts_with("cp")) || tags.split('.').any(|tag| tag == wanted)
 }
 
 /// `YYYY-MM-DD`, or `YYYY-MM-DDTHH:MM:SSZ`: what `uv --exclude-newer` takes.
@@ -476,7 +493,7 @@ impl Native {
             .map(String::as_str)
     }
 
-    /// What is wrong with the program the artifact runs.
+    /// What is wrong with the program the artifact runs, or how it is run.
     pub(crate) fn program_problem(&self) -> Option<&'static str> {
         let segment_ok = |part: &str| {
             !matches!(part, "" | "." | "..")
@@ -497,6 +514,25 @@ impl Native {
             (Packaging::Archive, Server::MlxLm) => {
                 Some("an mlxLm server comes as the mlx-lm wheel")
             }
+            (Packaging::Wheel { .. }, Server::Omlx) if self.program != OMLX_PROGRAM => {
+                Some("an omlx server runs the omlx console script")
+            }
+            (Packaging::Archive, Server::Omlx) => Some("an omlx server comes as an oMLX wheel"),
+            (_, Server::Omlx) if self.args.first().map(String::as_str) != Some("serve") => {
+                Some("an omlx server's args start with its serve subcommand")
+            }
+            (_, Server::Omlx)
+                if self.args.iter().any(|arg| {
+                    OMLX_RENDERED_FLAGS.iter().any(|flag| {
+                        arg == flag
+                            || arg
+                                .strip_prefix(flag)
+                                .is_some_and(|rest| rest.starts_with('='))
+                    })
+                }) =>
+            {
+                Some("an omlx server's --model-dir, --base-path and --hf-cache are Cairn's: it serves the pinned snapshot alone, by the served name, from a base path of the deployment's own")
+            }
             _ => None,
         }
     }
@@ -505,6 +541,24 @@ impl Native {
 /// The console script an MLX server runs, which the renderer starts through
 /// a launcher of its own ([`crate::render`]).
 pub const MLX_PROGRAM: &str = "mlx_lm.server";
+
+/// The console script an oMLX server runs.
+pub const OMLX_PROGRAM: &str = "omlx";
+
+/// The `omlx serve` flags the renderer passes itself ([`crate::render`]).
+const OMLX_RENDERED_FLAGS: [&str; 4] =
+    ["--model-dir", "--base-path", "--hf-cache", "--no-hf-cache"];
+
+/// Whether `name` can be an oMLX model id: oMLX names a model by its folder
+/// in `--model-dir`, and the served name is also a path segment of its load
+/// URL and a key of its settings file.
+pub(crate) fn is_folder_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
 
 /// A container profile's complete runnable form: what
 /// [`crate::render`] turns into the start and stop scripts its head runs.
@@ -547,6 +601,9 @@ pub enum Server {
     LlamaCpp,
     /// `mlx_lm.server`, Apple's MLX: native only, on Apple silicon.
     MlxLm,
+    /// oMLX's `omlx serve`, a batching MLX server: native only, on Apple
+    /// silicon.
+    Omlx,
 }
 
 impl Server {
@@ -555,6 +612,7 @@ impl Server {
             Self::Vllm => "vllm",
             Self::LlamaCpp => "llamaCpp",
             Self::MlxLm => "mlxLm",
+            Self::Omlx => "omlx",
         }
     }
 
@@ -564,15 +622,33 @@ impl Server {
             Self::Vllm => "vLLM",
             Self::LlamaCpp => "llama.cpp",
             Self::MlxLm => "MLX",
+            Self::Omlx => "oMLX",
         }
     }
 
     /// The port a deployment of it serves on unless placed otherwise.
     pub fn default_port(self) -> u16 {
         match self {
-            Self::Vllm => 8000,
+            Self::Vllm | Self::Omlx => 8000,
             Self::LlamaCpp => 8090,
             Self::MlxLm => 8080,
+        }
+    }
+
+    /// Whether it runs Apple's MLX: natively only, loading the weights'
+    /// snapshot directory, so it needs the repository's configuration files
+    /// beside them.
+    pub fn is_mlx(self) -> bool {
+        matches!(self, Self::MlxLm | Self::Omlx)
+    }
+
+    /// The path whose answer means the deployment serves its model. oMLX
+    /// answers `/v1/models` before any model is loaded, and its `/health`
+    /// answers 503 until its pinned model is.
+    pub fn health_path(self) -> &'static str {
+        match self {
+            Self::Omlx => "/health",
+            Self::Vllm | Self::LlamaCpp | Self::MlxLm => "/v1/models",
         }
     }
 }
@@ -1027,6 +1103,12 @@ impl InferenceProfile {
                 machines: self.requirements.machines,
             });
         }
+        if native.server == Server::Omlx && !is_folder_name(&self.served_name) {
+            problems.push(ValidationError::ServedNameNotAFolder {
+                profile: profile(),
+                served_name: self.served_name.clone(),
+            });
+        }
         problems
     }
 
@@ -1362,6 +1444,88 @@ mod tests {
             args: vec!["--model".into(), "{snapshot}".into()],
             env: BTreeMap::new(),
         }
+    }
+
+    fn omlx() -> Native {
+        Native {
+            server: Server::Omlx,
+            artifact: Artifact {
+                url: "https://github.com/jundot/omlx/releases/download/v0.8.3/omlx-0.8.3-cp312-cp312-macosx_15_0_universal2.whl".into(),
+                version: "0.8.3".into(),
+                sha256: SHA.into(),
+                packaging: Packaging::Wheel {
+                    python: "3.12".into(),
+                    resolved_before: "2026-11-23T00:00:00Z".into(),
+                },
+            },
+            program: OMLX_PROGRAM.into(),
+            args: ["serve", "--host", "0.0.0.0", "--port", "{port}", "--headless"]
+                .map(String::from)
+                .to_vec(),
+            env: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn an_omlx_engine_is_its_wheel_s_serve_on_cairn_s_model_folder() {
+        let said = |native: Native, served: &str| -> Vec<String> {
+            let mut profile = profile(Engine::Native(native), vec![weight(SHA)]);
+            profile.served_name = served.into();
+            profile.problems().iter().map(ToString::to_string).collect()
+        };
+        assert_eq!(
+            said(omlx(), "DeepSeek-V4.1-Flash-1017"),
+            Vec::<String>::new()
+        );
+        assert_eq!(Server::Omlx.default_port(), 8000);
+        assert_eq!(Server::Omlx.health_path(), "/health");
+
+        let mut elsewhere = omlx();
+        elsewhere.program = "omlx-server".into();
+        assert_eq!(
+            said(elsewhere, "r"),
+            ["profile r native artifact: an omlx server runs the omlx console script"]
+        );
+        let mut archived = omlx();
+        archived.artifact.url = "https://example.com/omlx-0.8.3.tar.gz".into();
+        archived.artifact.packaging = Packaging::Archive;
+        assert_eq!(
+            said(archived, "r"),
+            ["profile r native artifact: an omlx server comes as an oMLX wheel"]
+        );
+        let mut bare = omlx();
+        bare.args.remove(0);
+        assert_eq!(
+            said(bare, "r"),
+            ["profile r native artifact: an omlx server's args start with its serve subcommand"]
+        );
+        for flag in ["--model-dir", "--base-path=/tmp/omlx", "--hf-cache"] {
+            let mut own = omlx();
+            own.args.push(flag.into());
+            assert_eq!(
+                said(own, "r"),
+                ["profile r native artifact: an omlx server's --model-dir, --base-path and --hf-cache are Cairn's: it serves the pinned snapshot alone, by the served name, from a base path of the deployment's own"],
+                "{flag}"
+            );
+        }
+        assert_eq!(
+            said(omlx(), "deepseek-ai/DeepSeek-V4.1-Flash-1017"),
+            ["profile r serves \"deepseek-ai/DeepSeek-V4.1-Flash-1017\" on oMLX, which names a model by its folder in --model-dir: its servedName is one folder name of letters, digits, ., _ and -, with no /"]
+        );
+        let mut other_python = omlx();
+        other_python.artifact.packaging = Packaging::Wheel {
+            python: "3.13".into(),
+            resolved_before: "2026-11-23T00:00:00Z".into(),
+        };
+        assert_eq!(
+            said(other_python, "r"),
+            ["profile r native artifact: a wheel built for one CPython (its cpXY tag) installs only on that python, so python must match it"]
+        );
+        assert!(wheel_runs_on(
+            "omlx-0.8.3-cp311.cp312-cp312-macosx_15_0_universal2.whl",
+            "3.12"
+        ));
+        assert!(wheel_runs_on("mlx_lm-0.32.2-py3-none-any.whl", "3.13"));
     }
 
     #[test]

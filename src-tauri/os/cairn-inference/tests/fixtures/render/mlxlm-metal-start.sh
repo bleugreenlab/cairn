@@ -13,20 +13,31 @@ mkdir -p "$hf"/'hub/models--mlx-community--Qwen3.6-35B-A3B-4bit'
 art="$HOME/.cairn/inference/artifacts"/'a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8'
 run="$HOME/.cairn/inference/run"
 name='cairn-chat-r0'
+launched_at() { LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ' || true; }
 stop_server() {
   if [ ! -f "$run/$name.pid" ]; then return 0; fi
-  pid="$(cat "$run/$name.pid")"
+  pid="$(sed -n 1p "$run/$name.pid")"
+  launched="$(sed -n 2p "$run/$name.pid")"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    case "$command" in
-      ""|*"$art"*)
-        kill -TERM "$pid" 2>/dev/null || true
-        waited=0
-        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
-        kill -KILL "$pid" 2>/dev/null || true
-        ;;
-      *) echo "pid $pid is no longer $name, so it was left running" ;;
-    esac
+    if [ -n "$launched" ]; then
+      case "$(launched_at "$pid")" in ""|"$launched") ours=yes ;; *) ours=no ;; esac
+    else
+      case "$(ps -p "$pid" -o command= 2>/dev/null || true)" in ""|*"$art"*) ours=yes ;; *) ours=no ;; esac
+    fi
+    if [ "$ours" = no ]; then
+      echo "pid $pid is no longer $name, so it was left running"
+    else
+      kill -TERM "$pid" 2>/dev/null || true
+      waited=0
+      while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge 540 ]; then
+          echo "server $name (pid $pid) had not exited 540s after TERM, so it was left running, still holding its memory, rather than killed: killing a process that holds a large wired model can strand that memory until a reboot. Stop it once its requests finish" >&2
+          return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+      done
+    fi
   fi
   rm -f "$run/$name.pid"
 }
@@ -59,12 +70,12 @@ sys.argv[0] = '\''mlx_lm.server'\''
 server.main()
 ' 'Qwen/Qwen3.6-35B-A3B' '--model' "$hf"'/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/6821d6ad3681a4b137b066b76094fa82ebd0a380' '--host' '0.0.0.0' '--port' '8080' >"$run/$name.log" 2>&1 </dev/null &
 pid=$!
-echo "$pid" >"$run/$name.pid"
+printf '%s\n%s\n' "$pid" "$(launched_at "$pid")" >"$run/$name.pid"
 while true; do
   if curl -fsS -o /dev/null --max-time 5 'http://127.0.0.1:8080/v1/models'; then exit 0; fi
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "server $name exited before it was healthy; its last errors:"
-    grep -E 'Error|error|Exception' "$run/$name.log" | tail -n 6 || tail -n 10 "$run/$name.log"
+    grep -E 'Error|error|ERROR|Exception' "$run/$name.log" | tail -n 6 || tail -n 10 "$run/$name.log"
     rm -f "$run/$name.pid"
     exit 1
   fi

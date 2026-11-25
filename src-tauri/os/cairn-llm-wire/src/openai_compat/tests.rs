@@ -4,8 +4,8 @@ use super::context::{
 use super::conversation::{normalize_tool_call_groups, transcript_event_to_chat_message};
 use super::http::tool_schemas;
 use super::wire::{
-    default_function_type, ChatContent, ChatMessage, ChatStreamChunk, ChatStreamDelta,
-    PlainReasoning, StreamingAggregate, ToolCall, ToolFunction,
+    default_function_type, ChatContent, ChatMessage, ChatResponse, ChatStreamChunk,
+    ChatStreamDelta, PlainReasoning, StreamingAggregate, ToolCall, ToolFunction,
 };
 use crate::{MessageContent, MessageImage, ReplayEvent, ToolUseInfo};
 use serde_json::json;
@@ -199,6 +199,55 @@ fn a_delta_carrying_both_spellings_does_not_double_the_reasoning() {
         message.reasoning,
         Some(PlainReasoning::Reasoning("one two".to_string()))
     );
+}
+
+/// A real oMLX 0.8.3 chat completion (`mlx-community/Qwen3-0.6B-4bit`,
+/// thinking on, cut off by `max_tokens` while still reasoning), whole and
+/// streamed. oMLX sends its reasoning as `reasoning_content`, leaves out a
+/// `content` it has none of, and adds timings of its own to `usage`
+/// (`time_to_first_token`, `generation_tokens_per_second` and others), which
+/// the usage it extends parses past.
+#[test]
+fn an_omlx_completion_parses_with_its_reasoning_and_timings() {
+    let whole: ChatResponse = serde_json::from_str(include_str!(
+        "../../tests/fixtures/omlx_chat_completion.json"
+    ))
+    .unwrap();
+    let message = &whole.choices[0].message;
+    assert!(
+        matches!(&message.reasoning, Some(PlainReasoning::ReasoningContent(text)) if text.starts_with("Okay, so I need to figure out what 7 times 6 is.")),
+        "{:?}",
+        message.reasoning
+    );
+    assert!(message.content.is_none());
+    let usage = whole.usage.unwrap();
+    assert_eq!(
+        (usage.prompt_tokens, usage.completion_tokens),
+        (Some(22), Some(400))
+    );
+    assert_eq!(
+        usage.completion_tokens_details.unwrap()["reasoning_tokens"],
+        398
+    );
+
+    let mut aggregate = StreamingAggregate::default();
+    for line in include_str!("../../tests/fixtures/omlx_chat_completion.sse").lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            break;
+        }
+        aggregate.apply_chunk(&serde_json::from_str::<ChatStreamChunk>(data).unwrap());
+    }
+    assert_eq!(aggregate.finish_reason(), Some("length"));
+    assert!(aggregate.reasoning().contains("36 + 6 = 42"));
+    let streamed = aggregate.into_response(true);
+    assert!(matches!(
+        streamed.choices[0].message.reasoning,
+        Some(PlainReasoning::ReasoningContent(_))
+    ));
+    assert_eq!(streamed.usage.unwrap().completion_tokens, Some(400));
 }
 
 #[test]

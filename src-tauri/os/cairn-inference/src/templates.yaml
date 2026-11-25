@@ -149,3 +149,56 @@
     tokens unless a request asks for more (--max-tokens changes it). Cairn
     starts it through a launcher that loads the model before it listens and
     answers to the served name, both of which the bare server does not do.
+
+# oMLX on Apple silicon: a batching MLX server (continuous batching, paged
+# and SSD KV caches, Lightning MTP drafting) for the MLX and oQ
+# quantizations mlx-community publishes. Upstream's 0.8.3 release wheel for
+# CPython 3.12, a GitHub release asset pinned by the sha256 GitHub states
+# for it, installed by Cairn's uv with its PyPI dependencies resolved as PyPI
+# stood on 2026-11-23. Its mlx-lm, mlx-vlm, mlx-audio and mlx-embeddings are
+# git commits the wheel itself pins, so the install needs git on the machine.
+- id: omlx-metal
+  server: omlx
+  family: apple
+  runtime: metal
+  arch: aarch64
+  artifact:
+    url: https://github.com/jundot/omlx/releases/download/v0.8.3/omlx-0.8.3-cp312-cp312-macosx_15_0_universal2.whl
+    version: 0.8.3
+    sha256: 7604c313d387eb4bff0292c114c56dcbe022cefea44dc089e26ae718650adbaf
+    packaging: {kind: wheel, python: "3.12", resolvedBefore: "2026-11-23T00:00:00Z"}
+  formats: [mlx]
+  command: [omlx, serve, --host, 0.0.0.0, --port, "{port}", --headless]
+  notes: >-
+    Cairn starts it on a model folder whose one entry is the served name
+    linked to the pinned snapshot, so the served name is one folder name
+    (the repository's name without its owner), and on a base path of the
+    deployment's own, never the account's ~/.omlx, whose settings pin that
+    model. oMLX loads a pinned model at startup and answers /health 503
+    until it has, so a deployment's healthPath is /health: /v1/models
+    answers before any model is loaded. A load that does not fit answers
+    507 and leaves the server answering with nothing loaded, which the
+    start reports as a failed load. oMLX binds an address beyond loopback
+    only with an API key (--api-key or OMLX_API_KEY): without one, omlx
+    serve --host 0.0.0.0 exits with a configuration error, so this
+    template serves a deployment once Cairn gives each deployment its key.
+    Changing models means stopping the server and starting another: oMLX's
+    own unload freed under 1 GB of about 178 GB of DeepSeek V4.1 Flash, and
+    then no model would load (507). Its shutdown on TERM waits for the
+    requests in flight with no timeout, so a stop during a long generation
+    lasts as long as that request; Cairn waits for the process to exit and
+    never kills it (a killed process holding a large wired model can strand
+    that memory until a reboot, oMLX issue 2184). Thinking is on by default
+    and chosen per request (chat_template_kwargs {thinking_mode: chat}
+    turns it off); reasoning arrives as reasoning_content, and usage adds
+    timings such as time_to_first_token. It takes 8 concurrent requests
+    unless the profile passes --max-concurrent-requests. For DeepSeek V4.1
+    Flash: 0.8.3 has the operator's decode and MTP-depth changes (#5395,
+    #5525, #5527) but not the indexer batching (#5549) or the 2-bit code
+    decoding (#5555), merged after it, nor the batched drafter, which is
+    not upstream yet, so its speed with several streams is below the tuned
+    figures in cairn://p/cairn/models/attachments/25; a release with them
+    is a change of this pin. The tuned branch's V41_* variables have no
+    upstream equivalent and upstream reads none of them: draft depth
+    defaults to the DSpark block size (5), and there is no output-head
+    quantization, so nothing here changes the shipped weights' output.

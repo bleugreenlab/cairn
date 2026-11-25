@@ -154,7 +154,7 @@ pub fn weight_files(
     };
     let files = match server {
         Server::Vllm => pick(WeightFormat::Safetensors),
-        Server::MlxLm => {
+        Server::MlxLm | Server::Omlx => {
             return Err(
                 "MLX runs natively on Apple silicon, and a compose service is a container".into(),
             )
@@ -351,7 +351,7 @@ pub async fn resolve(
             }
             .gguf_quantization()
         }),
-        Server::Vllm | Server::MlxLm => read
+        Server::Vllm | Server::MlxLm | Server::Omlx => read
             .facts
             .quantization
             .clone()
@@ -374,7 +374,7 @@ pub async fn resolve(
             weights,
             // vLLM reads these beside the weights; a GGUF file holds them.
             config_files: match server {
-                Server::Vllm | Server::MlxLm => read.config_files.clone(),
+                Server::Vllm | Server::MlxLm | Server::Omlx => read.config_files.clone(),
                 Server::LlamaCpp => Vec::new(),
             },
         },

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::deployment::{Deployment, DeploymentId};
 use crate::machine::{MachineName, MachineRecord};
 use crate::model::Model;
-use crate::profile::{InferenceProfile, InferenceProfileId};
+use crate::profile::{InferenceProfile, InferenceProfileId, Server};
 use crate::record::RecordSource;
 
 /// Every inference record Cairn knows, keyed by id.
@@ -76,6 +76,12 @@ pub enum ValidationError {
     NativeSpansMachines {
         profile: InferenceProfileId,
         machines: u32,
+    },
+    /// An oMLX profile whose served name cannot be the folder oMLX names
+    /// its model by.
+    ServedNameNotAFolder {
+        profile: InferenceProfileId,
+        served_name: String,
     },
     EmptyStart {
         profile: InferenceProfileId,
@@ -144,6 +150,14 @@ pub enum ValidationError {
         which: &'static str,
         path: String,
     },
+    /// A deployment checking health where its server answers before its
+    /// model is loaded.
+    HealthBeforeLoad {
+        deployment: DeploymentId,
+        server: &'static str,
+        path: String,
+        expected: &'static str,
+    },
     EmptyAddress {
         machine: MachineName,
     },
@@ -184,6 +198,13 @@ impl fmt::Display for ValidationError {
             Self::NativeSpansMachines { profile, machines } => write!(
                 f,
                 "profile {profile} runs a native engine on {machines} machines; a native engine runs on one machine"
+            ),
+            Self::ServedNameNotAFolder {
+                profile,
+                served_name,
+            } => write!(
+                f,
+                "profile {profile} serves {served_name:?} on oMLX, which names a model by its folder in --model-dir: its servedName is one folder name of letters, digits, ., _ and -, with no /"
             ),
             Self::EmptyStart { profile } => write!(f, "profile {profile} has an empty start command"),
             Self::UnknownPlaceholder {
@@ -266,6 +287,15 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "deployment {deployment} {which} path {path:?} does not start with /"
+            ),
+            Self::HealthBeforeLoad {
+                deployment,
+                server,
+                path,
+                expected,
+            } => write!(
+                f,
+                "deployment {deployment} checks health at {path}, which {server} answers before its model is loaded; its healthPath is {expected}"
             ),
             Self::EmptyAddress { machine } => {
                 write!(f, "machine {machine} has an empty address")
@@ -510,6 +540,21 @@ impl Inventory {
                     })
                 }
                 Some(_) => {}
+            }
+            if let Some(server) = self
+                .profiles
+                .get(&deployment.profile)
+                .and_then(|profile| profile.engine.server())
+                .filter(|server| *server == Server::Omlx)
+            {
+                if deployment.health_path != server.health_path() {
+                    problems.push(ValidationError::HealthBeforeLoad {
+                        deployment: id(),
+                        server: server.label(),
+                        path: deployment.health_path.clone(),
+                        expected: server.health_path(),
+                    });
+                }
             }
             if !deployment.machines.contains(&deployment.head) {
                 problems.push(ValidationError::HeadNotInDeployment {

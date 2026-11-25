@@ -306,6 +306,7 @@ pub fn profile_id(
         Server::Vllm => "vllm",
         Server::LlamaCpp => "llamacpp",
         Server::MlxLm => "mlxlm",
+        Server::Omlx => "omlx",
     };
     id.push('-');
     id.push_str(server);
@@ -513,12 +514,12 @@ pub fn starting_profile(
             }
         }
         // MLX sizes its KV cache by each request and takes no context limit.
-        Server::MlxLm => {}
+        Server::MlxLm | Server::Omlx => {}
     }
     let need = match template.server {
         // vLLM takes its whole memory share up front.
         Server::Vllm => machine.usable_bytes(),
-        Server::LlamaCpp | Server::MlxLm => {
+        Server::LlamaCpp | Server::MlxLm | Server::Omlx => {
             predicted.per_machine_bytes
                 + projector.map_or(0, |p| p.file.size)
                 + kv_bytes_per_token(model, k).map_or(0, |per_token| per_token * predicted.context)
@@ -537,7 +538,7 @@ pub fn starting_profile(
     let text_only = match template.server {
         Server::LlamaCpp => projector.is_none(),
         Server::MlxLm => true,
-        Server::Vllm => false,
+        Server::Vllm | Server::Omlx => false,
     };
     if text_only {
         if let Some(modalities) = modalities.as_mut() {
@@ -571,11 +572,21 @@ pub fn starting_profile(
             name: model.name.clone(),
             weights,
             config_files: match template.server {
-                Server::Vllm | Server::MlxLm => source.config_files.clone(),
+                Server::Vllm | Server::MlxLm | Server::Omlx => source.config_files.clone(),
                 Server::LlamaCpp => Vec::new(),
             },
         },
-        served_name: model.name.clone(),
+        // oMLX names a model by one folder, so it serves the repository's
+        // own name without its owner.
+        served_name: match template.server {
+            Server::Omlx => model
+                .name
+                .rsplit('/')
+                .next()
+                .unwrap_or(&model.name)
+                .to_string(),
+            Server::Vllm | Server::LlamaCpp | Server::MlxLm => model.name.clone(),
+        },
         upstream_id: None,
         verbs: model.facts.verbs.clone(),
         modalities,
@@ -756,7 +767,8 @@ impl PredictedNeed {
 enum Runs {
     Vllm,
     LlamaCpp,
-    MlxLm,
+    /// mlx-lm's or oMLX's server, which take no context limit.
+    Mlx,
     Sglang,
     Unknown,
 }
@@ -893,7 +905,7 @@ pub fn predict_need(
     let runs = match profile.engine.server() {
         Some(Server::Vllm) => Runs::Vllm,
         Some(Server::LlamaCpp) => Runs::LlamaCpp,
-        Some(Server::MlxLm) => Runs::MlxLm,
+        Some(Server::MlxLm | Server::Omlx) => Runs::Mlx,
         None => named_engine(words.iter().copied())
             .or_else(|| description.and_then(|text| named_engine(words_of(text))))
             .unwrap_or(Runs::Unknown),
@@ -919,7 +931,7 @@ pub fn predict_need(
                 });
             }
         }
-        Runs::LlamaCpp | Runs::MlxLm | Runs::Unknown => {}
+        Runs::LlamaCpp | Runs::Mlx | Runs::Unknown => {}
     }
     let Some((weight_bytes, weights_from)) = weight_size(profile, model) else {
         return Err(
@@ -929,7 +941,7 @@ pub fn predict_need(
     };
     let machines = profile.requirements.machines.max(1);
     let kv = match (runs, model) {
-        (Runs::LlamaCpp | Runs::MlxLm, Some(model)) => flag::<u64>(&words, &["-c", "--ctx-size"])
+        (Runs::LlamaCpp | Runs::Mlx, Some(model)) => flag::<u64>(&words, &["-c", "--ctx-size"])
             .filter(|tokens| *tokens > 0)
             .or(model.facts.context)
             .zip(kv_bytes_per_token(model, machines))
@@ -1055,7 +1067,7 @@ mod tests {
 
     #[test]
     fn the_templates_parse_and_pin_their_engines() {
-        assert_eq!(templates().len(), 8);
+        assert_eq!(templates().len(), 9);
         for template in templates() {
             match (&template.image, &template.artifact) {
                 (Some(image), None) => {
@@ -1076,7 +1088,10 @@ mod tests {
 
     #[test]
     fn an_apple_pool_is_served_natively_within_metal_s_working_set() {
-        assert_eq!(ids(&studio()), vec!["llamacpp-metal", "mlxlm-metal"]);
+        assert_eq!(
+            ids(&studio()),
+            vec!["llamacpp-metal", "mlxlm-metal", "omlx-metal"]
+        );
         assert_eq!(
             template("llamacpp-cuda").serves(&studio()).unwrap_err(),
             "template llamacpp-cuda runs on nvidia (cuda), and the pool's accelerator is apple"
@@ -1219,6 +1234,41 @@ mod tests {
             panic!("an MLX profile is sized");
         };
         assert_eq!(Some(tokens), model.facts.context, "its trained context");
+    }
+
+    #[test]
+    fn an_omlx_starting_profile_serves_the_repository_s_own_name() {
+        let base = repo!("Qwen--Qwen3.6-35B-A3B");
+        let mlx = repo!("mlx-community--Qwen3.6-35B-A3B-4bit");
+        let model = model_of(&base);
+        let files = files(&model, &[mlx]);
+        let source = files
+            .source("mlx-community/Qwen3.6-35B-A3B-4bit@4bit")
+            .unwrap();
+        let predicted = fit(&model, source.bytes(), &studio()).unwrap();
+        let profile = starting_profile(
+            template("omlx-metal"),
+            source,
+            &model,
+            &studio(),
+            &predicted,
+            None,
+        );
+        assert_eq!(profile.problems(), vec![]);
+        assert_eq!(profile.id.as_str(), "qwen3.6-35b-a3b-4bit-omlx-metal-x1");
+        assert_eq!(profile.served_name, "Qwen3.6-35B-A3B");
+        assert_eq!(
+            args(&profile),
+            [
+                "serve",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "{port}",
+                "--headless"
+            ]
+        );
+        assert!(!profile.model.config_files.is_empty());
     }
 
     #[test]
