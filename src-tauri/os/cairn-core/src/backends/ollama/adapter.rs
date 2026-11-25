@@ -273,7 +273,7 @@ mod tests {
             .complete(&cairn_models::complete::HttpComplete, request())
             .unwrap_err();
         assert!(
-            matches!(error, CompletionError::Upstream(message) if message.contains("HTTP 500"))
+            matches!(error, CompletionError::Http { status: 500, message, .. } if message.contains("HTTP 500"))
         );
 
         let response = http_response("200 OK", r#"{"model":"qwen","choices":[]}"#);

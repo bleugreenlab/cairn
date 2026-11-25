@@ -44,7 +44,6 @@ fn send(call: CompletionCall<'_>) -> Result<CompletionReply, CompletionError> {
             (CompletionWire::Chat(endpoint), Delivery::Stream { sink, cancel }) => {
                 openai_compat::http::post_chat_completion_streaming(endpoint, body, cancel, sink)
                     .map(CompletionReply::Chat)
-                    .map_err(CompletionError::Stream)
             }
             (CompletionWire::Chat(endpoint), Delivery::Whole { timeout }) => {
                 openai_compat::http::post_chat_completion(endpoint, body, timeout)
@@ -281,9 +280,8 @@ mod tests {
                 &cancel,
             ))
             .unwrap_err();
-        assert_eq!(error, CompletionError::Stream(expected.clone()));
-        assert_eq!(error.to_string(), expected);
-        assert_eq!(error.into_stream_text(), expected);
+        assert_eq!(error, expected);
+        assert_eq!(error.into_stream_text(), expected.into_stream_text());
     }
 
     use crate::interface::relay::{RelayDoor, RelayRoute};

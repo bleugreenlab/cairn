@@ -109,6 +109,14 @@ pub fn upstream_error_detail(body: &str) -> String {
         .unwrap_or_else(|| body.to_string())
 }
 
+/// A `Retry-After` in delta-seconds. Cairn's gateway sends only that form, and
+/// an HTTP-date is ignored rather than guessed at: the caller's own backoff
+/// still applies without it.
+pub(crate) fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
 /// A model-emitted tool call, neutralized from the adapter's wire type: the
 /// dispatch id, the (already tool-name-normalized) verb, and the raw JSON
 /// argument string the tool dispatch / repair path parses.
@@ -331,10 +339,11 @@ impl CompletionError {
     }
 
     /// The message a streamed generation reports: a stream failure's own text,
-    /// or any other failure's display.
+    /// a refused status's message (which names the status), or any other
+    /// failure's display.
     pub fn into_stream_text(self) -> String {
         match self {
-            Self::Stream(text) => text,
+            Self::Stream(text) | Self::Http { message: text, .. } => text,
             other => other.to_string(),
         }
     }

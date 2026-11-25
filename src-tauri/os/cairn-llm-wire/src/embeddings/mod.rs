@@ -43,14 +43,6 @@ fn header_map(provider_name: &str, headers: &[(String, String)]) -> Result<Heade
     Ok(map)
 }
 
-/// A `Retry-After` in delta-seconds. Cairn's gateway sends only that form, and
-/// an HTTP-date is ignored rather than guessed at: the caller's own backoff
-/// still applies without it.
-fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    value.trim().parse::<u64>().ok().map(Duration::from_secs)
-}
-
 /// One POST of `body` to `url`, answering the reply text of a 2xx.
 ///
 /// A non-2xx is [`CompletionError::Http`]: its status and `Retry-After` as
@@ -87,7 +79,7 @@ fn post(
         }
     })?;
     let status = response.status();
-    let wait = retry_after(response.headers());
+    let wait = crate::retry_after(response.headers());
     let text = response.text().map_err(|error| match error.kind() {
         std::io::ErrorKind::TimedOut => CompletionError::Timeout,
         std::io::ErrorKind::ConnectionAborted

@@ -88,15 +88,29 @@ pub trait TurnEffects {
 }
 
 /// How a turn finds where its generations go next once the endpoint serving
-/// them is withdrawn ([`CompletionError::Withdrawn`], whose text it is given):
-/// a family for the new endpoint and the name the model is sent under there.
+/// them cannot take one for now ([`awaits_capacity`]): it is given the error
+/// and how many times this generation was already sent again, and answers
+/// with a family for the endpoint and the name the model is sent under there.
 /// It may wait, as a turn waits for its model to load before it starts. It
 /// owns what it needs, so a turn holding one borrows nothing more.
-pub type Reroute<F> = Box<dyn FnMut(&str) -> Result<(F, String), String>>;
+pub type Reroute<F> = Box<dyn FnMut(&CompletionError, usize) -> Result<(F, String), String>>;
 
-/// How many times one generation is sent again after a withdrawal before the
-/// withdrawal fails the turn: a model withdrawn over and over is not settling.
+/// How many times one generation is sent again before the failure fails the
+/// turn: a model withdrawn or refused over and over is not settling.
 const MAX_REROUTES: usize = 3;
+
+/// Whether a failed generation is sent again through the turn's [`Reroute`]:
+/// its endpoint was withdrawn, or the server refused it with a status that
+/// names a passing condition (an engine out of GPU memory answers 507).
+/// Neither says anything about the request, so the same request can succeed
+/// once capacity returns.
+fn awaits_capacity(error: &CompletionError) -> bool {
+    match error {
+        CompletionError::Withdrawn(_) => true,
+        CompletionError::Http { .. } => error.is_transient(),
+        _ => false,
+    }
+}
 
 /// One agent turn over protocol family `F`, with host effects `E`.
 pub struct FamilyTurn<'a, F: ProtocolFamily, E: TurnEffects> {
@@ -113,8 +127,8 @@ pub struct FamilyTurn<'a, F: ProtocolFamily, E: TurnEffects> {
     pub complete: &'a dyn Complete,
     pub cancel: Arc<AtomicBool>,
     /// Set for a provider whose model can be served somewhere else, or again,
-    /// after its endpoint is withdrawn mid-turn: the generation is sent there
-    /// rather than failing the turn.
+    /// after its endpoint is withdrawn or refuses for want of capacity
+    /// mid-turn: the generation is sent there rather than failing the turn.
     pub reroute: Option<Reroute<F>>,
 }
 
@@ -161,11 +175,11 @@ impl<F: ProtocolFamily, E: TurnEffects> HttpTurnHost for FamilyTurn<'_, F, E> {
                 ))
             };
             match (reply, self.reroute.as_mut()) {
-                (Err(CompletionError::Withdrawn(why)), Some(reroute))
-                    if rerouted < MAX_REROUTES =>
+                (Err(error), Some(reroute))
+                    if rerouted < MAX_REROUTES && awaits_capacity(&error) =>
                 {
-                    log::info!("{why}; finding where {} is served now", self.model);
-                    let (family, model) = reroute(&why)?;
+                    log::info!("{error}; finding where {} is served now", self.model);
+                    let (family, model) = reroute(&error, rerouted)?;
                     self.family = family;
                     self.model = model;
                     rerouted += 1;

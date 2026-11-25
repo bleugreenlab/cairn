@@ -113,10 +113,10 @@ pub(in crate::backends) trait WireAdapter {
     }
 
     /// Where this turn's generations go next once the deployment serving
-    /// them is withdrawn mid-turn: a provider whose model can be served
-    /// elsewhere, or again after a load, answers with how to find it, which
-    /// waits as [`Self::prepare_turn`] does. `None` lets the withdrawal fail
-    /// the turn.
+    /// them is withdrawn, or refuses one for want of capacity, mid-turn: a
+    /// provider whose model can be served elsewhere, or again after a load or
+    /// a wait, answers with how to find it, which waits as
+    /// [`Self::prepare_turn`] does. `None` lets the failure fail the turn.
     fn rerouter(
         &self,
         _orch: &Orchestrator,

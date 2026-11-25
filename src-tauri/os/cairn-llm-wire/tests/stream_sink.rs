@@ -73,7 +73,8 @@ impl Protocol {
                 &cancel,
                 sink,
             )
-            .map(|response| response.streamed_text),
+            .map(|response| response.streamed_text)
+            .map_err(cairn_llm_wire::CompletionError::into_stream_text),
             Self::Messages => anthropic_messages::http::post_message_streaming(
                 &anthropic_messages::http::MessagesEndpoint {
                     provider_name: "test".into(),

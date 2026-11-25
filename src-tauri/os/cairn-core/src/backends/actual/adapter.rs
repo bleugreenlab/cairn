@@ -55,9 +55,15 @@ impl ActualAdapter {
             ))
             .and_then(CompletionReply::into_chat)
             .map_err(|error| match error {
-                CompletionError::Upstream(message) => {
-                    CompletionError::Upstream(explain_upstream(&self.target, message))
-                }
+                CompletionError::Http {
+                    status,
+                    message,
+                    retry_after,
+                } => CompletionError::Http {
+                    status,
+                    message: explain_upstream(&self.target, message),
+                    retry_after,
+                },
                 other => other,
             })?;
         let text = response
@@ -328,8 +334,8 @@ mod tests {
         let error = adapter
             .complete(&cairn_models::complete::HttpComplete, request())
             .unwrap_err();
-        let CompletionError::Upstream(message) = error else {
-            panic!("expected an upstream error, got {error:?}");
+        let CompletionError::Http { message, .. } = error else {
+            panic!("expected an HTTP status error, got {error:?}");
         };
         assert!(message.contains("HTTP 503"), "{message}");
         assert!(message.contains("no model loaded"), "{message}");
@@ -355,8 +361,8 @@ mod tests {
         let error = adapter
             .complete(&cairn_models::complete::HttpComplete, request())
             .unwrap_err();
-        let CompletionError::Upstream(message) = error else {
-            panic!("expected an upstream error, got {error:?}");
+        let CompletionError::Http { message, .. } = error else {
+            panic!("expected an HTTP status error, got {error:?}");
         };
         assert!(
             message.contains("missing_or_malformed_credential"),

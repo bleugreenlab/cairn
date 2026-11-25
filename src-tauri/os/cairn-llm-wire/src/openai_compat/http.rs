@@ -176,15 +176,8 @@ pub fn post_chat_completion(
             SendError::Request(error) if error.is_timeout() => CompletionError::Timeout,
             SendError::Request(error) => CompletionError::Upstream(error.to_string()),
         })?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().unwrap_or_default();
-        return Err(CompletionError::Upstream(format!(
-            "{} chat completion returned HTTP {}: {}",
-            endpoint.provider_name,
-            status.as_u16(),
-            upstream_error_detail(&text)
-        )));
+    if !response.status().is_success() {
+        return Err(refusal(endpoint, response));
     }
     let text = response.text().map_err(|error| match error.kind() {
         std::io::ErrorKind::TimedOut => CompletionError::Timeout,
@@ -199,6 +192,29 @@ pub fn post_chat_completion(
         _ => CompletionError::InvalidResponse(error.to_string()),
     })?;
     serde_json::from_str(&text).map_err(|error| CompletionError::InvalidResponse(error.to_string()))
+}
+
+/// A non-2xx chat reply as [`crate::CompletionError::Http`]: its status and
+/// `Retry-After` as values, so a caller can tell a passing condition (a rate
+/// limit, an engine out of GPU memory) from a refusal of the request, and a
+/// message naming the status followed by the sentence the provider wrote. A
+/// provider that explains its own statuses matches on this, the one form a
+/// chat refusal takes, whole or streamed.
+fn refusal(endpoint: &Endpoint, response: withdrawal::Response) -> crate::CompletionError {
+    let status = response.status().as_u16();
+    let retry_after = crate::retry_after(response.headers());
+    let text = response
+        .text()
+        .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+    crate::CompletionError::Http {
+        status,
+        message: format!(
+            "{} chat completion returned HTTP {status}: {}",
+            endpoint.provider_name,
+            upstream_error_detail(&text)
+        ),
+        retry_after,
+    }
 }
 
 // Error-body extraction is shared by every HTTP protocol family, so it lives at
@@ -307,45 +323,50 @@ fn stream_lines(reader: impl BufRead + Send + 'static) -> Receiver<std::io::Resu
     receiver
 }
 
+/// One streamed chat completion. A non-2xx reply is
+/// [`crate::CompletionError::Http`], as the whole call's is; every other
+/// failure is [`crate::CompletionError::Stream`] with the transport's own text.
 pub fn post_chat_completion_streaming(
     endpoint: &Endpoint,
     body: Value,
     cancel: &Arc<AtomicBool>,
     sink: &mut dyn StreamSink,
-) -> Result<ChatResponse, String> {
+) -> Result<ChatResponse, crate::CompletionError> {
+    use crate::CompletionError;
     let client = cairn_tls::client_builder()
         .timeout(STREAM_ABSOLUTE_TIMEOUT)
         .build()
         .map_err(|error| {
-            format!(
+            CompletionError::Stream(format!(
                 "Failed to build {} streaming client: {error}",
                 endpoint.provider_name
-            )
+            ))
         })?;
     let request_started = Instant::now();
     let request = client
         .post(&endpoint.chat_url)
-        .headers(endpoint.header_map()?)
+        .headers(endpoint.header_map().map_err(CompletionError::Stream)?)
         .json(&OrderedSchemaAt::new(&body, OUTPUT_SCHEMA_PATH));
     let response = withdrawal::send(request, endpoint.withdrawal.as_ref()).map_err(|error| {
-        format!(
+        CompletionError::Stream(format!(
             "{} streaming request failed: {error}",
             endpoint.provider_name
-        )
+        ))
     })?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response
-            .text()
-            .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
-        return Err(format!(
-            "{} chat completion returned HTTP {}: {}",
-            endpoint.provider_name,
-            status.as_u16(),
-            upstream_error_detail(&text)
-        ));
+    if !response.status().is_success() {
+        return Err(refusal(endpoint, response));
     }
+    read_stream(endpoint, response, request_started, cancel, sink).map_err(CompletionError::Stream)
+}
 
+/// The body of a streamed reply whose status was a success, read to its end.
+fn read_stream(
+    endpoint: &Endpoint,
+    response: withdrawal::Response,
+    request_started: Instant,
+    cancel: &AtomicBool,
+    sink: &mut dyn StreamSink,
+) -> Result<ChatResponse, String> {
     let mut aggregate = StreamingAggregate::default();
     let mut streamed_text = false;
     let mut saw_done_sentinel = false;

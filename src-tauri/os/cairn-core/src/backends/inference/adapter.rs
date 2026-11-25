@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cairn_models::interface::complete::{
     Complete, CompletionCall, CompletionReply, CompletionWire,
@@ -193,6 +193,38 @@ fn ready_for_turn(
     Ok(route)
 }
 
+/// How long a turn waits before it resends a generation the engine refused
+/// for want of capacity, by how many times that generation was already sent
+/// again. A 507 passes as the generations holding the engine's memory end,
+/// which can take minutes, so the waits grow.
+const CAPACITY_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
+/// The longest an engine's own `Retry-After` is waited out.
+const MAX_CAPACITY_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// How often a capacity wait looks at the turn's interrupt flag.
+const CAPACITY_POLL: Duration = Duration::from_millis(100);
+
+/// Sleep for `wait` on the turn's own thread, ending early, as an error,
+/// once the turn is interrupted.
+fn wait_for_capacity(cancel: &AtomicBool, wait: Duration) -> Result<(), String> {
+    let until = Instant::now() + wait;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("interrupted while waiting for capacity".to_string());
+        }
+        let now = Instant::now();
+        if now >= until {
+            return Ok(());
+        }
+        std::thread::sleep(CAPACITY_POLL.min(until - now));
+    }
+}
+
 /// One agent turn's adapter. Its route is found on the turn's own thread
 /// ([`WireAdapter::prepare_turn`]), so a launch never blocks on a load.
 pub(super) struct InferenceAdapter {
@@ -269,7 +301,10 @@ impl WireAdapter for InferenceAdapter {
 
     /// A generation cut off because its deployment is being stopped is sent
     /// again wherever the model is served next, after the same visible,
-    /// interruptible wait a turn's first generation has.
+    /// interruptible wait a turn's first generation has. One the engine
+    /// refused for want of capacity (a 507 when its GPU memory is full) waits
+    /// first, as visibly and interruptibly, for the engine's `Retry-After` or
+    /// else a growing backoff, and then goes the same way.
     fn rerouter(
         &self,
         orch: &Orchestrator,
@@ -283,14 +318,38 @@ impl WireAdapter for InferenceAdapter {
         let run_id = config.run_id.clone();
         let session_id = session_id.to_string();
         let cancel = Arc::clone(cancel);
-        Some(Box::new(move |why: &str| {
-            tell(
-                &orch,
-                &run_id,
-                &session_id,
-                &format!("{why}. Asking for {model} again."),
-                json!({"inference": {"model": model, "withdrawn": why}}),
-            );
+        Some(Box::new(move |error: &CompletionError, resent: usize| {
+            match error {
+                CompletionError::Http {
+                    message,
+                    retry_after,
+                    ..
+                } => {
+                    let wait = retry_after.map_or_else(
+                        || CAPACITY_BACKOFF[resent.min(CAPACITY_BACKOFF.len() - 1)],
+                        |asked| asked.min(MAX_CAPACITY_WAIT),
+                    );
+                    let said = format!("{message}; sending again in {}s", wait.as_secs());
+                    tell(
+                        &orch,
+                        &run_id,
+                        &session_id,
+                        &format!("Waiting for {model}: {said}"),
+                        json!({"inference": {"model": model, "waiting": said}}),
+                    );
+                    wait_for_capacity(&cancel, wait)?;
+                }
+                withdrawn => {
+                    let why = withdrawn.to_string();
+                    tell(
+                        &orch,
+                        &run_id,
+                        &session_id,
+                        &format!("{why}. Asking for {model} again."),
+                        json!({"inference": {"model": model, "withdrawn": why}}),
+                    );
+                }
+            }
             let route = ready_for_turn(&orch, &run_id, &session_id, &model, &requester, &cancel)?;
             Ok((chat_family(&route), route.served_name))
         }))
