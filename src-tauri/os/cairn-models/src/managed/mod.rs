@@ -25,6 +25,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod follow;
 pub mod pin;
 pub mod spec;
 
@@ -408,13 +409,6 @@ struct Current {
     /// rollback it is as good as not installed.
     integration: u32,
     pin_source: PinOrigin,
-}
-
-/// `pin.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CachedPin {
-    etag: Option<String>,
-    pin: ToolPin,
 }
 
 /// The fields of a release's manifest (the publisher's, or
@@ -1012,58 +1006,28 @@ impl ManagedTool {
         serde_json::from_slice(&std::fs::read(self.root.join("current.json")).ok()?).ok()
     }
 
-    fn read_cached_pin(&self) -> Option<CachedPin> {
-        let cached: CachedPin =
-            serde_json::from_slice(&std::fs::read(self.root.join("pin.json")).ok()?).ok()?;
-        cached.pin.validate(self.spec).ok()?;
-        Some(cached)
-    }
-
-    /// The pin to follow: the published one when it validates for this
-    /// build, else the last published one that did, else the embedded one.
+    /// The pin to follow, by [`follow::Follow`]'s rule: the published one
+    /// when it validates for this build and carries a package for this host,
+    /// else the last published one that did, else the embedded one.
     fn effective_pin(&self) -> (ToolPin, PinOrigin) {
-        if self.prefer_embedded {
-            return (self.embedded.clone(), PinOrigin::Embedded);
+        let name = format!("managed {}", self.spec.name);
+        follow::Follow {
+            name: &name,
+            source: self.pins.as_ref(),
+            cache_dir: &self.root,
+            embedded: &self.embedded,
+            prefer_embedded: self.prefer_embedded,
         }
-        let name = self.spec.name;
-        let cached = self.read_cached_pin();
-        let fetched = self
-            .pins
-            .fetch(cached.as_ref().and_then(|cached| cached.etag.as_deref()));
-        let fallback = |cached: Option<CachedPin>| match cached {
-            Some(cached) => (cached.pin, PinOrigin::Cached),
-            None => (self.embedded.clone(), PinOrigin::Embedded),
-        };
-        match fetched {
-            Ok(PinFetch::NotModified) => match cached {
-                Some(cached) => (cached.pin, PinOrigin::Published),
-                None => fallback(None),
+        .effective(
+            |text| {
+                let pin = ToolPin::parse(self.spec, text)?;
+                if !self.target.is_some_and(|t| pin.package(t).is_some()) {
+                    return Err("it has no package for this host".into());
+                }
+                Ok(pin)
             },
-            Ok(PinFetch::Body { text, etag }) => match ToolPin::parse(self.spec, &text) {
-                Ok(pin) if self.target.is_some_and(|t| pin.package(t).is_some()) => {
-                    let record = CachedPin {
-                        etag,
-                        pin: pin.clone(),
-                    };
-                    if let Err(error) = write_json_atomically(&self.root, "pin.json", &record) {
-                        log::warn!("managed {name}: could not cache the published pin: {error}");
-                    }
-                    (pin, PinOrigin::Published)
-                }
-                Ok(_) => {
-                    log::warn!("managed {name}: the published pin has no package for this host");
-                    fallback(cached)
-                }
-                Err(error) => {
-                    log::warn!("managed {name}: ignoring the published pin: {error}");
-                    fallback(cached)
-                }
-            },
-            Err(error) => {
-                log::info!("managed {name}: the published pin is unreachable: {error}");
-                fallback(cached)
-            }
-        }
+            |pin| pin.validate(self.spec).is_ok(),
+        )
     }
 
     fn route(&self, pin: &ToolPin, target: &str, package: &ToolPackage) -> Box<ManualRoute> {

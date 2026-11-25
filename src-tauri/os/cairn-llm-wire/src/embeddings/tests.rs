@@ -78,6 +78,7 @@ fn endpoint(url: String) -> EmbeddingsEndpoint {
         url,
         headers: vec![("authorization".into(), "Bearer sk-test".into())],
         extras: Default::default(),
+        withdrawal: None,
     }
 }
 

@@ -357,6 +357,10 @@ pub fn serve_blocking(
             ledger,
             ServedError::new(400, "invalid_request_error", message),
         )),
+        Err(RelayError::Withdrawn(message)) => Err(refuse(
+            ledger,
+            ServedError::new(503, "model_unavailable", message),
+        )),
         Err(RelayError::Unreachable(message)) => {
             let request_id = ledger.id().to_string();
             ledger.finish(502, Outcome::UpstreamError, None, Some(message.clone()));

@@ -3,6 +3,7 @@
 use super::wire::{ChatMessage, ChatResponse, ChatStreamChunk, StreamingAggregate};
 use crate::schema_order::OrderedSchemaAt;
 use crate::stream::{StreamSink, StreamSummary};
+use crate::withdrawal::{self, SendError, Withdrawal};
 use crate::{require_terminal_event, GenerationConfig, ToolDefinition};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Map, Value};
@@ -27,6 +28,9 @@ pub struct Endpoint {
     pub backend_key: String,
     pub chat_url: String,
     pub headers: Vec<(String, String)>,
+    /// Set when Cairn can withdraw what serves this endpoint (one of its own
+    /// deployments): a withdrawn call is cut off and its connection closed.
+    pub withdrawal: Option<Withdrawal>,
 }
 
 /// Headers carry bearer keys, so the derived `Debug` would put every provider's
@@ -47,6 +51,7 @@ impl std::fmt::Debug for Endpoint {
                     .map(|(name, _)| format!("{name}: <redacted>"))
                     .collect::<Vec<_>>(),
             )
+            .field("withdrawal", &self.withdrawal)
             .finish()
     }
 }
@@ -153,25 +158,23 @@ pub fn post_chat_completion(
     timeout: Duration,
 ) -> Result<ChatResponse, crate::CompletionError> {
     use crate::CompletionError;
-    let client = cairn_tls::blocking_client_builder()
+    let client = cairn_tls::client_builder()
         .timeout(timeout)
         .build()
         .map_err(|error| CompletionError::Upstream(error.to_string()))?;
-    let response = client
+    let request = client
         .post(&endpoint.chat_url)
         .headers(
             endpoint
                 .header_map()
                 .map_err(CompletionError::InvalidRequest)?,
         )
-        .json(&OrderedSchemaAt::new(&body, OUTPUT_SCHEMA_PATH))
-        .send()
-        .map_err(|error| {
-            if error.is_timeout() {
-                CompletionError::Timeout
-            } else {
-                CompletionError::Upstream(error.to_string())
-            }
+        .json(&OrderedSchemaAt::new(&body, OUTPUT_SCHEMA_PATH));
+    let response =
+        withdrawal::send(request, endpoint.withdrawal.as_ref()).map_err(|error| match error {
+            SendError::Withdrawn => CompletionError::withdrawn(&endpoint.provider_name),
+            SendError::Request(error) if error.is_timeout() => CompletionError::Timeout,
+            SendError::Request(error) => CompletionError::Upstream(error.to_string()),
         })?;
     let status = response.status();
     if !status.is_success() {
@@ -183,9 +186,19 @@ pub fn post_chat_completion(
             upstream_error_detail(&text)
         )));
     }
-    response
-        .json()
-        .map_err(|error| CompletionError::InvalidResponse(error.to_string()))
+    let text = response.text().map_err(|error| match error.kind() {
+        std::io::ErrorKind::TimedOut => CompletionError::Timeout,
+        std::io::ErrorKind::ConnectionAborted
+            if endpoint
+                .withdrawal
+                .as_ref()
+                .is_some_and(Withdrawal::is_withdrawn) =>
+        {
+            CompletionError::withdrawn(&endpoint.provider_name)
+        }
+        _ => CompletionError::InvalidResponse(error.to_string()),
+    })?;
+    serde_json::from_str(&text).map_err(|error| CompletionError::InvalidResponse(error.to_string()))
 }
 
 // Error-body extraction is shared by every HTTP protocol family, so it lives at
@@ -300,7 +313,7 @@ pub fn post_chat_completion_streaming(
     cancel: &Arc<AtomicBool>,
     sink: &mut dyn StreamSink,
 ) -> Result<ChatResponse, String> {
-    let client = cairn_tls::blocking_client_builder()
+    let client = cairn_tls::client_builder()
         .timeout(STREAM_ABSOLUTE_TIMEOUT)
         .build()
         .map_err(|error| {
@@ -310,17 +323,16 @@ pub fn post_chat_completion_streaming(
             )
         })?;
     let request_started = Instant::now();
-    let response = client
+    let request = client
         .post(&endpoint.chat_url)
         .headers(endpoint.header_map()?)
-        .json(&OrderedSchemaAt::new(&body, OUTPUT_SCHEMA_PATH))
-        .send()
-        .map_err(|error| {
-            format!(
-                "{} streaming request failed: {error}",
-                endpoint.provider_name
-            )
-        })?;
+        .json(&OrderedSchemaAt::new(&body, OUTPUT_SCHEMA_PATH));
+    let response = withdrawal::send(request, endpoint.withdrawal.as_ref()).map_err(|error| {
+        format!(
+            "{} streaming request failed: {error}",
+            endpoint.provider_name
+        )
+    })?;
     let status = response.status();
     if !status.is_success() {
         let text = response
@@ -521,6 +533,7 @@ mod tests {
             backend_key: "custom:acc_vllm".into(),
             chat_url: format!("http://{address}/v1/chat/completions"),
             headers: vec![],
+            withdrawal: None,
         };
         let mut body = json!({ "model": "m", "messages": [] });
         apply_output_schema(&mut body, Some(schema));
@@ -800,6 +813,7 @@ mod reasoning_echo_tests {
             backend_key: "mock".into(),
             chat_url,
             headers: vec![],
+            withdrawal: None,
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![ChatMessage::user("hi".to_string())];

@@ -3255,14 +3255,12 @@ fn repository_checks_declare_only_the_toolchains_their_lanes_require() {
             | "claude-pin"
             | "claude-contract"
             | "uri-wasm"
-            | "rust-write-pins"
-            | "tls-sole-loader"
-            | "home-coverage"
-            | "plan-audit"
+            | "macos-tests"
+            | "windows-tests"
             | "workspace-compile"
             | "source-scans"
             | "third-party-notices" => &["bun", "rust"],
-            "executor-windows-check" | "executor-macos-check" | "core-macos-check" => &["rust"],
+            "executor-windows-check" | "macos-compile" => &["rust"],
             _ if check
                 .command
                 .split_whitespace()
@@ -3288,24 +3286,18 @@ fn repository_native_compile_checks_cover_macos_and_windows_all_targets() {
         .expect("repository must declare checks");
 
     for (name, target, platform, selection) in [
+        // Without the feature a cairn-core test build is a compile_error!.
         (
-            "executor-macos-check",
+            "macos-compile",
             None,
             "macos",
-            "-p cairn-exec -p cairn-common",
+            "-p cairn-exec -p cairn-common -p cairn-core --features cairn-core/test-utils",
         ),
         (
             "executor-windows-check",
             Some("x86_64-pc-windows-msvc"),
             "windows",
             "-p cairn-exec -p cairn-common",
-        ),
-        // Without the feature a cairn-core test build is a compile_error!.
-        (
-            "core-macos-check",
-            None,
-            "macos",
-            "-p cairn-core --features cairn-core/test-utils",
         ),
     ] {
         let check = contract
@@ -3392,11 +3384,16 @@ fn repository_rust_tests_key_on_the_whole_workspace_and_cover_harness_inputs() {
         .filter(|(name, _)| matches!(name.as_str(), "rust-lint" | "rust-tests"))
         .collect();
     let resolved = inputs(&checks);
+    // Keys, not cadence: rust-lint runs on main only, so a turn-end plan would
+    // never name it.
     let applies = |path: &str| {
-        applicable_turn_end_checks(&checks, &resolved, &[change(path)], Path::new("/repo"))
+        let mut names = plan_checks(&checks, &resolved, &[change(path)], Path::new("/repo"))
             .into_iter()
+            .filter(|plan| plan.applies)
             .map(|plan| plan.name)
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     };
 
     // The app crate's tests `include_str!` its capability files, so a Tauri

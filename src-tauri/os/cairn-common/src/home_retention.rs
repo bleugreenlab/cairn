@@ -16,7 +16,7 @@
 //!   classifies every top-level entry it prices here, and names the ones at or
 //!   above [`UNRECLAIMABLE_THRESHOLD_BYTES`] that are unclaimed or undecided;
 //! - this module's tests pin that a production-shaped home is fully claimed and
-//!   that the registry is well formed (the `home-coverage` lane);
+//!   that the registry is well formed (`home_retention::tests`, run by rust-tests);
 //! - a source scan (in the `source-scans` lane) refuses a literal joined onto a
 //!   home root whose first component is not registered here, so a new writer
 //!   cannot be born without a line.

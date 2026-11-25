@@ -239,8 +239,9 @@ impl ParsedPlanAudit {
 
     /// Whether a reader is told this run went unjudged. Only a narrow selection that
     /// ran no test goes unsaid. Silence from tests that did run cannot tell a run that
-    /// reached no statement from a hook that stopped capturing, so `tls-sole-loader`,
-    /// whose one test touches no database, says so on every head.
+    /// reached no statement from a hook that stopped capturing, so a selection whose
+    /// tests touch no database (cairn-tls's `sole_loader` scan alone) says so on
+    /// every head.
     pub(crate) fn tells_it_went_unjudged(&self) -> bool {
         !self.evaluated() && (!self.ran_no_test || self.selection == "full")
     }

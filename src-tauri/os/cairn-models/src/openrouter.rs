@@ -328,6 +328,7 @@ mod cache_tests {
                 backend_key: backend.into(),
                 chat_url: url,
                 headers: vec![],
+                withdrawal: None,
             },
             dialect: ChatDialect::default(),
             extras: Map::new(),

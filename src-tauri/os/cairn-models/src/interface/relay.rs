@@ -100,6 +100,9 @@ pub struct RelayRoute {
     pub sent_model: String,
     /// The account whose credential the headers carry, when one does.
     pub account_id: Option<String>,
+    /// Set when Cairn can withdraw what serves this route (one of its own
+    /// deployments): a withdrawn relay is cut off and its connection closed.
+    pub withdrawal: Option<crate::wire::withdrawal::Withdrawal>,
 }
 
 impl RelayRoute {
@@ -125,6 +128,7 @@ impl std::fmt::Debug for RelayRoute {
             .field("provider_name", &self.provider_name)
             .field("sent_model", &self.sent_model)
             .field("account_id", &self.account_id)
+            .field("withdrawal", &self.withdrawal)
             .finish()
     }
 }
@@ -173,12 +177,17 @@ pub enum RelayError {
     InvalidRequest(String),
     /// The provider could not be reached or sent no answer.
     Unreachable(String),
+    /// The route's deployment is being stopped, so the request was not sent;
+    /// sent again, it goes wherever the model is served next.
+    Withdrawn(String),
 }
 
 impl std::fmt::Display for RelayError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidRequest(message) | Self::Unreachable(message) => f.write_str(message),
+            Self::InvalidRequest(message)
+            | Self::Unreachable(message)
+            | Self::Withdrawn(message) => f.write_str(message),
         }
     }
 }

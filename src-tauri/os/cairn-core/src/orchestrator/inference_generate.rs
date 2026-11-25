@@ -445,7 +445,8 @@ pub fn starting_profile(
     projector: Option<&str>,
     hardware: &PoolHw,
 ) -> Result<InferenceProfile, String> {
-    let templates = fit::templates();
+    let pins = super::inference_pins::current();
+    let templates = pins.templates();
     let template = templates.iter().find(|t| t.id == template).ok_or_else(|| {
         format!(
             "there is no template {template}; the templates are {}",
@@ -457,7 +458,7 @@ pub fn starting_profile(
         )
     })?;
     template.serves(hardware).map_err(|why| {
-        match fit::templates_for(hardware).map(|serving| {
+        match fit::templates_for(templates, hardware).map(|serving| {
             serving
                 .iter()
                 .map(|t| t.id.as_str())
@@ -1382,10 +1383,13 @@ requirements:
         assert_eq!(halo.family, AcceleratorFamily::Amd);
         assert_eq!(halo.memory, HwMemory::Unified { total: 125 * GIB });
         assert_eq!(
-            fit::templates_for(&PoolHw {
-                machines: vec![halo],
-                linked: false,
-            })
+            fit::templates_for(
+                cairn_inference::engine_pins::EnginePins::embedded().templates(),
+                &PoolHw {
+                    machines: vec![halo],
+                    linked: false,
+                }
+            )
             .unwrap()
             .iter()
             .map(|t| t.id.as_str())

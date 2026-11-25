@@ -39,6 +39,7 @@ use cairn_inference::{
     unknown_address, Addresses, Deployment, DeploymentId, InferenceProfileId, Inventory, Network,
 };
 use cairn_models::types::catalog::{Modalities, VerbKind};
+use cairn_models::wire::withdrawal::Withdrawal;
 
 use super::inference::load_inventory;
 use super::inference_control::deployment_phases;
@@ -66,6 +67,9 @@ pub(crate) struct Route {
     pub context_length: Option<u64>,
     /// The key the engine requires, which every request to it carries.
     pub api_key: Option<DeploymentApiKey>,
+    /// What cuts every call on this route off when the deployment is
+    /// stopped ([`withdraw`]). Each endpoint built from the route carries it.
+    pub withdrawal: Withdrawal,
 }
 
 impl Route {
@@ -309,7 +313,46 @@ async fn route(
         served_name: profile.served_name.clone(),
         context_length: measure.context_length(),
         api_key,
+        withdrawal: withdrawal_of(deployment),
     })
+}
+
+/// Each deployment's withdrawal: what every route to it carries, and what
+/// stopping it withdraws before the head is asked to stop its server
+/// ([`withdraw`]). A stopping deployment keeps its withdrawn one, so a route
+/// taken while it stops (by a request that was ready just before) is cut off
+/// before it is sent; it gets a fresh one once it is healthy again
+/// ([`renew`]).
+static WITHDRAWALS: Mutex<BTreeMap<DeploymentId, Withdrawal>> = Mutex::new(BTreeMap::new());
+
+fn withdrawals() -> MutexGuard<'static, BTreeMap<DeploymentId, Withdrawal>> {
+    WITHDRAWALS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn withdrawal_of(deployment: &DeploymentId) -> Withdrawal {
+    withdrawals().entry(deployment.clone()).or_default().clone()
+}
+
+/// Cut off every call to `deployment` and refuse each later one until it is
+/// healthy again; the withdrawal counts the calls whose connections are
+/// still closing.
+pub(crate) fn withdraw(deployment: &DeploymentId) -> Withdrawal {
+    let withdrawal = withdrawal_of(deployment);
+    withdrawal.withdraw();
+    withdrawal
+}
+
+/// `deployment` is healthy: routes to it are no longer cut off.
+pub(crate) fn renew(deployment: &DeploymentId) {
+    let mut withdrawals = withdrawals();
+    if withdrawals
+        .get(deployment)
+        .is_some_and(Withdrawal::is_withdrawn)
+    {
+        withdrawals.remove(deployment);
+    }
 }
 
 /// Wait until `model` is ready to serve `verb` for `requester`, then say
@@ -558,6 +601,7 @@ pub(crate) mod tests {
             served_name: "deepseek-v4-flash-vision-exp".into(),
             context_length: Some(1_048_576),
             api_key: None,
+            withdrawal: Default::default(),
         }
     }
 

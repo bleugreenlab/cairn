@@ -50,7 +50,9 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
 /// Run `attempt` until it succeeds, fails for good, or has been tried
 /// [`ATTEMPTS`] times. Only a transient failure is retried, after the doubling
 /// delay or the provider's `Retry-After`, whichever is longer, and never once
-/// the caller has cancelled.
+/// the caller has cancelled. A withdrawn endpoint is not retried here: every
+/// attempt on the same route would be refused, so the caller asks again for
+/// a route instead.
 fn with_retry<T>(
     sleep: &dyn Fn(Duration),
     cancel: Option<&AtomicBool>,
@@ -64,6 +66,7 @@ fn with_retry<T>(
         };
         let asked = error.retry_after().unwrap_or_default();
         if !error.is_transient()
+            || matches!(error, CompletionError::Withdrawn(_))
             || tried >= ATTEMPTS
             || asked > MAX_IN_CALL_WAIT
             || cancelled(cancel)

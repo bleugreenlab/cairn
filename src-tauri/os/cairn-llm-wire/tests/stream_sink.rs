@@ -67,6 +67,7 @@ impl Protocol {
                     backend_key: "test".into(),
                     chat_url: url,
                     headers: vec![],
+                    withdrawal: None,
                 },
                 json!({}),
                 &cancel,

@@ -5,6 +5,7 @@ use crate::interface::complete::{
 };
 use crate::interface::relay::{prepare_body, Relay, RelayBody, RelayCall, RelayError, Relayed};
 use crate::relay::TapMode;
+use crate::wire::withdrawal::{self, SendError};
 use crate::wire::{
     anthropic_messages, decisions, embeddings, openai_compat, openai_responses, systemone,
 };
@@ -14,7 +15,26 @@ use crate::wire::{
 pub struct HttpComplete;
 
 impl Complete for HttpComplete {
+    /// A call that fails after its endpoint was withdrawn fails as
+    /// [`CompletionError::Withdrawn`], whatever the cut connection looked like
+    /// to the wire (a read error, a truncated stream), so its caller can tell
+    /// a stopping deployment from a failing one.
     fn complete(&self, call: CompletionCall<'_>) -> Result<CompletionReply, CompletionError> {
+        let withdrawal = call
+            .wire
+            .withdrawal()
+            .map(|(withdrawal, provider)| (withdrawal.clone(), provider.to_string()));
+        send(call).map_err(|error| match withdrawal {
+            Some((withdrawal, provider)) if withdrawal.is_withdrawn() => {
+                CompletionError::withdrawn(&provider)
+            }
+            _ => error,
+        })
+    }
+}
+
+fn send(call: CompletionCall<'_>) -> Result<CompletionReply, CompletionError> {
+    {
         let CompletionCall {
             wire,
             body,
@@ -117,7 +137,7 @@ impl Relay for HttpComplete {
             cancel,
         } = call;
         let prepared = prepare_body(door, &route.sent_model, body)?;
-        let client = cairn_tls::blocking_client_builder()
+        let client = cairn_tls::client_builder()
             .timeout(RELAY_ABSOLUTE_TIMEOUT)
             .connect_timeout(RELAY_CONNECT_TIMEOUT)
             .build()
@@ -135,12 +155,21 @@ impl Relay for HttpComplete {
                 request = request.header(name.as_str(), value.as_str());
             }
         }
-        let response = request
-            .body(prepared.body.to_string())
-            .send()
-            .map_err(|error| {
-                RelayError::Unreachable(format!("{} unreachable: {error}", route.provider_name))
-            })?;
+        let request = request.body(prepared.body.to_string());
+        // A relay cut off after its reply began reaches the client as a
+        // broken body: its status has already been sent.
+        let response = withdrawal::send(request, route.withdrawal.as_ref()).map_err(|error| {
+            match error {
+                SendError::Withdrawn => RelayError::Withdrawn(format!(
+                    "{} is being stopped, so this request was not sent there; sent again, it goes wherever the model is served next",
+                    route.provider_name
+                )),
+                SendError::Request(error) => RelayError::Unreachable(format!(
+                    "{} unreachable: {error}",
+                    route.provider_name
+                )),
+            }
+        })?;
         let status = response.status().as_u16();
         let mut headers = Vec::new();
         let mut upstream_request_id = None;
@@ -224,6 +253,7 @@ mod tests {
             backend_key: "local".to_string(),
             chat_url: url,
             headers: vec![("content-type".into(), "application/json".into())],
+            withdrawal: None,
         }
     }
 
@@ -312,6 +342,7 @@ mod tests {
             provider_name: "OpenRouter".into(),
             sent_model: "deepseek/served".into(),
             account_id: Some("acct".into()),
+            withdrawal: None,
         }
     }
 

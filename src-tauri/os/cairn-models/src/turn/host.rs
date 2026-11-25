@@ -87,6 +87,17 @@ pub trait TurnEffects {
     fn capture_final_output(&mut self, _text: &str) {}
 }
 
+/// How a turn finds where its generations go next once the endpoint serving
+/// them is withdrawn ([`CompletionError::Withdrawn`], whose text it is given):
+/// a family for the new endpoint and the name the model is sent under there.
+/// It may wait, as a turn waits for its model to load before it starts. It
+/// owns what it needs, so a turn holding one borrows nothing more.
+pub type Reroute<F> = Box<dyn FnMut(&str) -> Result<(F, String), String>>;
+
+/// How many times one generation is sent again after a withdrawal before the
+/// withdrawal fails the turn: a model withdrawn over and over is not settling.
+const MAX_REROUTES: usize = 3;
+
 /// One agent turn over protocol family `F`, with host effects `E`.
 pub struct FamilyTurn<'a, F: ProtocolFamily, E: TurnEffects> {
     pub family: F,
@@ -101,6 +112,10 @@ pub struct FamilyTurn<'a, F: ProtocolFamily, E: TurnEffects> {
     pub effects: E,
     pub complete: &'a dyn Complete,
     pub cancel: Arc<AtomicBool>,
+    /// Set for a provider whose model can be served somewhere else, or again,
+    /// after its endpoint is withdrawn mid-turn: the generation is sent there
+    /// rather than failing the turn.
+    pub reroute: Option<Reroute<F>>,
 }
 
 impl<F: ProtocolFamily, E: TurnEffects> FamilyTurn<'_, F, E> {
@@ -124,26 +139,40 @@ impl<F: ProtocolFamily, E: TurnEffects> FamilyTurn<'_, F, E> {
 
 impl<F: ProtocolFamily, E: TurnEffects> HttpTurnHost for FamilyTurn<'_, F, E> {
     fn post_generation(&mut self) -> Result<Generation<()>, String> {
-        let outgoing = self.family.fit(&self.conversation, self.context_window);
-        if matches!(outgoing, Cow::Owned(_)) {
-            log::info!(
-                "[cairn-context-trim] backend={} model={}",
-                self.family.wire().backend_key(),
-                self.model
-            );
-        }
-        let body = self.family.body(&self.model, &outgoing, &self.config);
-        drop(outgoing);
-        let reply = {
-            let mut sink = self.effects.stream_sink();
-            self.complete.complete(CompletionCall::stream(
-                self.family.wire(),
-                body,
-                &mut *sink,
-                &self.cancel,
-            ))
+        let mut rerouted = 0;
+        let reply = loop {
+            let outgoing = self.family.fit(&self.conversation, self.context_window);
+            if matches!(outgoing, Cow::Owned(_)) {
+                log::info!(
+                    "[cairn-context-trim] backend={} model={}",
+                    self.family.wire().backend_key(),
+                    self.model
+                );
+            }
+            let body = self.family.body(&self.model, &outgoing, &self.config);
+            drop(outgoing);
+            let reply = {
+                let mut sink = self.effects.stream_sink();
+                self.complete.complete(CompletionCall::stream(
+                    self.family.wire(),
+                    body,
+                    &mut *sink,
+                    &self.cancel,
+                ))
+            };
+            match (reply, self.reroute.as_mut()) {
+                (Err(CompletionError::Withdrawn(why)), Some(reroute))
+                    if rerouted < MAX_REROUTES =>
+                {
+                    log::info!("{why}; finding where {} is served now", self.model);
+                    let (family, model) = reroute(&why)?;
+                    self.family = family;
+                    self.model = model;
+                    rerouted += 1;
+                }
+                (reply, _) => break reply.map_err(|error| self.effects.explain_error(error))?,
+            }
         };
-        let reply = reply.map_err(|error| self.effects.explain_error(error))?;
         let Generation {
             assistant_message,
             assistant_text,
@@ -338,6 +367,7 @@ mod tests {
             effects,
             complete,
             cancel: Arc::new(AtomicBool::new(false)),
+            reroute: None,
         }
     }
 
@@ -352,6 +382,7 @@ mod tests {
                 backend_key: "chat".into(),
                 chat_url: "http://127.0.0.1:1".into(),
                 headers: vec![],
+                withdrawal: None,
             },
             dialect: ChatDialect::default(),
             extras: Map::new(),

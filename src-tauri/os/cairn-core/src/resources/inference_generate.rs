@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use cairn_common::query::QueryParam;
-use cairn_inference::fit::{templates, templates_for, Template};
+use cairn_inference::fit::{templates_for, Template};
 use cairn_inference::hf::{AuxiliaryFile, RepoFiles};
 use cairn_inference::AcceleratorFamily;
 use cairn_inference::{control::gib, Model};
@@ -396,8 +396,9 @@ pub(crate) async fn render_templates(orch: &Orchestrator, params: &[QueryParam])
         Ok(as_data) => as_data,
         Err(error) => return error,
     };
+    let pins = crate::orchestrator::inference_pins::current();
     let Some(pool) = find_query_value(params, "pool") else {
-        let all: Vec<&Template> = templates().iter().collect();
+        let all: Vec<&Template> = pins.templates().iter().collect();
         return templates_page(None, &all, as_data);
     };
     let scoped = async {
@@ -407,7 +408,7 @@ pub(crate) async fn render_templates(orch: &Orchestrator, params: &[QueryParam])
             pool: detected.key.0,
             accelerator: hardware.accelerator()?,
         };
-        Ok::<_, String>((scope, templates_for(&hardware)?))
+        Ok::<_, String>((scope, templates_for(pins.templates(), &hardware)?))
     }
     .await;
     match scoped {
@@ -432,7 +433,7 @@ pub(crate) async fn render_template(
         return error;
     }
     if find_query_value(params, "model").is_none() {
-        return match templates().iter().find(|t| t.id == id) {
+        return match crate::orchestrator::inference_pins::current().template(id) {
             Some(template) => {
                 let mut out = String::from("# Inference template\n\n");
                 template_lines(&mut out, template);
@@ -587,9 +588,10 @@ mod tests {
 
     #[test]
     fn the_templates_list_and_their_data_agree() {
-        let all: Vec<&Template> = templates().iter().collect();
+        let templates = cairn_inference::engine_pins::EnginePins::embedded().templates();
+        let all: Vec<&Template> = templates.iter().collect();
         let listed = templates_page(None, &all, false);
-        for template in templates() {
+        for template in templates {
             assert!(listed.contains(&format!("## {}", template.id)), "{listed}");
         }
         assert!(listed.contains("- hardware: amd on rocm, x86_64 only"));
@@ -599,12 +601,13 @@ mod tests {
         );
         let as_data = templates_page(None, &all, true);
         let parsed: serde_json::Value = serde_json::from_str(&as_data).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), templates().len());
+        assert_eq!(parsed.as_array().unwrap().len(), templates.len());
     }
 
     #[test]
     fn a_pool_s_templates_name_its_accelerator() {
-        let rocm: Vec<&Template> = templates()
+        let rocm: Vec<&Template> = cairn_inference::engine_pins::EnginePins::embedded()
+            .templates()
             .iter()
             .filter(|t| t.family == AcceleratorFamily::Amd)
             .collect();

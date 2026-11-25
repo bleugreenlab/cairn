@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::withdrawal::Withdrawal;
 use crate::CompletionError;
 
 /// Where an OpenAI-compatible embeddings deployment lives and how it
@@ -22,6 +23,9 @@ pub struct EmbeddingsEndpoint {
     /// (OpenRouter's `provider` routing object), merged by
     /// [`crate::merge_extras`].
     pub extras: serde_json::Map<String, Value>,
+    /// Set when Cairn can withdraw what serves this endpoint (one of its own
+    /// deployments): a withdrawn call is cut off and its connection closed.
+    pub withdrawal: Option<Withdrawal>,
 }
 
 impl std::fmt::Debug for EmbeddingsEndpoint {
@@ -32,6 +36,7 @@ impl std::fmt::Debug for EmbeddingsEndpoint {
             .field("url", &self.url)
             .field("headers", &super::redacted(&self.headers))
             .field("extras", &self.extras)
+            .field("withdrawal", &self.withdrawal)
             .finish()
     }
 }
@@ -79,6 +84,7 @@ pub fn post_embeddings(
         &body,
         timeout,
         hint,
+        endpoint.withdrawal.as_ref(),
     )?;
     read(&text)
 }

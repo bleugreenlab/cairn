@@ -29,6 +29,7 @@
 //! on the models facet's vocabulary, so it is hostable outside Cairn.
 pub mod control;
 pub mod deployment;
+pub mod engine_pins;
 pub mod fit;
 pub mod hf;
 pub mod import;

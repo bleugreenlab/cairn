@@ -45,7 +45,7 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 use cairn_models::interface::complete::CompletionError;
 use cairn_models::interface::session::SessionInput;
-use cairn_models::turn::{FamilyTurn, ProtocolFamily, TurnExit};
+use cairn_models::turn::{FamilyTurn, ProtocolFamily, Reroute, TurnExit};
 use cairn_models::wire::MessageContent;
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
@@ -110,6 +110,21 @@ pub(in crate::backends) trait WireAdapter {
         _cancel: &AtomicBool,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Where this turn's generations go next once the deployment serving
+    /// them is withdrawn mid-turn: a provider whose model can be served
+    /// elsewhere, or again after a load, answers with how to find it, which
+    /// waits as [`Self::prepare_turn`] does. `None` lets the withdrawal fail
+    /// the turn.
+    fn rerouter(
+        &self,
+        _orch: &Orchestrator,
+        _config: &SessionConfig,
+        _session_id: &str,
+        _cancel: &Arc<AtomicBool>,
+    ) -> Option<Reroute<Self::Family>> {
+        None
     }
 
     /// The id this turn's requests name for `model` on the wire. A provider
@@ -359,6 +374,7 @@ fn run_http_turn<A: WireAdapter>(
     let family = adapter.family(&connection)?;
     let generation_config = (&config).into();
     let complete = orch.models_runtime().complete.clone();
+    let reroute = adapter.rerouter(orch, &config, &session_id, &cancel);
     let mut turn = FamilyTurn {
         family,
         model: wire_model,
@@ -379,6 +395,7 @@ fn run_http_turn<A: WireAdapter>(
         },
         complete: &*complete,
         cancel,
+        reroute,
     };
     turn.run()
 }

@@ -108,11 +108,18 @@ impl ToolSpec {
     /// `CAIRN_RELEASE_BASE_URL` replaces the GitHub release with a mirror laid
     /// out the same way, as it does for the executor distribution.
     pub fn published_pin_url(&self) -> String {
-        let base = std::env::var("CAIRN_RELEASE_BASE_URL")
-            .ok()
-            .map(|base| base.trim().trim_end_matches('/').to_string())
-            .filter(|base| !base.is_empty())
-            .unwrap_or_else(|| CAIRN_RELEASES.to_string());
-        format!("{base}/{}/{}", self.release_tag(), self.pin_file_name())
+        published_url(&self.release_tag(), &self.pin_file_name())
     }
+}
+
+/// Where `file` of Cairn's rolling release `tag` is published: the GitHub
+/// release, or the mirror `CAIRN_RELEASE_BASE_URL` names, laid out the same
+/// way. Every pin Cairn follows at run time is fetched from here.
+pub fn published_url(tag: &str, file: &str) -> String {
+    let base = std::env::var("CAIRN_RELEASE_BASE_URL")
+        .ok()
+        .map(|base| base.trim().trim_end_matches('/').to_string())
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| CAIRN_RELEASES.to_string());
+    format!("{base}/{tag}/{file}")
 }

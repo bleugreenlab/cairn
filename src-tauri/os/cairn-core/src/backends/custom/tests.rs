@@ -1008,6 +1008,7 @@ fn an_endpoints_debug_never_renders_a_header_value() {
             ("authorization".into(), "Bearer sk-secret-value".into()),
             ("x-tenant".into(), "tenant-secret".into()),
         ],
+        withdrawal: None,
     };
     let rendered = format!("{endpoint:?}");
     assert!(!rendered.contains("sk-secret-value"), "{rendered}");

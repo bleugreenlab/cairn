@@ -23,7 +23,8 @@
 //!   model's KV geometry is known, and floored to a multiple of 1024; below
 //!   8192 nothing fits. With the geometry unknown nothing is clamped here, and
 //!   verification clamps to the cache the engine measures.
-//! - [`templates`] (`templates.yaml`): engines known to work, each an image
+//! - The templates (`templates.yaml`, each running the engine
+//!   [`crate::engine_pins`] pins for it): engines known to work, each an image
 //!   pinned by digest or, where no container reaches the GPU (Apple), a
 //!   native artifact pinned by hash, with the server it runs, the hardware it
 //!   serves and the weight formats it reads, and [`starting_profile`], one of them made into
@@ -73,7 +74,49 @@ pub const APPLE_USABLE: f64 = 0.84;
 pub const WEIGHT_OVERHEAD: f64 = 1.05;
 pub const MIN_CONTEXT: u64 = 8_192;
 
-/// One engine known to work: a starting point, not a rule.
+/// A template as `templates.yaml` writes it: everything but which release of
+/// its engine it runs, which [`crate::engine_pins`] fills in. A container
+/// template has a `command`; a native one has `args`, what its pinned
+/// program is given.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TemplateBase {
+    pub id: String,
+    pub server: Server,
+    pub family: AcceleratorFamily,
+    pub runtime: AcceleratorRuntime,
+    #[serde(default)]
+    pub arch: Option<Arch>,
+    pub formats: Vec<WeightFormat>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// `templates.yaml`, compiled in. Each template is a container's (with a
+/// `command`) or a native engine's (with `args`), never both.
+pub(crate) fn base_templates() -> &'static [TemplateBase] {
+    static BASES: OnceLock<Vec<TemplateBase>> = OnceLock::new();
+    BASES.get_or_init(|| {
+        let bases: Vec<TemplateBase> =
+            serde_yaml::from_str(include_str!("templates.yaml")).expect("templates.yaml parses");
+        for base in &bases {
+            assert!(
+                base.command.is_some() != base.args.is_some(),
+                "template {} has exactly one of command (a container's) and args (a native engine's)",
+                base.id
+            );
+        }
+        bases
+    })
+}
+
+/// One engine known to work: a starting point, not a rule. A template as
+/// offered is its `templates.yaml` entry with the engine its pin names
+/// ([`crate::engine_pins::EnginePins::templates`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Template {
@@ -171,19 +214,14 @@ impl Arch {
     }
 }
 
-/// The templates shipped with Cairn.
-pub fn templates() -> &'static [Template] {
-    static TEMPLATES: OnceLock<Vec<Template>> = OnceLock::new();
-    TEMPLATES.get_or_init(|| {
-        serde_yaml::from_str(include_str!("templates.yaml")).expect("templates.yaml parses")
-    })
-}
-
-/// The shipped templates that serve `pool`, or why the pool's accelerator
-/// cannot choose any.
-pub fn templates_for(pool: &PoolHw) -> Result<Vec<&'static Template>, String> {
+/// The `templates` that serve `pool`, or why the pool's accelerator cannot
+/// choose any.
+pub fn templates_for<'t>(
+    templates: &'t [Template],
+    pool: &PoolHw,
+) -> Result<Vec<&'t Template>, String> {
     pool.accelerator()?;
-    Ok(templates()
+    Ok(templates
         .iter()
         .filter(|template| template.serves(pool).is_ok())
         .collect())
@@ -1021,6 +1059,8 @@ mod tests {
         };
     }
 
+    use crate::engine_pins::EnginePins;
+
     fn model_of(repo: &HfRepo) -> Model {
         Model {
             name: repo.repo.clone(),
@@ -1036,7 +1076,7 @@ mod tests {
     }
 
     fn template(id: &str) -> &'static Template {
-        templates().iter().find(|t| t.id == id).unwrap()
+        EnginePins::embedded().template(id).unwrap()
     }
 
     fn spark(name: &str) -> MachineHw {
@@ -1106,8 +1146,9 @@ mod tests {
 
     #[test]
     fn the_templates_parse_and_pin_their_engines() {
-        assert_eq!(templates().len(), 9);
-        for template in templates() {
+        let templates = EnginePins::embedded().templates();
+        assert_eq!(templates.len(), 9);
+        for template in templates {
             match (&template.image, &template.artifact) {
                 (Some(image), None) => {
                     assert!(crate::profile::is_pinned_image(image), "{}", template.id);
@@ -1344,7 +1385,7 @@ mod tests {
     }
 
     fn ids(pool: &PoolHw) -> Vec<&'static str> {
-        templates_for(pool)
+        templates_for(EnginePins::embedded().templates(), pool)
             .unwrap()
             .iter()
             .map(|t| t.id.as_str())
@@ -1387,7 +1428,10 @@ mod tests {
             why,
             "the pool's machines have different accelerators (bginf-sp1: nvidia, fedora: amd), and one engine image serves one"
         );
-        assert_eq!(templates_for(&mixed).unwrap_err(), why);
+        assert_eq!(
+            templates_for(EnginePins::embedded().templates(), &mixed).unwrap_err(),
+            why
+        );
         assert_eq!(template("llamacpp-rocm").serves(&mixed).unwrap_err(), why);
         assert_eq!(fit(&Model::named("m"), GIB, &mixed).unwrap_err(), why);
 

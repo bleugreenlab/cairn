@@ -173,6 +173,7 @@ impl AgentBackend for OpenRouterBackend {
             provider_name: OPENROUTER_BACKEND_NAME.to_string(),
             sent_model: request.model.to_string(),
             account_id: Some(account_id),
+            withdrawal: None,
         })
     }
 

@@ -702,7 +702,7 @@ fn a_cached_pin_is_revalidated_with_its_etag() {
         write_json_atomically(
             &fixture.root,
             "pin.json",
-            &CachedPin {
+            &follow::CachedPin {
                 etag: Some("\"v2\"".to_string()),
                 pin: published.clone(),
             },

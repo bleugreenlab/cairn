@@ -200,6 +200,10 @@ pub struct ModelProfile {
     /// A profile a generation owns, not promoted as it stands, that nothing
     /// works on now: a fresh generation may regenerate it in place.
     pub regenerable: bool,
+    /// The engine it runs, when that is not its template's current engine
+    /// pin: a newer release new profiles would start from. Information only:
+    /// the profile keeps running, and is measured as, the engine it embeds.
+    pub behind_pin: Option<cairn_inference::engine_pins::PinLag>,
     /// Its measured fit per pool; empty when nothing is measured yet.
     pub fit: Vec<ProfileFit>,
     pub loadable: Vec<ProfileLoadable>,
@@ -383,6 +387,8 @@ pub(crate) struct Sources<'a> {
     pub unpromoted: &'a BTreeSet<String>,
     /// Generated profiles a fresh generation may regenerate in place.
     pub regenerable: &'a BTreeSet<String>,
+    /// The engine pins new profiles start from now.
+    pub pins: &'a cairn_inference::engine_pins::EnginePins,
     pub now: i64,
 }
 
@@ -1104,6 +1110,7 @@ impl Sources<'_> {
                             verifiable: profile.engine.is_runnable_form(),
                             edited: self.edited.contains(profile.id.as_str()),
                             regenerable: self.regenerable.contains(profile.id.as_str()),
+                            behind_pin: self.pins.lag(profile),
                             fit: self.profile_fit(profile),
                             loadable: self
                                 .models
@@ -1197,6 +1204,7 @@ async fn with_sources<T>(
     let gate = super::inference_generate::promotion::Gate::load(db).await?;
     let unpromoted = gate.unpromoted_profiles(&records);
     let regenerable = gate.regenerable_profiles(&records);
+    let pins = super::inference_pins::current();
     Ok(with(&Sources {
         inventory: &inventory,
         phases: &phases,
@@ -1209,6 +1217,7 @@ async fn with_sources<T>(
         edited: &stale,
         unpromoted: &unpromoted,
         regenerable: &regenerable,
+        pins: &pins,
         now: crate::fleet::unix_time_ms() as i64,
     }))
 }
@@ -1804,6 +1813,7 @@ deployments:
                 edited: &self.edited,
                 unpromoted: &self.unpromoted,
                 regenerable: &self.regenerable,
+                pins: cairn_inference::engine_pins::EnginePins::embedded(),
                 now: 600_000,
             }
         }

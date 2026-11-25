@@ -24,7 +24,7 @@ mod family;
 mod host;
 
 pub use family::{ChatFamily, MessagesFamily, ProtocolFamily, ResponsesFamily};
-pub use host::{FamilyTurn, ToolDispatch, TurnEffects};
+pub use host::{FamilyTurn, Reroute, ToolDispatch, TurnEffects};
 
 use crate::wire::{Generation, TurnToolCall, TurnUsage};
 use serde_json::Value;
@@ -129,7 +129,15 @@ pub fn run_turn(
         if cancel.load(Ordering::SeqCst) {
             return Ok(TurnExit::Cancelled);
         }
-        let generation = host.post_generation()?;
+        let generation = match host.post_generation() {
+            Ok(generation) => generation,
+            // A request that failed because the turn was interrupted (its
+            // wait for a model, or a stream the interrupt broke) ends the
+            // turn as interrupted, as an interrupted model wait does before
+            // the turn starts.
+            Err(_) if cancel.load(Ordering::SeqCst) => return Ok(TurnExit::Cancelled),
+            Err(error) => return Err(error),
+        };
         // A cancelled SSE request may have returned a partial generation.
         if cancel.load(Ordering::SeqCst) {
             return Ok(TurnExit::Cancelled);

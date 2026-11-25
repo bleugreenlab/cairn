@@ -653,8 +653,9 @@ mod tests {
     /// `cairn://skills/<id>`. Guard that each shipped package parses, and that
     /// the `workflows` skill is present and well-formed. Verifying the shipped
     /// file directly beats dogfooding through the running host, which serves a
-    /// stale binary and a stale synced copy. The `rust-write-pins` check in
-    /// `.cairn/config.yaml` runs this test by name on every pack SKILL.md change.
+    /// stale binary and a stale synced copy. A pack SKILL.md is a workspace-level
+    /// file to rust-tests' related selection, so any change to one runs the full
+    /// suite, this test included.
     #[test]
     fn bundled_skills_load_and_include_workflows() {
         let src_tauri = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

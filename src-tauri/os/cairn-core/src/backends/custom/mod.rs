@@ -223,6 +223,7 @@ impl CustomProviderConfig {
                 backend_key,
                 chat_url: self.chat_url(),
                 headers,
+                withdrawal: None,
             })),
             CustomProtocol::Decisions => Ok(DecisionRoute::Native(DecisionsEndpoint {
                 provider_name,

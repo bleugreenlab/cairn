@@ -84,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &key,
                 &cairn_models::openrouter::Attribution::cairn(),
             ),
+            withdrawal: None,
         },
         dialect: ChatDialect {
             max_tokens: Some(64),
@@ -134,6 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             effects: Effects::default(),
             complete: &HttpComplete,
             cancel: Arc::new(AtomicBool::new(false)),
+            reroute: None,
         };
         host.run()?;
         let usage = host.effects.usage.ok_or("missing session usage")?;

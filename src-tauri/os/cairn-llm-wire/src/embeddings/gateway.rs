@@ -58,6 +58,7 @@ pub fn post_gateway_embed(
         &body,
         timeout,
         |_| None,
+        None,
     )?;
     read(&text)
 }

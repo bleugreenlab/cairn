@@ -365,6 +365,7 @@ fn embedder_ready() -> Route {
         served_name: "qwen3-embedding-4b".into(),
         context_length: None,
         api_key: None,
+        withdrawal: Default::default(),
     }
 }
 
@@ -461,6 +462,7 @@ fn live_embedder_answers_at_the_offers_width() {
         api_key: std::env::var("CAIRN_LIVE_EMBED_KEY")
             .ok()
             .map(cairn_common::executor_protocol::DeploymentApiKey::new),
+        withdrawal: Default::default(),
     });
     let offer = provider().admit(EMBEDDER, VerbKind::Embed).unwrap();
     let capabilities = embed_capabilities(&offer);

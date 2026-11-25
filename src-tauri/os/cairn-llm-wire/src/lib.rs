@@ -27,6 +27,7 @@ pub mod stream;
 mod stream_end;
 pub mod systemone;
 pub mod tool_defs;
+pub mod withdrawal;
 
 pub use replay::{MessageContent, MessageImage, ReplayEvent, ToolUseInfo};
 pub use stream_end::require_terminal_event;
@@ -286,20 +287,34 @@ pub enum CompletionError {
     /// displayed unchanged.
     #[error("{0}")]
     Stream(String),
+    /// The endpoint's owner withdrew it before the call was answered (Cairn
+    /// stopping one of its own deployments): the connection was closed and
+    /// nothing usable came back. Sent again, the request goes wherever the
+    /// model is served next, so it is transient.
+    #[error("{0}")]
+    Withdrawn(String),
 }
 
 impl CompletionError {
+    /// The withdrawal of `provider_name`'s endpoint, in words.
+    pub fn withdrawn(provider_name: &str) -> Self {
+        Self::Withdrawn(format!(
+            "{provider_name} cut this call off because the deployment it went to is being stopped; sent again, it goes wherever the model is served next"
+        ))
+    }
+
     /// Whether trying the same request again later may succeed: a timeout,
-    /// an unreachable provider, or a status that names a passing condition
-    /// (a rate limit, an overloaded or failing upstream). A refusal of the
-    /// request or the credential is not, and neither is an unreadable reply.
+    /// an unreachable provider, a withdrawn endpoint, or a status that names
+    /// a passing condition (a rate limit, an overloaded or failing upstream).
+    /// A refusal of the request or the credential is not, and neither is an
+    /// unreadable reply.
     ///
     /// 507 is a local engine out of GPU memory for now: oMLX answers it,
     /// rather than queueing, when a load or a long prompt would pass its
     /// memory ceiling, and it passes as the requests holding that memory end.
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Timeout | Self::Unreachable(_) => true,
+            Self::Timeout | Self::Unreachable(_) | Self::Withdrawn(_) => true,
             Self::Http { status, .. } => {
                 matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 507)
             }

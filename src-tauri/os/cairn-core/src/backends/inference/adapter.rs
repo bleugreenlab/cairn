@@ -5,12 +5,13 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use cairn_models::interface::complete::{
     Complete, CompletionCall, CompletionReply, CompletionWire,
 };
-use cairn_models::turn::ChatFamily;
+use cairn_models::turn::{ChatFamily, Reroute};
 use serde_json::{json, Map};
 
 use super::{INFERENCE_BACKEND_KEY, INFERENCE_BACKEND_NAME};
@@ -42,18 +43,23 @@ pub(super) fn endpoint(route: &Route) -> Endpoint {
         backend_key: INFERENCE_BACKEND_KEY.to_string(),
         chat_url: route.chat_url(),
         headers,
+        withdrawal: Some(route.withdrawal.clone()),
     }
 }
 
 /// The embeddings endpoint of `route`'s deployment.
 pub(super) fn embed_route(route: &Route) -> cairn_models::interface::embed::EmbedRoute {
-    cairn_models::embed::openai::route_for(
+    let mut embed = cairn_models::embed::openai::route_for(
         INFERENCE_BACKEND_KEY,
         INFERENCE_BACKEND_NAME,
         &route.api_base,
         route.api_key.as_ref().map(|key| key.expose()),
         &[],
-    )
+    );
+    if let cairn_models::interface::embed::EmbedRoute::OpenAi(endpoint) = &mut embed {
+        endpoint.withdrawal = Some(route.withdrawal.clone());
+    }
+    embed
 }
 
 /// The relay route to `route`'s deployment: its API base and key, and the
@@ -67,6 +73,7 @@ pub(super) fn relay_route(route: &Route) -> cairn_models::interface::relay::Rela
         provider_name: INFERENCE_BACKEND_NAME.to_string(),
         sent_model: route.served_name.clone(),
         account_id: None,
+        withdrawal: Some(route.withdrawal.clone()),
     }
 }
 
@@ -127,6 +134,63 @@ pub(super) fn complete(
         latency_ms: started.elapsed().as_millis() as u64,
         account_id: None,
     })
+}
+
+/// Record in a session's transcript what its turn waits on.
+fn tell(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: &str,
+    content: &str,
+    raw: serde_json::Value,
+) {
+    if let Err(error) =
+        insert_system_message_sync(orch, run_id, Some(session_id), None, content, raw)
+    {
+        log::warn!("inference: could not record a model wait in run {run_id}: {error}");
+    }
+}
+
+/// Wait, on the turn's own thread and interruptibly, until `model` is ready
+/// for a session turn, saying in the transcript what the wait is on and,
+/// when there was one, that the model is ready.
+fn ready_for_turn(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: &str,
+    model: &str,
+    requester: &str,
+    cancel: &AtomicBool,
+) -> Result<Route, String> {
+    let waited = Cell::new(false);
+    let route = ready_blocking(
+        orch,
+        model,
+        cairn_models::types::catalog::VerbKind::Session,
+        requester,
+        None,
+        || cancel.load(Ordering::SeqCst),
+        |said| {
+            waited.set(true);
+            tell(
+                orch,
+                run_id,
+                session_id,
+                &format!("Waiting for {model}: {said}"),
+                json!({"inference": {"model": model, "waiting": said}}),
+            );
+        },
+    )?;
+    if waited.get() {
+        tell(
+            orch,
+            run_id,
+            session_id,
+            &format!("{model} is ready on deployment {}", route.deployment),
+            json!({"inference": {"model": model, "ready": route.deployment.as_str()}}),
+        );
+    }
+    Ok(route)
 }
 
 /// One agent turn's adapter. Its route is found on the turn's own thread
@@ -192,43 +256,44 @@ impl WireAdapter for InferenceAdapter {
                     .to_string(),
             );
         }
-        let model = self.model.clone();
-        let tell = |content: &str, raw: serde_json::Value| {
-            if let Err(error) = insert_system_message_sync(
-                orch,
-                &config.run_id,
-                Some(session_id),
-                None,
-                content,
-                raw,
-            ) {
-                log::warn!("inference: could not record the wait for {model}: {error}");
-            }
-        };
-        let waited = Cell::new(false);
-        let route = ready_blocking(
+        self.route = Some(ready_for_turn(
             orch,
-            &model,
-            cairn_models::types::catalog::VerbKind::Session,
+            &config.run_id,
+            session_id,
+            &self.model,
             &self.requester,
-            None,
-            || cancel.load(Ordering::SeqCst),
-            |said| {
-                waited.set(true);
-                tell(
-                    &format!("Waiting for {model}: {said}"),
-                    json!({"inference": {"model": model, "waiting": said}}),
-                );
-            },
-        )?;
-        if waited.get() {
-            tell(
-                &format!("{model} is ready on deployment {}", route.deployment),
-                json!({"inference": {"model": model, "ready": route.deployment.as_str()}}),
-            );
-        }
-        self.route = Some(route);
+            cancel,
+        )?);
         Ok(())
+    }
+
+    /// A generation cut off because its deployment is being stopped is sent
+    /// again wherever the model is served next, after the same visible,
+    /// interruptible wait a turn's first generation has.
+    fn rerouter(
+        &self,
+        orch: &Orchestrator,
+        config: &SessionConfig,
+        session_id: &str,
+        cancel: &Arc<AtomicBool>,
+    ) -> Option<Reroute<ChatFamily>> {
+        let orch = orch.clone();
+        let model = self.model.clone();
+        let requester = self.requester.clone();
+        let run_id = config.run_id.clone();
+        let session_id = session_id.to_string();
+        let cancel = Arc::clone(cancel);
+        Some(Box::new(move |why: &str| {
+            tell(
+                &orch,
+                &run_id,
+                &session_id,
+                &format!("{why}. Asking for {model} again."),
+                json!({"inference": {"model": model, "withdrawn": why}}),
+            );
+            let route = ready_for_turn(&orch, &run_id, &session_id, &model, &requester, &cancel)?;
+            Ok((chat_family(&route), route.served_name))
+        }))
     }
 
     fn wire_model(&self, model: &str) -> String {

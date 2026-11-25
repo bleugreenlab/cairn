@@ -31,6 +31,7 @@ pub(super) fn endpoint(api_key: &str) -> Endpoint {
             ("authorization".to_string(), format!("Bearer {api_key}")),
             ("content-type".to_string(), "application/json".to_string()),
         ],
+        withdrawal: None,
     }
 }
 

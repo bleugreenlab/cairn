@@ -33,6 +33,7 @@ impl ActualAdapter {
             backend_key: ACTUAL_BACKEND_KEY.to_string(),
             chat_url: target.url("/v1/chat/completions"),
             headers: target.headers(),
+            withdrawal: None,
         };
         Self { target, endpoint }
     }

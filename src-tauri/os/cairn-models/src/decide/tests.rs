@@ -89,6 +89,7 @@ fn logprobs_route() -> DecisionRoute {
         backend_key: "custom:acc_sparks".into(),
         chat_url: "http://sparks/v1/chat/completions".into(),
         headers: vec![],
+        withdrawal: None,
     })
 }
 

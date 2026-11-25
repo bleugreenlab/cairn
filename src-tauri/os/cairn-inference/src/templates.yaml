@@ -1,13 +1,17 @@
-# Engine templates generation fills in: which image serves which weights on
-# which hardware. Each image is pinned by the digest its registry served when
-# it was chosen; a template is changed by changing its digest here, and every
-# profile generated from it records which template it came from.
+# Engine templates generation fills in: which server serves which weights on
+# which hardware, and how it is started. Which release of the engine a
+# template runs is not written here: `engine-pins.json` (beside this crate's
+# Cargo.toml) pins each template's image by digest or its native artifact by
+# hash, and is published and followed so a new engine release needs no app
+# release (engine_pins.rs). Every profile generated from a template records
+# which template it came from, and embeds the engine it was made with.
 #
-# `command` is the full serving command with the container's entrypoint
-# cleared; generation appends the flags it computes (context, memory share,
-# tensor parallelism, and the rendezvous flags of a profile spanning machines).
-# `notes` is what the research behind a template found worth knowing when
-# running it; the generating agent reads it, and a starting profile carries it.
+# `command` is a container template's full serving command with the
+# container's entrypoint cleared; generation appends the flags it computes
+# (context, memory share, tensor parallelism, and the rendezvous flags of a
+# profile spanning machines). `notes` is what the research behind a template
+# found worth knowing when running it; the generating agent reads it, and a
+# starting profile carries it.
 #
 # A template serves a pool whose machines all have its accelerator `family`
 # and, when it names one, its CPU `arch`. The container's GPU options follow
@@ -19,63 +23,54 @@
 # (`Server::api_key_env`): vLLM's VLLM_API_KEY, llama.cpp's LLAMA_API_KEY,
 # oMLX's OMLX_API_KEY. mlx_lm.server takes none, so its notes say so.
 #
-# No container reaches an Apple GPU, so Apple's templates are native: an
-# `artifact` pinned by URL, version and sha256 instead of an `image`, and a
-# `command` whose first word is the program in it (a path inside an archive,
-# or a console script of a wheel). Their arguments read the pinned files from
-# the machine's own Hugging Face cache (`{cache}`, `{snapshot}`, `{weights}`).
+# No container reaches an Apple GPU, so Apple's templates are native: their
+# pin is an artifact and the program in it (a path inside an archive, or a
+# console script of a wheel), and `args` is what that program is given. The
+# arguments read the pinned files from the machine's own Hugging Face cache
+# (`{cache}`, `{snapshot}`, `{weights}`).
 
 # vLLM on DGX Spark (GB10, aarch64): NVIDIA's NGC build, the one bginf's
-# Qwen3.6 ran. nvcr.io/nvidia/vllm:26.05.post1-py3.
+# Qwen3.6 ran.
 - id: vllm-ngc
   server: vllm
   family: nvidia
   runtime: cuda
   arch: aarch64
-  image: nvcr.io/nvidia/vllm@sha256:94e21552f644e0c1627464ba89d2f7a4ce7442e196f72afa0bb5d7fba23cbb03
   formats: [safetensors]
   command: [vllm, serve, "{model}", --revision, "{revision}", --served-model-name, "{servedName}", --host, 0.0.0.0, --port, "{port}"]
 
-# vLLM on x86_64 NVIDIA cards: the upstream release image,
-# vllm/vllm-openai:v0.32.0.
+# vLLM on x86_64 NVIDIA cards: the upstream release image.
 - id: vllm-openai
   server: vllm
   family: nvidia
   runtime: cuda
   arch: x86_64
-  image: docker.io/vllm/vllm-openai@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
   formats: [safetensors]
   command: [vllm, serve, "{model}", --revision, "{revision}", --served-model-name, "{servedName}", --host, 0.0.0.0, --port, "{port}"]
 
 # llama.cpp's server on NVIDIA, for GGUF weights.
-# ghcr.io/ggml-org/llama.cpp:server-cuda.
 - id: llamacpp-cuda
   server: llamaCpp
   family: nvidia
   runtime: cuda
-  image: ghcr.io/ggml-org/llama.cpp@sha256:75037a842f2ec1d1b5317ce64078bbb4a2a134238e91a755c10ce31d8f90550a
   formats: [gguf]
   command: [/app/llama-server, -m, "{weights}", --alias, "{servedName}", --host, 0.0.0.0, --port, "{port}", -ngl, "999"]
 
-# llama.cpp's server on AMD through Vulkan, for GGUF weights: the build halo
-# has run its embedder on (server-vulkan, b11681).
+# llama.cpp's server on AMD through Vulkan, for GGUF weights.
 - id: llamacpp-vulkan
   server: llamaCpp
   family: amd
   runtime: vulkan
-  image: ghcr.io/ggml-org/llama.cpp@sha256:afdc5265d1cfc729ad3ebaac59fd60e5d15c3b7aef455d7dc16bc1dccbc4dc64
   formats: [gguf]
   command: [/app/llama-server, -m, "{weights}", --alias, "{servedName}", --host, 0.0.0.0, --port, "{port}", -ngl, "999"]
 
-# llama.cpp's server on AMD through ROCm (HIP), for GGUF weights:
-# ghcr.io/ggml-org/llama.cpp:server-rocm, b12063 (2cbca389f), built on ROCm
-# 7.2.1 by upstream's .devops/rocm.Dockerfile. amd64 only.
+# llama.cpp's server on AMD through ROCm (HIP), for GGUF weights: upstream's
+# server-rocm image, built by its .devops/rocm.Dockerfile. amd64 only.
 - id: llamacpp-rocm
   server: llamaCpp
   family: amd
   runtime: rocm
   arch: x86_64
-  image: ghcr.io/ggml-org/llama.cpp@sha256:cac35f0d13f73fb3bd533f7287ff59701cc5d3742c3af0a0a829d05b96d4b38e
   formats: [gguf]
   command: [/app/llama-server, -m, "{weights}", --alias, "{servedName}", --host, 0.0.0.0, --port, "{port}", -ngl, "999"]
   notes: >-
@@ -87,15 +82,12 @@
     in the image. On Strix Halo, ROCm generally prefills faster than Vulkan and
     Vulkan sometimes decodes faster (strixhalo.wiki/AI/llamacpp-with-ROCm).
 
-# vLLM on AMD through ROCm: vLLM's own ROCm release image,
-# vllm/vllm-openai-rocm:v0.33.0 (the same as its v0.33.0-rocm100 tag, ROCm
-# 10.0). amd64 only.
+# vLLM on AMD through ROCm: vLLM's own ROCm release image. amd64 only.
 - id: vllm-rocm
   server: vllm
   family: amd
   runtime: rocm
   arch: x86_64
-  image: docker.io/vllm/vllm-openai-rocm@sha256:4fcd39b758b660c4e9c345c021e2ea8f0ccdb31e3c32507d676cc3005ae83fba
   formats: [safetensors]
   command: [vllm, serve, "{model}", --revision, "{revision}", --served-model-name, "{servedName}", --host, 0.0.0.0, --port, "{port}"]
   notes: >-
@@ -108,20 +100,15 @@
     the faster engine for one stream.
 
 # llama.cpp's server on Apple silicon through Metal, for GGUF weights, run
-# natively: upstream's macOS arm64 release build b12283, which carries its
-# Metal library beside the binary (`llama-b12283/`).
+# natively: upstream's macOS arm64 release build, which carries its Metal
+# library beside the binary.
 - id: llamacpp-metal
   server: llamaCpp
   family: apple
   runtime: metal
   arch: aarch64
-  artifact:
-    url: https://github.com/ggml-org/llama.cpp/releases/download/b12283/llama-b12283-bin-macos-arm64.tar.gz
-    version: b12283
-    sha256: bbc2abe2001293687540fb274bf4114b27b56af1fc166ee76730f64996d68b00
-    packaging: {kind: archive}
   formats: [gguf]
-  command: [llama-b12283/llama-server, -m, "{weights}", --alias, "{servedName}", --host, 0.0.0.0, --port, "{port}", -ngl, "999"]
+  args: [-m, "{weights}", --alias, "{servedName}", --host, 0.0.0.0, --port, "{port}", -ngl, "999"]
   notes: >-
     Metal lets the GPU wire about 84% of the machine's memory on macOS 26 (a
     128 GiB M4 Max reports 110100 MiB to `llama-server --list-devices`); a
@@ -132,21 +119,16 @@
     projector), since MLX's server serves neither.
 
 # MLX on Apple silicon: mlx-lm's server, for the MLX quantizations
-# mlx-community publishes. The mlx-lm 0.32.2 wheel from PyPI, installed by
-# Cairn's uv on Python 3.12 with its dependencies (mlx among them) resolved as
-# PyPI stood on 2026-10-17.
+# mlx-community publishes. The mlx-lm wheel from PyPI, installed by Cairn's uv
+# with its dependencies (mlx among them) resolved as PyPI stood on the pin's
+# resolvedBefore.
 - id: mlxlm-metal
   server: mlxLm
   family: apple
   runtime: metal
   arch: aarch64
-  artifact:
-    url: https://files.pythonhosted.org/packages/d1/4f/000eefdeb41388782b47e7f39904cf2d9e7e49a60df5e172097c358dba8e/mlx_lm-0.32.2-py3-none-any.whl
-    version: 0.32.2
-    sha256: 5c0991248cfff5872503d74f466d2532dd8cb7fb3670cb9be7a06d7305dadc04
-    packaging: {kind: wheel, python: "3.12", resolvedBefore: "2026-10-17T00:00:00Z"}
   formats: [mlx]
-  command: [mlx_lm.server, --model, "{snapshot}", --host, 0.0.0.0, --port, "{port}"]
+  args: [--model, "{snapshot}", --host, 0.0.0.0, --port, "{port}"]
   notes: >-
     mlx_lm.server serves chat and text completions only: no embeddings and no
     image input, which on Apple are llama.cpp's. It takes no context limit
@@ -160,23 +142,19 @@
 
 # oMLX on Apple silicon: a batching MLX server (continuous batching, paged
 # and SSD KV caches, Lightning MTP drafting) for the MLX and oQ
-# quantizations mlx-community publishes. Upstream's 0.8.3 release wheel for
-# CPython 3.12, a GitHub release asset pinned by the sha256 GitHub states
-# for it, installed by Cairn's uv with its PyPI dependencies resolved as PyPI
-# stood on 2026-11-23. Its mlx-lm, mlx-vlm, mlx-audio and mlx-embeddings are
-# git commits the wheel itself pins, so the install needs git on the machine.
+# quantizations mlx-community publishes. Upstream's release wheel for CPython
+# 3.12, a GitHub release asset pinned by the sha256 GitHub states for it,
+# installed by Cairn's uv with its PyPI dependencies resolved as PyPI stood
+# on the pin's resolvedBefore. Its mlx-lm, mlx-vlm, mlx-audio and
+# mlx-embeddings are git commits the wheel itself pins, so the install needs
+# git on the machine.
 - id: omlx-metal
   server: omlx
   family: apple
   runtime: metal
   arch: aarch64
-  artifact:
-    url: https://github.com/jundot/omlx/releases/download/v0.8.3/omlx-0.8.3-cp312-cp312-macosx_15_0_universal2.whl
-    version: 0.8.3
-    sha256: 7604c313d387eb4bff0292c114c56dcbe022cefea44dc089e26ae718650adbaf
-    packaging: {kind: wheel, python: "3.12", resolvedBefore: "2026-11-23T00:00:00Z"}
   formats: [mlx]
-  command: [omlx, serve, --host, 0.0.0.0, --port, "{port}", --headless]
+  args: [serve, --host, 0.0.0.0, --port, "{port}", --headless]
   notes: >-
     Cairn starts it on a model folder whose one entry is the served name
     linked to the pinned snapshot, so the served name is one folder name
@@ -192,20 +170,23 @@
     Changing models means stopping the server and starting another: oMLX's
     own unload freed under 1 GB of about 178 GB of DeepSeek V4.1 Flash, and
     then no model would load (507). Its shutdown on TERM waits for the
-    requests in flight with no timeout, so a stop during a long generation
-    lasts as long as that request; Cairn waits for the process to exit and
-    never kills it (a killed process holding a large wired model can strand
-    that memory until a reboot, oMLX issue 2184). Thinking is on by default
+    requests in flight with no timeout, and it aborts a generation once
+    the client's connection closes, so before TERM Cairn takes the
+    deployment out of routing and cuts off its own calls to it; a stop then
+    waits only on a client outside Cairn. Cairn waits for the process to
+    exit and never kills it (a killed process holding a large wired model
+    can strand that memory until a reboot, oMLX issue 2184). Thinking is on by default
     and chosen per request (chat_template_kwargs {thinking_mode: chat}
     turns it off); reasoning arrives as reasoning_content, and usage adds
     timings such as time_to_first_token. It takes 8 concurrent requests
     unless the profile passes --max-concurrent-requests. For DeepSeek V4.1
-    Flash: 0.8.3 has the operator's decode and MTP-depth changes (#5395,
-    #5525, #5527) but not the indexer batching (#5549) or the 2-bit code
-    decoding (#5555), merged after it, nor the batched drafter, which is
-    not upstream yet, so its speed with several streams is below the tuned
-    figures in cairn://p/cairn/models/attachments/25; a release with them
-    is a change of this pin. The tuned branch's V41_* variables have no
-    upstream equivalent and upstream reads none of them: draft depth
-    defaults to the DSpark block size (5), and there is no output-head
-    quantization, so nothing here changes the shipped weights' output.
+    Flash on 0.8.3, the release first pinned: it has the operator's decode
+    and MTP-depth changes (#5395, #5525, #5527) but not the indexer batching
+    (#5549) or the 2-bit code decoding (#5555), merged after it, nor the
+    batched drafter, which is not upstream yet, so its speed with several
+    streams is below the tuned figures in cairn://p/cairn/models/attachments/25;
+    a release with them is a bump of this template's engine pin. The tuned
+    branch's V41_* variables have no upstream equivalent and upstream reads
+    none of them: draft depth defaults to the DSpark block size (5), and
+    there is no output-head quantization, so nothing here changes the
+    shipped weights' output.

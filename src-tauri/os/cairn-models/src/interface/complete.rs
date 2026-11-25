@@ -73,6 +73,22 @@ impl CompletionWire<'_> {
         }
     }
 
+    /// What withdraws this route's endpoint, when Cairn can (one of its own
+    /// deployments), and the provider's name for the error that says so.
+    pub fn withdrawal(&self) -> Option<(&crate::wire::withdrawal::Withdrawal, &str)> {
+        match self {
+            Self::Chat(endpoint) => endpoint
+                .withdrawal
+                .as_ref()
+                .map(|withdrawal| (withdrawal, endpoint.provider_name.as_str())),
+            Self::Embeddings(endpoint) => endpoint
+                .withdrawal
+                .as_ref()
+                .map(|withdrawal| (withdrawal, endpoint.provider_name.as_str())),
+            _ => None,
+        }
+    }
+
     /// The catalog's name for the protocol this route speaks. This is where a
     /// launch's route meets the wire an offer declares: compare through it,
     /// never by family string.

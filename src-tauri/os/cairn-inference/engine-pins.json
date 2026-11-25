@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "engines": {
+    "llamacpp-cuda": {
+      "reason": "llama.cpp's server-cuda image as ghcr.io served it when the template was chosen.",
+      "image": "ghcr.io/ggml-org/llama.cpp@sha256:75037a842f2ec1d1b5317ce64078bbb4a2a134238e91a755c10ce31d8f90550a",
+      "tag": "server-cuda"
+    },
+    "llamacpp-metal": {
+      "reason": "Upstream's macOS arm64 release build b12283, which carries its Metal library beside the binary.",
+      "artifact": {
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12283/llama-b12283-bin-macos-arm64.tar.gz",
+        "version": "b12283",
+        "sha256": "bbc2abe2001293687540fb274bf4114b27b56af1fc166ee76730f64996d68b00",
+        "packaging": {
+          "kind": "archive"
+        }
+      },
+      "program": "llama-b12283/llama-server"
+    },
+    "llamacpp-rocm": {
+      "reason": "server-rocm b12063 (2cbca389f), built on ROCm 7.2.1 by upstream's .devops/rocm.Dockerfile; amd64 only.",
+      "image": "ghcr.io/ggml-org/llama.cpp@sha256:cac35f0d13f73fb3bd533f7287ff59701cc5d3742c3af0a0a829d05b96d4b38e",
+      "tag": "server-rocm"
+    },
+    "llamacpp-vulkan": {
+      "reason": "server-vulkan b11681, the build halo has run its embedder on.",
+      "image": "ghcr.io/ggml-org/llama.cpp@sha256:afdc5265d1cfc729ad3ebaac59fd60e5d15c3b7aef455d7dc16bc1dccbc4dc64",
+      "tag": "server-vulkan"
+    },
+    "mlxlm-metal": {
+      "reason": "The mlx-lm 0.32.2 wheel from PyPI, its dependencies (mlx among them) resolved as PyPI stood on 2026-10-17.",
+      "artifact": {
+        "url": "https://files.pythonhosted.org/packages/d1/4f/000eefdeb41388782b47e7f39904cf2d9e7e49a60df5e172097c358dba8e/mlx_lm-0.32.2-py3-none-any.whl",
+        "version": "0.32.2",
+        "sha256": "5c0991248cfff5872503d74f466d2532dd8cb7fb3670cb9be7a06d7305dadc04",
+        "packaging": {
+          "kind": "wheel",
+          "python": "3.12",
+          "resolvedBefore": "2026-10-17T00:00:00Z"
+        }
+      },
+      "program": "mlx_lm.server"
+    },
+    "omlx-metal": {
+      "reason": "Upstream oMLX 0.8.3's CPython 3.12 release wheel, pinned by the sha256 GitHub states for it, its PyPI dependencies resolved as PyPI stood on 2026-11-23. It has the operator's decode and MTP-depth changes (#5395, #5525, #5527) but not the indexer batching (#5549), the 2-bit code decoding (#5555) or the batched drafter.",
+      "artifact": {
+        "url": "https://github.com/jundot/omlx/releases/download/v0.8.3/omlx-0.8.3-cp312-cp312-macosx_15_0_universal2.whl",
+        "version": "0.8.3",
+        "sha256": "7604c313d387eb4bff0292c114c56dcbe022cefea44dc089e26ae718650adbaf",
+        "packaging": {
+          "kind": "wheel",
+          "python": "3.12",
+          "resolvedBefore": "2026-11-23T00:00:00Z"
+        }
+      },
+      "program": "omlx"
+    },
+    "vllm-ngc": {
+      "reason": "NVIDIA's NGC build of vLLM, the one bginf's Qwen3.6 ran.",
+      "image": "nvcr.io/nvidia/vllm@sha256:94e21552f644e0c1627464ba89d2f7a4ce7442e196f72afa0bb5d7fba23cbb03",
+      "tag": "26.05.post1-py3"
+    },
+    "vllm-openai": {
+      "reason": "vLLM's upstream release image.",
+      "image": "docker.io/vllm/vllm-openai@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34",
+      "tag": "v0.32.0"
+    },
+    "vllm-rocm": {
+      "reason": "vLLM's own ROCm release image, the same as its v0.33.0-rocm100 tag (ROCm 10.0); amd64 only.",
+      "image": "docker.io/vllm/vllm-openai-rocm@sha256:4fcd39b758b660c4e9c345c021e2ea8f0ccdb31e3c32507d676cc3005ae83fba",
+      "tag": "v0.33.0"
+    }
+  }
+}

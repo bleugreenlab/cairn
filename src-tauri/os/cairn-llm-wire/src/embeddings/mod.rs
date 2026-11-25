@@ -19,6 +19,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
+use crate::withdrawal::{self, SendError, Withdrawal};
 use crate::{upstream_error_detail, CompletionError};
 
 /// Header values carry bearer keys and device tokens; only their names are
@@ -57,7 +58,9 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 /// credits (402) from a rate limit (429), followed by the sentence the
 /// provider wrote. `hint` adds a clause for a status that usually means the
 /// wrong kind of model. A request that never reached the provider is
-/// [`CompletionError::Unreachable`].
+/// [`CompletionError::Unreachable`]; one cut off by `withdrawal` is
+/// [`CompletionError::Withdrawn`].
+#[allow(clippy::too_many_arguments)]
 fn post(
     provider_name: &str,
     what: &str,
@@ -66,33 +69,33 @@ fn post(
     body: &Value,
     timeout: Duration,
     hint: fn(u16) -> Option<&'static str>,
+    withdrawal: Option<&Withdrawal>,
 ) -> Result<String, CompletionError> {
-    let client = cairn_tls::blocking_client_builder()
+    let client = cairn_tls::client_builder()
         .timeout(timeout)
         .build()
         .map_err(|error| CompletionError::Upstream(error.to_string()))?;
-    let response = client
+    let request = client
         .post(url)
         .headers(header_map(provider_name, headers).map_err(CompletionError::InvalidRequest)?)
-        .json(body)
-        .send()
-        .map_err(|error| {
-            if error.is_timeout() {
-                CompletionError::Timeout
-            } else {
-                CompletionError::Unreachable(format!(
-                    "{provider_name} {what} request failed: {error}"
-                ))
-            }
-        })?;
+        .json(body);
+    let response = withdrawal::send(request, withdrawal).map_err(|error| match error {
+        SendError::Withdrawn => CompletionError::withdrawn(provider_name),
+        SendError::Request(error) if error.is_timeout() => CompletionError::Timeout,
+        SendError::Request(error) => {
+            CompletionError::Unreachable(format!("{provider_name} {what} request failed: {error}"))
+        }
+    })?;
     let status = response.status();
     let wait = retry_after(response.headers());
-    let text = response.text().map_err(|error| {
-        if error.is_timeout() {
-            CompletionError::Timeout
-        } else {
-            CompletionError::InvalidResponse(error.to_string())
+    let text = response.text().map_err(|error| match error.kind() {
+        std::io::ErrorKind::TimedOut => CompletionError::Timeout,
+        std::io::ErrorKind::ConnectionAborted
+            if withdrawal.is_some_and(Withdrawal::is_withdrawn) =>
+        {
+            CompletionError::withdrawn(provider_name)
         }
+        _ => CompletionError::InvalidResponse(error.to_string()),
     })?;
     if !status.is_success() {
         let code = status.as_u16();

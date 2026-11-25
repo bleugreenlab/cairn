@@ -41,6 +41,7 @@ use cairn_inference::{
 use super::inference::load_inventory;
 use super::inference_generate::promotion::{self, Gate};
 use super::inference_keys;
+use super::inference_route;
 use super::Orchestrator;
 use crate::fleet::inference::Preemption;
 use crate::fleet::models::room::{gpu_allocated_bytes, RunningBatch};
@@ -727,6 +728,9 @@ async fn settle(
         before.map_or("(never acted on)", Phase::label),
         after.label()
     );
+    if matches!(after, Phase::Healthy { .. }) {
+        inference_route::renew(id);
+    }
     if let (Some(before), Some(deployment)) = (before, inventory.deployments.get(id)) {
         if let Some(outcome) = control::finished_load(before, after) {
             record_load(db, deployment, before, outcome, now_ms).await?;
@@ -740,6 +744,39 @@ async fn settle(
         }
     }
     Ok(())
+}
+
+/// How long a stop waits for the calls it cut off to close their connections
+/// before it sends the stop anyway. Closing takes milliseconds; a call still
+/// open after this is one the stop then waits on, as before.
+const WITHDRAW_WAIT: Duration = Duration::from_secs(10);
+
+/// Take `id` out of every call before its server is asked to exit: routes to
+/// it are refused from now on, and each call in flight is cut off, its
+/// connection closed. A server whose graceful shutdown waits for its open
+/// requests (oMLX's, with no timeout) aborts a generation once its client's
+/// connection closes, so with Cairn's calls gone its stop no longer waits
+/// on the longest of them. A client outside Cairn still holds it.
+async fn withdraw_calls(id: &DeploymentId) {
+    let withdrawal = inference_route::withdraw(id);
+    let cut = withdrawal.in_flight();
+    if cut == 0 {
+        return;
+    }
+    let started = std::time::Instant::now();
+    while withdrawal.in_flight() > 0 && started.elapsed() < WITHDRAW_WAIT {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    match withdrawal.in_flight() {
+        0 => log::info!(
+            "inference: deployment {id} withdrawn: {cut} call(s) to it cut off and closed in {}ms",
+            started.elapsed().as_millis()
+        ),
+        open => log::warn!(
+            "inference: deployment {id} withdrawn: {open} of the {cut} call(s) cut off were still open after {}s, so its stop is sent anyway and waits for them",
+            WITHDRAW_WAIT.as_secs()
+        ),
+    }
 }
 
 fn machine_list(deployment: &Deployment) -> String {
@@ -824,6 +861,7 @@ pub(crate) async fn request(
         )),
         Phase::Stopping { .. } => {
             let operation = plan.stop_operation().expect("checked above");
+            withdraw_calls(&id).await;
             if let Err(why) = heads.send(deployment.head.as_str(), &stop_command, id.as_str(), operation) {
                 let reason = format!("the stop could not be sent: {why}");
                 apply(

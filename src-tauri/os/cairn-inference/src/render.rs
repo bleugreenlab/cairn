@@ -803,7 +803,9 @@ fn native_word(value: &str) -> String {
 /// holding 2, 4 and 8 GiB of wired MLX arrays exited 0.06, 0.07 and 0.08 s
 /// after TERM on an M4 Pro. What takes long is the server's own graceful
 /// shutdown, which oMLX 0.8.3 (through uvicorn, with no shutdown timeout)
-/// holds open until its in-flight requests finish. So the grace is as long
+/// holds open until its in-flight requests finish. Cairn cuts its own calls
+/// off before it sends the stop (`inference_control`'s stop order), so what
+/// can still hold it is a client outside Cairn. So the grace is as long
 /// as the executor lets a stop run ([`crate::control::STOP_TIMEOUT_SECS`]),
 /// less a minute for the rest of the script, and a stop that runs out
 /// fails rather than reporting a server stopped that still holds its

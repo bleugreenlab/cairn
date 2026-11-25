@@ -37,6 +37,7 @@ impl OllamaAdapter {
                 backend_key: OLLAMA_BACKEND_KEY.to_string(),
                 chat_url: format!("{}/v1/chat/completions", base_url.trim_end_matches('/')),
                 headers: vec![("content-type".into(), "application/json".into())],
+                withdrawal: None,
             },
         })
     }
@@ -170,6 +171,7 @@ mod tests {
                 backend_key: OLLAMA_BACKEND_KEY.to_string(),
                 chat_url: "http://127.0.0.1:1/v1/chat/completions".to_string(),
                 headers: vec![("content-type".into(), "application/json".into())],
+                withdrawal: None,
             },
         }
     }
@@ -195,6 +197,7 @@ mod tests {
                 backend_key: OLLAMA_BACKEND_KEY.to_string(),
                 chat_url: format!("http://{address}/v1/chat/completions"),
                 headers: vec![("content-type".into(), "application/json".into())],
+                withdrawal: None,
             },
         }
     }

@@ -14,3 +14,6 @@ log = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "charset", "http2", "macos-system-configuration", "rustls-tls-native-roots"] }
 # The process's one TLS trust configuration: every client here is built on it.
 cairn-tls = { path = "../cairn-tls" }
+# A call that may be cut off is sent on the async client, on the wire's own
+# runtime, so dropping its future closes the connection (see withdrawal.rs).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

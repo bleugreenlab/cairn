@@ -56,6 +56,7 @@ impl CustomAdapter {
             backend_key: backend_key.clone(),
             chat_url: config.chat_url(),
             headers: config.headers.clone(),
+            withdrawal: None,
         };
         Self {
             config,
