@@ -1831,6 +1831,20 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<JobPreparation, 
         Err(CoordinateRefusal::Failed(error)) => return Err(error),
     };
 
+    // The archival base can move on a carry and can sit behind adopted work.
+    // Log the prepared head before any agent runs so replay attribution has an
+    // immutable first-launch coordinate, including across resumed sessions.
+    let agent_start_commit = match branch.as_deref() {
+        Some(branch) => match crate::jj::bookmark_commit_checked(&jj, &store, branch) {
+            Ok(commit) => commit,
+            Err(error) => {
+                log::warn!("[prepare_job] job {job_id}: start coordinate unavailable: {error}");
+                None
+            }
+        },
+        None => base_commit.clone(),
+    };
+
     // A branch's plan comparison starts at its live fork point with the base,
     // which a restart or adopted work leaves behind the archival base commit.
     // The bookmark exists by now, minted or not; a branchless job sits on its
@@ -2021,6 +2035,9 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<JobPreparation, 
     // composed from the issue's resolved inputs, so a watching parent must never
     // be shown its own issue description as something a person said (CAIRN-3408).
     store_launch_event_with_turn(orch, &run_id, &session_id, &prompt, now, Some(&turn_id))?;
+    if let Some(commit) = agent_start_commit.as_deref() {
+        log::info!("[prepare_job] job {job_id}: agent_start_commit={commit} run_id={run_id}");
+    }
 
     // ---- Emit system message for job start ------------------------------
     crate::messages::system::emit_job_event(
