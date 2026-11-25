@@ -535,13 +535,14 @@ impl EnrollmentOperations {
             .cloned()
     }
 
+    /// Drop the operations of one removed machine. Not by host: a host can
+    /// carry a second enrollment, whose operations are not this machine's.
     fn forget_identity(&self, reference: &str) -> Vec<EnrollmentOperation> {
         let mut entries = self.entries.lock().unwrap();
         let mut removed = Vec::new();
         entries.retain(|entry| {
-            let matches = executor_names_match(&entry.name, reference)
-                || entry.host.eq_ignore_ascii_case(reference)
-                || entry.executor_id == reference;
+            let matches =
+                executor_names_match(&entry.name, reference) || entry.executor_id == reference;
             if matches {
                 removed.push(entry.clone());
             }
@@ -763,11 +764,31 @@ fn silence_phrase(ms: u64) -> String {
 pub fn resolve_executor_reference(orch: &Orchestrator, reference: &str) -> Result<String, String> {
     let configured = crate::config::settings::load_fleet(&orch.config_dir);
     if let Some(config) = configured.remote_executors.values().find(|config| {
-        executor_names_match(&config.display_name, reference)
-            || executor_names_match(&config.host, reference)
-            || config.executor_id == reference
+        executor_names_match(&config.display_name, reference) || config.executor_id == reference
     }) {
         return Ok(config.executor_id.clone());
+    }
+    // A host can carry two enrollments (an ordinary executor and its
+    // publisher), so a host addresses a machine only when it names one.
+    let by_host: Vec<_> = configured
+        .remote_executors
+        .values()
+        .filter(|config| executor_names_match(&config.host, reference))
+        .collect();
+    match by_host.as_slice() {
+        [] => {}
+        [config] => return Ok(config.executor_id.clone()),
+        several => {
+            let names: Vec<_> = several
+                .iter()
+                .map(|config| config.display_name.as_str())
+                .collect();
+            return Err(format!(
+                "{reference} is the host of {} enrolled executors ({}); name the one you mean",
+                several.len(),
+                names.join(", ")
+            ));
+        }
     }
     // Attached machines include the runner's own colocated executor, which has
     // no remote declaration but is still a live target for drain and policy.
@@ -780,11 +801,19 @@ pub fn resolve_executor_reference(orch: &Orchestrator, reference: &str) -> Resul
     }
     let operations = orch.fleet.management().operations.all();
     if let Some(operation) = operations.iter().rev().find(|operation| {
-        executor_names_match(&operation.name, reference)
-            || executor_names_match(&operation.host, reference)
-            || operation.executor_id == reference
+        executor_names_match(&operation.name, reference) || operation.executor_id == reference
     }) {
         return Ok(operation.executor_id.clone());
+    }
+    let mut by_host: Vec<_> = operations
+        .iter()
+        .rev()
+        .filter(|operation| executor_names_match(&operation.host, reference))
+        .map(|operation| operation.executor_id.as_str())
+        .collect();
+    by_host.dedup();
+    if let [executor_id] = by_host.as_slice() {
+        return Ok(executor_id.to_string());
     }
     let mut known: Vec<_> = configured
         .remote_executors
@@ -879,7 +908,18 @@ pub fn declaration_defaults(
     request: &EnrollmentRequest,
     configured: &FleetConfig,
 ) -> Result<RemoteExecutorDeclaration, String> {
-    let derived_executor_id = safe_executor_id(&request.host);
+    let mut derived_executor_id = safe_executor_id(&request.host);
+    // The identity a host derives belongs to the account enrolled there. A
+    // second account on that host (the publisher beside its ordinary
+    // executor) is a new enrollment, not a re-add of that one, so it derives
+    // its own.
+    if configured
+        .remote_executors
+        .get(&derived_executor_id)
+        .is_some_and(|existing| !existing.ssh_user.eq_ignore_ascii_case(&request.ssh_user))
+    {
+        derived_executor_id = safe_executor_id(&format!("{}-{}", request.ssh_user, request.host));
+    }
     let executor_id = request
         .executor_id
         .as_deref()
@@ -4733,6 +4773,47 @@ mod tests {
             ssh_user: "dev".into(),
             ..EnrollmentRequest::default()
         }
+    }
+
+    /// A second account on an enrolled host derives an identity of its own
+    /// rather than being read as a re-add of the account already there.
+    #[test]
+    fn a_second_account_on_an_enrolled_host_derives_its_own_identity() {
+        let ordinary = declaration_defaults(&request("fedora"), &FleetConfig::default()).unwrap();
+        let mut configured = FleetConfig::default();
+        configured.remote_executors.insert(
+            ordinary.executor_id.clone(),
+            RemoteExecutorConfig {
+                host: ordinary.host.clone(),
+                ssh_user: ordinary.ssh_user.clone(),
+                platform: super::super::RemotePlatform::LinuxX86_64,
+                binary_path: "/home/dev/.local/bin/cairn-exec".into(),
+                cairn_home: "/home/dev/.cairn-exec".into(),
+                executor_id: ordinary.executor_id.clone(),
+                device_id: ordinary.device_id.clone(),
+                display_name: ordinary.display_name.clone(),
+                project_ids: Vec::new(),
+                bootstrapped_at_unix_ms: None,
+                legacy_retired_at_unix_ms: None,
+                legacy_tunnel_port: None,
+                extra_ssh_args: Vec::new(),
+            },
+        );
+        let publisher = declaration_defaults(
+            &EnrollmentRequest {
+                ssh_user: "cairn-publish".into(),
+                ..request("fedora")
+            },
+            &configured,
+        )
+        .unwrap();
+        assert_eq!(publisher.executor_id, "cairn-publish-fedora");
+        assert_eq!(publisher.ssh_user, "cairn-publish");
+        assert_eq!(publisher.cairn_home, None, "derived from its own account");
+        assert_eq!(publisher.binary_path, None, "derived from its own account");
+
+        let readd = declaration_defaults(&request("fedora"), &configured).unwrap();
+        assert_eq!(readd.executor_id, "fedora", "the same account is a re-add");
     }
 
     #[test]
