@@ -10089,7 +10089,18 @@ pub struct LearnedResourceEstimate {
 /// renders; it is inspection state and never crosses to an executor. No
 /// executor frame, field, admission rule or placement outcome changes, so a
 /// runner talking to an older executor gets nothing wrong.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 178;
+///
+/// Version 179 (cairn/7563) gives every inference deployment an API key.
+/// Each [`DeploymentOperation`] gains a defaulted `api_key`
+/// ([`DeploymentApiKey`]): the head runs the start and stop scripts with it in
+/// [`DEPLOYMENT_API_KEY_ENV`] and sends it as a bearer on every health check,
+/// a probe's included. What a runner gets wrong talking to a 178 executor:
+/// that executor drops the field, so its health checks reach an engine that
+/// now requires a key without one. vLLM answers its `/v1/models` health path
+/// 401, so a probe reports a healthy deployment stopped and the runner fails
+/// it as an engine gone, and a start reads as never healthy. That is a wrong
+/// read rather than a refusal, so the number moves (tenet 541).
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 179;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -27542,8 +27553,47 @@ mod relay_wire_tests {
     }
 }
 
+/// The variable a deployment's head sets to [`DeploymentApiKey`] in every
+/// script it runs for the deployment. The rendered scripts name it (the
+/// renderer's `cairn_inference::render::API_KEY_ENV`), never the key.
+pub const DEPLOYMENT_API_KEY_ENV: &str = "CAIRN_INFERENCE_API_KEY";
+
+/// The API key the runner minted for one deployment, which its engine
+/// requires of every request. The head hands it to the scripts in
+/// [`DEPLOYMENT_API_KEY_ENV`] and sends it as a bearer on its own health
+/// checks. Its `Debug` never shows the value, so a logged command does not
+/// carry it.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct DeploymentApiKey(String);
+
+impl DeploymentApiKey {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// The key itself, for the one place it is sent or stored.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// The `Authorization` header's value.
+    pub fn bearer(&self) -> String {
+        format!("Bearer {}", self.0)
+    }
+}
+
+impl std::fmt::Debug for DeploymentApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeploymentApiKey(<redacted>)")
+    }
+}
+
 /// What the runner asks a deployment's head to do. Only the head acts; a
-/// multi-machine profile's own scripts drive the other machines.
+/// multi-machine profile's own scripts drive the other machines. Each
+/// operation carries the deployment's `api_key` when it has one: every
+/// script then runs with it in [`DEPLOYMENT_API_KEY_ENV`], and every health
+/// check sends it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "operation", rename_all = "camelCase")]
 pub enum DeploymentOperation {
@@ -27562,6 +27612,8 @@ pub enum DeploymentOperation {
         health_url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cleanup: Option<DeploymentScript>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<DeploymentApiKey>,
     },
     /// Run `script`, bounded by `timeout_secs`, then wait up to
     /// `stopped_health_wait_secs` for `health_url` to stop answering. A start
@@ -27571,9 +27623,15 @@ pub enum DeploymentOperation {
         health_url: String,
         timeout_secs: u64,
         stopped_health_wait_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<DeploymentApiKey>,
     },
     /// One request to `health_url`, answered healthy or stopped.
-    Probe { health_url: String },
+    Probe {
+        health_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<DeploymentApiKey>,
+    },
 }
 
 /// A shell script and how long it may run.
@@ -29534,6 +29592,7 @@ mod tests {
                         script: "./stop.sh".into(),
                         timeout_secs: 600,
                     }),
+                    api_key: None,
                 },
             },
             ExecutorMessage::DeploymentCommand {
@@ -29544,6 +29603,7 @@ mod tests {
                     health_url: "http://10.20.20.40:8888/v1/models".into(),
                     timeout_secs: 600,
                     stopped_health_wait_secs: 120,
+                    api_key: None,
                 },
             },
             ExecutorMessage::DeploymentCommand {
@@ -29551,6 +29611,7 @@ mod tests {
                 deployment: "dsv4f-tp2".into(),
                 operation: DeploymentOperation::Probe {
                     health_url: "http://10.20.20.40:8888/v1/models".into(),
+                    api_key: None,
                 },
             },
             ExecutorMessage::DeploymentReport {

@@ -24,35 +24,45 @@ use crate::messages::transcript::insert_system_message_sync;
 use crate::orchestrator::inference_route::{ready_blocking, Route};
 use crate::orchestrator::Orchestrator;
 
-/// The chat endpoint of `route`'s deployment. The engines take no credential:
-/// they answer only on the lab network their pool's record names.
+/// The `Authorization` header every request to `route`'s engine carries: the
+/// deployment's own key, which Cairn minted when it started it.
+fn authorization(route: &Route) -> Option<(String, String)> {
+    route
+        .api_key
+        .as_ref()
+        .map(|key| ("authorization".to_string(), key.bearer()))
+}
+
+/// The chat endpoint of `route`'s deployment, which a decision uses too.
 pub(super) fn endpoint(route: &Route) -> Endpoint {
+    let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
+    headers.extend(authorization(route));
     Endpoint {
         provider_name: INFERENCE_BACKEND_NAME.to_string(),
         backend_key: INFERENCE_BACKEND_KEY.to_string(),
         chat_url: route.chat_url(),
-        headers: vec![("content-type".to_string(), "application/json".to_string())],
+        headers,
     }
 }
 
-/// The embeddings endpoint of `route`'s deployment, which takes no credential
-/// either.
+/// The embeddings endpoint of `route`'s deployment.
 pub(super) fn embed_route(route: &Route) -> cairn_models::interface::embed::EmbedRoute {
     cairn_models::embed::openai::route_for(
         INFERENCE_BACKEND_KEY,
         INFERENCE_BACKEND_NAME,
         &route.api_base,
-        None,
+        route.api_key.as_ref().map(|key| key.expose()),
         &[],
     )
 }
 
-/// The relay route to `route`'s deployment: its API base, no credential, and
-/// the engine's own name for the model, whatever name the client asked by.
+/// The relay route to `route`'s deployment: its API base and key, and the
+/// engine's own name for the model, whatever name the client asked by. The
+/// outside client's own credential is Cairn's to check, never forwarded.
 pub(super) fn relay_route(route: &Route) -> cairn_models::interface::relay::RelayRoute {
     cairn_models::interface::relay::RelayRoute {
         base_url: route.api_base.clone(),
-        headers: Vec::new(),
+        headers: authorization(route).into_iter().collect(),
         backend_key: INFERENCE_BACKEND_KEY.to_string(),
         provider_name: INFERENCE_BACKEND_NAME.to_string(),
         sent_model: route.served_name.clone(),

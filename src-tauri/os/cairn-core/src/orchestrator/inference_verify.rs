@@ -35,6 +35,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use cairn_common::executor_protocol::DeploymentApiKey;
 use cairn_db::turso::params;
 use cairn_inference::control::{Phase, START_REPORT_BOUND_SECS, STOP_REPORT_BOUND_SECS};
 use cairn_inference::verify::{self, ChatSample, EmbedSample, Speeds, Stage};
@@ -52,6 +53,7 @@ use super::inference::{
 };
 use super::inference_control::{load_history, load_states, rendered_head, SETTLE_MS};
 use super::inference_generate::promotion::{self, Admission, Binding, Gate};
+use super::inference_keys::{self, Keyed as _};
 use crate::fleet::models::{self, store::load_pins, PinTarget};
 use crate::fleet::pools::{Pool, PoolKey};
 use crate::storage::{LocalDb, RowExt};
@@ -76,10 +78,21 @@ pub trait Act: Send + Sync {
     ) -> Pending<'_, Result<String, String>>;
     /// Release `holder`'s pin on `deployment`, leaving it resident.
     fn unpin(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>>;
-    /// A GET's body, `None` when it did not answer successfully.
-    fn get(&self, url: String) -> Pending<'_, Option<String>>;
-    fn chat(&self, api_base: String, model: String) -> Pending<'_, Result<ChatSample, String>>;
-    fn embed(&self, api_base: String, model: String) -> Pending<'_, Result<EmbedSample, String>>;
+    /// A GET's body, `None` when it did not answer successfully. Every
+    /// request to the engine carries its deployment's `key`.
+    fn get(&self, url: String, key: Option<DeploymentApiKey>) -> Pending<'_, Option<String>>;
+    fn chat(
+        &self,
+        api_base: String,
+        model: String,
+        key: Option<DeploymentApiKey>,
+    ) -> Pending<'_, Result<ChatSample, String>>;
+    fn embed(
+        &self,
+        api_base: String,
+        model: String,
+        key: Option<DeploymentApiKey>,
+    ) -> Pending<'_, Result<EmbedSample, String>>;
     fn sleep(&self, ms: u64) -> Pending<'_, ()>;
     fn now_ms(&self) -> i64;
     /// How the attached machines are reached now.
@@ -842,6 +855,7 @@ async fn measure(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Measured
         .from_orch(&deployment.head)
         .ok_or_else(|| format!("the head {}", unknown_address(&deployment.head)))?
         .address;
+    let key = inference_keys::key(&plan.deployment);
     let mut measured = Measured {
         context: verify::context_of(&profile),
         ..Measured::default()
@@ -869,15 +883,16 @@ async fn measure(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Measured
     }
 
     let api_base = deployment.api_base(&address);
-    if let Some(models) = act.get(format!("{api_base}/models")).await {
+    if let Some(models) = act.get(format!("{api_base}/models"), key.clone()).await {
         measured.context = cairn_inference::served::max_model_len(&models, &profile.served_name)
             .or(measured.context);
     }
-    if let Some(metrics) = act.get(deployment.metrics_url(&address)).await {
+    if let Some(metrics) = act.get(deployment.metrics_url(&address), key.clone()).await {
         measured.kv = cairn_inference::metrics::kv_cache_tokens(&metrics);
     }
     let origin = api_base.trim_end_matches(&deployment.api_path).to_string();
-    measured.version = act.get(format!("{origin}/version")).await.and_then(|body| {
+    let version = act.get(format!("{origin}/version"), key.clone()).await;
+    measured.version = version.and_then(|body| {
         serde_json::from_str::<serde_json::Value>(&body)
             .ok()?
             .get("version")?
@@ -895,18 +910,18 @@ async fn measure(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Measured
         let mut samples = Vec::new();
         for _ in 0..3 {
             samples.push(
-                act.embed(api_base.clone(), profile.served_name.clone())
+                act.embed(api_base.clone(), profile.served_name.clone(), key.clone())
                     .await?,
             );
         }
         verify::embed_speeds(&samples)?
     } else {
-        act.chat(api_base.clone(), profile.served_name.clone())
+        act.chat(api_base.clone(), profile.served_name.clone(), key.clone())
             .await?;
         let mut samples = Vec::new();
         for _ in 0..3 {
             samples.push(
-                act.chat(api_base.clone(), profile.served_name.clone())
+                act.chat(api_base.clone(), profile.served_name.clone(), key.clone())
                     .await?,
             );
         }
@@ -1126,11 +1141,12 @@ impl Act for Live {
         })
     }
 
-    fn get(&self, url: String) -> Pending<'_, Option<String>> {
+    fn get(&self, url: String, key: Option<DeploymentApiKey>) -> Pending<'_, Option<String>> {
         Box::pin(async move {
             let response = self
                 .client
                 .get(&url)
+                .keyed(key.as_ref())
                 .timeout(Duration::from_secs(10))
                 .send()
                 .await
@@ -1142,7 +1158,12 @@ impl Act for Live {
         })
     }
 
-    fn chat(&self, api_base: String, model: String) -> Pending<'_, Result<ChatSample, String>> {
+    fn chat(
+        &self,
+        api_base: String,
+        model: String,
+        key: Option<DeploymentApiKey>,
+    ) -> Pending<'_, Result<ChatSample, String>> {
         Box::pin(async move {
             use futures_util::StreamExt;
             let body = serde_json::json!({
@@ -1157,6 +1178,7 @@ impl Act for Live {
             let response = self
                 .client
                 .post(format!("{api_base}/chat/completions"))
+                .keyed(key.as_ref())
                 .json(&body)
                 .send()
                 .await
@@ -1205,12 +1227,18 @@ impl Act for Live {
         })
     }
 
-    fn embed(&self, api_base: String, model: String) -> Pending<'_, Result<EmbedSample, String>> {
+    fn embed(
+        &self,
+        api_base: String,
+        model: String,
+        key: Option<DeploymentApiKey>,
+    ) -> Pending<'_, Result<EmbedSample, String>> {
         Box::pin(async move {
             let started = std::time::Instant::now();
             let answer: serde_json::Value = self
                 .client
                 .post(format!("{api_base}/embeddings"))
+                .keyed(key.as_ref())
                 .json(&serde_json::json!({"model": model, "input": verify::embed_batch()}))
                 .send()
                 .await
@@ -1530,7 +1558,7 @@ machines:
             })
         }
 
-        fn get(&self, url: String) -> Pending<'_, Option<String>> {
+        fn get(&self, url: String, _key: Option<DeploymentApiKey>) -> Pending<'_, Option<String>> {
             let kv = *self.kv_tokens.lock().unwrap();
             Box::pin(async move {
                 if url.ends_with("/v1/models") {
@@ -1551,6 +1579,7 @@ machines:
             &self,
             _api_base: String,
             _model: String,
+            _key: Option<DeploymentApiKey>,
         ) -> Pending<'_, Result<ChatSample, String>> {
             Box::pin(async move {
                 Ok(ChatSample {
@@ -1566,6 +1595,7 @@ machines:
             &self,
             _api_base: String,
             _model: String,
+            _key: Option<DeploymentApiKey>,
         ) -> Pending<'_, Result<EmbedSample, String>> {
             Box::pin(async move {
                 Ok(EmbedSample {

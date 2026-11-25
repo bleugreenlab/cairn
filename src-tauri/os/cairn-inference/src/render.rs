@@ -40,6 +40,14 @@
 //! runnable surface approved before a generated profile runs. The scripts
 //! use nothing beyond what macOS's bash 3.2 has.
 //!
+//! A deployment's API key never appears in a script. The head runs every
+//! script with it in [`API_KEY_ENV`], and the scripts only name that
+//! variable: the head's own health poll sends it as a bearer, and a server
+//! that takes a key ([`Server::api_key_env`]) is handed it in the variable it
+//! reads (a container through `-e NAME`, which copies the value from the
+//! runtime's own environment). A start given no key fails at once rather than
+//! run a server anyone on the network could use.
+//!
 //! Every value placed in a script is single-quoted by [`quote`], so no profile
 //! field reaches the shell as syntax. An argument or env value may span lines
 //! (a published compose command often does); a peer's script travels in a
@@ -79,6 +87,17 @@ pub struct MachineAt {
     /// `{self.link}` fill in.
     pub link: Option<String>,
 }
+
+/// The variable a deployment's head sets, in every script it runs for the
+/// deployment, to the deployment's API key.
+pub const API_KEY_ENV: &str = "CAIRN_INFERENCE_API_KEY";
+
+/// A start's first line after `set -euo pipefail`: no key, no start.
+const REQUIRE_KEY: &str = ": \"${CAIRN_INFERENCE_API_KEY:?this start was given no API key; the executor that ran it is older than the runner}\"\n";
+
+/// The header a curl in a script sends the key in, through a file descriptor
+/// rather than its argv.
+const KEY_HEADER: &str = "-H @<(printf 'Authorization: Bearer %s\\n' \"$CAIRN_INFERENCE_API_KEY\")";
 
 /// Single-quote `value` for a POSIX shell.
 pub fn quote(value: &str) -> String {
@@ -648,6 +667,12 @@ fn rank_script(
         }
         flags.extend(["-e".into(), quote(&format!("{key}={}", fill(value)?))]);
     }
+    // Only the head serves the API. After the profile's env, so the key the
+    // head was given is the one the server takes.
+    let key_env = container.server.api_key_env().filter(|_| rank == 0);
+    if let Some(name) = key_env {
+        flags.extend(["-e".into(), name.into()]);
+    }
     if cache {
         // Every file is already there and the mount is read-only: the
         // server must not try to fetch or write anything into it. Last, so
@@ -675,7 +700,8 @@ fn rank_script(
     out.push_str(&runtime_flags);
     let _ = writeln!(
         out,
-        "\"$rt\" run {} {}{}",
+        "{}\"$rt\" run {} {}{}",
+        key_env.map_or(String::new(), |name| format!("{name}=\"${API_KEY_ENV}\" ")),
         flags.join(" "),
         quote(&container.image),
         command
@@ -696,7 +722,7 @@ fn start_script(
     ranks: &Ranks<'_>,
 ) -> Result<String, Refusal> {
     let mut out = format!(
-        "#!/usr/bin/env bash\n# Rendered by Cairn from profile {} for deployment {}.\nset -euo pipefail\n",
+        "#!/usr/bin/env bash\n# Rendered by Cairn from profile {} for deployment {}.\nset -euo pipefail\n{REQUIRE_KEY}",
         profile.id, deployment.id
     );
     for (rank, peer) in ranks.machines.iter().enumerate().skip(1) {
@@ -724,7 +750,7 @@ fn start_script(
     ));
     let _ = writeln!(
         out,
-        "while true; do\n  if curl -fsS -o /dev/null --max-time 5 {health}; then exit 0; fi\n  if [ \"$(\"$rt\" inspect -f '{{{{.State.Running}}}}' {name} 2>/dev/null)\" != true ]; then\n    echo \"container {} exited before it was healthy; its last errors:\"\n    \"$rt\" logs --tail 400 {name} 2>&1 | grep -E 'Error|error|Exception' | tail -n 6 || \"$rt\" logs --tail 10 {name} 2>&1\n    exit 1\n  fi\n  sleep {HEALTH_POLL_SECS}\ndone",
+        "while true; do\n  if curl -fsS -o /dev/null --max-time 5 {KEY_HEADER} {health}; then exit 0; fi\n  if [ \"$(\"$rt\" inspect -f '{{{{.State.Running}}}}' {name} 2>/dev/null)\" != true ]; then\n    echo \"container {} exited before it was healthy; its last errors:\"\n    \"$rt\" logs --tail 400 {name} 2>&1 | grep -E 'Error|error|Exception' | tail -n 6 || \"$rt\" logs --tail 10 {name} 2>&1\n    exit 1\n  fi\n  sleep {HEALTH_POLL_SECS}\ndone",
         container_name(deployment.id.as_str(), 0)
     );
     Ok(out)
@@ -875,7 +901,7 @@ fn native_start_script(
     let values = values(profile, Some(CACHE_MARK), deployment, ranks, 0);
     let fill = |text: &str| fill(profile, text, &values, ranks, 0);
     let mut out = format!(
-        "#!/usr/bin/env bash\n# Rendered by Cairn from profile {} for deployment {}: {} {}, run natively.\nset -euo pipefail\n",
+        "#!/usr/bin/env bash\n# Rendered by Cairn from profile {} for deployment {}: {} {}, run natively.\nset -euo pipefail\n{REQUIRE_KEY}",
         profile.id,
         deployment.id,
         native.server.label(),
@@ -916,8 +942,12 @@ fn native_start_script(
         }
         command.push(native_word(&format!("{key}={}", fill(value)?)));
     }
-    // Last, so the profile's env cannot undo them: every pinned file is
-    // already in the cache, and the server fetches nothing.
+    // Last, so the profile's env cannot undo them: the server takes the key
+    // the head was given, every pinned file is already in the cache, and the
+    // server fetches nothing.
+    if let Some(name) = native.server.api_key_env() {
+        command.push(format!("'{name}='\"${API_KEY_ENV}\""));
+    }
     command.push("'HF_HOME='\"$hf\"".to_string());
     command.push(quote("HF_HUB_OFFLINE=1"));
     match (&native.artifact.packaging, native.server) {
@@ -968,9 +998,9 @@ fn native_start_script(
         // or not the model loaded (a 507 when it does not fit is logged, not
         // fatal), so the answer must count the model in.
         Server::Omlx => format!(
-            "if health=\"$(curl -fsS --max-time 5 {health})\"; then\n    if printf '%s' \"$health\" | grep -Eq '\"loaded_count\": *[1-9]'; then exit 0; fi\n    echo \"server $name answers its health check with no model loaded, so its load failed; its last errors:\"\n    {ERROR_LINES}\n    stop_server || true\n    exit 1\n  fi"
+            "if health=\"$(curl -fsS --max-time 5 {KEY_HEADER} {health})\"; then\n    if printf '%s' \"$health\" | grep -Eq '\"loaded_count\": *[1-9]'; then exit 0; fi\n    echo \"server $name answers its health check with no model loaded, so its load failed; its last errors:\"\n    {ERROR_LINES}\n    stop_server || true\n    exit 1\n  fi"
         ),
-        _ => format!("if curl -fsS -o /dev/null --max-time 5 {health}; then exit 0; fi"),
+        _ => format!("if curl -fsS -o /dev/null --max-time 5 {KEY_HEADER} {health}; then exit 0; fi"),
     };
     let _ = writeln!(
         out,
@@ -1468,7 +1498,7 @@ mod tests {
     fn volumes(script: &str) -> Vec<(String, String)> {
         script
             .lines()
-            .filter(|line| line.starts_with("\"$rt\" run "))
+            .filter(|line| line.contains("\"$rt\" run "))
             .flat_map(|line| {
                 let words: Vec<&str> = line.split(' ').collect();
                 words
@@ -1921,7 +1951,7 @@ mod tests {
         );
         assert!(start.contains("'HF_HOME='\"$hf\" 'HF_HUB_OFFLINE=1'"));
         assert!(
-            start.contains("nohup env -i 'HOME='\"$HOME\" 'PATH=/usr/bin:/bin:/usr/sbin:/sbin' 'TMPDIR='\"${TMPDIR:-/tmp}\" 'HF_HOME='"),
+            start.contains("nohup env -i 'HOME='\"$HOME\" 'PATH=/usr/bin:/bin:/usr/sbin:/sbin' 'TMPDIR='\"${TMPDIR:-/tmp}\" 'LLAMA_API_KEY='\"$CAIRN_INFERENCE_API_KEY\" 'HF_HOME='"),
             "the server inherits nothing of the executor's environment, its token included"
         );
         assert!(start.contains("name='cairn-embed-r0'"));
@@ -1929,7 +1959,7 @@ mod tests {
             "printf '%s\\n%s\\n' \"$pid\" \"$(launched_at \"$pid\")\" >\"$run/$name.pid\""
         ));
         assert!(
-            start.contains("curl -fsS -o /dev/null --max-time 5 'http://127.0.0.1:8090/v1/models'")
+            start.contains("--max-time 5 -H @<(printf 'Authorization: Bearer %s\\n' \"$CAIRN_INFERENCE_API_KEY\") 'http://127.0.0.1:8090/v1/models'")
         );
         assert!(
             start.find("stop_server\n").unwrap() < start.find("nohup env").unwrap(),
@@ -2032,7 +2062,7 @@ mod tests {
             "{start}"
         );
         assert!(start.contains(
-            "if health=\"$(curl -fsS --max-time 5 'http://127.0.0.1:8000/health')\"; then"
+            "if health=\"$(curl -fsS --max-time 5 -H @<(printf 'Authorization: Bearer %s\\n' \"$CAIRN_INFERENCE_API_KEY\") 'http://127.0.0.1:8000/health')\"; then"
         ));
         assert!(
             start.contains("grep -Eq '\"loaded_count\": *[1-9]'"),

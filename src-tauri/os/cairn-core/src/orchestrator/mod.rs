@@ -40,6 +40,7 @@ pub mod inference;
 pub mod inference_control;
 pub mod inference_generate;
 pub mod inference_import;
+pub(crate) mod inference_keys;
 pub mod inference_metrics;
 pub mod inference_models;
 pub mod inference_overview;

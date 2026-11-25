@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Rendered by Cairn from profile deepseek-v4.1-flash-1017-oq2e-mtp-omlx-metal-x1 for deployment chat: oMLX 0.8.3, run natively.
 set -euo pipefail
+: "${CAIRN_INFERENCE_API_KEY:?this start was given no API key; the executor that ran it is older than the runner}"
 hf="${HF_HOME:-$HOME/.cache/huggingface}"
 hf_get() { if [ -z "${HF_TOKEN:-}" ] && [ -s "$hf/token" ]; then HF_TOKEN="$(cat "$hf/token")"; fi; if [ -n "${HF_TOKEN:-}" ]; then curl -fsSL --retry 3 -H @<(printf 'Authorization: Bearer %s\n' "$HF_TOKEN") -o "$2" "$1"; else curl -fsSL --retry 3 -o "$2" "$1"; fi; }
 f="$hf"/'hub/models--mlx-community--DeepSeek-V4.1-Flash-1017-oQ2e-mtp/snapshots/6821d6ad3681a4b137b066b76094fa82ebd0a380/config.json'
@@ -58,11 +59,11 @@ rm -rf "$models"
 mkdir -p "$models" "$base"
 ln -s "$hf"'/hub/models--mlx-community--DeepSeek-V4.1-Flash-1017-oQ2e-mtp/snapshots/6821d6ad3681a4b137b066b76094fa82ebd0a380' "$models"/'DeepSeek-V4.1-Flash-1017'
 printf '%s\n' '{"version":3,"models":{"DeepSeek-V4.1-Flash-1017":{"is_pinned":true,"is_default":true}}}' >"$base/model_settings.json"
-nohup env -i 'HOME='"$HOME" 'PATH=/usr/bin:/bin:/usr/sbin:/sbin' 'TMPDIR='"${TMPDIR:-/tmp}" 'HF_HOME='"$hf" 'HF_HUB_OFFLINE=1' "$art/env/bin"/'omlx' 'serve' '--host' '0.0.0.0' '--port' '8000' '--headless' '--model-dir' "$models" '--base-path' "$base" '--no-hf-cache' >"$run/$name.log" 2>&1 </dev/null &
+nohup env -i 'HOME='"$HOME" 'PATH=/usr/bin:/bin:/usr/sbin:/sbin' 'TMPDIR='"${TMPDIR:-/tmp}" 'OMLX_API_KEY='"$CAIRN_INFERENCE_API_KEY" 'HF_HOME='"$hf" 'HF_HUB_OFFLINE=1' "$art/env/bin"/'omlx' 'serve' '--host' '0.0.0.0' '--port' '8000' '--headless' '--model-dir' "$models" '--base-path' "$base" '--no-hf-cache' >"$run/$name.log" 2>&1 </dev/null &
 pid=$!
 printf '%s\n%s\n' "$pid" "$(launched_at "$pid")" >"$run/$name.pid"
 while true; do
-  if health="$(curl -fsS --max-time 5 'http://127.0.0.1:8000/health')"; then
+  if health="$(curl -fsS --max-time 5 -H @<(printf 'Authorization: Bearer %s\n' "$CAIRN_INFERENCE_API_KEY") 'http://127.0.0.1:8000/health')"; then
     if printf '%s' "$health" | grep -Eq '"loaded_count": *[1-9]'; then exit 0; fi
     echo "server $name answers its health check with no model loaded, so its load failed; its last errors:"
     grep -E 'Error|error|ERROR|Exception' "$run/$name.log" | tail -n 6 || tail -n 10 "$run/$name.log"

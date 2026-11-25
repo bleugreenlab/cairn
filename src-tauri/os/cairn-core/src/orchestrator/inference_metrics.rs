@@ -15,8 +15,11 @@ use cairn_inference::control::Phase;
 use cairn_inference::metrics::{self, EngineSample, EngineSummary};
 use cairn_inference::{Addresses, DeploymentId};
 
+use cairn_common::executor_protocol::DeploymentApiKey;
+
 use super::inference::load_inventory;
 use super::inference_control::deployment_phases;
+use super::inference_keys::{self, Keyed as _};
 use super::Orchestrator;
 
 /// How often each healthy deployment is scraped.
@@ -79,6 +82,19 @@ fn retain(healthy: &BTreeSet<DeploymentId>) {
     windows().retain(|id, _| healthy.contains(id));
 }
 
+/// One engine's metrics body, asked with its deployment's key; `None` when
+/// it did not answer successfully.
+async fn scrape(
+    client: &reqwest::Client,
+    url: &str,
+    key: Option<&DeploymentApiKey>,
+) -> Option<String> {
+    match client.get(url).keyed(key).send().await {
+        Ok(response) if response.status().is_success() => response.text().await.ok(),
+        _ => None,
+    }
+}
+
 async fn scrape_once(orch: &Orchestrator, client: &reqwest::Client) -> Result<(), String> {
     let db = &orch.db.local;
     let inventory = load_inventory(db).await?;
@@ -99,10 +115,7 @@ async fn scrape_once(orch: &Orchestrator, client: &reqwest::Client) -> Result<()
             continue;
         };
         let url = deployment.metrics_url(&head.address);
-        let body = match client.get(&url).send().await {
-            Ok(response) if response.status().is_success() => response.text().await.ok(),
-            _ => None,
-        };
+        let body = scrape(client, &url, inference_keys::key(id).as_ref()).await;
         // An engine with no metrics (llama.cpp without `--metrics`) says
         // nothing and keeps no window.
         let Some(sample) = body

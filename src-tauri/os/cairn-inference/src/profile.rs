@@ -626,6 +626,21 @@ impl Server {
         }
     }
 
+    /// The environment variable the server reads its API key from, so Cairn
+    /// hands it the deployment's key without putting the key on a command
+    /// line: vLLM's `VLLM_API_KEY`, llama.cpp's `LLAMA_API_KEY` and oMLX's
+    /// `OMLX_API_KEY`, each the variable behind its `--api-key`. `None` for a
+    /// server that takes no key: `mlx_lm.server` has no authentication, so it
+    /// answers anyone who reaches its port.
+    pub fn api_key_env(self) -> Option<&'static str> {
+        match self {
+            Self::Vllm => Some("VLLM_API_KEY"),
+            Self::LlamaCpp => Some("LLAMA_API_KEY"),
+            Self::Omlx => Some("OMLX_API_KEY"),
+            Self::MlxLm => None,
+        }
+    }
+
     /// The port a deployment of it serves on unless placed otherwise.
     pub fn default_port(self) -> u16 {
         match self {

@@ -293,10 +293,16 @@ impl CompletionError {
     /// an unreachable provider, or a status that names a passing condition
     /// (a rate limit, an overloaded or failing upstream). A refusal of the
     /// request or the credential is not, and neither is an unreadable reply.
+    ///
+    /// 507 is a local engine out of GPU memory for now: oMLX answers it,
+    /// rather than queueing, when a load or a long prompt would pass its
+    /// memory ceiling, and it passes as the requests holding that memory end.
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Timeout | Self::Unreachable(_) => true,
-            Self::Http { status, .. } => matches!(status, 408 | 429 | 500 | 502 | 503 | 504),
+            Self::Http { status, .. } => {
+                matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 507)
+            }
             _ => false,
         }
     }

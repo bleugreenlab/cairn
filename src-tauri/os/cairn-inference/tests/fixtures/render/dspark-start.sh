@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Rendered by Cairn from profile deepseek-v4-flash-vision-exp-dspark-x2 for deployment dsv4f.
 set -euo pipefail
+: "${CAIRN_INFERENCE_API_KEY:?this start was given no API key; the executor that ran it is older than the runner}"
 # rank 1 on bginf-sp2
 ssh -o BatchMode=yes '10.20.20.41' 'bash -ls' <<'CAIRN_RANK_1'
 set -euo pipefail
@@ -38,9 +39,9 @@ mkdir -p "$hf"/'hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp'
 "$rt" rm -f 'cairn-dsv4f-r0' >/dev/null 2>&1 || true
 if [ "$rt" = docker ]; then gpu=(--gpus all); else gpu=(--device nvidia.com/gpu=all); fi
 if [ "$rt" = podman ]; then extra=(--security-opt label=disable --group-add keep-groups); else extra=(); fi
-"$rt" run -d --restart no --name 'cairn-dsv4f-r0' --ipc host --network host --shm-size '64gb' "${gpu[@]}" --ulimit 'memlock=-1:-1' "${extra[@]}" -v "$src"/'patches':'/opt/patches:ro' -v "$hf"/'hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp':'/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp:ro' -e 'NCCL_CUMEM_ENABLE=0' -e 'VLLM_HOST_IP=10.0.1.1' -e 'HF_HUB_OFFLINE=1' --entrypoint '' 'ghcr.io/anemll/dspark-vllm-gx10@sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8' 'bash' '-c' '/opt/patches/apply.sh && exec vllm serve deepseek-ai/DeepSeek-V4-Flash-Vision-Exp --revision 6821d6ad3681a4b137b066b76094fa82ebd0a380 --served-model-name deepseek-ai/DeepSeek-V4-Flash-Vision-Exp --port 8888 --tensor-parallel-size 2 --nnodes 2 --node-rank 0 --master-addr 10.0.1.1 --speculative-config '\''{"method":"dspark","num_speculative_tokens":5}'\'''
+VLLM_API_KEY="$CAIRN_INFERENCE_API_KEY" "$rt" run -d --restart no --name 'cairn-dsv4f-r0' --ipc host --network host --shm-size '64gb' "${gpu[@]}" --ulimit 'memlock=-1:-1' "${extra[@]}" -v "$src"/'patches':'/opt/patches:ro' -v "$hf"/'hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp':'/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp:ro' -e 'NCCL_CUMEM_ENABLE=0' -e 'VLLM_HOST_IP=10.0.1.1' -e VLLM_API_KEY -e 'HF_HUB_OFFLINE=1' --entrypoint '' 'ghcr.io/anemll/dspark-vllm-gx10@sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8' 'bash' '-c' '/opt/patches/apply.sh && exec vllm serve deepseek-ai/DeepSeek-V4-Flash-Vision-Exp --revision 6821d6ad3681a4b137b066b76094fa82ebd0a380 --served-model-name deepseek-ai/DeepSeek-V4-Flash-Vision-Exp --port 8888 --tensor-parallel-size 2 --nnodes 2 --node-rank 0 --master-addr 10.0.1.1 --speculative-config '\''{"method":"dspark","num_speculative_tokens":5}'\'''
 while true; do
-  if curl -fsS -o /dev/null --max-time 5 'http://127.0.0.1:8888/v1/models'; then exit 0; fi
+  if curl -fsS -o /dev/null --max-time 5 -H @<(printf 'Authorization: Bearer %s\n' "$CAIRN_INFERENCE_API_KEY") 'http://127.0.0.1:8888/v1/models'; then exit 0; fi
   if [ "$("$rt" inspect -f '{{.State.Running}}' 'cairn-dsv4f-r0' 2>/dev/null)" != true ]; then
     echo "container cairn-dsv4f-r0 exited before it was healthy; its last errors:"
     "$rt" logs --tail 400 'cairn-dsv4f-r0' 2>&1 | grep -E 'Error|error|Exception' | tail -n 6 || "$rt" logs --tail 10 'cairn-dsv4f-r0' 2>&1

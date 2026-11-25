@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cairn_common::executor_protocol::{
-    DeploymentOperation, DeploymentPhaseReport, DeploymentScript, ExecutorHealthSnapshot,
+    DeploymentApiKey, DeploymentOperation, DeploymentPhaseReport, DeploymentScript,
+    ExecutorHealthSnapshot,
 };
 use cairn_common::wire_vocabulary::MeasurementReading;
 use cairn_db::turso::params;
@@ -39,6 +40,7 @@ use cairn_inference::{
 
 use super::inference::load_inventory;
 use super::inference_generate::promotion::{self, Gate};
+use super::inference_keys;
 use super::Orchestrator;
 use crate::fleet::inference::Preemption;
 use crate::fleet::models::room::{gpu_allocated_bytes, RunningBatch};
@@ -569,6 +571,8 @@ struct Plan {
     health_url: String,
     /// Where the head is reached, which the health URL is formed from.
     head: Address,
+    /// The key its engine requires, which every command carries.
+    api_key: Option<DeploymentApiKey>,
 }
 
 impl Plan {
@@ -576,6 +580,7 @@ impl Plan {
         inventory: &Inventory,
         deployment: &Deployment,
         network: &Network,
+        api_key: Option<DeploymentApiKey>,
     ) -> Result<Self, String> {
         let profile = inventory
             .profiles
@@ -596,6 +601,7 @@ impl Plan {
             cleanup: rendered.cleanup,
             health_url: deployment.health_url(&head.address),
             head,
+            api_key,
         })
     }
 
@@ -608,6 +614,7 @@ impl Plan {
                 script,
                 timeout_secs: STOP_TIMEOUT_SECS,
             }),
+            api_key: self.api_key.clone(),
         }
     }
 
@@ -617,7 +624,15 @@ impl Plan {
             health_url: self.health_url.clone(),
             timeout_secs: STOP_TIMEOUT_SECS,
             stopped_health_wait_secs: STOPPED_HEALTH_WAIT_SECS,
+            api_key: self.api_key.clone(),
         })
+    }
+
+    fn probe_operation(&self) -> DeploymentOperation {
+        DeploymentOperation::Probe {
+            health_url: self.health_url.clone(),
+            api_key: self.api_key.clone(),
+        }
     }
 }
 
@@ -629,7 +644,7 @@ pub(crate) fn rendered_head(
     deployment: &Deployment,
     network: &Network,
 ) -> Result<Address, String> {
-    Plan::of(inventory, deployment, network).map(|plan| plan.head)
+    Plan::of(inventory, deployment, network, None).map(|plan| plan.head)
 }
 
 /// Which stored command an observation must belong to.
@@ -717,6 +732,13 @@ async fn settle(
             record_load(db, deployment, before, outcome, now_ms).await?;
         }
     }
+    // Nothing answers with the key any more, so the next start is given a
+    // fresh one.
+    if matches!(after, Phase::Stopped { .. }) {
+        if let Err(why) = inference_keys::forget(id) {
+            log::warn!("inference: deployment {id} stopped, and its API key was kept: {why}");
+        }
+    }
     Ok(())
 }
 
@@ -746,8 +768,13 @@ pub(crate) async fn request(
             format!("there is no deployment {id}; cairn://inference/deployments lists them")
         })?
         .clone();
-    let plan = Plan::of(&inventory, &deployment, &heads.network())
-        .map_err(|why| format!("Cairn cannot {} {id}: {why}", request.as_str()))?;
+    let plan = Plan::of(
+        &inventory,
+        &deployment,
+        &heads.network(),
+        inference_keys::key(&id),
+    )
+    .map_err(|why| format!("Cairn cannot {} {id}: {why}", request.as_str()))?;
     if request == Request::Stop && plan.stop.is_none() {
         return Err(format!(
             "Cairn cannot stop {id}: its profile {} has no stop command",
@@ -957,9 +984,7 @@ fn probe(
         deployment.head.as_str(),
         &command,
         deployment.id.as_str(),
-        DeploymentOperation::Probe {
-            health_url: plan.health_url.clone(),
-        },
+        plan.probe_operation(),
     ) {
         Ok(()) => true,
         Err(why) => {
@@ -1027,7 +1052,12 @@ pub(crate) async fn tick(
             .await?;
             continue;
         }
-        let plan = match Plan::of(&inventory, deployment, &heads.network()) {
+        let plan = match Plan::of(
+            &inventory,
+            deployment,
+            &heads.network(),
+            inference_keys::key(id),
+        ) {
             Ok(plan) => plan,
             Err(why) => {
                 if matches!(row.phase, Phase::Reserving { .. }) {
@@ -1141,7 +1171,12 @@ pub(crate) async fn probe_unknown(
         if probes.unknown_probed.contains(id) {
             continue;
         }
-        if let Ok(plan) = Plan::of(&inventory, deployment, &heads.network()) {
+        if let Ok(plan) = Plan::of(
+            &inventory,
+            deployment,
+            &heads.network(),
+            inference_keys::key(id),
+        ) {
             if probe(heads, probes, deployment, &plan, &readings, now_ms) {
                 probes.unknown_probed.insert(id.clone());
             }
@@ -1231,7 +1266,12 @@ pub(crate) async fn launch(
         .await?;
         return Ok(());
     }
-    let plan = match Plan::of(&inventory, deployment, &heads.network()) {
+    // The key the server will hold: the one kept for the deployment, else a
+    // fresh one. A start with no key is not sent.
+    let plan = inference_keys::ensure(id)
+        .map_err(|why| format!("its API key could not be kept: {why}"))
+        .and_then(|key| Plan::of(&inventory, deployment, &heads.network(), Some(key)));
+    let plan = match plan {
         Ok(plan) => plan,
         Err(why) => {
             apply(
@@ -1626,6 +1666,7 @@ pub(crate) mod tests {
             health_url,
             cleanup,
             timeout_secs,
+            ..
         } = operation
         else {
             panic!("a start was sent");

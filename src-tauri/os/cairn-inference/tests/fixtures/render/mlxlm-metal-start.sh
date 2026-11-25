@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Rendered by Cairn from profile qwen3.6-35b-a3b-4bit-mlxlm-metal-x1 for deployment chat: MLX 0.32.2, run natively.
 set -euo pipefail
+: "${CAIRN_INFERENCE_API_KEY:?this start was given no API key; the executor that ran it is older than the runner}"
 hf="${HF_HOME:-$HOME/.cache/huggingface}"
 hf_get() { if [ -z "${HF_TOKEN:-}" ] && [ -s "$hf/token" ]; then HF_TOKEN="$(cat "$hf/token")"; fi; if [ -n "${HF_TOKEN:-}" ]; then curl -fsSL --retry 3 -H @<(printf 'Authorization: Bearer %s\n' "$HF_TOKEN") -o "$2" "$1"; else curl -fsSL --retry 3 -o "$2" "$1"; fi; }
 f="$hf"/'hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/6821d6ad3681a4b137b066b76094fa82ebd0a380/config.json'
@@ -72,7 +73,7 @@ server.main()
 pid=$!
 printf '%s\n%s\n' "$pid" "$(launched_at "$pid")" >"$run/$name.pid"
 while true; do
-  if curl -fsS -o /dev/null --max-time 5 'http://127.0.0.1:8080/v1/models'; then exit 0; fi
+  if curl -fsS -o /dev/null --max-time 5 -H @<(printf 'Authorization: Bearer %s\n' "$CAIRN_INFERENCE_API_KEY") 'http://127.0.0.1:8080/v1/models'; then exit 0; fi
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "server $name exited before it was healthy; its last errors:"
     grep -E 'Error|error|ERROR|Exception' "$run/$name.log" | tail -n 6 || tail -n 10 "$run/$name.log"

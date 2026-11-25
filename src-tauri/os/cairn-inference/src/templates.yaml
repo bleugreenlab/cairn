@@ -14,6 +14,11 @@
 # from family and runtime when the profile is rendered (`render.rs`): NVIDIA
 # through the container runtime's GPU support, AMD through its device nodes.
 #
+# No template names an API key. Cairn mints one per deployment and the
+# renderer hands it to the server in the variable the server reads
+# (`Server::api_key_env`): vLLM's VLLM_API_KEY, llama.cpp's LLAMA_API_KEY,
+# oMLX's OMLX_API_KEY. mlx_lm.server takes none, so its notes say so.
+#
 # No container reaches an Apple GPU, so Apple's templates are native: an
 # `artifact` pinned by URL, version and sha256 instead of an `image`, and a
 # `command` whose first word is the program in it (a path inside an archive,
@@ -149,6 +154,9 @@
     tokens unless a request asks for more (--max-tokens changes it). Cairn
     starts it through a launcher that loads the model before it listens and
     answers to the served name, both of which the bare server does not do.
+    It has no API key or any other authentication: Cairn sends its
+    deployment key, and the server ignores it, so anyone who can reach its
+    port can use it.
 
 # oMLX on Apple silicon: a batching MLX server (continuous batching, paged
 # and SSD KV caches, Lightning MTP drafting) for the MLX and oQ
@@ -179,9 +187,8 @@
     answers before any model is loaded. A load that does not fit answers
     507 and leaves the server answering with nothing loaded, which the
     start reports as a failed load. oMLX binds an address beyond loopback
-    only with an API key (--api-key or OMLX_API_KEY): without one, omlx
-    serve --host 0.0.0.0 exits with a configuration error, so this
-    template serves a deployment once Cairn gives each deployment its key.
+    only with an API key (--api-key or OMLX_API_KEY), which Cairn gives it
+    in OMLX_API_KEY: the deployment's own key, minted when it starts.
     Changing models means stopping the server and starting another: oMLX's
     own unload freed under 1 GB of about 178 GB of DeepSeek V4.1 Flash, and
     then no model would load (507). Its shutdown on TERM waits for the

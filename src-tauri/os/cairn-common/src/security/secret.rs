@@ -171,6 +171,10 @@ pub enum SecretCategory {
     /// it can deliver events that wake threads. Rotating means rotating the
     /// endpoint and handing the sender the new value.
     IngressEndpointSecret,
+    /// The API key Cairn mints for one of its inference deployments, which
+    /// the engine requires of every request reaching it over the network.
+    /// Rotating means starting the deployment afresh.
+    InferenceDeploymentKey,
 }
 
 impl SecretCategory {
@@ -187,6 +191,7 @@ impl SecretCategory {
             Self::ModelBackendKey => "model-backend-key",
             Self::AccountToken => "account-token",
             Self::IngressEndpointSecret => "ingress-endpoint-secret",
+            Self::InferenceDeploymentKey => "inference-deployment-key",
         }
     }
 }

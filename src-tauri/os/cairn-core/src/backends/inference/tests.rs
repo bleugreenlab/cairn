@@ -364,6 +364,7 @@ fn embedder_ready() -> Route {
         api_base: "http://10.20.20.43:8090/v1".into(),
         served_name: "qwen3-embedding-4b".into(),
         context_length: None,
+        api_key: None,
     }
 }
 
@@ -401,7 +402,7 @@ fn an_embedding_loads_its_model_waits_for_health_and_is_sent_under_the_served_na
         panic!("an OpenAI embeddings route")
     };
     assert_eq!(target.url, "http://10.20.20.43:8090/v1/embeddings");
-    assert!(target.headers.is_empty(), "the engine takes no credential");
+    assert!(target.headers.is_empty(), "a route with no key sends none");
     assert_eq!(sent, "qwen3-embedding-4b");
 
     let offer = provider().admit(EMBEDDER, VerbKind::Embed).unwrap();
@@ -457,6 +458,9 @@ fn live_embedder_answers_at_the_offers_width() {
         api_base,
         served_name,
         context_length: None,
+        api_key: std::env::var("CAIRN_LIVE_EMBED_KEY")
+            .ok()
+            .map(cairn_common::executor_protocol::DeploymentApiKey::new),
     });
     let offer = provider().admit(EMBEDDER, VerbKind::Embed).unwrap();
     let capabilities = embed_capabilities(&offer);

@@ -29,6 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use cairn_common::executor_protocol::DeploymentApiKey;
 use cairn_config::inference::InferenceProfileDeclaration;
 use cairn_inference::control::Phase;
 use cairn_inference::served::{
@@ -41,6 +42,7 @@ use cairn_models::types::catalog::{Modalities, VerbKind};
 
 use super::inference::load_inventory;
 use super::inference_control::deployment_phases;
+use super::inference_keys::{self, Keyed as _};
 use super::Orchestrator;
 use crate::fleet::models::requests::RequestState;
 use crate::fleet::models::settings::Ms;
@@ -62,6 +64,8 @@ pub(crate) struct Route {
     pub served_name: String,
     /// The context the engine can hold, when it was measured.
     pub context_length: Option<u64>,
+    /// The key the engine requires, which every request to it carries.
+    pub api_key: Option<DeploymentApiKey>,
 }
 
 impl Route {
@@ -147,7 +151,15 @@ pub(crate) async fn served_now(orch: &Orchestrator) -> Result<Vec<ServedModel>, 
             continue;
         };
         let load = models::healthy_since(orch, &deployment.id).await;
-        measure(deployment, &head.address, &profile.served_name, load).await;
+        let key = inference_keys::key(&deployment.id);
+        measure(
+            deployment,
+            &head.address,
+            key.as_ref(),
+            &profile.served_name,
+            load,
+        )
+        .await;
     }
     Ok(served::served_models(&inventory, &measures()))
 }
@@ -281,13 +293,22 @@ async fn route(
                 unknown_address(&record.head)
             )
         })?;
-    let measure = measure(record, &head.address, &profile.served_name, load).await;
+    let api_key = inference_keys::key(deployment);
+    let measure = measure(
+        record,
+        &head.address,
+        api_key.as_ref(),
+        &profile.served_name,
+        load,
+    )
+    .await;
     Ok(Route {
         deployment: deployment.clone(),
         pool: pool.clone(),
         api_base: record.api_base(&head.address),
         served_name: profile.served_name.clone(),
         context_length: measure.context_length(),
+        api_key,
     })
 }
 
@@ -433,6 +454,7 @@ fn forget(deployment: &DeploymentId) {
 async fn measure(
     deployment: &Deployment,
     address: &str,
+    key: Option<&DeploymentApiKey>,
     served_name: &str,
     load: Option<Ms>,
 ) -> EngineMeasure {
@@ -444,7 +466,7 @@ async fn measure(
     if let Some(known) = known {
         return known;
     }
-    let (measure, answered) = probe(deployment, address, served_name).await;
+    let (measure, answered) = probe(deployment, address, key, served_name).await;
     // An engine that did not answer at all is measured again next time
     // rather than recorded as having no limits.
     if answered {
@@ -462,11 +484,17 @@ async fn measure(
 
 /// Read the engine's own model listing and metrics, and whether it answered
 /// either.
-async fn probe(deployment: &Deployment, address: &str, served_name: &str) -> (EngineMeasure, bool) {
+async fn probe(
+    deployment: &Deployment,
+    address: &str,
+    key: Option<&DeploymentApiKey>,
+    served_name: &str,
+) -> (EngineMeasure, bool) {
     let client = cairn_tls::client();
-    async fn body(client: &reqwest::Client, url: String) -> Result<Option<String>, ()> {
+    let body = |url: String| async move {
         let response = client
             .get(url)
+            .keyed(key)
             .timeout(MEASURE_TIMEOUT)
             .send()
             .await
@@ -474,10 +502,10 @@ async fn probe(deployment: &Deployment, address: &str, served_name: &str) -> (En
         if !response.status().is_success() {
             return Ok(None);
         }
-        Ok(response.text().await.ok())
-    }
-    let models = body(client, format!("{}/models", deployment.api_base(address))).await;
-    let metrics = body(client, deployment.metrics_url(address)).await;
+        Ok::<_, ()>(response.text().await.ok())
+    };
+    let models = body(format!("{}/models", deployment.api_base(address))).await;
+    let metrics = body(deployment.metrics_url(address)).await;
     let answered = models.is_ok() || metrics.is_ok();
     let measure = EngineMeasure {
         max_model_len: models
@@ -529,6 +557,7 @@ pub(crate) mod tests {
             api_base: "http://10.20.20.40:8888/v1".into(),
             served_name: "deepseek-v4-flash-vision-exp".into(),
             context_length: Some(1_048_576),
+            api_key: None,
         }
     }
 
