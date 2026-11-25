@@ -331,6 +331,31 @@ mod tests {
     }
 
     #[test]
+    fn claude_weekly_usage_beats_codex_when_more_allowance_would_expire() {
+        // Shape emitted by the Claude OAuth limits parser for weekly_all.
+        let claude = ProviderUsageWindow {
+            id: "weekly_all".into(),
+            label: "Current week (all models)".into(),
+            scope: ProviderUsageScope::Weekly,
+            scope_target: None,
+            used_percent: 11.0,
+            remaining_percent: 89.0,
+            resets_at: Some(NOW + 5 * 24 * HOUR),
+            reset_at_text: None,
+            window_duration_mins: Some(10_080),
+        };
+        let claude = cost(&[claude]).unwrap();
+        let codex = cost(&[week(49.0, 3 * 24)]).unwrap();
+        assert_eq!(claude.class(), CostClass::Expiring);
+        assert_eq!(codex.class(), CostClass::Expiring);
+        assert_eq!(claude.compare(&codex), Ordering::Less);
+        assert_eq!(
+            claude.describe(),
+            "Week 89% left, resets in 5d, ~62% would expire unused"
+        );
+    }
+
+    #[test]
     fn a_fast_burn_is_headroom_and_the_tightest_window_binds() {
         // 78% used in 2 days of 7 will run out before reset: nothing expires.
         let fast = cost(&[week(78.0, 120)]).unwrap();
