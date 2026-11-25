@@ -7,12 +7,7 @@
 
 use serde_json::{json, Value};
 
-use crate::execution::gates::capacity::tests::{
-    add_issue, add_started, add_thread, caps, detail, is_held,
-};
-use crate::execution::gates::capacity::THREAD_FOCUS_FACT;
-use crate::execution::gates::reorder::tests::{request, rows, thread_run, write};
-use crate::execution::gates::sweep::tests::{count, env, execution, Env};
+use crate::execution::gates::sweep::tests::{count, env, Env};
 use crate::mcp::types::{ChangeItem, ChangeMode};
 
 const ALPHA: &str = "run-alpha";
@@ -21,7 +16,6 @@ const ALPHA: &str = "run-alpha";
 /// session live.
 async fn adoption_env(name: &str) -> Env {
     let env = env(name).await;
-    caps(&env, 50, 50);
     add_thread(&env, "ta", "alpha").await;
     add_thread(&env, "tb", "beta").await;
     thread_run(&env, ALPHA, Some("ta"), None).await;
@@ -84,113 +78,6 @@ async fn executions_of(env: &Env, number: i32) -> i64 {
 
 fn triage() -> Value {
     json!({"recipe": "memory-triage"})
-}
-
-/// The thread that files the work owns it: the issue hangs from alpha before
-/// admission is decided, so alpha's own focus cap holds it, and the reply says
-/// so. Filing again adopts nothing twice.
-#[tokio::test]
-async fn a_thread_filing_adopts_an_unparented_issue_before_admission() {
-    let env = env("adopt-before-admission.db").await;
-    // Alpha's focus cap is one open child, and it already has one running.
-    caps(&env, 50, 1);
-    add_thread(&env, "ta", "alpha").await;
-    add_started(&env, 150, Some("ta"), "running").await;
-    thread_run(&env, ALPHA, Some("ta"), None).await;
-    add_issue(&env, 210, None).await;
-
-    // The preview asks the queue as it will stand once alpha has adopted the
-    // issue: alpha's cap is full, so it would be held there. Asked of the
-    // still-unparented row, the queue would wrongly say it starts.
-    let preview = preview_as(&env, Some(ALPHA), 210, triage()).await;
-    let (_, held_line) = preview
-        .split_once("the queue would hold it now: ")
-        .unwrap_or_else(|| panic!("the preview names the hold: {preview}"));
-    assert!(held_line.contains("alpha"), "on alpha's cap: {preview}");
-    assert!(
-        preview.contains("It would count against alpha's focus cap"),
-        "{preview}"
-    );
-    assert_eq!(
-        parents(&env, 210).await,
-        (None, None, None),
-        "preview writes no edge"
-    );
-    assert_eq!(executions_of(&env, 210).await, 0, "preview files nothing");
-
-    let filed = file_as(&env, Some(ALPHA), 210, triage()).await.unwrap();
-    assert!(
-        filed.contains("Adopted prj/210 under thread alpha: it had no parent"),
-        "{filed}"
-    );
-    assert_eq!(
-        parents(&env, 210).await,
-        (None, Some("ta".to_string()), None),
-        "a thread edge, and no issue ancestry"
-    );
-    assert!(is_held(&env, 210).await, "alpha's full focus cap holds it");
-    assert!(
-        filed.contains(
-            "Filed execution 1 for prj/210 \"Issue 210\" (recipe 'memory-triage'): Queued · \
-             alpha 1/1 running."
-        ),
-        "the reply says it is held on alpha's cap: {filed}"
-    );
-    let (execution_id, ..) = execution(&env, 210).await;
-    // The reply's line carries the count; the hold's detail names the child.
-    let held_detail = detail(&env, &execution_id).await;
-    assert!(
-        held_detail.contains("alpha") && held_detail.contains("150"),
-        "the hold names alpha's open child prj/150: {held_detail}"
-    );
-    assert!(
-        rows(&env)
-            .await
-            .contains_key(&(execution_id, THREAD_FOCUS_FACT.to_string())),
-        "it is held on alpha's own focus cap, which only a parented child counts against"
-    );
-
-    let again = file_as(&env, Some(ALPHA), 210, triage()).await.unwrap();
-    assert!(!again.contains("Adopted"), "{again}");
-    assert_eq!(parents(&env, 210).await.1.as_deref(), Some("ta"));
-}
-
-/// A loose issue that already has live work becomes one of the thread's open
-/// children the moment it is adopted, so a rerun on it opens no new child and
-/// the full thread cap does not hold it. The preview says what the filing
-/// then does.
-#[tokio::test]
-async fn an_adopting_rerun_on_live_work_is_previewed_as_the_filing_decides() {
-    let env = env("adopt-rerun-open.db").await;
-    caps(&env, 50, 1);
-    add_thread(&env, "ta", "alpha").await;
-    add_started(&env, 150, Some("ta"), "running").await;
-    thread_run(&env, ALPHA, Some("ta"), None).await;
-    // Unparented, with an execution already running.
-    add_started(&env, 220, None, "running").await;
-
-    let preview = preview_as(&env, Some(ALPHA), 220, triage()).await;
-    assert!(
-        preview.contains("Would adopt prj/220 under thread alpha first"),
-        "{preview}"
-    );
-    assert!(
-        !preview.contains("would hold it now"),
-        "already open once adopted, so alpha's full cap does not hold it: {preview}"
-    );
-    assert_eq!(parents(&env, 220).await, (None, None, None));
-    assert_eq!(executions_of(&env, 220).await, 1);
-
-    let filed = file_as(&env, Some(ALPHA), 220, triage()).await.unwrap();
-    assert!(
-        filed.contains("Adopted prj/220 under thread alpha"),
-        "{filed}"
-    );
-    assert_eq!(executions_of(&env, 220).await, 2);
-    assert!(
-        !is_held(&env, 220).await,
-        "it starts, as previewed: {filed}"
-    );
 }
 
 /// Nothing but a same-project thread's filing on an unparented issue adopts:
@@ -281,10 +168,7 @@ async fn a_preview_or_a_refused_filing_adopts_nothing() {
 
     let preview = preview_as(&env, Some(ALPHA), 210, triage()).await;
     assert!(
-        preview.contains(
-            "Would adopt prj/210 under thread alpha first: it has no parent. It would count \
-             against alpha's focus cap."
-        ),
+        preview.contains("Would adopt prj/210 under thread alpha first: it has no parent."),
         "room to spare, so nothing would hold it: {preview}"
     );
 
@@ -349,47 +233,53 @@ async fn a_start_refused_after_adoption_keeps_the_parent_and_says_so() {
     assert_eq!(executions_of(&env, 210).await, 1);
 }
 
-/// `place:"head"` on an unparented issue is decided against the thread about
-/// to adopt it: that thread may place its own work, and an operator's head
-/// filing, which adopts nothing, is still refused for want of a thread.
-#[tokio::test]
-async fn a_head_filing_is_placed_in_the_adopting_threads_queue() {
-    let env = adoption_env("adopt-head.db").await;
-    add_issue(&env, 210, None).await;
-    add_issue(&env, 211, None).await;
-    let head = json!({"recipe": "memory-triage", "place": "head"});
+pub(crate) async fn add_thread(env: &Env, id: &str, name: &str) {
+    env.db
+        .execute(
+            "INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES(?1,'p',?2,1,1)",
+            (id, name),
+        )
+        .await
+        .unwrap();
+}
 
-    let operator = file_as(&env, None, 211, head.clone()).await.unwrap_err();
-    assert!(operator.contains("has no parent thread"), "{operator}");
-    assert_eq!(parents(&env, 211).await, (None, None, None));
+pub(crate) async fn add_issue(env: &Env, number: i32, thread: Option<&str>) {
+    env.db.execute("INSERT INTO issues(id,project_id,number,title,status,progress,attention,parent_thread_id,created_at,updated_at) VALUES(?1,'p',?2,?3,'backlog','backlog','none',?4,1,1)", cairn_db::turso::params![format!("si{number}"),number,format!("Issue {number}"),thread]).await.unwrap();
+}
 
-    let with_after = file_as(
-        &env,
-        Some(ALPHA),
-        211,
-        json!({"recipe": "memory-triage", "place": "head",
-               "after": [{"fact": "issue_resolution", "issue": "cairn://p/prj/1", "resolution": "merged"}]}),
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        with_after.contains("place:\"head\" orders cap-held work"),
-        "{with_after}"
-    );
-    assert_eq!(
-        parents(&env, 211).await,
-        (None, None, None),
-        "refused before adopting"
-    );
+pub(crate) async fn thread_run(env: &Env, run: &str, thread: Option<&str>, parent: Option<&str>) {
+    let job = format!("job-{run}");
+    env.db.execute("INSERT INTO jobs(id,project_id,node_name,status,thread_id,parent_job_id,uri_segment,created_at,updated_at) VALUES(?1,'p','session','running',?2,?3,?4,1,1)",cairn_db::turso::params![job.as_str(),thread,parent,if parent.is_some(){"task-1"}else{"thread"}]).await.unwrap();
+    env.db.execute("INSERT INTO runs(id,project_id,job_id,status,created_at,updated_at) VALUES(?1,'p',?2,'live',1,1)",(run,job.as_str())).await.unwrap();
+}
 
-    let filed = file_as(&env, Some(ALPHA), 210, head).await.unwrap();
-    assert!(
-        filed.contains("It started now; nothing to place."),
-        "{filed}"
-    );
-    assert!(
-        filed.contains("Adopted prj/210 under thread alpha"),
-        "{filed}"
-    );
-    assert_eq!(parents(&env, 210).await.1.as_deref(), Some("ta"));
+pub(crate) fn request(run: Option<&str>) -> crate::mcp::types::McpCallbackRequest {
+    crate::mcp::types::McpCallbackRequest {
+        answer_bound_ms: None,
+        cwd: "/".into(),
+        run_id: run.map(str::to_string),
+        tool: "write".into(),
+        payload: Value::Null,
+        tool_use_id: None,
+        thread_id: None,
+        origin: None,
+    }
+}
+
+async fn write(
+    env: &Env,
+    run: Option<&str>,
+    target: &str,
+    mode: ChangeMode,
+    payload: Value,
+) -> Result<String, String> {
+    let item = ChangeItem {
+        target: target.into(),
+        mode,
+        payload: Some(payload),
+    };
+    crate::resources::mutations::dispatch_resource_change(&env.orch, &request(run), 0, &item, false)
+        .await
+        .map(|change| change.summary)
+        .map_err(|failure| failure.error)
 }

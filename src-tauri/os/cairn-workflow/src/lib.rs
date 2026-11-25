@@ -23,6 +23,7 @@ pub mod ports;
 pub mod pr_publish_attempts;
 pub mod progress;
 pub mod queries;
+pub mod queue;
 pub mod runtime;
 pub mod snapshot_migrate;
 pub mod step_behavior;

@@ -2117,7 +2117,7 @@ pub(crate) async fn resolve(
     result: &str,
     replay: bool,
 ) -> Result<(), String> {
-    let outcome = resolve_inner(orch, db, r, result, replay, None, None).await;
+    let outcome = resolve_inner(orch, db, r, result, replay, None).await;
     // Every exit may follow a terminal state write, including sibling stand-down
     // and diversion to the job. The seam rechecks all branch holds, so an error
     // or a duplicate resolver that left this row active cannot release it early.
@@ -2127,14 +2127,13 @@ pub(crate) async fn resolve(
     outcome
 }
 
-/// Re-drive the durable row whose focus hold won its exactly-once claim.
+/// Re-drive the durable row whose queue hold won its exactly-once claim.
 /// Its stored result and tool-result stamp remain authoritative across boot.
-pub(crate) async fn resume_focus_wait(
+pub(crate) async fn resume_queue_wait(
     orch: &Orchestrator,
     db: &LocalDb,
     id: &str,
     hold_id: &str,
-    admission: Option<crate::execution::gates::capacity::AdmissionGuard>,
 ) -> Result<(), String> {
     let id = id.to_string();
     let row = db.read(move |conn| {
@@ -2145,56 +2144,11 @@ pub(crate) async fn resume_focus_wait(
         })
     }).await.map_err(|e| e.to_string())?;
     if let Some((record, Some(result))) = row {
-        resolve_inner(orch, db, &record, &result, true, Some(hold_id), admission).await?;
+        resolve_inner(orch, db, &record, &result, true, Some(hold_id)).await?;
     }
     Ok(())
 }
 
-/// A System wait resolution whose admission wait ran out its bound. Its result
-/// is already durable (the row stays `resolving`), so it parks as the same
-/// re-entry hold a focus refusal arms, and the gate pass resumes it. A hold
-/// already standing on the job is left alone; the stuck-resolution sweep
-/// re-drives the row then.
-async fn park_busy_wait(
-    orch: &Orchestrator,
-    db: &LocalDb,
-    r: &Record,
-    busy: crate::execution::gates::capacity::AdmissionBusy,
-) -> Result<(), String> {
-    if crate::orchestrator::wakes::active_supply_hold(db, &r.job_id)
-        .await?
-        .is_some()
-    {
-        return Err(format!("wait admission busy: {busy}"));
-    }
-    if let Err(error) = crate::orchestrator::wakes::arm_thread_hold(
-        db,
-        &r.job_id,
-        crate::orchestrator::wakes::HoldKind::Resume,
-        "thread_focus",
-        "Waiting for the execution queue's admission lock, which stayed busy past its bound; \
-         the next gate pass resumes this wait."
-            .to_string(),
-        serde_json::json!({"durable_wait": r.id}).to_string(),
-        orch.services.clock.now(),
-    )
-    .await
-    {
-        // The row stays `resolving`, so the stuck-resolution sweep re-drives it.
-        log::warn!("wait {} could not park after admission busy: {error}", r.id);
-        return Err(format!("wait admission busy: {busy}"));
-    }
-    log::warn!(
-        "wait admission busy: {busy}; parked wait {} for the gate pass",
-        r.id
-    );
-    cairn_db::admission_hint::evidence_changed();
-    Ok(())
-}
-
-/// `admission` is the guard of a caller that already decided thread policy
-/// for this resume (a hold release); without one, a System resume decides it
-/// here.
 async fn resolve_inner(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -2202,7 +2156,6 @@ async fn resolve_inner(
     result: &str,
     replay: bool,
     resolving_hold_id: Option<&str>,
-    admission: Option<crate::execution::gates::capacity::AdmissionGuard>,
 ) -> Result<(), String> {
     // First-writer-wins claim: pending -> resolving. The row count distinguishes
     // the live resolver that won the transition from a duplicate that lost it; a
@@ -2283,49 +2236,22 @@ async fn resolve_inner(
         Some("system") => crate::execution::jobs::WakeCause::System,
         _ => return Err("wait has no classified wake cause".into()),
     };
-    // Admit before creating the pending successor: that turn would otherwise
-    // make a parked long wait look active before admission had been decided.
-    // The guard is handed to the continuation, which lets it go once the
-    // successor's slot is reserved.
-    let mut admission =
-        if admission.is_none() && wake_cause == crate::execution::jobs::WakeCause::System {
-            let guard = match orch
-                .admission_lock
-                .acquire(
-                    crate::execution::gates::capacity::AdmissionSite::HoldRelease,
-                    r.job_id.clone(),
-                )
-                .await
-            {
-                Ok(guard) => guard,
-                Err(busy) => return park_busy_wait(orch, db, r, busy).await,
-            };
-            if let Some((boundary, reason)) = crate::orchestrator::wakes::thread_job_refusal(
-                orch,
-                db,
-                &r.job_id,
-                crate::orchestrator::wakes::HoldKind::Resume,
-                None,
-                false,
-            )
+    // Keep the result durable while the execution is below the running line.
+    if wake_cause == crate::execution::jobs::WakeCause::System
+        && crate::orchestrator::wakes::queue_job_refusal(orch, db, &r.job_id)
             .await?
-            {
-                crate::orchestrator::wakes::arm_thread_hold(
-                    db,
-                    &r.job_id,
-                    crate::orchestrator::wakes::HoldKind::Resume,
-                    boundary,
-                    reason,
-                    serde_json::json!({"durable_wait":r.id}).to_string(),
-                    orch.services.clock.now(),
-                )
-                .await?;
-                return Ok(());
-            }
-            Some(guard)
-        } else {
-            admission
-        };
+            .is_some()
+    {
+        crate::orchestrator::wakes::arm_queue_hold(
+            db,
+            &r.job_id,
+            crate::orchestrator::wakes::HoldKind::Resume,
+            Some(serde_json::json!({"durable_wait": r.id}).to_string()),
+            orch.services.clock.now(),
+        )
+        .await?;
+        return Ok(());
+    }
 
     // Per-turn work from here down, reached by exactly one of the turn's
     // resolvers: resolve this turn's WaitResolved successor by explicit
@@ -2358,8 +2284,7 @@ async fn resolve_inner(
                     let goal_owner = resolved_cohort_goal_owner(orch, db, r).await;
                     #[cfg(test)]
                     tests::before_owned_continuation(&r.id).await;
-                    crate::execution::jobs::continue_job_impl_admitted(
-                        admission.take(),
+                    crate::execution::jobs::continue_job_impl(
                         wake_cause,
                         orch,
                         &r.job_id,
@@ -8030,69 +7955,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn long_wait_resolution_holds_before_successor_but_short_wait_remains_in_flight() {
-        for requested_ms in [30_000, 1_200_000] {
-            let (orch, mut record, _) = durable_env().await;
-            orch.update_settings(crate::models::UpdateSettings {
-                max_open_children_per_thread: Some(1),
-                max_concurrent_executions: Some(10),
-                ..Default::default()
-            })
-            .unwrap();
-            let now = chrono::Utc::now().timestamp_millis();
-            record.created = now - requested_ms;
-            record.deadline = Some(now);
-            let db = &orch.db.local;
-            db.execute_script("INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES('focus','p','focus',1,1);
-                UPDATE issues SET parent_thread_id='focus' WHERE id='i';
-                INSERT INTO issues(id,project_id,number,title,status,parent_thread_id,created_at,updated_at) VALUES('busy','p',2,'Busy','active','focus',1,1);
-                INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('busy-exec','recipe','busy','p','running',1,1);
-                INSERT INTO jobs(id,execution_id,project_id,issue_id,status,node_name,created_at,updated_at) VALUES('busy-job','busy-exec','p','busy','running','Busy',1,1);
-                INSERT INTO sessions(id,job_id,backend,status,created_at,updated_at) VALUES('busy-session','busy-job','claude','open',1,1);
-                INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('busy-turn','busy-session','busy-job',1,'running','initial',1,1);
-                UPDATE jobs SET current_turn_id='busy-turn',current_session_id='busy-session' WHERE id='busy-job';").await.unwrap();
-            // The busy child's turn is served by a process, so it is work.
-            orch.process_state
-                .register_process(
-                    "busy-run".into(),
-                    crate::agent_process::process::RunHandle::test_handle(
-                        Some("busy-session"),
-                        Some("busy-job"),
-                    ),
-                )
-                .unwrap();
-            insert(db, &record).await.unwrap();
-            register_warm(&orch);
-            resolve(&orch, db, &record, ELAPSED, false).await.unwrap();
-            if requested_ms > 300_000 {
-                assert!(
-                    wait_resolved_turns(&orch).await.is_empty(),
-                    "not even a pending successor before focus admits"
-                );
-                let holds = crate::orchestrator::wakes::load_active_provider_limit_holds(db)
-                    .await
-                    .unwrap();
-                assert_eq!(holds.len(), 1);
-                assert_eq!(holds[0].next_due_at(), None);
-                assert_eq!(wait_state(&orch).await, "resolving");
-                // No notifier is installed and no hint is emitted. The regular
-                // sweep, also used at boot, must recover the held resolution.
-                db.execute(
-                    "UPDATE turns SET state='complete',ended_at=3 WHERE id='busy-turn'",
-                    (),
-                )
-                .await
-                .unwrap();
-                crate::execution::gates::sweep::sweep(&orch).await.unwrap();
-                crate::execution::gates::sweep::sweep(&orch).await.unwrap();
-            }
-            assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
-            assert_eq!(wait_state(&orch).await, "resolved");
-            assert_eq!(tool_result_count(&orch).await, 1);
-        }
-    }
-
     /// A transient failure delivering the result, with the host still up, must
     /// not strand the parked call until the next boot (cairn/5778). The live
     /// resolver retries from the row's durable state, so the call gets its
@@ -9411,65 +9273,6 @@ mod tests {
             )
             .await
             .unwrap()
-    }
-
-    #[tokio::test]
-    async fn duration_parking_preserves_requested_length_after_inline_time() {
-        use crate::execution::gates::capacity::{
-            activity_job_rows_conn, Activity, ActivityScope, ParkCause,
-        };
-
-        for held in [false, true] {
-            for requested in [300_000, 420_000] {
-                let (orch, base, _) = durable_env().await;
-                // Both have less than five minutes left when they park. Only
-                // the originally short request may still occupy capacity.
-                let record = Record {
-                    created: base.created - 150_000,
-                    deadline: Some(base.created - 150_000 + requested),
-                    ..base
-                };
-                if held {
-                    insert_as(&orch.db.local, &record, Establish::Hold)
-                        .await
-                        .unwrap();
-                    let _handoff = convert_hold_to_park(&orch, &orch.db.local, &record)
-                        .await
-                        .unwrap();
-                } else {
-                    insert(&orch.db.local, &record).await.unwrap();
-                }
-
-                let persisted = wait_shape(&orch).await;
-                assert_eq!(persisted[0].4, record.created);
-                let activity = orch
-                    .db
-                    .local
-                    .read(|conn| {
-                        Box::pin(async move {
-                            let rows = activity_job_rows_conn(
-                                conn,
-                                ActivityScope::Issue("i"),
-                                &crate::execution::jobs::liveness::WorkObserver::nothing(),
-                            )
-                            .await?;
-                            assert_eq!(rows.len(), 1);
-                            Ok(rows.into_iter().next().unwrap().activity)
-                        })
-                    })
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    activity,
-                    if requested <= 300_000 {
-                        Activity::InFlight
-                    } else {
-                        Activity::Parked(ParkCause::SleepingUntil(record.deadline))
-                    },
-                    "held={held}, requested={requested}"
-                );
-            }
-        }
     }
 
     /// A takeover turns the batch's own row into the continuation: still the

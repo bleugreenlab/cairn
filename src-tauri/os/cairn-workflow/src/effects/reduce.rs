@@ -41,7 +41,6 @@ pub fn reduce_effect_result(result: EffectResult) -> Vec<WorkflowEffect> {
             vec![WorkflowEffect::AdvanceDag {
                 execution_id,
                 outbox_entry_id: None,
-                focus_admitted: false,
             }]
         }
         EffectResult::ActionFailed {
@@ -57,7 +56,6 @@ pub fn reduce_effect_result(result: EffectResult) -> Vec<WorkflowEffect> {
                 WorkflowEffect::AdvanceDag {
                     execution_id,
                     outbox_entry_id: None,
-                    focus_admitted: false,
                 },
             ]
         }

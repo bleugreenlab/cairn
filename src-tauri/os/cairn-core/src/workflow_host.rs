@@ -215,15 +215,7 @@ impl WorkflowHost for CoreWorkflowHost {
     }
     async fn execute(&self, workload: Workload) -> Result<Option<EffectResult>, String> {
         let effect = match workload {
-            Workload::AgentJobs {
-                jobs,
-                cause,
-                focus_admitted,
-            } => WorkflowEffect::StartAgentJobs {
-                jobs,
-                cause,
-                focus_admitted,
-            },
+            Workload::AgentJobs { jobs, cause } => WorkflowEffect::StartAgentJobs { jobs, cause },
             Workload::Action {
                 action_run_id,
                 execution_id,

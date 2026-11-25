@@ -1,9 +1,9 @@
 //! A dispatched launch that launch admission could not take.
 //!
 //! Advancement claims a ready job and hands it to the runner, whose first step
-//! is [`admit_thread_launch`]. Admission waits a bounded time for the execution
-//! queue's admission lock; when another admission holds it past that bound it
-//! refuses with nothing written. A refusal there used to be logged and dropped:
+//! is [`admit_thread_launch`]: a supply hold or the run queue may take the
+//! launch instead. Admission reads the job's database, and when that read
+//! fails it refuses with nothing written. A refusal there used to be logged and dropped:
 //! the job stayed claimed with no run until a later recompute demoted it to
 //! `pending`, and nothing launched it until some unrelated advancement of its
 //! execution happened along. A background task sat "preparing" for as long as
@@ -28,14 +28,12 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use crate::execution::gates::capacity::AdmissionGuard;
 use crate::orchestrator::Orchestrator;
 
 use super::admit_thread_launch;
 
-/// The pause before each re-dispatch of a refused launch. Every attempt also
-/// waits up to the admission lock's own bound, so the budget spans several
-/// minutes of contention before the job is failed.
+/// The pause before each re-dispatch of a refused launch. The budget spans
+/// several minutes before the job is failed.
 const REDRIVE_BACKOFF: [Duration; 6] = [
     Duration::from_secs(5),
     Duration::from_secs(15),
@@ -181,24 +179,23 @@ impl LaunchAdmissionWaits {
 
 /// Admit a launch the runner was handed, or arrange for it to be re-driven.
 ///
-/// `Some` is the admission to hold until the job reserves its slot. `None`
-/// means the runner starts nothing now: a hold took the launch (and owns its
-/// wake), or admission refused it and it is re-dispatched after a pause, or
-/// failed with the refusal once every attempt was refused.
+/// `true` means the runner starts the job now. `false` means it starts
+/// nothing now: a hold took the launch (and owns its wake), or admission
+/// refused it and it is re-dispatched after a pause, or failed with the
+/// refusal once every attempt was refused.
 pub async fn admit_dispatched_launch(
     orch: &Orchestrator,
     job_id: &str,
     cause: crate::execution::jobs::WakeCause,
-    focus_admitted: bool,
-) -> Option<AdmissionGuard> {
-    match admit_thread_launch(orch, job_id, cause, focus_admitted).await {
+) -> bool {
+    match admit_thread_launch(orch, job_id, cause).await {
         Ok(admitted) => {
             orch.launch_admission_waits.settle(job_id);
             admitted
         }
         Err(refusal) => {
             redrive_refused_launch(orch, job_id, &refusal);
-            None
+            false
         }
     }
 }
@@ -283,7 +280,6 @@ async fn redispatch(orch: &Orchestrator, job_id: &str) {
             crate::effects::types::WorkflowEffect::StartAgentJobs {
                 jobs: vec![job],
                 cause: cairn_workflow::effects::types::WakeCause::System,
-                focus_admitted: false,
             },
         )
         .await;

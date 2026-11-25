@@ -32,7 +32,7 @@ pub struct Hold {
     pub project_id: Option<String>,
     pub reason: String,
     pub expected_release: Option<ExpectedRelease>,
-    /// What the override button says ("Start now").
+    /// What the source's override button says.
     pub override_label: String,
     /// Where the held thing lives, when it has an address.
     pub source_uri: Option<String>,

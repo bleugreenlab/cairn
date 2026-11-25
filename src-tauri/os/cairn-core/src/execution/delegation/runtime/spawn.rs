@@ -1437,7 +1437,6 @@ pub(super) mod unstarted_child_tests {
     #[derive(Default)]
     pub(in crate::execution::delegation::runtime) struct HoldingExecutor {
         started: Mutex<Vec<String>>,
-        focus_admissions: Mutex<Vec<bool>>,
     }
 
     #[async_trait::async_trait]
@@ -1447,13 +1446,7 @@ pub(super) mod unstarted_child_tests {
             _orch: &Orchestrator,
             effect: WorkflowEffect,
         ) -> Result<Option<EffectResult>, String> {
-            if let WorkflowEffect::StartAgentJobs {
-                jobs,
-                focus_admitted,
-                ..
-            } = effect
-            {
-                self.focus_admissions.lock().unwrap().push(focus_admitted);
+            if let WorkflowEffect::StartAgentJobs { jobs, .. } = effect {
                 self.started
                     .lock()
                     .unwrap()
@@ -2216,91 +2209,6 @@ pub(super) mod unstarted_child_tests {
         );
     }
 
-    /// A claimed child whose launch admission refuses, because another
-    /// admission holds the lock past its bound, is not dropped (cairn/7296):
-    /// its task page says it waits for launch admission, and it is handed to
-    /// the runner again once the lock is free.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_refused_launch_admission_is_reported_and_dispatched_again() {
-        use crate::execution::gates::capacity::AdmissionSite;
-        let (orch, executor) = parent_fixture("refused-admission-redriven.db").await;
-        let outcome = spawn_background(&orch, "map the fleet").await;
-        let task = &outcome.spawned[0];
-        let child = task.job_id.clone();
-        assert_eq!(*executor.started.lock().unwrap(), vec![child.clone()]);
-
-        orch.launch_admission_waits
-            .set_backoff(vec![Duration::from_millis(50)]);
-        orch.admission_lock
-            .set_wait_bound(Duration::from_millis(20));
-        let holder = orch
-            .admission_lock
-            .acquire(AdmissionSite::Release, "another admission")
-            .await
-            .unwrap();
-        let admitted = crate::orchestrator::wakes::admit_dispatched_launch(
-            &orch,
-            &child,
-            crate::execution::jobs::WakeCause::System,
-            false,
-        )
-        .await;
-        assert!(admitted.is_none(), "the lock is held past the bound");
-        orch.admission_lock.set_wait_bound(Duration::from_secs(30));
-        drop(holder);
-
-        let wait = orch
-            .launch_admission_waits
-            .get(&child)
-            .expect("the refusal is recorded, not dropped");
-        assert_eq!((wait.refusals, wait.attempts_allowed), (1, 2));
-        assert!(
-            wait.last_refusal
-                .contains("launch admission was busy: this launch waited 0 s")
-                && !wait.last_refusal.contains("AdmissionBusy"),
-            "{wait:?}"
-        );
-        assert!(wait.next_attempt_unix.is_some(), "{wait:?}");
-        let request = crate::mcp::types::McpCallbackRequest {
-            answer_bound_ms: None,
-            thread_id: None,
-            cwd: "/tmp".to_string(),
-            run_id: None,
-            tool: "read".to_string(),
-            payload: serde_json::json!({}),
-            tool_use_id: None,
-            origin: None,
-        };
-        let page = crate::resources::read_cairn_resource(
-            &orch,
-            &request,
-            task.task_uri.as_deref().unwrap(),
-        )
-        .await;
-        assert!(
-            page.contains("waiting for Cairn to admit its launch since")
-                && page.contains("1 of 2 attempts refused")
-                && page.contains("next attempt at")
-                && page.contains("Nothing is needed from you"),
-            "{page}"
-        );
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while executor.started.lock().unwrap().len() < 2 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the refused launch was never dispatched again"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(
-            *executor.started.lock().unwrap(),
-            vec![child.clone(), child]
-        );
-    }
-
-    /// A launch refused through every attempt fails with the refusal, and the
-    /// parent parked on the task is answered rather than left waiting.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_launch_refused_through_every_attempt_fails_and_answers_the_parent() {
         let (orch, child, _requests) = spawn_and_park("refused-admission-exhausted.db").await;
@@ -2476,7 +2384,6 @@ pub(super) mod unstarted_child_tests {
         vec![WorkflowEffect::AdvanceDag {
             execution_id: "e".to_string(),
             outbox_entry_id: None,
-            focus_admitted: false,
         }]
     }
 
@@ -2489,18 +2396,9 @@ pub(super) mod unstarted_child_tests {
         persist_pending_packet(&orch).await;
         break_advancement_after_its_claim(&orch).await;
 
-        let mut effects = cascading_advance();
-        if let WorkflowEffect::AdvanceDag { focus_admitted, .. } = &mut effects[0] {
-            *focus_admitted = true;
-        }
-        let error = crate::effects::run::execute_effects(&orch, effects)
+        let error = crate::effects::run::execute_effects(&orch, cascading_advance())
             .await
             .expect_err("the broken action node fails the cascading reduction");
-        assert_eq!(
-            *executor.focus_admissions.lock().unwrap(),
-            [true],
-            "same-pass error handover retains fresh admission"
-        );
         assert!(error.contains("Action node has no valid config"), "{error}");
 
         let child = text(

@@ -244,10 +244,6 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
         "this runner's cadence for the service processes it supervises: anchors and last outcomes of scheduled methods; a destination runner anchors its own cadence from the declarations, which export with their thread or live in the repository",
     ),
     (
-        "queue_lane_turns",
-        "when each execution-queue lane last started work on this runner's queue; a lane spans projects (the shared lane spans every one), and a destination with no row simply serves the lane as never served",
-    ),
-    (
         "history_tier",
         "this machine's archive catalog: it names pack objects in the local file store; history travels as event rows",
     ),

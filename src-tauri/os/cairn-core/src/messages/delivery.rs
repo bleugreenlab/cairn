@@ -508,6 +508,8 @@ pub enum Hold {
     },
     /// Waiting on its own sub-agent tasks, or on a dependency when none is open.
     Tasks { pending: i64 },
+    /// Waiting for its execution to rise above the running line.
+    Queue,
     /// Waiting for the operator to answer its question.
     Question,
     /// Waiting for the operator to decide its permission request.
@@ -531,9 +533,6 @@ pub enum Hold {
         account: Option<String>,
         recheck_at: Option<i64>,
     },
-    /// Supply can serve its work again, but the fleet cap is full; it takes
-    /// the next free slot, oldest held first, asking again at `next_at`.
-    FleetSlot { next_at: Option<i64> },
 }
 
 /// When a parked call ends at the latest, as its wait row records it. It is
@@ -587,6 +586,7 @@ impl Hold {
     /// follow "It has not started a turn: ".
     pub fn render(&self) -> String {
         match self {
+            Hold::Queue => "it is queued; it reads this when its execution is above the running line".into(),
             Hold::Wait {
                 labels,
                 supersedable: true,
@@ -676,12 +676,6 @@ impl Hold {
                     "it is held because no account can serve {subject} now; {retry}, or sooner if an account frees up, and it reads this once it launches"
                 )
             }
-            Hold::FleetSlot { next_at } => format!(
-                "an account can serve it again, but every fleet slot is in use; it starts when one frees up, oldest held work first{}, and it reads this then",
-                next_at
-                    .map(|at| format!(" (it asks again at {})", Self::time(at)))
-                    .unwrap_or_default()
-            ),
         }
     }
 
@@ -690,10 +684,8 @@ impl Hold {
         if !hold.kind.is_supply() {
             return None;
         }
-        if hold.boundary_source == "fleet_slot" {
-            return Some(Hold::FleetSlot {
-                next_at: hold.next_due_at(),
-            });
+        if hold.is_queue_held() {
+            return Some(Hold::Queue);
         }
         let subject = hold
             .subject
@@ -746,7 +738,7 @@ impl Hold {
                 ..
             } => format!("held: no supply until {}", Self::time(*at)),
             Hold::NoSupply { .. } => "held: no supply".into(),
-            Hold::FleetSlot { .. } => "held: waiting for a fleet slot".into(),
+            Hold::Queue => "queued".into(),
         }
     }
 
@@ -874,13 +866,8 @@ pub(crate) async fn describe_hold(db: &LocalDb, job_id: &str) -> Option<Hold> {
             let gate = resume_gate
                 .as_deref()
                 .map(ProviderLimitGate::from_resume_gate);
-            // A launch that failed after waiting for a slot keeps the
-            // `fleet_slot` source when it gates, and a gated hold no longer
-            // waits for a slot, so the gate decides first.
-            if source == "fleet_slot" && gate.is_none() {
-                Hold::FleetSlot {
-                    next_at: retry_not_before,
-                }
+            if source == "queue" {
+                Hold::Queue
             } else {
                 Hold::ProviderLimit {
                     retry_not_before,
@@ -2835,34 +2822,6 @@ mod tests {
                 assert_eq!(expected.qualifier(), "held: provider limit, needs continue");
             }
         }
-
-        // A hold that waited for a fleet slot keeps that source when its
-        // launches then fail and gate it, but it waits for the operator now.
-        set_head_turn(&db, "job-1", "yielded", Some("provider_limit")).await;
-        seed_provider_limit_hold(&db, "job-1", reset, "fleet_slot", None).await;
-        assert_eq!(
-            describe_hold(&db, "job-1").await,
-            Some(Hold::FleetSlot {
-                next_at: Some(reset)
-            })
-        );
-        seed_provider_limit_hold(
-            &db,
-            "job-1",
-            reset,
-            "fleet_slot",
-            Some(crate::orchestrator::wakes::RESUME_GATE_LAUNCH_FAILED),
-        )
-        .await;
-        let gated = describe_hold(&db, "job-1").await.unwrap();
-        assert_eq!(
-            gated,
-            Hold::ProviderLimit {
-                retry_not_before: Some(reset),
-                gate: Some(ProviderLimitGate::LaunchFailed),
-            }
-        );
-        assert_eq!(gated.qualifier(), "held: provider limit, needs continue");
 
         // Any gate turns automatic resolution off, so a gate this build does
         // not know must still read as waiting for the operator.

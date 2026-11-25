@@ -184,83 +184,6 @@ pub(super) async fn run_thread_home(
     Some(cairn_uri::build_thread_uri(&project, &name))
 }
 
-/// The thread a queue order is for, and who placed it.
-pub(super) type QueueOrderer = (
-    std::sync::Arc<cairn_db::storage::LocalDb>,
-    cairn_db::models::Thread,
-    String,
-);
-
-/// Who orders a thread's queue (cairn/5848): the thread itself (its sessions
-/// and their tasks, or a page it owns) or the operator, whose requests carry no
-/// run. Returns the project's database, the thread, and the name a hold moved
-/// ahead records as having placed it. A reorder skips no cap and moves no
-/// other thread's place, so this identification is proportionate.
-pub(super) async fn queue_orderer(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    project: &str,
-    thread: &str,
-) -> Result<QueueOrderer, String> {
-    let (db, project_id, target) =
-        crate::execution::gates::reorder::queue_thread(orch, project, thread).await?;
-    let no_run = request
-        .run_id
-        .as_deref()
-        .filter(|run| !run.is_empty())
-        .is_none();
-    if no_run && request.row_write_origin().is_none() {
-        return Ok((db, target, "the operator".to_string()));
-    }
-    let acting = acting_thread_id(orch, request, project, &db, &project_id).await;
-    if acting.as_deref() == Some(target.id.as_str()) {
-        let name = target.name.clone();
-        return Ok((db, target, name));
-    }
-    let other = match acting {
-        Some(id) => crate::threads::crud::list(&db, &project_id)
-            .await
-            .ok()
-            .and_then(|threads| threads.into_iter().find(|thread| thread.id == id))
-            .map_or(id, |thread| thread.name),
-        None => "no thread".to_string(),
-    };
-    Err(format!(
-        "Only {thread} (its sessions and their tasks) or the operator orders {thread}'s queue; \
-         this run acts for {other}. Nothing changed."
-    ))
-}
-
-/// Why `place:"head"` and `after:` never go together.
-pub(super) const HEAD_WITH_AFTER: &str = "place:\"head\" orders cap-held work; an after:-gated \
-     execution has no place until its gates clear. File it without after:, or order it later \
-     with cairn:~/queue {order:[N]}. Nothing changed.";
-
-/// The upfront checks of `place:\"head\"` at filing, run before anything is
-/// written: it orders cap-held work only, in the queue of the thread the
-/// filed issue belongs to, and only that thread or the operator may ask.
-/// Returns who placed it.
-pub(super) async fn head_placed_by(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    project: &str,
-    parent_thread: Option<&str>,
-    filing: &str,
-    has_after: bool,
-) -> Result<String, String> {
-    if has_after {
-        return Err(HEAD_WITH_AFTER.to_string());
-    }
-    let Some(thread) = parent_thread else {
-        return Err(format!(
-            "place:\"head\" files an execution at the head of its parent thread's own queue, and \
-             {filing} has no parent thread. File it without place. Nothing changed."
-        ));
-    };
-    let (_, _, placed_by) = queue_orderer(orch, request, project, thread).await?;
-    Ok(placed_by)
-}
-
 /// The thread a write acts for, by id and name, if it acts for one.
 pub(super) async fn acting_thread(
     orch: &Orchestrator,
@@ -364,35 +287,6 @@ pub(super) async fn issue_parents(
     .map_err(|error| error.to_string())
 }
 
-/// The title of issue `number` of `project`, for a prompt's summary.
-pub(super) async fn issue_title(orch: &Orchestrator, project: &str, number: i32) -> Option<String> {
-    let db = orch.db.for_project(project).await;
-    db.query_opt_text(
-        "SELECT i.title FROM issues i JOIN projects p ON p.id = i.project_id
-          WHERE p.key = ?1 AND i.number = ?2",
-        (cairn_uri::canonical_project(project), number),
-    )
-    .await
-    .ok()
-    .flatten()
-}
-
-/// The name of the thread a write acts in, if it acts in one.
-pub(super) async fn acting_thread_name(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    project: &str,
-) -> Option<String> {
-    let (db, project_id) = project_id(orch, project).await.ok()?;
-    let acting = acting_thread_id(orch, request, project, &db, &project_id).await?;
-    crate::threads::crud::list(&db, &project_id)
-        .await
-        .ok()?
-        .into_iter()
-        .find(|thread| thread.id == acting)
-        .map(|thread| thread.name)
-}
-
 /// A structured row write's payload: a column map, absent meaning empty.
 fn row_payload(item: &ChangeItem) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     match item.payload.as_ref() {
@@ -463,37 +357,6 @@ pub(super) async fn dispatch(
     applied_data: &mut Option<serde_json::Value>,
 ) -> ResourceMutationResult<Option<String>> {
     let summary = match (resource, item.mode) {
-        (CairnResource::ThreadQueue { project, thread }, ChangeMode::Patch) => {
-            let order = item
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("order"))
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .ok_or_else(|| {
-                    build_failure(
-                        index,
-                        item,
-                        "payload.order is this thread's children by issue number, first to start \
-                         first: {order:[5841, 5829]}. Nothing changed.",
-                    )
-                })?;
-            let (db, target, placed_by) = queue_orderer(orch, request, project, thread)
-                .await
-                .map_err(|error| build_failure(index, item, error))?;
-            if dry_run {
-                format!(
-                    "Would order {thread}'s queue: {}",
-                    serde_json::Value::from(order.clone())
-                )
-            } else {
-                crate::execution::gates::reorder::order_thread_queue(
-                    orch, &db, &target, &order, &placed_by,
-                )
-                .await
-                .map_err(|error| build_failure(index, item, error))?
-            }
-        }
         (CairnResource::ThreadDb { project, name }, ChangeMode::Patch) => {
             let uri = format!("cairn://p/{project}/{name}/db");
             let payload = item

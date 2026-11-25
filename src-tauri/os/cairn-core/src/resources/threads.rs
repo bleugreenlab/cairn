@@ -27,109 +27,26 @@ pub(super) async fn resolve_thread_id(
     })).await.map_err(|error| format!("Failed to resolve thread: {error}"))
 }
 
-/// Canonical text queue; callers supply the workspace focus bound and the
-/// observation its children's standings are read against.
+/// A thread's queue is a filtered slice, never a second classification.
 pub(crate) async fn read_thread_queue(
+    orch: &crate::orchestrator::Orchestrator,
     db: &LocalDb,
     project_key: &str,
     thread: &str,
-    now: i64,
-    limit: i64,
-    observer: &WorkObserver,
 ) -> String {
-    let project_key = project_key.to_owned();
-    let thread = thread.to_owned();
-    let observer = observer.clone();
-    read_resource(db, move |conn| {
-        let (project_key, thread, observer) =
-            (project_key.clone(), thread.clone(), observer.clone());
-        Box::pin(async move {
-            let project = match lookup_project_by_key(conn, &project_key).await {
-                Ok(project) => project,
-                Err(error) => return Ok(error),
-            };
-            let thread_id = match crate::storage::query_opt_text_conn(
-                conn,
-                "SELECT id FROM threads WHERE project_id = ?1 AND name = ?2",
-                params![project.project_id.as_str(), thread.as_str()],
-            )
-            .await
-            {
-                Ok(Some(thread_id)) => thread_id,
-                Ok(None) => return Ok(format!("Thread '{thread}' not found")),
-                Err(error) => return Ok(format!("Failed to load thread '{thread}': {error}")),
-            };
-            let queue =
-                match crate::execution::gates::reorder::thread_queue_conn(conn, &thread_id).await {
-                    Ok(queue) => queue,
-                    Err(error) => return Ok(format!("Failed to load {thread}'s queue: {error}")),
-                };
-            let standings = crate::execution::gates::census::focus_standings_conn(conn, &thread_id, &observer).await.map_err(|e| e.to_string())?;
-            let mut rows = conn.query("SELECT id, number, title FROM issues WHERE parent_thread_id = ?1 ORDER BY number", params![thread_id.as_str()]).await.map_err(|e| e.to_string())?;
-            let mut listed = Vec::new();
-            while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
-                let id = row.text(0).map_err(|e| e.to_string())?;
-                if let Some(standing) = standings.get(&id) {
-                    listed.push((row.i64(1).map_err(|e| e.to_string())?, row.text(2).map_err(|e| e.to_string())?, standing.clone()));
-                }
-            }
-            listed.sort_by_key(|(number, _, standing)| (standing.tier(), match standing {
-                crate::execution::gates::census::FocusStanding::Queued { place, .. } => place.unwrap_or(usize::MAX),
-                _ => *number as usize,
-            }));
-            let running = listed.iter().filter(|(_, _, s)| s.tier() == 0).count();
-            let mut out = format!("# Queue — {thread}\n\nRunning {running}/{}\n\n", limit.max(1));
-            for (heading, tiers) in [("Running", vec![0]), ("Queued", vec![1, 2]), ("Held by open-PR bound", vec![3]), ("Parked", vec![4]), ("Stopped", vec![5])] {
-                out.push_str(&format!("## {heading}\n\n"));
-                let mut count = 0;
-                for (number, title, standing) in &listed {
-                    if !tiers.contains(&standing.tier()) { continue; }
-                    count += 1;
-                    out.push_str(&format!("- [{number}](cairn://p/{project_key}/{number}) {title} · {}\n", standing.line(now)));
-                }
-                if count == 0 { out.push_str("None.\n"); }
-                out.push('\n');
-            }
-            // Preserve the reorder's per-cap placement detail and operator provenance.
-            if !queue.is_empty() { out.push_str(&render_thread_queue(&project_key, &thread, &queue, now)); }
-            Ok(out)
-        })
-    })
-    .await
-    .unwrap_or_else(|error| error)
-}
-
-fn render_thread_queue(
-    project_key: &str,
-    thread: &str,
-    queue: &[crate::execution::gates::reorder::ThreadQueued],
-    now: i64,
-) -> String {
-    let mut out = format!("## Fresh release-order detail — {thread}\n\n");
-    if queue.is_empty() {
-        out.push_str("No cap-held executions.\n");
-        return out;
-    }
-    for (index, queued) in queue.iter().enumerate() {
-        let mut parts = vec![format!(
-            "[{number}](cairn://p/{project_key}/{number}) {title}",
-            number = queued.issue_number,
-            title = queued.issue_title
-        )];
-        let places = crate::execution::gates::reorder::places_phrase(queued, " · ");
-        if !places.is_empty() {
-            parts.push(places);
+    let id = match resolve_thread_id(db, project_key, thread).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return format!("Thread '{thread}' not found"),
+        Err(error) => return error,
+    };
+    match super::queue::view(orch).await {
+        Ok(mut view) => {
+            view.items
+                .retain(|row| row.item.thread_id.as_deref() == Some(id.as_str()));
+            super::queue::render(&view)
         }
-        parts.push(format!(
-            "held {}",
-            crate::clock::format_elapsed((now - queued.held_since).max(0))
-        ));
-        if let Some(by) = queued.placed_by() {
-            parts.push(format!("placed ahead by {by}"));
-        }
-        out.push_str(&format!("{}. {}\n", index + 1, parts.join(" · ")));
+        Err(error) => format!("Could not read {thread}'s queue: {error}"),
     }
-    out
 }
 
 pub(super) async fn resolve_migrated_thread_uri(
@@ -235,23 +152,19 @@ fn thread_delivery_semantics(status: &str) -> &'static str {
 /// node-family resource by [`cairn_uri::delegate_thread_descendant`] before dispatch
 /// reaches here, so there is no sub-path interpretation left in this function.
 ///
-/// `default_open_children` is the workspace's limit on a thread's open
-/// children (the execution queue's focus cap, `maxOpenChildrenPerThread`).
 pub(super) async fn read_thread(
     db: &LocalDb,
     project_key: &str,
     name: &str,
     path: &[String],
-    default_open_children: i64,
-    observer: &WorkObserver,
+    _default_open_children: i64,
+    _observer: &WorkObserver,
 ) -> String {
     let project_key = project_key.to_owned();
     let name = name.to_owned();
     let path = path.to_vec();
-    let observer = observer.clone();
     read_resource(db, move |conn| {
-        let observer = observer.clone();
-        Box::pin(async move {
+            Box::pin(async move {
             let project_key = project_key.as_str();
             let name = name.as_str();
             let path = path.as_slice();
@@ -364,29 +277,8 @@ pub(super) async fn read_thread(
                 listed.push((issue_id, number, title, status));
             }
             drop(children);
-            let ids: Vec<String> = listed.iter().map(|(id, ..)| id.clone()).collect();
-            let mut held = crate::execution::gates::census::gated_executions_for_issues_conn(
-                conn, &ids,
-            )
-            .await
-            .unwrap_or_default();
-
             out.push_str("\n## Children\n\n");
-            let standings = crate::execution::gates::census::focus_standings_conn(conn, &id, &observer).await.map_err(|e| e.to_string())?;
-            let limit = default_open_children.max(1);
-            if !listed.is_empty() {
-                let running = standings.values().filter(|s| s.tier() == 0).count();
-                let queued = standings.values().filter(|s| matches!(s, crate::execution::gates::census::FocusStanding::Queued { .. } | crate::execution::gates::census::FocusStanding::HeldForPrs { .. })).count();
-                let parked = standings.values().filter(|s| s.tier() == 4).count();
-                out.push_str(&format!("Running {running}/{limit} · queued {queued} · parked {parked}\n\n"));
-            }
             for (issue_id, number, title, status) in &listed {
-                let standing_line = standings.get(issue_id).map(|s| format!(" · {}", s.line(chrono::Utc::now().timestamp()))).unwrap_or_default();
-                let held_line = held
-                    .remove(issue_id)
-                    .and_then(|gated| gated.held.into_iter().next())
-                    .map(|execution| format!(" · {}", execution.line))
-                    .unwrap_or_default();
                 let failed_line = if status == "failed" {
                     match cairn_attention::delivery::issue_failure_conn(conn, issue_id)
                         .await
@@ -402,7 +294,7 @@ pub(super) async fn read_thread(
                     String::new()
                 };
                 out.push_str(&format!(
-                    "- [{number} — {title}](cairn://p/{}/{number}){failed_line}{standing_line}{held_line}\n",
+                    "- [{number} — {title}](cairn://p/{}/{number}) · {status}{failed_line}\n",
                     project.project_key
                 ));
             }
@@ -414,390 +306,6 @@ pub(super) async fn read_thread(
     })
     .await
     .unwrap_or_else(|error| error)
-}
-
-#[cfg(test)]
-mod children_tests {
-    use crate::execution::gates::sweep::tests::{env, file};
-    use serde_json::json;
-
-    #[tokio::test]
-    async fn failed_projection_children_name_failed_without_consuming_an_open_slot() {
-        let env = env("thread-children-failed-projection.db").await;
-        env.db
-            .execute_script(
-                "INSERT INTO threads(id, project_id, name, created_at, updated_at)
-               VALUES('th', 'p', 'harness', 1, 1);
-             UPDATE issues SET parent_thread_id = 'th', status = 'failed' WHERE id = 'i1';
-             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-               VALUES('failed-exec','recipe','i1','p','failed',1,1);
-             INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, uri_segment,
-                              status, created_at, updated_at)
-               VALUES('failed-job','failed-exec','i1','p','Builder','builder','failed',1,1);
-             INSERT INTO runs(id, job_id, issue_id, status, error_message, created_at, updated_at)
-               VALUES('failed-run','failed-job','i1','crashed','Launch refused',1,1);",
-            )
-            .await
-            .unwrap();
-        let page = super::read_thread(
-            &env.db,
-            "prj",
-            "harness",
-            &[],
-            4,
-            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert!(page.contains("Running 0/4"), "{page}");
-        assert!(page.contains("Failed"), "{page}");
-        assert!(page.contains("Launch refused"), "{page}");
-    }
-
-    /// A thread's children read the queue's own line, and the open paragraph
-    /// counts against the workspace limit.
-    #[tokio::test]
-    async fn the_children_section_reads_the_queued_line_and_the_open_count() {
-        let env = env("thread-children-queue.db").await;
-        let mut seed = String::from(
-            "INSERT INTO threads(id, project_id, name, created_at, updated_at)
-               VALUES('th', 'p', 'harness', 1, 1);",
-        );
-        for number in [100, 101, 102, 103, 105] {
-            seed.push_str(&format!(
-                "INSERT INTO issues(id, project_id, number, title, status, progress, attention,
-                                    parent_thread_id, created_at, updated_at)
-                   VALUES('ci{number}', 'p', {number}, 'Child {number}', 'active', 'active',
-                          'none', 'th', 1, 1);"
-            ));
-        }
-        for number in 100..104 {
-            seed.push_str(&format!(
-                "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-                   VALUES('ce{number}', 'recipe', 'ci{number}', 'p', 'running', 1, 1);
-                 INSERT INTO jobs(id, execution_id, project_id, issue_id, node_name, status,
-                                  started_at, created_at, updated_at)
-                   VALUES('cj{number}', 'ce{number}', 'p', 'ci{number}', 'builder', 'running',
-                          CAST(strftime('%s', 'now') AS INTEGER), 1, 1);"
-            ));
-        }
-        env.db.execute_script(&seed).await.unwrap();
-        file(&env, 105, json!([])).await.unwrap();
-        // The sweep numbers its place in line.
-        crate::execution::gates::sweep::sweep(&env.orch)
-            .await
-            .unwrap();
-
-        let page = super::read_thread(
-            &env.db,
-            "prj",
-            "harness",
-            &[],
-            4,
-            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                .await
-                .unwrap(),
-        )
-        .await;
-        use crate::execution::gates::census::{
-            focus_standings_conn, FocusParkCause, FocusStanding,
-        };
-        let standing = env
-            .db
-            .read({
-                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                    .await
-                    .unwrap();
-                move |conn| {
-                    let observer = observer.clone();
-                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
-                }
-            })
-            .await
-            .unwrap();
-        for n in 100..104 {
-            assert_eq!(
-                standing.get(&format!("ci{n}")),
-                Some(&FocusStanding::Running)
-            );
-        }
-        assert!(matches!(
-            standing.get("ci105"),
-            Some(FocusStanding::Queued { reentry: false, .. })
-        ));
-        assert!(page.contains("Running 4/4"), "{page}");
-        for (number, state, reason) in [
-            (100, "interrupted", None),
-            (101, "yielded", Some("wait")),
-            (102, "yielded", Some("permission")),
-        ] {
-            let reason = reason
-                .map(|r| format!("'{r}'"))
-                .unwrap_or_else(|| "NULL".into());
-            env.db.execute_script(format!(
-                "INSERT INTO sessions(id, job_id, status, backend_id, created_at, updated_at)
-                   VALUES('cs{number}', 'cj{number}', 'open', 'backend', 1, 1);
-                 INSERT INTO runs(id,project_id,job_id,issue_id,status,session_id,created_at,updated_at)
-                   VALUES('cr{number}','p','cj{number}','ci{number}','live','cs{number}',1,1);
-                 INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,yield_reason,created_at,updated_at)
-                   VALUES('ct{number}','cs{number}','cr{number}','cj{number}',1,'{state}',{reason},1,1);
-                 UPDATE jobs SET current_turn_id='ct{number}' WHERE id='cj{number}';"
-            )).await.unwrap();
-        }
-        env.db.execute_script(
-            "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at,deadline_ms)
-             VALUES('cw101','cj101','cr101','cs101','ct101','tool','{\"kind\":\"duration\"}','pending',1,1200001);"
-        ).await.unwrap();
-        let standing = env
-            .db
-            .read({
-                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                    .await
-                    .unwrap();
-                move |conn| {
-                    let observer = observer.clone();
-                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
-                }
-            })
-            .await
-            .unwrap();
-        assert_eq!(standing.get("ci100"), Some(&FocusStanding::Stopped));
-        assert!(matches!(
-            standing.get("ci101"),
-            Some(FocusStanding::Parked {
-                cause: FocusParkCause::SleepingUntil(Some(1200001))
-            })
-        ));
-        assert!(
-            matches!(standing.get("ci102"), Some(FocusStanding::Parked { cause: FocusParkCause::OperatorAwaiting { kind, .. } }) if kind == "permission")
-        );
-        assert_eq!(standing.get("ci103"), Some(&FocusStanding::Running));
-        env.db.execute_script(
-            "UPDATE jobs SET status='pending' WHERE id IN ('cj100','cj101');
-             INSERT INTO provider_limit_holds(id,job_id,backend,boundary_source,observed_text,state,created_at,updated_at,kind)
-             VALUES('ch100','cj100','backend','thread_focus','focus full','active',5,5,'launch'),
-                   ('ch101','cj101','backend','thread_open_prs','harness has 6/6 open PRs','active',6,6,'launch');
-             UPDATE jobs SET status='complete' WHERE id='cj103';
-             UPDATE executions SET status='complete' WHERE id='ce103';
-             INSERT INTO merge_requests(id,job_id,project_id,issue_id,title,source_branch,target_branch,status,opened_at,updated_at,github_pr_number,checks_status)
-             VALUES('cm103','cj103','p','ci103','PR','branch','main','open',1,1,5012,'SUCCESS');"
-        ).await.unwrap();
-        let standing = env
-            .db
-            .read({
-                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                    .await
-                    .unwrap();
-                move |conn| {
-                    let observer = observer.clone();
-                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
-                }
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            standing.get("ci100"),
-            Some(FocusStanding::Queued {
-                reentry: true,
-                place: Some(1),
-                ..
-            })
-        ));
-        assert!(matches!(
-            standing.get("ci101"),
-            Some(FocusStanding::HeldForPrs { .. })
-        ));
-        assert!(
-            matches!(standing.get("ci103"), Some(FocusStanding::Parked { cause: FocusParkCause::PrAwaiting { number: Some(5012), lanes } }) if lanes == "merge")
-        );
-        env.db.execute_script(
-            "UPDATE turns SET state='complete', yield_reason=NULL WHERE id='ct102';
-             UPDATE jobs SET status='blocked' WHERE id='cj102';
-             INSERT INTO artifacts(id,job_id,artifact_type,data,version,output_name,confirmed,created_at,updated_at)
-             VALUES('ca102','cj102','plan','{}',1,'plan',0,500,500);"
-        ).await.unwrap();
-        let standing = env
-            .db
-            .read({
-                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                    .await
-                    .unwrap();
-                move |conn| {
-                    let observer = observer.clone();
-                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
-                }
-            })
-            .await
-            .unwrap();
-        assert!(
-            matches!(standing.get("ci102"), Some(FocusStanding::Parked { cause: FocusParkCause::PlanAwaiting { who, since: 500, .. } }) if who == "you")
-        );
-        // Keep all standing bands populated together, including a stopped
-        // sibling beside a genuinely running job.
-        env.db.execute_script(
-            "INSERT INTO issues(id,project_id,number,title,status,progress,attention,parent_thread_id,created_at,updated_at)
-             VALUES('ci106','p',106,'Running child','active','active','none','th',1,1),
-                   ('ci107','p',107,'Stopped child','active','active','none','th',1,1);
-             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
-             VALUES('ce106','recipe','ci106','p','running',1,1),
-                   ('ce107','recipe','ci107','p','running',1,1);
-             INSERT INTO jobs(id,execution_id,project_id,issue_id,node_name,status,started_at,created_at,updated_at)
-             VALUES('cj106','ce106','p','ci106','builder','running',CAST(strftime('%s','now') AS INTEGER),1,1),
-                   ('cj107','ce107','p','ci107','builder','running',CAST(strftime('%s','now') AS INTEGER),1,1);
-             INSERT INTO sessions(id,job_id,status,backend_id,created_at,updated_at)
-             VALUES('cs107','cj107','open','backend',1,1);
-             INSERT INTO runs(id,project_id,job_id,issue_id,status,session_id,created_at,updated_at)
-             VALUES('cr107','p','cj107','ci107','live','cs107',1,1);
-             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,created_at,updated_at)
-             VALUES('ct107','cs107','cr107','cj107',1,'interrupted',1,1);
-             UPDATE jobs SET current_turn_id='ct107' WHERE id='cj107';"
-        ).await.unwrap();
-        let standing = env
-            .db
-            .read({
-                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                    .await
-                    .unwrap();
-                move |conn| {
-                    let observer = observer.clone();
-                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
-                }
-            })
-            .await
-            .unwrap();
-        assert_eq!(standing.get("ci106"), Some(&FocusStanding::Running));
-        assert_eq!(standing.get("ci107"), Some(&FocusStanding::Stopped));
-        let queue = super::read_thread_queue(
-            &env.db,
-            "prj",
-            "harness",
-            1000,
-            4,
-            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                .await
-                .unwrap(),
-        )
-        .await;
-        let sections = [
-            ("Running", vec![106]),
-            ("Queued", vec![100, 105]),
-            ("Held by open-PR bound", vec![101]),
-            ("Parked", vec![102, 103]),
-            ("Stopped", vec![107]),
-        ];
-        for (heading, numbers) in sections {
-            let section = queue
-                .split(&format!("## {heading}\n\n"))
-                .nth(1)
-                .unwrap_or_else(|| panic!("missing {heading}: {queue}"))
-                .split("\n## ")
-                .next()
-                .unwrap();
-            for number in numbers {
-                assert!(
-                    section.contains(&format!("cairn://p/prj/{number})")),
-                    "{section}"
-                );
-                assert!(
-                    section.contains(&standing[&format!("ci{number}")].line(1000)),
-                    "{section}"
-                );
-            }
-        }
-        assert!(
-            queue.find("cairn://p/prj/100)").unwrap() < queue.find("cairn://p/prj/105)").unwrap(),
-            "{queue}"
-        );
-        let overview = super::read_thread(
-            &env.db,
-            "prj",
-            "harness",
-            &[],
-            4,
-            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert!(
-            overview.contains("Running 1/4 · queued 3 · parked 2"),
-            "{overview}"
-        );
-        for (id, state) in &standing {
-            let number = id.strip_prefix("ci").unwrap();
-            let line = overview
-                .lines()
-                .find(|line| line.contains(&format!("cairn://p/prj/{number})")))
-                .unwrap();
-            let canonical = state.line(chrono::Utc::now().timestamp());
-            assert!(line.contains(&canonical), "{line}");
-        }
-        super::super::thread_seed::assert_focus_text(
-            &env.db,
-            "th",
-            &standing,
-            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                .await
-                .unwrap(),
-        )
-        .await;
-
-        // A non-retryable launch failure gates the re-entry: it leaves the band and
-        // reads as stopped, needing the operator, with no place in line.
-        env.db
-            .execute_script(
-                "UPDATE provider_limit_holds SET resume_gate='launch_failed',launch_attempts=1,launch_failures_json='[{\"at\":900,\"cause\":\"recipe node missing\",\"retryable\":false}]',updated_at=900 WHERE id='ch100';",
-            )
-            .await
-            .unwrap();
-        let standing = env
-            .db
-            .read({
-                let observer = crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                    .await
-                    .unwrap();
-                move |conn| {
-                    let observer = observer.clone();
-                    Box::pin(async move { focus_standings_conn(conn, "th", &observer).await })
-                }
-            })
-            .await
-            .unwrap();
-        assert!(
-            matches!(standing.get("ci100"), Some(FocusStanding::NeedsOperator { reason, since: 900 }) if reason.contains("launch failed: recipe node missing")),
-            "{:?}",
-            standing.get("ci100")
-        );
-        let issue = super::super::issue::read_issue(&env.db, &env.db, "prj", 100).await;
-        assert!(
-            issue.contains("launch failed: recipe node missing"),
-            "{issue}"
-        );
-        let queue = super::read_thread_queue(
-            &env.db,
-            "prj",
-            "harness",
-            1000,
-            4,
-            &crate::execution::jobs::liveness::WorkObserver::read(&env.orch)
-                .await
-                .unwrap(),
-        )
-        .await;
-        let stopped = queue
-            .split("## Stopped\n\n")
-            .nth(1)
-            .unwrap()
-            .split("\n## ")
-            .next()
-            .unwrap();
-        assert!(
-            stopped.contains("cairn://p/prj/100)")
-                && stopped.contains(&standing["ci100"].line(1000)),
-            "{queue}"
-        );
-    }
 }
 
 #[cfg(test)]

@@ -544,18 +544,12 @@ async fn render_issue_parts(
                 .flatten()
                 .as_ref()
                 .map(|hold| {
-                    let standing = crate::execution::gates::census::standing_for_hold(
-                        &hold.boundary_source,
+                    format!(
+                        " waiting on {}",
                         hold.observed_text
-                            .clone()
-                            .unwrap_or_else(|| hold.boundary_source.clone()),
-                        hold.created_at,
-                        hold.resume_gate.clone(),
-                        &hold.launch_failures_json,
-                        hold.updated_at,
-                        None,
-                    );
-                    format!(" {}", standing.line(chrono::Utc::now().timestamp()))
+                            .as_deref()
+                            .unwrap_or(&hold.boundary_source)
+                    )
                 })
                 .unwrap_or_default();
             let status = format!("{}{held}", job_status_icon(&job.status));

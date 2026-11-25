@@ -158,7 +158,7 @@ pub(crate) async fn unstarted_node_refusal(
         "This node has not started yet, so it has no branch of its own. A node's branch is \
          created when it starts; a turn opened before then would commit straight onto \
          `{base_branch}`. Its messages stay queued and reach it once it has started. To start \
-         it now, use Start now on its execution."
+         it now, move its execution above the running line in the queue."
     )))
 }
 

@@ -1,85 +1,310 @@
-//! `cairn://p/<project>/queue`: the fleet's execution queue, read from a
-//! project. The list is the workspace's, the same one Settings → Queue shows
-//! (`capacity::queue_view`), because the fleet cap spans every database; the
-//! project only says where an issue number in a write resolves. Its patch is
-//! `mutations::dispatch::queue`.
-
-use crate::models::{PinBy, PinKind};
+//! Presentation of the runner's single ordered queue.
+use crate::execution::queue::{self, QueueItem};
 use crate::orchestrator::Orchestrator;
+use crate::storage::RowExt;
 
-pub(super) async fn read_project_queue(orch: &Orchestrator, project: &str) -> String {
-    match crate::execution::gates::capacity::queue_view(orch).await {
-        Ok(view) => render(project, &view, orch.services.clock.now()),
-        Err(error) => format!("# Execution queue\n\nCould not read the queue: {error}"),
-    }
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueRow {
+    #[serde(flatten)]
+    pub item: QueueItem,
+    pub project_id: Option<String>,
+    pub project_key: Option<String>,
+    pub issue_number: Option<i64>,
+    pub issue_title: Option<String>,
+    pub thread_name: Option<String>,
+    pub seq: Option<i64>,
+    pub state: String,
 }
 
-/// `placed by judgment`, from the first pinned hold of an execution's census.
-fn pin_phrase(queued: &crate::execution::gates::capacity::QueuedExecution) -> Option<String> {
-    let pin = queued
-        .census
-        .as_ref()?
-        .gates
-        .iter()
-        .find_map(|gate| gate.hold.as_ref().and_then(|hold| hold.pin()))?;
-    let by = match &pin.by {
-        PinBy::Operator => "the operator".to_string(),
-        PinBy::Thread { thread } => thread.clone(),
-    };
-    Some(match pin.kind {
-        PinKind::Placed => format!("placed by {by}"),
-        PinKind::Frozen => format!("held at its place ahead of {by}'s move"),
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueView {
+    pub items: Vec<QueueRow>,
+    pub global_cap: usize,
+    pub thread_cap: usize,
+}
+
+/// Metadata and plain states are presentation only; membership, order and
+/// admission always come from the queue authority.
+pub async fn view(orch: &Orchestrator) -> Result<QueueView, String> {
+    let state = queue::read(orch).await?;
+    let mut items = Vec::with_capacity(state.items.len());
+    for item in state.items {
+        let mut row = QueueRow {
+            state: if item.parked {
+                "parked"
+            } else if item.runs {
+                "running"
+            } else {
+                "queued"
+            }
+            .into(),
+            item,
+            project_id: None,
+            project_key: None,
+            issue_number: None,
+            issue_title: None,
+            thread_name: None,
+            seq: None,
+        };
+        for db in orch.db.all_dbs().await {
+            let id = row.item.execution_id.clone();
+            let metadata = db
+                .read(move |conn| {
+                    let id = id.clone();
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT p.id, p.key, i.number, i.title, t.name, e.seq, i.id
+                         FROM executions e JOIN issues i ON i.id = e.issue_id
+                         JOIN projects p ON p.id = i.project_id
+                         LEFT JOIN threads t ON t.id = i.parent_thread_id WHERE e.id = ?1",
+                                [id.as_str()],
+                            )
+                            .await?;
+                        let Some(meta) = rows.next().await? else {
+                            return Ok(None);
+                        };
+                        let metadata = (
+                            meta.text(0)?,
+                            meta.text(1)?,
+                            meta.i64(2)?,
+                            meta.text(3)?,
+                            meta.opt_text(4)?,
+                            meta.i64(5)?,
+                        );
+                        let issue_id = meta.text(6)?;
+                        drop(rows);
+                        let mut waits = conn
+                            .query(
+                                "SELECT t.state,
+                         CASE WHEN t.yield_reason = 'wait' THEN
+                           (SELECT json_extract(aw.condition_json, '$.kind') FROM agent_waits aw
+                             WHERE aw.job_id = j.id AND aw.state IN ('pending', 'resolving')
+                             ORDER BY aw.created_at DESC LIMIT 1)
+                         ELSE t.yield_reason END FROM jobs j
+                         LEFT JOIN turns t ON t.id = j.current_turn_id
+                         WHERE j.execution_id = ?1 AND j.status IN ('running', 'pending')",
+                                [id.as_str()],
+                            )
+                            .await?;
+                        let mut reasons = Vec::new();
+                        let mut active = false;
+                        while let Some(wait) = waits.next().await? {
+                            let state = wait.opt_text(0)?;
+                            if state.as_deref() == Some("running") {
+                                active = true;
+                            }
+                            if state.as_deref() == Some("yielded") {
+                                if let Some(reason) = wait.opt_text(1)? {
+                                    if let Some(reason) = wait_label(&reason) {
+                                        reasons.push(reason);
+                                    }
+                                }
+                            }
+                        }
+                        drop(waits);
+                        let mut waiting = if active {
+                            None
+                        } else {
+                            reasons.into_iter().next()
+                        };
+                        if !active && waiting.is_none() {
+                            let mut supply = conn.query(
+                                "SELECT 1 FROM provider_limit_holds h JOIN jobs j ON j.id = h.job_id
+                                 WHERE j.execution_id = ?1 AND h.state = 'active'
+                                   AND h.boundary_source <> 'queue'
+                                 LIMIT 1",
+                                [id.as_str()],
+                            ).await?;
+                            if supply.next().await?.is_some() {
+                                waiting = Some("provider limit");
+                            }
+                        }
+                        if !active && waiting.is_none() {
+                            let scope = crate::execution::approvals::ApprovalScope::Issues(vec![issue_id.clone()]);
+                            if !crate::execution::approvals::pending_approvals_conn(conn, &scope).await?.is_empty() {
+                                waiting = Some("review");
+                            } else {
+                                let mut prs = conn.query(
+                                    "SELECT checks_status FROM merge_requests WHERE issue_id = ?1 AND status = 'open' ORDER BY opened_at DESC LIMIT 1",
+                                    [issue_id.as_str()],
+                                ).await?;
+                                if let Some(pr) = prs.next().await? {
+                                    waiting = Some(match pr.opt_text(0)?.as_deref() {
+                                        Some("SUCCESS") => "review",
+                                        _ => "check",
+                                    });
+                                }
+                            }
+                        }
+                        Ok(Some((metadata, waiting)))
+                    })
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(((project_id, key, number, title, thread, seq), waiting)) = metadata {
+                row.project_id = Some(project_id);
+                row.project_key = Some(key);
+                row.issue_number = Some(number);
+                row.issue_title = Some(title);
+                row.thread_name = thread;
+                row.seq = Some(seq);
+                if row.item.runs {
+                    if let Some(waiting) = waiting {
+                        row.state = format!("waiting on {waiting}");
+                    }
+                }
+                break;
+            }
+        }
+        items.push(row);
+    }
+    Ok(QueueView {
+        items,
+        global_cap: state.global_cap,
+        thread_cap: state.thread_cap,
     })
 }
 
-fn render(project: &str, view: &crate::execution::gates::capacity::QueueView, now: i64) -> String {
-    let project = cairn_uri::canonical_project(project);
+fn wait_label(reason: &str) -> Option<&'static str> {
+    match reason {
+        "queue" | "run_queue" => None,
+        "user_input" | "permission" | "safety_pause" => Some("person"),
+        "provider_limit" | "supply" => Some("provider limit"),
+        "checks" | "check" => Some("check"),
+        "review" | "artifact" => Some("review"),
+        "dependencies" | "dependency_wait" => Some("task work"),
+        "duration" => Some("timer"),
+        "terminal" | "run_batch" | "mcp_continuation" => None,
+        _ => None,
+    }
+}
+
+pub(super) async fn read_project_queue(orch: &Orchestrator, _project: &str) -> String {
+    match view(orch).await {
+        Ok(view) => render(&view),
+        Err(error) => format!("# Queue\n\nCould not read the queue: {error}"),
+    }
+}
+
+pub(super) fn render(view: &QueueView) -> String {
+    let running = view.items.iter().filter(|row| row.item.runs).count();
     let mut out = format!(
-        "# Execution queue\n\nEvery execution the caps hold, across every project and thread in \
-         the workspace, in the order the fleet releases them. Issue numbers in a write resolve \
-         in {project}.\n\nFleet: {}/{} running",
-        view.in_progress, view.limit
+        "# Queue\n\nRunning {running} of {}; per thread {}\n\n",
+        view.global_cap, view.thread_cap
     );
-    if view.waiting_for_machine > 0 {
+    let last_running = view.items.iter().rposition(|row| row.item.runs);
+    if last_running.is_none() {
+        out.push_str("── running line ──\n\n");
+    }
+    for (index, row) in view
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| !row.item.parked)
+    {
         out.push_str(&format!(
-            " ({} waiting for a machine)",
-            view.waiting_for_machine
+            "{}. {} · {} · {} · execution {}\n",
+            row.item.position.unwrap_or(index + 1),
+            issue_label(row),
+            row.thread_name.as_deref().unwrap_or("no thread"),
+            row.state,
+            row.item.execution_id
         ));
-    }
-    out.push_str(&format!(" · {} queued.\n\n", view.queued));
-    if view.held.is_empty() {
-        out.push_str("Nothing is queued.\n");
-        return out;
-    }
-    for (index, queued) in view.held.iter().enumerate() {
-        let mut parts = Vec::new();
-        parts.push(match (&queued.project_key, queued.issue_number) {
-            (Some(key), Some(number)) => {
-                let key = cairn_uri::canonical_project(key);
-                format!("[{key}/{number}](cairn://p/{key}/{number})")
-            }
-            _ => format!("execution {}", queued.execution_id),
-        });
-        parts.push(
-            queued
-                .thread_name
-                .clone()
-                .unwrap_or_else(|| "no thread".to_string()),
-        );
-        if let Some(title) = &queued.issue_title {
-            parts.push(title.clone());
+        if Some(index) == last_running {
+            out.push_str("\n── running line ──\n\n");
         }
-        if let Some(census) = &queued.census {
-            parts.push(census.summary.clone());
-        }
-        parts.push(format!(
-            "held {}",
-            crate::clock::format_elapsed((now - queued.held_since).max(0))
+    }
+    out.push_str("\n## Parked\n\n");
+    for row in view.items.iter().filter(|row| row.item.parked) {
+        out.push_str(&format!(
+            "- {} · {} · parked · execution {}\n",
+            issue_label(row),
+            row.thread_name.as_deref().unwrap_or("no thread"),
+            row.item.execution_id
         ));
-        if let Some(pin) = pin_phrase(queued) {
-            parts.push(pin);
-        }
-        out.push_str(&format!("{}. {}\n", index + 1, parts.join(" · ")));
     }
     out
+}
+
+fn issue_label(row: &QueueRow) -> String {
+    match (&row.project_key, row.issue_number) {
+        (Some(key), Some(number)) => {
+            let key = cairn_uri::canonical_project(key);
+            format!(
+                "[{key}/{number} — {}](cairn://p/{key}/{number})",
+                row.issue_title.as_deref().unwrap_or("")
+            )
+        }
+        _ => format!("issue {}", row.item.issue_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str, position: Option<usize>, runs: bool, state: &str) -> QueueRow {
+        QueueRow {
+            item: QueueItem {
+                execution_id: id.into(),
+                issue_id: format!("issue-{id}"),
+                thread_id: Some("t".into()),
+                position,
+                runs,
+                parked: position.is_none(),
+            },
+            project_id: Some("p".into()),
+            project_key: Some("prj".into()),
+            issue_number: Some(1),
+            issue_title: Some("Issue".into()),
+            thread_name: Some("alpha".into()),
+            seq: Some(1),
+            state: state.into(),
+        }
+    }
+
+    #[test]
+    fn wait_states_are_plain_labels_not_queue_mechanisms() {
+        for (reason, label) in [
+            ("provider_limit", Some("provider limit")),
+            ("checks", Some("check")),
+            ("user_input", Some("person")),
+            ("dependency_wait", Some("task work")),
+            ("run_queue", None),
+            ("run_batch", None),
+            ("mcp_continuation", None),
+        ] {
+            assert_eq!(wait_label(reason), label);
+        }
+    }
+
+    #[test]
+    fn presentation_preserves_authority_order_and_marks_the_last_running_item() {
+        let view = QueueView {
+            items: vec![
+                row("a", Some(1), true, "waiting on person"),
+                row("b", Some(2), false, "queued"),
+                row("c", Some(3), true, "running"),
+                row("d", Some(4), false, "queued"),
+                row("e", None, false, "parked"),
+            ],
+            global_cap: 2,
+            thread_cap: 1,
+        };
+        let text = render(&view);
+        assert!(text.contains("Running 2 of 2; per thread 1"));
+        assert!(text.contains("waiting on person"));
+        assert!(text.find("execution b").unwrap() < text.find("execution c").unwrap());
+        let line = text.find("── running line ──").unwrap();
+        assert!(text.find("execution c").unwrap() < line);
+        assert!(line < text.find("execution d").unwrap());
+        assert!(text.find("## Parked").unwrap() < text.find("execution e").unwrap());
+        assert_eq!(text.matches("running line").count(), 1);
+        for old in ["focus slot", "fleet slot", "re-entry ahead", "Start now"] {
+            assert!(!text.contains(old));
+        }
+    }
 }

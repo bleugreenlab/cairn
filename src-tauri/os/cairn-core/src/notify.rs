@@ -152,7 +152,6 @@ mod tests {
             parent_issue_id: None,
             parent_thread_id: None,
             held_executions: Vec::new(),
-            focus_standing: None,
             wont_start_executions: Vec::new(),
             labels: Vec::new(),
         }

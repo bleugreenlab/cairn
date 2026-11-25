@@ -225,9 +225,9 @@ pub enum CairnResource {
     ProjectMap {
         project: String,
     },
-    /// The workspace's execution queue (every cap-held execution, in the
-    /// fleet's release order), addressed from a project, whose issue numbers a
-    /// write resolves.
+    /// This runner's run queue: every issue execution it wants to run,
+    /// running ones included, in order, with the running line. Addressed from
+    /// a project, whose issue numbers a write resolves.
     ProjectQueue {
         project: String,
     },
@@ -305,8 +305,8 @@ pub enum CairnResource {
         name: String,
         path: Vec<String>,
     },
-    /// The thread's children's cap-held executions, in the order they start
-    /// (cairn/5848).
+    /// The thread's slice of the run queue: its children's entries, in queue
+    /// order.
     ThreadQueue {
         project: String,
         thread: String,

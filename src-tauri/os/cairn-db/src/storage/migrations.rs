@@ -2503,7 +2503,6 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("execution_gates", TableScope::ProjectScoped),
     // cairn/5943: when each queue lane last started work. Written beside the
     // release it records, in the database that owns the released execution.
-    ("queue_lane_turns", TableScope::ProjectScoped),
     ("executions", TableScope::ProjectScoped),
     // cairn/5814: how each execution create resolved its recipe, the option
     // sets those resolutions chose among, and live edits to a step's
@@ -3480,12 +3479,6 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "execution_gates",
         id_columns: &["id", "execution_id"],
-    },
-    // `lane` embeds a thread or issue id behind a prefix and stays bare: a
-    // moved project's lanes read as never served, which costs one round.
-    RekeyTableManifest {
-        table: "queue_lane_turns",
-        id_columns: &["execution_id"],
     },
     RekeyTableManifest {
         table: "ask_conditions",

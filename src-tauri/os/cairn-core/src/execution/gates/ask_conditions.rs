@@ -195,11 +195,7 @@ pub(crate) async fn insert_question_condition_conn(
 
 /// The facts an approver may defer on, for refusals and the affordance.
 pub fn deferrable_facts() -> Vec<&'static str> {
-    gate_vocabulary()
-        .fact_names()
-        .into_iter()
-        .filter(|fact| !super::capacity::CAPACITY_FACTS.contains(fact))
-        .collect()
+    gate_vocabulary().fact_names().into_iter().collect()
 }
 
 /// What one pass did with ask conditions.

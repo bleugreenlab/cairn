@@ -460,20 +460,31 @@ async fn evaluate(
         .await?
         .filter(|hold| hold.kind == crate::orchestrator::wakes::HoldKind::Resume)
         .map(|hold| {
-            let description = match hold.boundary_source.as_str() {
-                "thread_focus" if hold.resume_gate.is_none() => "waiting for a thread focus slot; re-entries precede fresh starts. It resumes on its own when a focus slot frees.".to_string(),
-                "thread_open_prs" if hold.resume_gate.is_none() => "waiting for room under the thread's open-PR bound. It resumes on its own when that bound allows it.".to_string(),
-                _ => {
-                    let description = if let Some(gate) = hold.resume_gate.as_deref() {
-                        return (hold.id, crate::execution::gates::census::gate_phrase(gate, &hold.launch_failures_json));
-                    } else {
-                        crate::messages::delivery::Hold::no_supply(&hold)
-                            .expect("a resume hold is a supply hold")
-                    };
-                    description.render()
+            let description = if let Some(gate) = hold.resume_gate.as_deref() {
+                crate::messages::delivery::Hold::ProviderLimit {
+                    retry_not_before: hold.retry_not_before,
+                    gate: Some(
+                        crate::messages::delivery::ProviderLimitGate::from_resume_gate(gate),
+                    ),
                 }
+                .render()
+            } else {
+                crate::messages::delivery::Hold::no_supply(&hold)
+                    .expect("a resume hold is a supply hold")
+                    .render()
             };
-            let description = match crate::execution::gates::census::latest_launch_failure_cause(&hold.launch_failures_json) {
+            let latest_cause =
+                serde_json::from_str::<Vec<serde_json::Value>>(&hold.launch_failures_json)
+                    .ok()
+                    .and_then(|failures| {
+                        failures.last().and_then(|failure| {
+                            failure
+                                .get("cause")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                    });
+            let description = match latest_cause {
                 Some(cause) => format!("{description} Latest launch failure: {cause}"),
                 None => description,
             };

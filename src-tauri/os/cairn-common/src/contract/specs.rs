@@ -297,14 +297,7 @@ pub(crate) const TITLE: KeySpec = KeySpec::new("title", KeyType::Str, "");
 pub(crate) const EXECUTION: KeySpec = KeySpec::new(
     "execution",
     KeyType::Object,
-    "true | {recipe?, overrides?, after?, place?} to also start an execution once the issue is created; omit to create only. With no recipe Cairn chooses: the workspace setting defaultRecipe until a measured chooser exists, refused (and no issue created) when it is unset; a named recipe is run exactly. The reply carries the resolution: the recipe and what decided it, one line per agent step with its allotment and what it would pick `now:` (each step selects at its own launch, so this is a prediction, not a lock; a single-model allotment is exact), and the URIs to change a step live or re-run on another recipe. `overrides` takes the same launch deltas the executions collection does, so a child can be created with review already off in one call. `after` takes the same gate clauses the executions collection does: the execution is filed HELD and starts only once every gate is satisfied. `place` takes the same value the executions collection does",
-);
-/// `place` on a filing, shared verbatim by the executions-collection append and
-/// the issue-create `execution` block.
-pub(crate) const QUEUE_PLACE: KeySpec = KeySpec::new(
-    "place",
-    KeyType::Str,
-    "head — if the execution queue's caps hold this execution, it takes the earliest places its parent thread's cap-held set already occupies (fleet and thread order), never ahead of another thread's work and skipping no cap. Only for a child of a thread, filed by that thread or the operator, and never with `after`. Omit to queue behind what is already held; reorder later with cairn://p/PROJECT/THREAD/queue {order:[N,...]}",
+    "true | {recipe?, overrides?, after?} to also start an execution once the issue is created; omit to create only. With no recipe Cairn chooses: the workspace setting defaultRecipe until a measured chooser exists, refused (and no issue created) when it is unset; a named recipe is run exactly. The reply carries the resolution: the recipe and what decided it, one line per agent step with its allotment and what it would pick `now:` (each step selects at its own launch, so this is a prediction, not a lock; a single-model allotment is exact), and the URIs to change a step live or re-run on another recipe. `overrides` takes the same launch deltas the executions collection does, so a child can be created with review already off in one call. `after` takes the same gate clauses the executions collection does: the execution is filed HELD and starts only once every gate is satisfied",
 );
 /// `after:` gates, shared verbatim by the executions-collection append, the
 /// issue-create `execution` block, and the execution patch — one grammar,
@@ -1154,17 +1147,12 @@ pub(crate) const SETTINGS_MAX_OPEN_TRIAGE_ISSUES: KeySpec = KeySpec::new(
 pub(crate) const SETTINGS_MAX_CONCURRENT_EXECUTIONS: KeySpec = KeySpec::new(
     "maxConcurrentExecutions",
     KeyType::Int,
-    "executions in progress across this runner's fleet before new starts hold for a slot (minimum 1)",
-);
-pub(crate) const SETTINGS_MAX_OPEN_PRS_PER_THREAD: KeySpec = KeySpec::new(
-    "maxOpenPrsPerThread",
-    KeyType::Int,
-    "open PR children per thread before new PR-producing launches hold (default 6, minimum 1)",
+    "global number of entries admitted from this runner's ordered queue, including waiting work (minimum 1)",
 );
 pub(crate) const SETTINGS_MAX_OPEN_CHILDREN_PER_THREAD: KeySpec = KeySpec::new(
     "maxOpenChildrenPerThread",
     KeyType::Int,
-    "open started children a thread may have before its new starts hold (minimum 1)",
+    "number of entries admitted from each thread's slice of the runner queue, including waiting work (minimum 1)",
 );
 pub(crate) const SETTINGS_PENDING_MEMORY_THRESHOLD: KeySpec = KeySpec::new(
     "pendingMemoryThreshold",

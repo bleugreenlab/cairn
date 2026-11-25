@@ -350,14 +350,10 @@ pub struct Settings {
     pub memory_triage_enabled: bool,
     /// Maximum open memory-triage issues for an exact scope.
     pub max_open_triage_issues_per_scope: i32,
-    /// Executions in progress across this runner's fleet before a new start
-    /// holds for a slot (tenet 1288). At least 1; an operator start skips it.
+    /// Global running line over this runner's ordered queue (minimum 1).
     pub max_concurrent_executions: i32,
-    /// Open started children a thread may have before its new starts hold
-    /// (tenet 1350). The workspace default; a thread may override it.
+    /// Per-thread running line over each thread's slice of the queue (minimum 1).
     pub max_open_children_per_thread: i32,
-    /// Open PR children per thread before new PR-producing launches hold (minimum 1).
-    pub max_open_prs_per_thread: i32,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     pub pending_memory_threshold: i32,
     /// Fraction of the model's context window at which a WARM thread session
@@ -466,8 +462,6 @@ pub struct UpdateSettings {
     pub max_concurrent_executions: Option<i32>,
     /// Open started children per thread before the thread's new starts hold.
     pub max_open_children_per_thread: Option<i32>,
-    /// Open PR children per thread before new PR-producing launches hold (minimum 1).
-    pub max_open_prs_per_thread: Option<i32>,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     pub pending_memory_threshold: Option<i32>,
     /// Fraction of the model's context window at which a warm thread session rebuilds.

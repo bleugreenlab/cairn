@@ -29,13 +29,10 @@ use crate::models::{
 /// and the tool results it pulls in all land after the reading that triggered.
 pub const DEFAULT_THREAD_COMPACT_THRESHOLD: f64 = 0.8;
 pub const DEFAULT_SEED_BUDGET_TOKENS: i32 = 12_000;
-/// Executions in progress across this runner's fleet before new starts hold
-/// (tenet 1288).
+/// Global running line over this runner's ordered queue.
 pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: i32 = 6;
-/// Open started children per thread before the thread's new starts hold
-/// (tenet 1350; the operator set the default).
+/// Per-thread running line over the thread's slice of the queue.
 pub const DEFAULT_MAX_OPEN_CHILDREN_PER_THREAD: i32 = 4;
-pub const DEFAULT_MAX_OPEN_PRS_PER_THREAD: i32 = 6;
 pub const DEFAULT_SEED_ERAS: i32 = 3;
 
 pub fn clamp_seed_budget_tokens(value: i32) -> i32 {
@@ -450,15 +447,12 @@ pub struct SettingsFile {
     /// Maximum open memory-triage issues for an exact scope.
     #[serde(default)]
     max_open_triage_issues_per_scope: Option<i32>,
-    /// Executions in progress across this runner's fleet before new starts hold.
+    /// Global running line over this runner's ordered queue.
     #[serde(default)]
     max_concurrent_executions: Option<i32>,
-    /// Open started children per thread before the thread's new starts hold.
+    /// Per-thread running line over the thread's slice of the queue.
     #[serde(default)]
     max_open_children_per_thread: Option<i32>,
-    /// Open PR children per thread before new PR-producing launches hold.
-    #[serde(default)]
-    max_open_prs_per_thread: Option<i32>,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     #[serde(default)]
     pending_memory_threshold: Option<i32>,
@@ -962,10 +956,6 @@ impl SettingsFile {
                 .max_open_children_per_thread
                 .unwrap_or(DEFAULT_MAX_OPEN_CHILDREN_PER_THREAD)
                 .max(1),
-            max_open_prs_per_thread: self
-                .max_open_prs_per_thread
-                .unwrap_or(DEFAULT_MAX_OPEN_PRS_PER_THREAD)
-                .max(1),
             pending_memory_threshold: self.pending_memory_threshold.unwrap_or(5).max(1),
             thread_compact_threshold: clamp_compact_threshold(
                 self.thread_compact_threshold
@@ -1036,7 +1026,6 @@ impl SettingsFile {
             ),
             max_concurrent_executions: Some(settings.max_concurrent_executions.max(1)),
             max_open_children_per_thread: Some(settings.max_open_children_per_thread.max(1)),
-            max_open_prs_per_thread: Some(settings.max_open_prs_per_thread.max(1)),
             pending_memory_threshold: Some(settings.pending_memory_threshold.max(1)),
             thread_compact_threshold: Some(clamp_compact_threshold(
                 settings.thread_compact_threshold,
@@ -1630,6 +1619,7 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "maxOpenTriageIssuesPerScope",
     "maxConcurrentExecutions",
     "maxOpenChildrenPerThread",
+    // Retired: remove the obsolete open-PR bound from existing YAML on save.
     "maxOpenPrsPerThread",
     "pendingMemoryThreshold",
     "externalReplies",
@@ -2179,9 +2169,6 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     if let Some(value) = input.max_open_children_per_thread {
         current.max_open_children_per_thread = value.max(1);
     }
-    if let Some(value) = input.max_open_prs_per_thread {
-        current.max_open_prs_per_thread = value.max(1);
-    }
     if let Some(value) = input.pending_memory_threshold {
         current.pending_memory_threshold = value.max(1);
     }
@@ -2522,39 +2509,35 @@ mod tests {
         let settings = empty.to_settings();
         assert_eq!(settings.max_concurrent_executions, 6);
         assert_eq!(settings.max_open_children_per_thread, 4);
-        assert_eq!(settings.max_open_prs_per_thread, 6);
 
-        let zeroed: SettingsFile = serde_yaml::from_str(
-            "maxConcurrentExecutions: 0\nmaxOpenChildrenPerThread: -3\nmaxOpenPrsPerThread: 0\n",
-        )
-        .unwrap();
+        let zeroed: SettingsFile =
+            serde_yaml::from_str("maxConcurrentExecutions: 0\nmaxOpenChildrenPerThread: -3\n")
+                .unwrap();
         let settings = zeroed.to_settings();
         assert_eq!(
             settings.max_concurrent_executions, 1,
             "there is no off value"
         );
         assert_eq!(settings.max_open_children_per_thread, 1);
-        assert_eq!(settings.max_open_prs_per_thread, 1);
 
         let serialized = serde_yaml::to_string(&SettingsFile::from_settings(&settings)).unwrap();
         assert!(serialized.contains("maxConcurrentExecutions: 1"));
         assert!(serialized.contains("maxOpenChildrenPerThread: 1"));
-        assert!(serialized.contains("maxOpenPrsPerThread: 1"));
 
         let dir = tempfile::tempdir().unwrap();
         let updated = update_settings(
             dir.path(),
             UpdateSettings {
-                max_open_prs_per_thread: Some(2),
+                max_open_children_per_thread: Some(2),
                 ..Default::default()
             },
             &ProviderNames::default(),
         )
         .unwrap();
-        assert_eq!(updated.max_open_prs_per_thread, 2);
-        assert_eq!(load_settings(dir.path()).max_open_prs_per_thread, 2);
+        assert_eq!(updated.max_open_children_per_thread, 2);
+        assert_eq!(load_settings(dir.path()).max_open_children_per_thread, 2);
         save_settings(dir.path(), &updated).unwrap();
-        assert_eq!(load_settings(dir.path()).max_open_prs_per_thread, 2);
+        assert_eq!(load_settings(dir.path()).max_open_children_per_thread, 2);
     }
 
     #[test]

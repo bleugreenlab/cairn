@@ -30,16 +30,8 @@
 //! (`runs::queries::reconcile_stale_runs`) returns it to pending and advances
 //! the execution again.
 //!
-//! ## A burst is released in order, and never rate-limited
-//!
-//! One merge can release every execution a plan filed after it. They are
-//! released in the queue's one order (the lanes in rotation, each by
-//! `queue_key`; see `rotation`), because admission ranks by queue time and a
-//! nondeterministic release order would turn a plan's implicit priority into a
-//! coin flip. There is deliberately NO stagger, cap,
-//! or rate limit here: a count cap wearing a schedule would be a second brake
-//! masking the admission defects it compensates for (ruled by the execution
-//! thread). A thread that wants serialization chains its `after:` edges.
+//! Authored gates only decide when jobs are created. The run queue decides
+//! which released executions may run.
 //!
 //! ## Foreclosure holds and wakes
 //!
@@ -68,7 +60,6 @@ use cairn_workflow::gates::store::{
 use tokio::sync::mpsc;
 
 use super::authoring::gate_vocabulary;
-use super::capacity::{AdmissionSite, QueueSnapshot, Start};
 use super::vocabulary::{GateContext, GateOutcome, GateVocabulary};
 use crate::messages::queued::DeliveryUrgency;
 use crate::models::ExecutionGate;
@@ -119,44 +110,11 @@ pub enum ReleaseCause {
     /// Every authored gate resolved true.
     Satisfied,
     /// Someone decided not to wait. Carries the acting principal, serialized,
-    /// which is recorded on the row and is what renders the release as an
-    /// override, and how much of the hold it skips.
-    Override {
-        principal: serde_json::Value,
-        scope: OverrideScope,
-    },
+    /// which is recorded on the row and renders the release as an override.
+    Override { principal: serde_json::Value },
     /// The last authored gate was patched off, so nothing it wrote is left to
     /// wait on.
     GatesRemoved,
-}
-
-/// How much of a hold an override skips.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OverrideScope {
-    /// The authored `after:` gates only: an agent's or a caller's
-    /// `{release:true}`. The execution queue's caps still apply, because a cap
-    /// governs what a thread starts itself (tenet 1319): a thread must not be
-    /// able to release its own way past its cap.
-    AuthoredGates,
-    /// Every gate, the caps included: a Start now, on the operator's
-    /// authority (`by`).
-    Everything { by: CapSkipAuthority },
-}
-
-/// Whose authority a start past every cap rests on. Only the operator's: either
-/// their own Start now, or a grant they gave a thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CapSkipAuthority {
-    /// The operator's own Start now, with a principal the invoke's
-    /// credentials proved.
-    Operator,
-    /// A thread's `{start_now:true}`, allowed by a grant the operator gave it.
-    /// `decision` is the authorization journal's id for the decision that
-    /// cited the grant, so the start can be traced to it.
-    Granted {
-        thread: String,
-        decision: Option<String>,
-    },
 }
 
 /// What a release attempt did.
@@ -164,8 +122,6 @@ pub enum CapSkipAuthority {
 pub enum ReleaseOutcome {
     /// This caller released it; its jobs exist.
     Released,
-    /// Every authored gate allows it, but the execution queue's caps hold it.
-    HeldByCap(Vec<crate::models::CapacityHold>),
     /// Nothing to release: already released, superseded, its issue resolved,
     /// or its authored gates do not license the cause.
     NotHeld,
@@ -188,20 +144,6 @@ pub struct SweepReport {
     pub evaluated: usize,
     /// Those whose authored gates all allowed them to start.
     pub candidates: usize,
-    /// Candidates the execution queue's caps held.
-    pub held_by_cap: usize,
-    /// How long the release phase waited for the admission lock, and held
-    /// it; `None` when the pass took no lock.
-    pub lock_wait_ms: Option<u64>,
-    pub lock_held_ms: Option<u64>,
-    /// Statements issued on every open database while the pass held the
-    /// lock: in a test, where nothing else runs, the pass's own.
-    #[cfg(test)]
-    pub lock_statements: Option<usize>,
-    /// Write transactions on every open database while the pass held the
-    /// lock.
-    #[cfg(test)]
-    pub lock_writes: Option<usize>,
     /// Authored gates resolved this pass, by fact and outcome (`satisfied`,
     /// `refuted`, `no_evidence`, `foreclosed`).
     pub clauses: BTreeMap<(String, &'static str), usize>,
@@ -225,12 +167,8 @@ pub(crate) async fn sweep_with(
     vocabulary: &GateVocabulary,
     now: i64,
 ) -> Result<SweepReport, String> {
-    crate::orchestrator::wakes::resolve_thread_holds(orch, now).await?;
+    crate::orchestrator::wakes::recover_held_work(orch, now).await?;
     let mut report = SweepReport::default();
-    // The queue's order, across every database: a fleet slot that frees goes
-    // to whatever is first in line, wherever it lives. An earlier execution
-    // held only by its own thread's cap does not stop a later one from another
-    // thread taking a free fleet slot: each is decided on its own caps.
     let mut held = Vec::new();
     for (db_index, db) in orch.db.all_dbs().await.into_iter().enumerate() {
         let listed = db
@@ -243,12 +181,9 @@ pub(crate) async fn sweep_with(
                 .map(|(execution, gates)| (db_index, db.clone(), execution, gates)),
         );
     }
-    // Capacity keys never tie. An execution with no capacity row yet (one
-    // that waits on its own `after:` gates) keys on the second it was filed,
-    // so a burst filed at one instant ties and keeps its issue order.
     held.sort_by(|(a_db, _, a, _), (b_db, _, b, _)| {
         (
-            a.queue_key,
+            a.held_since,
             a_db,
             a.issue_number.is_none(),
             a.issue_number,
@@ -256,7 +191,7 @@ pub(crate) async fn sweep_with(
             &a.execution_id,
         )
             .cmp(&(
-                b.queue_key,
+                b.held_since,
                 b_db,
                 b.issue_number.is_none(),
                 b.issue_number,
@@ -269,10 +204,6 @@ pub(crate) async fn sweep_with(
         .iter()
         .map(|(_, _, execution, _)| execution.execution_id.clone())
         .collect();
-    // Evaluate, without the admission lock: resolve each execution's authored
-    // gates and record what they say. One whose authored gates all allow it
-    // is a candidate; whether the queue's caps let it start is the release
-    // phase's to decide.
     let mut candidates = Vec::new();
     for (_, db, execution, gates) in held {
         // One execution whose evidence cannot be read must not hold up the
@@ -302,10 +233,8 @@ pub(crate) async fn sweep_with(
         }
     }
     report.candidates = candidates.len();
-    let queue = release_candidates(orch, &candidates, now, &mut report).await;
-    if let Err(error) = super::capacity::refresh_places(orch, queue.as_ref()).await {
-        log::warn!("gate sweep could not rewrite the queue's places in line: {error}");
-    }
+    release_candidates(orch, &candidates, now, &mut report).await;
+    crate::execution::queue::settle(orch).await?;
     // A released or superseded execution is no longer listed held, so its
     // stamp goes with this pass.
     orch.sweep_pulse.retain_evaluated(&held_ids);
@@ -313,26 +242,6 @@ pub(crate) async fn sweep_with(
     // vocabulary in the same pass; there is no second sweeper.
     report.asks = super::ask_conditions::sweep_ask_conditions(orch, vocabulary, now).await;
     Ok(report)
-}
-
-fn millis(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Statements and write transactions issued on every open database so far,
-/// read around the lock to count what a pass does while holding it.
-#[cfg(test)]
-async fn issued(orch: &Orchestrator) -> (usize, usize) {
-    orch.db
-        .all_dbs()
-        .await
-        .iter()
-        .fold((0, 0), |(statements, writes), db| {
-            (
-                statements + db.statement_count(),
-                writes + db.write_transaction_count(),
-            )
-        })
 }
 
 /// A held execution whose authored gates all allow it to start this pass.
@@ -343,155 +252,24 @@ struct Candidate {
     gates_moved: bool,
 }
 
-/// The release phase of a pass: every candidate, in the queue's release order,
-/// decided against ONE read of the queue under ONE acquisition of the admission
-/// lock. The read is kept current as candidates release and hold, and the next
-/// candidate decided is always the first undecided one in the order as it
-/// stands then: a release spends its lane's turn and so re-ranks the lanes.
-/// Candidates the order does not hold yet (no cap held them) follow, in their
-/// evaluation order. A candidate its thread's cap holds is held and its lane's
-/// turn untouched, so a lane at its focus cap keeps its rank.
-///
-/// The walk costs `O(candidates × n log n)` of pure compute under the lock
-/// for `n` queued executions; it reads nothing more.
-///
-/// A candidate the caps hold on exactly the caps its rows already record
-/// costs no write: its facts are refreshed with the rest of the queue's after
-/// the pass. One that starts, newly holds, or whose caps changed is written
-/// through [`release_conn`], whose guarded update keeps a release exactly-once
-/// against every other releaser.
-///
-/// Returns the queue as the pass left it, for that refresh, or `None` when
-/// the pass decided nothing (no candidate, a busy lock, an unreadable queue).
 async fn release_candidates(
     orch: &Orchestrator,
     candidates: &[Candidate],
     now: i64,
     report: &mut SweepReport,
-) -> Option<QueueSnapshot> {
-    if candidates.is_empty() {
-        return None;
-    }
-    let guard = match orch
-        .admission_lock
-        .acquire(
-            AdmissionSite::SweepPass,
-            format!("{} candidates", candidates.len()),
-        )
-        .await
-    {
-        Ok(guard) => guard,
-        Err(busy) => {
-            report.lock_wait_ms = Some(millis(busy.waited));
-            log::warn!(
-                "gate sweep left {} candidate(s) for the next pass: {busy}",
-                candidates.len()
-            );
-            return None;
-        }
-    };
-    report.lock_wait_ms = Some(millis(guard.waited()));
-    #[cfg(test)]
-    let issued_at_acquire = issued(orch).await;
-    let starts: Vec<Start<'_>> = candidates
-        .iter()
-        .map(|candidate| Start {
-            db: &candidate.db,
-            issue_id: candidate.execution.issue_id.as_deref(),
-            execution_id: Some(&candidate.execution.execution_id),
-        })
-        .collect();
-    let mut queue = match QueueSnapshot::load(orch, &starts).await {
-        Ok(queue) => queue,
-        Err(error) => {
-            log::error!("gate sweep could not read the execution queue: {error}");
-            return None;
-        }
-    };
-    let mut released = Vec::new();
-    let mut moved = HashSet::new();
-    let mut decided = vec![false; candidates.len()];
-    while let Some(index) = (0..candidates.len())
-        .filter(|index| !decided[*index])
-        .min_by_key(|index| {
-            let rank = queue.rank_of(&starts[*index]);
-            (rank.is_none(), rank.unwrap_or(0), *index)
-        })
-    {
-        decided[index] = true;
-        let (candidate, start) = (&candidates[index], &starts[index]);
-        let admission = queue.decide(start);
-        if queue.holds_as_stored(start, &admission) {
-            report.held_by_cap += 1;
-            continue;
-        }
-        let execution_id = candidate.execution.execution_id.as_str();
-        let turn = admission.turn;
-        let outcome = candidate
-            .db
-            .write(|conn| {
-                let execution_id = execution_id.to_string();
-                let admission = admission.clone();
-                Box::pin(async move {
-                    release_conn(
-                        conn,
-                        &execution_id,
-                        now,
-                        &ReleaseCause::Satisfied,
-                        &admission,
-                    )
-                    .await
-                })
-            })
-            .await;
-        match outcome {
-            Ok(ConnRelease::Released(tail)) => {
-                queue.record_release(start, turn);
-                released.push((index, tail));
-            }
-            Ok(ConnRelease::HeldByCap {
-                blocks,
-                moved: changed,
-            }) => {
-                report.held_by_cap += 1;
-                queue.record_hold(start, &blocks, now);
-                if changed {
-                    moved.insert(index);
+) {
+    for candidate in candidates {
+        let id = &candidate.execution.execution_id;
+        match release_in(orch, &candidate.db, id, ReleaseCause::Satisfied, now).await {
+            Ok(ReleaseOutcome::Released) => report.released.push(id.clone()),
+            Ok(ReleaseOutcome::NotHeld) => {
+                if candidate.gates_moved {
+                    announce_gates_moved(orch, &candidate.db, id).await;
                 }
             }
-            Ok(ConnRelease::NotHeld) => {}
-            Err(error) => {
-                log::error!("gate sweep could not release held execution {execution_id}: {error}")
-            }
+            Err(error) => log::error!("gate sweep could not release {id}: {error}"),
         }
     }
-    report.lock_held_ms = Some(millis(guard.held()));
-    #[cfg(test)]
-    {
-        let (statements, writes) = issued(orch).await;
-        report.lock_statements = Some(statements - issued_at_acquire.0);
-        report.lock_writes = Some(writes - issued_at_acquire.1);
-    }
-    drop(guard);
-
-    let mut announced = HashSet::new();
-    for (index, tail) in released {
-        let candidate = &candidates[index];
-        let execution_id = &candidate.execution.execution_id;
-        log::info!(
-            "released held execution {execution_id} ({:?})",
-            ReleaseCause::Satisfied
-        );
-        announce_release(orch, &candidate.db, execution_id, tail).await;
-        report.released.push(execution_id.clone());
-        announced.insert(index);
-    }
-    for (index, candidate) in candidates.iter().enumerate() {
-        if !announced.contains(&index) && (candidate.gates_moved || moved.contains(&index)) {
-            announce_gates_moved(orch, &candidate.db, &candidate.execution.execution_id).await;
-        }
-    }
-    Some(queue)
 }
 
 /// What evaluating one held execution found.
@@ -503,8 +281,6 @@ pub struct Evaluation {
     pub foreclosed: Vec<String>,
     /// The census phrase of each gate still unmet, with its evidence state.
     pub waiting: Vec<String>,
-    /// The execution queue's caps holding it, once every authored gate is met.
-    pub held_by: Vec<crate::models::CapacityHold>,
 }
 
 /// Evaluate one execution now, releasing it if every gate is already true.
@@ -534,9 +310,6 @@ pub(crate) async fn evaluate_execution_at(
         .map_err(|error| format!("failed to list held executions: {error}"))?
         .into_iter()
         .find(|held| held.execution_id == wanted);
-    // A cap hold this evaluation writes is numbered by the next sweep, which
-    // rewrites every place in line: numbering spans every database, and this
-    // runs on the filing path.
     match held {
         Some(held) => evaluate_held(orch, &db, &gate_vocabulary(), &held, now).await,
         None => Ok(Evaluation::default()),
@@ -615,7 +388,6 @@ async fn evaluate_gates(
         .await?
         {
             ReleaseOutcome::Released => evaluation.released = true,
-            ReleaseOutcome::HeldByCap(blocks) => evaluation.held_by = blocks,
             ReleaseOutcome::NotHeld => {}
         }
     }
@@ -664,9 +436,7 @@ async fn resolve_gates(
     let mut gates_moved = false;
     let mut outcomes = Vec::new();
     for gate in gates {
-        // Capacity gates are not resolved here: they are decided at release,
-        // under the admission lock, once the authored gates allow it.
-        if gate.is_satisfied() || super::capacity::capacity_fact(&gate.predicate_json).is_some() {
+        if gate.is_satisfied() {
             continue;
         }
         let clause: TriggerClause = match serde_json::from_str(&gate.predicate_json) {
@@ -813,7 +583,7 @@ async fn record_outcome(
 
 /// Release a held execution: the second half of a launch, applied to the row
 /// that already exists. The execution queue's caps are decided here too,
-/// unless the cause is a Start now ([`OverrideScope::Everything`]).
+/// Authored-gate release does not bypass the run queue.
 pub async fn release(
     orch: &Orchestrator,
     execution_id: &str,
@@ -825,32 +595,6 @@ pub async fn release(
     release_in(orch, &db, execution_id, cause, orch.services.clock.now()).await
 }
 
-/// The admission decision for one held execution, taken under the admission
-/// lock the caller holds. Always decided, even for an operator start that will
-/// skip it, so the start records which caps it skipped.
-pub(crate) async fn admission_for(
-    orch: &Orchestrator,
-    db: &LocalDb,
-    execution_id: &str,
-) -> Result<super::capacity::Admission, String> {
-    let id = execution_id.to_string();
-    let issue_id = db
-        .read(move |conn| {
-            let id = id.clone();
-            Box::pin(async move {
-                crate::storage::query_opt_text_conn(
-                    conn,
-                    "SELECT issue_id FROM executions WHERE id = ?1",
-                    params![id.as_str()],
-                )
-                .await
-            })
-        })
-        .await
-        .map_err(|error| format!("failed to read execution {execution_id}: {error}"))?;
-    super::capacity::decide(orch, db, issue_id.as_deref(), Some(execution_id)).await
-}
-
 async fn release_in(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -858,64 +602,20 @@ async fn release_in(
     cause: ReleaseCause,
     now: i64,
 ) -> Result<ReleaseOutcome, String> {
-    let guard = orch
-        .admission_lock
-        .acquire(AdmissionSite::Release, execution_id)
-        .await
-        .map_err(|busy| busy.to_string())?;
-    let admission = admission_for(orch, db, execution_id).await?;
-    // A Start now is an act on the owning thread's record, which it is told
-    // about once the start commits; where the child stood is read now, under
-    // the lock, as the line it skips.
-    let start_subject = match &cause {
-        ReleaseCause::Override {
-            scope: OverrideScope::Everything { .. },
-            ..
-        } => super::queue_notice::place_before_start(orch, db, execution_id).await,
-        _ => None,
-    };
     let execution = execution_id.to_string();
     let outcome = db
         .write(|conn| {
             let execution_id = execution.clone();
             let cause = cause.clone();
-            let admission = admission.clone();
-            Box::pin(
-                async move { release_conn(conn, &execution_id, now, &cause, &admission).await },
-            )
+            Box::pin(async move { release_conn(conn, &execution_id, now, &cause).await })
         })
         .await
         .map_err(|error| format!("failed to release execution {execution_id}: {error}"))?;
-    drop(guard);
     match outcome {
         ConnRelease::Released(released) => {
             log::info!("released held execution {execution_id} ({cause:?})");
             announce_release(orch, db, execution_id, released).await;
-            if let (
-                Some(subject),
-                ReleaseCause::Override {
-                    scope: OverrideScope::Everything { by },
-                    ..
-                },
-            ) = (start_subject, &cause)
-            {
-                super::queue_notice::started(
-                    orch,
-                    db,
-                    execution_id,
-                    subject,
-                    by,
-                    &admission.blocks,
-                )
-                .await;
-            }
             Ok(ReleaseOutcome::Released)
-        }
-        ConnRelease::HeldByCap { blocks, moved } => {
-            if moved {
-                announce_gates_moved(orch, db, execution_id).await;
-            }
-            Ok(ReleaseOutcome::HeldByCap(blocks))
         }
         ConnRelease::NotHeld => Ok(ReleaseOutcome::NotHeld),
     }
@@ -944,6 +644,9 @@ pub(crate) async fn announce_release(
         supersessions,
     } = released;
     crate::execution::recipe::stop_superseded_agents(orch, &supersessions);
+    if let Err(error) = crate::execution::queue::settle(orch).await {
+        log::error!("could not settle queue after release {execution_id}: {error}");
+    }
     let execution_change =
         crate::notify::execution_db_change_for_id(db, execution_id, "update").await;
     let _ = orch.services.emitter.emit("db-change", execution_change);
@@ -954,7 +657,7 @@ pub(crate) async fn announce_release(
     // else will claim: a host that stops before this advance runs replays it
     // from the outbox at its next start.
     if let Err(error) = crate::workflow_host::runtime(orch)
-        .enqueue_advance(execution_id, true)
+        .enqueue_advance(execution_id)
         .await
     {
         log::error!("Could not persist the advance of released execution {execution_id}: {error}");
@@ -962,7 +665,6 @@ pub(crate) async fn announce_release(
             let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
                 execution_id: execution_id.to_string(),
                 outbox_entry_id: None,
-                focus_admitted: true,
             });
         }
     }
@@ -978,12 +680,6 @@ pub(crate) enum ConnRelease {
     /// This caller released it and must run [`announce_release`] after the
     /// commit.
     Released(Released),
-    /// Its authored gates allow it, but the queue's caps hold it; their rows
-    /// were written in this transaction (`moved` when any changed).
-    HeldByCap {
-        blocks: Vec<crate::models::CapacityHold>,
-        moved: bool,
-    },
     /// This caller may not release it, and owns nothing.
     NotHeld,
 }
@@ -992,17 +688,6 @@ pub(crate) enum ConnRelease {
 /// [`ConnRelease::NotHeld`] means this caller may not release it — already
 /// released, superseded, its issue resolved, or its CURRENT authored gates do
 /// not license `cause` — so it owns nothing and mints nothing.
-///
-/// `admission` is the execution queue's decision, taken under the admission
-/// lock the caller holds. A release records its lane's turn with the stamp
-/// that decision minted (`rotation::record_turn_conn`), after the guarded
-/// update, so a caller that lost the race records nothing. Unless the cause is
-/// a Start now ([`OverrideScope::Everything`]), a blocking cap is written as (or kept as) a
-/// capacity gate row in THIS transaction and the execution stays held, so a
-/// held execution is never left without the rows that hold it. A cap that no
-/// longer blocks is marked cleared but not latched: a free slot can be taken
-/// again, and the row keeps the execution's place in line. On release every
-/// capacity row latches.
 ///
 /// A `pending` execution — a held next attempt — takes the attempt HERE: the
 /// same supersede a normal launch performs at insert, run against whatever
@@ -1029,9 +714,7 @@ pub(crate) async fn release_conn(
     execution_id: &str,
     now: i64,
     cause: &ReleaseCause,
-    admission: &super::capacity::Admission,
 ) -> DbResult<ConnRelease> {
-    use super::capacity::CapacityHoldExt;
     use cairn_workflow::gates::store;
 
     if !store::release_eligible_conn(conn, execution_id).await? {
@@ -1047,104 +730,8 @@ pub(crate) async fn release_conn(
     if !authorized {
         return Ok(ConnRelease::NotHeld);
     }
-    let skips_caps = matches!(
-        cause,
-        ReleaseCause::Override {
-            scope: OverrideScope::Everything { .. },
-            ..
-        }
-    );
-
-    if !skips_caps {
-        let releasable = crate::storage::query_opt_text_conn(
-            conn,
-            concat!(
-                "SELECT e.id FROM executions e WHERE e.id = ?1 AND e.released_at IS NULL AND ",
-                cairn_db::live_execution_sql!()
-            ),
-            params![execution_id],
-        )
-        .await?
-        .is_some();
-        if !releasable {
-            return Ok(ConnRelease::NotHeld);
-        }
-        let mut moved = false;
-        for fact in super::capacity::CAPACITY_FACTS {
-            let predicate = super::capacity::capacity_predicate(fact);
-            match admission.blocks.iter().find(|block| block.fact() == *fact) {
-                Some(block) => {
-                    let prior = existing
-                        .iter()
-                        .find(|gate| gate.predicate_json == predicate)
-                        .and_then(|gate| gate.detail.as_deref());
-                    let detail = super::capacity::carry_queue_facts(fact, prior, block);
-                    moved |= store::hold_capacity_gate_conn(
-                        conn,
-                        execution_id,
-                        &predicate,
-                        block.seq(),
-                        &detail,
-                        now,
-                    )
-                    .await?;
-                }
-                None => {
-                    moved |= store::clear_capacity_gate_conn(conn, execution_id, &predicate).await?
-                }
-            }
-        }
-        if !admission.is_clear() {
-            // An agent's early release still takes effect on what it may
-            // skip: its authored gates latch and its override is recorded, so
-            // the execution starts on its own once the caps clear.
-            if let ReleaseCause::Override { principal, .. } = cause {
-                for gate in existing.iter().filter(|gate| {
-                    !gate.is_satisfied()
-                        && super::capacity::capacity_fact(&gate.predicate_json).is_none()
-                }) {
-                    store::record_outcome_conn(conn, &gate.id, "satisfied", Some(now)).await?;
-                }
-                conn.execute(
-                    "UPDATE executions SET release_override_json = ?2
-                      WHERE id = ?1 AND released_at IS NULL",
-                    params![
-                        execution_id,
-                        serde_json::json!({ "principal": principal, "at": now }).to_string()
-                    ],
-                )
-                .await?;
-                moved = true;
-            }
-            return Ok(ConnRelease::HeldByCap {
-                blocks: admission.blocks.clone(),
-                moved,
-            });
-        }
-    }
-
     let override_json = match cause {
-        ReleaseCause::Override {
-            principal,
-            scope: OverrideScope::Everything { by },
-        } => {
-            let skipped: Vec<&str> = admission
-                .blocks
-                .iter()
-                .map(CapacityHoldExt::skipped_label)
-                .collect();
-            let mut record = serde_json::json!({
-                "principal": principal,
-                "at": now,
-                "operator": matches!(by, CapSkipAuthority::Operator),
-                "skipped": skipped,
-            });
-            if let CapSkipAuthority::Granted { thread, decision } = by {
-                record["granted"] = serde_json::json!({ "thread": thread, "decision": decision });
-            }
-            Some(record.to_string())
-        }
-        ReleaseCause::Override { principal, .. } => {
+        ReleaseCause::Override { principal } => {
             Some(serde_json::json!({ "principal": principal, "at": now }).to_string())
         }
         ReleaseCause::Satisfied | ReleaseCause::GatesRemoved => None,
@@ -1152,7 +739,6 @@ pub(crate) async fn release_conn(
     if release_execution_conn(conn, execution_id, now, override_json.as_deref()).await? == 0 {
         return Ok(ConnRelease::NotHeld);
     }
-    store::latch_capacity_gates_conn(conn, execution_id, now).await?;
     let mut rows = conn
         .query(
             "SELECT issue_id, lifecycle FROM executions WHERE id = ?1",
@@ -1164,11 +750,6 @@ pub(crate) async fn release_conn(
         None => return Ok(ConnRelease::NotHeld),
     };
     drop(rows);
-    // A start is a turn, whatever the cause: Start now spends its lane's turn
-    // as surely as a sweep's release does.
-    super::rotation::record_turn_conn(conn, issue_id.as_deref(), execution_id, admission.turn, now)
-        .await?;
-
     let mut supersessions = Vec::new();
     if let (Some(issue_id), "pending") = (issue_id.as_deref(), lifecycle.as_str()) {
         let actor = match cause {
@@ -1596,7 +1177,6 @@ pub(crate) mod tests {
     const RECIPE: &str = "memory-triage";
 
     /// The gate-sweep test world, shared with the execution queue's tests
-    /// (`capacity::tests`).
     pub(crate) struct Env {
         _temp: tempfile::TempDir,
         pub(crate) orch: Orchestrator,
@@ -1734,7 +1314,6 @@ pub(crate) mod tests {
             None,
             LaunchIntent::NewAttempt,
             clauses,
-            crate::execution::recipe::QueuePlace::Tail,
         )
         .await
     }
@@ -1919,7 +1498,7 @@ pub(crate) mod tests {
             None,
             crate::models::TriggerType::Manual,
             LaunchIntent::NewAttempt,
-            crate::execution::recipe::Starter::Operator,
+            false,
         )
         .await
         .unwrap();
@@ -3003,7 +2582,7 @@ pub(crate) mod tests {
         let summary = patch(&env, 2, GatePatch::Replace(Vec::new()))
             .await
             .unwrap();
-        assert!(summary.contains("started now"), "got: {summary}");
+        assert!(summary.contains("joined the run queue"), "got: {summary}");
         let (id, status, released_at, jobs) = execution(&env, 2).await;
         assert_eq!(status, "running");
         assert!(released_at.is_some() && jobs > 0);
@@ -3185,123 +2764,6 @@ pub(crate) mod tests {
         assert!(advanced(&mut env).is_empty());
     }
 
-    #[tokio::test]
-    async fn latest_held_filing_replaces_pending_without_stale_release() {
-        use super::super::capacity::tests::caps;
-
-        let env = env("gate-sweep-latest-held.db").await;
-        seed_live_attempt(&env).await;
-        // The live coordinator fills the fleet; neither filing has authored gates.
-        caps(&env, 1, 4);
-        file(&env, 5, json!([])).await.unwrap();
-        let (older, _, released, jobs) = execution(&env, 5).await;
-        assert_eq!((released, jobs), (None, 0));
-        file(&env, 5, json!([])).await.unwrap();
-        let (newer, _, released, jobs) = execution(&env, 5).await;
-        assert_ne!(older, newer);
-        assert_eq!((released, jobs), (None, 0));
-        for id in [&older, &newer] {
-            let gates = gates_of(&env.db, id).await.unwrap();
-            assert!(!gates.is_empty());
-            assert!(gates.iter().all(|gate| {
-                super::super::capacity::capacity_fact(&gate.predicate_json)
-                    == Some(super::super::capacity::FLEET_SLOT_FACT)
-                    && !gate.is_satisfied()
-            }));
-        }
-        assert_eq!(
-            count(
-                &env,
-                "SELECT COUNT(*) FROM executions WHERE issue_id = 'i5'
-                   AND lifecycle = 'pending' AND released_at IS NULL"
-            )
-            .await,
-            1,
-            "only the latest filing remains queued"
-        );
-        assert!(sweep_at(&env.orch, now())
-            .await
-            .unwrap()
-            .released
-            .is_empty());
-        assert_eq!(
-            count(
-                &env,
-                "SELECT COUNT(*) FROM jobs WHERE id = 'live-job' AND status = 'running'"
-            )
-            .await,
-            1,
-            "queued successors must not freeze the live attempt"
-        );
-        assert_eq!(lifecycle(&env, &older).await, "superseded");
-        assert_eq!(lifecycle(&env, &newer).await, "pending");
-        assert_eq!(lifecycle(&env, "live").await, "canonical");
-        assert_eq!(
-            count(
-                &env,
-                &format!(
-            "SELECT COUNT(*) FROM execution_supersessions WHERE superseded_execution_id = '{older}'
-             AND successor_execution_id = '{newer}' AND reason = 'successor_created'
-             AND actor_kind IS NOT NULL AND created_at IS NOT NULL"
-        )
-            )
-            .await,
-            1
-        );
-        assert_eq!(
-            release(&env.orch, &older, ReleaseCause::Satisfied)
-                .await
-                .unwrap(),
-            ReleaseOutcome::NotHeld
-        );
-        caps(&env, 6, 4);
-        assert_eq!(
-            sweep_at(&env.orch, now()).await.unwrap().released,
-            vec![newer.clone()]
-        );
-        assert_eq!(
-            release(&env.orch, &older, ReleaseCause::Satisfied)
-                .await
-                .unwrap(),
-            ReleaseOutcome::NotHeld
-        );
-        assert_eq!(lifecycle(&env, &newer).await, "canonical");
-        assert_eq!(lifecycle(&env, "live").await, "superseded");
-        assert!(sweep_at(&env.orch, now())
-            .await
-            .unwrap()
-            .released
-            .is_empty());
-        assert_eq!(
-            count(
-                &env,
-                &format!("SELECT COUNT(*) FROM jobs WHERE execution_id = '{newer}' AND status = 'pending'")
-            )
-            .await,
-            execution(&env, 5).await.3,
-            "the stale release did not cancel the newer attempt's jobs"
-        );
-        assert!(execution(&env, 5).await.3 > 0);
-        assert_eq!(
-            count(
-                &env,
-                &format!(
-                    "SELECT COUNT(*) FROM executions WHERE id = '{older}' AND released_at IS NULL"
-                )
-            )
-            .await,
-            1
-        );
-        assert_eq!(
-            count(
-                &env,
-                &format!("SELECT COUNT(*) FROM jobs WHERE execution_id = '{older}'")
-            )
-            .await,
-            0
-        );
-    }
-
     async fn lifecycle(env: &Env, id: &str) -> String {
         env.db
             .query_opt_text(
@@ -3313,7 +2775,6 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    /// Seed issue 5 with a canonical execution `live` whose one job is running.
     async fn seed_live_attempt(env: &Env) {
         env.db
             .execute_script(
@@ -3326,9 +2787,6 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    /// Coordinator review: "re-run this after X merges" on an issue with a
-    /// running attempt must not fence that attempt when filed. The held next
-    /// attempt is `pending` while it waits, and takes the attempt at release.
     #[tokio::test]
     async fn a_held_next_attempt_fences_nothing_until_it_starts() {
         let env = env("gate-sweep-pending.db").await;

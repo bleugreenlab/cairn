@@ -326,15 +326,6 @@ pub fn compact_job(
     let db = owning_db(orch, job_id)?;
     refuse_before_teardown(orch, &db, job_id)?;
 
-    let admission = crate::storage::run_db_blocking(|| async {
-        orch.admission_lock
-            .acquire(
-                crate::execution::gates::capacity::AdmissionSite::HoldRelease,
-                job_id.to_string(),
-            )
-            .await
-            .map_err(|error| error.to_string())
-    })?;
     let lock = orch.job_launch_lock(job_id);
     let guard = acquire_launch_lock(&lock, job_id)?;
     // Re-read under the lock: whatever was live may have finished while this
@@ -342,7 +333,6 @@ pub fn compact_job(
     let live = live_work_for_job(orch, job_id)?;
     if live.is_empty() {
         drop(guard);
-        drop(admission);
         return idle(identity_override);
     }
 
@@ -392,7 +382,6 @@ pub fn compact_job(
     let diagnostic_error = (!diagnostics.is_empty()).then(|| diagnostics.join("; "));
 
     let run = crate::execution::jobs::continue_job_launch_locked_for_operator_compact(
-        admission,
         orch,
         job_id,
         identity_override,

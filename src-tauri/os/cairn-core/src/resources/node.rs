@@ -381,20 +381,25 @@ impl StoppedWork {
     /// before its flush or follow-up, not a stop.
     fn read(
         status: &str,
-        activity: Option<&crate::execution::gates::capacity::Activity>,
+        activity: Option<&crate::execution::jobs::liveness::Liveness>,
         head: Option<(String, Option<String>, i64)>,
     ) -> Option<Self> {
-        use crate::execution::gates::capacity::{Activity, ParkCause};
+        use crate::execution::jobs::liveness::Liveness;
         if status != "running" {
             return None;
         }
-        match activity? {
-            Activity::Parked(ParkCause::LivenessUnknown(since)) => {
+        let alive = matches!(activity?, Liveness::Alive { .. } | Liveness::Busy);
+        let (turn_state, end_reason, since) = head?;
+        // Only a pending or running turn's standing rests on a process; an
+        // ended turn is stopped whatever run row still reads live, and a job
+        // with no turn, or a complete or yielded one, is not stopped work.
+        match (turn_state.as_str(), activity?) {
+            _ if alive => None,
+            ("pending" | "running", Liveness::Unknown { since }) => {
                 Some(Self::Unknown { since: *since })
             }
-            Activity::Parked(ParkCause::Stopped) => {
-                let (turn_state, end_reason, since) = head?;
-                (turn_state != "complete").then_some(Self::Stopped {
+            ("pending" | "running" | "failed" | "interrupted" | "cancelled", _) => {
+                Some(Self::Stopped {
                     turn_state,
                     end_reason,
                     since,
@@ -413,7 +418,7 @@ impl StoppedWork {
 
     fn render(&self, now: i64) -> String {
         let ago = |since: i64| crate::clock::format_elapsed(now.saturating_sub(since).max(0));
-        const OWNER: &str = "It holds no fleet slot and nothing will resume it on its own: \
+        const OWNER: &str = "Nothing will resume it on its own: \
                              send it a message to resume it, or close it.";
         match self {
             Self::Stopped {
@@ -445,7 +450,7 @@ impl StoppedWork {
     }
 }
 
-/// The job's activity as the caps read it, and its head turn's state, end
+/// The job's observed liveness, and its head turn's state, end
 /// reason and last movement. Best-effort: a summary without the reading falls
 /// back to the job's label.
 async fn load_work_standing(
@@ -453,12 +458,7 @@ async fn load_work_standing(
     job_id: &str,
     observer: &crate::execution::jobs::liveness::WorkObserver,
 ) -> WorkStanding {
-    use crate::execution::gates::capacity::{activity_job_rows_conn, ActivityScope};
-    let activity = activity_job_rows_conn(conn, ActivityScope::Job(job_id), observer)
-        .await
-        .ok()
-        .and_then(|rows| rows.into_iter().next())
-        .map(|row| row.activity);
+    let activity = observer.job_conn(conn, job_id).await.ok();
     let head = async {
         let mut rows = conn
             .query(
@@ -2574,10 +2574,10 @@ struct JobSummaryRows {
     work: WorkStanding,
 }
 
-/// A job's activity as the caps read it, and its head turn's state, end
+/// A job's observed liveness, and its head turn's state, end
 /// reason and last movement.
 type WorkStanding = (
-    Option<crate::execution::gates::capacity::Activity>,
+    Option<crate::execution::jobs::liveness::Liveness>,
     Option<(String, Option<String>, i64)>,
 );
 

@@ -12,8 +12,6 @@ use super::*;
 pub struct AdvanceError {
     pub message: String,
     pub claimed_agent_jobs: Vec<Job>,
-    /// Same-pass fresh admission retained for error-path handover only.
-    pub focus_admitted_job_ids: Vec<String>,
 }
 
 impl std::fmt::Display for AdvanceError {
@@ -27,7 +25,6 @@ impl From<String> for AdvanceError {
         Self {
             message,
             claimed_agent_jobs: Vec::new(),
-            focus_admitted_job_ids: Vec::new(),
         }
     }
 }
@@ -632,7 +629,6 @@ pub async fn reevaluate_condition(
                 vec![WorkflowEffect::AdvanceDag {
                     execution_id: execution_id.to_string(),
                     outbox_entry_id: None,
-                    focus_admitted: false,
                 }],
             )
             .await?;

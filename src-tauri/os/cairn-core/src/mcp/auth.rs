@@ -572,8 +572,8 @@ mod tests {
             // `permission.rs`.
             "src-tauri/src/commands/fleet.rs",
             // The operator's starts and releases of held work
-            // (`start_recipe_execution`, `start_held_execution_now`,
-            // `move_held_execution`, `order_thread_queue`,
+            // (`start_recipe_execution`, `move_queue_item`,
+            // `park_queue_item`, `unpark_queue_item`,
             // `override_operator_hold`): routed through
             // `operator_target`
             // like tenet verdicts, so only the main webview reaches the local

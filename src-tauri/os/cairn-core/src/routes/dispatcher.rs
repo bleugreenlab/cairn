@@ -1151,7 +1151,6 @@ async fn fire_issue_sink(
                     // supersede.
                     crate::execution::recipe::LaunchIntent::NewAttempt,
                     Vec::new(),
-                    crate::execution::recipe::QueuePlace::Tail,
                 )
                 .await
             }

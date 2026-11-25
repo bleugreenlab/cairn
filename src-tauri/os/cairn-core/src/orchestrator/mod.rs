@@ -788,7 +788,6 @@ impl OrchestratorBuilder {
         // reconstructs archived events before the orchestrator is built.
         crate::mcp::handlers::read::register_archived_file_renderer();
 
-        let admission_lock = Arc::new(crate::execution::gates::capacity::AdmissionLock::default());
         let private_lanes = Arc::new(crate::execution::jobs::PrivateLaneLedger::default());
         let admission_renewal = crate::execution::jobs::AdmissionRenewal::new(
             self.db.local.clone(),
@@ -956,12 +955,8 @@ impl OrchestratorBuilder {
             sidebar_active_issues_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sidebar_active_issues_rebuild: Arc::new(TokioMutex::new(())),
             sidebar_active_issues_rebuild_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            admission_lock: admission_lock.clone(),
             launch_admission_waits: Arc::default(),
-            held_work_memo: Arc::default(),
-            sweep_pulse: Arc::new(crate::execution::gates::pulse::SweepPulse::new(
-                admission_lock,
-            )),
+            sweep_pulse: Arc::new(crate::execution::gates::pulse::SweepPulse::new()),
             write_stops: Arc::default(),
             context_token_snapshots: self.context_token_snapshots,
             team_attention_sender: self.team_attention_sender,
@@ -2028,18 +2023,9 @@ pub struct Orchestrator {
     /// after acquiring it so one query pass serves an entire concurrent burst.
     pub sidebar_active_issues_rebuild: Arc<TokioMutex<()>>,
     sidebar_active_issues_rebuild_count: Arc<std::sync::atomic::AtomicU64>,
-    /// The execution queue's admission lock: every capped filing and every
-    /// gate release decides its caps and writes under it, so two admissions
-    /// never interleave over a count that spans databases. Bounded and
-    /// attributed; see `execution::gates::capacity::AdmissionLock`.
-    pub(crate) admission_lock: Arc<crate::execution::gates::capacity::AdmissionLock>,
     /// Dispatched launches admission refused, while they are re-driven; see
     /// `orchestrator::wakes::launch_admission`.
     pub(crate) launch_admission_waits: Arc<crate::orchestrator::wakes::LaunchAdmissionWaits>,
-    /// Thread-bound holds the last pass over held work refused, so the next
-    /// pass skips those whose thread has not changed; see
-    /// `orchestrator::wakes::provider_limits`.
-    pub(crate) held_work_memo: Arc<crate::orchestrator::wakes::HeldWorkMemo>,
     /// The gate sweep loop's liveness and each held execution's last
     /// evaluation; see `execution::gates::pulse`.
     pub sweep_pulse: Arc<crate::execution::gates::pulse::SweepPulse>,
@@ -2270,6 +2256,11 @@ impl Orchestrator {
         self.spawn_blocking_detached(move || {
             crate::execution::jobs::promote_private_lanes_blocking(&orch);
             crate::execution::jobs::promote_call_lanes(&orch);
+            if let Err(error) = crate::storage::run_db_blocking(|| async {
+                crate::execution::queue::settle(&orch).await
+            }) {
+                log::warn!("Startup queue settlement failed: {error}");
+            }
         });
     }
 

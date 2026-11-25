@@ -100,21 +100,11 @@ pub(crate) const THREAD_QUEUE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ThreadQueue,
     uri_template: "cairn://p/{project}/{thread}/queue",
     name: "Thread queue",
-    description: "This thread's children by derived standing: Running under the workspace focus bound, Queued (re-entries before fresh starts), Held by the open-PR bound, Parked with what they await, and Stopped. Only agent work in flight counts toward focus; open plans, PRs and other waits remain visible. Patch `order` with child issue numbers to put listed work first within each queue band; unlisted work follows in its existing order. Fresh work never moves ahead of a re-entry. Fresh executions rotate within the fleet and thread places the thread already occupies, so no other thread's place moves and no cap is skipped. Only the thread itself (its sessions and tasks) or the operator may order it. Only the operator's Start now skips the caps. To file at the head of the fresh band, pass place:\"head\" with the execution.",
+    description: "This thread's filtered slice of the runner's single queue: the same global positions, order and plain states. Read-only; change the canonical queue at cairn:@/queue with move, park or unpark.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: &[MutationSpec {
-        mode: ChangeMode::Patch,
-        required: &[KeySpec::new(
-            "order",
-            KeyType::Array,
-            "this thread's children by issue number, first within their own band; re-entries always precede fresh work",
-        )],
-        optional: &[],
-        label: "order this thread's held children",
-        example: "write({changes:[{target:\"cairn:~/queue\",mode:\"patch\",payload:{order:[5841,5829]}}]})",
-    }],
+    mutations: NO_MUTATIONS,
 };
 
 pub(crate) const THREAD_DB_CONTRACT: ResourceContract = ResourceContract {
@@ -257,7 +247,7 @@ pub(crate) const THREAD_CONTRACT: ResourceContract = ResourceContract {
     // resolves to a node-family kind whose template spells an issue coordinate a
     // thread does not have. Reading any of these addresses returns that family's
     // own affordance block, so this line only has to say the addresses exist.
-    description: "A first-class thread overview, including child branches' literal head/base and bounded ahead/behind counts (≥ means capped; unresolved ancestry is unknown). Reading never prepares branches or acquires a checkout. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /queue (running, queued, PR-held, parked and stopped children; patch {order:[N,...]} to reorder within re-entry and fresh bands), /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /pages, /services, /checks (the check requests it filed; append one with {suite, revision}, the revision required). The session has no branch. Branch-shaped resources (diff, changed, rebase) do not apply to the thread session itself.",
+    description: "A first-class thread overview, including child branches' literal head/base and bounded ahead/behind counts (≥ means capped; unresolved ancestry is unknown). Reading never prepares branches or acquires a checkout. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /queue (this thread's slice of the run queue; reorder at cairn:@/queue), /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /pages, /services, /checks (the check requests it filed; append one with {suite, revision}, the revision required). The session has no branch. Branch-shaped resources (diff, changed, rebase) do not apply to the thread session itself.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -343,7 +333,7 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
         kind: ResourceKind::IssueExecutions,
         uri_template: "cairn://p/{project}/{number}/executions",
         name: "Issue executions",
-        description: "Executions for an issue. Every listed execution links to its snapshot at cairn://p/PROJECT/NUMBER/executions/SEQ. Withdraw held work there with standalone Patch {cancel:true}; only its authenticated filing node/thread, its actual parent thread, or the verified operator may cancel. Withdrawn history retains who acted and when, even after its gates are removed. Append {recipe?, branch?, continuity?, lifecycle?, overrides?, after?, place?} to start a new execution programmatically. A named recipe is run exactly; with none named Cairn chooses (the workspace setting defaultRecipe until a measured chooser exists; refused, naming the setting, when it is unset). The reply always carries the resolution: `recipe: <id> · <what decided it>`, one line per agent step with what it would pick `now:` (each step selects at its own launch; a single-model allotment is `(exact)`), and the patch and re-append that change it. Every ordinary filing replaces older pending attempts atomically. A held successor leaves current canonical work running until release; an immediate successor, or the held successor's eventual release, supersedes canonical work (its nodes are fenced and its agents stopped). With `after` the execution is filed HELD and starts only when every gate clause is satisfied; a `tenet_verdict` clause holds it on the operator's verdict on a tenet. A thread of this project filing on an issue with no parent adopts it first, so the issue counts against that thread's focus cap and queue and its attention (plan gates, reviews, failures) reaches the thread; an existing parent of either kind, and a start by the operator or by an issue's own agent, are left as they are. A preview names the adoption it would make; a filing refused before launch adopts nothing, and one refused after keeps the adoption and says so.",
+        description: "Executions for an issue. Every listed execution links to its snapshot at cairn://p/PROJECT/NUMBER/executions/SEQ. Withdraw held work there with standalone Patch {cancel:true}; only its authenticated filing node/thread, its actual parent thread, or the verified operator may cancel. Withdrawn history retains who acted and when, even after its gates are removed. Append {recipe?, branch?, continuity?, lifecycle?, overrides?, after?} to start a new execution programmatically. A named recipe is run exactly; with none named Cairn chooses (the workspace setting defaultRecipe until a measured chooser exists; refused, naming the setting, when it is unset). The reply always carries the resolution: `recipe: <id> · <what decided it>`, one line per agent step with what it would pick `now:` (each step selects at its own launch; a single-model allotment is `(exact)`), and the patch and re-append that change it. Every ordinary filing replaces older pending attempts atomically. A held successor leaves current canonical work running until release; an immediate successor, or the held successor's eventual release, supersedes canonical work (its nodes are fenced and its agents stopped). With `after` the execution is filed HELD and starts only when every gate clause is satisfied; a `tenet_verdict` clause holds it on the operator's verdict on a tenet. A thread of this project filing on an issue with no parent adopts it first, so the issue takes its place in that thread's slice of the run queue and its attention (plan gates, reviews, failures) reaches the thread; an existing parent of either kind, and a start by the operator or by an issue's own agent, are left as they are. A preview names the adoption it would make; a filing refused before launch adopts nothing, and one refused after keeps the adoption and says so.",
         read_projections: NO_PROJECTIONS,
         related: &[RelatedSpec {
             label: "execution snapshot (SEQ from this collection; cancel held work there)",
@@ -377,7 +367,6 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
                 ),
                 LAUNCH_OVERRIDES,
                 AFTER_GATES,
-                QUEUE_PLACE,
             ],
             label: "start execution",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions\",mode:\"append\",payload:{recipe:\"planbuild\",overrides:{without:[\"review\"]}}}]})",
@@ -438,22 +427,11 @@ pub(crate) const ISSUE_EXECUTION_CONTRACT: ResourceContract =
             required: &[KeySpec::new(
                 "release",
                 KeyType::Bool,
-                "true starts a HELD execution now, without waiting for its after: gates (the queue's caps still apply); recorded as an override with the acting principal",
+                "true starts a HELD execution now, without waiting for its after: gates (it joins the end of the run queue); recorded as an override with the acting principal",
             )],
             optional: &[],
             label: "release held execution early",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions/2\",mode:\"patch\",payload:{release:true}}]})",
-        },
-        MutationSpec {
-            mode: ChangeMode::Patch,
-            required: &[KeySpec::new(
-                "start_now",
-                KeyType::Bool,
-                "true starts it at once past the fleet cap and its thread's focus cap. Asks the operator with an authority card unless this thread holds a grant; the start is recorded as an override naming the thread",
-            )],
-            optional: &[],
-            label: "start a held execution now, over every cap (asks the operator)",
-            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions/SEQ\",mode:\"patch\",payload:{start_now:true}}]})",
         },
         MutationSpec {
             mode: ChangeMode::Patch,

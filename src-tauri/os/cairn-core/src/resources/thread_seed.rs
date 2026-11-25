@@ -184,7 +184,7 @@ pub(crate) async fn compose_thread_seed(
     .await
 }
 
-/// `observer` is what the children's census reads their standings against.
+/// Compose the thread's record and its children's authored-gate census.
 pub(crate) async fn compose_thread_seed_with_policy(
     db: &LocalDb,
     job_id: &str,
@@ -2454,7 +2454,6 @@ struct ChildStatus {
     /// (`execution::missing_output`). Nobody approves these; the mark says why
     /// the node stopped.
     missing_outputs: Vec<CensusMissingOutput>,
-    standing: Option<crate::execution::gates::census::FocusStanding>,
 }
 
 /// One node blocked because its turn ended without the output it owes.
@@ -2540,11 +2539,6 @@ impl ChildStatus {
         // The held marker rides on the address line, not the detail block, so
         // a collapsed census that drops detail still says a child is held.
         let held = if self.held.is_empty() { "" } else { " · held" };
-        let standing = self
-            .standing
-            .as_ref()
-            .map(|s| format!(" · {}", s.line(chrono::Utc::now().timestamp())))
-            .unwrap_or_default();
         // An approval waiting on the reader is the same kind of fact as held,
         // and rides the address line for the same reason.
         let awaiting = self
@@ -2564,7 +2558,7 @@ impl ChildStatus {
             format!(" · {}", self.failures.join(" · "))
         };
         format!(
-            "- `{}` **{}**{standing}{held}{awaiting}{blocked} · {}{failure}\n",
+            "- `{}` **{}**{held}{awaiting}{blocked} · {}{failure}\n",
             self.uri,
             self.status,
             one_line(&self.title)
@@ -2577,9 +2571,6 @@ impl ChildStatus {
     /// omitted rather than rendered empty — "no PR" is not news.
     fn detail_line(&self, now: i64) -> String {
         let mut facets: Vec<String> = Vec::new();
-        if let Some(standing) = &self.standing {
-            facets.push(standing.line(now));
-        }
         if !self.nodes.is_empty() {
             facets.push(
                 self.nodes
@@ -2701,36 +2692,6 @@ fn render_children(children: &[ChildStatus], now: i64) -> String {
     out
 }
 
-#[cfg(test)]
-pub(super) async fn assert_focus_text(
-    db: &LocalDb,
-    thread_id: &str,
-    expected: &HashMap<String, crate::execution::gates::census::FocusStanding>,
-    observer: &WorkObserver,
-) {
-    let children = load_children(db, Some(thread_id), observer).await.unwrap();
-    let now = chrono::Utc::now().timestamp();
-    for (id, standing) in expected {
-        let number = id.strip_prefix("ci").unwrap();
-        let child = children
-            .iter()
-            .find(|child| child.uri.rsplit('/').next() == Some(number))
-            .unwrap_or_else(|| panic!("missing census child {number}"));
-        assert_eq!(child.standing.as_ref(), Some(standing), "{}", child.uri);
-        let line = standing.line(now);
-        assert!(
-            child.census_line().contains(&line),
-            "{}",
-            child.census_line()
-        );
-        assert!(
-            child.detail_line(now).contains(&line),
-            "{}",
-            child.detail_line(now)
-        );
-    }
-}
-
 /// Assemble every child issue's live status.
 ///
 /// Each statement takes its own pooled read, so a thread's whole census is never
@@ -2746,7 +2707,7 @@ pub(super) async fn assert_focus_text(
 async fn load_children(
     db: &LocalDb,
     thread_id: Option<&str>,
-    observer: &WorkObserver,
+    _observer: &WorkObserver,
 ) -> Result<Vec<ChildStatus>, String> {
     let Some(thread_id) = thread_id else {
         return Ok(Vec::new());
@@ -2792,24 +2753,7 @@ async fn load_children(
             wont_start: Vec::new(),
             approvals: Vec::new(),
             missing_outputs: Vec::new(),
-            standing: None,
         });
-    }
-    let standing_thread = thread_id.to_owned();
-    let observer = observer.clone();
-    let standings = read_resource(db, move |conn| {
-        let (standing_thread, observer) = (standing_thread.clone(), observer.clone());
-        Box::pin(async move {
-            crate::execution::gates::census::focus_standings_conn(conn, &standing_thread, &observer)
-                .await
-                .map_err(|e| e.to_string())
-        })
-    })
-    .await?;
-    for (id, standing) in standings {
-        if let Some(index) = at.get(&id) {
-            children[*index].standing = Some(standing);
-        }
     }
     // A merged or closed child's resolution already ended its work; a gated
     // execution or artifact left on it is not something to wait on, and its
@@ -4320,8 +4264,8 @@ mod tests {
         let seed = compose_thread_seed(&db, THREAD_JOB, now).await.unwrap();
         assert!(
             seed.content.contains(
-                "- `cairn://p/prj/23` **active** · Running · awaiting you · Plan the backoff\n  \
-                 Running · Planner ⏸ · plan awaiting you · 3d 2h 5m\n  \
+                "- `cairn://p/prj/23` **active** · awaiting you · Plan the backoff\n  \
+                 Planner ⏸ · plan awaiting you · 3d 2h 5m\n  \
                  confirm cairn://p/prj/23/1/planner/plan\n"
             ),
             "the pending child's census is wrong: {}",
@@ -4360,8 +4304,8 @@ mod tests {
         let seed = compose_thread_seed(&db, THREAD_JOB, now).await.unwrap();
         assert!(
             seed.content.contains(
-                "- `cairn://p/prj/24` **active** · Parked · no agent work in flight · blocked: no plan · Plan the backoff\n  \
-                 Parked · no agent work in flight · Planner ◼ · no plan · 3d 2h 5m"
+                "- `cairn://p/prj/24` **active** · blocked: no plan · Plan the backoff\n  \
+                 Planner ◼ · no plan · 3d 2h 5m"
             ),
             "the blocked child's census is wrong: {}",
             seed.content
@@ -4534,7 +4478,7 @@ mod tests {
         let seed = compose_thread_seed(&db, THREAD_JOB, now).await.unwrap();
         assert!(
             seed.content
-                .contains("  Running · Planner ⏸ · plan awaiting you · 12d 3h 5m · stale\n"),
+                .contains("  Planner ⏸ · plan awaiting you · 12d 3h 5m · stale\n"),
             "{}",
             seed.content
         );
@@ -4548,7 +4492,7 @@ mod tests {
         let seed = compose_thread_seed(&db, THREAD_JOB, now).await.unwrap();
         assert!(
             seed.content.contains(
-                "  Running · Planner ⏸ · plan awaiting you · deferred until issue cairn://p/prj/22 merged · 72d\n"
+                "  Planner ⏸ · plan awaiting you · deferred until issue cairn://p/prj/22 merged · 72d\n"
             ),
             "{}",
             seed.content
@@ -4572,7 +4516,7 @@ mod tests {
         let seed = compose_thread_seed(&db, THREAD_JOB, now).await.unwrap();
         assert!(
             seed.content
-                .contains("- `cairn://p/prj/23` **active** · Running · awaiting prj/21 · Plan the backoff\n  Running · Planner ⏸ · plan awaiting prj/21 · 1h\n"),
+                .contains("- `cairn://p/prj/23` **active** · awaiting prj/21 · Plan the backoff\n  Planner ⏸ · plan awaiting prj/21 · 1h\n"),
             "{}",
             seed.content
         );
@@ -4631,8 +4575,8 @@ mod tests {
         // builder of the superseded attempt is not where this work stands.
         assert!(
             seed.content.contains(
-                "- `cairn://p/prj/21` **active** · Running · Lease renewal backoff\n  \
-                 Running · builder ✓ review ◐ · PR #892 open · checks 1✓ 1✗ (lint) · \
+                "- `cairn://p/prj/21` **active** · Lease renewal backoff\n  \
+                 builder ✓ review ◐ · PR #892 open · checks 1✓ 1✗ (lint) · \
                  1 unanswered question · active 15m ago\n"
             ),
             "the live child's census line is wrong: {}",

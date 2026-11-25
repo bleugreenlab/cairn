@@ -101,6 +101,11 @@ pub(crate) fn project_relative_suffix(uri: &str) -> Option<&str> {
 /// run's own thread — needs the join without the lookup.
 pub(crate) fn resolve_home_relative_against(home_uri: &str, uri: &str) -> Option<String> {
     if let Some(suffix) = home_relative_suffix(uri) {
+        // The runner queue is project-addressed, not owned by a node or task.
+        if suffix == "queue" || suffix.starts_with("queue?") {
+            let project_uri = project_uri_from_home(home_uri)?;
+            return Some(format!("{project_uri}/{suffix}"));
+        }
         return Some(if suffix.is_empty() {
             home_uri.to_string()
         } else {
@@ -1367,6 +1372,22 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("nope"), "{error}");
         assert_eq!(db.live_connections(), 0);
+    }
+
+    #[test]
+    fn home_queue_always_names_the_runner_queue() {
+        for home in [
+            "cairn://p/cairn",
+            "cairn://p/cairn/execution",
+            "cairn://p/cairn/execution/task/t1",
+            "cairn://p/cairn/7546/1/builder",
+            "cairn://p/cairn/7546/1/builder/task/t1",
+        ] {
+            assert_eq!(
+                resolve_home_relative_against(home, "cairn:~/queue").as_deref(),
+                Some("cairn://p/cairn/queue")
+            );
+        }
     }
 
     /// `cairn:~/attachments` names the CONVERSATION's attachments, not the

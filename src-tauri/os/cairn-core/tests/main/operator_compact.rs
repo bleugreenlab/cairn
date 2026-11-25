@@ -529,13 +529,11 @@ async fn cold_compact_carries_queued_messages() {
         "force_digest_reseed": false, "reseed_reason": null,
         "supersede_pending_retry": false
     });
-    cairn_core::internal::orchestrator::wakes::arm_thread_hold(
+    cairn_core::internal::orchestrator::wakes::arm_queue_hold(
         &db,
         "job-1",
         cairn_core::internal::orchestrator::wakes::HoldKind::Resume,
-        "thread_focus",
-        "focus full".into(),
-        held_input.to_string(),
+        Some(held_input.to_string()),
         4,
     )
     .await

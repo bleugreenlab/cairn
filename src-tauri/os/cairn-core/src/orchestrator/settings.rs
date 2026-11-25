@@ -289,12 +289,20 @@ impl Orchestrator {
             );
         }
 
-        // Raising either execution-queue cap may free held starts at once.
+        // Either running line can admit or displace queue entries.
         if current.max_concurrent_executions != before.max_concurrent_executions
             || current.max_open_children_per_thread != before.max_open_children_per_thread
-            || current.max_open_prs_per_thread != before.max_open_prs_per_thread
         {
-            crate::execution::gates::sweep::notify_gate_evidence_changed();
+            let orch = self.clone();
+            super::spawn_onto(
+                self.runtime.as_ref(),
+                async move {
+                    if let Err(error) = crate::execution::queue::settle(&orch).await {
+                        log::warn!("queue: settling after a cap change failed: {error}");
+                    }
+                },
+                || log::warn!("queue: could not schedule settlement after a cap change"),
+            );
         }
 
         // Emit config-changed event

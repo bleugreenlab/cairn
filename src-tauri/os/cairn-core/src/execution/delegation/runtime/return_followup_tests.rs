@@ -203,26 +203,6 @@ async fn claude_task_that_returns_on_its_reprompt_settles_and_resumes_its_parent
     assert_eq!(run_status(&orch, &run_id).await, "live");
     assert!(orch.process_state.is_warm(&run_id), "warm after the turn");
     assert_eq!(reprompts(&orch, &child).await, 1);
-    assert_eq!(
-        fleet_slots_held(&orch, &child).await,
-        0,
-        "a returned task on a live, warm run is not working"
-    );
-}
-
-/// Whether the job counts against the fleet's working-job cap.
-async fn fleet_slots_held(orch: &Orchestrator, job_id: &str) -> i64 {
-    count(
-        orch,
-        &format!(
-            concat!(
-                "SELECT COUNT(*) FROM jobs j WHERE j.id = '{}' AND ",
-                cairn_db::fleet_working_job_sql!()
-            ),
-            job_id
-        ),
-    )
-    .await
 }
 
 /// The Claude twin of the ignored re-prompt: the parent is released with the
@@ -1321,7 +1301,6 @@ async fn codex_task_turns_all_run_on_a_live_run_and_the_returning_one_settles_it
     }
     assert_eq!(run_status(&orch, "run-child").await, "live");
     assert!(orch.process_state.is_warm("run-child"));
-    assert_eq!(fleet_slots_held(&orch, &child).await, 0);
 }
 
 /// The sgpd/42 failure as the Codex reader reports it: a fatal error ends the

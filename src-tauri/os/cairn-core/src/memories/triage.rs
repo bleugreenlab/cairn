@@ -434,7 +434,6 @@ async fn spawn_triage_for_scope_inner(
                     // attempt.
                     crate::execution::recipe::LaunchIntent::NewAttempt,
                     Vec::new(),
-                    crate::execution::recipe::QueuePlace::Tail,
                 )
                 .await
             }

@@ -12,6 +12,178 @@ use tokio::sync::broadcast;
 use super::common::*;
 use super::unanswered_calls::{settle_unanswered_calls, InterruptCause};
 
+/// Stop every running job of `execution_id` at its next tool boundary,
+/// resumably, because the run queue no longer admits it.
+pub async fn displace_execution(orch: &Orchestrator, execution_id: &str) -> Result<(), String> {
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let jobs = db.query_all(
+        "SELECT j.id FROM jobs j JOIN turns t ON t.id=j.current_turn_id
+         WHERE j.execution_id=?1 AND t.state='running'
+           AND NOT EXISTS (SELECT 1 FROM agent_waits w WHERE w.job_id=j.id AND w.state IN ('pending','resolving') AND COALESCE(w.hold,'parked')<>'inline')
+           AND NOT EXISTS (SELECT 1 FROM provider_limit_holds h WHERE h.job_id=j.id AND h.state='active')",
+        (execution_id.to_string(),), |row| row.text(0),
+    ).await.map_err(|error| error.to_string())?;
+    for job_id in jobs {
+        let lock = orch.job_launch_lock(&job_id);
+        // The guard never crosses an await: admission and head capture are one
+        // synchronous critical section on the database runtime.
+        let orch = orch.clone();
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            run_db_blocking(|| async {
+                // Selection may have raced a self-suspension or a provider
+                // hold. Revalidate under launch authority before arming intent.
+                let eligible = db.query_opt_text(
+                    "SELECT j.id FROM jobs j JOIN turns t ON t.id=j.current_turn_id
+                     WHERE j.id=?1 AND t.state='running'
+                       AND NOT EXISTS (SELECT 1 FROM agent_waits w WHERE w.job_id=j.id AND w.state IN ('pending','resolving') AND COALESCE(w.hold,'parked')<>'inline')
+                       AND NOT EXISTS (SELECT 1 FROM provider_limit_holds h WHERE h.job_id=j.id AND h.state='active')",
+                    (job_id.clone(),),
+                ).await.map_err(|error| error.to_string())?;
+                if eligible.is_none() {
+                    return Ok(());
+                }
+                if crate::orchestrator::wakes::queue_job_refusal(&orch, &db, &job_id)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(());
+                }
+                crate::orchestrator::wakes::arm_queue_hold(
+                    &db,
+                    &job_id,
+                    crate::orchestrator::wakes::HoldKind::Yield,
+                    None,
+                    orch.services.clock.now(),
+                )
+                .await?;
+                Ok::<_, String>(())
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+    }
+    Ok(())
+}
+
+/// A model-facing tool return is the displacement boundary. Persisted holds
+/// are the intent; no in-memory notification is needed to survive a restart.
+/// Let the response reach the provider transcript before interrupting it.
+pub(crate) async fn displace_at_tool_boundary(orch: &Orchestrator, run_id: &str, job_id: &str) {
+    let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await else {
+        return;
+    };
+    if !db
+        .query_opt_text(
+            "SELECT id FROM provider_limit_holds WHERE job_id=?1 AND run_id=?2
+         AND state='active' AND kind='yield' AND boundary_source='queue'",
+            (job_id.to_string(), run_id.to_string()),
+        )
+        .await
+        .is_ok_and(|hold| hold.is_some())
+    {
+        return;
+    }
+    let orch = orch.clone();
+    let run_id = run_id.to_string();
+    let job_id = job_id.to_string();
+    cairn_common::task::spawn(async move {
+        loop {
+            tokio::time::sleep(SUSPEND_HANDOFF_GRACE).await;
+            let (worker, run, job) = (orch.clone(), run_id.clone(), job_id.clone());
+            let parked =
+                tokio::task::spawn_blocking(move || park_queue_boundary(&worker, &run, &job)).await;
+            match parked {
+                Ok(Ok(Some(true))) => {
+                    // The entry may have risen above the line during handoff.
+                    if let Err(error) = crate::execution::queue::settle(&orch).await {
+                        log::warn!("Queue settle after boundary park failed: {error}");
+                    }
+                    return;
+                }
+                // Transcript persistence can trail the socket response. Wait for
+                // every already-issued call's real result, not an elapsed guess.
+                Ok(Ok(Some(false))) => continue,
+                Ok(Ok(None)) => return,
+                Ok(Err(error)) => {
+                    log::warn!("Queue boundary park failed: {error}");
+                    return;
+                }
+                Err(error) => {
+                    log::warn!("Queue boundary worker failed: {error}");
+                    return;
+                }
+            }
+        }
+    });
+}
+
+pub(crate) fn park_queue_boundary(
+    orch: &Orchestrator,
+    run_id: &str,
+    job_id: &str,
+) -> Result<Option<bool>, String> {
+    let lock = orch.job_launch_lock(job_id);
+    let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let owner = orch
+        .process_state
+        .capture_process_identity(run_id)
+        .and_then(|identity| {
+            orch.process_state
+                .capture_turn_owner_for_identity(&identity)
+        });
+    let yielded = run_db_blocking(|| async {
+        let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(turn_id) = db.query_opt_text(
+            "SELECT t.id FROM jobs j JOIN turns t ON t.id=j.current_turn_id
+             JOIN provider_limit_holds h ON h.job_id=j.id AND h.turn_id=t.id
+             WHERE j.id=?1 AND t.run_id=?2 AND t.state='running'
+               AND h.state='active' AND h.kind='yield' AND h.boundary_source='queue'
+               AND NOT EXISTS (SELECT 1 FROM agent_waits w WHERE w.job_id=j.id AND w.state IN ('pending','resolving') AND COALESCE(w.hold,'parked')<>'inline')",
+            (job_id.to_string(), run_id.to_string()),
+        ).await.map_err(|error| error.to_string())? else { return Ok(None); };
+        // Parallel calls already issued by this turn all keep their real result.
+        // Their own return reaches this same seam once the last one finishes.
+        if !super::unanswered_calls::open_call_names(&db, run_id, &turn_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_empty()
+        {
+            return Ok(Some(false));
+        }
+        let now = orch.services.clock.now();
+        db.write(move |conn| {
+            let turn_id = turn_id.clone();
+            Box::pin(async move {
+                crate::transitions::turn::yield_running_turn_conn(
+                    conn,
+                    &turn_id,
+                    crate::models::TurnYieldReason::ProviderLimit,
+                    now,
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok::<_, String>(Some(true))
+    })?;
+    if yielded == Some(true) {
+        park_owned_turn_launch_locked(orch, run_id, owner.as_ref())?;
+    }
+    drop(guard);
+    if yielded == Some(true) {
+        publish_retained_turn_idle(orch, run_id);
+    }
+    Ok(yielded)
+}
+
 pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str, cancel_owned_waits: bool) {
     // A durable self-suspend already yielded on its own wait; only external
     // Stop cancels that wait and relabels its turn as user_stop.
@@ -522,20 +694,36 @@ pub(crate) fn park_owned_turn(
     let guard = launch_lock
         .as_ref()
         .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let parked = park_owned_turn_launch_locked(orch, run_id, Some(owner))?;
+    drop(guard);
+    if parked {
+        publish_retained_turn_idle(orch, run_id);
+    }
+    Ok(())
+}
+
+fn park_owned_turn_launch_locked(
+    orch: &Orchestrator,
+    run_id: &str,
+    owner: Option<&ProcessTurnOwner>,
+) -> Result<bool, String> {
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
     if owner.process_identity().run_id() != run_id
         || !orch.process_state.is_turn_owner_current(owner)
     {
-        return Ok(());
+        return Ok(false);
     }
     if turn_state(orch, owner.turn_id()).as_deref() != Some("yielded") {
         log::warn!(
             "Refusing durable park for run {run_id}: turn {} is not durably yielded",
             owner.turn_id()
         );
-        return Ok(());
+        return Ok(false);
     }
     if !orch.process_state.retire_turn_accounting_if_owned(owner) {
-        return Ok(());
+        return Ok(false);
     }
     // Do not restake a wait resolved during handoff or overwrite operator Stop.
     if let Err(error) = crate::backends::stdin::send_interrupt(
@@ -547,11 +735,7 @@ pub(crate) fn park_owned_turn(
         log::warn!("Failed to interrupt owned durable park for {run_id}: {error}");
     }
     let parked = orch.process_state.transition_to_warm_if_owned(owner);
-    drop(guard);
-    if parked {
-        publish_retained_turn_idle(orch, run_id);
-    }
-    Ok(())
+    Ok(parked)
 }
 
 /// Publish an actual park or Stop, never successful completion effects.

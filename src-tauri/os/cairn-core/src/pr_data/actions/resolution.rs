@@ -2008,7 +2008,7 @@ pub async fn advance_producing_execution_after_pr_resolution(
     };
 
     if let Err(error) = crate::workflow_host::runtime(orch)
-        .enqueue_advance(&execution_id, false)
+        .enqueue_advance(&execution_id)
         .await
     {
         log::warn!(

@@ -31,8 +31,8 @@
 //! [`AuthorityPlace::Tool`] with [`ToolKind::McpServer`] at workspace scope,
 //! [`AuthorityPlace::ExternalAccount`] with [`AuthorityAction::Write`], which
 //! spending a subscription account's usage-reset credit reaches, and
-//! [`AuthorityPlace::ExecutionQueue`], where a thread moves other threads'
-//! held work (`Write`) or starts its own past every cap (`Run`). The
+//! [`AuthorityPlace::ExecutionQueue`], where a thread moves, parks or unparks
+//! executions in its own slice of the shared queue (`Write`). The
 //! remaining places and actions exist so the follow-on adapters named in
 //! [`FOLLOW_ON_ADAPTERS`] normalize into this vocabulary rather than inventing
 //! parallel names later; they carry no enforcement today.
@@ -153,9 +153,8 @@ pub enum AuthorityPlace {
     HostPath { canonical_path: String },
     /// A canonical `cairn://` resource. Not wired in v1.
     Resource { canonical_uri: String },
-    /// The workspace's execution queue: the fleet's release order and its
-    /// caps, which span every project database. `Write` reorders that line
-    /// across threads; `Run` starts held work past every cap.
+    /// The runner's execution queue, spanning its projects. `Write` moves,
+    /// parks or unparks an execution in the asking thread's slice.
     ExecutionQueue { workspace_id: String },
     /// How one store bookmark catches up with its base. `Write` sets or clears
     /// its merge catch-up mode, which exempts that one branch from replay and
@@ -1406,13 +1405,9 @@ pub enum AuthorityReason {
     /// An outside client of Cairn's served API spending a remote provider's
     /// account. Only a standing grant bound to that client allows it.
     ServedApiRemoteUse,
-    /// A thread moving held work across threads in the fleet's release order.
-    /// It changes when other threads' work starts, which is beyond what a
-    /// thread's own order (its own children, in its own places) may do.
+    /// A thread changing its executions' positions or park state in the shared
+    /// queue, affecting when other threads' work is admitted.
     QueueReorderAcrossThreads,
-    /// A thread starting held work past every cap. The caps constrain what a
-    /// thread starts itself (tenet 1319), so only the operator may skip them.
-    QueueStartNow,
     /// Removing a stored object: its bytes are deleted for every reader and
     /// every address shows a tombstone instead. Destructive, and it decides
     /// over whatever private matter the object shows, so only the operator may
@@ -1450,7 +1445,6 @@ impl AuthorityReason {
             AuthorityReason::ExternalAccountWrite => "external_account_write",
             AuthorityReason::ServedApiRemoteUse => "served_api_remote_use",
             AuthorityReason::QueueReorderAcrossThreads => "queue_reorder_across_threads",
-            AuthorityReason::QueueStartNow => "queue_start_now",
             AuthorityReason::StoredContentRemoval => "stored_content_removal",
             AuthorityReason::BranchCatchUpMode => "branch_catch_up_mode",
             AuthorityReason::ProjectLibraryTrust => "project_library_trust",
@@ -2556,17 +2550,11 @@ mod thread_constraint_tests {
         let scope = queue(AuthorityAction::Write, None).scope;
         assert_eq!(scope.shorthand(), "workspace/default/queue:write");
         assert_eq!(scope.place_kind(), "execution_queue");
-        assert_eq!(
-            queue(AuthorityAction::Run, None).scope.shorthand(),
-            "workspace/default/queue:run"
-        );
     }
 
     #[test]
     fn the_grant_bound_to_a_thread_covers_that_threads_request() {
-        for action in [AuthorityAction::Write, AuthorityAction::Run] {
-            assert!(bound("t-judgment").covers(&queue(action, Some("t-judgment"))));
-        }
+        assert!(bound("t-judgment").covers(&queue(AuthorityAction::Write, Some("t-judgment"))));
     }
 
     #[test]
@@ -2584,7 +2572,6 @@ mod thread_constraint_tests {
     #[test]
     fn another_threads_id_does_not_match() {
         assert!(!bound("t-judgment").covers(&queue(AuthorityAction::Write, Some("t-ui"))));
-        assert!(!bound("t-judgment").covers(&queue(AuthorityAction::Run, Some("t-ui"))));
     }
 
     #[test]
@@ -2616,7 +2603,7 @@ mod thread_constraint_tests {
         assert!(json.contains("\"constraint\":\"acting_thread\""), "{json}");
         assert_eq!(AuthorityConstraintSet::parse(&json).unwrap(), constraints);
 
-        let request = queue(AuthorityAction::Run, Some("t-judgment"));
+        let request = queue(AuthorityAction::Write, Some("t-judgment"));
         let json = serde_json::to_string(&request).unwrap();
         let back: AuthorityRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, request);
@@ -2631,7 +2618,6 @@ mod thread_constraint_tests {
             AuthorityReason::QueueReorderAcrossThreads.as_str(),
             "queue_reorder_across_threads"
         );
-        assert_eq!(AuthorityReason::QueueStartNow.as_str(), "queue_start_now");
         assert_eq!(
             AuthorityReason::StoredContentRemoval.as_str(),
             "stored_content_removal"

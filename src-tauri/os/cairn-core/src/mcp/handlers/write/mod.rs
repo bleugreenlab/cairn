@@ -1065,7 +1065,7 @@ async fn handle_write_attempt(
             let (index, first) = &authority_requests[0];
             let message = match first {
                 // A queue act is a thread's to ask for; the operator's own
-                // move and Start now are on the queue page.
+                // Position and membership actions are on the queue page.
                 first if first.requires_thread_binding() => format!(
                     "Denied: to {} is a named authority boundary, and only a run acting for a \
                      thread can ask the operator for it. The operator moves held work and starts \

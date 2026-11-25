@@ -53,6 +53,7 @@ pub mod operator_compact;
 pub mod ownership;
 pub mod provider_change;
 pub mod queries;
+pub mod queue;
 pub mod recipe;
 pub mod recipe_resolution;
 pub mod routing;

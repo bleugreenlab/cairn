@@ -1,7 +1,7 @@
 //! Programmatic execution start via an issue's executions collection.
 //!
-//! Appending `{recipe?, branch?, continuity?, lifecycle?, overrides?, after?,
-//! place?}` to `cairn://p/PROJECT/NUMBER/executions` starts a new execution,
+//! Appending `{recipe?, branch?, continuity?, lifecycle?, overrides?, after?}`
+//! to `cairn://p/PROJECT/NUMBER/executions` starts a new execution,
 //! on the named recipe or, with none named, on the one Cairn resolves
 //! (`execution::recipe_resolution`). This is the external-driver entry point:
 //! it shares
@@ -229,23 +229,26 @@ pub(crate) async fn check_filing(
     .await
 }
 
-/// What the execution queue would do with a new filing on issue `number` once
-/// thread `thread_id` has adopted it: `None` when it would start, or the line
-/// naming the caps that would hold it. Read-only.
-pub(crate) async fn prospective_queue_line(
-    orch: &Orchestrator,
-    project_key: &str,
-    number: i32,
-    thread_id: &str,
-) -> Result<Option<String>, String> {
-    let owning_db = orch.db.for_project(project_key).await;
-    let (_, issue_id, _) = resolve_project_and_issue(&owning_db, project_key, number).await?;
-    let admission = crate::execution::gates::capacity::decide_with_thread(
-        orch, &owning_db, &issue_id, thread_id,
-    )
-    .await?;
-    Ok((!admission.blocks.is_empty())
-        .then(|| crate::execution::gates::census::queued_summary(&admission.blocks)))
+/// Where a just-filed execution stands in this runner's run queue, as one
+/// plain sentence: running, or queued at its position. Empty when the queue
+/// cannot be read or does not hold it (another runner owns it, or it is
+/// parked); the filing stands either way.
+async fn queue_standing(orch: &Orchestrator, execution_id: &str) -> String {
+    let state = match crate::execution::queue::read(orch).await {
+        Ok(state) => state,
+        Err(error) => {
+            log::warn!("run queue unreadable after filing execution {execution_id}: {error}");
+            return String::new();
+        }
+    };
+    match state.item(execution_id) {
+        Some(item) if item.runs => " It is running.".to_string(),
+        Some(item) => match item.position {
+            Some(position) => format!(" It is queued at position {position}."),
+            None => String::new(),
+        },
+        None => String::new(),
+    }
 }
 
 /// The reply's resolution block: the recipe and why, one line per agent step,
@@ -338,7 +341,6 @@ pub(crate) async fn start_execution_from_collection(
     overrides: Option<crate::models::LaunchDeltas>,
     intent: crate::execution::recipe::LaunchIntent,
     after: Vec<crate::routes::TriggerClause>,
-    place: crate::execution::recipe::QueuePlace,
 ) -> Result<String, String> {
     // Route the issue lookup to the database that OWNS the project: a team
     // project's issue rows live wholly in its synced replica (CAIRN-2181), so
@@ -374,11 +376,6 @@ pub(crate) async fn start_execution_from_collection(
         crate::models::TriggerType::Manual,
         intent,
         &after,
-        // A write to an executions collection is never the operator's own
-        // start: agents, the CLI, issue creation and the route dispatcher all
-        // file here, so the execution queue's caps apply (cairn/5802).
-        crate::execution::recipe::Starter::Capped,
-        place.clone(),
         filing.principal.clone(),
     )
     .await?;
@@ -387,17 +384,9 @@ pub(crate) async fn start_execution_from_collection(
     // Creation-time evaluation: a gate filed after something that has already
     // happened releases now, not on an event long past. The execution row is
     // durable either way, so a failed evaluation is the next tick's to retry,
-    // not this write's to refuse. Only authored gates need it: an execution
-    // the queue alone holds was decided under the admission lock a moment ago,
-    // and deciding it again would take the lock again for the same answer.
-    let evaluation = match (execution.status, after.is_empty()) {
-        (crate::models::ExecutionStatus::Held, true) => {
-            Some(crate::execution::gates::sweep::Evaluation {
-                held_by: launched.held_by,
-                ..Default::default()
-            })
-        }
-        (crate::models::ExecutionStatus::Held, false) => Some(
+    // not this write's to refuse.
+    let evaluation = match execution.status {
+        crate::models::ExecutionStatus::Held => Some(
             crate::execution::gates::sweep::evaluate_execution(orch, &execution.id)
                 .await
                 .unwrap_or_else(|error| {
@@ -466,34 +455,12 @@ pub(crate) async fn start_execution_from_collection(
     let superseded = superseded.map(|(_, seq)| seq);
 
     if let Some(evaluation) = evaluation.filter(|evaluation| !evaluation.released) {
-        // Held by the queue alone. A tail filing's line carries no place in
-        // line: places are numbered at the end of a sweep pass, never on the
-        // filing path. A head filing took places its thread's set already had
-        // in its own insert transaction, and its census says which.
-        let queued = if evaluation.waiting.is_empty() && !evaluation.held_by.is_empty() {
-            Some(match place {
-                crate::execution::recipe::QueuePlace::Head { .. } => {
-                    crate::execution::gates::census::queued_summary_for(
-                        &owning_db,
-                        &execution.id,
-                        &evaluation.held_by,
-                    )
-                    .await
-                }
-                crate::execution::recipe::QueuePlace::Tail => {
-                    crate::execution::gates::census::queued_summary(&evaluation.held_by)
-                }
-            })
-        } else {
-            None
-        };
         let held = held_filing_summary(
             &format!("{key}/{number} \"{title}\""),
             seq,
             &execution.recipe_id,
             &issue_uri,
             &evaluation,
-            queued.as_deref(),
             matches!(intent, crate::execution::recipe::LaunchIntent::NewAttempt)
                 .then_some(superseded),
         );
@@ -519,13 +486,10 @@ pub(crate) async fn start_execution_from_collection(
         }
         None => String::new(),
     };
-    let placed = match place {
-        crate::execution::recipe::QueuePlace::Head { .. } => " It started now; nothing to place.",
-        crate::execution::recipe::QueuePlace::Tail => "",
-    };
+    let queued = queue_standing(orch, &execution.id).await;
     Ok(format!(
         "Started execution {} for {}/{} \"{}\" (recipe '{}').{}{} Watch {} for attention.\n{}",
-        seq, key, number, title, execution.recipe_id, standing, placed, issue_uri, resolved
+        seq, key, number, title, execution.recipe_id, standing, queued, issue_uri, resolved
     ))
 }
 
@@ -533,9 +497,7 @@ pub(crate) async fn start_execution_from_collection(
 /// what the evidence says about each gate, what it will do to the issue's
 /// attempt when it starts, and the way out if waiting is wrong.
 ///
-/// `issue` names the issue as `key/number "title"`. `queued` is the census's
-/// queued line when only the execution queue holds it (no gate the filer wrote
-/// is unmet). `next_attempt` is `Some(owner_now)` for a held next attempt: it
+/// `issue` names the issue as `key/number "title"`. `next_attempt` is `Some(owner_now)` for a held next attempt: it
 /// fenced nothing at filing, and takes the attempt from whichever execution
 /// owns it at release.
 fn held_filing_summary(
@@ -544,22 +506,8 @@ fn held_filing_summary(
     recipe_id: &str,
     issue_uri: &str,
     evaluation: &crate::execution::gates::sweep::Evaluation,
-    queued: Option<&str>,
     next_attempt: Option<Option<i64>>,
 ) -> String {
-    if let Some(queued) = queued {
-        let attempt = match next_attempt {
-            Some(Some(owner)) => format!(
-                " Filing it fenced nothing: execution {owner} keeps running until this one \
-                 starts."
-            ),
-            _ => String::new(),
-        };
-        return format!(
-            "Filed execution {seq} for {issue} (recipe '{recipe_id}'): {queued}.{attempt} {}",
-            crate::execution::gates::capacity::ONLY_START_NOW_SKIPS_THE_QUEUE
-        );
-    }
     let exit =
         format!(" Release it early with patch {{release:true}} on {issue_uri}/executions/{seq}.");
     let attempt = match next_attempt {
@@ -599,9 +547,6 @@ fn held_filing_summary(
 pub(crate) enum GatePatch {
     /// `{release: true}`: start now, recording who decided not to wait.
     Release,
-    /// `{start_now: true}`: start now past every cap, the queue's included,
-    /// on a grant the operator gave the asking thread (cairn/5942).
-    StartNow,
     /// `{after: [...]}`: the full replacement gate list.
     Replace(Vec<crate::routes::TriggerClause>),
 }
@@ -627,16 +572,7 @@ pub(crate) async fn patch_execution_gates(
         cairn_uri::build_issue_uri(&cairn_uri::canonical_project(project_key), number)
     );
     let state = crate::execution::gates::authoring::hold_state(&owning_db, &execution_id).await?;
-    let job_holds = if matches!(&patch, GatePatch::StartNow) {
-        crate::execution::gates::open_prs::thread_holds(&owning_db, &execution_id)
-            .await
-            .map_err(|error| error.to_string())?
-    } else {
-        Vec::new()
-    };
-    if job_holds.is_empty() {
-        crate::execution::gates::authoring::require_held(&state, &label)?;
-    }
+    crate::execution::gates::authoring::require_held(&state, &label)?;
 
     match patch {
         GatePatch::Release => {
@@ -644,94 +580,26 @@ pub(crate) async fn patch_execution_gates(
                 return Ok(format!("Would release {label} early"));
             }
             let principal = acting_principal(orch, request).await;
-            // Skips the authored `after:` gates only: a cap governs what a
-            // thread starts itself (tenet 1319), so `release:true` never skips
-            // one, whoever writes it. Skipping the caps is `start_now:true`,
-            // which only the operator's approval allows.
             let outcome = crate::execution::gates::sweep::release(
                 orch,
                 &execution_id,
                 crate::execution::gates::sweep::ReleaseCause::Override {
                     principal: principal.clone(),
-                    scope: crate::execution::gates::sweep::OverrideScope::AuthoredGates,
                 },
             )
             .await?;
             match outcome {
-                crate::execution::gates::sweep::ReleaseOutcome::Released => Ok(format!(
-                    "Released {label} early: its jobs exist and it advances now. Recorded as an \
-                     override by {principal}."
-                )),
-                crate::execution::gates::sweep::ReleaseOutcome::HeldByCap(blocks) => {
-                    if let Err(error) =
-                        crate::execution::gates::capacity::refresh_places(orch, None).await
-                    {
-                        log::warn!("could not rewrite the queue's places in line: {error}");
-                    }
-                    let queued = crate::execution::gates::census::queued_summary_for(
-                        &owning_db,
-                        &execution_id,
-                        &blocks,
-                    )
-                    .await;
+                crate::execution::gates::sweep::ReleaseOutcome::Released => {
+                    let queued = queue_standing(orch, &execution_id).await;
                     Ok(format!(
-                        "Released the `after:` gates on {label} (override by {principal}); still \
-                         {queued}. {}",
-                        crate::execution::gates::capacity::ONLY_START_NOW_SKIPS_THE_QUEUE
+                        "Released {label} early: its jobs exist and it joined the run queue.\
+                         {queued} Recorded as an override by {principal}."
                     ))
                 }
                 crate::execution::gates::sweep::ReleaseOutcome::NotHeld => Err(format!(
                     "{label} was released by someone else first; it is already running"
                 )),
             }
-        }
-        GatePatch::StartNow => {
-            if dry_run {
-                return Ok(format!(
-                    "Would start {label} now, past every cap (asks the operator unless this \
-                     thread holds a grant)"
-                ));
-            }
-            let granted = crate::resources::mutations::authorize_start_now(
-                orch,
-                request,
-                project_key,
-                number,
-                exec_seq,
-            )
-            .await?;
-            let principal = acting_principal(orch, request).await;
-            let thread = granted.thread.clone();
-            let outcome = crate::execution::gates::start_now::start_now(
-                orch,
-                &execution_id,
-                principal,
-                crate::execution::gates::sweep::CapSkipAuthority::Granted {
-                    thread: granted.thread,
-                    decision: granted.decision,
-                },
-            )
-            .await?;
-            // The census line names the caps the start skipped, which the
-            // launch sentence does not.
-            let ids = vec![execution_id.clone()];
-            let census = owning_db
-                .read(move |conn| {
-                    let ids = ids.clone();
-                    Box::pin(async move {
-                        crate::execution::gates::census::census_for_executions_conn(conn, &ids)
-                            .await
-                    })
-                })
-                .await
-                .ok()
-                .and_then(|mut found| found.remove(&execution_id))
-                .map(|census| census.summary)
-                .unwrap_or_else(|| format!("started now by {thread} under the operator's grant"));
-            Ok(format!(
-                "{} It was {census}. Recorded as an override by {thread}.",
-                outcome.sentence(&label)
-            ))
         }
         GatePatch::Replace(clauses) => {
             let gates = crate::execution::gates::authoring::canonical_predicates(

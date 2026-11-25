@@ -11,23 +11,23 @@ use cairn_uri::CairnResource;
 /// agent on one provider is to name that provider's model for it.
 pub(super) const RETIRED_EXECUTION_BACKEND: &str = "payload.backend was retired: each node now selects a model within its allotment. To run an agent on one provider, name its model: overrides.agents.<agent>.models: [provider/model]; see docs/backends.md#model-selection";
 
-/// `place`, on a filing: `"head"` asks for the head of the issue's thread's
-/// own queue; absent queues it behind what is already held.
-pub(super) fn parse_place(
+/// `place` on a filing is gone: every filing joins the end of the run queue,
+/// and the queue's own `move` is the one way to reorder. Refused by name so
+/// a caller using the old key learns where ordering lives now.
+pub(super) fn refuse_place(
     index: usize,
     item: &ChangeItem,
     value: Option<&serde_json::Value>,
     key: &str,
-) -> ResourceMutationResult<bool> {
+) -> ResourceMutationResult<()> {
     match value {
-        None | Some(serde_json::Value::Null) => Ok(false),
-        Some(value) if value.as_str() == Some("head") => Ok(true),
-        Some(other) => Err(build_failure(
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(_) => Err(build_failure(
             index,
             item,
             format!(
-                "{key} takes only \"head\" (file it at the head of its thread's own queue), not \
-                 {other}; omit it to queue behind what is already held. Nothing changed."
+                "{key} was retired: a filing joins the end of the run queue. Reorder it with \
+                 cairn:@/queue {{move:{{execution:ID,position:N}}}}. Nothing changed."
             ),
         )),
     }
@@ -109,7 +109,7 @@ pub(super) async fn dispatch(
                 },
                 None => crate::execution::recipe::LaunchIntent::NewAttempt,
             };
-            let head = parse_place(
+            refuse_place(
                 index,
                 item,
                 item.payload.as_ref().and_then(|p| p.get("place")),
@@ -124,7 +124,7 @@ pub(super) async fn dispatch(
             // A same-project thread filing work on an issue that hangs from
             // nothing adopts it, so the issue's attention (its plan gates, its
             // reviews, its failure) reaches the thread that asked for it, and
-            // its thread's focus cap and queue govern it. Only the trusted
+            // it takes its place in that thread's slice of the run queue. Only the trusted
             // acting thread qualifies; an issue with either kind of parent,
             // and every start that is not a thread's, is left as it is.
             let parents = super::threads::issue_parents(orch, project, *number)
@@ -136,21 +136,6 @@ pub(super) async fn dispatch(
                 }
                 _ => None,
             };
-            let effective_thread = parents
-                .as_ref()
-                .and_then(|parents| parents.thread.clone())
-                .or_else(|| adopter.as_ref().map(|(_, name)| name.clone()));
-            let mut place = file_place(
-                orch,
-                request,
-                project,
-                *number,
-                head,
-                effective_thread.as_deref(),
-                !after.is_empty(),
-            )
-            .await
-            .map_err(|error| build_failure(index, item, error))?;
             // With no recipe named, Cairn chooses; either way the recipe is
             // resolved before anything is written, so a refusal files nothing.
             let creator =
@@ -189,30 +174,11 @@ pub(super) async fn dispatch(
                 .map_err(|error| build_failure(index, item, error))?;
             }
             if dry_run {
-                // The adoption moves the issue into the thread's focus count,
-                // so the queue is asked as it will stand after it. A filing
-                // with `after:` takes no place until its gates clear.
                 let adopts = match &adopter {
-                    Some((thread_id, name)) => {
-                        let queue = if after.is_empty() {
-                            executions::prospective_queue_line(orch, project, *number, thread_id)
-                                .await
-                                .map_err(|error| build_failure(index, item, error))?
-                        } else {
-                            None
-                        };
-                        let queue = match queue {
-                            Some(line) => format!(
-                                " It would count against {name}'s focus cap, and the queue \
-                                 would hold it now: {line}"
-                            ),
-                            None => format!(" It would count against {name}'s focus cap."),
-                        };
-                        format!(
-                            "\nWould adopt {project}/{number} under thread {name} first: it has \
-                             no parent.{queue}"
-                        )
-                    }
+                    Some((_, name)) => format!(
+                        "\nWould adopt {project}/{number} under thread {name} first: it has no \
+                         parent."
+                    ),
                     None => String::new(),
                 };
                 format!(
@@ -225,9 +191,9 @@ pub(super) async fn dispatch(
                     filing.resolution.line()
                 )
             } else {
-                // Adopt before the launch: admission reads the issue's thread
-                // for its focus cap and queue, so the edge must be durable
-                // before the start is decided.
+                // Adopt before the launch: the run queue reads the issue's
+                // thread for its slice, so the edge must be durable before the
+                // execution joins the queue.
                 let mut adopted = None;
                 let mut adoption_note = String::new();
                 if let Some((thread_id, thread_name)) = &adopter {
@@ -247,23 +213,8 @@ pub(super) async fn dispatch(
                             adopted = Some(thread_name.clone());
                         }
                         // Someone gave it a parent between the read above and
-                        // this write; that parent stands, and a head place is
-                        // decided again against it.
+                        // this write; that parent stands.
                         crate::issues::crud::ThreadAdoption::AlreadyParented(_) => {
-                            let current = super::threads::issue_parents(orch, project, *number)
-                                .await
-                                .map_err(|error| build_failure(index, item, error))?;
-                            place = file_place(
-                                orch,
-                                request,
-                                project,
-                                *number,
-                                head,
-                                current.and_then(|parents| parents.thread).as_deref(),
-                                !after.is_empty(),
-                            )
-                            .await
-                            .map_err(|error| build_failure(index, item, error))?;
                             adoption_note = format!(
                                 "\n{project}/{number} gained a parent before {thread_name} could \
                                  adopt it; that parent stands."
@@ -281,7 +232,6 @@ pub(super) async fn dispatch(
                     overrides,
                     intent,
                     after,
-                    place,
                 )
                 .await;
                 match started {
@@ -382,33 +332,6 @@ pub(super) async fn dispatch(
     Ok(Some(summary))
 }
 
-/// Where a filing queues: at the tail, or, for `place:"head"`, at the head of
-/// `thread`'s own queue (the issue's parent thread, or the thread about to
-/// adopt it), checked before anything is written.
-async fn file_place(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    project: &str,
-    number: i32,
-    head: bool,
-    thread: Option<&str>,
-    has_after: bool,
-) -> Result<crate::execution::recipe::QueuePlace, String> {
-    if !head {
-        return Ok(crate::execution::recipe::QueuePlace::Tail);
-    }
-    let placed_by = super::threads::head_placed_by(
-        orch,
-        request,
-        project,
-        thread,
-        &format!("{project}/{number}"),
-        has_after,
-    )
-    .await?;
-    Ok(crate::execution::recipe::QueuePlace::Head { placed_by })
-}
-
 /// Parse an `after` array of gate clause objects, refusing prose, malformed
 /// clauses, and unknown facts at write time with the corrected object. Shared by
 /// both launch doors and the gate patch, so one grammar is refused one way.
@@ -425,7 +348,7 @@ pub(super) fn parse_after_clauses(
     Ok(clauses)
 }
 
-/// The gate half of an execution patch: `{release: true}`, `{start_now: true}`
+/// The gate half of an execution patch: `{release: true}`
 /// or `{after: [...]}`, one at a time, and never mixed with a snapshot edit or
 /// a re-evaluation, so a write cannot half-apply.
 fn parse_gate_patch(
@@ -434,15 +357,11 @@ fn parse_gate_patch(
     payload: &serde_json::Value,
 ) -> ResourceMutationResult<Option<executions::GatePatch>> {
     let release = payload.get("release");
-    let start_now = payload.get("start_now");
     let after = payload.get("after");
-    if release.is_none() && start_now.is_none() && after.is_none() {
+    if release.is_none() && after.is_none() {
         return Ok(None);
     }
-    let gate_keys = [release, start_now, after]
-        .iter()
-        .filter(|key| key.is_some())
-        .count();
+    let gate_keys = [release, after].iter().filter(|key| key.is_some()).count();
     if ["agent", "snapshot", "reevaluate"]
         .iter()
         .any(|key| payload.get(key).is_some())
@@ -451,20 +370,8 @@ fn parse_gate_patch(
         return Err(build_failure(
             index,
             item,
-            "payload.release, payload.start_now and payload.after each stand alone: send \
-             {release:true} to release its after: gates, {start_now:true} to start it past every \
-             cap, or {after:[...]} to replace its gates, in separate changes",
+            "payload.release and payload.after each stand alone; send {release:true} or {after:[...]} in separate changes",
         ));
-    }
-    if let Some(start_now) = start_now {
-        return match start_now {
-            serde_json::Value::Bool(true) => Ok(Some(executions::GatePatch::StartNow)),
-            _ => Err(build_failure(
-                index,
-                item,
-                "payload.start_now must be true; to keep an execution held, omit it",
-            )),
-        };
     }
     if let Some(release) = release {
         return match release {
@@ -529,7 +436,6 @@ mod cancellation_payload_tests {
             json!({"cancel":true,"after":[]}),
             json!({"cancel":true,"agent":"builder"}),
             json!({"cancel":true,"release":true}),
-            json!({"cancel":true,"start_now":true}),
         ] {
             assert!(
                 super::validate_cancel_payload(&payload).is_err(),

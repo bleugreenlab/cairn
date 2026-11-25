@@ -4,7 +4,7 @@
 //! (tenet 785): they record what was last decided, not what is running now. A
 //! job left `running` behind a turn whose process died reads exactly like one
 //! mid-turn. Everything that has to know whether work is actually under way
-//! (the fleet and focus caps, the census, the node summary, the unowned-running
+//! (the node summary and the unowned-running
 //! sweep) reads it here, from evidence:
 //!
 //! - **A process.** This host's registry holds an agent handle for the job's
@@ -100,19 +100,6 @@ macro_rules! live_run_since_sql {
            ORDER BY live_run.updated_at DESC LIMIT 1)"
     };
 }
-pub(crate) use live_run_since_sql;
-
-/// The id of job `j`'s most recently updated run that still reads live, or
-/// NULL: the run a launch in admission would be launching. Expects a `jobs` row
-/// aliased `j`; seeks `idx_runs_job_id`.
-macro_rules! live_run_id_sql {
-    () => {
-        "(SELECT live_run.id FROM runs live_run
-           WHERE live_run.job_id = j.id AND live_run.status IN ('starting', 'live')
-           ORDER BY live_run.updated_at DESC, live_run.id DESC LIMIT 1)"
-    };
-}
-pub(crate) use live_run_id_sql;
 
 const LIVE_RUN_SINCE_SQL: &str = concat!(
     "SELECT ",

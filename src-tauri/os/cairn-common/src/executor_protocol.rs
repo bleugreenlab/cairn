@@ -8634,15 +8634,12 @@ pub struct LearnedResourceEstimate {
 /// variant, field or serialized form changes, and a runner talking to an older
 /// executor gets nothing wrong.
 ///
-/// cairn/5802 does not move the number. The execution queue holds new
-/// executions behind a fleet cap and a per-thread focus cap as gate rows the
-/// runner files and releases before any job, cell request or placement exists:
-/// two settings keys join the workspace contract, two condition-SQL predicates
-/// and a gate `detail` column join the runner's database, and the runner reads
-/// its own placement queue to say how much in-progress work still waits for a
-/// machine. A held execution has no jobs, so nothing about it ever reaches an
-/// executor, and no frame, variant, field or serialized form changes; a runner
-/// talking to an older executor gets nothing wrong.
+/// cairn/7546 does not move the number. The runner's ordered execution list
+/// replaces runner-owned capacity gates and decides which existing job launches
+/// and resumptions it drives. Removing the fleet's read-only count of jobs
+/// waiting for a machine changes no placement request, frame, or executor
+/// action: an older executor receives the same workloads and gets nothing wrong.
+/// Queue membership and the two running lines are runner-local database facts.
 ///
 /// cairn/4999 does not move the number. [`ExecutionLoadContext`] gains a
 /// defaulted `hostStallStale` flag, and the executor now records

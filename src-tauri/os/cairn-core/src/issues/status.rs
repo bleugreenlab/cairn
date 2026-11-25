@@ -717,6 +717,9 @@ pub(crate) fn resolve_terminal_locked<'a>(
         // merge or close, the recipe action — so this is where `issue_resolution`
         // and `pr_state` gates hear about it.
         crate::execution::gates::sweep::notify_gate_evidence_changed();
+        if let Err(error) = crate::execution::queue::settle(orch).await {
+            log::warn!("Queue settlement after issue resolution failed: {error}");
+        }
         orch.notify_tenet_evidence();
 
         Ok(report)

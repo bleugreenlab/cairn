@@ -29,7 +29,6 @@ pub enum Workload {
     AgentJobs {
         jobs: Vec<crate::models::Job>,
         cause: crate::effects::types::WakeCause,
-        focus_admitted: bool,
     },
     Action {
         action_run_id: String,
@@ -155,15 +154,7 @@ impl WorkflowRuntime {
 
     /// Persist advancement in the private host outbox before notifying the live
     /// worker. The row remains replayable when there is no receiver.
-    ///
-    /// `focus_admitted` says this advance continues work the thread focus cap
-    /// already admitted (a release, a fresh launch). It rides on the live
-    /// notification only: a replay after a restart re-checks the cap.
-    pub async fn enqueue_advance(
-        &self,
-        execution_id: &str,
-        focus_admitted: bool,
-    ) -> Result<String, String> {
+    pub async fn enqueue_advance(&self, execution_id: &str) -> Result<String, String> {
         let id = crate::effects::outbox::insert_pending_with_payload_async(
             &self.private_db,
             "advance_dag",
@@ -176,7 +167,6 @@ impl WorkflowRuntime {
             let _ = tx.send(WorkflowEffect::AdvanceDag {
                 execution_id: execution_id.to_owned(),
                 outbox_entry_id: Some(id.clone()),
-                focus_admitted,
             });
         }
         Ok(id)

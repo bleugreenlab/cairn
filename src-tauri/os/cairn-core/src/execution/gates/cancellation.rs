@@ -354,7 +354,7 @@ mod tests {
                     )
                     .await?;
                     let census = &censuses[&id];
-                    assert!(!census.held && !census.queued);
+                    assert!(!census.held);
                     assert!(census.summary.contains("withdrawn by node coord"));
                     assert!(census.summary.contains("never started"));
                     Ok::<_, DbError>(())
@@ -606,7 +606,7 @@ mod authority_boundary_tests {
 mod transition_order_tests {
     use super::*;
     use crate::execution::gates::sweep::tests::{count, env, execution, file};
-    use crate::execution::gates::sweep::{self, ConnRelease, OverrideScope, ReleaseCause};
+    use crate::execution::gates::sweep::{self, ConnRelease, ReleaseCause};
     use serde_json::json;
 
     async fn release(db: &LocalDb, id: String) -> ConnRelease {
@@ -619,9 +619,7 @@ mod transition_order_tests {
                     100,
                     &ReleaseCause::Override {
                         principal: json!({"kind":"operator"}),
-                        scope: OverrideScope::AuthoredGates,
                     },
-                    &Default::default(),
                 )
                 .await
             })

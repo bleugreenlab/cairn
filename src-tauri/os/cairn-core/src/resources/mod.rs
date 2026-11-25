@@ -44,7 +44,7 @@ mod progress;
 mod project;
 mod project_map;
 mod publications;
-mod queue;
+pub mod queue;
 mod read;
 #[cfg(test)]
 mod read_contract_tests;
@@ -89,10 +89,6 @@ pub(crate) use rebase::{node_base_branch, NodeRebaseRows};
 pub(crate) use thread_seed::{
     compose_node_seed, compose_thread_seed_with_policy, seed_tokens, SeedPolicy, ThreadSeed,
 };
-/// The one interpretation of a thread sub-path, shared by the read dispatcher,
-/// the write dispatcher, and anything that resolves a thread-addressed resource.
-#[cfg(test)]
-pub(crate) use threads::read_thread_queue;
 pub(crate) use transcript::{era_source_digest, navigation_passage_event_id};
 
 /// One job's transcript exactly as `.../chat/raw?format=json` serves it: every

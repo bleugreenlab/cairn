@@ -44,16 +44,7 @@ pub(crate) async fn settle_advance<T>(
         Ok(jobs) => Ok(jobs),
         Err(error) => {
             if !error.claimed_agent_jobs.is_empty() {
-                let (admitted, pending): (Vec<_>, Vec<_>) = error
-                    .claimed_agent_jobs
-                    .into_iter()
-                    .partition(|job| error.focus_admitted_job_ids.contains(&job.id));
-                if !admitted.is_empty() {
-                    hand_over_claimed_jobs(orch, admitted, &error.message, true).await;
-                }
-                if !pending.is_empty() {
-                    hand_over_claimed_jobs(orch, pending, &error.message, false).await;
-                }
+                hand_over_claimed_jobs(orch, error.claimed_agent_jobs, &error.message).await;
             }
             Err(error.message)
         }
@@ -68,12 +59,7 @@ pub(crate) async fn settle_advance<T>(
 /// They are handed to the runner exactly as a successful advancement's caller
 /// would; if even that fails, each is failed through `mark_job_start_failed`,
 /// which also answers whoever waits on it.
-async fn hand_over_claimed_jobs(
-    orch: &Orchestrator,
-    jobs: Vec<Job>,
-    cause: &str,
-    focus_admitted: bool,
-) {
+async fn hand_over_claimed_jobs(orch: &Orchestrator, jobs: Vec<Job>, cause: &str) {
     let handed = match orch.executor.get() {
         Some(executor) => executor
             .execute(
@@ -81,7 +67,6 @@ async fn hand_over_claimed_jobs(
                 crate::effects::types::WorkflowEffect::StartAgentJobs {
                     jobs: jobs.clone(),
                     cause: cairn_workflow::effects::types::WakeCause::System,
-                    focus_admitted,
                 },
             )
             .await

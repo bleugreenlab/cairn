@@ -46,7 +46,7 @@ mod projects;
 mod prompts;
 mod publish;
 mod queue;
-pub(crate) use queue::{asking_thread_id, authorize_start_now, queue_authority};
+pub(crate) use queue::{asking_thread_id, queue_authority};
 mod rebase;
 pub(crate) use rebase::{acceptance_debt_section, rebase_authority};
 mod camps;
@@ -72,13 +72,11 @@ mod issue_mutation_tests;
 #[cfg(test)]
 mod models_account_tests;
 #[cfg(test)]
-mod queue_authority_tests;
-#[cfg(test)]
 mod resolved_issue_filing_tests;
 #[cfg(test)]
 mod resource_gate_tests;
 #[cfg(test)]
-mod thread_adoption_tests;
+pub(crate) mod thread_adoption_tests;
 #[cfg(test)]
 mod thread_mutation_tests;
 

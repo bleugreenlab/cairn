@@ -4,7 +4,7 @@ mod actions;
 mod agents;
 mod blocking;
 mod browsers;
-mod dispatch;
+pub(super) mod dispatch;
 mod hash;
 mod labels;
 mod mcp;
@@ -23,7 +23,7 @@ pub(crate) use blocking::{
     blocking_append_kind, run_blocking_group, validate_blocking_group, BlockingResult,
 };
 pub(crate) use dispatch::{
-    acceptance_debt_section, asking_thread_id, attachment_removal_authority, authorize_start_now,
+    acceptance_debt_section, asking_thread_id, attachment_removal_authority,
     dispatch_resource_change, dispatch_resource_change_under_store, inference_records_authority,
     machine_services_authority, queue_authority, rebase_authority,
 };

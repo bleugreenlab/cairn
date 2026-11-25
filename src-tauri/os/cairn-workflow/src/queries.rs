@@ -866,7 +866,7 @@ mod tests {
         exec(&db, "INSERT INTO jobs(id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at)
                    VALUES('builder','launch-held','open','proj-1','builder','pending',4,4)").await;
         exec(&db, "INSERT INTO provider_limit_holds(id,job_id,backend,boundary_source,kind,created_at,updated_at)
-                   VALUES('h','builder','claude','thread_open_prs','launch',4,4)").await;
+                   VALUES('h','builder','claude','queue','launch',4,4)").await;
         let held_page = list_all_executions_async(&db, &held, 1, 0).await.unwrap();
         assert_eq!(held_page.items[0].id, "launch-held");
         assert_eq!(held_page.total, 2);

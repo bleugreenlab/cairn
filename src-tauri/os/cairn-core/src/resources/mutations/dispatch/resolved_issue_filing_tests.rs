@@ -4,18 +4,11 @@
 //! BEFORE its issue resolved is untouched: the census still reads it as
 //! `won't start`.
 //!
-//! Each filing goes through the real `IssueExecutions` append dispatcher. The
-//! fleet is full, so a filing the door lets through is held `Queued`, the
-//! shape of the specimen (rs/1247, cairn://posts/610).
-
 use std::collections::BTreeSet;
 
 use serde_json::json;
 
-use crate::execution::gates::capacity::tests::{
-    add_issue, add_started, full_fleet, is_held, summary,
-};
-use crate::execution::gates::reorder::tests::request;
+use super::thread_adoption_tests::{add_issue, request};
 use crate::execution::gates::sweep::tests::{count, env, execution, Env};
 use crate::mcp::types::{ChangeItem, ChangeMode};
 
@@ -23,7 +16,9 @@ async fn file(env: &Env, number: i32, dry_run: bool) -> Result<String, String> {
     let item = ChangeItem {
         target: format!("cairn://p/prj/{number}/executions"),
         mode: ChangeMode::Append,
-        payload: Some(json!({"recipe": "memory-triage"})),
+        payload: Some(
+            json!({"recipe": "memory-triage", "after":[{"fact":"clock","notBefore":"2099-01-01T00:00:00Z"}]}),
+        ),
     };
     crate::resources::mutations::dispatch_resource_change(
         &env.orch,
@@ -73,9 +68,9 @@ async fn written(env: &Env, number: i32) -> (i64, i64, i64) {
 async fn filing_on_a_merged_or_closed_issue_is_refused_and_writes_nothing() {
     for (column, resolution) in [("closed_at", "closed"), ("merged_at", "merged")] {
         let env = env(&format!("file-on-{resolution}.db")).await;
-        full_fleet(&env).await;
         // An issue whose first execution minted a branch, and one with none.
-        add_started(&env, 310, None, "complete").await;
+        add_issue(&env, 310, None).await;
+        env.db.execute_script("INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('se310','recipe','si310','p','complete',1,1); INSERT INTO jobs(id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at) VALUES('sj310','se310','si310','p','builder','complete',1,1);").await.unwrap();
         env.db
             .execute_script(
                 "UPDATE jobs SET branch = 'agent/prj-310-builder-0', uri_segment = 'builder'
@@ -130,17 +125,30 @@ async fn filing_on_a_merged_or_closed_issue_is_refused_and_writes_nothing() {
 #[tokio::test]
 async fn an_execution_held_before_its_issue_closed_still_reads_wont_start() {
     let env = env("held-then-closed.db").await;
-    full_fleet(&env).await;
     add_issue(&env, 320, None).await;
 
     let filed = file(&env, 320, false).await.unwrap();
-    assert!(filed.contains("Queued"), "{filed}");
-    assert!(is_held(&env, 320).await);
+    assert!(filed.contains("HELD"), "{filed}");
     let (execution_id, ..) = execution(&env, 320).await;
 
     resolve(&env, 320, "closed_at", "closed").await;
     assert_eq!(
-        summary(&env, &execution_id).await,
+        env.db
+            .read(|conn| {
+                let id = execution_id.clone();
+                Box::pin(async move {
+                    Ok(crate::execution::gates::census::census_for_executions_conn(
+                        conn,
+                        std::slice::from_ref(&id),
+                    )
+                    .await?
+                    .remove(&id)
+                    .unwrap()
+                    .summary)
+                })
+            })
+            .await
+            .unwrap(),
         "won't start: prj/320 closed"
     );
 
@@ -170,7 +178,7 @@ async fn filing_and_release_agree_on_which_issues_are_resolved() {
                 "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                    VALUES('ge{number}', 'recipe', 'si{number}', 'p', 'held', 1, 1);
                  INSERT INTO execution_gates(id, execution_id, seq, predicate_json, created_at)
-                   VALUES('gg{number}', 'ge{number}', 0, '{{\"fact\":\"fleet_slot\"}}', 1);
+                   VALUES('gg{number}', 'ge{number}', 0, '{{\"fact\":\"clock\"}}', 1);
                  UPDATE issues SET {set} WHERE id = 'si{number}';"
             ))
             .await

@@ -110,8 +110,8 @@ pub async fn prepare_batch(
                 },
             ));
         }
-        // Moving held work across threads, or starting it past every cap, is
-        // the operator's to approve; a thread asks with a card.
+        // Moving, parking or unparking work in the asking thread's queue slice
+        // is the operator's to approve; a thread asks with a card.
         if let Some(outcome) =
             crate::resources::mutations::queue_authority(orch, request, item).await
         {

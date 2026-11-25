@@ -155,9 +155,9 @@ pub(crate) use inputs::{
     resolve_ctx_self_schemas_with_snapshot, resolve_instruction_prompt_conn,
 };
 pub(crate) use lifecycle::{
-    continue_automatic_retry, continue_job_impl_admitted,
-    continue_job_launch_locked_for_operator_compact, continue_job_launch_locked_for_recovery,
-    resume_held_continuation, OperatorBoundary, RecoveryContinuation,
+    continue_automatic_retry, continue_job_launch_locked_for_operator_compact,
+    continue_job_launch_locked_for_recovery, resume_held_continuation, OperatorBoundary,
+    RecoveryContinuation,
 };
 // The branch-mode coordinate decision. Production reaches it only through
 // `prepare_job`; the delegation edge's regression imports it to run the mode it
@@ -318,7 +318,6 @@ fn hold_start_for_reservation(
                 let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
                     execution_id: execution,
                     outbox_entry_id: Some(outbox_entry_id),
-                focus_admitted: false,
                 });
             }
             None => log::warn!(

@@ -497,10 +497,6 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     owned("execution_agent_edits", "executions"),
     // One row per distinct recipe set a project's resolutions chose among.
     owned("recipe_option_sets", "projects"),
-    keep(
-        "queue_lane_turns",
-        "one row per queue lane that has started work: bounded by the threads and parent issues there are",
-    ),
     owned("execution_trigger_sources", "executions"),
     owned("pr_node_port_fires", "executions"),
     owned("pr_publish_attempts", "action_runs"),

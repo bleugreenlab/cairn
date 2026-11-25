@@ -445,7 +445,6 @@ pub async fn launch(
         None,
         crate::models::TriggerType::Manual,
         crate::execution::recipe::LaunchIntent::NewAttempt,
-        crate::execution::recipe::Starter::Capped,
     )
     .await
     .and_then(|launched| {

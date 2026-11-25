@@ -88,8 +88,7 @@ macro_rules! gated_execution_source_sql {
 /// The executions with an UNSATISFIED gate row: [`gated_execution_source_sql!`]
 /// narrowed to the rows `idx_execution_gates_unsatisfied` holds, which grow
 /// with live work rather than with history. A source only for a statement
-/// whose predicate requires an unsatisfied gate (a cap holding it, or
-/// [`awaits_authored_gate_sql!`]); an execution whose gates are all satisfied
+/// whose predicate requires an unsatisfied authored gate; an execution whose gates are all satisfied
 /// but which is still unreleased is still held, and this would miss it. The
 /// same placement rules apply. Expects an `executions` row aliased `e`.
 #[macro_export]
@@ -99,36 +98,11 @@ macro_rules! unsatisfied_gate_source_sql {
     };
 }
 
-/// True when gate row `g` is a CAPACITY hold the system filed (the execution
-/// queue's fleet slot or thread focus), not an authored `after:` gate. Expects
-/// an `execution_gates` row aliased `g`. The fact names are
-/// `execution::gates::capacity`'s, which a test holds to this string.
-#[macro_export]
-macro_rules! capacity_gate_sql {
-    () => {
-        "json_extract(g.predicate_json, '$.fact') IN ('fleet_slot', 'thread_focus')"
-    };
-}
-
-/// True when execution `e` still waits on an AUTHORED `after:` gate. Such an
-/// execution takes no place in the execution queue: a capacity row it holds
-/// from before an `after:` patch is neither ahead of anyone nor numbered, and
-/// its place is decided again when its own gates clear. Expects an
-/// `executions` row aliased `e`; spells the capacity facts as
-/// [`capacity_gate_sql!`] does (a test holds the two together).
-#[macro_export]
-macro_rules! awaits_authored_gate_sql {
-    () => {
-        "EXISTS (SELECT 1 FROM execution_gates authored_gate WHERE authored_gate.execution_id = e.id AND authored_gate.satisfied_at IS NULL AND json_extract(authored_gate.predicate_json, '$.fact') NOT IN ('fleet_slot', 'thread_focus'))"
-    };
-}
-
 /// True when prompt `p` is an open question on its job `j`'s current turn:
 /// unanswered, unwithdrawn, on a live job, on a turn that was not cancelled.
 /// Expects `prompts p`, `jobs j` (resolved as `COALESCE(p.job_id, r.job_id)`)
 /// and `turns pt` (the prompt's turn, LEFT JOINed). The notification center
-/// lists exactly these as questions, and the fleet cap frees exactly these
-/// jobs' slots, so the two can never disagree about who waits on the operator.
+/// lists exactly these as questions.
 #[macro_export]
 macro_rules! open_prompt_sql {
     () => {
@@ -141,7 +115,7 @@ macro_rules! open_prompt_sql {
 /// live, or a blocking question holding its job ([`open_prompt_sql!`]).
 ///
 /// The two predicates answer different questions and must not be merged.
-/// [`open_prompt_sql!`] is "this question holds its job": the fleet cap and
+/// [`open_prompt_sql!`] is "this question holds its job":
 /// [`job_awaits_operator_sql!`] count on it, and a non-blocking asker is not
 /// held, since its turn moves on by design. This one is "the operator owes
 /// this question an answer", for the surfaces that list questions to the
@@ -185,68 +159,7 @@ macro_rules! job_awaits_operator_sql {
     };
 }
 
-/// True when execution `e` is one the FLEET cap may count: live, started (not
-/// held), and not a thread's host execution (a thread's task jobs live in an
-/// issue-less host execution, and threads never count). Expects an
-/// `executions` row aliased `e`.
-///
-/// Whether it counts also needs a working job ([`fleet_working_job_sql!`],
-/// then a machine-use classification of that job's yielded turn in
-/// `execution::gates::capacity`) and `e.runner_device_id` to be THIS device:
-/// each runner owns its own fleet, so a team member's executions consume
-/// theirs. That device scope is deliberate and is the opposite of
-/// [`open_thread_child_sql!`], which has none. Do not align the two.
-#[macro_export]
-macro_rules! fleet_counted_execution_sql {
-    () => {
-        concat!(
-            $crate::live_execution_sql!(),
-            " AND NOT (",
-            $crate::gated_unreleased_sql!(),
-            ") AND NOT EXISTS (SELECT 1 FROM jobs thread_host_job WHERE thread_host_job.execution_id = e.id AND thread_host_job.thread_id IS NOT NULL)"
-        )
-    };
-}
-
-/// True when job `j` may hold its execution's fleet slot: `running`, or
-/// `pending` and placeable, and not waiting on the operator. Expects a `jobs`
-/// row aliased `j`.
-///
-/// A placeable `pending` job counts, so a release burst cannot overrun the
-/// fleet before it is placed (a freshly released root job has no
-/// predecessors). A `pending` job is NOT placeable while a job in its
-/// execution is waiting on the operator (`blocked` on an approval or review,
-/// or [`job_awaits_operator_sql!`], the one definition the notification
-/// center also reads): that is a downstream node whose
-/// predecessor is parked on the operator, and counting it would keep an
-/// execution in plan review holding a slot with nothing running. That test
-/// is an approximation of "its DAG predecessors are complete": a placeable
-/// parallel branch beside a parked sibling is under-counted, which
-/// over-releases by one (the safe direction; per-machine admission absorbs
-/// it). `blocked`, `idle` and terminal jobs never count.
-#[macro_export]
-macro_rules! fleet_working_job_sql {
-    () => {
-        concat!(
-            // The subquery rebinds `j` to each job that waits on the
-            // operator, so the shared predicate applies to it unchanged; the
-            // left-hand `j.execution_id` is still the outer job's. The job
-            // itself needs no exclusion: it is `pending`, so not `blocked`,
-            // and if it awaits the operator the outer test drops it anyway.
-            "(j.status = 'running' OR (j.status = 'pending' AND j.execution_id NOT IN (SELECT j.execution_id FROM jobs j WHERE j.execution_id IS NOT NULL AND j.status IN ('blocked', 'pending', 'running') AND (j.status = 'blocked' OR ",
-            $crate::job_awaits_operator_sql!(),
-            " OR ",
-            $crate::job_held_sql!(),
-            ")))) AND NOT ",
-            $crate::job_awaits_operator_sql!(),
-            " AND NOT ",
-            $crate::job_held_sql!()
-        )
-    };
-}
-
-/// True when job `j` has an active launch or resume hold (supply, fleet,
-/// thread focus or open-PR bound). Held work is neither working nor placeable,
+/// True when job `j` has an active launch or resume hold. Held work is not placeable,
 /// but remains nonterminal, so its execution stays live. Expects a `jobs` row
 /// aliased `j`.
 #[macro_export]
@@ -295,39 +208,6 @@ macro_rules! supply_hold_owns_job_sql {
     };
 }
 
-/// Ownership for the re-entry band, including a provider-yield hold that has
-/// subsequently reached the focus boundary. Supply launch/resume ownership
-/// remains separate because those holds also make a node unplaceable.
-#[macro_export]
-macro_rules! reentry_hold_owns_job_sql {
-    () => {
-        concat!(
-            "(", $crate::supply_hold_owns_job_sql!(),
-            " OR (supply_hold.state = 'active' AND supply_hold.kind = 'yield'
-                  AND j.current_turn_id = supply_hold.turn_id
-                  AND EXISTS (SELECT 1 FROM turns held_head WHERE held_head.id = j.current_turn_id
-                               AND held_head.state = 'yielded' AND held_head.yield_reason = 'provider_limit')))"
-        )
-    };
-}
-
-/// A thread hold that waits in its thread's band for a slot: it owns its job
-/// ([`reentry_hold_owns_job_sql!`]) and carries no `resume_gate`. A gated hold
-/// (every automatic launch failed, or a tool call had no recorded result) is
-/// never released automatically, so it is not in line: counting it would hold
-/// every later start on the thread behind work that cannot move. Expects a
-/// `provider_limit_holds` row aliased `supply_hold` and a `jobs` row aliased `j`.
-#[macro_export]
-macro_rules! reentry_band_hold_sql {
-    () => {
-        concat!(
-            "(",
-            $crate::reentry_hold_owns_job_sql!(),
-            " AND supply_hold.resume_gate IS NULL)"
-        )
-    };
-}
-
 /// True when job `j` has not ended: `pending`, `running`, `blocked` or `idle`.
 /// A job that waits on the operator (a question, a permission, a PR or plan
 /// awaiting review) is always one of these, so it is covered; `idle` is
@@ -342,8 +222,7 @@ macro_rules! nonterminal_job_sql {
 
 /// True when issue `i` is an OPEN child for listings: unresolved, with a
 /// released live execution and nonterminal job, or an open PR. Includes both
-/// running and parked work; this is not the focus-cap count. Activity is derived
-/// from each job's head turn and waits by the shared Rust activity classifier.
+/// running and waiting work. This is a listing predicate, not queue admission.
 /// The caller adds `i.parent_thread_id = ?`. Expects an `issues` row aliased `i`;
 /// intentionally independent of device scope.
 #[macro_export]
@@ -361,20 +240,6 @@ macro_rules! open_thread_child_sql {
     };
 }
 
-/// The execution-queue LANE of issue `i`: the parent that filed the work.
-/// `thread:<id>` for a thread's child, else `issue:<id>` for a child of a
-/// coordinator or other parent issue, else `shared`, one lane for top-level
-/// issues and (with `i` LEFT JOINed and absent) issue-less executions. The
-/// queue releases lanes in rotation (`execution::gates::rotation`), so a burst
-/// one parent files takes one turn per round instead of the whole fleet.
-/// Reads `issues` only. Expects an `issues` row aliased `i`.
-#[macro_export]
-macro_rules! queue_lane_sql {
-    () => {
-        "CASE WHEN i.parent_thread_id IS NOT NULL THEN 'thread:' || i.parent_thread_id WHEN i.parent_issue_id IS NOT NULL THEN 'issue:' || i.parent_issue_id ELSE 'shared' END"
-    };
-}
-
 /// True when condition row `ce` is blocked and its node has no routed row, so
 /// the condition is still routed nowhere. Expects a `condition_evaluations` row
 /// aliased `ce`.
@@ -382,15 +247,6 @@ macro_rules! queue_lane_sql {
 macro_rules! still_blocked_condition_sql {
     () => {
         "ce.outcome = 'blocked' AND NOT EXISTS (SELECT 1 FROM condition_evaluations routed WHERE routed.execution_id = ce.execution_id AND routed.recipe_node_id = ce.recipe_node_id AND routed.outcome = 'routed')"
-    };
-}
-
-/// True when issue `i` is unresolved and has an open PR. The caller scopes
-/// `i.parent_thread_id`; multiple PR rows still count the child only once.
-#[macro_export]
-macro_rules! thread_open_pr_child_sql {
-    () => {
-        "i.merged_at IS NULL AND i.closed_at IS NULL AND EXISTS (SELECT 1 FROM merge_requests open_pr WHERE open_pr.issue_id = i.id AND open_pr.status = 'open')"
     };
 }
 
@@ -551,7 +407,7 @@ mod tests {
             "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                VALUES('e12', 'r', 'i12', 'p', 'held', 1, 1);
              INSERT INTO execution_gates(id, execution_id, seq, predicate_json, created_at)
-               VALUES('g12', 'e12', 0, '{\"fact\":\"fleet_slot\"}', 1);",
+               VALUES('g12', 'e12', 0, '{\"fact\":\"clock\"}', 1);",
         )
         .await
         .unwrap();

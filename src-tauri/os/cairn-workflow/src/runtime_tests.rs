@@ -16,7 +16,6 @@ use storage::{LocalDb, MigrationRunner, TEAM_MIGRATIONS};
 struct Host {
     owning: Arc<LocalDb>,
     calls: Mutex<Vec<String>>,
-    admissions: Mutex<Vec<(effects::types::WakeCause, bool)>>,
     checkpoint_passes: Mutex<Vec<bool>>,
     head: Mutex<String>,
     /// The host's answer to a decision node; `None` means none is expected.
@@ -131,15 +130,7 @@ impl WorkflowHost for Host {
                     .map_err(|e| e.to_string())?;
                 Ok(Some(EffectResult::ActionComplete { execution_id }))
             }
-            Workload::AgentJobs {
-                jobs,
-                cause,
-                focus_admitted,
-            } => {
-                self.admissions
-                    .lock()
-                    .unwrap()
-                    .push((cause, focus_admitted));
+            Workload::AgentJobs { jobs, .. } => {
                 assert_eq!(jobs.len(), 1);
                 assert_eq!(jobs[0].recipe_node_id.as_deref(), Some("agent"));
                 self.calls.lock().unwrap().push("agent".into());
@@ -165,7 +156,6 @@ async fn fixture(team: bool) -> (WorkflowRuntime, Arc<Host>, tempfile::TempDir) 
     let host = Arc::new(Host {
         owning,
         calls: Mutex::new(vec![]),
-        admissions: Mutex::new(vec![]),
         checkpoint_passes: Mutex::new(vec![]),
         head: Mutex::new("head-one".into()),
         condition_answer: Mutex::new(None),
@@ -265,7 +255,6 @@ fn advance(id: Option<String>) -> WorkflowEffect {
     WorkflowEffect::AdvanceDag {
         execution_id: "exec".into(),
         outbox_entry_id: id,
-        focus_admitted: false,
     }
 }
 
@@ -1407,7 +1396,7 @@ async fn quiet_dependency_healing_preserves_unproven_stopped_held_and_malformed_
         "UPDATE executions SET snapshot='{broken';",
         "UPDATE executions SET lifecycle='superseded';",
         "UPDATE executions SET lifecycle='pending';",
-        "INSERT INTO execution_gates(id,execution_id,seq,predicate_json,created_at) VALUES('gate','exec',0,'{\"fact\":\"fleet_slot\"}',1);"
+        "INSERT INTO execution_gates(id,execution_id,seq,predicate_json,created_at) VALUES('gate','exec',0,'{\"fact\":\"clock\"}',1);"
     ];
     for sql in controls {
         let (_runtime, host, _dir) = fixture(false).await;
@@ -1806,39 +1795,4 @@ async fn a_live_retry_after_quiet_failure_gets_a_new_resolution_identity() {
         .unwrap();
     assert_eq!(outcome.newly_terminal_issue_ids, ["issue"]);
     assert_eq!(count(&host.owning, "SELECT COUNT(*) FROM issues WHERE status='failed' AND quiet_failure_generation <> resolution_generation").await, 1, "the historical quiet marker must not suppress the retry's new failure");
-}
-
-#[tokio::test]
-async fn fresh_focus_admission_follows_only_the_current_effect_chain() {
-    for fresh in [false, true] {
-        let (runtime, host, _dir) = fixture(true).await;
-        seed_condition(
-            &host,
-            legacy_ai_condition(serde_json::json!({"conditionType":"ai", "question":"Route?", "model":"md", "ports":["yes","no"], "onError":"block"})),
-        ).await;
-        *host.condition_answer.lock().unwrap() = Some(Ok(picked("no")));
-        let mut root = advance(None);
-        if let WorkflowEffect::AdvanceDag { focus_admitted, .. } = &mut root {
-            *focus_admitted = fresh;
-        }
-        effects::run::execute_effects(&runtime, vec![root])
-            .await
-            .unwrap();
-        assert_eq!(
-            *host.admissions.lock().unwrap(),
-            [(effects::types::WakeCause::System, fresh)]
-        );
-        // A later advancement has no inherited admission, even for this execution.
-        host.owning
-            .execute_script("UPDATE jobs SET status='pending' WHERE id='job'")
-            .await
-            .unwrap();
-        effects::run::execute_effects(&runtime, vec![advance(None)])
-            .await
-            .unwrap();
-        assert_eq!(
-            host.admissions.lock().unwrap().last(),
-            Some(&(effects::types::WakeCause::System, false))
-        );
-    }
 }

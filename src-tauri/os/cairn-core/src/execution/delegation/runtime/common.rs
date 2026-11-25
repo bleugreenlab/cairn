@@ -533,7 +533,6 @@ pub(super) async fn dispatch_ready_agent_jobs(
             WorkflowEffect::StartAgentJobs {
                 jobs: ready_jobs,
                 cause: cairn_workflow::effects::types::WakeCause::System,
-                focus_admitted: false,
             },
         )
         .await

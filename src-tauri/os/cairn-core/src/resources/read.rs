@@ -2991,20 +2991,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("thread queue", &params) {
                 error
             } else {
-                match crate::execution::jobs::liveness::WorkObserver::read(orch).await {
-                    Ok(observer) => {
-                        super::threads::read_thread_queue(
-                            db,
-                            &project,
-                            &thread,
-                            orch.services.clock.now(),
-                            i64::from(orch.get_settings().max_open_children_per_thread),
-                            &observer,
-                        )
-                        .await
-                    }
-                    Err(error) => format!("Failed to load {thread}'s queue: {error}"),
-                }
+                super::threads::read_thread_queue(orch, db, &project, &thread).await
             }
         }
         CairnResource::ProjectCheckResults { project, revision } => {

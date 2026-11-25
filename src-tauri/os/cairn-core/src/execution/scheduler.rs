@@ -520,7 +520,7 @@ const SUPPLY_CHANGE_DEBOUNCE: std::time::Duration = std::time::Duration::from_se
 /// slot can take only some of them the longest-held work goes first.
 fn sort_oldest_first(holds: &mut [crate::orchestrator::wakes::ProviderLimitHold]) {
     holds.sort_by(|left, right| {
-        (left.queue_order(), left.id.as_str()).cmp(&(right.queue_order(), right.id.as_str()))
+        (left.created_at, left.id.as_str()).cmp(&(right.created_at, right.id.as_str()))
     });
 }
 
@@ -636,10 +636,6 @@ async fn fire_scheduled_recipe(
         // supersede; `NewAttempt` is a no-op on a fresh issue's lineage.
         crate::execution::recipe::LaunchIntent::NewAttempt,
         &[],
-        // Nobody is present at a schedule's trigger: the execution queue's caps
-        // apply, and the held start releases on its own when they clear.
-        crate::execution::recipe::Starter::Capped,
-        crate::execution::recipe::QueuePlace::Tail,
     )
     .await?;
 
@@ -1096,84 +1092,5 @@ edges:
             next > Utc::now(),
             "the schedule does not immediately re-fire"
         );
-    }
-
-    /// cairn/5844 V8: a due schedule fires while a sweep pass holds the
-    /// admission lock. The scheduler never waits on a pass; the capped fire
-    /// waits only for its own bounded acquisition, and lands once the pass
-    /// lets go.
-    #[tokio::test]
-    async fn a_due_schedule_fires_while_a_sweep_pass_holds_the_admission_lock() {
-        use crate::execution::gates::capacity::AdmissionSite;
-
-        let db = crate::storage::migrated_test_db("scheduler-fire-under-sweep.db").await;
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let config_dir = root.join("config");
-        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
-        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
-        std::fs::write(config_dir.join("agents/build.md"), BUILD_AGENT_MD).unwrap();
-        std::fs::write(
-            config_dir.join("recipes/nightly.yaml"),
-            SCHEDULE_RECIPE_YAML,
-        )
-        .unwrap();
-        let project_dir = root.join("project");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        db.execute_script(format!(
-            "
-            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
-            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES('p', 'w', 'Project', 'proj', '{}', 1, 1);
-            ",
-            project_dir.display()
-        ))
-        .await
-        .unwrap();
-        let orch = orchestrator_with_config(db, config_dir);
-        orch.admission_lock
-            .set_wait_bound(std::time::Duration::from_secs(5));
-
-        // The sweep loop, blocked mid-pass on the admission lock.
-        let guard = orch
-            .admission_lock
-            .acquire(AdmissionSite::SweepPass, "1 candidates")
-            .await
-            .unwrap();
-        cairn_common::task::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            drop(guard);
-        });
-
-        let wake = Utc::now();
-        let due = vec![(
-            ScheduledRecipe {
-                id: "nightly".to_string(),
-                name: "Nightly".to_string(),
-                project_id: "p".to_string(),
-                project_key: "proj".to_string(),
-                project_path: project_dir.clone(),
-                schedule_config: daily_config(),
-            },
-            wake - Duration::seconds(1),
-        )];
-        let failed = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            fire_due(&orch, &due, &[], &[], wake),
-        )
-        .await
-        .expect("the fire completes within 3s of a pass that holds the lock for 300ms");
-        assert!(!failed, "the due schedule fired");
-        let executions = orch
-            .db
-            .local
-            .query_opt_i64(
-                "SELECT COUNT(*) FROM executions WHERE triggered_by = 'schedule'",
-                (),
-            )
-            .await
-            .unwrap();
-        assert_eq!(executions, Some(1));
-        assert_eq!(orch.admission_lock.acquisitions(AdmissionSite::Filing), 1);
     }
 }

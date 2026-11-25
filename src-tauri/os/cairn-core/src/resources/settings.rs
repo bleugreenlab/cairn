@@ -120,10 +120,6 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         settings.max_open_children_per_thread
     ));
     out.push_str(&format!(
-        "- maxOpenPrsPerThread: {}\n",
-        settings.max_open_prs_per_thread
-    ));
-    out.push_str(&format!(
         "- pendingMemoryThreshold: {}\n",
         settings.pending_memory_threshold
     ));

@@ -35,9 +35,6 @@ pub struct CreateExecutionSpec {
     /// once every gate is satisfied. "Create the issue and a held execution on
     /// it" in one call.
     pub(crate) after: Vec<crate::routes::TriggerClause>,
-    /// Where a capped hold takes its place: `Head` files it at the head of its
-    /// parent thread's own queue (cairn/5848), checked before the issue exists.
-    pub(crate) place: crate::execution::recipe::QueuePlace,
 }
 
 /// Persist a new issue and emit the standard side effects (embed, sync,
@@ -248,7 +245,6 @@ pub async fn create_issue_in_project(
             // attempt yet.
             crate::execution::recipe::LaunchIntent::NewAttempt,
             spec.after,
-            spec.place,
         )
         .await
         {

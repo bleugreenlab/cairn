@@ -423,13 +423,19 @@ async fn recompute_issue_status_with_reopen_conn(
     issue_id: &str,
     explicitly_reopened: bool,
 ) -> DbResult<StatusWrite> {
-    let Some((progress, attention)) = issue_progress_attention(conn, issue_id).await? else {
+    let Some((progress, attention, queue_state)) = issue_progress_attention(conn, issue_id).await?
+    else {
         return Ok(StatusWrite::default());
     };
+    // The run queue's decision (`executions.queue_state`) refines active work:
+    // a park is the operator's explicit act and reads first; below the running
+    // line reads `queued` unless the issue is waiting on someone.
     let status = match progress {
         IssueProgress::Merged => "merged",
         IssueProgress::Closed => "closed",
+        IssueProgress::Active if queue_state.as_deref() == Some("parked") => "parked",
         _ if attention.blocks_status_projection() => "waiting",
+        IssueProgress::Active if queue_state.as_deref() == Some("queued") => "queued",
         IssueProgress::Backlog => "backlog",
         IssueProgress::Active => "active",
         IssueProgress::Complete => "complete",
@@ -552,7 +558,7 @@ async fn stored_projection(
 async fn issue_progress_attention(
     conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
-) -> DbResult<Option<(IssueProgress, IssueAttention)>> {
+) -> DbResult<Option<(IssueProgress, IssueAttention, Option<String>)>> {
     let mut issue_rows = conn
         .query(
             "SELECT merged_at, closed_at FROM issues WHERE id = ?1",
@@ -563,6 +569,7 @@ async fn issue_progress_attention(
         return Ok(None);
     };
 
+    let mut queue_state = None;
     let progress = if issue_row.opt_i64(0)?.is_some() {
         IssueProgress::Merged
     } else if issue_row.opt_i64(1)?.is_some() {
@@ -570,7 +577,7 @@ async fn issue_progress_attention(
     } else {
         let mut rows = conn
             .query(
-                "SELECT status FROM executions e WHERE issue_id = ?1
+                "SELECT status, queue_state FROM executions e WHERE issue_id = ?1
                    AND (lifecycle = 'canonical'
                         OR (lifecycle = 'pending' AND NOT EXISTS (
                             SELECT 1 FROM executions owner
@@ -581,7 +588,13 @@ async fn issue_progress_attention(
             .await?;
         // Lifecycle, not historical success, chooses the one attempt whose
         // outcome matters. A pending filing owns nothing until release.
-        let status = rows.next().await?.map(|row| row.text(0)).transpose()?;
+        let status = match rows.next().await? {
+            Some(row) => {
+                queue_state = row.opt_text(1)?;
+                Some(row.text(0)?)
+            }
+            None => None,
+        };
         match status.as_deref() {
             None | Some("held") => IssueProgress::Backlog,
             Some("running" | "paused" | "pending") => IssueProgress::Active,
@@ -668,7 +681,7 @@ async fn issue_progress_attention(
         IssueAttention::None
     };
 
-    Ok(Some((progress, attention)))
+    Ok(Some((progress, attention, queue_state)))
 }
 
 async fn issue_completed_at(

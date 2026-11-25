@@ -30,7 +30,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 
-use super::capacity::{AdmissionHolder, AdmissionLock};
 use super::sweep::SweepReport;
 use crate::models::{Execution, ExecutionGateCensus, Issue};
 use crate::orchestrator::Orchestrator;
@@ -109,11 +108,16 @@ pub struct SweepPulse {
     /// the executions the last pass found held.
     evaluated: Mutex<HashMap<String, i64>>,
     passes: watch::Sender<PassSummary>,
-    admission_lock: Arc<AdmissionLock>,
+}
+
+impl Default for SweepPulse {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SweepPulse {
-    pub fn new(admission_lock: Arc<AdmissionLock>) -> Self {
+    pub fn new() -> Self {
         Self {
             installed: AtomicBool::new(false),
             boot_at: AtomicI64::new(0),
@@ -124,7 +128,6 @@ impl SweepPulse {
             passes_completed: AtomicU64::new(0),
             evaluated: Mutex::new(HashMap::new()),
             passes: watch::channel(PassSummary::default()).0,
-            admission_lock,
         }
     }
 
@@ -184,7 +187,6 @@ impl SweepPulse {
         StallReadings {
             progress_at: self.progress_at(),
             last_pass_ms: self.last_duration_ms.load(Ordering::Relaxed),
-            holder: self.admission_lock.holder(),
         }
     }
 
@@ -332,19 +334,15 @@ async fn pass(orch: &Orchestrator, trigger: Trigger) {
 
 /// The one INFO line a pass logs.
 pub fn pass_line(trigger: Trigger, report: &SweepReport, duration: Duration) -> String {
-    let lock = |ms: Option<u64>| ms.map_or_else(|| "-".to_string(), |ms| ms.to_string());
     format!(
         "execution gate sweep pass trigger={} duration_ms={} evaluated={} candidates={} \
-         released={} held_by_cap={} foreclosed={} lock_wait_ms={} lock_held_ms={} clauses={}",
+         released={} foreclosed={} clauses={}",
         trigger.as_str(),
         duration_ms(duration),
         report.evaluated,
         report.candidates,
         report.released.len(),
-        report.held_by_cap,
         report.foreclosed.len(),
-        lock(report.lock_wait_ms),
-        lock(report.lock_held_ms),
         clause_tally(&report.clauses),
     )
 }
@@ -379,7 +377,6 @@ pub struct StallReadings {
     /// The last completed pass, or the loop's start; `None` with no loop.
     pub progress_at: Option<i64>,
     pub last_pass_ms: u64,
-    pub holder: Option<AdmissionHolder>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,17 +425,8 @@ impl StallMonitor {
 fn stall_line(event: StallEvent, readings: &StallReadings) -> String {
     match event {
         StallEvent::Onset { since } | StallEvent::Repeat { since } => {
-            let (holder, subject, held_for) =
-                readings.holder.as_ref().map_or(("none", "", 0), |holder| {
-                    (
-                        holder.site.as_str(),
-                        holder.subject.as_str(),
-                        duration_ms(holder.held),
-                    )
-                });
             format!(
-                "execution gate sweep stalled since={} last_pass_ms={} lock_holder={holder} \
-                 holder_subject={subject} held_for_ms={held_for}",
+                "execution gate sweep stalled since={} last_pass_ms={}",
                 crate::clock::stamp(since).unwrap_or_else(|| since.to_string()),
                 readings.last_pass_ms,
             )
@@ -477,15 +465,13 @@ pub(crate) fn spawn_sweep_watchdog(pulse: Arc<SweepPulse>, clock: Arc<dyn Clock>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::gates::capacity::AdmissionSite;
-    use crate::execution::gates::sweep::tests::{env, execution, file, now, Env, NOW};
+    use crate::execution::gates::sweep::tests::{env, execution, file, Env};
     use serde_json::json;
 
     fn readings(progress_at: Option<i64>) -> StallReadings {
         StallReadings {
             progress_at,
             last_pass_ms: 7,
-            holder: None,
         }
     }
 
@@ -552,52 +538,12 @@ mod tests {
     }
 
     #[test]
-    fn a_stall_line_names_the_lock_holder() {
-        let holder = AdmissionHolder {
-            site: AdmissionSite::SweepPass,
-            subject: "3 candidates".to_string(),
-            held: Duration::from_millis(1_234),
-        };
-        let line = stall_line(
-            StallEvent::Onset { since: 1_000 },
-            &StallReadings {
-                progress_at: Some(1_000),
-                last_pass_ms: 42,
-                holder: Some(holder),
-            },
-        );
-        assert!(
-            line.starts_with("execution gate sweep stalled since="),
-            "{line}"
-        );
-        assert!(
-            line.ends_with(
-                "last_pass_ms=42 lock_holder=sweep_pass holder_subject=3 candidates \
-                 held_for_ms=1234"
-            ),
-            "{line}"
-        );
-        let free = stall_line(StallEvent::Repeat { since: 1_000 }, &readings(Some(1_000)));
-        assert!(
-            free.contains("lock_holder=none holder_subject= held_for_ms=0"),
-            "{free}"
-        );
-        assert_eq!(
-            stall_line(StallEvent::Recovered { lasted_s: 9 }, &readings(None)),
-            "execution gate sweep recovered stalled_for_s=9"
-        );
-    }
-
-    #[test]
     fn the_pass_line_carries_every_count_and_the_clause_tally() {
         let mut report = SweepReport {
             released: vec!["a".to_string()],
             foreclosed: vec!["g".to_string()],
             evaluated: 5,
             candidates: 2,
-            held_by_cap: 1,
-            lock_wait_ms: Some(0),
-            lock_held_ms: Some(3),
             ..SweepReport::default()
         };
         report
@@ -612,13 +558,13 @@ mod tests {
         assert_eq!(
             pass_line(Trigger::Nudge, &report, Duration::from_millis(12)),
             "execution gate sweep pass trigger=nudge duration_ms=12 evaluated=5 candidates=2 \
-             released=1 held_by_cap=1 foreclosed=1 lock_wait_ms=0 lock_held_ms=3 \
+             released=1 foreclosed=1 \
              clauses=issue_resolution:no_evidence=3,satisfied=1;pr_state:foreclosed=1"
         );
         assert_eq!(
             pass_line(Trigger::Tick, &SweepReport::default(), Duration::ZERO),
             "execution gate sweep pass trigger=tick duration_ms=0 evaluated=0 candidates=0 \
-             released=0 held_by_cap=0 foreclosed=0 lock_wait_ms=- lock_held_ms=- clauses=-"
+             released=0 foreclosed=0 clauses=-"
         );
     }
 
@@ -664,123 +610,11 @@ mod tests {
         assert_eq!(execution(&env, 3).await.1, "running");
     }
 
-    /// cairn/5844 V8, second half: ten nudges during one pass become exactly
-    /// one follow-up pass.
-    #[tokio::test]
-    async fn nudges_during_a_pass_coalesce_into_one_follow_up_pass() {
-        let env = env("pulse-coalesce.db").await;
-        // A held execution whose gate is now met: a candidate, so the boot
-        // pass takes the admission lock.
-        file(&env, 3, merged_after(4)).await.unwrap();
-        crate::execution::gates::sweep::tests::resolve_issue(&env, 4, "merged").await;
-        env.orch
-            .admission_lock
-            .set_wait_bound(Duration::from_secs(5));
-        let guard = env
-            .orch
-            .admission_lock
-            .acquire(AdmissionSite::SweepPass, "the test")
-            .await
-            .unwrap();
-
-        let nudge = start_loop(
-            &env,
-            SweepLoopConfig {
-                debounce: Duration::from_millis(50),
-                max_sleep: Duration::from_secs(600),
-            },
-        );
-        // The boot pass is mid-pass, blocked on the lock the test holds.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while env.orch.sweep_pulse.passes_started() < 1 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(env.orch.sweep_pulse.passes_completed(), 0);
-        for _ in 0..10 {
-            nudge.send(()).unwrap();
-        }
-        drop(guard);
-
-        passes(&env, 2).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(
-            env.orch.sweep_pulse.passes_completed(),
-            2,
-            "ten nudges during one pass are one follow-up pass"
-        );
-        assert_eq!(env.orch.sweep_pulse.passes_started(), 2);
-    }
-
-    /// cairn/5844 V9, the queue view's half: `stalled_since` follows the pulse.
-    #[tokio::test]
-    async fn the_queue_view_says_since_when_the_sweep_is_stalled() {
-        let env = env("pulse-stalled.db").await;
-        let view = super::super::capacity::queue_view(&env.orch).await.unwrap();
-        assert_eq!(view.stalled_since, None, "no loop runs here");
-
-        let pulse = &env.orch.sweep_pulse;
-        pulse.mark_installed(NOW - 400);
-        pulse.pass_completed(NOW - 360, Duration::ZERO, PassSummary::default());
-        let view = super::super::capacity::queue_view(&env.orch).await.unwrap();
-        assert_eq!(view.stalled_since, Some(NOW - 360));
-
-        pulse.pass_completed(now(), Duration::ZERO, PassSummary::default());
-        let view = super::super::capacity::queue_view(&env.orch).await.unwrap();
-        assert_eq!(view.stalled_since, None, "a completed pass clears it");
-    }
-
-    /// cairn/5844 V10: a pass stamps each held execution it evaluates, the
-    /// queue view carries the stamp, and a release prunes it on the next pass.
-    #[tokio::test]
-    async fn a_pass_stamps_what_it_evaluated_and_prunes_what_it_released() {
-        use crate::execution::gates::capacity::tests::full_fleet;
-        use crate::execution::gates::sweep::sweep_at;
-
-        let env = env("pulse-evaluated.db").await;
-        full_fleet(&env).await;
-        file(&env, 1, json!([])).await.unwrap();
-        let (held, status, ..) = execution(&env, 1).await;
-        assert_eq!(status, "held");
-
-        let unstamped = super::super::capacity::queue_view(&env.orch).await.unwrap();
-        assert_eq!(
-            unstamped.held[0].census.as_ref().unwrap().evaluated_at,
-            None,
-            "nothing has evaluated it yet"
-        );
-
-        sweep_at(&env.orch, now()).await.unwrap();
-        let view = super::super::capacity::queue_view(&env.orch).await.unwrap();
-        assert_eq!(view.held[0].execution_id, held);
-        assert_eq!(
-            view.held[0].census.as_ref().unwrap().evaluated_at,
-            Some(NOW)
-        );
-
-        env.db
-            .execute("UPDATE jobs SET status = 'complete' WHERE id = 'sj100'", ())
-            .await
-            .unwrap();
-        let report = sweep_at(&env.orch, now()).await.unwrap();
-        assert_eq!(report.released, vec![held.clone()]);
-        assert_eq!(env.orch.sweep_pulse.evaluated_at(&held), Some(NOW));
-        sweep_at(&env.orch, now()).await.unwrap();
-        assert_eq!(
-            env.orch.sweep_pulse.evaluated_at(&held),
-            None,
-            "a released execution drops out on the next pass"
-        );
-    }
-
     /// A loop that has started but never completed a pass counts from its
     /// start.
     #[test]
     fn a_loop_with_no_completed_pass_counts_from_its_start() {
-        let pulse = SweepPulse::new(Arc::new(AdmissionLock::default()));
+        let pulse = SweepPulse::new();
         assert_eq!(pulse.stalled_since(10_000), None);
         pulse.mark_installed(1_000);
         assert_eq!(pulse.stalled_since(1_300), None);

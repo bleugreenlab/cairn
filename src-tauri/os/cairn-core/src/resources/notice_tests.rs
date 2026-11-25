@@ -108,9 +108,8 @@ async fn live_notices_cross_resource_read_boundaries_and_expire() {
 
 #[tokio::test]
 async fn notice_mutation_attributes_operator_and_thread_and_rejects_unverified() {
+    use super::mutations::dispatch::thread_adoption_tests::{add_thread, thread_run};
     use super::mutations::dispatch_resource_change;
-    use crate::execution::gates::capacity::tests::add_thread;
-    use crate::execution::gates::reorder::tests::thread_run;
     use crate::mcp::types::{ChangeItem, ChangeMode};
     use cairn_common::protocol::DispatchOrigin;
 

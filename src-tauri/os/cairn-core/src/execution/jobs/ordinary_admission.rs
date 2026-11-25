@@ -3666,7 +3666,7 @@ mod tests {
         assert_eq!(held.kind, crate::orchestrator::wakes::HoldKind::Resume);
         assert_eq!(held.resume_json.as_deref(), Some(input.as_str()));
         assert!(held.retry_not_before.is_some());
-        assert_ne!(held.boundary_source, "thread_focus");
+        assert_ne!(held.boundary_source, "queue");
         assert_ne!(orch.process_state.has_process("cold"), Some(true));
     }
 

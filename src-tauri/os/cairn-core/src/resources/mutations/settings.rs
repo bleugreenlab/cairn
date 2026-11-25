@@ -37,7 +37,6 @@ pub(crate) const PREF_KEYS: &[&str] = &[
     "maxOpenTriageIssuesPerScope",
     "maxConcurrentExecutions",
     "maxOpenChildrenPerThread",
-    "maxOpenPrsPerThread",
     "pendingMemoryThreshold",
     "threadCompactThreshold",
     "seedBudgetTokens",

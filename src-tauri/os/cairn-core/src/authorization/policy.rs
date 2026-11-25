@@ -62,7 +62,6 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     // here is the operator's to approve.
     "maxConcurrentExecutions",
     "maxOpenChildrenPerThread",
-    "maxOpenPrsPerThread",
 ];
 
 /// Sections that are cosmetic or account-local: they change how this install
@@ -150,19 +149,11 @@ pub fn classify(scope: &AuthorityScope, owned_by_actor: bool) -> AuthorityPolicy
         }
 
         // ── The execution queue ─────────────────────────────────────────────────────
-        // A thread ordering its own children works in places its work already
-        // holds and never reaches here. Moving held work across the fleet's
-        // order changes when OTHER threads' work starts, even when the row
-        // moved is the thread's own: the blast radius is everyone it passes.
+        // Moving, parking or unparking an execution changes admission for the
+        // shared queue. The resource validates the asking thread's ownership;
+        // its write still requires the operator's approval.
         (AuthorityPlace::ExecutionQueue { .. }, AuthorityAction::Write) => {
             AuthorityPolicy::RequiresApproval(AuthorityReason::QueueReorderAcrossThreads)
-        }
-        // Starting held work past every cap. The caps constrain what a thread
-        // starts itself (tenet 1319), so a thread skipping them is exactly
-        // the expansion they exist to prevent, and only the operator's
-        // approval may allow it.
-        (AuthorityPlace::ExecutionQueue { .. }, AuthorityAction::Run) => {
-            AuthorityPolicy::RequiresApproval(AuthorityReason::QueueStartNow)
         }
 
         // ── A branch's catch-up mode ─────────────────────────────────────
@@ -333,7 +324,6 @@ mod tests {
             "channels",
             "maxConcurrentExecutions",
             "maxOpenChildrenPerThread",
-            "maxOpenPrsPerThread",
         ] {
             assert_eq!(
                 classify(&settings(section), false),
@@ -433,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn moving_or_starting_queued_work_requires_approval() {
+    fn queue_writes_require_approval() {
         let queue = AuthorityPlace::ExecutionQueue {
             workspace_id: "default".to_string(),
         };
@@ -444,15 +434,8 @@ mod tests {
             ),
             AuthorityPolicy::RequiresApproval(AuthorityReason::QueueReorderAcrossThreads)
         );
-        assert_eq!(
-            classify(
-                &AuthorityScope::new(queue.clone(), AuthorityAction::Run),
-                false
-            ),
-            AuthorityPolicy::RequiresApproval(AuthorityReason::QueueStartNow)
-        );
-        // Ownership does not make either direct: a thread's own row still
-        // passes other threads' work.
+        // Ownership does not make a write direct: a thread's own row still
+        // affects other threads' admission.
         assert_eq!(
             classify(
                 &AuthorityScope::new(queue.clone(), AuthorityAction::Write),

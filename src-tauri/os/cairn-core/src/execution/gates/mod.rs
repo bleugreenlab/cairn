@@ -4,22 +4,10 @@
 //! The durable gate rows and their store live in `cairn_workflow::gates`,
 //! beside the status projection that reads them.
 
-#[cfg(test)]
-mod admission_tests;
 pub mod ask_conditions;
 pub mod authoring;
 pub mod cancellation;
-pub mod capacity;
 pub mod census;
-#[cfg(test)]
-mod held_reads_tests;
-pub mod open_prs;
 pub mod pulse;
-pub(crate) mod queue_notice;
-pub mod reorder;
-pub mod rotation;
-#[cfg(test)]
-mod rotation_tests;
-pub mod start_now;
 pub mod sweep;
 pub mod vocabulary;
