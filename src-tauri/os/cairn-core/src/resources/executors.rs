@@ -217,7 +217,7 @@ use cairn_common::executor_protocol::{
     RetirementOutcome, RetirementPhase, WorkloadSurvivor,
 };
 use cairn_common::executor_protocol::{
-    GpuDevice, GpuMemory, MachineMemory, UnifiedAllocationSource, UnifiedPool,
+    GpuDevice, GpuMemory, GpuWiredLimit, MachineMemory, UnifiedAllocationSource, UnifiedPool,
 };
 
 use crate::fleet::management::{EnrollmentCleanup, EnrollmentOperation};
@@ -7016,6 +7016,7 @@ fn render_gpu_memory(
             source,
             pool,
             apertures,
+            wired_limit,
         } => {
             // The Memory reading is quoted as the pool only where the executor
             // says it measures the host. Under a cgroup limit it is the limit,
@@ -7079,7 +7080,23 @@ fn render_gpu_memory(
                     )),
                 )
             });
-            format!("unified memory, one pool with system memory: {pool}; {allocated}{apertures}")
+            let wired_limit = wired_limit.as_ref().map_or(String::new(), |reading| {
+                format!(
+                    "; {}",
+                    gpu_field("Metal wired limit", reading, |limit| match limit {
+                        GpuWiredLimit::OsDefault =>
+                            "Metal wired limit macOS's default (iogpu.wired_limit_mb is 0)"
+                                .to_string(),
+                        GpuWiredLimit::Configured { bytes: limit } => format!(
+                            "Metal wired limit {} (iogpu.wired_limit_mb), the most of the pool the GPU may hold",
+                            bytes(*limit)
+                        ),
+                    })
+                )
+            });
+            format!(
+                "unified memory, one pool with system memory: {pool}; {allocated}{apertures}{wired_limit}"
+            )
         }
     })
 }
@@ -14153,6 +14170,7 @@ mod tests {
                 source: UnifiedAllocationSource::NvmlComputeProcesses,
                 pool,
                 apertures: None,
+                wired_limit: None,
             },
             MeasurementReading::Measured { value: 350 },
         )
@@ -14362,6 +14380,7 @@ mod tests {
                     source: UnifiedAllocationSource::AppleDriverInUse,
                     pool: host_pool(),
                     apertures: None,
+                    wired_limit: None,
                 },
                 MeasurementReading::Unavailable {
                     reason: MeasurementGap::SamplingFailed,
@@ -14398,6 +14417,7 @@ mod tests {
                     },
                     source: UnifiedAllocationSource::AmdgpuGtt,
                     pool: host_pool(),
+                    wired_limit: None,
                     apertures: Some(GpuApertures {
                         carve_out: MeasurementReading::Measured {
                             value: GpuCarveOut {

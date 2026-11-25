@@ -536,6 +536,7 @@ mod tests {
                     value: UnifiedPool::HostMemory,
                 },
                 apertures: None,
+                wired_limit: None,
             },
         );
         let host = |devices| HostHealth {

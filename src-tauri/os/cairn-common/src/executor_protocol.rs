@@ -10100,6 +10100,15 @@ pub struct LearnedResourceEstimate {
 /// 401, so a probe reports a healthy deployment stopped and the runner fails
 /// it as an engine gone, and a start reads as never healthy. That is a wrong
 /// read rather than a refusal, so the number moves (tenet 541).
+///
+/// cairn/7564 does not move the number. [`GpuMemory::Unified`] gains a
+/// defaulted `wiredLimit` ([`GpuWiredLimit`]): an Apple silicon executor reads
+/// `iogpu.wired_limit_mb` and reports the operator's ceiling on what Metal lets
+/// the GPU wire, macOS's default when it reads 0, or a named gap. The
+/// inference fit bounds an Apple machine by a configured ceiling and keeps its
+/// fixed share otherwise. What a runner gets wrong talking to an older
+/// executor: nothing; that executor sends no `wiredLimit` and the fit keeps
+/// the share it always used. An older runner ignores the key.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 179;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -20026,7 +20035,29 @@ pub enum GpuMemory {
         /// and from an executor that predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         apertures: Option<GpuApertures>,
+        /// What Metal lets this GPU wire of the pool, on Apple silicon. `None`
+        /// from every other reader and from an executor that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wired_limit: Option<MeasurementReading<GpuWiredLimit>>,
     },
+}
+
+/// The ceiling `iogpu.wired_limit_mb` puts on the system memory an Apple
+/// silicon GPU may wire, which Metal reports as `recommendedMaxWorkingSetSize`.
+/// A load past it fails rather than pages, so it is the budget a model on
+/// such a machine has, not the pool.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum GpuWiredLimit {
+    /// The sysctl reads 0: macOS's own default, a share of memory that grows
+    /// with the memory installed and that the sysctl does not state.
+    OsDefault,
+    /// The operator set the sysctl: the GPU may wire at most this much.
+    Configured { bytes: u64 },
 }
 
 /// An integrated GPU's other memory figures, carried for diagnosis and never
@@ -32010,6 +32041,7 @@ mod tests {
                                     value: UnifiedPool::CgroupLimited { limit_bytes: 4 },
                                 },
                                 apertures: None,
+                                wired_limit: None,
                             },
                         },
                         utilization_millis: MeasurementReading::Unavailable {
@@ -32030,6 +32062,7 @@ mod tests {
                                 pool: MeasurementReading::Measured {
                                     value: UnifiedPool::HostMemory,
                                 },
+                                wired_limit: None,
                                 apertures: Some(GpuApertures {
                                     carve_out: MeasurementReading::Measured {
                                         value: GpuCarveOut {
@@ -35088,6 +35121,7 @@ mod tests {
                                 value: UnifiedPool::HostMemory,
                             },
                             apertures: None,
+                            wired_limit: None,
                         },
                     },
                     utilization_millis: MeasurementReading::Measured { value: 350 },
@@ -35107,6 +35141,7 @@ mod tests {
                             pool: MeasurementReading::Measured {
                                 value: UnifiedPool::HostMemory,
                             },
+                            wired_limit: None,
                             apertures: Some(GpuApertures {
                                 carve_out: MeasurementReading::Measured {
                                     value: GpuCarveOut {
@@ -35167,6 +35202,7 @@ mod tests {
             memory,
             GpuMemory::Unified {
                 apertures: None,
+                wired_limit: None,
                 ..
             }
         ));
@@ -35207,6 +35243,7 @@ mod tests {
                         value: UnifiedPool::HostMemory,
                     },
                     apertures: None,
+                    wired_limit: None,
                 },
             },
         );

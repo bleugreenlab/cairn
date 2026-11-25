@@ -13,7 +13,9 @@
 //!   machines carries `weights / k × 1.05` plus a reserve for activations, in
 //!   the memory an engine may use there: 0.90 of a discrete card's VRAM, 0.85
 //!   of a unified machine's memory, or on Apple silicon what Metal lets its GPU
-//!   wire ([`APPLE_USABLE`]). That is a bound, never a claim: an engine that
+//!   wire: the ceiling the operator set (`iogpu.wired_limit_mb`, which the
+//!   executor reports as [`MachineHw::wired_limit`]), else [`APPLE_USABLE`].
+//!   That is a bound, never a claim: an engine that
 //!   sizes itself (llama.cpp, MLX) needs only its weights, KV cache and the
 //!   reserve, on unified memory as anywhere (tenet 1363). More than one machine needs a linked
 //!   pool, and `k` must divide the attention heads. The context is the
@@ -51,11 +53,22 @@ const GIB: u64 = 1 << 30;
 pub const RESERVE_BYTES: u64 = 2 * GIB;
 pub const DISCRETE_USABLE: f64 = 0.90;
 pub const UNIFIED_USABLE: f64 = 0.85;
-/// What Metal lets an Apple silicon GPU wire of the machine's memory, its
-/// `recommendedMaxWorkingSetSize`: 110100 MiB of a 128 GiB M4 Max on macOS 26
-/// (llama.cpp b12283's `--list-devices`, 11-11). A load past it fails rather
-/// than pages. Raising it (`iogpu.wired_limit_mb`) is the operator's call,
-/// never Cairn's.
+/// What Metal lets an Apple silicon GPU wire of the machine's memory by
+/// default, its `recommendedMaxWorkingSetSize`, for a machine whose executor
+/// reports no ceiling the operator set. A load past it fails rather than
+/// pages. Raising it (`iogpu.wired_limit_mb`) is the operator's call, never
+/// Cairn's.
+///
+/// macOS's default is no one fraction: it grows with the memory installed.
+/// 0.84 is 110100 MiB of a 128 GiB M4 Max on macOS 26 (llama.cpp b12283's
+/// `--list-devices`, 11-11). A 256 GB M5 Ultra Mac Studio on macOS 27.0 reads
+/// 222.7 GiB, 0.87 (iolaSay, "Mac Studio M5 Ultra 本地大模型与 Splash 改造实测",
+/// 2026-11-11), matching the 239.1 GB a 256 GB M3 Ultra reports
+/// (Augustas11/macprovider#2226). A 48 GB M5 Pro on macOS 27.0 reads 0.78
+/// (searoom.app, "One pool, two ceilings", 2026-09-03). So 0.84 understates
+/// the larger machines, which keeps the fit a bound there, and overstates the
+/// smaller ones. The "75% above 36 GB" figure repeated widely is not what
+/// these machines measure.
 pub const APPLE_USABLE: f64 = 0.84;
 pub const WEIGHT_OVERHEAD: f64 = 1.05;
 pub const MIN_CONTEXT: u64 = 8_192;
@@ -185,6 +198,11 @@ pub struct MachineHw {
     pub gpu: String,
     pub memory: HwMemory,
     pub arch: Arch,
+    /// On Apple silicon, the ceiling the operator set on what Metal lets the
+    /// GPU wire (`iogpu.wired_limit_mb`), as the executor read it. `None` for
+    /// macOS's default, an executor that does not report it, and every other
+    /// family.
+    pub wired_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +219,21 @@ pub enum HwMemory {
 impl MachineHw {
     /// What an engine may take on this machine.
     pub fn usable_bytes(&self) -> u64 {
-        (self.memory_bytes() as f64 * self.usable_fraction()) as u64
+        match self.apple_wired_limit() {
+            Some(limit) => limit,
+            None => (self.memory_bytes() as f64 * self.usable_fraction()) as u64,
+        }
+    }
+
+    /// The wired ceiling an Apple machine's operator set, never more than its
+    /// memory: a sysctl above the RAM installed does not add any.
+    fn apple_wired_limit(&self) -> Option<u64> {
+        match self.family {
+            AcceleratorFamily::Apple => {
+                self.wired_limit.map(|limit| limit.min(self.memory_bytes()))
+            }
+            _ => None,
+        }
     }
 
     /// The GPU's memory: the machine's on a unified machine, the card's VRAM
@@ -216,7 +248,10 @@ impl MachineHw {
     /// The share of [`Self::memory_bytes`] an engine may take.
     pub fn usable_fraction(&self) -> f64 {
         match (self.family, self.memory) {
-            (AcceleratorFamily::Apple, _) => APPLE_USABLE,
+            (AcceleratorFamily::Apple, _) => match self.apple_wired_limit() {
+                Some(limit) if self.memory_bytes() > 0 => limit as f64 / self.memory_bytes() as f64,
+                _ => APPLE_USABLE,
+            },
             (_, HwMemory::Unified { .. }) => UNIFIED_USABLE,
             (_, HwMemory::Discrete { .. }) => DISCRETE_USABLE,
         }
@@ -1011,6 +1046,7 @@ mod tests {
             gpu: "NVIDIA GB10".into(),
             memory: HwMemory::Unified { total: 128 * GIB },
             arch: Arch::Aarch64,
+            wired_limit: None,
         }
     }
 
@@ -1029,6 +1065,7 @@ mod tests {
                 gpu: "NVIDIA GeForce RTX 4090".into(),
                 memory: HwMemory::Discrete { vram: 24 * GIB },
                 arch: Arch::X86_64,
+                wired_limit: None,
             }],
             linked: false,
         }
@@ -1042,6 +1079,7 @@ mod tests {
                 gpu: "AMD Radeon 8060S".into(),
                 memory: HwMemory::Unified { total: 128 * GIB },
                 arch: Arch::X86_64,
+                wired_limit: None,
             }],
             linked: false,
         }
@@ -1060,6 +1098,7 @@ mod tests {
                 gpu: "Apple M5 Ultra".into(),
                 memory: HwMemory::Unified { total: 256 * GIB },
                 arch: Arch::Aarch64,
+                wired_limit: None,
             }],
             linked: false,
         }

@@ -12,7 +12,8 @@
 use std::collections::BTreeMap;
 
 use cairn_common::executor_protocol::{
-    model_gpus, ExecutorHealthSnapshot, GpuDevice, GpuMemory, GpuVendor, MachineMemory,
+    model_gpus, ExecutorHealthSnapshot, GpuDevice, GpuMemory, GpuVendor, GpuWiredLimit,
+    MachineMemory,
 };
 use cairn_common::wire_vocabulary::MeasurementReading;
 use cairn_inference::fit::{self, Arch, HwMemory, MachineHw, PoolHw, Predicted};
@@ -122,6 +123,7 @@ impl StatedHardware {
             },
             arch: Arch::parse(&self.arch)
                 .ok_or_else(|| format!("architecture {} is not aarch64 or x86_64", self.arch))?,
+            wired_limit: None,
         })
     }
 }
@@ -202,12 +204,28 @@ fn hardware_from(
             return Err(format!("{name} has not reported its GPU's memory"))
         }
     };
+    // Only a ceiling the operator set is a number. macOS's default, a gap, and
+    // an executor that predates the reading all leave the fit its fixed share.
+    let wired_limit = match &device.memory {
+        MeasurementReading::Measured {
+            value:
+                GpuMemory::Unified {
+                    wired_limit:
+                        Some(MeasurementReading::Measured {
+                            value: GpuWiredLimit::Configured { bytes },
+                        }),
+                    ..
+                },
+        } => Some(*bytes),
+        _ => None,
+    };
     Ok(MachineHw {
         name: name.clone(),
         family,
         gpu: device.model.clone(),
         memory,
         arch,
+        wired_limit,
     })
 }
 
@@ -259,6 +277,11 @@ pub struct MachineFacts {
     pub memory_bytes: u64,
     /// What [`fit::fit`] lets an engine take here.
     pub usable_bytes: u64,
+    /// On Apple silicon, the ceiling the operator set on what Metal lets the
+    /// GPU wire (`iogpu.wired_limit_mb`), which `usable_bytes` is then bounded
+    /// by. Absent where macOS's default share applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wired_limit_bytes: Option<u64>,
     pub arch: Arch,
     pub blackwell: bool,
     /// Whether this machine's hardware is what an earlier generation stated,
@@ -312,6 +335,7 @@ pub fn pool_facts(
                     },
                     memory_bytes: machine.memory_bytes(),
                     usable_bytes: machine.usable_bytes(),
+                    wired_limit_bytes: machine.wired_limit,
                     arch: machine.arch,
                     blackwell: machine.blackwell(),
                     stated: stated.contains_key(machine.name.as_str()),
@@ -1211,6 +1235,7 @@ mod tests {
                 gpu: "NVIDIA GeForce RTX 4090".into(),
                 memory: HwMemory::Discrete { vram: 24 * GIB },
                 arch: Arch::X86_64,
+                wired_limit: None,
             }],
             linked: false,
         }
@@ -1306,6 +1331,7 @@ requirements:
                         value: UnifiedPool::HostMemory,
                     },
                     apertures: None,
+                    wired_limit: None,
                 },
             },
             utilization_millis: MeasurementReading::Measured { value: 0 },
