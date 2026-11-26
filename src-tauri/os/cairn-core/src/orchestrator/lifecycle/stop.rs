@@ -13,7 +13,8 @@ use super::common::*;
 use super::unanswered_calls::{settle_unanswered_calls, InterruptCause};
 
 /// Stop every running job of `execution_id` at its next tool boundary,
-/// resumably, because the run queue no longer admits it.
+/// resumably, because the operator parked it. A turn the operator's own
+/// message started is spared: `queue_job_refusal` admits that job.
 pub async fn displace_execution(orch: &Orchestrator, execution_id: &str) -> Result<(), String> {
     let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id)
         .await
@@ -69,12 +70,20 @@ pub async fn displace_execution(orch: &Orchestrator, execution_id: &str) -> Resu
     Ok(())
 }
 
+/// What a turn stopped by a park reads as the last line of its tool result.
+pub(crate) const PARKED_LINE: &str = "Parked";
+
 /// A model-facing tool return is the displacement boundary. Persisted holds
 /// are the intent; no in-memory notification is needed to survive a restart.
 /// Let the response reach the provider transcript before interrupting it.
-pub(crate) async fn displace_at_tool_boundary(orch: &Orchestrator, run_id: &str, job_id: &str) {
+/// True when this boundary parks the turn, so the result can say so.
+pub(crate) async fn displace_at_tool_boundary(
+    orch: &Orchestrator,
+    run_id: &str,
+    job_id: &str,
+) -> bool {
     let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await else {
-        return;
+        return false;
     };
     if !db
         .query_opt_text(
@@ -85,7 +94,7 @@ pub(crate) async fn displace_at_tool_boundary(orch: &Orchestrator, run_id: &str,
         .await
         .is_ok_and(|hold| hold.is_some())
     {
-        return;
+        return false;
     }
     let orch = orch.clone();
     let run_id = run_id.to_string();
@@ -119,6 +128,7 @@ pub(crate) async fn displace_at_tool_boundary(orch: &Orchestrator, run_id: &str,
             }
         }
     });
+    true
 }
 
 pub(crate) fn park_queue_boundary(

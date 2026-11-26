@@ -67,7 +67,6 @@ pub use review_push::{
     create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_bounded_failed_review,
     rearm_review_checks_on_startup,
 };
-pub(crate) use stop::displace_at_tool_boundary;
 pub use stop::displace_execution;
 pub(crate) use stop::finish_resolution_response;
 #[cfg(test)]
@@ -75,6 +74,7 @@ pub(crate) use stop::park_owned_turn;
 #[cfg(test)]
 pub(crate) use stop::park_queue_boundary;
 pub(crate) use stop::suspend_owned_run_after_handoff_then;
+pub(crate) use stop::{displace_at_tool_boundary, PARKED_LINE};
 pub(crate) use stop::{
     find_descendant_job_ids, kill_session_with_reason_launch_locked, settle_live_turn,
     TurnSettlement, OPERATOR_COMPACT_EXIT_REASON, PROVIDER_SILENCE_RECOVERY_EXIT_REASON,

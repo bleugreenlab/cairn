@@ -508,7 +508,7 @@ pub enum Hold {
     },
     /// Waiting on its own sub-agent tasks, or on a dependency when none is open.
     Tasks { pending: i64 },
-    /// Waiting for its execution to rise above the running line.
+    /// Waiting for the run queue to give its execution a seat.
     Queue,
     /// Waiting for the operator to answer its question.
     Question,
@@ -586,7 +586,7 @@ impl Hold {
     /// follow "It has not started a turn: ".
     pub fn render(&self) -> String {
         match self {
-            Hold::Queue => "it is queued; it reads this when its execution is above the running line".into(),
+            Hold::Queue => "it is queued; it reads this when it starts".into(),
             Hold::Wait {
                 labels,
                 supersedable: true,
@@ -1621,6 +1621,17 @@ pub(crate) struct DirectMessageRef {
     pub(crate) message_id: String,
 }
 
+/// A launch the run queue gave no seat left a queue hold and started nothing:
+/// the sender is told the job is queued, not that its wake failed. Any other
+/// failure stays the failure it was.
+fn queue_held_or(db: &LocalDb, job_id: &str, error: String) -> Result<NudgeOutcome, String> {
+    let job = job_id.to_string();
+    match run_db_blocking(move || async move { Ok::<_, String>(describe_hold(db, &job).await) }) {
+        Ok(Some(Hold::Queue)) => Ok(NudgeOutcome::Held(Hold::Queue)),
+        _ => Err(error),
+    }
+}
+
 /// What a nudge did with the content already queued for a job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NudgeOutcome {
@@ -1843,7 +1854,10 @@ fn nudge_unobserved(
     }
 
     let flushed = if let Some(run_id) = live_run_id.or_else(|| latest_run_for_job(&db, job_id)) {
-        flush_on_idle(orch, &run_id)?
+        match flush_on_idle(orch, &run_id) {
+            Ok(flushed) => flushed,
+            Err(error) => return queue_held_or(&db, job_id, error),
+        }
     } else {
         // No run at all. A recipe node in that state has never been through
         // its start: it has the session its job was created with, but not its
@@ -1869,7 +1883,7 @@ fn nudge_unobserved(
                 )))
             }
         }
-        crate::execution::jobs::continue_job_impl(
+        if let Err(error) = crate::execution::jobs::continue_job_impl(
             pending_wake_cause(
                 &db,
                 job_id,
@@ -1881,8 +1895,13 @@ fn nudge_unobserved(
             None,
             None,
             None,
-        )
-        .map_err(|error| format!("could not resume queued delivery: {error}"))?;
+        ) {
+            return queue_held_or(
+                &db,
+                job_id,
+                format!("could not resume queued delivery: {error}"),
+            );
+        }
         FlushOutcome::Resumed
     };
     Ok(match flushed {

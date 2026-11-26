@@ -3151,26 +3151,25 @@ fn continue_job_launch_locked_inner(
     }
 
     // Refuse before claiming deliveries; the hold carries the exact continuation.
-    if cause == WakeCause::System {
-        if let Some(reason) = run_db_borrowed(crate::orchestrator::wakes::queue_job_refusal(
-            orch, &owning_db, job_id,
-        ))? {
-            let subject = serde_json::to_string(&HeldContinuation::capture(
-                message,
-                prompt_resume.as_ref(),
-                &continuation_intent,
-                cause,
-            ))
-            .map_err(|error| error.to_string())?;
-            run_db_borrowed(crate::orchestrator::wakes::arm_queue_hold(
-                &owning_db,
-                job_id,
-                crate::orchestrator::wakes::HoldKind::Resume,
-                Some(subject),
-                orch.services.clock.now(),
-            ))?;
-            return Err(reason);
-        }
+    // Whatever woke the job, a turn the run queue would not seat never starts.
+    if let Some(reason) = run_db_borrowed(crate::orchestrator::wakes::queue_job_refusal(
+        orch, &owning_db, job_id,
+    ))? {
+        let subject = serde_json::to_string(&HeldContinuation::capture(
+            message,
+            prompt_resume.as_ref(),
+            &continuation_intent,
+            cause,
+        ))
+        .map_err(|error| error.to_string())?;
+        run_db_borrowed(crate::orchestrator::wakes::arm_queue_hold(
+            &owning_db,
+            job_id,
+            crate::orchestrator::wakes::HoldKind::Resume,
+            Some(subject),
+            orch.services.clock.now(),
+        ))?;
+        return Err(reason);
     }
 
     // Claim operator-authored follow-ups before session preparation. Delivery is

@@ -473,37 +473,54 @@ async fn owns_held_job(orch: &Orchestrator, db: &LocalDb, job_id: &str) -> Resul
     }))
 }
 
-/// What a job below the run queue's running line is told, and what its queue
-/// hold records.
-pub const BELOW_RUNNING_LINE: &str = "Below the running line";
+/// What a queue hold records as its reason.
+pub const QUEUED: &str = "Queued";
 
-/// Why the run queue does not admit `job_id`'s work now, or `None` when it
-/// does. Only an issue execution's work is queued: a job outside one (a
-/// thread's own session) is never refused here.
+/// Why the run queue does not seat `job_id`'s work now (`Queued · 2nd in
+/// line`), or `None` when it does. Every launch of an issue execution's work
+/// asks this, whatever woke it, so no turn starts that the queue would not
+/// seat. Only an issue execution's work is queued: a job outside one (a
+/// thread's own session) is never refused here. A launch carrying the
+/// operator's own message to the agent is never refused either: it runs the
+/// addressed agent without changing its place or park state.
 pub async fn queue_job_refusal(
     orch: &Orchestrator,
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Option<String>, String> {
-    let execution = db
+    let row = db
         .query_opt(
-            "SELECT e.id FROM jobs j JOIN executions e ON e.id = j.execution_id
+            "SELECT e.id,
+                    EXISTS (SELECT 1 FROM queued_messages q
+                             WHERE q.job_id = j.id AND q.kind = 'operator'
+                               AND q.delivered_at IS NULL)
+               FROM jobs j JOIN executions e ON e.id = j.execution_id
               WHERE j.id = ?1 AND e.issue_id IS NOT NULL",
             (job_id.to_string(),),
-            |row| row.text(0),
+            |row| Ok((row.text(0)?, row.i64(1)? != 0)),
         )
         .await
         .map_err(|error| error.to_string())?;
-    let Some(execution) = execution else {
+    let Some((execution, operator_message)) = row else {
         return Ok(None);
     };
-    Ok((!crate::execution::queue::runs(orch, &execution).await?)
-        .then(|| BELOW_RUNNING_LINE.to_string()))
+    if operator_message {
+        return Ok(None);
+    }
+    use crate::execution::queue::QueueItem;
+    let state = crate::execution::queue::admit(orch, &execution).await?;
+    // An execution the list does not hold (superseded, resolved, another
+    // runner's) is not the queue's to refuse: the ownership and supersession
+    // fences later in the same launch answer it.
+    Ok(state
+        .item(&execution)
+        .filter(|item| !item.runs)
+        .map(QueueItem::queued_label))
 }
 
-/// Hold `job_id` while the run queue keeps its execution below the running
-/// line. A queue hold has no clock: the queue releases it
-/// ([`resume_queue_held`]) when it admits the execution. A job has one active
+/// Hold `job_id` while the run queue gives its execution no seat. A queue hold
+/// has no clock: the queue releases it ([`resume_queue_held`]) when it seats
+/// the execution. A job has one active
 /// hold, so arming again returns or refreshes the one there is.
 ///
 /// A launch hold returns the job to `pending`. A resume rests on the job's
@@ -544,7 +561,7 @@ pub async fn arm_queue_hold(
             turn_id: turn_id.filter(|_| kind == HoldKind::Resume),
             refusal: CapacityRefusal {
                 subject: "queue".to_string(),
-                reason: BELOW_RUNNING_LINE.to_string(),
+                reason: QUEUED.to_string(),
                 retry_at: None,
                 retry_account: None,
             },
@@ -593,7 +610,7 @@ async fn arm_queue_yield(
                               WHERE EXISTS (SELECT 1 FROM jobs j JOIN turns t ON t.id=j.current_turn_id
                                              WHERE j.id=?2 AND t.id=?4 AND t.state='running')",
                             params![id.as_str(), job.as_str(), run_id.as_str(), turn_id.as_str(),
-                                backend.as_str(), BELOW_RUNNING_LINE, now],
+                                backend.as_str(), QUEUED, now],
                         )
                         .await?;
                     if armed == 0 {
@@ -687,23 +704,16 @@ async fn queue_yield_in_handoff(
 
 /// The host's cold-launch seam, shared by DAG dispatch and owner pickup:
 /// whether `job_id` launches now. `false` means a hold owns the launch: a
-/// supply hold already did, or the run queue keeps a system-caused launch
-/// below its running line and a queue hold now does. An addressed launch is
-/// the operator's and is never queued.
-pub async fn admit_thread_launch(
-    orch: &Orchestrator,
-    job_id: &str,
-    cause: crate::execution::jobs::WakeCause,
-) -> Result<bool, String> {
+/// supply hold already did, or the run queue gives its execution no seat and
+/// a queue hold now does.
+pub async fn admit_thread_launch(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
         .map_err(|e| e.to_string())?;
     if active_supply_hold(&db, job_id).await?.is_some() {
         return Ok(false);
     }
-    if cause == crate::execution::jobs::WakeCause::System
-        && queue_job_refusal(orch, &db, job_id).await?.is_some()
-    {
+    if queue_job_refusal(orch, &db, job_id).await?.is_some() {
         arm_queue_hold(
             &db,
             job_id,
@@ -731,7 +741,7 @@ pub async fn recover_held_work(orch: &Orchestrator, now: i64) -> Result<(), Stri
 /// Ask every supply hold not gated on the operator whether the accounts as
 /// they now stand can serve its work, oldest first, and release those they
 /// can. A hold that still cannot run re-arms and stays held; one whose work
-/// the run queue keeps below its running line becomes a queue hold. Queue
+/// the run queue gives no seat becomes a queue hold. Queue
 /// holds are the queue's to release and are not asked. No jitter: a supply
 /// change has no shared instant to spread. Returns how many were released.
 pub async fn release_holds_on_supply_change(orch: &Orchestrator, now: i64) -> usize {
@@ -1797,10 +1807,9 @@ pub async fn release_on_supply_change(
 }
 
 /// Decide one hold, returning whether it was released. Supply is asked first,
-/// then the run queue: work supply can serve again but the queue keeps below
-/// its running line becomes a queue hold, keeping its kind, head and payload,
-/// and the queue releases it when it admits the execution. An addressed
-/// continuation is the operator's and is never queued.
+/// then the run queue: work supply can serve again but the queue gives no seat
+/// becomes a queue hold, keeping its kind, head and payload, and the queue
+/// releases it when it seats the execution.
 async fn resolve(
     orch: &Orchestrator,
     hold: &ProviderLimitHold,
@@ -1839,16 +1848,9 @@ async fn resolve(
     if !hold_can_launch(orch, &db, hold, now).await? {
         return Ok(false);
     }
-    let addressed = hold
-        .resume_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-        .is_some_and(|v| v.get("cause").and_then(|c| c.as_str()) == Some("addressed"));
-    if !addressed {
-        if let Some(reason) = queue_job_refusal(orch, &db, &hold.job_id).await? {
-            hold_on_queue(&db, hold, &reason, now).await?;
-            return Ok(false);
-        }
+    if queue_job_refusal(orch, &db, &hold.job_id).await?.is_some() {
+        hold_on_queue(&db, hold, QUEUED, now).await?;
+        return Ok(false);
     }
     match hold.kind {
         HoldKind::Yield => resolve_yield(orch, &db, hold, now, trigger).await,

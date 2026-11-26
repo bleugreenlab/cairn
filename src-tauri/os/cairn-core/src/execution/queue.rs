@@ -7,27 +7,40 @@
 //! superseded, withdrawn, or its issue merged or closed. Starting to run, and
 //! finishing its recipe, do not remove it.
 //!
-//! Two lines are drawn over that one list ([`cairn_workflow::queue::selection`]):
-//! an entry runs if and only if it is among the first `per_thread` entries of
-//! its thread's slice and, among the entries that pass that, among the first
-//! `global`. Position is the only input: an entry waiting on a check, a review,
-//! a person, or a provider limit holds its place exactly as a running one does.
+//! Seats are given over that one list ([`cairn_workflow::queue::selection`])
+//! by what each entry is doing, read from facts the runner already stores
+//! (`activity_sql!`):
+//!
+//! - **Active**: agent work is in flight. A turn is running or due, or the
+//!   execution waits on something Cairn is doing now (its own check lanes or
+//!   check requests, a run batch, a terminal, a tool call, a timer, a provider
+//!   limit with a known reset). It holds a seat, through the wait, wherever it
+//!   is in the list, so it never has to win one back and is never cut.
+//! - **Wanting**: work is due and the queue holds it (a queue hold). It takes
+//!   a free seat by its place in the list.
+//! - **Dormant**: nothing it waits on is moving: a person (a review, a
+//!   question, a permission, an approval, an operator request), or nothing at
+//!   all. It holds no seat and keeps its place. When a person acts on it its
+//!   launch asks [`admit`], and it competes for the next free seat as wanting.
+//!
+//! No timer and no age enter the decision. The two caps bound the seats
+//! globally and per thread; active work counts against them even past them,
+//! and only wanting work waits for room.
 //!
 //! Park is the only way out short of resolution: a parked row stays stored
-//! (so nothing re-adds it) but takes no position. Unpark returns it to the end.
-//! Moving an entry is the only way to change what runs; there is no override.
+//! (so nothing re-adds it) but takes no position, and parking stops its
+//! running work at the next tool boundary. Unpark returns it to the end.
 //!
 //! Every change to the list ends in [`settle`], which reads the list, decides,
-//! and acts on the difference: jobs of an admitted execution waiting on the
-//! queue are resumed, and running jobs of an execution below the line are
-//! stopped at their next tool boundary, resumably. The same pass runs at
-//! startup and on the gate sweep's cadence, so a restart reproduces the
-//! running set from the stored list alone.
+//! and resumes the held work of every seated execution. The same pass runs at
+//! startup and on the gate sweep's cadence, so a restart reproduces the seats
+//! from the stored list and the stored facts alone.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use cairn_db::turso::params;
+pub use cairn_workflow::queue::Activity;
 use cairn_workflow::queue::{selection, QueueCaps, QueueEntry};
 use serde::Serialize;
 
@@ -56,6 +69,7 @@ pub struct ExecutionFact {
     pub joinable: bool,
     /// When it became runnable, which orders a batch of joiners.
     pub since: i64,
+    pub activity: Activity,
 }
 
 /// Where an entry is, and whether it runs.
@@ -67,9 +81,33 @@ pub struct QueueItem {
     pub thread_id: Option<String>,
     /// One-based place in the list; `None` when parked.
     pub position: Option<usize>,
-    /// Inside both lines.
+    /// Holds a seat.
     pub runs: bool,
     pub parked: bool,
+    pub activity: Activity,
+    /// Wanting and given no seat: its place among those waiting for one.
+    pub in_line: Option<usize>,
+}
+
+impl QueueItem {
+    /// What a launch held for this entry says: `Queued · 2nd in line`.
+    pub fn queued_label(&self) -> String {
+        match self.in_line {
+            Some(place) => format!("Queued · {} in line", ordinal(place)),
+            None => "Queued".into(),
+        }
+    }
+}
+
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
 }
 
 /// The list as one decision saw it: unparked entries in order, then parked.
@@ -82,7 +120,7 @@ pub struct QueueState {
 }
 
 impl QueueState {
-    /// Whether `execution_id` is inside both lines.
+    /// Whether `execution_id` holds a seat.
     pub fn runs(&self, execution_id: &str) -> bool {
         self.items
             .iter()
@@ -164,12 +202,25 @@ pub fn plan_membership(
 }
 
 /// Decide the list: a parked row takes no position, and a row whose execution
-/// no open database knows cannot run here, so it is passed over by both lines.
+/// no open database knows cannot run here, so it is never seated. `asking` is
+/// an execution whose launch is asking for a seat: it competes as wanting
+/// even before anything is held for it.
 pub fn decide(
     rows: &[StoredRow],
     facts: &HashMap<String, ExecutionFact>,
     caps: QueueCaps,
+    asking: Option<&str>,
 ) -> QueueState {
+    let activity = |id: &str| {
+        let stored = facts
+            .get(id)
+            .map_or(Activity::Dormant, |fact| fact.activity);
+        if asking == Some(id) && stored == Activity::Dormant {
+            Activity::Wanting
+        } else {
+            stored
+        }
+    };
     let listed: Vec<&StoredRow> = rows.iter().filter(|row| !row.parked).collect();
     let entries: Vec<QueueEntry> = listed
         .iter()
@@ -177,26 +228,31 @@ pub fn decide(
         .map(|row| QueueEntry {
             execution_id: row.execution_id.clone(),
             thread_id: facts[&row.execution_id].thread_id.clone(),
+            activity: activity(&row.execution_id),
         })
         .collect();
-    let runs: HashSet<&str> = entries
+    let decisions: HashMap<&str, cairn_workflow::queue::QueueDecision> = entries
         .iter()
         .zip(selection(&entries, caps))
-        .filter(|(_, decision)| decision.admitted)
-        .map(|(entry, _)| entry.execution_id.as_str())
+        .map(|(entry, decision)| (entry.execution_id.as_str(), decision))
         .collect();
     let mut items: Vec<QueueItem> = listed
         .iter()
         .enumerate()
-        .map(|(index, row)| QueueItem {
-            execution_id: row.execution_id.clone(),
-            issue_id: row.issue_id.clone(),
-            thread_id: facts
-                .get(&row.execution_id)
-                .and_then(|fact| fact.thread_id.clone()),
-            position: Some(index + 1),
-            runs: runs.contains(row.execution_id.as_str()),
-            parked: false,
+        .map(|(index, row)| {
+            let decision = decisions.get(row.execution_id.as_str());
+            QueueItem {
+                execution_id: row.execution_id.clone(),
+                issue_id: row.issue_id.clone(),
+                thread_id: facts
+                    .get(&row.execution_id)
+                    .and_then(|fact| fact.thread_id.clone()),
+                position: Some(index + 1),
+                runs: decision.is_some_and(|decision| decision.admitted),
+                parked: false,
+                activity: activity(&row.execution_id),
+                in_line: decision.and_then(|decision| decision.in_line),
+            }
         })
         .collect();
     items.extend(rows.iter().filter(|row| row.parked).map(|row| {
@@ -209,6 +265,10 @@ pub fn decide(
             position: None,
             runs: false,
             parked: true,
+            activity: facts
+                .get(&row.execution_id)
+                .map_or(Activity::Dormant, |fact| fact.activity),
+            in_line: None,
         }
     }));
     QueueState {
@@ -272,15 +332,72 @@ pub fn caps(orch: &Orchestrator) -> QueueCaps {
 const STORED_ROWS_SQL: &str =
     "SELECT execution_id, issue_id, rank, parked_at IS NOT NULL FROM run_queue ORDER BY rank, execution_id";
 
+/// The `agent_waits` kinds a person answers. A pending wait of any other kind
+/// is on something Cairn is doing (check lanes or requests, a run batch, a
+/// terminal, a tool call, a `waitFor` duration), which its resolver ends.
+macro_rules! person_wait_kinds {
+    () => {
+        "'operator_request'"
+    };
+}
+
+/// What execution `e` is doing: `active`, `wanting` or `dormant` (see the
+/// module docs). Active is read from any of its jobs that is still open;
+/// check lanes and check requests count on any of its jobs, open or not, since
+/// a handed-off node's turn-end checks still wake it.
+macro_rules! activity_sql {
+    () => { concat!(
+    "CASE WHEN EXISTS (
+        SELECT 1 FROM jobs aj LEFT JOIN turns ht ON ht.id = aj.current_turn_id
+         WHERE aj.execution_id = e.id AND aj.status IN ('running', 'pending') AND (
+               ht.state IN ('pending', 'running')
+            OR (aj.status = 'running' AND aj.current_turn_id IS NULL)
+            OR EXISTS (SELECT 1 FROM agent_waits aw WHERE aw.job_id = aj.id
+                         AND (aw.state = 'resolving'
+                              OR (aw.state = 'pending'
+                                  AND COALESCE(aw.kind, json_extract(aw.condition_json, '$.kind'))
+                                      NOT IN (",
+    person_wait_kinds!(),
+    "))))
+            OR EXISTS (SELECT 1 FROM provider_limit_holds ah WHERE ah.job_id = aj.id
+                         AND ah.state = 'active' AND ah.boundary_source <> 'queue'
+                         AND ah.retry_not_before IS NOT NULL AND ah.resume_gate IS NULL)))
+      OR EXISTS (
+        SELECT 1 FROM jobs cj
+         WHERE cj.execution_id = e.id AND (
+               EXISTS (SELECT 1 FROM turn_end_check_attempts ta WHERE ta.id = cj.turn_end_check_attempt_id
+                         AND ta.state IN ('requested', 'claimed', 'runtime_started', 'deferred', 'submitted'))
+            OR EXISTS (SELECT 1 FROM check_requests cr WHERE cr.requester_job_id = cj.id
+                         AND cr.state IN ('accepted', 'queued', 'granted', 'running'))))
+     THEN 'active'
+     WHEN EXISTS (
+        SELECT 1 FROM jobs wj JOIN provider_limit_holds wh ON wh.job_id = wj.id
+         WHERE wj.execution_id = e.id AND wh.state = 'active' AND wh.boundary_source = 'queue')
+     THEN 'wanting'
+     ELSE 'dormant' END"
+    ) };
+}
+
+fn parse_activity(value: &str) -> Activity {
+    match value {
+        "active" => Activity::Active,
+        "wanting" => Activity::Wanting,
+        _ => Activity::Dormant,
+    }
+}
+
 /// Every live execution on this runner (`?1`) in one database: its issue, its
-/// thread, and whether it is runnable now. `held` is an execution waiting on
-/// an authored `after:` gate; it is not in the list until released.
+/// thread, whether it is runnable now, and what it is doing. `held` is an
+/// execution waiting on an authored `after:` gate; it is not in the list until
+/// released.
 const LIVE_EXECUTIONS_SQL: &str = concat!(
     "SELECT e.id, e.issue_id, i.parent_thread_id,
             CASE WHEN e.status IN ('running', 'paused') AND NOT (",
     cairn_db::gated_unreleased_sql!(),
     ") THEN 1 ELSE 0 END,
-            COALESCE(e.released_at, e.started_at), e.queue_state
+            COALESCE(e.released_at, e.started_at), e.queue_state, ",
+    activity_sql!(),
+    "
        FROM executions e INDEXED BY idx_executions_run_queue JOIN issues i ON i.id = e.issue_id
       WHERE e.lifecycle IN ('canonical', 'pending')
         AND COALESCE(e.runner_device_id, ?1) = ?1 AND ",
@@ -378,6 +495,7 @@ async fn execution_facts(
                                 thread_id: row.opt_text(2)?,
                                 joinable: row.i64(3)? != 0,
                                 since: row.opt_i64(4)?.unwrap_or(0),
+                                activity: parse_activity(&row.text(6)?),
                             },
                             row.opt_text(5)?,
                         ));
@@ -414,12 +532,13 @@ async fn execution_facts(
 }
 
 /// The queue state an issue's status projection reads from its execution:
-/// `queued` below the line, `parked` when parked, none when it runs.
+/// `queued` while its due work waits for a seat, `parked` when parked, none
+/// when it is seated or dormant (a dormant entry reads as what it waits on).
 fn recorded_state(item: &QueueItem) -> Option<&'static str> {
-    match (item.parked, item.runs) {
-        (true, _) => Some("parked"),
-        (false, false) => Some("queued"),
-        (false, true) => None,
+    match (item.parked, item.runs, item.activity) {
+        (true, _, _) => Some("parked"),
+        (false, false, Activity::Wanting) => Some("queued"),
+        _ => None,
     }
 }
 
@@ -465,10 +584,11 @@ async fn record_states(state: &QueueState, located: &Located) {
 }
 
 /// Read the list, bring its membership up to date, apply `change` to it, store
-/// it, and decide it. `change` returns false when its subject is not in the
-/// list, which fails the call without writing.
+/// it, and decide it, `asking` competing as wanting. `change` returns false
+/// when its subject is not in the list, which fails the call without writing.
 async fn under_lock(
     orch: &Orchestrator,
+    asking: Option<&str>,
     change: impl FnOnce(&mut Vec<StoredRow>) -> Result<(), String>,
 ) -> Result<(QueueState, Located), String> {
     let _guard = QUEUE_LOCK.lock().await;
@@ -487,18 +607,19 @@ async fn under_lock(
             .await
             .map_err(|error| format!("failed to store the run queue: {error}"))?;
     }
-    Ok((decide(&rows, &facts, caps(orch)), located))
+    Ok((decide(&rows, &facts, caps(orch), asking), located))
 }
 
 /// The list as it stands, membership brought up to date.
 pub async fn read(orch: &Orchestrator) -> Result<QueueState, String> {
-    Ok(under_lock(orch, |_| Ok(())).await?.0)
+    Ok(under_lock(orch, None, |_| Ok(())).await?.0)
 }
 
-/// Whether `execution_id` runs now. Every path that would start or continue
-/// an issue execution's work asks this, and nothing else.
-pub async fn runs(orch: &Orchestrator, execution_id: &str) -> Result<bool, String> {
-    Ok(read(orch).await?.runs(execution_id))
+/// The decision a launch of `execution_id`'s work gets: seated already, or
+/// given a free seat by its place as wanting work. Every path that would start
+/// or continue an issue execution's work asks this, and nothing else.
+pub async fn admit(orch: &Orchestrator, execution_id: &str) -> Result<QueueState, String> {
+    Ok(under_lock(orch, Some(execution_id), |_| Ok(())).await?.0)
 }
 
 fn missing(execution_id: &str) -> String {
@@ -511,7 +632,7 @@ pub async fn move_to(
     execution_id: &str,
     position: usize,
 ) -> Result<QueueState, String> {
-    let (state, located) = under_lock(orch, |rows| {
+    let (state, located) = under_lock(orch, None, |rows| {
         if rows
             .iter()
             .any(|row| row.execution_id == execution_id && row.parked)
@@ -529,45 +650,51 @@ pub async fn move_to(
     Ok(state)
 }
 
-/// Park (`true`) or unpark an entry, then act on what that changes.
+/// Park (`true`) or unpark an entry, then act on what that changes. Parking
+/// stops the execution's running work at its next tool boundary, resumably;
+/// it is the one change that stops work the queue already seated.
 pub async fn set_parked(
     orch: &Orchestrator,
     execution_id: &str,
     parked: bool,
 ) -> Result<QueueState, String> {
-    let (state, located) = under_lock(orch, |rows| {
+    let (state, located) = under_lock(orch, None, |rows| {
         plan_park(rows, execution_id, parked)
             .then_some(())
             .ok_or_else(|| missing(execution_id))
     })
     .await?;
     act(orch, &state, &located).await;
+    if parked {
+        if let Err(error) =
+            crate::orchestrator::lifecycle::displace_execution(orch, execution_id).await
+        {
+            log::warn!("run queue could not stop parked execution {execution_id}: {error}");
+        }
+    }
     Ok(state)
 }
 
 /// Read and decide the list and act on it: the pass every change ends in,
 /// and the startup and periodic backstop.
 pub async fn settle(orch: &Orchestrator) -> Result<QueueState, String> {
-    let (state, located) = under_lock(orch, |_| Ok(())).await?;
+    let (state, located) = under_lock(orch, None, |_| Ok(())).await?;
     act(orch, &state, &located).await;
     Ok(state)
 }
 
-/// Make the running set and the issues' statuses match the decision.
-/// Idempotent: an admitted execution with nothing waiting, a displaced one
-/// already stopped, and an unchanged state are no-ops.
+/// Make the issues' statuses match the decision and resume the held work of
+/// every seated execution. Nothing seated is ever stopped here: active work
+/// holds its seat, and an unseated entry has no work running. Idempotent: a
+/// seated execution with nothing held and an unchanged state are no-ops.
 async fn act(orch: &Orchestrator, state: &QueueState, located: &Located) {
     record_states(state, located).await;
-    for item in &state.items {
-        let result = if item.runs {
+    for item in state.items.iter().filter(|item| item.runs) {
+        if let Err(error) =
             crate::orchestrator::wakes::resume_queue_held(orch, &item.execution_id).await
-        } else {
-            crate::orchestrator::lifecycle::displace_execution(orch, &item.execution_id).await
-        };
-        if let Err(error) = result {
+        {
             log::warn!(
-                "run queue could not {} execution {}: {error}",
-                if item.runs { "resume" } else { "stop" },
+                "run queue could not resume execution {}: {error}",
                 item.execution_id
             );
         }

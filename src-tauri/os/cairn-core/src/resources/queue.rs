@@ -1,5 +1,5 @@
 //! Presentation of the runner's single ordered queue.
-use crate::execution::queue::{self, QueueItem};
+use crate::execution::queue::{self, Activity, QueueItem};
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
 
@@ -32,14 +32,7 @@ pub async fn view(orch: &Orchestrator) -> Result<QueueView, String> {
     let mut items = Vec::with_capacity(state.items.len());
     for item in state.items {
         let mut row = QueueRow {
-            state: if item.parked {
-                "parked"
-            } else if item.runs {
-                "running"
-            } else {
-                "queued"
-            }
-            .into(),
+            state: plain_state(&item, None),
             item,
             project_id: None,
             project_key: None,
@@ -131,11 +124,8 @@ pub async fn view(orch: &Orchestrator) -> Result<QueueView, String> {
                                     "SELECT checks_status FROM merge_requests WHERE issue_id = ?1 AND status = 'open' ORDER BY opened_at DESC LIMIT 1",
                                     [issue_id.as_str()],
                                 ).await?;
-                                if let Some(pr) = prs.next().await? {
-                                    waiting = Some(match pr.opt_text(0)?.as_deref() {
-                                        Some("SUCCESS") => "review",
-                                        _ => "check",
-                                    });
+                                if prs.next().await?.is_some() {
+                                    waiting = Some("review");
                                 }
                             }
                         }
@@ -151,11 +141,7 @@ pub async fn view(orch: &Orchestrator) -> Result<QueueView, String> {
                 row.issue_title = Some(title);
                 row.thread_name = thread;
                 row.seq = Some(seq);
-                if row.item.runs {
-                    if let Some(waiting) = waiting {
-                        row.state = format!("waiting on {waiting}");
-                    }
-                }
+                row.state = plain_state(&row.item, waiting);
                 break;
             }
         }
@@ -166,6 +152,20 @@ pub async fn view(orch: &Orchestrator) -> Result<QueueView, String> {
         global_cap: state.global_cap,
         thread_cap: state.thread_cap,
     })
+}
+
+/// One plain state per row, from what the queue decided and what the entry
+/// waits on: seated work runs or waits on something in flight, held work is
+/// queued with its place in line, and dormant work says what it waits on.
+fn plain_state(item: &QueueItem, waiting: Option<&str>) -> String {
+    match (item.parked, item.runs, item.activity, waiting) {
+        (true, ..) => "parked".into(),
+        (false, true, Activity::Active, Some(waiting)) => format!("waiting on {waiting}"),
+        (false, true, _, _) => "running".into(),
+        (false, false, Activity::Wanting, _) => item.queued_label().to_lowercase(),
+        (false, false, _, Some(waiting)) => format!("waiting on {waiting}"),
+        (false, false, _, None) => "idle".into(),
+    }
 }
 
 fn wait_label(reason: &str) -> Option<&'static str> {
@@ -191,14 +191,15 @@ pub(super) async fn read_project_queue(orch: &Orchestrator, _project: &str) -> S
 
 pub(super) fn render(view: &QueueView) -> String {
     let running = view.items.iter().filter(|row| row.item.runs).count();
+    let queued = view
+        .items
+        .iter()
+        .filter(|row| !row.item.runs && !row.item.parked && row.item.activity == Activity::Wanting)
+        .count();
     let mut out = format!(
-        "# Queue\n\nRunning {running} of {}; per thread {}\n\n",
+        "# Queue\n\nRunning {running} of {}; per thread {}; {queued} queued\n\n",
         view.global_cap, view.thread_cap
     );
-    let last_running = view.items.iter().rposition(|row| row.item.runs);
-    if last_running.is_none() {
-        out.push_str("── running line ──\n\n");
-    }
     for (index, row) in view
         .items
         .iter()
@@ -213,9 +214,6 @@ pub(super) fn render(view: &QueueView) -> String {
             row.state,
             row.item.execution_id
         ));
-        if Some(index) == last_running {
-            out.push_str("\n── running line ──\n\n");
-        }
     }
     out.push_str("\n## Parked\n\n");
     for row in view.items.iter().filter(|row| row.item.parked) {
@@ -246,23 +244,26 @@ fn issue_label(row: &QueueRow) -> String {
 mod tests {
     use super::*;
 
-    fn row(id: &str, position: Option<usize>, runs: bool, state: &str) -> QueueRow {
+    fn row(id: &str, position: Option<usize>, runs: bool, activity: Activity) -> QueueRow {
+        let item = QueueItem {
+            execution_id: id.into(),
+            issue_id: format!("issue-{id}"),
+            thread_id: Some("t".into()),
+            position,
+            runs,
+            parked: position.is_none(),
+            activity,
+            in_line: (!runs && activity == Activity::Wanting).then_some(1),
+        };
         QueueRow {
-            item: QueueItem {
-                execution_id: id.into(),
-                issue_id: format!("issue-{id}"),
-                thread_id: Some("t".into()),
-                position,
-                runs,
-                parked: position.is_none(),
-            },
+            state: plain_state(&item, (activity == Activity::Dormant).then_some("review")),
+            item,
             project_id: Some("p".into()),
             project_key: Some("prj".into()),
             issue_number: Some(1),
             issue_title: Some("Issue".into()),
             thread_name: Some("alpha".into()),
             seq: Some(1),
-            state: state.into(),
         }
     }
 
@@ -282,28 +283,32 @@ mod tests {
     }
 
     #[test]
-    fn presentation_preserves_authority_order_and_marks_the_last_running_item() {
+    fn presentation_keeps_authority_order_and_says_what_each_entry_is_doing() {
         let view = QueueView {
             items: vec![
-                row("a", Some(1), true, "waiting on person"),
-                row("b", Some(2), false, "queued"),
-                row("c", Some(3), true, "running"),
-                row("d", Some(4), false, "queued"),
-                row("e", None, false, "parked"),
+                row("a", Some(1), false, Activity::Dormant),
+                row("b", Some(2), false, Activity::Wanting),
+                row("c", Some(3), true, Activity::Active),
+                row("d", Some(4), true, Activity::Wanting),
+                row("e", None, false, Activity::Dormant),
             ],
             global_cap: 2,
             thread_cap: 1,
         };
         let text = render(&view);
-        assert!(text.contains("Running 2 of 2; per thread 1"));
-        assert!(text.contains("waiting on person"));
-        assert!(text.find("execution b").unwrap() < text.find("execution c").unwrap());
-        let line = text.find("── running line ──").unwrap();
-        assert!(text.find("execution c").unwrap() < line);
-        assert!(line < text.find("execution d").unwrap());
+        assert!(text.contains("Running 2 of 2; per thread 1; 1 queued"));
+        assert!(text.contains("1. [prj/1 — Issue](cairn://p/prj/1) · alpha · waiting on review"));
+        assert!(text.contains("queued · 1st in line · execution b"));
+        assert!(text.contains("running · execution c"));
+        assert!(text.find("execution a").unwrap() < text.find("execution b").unwrap());
         assert!(text.find("## Parked").unwrap() < text.find("execution e").unwrap());
-        assert_eq!(text.matches("running line").count(), 1);
-        for old in ["focus slot", "fleet slot", "re-entry ahead", "Start now"] {
+        for old in [
+            "running line",
+            "focus slot",
+            "fleet slot",
+            "re-entry ahead",
+            "Start now",
+        ] {
             assert!(!text.contains(old));
         }
     }

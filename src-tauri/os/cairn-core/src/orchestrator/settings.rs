@@ -289,7 +289,7 @@ impl Orchestrator {
             );
         }
 
-        // Either running line can admit or displace queue entries.
+        // Either cap can free seats for held queue entries.
         if current.max_concurrent_executions != before.max_concurrent_executions
             || current.max_open_children_per_thread != before.max_open_children_per_thread
         {

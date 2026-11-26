@@ -226,7 +226,7 @@ pub enum CairnResource {
         project: String,
     },
     /// This runner's run queue: every issue execution it wants to run,
-    /// running ones included, in order, with the running line. Addressed from
+    /// running ones included, in order, with what each is doing. Addressed from
     /// a project, whose issue numbers a write resolves.
     ProjectQueue {
         project: String,

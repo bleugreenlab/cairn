@@ -29,9 +29,9 @@ use crate::models::{
 /// and the tool results it pulls in all land after the reading that triggered.
 pub const DEFAULT_THREAD_COMPACT_THRESHOLD: f64 = 0.8;
 pub const DEFAULT_SEED_BUDGET_TOKENS: i32 = 12_000;
-/// Global running line over this runner's ordered queue.
+/// Seats in this runner's ordered queue; only active work holds one.
 pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: i32 = 6;
-/// Per-thread running line over the thread's slice of the queue.
+/// Seats per thread in this runner's ordered queue.
 pub const DEFAULT_MAX_OPEN_CHILDREN_PER_THREAD: i32 = 4;
 pub const DEFAULT_SEED_ERAS: i32 = 3;
 
@@ -447,10 +447,10 @@ pub struct SettingsFile {
     /// Maximum open memory-triage issues for an exact scope.
     #[serde(default)]
     max_open_triage_issues_per_scope: Option<i32>,
-    /// Global running line over this runner's ordered queue.
+    /// Seats in this runner's ordered queue; only active work holds one.
     #[serde(default)]
     max_concurrent_executions: Option<i32>,
-    /// Per-thread running line over the thread's slice of the queue.
+    /// Seats per thread in this runner's ordered queue.
     #[serde(default)]
     max_open_children_per_thread: Option<i32>,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.

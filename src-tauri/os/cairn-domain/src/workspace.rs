@@ -350,9 +350,10 @@ pub struct Settings {
     pub memory_triage_enabled: bool,
     /// Maximum open memory-triage issues for an exact scope.
     pub max_open_triage_issues_per_scope: i32,
-    /// Global running line over this runner's ordered queue (minimum 1).
+    /// Seats in this runner's ordered queue; only active work holds one
+    /// (minimum 1).
     pub max_concurrent_executions: i32,
-    /// Per-thread running line over each thread's slice of the queue (minimum 1).
+    /// Seats per thread in this runner's ordered queue (minimum 1).
     pub max_open_children_per_thread: i32,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     pub pending_memory_threshold: i32,

@@ -230,8 +230,8 @@ pub(crate) async fn check_filing(
 }
 
 /// Where a just-filed execution stands in this runner's run queue, as one
-/// plain sentence: running, or queued at its position. Empty when the queue
-/// cannot be read or does not hold it (another runner owns it, or it is
+/// plain sentence: running, or queued with its place in line. Empty when the
+/// queue cannot be read or does not hold it (another runner owns it, or it is
 /// parked); the filing stands either way.
 async fn queue_standing(orch: &Orchestrator, execution_id: &str) -> String {
     let state = match crate::execution::queue::read(orch).await {
@@ -243,8 +243,9 @@ async fn queue_standing(orch: &Orchestrator, execution_id: &str) -> String {
     };
     match state.item(execution_id) {
         Some(item) if item.runs => " It is running.".to_string(),
+        Some(item) if item.in_line.is_some() => format!(" {}.", item.queued_label()),
         Some(item) => match item.position {
-            Some(position) => format!(" It is queued at position {position}."),
+            Some(position) => format!(" It is at position {position} in the queue."),
             None => String::new(),
         },
         None => String::new(),

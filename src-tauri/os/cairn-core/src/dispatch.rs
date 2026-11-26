@@ -1547,7 +1547,9 @@ async fn augment_with_queued_dms(
     else {
         return;
     };
-    crate::orchestrator::lifecycle::displace_at_tool_boundary(orch, run_id, &job_id).await;
+    if crate::orchestrator::lifecycle::displace_at_tool_boundary(orch, run_id, &job_id).await {
+        reminders.push(crate::orchestrator::lifecycle::PARKED_LINE.to_string());
+    }
     if !tool_boundary_has_pending(orch, &job_id).await {
         return;
     }

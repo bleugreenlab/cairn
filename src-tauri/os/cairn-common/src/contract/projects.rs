@@ -144,7 +144,7 @@ pub(crate) const PROJECT_QUEUE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectQueue,
     uri_template: "cairn://p/{project}/queue",
     name: "Execution queue",
-    description: "This runner's single ordered queue, across its projects, including running and waiting work, with a running line and a separate Parked group. Move changes one execution's 1-based position; position 1 is the top. Park removes it from the list and unpark returns it at the end. Each patch contains exactly one action. An authenticated agent may act only on executions in its own thread's slice; an operator approval or grant is still required. Operator actions use the UI credential in Settings → Queue.",
+    description: "This runner's single ordered queue, across its projects, including running and waiting work, each saying what it is doing (running, waiting on something, queued with its place in line, or idle), and a separate Parked group. Only active work holds one of the seats the two settings allow. Move changes one execution's 1-based position; position 1 is the top. Park removes it from the list and unpark returns it at the end. Each patch contains exactly one action. An authenticated agent may act only on executions in its own thread's slice; an operator approval or grant is still required. Operator actions use the UI credential in Settings → Queue.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,

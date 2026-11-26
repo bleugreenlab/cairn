@@ -88,7 +88,7 @@ pub struct Issue {
 pub enum IssueStatus {
     #[default]
     Backlog,
-    /// In its runner's run queue, below the running line.
+    /// In its runner's run queue, with work due and no seat yet.
     Queued,
     /// Taken out of its runner's run queue by a park.
     Parked,

@@ -2236,11 +2236,10 @@ async fn resolve_inner(
         Some("system") => crate::execution::jobs::WakeCause::System,
         _ => return Err("wait has no classified wake cause".into()),
     };
-    // Keep the result durable while the execution is below the running line.
-    if wake_cause == crate::execution::jobs::WakeCause::System
-        && crate::orchestrator::wakes::queue_job_refusal(orch, db, &r.job_id)
-            .await?
-            .is_some()
+    // Keep the result durable while the run queue gives the execution no seat.
+    if crate::orchestrator::wakes::queue_job_refusal(orch, db, &r.job_id)
+        .await?
+        .is_some()
     {
         crate::orchestrator::wakes::arm_queue_hold(
             db,

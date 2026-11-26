@@ -183,12 +183,8 @@ impl LaunchAdmissionWaits {
 /// nothing now: a hold took the launch (and owns its wake), or admission
 /// refused it and it is re-dispatched after a pause, or failed with the
 /// refusal once every attempt was refused.
-pub async fn admit_dispatched_launch(
-    orch: &Orchestrator,
-    job_id: &str,
-    cause: crate::execution::jobs::WakeCause,
-) -> bool {
-    match admit_thread_launch(orch, job_id, cause).await {
+pub async fn admit_dispatched_launch(orch: &Orchestrator, job_id: &str) -> bool {
+    match admit_thread_launch(orch, job_id).await {
         Ok(admitted) => {
             orch.launch_admission_waits.settle(job_id);
             admitted

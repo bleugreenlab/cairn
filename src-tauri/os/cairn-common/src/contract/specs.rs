@@ -1147,12 +1147,12 @@ pub(crate) const SETTINGS_MAX_OPEN_TRIAGE_ISSUES: KeySpec = KeySpec::new(
 pub(crate) const SETTINGS_MAX_CONCURRENT_EXECUTIONS: KeySpec = KeySpec::new(
     "maxConcurrentExecutions",
     KeyType::Int,
-    "global number of entries admitted from this runner's ordered queue, including waiting work (minimum 1)",
+    "seats in this runner's ordered queue (minimum 1): work in flight, or waiting on something Cairn is doing, holds one; work waiting on a person or on nothing moving holds none and keeps its place",
 );
 pub(crate) const SETTINGS_MAX_OPEN_CHILDREN_PER_THREAD: KeySpec = KeySpec::new(
     "maxOpenChildrenPerThread",
     KeyType::Int,
-    "number of entries admitted from each thread's slice of the runner queue, including waiting work (minimum 1)",
+    "seats per thread in the runner queue (minimum 1), counted the same way as maxConcurrentExecutions",
 );
 pub(crate) const SETTINGS_PENDING_MEMORY_THRESHOLD: KeySpec = KeySpec::new(
     "pendingMemoryThreshold",
