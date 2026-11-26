@@ -3442,6 +3442,20 @@ pub(crate) fn get_check_result_observation(
 
 /// The observation a permalink handle names, within one project.
 fn observation_by_handle_sql() -> String {
+    observation_row_sql(&format!(
+        "check_result_observations o INDEXED BY {CHECK_OBSERVATION_HANDLE_INDEX}
+          WHERE o.project_id=?1 AND o.public_handle=?2 AND o.public_handle IS NOT NULL"
+    ))
+}
+
+/// The observation a row id names, within one project.
+fn observation_by_id_sql() -> String {
+    observation_row_sql("check_result_observations o WHERE o.project_id=?1 AND o.id=?2")
+}
+
+/// One observation row's columns, as [`load_observation_row`] reads them, from
+/// `source` (a FROM clause with its WHERE, binding project id and key).
+fn observation_row_sql(source: &str) -> String {
     format!(
         "SELECT o.id,o.project_id,o.commit_sha,o.tree_hash,o.check_name,o.input_hash,
                 o.environment_fingerprint,o.exit_code,o.verdict,o.failure_kind,o.complete,
@@ -3452,9 +3466,8 @@ fn observation_by_handle_sql() -> String {
                 o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                 o.output_tail,o.defined_by_commit_sha,o.verdict_platform,o.verdict_arch,
                 o.selection,o.deferred_count,{OBSERVATION_PHASE_COLUMNS},o.verdict_result_json,
-                o.plan_audit_state,o.plan_audit_note,o.nested_sandbox_lane
-           FROM check_result_observations o INDEXED BY {CHECK_OBSERVATION_HANDLE_INDEX}
-          WHERE o.project_id=?1 AND o.public_handle=?2 AND o.public_handle IS NOT NULL"
+                o.plan_audit_state,o.plan_audit_note,o.nested_sandbox_lane,o.public_handle
+           FROM {source}"
     )
 }
 
@@ -3465,16 +3478,33 @@ pub(crate) fn get_check_result_observation_by_handle(
     project_id: &str,
     public_handle: &str,
 ) -> Result<Option<CheckResultObservationProjection>, String> {
-    let keys = (project_id.to_string(), public_handle.to_string());
+    load_observation_row(db, observation_by_handle_sql(), project_id, public_handle)
+}
+
+/// Load one immutable observation by its row id, for an address that carries
+/// the raw id rather than the permalink handle.
+pub(crate) fn get_check_result_observation_by_id(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    observation_id: &str,
+) -> Result<Option<CheckResultObservationProjection>, String> {
+    load_observation_row(db, observation_by_id_sql(), project_id, observation_id)
+}
+
+fn load_observation_row(
+    db: Arc<LocalDb>,
+    sql: String,
+    project_id: &str,
+    key: &str,
+) -> Result<Option<CheckResultObservationProjection>, String> {
+    let keys = (project_id.to_string(), key.to_string());
     run_checkpoint_cache_db(async move {
         db.read(|conn| {
             let keys = keys.clone();
+            let sql = sql.clone();
             Box::pin(async move {
                 let mut rows = conn
-                    .query(
-                        observation_by_handle_sql(),
-                        params![keys.0.as_str(), keys.1.as_str()],
-                    )
+                    .query(sql, params![keys.0.as_str(), keys.1.as_str()])
                     .await?;
                 let Some(row) = rows.next().await? else {
                     return Ok(None);
@@ -3533,7 +3563,7 @@ pub(crate) fn get_check_result_observation_by_handle(
                     tests: Vec::new(),
                     persisted_counts: observation_test_totals(conn, &id).await?,
                     verdict_result: compact_result(row.opt_text(48)?),
-                    public_handle: Some(keys.1.clone()),
+                    public_handle: row.opt_text(52)?,
                     plan_audit_state: row.opt_text(49)?,
                     plan_audit_note: row.opt_text(50)?,
                     audit_findings,

@@ -5,8 +5,9 @@
 
 use crate::execution::cache::{
     get_check_result_observation, get_check_result_observation_by_handle,
-    CheckResultObservationProjection,
+    get_check_result_observation_by_id, CheckResultObservationProjection,
 };
+use crate::execution::checks::requests;
 use crate::mcp::handlers::branch::resolve_for_read;
 use crate::mcp::handlers::run_context::project_id_by_key;
 use crate::mcp::types::McpCallbackRequest;
@@ -39,12 +40,10 @@ pub(super) async fn read_project_check_observation(
     project: &str,
     handle: &str,
 ) -> String {
-    if let Some(request) = request_handle(handle) {
-        return format!(
-            "`{request}` is a check request, not a ledger row. Read it at cairn://p/{project}/check-requests/{request}"
-        );
-    }
-    if handle.len() != 24 || !handle.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    let uuid = request_handle(handle);
+    if uuid.is_none()
+        && (handle.len() != 24 || !handle.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
         return "Invalid check observation handle: expected a 24-hex ledger handle".to_string();
     }
     let db = orch.db.for_project(project).await;
@@ -52,41 +51,74 @@ pub(super) async fn read_project_check_observation(
         Ok(project_id) => project_id,
         Err(error) => return error,
     };
-    match get_check_result_observation_by_handle(db, &project_id, handle) {
-        Ok(Some(observation)) => {
-            let environment = if observation.environment_fingerprint.is_empty() {
-                "unfingerprinted"
-            } else {
-                observation.environment_fingerprint.as_str()
-            };
-            let query = CheckResultsQuery {
-                suite: observation.check_name.clone(),
-                environment: environment.to_string(),
-                environment_fingerprint: observation.environment_fingerprint.clone(),
-                status: None,
-                name: None,
-                limit: observation.test_total.max(1),
-                offset: 0,
-            };
-            let citation = format!("cairn://p/{project}/check-observations/{handle}");
-            render_observation(
-                project,
-                &observation.source_commit_sha,
-                &observation.source_commit_sha,
-                &query,
-                &observation,
-                Some(&citation),
-                ran_on(orch, &observation).as_deref(),
-            )
-        }
+    let Some(uuid) = uuid else {
+        return match get_check_result_observation_by_handle(db, &project_id, handle) {
+            Ok(Some(observation)) => render_ledger_row(orch, project, &observation),
+            Ok(None) => "Check observation not found".to_string(),
+            Err(error) => format!("Unable to read check observation: {error}"),
+        };
+    };
+    // A UUID is either a raw observation row id or a check request id; only a
+    // lookup tells which, and an address naming neither is simply not found.
+    match get_check_result_observation_by_id(db, &project_id, &uuid) {
+        Ok(Some(observation)) => return render_ledger_row(orch, project, &observation),
+        Ok(None) => {}
+        Err(error) => return format!("Unable to read check observation: {error}"),
+    }
+    let request_db = match requests::request_db(orch, &project_id).await {
+        Ok(db) => db,
+        Err(error) => return error,
+    };
+    match requests::load_request(&request_db, &project_id, &uuid).await {
+        Ok(Some(_)) => format!(
+            "`{uuid}` is a check request, not a ledger row. Read it at cairn://p/{project}/check-requests/{uuid}"
+        ),
         Ok(None) => "Check observation not found".to_string(),
-        Err(error) => format!("Unable to read check observation: {error}"),
+        Err(error) => error,
     }
 }
 
-/// The lowercase hyphenated form of a check request id, or `None` when
-/// `handle` is not a 36-character UUID. Ledger handles are 24 hex characters,
-/// so the two never collide.
+/// One ledger row as its permalink page, cited by its `check-observations`
+/// handle; a row recorded before handles existed cites its commit coordinate.
+fn render_ledger_row(
+    orch: &Orchestrator,
+    project: &str,
+    observation: &CheckResultObservationProjection,
+) -> String {
+    let environment = if observation.environment_fingerprint.is_empty() {
+        "unfingerprinted"
+    } else {
+        observation.environment_fingerprint.as_str()
+    };
+    let query = CheckResultsQuery {
+        suite: observation.check_name.clone(),
+        environment: environment.to_string(),
+        environment_fingerprint: observation.environment_fingerprint.clone(),
+        status: None,
+        name: None,
+        limit: observation.test_total.max(1),
+        offset: 0,
+    };
+    let citation = observation
+        .public_handle
+        .as_deref()
+        .map(|handle| format!("cairn://p/{project}/check-observations/{handle}"));
+    render_observation(
+        project,
+        &observation.source_commit_sha,
+        &observation.source_commit_sha,
+        &query,
+        observation,
+        citation.as_deref(),
+        ran_on(orch, observation).as_deref(),
+    )
+}
+
+/// The lowercase hyphenated form of a 36-character UUID, or `None` for any
+/// other shape. A check request id has this shape, but so does a raw
+/// observation row id, so the shape alone never says which one an address
+/// names; only a lookup does.  Ledger handles are 24 hex characters and never
+/// take this shape.
 pub(super) fn request_handle(handle: &str) -> Option<String> {
     if handle.len() != 36 {
         return None;
@@ -1275,12 +1307,103 @@ mod tests {
             page.starts_with("Invalid check observation handle"),
             "{page}"
         );
-        // A request id names its own resource, which the reader is pointed at.
+    }
+
+    const HELD_OBSERVATION: &str = "1f17d0d7-4fc7-46e6-b789-40b81e7866bf";
+    const HELD_HANDLE: &str = "eac28997b54c433ca0f17791";
+
+    /// A failed main-cadence ledger row, which also enqueues its incident source.
+    async fn seed_held_observation(orch: &Orchestrator) {
+        let db = orch.db.for_project("proj").await;
+        db.execute_script(&format!(
+            "INSERT INTO check_result_observations
+               (id,public_handle,project_id,commit_sha,tree_hash,check_name,input_hash,
+                environment_fingerprint,exit_code,verdict,complete,reusable,parser_version,
+                result_schema_version,ran_at,duration_ms,cadence,output_tail)
+             VALUES('{HELD_OBSERVATION}','{HELD_HANDLE}','p','commit-held','tree','rust-tests',
+                'input','env',1,'failed',0,0,1,1,1000,1,'main','raw failure');"
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_uuid_resolves_by_lookup_never_by_shape() {
+        let (_root, orch) = request_fixture().await;
+        seed_held_observation(&orch).await;
         let request = uuid::Uuid::new_v4().to_string();
+        orch.db
+            .for_project("proj")
+            .await
+            .execute(
+                "INSERT INTO check_requests(id,project_id,accepted_at_ms,suite,consumer,requester_ref,
+                    priority,state,state_since_ms,updated_ms)
+                 VALUES(?1,'p',1,'smoke','requested','test','review_check','queued',1,1)",
+                (request.clone(),),
+            )
+            .await
+            .unwrap();
+
+        // A raw ledger row id renders the row, cited by its handle.
+        let page = read_project_check_observation(&orch, "proj", HELD_OBSERVATION).await;
+        assert!(page.starts_with("# Check results: rust-tests"), "{page}");
+        assert!(
+            page.contains(&format!("cairn://p/proj/check-observations/{HELD_HANDLE}")),
+            "{page}"
+        );
+        assert!(!page.contains("check-requests"), "{page}");
+        // The row is the same one its handle names.
+        assert_eq!(
+            page,
+            read_project_check_observation(&orch, "proj", HELD_HANDLE).await
+        );
+        // Another project's row is not this project's.
+        assert_eq!(
+            read_project_check_observation(&orch, "other", HELD_OBSERVATION).await,
+            "Check observation not found"
+        );
+
+        // A check request id points at the request, which opens.
         let page = read_project_check_observation(&orch, "proj", &request).await;
         assert!(
             page.contains(&format!("cairn://p/proj/check-requests/{request}")),
             "{page}"
+        );
+        let opened =
+            super::super::check_requests::read_check_request(&orch, "proj", &request, false).await;
+        assert!(!opened.contains("is unknown"), "{opened}");
+
+        // A UUID naming neither is not found, never a redirect to nothing.
+        let unknown = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            read_project_check_observation(&orch, "proj", &unknown).await,
+            "Check observation not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stuck_source_footer_cites_an_observation_that_opens() {
+        let (_root, orch) = request_fixture().await;
+        seed_held_observation(&orch).await;
+        let db = orch.db.for_project("proj").await;
+        let now = 1 + 3600 + 1;
+        let health = crate::execution::main_incidents_store::source_health(&db, Some("p"), now)
+            .await
+            .unwrap();
+        assert_eq!(health.stuck, 1);
+        let text = health.to_string();
+        let prefix = "held observation cairn://p/proj/check-observations/";
+        let start = text.find(prefix).unwrap_or_else(|| panic!("{text}")) + prefix.len();
+        let handle: String = text[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        assert_eq!(handle.len(), 24, "{text}");
+        let page = read_project_check_observation(&orch, "proj", &handle).await;
+        assert!(page.starts_with("# Check results: rust-tests"), "{page}");
+        assert!(
+            !text.contains(&format!("held observation `{HELD_OBSERVATION}`")),
+            "{text}"
         );
     }
 

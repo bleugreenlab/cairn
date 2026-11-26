@@ -1496,26 +1496,50 @@ pub(crate) async fn source_health(
             |r| Ok((r.i64(0)?, r.i64(1)?, r.i64(2)?, r.i64(3)?)),
         )
         .await?;
-    let examples =
-        if stuck > 0 {
-            db.query_all(
-            "SELECT event_key,observation_id,attempts,created_at,error FROM main_incident_sources
-             WHERE processed_at IS NULL AND (?1 IS NULL OR project_id=?1)
-               AND (held_until IS NULL OR held_until<=?4)
-               AND (attempts>=?3 OR COALESCE(held_until,created_at)<=?2)
-             ORDER BY created_at,project_id,event_key LIMIT 10",
-            params![project,now-SOURCE_STUCK_AGE_S,SOURCE_STUCK_ATTEMPTS,now],
+    let examples = if stuck > 0 {
+        db.query_all(
+            "SELECT s.event_key,s.observation_id,s.attempts,s.created_at,s.error,
+                    o.public_handle,p.key
+               FROM main_incident_sources s
+               LEFT JOIN check_result_observations o ON o.id=s.observation_id
+               LEFT JOIN projects p ON p.id=s.project_id
+             WHERE s.processed_at IS NULL AND (?1 IS NULL OR s.project_id=?1)
+               AND (s.held_until IS NULL OR s.held_until<=?4)
+               AND (s.attempts>=?3 OR COALESCE(s.held_until,s.created_at)<=?2)
+             ORDER BY s.created_at,s.project_id,s.event_key LIMIT 10",
+            params![
+                project,
+                now - SOURCE_STUCK_AGE_S,
+                SOURCE_STUCK_ATTEMPTS,
+                now
+            ],
             move |r| {
-                let error=r.opt_text(4)?.unwrap_or_else(||"pending delivery".into());
-                let error: String=error.chars().take(200).collect();
-                Ok(format!("source `{}`; held observation `{}`; attempts {}; age {}s; reason: {}",
-                    r.text(0)?,r.opt_text(1)?.unwrap_or_else(||"none (row-less attempt)".into()),
-                    r.i64(2)?,now.saturating_sub(r.i64(3)?),error))
+                let error = r.opt_text(4)?.unwrap_or_else(|| "pending delivery".into());
+                let error: String = error.chars().take(200).collect();
+                // The observation is cited by an address that opens: its
+                // permalink handle, or for a row recorded before handles its
+                // row id, which the check-observations read also resolves.
+                let observation = match (r.opt_text(1)?, r.opt_text(5)?, r.opt_text(6)?) {
+                    (None, ..) => "none (row-less attempt)".to_string(),
+                    (Some(id), handle, Some(key)) => format!(
+                        "cairn://p/{key}/check-observations/{}",
+                        handle.unwrap_or(id)
+                    ),
+                    (Some(id), _, None) => format!("`{id}`"),
+                };
+                Ok(format!(
+                    "source `{}`; held observation {observation}; attempts {}; age {}s; reason: {}",
+                    r.text(0)?,
+                    r.i64(2)?,
+                    now.saturating_sub(r.i64(3)?),
+                    error
+                ))
             },
-        ).await?
-        } else {
-            Vec::new()
-        };
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
     Ok(SourceHealth {
         pending,
         held_for_corroboration,
