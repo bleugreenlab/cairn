@@ -10106,6 +10106,14 @@ pub struct LearnedResourceEstimate {
 /// fixed share otherwise. What a runner gets wrong talking to an older
 /// executor: nothing; that executor sends no `wiredLimit` and the fit keeps
 /// the share it always used. An older runner ignores the key.
+///
+/// cairn/7622 does not move the number. A Windows executor takes a command's
+/// exit status from the poll that saw its leader exit, instead of then waiting
+/// on the job object, whose wait blocked for good once the polls had consumed
+/// the job's completion messages. No frame changes shape and the status
+/// reported is the leader's, as it was. What a runner gets wrong talking to an
+/// older executor: nothing it can read off the wire; that executor's commands
+/// never complete, which is why no protocol 179 Windows executor is published.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 179;
 
 /// The version `build.rs` derived from the paragraphs above
