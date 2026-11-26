@@ -186,6 +186,76 @@ pub struct FencedCommandAcceptance {
     pub scratch_head: Option<String>,
 }
 
+/// The facts a request kind's runner component publishes for its card, stored
+/// whole as the request's facts document: the card's own fields under
+/// `document`, beside the trusted inputs an acceptance freezes. Every reader of
+/// a stored facts document, the desktop's Touch ID prompt included, reads it
+/// through this type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActorFacts {
+    pub document: serde_json::Value,
+    pub running_version: Option<String>,
+    pub main_commit: Option<String>,
+    pub candidate_commit: Option<String>,
+    pub base_commit: Option<String>,
+    pub policy_project_id: Option<String>,
+    pub drain: Option<DrainAcceptance>,
+    /// The act and executor witness a `fenced_command` card would accept.
+    #[serde(default)]
+    pub fenced_command: Option<FencedCommandAcceptance>,
+}
+
+impl ActorFacts {
+    /// The card a `fenced_command` request's facts describe.
+    pub fn fenced_command_facts(&self) -> Result<FencedCommandFacts, serde_json::Error> {
+        FencedCommandFacts::deserialize(&self.document)
+    }
+}
+
+/// A `fenced_command` card: the [`ActorFacts::document`] the runner publishes
+/// for that kind, which the card renders and the Touch ID prompt quotes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FencedCommandFacts {
+    /// The requesting node's `$TMPDIR` scratch, when it has one.
+    pub scratch: Option<FencedCommandScratchFacts>,
+    pub executor: FencedCommandExecutorFacts,
+    pub commit: FencedCommandCommitFacts,
+    /// Repository-relative; empty for the repository root.
+    pub cwd: String,
+    pub command: String,
+    pub timeout_ms: u64,
+    pub node: String,
+    /// What the act can reach, in the operator's words.
+    pub consequence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FencedCommandScratchFacts {
+    pub head: Option<String>,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FencedCommandExecutorFacts {
+    pub name: String,
+    pub os: String,
+    pub executor_id: String,
+    pub device_id: String,
+    pub credential_floor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FencedCommandCommitFacts {
+    pub id: String,
+    pub branch: String,
+    pub diff_uri: String,
+}
+
 /// The executor facts a `fenced_command` report carries. The executor is a
 /// placement fact authenticated by enrolment, never a principal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -17,10 +17,11 @@ use cairn_common::executor_protocol::{
 };
 use cairn_common::protocol::CallbackRequest;
 use cairn_common::requests::{
-    ExecutorFloorWitness, FencedCommandAcceptance, FencedCommandAct, FencedCommandTarget,
+    ExecutorFloorWitness, FencedCommandAcceptance, FencedCommandAct, FencedCommandCommitFacts,
+    FencedCommandExecutorFacts, FencedCommandFacts, FencedCommandScratchFacts, FencedCommandTarget,
 };
 use cairn_common::run_contract::RUN_BATCH_CEILING_MS;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::registry::ActorFacts;
 use crate::orchestrator::Orchestrator;
@@ -310,31 +311,32 @@ pub(crate) async fn facts(orch: &Orchestrator, target: Option<&str>) -> Result<A
     let scratch_head = scratch
         .as_ref()
         .and_then(|scratch| scratch.head_commit.clone());
-    let document = json!({
-        "scratch": scratch.as_ref().map(|scratch| json!({
-            "head": scratch.head_commit,
-            "bytes": scratch.head_bytes,
-        })),
-        "executor": {
-            "name": floor.name,
-            "os": floor.os,
-            "executorId": floor.executor_id,
-            "deviceId": floor.device_id,
-            "credentialFloor": "refused",
+    let document = FencedCommandFacts {
+        scratch: scratch.as_ref().map(|scratch| FencedCommandScratchFacts {
+            head: scratch.head_commit.clone(),
+            bytes: scratch.head_bytes,
+        }),
+        executor: FencedCommandExecutorFacts {
+            name: floor.name.clone(),
+            os: floor.os.clone(),
+            executor_id: floor.executor_id.clone(),
+            device_id: floor.device_id.clone(),
+            credential_floor: "refused".into(),
         },
-        "commit": {
-            "id": act.commit,
-            "branch": act.branch,
-            "diffUri": format!("{}/diff", act.node),
+        commit: FencedCommandCommitFacts {
+            id: act.commit.clone(),
+            branch: act.branch.clone(),
+            diff_uri: format!("{}/diff", act.node),
         },
-        "cwd": act.cwd,
-        "command": act.command,
-        "timeoutMs": act.timeout_ms,
-        "node": act.node,
-        "consequence": consequence(&floor.name),
-    });
+        cwd: act.cwd.clone(),
+        command: act.command.clone(),
+        timeout_ms: act.timeout_ms,
+        node: act.node.clone(),
+        consequence: consequence(&floor.name),
+    };
     Ok(ActorFacts {
-        document,
+        document: serde_json::to_value(document)
+            .map_err(|error| format!("fenced_command facts are unencodable: {error}"))?,
         running_version: None,
         main_commit: None,
         candidate_commit: None,
@@ -398,6 +400,7 @@ pub(crate) async fn recheck_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn accepted_act() -> FencedCommandAcceptance {
         FencedCommandAcceptance {

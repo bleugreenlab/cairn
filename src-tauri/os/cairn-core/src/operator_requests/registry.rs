@@ -13,7 +13,7 @@ use serde_json::Value;
 use super::AcceptedRequestContext;
 use crate::orchestrator::Orchestrator;
 use cairn_common::requests::{
-    DrainAcceptance, FencedCommandAcceptance, RequestAcceptance, RequestAttemptOutcome, RequestKind,
+    FencedCommandAcceptance, RequestAcceptance, RequestAttemptOutcome, RequestKind,
 };
 
 pub const REGISTERED_KINDS: &[&str] = &["rebuild", "bump_version", "lift_drain", "fenced_command"];
@@ -125,20 +125,7 @@ impl std::fmt::Display for ReleaseVersion {
 
 /// Trusted source state comes from the registered runner component, never the
 /// filing payload. A source stamp is read by the consumer's canonical reader.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ActorFacts {
-    pub document: Value,
-    pub running_version: Option<String>,
-    pub main_commit: Option<String>,
-    pub candidate_commit: Option<String>,
-    pub base_commit: Option<String>,
-    pub policy_project_id: Option<String>,
-    pub drain: Option<DrainAcceptance>,
-    /// The act and executor witness a `fenced_command` card would accept.
-    #[serde(default)]
-    pub fenced_command: Option<FencedCommandAcceptance>,
-}
+pub(crate) use cairn_common::requests::ActorFacts;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutorTarget {
