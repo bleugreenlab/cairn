@@ -325,7 +325,7 @@ async fn activity_is_read_from_stored_facts() {
         );
         db.execute_script(&sql).await.unwrap();
         if let Some(kind) = wait {
-            db.execute_script(&format!(
+            db.execute_script(format!(
                 "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at,kind)
                    VALUES('w-{id}','j-{id}','r-{id}','s-{id}','t-{id}','call','{{\"kind\":\"{kind}\"}}','pending',1,'{kind}');"
             ))
@@ -334,7 +334,7 @@ async fn activity_is_read_from_stored_facts() {
         }
         if let Some(source) = hold {
             let reset = if *source == "queue" { "NULL" } else { "99" };
-            db.execute_script(&format!(
+            db.execute_script(format!(
                 "INSERT INTO provider_limit_holds(id,job_id,run_id,turn_id,backend,boundary_source,retry_not_before,created_at,updated_at)
                    VALUES('h-{id}','j-{id}','r-{id}','t-{id}','claude','{source}',{reset},1,1);"
             ))
@@ -374,7 +374,7 @@ async fn a_launch_with_no_seat_is_held_unless_it_carries_the_operators_message()
     .await
     .unwrap();
     for (n, id, turn_state) in [(1, "busy", "running"), (2, "idle", "complete")] {
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
                VALUES('i-{id}','p',{n},'I','active',1,1);
              INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
