@@ -2318,6 +2318,9 @@ fn fresh_observation_write(
         // A lint result vouches for itself: one that measured nothing must not
         // be stored as complete. tsc's `complete: false` means "not a test
         // enumeration", so other non-test parses keep counting as complete.
+        // With no parse at all, only a test runner owes an enumeration it did
+        // not give: the same predicate reuse and the main cadence ask, so a
+        // clean `cargo check ... --features cairn-core/test-utils` is complete.
         complete: parsed
             .map(|result| {
                 if is_lint_parser(&result.parser) {
@@ -2326,7 +2329,9 @@ fn fresh_observation_write(
                     !result.is_test_runner() || result.complete
                 }
             })
-            .unwrap_or(!plan.command.contains("test")),
+            .unwrap_or_else(|| {
+                !crate::execution::check_parsers::is_test_runner_command(&plan.command)
+            }),
         reusable: reuse.reusable,
         non_reusable_reason: reuse.reason,
         parser_version: crate::execution::check_identity::CHECK_PARSER_VERSION as i64,
