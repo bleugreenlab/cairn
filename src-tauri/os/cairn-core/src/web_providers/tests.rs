@@ -99,6 +99,7 @@ fn stored_auth(token: &str) -> StoredAuth {
         authorization_endpoint: "https://dash.cloudflare.com/oauth2/auth".into(),
         token_endpoint: "https://dash.cloudflare.com/oauth2/token".into(),
         registration_endpoint: None,
+        revocation_endpoint: None,
         client_id: "93e9beed884bec7080022cbf0f2d25ee".into(),
         client_secret: None,
         access_token: token.into(),

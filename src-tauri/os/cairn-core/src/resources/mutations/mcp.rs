@@ -20,6 +20,7 @@ use crate::config::mcp_servers::{
 use crate::config::mcp_tools::{self, ToolScope};
 use crate::config::project_settings::load_project_settings_read_only;
 use crate::mcp::handlers::skills_resources;
+use crate::mcp::oauth::store::{self as oauth_store, ProviderRevocation};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use cairn_common::authorization::{AuthorityMutation, AuthorityRequest};
@@ -504,36 +505,43 @@ async fn write_server(
     }
 }
 
-/// Remove a server from its scope's config AND purge its captured tool list
-/// (CAIRN-1334's per-server tool store). The tool purge is best-effort cleanup:
-/// the server is already gone from config, so a purge failure does not fail the
-/// delete. `${VAR}`-referenced secrets live in the keychain/environment, not the
-/// config, so there is nothing secret to remove here.
+/// Remove a server from its scope's config, purge its captured tool list
+/// (CAIRN-1334's per-server tool store), and sign out its OAuth credential.
+///
+/// The OAuth tokens live in the keychain under the server's credential key,
+/// so removing only the config entry would leave a live grant behind for any
+/// later server of the same name. Sign-out runs once the server is gone from
+/// the config and revokes the grant at the provider best-effort; the inner
+/// result is what it did, and an inner `Err` is a keychain failure that does
+/// not undo the removal.
 async fn remove_server(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     scope: McpWriteScope,
     name: &str,
-) -> Result<(), String> {
+) -> Result<Result<ProviderRevocation, String>, String> {
+    let project_path = match scope {
+        McpWriteScope::Workspace => None,
+        McpWriteScope::Project => Some(resolve_project_path(orch, request).await?),
+    };
     // The catalog withdrawal is part of the removal, not cleanup after it: it
     // is what refuses a capture still in flight, so its failure fails the
     // removal and leaves the server registered for a retry.
-    match scope {
-        McpWriteScope::Workspace => {
+    match project_path.as_deref() {
+        None => {
             mcp_tools::withdraw_and_unregister(&orch.config_dir, ToolScope::Workspace, name, || {
                 delete_workspace_mcp_server(&orch.config_dir, name)
             })
         }
-        McpWriteScope::Project => {
-            let project_path = resolve_project_path(orch, request).await?;
-            mcp_tools::withdraw_and_unregister(
-                &orch.config_dir,
-                ToolScope::Project(&project_path),
-                name,
-                || delete_project_mcp_server(&project_path, name),
-            )
-        }
-    }
+        Some(path) => mcp_tools::withdraw_and_unregister(
+            &orch.config_dir,
+            ToolScope::Project(path),
+            name,
+            || delete_project_mcp_server(path, name),
+        ),
+    }?;
+    let credential_key = crate::config::secrets::credential_key(name, project_path.as_deref());
+    Ok(oauth_store::sign_out(&credential_key).await)
 }
 
 /// `write cairn://mcp` create — add a new server to the registry.
@@ -676,9 +684,9 @@ pub(super) async fn apply_mcp_action(
     )
 }
 
-/// `write cairn://mcp/<server>` delete — remove one server and purge its
-/// captured tool list. `${VAR}`-referenced secrets live in the keychain, not the
-/// config, so nothing secret is stored to purge here.
+/// `write cairn://mcp/<server>` delete — remove one server, purge its
+/// captured tool list, and sign out its OAuth credential, saying in the reply
+/// whether the provider revoked the grant.
 pub(super) async fn apply_mcp_delete(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -712,11 +720,19 @@ pub(super) async fn apply_mcp_delete(
         existing.get(server),
     )
     .await?;
-    remove_server(orch, request, scope, server).await?;
-    Ok(format!(
-        "Removed {} MCP server '{server}'",
-        scope_label(scope)
-    ))
+    let signed_out = remove_server(orch, request, scope, server).await?;
+    let removed = format!("Removed {} MCP server '{server}'", scope_label(scope));
+    Ok(match signed_out {
+        Ok(ProviderRevocation::NothingStored) => removed,
+        Ok(outcome) => format!(
+            "{removed} and signed out its OAuth authorization. {}",
+            outcome.describe()
+        ),
+        Err(error) => format!(
+            "{removed}, but its OAuth tokens could not be removed from the keychain ({error}). \
+             They are only ever sent to the URL they were issued for."
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -747,6 +763,45 @@ mod tests {
             config_dir.to_path_buf(),
         )
         .build()
+    }
+
+    /// Removing a server signs out the OAuth credential stored under its
+    /// name, so a server later added under that name starts unauthorized.
+    #[tokio::test]
+    async fn removing_a_server_removes_its_oauth_credential_from_the_keychain() {
+        crate::config::secrets::mock_keychain::install();
+        let temp = tempfile::TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let name = "oauth-removed";
+        let config = McpServerConfig {
+            transport: "http".into(),
+            command: None,
+            url: Some("https://mcp.example.test/mcp".into()),
+            ..stdio("unused", &[])
+        };
+        mcp_servers::upsert_workspace_mcp_server(&orch.config_dir, name, &config).unwrap();
+        // No issuer and no endpoint: revocation is unsupported and offline.
+        let auth: oauth_store::StoredAuth = serde_json::from_value(serde_json::json!({
+            "resource": "https://mcp.example.test/mcp",
+            "authorization_endpoint": "https://auth.example.test/authorize",
+            "token_endpoint": "https://auth.example.test/token",
+            "client_id": "client",
+            "access_token": "left-behind"
+        }))
+        .unwrap();
+        oauth_store::save(name, &auth).unwrap();
+
+        let signed_out = remove_server(
+            &orch,
+            &McpCallbackRequest::default(),
+            McpWriteScope::Workspace,
+            name,
+        )
+        .await
+        .unwrap();
+        assert_eq!(signed_out, Ok(ProviderRevocation::Unsupported));
+        assert!(oauth_store::load(name).unwrap().is_none());
+        assert!(!mcp_servers::load_workspace_mcp_servers(&orch.config_dir).contains_key(name));
     }
 
     /// The agent's delete through its real removal step: a withdrawal that

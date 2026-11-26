@@ -170,6 +170,7 @@ pub async fn complete(
             authorization_endpoint: oauth.authorize.clone(),
             token_endpoint: oauth.token.clone(),
             registration_endpoint: None,
+            revocation_endpoint: None,
             client_id: oauth.client_id.clone(),
             client_secret: None,
             access_token: tokens.access_token,

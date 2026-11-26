@@ -46,7 +46,10 @@ use cairn_packs::server_config::{CatalogOAuthContext, CredentialGeneration};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
-use super::{refresh_access_token, TokenRequestError, TokenSet, EXPIRY_SKEW_SECS};
+use super::{
+    fetch_auth_server_metadata, refresh_access_token, resource_covers, revoke_token, RevokeError,
+    TokenKind, TokenRequestError, TokenSet, EXPIRY_SKEW_SECS,
+};
 use crate::config::credential_witness::{self, CredentialMutationGuard};
 
 /// Short-lived authorization state stored in the same keychain namespace as
@@ -97,6 +100,11 @@ pub struct StoredAuth {
     pub token_endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_endpoint: Option<String>,
+    /// RFC 7009 revocation endpoint the issuer advertised when this grant was
+    /// obtained. Absent on records written before it was kept, in which case
+    /// [`sign_out`] rediscovers it from `issuer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint: Option<String>,
     pub client_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
@@ -371,22 +379,166 @@ pub fn save(server: &str, auth: &StoredAuth) -> Result<(), String> {
     write_auth(&guard, server, &current, auth)
 }
 
-/// Sign `server` out. The tokens go; the generation history stays behind as a
-/// tombstone. Succeeds when nothing is signed in.
+/// Remove `server`'s tokens locally only. The generation history stays behind
+/// as a tombstone. Succeeds when nothing is signed in. A user-facing sign-out
+/// is [`sign_out`], which also revokes the grant at the provider.
 pub fn delete(server: &str) -> Result<(), String> {
+    remove(server).map(drop)
+}
+
+/// What [`remove`] took out of the keychain.
+enum Removed {
+    Nothing,
+    /// A record was there but could not be parsed, so its tokens are unknown.
+    Unreadable,
+    Auth(StoredAuth),
+}
+
+/// Tombstone `server` under the mutation lock, returning the record it held,
+/// so a sign-out revokes exactly the tokens it removed and no refresh can land
+/// between the read and the write.
+fn remove(server: &str) -> Result<Removed, String> {
     let guard = credential_witness::acquire()?;
     let (current, _) = read_current(server);
-    match current {
-        Current::Absent | Current::Tombstone(_) => Ok(()),
-        Current::Unavailable(e) => Err(e),
-        _ => {
-            let tombstone = next_generation(server, &current)?;
-            write_entry(
-                &guard,
-                server,
-                &StoredEntry::Tombstone(Tombstone { tombstone }),
-            )
+    let removed = match &current {
+        Current::Absent | Current::Tombstone(_) => return Ok(Removed::Nothing),
+        Current::Unavailable(e) => return Err(e.clone()),
+        Current::Corrupt => Removed::Unreadable,
+        Current::Witnessed(auth, _) | Current::Legacy(auth) => Removed::Auth(auth.clone()),
+    };
+    let tombstone = next_generation(server, &current)?;
+    write_entry(
+        &guard,
+        server,
+        &StoredEntry::Tombstone(Tombstone { tombstone }),
+    )?;
+    Ok(removed)
+}
+
+/// What signing out did at the authorization server that issued the grant.
+/// Serialized as `{revocation, detail?}` for the settings invoke.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "revocation", content = "detail", rename_all = "snake_case")]
+pub enum ProviderRevocation {
+    /// No authorization was stored, so there was no grant to revoke.
+    NothingStored,
+    /// The authorization server accepted the revocation.
+    Revoked,
+    /// The authorization server advertises no revocation endpoint (or revokes
+    /// none of the tokens held), so the grant stays live there until it
+    /// expires.
+    Unsupported,
+    /// Revocation was attempted and did not succeed; the grant may be live.
+    Failed(String),
+}
+
+impl ProviderRevocation {
+    /// One sentence telling the user whether the grant is still live.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::NothingStored => {
+                "No OAuth authorization was stored, so there was no grant to revoke.".to_string()
+            }
+            Self::Revoked => "The authorization server revoked the OAuth grant.".to_string(),
+            Self::Unsupported => "The authorization server offers no token revocation, so the \
+                 OAuth grant stays live there until it expires; revoke it in the provider's own \
+                 settings to end it now."
+                .to_string(),
+            Self::Failed(cause) => format!(
+                "Revoking the OAuth grant at the authorization server failed ({cause}), so it \
+                 may still be live there; revoke it in the provider's own settings to be sure."
+            ),
         }
+    }
+}
+
+/// How long a sign-out waits on the provider. Local removal has already
+/// happened by then, so this bounds only how long the user waits to be told.
+const REVOCATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sign `server` out: remove its tokens locally, then revoke the grant at the
+/// authorization server (RFC 7009), best-effort and bounded by
+/// [`REVOCATION_TIMEOUT`].
+///
+/// Local removal comes first and never waits on the provider, so a provider
+/// that is down or slow cannot leave tokens in the keychain. `Err` means only
+/// that the local removal failed, and then nothing was sent anywhere and the
+/// sign-out can simply be retried. `Ok` reports what the provider did.
+pub async fn sign_out(server: &str) -> Result<ProviderRevocation, String> {
+    Ok(match remove(server)? {
+        Removed::Nothing => ProviderRevocation::NothingStored,
+        Removed::Unreadable => ProviderRevocation::Failed(
+            "the stored record was unreadable, so its tokens could not be revoked".to_string(),
+        ),
+        Removed::Auth(auth) => {
+            match tokio::time::timeout(REVOCATION_TIMEOUT, revoke_grant(&auth)).await {
+                Ok(outcome) => outcome,
+                Err(_) => ProviderRevocation::Failed(format!(
+                    "no answer within {}s",
+                    REVOCATION_TIMEOUT.as_secs()
+                )),
+            }
+        }
+    })
+}
+
+/// Revoke the refresh token, which is what keeps the grant alive, and then the
+/// access token where the server supports revoking it.
+async fn revoke_grant(auth: &StoredAuth) -> ProviderRevocation {
+    let endpoint = match auth.revocation_endpoint.clone() {
+        Some(endpoint) => endpoint,
+        None => {
+            let Some(issuer) = auth.issuer.as_deref() else {
+                return ProviderRevocation::Unsupported;
+            };
+            match fetch_auth_server_metadata(issuer).await {
+                Ok(meta) => match meta.revocation_endpoint {
+                    Some(endpoint) => endpoint,
+                    None => return ProviderRevocation::Unsupported,
+                },
+                Err(e) => {
+                    return ProviderRevocation::Failed(format!(
+                        "could not discover the revocation endpoint: {e}"
+                    ))
+                }
+            }
+        }
+    };
+    let tokens = auth
+        .refresh_token
+        .iter()
+        .map(|token| (token, TokenKind::Refresh))
+        .chain(std::iter::once((&auth.access_token, TokenKind::Access)))
+        .filter(|(token, _)| !token.is_empty());
+    let mut revoked_any = false;
+    let mut failures = Vec::new();
+    for (token, kind) in tokens {
+        let label = match kind {
+            TokenKind::Refresh => "refresh token",
+            TokenKind::Access => "access token",
+        };
+        match revoke_token(
+            &endpoint,
+            &auth.client_id,
+            auth.client_secret.as_deref(),
+            token,
+            kind,
+        )
+        .await
+        {
+            Ok(()) => revoked_any = true,
+            // An access token the server will not revoke expires on its own.
+            Err(RevokeError::UnsupportedTokenType) if kind == TokenKind::Access => {}
+            Err(RevokeError::UnsupportedTokenType) => {
+                failures.push(format!("{label}: unsupported_token_type"))
+            }
+            Err(RevokeError::Failed(e)) => failures.push(format!("{label}: {e}")),
+        }
+    }
+    match (failures.is_empty(), revoked_any) {
+        (true, true) => ProviderRevocation::Revoked,
+        (true, false) => ProviderRevocation::Unsupported,
+        (false, _) => ProviderRevocation::Failed(failures.join("; ")),
     }
 }
 
@@ -622,7 +774,26 @@ pub async fn reject(server: &str, presented: Option<&str>, may_refresh: bool) ->
 /// server has [rejected](reject) it, or a refresh is impossible/refused.
 /// Unreadable credentials and transient refresh failures preserve their cause
 /// as errors, rather than sending an unauthenticated request.
-pub async fn get_valid_access_token(server: &str) -> Result<Option<String>, String> {
+///
+/// `presented_to` is the URL the token is about to be sent to, for an MCP
+/// server's bearer. The credential is looked up by name, and a name can be
+/// removed and re-added pointing somewhere else, so a token whose `resource`
+/// does not [cover](resource_covers) that URL is refused with an error rather
+/// than sent to a host it was never issued for. `None` is for a pack OAuth
+/// credential, which carries no resource and is sent to its declared API.
+pub async fn get_valid_access_token(
+    server: &str,
+    presented_to: Option<&str>,
+) -> Result<Option<String>, String> {
+    let bound = |auth: &StoredAuth| match presented_to {
+        Some(url) if !resource_covers(&auth.resource, url) => Err(format!(
+            "The OAuth authorization stored for MCP server '{server}' was issued for {}, which \
+             does not cover its configured URL {url}, so it was not sent there. Sign out of \
+             the server and authorize it again.",
+            auth.resource
+        )),
+        _ => Ok(()),
+    };
     let (current, raw) = read_current(server);
     let mut auth = match current {
         Current::Witnessed(auth, _) | Current::Legacy(auth) if auth.rejected_at.is_none() => auth,
@@ -630,6 +801,7 @@ pub async fn get_valid_access_token(server: &str) -> Result<Option<String>, Stri
         Current::Corrupt => return Err(format!("Stored OAuth record for {server} is corrupt")),
         _ => return Ok(None),
     };
+    bound(&auth)?;
     if !auth.is_expired() {
         return Ok(Some(auth.access_token));
     }
@@ -652,9 +824,15 @@ pub async fn get_valid_access_token(server: &str) -> Result<Option<String>, Stri
                 true => Ok(Some(auth.access_token)),
                 // A sign-out or sign-in superseded the refresh. Never resurrect
                 // the old credential or return a newer rejected credential.
-                false => Ok(load(server)?
+                false => match load(server)?
                     .filter(|current| !current.is_expired() && current.rejected_at.is_none())
-                    .map(|current| current.access_token)),
+                {
+                    Some(current) => {
+                        bound(&current)?;
+                        Ok(Some(current.access_token))
+                    }
+                    None => Ok(None),
+                },
             }
         }
         Err(TokenRequestError::Refused(error)) => {
@@ -689,7 +867,7 @@ mod tests {
         let status = status(server);
         assert_eq!(status.state, "error");
         assert!(status.detail.unwrap().contains("Keychain unavailable"));
-        assert!(get_valid_access_token(server)
+        assert!(get_valid_access_token(server, None)
             .await
             .unwrap_err()
             .contains("Keychain unavailable"));
@@ -735,6 +913,7 @@ mod tests {
             authorization_endpoint: "https://auth.example.com/authorize".to_string(),
             token_endpoint: "https://auth.example.com/token".to_string(),
             registration_endpoint: None,
+            revocation_endpoint: None,
             client_id: "client-123".to_string(),
             client_secret: None,
             access_token: server_token.to_string(),
@@ -887,7 +1066,10 @@ mod tests {
         let server = "store-valid";
         save(server, &sample("still-good")).unwrap();
         assert_eq!(
-            get_valid_access_token(server).await.unwrap().as_deref(),
+            get_valid_access_token(server, None)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("still-good")
         );
     }
@@ -895,7 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn missing_server_yields_none() {
         mock_keychain::install();
-        assert!(get_valid_access_token("store-absent")
+        assert!(get_valid_access_token("store-absent", None)
             .await
             .unwrap()
             .is_none());
@@ -1131,7 +1313,10 @@ mod tests {
         assert_eq!(st.state, "needs_auth");
         assert!(st.detail.is_some(), "the UI should say why: {st:?}");
         // Never presented again, and the generation moved so caches notice.
-        assert!(get_valid_access_token(server).await.unwrap().is_none());
+        assert!(get_valid_access_token(server, None)
+            .await
+            .unwrap()
+            .is_none());
         assert!(signed_in(server).generation.counter > before.counter);
         // Kept, not signed out: a re-authorize may reuse its client identity.
         assert_eq!(load(server).unwrap().unwrap().client_id, "client-123");
@@ -1146,7 +1331,10 @@ mod tests {
         save(server, &sample("fresh")).unwrap();
         assert_eq!(status(server).state, "authorized");
         assert_eq!(
-            get_valid_access_token(server).await.unwrap().as_deref(),
+            get_valid_access_token(server, None)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("fresh")
         );
     }
@@ -1236,6 +1424,187 @@ mod tests {
         assert_eq!(hits(&requests), 1);
         assert_eq!(signed_in(unavailable), before);
         assert_eq!(status(unavailable).state, "authorized");
+    }
+
+    #[tokio::test]
+    async fn a_token_is_only_resolved_for_a_url_its_resource_covers() {
+        mock_keychain::install();
+        let server = "bound-to-resource";
+        save(server, &sample("bound-token")).unwrap();
+        assert_eq!(
+            get_valid_access_token(server, Some("https://api.example.com/mcp"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("bound-token")
+        );
+        let refused = get_valid_access_token(server, Some("https://elsewhere.example.net/mcp"))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("does not cover"), "{refused}");
+        assert!(!refused.contains("bound-token"), "{refused}");
+    }
+
+    type Forms = std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>;
+
+    /// A loopback authorization server: RFC 8414 metadata at its well-known
+    /// (advertising `/revoke` only when `advertise_revocation`), and a
+    /// revocation endpoint answering `revoke_status` that records every form.
+    async fn authorization_server(
+        advertise_revocation: bool,
+        revoke_status: u16,
+    ) -> (String, Forms) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let revocation = if advertise_revocation {
+            format!(r#","revocation_endpoint":"{issuer}/revoke""#)
+        } else {
+            String::new()
+        };
+        let metadata = format!(
+            r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","code_challenge_methods_supported":["S256"]{revocation}}}"#
+        );
+        let forms: Forms = Default::default();
+        let recorded = forms.clone();
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                axum::routing::get(move || async move { metadata }),
+            )
+            .route(
+                "/revoke",
+                axum::routing::post(move |body: String| {
+                    let recorded = recorded.clone();
+                    async move {
+                        recorded.lock().unwrap().push(
+                            url::form_urlencoded::parse(body.as_bytes())
+                                .into_owned()
+                                .collect(),
+                        );
+                        axum::http::StatusCode::from_u16(revoke_status).unwrap()
+                    }
+                }),
+            );
+        cairn_common::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (issuer, forms)
+    }
+
+    fn form(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sign_out_revokes_both_tokens_with_the_client_authentication_and_deletes() {
+        mock_keychain::install();
+        let server = "sign-out-revokes";
+        let (issuer, forms) = authorization_server(true, 200).await;
+        save(
+            server,
+            &StoredAuth {
+                issuer: Some(issuer.clone()),
+                revocation_endpoint: Some(format!("{issuer}/revoke")),
+                client_secret: Some("secret-xyz".into()),
+                ..sample("access-1")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sign_out(server).await, Ok(ProviderRevocation::Revoked));
+        let client = [("client_id", "client-123"), ("client_secret", "secret-xyz")];
+        assert_eq!(
+            *forms.lock().unwrap(),
+            [
+                form(
+                    &[
+                        &[
+                            ("token", "refresh-abc"),
+                            ("token_type_hint", "refresh_token")
+                        ][..],
+                        &client
+                    ]
+                    .concat()
+                ),
+                form(
+                    &[
+                        &[("token", "access-1"), ("token_type_hint", "access_token")][..],
+                        &client
+                    ]
+                    .concat()
+                ),
+            ]
+        );
+        assert!(load(server).unwrap().is_none());
+        assert!(matches!(witness(server), OAuthWitness::SignedOut(_)));
+        // A second sign-out has nothing left to revoke and sends nothing.
+        assert_eq!(
+            sign_out(server).await,
+            Ok(ProviderRevocation::NothingStored)
+        );
+        assert_eq!(forms.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_record_that_predates_the_stored_endpoint_rediscovers_it_from_its_issuer() {
+        mock_keychain::install();
+        let server = "sign-out-rediscovers";
+        let (issuer, forms) = authorization_server(true, 200).await;
+        save(
+            server,
+            &StoredAuth {
+                issuer: Some(issuer),
+                ..sample("access-1")
+            },
+        )
+        .unwrap();
+        assert_eq!(sign_out(server).await, Ok(ProviderRevocation::Revoked));
+        assert_eq!(forms.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn without_a_revocation_endpoint_nothing_is_sent_and_the_grant_is_reported_live() {
+        mock_keychain::install();
+        let server = "sign-out-unsupported";
+        let (issuer, forms) = authorization_server(false, 200).await;
+        save(
+            server,
+            &StoredAuth {
+                issuer: Some(issuer),
+                ..sample("access-1")
+            },
+        )
+        .unwrap();
+        let outcome = sign_out(server).await.unwrap();
+        assert_eq!(outcome, ProviderRevocation::Unsupported);
+        assert!(outcome.describe().contains("stays live"));
+        assert!(forms.lock().unwrap().is_empty());
+        assert!(load(server).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_deletion_happens_even_when_revocation_fails() {
+        mock_keychain::install();
+        let server = "sign-out-revocation-fails";
+        let (issuer, forms) = authorization_server(true, 503).await;
+        save(
+            server,
+            &StoredAuth {
+                revocation_endpoint: Some(format!("{issuer}/revoke")),
+                ..sample("access-1")
+            },
+        )
+        .unwrap();
+        let outcome = sign_out(server).await.unwrap();
+        assert!(
+            matches!(&outcome, ProviderRevocation::Failed(cause) if cause.contains("503")),
+            "{outcome:?}"
+        );
+        assert!(outcome.describe().contains("may still be live"));
+        assert_eq!(forms.lock().unwrap().len(), 2);
+        assert!(load(server).unwrap().is_none());
+        assert_eq!(status(server).state, "needs_auth");
     }
 
     #[test]

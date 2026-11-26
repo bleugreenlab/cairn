@@ -209,6 +209,10 @@ pub struct AuthServerMetadata {
     pub token_endpoint: String,
     #[serde(default)]
     pub registration_endpoint: Option<String>,
+    /// RFC 7009 token revocation endpoint (advertised per RFC 8414). Absent
+    /// means the server offers no way to revoke a grant from the client side.
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
     #[serde(default)]
     pub scopes_supported: Vec<String>,
     #[serde(default)]
@@ -272,6 +276,30 @@ pub fn canonical_resource_uri(url: &str) -> Result<String, String> {
     let origin = origin_string(&parsed);
     let path = parsed.path().trim_end_matches('/');
     Ok(format!("{origin}{path}"))
+}
+
+/// Whether a token issued for `resource` may be presented to `url`.
+///
+/// RFC 8707 lets a resource identifier be more general than the endpoint it
+/// guards, and protected resource metadata often names the bare origin of an
+/// MCP server mounted at `/mcp`. So `url` is covered when it has the same
+/// origin and its path is the resource's path or lies beneath it on a segment
+/// boundary (`/mcp` covers `/mcp/v2`, never `/mcpx`). Anything unparseable
+/// covers nothing: this is the check that keeps a bearer from reaching a host
+/// it was not issued for.
+pub fn resource_covers(resource: &str, url: &str) -> bool {
+    let (Ok(resource), Ok(url)) = (reqwest::Url::parse(resource), reqwest::Url::parse(url)) else {
+        return false;
+    };
+    if origin_string(&resource) != origin_string(&url) {
+        return false;
+    }
+    let base = resource.path().trim_end_matches('/');
+    let path = url.path().trim_end_matches('/');
+    path == base
+        || path
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// `scheme://host[:port]` with the scheme/host lowercased (reqwest::Url already
@@ -600,6 +628,85 @@ async fn post_token_request(
     let parsed: TokenResponseBody = serde_json::from_str(&body)
         .map_err(|e| TokenRequestError::Failed(format!("Invalid token response: {e}: {body}")))?;
     Ok(parsed.into_token_set(prior_refresh))
+}
+
+// ---------------------------------------------------------------------------
+// Token revocation (RFC 7009)
+// ---------------------------------------------------------------------------
+
+/// Which token a revocation request names, sent as its `token_type_hint`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    Refresh,
+    Access,
+}
+
+impl TokenKind {
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Refresh => "refresh_token",
+            Self::Access => "access_token",
+        }
+    }
+}
+
+/// Why a revocation request did not revoke the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevokeError {
+    /// RFC 7009 §2.2.1 `unsupported_token_type`: the server does not revoke
+    /// tokens of this kind (commonly access tokens, which then simply expire).
+    UnsupportedTokenType,
+    /// The request failed or the server refused it for any other reason.
+    Failed(String),
+}
+
+/// Revoke one token at an RFC 7009 revocation endpoint.
+///
+/// The client authenticates exactly as it does at the token endpoint here:
+/// `client_id` in the form, plus `client_secret` when the registration issued
+/// one. A `200` is success, including for a token the server already
+/// considers invalid (RFC 7009 §2.2).
+pub async fn revoke_token(
+    revocation_endpoint: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    token: &str,
+    kind: TokenKind,
+) -> Result<(), RevokeError> {
+    if !is_secure_endpoint(revocation_endpoint) {
+        return Err(RevokeError::Failed(format!(
+            "Revocation endpoint must be HTTPS: {revocation_endpoint}"
+        )));
+    }
+    let client = oauth_http_client().await.map_err(RevokeError::Failed)?;
+    let mut form = vec![
+        ("token", token.to_string()),
+        ("token_type_hint", kind.hint().to_string()),
+        ("client_id", client_id.to_string()),
+    ];
+    if let Some(secret) = client_secret {
+        form.push(("client_secret", secret.to_string()));
+    }
+    let resp = client
+        .post(revocation_endpoint)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| RevokeError::Failed(format!("Revocation request failed: {e}")))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let code = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("error")?.as_str().map(str::to_string));
+    if code.as_deref() == Some("unsupported_token_type") {
+        return Err(RevokeError::UnsupportedTokenType);
+    }
+    Err(RevokeError::Failed(format!(
+        "Revocation endpoint returned {status}: {body}"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1108,39 @@ mod tests {
             canonical_resource_uri("https://api.example.com:8443/mcp#frag").unwrap(),
             "https://api.example.com:8443/mcp"
         );
+    }
+
+    #[test]
+    fn a_resource_covers_only_its_own_origin_and_the_paths_beneath_it() {
+        let origin = "https://mcp.example.com";
+        assert!(resource_covers(origin, "https://mcp.example.com/mcp"));
+        assert!(resource_covers(origin, "https://MCP.example.com:443/"));
+        let mounted = "https://mcp.example.com/mcp";
+        assert!(resource_covers(mounted, "https://mcp.example.com/mcp/"));
+        assert!(resource_covers(
+            mounted,
+            "https://mcp.example.com/mcp/v2?x=1"
+        ));
+        assert!(!resource_covers(mounted, "https://mcp.example.com/mcpx"));
+        assert!(!resource_covers(mounted, "https://mcp.example.com/"));
+        assert!(!resource_covers(origin, "https://other.example.com/mcp"));
+        assert!(!resource_covers(origin, "http://mcp.example.com/mcp"));
+        assert!(!resource_covers(origin, "https://mcp.example.com:8443/mcp"));
+        assert!(!resource_covers("", "https://mcp.example.com/mcp"));
+    }
+
+    #[test]
+    fn auth_server_metadata_reads_the_revocation_endpoint() {
+        let meta = parse_auth_server_metadata(
+            r#"{"issuer":"https://a","revocation_endpoint":"https://a/revoke"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            meta.revocation_endpoint.as_deref(),
+            Some("https://a/revoke")
+        );
+        let meta = parse_auth_server_metadata(r#"{"issuer":"https://a"}"#).unwrap();
+        assert_eq!(meta.revocation_endpoint, None);
     }
 
     #[test]

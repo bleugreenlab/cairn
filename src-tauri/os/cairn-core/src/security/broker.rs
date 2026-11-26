@@ -630,11 +630,18 @@ pub fn mcp_var_is_set(
 /// server Cairn does not control, and a server that echoes its own
 /// `Authorization` header back in an error body would otherwise put a live token
 /// straight into a tool result.
+///
+/// `presented_to` is the server URL the token will be sent to; a stored token
+/// whose resource does not cover it is refused rather than returned (see
+/// [`crate::mcp::oauth::store::get_valid_access_token`]).
 pub async fn mcp_oauth_token(
     credential_key: &str,
+    presented_to: &str,
     purpose: &str,
 ) -> Result<Option<BrokeredSecret>, String> {
-    let Some(value) = crate::mcp::oauth::store::get_valid_access_token(credential_key).await?
+    let Some(value) =
+        crate::mcp::oauth::store::get_valid_access_token(credential_key, Some(presented_to))
+            .await?
     else {
         return Ok(None);
     };
@@ -686,7 +693,8 @@ pub async fn pack_oauth_token(
     purpose: &str,
 ) -> Result<Option<BrokeredSecret>, String> {
     let account = crate::web_providers::oauth::account(pack, credential);
-    let Some(value) = crate::mcp::oauth::store::get_valid_access_token(&account).await? else {
+    let Some(value) = crate::mcp::oauth::store::get_valid_access_token(&account, None).await?
+    else {
         return Ok(None);
     };
     let source = CredentialSource::PackOAuth {
@@ -1861,6 +1869,7 @@ mod tests {
                 authorization_endpoint: "https://login.test/a".into(),
                 token_endpoint: "https://login.test/t".into(),
                 registration_endpoint: None,
+                revocation_endpoint: None,
                 client_id: "c".into(),
                 client_secret: None,
                 access_token: token.into(),
