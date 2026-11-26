@@ -1,0 +1,5 @@
+{
+  "description": "The files of a Cairn-owned runtime package (@cairn/sdk, @cairn/harness) that run: what release staging (scripts/stage-workflow-runtime.ts) copies and what the runner ships to a JavaScript launch (cairn-core runtime.rs). Paths are relative to the package root; `*` matches within one path segment. Tests, READMEs and tsconfig are never executed and so never travel.",
+  "include": ["package.json", "src/*.ts"],
+  "exclude": ["src/*.test.ts"]
+}
