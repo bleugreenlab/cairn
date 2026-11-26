@@ -58,12 +58,13 @@ pub use heal::*;
 pub use in_place::in_place_blocking;
 pub use landing_gate::*;
 pub use leased_push::{
-    confirm_leased_push, publish_landing_atomic, publish_landing_atomic_unrecorded,
-    push_bookmark_expecting, push_commit_expecting_unrecorded, push_managed_branch_unrecorded,
-    push_refs_leased, readback_leased_push, readback_leased_push_exact, record_leased_push,
+    confirm_leased_push, plan_divergence_merge, publish_landing_atomic,
+    publish_landing_atomic_unrecorded, push_bookmark_expecting, push_commit_expecting_unrecorded,
+    push_divergence_merge_unrecorded, push_managed_branch_unrecorded, push_refs_leased,
+    readback_leased_push, readback_leased_push_exact, record_leased_push,
     record_origin_observation, retire_remote_branch_unrecorded, AcceptedHeads, AcceptedRef,
-    LandingPublication, LeasedPush, LeasedPushError, LeasedRefRole, LeasedRefUpdate, TargetProof,
-    RECORD_COMMITTED_UNVERIFIED,
+    DivergenceMerge, LandingPublication, LeasedPush, LeasedPushError, LeasedRefRole,
+    LeasedRefUpdate, TargetProof, RECORD_COMMITTED_UNVERIFIED,
 };
 pub use maintenance::*;
 pub use merge::*;

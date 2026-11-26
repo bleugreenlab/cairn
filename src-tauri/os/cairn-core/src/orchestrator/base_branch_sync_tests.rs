@@ -1148,6 +1148,234 @@ async fn a_prepared_replay_of_a_published_parent_is_published_over_its_old_tip()
     );
 }
 
+/// cairn/7558: child pull requests on GitHub target their parent's branch, so a
+/// carry of the parent that stays in the store is the commit a GitHub merge
+/// into the parent forks from. While an open remote PR targets the parent, the
+/// carry is published in the same preparation and origin equals the store;
+/// with none, the carry stays local until the branch's next publication.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carried_parent_is_published_while_an_open_child_pr_targets_it() {
+    let Some(f) = PublishedParent::new("carry-publishes-parent.db").await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    use crate::orchestrator::base_advance::preparation::{prepare_branch, PreparationRequest};
+    let carry = || async {
+        let prepared = prepare_branch(
+            &f.orch,
+            PreparationRequest::for_check("proj-parent", PARENT, Some("parent".to_string())),
+        )
+        .await
+        .unwrap_or_else(|refusal| panic!("the parent's preparation was refused: {refusal}"));
+        assert!(prepared.advanced, "the parent was carried onto main");
+        assert_eq!(f.store_tip(), prepared.head_after);
+        prepared
+    };
+
+    let first_main = f.push_outside("main", "main-one.rs");
+    sync(&f.orch, "proj-parent", "main").await;
+    let first = carry().await;
+    assert!(crate::jj::revset_descends_from(
+        &f.jj,
+        &f.store,
+        &first.head_after,
+        &first_main
+    ));
+    assert_eq!(
+        f.origin_tip(PARENT),
+        f.published,
+        "with no open remote PR on or into the parent, the carry stays in the store"
+    );
+
+    f.orch
+        .db
+        .local
+        .execute(
+            "INSERT INTO merge_requests
+             (id, job_id, project_id, title, source_branch, target_branch, status, is_local, opened_at, updated_at)
+             VALUES ('mr-child', 'child', 'proj-parent', 'Child', ?1, ?2, 'open', 0, 1, 1)",
+            params![CHILD, PARENT],
+        )
+        .await
+        .unwrap();
+    let second_main = f.push_outside("main", "main-two.rs");
+    sync(&f.orch, "proj-parent", "main").await;
+    let second = carry().await;
+    assert!(
+        !second
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("publishing it failed")),
+        "{:?}",
+        second.warnings
+    );
+    assert!(crate::jj::revset_descends_from(
+        &f.jj,
+        &f.store,
+        &second.head_after,
+        &second_main
+    ));
+    assert_eq!(
+        f.origin_tip(PARENT),
+        f.store_tip(),
+        "the parent a child PR targets is on origin exactly as the store carried it"
+    );
+}
+
+/// The store's commit and a commit pushed to origin outside Cairn, both on
+/// `PARENT`, and a two-parent merge of them made outside Cairn too.
+fn split_parent_and_outside_merge(f: &PublishedParent) -> (String, String, String) {
+    use crate::jj::tests::{git, git_stdout};
+    let store_side = f.seal("store-side.rs");
+    let origin_side = f.push_outside(PARENT, "origin-side.rs");
+    let repo = Path::new(&f.repo_path);
+    git(
+        repo,
+        &[
+            "fetch",
+            "-q",
+            &f.origin.to_string_lossy(),
+            &format!("refs/heads/{PARENT}"),
+        ],
+    );
+    let tree = git_stdout(
+        repo,
+        &["merge-tree", "--write-tree", &store_side, &origin_side],
+    );
+    let merge = git_stdout(
+        repo,
+        &[
+            "-c",
+            "user.name=o",
+            "-c",
+            "user.email=o@e.com",
+            "commit-tree",
+            &tree,
+            "-p",
+            &store_side,
+            "-p",
+            &origin_side,
+            "-m",
+            "merged outside Cairn",
+        ],
+    );
+    (store_side, origin_side, merge)
+}
+
+/// cairn/7558's recovery: the store's name was conflicted between its own
+/// carry and origin's GitHub merge, and origin then held a merge of both. The
+/// fast-forward takes that merge and settles the name, since it drops nothing,
+/// rather than refusing for the conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conflicted_name_is_settled_onto_an_origin_copy_holding_every_version() {
+    let Some(f) = PublishedParent::new("origin-settles-conflicted-name.db").await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    use crate::jj::tests::git;
+    let (store_side, origin_side, merge) = split_parent_and_outside_merge(&f);
+    // Importing origin's move of a bookmark the store also moved conflicts it.
+    f.jj.run(
+        &f.store,
+        &[
+            "git",
+            "fetch",
+            "--remote",
+            "origin",
+            "--branch",
+            PARENT,
+            "--ignore-working-copy",
+        ],
+        "test: import origin's move",
+    )
+    .unwrap();
+    let mut sides = vec![store_side.clone(), origin_side.clone()];
+    sides.sort();
+    assert_eq!(
+        cairn_vcs::local_bookmark_targets(&f.store, PARENT).unwrap(),
+        sides,
+        "the fixture's name is conflicted between both versions"
+    );
+    git(
+        Path::new(&f.repo_path),
+        &[
+            "push",
+            "-q",
+            &f.origin.to_string_lossy(),
+            &format!("{merge}:refs/heads/{PARENT}"),
+        ],
+    );
+
+    let answer = fast_forward_now(&f.orch, "proj-parent", PARENT)
+        .await
+        .unwrap_or_else(|error| panic!("the settling take was refused: {error}"));
+    assert!(answer.starts_with("Settled "), "{answer}");
+    for version in [&store_side, &origin_side] {
+        assert!(answer.contains(short(version)), "{answer}");
+    }
+    assert_eq!(
+        cairn_vcs::local_bookmark_targets(&f.store, PARENT).unwrap(),
+        vec![merge.clone()],
+        "the name is settled on origin's merge"
+    );
+    assert_eq!(f.origin_tip(PARENT), merge);
+}
+
+/// When the store and origin each hold a commit the other lacks, the remedy
+/// that loses nothing: one two-parent merge, the store's tip first, pushed to
+/// origin as a fast-forward and taken into the store. Neither side is
+/// rewritten.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_origin_combines_a_diverged_branch_without_rewriting_either_side() {
+    let Some(f) = PublishedParent::new("merge-origin-divergence.db").await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    use crate::jj::tests::git_stdout;
+    let store_side = f.seal("store-side.rs");
+    let origin_side = f.push_outside(PARENT, "origin-side.rs");
+    let refused = fast_forward_now(&f.orch, "proj-parent", PARENT).await;
+    assert!(
+        format!("{refused:?}").contains("merge-origin"),
+        "the divergence names the merge remedy: {refused:?}"
+    );
+    assert_eq!(f.store_tip(), store_side, "the fast-forward moved nothing");
+
+    let answer =
+        crate::orchestrator::base_advance::merge_origin_into_branch(&f.orch, "proj-parent", PARENT)
+            .await
+            .unwrap_or_else(|error| panic!("the merge was refused: {error}"));
+    let merge = f.store_tip();
+    assert!(
+        answer.contains("the store and origin now agree"),
+        "{answer}"
+    );
+    assert_eq!(
+        f.origin_tip(PARENT),
+        merge,
+        "origin fast-forwarded to the merge"
+    );
+    let parents = git_stdout(
+        Path::new(&f.repo_path),
+        &["rev-list", "--parents", "-n", "1", &merge],
+    );
+    assert_eq!(
+        parents.split_whitespace().skip(1).collect::<Vec<_>>(),
+        vec![store_side.as_str(), origin_side.as_str()],
+        "the merge's parents are the store's tip, then origin's, both unrewritten"
+    );
+    for file in ["store-side.rs", "origin-side.rs", "parent.rs"] {
+        git_stdout(
+            Path::new(&f.repo_path),
+            &["cat-file", "-e", &format!("{merge}:{file}")],
+        );
+    }
+    assert_eq!(
+        known_drift(&f.orch, "proj-parent", &f.store, PARENT).await,
+        None
+    );
+}
+
 /// And when origin's extra commit is a pure fast-forward, the publication's
 /// re-check takes it and goes ahead.
 #[tokio::test(flavor = "multi_thread")]

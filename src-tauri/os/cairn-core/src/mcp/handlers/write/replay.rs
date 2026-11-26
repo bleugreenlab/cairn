@@ -1288,6 +1288,7 @@ fn restart_item_phrase(change: &serde_json::Value) -> String {
     {
         Some("replay") => "the replay",
         Some("fast-forward-from-origin") => "the fast-forward",
+        Some("merge-origin") => "the merge",
         _ => "it",
     };
     format!("not confirmed: re-read `{target}` before requesting {request} again")

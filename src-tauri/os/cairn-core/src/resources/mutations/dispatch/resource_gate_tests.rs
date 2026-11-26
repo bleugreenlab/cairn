@@ -66,7 +66,7 @@ fn rebase_patch_spec() -> &'static MutationSpec {
 
 /// The rebase spec's label names every action dispatch accepts.
 const REBASE_LABEL: &str =
-    "replay this branch, take origin's fast-forward of it or its base, retry its recovery repair, rebuild it from attested coordinates, set its catch-up mode, mark its review, or dismiss an unknown acceptance";
+    "replay this branch, take origin's fast-forward of it or its base, merge origin's diverged copy into it, retry its recovery repair, rebuild it from attested coordinates, set its catch-up mode, mark its review, or dismiss an unknown acceptance";
 
 #[test]
 fn the_rebase_label_names_every_accepted_action() {

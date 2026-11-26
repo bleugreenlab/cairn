@@ -770,9 +770,11 @@ pub struct OriginRecord {
     pub expected: Option<String>,
     pub target: Option<String>,
     /// Also take the record into the LOCAL bookmark: it moves from exactly
-    /// this commit to `target` in the same transaction, and only that branch
-    /// is exported to git. `None` leaves the local bookmark untouched.
-    pub advance_local_from: Option<String>,
+    /// these commits to `target` in the same transaction, and only that branch
+    /// is exported to git. One commit is a settled bookmark at it; several are
+    /// every version of a conflicted name, which the move settles. `None`
+    /// leaves the local bookmark untouched.
+    pub advance_local_from: Option<Vec<String>>,
 }
 
 /// Write origin records in ONE jj transaction that touches only those refs.
@@ -815,17 +817,31 @@ pub fn record_origin_bookmarks(
                 ));
                 }
                 if let Some(expected_local) = &record.advance_local_from {
-                    let local = repo
-                        .view()
-                        .get_local_bookmark(RefName::new(&record.branch))
-                        .as_normal()
-                        .map(|id| id.hex());
-                    if local.as_ref() != Some(expected_local) || record.target.is_none() {
+                    let local = repo.view().get_local_bookmark(RefName::new(&record.branch));
+                    let mut now: Vec<String> = local.added_ids().map(|id| id.hex()).collect();
+                    now.sort();
+                    now.dedup();
+                    let mut expected = expected_local.clone();
+                    expected.sort();
+                    expected.dedup();
+                    // One expected commit must be the settled target, never a
+                    // side of a conflict that happens to list only it.
+                    let unchanged = match expected.as_slice() {
+                        [] => false,
+                        [one] => local.as_normal().map(|id| id.hex()).as_ref() == Some(one),
+                        _ => local.has_conflict() && now == expected,
+                    };
+                    if !unchanged || record.target.is_none() {
                         return Err(format!(
-                            "`{}` moved after it was judged (expected {expected_local}, now {}); \
-                         nothing recorded",
+                            "`{}` moved after it was judged (expected {}, now {}); nothing \
+                             recorded",
                             record.branch,
-                            local.as_deref().unwrap_or("<absent or conflicted>")
+                            expected.join(" and "),
+                            if now.is_empty() {
+                                "<absent>".to_string()
+                            } else {
+                                now.join(" and ")
+                            }
                         ));
                     }
                 }

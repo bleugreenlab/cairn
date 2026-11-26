@@ -284,7 +284,7 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
             REBASE_SOURCE_BASE_REASON,
             REBASE_EXPECTED_TIP,
         ],
-        label: "replay this branch, take origin's fast-forward of it or its base, retry its recovery repair, rebuild it from attested coordinates, set its catch-up mode, mark its review, or dismiss an unknown acceptance",
+        label: "replay this branch, take origin's fast-forward of it or its base, merge origin's diverged copy into it, retry its recovery repair, rebuild it from attested coordinates, set its catch-up mode, mark its review, or dismiss an unknown acceptance",
         example: "replay: write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\",resolution:\"take-committed-tip\"}}]}) | dismiss an unknown acceptance: write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"dismiss-acceptance\",acceptance_id:\"ID\",expected_head:\"FULL_HEAD\",reason:\"...\"}}]}) | rebuild a flagged branch: write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"rebuild\",source_commit:\"FULL_SOURCE\",source_base:\"FULL_CUT\",source_base_reason:\"...\",expected_tip:\"FULL_FLAGGED_TIP\"}}]})",
     }],
 };

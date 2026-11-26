@@ -378,6 +378,260 @@ pub fn push_commit_expecting_unrecorded(
     )
 }
 
+// ── Combining a divergence ──────────────────────────────────────────────────
+
+/// How the store's versions of a store-owned branch and origin's copy of it
+/// combine, judged by [`plan_divergence_merge`] before anything is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DivergenceMerge {
+    /// Origin's copy already contains every version the store holds: taking it
+    /// is a fast-forward, and there is nothing to merge.
+    OriginContainsStore,
+    /// The store's `local` already contains origin's copy: publishing it is a
+    /// fast-forward, and there is nothing to merge.
+    StoreContainsOrigin { local: String },
+    /// `commit` merges the store's `store` (first parent) with origin's
+    /// `origin` (second parent). It is written to the backing repository only;
+    /// no ref names it yet. `sides` is every version the store's name recorded
+    /// when it was planned, which [`push_divergence_merge_unrecorded`] re-checks.
+    Merge {
+        commit: String,
+        store: String,
+        origin: String,
+        sides: Vec<String>,
+    },
+    /// The two sides change the same lines. Nothing was written.
+    Conflicted {
+        store: String,
+        origin: String,
+        paths: Vec<String>,
+    },
+    /// More than one store version remains beside origin's once every version
+    /// another contains is set aside, so no two-parent merge holds them all.
+    Unmergeable { versions: Vec<String> },
+}
+
+/// Plan the merge that combines the store's copy of `branch` with origin's
+/// `origin` when each holds commits the other lacks: the one remedy for a
+/// divergence that drops nothing and rewrites nothing.
+///
+/// The store's versions are its bookmark's targets: one for a settled name,
+/// each side of a conflicted one. A version that another (or origin's copy)
+/// contains is already accounted for. When exactly one store version and
+/// origin's copy remain, their merge is computed with `git merge-tree` and,
+/// when clean, written as a two-parent commit with the store's version first.
+/// The commit is an object in the backing repository and nothing else: no ref,
+/// bookmark or jj operation moves.
+///
+/// The caller holds the store lock, so the versions read here are the ones the
+/// push re-checks.
+pub fn plan_divergence_merge(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    origin: &str,
+) -> Result<DivergenceMerge, String> {
+    let repo = backing_checkout(store)?;
+    let sides = crate::local_bookmark_targets(store, branch)?;
+    if sides.is_empty() {
+        return Err(format!(
+            "the store has no bookmark `{branch}` to merge origin's copy into"
+        ));
+    }
+    run_git(
+        jj,
+        &repo,
+        &["cat-file", "-e", &format!("{origin}^{{commit}}")],
+        "git cat-file -e (origin's copy)",
+    )
+    .map_err(|error| format!("origin's {origin} is not in the backing repository: {error}"))?;
+    let contains = |ancestor: &str, descendant: &str| {
+        ancestor == descendant || git_is_ancestor(jj, &repo, ancestor, descendant)
+    };
+    if sides.iter().all(|side| contains(side, origin)) {
+        return Ok(DivergenceMerge::OriginContainsStore);
+    }
+    let mut candidates: Vec<&str> = sides.iter().map(String::as_str).collect();
+    candidates.push(origin);
+    candidates.sort_unstable();
+    candidates.dedup();
+    let heads: Vec<&str> = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !candidates
+                .iter()
+                .any(|other| other != candidate && git_is_ancestor(jj, &repo, candidate, other))
+        })
+        .collect();
+    let store_heads: Vec<String> = heads
+        .iter()
+        .filter(|head| **head != origin)
+        .map(|head| head.to_string())
+        .collect();
+    if !heads.contains(&origin) {
+        return Ok(match store_heads.as_slice() {
+            [local] => DivergenceMerge::StoreContainsOrigin {
+                local: local.clone(),
+            },
+            _ => DivergenceMerge::Unmergeable {
+                versions: store_heads,
+            },
+        });
+    }
+    let [store_side] = store_heads.as_slice() else {
+        return Ok(DivergenceMerge::Unmergeable {
+            versions: heads.iter().map(|head| head.to_string()).collect(),
+        });
+    };
+    let output = jj.command_output(
+        cairn_platform::env::git()
+            .args([
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                "-z",
+                store_side,
+                origin,
+            ])
+            .current_dir(&repo),
+        JJ_DEFAULT_TIMEOUT,
+        "git merge-tree (origin divergence)",
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut sections = stdout.split('\0');
+    let tree = sections.next().unwrap_or_default().trim().to_string();
+    match output.status.code() {
+        Some(0) if !tree.is_empty() => {}
+        // Conflicted stages follow the tree, one `<mode> <object> <stage>\t<path>`
+        // record each, so one path appears up to three times.
+        Some(1) => {
+            let mut paths: Vec<String> = sections
+                .filter_map(|entry| entry.split_once('\t'))
+                .map(|(_, path)| path.to_string())
+                .collect();
+            paths.sort();
+            paths.dedup();
+            return Ok(DivergenceMerge::Conflicted {
+                store: store_side.clone(),
+                origin: origin.to_string(),
+                paths,
+            });
+        }
+        _ => {
+            return Err(format!(
+                "merge `{branch}`'s {store_side} with origin's {origin}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+    let message = format!(
+        "Merge origin's `{branch}` into the store's\n\nThe store's {store_side} and origin's \
+         {origin} each held commits the other lacked. This merge keeps both and rewrites \
+         neither."
+    );
+    let commit = jj.command_output(
+        cairn_platform::env::git()
+            .args([
+                "commit-tree",
+                &tree,
+                "-p",
+                store_side,
+                "-p",
+                origin,
+                "-m",
+                &message,
+            ])
+            .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", crate::MANAGED_IDENTITY_NAME)
+            .env("GIT_AUTHOR_EMAIL", crate::MANAGED_IDENTITY_EMAIL)
+            .env("GIT_COMMITTER_NAME", crate::MANAGED_IDENTITY_NAME)
+            .env("GIT_COMMITTER_EMAIL", crate::MANAGED_IDENTITY_EMAIL),
+        JJ_DEFAULT_TIMEOUT,
+        "git commit-tree (origin divergence merge)",
+    )?;
+    if !commit.status.success() {
+        return Err(format!(
+            "write the merge of `{branch}`'s {store_side} and origin's {origin}: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        ));
+    }
+    Ok(DivergenceMerge::Merge {
+        commit: String::from_utf8_lossy(&commit.stdout).trim().to_string(),
+        store: store_side.clone(),
+        origin: origin.to_string(),
+        sides,
+    })
+}
+
+/// Send a planned divergence merge to origin as a fast-forward of exactly
+/// `origin`, touching nothing local.
+///
+/// Read-only preconditions, checked before sending: the store's bookmark still
+/// records exactly `sides`; `merge` is in the backing repository; and `merge`
+/// descends from `origin` and from every side. The update is a
+/// [`LeasedRefRole::Target`] proven to descend, so origin's history only ever
+/// grows: origin moves only while it still holds `origin`, and only to a commit
+/// that contains it. On `Ok` origin holds the merge; the store takes it as
+/// origin's fast-forward ([`crate::fast_forward_branch_from_origin`]).
+pub fn push_divergence_merge_unrecorded(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    sides: &[String],
+    origin: &str,
+    merge: &str,
+) -> Result<AcceptedHeads, LeasedPushError> {
+    let precondition = LeasedPushError::Precondition;
+    let repo = backing_checkout(store).map_err(precondition)?;
+    for commit in sides.iter().map(String::as_str).chain([origin, merge]) {
+        if commit.len() < 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(precondition(format!(
+                "`{branch}`: `{commit}` is not a full commit id; a lease must be exact"
+            )));
+        }
+    }
+    let mut expected = sides.to_vec();
+    expected.sort();
+    expected.dedup();
+    let now = crate::local_bookmark_targets(store, branch).map_err(precondition)?;
+    if now != expected {
+        return Err(precondition(format!(
+            "the store bookmark `{branch}` is {}, not the {} the merge was planned from",
+            if now.is_empty() {
+                "<absent>".to_string()
+            } else {
+                now.join(" and ")
+            },
+            expected.join(" and ")
+        )));
+    }
+    run_git(
+        jj,
+        &repo,
+        &["cat-file", "-e", &format!("{merge}^{{commit}}")],
+        "git cat-file -e (divergence merge)",
+    )
+    .map_err(precondition)?;
+    if let Some(missing) = expected
+        .iter()
+        .map(String::as_str)
+        .chain([origin])
+        .find(|parent| !git_is_ancestor(jj, &repo, parent, merge))
+    {
+        return Err(precondition(format!(
+            "the merge {merge} does not contain {missing}, so it would drop it"
+        )));
+    }
+    let update = LeasedRefUpdate {
+        branch: branch.to_string(),
+        expected_old: Some(origin.to_string()),
+        new: Some(merge.to_string()),
+        role: LeasedRefRole::Target(TargetProof::Descends),
+    };
+    send_refs(jj, &repo, &[&update])
+}
+
 /// Delete origin's `branch` only while it is exactly `expected_old`, touching
 /// nothing local.
 ///
@@ -1098,8 +1352,17 @@ fn settled_records(store: &Path, records: &[crate::OriginRecord]) -> Result<Sett
             (Some(local), Some(want)) => local.as_slice() == std::slice::from_ref(want),
             (Some(local), None) => local.is_empty(),
         };
+        let local_at_prior = match (&local, &record.advance_local_from) {
+            (Some(local), Some(prior)) => {
+                let mut prior = prior.clone();
+                prior.sort();
+                prior.dedup();
+                *local == prior
+            }
+            _ => true,
+        };
         at_target &= recorded == record.target && local_at(&record.target);
-        at_prior &= recorded == record.expected && local_at(&record.advance_local_from);
+        at_prior &= recorded == record.expected && local_at_prior;
         views.push(format!(
             "`{}@origin` at {}{}",
             record.branch,

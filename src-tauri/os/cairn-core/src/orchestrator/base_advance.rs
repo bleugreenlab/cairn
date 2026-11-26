@@ -302,6 +302,43 @@ pub(crate) async fn publish_managed_branch(
     Ok(())
 }
 
+/// Publish a branch the preparer just carried onto an advanced base when a
+/// remote pull request needs it on origin, asking the commit verbs' own rule
+/// ([`crate::merge_requests::queries::publication_requirement_for_managed_branch`]).
+/// Answers whether it published.
+///
+/// GitHub presents and merges a child pull request against origin's copy of
+/// its base. A carried base the store holds but origin does not is therefore
+/// one a GitHub merge forks from: origin's copy and the store's each gain a
+/// commit the other lacks, and the store's fast-forward-only take refuses.
+/// Publishing in the same operation as the carry keeps the two equal. A branch
+/// no open remote pull request touches stays local until its next publication
+/// barrier, exactly as a commit would leave it.
+///
+/// The caller holds no reservation on the branch: this reserves it, through
+/// [`publish_managed_branch`].
+pub(crate) async fn publish_carried_branch(
+    orch: &Orchestrator,
+    project_id: &str,
+    owner_job_id: &str,
+    store: &Path,
+    branch: &str,
+) -> Result<bool, String> {
+    use crate::merge_requests::queries::{
+        publication_requirement_for_managed_branch, PublicationRequirement,
+    };
+    let db = owning_db_for_project(&orch.db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    match publication_requirement_for_managed_branch(&db, owner_job_id, project_id, branch).await {
+        PublicationRequirement::DeferredUntilPublication => Ok(false),
+        PublicationRequirement::RequiredForOpenPr => {
+            publish_managed_branch(orch, store, branch).await?;
+            Ok(true)
+        }
+    }
+}
+
 /// The database holding `store`'s recovery fences: the one whose transaction
 /// recorded them, the database owning the project the store serves.
 pub(crate) async fn recovery_fence_db(orch: &Orchestrator, store: &Path) -> Arc<LocalDb> {
@@ -644,7 +681,8 @@ impl Publisher<'_> {
         };
         match judged {
             Judged::FastForward(taken) => match taken? {
-                crate::jj::OriginFastForward::Advanced { to, .. } => Ok(OriginMove::Taken(to)),
+                crate::jj::OriginFastForward::Advanced { to, .. }
+                | crate::jj::OriginFastForward::Settled { to, .. } => Ok(OriginMove::Taken(to)),
                 other => Err(format!(
                     "`{branch}` was not published: origin's copy {observed} descends from its \
                      head {head}, but taking it answered {other:?}"
@@ -2809,7 +2847,6 @@ pub(crate) async fn reconcile_base_branch_advance(
         log::debug!("origin holds no `{branch}` for project {project_id}; nothing to take");
         return Ok(());
     };
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, repo);
     let reservation = orch
         .reserve_branches(
@@ -2819,55 +2856,8 @@ pub(crate) async fn reconcile_base_branch_advance(
             crate::mcp::vcs::STORE_LOCK_TIMEOUT,
         )
         .await?;
-    let outcome = {
-        let guard = orch
-            .acquire_jj_store_lock(
-                &store,
-                crate::orchestrator::StoreLockClass::Background,
-                format!("origin fast-forward of {branch}"),
-            )
-            .await;
-        let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
-        let _phase = guard.phase("fast-forward from origin");
-        let preserved = crate::orchestrator::branch_recovery::preserved_import_bookmarks(
-            orch,
-            &store,
-            &[branch],
-            &format!("Fast-forwarding `{branch}` from origin"),
-        )
-        .await?;
-        let jj = jj.preserving_import_bookmarks(preserved);
-        // The fast-forward is a refs-only take of this one branch: admit its
-        // writer before it moves. The bracket around it is kept, though the
-        // take no longer imports or moves any other bookmark.
-        guard
-            .branch_write_permit(
-                &db,
-                &reservation,
-                project_id,
-                branch,
-                crate::orchestrator::BatchAdmission::None,
-            )
-            .await?;
-        let (ff_store, ff_repo, ff_branch) =
-            (store.clone(), repo.to_path_buf(), branch.to_string());
-        let (_guard, outcome) = orch
-            .bracket_store_mutation(
-                guard,
-                Some(&reservation),
-                db.clone(),
-                project_id,
-                move || {
-                    crate::jj::ensure_store_initialized(&jj, &ff_store, &ff_repo).and_then(|()| {
-                        crate::jj::fast_forward_branch_from_origin(
-                            &jj, &ff_store, &ff_branch, &observed,
-                        )
-                    })
-                },
-            )
-            .await?;
-        outcome
-    };
+    let outcome =
+        take_origin_copy(orch, &db, project_id, repo, branch, &observed, &reservation).await?;
     match outcome {
         crate::jj::OriginFastForward::Current { .. } | crate::jj::OriginFastForward::NoBookmark => {
             Ok(())
@@ -2882,7 +2872,9 @@ pub(crate) async fn reconcile_base_branch_advance(
         crate::jj::OriginFastForward::Diverged { local, remote } => {
             let reason = format!(
                 "origin's `{branch}` ({remote}) and the store's ({local}) each hold commits the \
-                 other lacks, so it is not a fast-forward and the store did not take it"
+                 other lacks, so it is not a fast-forward and the store did not take it; \
+                 `merge-origin` on the branch's rebase page combines them in one two-parent \
+                 merge that rebases, drops and force-pushes nothing"
             );
             notify_on_branch_jobs(
                 orch,
@@ -2909,6 +2901,299 @@ pub(crate) async fn reconcile_base_branch_advance(
             .await;
             Ok(())
         }
+        crate::jj::OriginFastForward::Settled { sides, to } => {
+            notify_on_branch_jobs(
+                orch,
+                &db,
+                project_id,
+                branch,
+                &build_origin_fast_forward_note(branch, &sides.join("` and `"), &to),
+                DeliveryUrgency::Passive,
+                &format!("origin-fast-forward:{project_id}:{branch}:{to}"),
+            )
+            .await;
+            Ok(())
+        }
+    }
+}
+
+/// A commit id as a sentence names it: its first twelve characters.
+fn short(commit: &str) -> &str {
+    &commit[..commit.len().min(12)]
+}
+
+/// Take origin's `observed` copy of a store-owned `branch` into the store when
+/// it is a fast-forward of every version the store holds
+/// ([`crate::jj::fast_forward_branch_from_origin`]), under the store lock with
+/// this branch's writer admitted. The caller holds `reservation` on the branch.
+async fn take_origin_copy(
+    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
+    project_id: &str,
+    repo: &Path,
+    branch: &str,
+    observed: &str,
+    reservation: &crate::orchestrator::BranchReservation,
+) -> Result<crate::jj::OriginFastForward, String> {
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, repo);
+    let guard = orch
+        .acquire_jj_store_lock(
+            &store,
+            crate::orchestrator::StoreLockClass::Background,
+            format!("origin fast-forward of {branch}"),
+        )
+        .await;
+    let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
+    let _phase = guard.phase("fast-forward from origin");
+    let preserved = crate::orchestrator::branch_recovery::preserved_import_bookmarks(
+        orch,
+        &store,
+        &[branch],
+        &format!("Fast-forwarding `{branch}` from origin"),
+    )
+    .await?;
+    let jj = jj.preserving_import_bookmarks(preserved);
+    // The fast-forward is a refs-only take of this one branch: admit its
+    // writer before it moves. The bracket around it is kept, though the take
+    // imports and moves no other bookmark.
+    guard
+        .branch_write_permit(
+            db,
+            reservation,
+            project_id,
+            branch,
+            crate::orchestrator::BatchAdmission::None,
+        )
+        .await?;
+    let (ff_store, ff_repo, ff_branch, ff_observed) = (
+        store.clone(),
+        repo.to_path_buf(),
+        branch.to_string(),
+        observed.to_string(),
+    );
+    let (_guard, outcome) = orch
+        .bracket_store_mutation(
+            guard,
+            Some(reservation),
+            db.clone(),
+            project_id,
+            move || {
+                crate::jj::ensure_store_initialized(&jj, &ff_store, &ff_repo).and_then(|()| {
+                    crate::jj::fast_forward_branch_from_origin(
+                        &jj,
+                        &ff_store,
+                        &ff_branch,
+                        &ff_observed,
+                    )
+                })
+            },
+        )
+        .await?;
+    Ok(outcome)
+}
+
+/// Combine a store-owned `branch` whose store and origin copies each hold
+/// commits the other lacks, losing nothing and rewriting nothing: one
+/// two-parent merge of the store's tip and origin's, pushed to origin as a
+/// fast-forward of exactly origin's copy, then taken into the store as
+/// origin's fast-forward of the store's.
+///
+/// The branch is reserved throughout, so nothing in Cairn moves it between the
+/// plan, the push and the take. The plan reads the store's versions under the
+/// store lock and writes only the merge object; the push runs with the lock
+/// released. When origin's copy already contains the store's, there is
+/// nothing to merge and this is the ordinary fast-forward; when the store's
+/// contains origin's, the branch's next publication sends it. A merge that
+/// conflicts writes nothing and is reported with its paths.
+pub(crate) async fn merge_origin_into_branch(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+) -> Result<String, String> {
+    let db = owning_db_for_project(&orch.db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let repo_path = load_project_repo_path(&orch.db, project_id)
+        .await?
+        .ok_or_else(|| "Cairn holds no repository path for this project".to_string())?;
+    let repo = Path::new(&repo_path);
+    if !project_has_origin(orch, repo) {
+        return Err(format!(
+            "this project has no `origin` remote, so `{branch}` has no origin copy to merge"
+        ));
+    }
+    let observed = crate::orchestrator::base_branch_sync::fetch_origin_observation_serialized(
+        orch,
+        repo,
+        branch,
+        crate::orchestrator::base_branch_sync::FetchRecord {
+            project_id,
+            source: crate::orchestrator::base_branch_sync::Source::Fetch,
+        },
+    )
+    .await?;
+    let Some(origin) = observed else {
+        return Ok(format!(
+            "Origin holds no `{branch}`, so there is nothing to merge; its next publication \
+             creates it."
+        ));
+    };
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, repo);
+    let reservation = orch
+        .reserve_branches(
+            &store,
+            &[branch],
+            "merge origin's copy",
+            crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+        )
+        .await?;
+    let plan = {
+        let guard = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                format!("plan the merge of origin's {branch}"),
+            )
+            .await;
+        guard
+            .branch_write_permit(
+                &db,
+                &reservation,
+                project_id,
+                branch,
+                crate::orchestrator::BatchAdmission::None,
+            )
+            .await?;
+        let fence_db = recovery_fence_db(orch, &store).await;
+        crate::orchestrator::branch_recovery::refuse_if_fenced(
+            &fence_db,
+            &store,
+            &[branch],
+            &format!("Merging origin's `{branch}`"),
+        )
+        .await?;
+        let plan = crate::jj::in_place_blocking(|| {
+            crate::jj::plan_divergence_merge(&jj, &store, branch, &origin)
+        });
+        drop(guard);
+        plan?
+    };
+    let (commit, store_side, sides) = match plan {
+        crate::jj::DivergenceMerge::OriginContainsStore => {
+            drop(reservation);
+            let taken =
+                crate::orchestrator::base_branch_sync::fast_forward_now(orch, project_id, branch)
+                    .await?;
+            return Ok(format!(
+                "Origin's `{}` already contains every version the store holds, so there is \
+                 nothing to merge. {taken}",
+                short(&origin)
+            ));
+        }
+        crate::jj::DivergenceMerge::StoreContainsOrigin { local } => {
+            return Ok(format!(
+                "The store's `{}` already contains origin's `{}`, so there is nothing to merge; \
+                 the branch's next publication fast-forwards origin to it.",
+                short(&local),
+                short(&origin)
+            ));
+        }
+        crate::jj::DivergenceMerge::Conflicted {
+            store: store_side,
+            origin,
+            paths,
+        } => {
+            return Err(format!(
+                "Merging origin's `{branch}` ({origin}) into the store's ({store_side}) conflicts \
+                 in {}, so nothing was written, pushed or moved. Resolve it in a checkout of \
+                 the branch: merge origin's commit in, resolve those paths, and commit.",
+                paths
+                    .iter()
+                    .map(|path| format!("`{path}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+        crate::jj::DivergenceMerge::Unmergeable { versions } => {
+            return Err(format!(
+                "`{branch}` has {} versions that neither origin's {origin} nor one another \
+                 contain ({}), so no single two-parent merge holds them all. Settle the store's \
+                 conflicted name on this page first; nothing was written or moved.",
+                versions.len(),
+                versions.join(", ")
+            ))
+        }
+        crate::jj::DivergenceMerge::Merge {
+            commit,
+            store: store_side,
+            sides,
+            ..
+        } => (commit, store_side, sides),
+    };
+    let observation = orch.base_branch_sync.observe();
+    let (push_jj, push_store, push_branch, push_origin, push_commit) = (
+        jj.clone(),
+        store.clone(),
+        branch.to_string(),
+        origin.clone(),
+        commit.clone(),
+    );
+    tokio::task::spawn_blocking(move || {
+        crate::jj::push_divergence_merge_unrecorded(
+            &push_jj,
+            &push_store,
+            &push_branch,
+            &sides,
+            &push_origin,
+            &push_commit,
+        )
+    })
+    .await
+    .map_err(|error| format!("the merge push worker did not finish: {error}"))?
+    .map_err(|error| match error {
+        crate::jj::LeasedPushError::TargetMoved { observed, .. } => format!(
+            "Origin's `{branch}` moved to {} after it was read as {origin}, so the merge {commit} \
+             was not pushed and nothing moved. Ask again to merge its new copy.",
+            observed.as_deref().unwrap_or("<absent>")
+        ),
+        error => format!("The merge {commit} of `{branch}` was not pushed: {error}"),
+    })?;
+    crate::orchestrator::base_branch_sync::record_publication(
+        orch,
+        &store,
+        branch,
+        &commit,
+        observation,
+    )
+    .await;
+    let taken = take_origin_copy(orch, &db, project_id, repo, branch, &commit, &reservation).await;
+    let pushed = format!(
+        "Merged origin's `{branch}` `{}` into the store's `{}` as `{}` (first parent the \
+         store's, second origin's), and pushed it to origin as a fast-forward of `{}`. Nothing \
+         was rebased, dropped or force-pushed.",
+        short(&origin),
+        short(&store_side),
+        short(&commit),
+        short(&origin)
+    );
+    match taken {
+        Ok(
+            crate::jj::OriginFastForward::Advanced { .. }
+            | crate::jj::OriginFastForward::Settled { .. }
+            | crate::jj::OriginFastForward::Current { .. },
+        ) => Ok(format!(
+            "{pushed} The store fast-forwarded to it, so the store and origin now agree."
+        )),
+        Ok(other) => Ok(format!(
+            "{pushed} The store did not take it ({other:?}); the next poll of origin retries the \
+             fast-forward."
+        )),
+        Err(error) => Ok(format!(
+            "{pushed} The store did not take it yet ({error}); the next poll of origin retries \
+             the fast-forward."
+        )),
     }
 }
 
@@ -2959,9 +3244,10 @@ fn build_origin_divergence_note(branch: &str, local: &str, remote: &str) -> Stri
         "⛔ [Branch update] Origin's `{branch}` is at `{remote}`, which the store's `{local}` \
          does not contain, and it does not contain the store's either: each side holds commits \
          the other lacks. The store will not move your branch sideways, so it stays at \
-         `{local}`, and publishing it is refused until the two agree. Read `cairn:~/rebase` for \
-         both commits; combining them is a decision for you or your thread, not something to \
-         force-push."
+         `{local}`, and publishing it is refused until the two agree. The remedy that loses \
+         nothing is one two-parent merge of both, pushed to origin as a fast-forward and then \
+         taken into the store, with nothing rebased or force-pushed:\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{action:\"merge-origin\"}}}}]}})\n```\n\nIt refuses, naming the paths, if the two change the same lines. `cairn:~/rebase` shows \
+         both commits."
     )
 }
 

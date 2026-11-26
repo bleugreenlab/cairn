@@ -29,11 +29,19 @@ const AGENT_COMMIT_VERBS: &[(&str, &[&str])] = &[
 /// ask the same publication rule the commit verbs ask, or it becomes a second
 /// definition of when a branch belongs on origin.
 ///
-/// There are none today. Base advance is lazy: the preparer and explicit
-/// replays rewrite the store and publish nothing, leaving origin to the branch's
-/// next commit verb or PR barrier, and `base_advance_publishes_nothing` holds
-/// them to that. A path that starts publishing on its own belongs here.
-const AUTOMATIC_PUBLISHERS: &[(&str, &str)] = &[];
+/// One today: a carry. Base advance is lazy about WHEN a branch moves, but a
+/// branch it moves that an open remote pull request needs (its head, or the
+/// base a child PR targets) is published in the same operation by
+/// `base_advance::publish_carried_branch`, which `prepare_branch` calls once
+/// its guards and reservation are released. Left local, that carry is the
+/// commit a GitHub merge into the branch forks from, and the store and origin
+/// diverge. The preparer modules themselves still name no push
+/// (`base_advance_publishes_nothing`). A path that starts publishing on its
+/// own belongs here.
+const AUTOMATIC_PUBLISHERS: &[(&str, &str)] = &[(
+    "base-advance carry publication",
+    include_str!("../orchestrator/base_advance.rs"),
+)];
 
 /// The base-advance modules whose whole source is production code (their tests
 /// live in sibling files), none of which may push.
@@ -115,10 +123,11 @@ fn automatic_publishers_consult_the_commit_verbs_rule() {
     }
 }
 
-/// Lazy base advance never reaches origin itself. `base_advance.rs` holds the
-/// managed publication wrapper, so its production code names the wrapper once,
-/// at its definition; the modules beside it name no push at all. A base-advance
-/// path that publishes must move into `AUTOMATIC_PUBLISHERS` and ask the rule.
+/// Base advance reaches origin through one door only. `base_advance.rs` holds
+/// the managed publication wrapper, so its production code names the wrapper
+/// twice: at its definition, and in `publish_carried_branch`, which asks the
+/// commit verbs' rule first. The modules beside it name no push at all. Any
+/// other base-advance path that publishes must go through that function.
 #[test]
 fn base_advance_publishes_nothing() {
     let wrapper_home = include_str!("../orchestrator/base_advance.rs")
@@ -127,9 +136,25 @@ fn base_advance_publishes_nothing() {
         .unwrap();
     assert_eq!(
         wrapper_home.matches("publish_managed_branch(").count(),
-        1,
-        "base_advance.rs calls `publish_managed_branch` on its own initiative; register it \
-         in AUTOMATIC_PUBLISHERS and ask `publication_requirement_for_managed_branch`"
+        2,
+        "base_advance.rs calls `publish_managed_branch` somewhere other than its definition \
+         and `publish_carried_branch`; publish a carry through `publish_carried_branch`, which \
+         asks `publication_requirement_for_managed_branch`"
+    );
+    let carry = wrapper_home
+        .split("pub(crate) async fn publish_carried_branch(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("base_advance.rs defines publish_carried_branch");
+    let asks = carry
+        .find("publication_requirement_for_managed_branch(")
+        .expect("publish_carried_branch asks the publication rule");
+    let publishes = carry
+        .find("publish_managed_branch(")
+        .expect("publish_carried_branch publishes through the managed wrapper");
+    assert!(
+        asks < publishes,
+        "publish_carried_branch must ask the publication rule before it publishes"
     );
     for (name, source) in NON_PUBLISHING_ADVANCERS {
         for push in [

@@ -442,6 +442,10 @@ pub enum OriginFastForward {
     /// Origin's copy strictly descended from the store's bookmark, which now
     /// points at it.
     Advanced { from: String, to: String },
+    /// The store's name was conflicted, and origin's copy descends from every
+    /// version it recorded (`sides`), so it holds all of them: the name now
+    /// points at it, settled, and nothing any version held was dropped.
+    Settled { sides: Vec<String>, to: String },
     /// Origin still holds this store's own earlier publication of the branch,
     /// which the store has since rewritten (a base-advance replay): see
     /// [`origin_copy_is_superseded`]. Nothing was moved; the branch's next
@@ -480,6 +484,12 @@ pub const ORIGIN_SCAFFOLDING_REFUSAL: &str = "origin fast-forward refused";
 /// remote record or git ref is imported, exported or moved, so the take is a
 /// single-branch write. It is verified afterwards.
 ///
+/// A conflicted name is a fast-forward too when origin's copy descends from
+/// every version the name records: taking it settles the name
+/// ([`OriginFastForward::Settled`]) with nothing lost, in the same single
+/// transaction, compare-and-swapped against exactly those versions. When
+/// origin's copy lacks one of them, the take is refused naming it.
+///
 /// The observation ref is deleted once this answers, whatever the answer or
 /// error: its lifecycle is one fetch-and-judge. The observed commit is named in
 /// the answer, and its objects stay readable by id until git's own prune.
@@ -515,19 +525,46 @@ fn judge_and_take_origin_copy(
     branch: &str,
     observed: &str,
 ) -> Result<OriginFastForward, String> {
-    if bookmark_name_is_conflicted(jj, store, branch)? {
-        return Err(format!(
-            "`{branch}`'s name is conflicted in the store, so there is no single tip to \
-             fast-forward; settle it on the branch's rebase page first"
-        ));
-    }
-    let Some(local) = bookmark_commit_checked(jj, store, branch)? else {
-        return Ok(OriginFastForward::NoBookmark);
+    // `local` is the settled tip; a conflicted name has none, only its sides.
+    let (local, sides) = if bookmark_name_is_conflicted(jj, store, branch)? {
+        let sides = crate::local_bookmark_targets(store, branch)?;
+        let lacking: Vec<&str> = sides
+            .iter()
+            .map(String::as_str)
+            .filter(|side| *side != observed && !git_is_ancestor(jj, checkout, side, observed))
+            .collect();
+        if sides.is_empty() || !lacking.is_empty() {
+            return Err(format!(
+                "`{branch}`'s {CONFLICTED_NAME_REFUSAL} in the store ({}), and origin's {observed} \
+                 does not contain {}, so taking it would drop that version. Combine them with a \
+                 two-parent merge, which drops and rewrites nothing: `merge-origin` on the \
+                 branch's rebase page",
+                if sides.is_empty() {
+                    "no version is readable".to_string()
+                } else {
+                    format!("versions {}", sides.join(" and "))
+                },
+                if lacking.is_empty() {
+                    "any of them".to_string()
+                } else {
+                    lacking.join(" or ")
+                }
+            ));
+        }
+        (None, sides)
+    } else {
+        let Some(local) = bookmark_commit_checked(jj, store, branch)? else {
+            return Ok(OriginFastForward::NoBookmark);
+        };
+        if local == observed || git_is_ancestor(jj, checkout, observed, &local) {
+            return Ok(OriginFastForward::Current { local });
+        }
+        (Some(local.clone()), vec![local])
     };
-    if local == observed || git_is_ancestor(jj, checkout, observed, &local) {
-        return Ok(OriginFastForward::Current { local });
-    }
-    if !git_is_ancestor(jj, checkout, &local, observed) {
+    if let Some(local) = local
+        .clone()
+        .filter(|local| !git_is_ancestor(jj, checkout, local, observed))
+    {
         let remote = observed.to_string();
         return Ok(
             match origin_copy_is_superseded(jj, store, branch, &local, observed) {
@@ -572,6 +609,28 @@ fn judge_and_take_origin_copy(
         )?
         .stdout;
     let tracking_before = String::from_utf8_lossy(&tracking_before).trim().to_string();
+    // A settled bookmark's export holds its git ref at it. A conflicted name
+    // exports nothing, so its git ref is whatever it last held.
+    let head_before = match &local {
+        Some(local) => Some(local.clone()),
+        None => {
+            let head = jj
+                .command_output(
+                    cairn_platform::env::git()
+                        .args([
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            &format!("refs/heads/{branch}"),
+                        ])
+                        .current_dir(checkout),
+                    JJ_DEFAULT_TIMEOUT,
+                    "git rev-parse (conflicted branch ref)",
+                )?
+                .stdout;
+            Some(String::from_utf8_lossy(&head).trim().to_string()).filter(|head| !head.is_empty())
+        }
+    };
     let (recorded, _) = crate::recorded_origin_bookmark(store, branch)?;
     let git_writes = [
         super::leased_push::GitRefWrite {
@@ -582,7 +641,7 @@ fn judge_and_take_origin_copy(
         },
         super::leased_push::GitRefWrite {
             name: format!("refs/heads/{branch}"),
-            prior: Some(local.clone()),
+            prior: head_before,
             written: Some(observed.to_string()),
             by_transaction: true,
         },
@@ -591,7 +650,7 @@ fn judge_and_take_origin_copy(
         branch: branch.to_string(),
         expected: recorded,
         target: Some(observed.to_string()),
-        advance_local_from: Some(local.clone()),
+        advance_local_from: Some(sides.clone()),
     };
     let outcome = super::export::with_checkout_head_preserved(jj, store, || {
         super::leased_push::record_with_rollback(
@@ -613,16 +672,23 @@ fn judge_and_take_origin_copy(
             verify_taken_branch(jj, store, checkout, branch, observed).err()
         }
     };
+    let from = sides.join(" and ");
     if let Some(note) = unverified {
         log::warn!(
-            "store bookmark `{branch}` fast-forwarded from {local} to origin's {observed}, but \
+            "store bookmark `{branch}` fast-forwarded from {from} to origin's {observed}, but \
              it could not be verified: {note}"
         );
     }
-    log::info!("store bookmark `{branch}` fast-forwarded from {local} to origin's {observed}");
-    Ok(OriginFastForward::Advanced {
-        from: local,
-        to: observed.to_string(),
+    log::info!("store bookmark `{branch}` fast-forwarded from {from} to origin's {observed}");
+    Ok(match local {
+        Some(local) => OriginFastForward::Advanced {
+            from: local,
+            to: observed.to_string(),
+        },
+        None => OriginFastForward::Settled {
+            sides,
+            to: observed.to_string(),
+        },
     })
 }
 

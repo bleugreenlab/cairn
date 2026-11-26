@@ -230,7 +230,8 @@ async fn origin_integration(
     let taken = judge_origin_target(orch, store, merge_context, reservation).await?;
     match taken.judged {
         crate::jj::OriginFastForward::Current { .. }
-        | crate::jj::OriginFastForward::Advanced { .. } => Ok(OriginIntegration {
+        | crate::jj::OriginFastForward::Advanced { .. }
+        | crate::jj::OriginFastForward::Settled { .. } => Ok(OriginIntegration {
             origin: taken.origin,
             rewrites: false,
         }),

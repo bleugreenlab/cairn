@@ -918,6 +918,16 @@ pub(crate) async fn fast_forward_now(
         .ok_or_else(|| "Cairn holds no repository path for this project".to_string())?;
     let store = crate::jj::project_store_dir(&orch.config_dir, &repo);
     let before = cairn_vcs::resolve_coordinate(&store, branch).await.ok();
+    // A conflicted name resolves to no coordinate; its versions say what a
+    // take that settles it settled.
+    let versions = {
+        let (store, branch) = (store.clone(), branch.to_string());
+        tokio::task::spawn_blocking(move || cairn_vcs::local_bookmark_targets(&store, &branch))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+    };
     sync(orch, project_id, branch).await;
     let after = cairn_vcs::resolve_coordinate(&store, branch).await.ok();
     let state = orch
@@ -934,6 +944,17 @@ pub(crate) async fn fast_forward_now(
             .unwrap_or_else(|| "nothing".to_string())
     };
     Ok(match (&before, &after, state.remote_tip.as_deref()) {
+        (None, Some(after), _) if versions.len() > 1 => format!(
+            "Settled `{branch}`'s conflicted name onto origin's `{}`, which contains every version \
+             the store recorded ({}), so nothing was dropped. Work cut from it is being replayed \
+             onto the new tip.",
+            short(after),
+            versions
+                .iter()
+                .map(|version| format!("`{}`", short(version)))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
         (before, after, _) if before != after => format!(
             "Fast-forwarded `{branch}` from {} to origin's {}. Work cut from it is being \
              replayed onto the new tip.",

@@ -1035,8 +1035,9 @@ async fn own_origin_section(orch: &Orchestrator, rows: &NodeRebaseRows, branch: 
         "# Behind origin\n\n{}. The store owns this branch and takes origin's copy only when it is \
          a pure fast-forward, which it does on its own within a minute; this asks for it \
          now:\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{action:\"fast-forward-from-origin\"}}}}]}})\n```\n\nIf origin's copy has diverged from the store's, the request says so and moves nothing, and \
-         publishing the branch is refused until the two agree: combining them is a decision for \
-         this branch's owner, never a force-push.\n\n",
+         publishing the branch is refused until the two agree. This branch's owner can then \
+         combine them in one two-parent merge, pushed to origin as a fast-forward and taken into \
+         the store, which rebases, drops and force-pushes nothing:\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{action:\"merge-origin\"}}}}]}})\n```\n\n",
         capitalized(&drift.describe(chrono::Utc::now()))
     )
 }
@@ -1252,8 +1253,10 @@ fn render_conflicted_name(assessment: &crate::jj::ConflictedNameAssessment) -> S
         }
         crate::jj::ConflictedNameOutlook::Refused(refusal) => out.push_str(&format!(
             "\n**Not settleable automatically:** {}. Choosing one version would silently drop \
-             the other's commits, so the store will not. A maintainer can combine them with one \
-             of these orderings, run against the store:\n\n```sh\n{}\n```\n\n",
+             the other's commits, so the store will not. When one version is origin's copy of \
+             the branch, this node can combine them in one two-parent merge, pushed to origin as \
+             a fast-forward and taken into the store, which rebases and drops nothing:\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{action:\"merge-origin\"}}}}]}})\n```\n\nOtherwise a maintainer can combine them with one of these orderings, run against the \
+             store:\n\n```sh\n{}\n```\n\n",
             refusal.reason,
             refusal.commands.join("\n")
         )),

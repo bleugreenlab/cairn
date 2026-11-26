@@ -58,6 +58,10 @@ enum RebaseAction<'a> {
     FastForwardFromOrigin {
         base: bool,
     },
+    /// Combine this node's branch with origin's diverged copy in one
+    /// two-parent merge, pushed to origin as a fast-forward and then taken
+    /// into the store (`base_advance::merge_origin_into_branch`).
+    MergeOrigin,
     /// The bounded managed retry of a recovery fence's targeted repair
     /// (`orchestrator/branch_recovery.rs`), brought forward.
     Repair,
@@ -110,16 +114,25 @@ fn parse_rebase_action(payload: &serde_json::Value) -> Result<RebaseAction<'_>, 
     }
     if !matches!(
         action,
-        "replay" | "fast-forward-from-origin" | "repair" | "regenerate"
+        "replay" | "fast-forward-from-origin" | "merge-origin" | "repair" | "regenerate"
     ) {
         return Err(format!(
-            "payload.action must be 'replay', 'fast-forward-from-origin', 'repair', 'regenerate', 'rebuild', 'catch-up-mode', 'mark-reviewed' or 'dismiss-acceptance', got '{action}'"
+            "payload.action must be 'replay', 'fast-forward-from-origin', 'merge-origin', 'repair', 'regenerate', 'rebuild', 'catch-up-mode', 'mark-reviewed' or 'dismiss-acceptance', got '{action}'"
         ));
     }
     if let Some(key) = present_key(payload, &DISMISSAL_KEYS) {
         return Err(format!(
             "payload.{key} applies only to action:'dismiss-acceptance'"
         ));
+    }
+    if action == "merge-origin" {
+        if let Some(key) = present_key(payload, &REPLAY_AND_FAST_FORWARD_KEYS) {
+            return Err(format!(
+                "payload.{key} does not apply to action:'merge-origin', which merges origin's \
+                 copy of this node's own branch into the store's and takes nothing else"
+            ));
+        }
+        return Ok(RebaseAction::MergeOrigin);
     }
     if action == "regenerate" {
         if let Some(key) = present_key(payload, &REPLAY_AND_FAST_FORWARD_KEYS) {
@@ -228,29 +241,30 @@ fn parse_dismissal(payload: &serde_json::Value) -> Result<Dismissal<'_>, String>
     })
 }
 
-/// Only the node that owns the branch may dismiss its debt: the agent closest
-/// to the work, or a task it delegated (which runs under the same job). A
-/// foreign node, or a request from no run at all, is refused; there is no
-/// separate operator path here.
+/// Only the node that owns the branch may dismiss its debt or publish a merge
+/// onto it: the agent closest to the work, or a task it delegated (which runs
+/// under the same job). A foreign node, or a request from no run at all, is
+/// refused; there is no separate operator path here. `act` names the request
+/// in the refusal ("dismissing an acceptance").
 async fn authorize_branch_owner(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     owner_job_id: &str,
+    act: &str,
 ) -> Result<(), String> {
     let (ctx, _) = crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request)
         .await
         .map_err(|_| {
-            "Unauthorized: dismissing an acceptance is the repair of the node that owns the \
-             branch, and this request comes from no agent run. Ask that node to send it."
-                .to_string()
+            format!(
+                "Unauthorized: {act} is the repair of the node that owns the branch, and this \
+                 request comes from no agent run. Ask that node to send it."
+            )
         })?;
     if ctx.job_id != owner_job_id {
-        return Err(
-            "Unauthorized: only the node that owns this branch, or a task it delegated, may \
-             dismiss its acceptances; this request comes from a different node. Nothing was \
-             changed."
-                .to_string(),
-        );
+        return Err(format!(
+            "Unauthorized: {act} is for the node that owns this branch, or a task it \
+             delegated; this request comes from a different node. Nothing was changed."
+        ));
     }
     Ok(())
 }
@@ -1206,7 +1220,7 @@ async fn dispatch_action(
 
             match action {
                 RebaseAction::DismissAcceptance(dismissal) => {
-                    authorize_branch_owner(orch, request, &rows.job_id)
+                    authorize_branch_owner(orch, request, &rows.job_id, "dismissing an acceptance")
                         .await
                         .map_err(|error| build_failure(index, item, error))?;
                     dismiss_acceptance(orch, &db, project, &branch, &dismissal, dry_run)
@@ -1269,6 +1283,37 @@ async fn dispatch_action(
                             orch,
                             &project_id,
                             &target,
+                        )
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?
+                    }
+                }
+                RebaseAction::MergeOrigin => {
+                    authorize_branch_owner(
+                        orch,
+                        request,
+                        &rows.job_id,
+                        "merging origin's copy into a branch",
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                    if dry_run {
+                        format!(
+                            "Would merge origin's copy of `{branch}` into the store's with one \
+                             two-parent merge, push it to origin as a fast-forward, and take it \
+                             into the store"
+                        )
+                    } else {
+                        let project_id = crate::mcp::handlers::run_context::project_id_by_key(
+                            &orch.db.local,
+                            project,
+                        )
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                        crate::orchestrator::base_advance::merge_origin_into_branch(
+                            orch,
+                            &project_id,
+                            &branch,
                         )
                         .await
                         .map_err(|error| build_failure(index, item, error))?
@@ -2272,8 +2317,13 @@ mod tests {
             .unwrap(),
             RebaseAction::FastForwardFromOrigin { base: true }
         );
+        assert_eq!(
+            parse_rebase_action(&serde_json::json!({"action": "merge-origin"})).unwrap(),
+            RebaseAction::MergeOrigin
+        );
         for (payload, expected) in [
-            (serde_json::json!({"action": "undo"}), "payload.action must be 'replay', 'fast-forward-from-origin', 'repair', 'regenerate', 'rebuild', 'catch-up-mode', 'mark-reviewed' or 'dismiss-acceptance', got 'undo'"),
+            (serde_json::json!({"action": "undo"}), "payload.action must be 'replay', 'fast-forward-from-origin', 'merge-origin', 'repair', 'regenerate', 'rebuild', 'catch-up-mode', 'mark-reviewed' or 'dismiss-acceptance', got 'undo'"),
+            (serde_json::json!({"action": "merge-origin", "branch": "base"}), "payload.branch does not apply to action:'merge-origin', which merges origin's copy of this node's own branch into the store's and takes nothing else"),
             (serde_json::json!({"action": "replay", "branch": "base"}), "payload.branch applies only to fast-forward-from-origin"),
             (serde_json::json!({"action": "replay", "resolution": "ours"}), "payload.resolution must be 'take-committed-tip' when provided"),
             (serde_json::json!({"action": "replay", "cancel_holding_batch": "yes"}), "payload.cancel_holding_batch is true or false"),

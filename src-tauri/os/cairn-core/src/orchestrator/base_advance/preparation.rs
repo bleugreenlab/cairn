@@ -886,14 +886,22 @@ pub(crate) async fn held_by_parent_conflict(
 ///
 /// Every preparation is reported to the merge attempt whose task it runs on,
 /// if any (`pr_data::actions::merge_metrics`); elsewhere the report is a no-op.
+///
+/// A carry this installs is published when an open remote pull request needs
+/// the branch on origin ([`super::publish_carried_branch`]), once every guard
+/// and the preparation's own reservation are released. A caller that passed
+/// its own reservation (a landing) publishes what it lands itself. A failed
+/// publication is a warning on the prepared branch, never a refusal of the
+/// carry, which is already installed.
 pub(crate) async fn prepare_branch(
     orch: &Orchestrator,
     request: PreparationRequest,
 ) -> Result<PreparedBranch, PreparationRefusal> {
     use crate::pr_data::actions::merge_metrics::{note_preparation, PreparationNote};
     let branch = request.branch.clone();
+    let caller_reserved = request.reservation.is_some();
     let started = std::time::Instant::now();
-    let result = prepare_branch_unobserved(orch, request).await;
+    let mut result = prepare_branch_unobserved(orch, request).await;
     let note = match &result {
         Ok(prepared) => PreparationNote::Prepared {
             head_before: &prepared.head_before,
@@ -906,6 +914,25 @@ pub(crate) async fn prepare_branch(
         },
     };
     note_preparation(&branch, started.elapsed(), note);
+    if let Ok(prepared) = result.as_mut() {
+        if prepared.advanced && !caller_reserved {
+            if let Err(error) = super::publish_carried_branch(
+                orch,
+                &prepared.project_id,
+                &prepared.relationship.owner_job_id,
+                &prepared.store,
+                &prepared.branch,
+            )
+            .await
+            {
+                log::warn!("the carried `{branch}` was not published: {error}");
+                prepared.warnings.push(format!(
+                    "`{branch}` was carried onto its base, but an open pull request needs it on \
+                     origin and publishing it failed: {error}"
+                ));
+            }
+        }
+    }
     result
 }
 
