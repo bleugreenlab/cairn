@@ -12,14 +12,22 @@
 //! needs a database. Which entry a URI resolves to is decided once, by
 //! cairn-core's resolver, and both readers consume that one answer: an agent
 //! receives [`render_references_block`] appended to its delivered message, and
-//! the transcript renders the same [`References`] from a read-only invoke
-//! command. Neither reader re-derives an entry, so they cannot disagree.
+//! the transcript shows one URI's [`ReferenceEntry`] in the hover card of its
+//! address chip, from a read-only invoke command. Neither reader re-derives an
+//! entry, so they cannot disagree.
+//!
+//! The agent's block carries only what the agent cannot cheaply get or would
+//! otherwise mis-paraphrase. Quotations keep the cited words verbatim, which is
+//! the block's purpose; a preview is one line (kind, title, status) because the
+//! agent can read the URI for more; a file is left out, since its path is
+//! already in the message text. The transcript's card shows the whole entry.
 //!
 //! The bounds are part of the contract, because the block rides in prompts
 //! under the launch lock: at most [`MAX_REFERENCE_ENTRIES`] entries with a
 //! count of the rest, a quotation cut at [`QUOTATION_CHARS`] with the URI that
-//! holds the remainder, and no recursion, since an earlier block or a quoted
-//! passage is never itself scanned for references.
+//! holds the remainder, a preview's title cut at [`PREVIEW_TITLE_CHARS`], and
+//! no recursion, since an earlier block or a quoted passage is never itself
+//! scanned for references.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +44,10 @@ pub const MAX_REFERENCE_ENTRIES: usize = 8;
 /// How much of a quoted passage the block carries before it elides the rest and
 /// points at the URI that holds it.
 pub const QUOTATION_CHARS: usize = 600;
+
+/// How much of a preview's title the agent's block carries. Issue titles here
+/// often run past 250 characters, and the agent can read the URI for the rest.
+pub const PREVIEW_TITLE_CHARS: usize = 120;
 
 /// What one cited URI means to a reader who has not opened it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,18 +202,22 @@ fn split_line_suffix(path: &str) -> (&str, Option<String>) {
 ///
 /// Shaped like the affordance block every resource read ends with: a `##`
 /// heading, then one list item per entry whose link is the URI it explains.
-/// `stamp` renders an epoch-seconds instant in the reader's local time.
+/// `stamp` renders an epoch-seconds instant in the reader's local time. A
+/// file entry renders nothing; the agent's resolution leaves files out before
+/// the cap so they do not take an entry's place.
 pub fn render_references_block(
     references: &References,
     stamp: &dyn Fn(i64) -> Option<String>,
 ) -> Option<String> {
-    if references.entries.is_empty() {
+    let rendered: String = references
+        .entries
+        .iter()
+        .map(|entry| render_entry(entry, stamp))
+        .collect();
+    if rendered.is_empty() {
         return None;
     }
-    let mut out = format!("{REFERENCES_HEADING}\n\n");
-    for entry in &references.entries {
-        out.push_str(&render_entry(entry, stamp));
-    }
+    let mut out = format!("{REFERENCES_HEADING}\n\n{rendered}");
     if references.more > 0 {
         let noun = if references.more == 1 {
             "reference"
@@ -260,26 +276,25 @@ fn render_entry(entry: &ReferenceEntry, stamp: &dyn Fn(i64) -> Option<String>) -
             resource,
             title,
             status,
-            line,
-            at,
+            ..
         } => {
-            let mut facts = vec![title.clone()];
+            let mut facts = vec![bounded_title(title)];
             facts.extend(status.clone());
-            if let Some(moved) = at.and_then(stamp) {
-                facts.push(format!("moved {moved}"));
-            }
             let kind = kind_word(resource);
-            let mut out = format!("- [{kind}]({uri}): {}\n", facts.join(" · "));
-            if let Some(line) = line {
-                out.push_str(&format!("  {line}\n"));
-            }
-            out
+            format!("- [{kind}]({uri}): {}\n", facts.join(" · "))
         }
-        ReferenceEntry::File { uri, path, lines } => match lines {
-            Some(lines) => format!("- [file]({uri}): {path}, {lines}\n"),
-            None => format!("- [file]({uri}): {path}\n"),
-        },
+        ReferenceEntry::File { .. } => String::new(),
     }
+}
+
+/// A preview title on one line, cut at [`PREVIEW_TITLE_CHARS`] with an ellipsis.
+fn bounded_title(title: &str) -> String {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.chars().count() <= PREVIEW_TITLE_CHARS {
+        return title;
+    }
+    let cut: String = title.chars().take(PREVIEW_TITLE_CHARS - 1).collect();
+    format!("{}…", cut.trim_end())
 }
 
 #[cfg(test)]
@@ -350,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn the_block_quotes_previews_and_counts_the_rest() {
+    fn the_block_quotes_verbatim_previews_in_one_line_and_names_no_file() {
         let references = References {
             entries: vec![
                 ReferenceEntry::Quotation {
@@ -385,12 +400,38 @@ mod tests {
              \x20 >\n\
              \x20 > Second.\n\
              \x20 > … (elided; read cairn://p/cairn/execution/chat/turn/3 for the rest)\n\
-             - [Issue details](cairn://p/cairn/7): Fix it · active · moved T9\n\
-             \x20 Why it matters.\n\
-             - [file](file:a.rs:3): a.rs, line 3\n\
+             - [Issue details](cairn://p/cairn/7): Fix it · active\n\
              - and 2 more references not shown"
         );
         assert!(render_references_block(&References::default(), &stamp).is_none());
+        let only_files = References {
+            entries: vec![file_reference("file:a.rs").unwrap()],
+            more: 0,
+        };
+        assert!(render_references_block(&only_files, &stamp).is_none());
+    }
+
+    #[test]
+    fn a_long_preview_title_is_cut_to_one_bounded_line() {
+        let references = References {
+            entries: vec![ReferenceEntry::Preview {
+                uri: "cairn://p/cairn/7".into(),
+                resource: "issue".into(),
+                title: format!("{}\nsecond line", "word ".repeat(60)),
+                status: Some("closed".into()),
+                line: None,
+                at: None,
+            }],
+            more: 0,
+        };
+        let block = render_references_block(&references, &stamp).unwrap();
+        let entry = block.lines().last().unwrap();
+        assert_eq!(block.lines().count(), 3, "{block}");
+        assert!(entry.ends_with("… · closed"), "{entry}");
+        let title = entry
+            .trim_start_matches("- [Issue details](cairn://p/cairn/7): ")
+            .trim_end_matches(" · closed");
+        assert!(title.chars().count() <= PREVIEW_TITLE_CHARS, "{title}");
     }
 
     #[test]

@@ -2,10 +2,11 @@
 //!
 //! [`cairn_common::references`] defines what an entry is and how a block reads;
 //! this module decides which entry a URI gets, from bounded, targeted reads of
-//! the store. Every reader of a references block comes through here: the agent
+//! the store. Every reader of a reference comes through here: the agent
 //! delivery paths append [`references_block`], and the transcript's invoke
-//! command returns [`resolve_references`] as data, so a message reads the same
-//! to the agent that received it and to the operator watching.
+//! command returns one URI's [`resolve_reference`] as data for an address
+//! chip's hover card, so a URI reads the same to the agent that received it
+//! and to the operator watching.
 //!
 //! Resolution is reference-first and fail-quiet. Each URI costs a few indexed
 //! statements, never a full resource read, because a block is built while a
@@ -48,15 +49,20 @@ const ALIAS_ARTIFACT: &str = "create-pr";
 /// The references block for `text`, rendered for an agent, or `None` when
 /// `text` names nothing that resolves.
 pub(crate) async fn references_block(orch: &Orchestrator, text: &str) -> Option<String> {
-    render_references_block(&resolve_references(orch, text).await, &|at| {
+    render_references_block(&agent_references(orch, text).await, &|at| {
         crate::clock::stamp(at)
     })
 }
 
-/// Every entry `text`'s distinct URIs resolve to, in first-appearance order,
-/// capped at [`MAX_REFERENCE_ENTRIES`] with the remainder counted.
-pub async fn resolve_references(orch: &Orchestrator, text: &str) -> References {
-    let uris = reference_uris(text);
+/// The entries an agent's block carries for `text`'s distinct URIs, in
+/// first-appearance order, capped at [`MAX_REFERENCE_ENTRIES`] with the
+/// remainder counted. `file:` URIs are left out before the cap: the path is
+/// already in the text, so an entry for it tells the agent nothing.
+async fn agent_references(orch: &Orchestrator, text: &str) -> References {
+    let uris: Vec<String> = reference_uris(text)
+        .into_iter()
+        .filter(|uri| !uri.starts_with("file:"))
+        .collect();
     if uris.is_empty() {
         return References::default();
     }

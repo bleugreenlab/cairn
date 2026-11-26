@@ -156,7 +156,7 @@ async fn a_long_turn_is_elided_and_its_own_references_are_not_expanded() {
     );
     let orch = fixture("references-turn-long.db", &[&[("user", long.as_str())]]).await;
     let text = format!("Quoting {TURN} here.");
-    let references = resolve_references(&orch, &text).await;
+    let references = agent_references(&orch, &text).await;
     assert_eq!(references.entries.len(), 1, "{references:?}");
     let (_, _, _, quoted, elided) = quotation(&references.entries[0]);
     assert!(elided);
@@ -173,13 +173,13 @@ async fn a_long_turn_is_elided_and_its_own_references_are_not_expanded() {
 }
 
 #[tokio::test]
-async fn previews_name_the_issue_node_thread_and_comment_in_one_line() {
+async fn previews_name_the_issue_node_thread_and_comment_and_leave_files_out() {
     let orch = fixture("references-previews.db", &[]).await;
     let text = format!(
-        "cairn://p/proj/2, {NODE}, cairn://p/proj/execution, cairn://p/proj/2/comments/1, \
-         file:src/lib.rs:12 and cairn://p/proj/2 again."
+        "cairn://p/proj/2, {NODE}, file:src/lib.rs:12, cairn://p/proj/execution, \
+         cairn://p/proj/2/comments/1 and cairn://p/proj/2 again."
     );
-    let references = resolve_references(&orch, &text).await;
+    let references = agent_references(&orch, &text).await;
     assert_eq!(
         references.entries,
         vec![
@@ -215,14 +215,34 @@ async fn previews_name_the_issue_node_thread_and_comment_in_one_line() {
                 text: "Looks right to me.".into(),
                 elided: false,
             },
-            ReferenceEntry::File {
-                uri: "file:src/lib.rs:12".into(),
-                path: "src/lib.rs".into(),
-                lines: Some("line 12".into()),
-            },
         ]
     );
     assert_eq!(references.more, 0);
+
+    // The agent reads each preview as one line, and the quotation verbatim.
+    let block = references_block(&orch, &text).await.unwrap();
+    assert_eq!(
+        block,
+        format!(
+            "## References\n\n\
+             - [Issue details](cairn://p/proj/2): Child · active\n\
+             - [Node summary](cairn://p/proj/2/1/builder): Child · running\n\
+             - [Thread](cairn://p/proj/execution): proj/execution · active\n\
+             - [Issue comment](cairn://p/proj/2/comments/1): quoted from an agent, {}\n\
+             \x20 > Looks right to me.",
+            crate::clock::stamp(70).unwrap()
+        )
+    );
+
+    // A hover card still names a file's path and range.
+    assert_eq!(
+        resolve_reference(&orch, "file:src/lib.rs:12").await,
+        Some(ReferenceEntry::File {
+            uri: "file:src/lib.rs:12".into(),
+            path: "src/lib.rs".into(),
+            lines: Some("line 12".into()),
+        })
+    );
 }
 
 /// A check observation stores `ran_at` in epoch milliseconds, the way the
@@ -272,11 +292,22 @@ async fn an_unresolvable_uri_gets_no_entry_and_the_cap_counts_the_rest() {
         .await
         .is_none());
 
-    let files: Vec<String> = (1..=11).map(|n| format!("file:src/f{n}.rs")).collect();
-    let text = format!("cairn://p/proj/99 {}", files.join(" "));
-    let references = resolve_references(&orch, &text).await;
+    for number in 10..21 {
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+                 VALUES(?1,'p',?2,'Sibling','active','active','none',1,1)",
+                params![format!("issue-{number}"), number],
+            )
+            .await
+            .unwrap();
+    }
+    let issues: Vec<String> = (10..21).map(|n| format!("cairn://p/proj/{n}")).collect();
+    let text = format!("cairn://p/proj/99 file:src/a.rs {}", issues.join(" "));
+    let references = agent_references(&orch, &text).await;
     assert_eq!(references.entries.len(), MAX_REFERENCE_ENTRIES);
-    assert_eq!(references.entries[0].uri(), "file:src/f1.rs");
+    assert_eq!(references.entries[0].uri(), "cairn://p/proj/10");
     assert_eq!(references.more, 11 - MAX_REFERENCE_ENTRIES);
     let block = references_block(&orch, &text).await.unwrap();
     assert!(
@@ -366,9 +397,10 @@ async fn a_review_push_names_the_artifact_title_and_summary_not_its_body() {
     }
 }
 
-/// The acceptance shape: a direct message that cites a chat turn reaches its
-/// recipient as the header, the content, and the reply hint, then the block
-/// quoting the turn with its author and time, with nothing pasted by the sender.
+/// The acceptance shape: a direct message that cites a chat turn, an issue and
+/// a file reaches its recipient as the header, the content, and the reply
+/// hint, then the block quoting the turn with its author and time and naming
+/// the issue in one line, with nothing pasted by the sender and no file entry.
 #[tokio::test]
 async fn a_direct_message_citing_a_turn_delivers_the_quoted_words_after_the_reply_hint() {
     use crate::orchestrator::attention_delivery::render_push_resolved;
@@ -385,7 +417,9 @@ async fn a_direct_message_citing_a_turn_delivers_the_quoted_words_after_the_repl
         .execute(
             "INSERT INTO messages(id,channel_type,channel_id,sender_run_id,sender_name,content,created_at)
              VALUES('m-1','direct',NULL,NULL,'cairn://p/proj/execution',?1,5)",
-            params![format!("The operator ruled in {TURN}; plan around it.")],
+            params![format!(
+                "The operator ruled in {TURN} on cairn://p/proj/2; see file:src/lib.rs:12."
+            )],
         )
         .await
         .unwrap();
@@ -404,11 +438,12 @@ async fn a_direct_message_citing_a_turn_delivers_the_quoted_words_after_the_repl
     let reply = "(Reply with write {target:\"cairn://p/proj/execution/messages\", mode:\"append\", payload:{content}}.)";
     let stamp = crate::clock::stamp(100).unwrap();
     let expected_tail = format!(
-        "[Direct message from cairn://p/proj/execution] The operator ruled in {TURN}; plan around it.\n\
+        "[Direct message from cairn://p/proj/execution] The operator ruled in {TURN} on cairn://p/proj/2; see file:src/lib.rs:12.\n\
          {reply}\n\n\
          ## References\n\n\
          - [Transcript turn]({TURN}): quoted from the operator, {stamp}\n\
-         \x20 > Hold the lease change until Monday."
+         \x20 > Hold the lease change until Monday.\n\
+         - [Issue details](cairn://p/proj/2): Child · active"
     );
     assert!(rendered.ends_with(&expected_tail), "{rendered}");
 }
