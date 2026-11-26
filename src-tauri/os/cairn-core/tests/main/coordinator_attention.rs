@@ -738,10 +738,10 @@ async fn a_thread_filing_on_an_unparented_issue_hears_its_plan_gate() {
         !written.contains("\"failures\":[{"),
         "the plan is written: {written}"
     );
-    db.execute_script(format!(
+    db.execute_script(
         "UPDATE turns SET state='complete', ended_at=2, updated_at=2 WHERE id='planner-turn';
-         UPDATE runs SET status='complete' WHERE id='planner-run';"
-    ))
+         UPDATE runs SET status='complete' WHERE id='planner-run';",
+    )
     .await
     .unwrap();
     cairn_core::internal::execution::advancement::recompute_job(&orch, &planner).unwrap();

@@ -10114,6 +10114,10 @@ pub struct LearnedResourceEstimate {
 /// reported is the leader's, as it was. What a runner gets wrong talking to an
 /// older executor: nothing it can read off the wire; that executor's commands
 /// never complete, which is why no protocol 179 Windows executor is published.
+///
+/// cairn/7639 does not move the number. It adds a lint allowance to the
+/// executor's leader-exit match and changes no code path, frame, or field, so
+/// an older executor sends and reads exactly what a newer one does.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 179;
 
 /// The version `build.rs` derived from the paragraphs above

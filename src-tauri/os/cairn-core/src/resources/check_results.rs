@@ -1315,7 +1315,7 @@ mod tests {
     /// A failed main-cadence ledger row, which also enqueues its incident source.
     async fn seed_held_observation(orch: &Orchestrator) {
         let db = orch.db.for_project("proj").await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO check_result_observations
                (id,public_handle,project_id,commit_sha,tree_hash,check_name,input_hash,
                 environment_fingerprint,exit_code,verdict,complete,reusable,parser_version,

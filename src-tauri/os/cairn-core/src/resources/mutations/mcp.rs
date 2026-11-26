@@ -838,7 +838,7 @@ mod tests {
         let in_flight = withdrawal_epoch(&config_dir, ToolScope::Workspace, "plain").unwrap();
 
         // The retry succeeds, then an identical definition is re-added.
-        remove_server(&orch, &request, McpWriteScope::Workspace, "plain")
+        let _ = remove_server(&orch, &request, McpWriteScope::Workspace, "plain")
             .await
             .unwrap();
         assert!(!mcp_servers::load_workspace_mcp_servers(&config_dir).contains_key("plain"));

@@ -391,7 +391,7 @@ enum Removed {
     Nothing,
     /// A record was there but could not be parsed, so its tokens are unknown.
     Unreadable,
-    Auth(StoredAuth),
+    Auth(Box<StoredAuth>),
 }
 
 /// Tombstone `server` under the mutation lock, returning the record it held,
@@ -404,7 +404,9 @@ fn remove(server: &str) -> Result<Removed, String> {
         Current::Absent | Current::Tombstone(_) => return Ok(Removed::Nothing),
         Current::Unavailable(e) => return Err(e.clone()),
         Current::Corrupt => Removed::Unreadable,
-        Current::Witnessed(auth, _) | Current::Legacy(auth) => Removed::Auth(auth.clone()),
+        Current::Witnessed(auth, _) | Current::Legacy(auth) => {
+            Removed::Auth(Box::new(auth.clone()))
+        }
     };
     let tombstone = next_generation(server, &current)?;
     write_entry(
