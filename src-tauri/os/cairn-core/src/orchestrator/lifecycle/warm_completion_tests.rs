@@ -275,6 +275,7 @@ async fn user_stop_pauses_codex_goal_before_worst_order_idle_and_resumes_same_ba
         &content,
         "session-stop",
         None,
+        cairn_models::interface::session::InputAuthor::Operator,
     )
     .expect("an explicit admitted message should reactivate the paused goal");
 

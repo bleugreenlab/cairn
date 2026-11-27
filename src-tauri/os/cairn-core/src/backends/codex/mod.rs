@@ -876,6 +876,7 @@ fn send_app_server_user_message(
         content: &crate::agent_process::stdin::MessageContent::text(content),
         session_id: "session-1",
         parent_tool_use_id: None,
+        author: cairn_models::interface::session::InputAuthor::Operator,
     })
 }
 

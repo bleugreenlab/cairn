@@ -204,6 +204,16 @@ fn interrupt_context_durable_markers() {
 }
 
 #[test]
+fn synthetic_input_attribution() {
+    pass(cases::synthetic_input_attribution());
+}
+
+#[test]
+fn mixed_author_lines_run_as_separate_turns() {
+    pass(cases::mixed_author_lines_run_as_separate_turns());
+}
+
+#[test]
 fn interrupt_context_mixed_siblings() {
     pass(cases::interrupt_context_mixed_siblings());
 }

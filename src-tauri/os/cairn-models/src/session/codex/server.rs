@@ -1121,6 +1121,7 @@ mod tests {
                 content: &MessageContent::text("again"),
                 session_id: "session-1",
                 parent_tool_use_id: None,
+                author: crate::interface::session::InputAuthor::Cairn,
             })
             .unwrap();
         let requests = requests.lock().unwrap();

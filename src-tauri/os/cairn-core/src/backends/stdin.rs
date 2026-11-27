@@ -7,7 +7,7 @@
 use crate::agent_process::process::{
     AgentProcessState, GoalPauseClaim, PauseIntent, SessionControl,
 };
-use cairn_models::interface::session::{InterruptCause, SessionInput};
+use cairn_models::interface::session::{InputAuthor, InterruptCause, SessionInput};
 
 /// Lock a run's control and goal claim, then call `f` with them.
 fn with_session_control<T, F>(
@@ -131,19 +131,21 @@ pub(crate) fn provider_serves_turn(
     .flatten()
 }
 
-/// Send a user message to a running agent process.
+/// Send a user message to a running agent process, speaking for `author`.
 pub(crate) fn send_user_message(
     process_state: &AgentProcessState,
     run_id: &str,
     content: &crate::agent_process::stdin::MessageContent,
     session_id: &str,
     parent_tool_use_id: Option<&str>,
+    author: InputAuthor,
 ) -> Result<(), String> {
     with_session_control(process_state, run_id, |control, _claim| {
         control.send(&SessionInput {
             content,
             session_id,
             parent_tool_use_id,
+            author,
         })
     })
 }

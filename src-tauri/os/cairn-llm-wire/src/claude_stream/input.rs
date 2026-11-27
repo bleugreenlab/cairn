@@ -41,15 +41,20 @@ pub fn build_message_content(content: &MessageContent) -> Result<Value, String> 
 }
 
 /// Send a user message to Claude via stdin using pre-resolved native parts.
+///
+/// A `synthetic` message carries `isSynthetic: true`, which tells the CLI it
+/// is not the user's own words; an unmarked line keeps the plain shape, which
+/// the CLI reads as the user's.
 pub fn send_user_message(
     stdin: &mut dyn Write,
     session_id: &str,
     content: &MessageContent,
     parent_tool_use_id: Option<&str>,
+    synthetic: bool,
 ) -> Result<(), String> {
     let message_content = build_message_content(content)?;
 
-    let message = json!({
+    let mut message = json!({
         "type": "user",
         "message": {
             "role": "user",
@@ -58,6 +63,9 @@ pub fn send_user_message(
         "session_id": session_id,
         "parent_tool_use_id": parent_tool_use_id
     });
+    if synthetic {
+        message["isSynthetic"] = Value::Bool(true);
+    }
 
     writeln!(stdin, "{}", message).map_err(|e| format!("Failed to write to stdin: {}", e))?;
     stdin

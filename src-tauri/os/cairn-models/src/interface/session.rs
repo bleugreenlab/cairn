@@ -519,6 +519,17 @@ pub struct LaunchedSession {
     pub facts: SessionFacts,
 }
 
+/// Who a message to a live session speaks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputAuthor {
+    /// The operator's own words.
+    Operator,
+    /// Everything else: text Cairn composes, and peer messages and notices it
+    /// relays. A provider that can tell the model so marks it as not the
+    /// user's.
+    Cairn,
+}
+
 /// One user message to a live session.
 #[derive(Debug, Clone, Copy)]
 pub struct SessionInput<'a> {
@@ -526,6 +537,7 @@ pub struct SessionInput<'a> {
     /// Cairn's session id.
     pub session_id: &'a str,
     pub parent_tool_use_id: Option<&'a str>,
+    pub author: InputAuthor,
 }
 
 /// A live session's one writer, shared by everything that talks to it. Empty

@@ -781,7 +781,7 @@ fn empty_message_is_refused_by_both_serializers_and_never_reaches_stdin() {
         assert!(build_codex_input(&content).is_err());
 
         let mut buffer = Cursor::new(Vec::new());
-        assert!(send_user_message(&mut buffer, "session-123", &content, None).is_err());
+        assert!(send_user_message(&mut buffer, "session-123", &content, None, false).is_err());
         assert!(
             buffer.into_inner().is_empty(),
             "a refused message must not be written"
@@ -814,6 +814,7 @@ fn test_send_user_message() {
         "session-123",
         &MessageContent::text("Hello, Claude!"),
         None,
+        false,
     )
     .unwrap();
 
@@ -824,6 +825,30 @@ fn test_send_user_message() {
     assert_eq!(parsed["message"]["role"], "user");
     assert_eq!(parsed["message"]["content"], "Hello, Claude!");
     assert!(parsed["parent_tool_use_id"].is_null());
+    assert!(
+        parsed.get("isSynthetic").is_none(),
+        "the user's own line keeps the plain shape"
+    );
+}
+
+#[test]
+fn a_synthetic_user_message_is_marked() {
+    let mut buffer = Cursor::new(Vec::new());
+
+    send_user_message(
+        &mut buffer,
+        "session-123",
+        &MessageContent::text("[Direct message from a peer]"),
+        None,
+        true,
+    )
+    .unwrap();
+
+    let parsed = parse_buffer(buffer);
+
+    assert_eq!(parsed["type"], "user");
+    assert_eq!(parsed["isSynthetic"], true);
+    assert_eq!(parsed["message"]["content"], "[Direct message from a peer]");
 }
 
 #[test]
@@ -835,6 +860,7 @@ fn test_send_user_message_with_parent_tool_use_id() {
         "session-456",
         &MessageContent::text("Subagent message"),
         Some("toolu_abc123"),
+        false,
     )
     .unwrap();
 

@@ -16,9 +16,9 @@ use serde_json::json;
 pub use crate::claude::api_key::API_KEY_ENV;
 use crate::claude::tokens::OAUTH_TOKEN_ENV;
 use crate::interface::session::{
-    ApprovalMode, ClaudeMode, Cli, LaunchedSession, ProviderSpec, SecretEnv, SessionControl,
-    SessionError, SessionEvents, SessionFacts, SessionHost, SessionInput, SessionProvider,
-    SessionSpec, SessionStart,
+    ApprovalMode, ClaudeMode, Cli, InputAuthor, LaunchedSession, ProviderSpec, SecretEnv,
+    SessionControl, SessionError, SessionEvents, SessionFacts, SessionHost, SessionInput,
+    SessionProvider, SessionSpec, SessionStart,
 };
 use crate::wire::claude_stream;
 use crate::wire::MessageContent;
@@ -389,6 +389,7 @@ impl SessionControl for ClaudeControl {
             input.session_id,
             input.content,
             input.parent_tool_use_id,
+            input.author != InputAuthor::Operator,
         )
     }
 
@@ -727,6 +728,7 @@ mod tests {
                 content: &MessageContent::text("again"),
                 session_id: "session-1",
                 parent_tool_use_id: None,
+                author: InputAuthor::Operator,
             })
             .unwrap();
         control
@@ -741,6 +743,26 @@ mod tests {
         assert_eq!(sent[1]["session_id"], "session-1");
         assert!(sent[1].get("parent_tool_use_id").is_some());
         assert_eq!(sent[2]["request"]["subtype"], "interrupt");
+    }
+
+    /// Only the operator's own words reach the CLI unmarked.
+    #[test]
+    fn a_message_not_from_the_operator_is_sent_synthetic() {
+        let shared = Shared::default();
+        let mut control = ClaudeControl::new(Box::new(shared.clone()));
+        for author in [InputAuthor::Operator, InputAuthor::Cairn] {
+            control
+                .send(&SessionInput {
+                    content: &MessageContent::text("words"),
+                    session_id: "session-1",
+                    parent_tool_use_id: None,
+                    author,
+                })
+                .unwrap();
+        }
+        let sent = lines(&shared);
+        assert!(sent[0].get("isSynthetic").is_none());
+        assert_eq!(sent[1]["isSynthetic"], true);
     }
 
     #[test]

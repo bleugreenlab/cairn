@@ -1985,3 +1985,194 @@ pub fn interrupt_context_mixed_siblings() -> CaseResult {
     }
     Ok(())
 }
+
+/// The model id Cairn runs agents on: Opus at or past 4.8, where the CLI
+/// attributes an unmarked stream-json user message to the user.
+const SYNTHETIC_MODEL: &str = "claude-opus-5-5";
+/// What the pinned CLI puts ahead of a message sent with `isSynthetic: true`,
+/// in the same user text block. Measured on 2.1.332 under Cairn's launch
+/// environment (nonessential traffic off), mid-turn and between turns alike.
+pub const NON_USER_PREFIX: &str = "[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT]\n";
+const SYNTHETIC_CANARY: &str = "SYNTHETIC-canary-7e21";
+const RUN_WAIT: &str = r#"{"commands":[{"waitFor":{"duration":"3m"}}]}"#;
+
+/// A session on [`SYNTHETIC_MODEL`] with a turn behind it (`mid_turn`: one
+/// still holding a tool call open, released by the returned gate).
+fn synthetic_session(
+    c: Check,
+    env: &ContractEnv,
+    mid_turn: bool,
+) -> Result<(Session, Option<crate::fake_messages::McpResponseGate>), CaseFailure> {
+    let mut session = launch(c, env, Launch::new().model(SYNTHETIC_MODEL))?;
+    if !mid_turn {
+        session.ok_turn(c, "Say hello.")?;
+        return Ok((session, None));
+    }
+    let gate = env.mcp.hold_next_response(MCP_TOOL_TEXT);
+    env.fake.queue([Mode::Tool {
+        name: "mcp__cairn__run",
+        args: RUN_WAIT,
+    }]);
+    c.ok(session.turn("Run the host wait."), "starting the turn")?;
+    c.ok(gate.wait(), "holding the tool call open")?;
+    Ok((session, Some(gate)))
+}
+
+/// Read results until the session has produced `count` of them.
+fn results_until(c: Check, session: &mut Session, count: usize) -> CaseResult {
+    let seen = |session: &Session| {
+        session
+            .frames
+            .iter()
+            .filter(|frame| frame.kind() == "result")
+            .count()
+    };
+    while seen(session) < count {
+        session.result(c)?;
+    }
+    Ok(())
+}
+
+/// The last user text the model was sent in `body`.
+fn last_user_text(body: &Value) -> Option<String> {
+    let last = body["messages"].as_array()?.last()?;
+    if last["role"] != "user" {
+        return None;
+    }
+    match &last["content"] {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(blocks) => match blocks.as_slice() {
+            [block] if block["type"] == "text" => block["text"].as_str().map(str::to_string),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The Messages request that delivered the canary, sent as `author`.
+fn synthetic_delivery(
+    c: Check,
+    mid_turn: bool,
+    author: cairn_models::interface::session::InputAuthor,
+) -> Result<Value, CaseFailure> {
+    let env = c.setup(ContractEnv::new(), "creating an isolated case")?;
+    let (mut session, gate) = synthetic_session(c, &env, mid_turn)?;
+    c.ok(
+        session.send_as(SYNTHETIC_CANARY, author),
+        "sending the canary through ClaudeControl",
+    )?;
+    drop(gate);
+    // A message sent while a tool call is open is not folded into that turn:
+    // the CLI runs it as the next one.
+    results_until(c, &mut session, 2)?;
+    let request = env
+        .fake
+        .inference()
+        .into_iter()
+        .find(|served| served.body.to_string().contains(SYNTHETIC_CANARY));
+    let mut body = c
+        .some(request, "a Messages request carrying the canary")?
+        .body;
+    // Per-run noise: the session ids, and the scratch path in the environment.
+    body["metadata"] = Value::Null;
+    for message in body["messages"].as_array_mut().into_iter().flatten() {
+        if message["role"] == "system" {
+            message["content"] = Value::Null;
+        }
+    }
+    Ok(body)
+}
+
+/// Every path at which `a` and `b` differ.
+fn json_diff(path: &str, a: &Value, b: &Value, out: &mut Vec<String>) {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            for key in x.keys().chain(y.keys().filter(|key| !x.contains_key(*key))) {
+                json_diff(
+                    &format!("{path}.{key}"),
+                    x.get(key).unwrap_or(&Value::Null),
+                    y.get(key).unwrap_or(&Value::Null),
+                    out,
+                );
+            }
+        }
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
+            for (index, (p, q)) in x.iter().zip(y).enumerate() {
+                json_diff(&format!("{path}[{index}]"), p, q, out);
+            }
+        }
+        _ if a != b => out.push(path.to_string()),
+        _ => {}
+    }
+}
+
+/// `isSynthetic: true` changes exactly one thing the model is sent: the
+/// message's text gains [`NON_USER_PREFIX`]. Unmarked, it reaches the model
+/// verbatim, as the user's words.
+pub fn synthetic_input_attribution() -> CaseResult {
+    use cairn_models::interface::session::InputAuthor;
+    let c = Check("synthetic_input_attribution");
+    for mid_turn in [false, true] {
+        let plain = synthetic_delivery(c, mid_turn, InputAuthor::Operator)?;
+        let marked = synthetic_delivery(c, mid_turn, InputAuthor::Cairn)?;
+        c.that(
+            last_user_text(&plain).as_deref() == Some(SYNTHETIC_CANARY),
+            || format!("mid_turn={mid_turn}: the operator's message reached the model as {plain}"),
+        )?;
+        c.that(
+            last_user_text(&marked) == Some(format!("{NON_USER_PREFIX}{SYNTHETIC_CANARY}")),
+            || format!("mid_turn={mid_turn}: the synthetic message reached the model as {marked}"),
+        )?;
+        let mut diff = Vec::new();
+        json_diff("", &plain, &marked, &mut diff);
+        c.that(diff.len() == 1, || {
+            format!("mid_turn={mid_turn}: marking changed more than the text: {diff:?}")
+        })?;
+    }
+    Ok(())
+}
+
+/// Back-to-back lines are not merged: each runs a model turn of its own, and
+/// each keeps its own author. A message mixing authors therefore cannot be
+/// split into lines without splitting its turn.
+pub fn mixed_author_lines_run_as_separate_turns() -> CaseResult {
+    use cairn_models::interface::session::InputAuthor;
+    let c = Check("mixed_author_lines_run_as_separate_turns");
+    let parts = [
+        ("SPLIT-first-4a", InputAuthor::Cairn),
+        ("SPLIT-second-4b", InputAuthor::Operator),
+        ("SPLIT-third-4c", InputAuthor::Cairn),
+    ];
+    for mid_turn in [false, true] {
+        let env = c.setup(ContractEnv::new(), "creating an isolated case")?;
+        let (mut session, gate) = synthetic_session(c, &env, mid_turn)?;
+        for (text, author) in parts {
+            c.ok(session.send_as(text, author), "sending one line")?;
+        }
+        drop(gate);
+        results_until(c, &mut session, 1 + parts.len())?;
+        let delivered: Vec<Option<String>> = env
+            .fake
+            .inference()
+            .iter()
+            .map(|served| last_user_text(&served.body))
+            .filter(|text| {
+                text.as_deref()
+                    .is_some_and(|text| parts.iter().any(|(part, _)| text.ends_with(part)))
+            })
+            .collect();
+        let expected: Vec<Option<String>> = parts
+            .iter()
+            .map(|(text, author)| {
+                Some(match author {
+                    InputAuthor::Operator => text.to_string(),
+                    InputAuthor::Cairn => format!("{NON_USER_PREFIX}{text}"),
+                })
+            })
+            .collect();
+        c.that(delivered == expected, || {
+            format!("mid_turn={mid_turn}: each line in its own request, in order, expected {expected:?}, got {delivered:?}\n{}", session.report())
+        })?;
+    }
+    Ok(())
+}

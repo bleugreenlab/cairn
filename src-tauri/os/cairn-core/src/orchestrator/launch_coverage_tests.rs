@@ -1051,6 +1051,7 @@ async fn every_catalog_provider_launches_through_the_facet() {
                     &MessageContent::text("warm"),
                     &session,
                     None,
+                    cairn_models::interface::session::InputAuthor::Operator,
                 )
                 .unwrap();
                 crate::backends::stdin::send_interrupt(

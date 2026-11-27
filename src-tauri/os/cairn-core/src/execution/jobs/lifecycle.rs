@@ -93,6 +93,10 @@ pub(super) fn deliver_prepared_warm_continuation(
         &message_content,
         &launch.session_id,
         None,
+        continuation_author(
+            launch.origin,
+            HeldContinuation::message_of(launch.resume_json.as_deref()).as_deref(),
+        ),
     )?;
     pending_launch_turn.adopted();
     super::stale_plan::confirm_delivered(orch, turn_id, run_id);
@@ -2576,6 +2580,11 @@ impl HeldContinuation {
             },
         }
     }
+
+    /// The immediate message a prepared launch's held continuation carries.
+    fn message_of(resume_json: Option<&str>) -> Option<String> {
+        serde_json::from_str::<Self>(resume_json?).ok()?.message
+    }
 }
 
 pub(crate) fn resume_held_continuation(
@@ -4602,6 +4611,10 @@ fn continue_job_launch_locked_inner(
             &message_content,
             &session_id,
             None,
+            continuation_author(
+                continuation_origin(has_operator_queued, prompt_resume.as_ref(), &drained_pushes),
+                (!trigger.synthetic).then_some(trigger.message.as_str()),
+            ),
         )?;
         pending_launch_turn.adopted();
         let mut stdin_event = crate::resume_timing::ResumeTimingEvent::new("warm_stdin_written");
@@ -4959,6 +4972,67 @@ fn continuation_origin(
         crate::storage::LaunchOrigin::Operator
     } else {
         crate::storage::LaunchOrigin::Background
+    }
+}
+
+/// Whose words a continuation's prompt speaks for. The prompt goes to the
+/// session as one message even when it mixes the operator's text with peer
+/// messages and Cairn's notices: the Claude CLI runs every stdin line as a
+/// turn of its own, so splitting it by author would split the turn. It is the
+/// operator's when the continuation serves the operator, by its origin or by
+/// an immediate operator message, and Cairn's otherwise, so a resume woken
+/// only by peers, notices or pushes never reaches the model as the operator.
+fn continuation_author(
+    origin: crate::storage::LaunchOrigin,
+    operator_message: Option<&str>,
+) -> cairn_models::interface::session::InputAuthor {
+    use cairn_models::interface::session::InputAuthor;
+    if origin == crate::storage::LaunchOrigin::Operator
+        || operator_message.is_some_and(|message| !message.trim().is_empty())
+    {
+        InputAuthor::Operator
+    } else {
+        InputAuthor::Cairn
+    }
+}
+
+#[cfg(test)]
+mod continuation_author_tests {
+    use super::{continuation_author, HeldContinuation};
+    use crate::storage::LaunchOrigin;
+    use cairn_models::interface::session::InputAuthor;
+
+    #[test]
+    fn a_continuation_speaks_for_the_operator_only_when_it_serves_one() {
+        assert_eq!(
+            continuation_author(LaunchOrigin::Operator, None),
+            InputAuthor::Operator
+        );
+        assert_eq!(
+            continuation_author(LaunchOrigin::Background, Some("please rebase")),
+            InputAuthor::Operator
+        );
+        assert_eq!(
+            continuation_author(LaunchOrigin::Background, Some("  ")),
+            InputAuthor::Cairn
+        );
+        assert_eq!(
+            continuation_author(LaunchOrigin::Background, None),
+            InputAuthor::Cairn
+        );
+    }
+
+    #[test]
+    fn a_prepared_launch_keeps_its_held_operator_message() {
+        assert_eq!(
+            HeldContinuation::message_of(Some(
+                r#"{"cause":"addressed","operator_goal":null,"message":"rebase now","suppress_user_event":false,"suppress_self_suspend_note":false,"preclaimed_retry_turn_id":null,"preclaimed_successor_turn_id":null,"answers_open_tool_call":false,"goal_owner":null,"force_digest_reseed":false,"reseed_reason":null,"supersede_pending_retry":false}"#
+            ))
+            .as_deref(),
+            Some("rebase now")
+        );
+        assert_eq!(HeldContinuation::message_of(None), None);
+        assert_eq!(HeldContinuation::message_of(Some("not json")), None);
     }
 }
 

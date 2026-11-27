@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use cairn_models::claude::api_key::api_key_launch;
 use cairn_models::claude::tokens::{ClaudeOAuth, ClaudeSessionCredential};
 use cairn_models::interface::session::{
-    ApprovalMode, ClaudeMode, ClaudeSpec, Cli, CodexModels, PlacedFile, ProcessHandle,
+    ApprovalMode, ClaudeMode, ClaudeSpec, Cli, CodexModels, InputAuthor, PlacedFile, ProcessHandle,
     ProviderSpec, SessionControl, SessionError, SessionEvents, SessionHost, SessionInput,
     SessionProvider, SessionSpec, SessionStart,
 };
@@ -628,17 +628,22 @@ impl Session {
     /// Send a user turn the way Cairn does: the first through `open_turn`,
     /// later ones through `send`.
     pub fn turn(&mut self, text: &str) -> Result<(), String> {
-        let content = MessageContent::text(text);
         if self.opened {
-            self.control.send(&SessionInput {
-                content: &content,
-                session_id: &self.session_id,
-                parent_tool_use_id: None,
-            })
+            self.send_as(text, InputAuthor::Operator)
         } else {
             self.opened = true;
-            self.control.open_turn(&content)
+            self.control.open_turn(&MessageContent::text(text))
         }
+    }
+
+    /// Send a message to the opened session through `send`, as `author`.
+    pub fn send_as(&mut self, text: &str, author: InputAuthor) -> Result<(), String> {
+        self.control.send(&SessionInput {
+            content: &MessageContent::text(text),
+            session_id: &self.session_id,
+            parent_tool_use_id: None,
+            author,
+        })
     }
 
     /// Read until `stop` holds for a frame, at most `timeout`.

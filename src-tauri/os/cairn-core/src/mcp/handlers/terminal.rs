@@ -5052,6 +5052,7 @@ fn send_terminal_exit_context(
         &crate::agent_process::stdin::MessageContent::text(&content),
         session_id,
         None,
+        cairn_models::interface::session::InputAuthor::Cairn,
     ) {
         Ok(()) => {
             log::info!(
