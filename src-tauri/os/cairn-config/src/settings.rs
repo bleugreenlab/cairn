@@ -473,7 +473,7 @@ pub struct SettingsFile {
     /// `~` is expanded to the user's home. Absent = the conservative built-in
     /// default (cloud cred stores, ssh/gpg keys, `~/.cairn[-dev]`). See
     /// `docs/worktree-fence.md`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     sandbox_deny_read: Option<Vec<String>>,
     /// Cairn's own MCP endpoint as agents reach it. Config-only (YAML, not in
     /// the Settings DTO); preserved across saves.
@@ -1613,7 +1613,10 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "repoTargetSweepDays",
     "bugReports",
     "thinkingDisplayMode",
+    "transcriptTextSize",
+    "transcriptDensity",
     "logLevel",
+    "logRetentionDays",
     "memoryReviewEnabled",
     "memoryTriageEnabled",
     "maxOpenTriageIssuesPerScope",
@@ -1622,6 +1625,9 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     // Retired: remove the obsolete open-PR bound from existing YAML on save.
     "maxOpenPrsPerThread",
     "pendingMemoryThreshold",
+    "threadCompactThreshold",
+    "seedBudgetTokens",
+    "seedEras",
     "externalReplies",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
@@ -2696,6 +2702,160 @@ externalReplies: disabled
         );
         assert_eq!(restored.transcript_text_size, TranscriptTextSize::Large);
         assert_eq!(restored.transcript_density, TranscriptDensity::Relaxed);
+    }
+
+    #[test]
+    fn save_settings_persists_transcript_log_and_seed_policy() {
+        let temp = TempDir::new().unwrap();
+        let settings = Settings {
+            transcript_text_size: TranscriptTextSize::Large,
+            transcript_density: TranscriptDensity::Relaxed,
+            log_retention_days: 41,
+            thread_compact_threshold: 0.55,
+            seed_budget_tokens: 7_500,
+            seed_eras: 9,
+            ..test_settings()
+        };
+        let defaults = test_settings();
+        assert_ne!(settings.transcript_text_size, defaults.transcript_text_size);
+        assert_ne!(settings.transcript_density, defaults.transcript_density);
+        assert_ne!(settings.log_retention_days, defaults.log_retention_days);
+        assert_ne!(
+            settings.thread_compact_threshold,
+            defaults.thread_compact_threshold
+        );
+        assert_ne!(settings.seed_budget_tokens, defaults.seed_budget_tokens);
+        assert_ne!(settings.seed_eras, defaults.seed_eras);
+
+        save_settings(temp.path(), &settings).unwrap();
+        let loaded = load_settings(temp.path());
+
+        assert_eq!(loaded.transcript_text_size, TranscriptTextSize::Large);
+        assert_eq!(loaded.transcript_density, TranscriptDensity::Relaxed);
+        assert_eq!(loaded.log_retention_days, 41);
+        assert_eq!(loaded.thread_compact_threshold, 0.55);
+        assert_eq!(loaded.seed_budget_tokens, 7_500);
+        assert_eq!(loaded.seed_eras, 9);
+    }
+
+    /// Every `SettingsFile` key that `save_settings` does not own, with the
+    /// writer that does. A key in neither this table nor `SETTINGS_DTO_KEYS`
+    /// is one a settings-panel save silently drops.
+    const OWNED_ELSEWHERE: &[(&str, &str)] = &[
+        ("voice", "set_voice_preferences"),
+        ("tierDefaults", "retire_grid_in (TIER_GRID_KEYS)"),
+        ("tiers", "retire_grid_in (TIER_GRID_KEYS)"),
+        ("backends", "retire_grid_in (TIER_GRID_KEYS)"),
+        ("activeBackend", "retire_grid_in (TIER_GRID_KEYS)"),
+        ("mcpServers", "cairn-core config::mcp_servers"),
+        (
+            "sandboxDenyRead",
+            "hand-edited YAML (load_sandbox_deny_read)",
+        ),
+        ("mcp", "hand-edited YAML (load_mcp_public_url)"),
+        (
+            "browserNetworkSensitiveNames",
+            "hand-edited YAML (load_browser_network_sensitive_names)",
+        ),
+        ("buildServices", "mutate_build_services"),
+        ("buildSlots", "set_fleet / mutate_fleet"),
+        ("inference", "set_inference"),
+        ("servedApi", "set_served_api"),
+        ("webFetch", "cairn-core web_providers::upsert_options"),
+        ("activeWebFetch", "cairn-core web_providers"),
+        ("webSearch", "cairn-core web_providers::upsert_options"),
+        ("activeWebSearch", "cairn-core web_providers"),
+        ("pdf", "cairn-core web_providers::upsert_options"),
+        ("activePdf", "cairn-core web_providers"),
+        (
+            "zeroDataRetentionProviders",
+            "hand-edited YAML (load_zero_data_retention_providers)",
+        ),
+        ("acceptedFenceCommands", "set_accepted_fence_command"),
+        ("eventLog", "hand-edited YAML (load_event_log_settings)"),
+        ("archive", "hand-edited YAML (load_archive_settings)"),
+    ];
+
+    /// The top-level keys `SettingsFile` reads, as serde names them (renames
+    /// applied, read-only legacy fields included), taken from the field list
+    /// its derived `Deserialize` hands to `deserialize_struct`.
+    fn settings_file_keys() -> &'static [&'static str] {
+        struct FieldNames<'a>(&'a mut &'static [&'static str]);
+        impl<'de> serde::Deserializer<'de> for FieldNames<'_> {
+            type Error = serde::de::value::Error;
+            fn deserialize_any<V: serde::de::Visitor<'de>>(
+                self,
+                _: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(serde::de::Error::custom("not a struct"))
+            }
+            fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _: &'static str,
+                fields: &'static [&'static str],
+                _: V,
+            ) -> Result<V::Value, Self::Error> {
+                *self.0 = fields;
+                Err(serde::de::Error::custom("fields captured"))
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map enum identifier ignored_any
+            }
+        }
+        let mut fields: &'static [&'static str] = &[];
+        let _ = SettingsFile::deserialize(FieldNames(&mut fields));
+        fields
+    }
+
+    fn unowned_settings_keys<'a>(keys: &[&'a str]) -> Vec<&'a str> {
+        keys.iter()
+            .copied()
+            .filter(|key| {
+                !SETTINGS_DTO_KEYS.contains(key)
+                    && !OWNED_ELSEWHERE.iter().any(|(owned, _)| owned == key)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_settings_file_key_has_a_writer() {
+        let keys = settings_file_keys();
+        assert!(keys.contains(&"buildSlots") && keys.contains(&"seedEras"));
+        assert_eq!(
+            unowned_settings_keys(keys),
+            Vec::<&str>::new(),
+            "add each key to SETTINGS_DTO_KEYS if save_settings writes it, \
+             or to OWNED_ELSEWHERE naming the writer that does"
+        );
+
+        // Positive control: a field nobody lists is reported.
+        let mut with_new_field = keys.to_vec();
+        with_new_field.push("brandNewSetting");
+        assert_eq!(unowned_settings_keys(&with_new_field), ["brandNewSetting"]);
+
+        for (key, writer) in OWNED_ELSEWHERE {
+            assert!(
+                keys.contains(key),
+                "{key} ({writer}) is no SettingsFile key"
+            );
+            assert!(
+                !SETTINGS_DTO_KEYS.contains(key),
+                "{key} is listed as owned by both save_settings and {writer}"
+            );
+        }
+
+        // Whatever the DTO serializes, the save must carry.
+        let serialized =
+            serde_yaml::to_value(SettingsFile::from_settings(&test_settings())).unwrap();
+        for key in serialized.as_mapping().unwrap().keys() {
+            let key = key.as_str().unwrap();
+            assert!(
+                SETTINGS_DTO_KEYS.contains(&key),
+                "from_settings writes {key}, which save_settings drops"
+            );
+        }
     }
 
     #[test]
