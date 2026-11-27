@@ -2511,16 +2511,23 @@ async fn attempt_lane(
             false,
         );
     }
-    if let Some(no_verdict) = result.no_verdict.as_ref() {
-        return attempt(
-            CadenceVerdict::Death {
-                row: None,
-                cause: format!("{}: {}", no_verdict.kind, no_verdict.cause),
-            },
+    // A run without a verdict can still have recorded its row, and recording a
+    // main row enqueued an `observation:` incident source in the same
+    // transaction. The death keeps that row, so the report files and
+    // acknowledges that one source instead of a second, row-less one.
+    let death = result.no_verdict.as_ref().map(|no_verdict| {
+        (
+            format!("{}: {}", no_verdict.kind, no_verdict.cause),
             no_verdict.kind == NO_VERDICT_SUPPRESSED,
-        );
-    }
+        )
+    });
+    let died = |row: Option<CadenceRow>, (cause, suppressed): (String, bool)| {
+        attempt(CadenceVerdict::Death { row, cause }, suppressed)
+    };
     let Some(observation_id) = result.observation_id.as_deref() else {
+        if let Some(death) = death {
+            return died(None, death);
+        }
         return attempt(
             CadenceVerdict::NoVerdict {
                 row: None,
@@ -2540,12 +2547,20 @@ async fn attempt_lane(
     };
     loop {
         match load_row(&db, context.project_key, observation_id, &names).await {
-            Ok(row) => return attempt(lane.verdict.classify(row), false),
+            Ok(row) => {
+                return match death {
+                    Some(death) => died(Some(row), death),
+                    None => attempt(lane.verdict.classify(row), false),
+                }
+            }
             Err(error) if attempted.consumer_guard.is_some() => {
                 log::error!("live cadence observation {observation_id} could not be read: {error}; retaining the consumer and retrying before reporting");
                 tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
             }
             Err(error) => {
+                if let Some(death) = death {
+                    return died(None, death);
+                }
                 return attempt(
                     CadenceVerdict::NoVerdict {
                         row: None,
@@ -2554,7 +2569,7 @@ async fn attempt_lane(
                         ),
                     },
                     false,
-                )
+                );
             }
         }
     }
