@@ -360,7 +360,6 @@ pub(super) async fn from_sources(
     entries.extend(failures);
     let (reviews, stale_at) = awaiting_review(db, project, now, watched).await?;
     entries.extend(reviews);
-    entries.extend(missing_outputs(db, project, watched).await?);
     let next_change_at = match (failures_settle_at, stale_at) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -895,51 +894,6 @@ pub(super) async fn awaiting_review(
         })
         .collect();
     Ok((entries, stale_at))
-}
-
-/// A top-level job blocked because its turn ended without the output it owes,
-/// read through the one definition of that state (`execution::missing_output`,
-/// the sweep's own rule). Open and link-only: nobody approves a missing output,
-/// and the entry leaves the list once its cause clears.
-///
-/// Keyed by the job and the moment its turn ended, so a later turn that also
-/// ends without the output is a new occurrence an earlier dismissal does not
-/// hide. Its age is rendered from `at` by the reader, so nothing here needs a
-/// rebuild timer, and nothing is ever sent for it.
-pub(super) async fn missing_outputs(
-    db: &LocalDb,
-    project: &ProjectRef,
-    watched: &mut Watched,
-) -> Result<Vec<OperatorNotification>, String> {
-    use crate::execution::approvals::ApprovalScope;
-    use crate::execution::missing_output::blocked_on_output_with_candidates;
-    // A job joins this list by reaching `blocked`, which its frame carries;
-    // every blocked candidate is watched for what moves it after that.
-    let (blocked, candidates) =
-        blocked_on_output_with_candidates(db, ApprovalScope::Project(project.id.clone()))
-            .await
-            .map_err(db_error)?;
-    watched.jobs.extend(candidates);
-    Ok(blocked
-        .into_iter()
-        .map(|missing| {
-            entry(
-                project,
-                format!("missing-output:{}:{}", missing.job_id, missing.since),
-                NotificationKind::MissingOutput,
-                missing.since,
-                format!(
-                    "#{} {}: blocked, no {}",
-                    missing.issue_number,
-                    missing.node_name,
-                    missing.what()
-                ),
-                missing.node_uri.clone(),
-                None,
-                None,
-            )
-        })
-        .collect())
 }
 
 /// What the registered hold sources report for the project.

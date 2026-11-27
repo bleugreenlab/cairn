@@ -64,9 +64,6 @@ pub enum NotificationKind {
     /// A thread's message to the operator that states a default, open until
     /// he answers it.
     OperatorMessage,
-    /// A top-level job blocked because its turn ended without the output it
-    /// owes. A passive mark: link-only, never toasted or chimed.
-    MissingOutput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -121,14 +118,16 @@ pub enum NotificationAction {
         action_run_id: String,
         merge_method: String,
     },
-    /// `override_operator_hold`.
+    /// `override_operator_hold`, offered only when `override_label` is
+    /// present: absent, the hold has no override and shows no button.
     #[serde(rename_all = "camelCase")]
     Hold {
         source: String,
         hold_id: String,
         reason: String,
         expected_release: Option<ExpectedRelease>,
-        override_label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        override_label: Option<String>,
     },
     /// `write_channel_resource` append `{content}` on `message`, the
     /// message's `cairn://operator/messages/{id}`. `default_text` is what its

@@ -125,19 +125,71 @@ async fn a_pr_entry_carries_the_newest_headline_about_its_issue() {
     );
 }
 
-#[test]
-fn the_missing_output_kind_is_snake_case_on_the_wire() {
-    assert_eq!(
-        serde_json::to_value(NotificationKind::MissingOutput).unwrap(),
-        serde_json::json!("missing_output")
-    );
+/// A hold source that reports one hold, with or without an override.
+struct OneHold {
+    name: &'static str,
+    override_label: Option<&'static str>,
 }
 
-/// cairn/5960: a planner whose turn ended without its plan is an open,
-/// link-only entry at the node, dated by the turn's end, and it leaves the
-/// list as soon as the plan is written (which makes it an approval instead).
+impl HoldSource for OneHold {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn holds(&self, _project_id: &str) -> Vec<Hold> {
+        vec![Hold {
+            id: "h1".into(),
+            project_id: None,
+            reason: "Waiting".into(),
+            expected_release: None,
+            override_label: self.override_label.map(str::to_string),
+            source_uri: None,
+            opened_at: 1,
+            released_at: None,
+        }]
+    }
+}
+
+/// A hold with nothing to override carries no override on the wire, which is
+/// what tells the center to render no button; one with an override names it.
+/// A source without one never reaches an override: the default refuses.
+#[test]
+fn a_hold_without_an_override_serializes_none_and_refuses_one() {
+    let registry = HoldRegistry::default();
+    registry.register(std::sync::Arc::new(OneHold {
+        name: "warning",
+        override_label: None,
+    }));
+    registry.register(std::sync::Arc::new(OneHold {
+        name: "held",
+        override_label: Some("Retry"),
+    }));
+    let project = ProjectRef {
+        id: "p".into(),
+        key: "prj".into(),
+    };
+    let actions: HashMap<String, serde_json::Value> = derive::holds(&registry, &project)
+        .into_iter()
+        .map(|entry| (entry.key, serde_json::to_value(entry.action).unwrap()))
+        .collect();
+    let warning = &actions["hold:warning:h1"];
+    assert_eq!(warning["kind"], "hold");
+    assert!(
+        warning.get("overrideLabel").is_none(),
+        "no override, no field: {warning}"
+    );
+    assert_eq!(actions["hold:held:h1"]["overrideLabel"], "Retry");
+    assert!(registry
+        .override_hold("warning", "h1")
+        .unwrap_err()
+        .contains("offers no override"));
+}
+
+/// Tenet 1314: a planner whose turn ended without its plan waits on its own
+/// agent, not on the operator, so it is no entry. Writing the plan makes it an
+/// approval, which is.
 #[tokio::test]
-async fn a_job_blocked_on_its_missing_output_is_an_open_link_only_entry() {
+async fn a_job_blocked_on_its_missing_output_is_not_an_entry() {
     let db = crate::storage::migrated_test_db("notif-missing-output").await;
     crate::execution::missing_output::tests::seed_blocked_planner(&db, "i4", 4, "j-plan", 500)
         .await;
@@ -155,24 +207,7 @@ async fn a_job_blocked_on_its_missing_output_is_an_open_link_only_entry() {
     };
 
     let snapshot = derive().await;
-    let missing: Vec<_> = snapshot
-        .entries
-        .iter()
-        .filter(|entry| entry.kind == NotificationKind::MissingOutput)
-        .collect();
-    assert_eq!(missing.len(), 1, "{:#?}", snapshot.entries);
-    let entry = missing[0];
-    assert_eq!(entry.key, "missing-output:j-plan:500");
-    assert_eq!(entry.at, 500);
-    assert_eq!(entry.summary, "#4 Planner: blocked, no plan");
-    assert_eq!(entry.source_uri, "cairn://p/prj/4/1/planner");
-    assert_eq!(entry.state, NotificationState::Open);
-    assert_eq!(entry.action, None);
-    assert!(!entry.stale);
-    assert_eq!(
-        snapshot.next_change_at, None,
-        "an age is rendered by the reader; nothing reschedules the list"
-    );
+    assert!(snapshot.entries.is_empty(), "{:#?}", snapshot.entries);
 
     db.execute(
         "INSERT INTO artifacts(id, job_id, artifact_type, data, version, output_name, confirmed, created_at, updated_at)
@@ -514,13 +549,6 @@ async fn writes_that_move_an_entry_are_frames_the_center_lets_through() {
                 "update",
             ),
             true,
-        ),
-        (
-            // The fixture has no recipe for its derivation to find, so this
-            // one only checks the frame.
-            "a job reaching blocked may be missing its output",
-            Write::Job("UPDATE jobs SET status = 'blocked' WHERE id = 'lc-worker'", "lc-worker"),
-            false,
         ),
     ];
     for (n, (why, write, moves)) in cases.iter().enumerate() {

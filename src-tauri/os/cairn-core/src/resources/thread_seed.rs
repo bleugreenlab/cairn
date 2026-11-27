@@ -4401,10 +4401,8 @@ mod tests {
             .await
             .unwrap();
             assert!(
-                snapshot.entries.iter().any(
-                    |entry| entry.kind == crate::notifications::NotificationKind::MissingOutput
-                ),
-                "{:#?}",
+                snapshot.entries.is_empty(),
+                "a missing output waits on its agent, not the operator: {:#?}",
                 snapshot.entries
             );
         }

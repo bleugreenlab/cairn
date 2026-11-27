@@ -469,7 +469,8 @@ impl HoldSource for HealthSource {
             expected_release: Some(ExpectedRelease::Text(
                 "After keychain access succeeds".into(),
             )),
-            override_label: "Unlock keychain in desktop".into(),
+            // The remedy is the operator's, in the desktop: nothing to override.
+            override_label: None,
             source_uri: None,
             opened_at: record.opened_at,
             released_at: if state.persistence_failed {
@@ -478,10 +479,6 @@ impl HoldSource for HealthSource {
                 record.released_at
             },
         }]
-    }
-
-    fn override_hold(&self, _hold_id: &str) -> Result<(), String> {
-        Err(GUIDANCE.into())
     }
 }
 
@@ -869,10 +866,7 @@ mod tests {
         let source = HealthSource(restored.clone());
         assert_eq!(source.holds("any-project").len(), 1);
         assert!(source.holds("any-project")[0].released_at.is_none());
-        assert!(source
-            .override_hold("ignored")
-            .unwrap_err()
-            .contains("unlock"));
+        assert_eq!(source.holds("any-project")[0].override_label, None);
         drop(gate);
         finish(&reader);
         durable(&path, true);

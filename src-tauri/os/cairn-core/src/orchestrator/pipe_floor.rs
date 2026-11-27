@@ -12,10 +12,11 @@
 //! recovery or by evidence expiring into a named gap, every process lane is
 //! promoted again, so nothing waits on an unrelated process exit.
 //!
-//! The operator sees one hold per engagement, workspace-wide rather than under
-//! any project, because the condition is the host's and no project caused it.
+//! The floor is not an operator notification: it clears on measurement and
+//! waits on nothing the operator can do. Where it shows is the executor page,
+//! which renders each engagement from its row.
 //!
-//! Each engagement is also a row (`pipe_floor_engagements`, cairn/6440): a
+//! Each engagement is a row (`pipe_floor_engagements`, cairn/6440): a
 //! descriptor census taken as the floor engages ([`census`]), then a bounded
 //! release of idle sessions through the canonical Keep-policy retire
 //! ([`release`]) that keeps releasing until the bar admission reopens on
@@ -32,16 +33,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cairn_common::executor_protocol::LOCAL_EXECUTOR_NAME;
-use cairn_common::pipe_health::{
-    PipeCapacity, PipeHealthAssessment, PipeHealthTransition, RECOVERED_AT_BYTES, RECOVERY_SAMPLES,
-};
+use cairn_common::pipe_health::{PipeCapacity, PipeHealthAssessment};
 use cairn_procmem::identity::StartKey;
 use cairn_procmem::{KernelRead, ProcessIdentity};
 
 use self::census::{AdmissionCounts, Attribution, SessionProcess, SessionState};
 use self::release::{Candidate, FloorNow, ReleaseRecord, ReleaseWorld, RetireAttempt};
 use crate::agent_process::process::WarmProcess;
-use crate::notifications::{ExpectedRelease, Hold, HoldSource};
 use crate::orchestrator::lifecycle::{
     retire_unowned_idle, run_sessions, NotRetired, RetireGrounds,
 };
@@ -54,153 +52,6 @@ const CENSUS_DEADLINE: Duration = Duration::from_secs(3);
 /// How long a released session's leader has to exit before the experiment
 /// stops on an unconfirmed release.
 const EXIT_WAIT: Duration = Duration::from_secs(5);
-
-const SOURCE: &str = "pipe-health";
-
-/// The lanes the floor holds, in the operator's words.
-const AFFECTED: &str = "new Claude and Codex sessions, process-backed calls, and new Codex \
-                        app-servers on this runner's host; running sessions, warm \
-                        continuations and stateless calls are not held";
-
-#[derive(Debug, Clone)]
-struct Engagement {
-    id: String,
-    /// The hold's current assessment, refreshed as its phase moves.
-    assessment: String,
-    /// The census and release summary, appended once known.
-    annotations: Vec<String>,
-    /// How it cleared, with the assessment at clearance.
-    cleared: Option<String>,
-    opened_at: i64,
-    released_at: Option<i64>,
-}
-
-impl Engagement {
-    fn reason(&self) -> String {
-        let mut reason = format!(
-            "This runner's host is refusing new agent processes: {}. Held: {AFFECTED}. It clears \
-             after {RECOVERY_SAMPLES} spaced readings of at least {RECOVERED_AT_BYTES} B.",
-            self.assessment
-        );
-        for annotation in &self.annotations {
-            reason.push(' ');
-            reason.push_str(annotation);
-        }
-        if let Some(cleared) = &self.cleared {
-            reason.push(' ');
-            reason.push_str(cleared);
-        }
-        reason
-    }
-}
-
-/// The floor's operator-visible record: at most one engagement at a time,
-/// opened when the floor engages and released, with how it cleared, when it
-/// clears. Repeated samples inside one engagement change nothing.
-#[derive(Default)]
-pub(crate) struct PipeFloorNotices {
-    engagement: Mutex<Option<Engagement>>,
-}
-
-impl PipeFloorNotices {
-    /// Fold one transition in. Returns whether the record changed, which is
-    /// when the notification center needs to hear about it.
-    pub(crate) fn observe(&self, transition: &PipeHealthTransition, now: i64) -> bool {
-        let mut engagement = self.engagement.lock().unwrap_or_else(|e| e.into_inner());
-        if transition.engaged() {
-            *engagement = Some(Engagement {
-                id: uuid::Uuid::new_v4().to_string(),
-                assessment: transition.to.describe(),
-                annotations: Vec::new(),
-                cleared: None,
-                opened_at: now,
-                released_at: None,
-            });
-            return true;
-        }
-        let Some(open) = engagement
-            .as_mut()
-            .filter(|open| open.released_at.is_none())
-        else {
-            return false;
-        };
-        if let Some(clearance) = transition.clearance() {
-            open.released_at = Some(now);
-            open.cleared = Some(format!(
-                "Cleared by {clearance}: {}.",
-                transition.to.describe()
-            ));
-            return true;
-        }
-        // Still held, but its phase or recovery progress moved: the hold says
-        // what it is now, under the same id and with its census kept.
-        if !transition.to.admits() {
-            let assessment = transition.to.describe();
-            if assessment != open.assessment {
-                open.assessment = assessment;
-                return true;
-            }
-        }
-        false
-    }
-
-    /// The open engagement's id, minted when it engaged.
-    pub(crate) fn engagement_id(&self) -> Option<String> {
-        let engagement = self.engagement.lock().unwrap_or_else(|e| e.into_inner());
-        engagement.as_ref().map(|open| open.id.clone())
-    }
-
-    /// Append the census and release summary to engagement `id`'s notice.
-    /// Returns whether it changed; an engagement since replaced is left alone.
-    pub(crate) fn annotate(&self, id: &str, summary: &str) -> bool {
-        let mut engagement = self.engagement.lock().unwrap_or_else(|e| e.into_inner());
-        match engagement.as_mut() {
-            Some(open) if open.id == id => {
-                open.annotations.push(summary.to_string());
-                true
-            }
-            _ => false,
-        }
-    }
-}
-
-impl HoldSource for PipeFloorNotices {
-    fn name(&self) -> &'static str {
-        SOURCE
-    }
-
-    fn holds(&self, _project_id: &str) -> Vec<Hold> {
-        let engagement = self.engagement.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(engagement) = engagement.as_ref() else {
-            return Vec::new();
-        };
-        if engagement.released_at.is_some_and(|at| {
-            at < chrono::Utc::now().timestamp() - crate::notifications::RECENT_WINDOW_SECS
-        }) {
-            return Vec::new();
-        }
-        vec![Hold {
-            id: format!("{SOURCE}:{}", engagement.id),
-            project_id: None,
-            reason: engagement.reason(),
-            expected_release: Some(ExpectedRelease::Text(
-                "When fresh pipes on this host measure healthy again".into(),
-            )),
-            override_label: "Clears on measurement".into(),
-            source_uri: Some("cairn://executors".into()),
-            opened_at: engagement.opened_at,
-            released_at: engagement.released_at,
-        }]
-    }
-
-    fn override_hold(&self, _hold_id: &str) -> Result<(), String> {
-        Err(
-            "the fresh-pipe floor clears on measurement, not on request: a process started \
-             now could block forever on its first pipe write"
-                .into(),
-        )
-    }
-}
 
 impl Orchestrator {
     /// The runner host's fresh-pipe floor when it refuses new processes now,
@@ -216,12 +67,10 @@ impl Orchestrator {
         self.pipe_health.assess_now()
     }
 
-    /// Register the floor's notices and start sampling this host. Each
-    /// transition updates the operator's hold, and a clearance promotes every
-    /// process lane at once.
+    /// Start sampling this host. An engagement is recorded and its census
+    /// and release pass run detached; a clearance promotes every process lane
+    /// at once.
     pub(crate) fn spawn_pipe_floor(&self) {
-        let notices = Arc::new(PipeFloorNotices::default());
-        self.register_hold_source(notices.clone());
         let floor = Arc::new(FloorRecord::default());
         // Hashing the runner's executable is unbounded disk I/O: do it now, off
         // the sampler, so no engagement waits on it.
@@ -243,33 +92,28 @@ impl Orchestrator {
                     transition.to.describe()
                 );
             }
-            if notices.observe(&transition, chrono::Utc::now().timestamp()) {
-                emit_holds(&orch);
-            }
             if transition.engaged() {
-                if let Some(id) = notices.engagement_id() {
-                    let open = PipeFloorEngagementOpen {
-                        id,
-                        host: LOCAL_EXECUTOR_NAME.into(),
-                        // Resolved by the detached writers: the sampler never
-                        // reads the executable.
-                        build_id: String::new(),
-                        opened_at_ms: unix_ms() as i64,
-                        opening_reading_bytes: transition
-                            .to
-                            .capacity
-                            .map(|capacity| capacity.accepted_bytes as i64),
-                        opening_at_least: transition
-                            .to
-                            .capacity
-                            .is_some_and(|capacity| capacity.at_least),
-                        opening_assessment: transition.to.describe(),
-                    };
-                    *floor.open.lock().unwrap_or_else(|e| e.into_inner()) = Some(open.clone());
-                    let (orch, notices, floor) = (orch.clone(), notices.clone(), floor.clone());
-                    orch.clone()
-                        .spawn_blocking_detached(move || engage(&orch, &notices, &floor, open));
-                }
+                let open = PipeFloorEngagementOpen {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    host: LOCAL_EXECUTOR_NAME.into(),
+                    // Resolved by the detached writers: the sampler never
+                    // reads the executable.
+                    build_id: String::new(),
+                    opened_at_ms: unix_ms() as i64,
+                    opening_reading_bytes: transition
+                        .to
+                        .capacity
+                        .map(|capacity| capacity.accepted_bytes as i64),
+                    opening_at_least: transition
+                        .to
+                        .capacity
+                        .is_some_and(|capacity| capacity.at_least),
+                    opening_assessment: transition.to.describe(),
+                };
+                *floor.open.lock().unwrap_or_else(|e| e.into_inner()) = Some(open.clone());
+                let (orch, floor) = (orch.clone(), floor.clone());
+                orch.clone()
+                    .spawn_blocking_detached(move || engage(&orch, &floor, open));
             }
             if let Some(clearance) = transition.clearance() {
                 let open = floor.open.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -498,13 +342,6 @@ struct FloorRecord {
     window: Mutex<VecDeque<u64>>,
 }
 
-fn emit_holds(orch: &Orchestrator) {
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({ "table": crate::notifications::HOLDS_TABLE }),
-    );
-}
-
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -538,12 +375,7 @@ where
 
 /// Persist an engagement, take its census, and run (or skip) its release
 /// pass. Runs on a detached blocking task.
-fn engage(
-    orch: &Orchestrator,
-    notices: &PipeFloorNotices,
-    floor: &FloorRecord,
-    mut open: PipeFloorEngagementOpen,
-) {
+fn engage(orch: &Orchestrator, floor: &FloorRecord, mut open: PipeFloorEngagementOpen) {
     open.build_id = runner_build_id();
     let db = orch.db.local.clone();
     let id = open.id.clone();
@@ -552,7 +384,7 @@ fn engage(
         async move { store::open_engagement(&db, &open).await }
     });
     let census = take_census(orch);
-    let census_line = match &census {
+    match &census {
         Ok((attribution, admission)) => {
             let summary = attribution.summary(*admission);
             let json = serde_json::to_string(&summary).unwrap_or_default();
@@ -560,22 +392,16 @@ fn engage(
                 let (db, id) = (db.clone(), id.clone());
                 async move { store::record_census(&db, &id, &json, unix_ms() as i64).await }
             });
-            describe_census(&summary)
         }
-        Err(error) => format!("The descriptor census failed: {error}."),
-    };
+        Err(error) => {
+            log::warn!("pipe floor engagement {id}: the descriptor census failed: {error}")
+        }
+    }
     let (state, detail) = release_pass(orch, floor, &open, census.ok().map(|(a, _)| a));
     store_write("a reclamation verdict", || {
         let (db, id, detail) = (db.clone(), id.clone(), detail.clone());
         async move { store::set_reclamation(&db, &id, state, Some(&detail)).await }
     });
-    let summary = format!(
-        "{census_line} Idle-session release: {}; {detail}.",
-        state.as_str().replace('_', " ")
-    );
-    if notices.annotate(&id, &summary) {
-        emit_holds(orch);
-    }
 }
 
 /// Decide whether this engagement releases anything, and run the pass if so.
@@ -628,29 +454,6 @@ fn release_pass(
     };
     let result = release::run_release_pass(&mut world, census, &mut window);
     (result.verdict, result.detail)
-}
-
-fn describe_census(summary: &census::CensusSummary) -> String {
-    if !summary.supported {
-        return "No descriptor census on this platform.".into();
-    }
-    let families: Vec<String> = summary
-        .families
-        .iter()
-        .take(5)
-        .map(|family| format!("{} {}", family.family, family.pipe_fds))
-        .collect();
-    format!(
-        "Census at engagement: {} pipe descriptors across {} processes{} (top: {}); agent \
-         processes {} active, {} idle, {} protected.",
-        summary.pipe_fds,
-        summary.processes,
-        if summary.partial { ", partial" } else { "" },
-        families.join(", "),
-        summary.admission.active,
-        summary.admission.idle,
-        summary.admission.protected
-    )
 }
 
 /// The descriptor census attributed to this runner's registered sessions,
@@ -870,92 +673,6 @@ impl ReleaseWorld for LiveWorld<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_common::pipe_health::{PipeAdmission, PipeCapacity, PipeHealth};
-    use cairn_common::wire_vocabulary::Measurement;
-
-    fn assessment(bytes: u64, recovered: bool) -> PipeHealthAssessment {
-        let mut health = PipeHealth::new(true);
-        let reading = |at| {
-            Measurement::measured(
-                at,
-                PipeCapacity {
-                    accepted_bytes: bytes,
-                    at_least: false,
-                },
-            )
-        };
-        if recovered {
-            health.observe(Measurement::measured(
-                0,
-                PipeCapacity {
-                    accepted_bytes: 512,
-                    at_least: false,
-                },
-            ));
-            health.observe(reading(5_000));
-            health.observe(reading(10_000));
-            return health.assess(10_000);
-        }
-        health.observe(reading(0));
-        health.assess(0)
-    }
-
-    #[test]
-    fn one_notice_per_engagement_and_its_clearance_is_named() {
-        let notices = PipeFloorNotices::default();
-        let engaged = PipeHealthTransition {
-            from: PipeAdmission::Healthy,
-            to: assessment(512, false),
-        };
-        assert!(notices.observe(&engaged, 100));
-        let holds = notices.holds("any");
-        assert_eq!(holds.len(), 1);
-        assert_eq!(
-            holds[0].project_id, None,
-            "the host's condition, not a project's"
-        );
-        assert!(holds[0].reason.contains("512 B"), "{}", holds[0].reason);
-        assert!(holds[0].reason.contains("process-backed calls"));
-        let first_id = holds[0].id.clone();
-
-        // A degraded-to-stale-hold move is not a new engagement: the same hold
-        // says what it is now, once.
-        let still_held = PipeHealthTransition {
-            from: PipeAdmission::Degraded,
-            to: PipeHealthAssessment {
-                admission: PipeAdmission::StaleHold,
-                ..assessment(512, false)
-            },
-        };
-        assert!(notices.observe(&still_held, 110));
-        assert!(!notices.observe(&still_held, 111));
-        let holds = notices.holds("any");
-        assert_eq!(holds[0].id, first_id);
-        assert!(
-            holds[0].reason.contains("bounded stale hold"),
-            "{}",
-            holds[0].reason
-        );
-
-        let cleared = PipeHealthTransition {
-            from: PipeAdmission::Degraded,
-            to: assessment(65_536, true),
-        };
-        let now = chrono::Utc::now().timestamp();
-        assert!(notices.observe(&cleared, now));
-        let holds = notices.holds("any");
-        assert_eq!(holds[0].released_at, Some(now));
-        assert!(
-            holds[0].reason.contains("measured recovery"),
-            "{}",
-            holds[0].reason
-        );
-        assert!(
-            !notices.observe(&cleared, now + 10),
-            "a clearance is recorded once"
-        );
-        assert!(notices.override_hold(&first_id).is_err());
-    }
 
     #[test]
     fn the_page_shows_the_engagement_census_releases_and_verdict() {
@@ -1029,106 +746,5 @@ mod tests {
         let disabled = render_engagement(None, Some(&engagement));
         assert!(disabled.contains("disabled for this build after engagement e1: 3 releases"));
         assert!(disabled.contains("never engaged"));
-    }
-
-    /// The hold follows its phase: a degraded engagement whose next reading is
-    /// back above the floor says it is recovering, under the same id and with
-    /// its census kept, before the floor clears.
-    #[test]
-    fn the_hold_notice_moves_from_degraded_to_recovering_before_it_clears() {
-        let notices = PipeFloorNotices::default();
-        let mut health = PipeHealth::new(true);
-        let reading = |at, bytes| {
-            Measurement::measured(
-                at,
-                PipeCapacity {
-                    accepted_bytes: bytes,
-                    at_least: false,
-                },
-            )
-        };
-        health.observe(reading(0, 512));
-        notices.observe(
-            &PipeHealthTransition {
-                from: PipeAdmission::Healthy,
-                to: health.assess(0),
-            },
-            1,
-        );
-        let id = notices.engagement_id().unwrap();
-        notices.annotate(&id, "Census at engagement: 754 pipe descriptors.");
-        assert!(notices.holds("any")[0]
-            .reason
-            .contains("pipe health: degraded"));
-
-        health.observe(reading(5_000, 65_536));
-        let recovering = PipeHealthTransition {
-            from: PipeAdmission::Degraded,
-            to: health.assess(5_000),
-        };
-        assert!(notices.observe(&recovering, 6));
-        assert!(
-            !notices.observe(&recovering, 7),
-            "an unchanged hold is quiet"
-        );
-        let hold = &notices.holds("any")[0];
-        assert_eq!(hold.id, format!("{SOURCE}:{id}"));
-        assert_eq!(hold.released_at, None);
-        assert!(
-            hold.reason
-                .contains("pipe health: recovering; pipe healthy again (65536 B)"),
-            "{}",
-            hold.reason
-        );
-        assert!(
-            !hold.reason.contains("pipe health: degraded"),
-            "{}",
-            hold.reason
-        );
-        assert!(hold
-            .reason
-            .contains("Census at engagement: 754 pipe descriptors."));
-    }
-
-    #[test]
-    fn the_hold_notice_carries_the_census_of_its_own_engagement() {
-        let notices = PipeFloorNotices::default();
-        notices.observe(
-            &PipeHealthTransition {
-                from: PipeAdmission::Healthy,
-                to: assessment(512, false),
-            },
-            1,
-        );
-        let id = notices.engagement_id().unwrap();
-        assert!(!notices.annotate("another", "stale summary"));
-        assert!(notices.annotate(&id, "Census at engagement: 754 pipe descriptors."));
-        let reason = &notices.holds("any")[0].reason;
-        assert!(reason.contains("pipe health: degraded"), "{reason}");
-        assert!(
-            reason.ends_with("Census at engagement: 754 pipe descriptors."),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn expiry_into_a_gap_is_not_reported_as_recovery() {
-        let notices = PipeFloorNotices::default();
-        notices.observe(
-            &PipeHealthTransition {
-                from: PipeAdmission::Healthy,
-                to: assessment(512, false),
-            },
-            1,
-        );
-        notices.observe(
-            &PipeHealthTransition {
-                from: PipeAdmission::StaleHold,
-                to: PipeHealthAssessment::not_reported("stale"),
-            },
-            chrono::Utc::now().timestamp(),
-        );
-        let reason = &notices.holds("any")[0].reason;
-        assert!(reason.contains("not recovered"), "{reason}");
     }
 }

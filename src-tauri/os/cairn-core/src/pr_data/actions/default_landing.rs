@@ -1130,6 +1130,16 @@ pub(super) async fn take_origin_target(
         ));
     }
     if taken.local.as_deref() != Some(taken.origin.as_str()) {
+        // The store holds origin's copy and more: the unlanded-default
+        // incident, which this landing now waits on.
+        if matches!(taken.judged, crate::jj::OriginFastForward::Current { .. }) {
+            crate::orchestrator::unlanded_default::landing_refused(
+                orch,
+                &merge_context.project_id,
+                &merge_context.target_branch,
+                &merge_context.mr.mr_id,
+            );
+        }
         return Err(origin_target_refusal(
             merge_context,
             format!(

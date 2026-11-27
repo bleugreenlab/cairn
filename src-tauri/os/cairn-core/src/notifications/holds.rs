@@ -1,10 +1,17 @@
 //! The extension point for holds and warnings.
 //!
 //! A hold is something the system is deliberately not doing yet on the
-//! operator's behalf (an execution queued behind fleet capacity, work paced
-//! against a weekly quota), with an expected release and an override the
-//! operator can take. The producers live with the subsystems that own those
-//! decisions; this module only gives them one shape and one place to surface.
+//! operator's behalf (fleet admission closed on unreadable settings), or a
+//! warning that waits on an act only the operator can take (unlocking the
+//! keychain, reconnecting an account). Like every entry in the center it must
+//! wait on the operator: a pacing state that clears by itself, with nothing for
+//! him to do, is not a hold source. The producers live with the subsystems that
+//! own those decisions; this module only gives them one shape and one place to
+//! surface.
+//!
+//! An override is optional. A hold whose remedy lives elsewhere carries none,
+//! and the center renders no button for it, so a button that can only refuse
+//! cannot be expressed.
 //!
 //! A source signals that its answer changed by emitting
 //! `db-change {table: "operator_holds", projectId}`, which dirties the
@@ -32,8 +39,9 @@ pub struct Hold {
     pub project_id: Option<String>,
     pub reason: String,
     pub expected_release: Option<ExpectedRelease>,
-    /// What the source's override button says.
-    pub override_label: String,
+    /// What the source's override button says, when the source can release
+    /// the hold on the operator's say-so. `None` renders no button.
+    pub override_label: Option<String>,
     /// Where the held thing lives, when it has an address.
     pub source_uri: Option<String>,
     /// Unix seconds.
@@ -48,11 +56,15 @@ pub trait HoldSource: Send + Sync {
     fn name(&self) -> &'static str;
     /// Live holds for the project, plus recently released ones.
     fn holds(&self, project_id: &str) -> Vec<Hold>;
-    /// Release the hold now, on the operator's say-so.
-    fn override_hold(&self, hold_id: &str) -> Result<(), String>;
+    /// Release the hold now, on the operator's say-so. Only a source whose
+    /// holds carry an `override_label` implements it; the default refuses,
+    /// because a source without an override never offers the button.
+    fn override_hold(&self, _hold_id: &str) -> Result<(), String> {
+        Err(format!("{} offers no override", self.name()))
+    }
 }
 
-/// The registered sources. None are registered in production yet.
+/// The registered sources.
 #[derive(Default)]
 pub struct HoldRegistry {
     sources: RwLock<Vec<Arc<dyn HoldSource>>>,

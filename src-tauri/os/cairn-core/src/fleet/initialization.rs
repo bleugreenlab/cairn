@@ -107,7 +107,7 @@ impl HoldSource for InitializationSource {
             project_id: None,
             reason: format!("Fleet admission is closed because authoritative settings could not be loaded: {error}"),
             expected_release: Some(ExpectedRelease::Text("After fleet settings are readable and valid; automatic retries remain active".into())),
-            override_label: "Retry fleet settings".into(),
+            override_label: Some("Retry fleet settings".into()),
             source_uri: Some("cairn://executors".into()),
             opened_at: self.opened_at,
             released_at: None,

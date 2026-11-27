@@ -727,8 +727,8 @@ impl ProjectionInvalidatingEmitter {
     /// a direct source of entries.
     ///
     /// The center's entries hang off a few jobs (an open or recent question or
-    /// permission, a PR, a recent failure, a pending approval candidate, a
-    /// blocked job), and the published snapshot names them and their turns
+    /// permission, a PR, a recent failure, a pending approval candidate), and
+    /// the published snapshot names them and their turns
     /// (`watched_job_ids`, `watched_turn_ids`). Any write to one of those is
     /// relevant. A write to any other job can open an entry only by carrying a
     /// state that opens one by itself, and the frame says which state it
@@ -736,7 +736,6 @@ impl ProjectionInvalidatingEmitter {
     ///
     /// - a turn reaching `failed` or `interrupted` may be an agent failure, and
     ///   one reaching `cancelled` may close a question on it;
-    /// - a job reaching `blocked` may be missing its output;
     /// - a job inserted or deleted is relevant whatever it says.
     ///
     /// A running agent's turn starting, streaming and completing, and its job's
@@ -802,7 +801,7 @@ fn notification_frame_could_move(
         return text("state")
             .is_none_or(|state| matches!(state, "failed" | "interrupted" | "cancelled"));
     }
-    text("action") != Some("update") || text("status").is_none_or(|status| status == "blocked")
+    text("action") != Some("update") || text("status").is_none()
 }
 
 /// Whether a frame describing a row under some job could touch a projection
@@ -3245,6 +3244,9 @@ mod tests {
             turn_frame("worker", "w-t2", "update", Some("complete")),
             job_frame("worker", "update", Some("idle")),
             job_frame("worker", "update", Some("complete")),
+            // A blocked job waits on its own agent or reviewer; a review it
+            // is blocked on is watched through its artifact's job.
+            job_frame("worker", "update", Some("blocked")),
             // A run's join to its job is fixed at insert, so the center does
             // not read `runs` at all.
             serde_json::json!({"table": "runs", "action": "update", "projectId": "proj", "runId": "r", "jobId": "worker"}),
@@ -3254,7 +3256,7 @@ mod tests {
         assert_eq!(s.notifications.generation("proj"), before);
         assert_eq!(
             s.notifications.activity_filtered(),
-            BTreeMap::from([("jobs", 4), ("turns", 4)])
+            BTreeMap::from([("jobs", 5), ("turns", 4)])
         );
     }
 
@@ -3297,10 +3299,6 @@ mod tests {
                 "the asker's job ending",
             ),
             (
-                job_frame("worker", "update", Some("blocked")),
-                "a job missing its output",
-            ),
-            (
                 job_frame("worker", "update", None),
                 "a job frame without its status",
             ),
@@ -3325,7 +3323,7 @@ mod tests {
         assert!(s.notifications.activity_filtered().is_empty());
         assert_eq!(
             s.notifications.activity_by_table(),
-            BTreeMap::from([("jobs", 6), ("projects", 1), ("turns", 7)])
+            BTreeMap::from([("jobs", 5), ("projects", 1), ("turns", 7)])
         );
     }
 

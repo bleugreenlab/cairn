@@ -74,10 +74,6 @@ impl HoldSource for SignInExpiryNotices {
             .map(|store| notices(&store, chrono::Utc::now().timestamp()))
             .unwrap_or_default()
     }
-
-    fn override_hold(&self, _hold_id: &str) -> Result<(), String> {
-        Err("A sign-in deadline is the provider's and cannot be overridden. Reconnect the account from Settings → Providers.".to_string())
-    }
 }
 
 fn provider_name(account: &ProviderAccount) -> &'static str {
@@ -122,7 +118,7 @@ fn notice(account: &ProviderAccount, now: i64) -> Option<Hold> {
         reason,
         expected_release: None,
         // Nothing to override: the act that clears it is a reconnect.
-        override_label: String::new(),
+        override_label: None,
         source_uri: source_uri.clone(),
         opened_at,
         released_at: None,
@@ -231,7 +227,7 @@ mod tests {
         );
         assert!(first.reason.contains("in 2 days"), "{}", first.reason);
         assert!(first.project_id.is_none(), "workspace-wide");
-        assert!(first.override_label.is_empty());
+        assert_eq!(first.override_label, None, "a reconnect, not a button");
 
         let second = notice(&account, deadline - 5 * 60 * 60).unwrap();
         assert_ne!(

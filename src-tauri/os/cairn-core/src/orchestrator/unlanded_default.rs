@@ -12,12 +12,21 @@
 //!
 //! The base-branch poll already learns origin's tip every minute. After each
 //! poll, [`check`] compares the store's bookmark with it. A head seen ahead on
-//! [`CONFIRMING_POLLS`] consecutive polls is raised once, as an operator hold
-//! notification and as a message to [`NOTICE_THREADS`]. A landing is not
-//! mistaken for one: its head is a recorded `merged_commit`, and it reaches
-//! origin within the same publication, well inside one poll interval.
+//! [`CONFIRMING_POLLS`] consecutive polls is raised once, as a message to
+//! [`NOTICE_THREADS`]. A landing is not mistaken for one: its head is a
+//! recorded `merged_commit`, and it reaches origin within the same publication,
+//! well inside one poll interval.
+//!
+//! It reaches the operator's notification center only while it has a
+//! consequence: a landing into the branch was refused because the store's copy
+//! was not origin's ([`landing_refused`]), and that merge request is still
+//! open, waiting on it. A dormant project whose branch sits ahead with nothing
+//! trying to land waits on no one, so it lists nothing. The entry resolves when
+//! the incident clears or the last refused landing stops waiting (merged by
+//! other means, or closed), and carries no override: the remedy is a
+//! publication or a reset, done elsewhere.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -60,6 +69,12 @@ pub(crate) struct Incident {
     pub(crate) first_seen: i64,
     pub(crate) raised_at: Option<i64>,
     pub(crate) cleared_at: Option<i64>,
+    /// Unix seconds since a landing into the branch, refused while this
+    /// incident stood, has been waiting on it: what makes it the operator's.
+    pub(crate) waiting_since: Option<i64>,
+    /// Unix seconds when the last refused landing stopped waiting, with the
+    /// incident still standing.
+    pub(crate) waiting_ended: Option<i64>,
     sightings: u32,
 }
 
@@ -73,12 +88,27 @@ impl Incident {
             first_seen: now,
             raised_at: None,
             cleared_at: None,
+            waiting_since: None,
+            waiting_ended: None,
             sightings: 0,
         }
     }
 
     fn is_open(&self) -> bool {
         self.raised_at.is_some() && self.cleared_at.is_none()
+    }
+
+    fn is_waited_on(&self) -> bool {
+        self.waiting_since.is_some() && self.waiting_ended.is_none()
+    }
+
+    /// When the operator's entry for it resolved: the incident clearing or
+    /// nothing waiting on it any more, whichever came first.
+    fn released_at(&self) -> Option<i64> {
+        match (self.cleared_at, self.waiting_ended) {
+            (Some(cleared), Some(ended)) => Some(cleared.min(ended)),
+            (cleared, ended) => cleared.or(ended),
+        }
     }
 
     pub(crate) fn describe(&self) -> String {
@@ -110,10 +140,24 @@ pub(crate) enum Change {
 /// later.
 #[derive(Default)]
 pub(crate) struct Sightings {
-    entries: Mutex<HashMap<(String, String), Incident>>,
+    state: Mutex<SightingState>,
+}
+
+type BranchKey = (String, String);
+
+#[derive(Default)]
+struct SightingState {
+    incidents: HashMap<BranchKey, Incident>,
+    /// Merge requests into each branch whose landing was refused because the
+    /// store's copy was not origin's, kept while they stay open.
+    refused: HashMap<BranchKey, BTreeSet<String>>,
 }
 
 impl Sightings {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SightingState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Record one poll's comparison at `now` (Unix seconds).
     pub(crate) fn note(
         &self,
@@ -122,23 +166,32 @@ impl Sightings {
         comparison: Comparison,
         now: i64,
     ) -> Change {
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.lock();
+        let SightingState {
+            incidents: entries,
+            refused,
+        } = &mut *state;
         let key = (project_id.to_string(), branch.to_string());
         match comparison {
             Comparison::Unknown => Change::None,
-            Comparison::NotAhead => match entries.get_mut(&key) {
-                Some(entry) if entry.is_open() => {
-                    entry.cleared_at = Some(now);
-                    Change::Cleared(entry.clone())
+            Comparison::NotAhead => {
+                // Landings into the branch can go through again, so nothing
+                // they were refused for still waits on it.
+                refused.remove(&key);
+                match entries.get_mut(&key) {
+                    Some(entry) if entry.is_open() => {
+                        entry.cleared_at = Some(now);
+                        Change::Cleared(entry.clone())
+                    }
+                    Some(entry) if entry.raised_at.is_none() => {
+                        entries.remove(&key);
+                        Change::None
+                    }
+                    _ => Change::None,
                 }
-                Some(entry) if entry.raised_at.is_none() => {
-                    entries.remove(&key);
-                    Change::None
-                }
-                _ => Change::None,
-            },
+            }
             Comparison::Ahead { local, origin } => {
-                let entry = entries.entry(key).or_insert_with(|| {
+                let entry = entries.entry(key.clone()).or_insert_with(|| {
                     Incident::sighted(project_id, branch, local.clone(), origin.clone(), now)
                 });
                 if entry.is_open() {
@@ -158,21 +211,92 @@ impl Sightings {
                     return Change::None;
                 }
                 entry.raised_at = Some(now);
+                // A landing refused before the second sighting confirmed it
+                // is already waiting on it.
+                if refused.get(&key).is_some_and(|ids| !ids.is_empty()) {
+                    entry.waiting_since = Some(now);
+                }
                 Change::Raised(entry.clone())
             }
         }
     }
 
-    /// Raised incidents for `project_id`, open ones and those cleared within the
-    /// notification center's recent window.
+    /// Record that landing `merge_request` into `branch` was refused because
+    /// the store's copy was not origin's. Returns whether that made a standing
+    /// incident the operator's.
+    pub(crate) fn note_refused_landing(
+        &self,
+        project_id: &str,
+        branch: &str,
+        merge_request: &str,
+        now: i64,
+    ) -> bool {
+        let mut state = self.lock();
+        let key = (project_id.to_string(), branch.to_string());
+        state
+            .refused
+            .entry(key.clone())
+            .or_default()
+            .insert(merge_request.to_string());
+        match state.incidents.get_mut(&key) {
+            Some(incident) if incident.is_open() && !incident.is_waited_on() => {
+                incident.waiting_since = Some(now);
+                incident.waiting_ended = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The refused merge requests into `branch` not yet seen closed.
+    fn refused_landings(&self, project_id: &str, branch: &str) -> Vec<String> {
+        self.lock()
+            .refused
+            .get(&(project_id.to_string(), branch.to_string()))
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Keep only the refused landings into `branch` that are still open.
+    /// Returns whether the last one leaving ended the operator's entry.
+    fn settle_refused(
+        &self,
+        project_id: &str,
+        branch: &str,
+        still_open: &HashSet<String>,
+        now: i64,
+    ) -> bool {
+        let mut state = self.lock();
+        let key = (project_id.to_string(), branch.to_string());
+        let Some(ids) = state.refused.get_mut(&key) else {
+            return false;
+        };
+        ids.retain(|id| still_open.contains(id));
+        if !ids.is_empty() {
+            return false;
+        }
+        state.refused.remove(&key);
+        match state.incidents.get_mut(&key) {
+            Some(incident) if incident.is_open() && incident.is_waited_on() => {
+                incident.waiting_ended = Some(now);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Raised incidents for `project_id` that a refused landing waited on,
+    /// still waiting or resolved within the notification center's recent
+    /// window.
     fn reported(&self, project_id: &str, now: i64) -> Vec<Incident> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries
+        self.lock()
+            .incidents
             .values()
             .filter(|incident| incident.project_id == project_id && incident.raised_at.is_some())
+            .filter(|incident| incident.waiting_since.is_some())
             .filter(|incident| {
                 incident
-                    .cleared_at
+                    .released_at()
                     .is_none_or(|at| at >= now - crate::notifications::RECENT_WINDOW_SECS)
             })
             .cloned()
@@ -209,6 +333,60 @@ pub(crate) async fn check(
             emit_holds(orch, project_id);
             notify_threads(orch, db, &incident).await;
         }
+    }
+    settle_refused_landings(orch, db, project_id, branch, now).await;
+}
+
+/// Drop refused landings that are no longer open, so an incident nothing
+/// waits on leaves the operator's list.
+async fn settle_refused_landings(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    branch: &str,
+    now: i64,
+) {
+    let sightings = &orch.base_branch_sync.unlanded;
+    if sightings.refused_landings(project_id, branch).is_empty() {
+        return;
+    }
+    let open = db
+        .query_all(
+            "SELECT id FROM merge_requests
+              WHERE project_id = ?1 AND target_branch = ?2 AND status = 'open'",
+            params![project_id, branch],
+            |row| row.text(0),
+        )
+        .await;
+    match open {
+        Ok(open) => {
+            if sightings.settle_refused(project_id, branch, &open.into_iter().collect(), now) {
+                emit_holds(orch, project_id);
+            }
+        }
+        Err(error) => log::warn!(
+            "project {project_id}: could not tell which refused landings into `{branch}` still \
+             wait: {error}"
+        ),
+    }
+}
+
+/// A landing of `merge_request` into the default branch `branch` was refused
+/// because the store's copy holds commits origin's lacks. If the incident is
+/// raised, it now has a consequence, and the operator sees it.
+pub(crate) fn landing_refused(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+    merge_request: &str,
+) {
+    let now = orch.services.clock.now();
+    if orch
+        .base_branch_sync
+        .unlanded
+        .note_refused_landing(project_id, branch, merge_request, now)
+    {
+        emit_holds(orch, project_id);
     }
 }
 
@@ -333,7 +511,8 @@ fn short(commit: &str) -> &str {
     &commit[..commit.len().min(12)]
 }
 
-/// Surfaces raised incidents in the operator's notification center.
+/// Surfaces raised incidents a refused landing waits on in the operator's
+/// notification center.
 struct Notices {
     sightings: Weak<Sightings>,
 }
@@ -350,28 +529,29 @@ impl HoldSource for Notices {
         sightings
             .reported(project_id, chrono::Utc::now().timestamp())
             .into_iter()
-            .map(|incident| Hold {
-                id: format!("{SOURCE}:{}:{}", incident.branch, incident.local),
-                project_id: Some(incident.project_id.clone()),
-                reason: incident.describe(),
-                expected_release: Some(ExpectedRelease::Text(format!(
-                    "When the store's `{}` and origin's agree again",
-                    incident.branch
-                ))),
-                override_label: "Clears when resolved".into(),
-                source_uri: None,
-                opened_at: incident.raised_at.unwrap_or(incident.first_seen),
-                released_at: incident.cleared_at,
+            .map(|incident| {
+                let waiting_since = incident.waiting_since.unwrap_or(incident.first_seen);
+                Hold {
+                    // Per waiting episode: a landing refused again after the
+                    // last one stopped waiting is a new occurrence.
+                    id: format!(
+                        "{SOURCE}:{}:{}:{waiting_since}",
+                        incident.branch, incident.local
+                    ),
+                    project_id: Some(incident.project_id.clone()),
+                    reason: incident.describe(),
+                    expected_release: Some(ExpectedRelease::Text(format!(
+                        "When the store's `{}` and origin's agree again, or no refused landing \
+                         still waits on it",
+                        incident.branch
+                    ))),
+                    override_label: None,
+                    source_uri: None,
+                    opened_at: waiting_since,
+                    released_at: incident.released_at(),
+                }
             })
             .collect()
-    }
-
-    fn override_hold(&self, _hold_id: &str) -> Result<(), String> {
-        Err(
-            "This clears itself once the store's default branch and origin's agree. Publish \
-             the commits after review, or put the store's default branch back on origin's tip."
-                .into(),
-        )
     }
 }
 
@@ -491,9 +671,94 @@ mod tests {
         }
     }
 
+    /// A head ahead of origin that nothing tries to land on (a dormant
+    /// project's operator commit) is an incident the owning thread hears
+    /// about, but no operator entry: it waits on no one.
+    #[test]
+    fn an_incident_no_landing_waits_on_is_no_operator_entry() {
+        let sightings = Arc::new(Sightings::default());
+        let notices = Notices {
+            sightings: Arc::downgrade(&sightings),
+        };
+        sightings.note("p", "main", ahead("579f20af"), 10);
+        assert!(matches!(
+            sightings.note("p", "main", ahead("579f20af"), 70),
+            Change::Raised(_)
+        ));
+        assert!(sightings.reported("p", 80).is_empty());
+        assert!(notices.holds("p").is_empty());
+    }
+
+    /// A landing refused because of the incident makes it the operator's,
+    /// with no override button, until that landing stops waiting; a later
+    /// refusal is a new occurrence, and the incident clearing resolves it.
+    #[test]
+    fn a_refused_landing_lists_the_incident_until_it_stops_waiting() {
+        let sightings = Arc::new(Sightings::default());
+        let notices = Notices {
+            sightings: Arc::downgrade(&sightings),
+        };
+        let now = chrono::Utc::now().timestamp();
+        sightings.note("p", "main", ahead("stray"), now - 100);
+        sightings.note("p", "main", ahead("stray"), now - 90);
+
+        assert!(sightings.note_refused_landing("p", "main", "mr-1", now - 80));
+        assert!(
+            !sightings.note_refused_landing("p", "main", "mr-2", now - 75),
+            "already waited on"
+        );
+        let holds = notices.holds("p");
+        assert_eq!(holds.len(), 1);
+        let first = holds[0].clone();
+        assert_eq!(first.override_label, None, "no do-nothing button");
+        assert_eq!(first.opened_at, now - 80);
+        assert_eq!(first.released_at, None);
+        assert!(first.reason.contains("cairn:@/vcs/log?branch=main"));
+        assert!(notices.holds("other").is_empty());
+
+        // One refused landing still open keeps it listed.
+        let open = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect();
+        assert!(!sightings.settle_refused("p", "main", &open(&["mr-2"]), now - 60));
+        assert_eq!(notices.holds("p")[0].released_at, None);
+        assert!(sightings.settle_refused("p", "main", &open(&[]), now - 50));
+        assert_eq!(notices.holds("p")[0].released_at, Some(now - 50));
+
+        // Refused again: a new occurrence an earlier dismissal does not hide.
+        assert!(sightings.note_refused_landing("p", "main", "mr-3", now - 40));
+        let again = notices.holds("p");
+        assert_eq!(again.len(), 1);
+        assert_ne!(again[0].id, first.id);
+        assert_eq!(again[0].released_at, None);
+
+        assert!(matches!(
+            sightings.note("p", "main", Comparison::NotAhead, now - 30),
+            Change::Cleared(_)
+        ));
+        assert_eq!(notices.holds("p")[0].released_at, Some(now - 30));
+        assert!(
+            sightings.refused_landings("p", "main").is_empty(),
+            "landings go through once the store agrees with origin"
+        );
+    }
+
+    /// A landing refused before the second sighting confirms the incident is
+    /// already waiting on it when it is raised.
+    #[test]
+    fn a_landing_refused_before_the_raise_is_waiting_from_the_raise() {
+        let sightings = Sightings::default();
+        sightings.note("p", "main", ahead("stray"), 10);
+        assert!(!sightings.note_refused_landing("p", "main", "mr-1", 20));
+        let Change::Raised(incident) = sightings.note("p", "main", ahead("stray"), 70) else {
+            panic!("the second sighting raises");
+        };
+        assert_eq!(incident.waiting_since, Some(70));
+        assert_eq!(sightings.reported("p", 80).len(), 1);
+    }
+
     /// cairn/7323: a stray head is raised on its second consecutive sighting,
-    /// once, shown to the operator until it clears, and a landing in between
-    /// (a head that is not ahead) never raises anything.
+    /// once, shown to the operator while a landing waits on it until it
+    /// clears, and a landing in between (a head that is not ahead) never raises
+    /// anything.
     #[test]
     fn a_head_ahead_of_origin_is_raised_once_when_it_persists() {
         let sightings = Sightings::default();
@@ -516,6 +781,7 @@ mod tests {
             sightings.note("p", "main", Comparison::Unknown, 190),
             Change::None
         );
+        assert!(sightings.note_refused_landing("p", "main", "mr", 190));
         let reported = sightings.reported("p", 190);
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].local, "stray-2");
