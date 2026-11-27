@@ -197,6 +197,78 @@ pub(crate) const TRANSFERRED_OUTCOME: &str = r#"{"outcome":"transferred_to_inner
 /// running behind its item's permission, and a withdrawn permission hands this
 /// row back. The hold is released when the batch answers, through
 /// [`deliver_held_inline`] or a park's [`resolve`].
+/// Wait `id` as this transaction holds it, `(job_id, state, kind)`. A writer
+/// reads its row before changing it, so the count it moves on the job is
+/// exactly the change its own write makes.
+async fn wait_now(
+    c: &cairn_db::storage::TrackedConnection,
+    id: &str,
+) -> DbResult<Option<(String, String, Option<String>)>> {
+    let mut rows = c
+        .query(
+            "SELECT job_id, state, kind FROM agent_waits WHERE id = ?1",
+            params![id],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(row
+            .opt_text(0)?
+            .map(|job| Ok::<_, cairn_db::storage::DbError>((job, row.text(1)?, row.opt_text(2)?)))
+            .transpose()?),
+        None => Ok(None),
+    }
+}
+
+/// Move `job`'s `open_cairn_waits` for one wait of `kind` that went from
+/// `before` to `after`.
+async fn moved_wait(
+    c: &cairn_db::storage::TrackedConnection,
+    job: &str,
+    before: &str,
+    after: &str,
+    kind: Option<&str>,
+) -> DbResult<()> {
+    use cairn_db::stored_status::jobs::{add_open_cairn_waits, wait_delta};
+    let delta = wait_delta(Some((before, kind)), Some((after, kind)));
+    let _ = add_open_cairn_waits(c, job, delta).await?;
+    Ok(())
+}
+
+/// [`moved_wait`] for a wait read with [`wait_now`] before a write that
+/// changed `changed` rows to `after`.
+async fn moved_if_changed(
+    c: &cairn_db::storage::TrackedConnection,
+    before: &Option<(String, String, Option<String>)>,
+    changed: u64,
+    after: &str,
+) -> DbResult<()> {
+    match before {
+        Some((job, state, kind)) if changed > 0 => {
+            moved_wait(c, job, state, after, kind.as_deref()).await
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Every `(job_id, kind)` a run-and-call-keyed wait write returned, moved
+/// from `before` to `after`.
+async fn moved_returned(
+    c: &cairn_db::storage::TrackedConnection,
+    mut rows: cairn_db::storage::TrackedRows,
+    before: &str,
+    after: &str,
+) -> DbResult<u64> {
+    let mut moved = Vec::new();
+    while let Some(row) = rows.next().await? {
+        moved.push((row.text(0)?, row.opt_text(1)?));
+    }
+    drop(rows);
+    for (job, kind) in &moved {
+        moved_wait(c, job, before, after, kind.as_deref()).await?;
+    }
+    Ok(moved.len() as u64)
+}
+
 pub(crate) async fn relinquish_to_inner_wait(
     conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
@@ -204,14 +276,16 @@ pub(crate) async fn relinquish_to_inner_wait(
 ) -> DbResult<RelinquishOutcome> {
     let now = chrono::Utc::now().timestamp_millis();
     let resolution = TRANSFERRED_OUTCOME;
-    let changed = conn
-        .execute(
+    let rows = conn
+        .query(
             "UPDATE agent_waits SET state='resolved',resolution_json=?3,resolved_at=?4 \
              WHERE run_id=?1 AND tool_use_id=?2 AND state='pending' \
-             AND successor_turn_id IS NULL AND result_stored_at IS NULL",
+             AND successor_turn_id IS NULL AND result_stored_at IS NULL \
+             RETURNING job_id, kind",
             params![run_id, tool_use_id, resolution, now],
         )
         .await?;
+    let changed = moved_returned(conn, rows, "pending", "resolved").await?;
     if changed > 0 {
         return Ok(RelinquishOutcome::Transferred);
     }
@@ -561,6 +635,14 @@ async fn claim_parked_waits(
                 if changed == 0 {
                     continue;
                 }
+                moved_wait(
+                    c,
+                    &record.job_id,
+                    "pending",
+                    "resolving",
+                    Some(record.condition.kind()),
+                )
+                .await?;
                 // A no-op for every condition but a run batch.
                 super::run::detached::insert_converted(
                     c,
@@ -679,14 +761,16 @@ pub(crate) async fn reclaim_from_inner_wait(
     tool_use_id: &str,
 ) -> DbResult<bool> {
     let transferred = TRANSFERRED_OUTCOME;
-    let changed = conn
-        .execute(
+    let rows = conn
+        .query(
             "UPDATE agent_waits SET state='pending',resolution_json=NULL,resolved_at=NULL \
              WHERE run_id=?1 AND tool_use_id=?2 AND state='resolved' AND resolution_json=?3 \
-             AND successor_turn_id IS NULL AND result_stored_at IS NULL",
+             AND successor_turn_id IS NULL AND result_stored_at IS NULL \
+             RETURNING job_id, kind",
             params![run_id, tool_use_id, transferred],
         )
         .await?;
+    let changed = moved_returned(conn, rows, "resolved", "pending").await?;
     Ok(changed > 0)
 }
 
@@ -892,7 +976,8 @@ pub(crate) async fn store_columns_conn(
     columns: &ConditionColumns,
     deadline_ms: Option<i64>,
 ) -> DbResult<bool> {
-    Ok(conn
+    let before = wait_now(conn, wait_id).await?;
+    let stored = conn
         .execute(
             STORE_CONDITION_SQL,
             params![
@@ -906,7 +991,18 @@ pub(crate) async fn store_columns_conn(
             ],
         )
         .await?
-        == 1)
+        == 1;
+    // The kind can change in place, and a pending wait on a person does not
+    // count: the state stays, so the count moves by the kind alone.
+    if let (true, Some((job, state, old_kind))) = (stored, &before) {
+        use cairn_db::stored_status::jobs::{add_open_cairn_waits, wait_delta};
+        let delta = wait_delta(
+            Some((state.as_str(), old_kind.as_deref())),
+            Some((state.as_str(), Some(columns.kind))),
+        );
+        let _ = add_open_cairn_waits(conn, job, delta).await?;
+    }
+    Ok(stored)
 }
 
 /// One suspended call: the parked turn, the tool call awaiting a result, and
@@ -1271,6 +1367,7 @@ async fn settle_held_inline(db: &LocalDb, record: &Record) -> Result<HeldDeliver
     db.write(|c| {
         let (id, turn_id) = (id.clone(), turn_id.clone());
         Box::pin(async move {
+            let before = wait_now(c, &id).await?;
             let changed = c
                 .execute(
                     "UPDATE agent_waits SET state='resolved',resolution_json=?3,resolved_at=?4 \
@@ -1284,6 +1381,7 @@ async fn settle_held_inline(db: &LocalDb, record: &Record) -> Result<HeldDeliver
                     ],
                 )
                 .await?;
+            moved_if_changed(c, &before, changed, "resolved").await?;
             if changed > 0 {
                 return Ok(HeldDelivery::Delivered);
             }
@@ -1577,6 +1675,10 @@ async fn insert_as(db: &LocalDb, r: &Record, establish: Establish) -> Result<boo
         let columns=ConditionColumns::of(&r.condition,r.deadline).map_err(DbError::internal)?;
         let hold = (establish == Establish::Hold).then_some("inline");
         c.execute(INSERT_WAIT_SQL,params![r.id.as_str(),r.job_id.as_str(),r.run_id.as_str(),r.session_id.as_str(),r.turn_id.as_str(),r.tool_use_id.as_str(),columns.json.as_str(),r.deadline,columns.kind,columns.due_at_ms,columns.next_poll_at_ms,columns.pending_prompt_id.as_deref(),r.created,hold]).await?;
+        {
+            use cairn_db::stored_status::jobs::{add_open_cairn_waits, wait_delta};
+            let _ = add_open_cairn_waits(c, &r.job_id, wait_delta(None, Some(("pending", Some(columns.kind))))).await?;
+        }
         if establish == Establish::Hold {
             return Ok(false);
         }
@@ -1792,12 +1894,14 @@ async fn complete_resolution_in_fact(
     db.write(|c| {
         let id = id.clone();
         Box::pin(async move {
+            let before = wait_now(c, &id).await?;
             let completed = c
                 .execute(
                     "UPDATE agent_waits SET state='resolved',resolved_at=COALESCE(resolved_at,?2) WHERE id=?1 AND state='resolving' AND successor_turn_id IS NOT NULL AND result_stored_at IS NOT NULL",
                     params![id.clone(), now],
                 )
                 .await?;
+            moved_if_changed(c, &before, completed, "resolved").await?;
             if completed > 0 {
                 log::warn!("suspension {id} had resolved in fact but never recorded it; completed");
             }
@@ -1846,6 +1950,7 @@ async fn mark_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result<b
                 None => None,
             };
             drop(rows);
+            let before = wait_now(c, &id).await?;
             let now = chrono::Utc::now().timestamp_millis();
             let marked = c
                 .execute(
@@ -1853,6 +1958,7 @@ async fn mark_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result<b
                     params![id.clone(), result, now],
                 )
                 .await?;
+            moved_if_changed(c, &before, marked, "resolving").await?;
             // Abandoning ends only the wait, never the batch's hold. Supersession
             // leaves the batch running, so it keeps the result durable too.
             // Operator Compact has asked the fleet to cancel the batch, but its
@@ -2019,11 +2125,12 @@ async fn cancel_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result
     db.write(|c| {
         let (id, result) = (id.clone(), abandoned_result(cause));
         Box::pin(async move {
-            c.execute(
+            let before = wait_now(c, &id).await?;
+            let cancelled = c.execute(
                 "UPDATE agent_waits SET state='cancelled',resolution_json=COALESCE(resolution_json,?2),resolved_at=COALESCE(resolved_at,?3) WHERE id=?1 AND state IN ('pending','resolving')",
-                params![id, result, now],
+                params![id.as_str(), result, now],
             ).await?;
-            Ok(())
+            moved_if_changed(c, &before, cancelled, "cancelled").await
         })
     })
     .await
@@ -2074,13 +2181,15 @@ pub(crate) async fn cancel_run_waits_conn(
 ) -> DbResult<()> {
     let mut rows = c
         .query(
-            "SELECT id,job_id,condition_json FROM agent_waits WHERE run_id=?1 AND state IN ('pending','resolving')",
+            "SELECT id,job_id,condition_json,state,kind FROM agent_waits WHERE run_id=?1 AND state IN ('pending','resolving')",
             params![run_id],
         )
         .await?;
     let mut batches = Vec::new();
+    let mut open = Vec::new();
     while let Some(row) = rows.next().await? {
         let (id, job_id) = (row.text(0)?, row.text(1)?);
+        open.push((job_id.clone(), row.text(3)?, row.opt_text(4)?));
         if let Ok(condition) = serde_json::from_str::<Condition>(&row.text(2)?) {
             if condition.is_tree_run_batch() {
                 batches.push((id, job_id, condition));
@@ -2097,6 +2206,10 @@ pub(crate) async fn cancel_run_waits_conn(
         params![run_id, now],
     )
     .await?;
+    // Exactly the open rows read above, in this transaction, are cancelled.
+    for (job, state, kind) in &open {
+        moved_wait(c, job, state, "cancelled", kind.as_deref()).await?;
+    }
     Ok(())
 }
 
@@ -2167,12 +2280,14 @@ async fn resolve_inner(
         .write(|c| {
             let (id, out) = (id.clone(), out.clone());
             Box::pin(async move {
+                let before = wait_now(c, &id).await?;
                 let changed = c
                     .execute(
                         "UPDATE agent_waits SET state='resolving',resolution_json=?2,resolving_at=?3 WHERE id=?1 AND state='pending'",
-                        params![id, out, chrono::Utc::now().timestamp_millis()],
+                        params![id.as_str(), out, chrono::Utc::now().timestamp_millis()],
                     )
                     .await?;
+                moved_if_changed(c, &before, changed, "resolving").await?;
                 Ok(changed)
             })
         })
@@ -2343,7 +2458,21 @@ async fn resolve_inner(
 
     // Mark resolved (idempotent CAS on the resolving state).
     let id = r.id.clone();
-    db.write(|c|{let id=id.clone();Box::pin(async move{c.execute("UPDATE agent_waits SET state='resolved',resolved_at=?2 WHERE id=?1 AND state='resolving'",params![id,chrono::Utc::now().timestamp_millis()]).await?;Ok(())})}).await.map_err(|e|e.to_string())?;
+    db.write(|c| {
+        let id = id.clone();
+        Box::pin(async move {
+            let before = wait_now(c, &id).await?;
+            let resolved = c
+                .execute(
+                    "UPDATE agent_waits SET state='resolved',resolved_at=?2 WHERE id=?1 AND state='resolving'",
+                    params![id.as_str(), chrono::Utc::now().timestamp_millis()],
+                )
+                .await?;
+            moved_if_changed(c, &before, resolved, "resolved").await
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2419,11 +2548,16 @@ async fn divert_to_job(
                 now,
             )
             .await?;
-            c.execute(
-                "UPDATE agent_waits SET state='resolved',resolved_at=?2 WHERE id=?1 AND state='resolving'",
-                params![id, now],
-            )
-            .await?;
+            let resolved = c
+                .execute(
+                    "UPDATE agent_waits SET state='resolved',resolved_at=?2 WHERE id=?1 AND state='resolving'",
+                    params![id, now],
+                )
+                .await?;
+            if resolved > 0 {
+                // Read as resolving above, so it counted.
+                let _ = cairn_db::stored_status::jobs::add_open_cairn_waits(c, &job_id, -1).await?;
+            }
             Ok(Some(steered))
         })
     })
@@ -2528,9 +2662,14 @@ async fn stood_down_for_active_sibling(db: &LocalDb, r: &Record) -> Result<bool,
                 let changed = c
                     .execute(
                         "UPDATE agent_waits SET state='resolved',resolved_at=?4 WHERE id=?1 AND state='resolving' AND EXISTS (SELECT 1 FROM agent_waits sibling WHERE sibling.job_id=?2 AND sibling.predecessor_turn_id=?3 AND sibling.id<>?1 AND sibling.state IN ('pending','resolving'))",
-                        params![id, job_id, turn_id, now],
+                        params![id, job_id.as_str(), turn_id, now],
                     )
                     .await?;
+                if changed > 0 {
+                    // Resolving counted, whatever its kind.
+                    let _ =
+                        cairn_db::stored_status::jobs::add_open_cairn_waits(c, &job_id, -1).await?;
+                }
                 Ok(changed)
             })
         })
@@ -3234,12 +3373,14 @@ async fn settle_if_unresumable(orch: &Orchestrator, db: &LocalDb, record: &Recor
                     None => return Ok(false),
                 };
                 drop(rows);
+                let before = wait_now(c, &id).await?;
                 let changed = c
                     .execute(
                         "UPDATE agent_waits SET state='cancelled',resolution_json=?2,resolved_at=COALESCE(resolved_at,?3) WHERE id=?1 AND state IN ('pending','resolving')",
-                        params![id, unresumable_resolution(&cause, stored.as_deref()), now],
+                        params![id.as_str(), unresumable_resolution(&cause, stored.as_deref()), now],
                     )
                     .await?;
+                moved_if_changed(c, &before, changed, "cancelled").await?;
                 Ok(changed > 0)
             })
         })
@@ -3738,6 +3879,61 @@ async fn resolution_after_restart(
             request_id,
             settled_attempts,
         } => crate::operator_requests::wait::trigger(orch, request_id, settled_attempts).await,
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    /// A wait's kind converted in place, then its abandonment and cancel, each
+    /// storing the activity it leaves with no refresh of the test's own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_writers_store_the_activity_they_leave() {
+        use crate::execution::queue::tests::{assert_activity, seed_project, seed_turn_job};
+        let db = std::sync::Arc::new(crate::storage::migrated_test_db("wait-activity.db").await);
+        seed_project(&db).await;
+        seed_turn_job(&db, 1, "running", "yielded").await;
+        db.execute_script(
+            "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at,kind)
+               VALUES('w','j1','r-j1','s-j1','t1','call','{\"kind\":\"duration\"}','pending',1,'duration');",
+        )
+        .await
+        .unwrap();
+        crate::execution::queue::tests::seed_stored_status(&db).await;
+        assert_activity(&db, "e1", "active", "seeding").await;
+
+        let store = |condition: Condition| {
+            let db = db.clone();
+            async move {
+                let columns = ConditionColumns::of(&condition, None).unwrap();
+                db.write(move |conn| {
+                    let columns = columns.clone();
+                    Box::pin(async move { store_columns_conn(conn, "w", &columns, None).await })
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let person = Condition::OperatorRequest {
+            request_id: "request".into(),
+            settled_attempts: Vec::new(),
+        };
+        assert!(store(person.clone()).await);
+        assert_activity(&db, "e1", "dormant", "conversion to a person's wait").await;
+        assert!(store(Condition::Duration).await);
+        assert_activity(&db, "e1", "active", "conversion back to a timer").await;
+        assert!(store(person).await);
+        assert_activity(&db, "e1", "dormant", "conversion to a person's wait again").await;
+
+        assert!(mark_abandoned(&db, "w", AbandonCause::Superseded)
+            .await
+            .unwrap());
+        assert_activity(&db, "e1", "active", "abandonment (resolving)").await;
+        cancel_abandoned(&db, "w", AbandonCause::Superseded)
+            .await
+            .unwrap();
+        assert_activity(&db, "e1", "dormant", "cancel the abandoned wait").await;
     }
 }
 
@@ -8353,6 +8549,7 @@ mod tests {
             )
             .await
             .unwrap();
+        crate::execution::queue::tests::seed_stored_status(&orch.db.local).await;
 
         resolve(&orch, &orch.db.local, &record, ELAPSED, true)
             .await
@@ -8738,6 +8935,7 @@ mod tests {
             )
             .await
             .unwrap();
+        crate::execution::queue::tests::seed_stored_status(&orch.db.local).await;
 
         // The resumed turn issues its own wait.
         let next = Record {

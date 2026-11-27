@@ -936,6 +936,9 @@ async fn fence_workflow(orch: &Orchestrator, job_id: &str) -> Result<(), String>
                     params![now, job_id.as_str()],
                 )
                 .await?;
+                // Its running and pending turns ended above.
+                let _ = cairn_db::stored_status::jobs::set_no_turn_running(conn, &job_id, now)
+                    .await?;
                 Ok(())
             })
         })

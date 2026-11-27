@@ -336,7 +336,8 @@ async fn pass(orch: &Orchestrator, trigger: Trigger) {
 pub fn pass_line(trigger: Trigger, report: &SweepReport, duration: Duration) -> String {
     format!(
         "execution gate sweep pass trigger={} duration_ms={} evaluated={} candidates={} \
-         released={} foreclosed={} clauses={}",
+         released={} foreclosed={} clauses={} settle_wait_ms={} settle_lock_ms={} facts_ms={} \
+         act_ms={} act_records={} act_resumes={} act_resume_ms={}",
         trigger.as_str(),
         duration_ms(duration),
         report.evaluated,
@@ -344,6 +345,13 @@ pub fn pass_line(trigger: Trigger, report: &SweepReport, duration: Duration) -> 
         report.released.len(),
         report.foreclosed.len(),
         clause_tally(&report.clauses),
+        report.queue.wait_ms,
+        report.queue.lock_ms,
+        report.queue.facts_ms,
+        report.queue.act_ms,
+        report.queue.act_records,
+        report.queue.act_resumes,
+        report.queue.act_resume_ms,
     )
 }
 
@@ -559,12 +567,27 @@ mod tests {
             pass_line(Trigger::Nudge, &report, Duration::from_millis(12)),
             "execution gate sweep pass trigger=nudge duration_ms=12 evaluated=5 candidates=2 \
              released=1 foreclosed=1 \
-             clauses=issue_resolution:no_evidence=3,satisfied=1;pr_state:foreclosed=1"
+             clauses=issue_resolution:no_evidence=3,satisfied=1;pr_state:foreclosed=1 \
+             settle_wait_ms=0 settle_lock_ms=0 facts_ms=0 act_ms=0 act_records=0 act_resumes=0 \
+             act_resume_ms=0"
         );
+        let timed = SweepReport {
+            queue: crate::execution::queue::SettleTimings {
+                wait_ms: 1,
+                lock_ms: 9,
+                facts_ms: 8,
+                act_ms: 30,
+                act_records: 2,
+                act_resumes: 3,
+                act_resume_ms: 25,
+            },
+            ..SweepReport::default()
+        };
         assert_eq!(
-            pass_line(Trigger::Tick, &SweepReport::default(), Duration::ZERO),
+            pass_line(Trigger::Tick, &timed, Duration::ZERO),
             "execution gate sweep pass trigger=tick duration_ms=0 evaluated=0 candidates=0 \
-             released=0 foreclosed=0 clauses=-"
+             released=0 foreclosed=0 clauses=- settle_wait_ms=1 settle_lock_ms=9 facts_ms=8 \
+             act_ms=30 act_records=2 act_resumes=3 act_resume_ms=25"
         );
     }
 

@@ -469,10 +469,26 @@ impl Drop for PendingLaunchTurnGuard<'_> {
                 let db = self.db.clone();
                 let turn_id = turn_id.clone();
                 async move {
-                    db.execute(
-                        "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, updated_at = ?2 WHERE id = ?3 AND state = 'running'",
-                        cairn_db::turso::params![end_reason.as_str(), now, turn_id.as_str()],
-                    )
+                    db.write(move |conn| {
+                        let (turn_id, end_reason) = (turn_id.clone(), end_reason.clone());
+                        Box::pin(async move {
+                            let changed = conn.execute(
+                                "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, updated_at = ?2 WHERE id = ?3 AND state = 'running'",
+                                cairn_db::turso::params![end_reason.as_str(), now, turn_id.as_str()],
+                            )
+                            .await?;
+                            if changed > 0 {
+                                let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                                    conn,
+                                    &turn_id,
+                                    cairn_db::stored_status::jobs::HeadTurn::Idle,
+                                    now,
+                                )
+                                .await?;
+                            }
+                            Ok(changed)
+                        })
+                    })
                     .await
                     .map_err(|error| error.to_string())
                 }
@@ -492,12 +508,28 @@ impl Drop for PendingLaunchTurnGuard<'_> {
                 let db = self.db.clone();
                 let turn_id = turn_id.clone();
                 async move {
-                    db.execute(
-                    "UPDATE turns SET state = 'cancelled', end_reason = 'launch_refused', ended_at = ?1, updated_at = ?1 WHERE id = ?2 AND state IN ('pending', 'running')",
-                    cairn_db::turso::params![now, turn_id.as_str()],
-                )
-                .await
-                .map_err(|error| error.to_string())
+                    db.write(move |conn| {
+                        let turn_id = turn_id.clone();
+                        Box::pin(async move {
+                            let changed = conn.execute(
+                                "UPDATE turns SET state = 'cancelled', end_reason = 'launch_refused', ended_at = ?1, updated_at = ?1 WHERE id = ?2 AND state IN ('pending', 'running')",
+                                cairn_db::turso::params![now, turn_id.as_str()],
+                            )
+                            .await?;
+                            if changed > 0 {
+                                let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                                    conn,
+                                    &turn_id,
+                                    cairn_db::stored_status::jobs::HeadTurn::Idle,
+                                    now,
+                                )
+                                .await?;
+                            }
+                            Ok(changed)
+                        })
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
                 }
             });
             if result.as_ref().is_ok_and(|changed| *changed > 0) {
@@ -3108,7 +3140,28 @@ fn continue_job_launch_locked(
                 let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
                     .await
                     .map_err(|e| e.to_string())?;
-                db.execute("UPDATE provider_limit_holds SET state='superseded',updated_at=?1 WHERE id=?2 AND state='active' AND turn_id IS ?3 AND resume_json IS ?4",cairn_db::turso::params![orch.services.clock.now(),hold.id,hold.turn_id,hold.resume_json]).await.map_err(|e|e.to_string())?;
+                let now = orch.services.clock.now();
+                db.write(move |conn| {
+                    let hold = hold.clone();
+                    Box::pin(async move {
+                        let retired = conn.execute(
+                            "UPDATE provider_limit_holds SET state='superseded',updated_at=?1 WHERE id=?2 AND state='active' AND turn_id IS ?3 AND resume_json IS ?4",
+                            cairn_db::turso::params![now, hold.id.as_str(), hold.turn_id.as_deref(), hold.resume_json.as_deref()],
+                        )
+                        .await?;
+                        if retired > 0 {
+                            let _ = cairn_db::stored_status::jobs::set_hold_standing(
+                                conn,
+                                &hold.job_id,
+                                cairn_db::stored_status::jobs::HoldStanding::None,
+                            )
+                            .await?;
+                        }
+                        Ok(())
+                    })
+                })
+                .await
+                .map_err(|e| e.to_string())?;
                 Ok(())
             }) {
                 log::error!("Could not retire addressed hold after handoff: {error}");
@@ -6513,6 +6566,13 @@ fn mark_stale_active_turn_for_continue(
                         turn_id.as_str(),
                         state.to_string()
                     ],
+                )
+                .await?;
+                let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                    conn,
+                    &turn_id,
+                    cairn_db::stored_status::jobs::HeadTurn::Idle,
+                    now,
                 )
                 .await?;
                 conn.on_commit(cairn_db::admission_hint::evidence_changed);

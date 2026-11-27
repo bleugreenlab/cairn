@@ -37,6 +37,13 @@ pub async fn start_turn(
                 params![run_id.as_str(), now, now, turn_id.as_str()],
             )
             .await?;
+            let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                conn,
+                &turn_id,
+                cairn_db::stored_status::jobs::HeadTurn::Running,
+                now,
+            )
+            .await?;
             Ok(())
         })
     })
@@ -148,6 +155,13 @@ pub async fn yield_running_turn_conn(
         )
         .await?;
     if changed > 0 {
+        let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+            conn,
+            turn_id,
+            cairn_db::stored_status::jobs::HeadTurn::Idle,
+            now,
+        )
+        .await?;
         // A parked turn may free its execution's fleet slot.
         conn.on_commit(cairn_db::admission_hint::evidence_changed);
     }
@@ -253,6 +267,14 @@ async fn update_terminal_turn(
                     now,
                     turn_id.as_str()
                 ],
+            )
+            .await?;
+            // Every state this writes is terminal: the head is no longer due.
+            let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                conn,
+                &turn_id,
+                cairn_db::stored_status::jobs::HeadTurn::Idle,
+                now,
             )
             .await?;
             conn.on_commit(cairn_db::admission_hint::evidence_changed);

@@ -231,6 +231,18 @@ pub async fn update_turn(
                     ],
                 )
                 .await?;
+                let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                    conn,
+                    &turn_id,
+                    cairn_db::stored_status::jobs::HeadTurn::of(
+                        &state,
+                        &current.start_reason.to_string(),
+                        run_id.as_deref(),
+                        end_reason.as_deref(),
+                    ),
+                    i64::from(updated_at),
+                )
+                .await?;
                 conn.on_commit(cairn_db::admission_hint::evidence_changed);
 
                 load_turn_conn(conn, &turn_id)
@@ -549,6 +561,18 @@ async fn create_turn_conn(
         conn.execute(
             "UPDATE jobs SET current_turn_id = ?1 WHERE id = ?2",
             params![new_turn.id.as_str(), job_id],
+        )
+        .await?;
+        let _ = cairn_db::stored_status::jobs::set_head_turn(
+            conn,
+            job_id,
+            cairn_db::stored_status::jobs::HeadTurn::of(
+                &new_turn.state,
+                &new_turn.start_reason,
+                new_turn.run_id.as_deref(),
+                None,
+            ),
+            i64::from(new_turn.updated_at),
         )
         .await?;
     }

@@ -854,7 +854,7 @@ mod tests {
     async fn db() -> LocalDb {
         let db = LocalDb::open(":memory:").await.unwrap();
         db.exclusive(|conn| Box::pin(async move {
-            conn.execute_batch("CREATE TABLE agent_waits(id TEXT PRIMARY KEY,state TEXT NOT NULL,condition_json TEXT NOT NULL,deadline_ms INTEGER,created_at INTEGER DEFAULT 0,kind TEXT,due_at_ms INTEGER,next_poll_at_ms INTEGER,pending_prompt_id TEXT); CREATE TABLE prompts(id TEXT PRIMARY KEY,response TEXT,answered_at INTEGER,mcp_wait_id TEXT REFERENCES agent_waits(id),mcp_consumed_at INTEGER,withdrawn_at INTEGER);").await?;
+            conn.execute_batch("CREATE TABLE agent_waits(id TEXT PRIMARY KEY,job_id TEXT,state TEXT NOT NULL,condition_json TEXT NOT NULL,deadline_ms INTEGER,created_at INTEGER DEFAULT 0,kind TEXT,due_at_ms INTEGER,next_poll_at_ms INTEGER,pending_prompt_id TEXT); CREATE TABLE prompts(id TEXT PRIMARY KEY,response TEXT,answered_at INTEGER,mcp_wait_id TEXT REFERENCES agent_waits(id),mcp_consumed_at INTEGER,withdrawn_at INTEGER);").await?;
             Ok(())
         })).await.unwrap();
         db

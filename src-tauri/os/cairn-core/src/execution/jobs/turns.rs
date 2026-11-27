@@ -384,6 +384,15 @@ async fn claim_retry_turn_start_conn(
             params![run_id, now, turn_id],
         )
         .await?;
+    if changed > 0 {
+        let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+            conn,
+            turn_id,
+            cairn_db::stored_status::jobs::HeadTurn::Running,
+            i64::from(now),
+        )
+        .await?;
+    }
     Ok(changed > 0)
 }
 
@@ -1105,6 +1114,15 @@ pub(crate) fn abandon_pending_retry_if_head_matches(
                             params![now, retry_turn_id.as_str()],
                         )
                         .await?;
+                    if changed > 0 {
+                        let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                            conn,
+                            &retry_turn_id,
+                            cairn_db::stored_status::jobs::HeadTurn::Idle,
+                            i64::from(now),
+                        )
+                        .await?;
+                    }
                     conn.on_commit(cairn_db::admission_hint::evidence_changed);
                     Ok(changed > 0)
                 })
@@ -1274,6 +1292,13 @@ async fn create_turn_conn(
     conn.execute(
         "UPDATE jobs SET current_turn_id = ?1 WHERE id = ?2",
         params![Some(turn_id), job_id],
+    )
+    .await?;
+    let _ = cairn_db::stored_status::jobs::set_head_turn(
+        conn,
+        job_id,
+        cairn_db::stored_status::jobs::HeadTurn::Running,
+        i64::from(now),
     )
     .await?;
     Ok(())
@@ -1799,6 +1824,14 @@ pub(crate) fn admit_codex_goal_turn(
                         params![turn_id.as_str(), now, job_id.as_str()],
                     )
                     .await?;
+                    // The head is now the running turn this admission claimed.
+                    let _ = cairn_db::stored_status::jobs::set_head_turn(
+                        conn,
+                        &job_id,
+                        cairn_db::stored_status::jobs::HeadTurn::Running,
+                        i64::from(now),
+                    )
+                    .await?;
                     Ok(CodexGoalTurnAdmission::Admitted(turn_id))
                 })
             })
@@ -1867,6 +1900,13 @@ pub fn start_turn(orch: &Orchestrator, turn_id: &str, run_id: &str) -> Result<()
                              SET state = 'running', run_id = ?1, started_at = ?2, updated_at = ?2
                              WHERE id = ?3",
                             params![run_id.as_str(), now, turn_id.as_str()],
+                        )
+                        .await?;
+                        let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                            conn,
+                            &turn_id,
+                            cairn_db::stored_status::jobs::HeadTurn::Running,
+                            i64::from(now),
                         )
                         .await?;
                         Ok((session_id, job_id))

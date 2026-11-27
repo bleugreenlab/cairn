@@ -149,6 +149,8 @@ pub struct SweepReport {
     pub clauses: BTreeMap<(String, &'static str), usize>,
     /// What the pass did with conditions on pending asks.
     pub asks: super::ask_conditions::AskSweepReport,
+    /// Where the pass's run queue settle spent its time.
+    pub queue: crate::execution::queue::SettleTimings,
 }
 
 /// Evaluate every held execution in every open database, as of now.
@@ -234,7 +236,7 @@ pub(crate) async fn sweep_with(
     }
     report.candidates = candidates.len();
     release_candidates(orch, &candidates, now, &mut report).await;
-    crate::execution::queue::settle(orch).await?;
+    report.queue = crate::execution::queue::settle_timed(orch).await?.1;
     // A released or superseded execution is no longer listed held, so its
     // stamp goes with this pass.
     orch.sweep_pulse.retain_evaluated(&held_ids);

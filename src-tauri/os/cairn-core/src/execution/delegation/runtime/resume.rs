@@ -88,6 +88,13 @@ async fn prepare_parent_for_delegated_wait_db(
                     (now, pred_turn_id.as_str()),
                 )
                 .await?;
+                let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                    conn,
+                    &pred_turn_id,
+                    cairn_db::stored_status::jobs::HeadTurn::Idle,
+                    i64::from(now),
+                )
+                .await?;
                 conn.on_commit(cairn_db::admission_hint::evidence_changed);
             }
 
@@ -113,6 +120,19 @@ async fn prepare_parent_for_delegated_wait_db(
             conn.execute(
                 "UPDATE jobs SET current_turn_id = ?1 WHERE id = ?2",
                 (pred_turn_id.as_str(), parent_job_id.as_str()),
+            )
+            .await?;
+            // The head is the predecessor this call read, yielded above when
+            // it was running.
+            let head = match turn_state.as_deref() {
+                Some("running") | None => cairn_db::stored_status::jobs::HeadTurn::Idle,
+                Some(state) => cairn_db::stored_status::jobs::HeadTurn::of_state(state),
+            };
+            let _ = cairn_db::stored_status::jobs::set_head_turn(
+                conn,
+                &parent_job_id,
+                head,
+                chrono::Utc::now().timestamp(),
             )
             .await?;
             Ok(())
@@ -548,7 +568,9 @@ fn delegated_sibling_ids(
 /// The marker heading the job, with no run and no `end_reason`, is also the
 /// run queue's record that the parent's resume is owed: it keeps the
 /// execution active between the last task settling and the resume minting its
-/// own turn (see `activity_sql!` in `execution/queue.rs`).
+/// own turn. The claim stores that as the job's `head_turn = 'resume_owed'`
+/// (`cairn_db::stored_status::jobs`), and every write that moves the head off
+/// the marker or changes it stores the new head's value.
 async fn claim_dependency_unblock(
     db: &LocalDb,
     parent_job_id: &str,
@@ -574,6 +596,16 @@ async fn claim_dependency_unblock(
                         (now, successor_id.as_str(), parent_job_id.as_str()),
                     )
                     .await?;
+                if affected == 1 {
+                    // The completed marker heads the job: its resume is owed.
+                    let _ = cairn_db::stored_status::jobs::set_head_turn(
+                        conn,
+                        &parent_job_id,
+                        cairn_db::stored_status::jobs::HeadTurn::ResumeOwed,
+                        i64::from(now),
+                    )
+                    .await?;
+                }
                 conn.on_commit(cairn_db::admission_hint::evidence_changed);
                 return Ok((affected == 1).then_some(successor_id));
             }
@@ -631,6 +663,13 @@ async fn claim_dependency_unblock(
                     "dependency-unblock ownership changed during atomic claim".to_string(),
                 ));
             }
+            let _ = cairn_db::stored_status::jobs::set_head_turn(
+                conn,
+                &parent_job_id,
+                cairn_db::stored_status::jobs::HeadTurn::ResumeOwed,
+                i64::from(now),
+            )
+            .await?;
             Ok(Some(successor_id))
         })
     })
@@ -650,16 +689,35 @@ async fn release_unlaunched_dependency_unblock(
     marker_turn_id: &str,
 ) -> Result<bool, String> {
     let now = chrono::Utc::now().timestamp();
-    db.execute(
-        "UPDATE turns SET end_reason = 'launch_refused', updated_at = ?3
-          WHERE id = ?1 AND start_reason = 'dependency_unblock' AND end_reason IS NULL
-            AND id = (SELECT current_turn_id FROM jobs WHERE id = ?2)
-            AND NOT EXISTS (SELECT 1 FROM provider_limit_holds h
-                             WHERE h.job_id = ?2 AND h.state = 'active' AND h.turn_id = ?1)",
-        cairn_db::turso::params![marker_turn_id, parent_job_id, now],
-    )
+    let (job, marker) = (parent_job_id.to_string(), marker_turn_id.to_string());
+    db.write(move |conn| {
+        let (job, marker) = (job.clone(), marker.clone());
+        Box::pin(async move {
+            let released = conn
+                .execute(
+                    "UPDATE turns SET end_reason = 'launch_refused', updated_at = ?3
+                      WHERE id = ?1 AND start_reason = 'dependency_unblock' AND end_reason IS NULL
+                        AND id = (SELECT current_turn_id FROM jobs WHERE id = ?2)
+                        AND NOT EXISTS (SELECT 1 FROM provider_limit_holds h
+                                         WHERE h.job_id = ?2 AND h.state = 'active' AND h.turn_id = ?1)",
+                    cairn_db::turso::params![marker.as_str(), job.as_str(), now],
+                )
+                .await?
+                == 1;
+            if released {
+                // The marker still heads the job, now with an end reason.
+                let _ = cairn_db::stored_status::jobs::set_head_turn(
+                    conn,
+                    &job,
+                    cairn_db::stored_status::jobs::HeadTurn::Idle,
+                    now,
+                )
+                .await?;
+            }
+            Ok(released)
+        })
+    })
     .await
-    .map(|released| released == 1)
     .map_err(|e| format!("Failed to release unlaunched dependency unblock: {e}"))
 }
 

@@ -559,6 +559,13 @@ pub async fn force_fail_job_turn_conn(
                 params![now, now, turn_id.as_str()],
             )
             .await?;
+            let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                conn,
+                &turn_id,
+                cairn_db::stored_status::jobs::HeadTurn::Idle,
+                now,
+            )
+            .await?;
             conn.on_commit(cairn_db::admission_hint::evidence_changed);
         }
         other => {

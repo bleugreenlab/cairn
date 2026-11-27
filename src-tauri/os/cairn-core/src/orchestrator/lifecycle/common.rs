@@ -152,6 +152,13 @@ pub(super) fn settle_turn_outcome(
                         ),
                     )
                     .await?;
+                    let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                        conn,
+                        &turn_id,
+                        cairn_db::stored_status::jobs::HeadTurn::Idle,
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .await?;
                     conn.on_commit(cairn_db::admission_hint::evidence_changed);
                     Ok(())
                 })
@@ -251,6 +258,13 @@ pub(super) fn settle_turn_interruption(
                          updated_at = ?2
                      WHERE id = ?3",
                         (end_reason.as_deref(), now, turn_id.as_str()),
+                    )
+                    .await?;
+                    let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                        conn,
+                        &turn_id,
+                        cairn_db::stored_status::jobs::HeadTurn::Idle,
+                        chrono::Utc::now().timestamp(),
                     )
                     .await?;
                     conn.on_commit(cairn_db::admission_hint::evidence_changed);

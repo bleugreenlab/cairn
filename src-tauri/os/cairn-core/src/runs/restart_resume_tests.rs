@@ -974,6 +974,10 @@ async fn seed_held_run_call(db: &LocalDb, job: &str, turn: &str) {
     )
     .await
     .unwrap();
+    // A raw insert is not a writer: give the job the count its wait carries.
+    cairn_db::stored_status::jobs::seed_from_sources_for_test(db)
+        .await
+        .unwrap();
 }
 
 async fn held_tool_results(db: &LocalDb) -> Vec<String> {

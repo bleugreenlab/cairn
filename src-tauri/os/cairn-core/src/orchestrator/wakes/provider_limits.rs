@@ -259,6 +259,7 @@ pub async fn yield_and_arm_provider_limit_hold(
         let observation = observation.clone();
         Box::pin(async move {
             let o = observation;
+            let job_id = o.job_id.clone();
             crate::transitions::turn::yield_running_turn_conn(
                 conn,
                 &o.turn_id,
@@ -319,7 +320,10 @@ pub async fn yield_and_arm_provider_limit_hold(
                 ).await?;
                 id
             };
-            load_conn(conn, &id).await?.ok_or_else(|| DbError::internal("armed hold disappeared".to_string()))
+            let _ = &job_id;
+            let armed = load_conn(conn, &id).await?.ok_or_else(|| DbError::internal("armed hold disappeared".to_string()))?;
+            store_active_standing(conn, &armed).await?;
+            Ok(armed)
         })
     }).await.map_err(|error| error.to_string())
 }
@@ -455,9 +459,11 @@ async fn arm_job_hold(
             if r.kind == HoldKind::Launch && boundary.is_some() {
                 conn.execute("UPDATE jobs SET status='pending',updated_at=?2 WHERE id=?1 AND status IN ('pending','running')", params![r.job_id.as_str(),r.now]).await?;
             }
-            load_conn(conn, &id)
+            let armed = load_conn(conn, &id)
                 .await?
-                .ok_or_else(|| DbError::internal("armed hold disappeared".to_string()))
+                .ok_or_else(|| DbError::internal("armed hold disappeared".to_string()))?;
+            store_active_standing(conn, &armed).await?;
+            Ok(armed)
         })
     })
     .await
@@ -622,9 +628,12 @@ async fn arm_queue_yield(
                     id
                 }
             };
-            load_conn(conn, &id)
+            let _ = &job;
+            let armed = load_conn(conn, &id)
                 .await?
-                .ok_or_else(|| DbError::internal("armed hold disappeared".to_string()))
+                .ok_or_else(|| DbError::internal("armed hold disappeared".to_string()))?;
+            store_active_standing(conn, &armed).await?;
+            Ok(armed)
         })
     })
     .await
@@ -795,10 +804,7 @@ async fn recover_undriven_resumes(
         .await
         .map_err(|error| error.to_string())?;
     if finished.is_some() {
-        db.execute(
-            format!("UPDATE provider_limit_holds SET state='superseded',updated_at=?1 WHERE {FINISHED_QUEUE_WAIT_HOLD}"),
-            params![now],
-        ).await.map_err(|error| error.to_string())?;
+        retire_holds_where(db, "superseded", FINISHED_QUEUE_WAIT_HOLD, now).await?;
     }
     let candidates = db.query_all(
         "SELECT h.id,h.job_id FROM provider_limit_holds h
@@ -991,13 +997,23 @@ pub async fn settle_supply_held_start(
                         run_id
                     }
                 };
-                conn.execute(
+                let cancelled_head = conn.execute(
                     "UPDATE turns SET state='cancelled', end_reason='launch_refused', ended_at=?2, updated_at=?2
                      WHERE id=(SELECT current_turn_id FROM jobs WHERE id=?1)
                        AND (state='pending' OR (state='running' AND start_reason='retry'))",
                     params![job.as_str(), now],
                 )
                 .await?;
+                // `id=current_turn_id`: a cancelled turn here is the head.
+                if cancelled_head > 0 {
+                    let _ = cairn_db::stored_status::jobs::set_head_turn(
+                        conn,
+                        &job,
+                        cairn_db::stored_status::jobs::HeadTurn::Idle,
+                        now,
+                    )
+                    .await?;
+                }
                 conn.on_commit(cairn_db::admission_hint::evidence_changed);
                 conn.execute(
                     "UPDATE provider_limit_holds SET run_id=COALESCE(run_id, ?2) WHERE id=?1",
@@ -1070,12 +1086,38 @@ pub async fn supersede_orphaned_provider_limit_holds(
     if orphaned.is_none() {
         return Ok(0);
     }
-    db.execute(
-        format!(
-            "UPDATE provider_limit_holds SET state='superseded', updated_at=?1 WHERE {ORPHANED_HOLD}"
-        ),
-        params![now],
-    )
+    retire_holds_where(db, "superseded", ORPHANED_HOLD, now).await
+}
+
+/// Move every hold matching `predicate` to `state`, and refresh the run-queue
+/// activity of each job that held one, in one transaction. Returns how many.
+async fn retire_holds_where(
+    db: &LocalDb,
+    state: &'static str,
+    predicate: &'static str,
+    now: i64,
+) -> Result<u64, String> {
+    db.write(move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    format!(
+                        "UPDATE provider_limit_holds SET state=?2, updated_at=?1 WHERE {predicate} RETURNING job_id"
+                    ),
+                    params![now, state],
+                )
+                .await?;
+            let mut jobs = Vec::new();
+            while let Some(row) = rows.next().await? {
+                jobs.push(row.text(0)?);
+            }
+            drop(rows);
+            for job in &jobs {
+                store_no_hold(conn, job).await?;
+            }
+            Ok(jobs.len() as u64)
+        })
+    })
     .await
     .map_err(|error| error.to_string())
 }
@@ -1093,10 +1135,24 @@ pub async fn load_active_provider_limit_holds(
 }
 
 pub async fn cancel_provider_limit_holds_for_job(db: &LocalDb, job_id: &str) -> Result<(), String> {
-    db.execute(
-        "UPDATE provider_limit_holds SET state='cancelled', updated_at=?1 WHERE job_id=?2 AND state='active'",
-        params![chrono::Utc::now().timestamp(), job_id],
-    ).await.map(|_| ()).map_err(|error| error.to_string())
+    let job_id = job_id.to_string();
+    db.write(move |conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let cancelled = conn
+                .execute(
+                    "UPDATE provider_limit_holds SET state='cancelled', updated_at=?1 WHERE job_id=?2 AND state='active'",
+                    params![chrono::Utc::now().timestamp(), job_id.as_str()],
+                )
+                .await?;
+            if cancelled > 0 {
+                store_no_hold(conn, &job_id).await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn set_state_conn(
@@ -1105,11 +1161,18 @@ async fn set_state_conn(
     state: &str,
     now: i64,
 ) -> DbResult<()> {
-    conn.execute(
-        "UPDATE provider_limit_holds SET state=?1, updated_at=?2 WHERE id=?3 AND state='active'",
-        params![state, now, id],
-    )
-    .await?;
+    let mut rows = conn
+        .query(
+            "UPDATE provider_limit_holds SET state=?1, updated_at=?2 WHERE id=?3 AND state='active'
+             RETURNING job_id",
+            params![state, now, id],
+        )
+        .await?;
+    let retired = rows.next().await?.map(|row| row.text(0)).transpose()?;
+    drop(rows);
+    if let Some(job) = retired {
+        store_no_hold(conn, &job).await?;
+    }
     Ok(())
 }
 
@@ -1137,6 +1200,57 @@ async fn job_ineligible_conn(
         || row.opt_i64(1)?.is_some()
         || row.opt_i64(2)?.is_some()
         || row.opt_text(3)?.is_some_and(|status| status != "active"))
+}
+
+/// Store `hold`'s standing on its job: the caller just wrote it active and
+/// read it back, so its columns are the ones this write left.
+async fn store_active_standing(
+    conn: &crate::storage::TrackedConnection,
+    hold: &ProviderLimitHold,
+) -> DbResult<()> {
+    use cairn_db::stored_status::jobs::{set_hold_standing, HoldStanding};
+    let standing = HoldStanding::of_active(
+        &hold.boundary_source,
+        hold.retry_not_before,
+        hold.resume_gate.as_deref(),
+    );
+    let _ = set_hold_standing(conn, &hold.job_id, standing).await?;
+    Ok(())
+}
+
+/// Store that `job_id` has no active hold: the caller just retired its one.
+async fn store_no_hold(conn: &crate::storage::TrackedConnection, job_id: &str) -> DbResult<()> {
+    use cairn_db::stored_status::jobs::{set_hold_standing, HoldStanding};
+    let _ = set_hold_standing(conn, job_id, HoldStanding::None).await?;
+    Ok(())
+}
+
+/// Store the standing a hold `UPDATE ... RETURNING job_id, boundary_source,
+/// retry_not_before, resume_gate` left active, for each row it returned.
+async fn store_returned_standing(
+    conn: &crate::storage::TrackedConnection,
+    mut rows: crate::storage::TrackedRows,
+) -> DbResult<()> {
+    use cairn_db::stored_status::jobs::{set_hold_standing, HoldStanding};
+    let mut left = Vec::new();
+    while let Some(row) = rows.next().await? {
+        left.push((
+            row.text(0)?,
+            row.text(1)?,
+            row.opt_i64(2)?,
+            row.opt_text(3)?,
+        ));
+    }
+    drop(rows);
+    for (job, source, retry, gate) in left {
+        let _ = set_hold_standing(
+            conn,
+            &job,
+            HoldStanding::of_active(&source, retry, gate.as_deref()),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Atomically consume a yield hold and publish its sole pending successor.
@@ -1194,6 +1308,15 @@ async fn claim(
                 "UPDATE provider_limit_holds SET state='resolved', resolved_at=?1, updated_at=?1 WHERE id=?2",
                 params![now, id],
             ).await?;
+            store_no_hold(conn, &hold.job_id).await?;
+            // The pending successor this claim minted heads the job.
+            let _ = cairn_db::stored_status::jobs::set_head_turn(
+                conn,
+                &hold.job_id,
+                cairn_db::stored_status::jobs::HeadTurn::Running,
+                now,
+            )
+            .await?;
             Ok(Some((hold, successor, session_id)))
         })
     }).await.map_err(|error| error.to_string())
@@ -1242,6 +1365,7 @@ async fn claim_supply_hold(
                 params![now, hold.id.as_str()],
             )
             .await?;
+            store_no_hold(conn, &hold.job_id).await?;
             Ok(true)
         })
     })
@@ -1283,6 +1407,14 @@ async fn restore_after_launch_failure(
                 "UPDATE jobs SET current_turn_id=?1, updated_at=?2 WHERE id=?3 AND current_turn_id=?4",
                 params![turn_id.as_str(), now, hold.job_id.as_str(), successor.as_str()],
             ).await?;
+            // The head is again the provider-yielded turn checked above.
+            let _ = cairn_db::stored_status::jobs::set_head_turn(
+                conn,
+                &hold.job_id,
+                cairn_db::stored_status::jobs::HeadTurn::Idle,
+                now,
+            )
+            .await?;
             restore_failed_hold_conn(conn, &hold.id, now, &error).await?;
             Ok(true)
         })
@@ -1332,23 +1464,25 @@ async fn restore_failed_hold_conn(
         None => error.to_string(),
     };
     let failure = serde_json::json!({"at":now,"cause":cause,"retryable":!permanent}).to_string();
-    conn.execute(
-        "UPDATE provider_limit_holds SET state='active',resolved_at=NULL,
-           launch_attempts=launch_attempts+1,retry_not_before=?2,
-           resume_gate=CASE WHEN ?3 THEN COALESCE(resume_gate,?4) ELSE resume_gate END,
-           launch_failures_json=json_insert(launch_failures_json,'$[#]',json(?5)),updated_at=?6
-         WHERE id=?1 AND state='resolved'",
-        params![
-            hold_id,
-            now.saturating_add(300),
-            permanent,
-            RESUME_GATE_LAUNCH_FAILED,
-            failure,
-            now
-        ],
-    )
-    .await?;
-    Ok(())
+    let rows = conn
+        .query(
+            "UPDATE provider_limit_holds SET state='active',resolved_at=NULL,
+               launch_attempts=launch_attempts+1,retry_not_before=?2,
+               resume_gate=CASE WHEN ?3 THEN COALESCE(resume_gate,?4) ELSE resume_gate END,
+               launch_failures_json=json_insert(launch_failures_json,'$[#]',json(?5)),updated_at=?6
+             WHERE id=?1 AND state='resolved'
+             RETURNING job_id, boundary_source, retry_not_before, resume_gate",
+            params![
+                hold_id,
+                now.saturating_add(300),
+                permanent,
+                RESUME_GATE_LAUNCH_FAILED,
+                failure,
+                now
+            ],
+        )
+        .await?;
+    store_returned_standing(conn, rows).await
 }
 
 /// Restore a refused resume while its caller still holds the job launch lock.
@@ -1372,7 +1506,18 @@ pub(crate) async fn restore_resume_hold_after_launch_failure(
     .map_err(|error| error.to_string())
 }
 
+/// Restore a refused resume claim. Each write below stores the job fact it
+/// changes, beside it.
 async fn restore_resume_claim_conn(
+    conn: &crate::storage::TrackedConnection,
+    hold_id: &str,
+    now: i64,
+    error: &str,
+) -> DbResult<bool> {
+    restore_resume_claim_inner(conn, hold_id, now, error).await
+}
+
+async fn restore_resume_claim_inner(
     conn: &crate::storage::TrackedConnection,
     hold_id: &str,
     now: i64,
@@ -1403,7 +1548,7 @@ async fn restore_resume_claim_conn(
     drop(active);
     if let Some(active_id) = active_id {
         let failure = serde_json::json!({"at":now,"cause":error,"retryable":true}).to_string();
-        conn.execute(
+        let carried = conn.query(
             "UPDATE provider_limit_holds SET resume_json=COALESCE(resume_json,?2),
                boundary_source=CASE WHEN ?3 AND COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN ?4 ELSE boundary_source END,
                created_at=CASE WHEN ?3 AND COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN ?5 ELSE created_at END,
@@ -1411,7 +1556,8 @@ async fn restore_resume_claim_conn(
                launch_attempts=launch_attempts+CASE WHEN COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN 1 ELSE 0 END,
                launch_failures_json=CASE WHEN COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN json_insert(launch_failures_json,'$[#]',json(?7)) ELSE launch_failures_json END,
                updated_at=CASE WHEN COALESCE(json_extract(resume_json,'$.cause'),'system')<>'addressed' THEN ?8 ELSE updated_at END
-             WHERE id=?1",
+             WHERE id=?1
+             RETURNING job_id, boundary_source, retry_not_before, resume_gate",
             params![
                 active_id,
                 hold.resume_json.as_deref(),
@@ -1424,6 +1570,7 @@ async fn restore_resume_claim_conn(
             ],
         )
         .await?;
+        store_returned_standing(conn, carried).await?;
         conn.execute(
             "UPDATE provider_limit_holds SET state='superseded',launch_attempts=launch_attempts+1,
                launch_failures_json=json_insert(launch_failures_json,'$[#]',json(?2)),updated_at=?3 WHERE id=?1 AND state='resolved'",
@@ -1487,7 +1634,13 @@ async fn restore_resume_claim_conn(
                 {
                     return Ok(false);
                 }
-                conn.execute("UPDATE agent_waits SET state='resolving',resolved_at=NULL WHERE id=?1 AND state='resolved'", params![wait_id]).await?;
+                let revived = conn.execute("UPDATE agent_waits SET state='resolving',resolved_at=NULL WHERE id=?1 AND state='resolved'", params![wait_id]).await?;
+                if revived > 0 {
+                    // Resolved counted nothing; resolving counts.
+                    let _ =
+                        cairn_db::stored_status::jobs::add_open_cairn_waits(conn, &hold.job_id, 1)
+                            .await?;
+                }
             }
         }
     }
@@ -1528,6 +1681,14 @@ async fn restore_resume_claim_conn(
             if changed == 0 {
                 return Ok(false);
             }
+            // The head is this successor, pending again.
+            let _ = cairn_db::stored_status::jobs::set_head_turn(
+                conn,
+                &hold.job_id,
+                cairn_db::stored_status::jobs::HeadTurn::Running,
+                now,
+            )
+            .await?;
             resting_head = current;
         } else {
             conn.execute(
@@ -1540,6 +1701,15 @@ async fn restore_resume_claim_conn(
                 "UPDATE jobs SET current_turn_id=?2,updated_at=?3 WHERE id=?1 AND current_turn_id=?4",
                 params![hold.job_id.as_str(),original,now,current.as_str()],
             ).await?;
+            // The head is the original again, a terminal turn (it had a
+            // pending successor).
+            let _ = cairn_db::stored_status::jobs::set_head_turn(
+                conn,
+                &hold.job_id,
+                cairn_db::stored_status::jobs::HeadTurn::Idle,
+                now,
+            )
+            .await?;
         }
     }
     conn.execute(
@@ -1655,15 +1825,17 @@ async fn rearm(
             } else {
                 Some("recheck")
             };
-            conn.execute(
-                "UPDATE provider_limit_holds SET retry_not_before=?1, boundary_account_id=?2,
-                   boundary_source=COALESCE(?5, boundary_source),
-                   observed_text=COALESCE(?6, observed_text), updated_at=?3
-                 WHERE id=?4 AND state='active'",
-                params![at, account, now, id.as_str(), source, reason],
-            )
-            .await?;
-            Ok(())
+            let rows = conn
+                .query(
+                    "UPDATE provider_limit_holds SET retry_not_before=?1, boundary_account_id=?2,
+                       boundary_source=COALESCE(?5, boundary_source),
+                       observed_text=COALESCE(?6, observed_text), updated_at=?3
+                     WHERE id=?4 AND state='active'
+                     RETURNING job_id, boundary_source, retry_not_before, resume_gate",
+                    params![at, account, now, id.as_str(), source, reason],
+                )
+                .await?;
+            store_returned_standing(conn, rows).await
         })
     })
     .await
@@ -1872,14 +2044,26 @@ async fn hold_on_queue(
     if hold.is_queue_held() && hold.observed_text.as_deref() == Some(reason) {
         return Ok(());
     }
-    db.execute(
-        "UPDATE provider_limit_holds SET boundary_source='queue', retry_not_before=NULL,
-           boundary_account_id=NULL, observed_text=?2, updated_at=?3
-         WHERE id=?1 AND state='active'",
-        params![hold.id.as_str(), reason, now],
-    )
+    let (id, job_id, reason) = (hold.id.clone(), hold.job_id.clone(), reason.to_string());
+    db.write(move |conn| {
+        let (id, job_id, reason) = (id.clone(), job_id.clone(), reason.clone());
+        Box::pin(async move {
+            let queued = conn
+                .execute(
+                    "UPDATE provider_limit_holds SET boundary_source='queue', retry_not_before=NULL,
+                       boundary_account_id=NULL, observed_text=?2, updated_at=?3
+                     WHERE id=?1 AND state='active'",
+                    params![id.as_str(), reason.as_str(), now],
+                )
+                .await?;
+            if queued > 0 {
+                use cairn_db::stored_status::jobs::{set_hold_standing, HoldStanding};
+                let _ = set_hold_standing(conn, &job_id, HoldStanding::Queue).await?;
+            }
+            Ok(())
+        })
+    })
     .await
-    .map(|_| ())
     .map_err(|error| error.to_string())
 }
 
@@ -2181,6 +2365,111 @@ mod tests {
     }
 
     const NOW: i64 = 10_000;
+
+    async fn loaded(db: &LocalDb, id: &str) -> ProviderLimitHold {
+        let id = id.to_string();
+        db.read(move |conn| {
+            let id = id.clone();
+            Box::pin(async move { load_conn(conn, &id).await })
+        })
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    /// Every hold writer the queue's activity reads through, entered and left
+    /// on a running job whose turn is not running, so the hold alone decides:
+    /// a timed hold is active, a queue hold wanting, an untimed one dormant.
+    /// No refresh of the test's own follows a write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_writers_store_the_activity_they_leave() {
+        use crate::execution::queue::tests::{assert_activity, seed_project, seed_turn_job};
+        let db = crate::storage::migrated_test_db("hold-activity.db").await;
+        seed_project(&db).await;
+        seed_turn_job(&db, 1, "running", "running").await;
+        assert_activity(&db, "e1", "active", "seeding").await;
+
+        let armed = yield_and_arm_provider_limit_hold(
+            &db,
+            ProviderLimitObservation {
+                job_id: "j1".into(),
+                run_id: "r-j1".into(),
+                turn_id: "t1".into(),
+                backend: "claude".into(),
+                account_id: None,
+                retry_not_before: Some(NOW + 100),
+                boundary_source: "rate_limit_event".into(),
+                observed_text: None,
+                resume_gate: None,
+                boundary_account_id: None,
+                now: NOW,
+            },
+        )
+        .await
+        .unwrap();
+        assert_activity(&db, "e1", "active", "yield and arm").await;
+
+        let (claimed, successor, _) = claim(&db, &armed.id, NOW, true).await.unwrap().unwrap();
+        assert_activity(&db, "e1", "active", "claim (its successor is due)").await;
+
+        assert!(
+            restore_after_launch_failure(&db, &claimed, &successor, NOW, "boom")
+                .await
+                .unwrap()
+        );
+        assert_activity(&db, "e1", "active", "restore after launch failure").await;
+
+        hold_on_queue(&db, &loaded(&db, &armed.id).await, QUEUED, NOW)
+            .await
+            .unwrap();
+        assert_activity(&db, "e1", "wanting", "hold on the queue").await;
+
+        rearm(&db, &loaded(&db, &armed.id).await, None, None, None, NOW)
+            .await
+            .unwrap();
+        assert_activity(&db, "e1", "dormant", "rearm with no reset").await;
+
+        let resume = arm_supply_hold(
+            &db,
+            SupplyRefusal {
+                job_id: "j1".into(),
+                kind: HoldKind::Resume,
+                backend: "claude".into(),
+                run_id: None,
+                turn_id: Some("t1".into()),
+                refusal: CapacityRefusal {
+                    subject: "claude/opus".into(),
+                    reason: "out of usage".into(),
+                    retry_at: Some(NOW + 50),
+                    retry_account: Some("acct".into()),
+                },
+                now: NOW,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded(&db, &armed.id).await.state, "superseded");
+        assert_activity(&db, "e1", "active", "a supply hold supersedes the yield").await;
+
+        assert!(claim_supply_hold(&db, &resume, NOW).await.unwrap());
+        assert_activity(&db, "e1", "dormant", "claim the supply hold").await;
+
+        let id = resume.id.clone();
+        let restored = db
+            .write(move |conn| {
+                let id = id.clone();
+                Box::pin(async move { restore_resume_claim_conn(conn, &id, NOW, "boom").await })
+            })
+            .await
+            .unwrap();
+        assert!(restored);
+        assert_activity(&db, "e1", "active", "restore the resume claim").await;
+
+        cancel_provider_limit_holds_for_job(&db, "j1")
+            .await
+            .unwrap();
+        assert_activity(&db, "e1", "dormant", "cancel the job's holds").await;
+    }
 
     /// Job `a` running on a stored selection that chose `claude/opus`; job `b`
     /// pinned to `claude/opus`; job `r` resting on its head turn `head`.

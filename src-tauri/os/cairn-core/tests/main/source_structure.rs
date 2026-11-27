@@ -1273,3 +1273,405 @@ fn orchestrator_async_spawns_use_counted_task_wrappers() {
         violations.join("\n")
     );
 }
+
+/// The inputs of each per-job stored fact (`cairn_db::stored_status::jobs`), as
+/// `(table, columns an UPDATE may set, whether an INSERT or DELETE of a row
+/// writes one, the setters that store it)`. A statement writing an input must
+/// sit in a function that calls one of its setters (or a local helper named
+/// here that calls one). `jobs.status` is no input: the partial index re-reads
+/// it from the row.
+const STORED_STATUS_INPUTS: &[(&str, &[&str], bool, &[&str])] = &[
+    (
+        "jobs",
+        &["current_turn_id"],
+        false,
+        &["set_head_turn", "set_no_turn_running"],
+    ),
+    (
+        "turns",
+        &["state", "start_reason", "run_id", "end_reason"],
+        false,
+        &["set_head_turn", "set_no_turn_running"],
+    ),
+    (
+        "jobs",
+        &["turn_end_check_attempt_id"],
+        false,
+        &["set_turn_end_attempt_state"],
+    ),
+    (
+        "turn_end_check_attempts",
+        &["state"],
+        false,
+        &["set_turn_end_attempt_state"],
+    ),
+    (
+        "agent_waits",
+        &["state", "kind"],
+        true,
+        &[
+            "add_open_cairn_waits",
+            "moved_wait",
+            "moved_if_changed",
+            "moved_returned",
+        ],
+    ),
+    (
+        "provider_limit_holds",
+        &[
+            "state",
+            "boundary_source",
+            "retry_not_before",
+            "resume_gate",
+        ],
+        true,
+        &[
+            "set_hold_standing",
+            "store_active_standing",
+            "store_no_hold",
+            "store_returned_standing",
+        ],
+    ),
+    // An open-to-open update changes nothing; leaving the open set always
+    // releases the request's `open_key`.
+    (
+        "check_requests",
+        &["open_key"],
+        true,
+        &["add_open_check_requests"],
+    ),
+    // Cascade parents: deleting one silently deletes waits, holds or check
+    // requests a count may hold. No setter can see that, so every such delete
+    // is allowlisted with the reason its job's counts stay right.
+    ("runs", &[], true, &[]),
+    ("sessions", &[], true, &[]),
+    ("turns", &[], true, &[]),
+    ("check_result_observations", &[], true, &[]),
+];
+
+/// Production items that write a stored fact's input without its setter, with
+/// why: `(path under src-tauri, function or const, reason)`. Checked for
+/// staleness, so it only shrinks.
+const STORED_STATUS_UNSET: &[(&str, &str, &str)] = &[
+    (
+        "os/cairn-core/src/mcp/handlers/durable_suspend.rs",
+        "INSERT_WAIT_SQL",
+        "executed only by insert_as, which adds the wait to its job's count",
+    ),
+    (
+        "os/cairn-core/src/mcp/handlers/durable_suspend.rs",
+        "STORE_CONDITION_SQL",
+        "executed only by store_columns_conn, which moves its job's count by the kind change",
+    ),
+    (
+        "os/cairn-core/src/jobs/cleanup.rs",
+        "delete_owned_jobs",
+        "deletes the jobs whose runs, sessions, turns and holds it deletes; their facts go with their rows",
+    ),
+    (
+        "os/cairn-core/src/projects/migrate.rs",
+        "sweep_shared_half",
+        "deletes the project's jobs with everything under them; their facts go with their rows",
+    ),
+    (
+        "os/cairn-core/src/execution/jobs/ordinary_admission.rs",
+        "enqueue_or_start",
+        "binds a run to a pending turn; a pending head is running whatever its run",
+    ),
+    (
+        "os/cairn-core/src/execution/jobs/ordinary_admission.rs",
+        "start_stateless_now",
+        "binds a run to a pending turn; a pending head is running whatever its run",
+    ),
+    (
+        "os/cairn-core/src/execution/jobs/turns.rs",
+        "supersede_pending_retry_conn",
+        "renames only a pending turn's start reason; a pending head is running whatever its reason",
+    ),
+    (
+        "os/cairn-core/src/execution/jobs/turns.rs",
+        "start_prepared_turn",
+        "rebinds a running retry turn's run; a running head is running whatever its run",
+    ),
+    (
+        "os/cairn-core/src/sessions/queries.rs",
+        "rotate_session_conn",
+        "deletes only the successor session this transaction minted, before anything could hang off it",
+    ),
+];
+
+/// Whether `text` assigns `column` (`column =`, `column=`), as a whole word.
+fn assigns(text: &str, column: &str) -> bool {
+    text.match_indices(column).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + column.len()..].trim_start();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            && after.starts_with('=')
+            && !after.starts_with("==")
+    })
+}
+
+/// The input-writing SQL in `body`, each with the setters that store it: each
+/// statement runs from its verb to the end of the string literal that holds
+/// it.
+fn fact_writes(body: &str) -> Vec<(String, &'static [&'static str])> {
+    let upper = body.to_ascii_uppercase();
+    let mut found = Vec::new();
+    for (table, columns, rows, setters) in STORED_STATUS_INPUTS {
+        let table_upper = table.to_ascii_uppercase();
+        for verb in [
+            "UPDATE ",
+            "INSERT INTO ",
+            "INSERT OR IGNORE INTO ",
+            "DELETE FROM ",
+        ] {
+            let needle = format!("{verb}{table_upper}");
+            for (at, _) in upper.match_indices(&needle) {
+                let next = upper[at + needle.len()..].chars().next();
+                if next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let statement = &body[at..];
+                let statement = &statement[..statement.find('"').unwrap_or(statement.len())];
+                let writes = if verb == "UPDATE " {
+                    let set = statement
+                        .to_ascii_uppercase()
+                        .find(" SET ")
+                        .map(|start| &statement[start..])
+                        .unwrap_or_default();
+                    let set = &set[..set
+                        .to_ascii_uppercase()
+                        .find(" WHERE ")
+                        .unwrap_or(set.len())];
+                    columns.iter().any(|column| assigns(set, column))
+                } else if setters.is_empty() {
+                    // A cascade parent writes a fact only by being deleted.
+                    *rows && verb == "DELETE FROM "
+                } else {
+                    *rows
+                };
+                if writes {
+                    found.push((format!("{verb}{table}"), *setters));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Every production item, as `(path under src-tauri, function or const,
+/// statements)`, whose SQL writes a stored fact's input without calling one of
+/// that fact's setters.
+fn unrefreshed_fact_writers(files: &[(PathBuf, String)]) -> Vec<(String, String, Vec<String>)> {
+    let test_only = test_only_module_files(files);
+    let mut found = Vec::new();
+    for (path, source) in files {
+        let display = path.to_string_lossy().replace('\\', "/");
+        let Some((_, relative)) = display.split_once("src-tauri/") else {
+            continue;
+        };
+        if !relative.contains("src/")
+            || relative.contains("/tests/")
+            || relative.ends_with("_tests.rs")
+            || test_only.contains(path)
+            || relative.ends_with("cairn-db/src/stored_status/jobs.rs")
+        {
+            continue;
+        }
+        // (item, compiled only for tests, body) in source order. A top-level
+        // const or static is an item of its own, so SQL held in one is not
+        // charged to the function above it.
+        let mut items: Vec<(String, bool, String)> = Vec::new();
+        for line in production_lines(source) {
+            if let Some(name) = declared_fn(line.text) {
+                items.push((name.to_string(), line.gated, String::new()));
+            } else if let Some(rest) = line
+                .text
+                .strip_prefix("const ")
+                .or_else(|| line.text.strip_prefix("pub(crate) const "))
+                .or_else(|| line.text.strip_prefix("pub const "))
+                .or_else(|| line.text.strip_prefix("static "))
+            {
+                let name = rest
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .next();
+                items.push((
+                    name.unwrap_or_default().to_string(),
+                    line.gated,
+                    String::new(),
+                ));
+            }
+            if let Some((_, _, body)) = items.last_mut() {
+                body.push_str(line.text);
+                body.push('\n');
+            }
+        }
+        for (name, _, body) in items.into_iter().filter(|(_, gated, _)| !gated) {
+            let unset: Vec<String> = fact_writes(&body)
+                .into_iter()
+                .filter(|(_, setters)| !setters.iter().any(|setter| body.contains(setter)))
+                .map(|(write, _)| write)
+                .collect();
+            if !unset.is_empty() {
+                found.push((relative.to_string(), name, unset));
+            }
+        }
+    }
+    found
+}
+
+/// A line outside every top-level test module, and whether the item it
+/// belongs to is gated on tests by its own attributes.
+struct ProductionLine<'a> {
+    text: &'a str,
+    gated: bool,
+}
+
+/// The lines of `source` outside its top-level `#[cfg(test)] mod … { … }`
+/// blocks, by rustfmt's layout: such a block opens at column 0 and closes at
+/// the next column-0 `}`. Brace counting is not used, because SQL and format
+/// strings carry braces of their own. An item whose attributes include
+/// `#[test]`, `#[tokio::test]` or `#[cfg(test)]` is marked gated.
+fn production_lines(source: &str) -> Vec<ProductionLine<'_>> {
+    let mut out = Vec::new();
+    let mut in_test_module = false;
+    let mut attribute_gates = false;
+    let mut gated = false;
+    for line in source.lines() {
+        if in_test_module {
+            if line == "}" {
+                in_test_module = false;
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#[") {
+            attribute_gates |= trimmed.starts_with("#[test]")
+                || trimmed.starts_with("#[tokio::test")
+                || gates_on_test(trimmed);
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        let item = line
+            .strip_prefix("pub")
+            .map(|rest| {
+                rest.strip_prefix('(')
+                    .and_then(|scoped| scoped.split_once(") ").map(|(_, rest)| rest))
+                    .unwrap_or(rest.trim_start())
+            })
+            .unwrap_or(line);
+        if attribute_gates && item.starts_with("mod ") && line.trim_end().ends_with('{') {
+            in_test_module = true;
+            attribute_gates = false;
+            continue;
+        }
+        if declared_fn(line).is_some() || !line.starts_with(' ') {
+            gated = attribute_gates;
+        }
+        attribute_gates = false;
+        out.push(ProductionLine { text: line, gated });
+    }
+    out
+}
+
+/// cairn/7675. Each job's facts (`cairn_db::stored_status::jobs`) are explicit
+/// values its acting sites write, and the run queue trusts them, so every
+/// write to a fact's input must call that fact's setter in the same function
+/// and transaction, with the value it caused. A writer that forgets leaves a
+/// seat held by finished work, or running work unseated, until the job next
+/// changes; nothing reconciles it.
+#[test]
+fn stored_status_inputs_are_written_with_their_setters() {
+    let found = unrefreshed_fact_writers(&workspace_rust_files());
+    let unexpected: Vec<String> = found
+        .iter()
+        .filter(|(path, name, _)| {
+            !STORED_STATUS_UNSET
+                .iter()
+                .any(|(allowed, item, _)| path == allowed && name == item)
+        })
+        .map(|(path, name, writes)| format!("{path}: {name} ({})", writes.join(", ")))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "these write an input of a stored job fact without its setter; call the fact's \
+         cairn_db::stored_status::jobs setter with the value this write caused, in the same \
+         transaction:\n{}",
+        unexpected.join("\n")
+    );
+    let stale: Vec<String> = STORED_STATUS_UNSET
+        .iter()
+        .filter(|(allowed, item, _)| {
+            !found
+                .iter()
+                .any(|(path, name, _)| path == allowed && name == item)
+        })
+        .map(|(path, item, reason)| format!("{path}: {item} ({reason})"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these allowlisted writers no longer write a fact unrefreshed; delete their entries:\n{}",
+        stale.join("\n")
+    );
+}
+
+/// The stored job facts have one writer each, all in one module.
+#[test]
+fn only_stored_status_writes_the_job_facts() {
+    let mut needles = Vec::new();
+    for column in [
+        "head_turn",
+        "activity_at",
+        "turn_end_attempt_state",
+        "open_cairn_waits",
+        "hold_standing",
+        "open_check_requests",
+    ] {
+        needles.push(format!("SET {column}"));
+        needles.push(format!(", {column} ="));
+        needles.push(format!(",{column}="));
+    }
+    let needles: Vec<&str> = needles.iter().map(String::as_str).collect();
+    assert_only_in(
+        &needles,
+        &["cairn-db/src/stored_status/jobs.rs"],
+        "the per-job stored facts are written only by their cairn_db::stored_status::jobs setters",
+    );
+}
+
+#[test]
+fn the_fact_writer_detector_reads_set_clauses_and_row_writes() {
+    let writes = |sql: &str| -> Vec<String> {
+        fact_writes(sql)
+            .into_iter()
+            .map(|(write, _)| write)
+            .collect()
+    };
+    assert_eq!(
+        writes("\"UPDATE jobs SET current_turn_id = ?1, updated_at = ?2 WHERE id = ?3\""),
+        ["UPDATE jobs"]
+    );
+    assert!(writes("\"UPDATE jobs SET status = 'running' WHERE id = ?1\"").is_empty());
+    assert!(writes("\"UPDATE jobs SET model = NULL WHERE status = 'pending'\"").is_empty());
+    assert_eq!(
+        writes("\"UPDATE turns SET run_id = ?1 WHERE state = 'pending'\""),
+        ["UPDATE turns"]
+    );
+    assert!(writes("\"UPDATE jobs_view SET current_turn_id = 1\"").is_empty());
+    assert_eq!(
+        writes("\"UPDATE agent_waits SET hold=NULL,state='resolved' WHERE id=?1\""),
+        ["UPDATE agent_waits"]
+    );
+    assert!(writes("\"UPDATE agent_waits SET resume_state='x' WHERE id=?1\"").is_empty());
+    assert_eq!(
+        writes("\"DELETE FROM provider_limit_holds WHERE job_id = ?1\""),
+        ["DELETE FROM provider_limit_holds"]
+    );
+    assert_eq!(
+        writes("\"DELETE FROM turns WHERE job_id = ?1\""),
+        ["DELETE FROM turns"]
+    );
+    assert!(writes("\"INSERT INTO turns (id) VALUES (?1)\"").is_empty());
+}

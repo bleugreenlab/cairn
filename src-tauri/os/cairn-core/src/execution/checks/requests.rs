@@ -724,38 +724,57 @@ async fn accept_with_context(
             .map(str::to_string)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = now_ms();
+        let values: Vec<cairn_db::turso::Value> = cairn_db::turso::params![
+            id.as_str(),
+            spec.project_id.as_str(),
+            suite,
+            spec.revision.clone(),
+            spec.subject_job_id.as_str(),
+            selector_json.clone(),
+            i64::from(spec.retry),
+            spec.requester_ref.as_str(),
+            spec.requester_job_id.clone(),
+            commit.clone(),
+            pinned.clone(),
+            key.as_str(),
+            this_runner(),
+            now,
+            spec.consumer.as_str(),
+            match spec.priority {
+                cairn_common::wire_vocabulary::CellPriority::ReviewCheck => "review_check",
+                cairn_common::wire_vocabulary::CellPriority::WriteCheck => "write_check",
+                cairn_common::wire_vocabulary::CellPriority::AgentInteractive =>
+                    "agent_interactive",
+            },
+            context.map(str::to_string),
+            spec.cadence,
+        ]
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("persist check request: {error}"))?;
+        let requester = spec.requester_job_id.clone();
         let inserted = db
-            .execute(
-                "INSERT INTO check_requests(id,project_id,suite,revision_spec,subject_job_id,selector_json,retry,
-                    consumer,requester_ref,requester_job_id,priority,state,commit_sha,pinned_executor,
-                    open_key,driven_by,accepted_at_ms,state_since_ms,updated_ms,context_json,cadence)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?15,?8,?9,?16,'accepted',?10,?11,?12,?13,?14,?14,?14,?17,?18)
-                 ON CONFLICT DO NOTHING",
-                cairn_db::turso::params![
-                    id.as_str(),
-                    spec.project_id.as_str(),
-                    suite,
-                    spec.revision.clone(),
-                    spec.subject_job_id.as_str(),
-                    selector_json.clone(),
-                    i64::from(spec.retry),
-                    spec.requester_ref.as_str(),
-                    spec.requester_job_id.clone(),
-                    commit.clone(),
-                    pinned.clone(),
-                    key.as_str(),
-                    this_runner(),
-                    now,
-                    spec.consumer.as_str(),
-                    match spec.priority {
-                        cairn_common::wire_vocabulary::CellPriority::ReviewCheck => "review_check",
-                        cairn_common::wire_vocabulary::CellPriority::WriteCheck => "write_check",
-                        cairn_common::wire_vocabulary::CellPriority::AgentInteractive => "agent_interactive",
-                    },
-                    context.map(str::to_string),
-                    spec.cadence,
-                ],
-            )
+            .write(move |conn| {
+                let (values, requester) = (values.clone(), requester.clone());
+                Box::pin(async move {
+                    let inserted = conn
+                        .execute(
+                            "INSERT INTO check_requests(id,project_id,suite,revision_spec,subject_job_id,selector_json,retry,
+                                consumer,requester_ref,requester_job_id,priority,state,commit_sha,pinned_executor,
+                                open_key,driven_by,accepted_at_ms,state_since_ms,updated_ms,context_json,cadence)
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?15,?8,?9,?16,'accepted',?10,?11,?12,?13,?14,?14,?14,?17,?18)
+                             ON CONFLICT DO NOTHING",
+                            values,
+                        )
+                        .await?;
+                    // A requester in another database is not counted, as before.
+                    if let (true, Some(job)) = (inserted > 0, requester.as_deref()) {
+                        let _ = cairn_db::stored_status::jobs::add_open_check_requests(conn, job, 1)
+                            .await?;
+                    }
+                    Ok(inserted)
+                })
+            })
             .await
             .map_err(|error| format!("persist check request: {error}"))?;
         if inserted > 0 {
@@ -1315,25 +1334,44 @@ async fn settle(
     let evidence = answer.evidence();
     let outcome = serde_json::to_string(&answer).expect("a check request answer serializes");
     for attempt in 0..5u32 {
+        let (id, project_id) = (row.id.clone(), row.project_id.clone());
+        let requester = row.requester_job_id.clone();
+        let (outcome, evidence, observation_id) =
+            (outcome.clone(), evidence.clone(), observation_id.clone());
         let written = db
-            .execute(
-                format!(
-                    "UPDATE check_requests SET state=?2,outcome_json=?3,evidence=?4,open_key=NULL,
-                        observation_id=COALESCE(observation_id,
-                            (SELECT id FROM check_result_observations WHERE project_id=?6 AND id=?5)),
-                        waiting_to_learn=NULL,state_since_ms=?7,updated_ms=?7
-                      WHERE id=?1 AND state IN {OPEN_STATES}"
-                ),
-                cairn_db::turso::params![
-                    row.id.as_str(),
-                    state,
-                    outcome.as_str(),
-                    evidence.clone(),
-                    observation_id.clone(),
-                    row.project_id.as_str(),
-                    now_ms(),
-                ],
-            )
+            .write(move |conn| {
+                let (id, project_id, requester) = (id.clone(), project_id.clone(), requester.clone());
+                let (outcome, evidence, observation_id) =
+                    (outcome.clone(), evidence.clone(), observation_id.clone());
+                Box::pin(async move {
+                    let settled = conn.execute(
+                        format!(
+                            "UPDATE check_requests SET state=?2,outcome_json=?3,evidence=?4,open_key=NULL,
+                                observation_id=COALESCE(observation_id,
+                                    (SELECT id FROM check_result_observations WHERE project_id=?6 AND id=?5)),
+                                waiting_to_learn=NULL,state_since_ms=?7,updated_ms=?7
+                              WHERE id=?1 AND state IN {OPEN_STATES}"
+                        ),
+                        cairn_db::turso::params![
+                            id.as_str(),
+                            state,
+                            outcome.as_str(),
+                            evidence,
+                            observation_id,
+                            project_id.as_str(),
+                            now_ms(),
+                        ],
+                    )
+                    .await?;
+                    // Only the write that moved it out of the open set counts:
+                    // a second settle finds it settled and changes nothing.
+                    if let (true, Some(job)) = (settled > 0, requester.as_deref()) {
+                        let _ = cairn_db::stored_status::jobs::add_open_check_requests(conn, job, -1)
+                            .await?;
+                    }
+                    Ok(())
+                })
+            })
             .await;
         match written {
             Ok(_) => break,

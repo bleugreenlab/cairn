@@ -453,12 +453,34 @@ fn start_inline_host_wait_successor_locked(
     }
     if update.started {
         crate::storage::run_db_blocking(|| async {
-            db.execute(
-                "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, updated_at = ?2 \
-                 WHERE id = ?3 AND run_id = ?4 AND state = 'running'",
-                params![kind.end_reason().to_string(), chrono::Utc::now().timestamp(),
-                    update.turn_id.as_str(), run_id],
-            ).await.map_err(|error| error.to_string())
+            let (end_reason, turn_id, run_id) = (
+                kind.end_reason().to_string(),
+                update.turn_id.clone(),
+                run_id.to_string(),
+            );
+            db.write(move |conn| {
+                let (end_reason, turn_id, run_id) =
+                    (end_reason.clone(), turn_id.clone(), run_id.clone());
+                Box::pin(async move {
+                    conn.execute(
+                        "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, updated_at = ?2 \
+                         WHERE id = ?3 AND run_id = ?4 AND state = 'running'",
+                        params![end_reason.as_str(), chrono::Utc::now().timestamp(),
+                            turn_id.as_str(), run_id.as_str()],
+                    )
+                    .await?;
+                    let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                        conn,
+                        &turn_id,
+                        cairn_db::stored_status::jobs::HeadTurn::Idle,
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())
         })?;
     }
     Ok((
@@ -492,11 +514,32 @@ fn cancel_inline_pending_successor(
         let Some(turn_id) = turn_id else {
             return Ok(None);
         };
-        let changed = db.execute(
-            "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, updated_at = ?2 \
-             WHERE id = ?3 AND state = 'pending'",
-            params![kind.end_reason().to_string(), chrono::Utc::now().timestamp(), turn_id.as_str()],
-        ).await.map_err(|error| error.to_string())?;
+        let (end_reason, cancelled) = (kind.end_reason().to_string(), turn_id.clone());
+        let changed = db
+            .write(move |conn| {
+                let (end_reason, turn_id) = (end_reason.clone(), cancelled.clone());
+                Box::pin(async move {
+                    let changed = conn
+                        .execute(
+                            "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, updated_at = ?2 \
+                             WHERE id = ?3 AND state = 'pending'",
+                            params![end_reason.as_str(), chrono::Utc::now().timestamp(), turn_id.as_str()],
+                        )
+                        .await?;
+                    if changed > 0 {
+                        let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                            conn,
+                            &turn_id,
+                            cairn_db::stored_status::jobs::HeadTurn::Idle,
+                            chrono::Utc::now().timestamp(),
+                        )
+                        .await?;
+                    }
+                    Ok(changed)
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())?;
         Ok((changed > 0).then_some(SuccessorTurnUpdate {
             // `started` requests the update notification, including this cancellation.
             turn_id,
@@ -709,12 +752,30 @@ fn settle_undriven_successor_locked(
             return Ok(false);
         }
         let now = chrono::Utc::now().timestamp();
+        let (reason, settled_turn) = (end_reason.to_string(), turn_id.to_string());
         let settled = owning_db
-            .execute(
-                "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, \
-                 updated_at = ?2 WHERE id = ?3 AND state = 'pending'",
-                params![end_reason, now, turn_id],
-            )
+            .write(move |conn| {
+                let (reason, turn_id) = (reason.clone(), settled_turn.clone());
+                Box::pin(async move {
+                    let settled = conn
+                        .execute(
+                            "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, \
+                             updated_at = ?2 WHERE id = ?3 AND state = 'pending'",
+                            params![reason.as_str(), now, turn_id.as_str()],
+                        )
+                        .await?;
+                    if settled > 0 {
+                        let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                            conn,
+                            &turn_id,
+                            cairn_db::stored_status::jobs::HeadTurn::Idle,
+                            now,
+                        )
+                        .await?;
+                    }
+                    Ok(settled)
+                })
+            })
             .await
             .map_err(|error| error.to_string())?;
         if settled > 0 {
@@ -854,6 +915,13 @@ pub(super) async fn ensure_successor_turn(
         params![turn_id.as_str(), job_id],
     )
     .await?;
+    let _ = cairn_db::stored_status::jobs::set_head_turn(
+        conn,
+        job_id,
+        cairn_db::stored_status::jobs::HeadTurn::Running,
+        i64::from(now),
+    )
+    .await?;
 
     Ok(SuccessorTurnUpdate {
         turn_id,
@@ -949,6 +1017,13 @@ async fn start_turn_for_run(
         WHERE id = ?3
         ",
         params![run_id, now, turn_id],
+    )
+    .await?;
+    let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+        conn,
+        turn_id,
+        cairn_db::stored_status::jobs::HeadTurn::Running,
+        i64::from(now),
     )
     .await?;
     Ok(true)

@@ -1293,6 +1293,13 @@ fn terminalize_failed_start(
                              (state IN ('pending','running') OR (state='cancelled' AND end_reason='launch_refused'))",
                             cairn_db::turso::params![error.as_str(), now, turn_id.as_str(), run_id.as_str()],
                         ).await?;
+                        let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                            conn,
+                            &turn_id,
+                            cairn_db::stored_status::jobs::HeadTurn::Idle,
+                            now,
+                        )
+                        .await?;
                     }
                     if !preserve_run {
                         conn.execute(
@@ -1721,6 +1728,13 @@ fn settle_unlaunched_run(orch: &Orchestrator, run_id: &str, turn_id: &str) -> Re
                                 crate::models::TurnEndReason::LaunchRefused.to_string(),
                                 now
                             ],
+                        )
+                        .await?;
+                        let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                            conn,
+                            &turn_id,
+                            cairn_db::stored_status::jobs::HeadTurn::Idle,
+                            now,
                         )
                         .await?;
                         conn.on_commit(cairn_db::admission_hint::evidence_changed);

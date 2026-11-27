@@ -343,7 +343,12 @@ pub(crate) fn request_turn_end_attempt(
             .map_err(|e| e.to_string())?;
         db.write(move |conn| { let id=stored_id.clone(); let job=job_id.clone(); Box::pin(async move {
             conn.execute("INSERT INTO turn_end_check_attempts(id,job_id,state,reason,created_at,updated_at) VALUES (?1,?2,'requested',NULL,unixepoch()*1000,unixepoch()*1000)",(id.as_str(),job.as_str())).await?;
-            conn.execute("UPDATE jobs SET turn_end_check_attempt_id=?1 WHERE id=?2 AND (turn_end_check_attempt_id IS NULL OR NOT EXISTS (SELECT 1 FROM turn_end_check_attempts current WHERE current.id=jobs.turn_end_check_attempt_id AND current.state IN ('requested','claimed','runtime_started','deferred','submitted')))",(id.as_str(),job.as_str())).await?;
+            let repointed = conn.execute("UPDATE jobs SET turn_end_check_attempt_id=?1 WHERE id=?2 AND (turn_end_check_attempt_id IS NULL OR NOT EXISTS (SELECT 1 FROM turn_end_check_attempts current WHERE current.id=jobs.turn_end_check_attempt_id AND current.state IN ('requested','claimed','runtime_started','deferred','submitted')))",(id.as_str(),job.as_str())).await?;
+            // Repointed, the job's attempt is this new one; otherwise its
+            // pointer still names the active attempt it had.
+            if repointed > 0 {
+                let _ = cairn_db::stored_status::jobs::set_turn_end_attempt_state(conn, &job, Some("requested")).await?;
+            }
             Ok::<_,crate::storage::DbError>(())
         })}).await.map_err(|e|e.to_string())
     })?;
@@ -477,6 +482,9 @@ pub(crate) fn transition_turn_end_attempt(
                     "UPDATE jobs SET turn_end_check_attempt_id=?1 WHERE id=?2",
                     (id.as_str(), job.as_str()),
                 ).await?;
+                let _ = cairn_db::stored_status::jobs::set_turn_end_attempt_state(conn, &job, Some(&state)).await?;
+            } else {
+                let _ = cairn_db::stored_status::jobs::set_turn_end_attempt_state_if_pointed(conn, &job, &id, &state).await?;
             }
             Ok::<_,crate::storage::DbError>(())
         })}).await.map_err(|e|e.to_string())
@@ -508,14 +516,27 @@ pub(crate) fn abandon_turn_end_attempt(
         let db = crate::execution::routing::owning_db_for_job(&dbs, &job)
             .await
             .map_err(|e| e.to_string())?;
-        db.execute(
-            "UPDATE turn_end_check_attempts SET state='failed',reason=?1 || branch_advance_reason,updated_at=unixepoch()*1000
-              WHERE id=?2 AND job_id=?3
-                AND state IN ('requested','claimed','runtime_started','deferred','submitted')",
-            (reason.as_str(), id.as_str(), job.as_str()),
-        )
+        db.write(move |conn| {
+            let (job, id, reason) = (job.clone(), id.clone(), reason.clone());
+            Box::pin(async move {
+                let abandoned = conn
+                    .execute(
+                        "UPDATE turn_end_check_attempts SET state='failed',reason=?1 || branch_advance_reason,updated_at=unixepoch()*1000
+                          WHERE id=?2 AND job_id=?3
+                            AND state IN ('requested','claimed','runtime_started','deferred','submitted')",
+                        (reason.as_str(), id.as_str(), job.as_str()),
+                    )
+                    .await?;
+                if abandoned > 0 {
+                    let _ = cairn_db::stored_status::jobs::set_turn_end_attempt_state_if_pointed(
+                        conn, &job, &id, "failed",
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
         .await
-        .map(|_| ())
         .map_err(|e| e.to_string())
     })
 }
@@ -980,7 +1001,13 @@ pub(crate) async fn reconcile_turn_end_attempts_on_startup(orch: &Orchestrator) 
     const REASON: &str = RESTART_INTERRUPTED_REASON;
     for db in orch.db.all_dbs().await {
         if let Err(error)=db.write(|conn| Box::pin(async move {
-            conn.execute("UPDATE turn_end_check_attempts SET state='failed',reason=?1 || branch_advance_reason,updated_at=unixepoch()*1000 WHERE state IN ('requested','claimed','runtime_started','deferred','submitted')",(REASON,)).await?;
+            let mut rows = conn.query("UPDATE turn_end_check_attempts SET state='failed',reason=?1 || branch_advance_reason,updated_at=unixepoch()*1000 WHERE state IN ('requested','claimed','runtime_started','deferred','submitted') RETURNING id, job_id",(REASON,)).await?;
+            let mut failed = Vec::new();
+            while let Some(row) = rows.next().await? { failed.push((row.text(0)?, row.text(1)?)); }
+            drop(rows);
+            for (id, job) in &failed {
+                let _ = cairn_db::stored_status::jobs::set_turn_end_attempt_state_if_pointed(conn, job, id, "failed").await?;
+            }
             Ok::<_,crate::storage::DbError>(())
         })).await { log::warn!("startup turn-end attempt reconciliation failed: {error}"); }
     }

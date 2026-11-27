@@ -351,6 +351,10 @@ async fn insert_request(orch: &Orchestrator, state: &str, set: &str) -> String {
             .await
             .unwrap();
     }
+    // A raw insert is not a writer: give its requester the count it carries.
+    cairn_db::stored_status::jobs::seed_from_sources_for_test(&orch.db.local)
+        .await
+        .unwrap();
     id
 }
 
@@ -1582,4 +1586,65 @@ async fn the_open_requests_read_and_the_settled_wait_agree() {
     let body = read_uri(&orch, &uri).await;
     assert_eq!(listed(&body), vec![running.clone()], "{body}");
     assert_eq!(waited(&orch, &uri).await, vec![running]);
+}
+
+/// A request counts on its requester whatever the requester's status, from
+/// the accept that files it to the settle that ends it, each refreshing the
+/// requester in its own transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accept_and_settle_store_the_requesters_queue_activity() {
+    use crate::execution::queue::tests::{assert_activity, seed_execution, seed_job, seed_project};
+    let db = crate::storage::migrated_test_db("check-request-activity.db").await;
+    seed_project(&db).await;
+    let orch = crate::resources::references::test_orchestrator(db);
+    let db = orch.db.local.clone();
+    for (n, status) in [(1, "complete"), (2, "pending")] {
+        let (execution, job) = (format!("e{n}"), format!("j{n}"));
+        seed_execution(&db, n, &execution).await;
+        seed_job(&db, &execution, &job, status).await;
+        crate::execution::queue::tests::seed_stored_status(&db).await;
+        assert_activity(&db, &execution, "dormant", "seeding").await;
+
+        let mut filed = spec("rust-tests", None);
+        filed.subject_job_id = job.clone();
+        filed.requester_job_id = Some(job.clone());
+        let accepted = accept(
+            &db,
+            &filed,
+            "rust-tests",
+            &Coordinate::Commit(format!("c{n}")),
+        )
+        .await
+        .unwrap();
+        assert_activity(
+            &db,
+            &execution,
+            "active",
+            &format!("accept on a {status} job"),
+        )
+        .await;
+
+        let open = load_request(&db, "p", &accepted.id).await.unwrap().unwrap();
+        // A second settle of the same open row (a late answer, a racing
+        // cancel) finds it settled and moves nothing; the count's CHECK would
+        // refuse a decrement below zero.
+        for _ in 0..2 {
+            settle(
+                &orch,
+                &db,
+                &open,
+                CheckRequestAnswer::Failed {
+                    error: "done".into(),
+                },
+            )
+            .await;
+        }
+        assert_activity(
+            &db,
+            &execution,
+            "dormant",
+            &format!("settle on a {status} job"),
+        )
+        .await;
+    }
 }

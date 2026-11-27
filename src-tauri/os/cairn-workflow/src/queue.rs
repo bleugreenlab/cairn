@@ -2,18 +2,8 @@
 
 use std::collections::HashMap;
 
-/// What an entry is doing, as the runner's stored facts say.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Activity {
-    /// Agent work is in flight: a turn running or due, or a wait on something
-    /// Cairn is doing now. It holds its seat however far down the list it is.
-    Active,
-    /// Work is due but not started: it takes a free seat by its place.
-    Wanting,
-    /// Nothing it waits on is moving. It keeps its place and holds no seat.
-    Dormant,
-}
+/// What an entry is doing, as its jobs' stored activity says.
+pub use cairn_db::stored_status::jobs::Activity;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueEntry {

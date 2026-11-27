@@ -1775,6 +1775,15 @@ async fn reconcile_stale_runs_db(
                         params![now, turn_id.as_str()],
                     )
                     .await?;
+                if updated > 0 {
+                    let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                        conn,
+                        turn_id,
+                        cairn_db::stored_status::jobs::HeadTurn::Idle,
+                        now,
+                    )
+                    .await?;
+                }
                 conn.on_commit(cairn_db::admission_hint::evidence_changed);
                 if updated > 0 {
                     orphaned_pending_count += 1;
@@ -2196,6 +2205,13 @@ pub async fn settle_stranded_turns(
                 params![now, turn_id.as_str()],
             )
             .await?;
+            let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                conn,
+                &turn_id,
+                cairn_db::stored_status::jobs::HeadTurn::Idle,
+                now,
+            )
+            .await?;
             conn.on_commit(cairn_db::admission_hint::evidence_changed);
             settled.push(settled_as(turn_id, SettledTurnOutcome::YieldedForHeldCall));
             continue;
@@ -2206,15 +2222,30 @@ pub async fn settle_stranded_turns(
             // its row, as a stop would. Nothing else settles it: the call's
             // drop guard cannot yield a turn that is no longer running, and
             // the next boot would resume this crashed turn from the row.
-            conn.execute(
-                "UPDATE agent_waits
-                 SET state = 'cancelled', resolved_at = ?2
-                 WHERE predecessor_turn_id = ?1
-                   AND state = 'pending'
-                   AND hold = 'inline'",
-                params![turn_id.as_str(), now],
-            )
-            .await?;
+            let mut cancelled = conn
+                .query(
+                    "UPDATE agent_waits
+                     SET state = 'cancelled', resolved_at = ?2
+                     WHERE predecessor_turn_id = ?1
+                       AND state = 'pending'
+                       AND hold = 'inline'
+                     RETURNING job_id, kind",
+                    params![turn_id.as_str(), now],
+                )
+                .await?;
+            let mut removed = Vec::new();
+            while let Some(row) = cancelled.next().await? {
+                removed.push((row.text(0)?, row.opt_text(1)?));
+            }
+            drop(cancelled);
+            for (job, kind) in removed {
+                let delta = cairn_db::stored_status::jobs::wait_delta(
+                    Some(("pending", kind.as_deref())),
+                    Some(("cancelled", kind.as_deref())),
+                );
+                let _ =
+                    cairn_db::stored_status::jobs::add_open_cairn_waits(conn, &job, delta).await?;
+            }
         }
         let (target_state, end_reason, outcome) = match (settlement, turn_state.as_str()) {
             (StaleRunSettlement::HostRestart, "running") => (
@@ -2241,6 +2272,14 @@ pub async fn settle_stranded_turns(
                  updated_at = ?3
              WHERE id = ?4",
             params![target_state, end_reason, now, turn_id.as_str()],
+        )
+        .await?;
+        // Every target state is terminal: the head, if this turn, is idle.
+        let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+            conn,
+            &turn_id,
+            cairn_db::stored_status::jobs::HeadTurn::Idle,
+            now,
         )
         .await?;
         conn.on_commit(cairn_db::admission_hint::evidence_changed);

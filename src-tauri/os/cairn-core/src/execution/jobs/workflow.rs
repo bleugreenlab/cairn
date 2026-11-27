@@ -816,6 +816,10 @@ async fn reset_run_for_redispatch(db: &LocalDb, run_id: &str, job_id: &str) -> R
                 params![now, run_id.as_str()],
             )
             .await?;
+            // Every pending and running turn of the job ended above.
+            let _ =
+                cairn_db::stored_status::jobs::set_no_turn_running(conn, &job_id, i64::from(now))
+                    .await?;
             Ok(())
         })
     })

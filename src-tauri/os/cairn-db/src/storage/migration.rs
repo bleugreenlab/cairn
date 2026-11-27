@@ -389,6 +389,12 @@ impl Migration {
         self.name
     }
 
+    /// The migration's SQL, so a test can replay a backfill it carries against
+    /// rows it seeds, under whatever number the landing gives the file.
+    pub fn sql(&self) -> &'static str {
+        self.sql
+    }
+
     /// The lineage position this migration occupies, which is also the numeric
     /// prefix of its SQL filename. Exposed so a test can migrate a database to
     /// the state that preceded a given migration and assert what it did.

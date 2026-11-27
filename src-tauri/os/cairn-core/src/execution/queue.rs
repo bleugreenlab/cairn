@@ -8,8 +8,13 @@
 //! finishing its recipe, do not remove it.
 //!
 //! Seats are given over that one list ([`cairn_workflow::queue::selection`])
-//! by what each entry is doing, read from facts the runner already stores
-//! (`activity_sql!`):
+//! by what each entry is doing: the greatest activity among its jobs, a fixed
+//! `CASE` over facts each job row stores
+//! ([`cairn_db::stored_status::jobs::QUEUE_ACTIVITY_SQL`]). Each fact is an
+//! explicit value its acting site writes in its own transaction, and the
+//! queue reads only active and wanting jobs, through a partial index on that
+//! predicate, so a pass costs the work in flight rather than the number of
+//! live executions:
 //!
 //! - **Active**: agent work is in flight. A turn is running or due, or the
 //!   execution waits on something Cairn is doing now (its own check lanes or
@@ -336,74 +341,16 @@ pub fn caps(orch: &Orchestrator) -> QueueCaps {
 const STORED_ROWS_SQL: &str =
     "SELECT execution_id, issue_id, rank, parked_at IS NOT NULL FROM run_queue ORDER BY rank, execution_id";
 
-/// The `agent_waits` kinds a person answers. A pending wait of any other kind
-/// is on something Cairn is doing (check lanes or requests, a run batch, a
-/// terminal, a tool call, a `waitFor` duration), which its resolver ends.
-macro_rules! person_wait_kinds {
-    () => {
-        "'operator_request'"
-    };
-}
-
-/// What execution `e` is doing: `active`, `wanting` or `dormant` (see the
-/// module docs). Active is read from any of its jobs that is still open;
-/// check lanes and check requests count on any of its jobs, open or not, since
-/// a handed-off node's turn-end checks still wake it.
-macro_rules! activity_sql {
-    () => { concat!(
-    "CASE WHEN EXISTS (
-        SELECT 1 FROM jobs aj LEFT JOIN turns ht ON ht.id = aj.current_turn_id
-         WHERE aj.execution_id = e.id AND aj.status IN ('running', 'pending') AND (
-               ht.state IN ('pending', 'running')
-            OR (ht.state = 'complete' AND ht.start_reason = 'dependency_unblock'
-                AND ht.run_id IS NULL AND ht.end_reason IS NULL)
-            OR (aj.status = 'running' AND aj.current_turn_id IS NULL)
-            OR EXISTS (SELECT 1 FROM agent_waits aw WHERE aw.job_id = aj.id
-                         AND (aw.state = 'resolving'
-                              OR (aw.state = 'pending'
-                                  AND COALESCE(aw.kind, json_extract(aw.condition_json, '$.kind'))
-                                      NOT IN (",
-    person_wait_kinds!(),
-    "))))
-            OR EXISTS (SELECT 1 FROM provider_limit_holds ah WHERE ah.job_id = aj.id
-                         AND ah.state = 'active' AND ah.boundary_source <> 'queue'
-                         AND ah.retry_not_before IS NOT NULL AND ah.resume_gate IS NULL)))
-      OR EXISTS (
-        SELECT 1 FROM jobs cj
-         WHERE cj.execution_id = e.id AND (
-               EXISTS (SELECT 1 FROM turn_end_check_attempts ta WHERE ta.id = cj.turn_end_check_attempt_id
-                         AND ta.state IN ('requested', 'claimed', 'runtime_started', 'deferred', 'submitted'))
-            OR EXISTS (SELECT 1 FROM check_requests cr WHERE cr.requester_job_id = cj.id
-                         AND cr.state IN ('accepted', 'queued', 'granted', 'running'))))
-     THEN 'active'
-     WHEN EXISTS (
-        SELECT 1 FROM jobs wj JOIN provider_limit_holds wh ON wh.job_id = wj.id
-         WHERE wj.execution_id = e.id AND wh.state = 'active' AND wh.boundary_source = 'queue')
-     THEN 'wanting'
-     ELSE 'dormant' END"
-    ) };
-}
-
-fn parse_activity(value: &str) -> Activity {
-    match value {
-        "active" => Activity::Active,
-        "wanting" => Activity::Wanting,
-        _ => Activity::Dormant,
-    }
-}
-
 /// Every live execution on this runner (`?1`) in one database: its issue, its
-/// thread, whether it is runnable now, and what it is doing. `held` is an
-/// execution waiting on an authored `after:` gate; it is not in the list until
-/// released.
+/// thread, and whether it is runnable now. `held` is an execution waiting on
+/// an authored `after:` gate; it is not in the list until released. What each
+/// is doing is read beside it from its jobs' stored activity.
 const LIVE_EXECUTIONS_SQL: &str = concat!(
     "SELECT e.id, e.issue_id, i.parent_thread_id,
             CASE WHEN e.status IN ('running', 'paused') AND NOT (",
     cairn_db::gated_unreleased_sql!(),
     ") THEN 1 ELSE 0 END,
-            COALESCE(e.released_at, e.started_at), e.queue_state, ",
-    activity_sql!(),
-    "
+            COALESCE(e.released_at, e.started_at), e.queue_state
        FROM executions e INDEXED BY idx_executions_run_queue JOIN issues i ON i.id = e.issue_id
       WHERE e.lifecycle IN ('canonical', 'pending')
         AND COALESCE(e.runner_device_id, ?1) = ?1 AND ",
@@ -501,12 +448,19 @@ async fn execution_facts(
                                 thread_id: row.opt_text(2)?,
                                 joinable: row.i64(3)? != 0,
                                 since: row.opt_i64(4)?.unwrap_or(0),
-                                activity: parse_activity(&row.text(6)?),
+                                activity: Activity::Dormant,
                             },
                             row.opt_text(5)?,
                         ));
                     }
                     drop(rows);
+                    let doing =
+                        cairn_db::stored_status::jobs::non_dormant_executions(conn).await?;
+                    for (id, fact, _) in &mut live {
+                        if let Some(activity) = doing.get(id.as_str()) {
+                            fact.activity = *activity;
+                        }
+                    }
                     let mut present = Vec::new();
                     for chunk in ids.chunks(cairn_db::sql::IN_LIST_CHUNK) {
                         let sql = format!(
@@ -550,8 +504,9 @@ fn recorded_state(item: &QueueItem) -> Option<&'static str> {
 
 /// Record each execution's queue state where its issue's status is projected,
 /// and re-project that status, only where it changed. The queue is the one
-/// writer of `executions.queue_state`.
-async fn record_states(state: &QueueState, located: &Located) {
+/// writer of `executions.queue_state`. Returns how many it wrote.
+async fn record_states(state: &QueueState, located: &Located) -> usize {
+    let mut records = 0;
     for item in &state.items {
         let Some((db, recorded)) = located.get(&item.execution_id) else {
             continue;
@@ -580,30 +535,69 @@ async fn record_states(state: &QueueState, located: &Located) {
                 })
             })
             .await;
-        if let Err(error) = written {
-            log::warn!(
+        match written {
+            Ok(()) => records += 1,
+            Err(error) => log::warn!(
                 "run queue could not record the state of execution {}: {error}",
                 item.execution_id
-            );
+            ),
         }
     }
+    records
+}
+
+/// Where one settle spent its time, for the gate sweep's pass line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SettleTimings {
+    /// Waiting for [`QUEUE_LOCK`].
+    pub wait_ms: u64,
+    /// Holding it: reading, deciding and storing the list.
+    pub lock_ms: u64,
+    /// The part of `lock_ms` spent reading the executions' facts.
+    pub facts_ms: u64,
+    /// Acting on the decision, after the lock is released.
+    pub act_ms: u64,
+    /// Queue states recorded by the act.
+    pub act_records: usize,
+    /// Seated executions whose held work the act resumed.
+    pub act_resumes: usize,
+    /// The part of `act_ms` spent resuming them.
+    pub act_resume_ms: u64,
+}
+
+fn elapsed_ms(since: std::time::Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// What one locked pass found and how long it took.
+struct Pass {
+    state: QueueState,
+    located: Located,
+    timings: SettleTimings,
 }
 
 /// Read the list, bring its membership up to date, apply `change` to it, store
 /// it, and decide it, `asking` competing as wanting. `change` returns false
 /// when its subject is not in the list, which fails the call without writing.
+/// `caller` names the pass in its DEBUG timing line.
 async fn under_lock(
     orch: &Orchestrator,
+    caller: &'static str,
     asking: Option<&str>,
     change: impl FnOnce(&mut Vec<StoredRow>) -> Result<(), String>,
-) -> Result<(QueueState, Located), String> {
+) -> Result<Pass, String> {
+    let waited = std::time::Instant::now();
     let _guard = QUEUE_LOCK.lock().await;
+    let wait_ms = elapsed_ms(waited);
+    let locked = std::time::Instant::now();
     let local = orch.db.local.clone();
     let stored = stored_rows(&local)
         .await
         .map_err(|error| format!("failed to read the run queue: {error}"))?;
     let before = stored.clone();
+    let facts_started = std::time::Instant::now();
     let (facts, known, located) = execution_facts(orch, &stored).await?;
+    let facts_ms = elapsed_ms(facts_started);
     let Membership {
         mut rows, dropped, ..
     } = plan_membership(stored, &facts, &known);
@@ -613,19 +607,36 @@ async fn under_lock(
             .await
             .map_err(|error| format!("failed to store the run queue: {error}"))?;
     }
-    Ok((decide(&rows, &facts, caps(orch), asking), located))
+    let state = decide(&rows, &facts, caps(orch), asking);
+    let lock_ms = elapsed_ms(locked);
+    log::debug!(
+        "run queue pass caller={caller} wait_ms={wait_ms} lock_ms={lock_ms} facts_ms={facts_ms} live={}",
+        facts.len()
+    );
+    Ok(Pass {
+        state,
+        located,
+        timings: SettleTimings {
+            wait_ms,
+            lock_ms,
+            facts_ms,
+            ..SettleTimings::default()
+        },
+    })
 }
 
 /// The list as it stands, membership brought up to date.
 pub async fn read(orch: &Orchestrator) -> Result<QueueState, String> {
-    Ok(under_lock(orch, None, |_| Ok(())).await?.0)
+    Ok(under_lock(orch, "read", None, |_| Ok(())).await?.state)
 }
 
 /// The decision a launch of `execution_id`'s work gets: seated already, or
 /// given a free seat by its place as wanting work. Every path that would start
 /// or continue an issue execution's work asks this, and nothing else.
 pub async fn admit(orch: &Orchestrator, execution_id: &str) -> Result<QueueState, String> {
-    Ok(under_lock(orch, Some(execution_id), |_| Ok(())).await?.0)
+    Ok(under_lock(orch, "admit", Some(execution_id), |_| Ok(()))
+        .await?
+        .state)
 }
 
 fn missing(execution_id: &str) -> String {
@@ -638,7 +649,7 @@ pub async fn move_to(
     execution_id: &str,
     position: usize,
 ) -> Result<QueueState, String> {
-    let (state, located) = under_lock(orch, None, |rows| {
+    let Pass { state, located, .. } = under_lock(orch, "move", None, |rows| {
         if rows
             .iter()
             .any(|row| row.execution_id == execution_id && row.parked)
@@ -664,7 +675,7 @@ pub async fn set_parked(
     execution_id: &str,
     parked: bool,
 ) -> Result<QueueState, String> {
-    let (state, located) = under_lock(orch, None, |rows| {
+    let Pass { state, located, .. } = under_lock(orch, "park", None, |rows| {
         plan_park(rows, execution_id, parked)
             .then_some(())
             .ok_or_else(|| missing(execution_id))
@@ -684,18 +695,37 @@ pub async fn set_parked(
 /// Read and decide the list and act on it: the pass every change ends in,
 /// and the startup and periodic backstop.
 pub async fn settle(orch: &Orchestrator) -> Result<QueueState, String> {
-    let (state, located) = under_lock(orch, None, |_| Ok(())).await?;
-    act(orch, &state, &located).await;
-    Ok(state)
+    Ok(settle_timed(orch).await?.0)
+}
+
+/// [`settle`], with where its time went.
+pub async fn settle_timed(orch: &Orchestrator) -> Result<(QueueState, SettleTimings), String> {
+    let Pass {
+        state,
+        located,
+        mut timings,
+    } = under_lock(orch, "settle", None, |_| Ok(())).await?;
+    let acted = std::time::Instant::now();
+    let (records, resumes, resume_ms) = act(orch, &state, &located).await;
+    timings.act_ms = elapsed_ms(acted);
+    timings.act_records = records;
+    timings.act_resumes = resumes;
+    timings.act_resume_ms = resume_ms;
+    Ok((state, timings))
 }
 
 /// Make the issues' statuses match the decision and resume the held work of
 /// every seated execution. Nothing seated is ever stopped here: active work
 /// holds its seat, and an unseated entry has no work running. Idempotent: a
 /// seated execution with nothing held and an unchanged state are no-ops.
-async fn act(orch: &Orchestrator, state: &QueueState, located: &Located) {
-    record_states(state, located).await;
+/// Returns the states recorded, the executions resumed, and the time resuming
+/// took.
+async fn act(orch: &Orchestrator, state: &QueueState, located: &Located) -> (usize, usize, u64) {
+    let records = record_states(state, located).await;
+    let resuming = std::time::Instant::now();
+    let mut resumes = 0;
     for item in state.items.iter().filter(|item| item.runs) {
+        resumes += 1;
         if let Err(error) =
             crate::orchestrator::wakes::resume_queue_held(orch, &item.execution_id).await
         {
@@ -705,8 +735,9 @@ async fn act(orch: &Orchestrator, state: &QueueState, located: &Located) {
             );
         }
     }
+    (records, resumes, elapsed_ms(resuming))
 }
 
 #[cfg(test)]
 #[path = "queue_tests.rs"]
-mod tests;
+pub(crate) mod tests;

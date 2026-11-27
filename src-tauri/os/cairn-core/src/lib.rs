@@ -5,7 +5,9 @@
 //! the desktop app and server is available only through the `internal-api`
 //! feature, via the unstable `internal` module, and is explicitly unstable.
 
-#![cfg_attr(kani, recursion_limit = "256")]
+// The layout of the deepest test futures (a notice fanned out through job
+// writers that each refresh run-queue activity) exceeds the default 128.
+#![recursion_limit = "256"]
 
 // The unit tests are written against the `test-utils` surface, and the crate
 // deliberately does not enable it on itself through a dev-dependency: that

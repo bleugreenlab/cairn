@@ -912,6 +912,13 @@ pub(crate) async fn withdraw_permission_request(
                                 params![turn_id, now],
                             )
                             .await?;
+                            let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                                conn,
+                                turn_id,
+                                cairn_db::stored_status::jobs::HeadTurn::Running,
+                                chrono::Utc::now().timestamp(),
+                            )
+                            .await?;
                             HandBack::Unyielded
                         } else {
                             HandBack::ProviderTurnEnded {
@@ -3790,6 +3797,13 @@ pub(super) async fn yield_turn_for_host(
         WHERE id = ?3
         ",
         params![reason.as_str(), now, turn_id],
+    )
+    .await?;
+    let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+        conn,
+        turn_id,
+        cairn_db::stored_status::jobs::HeadTurn::Idle,
+        i64::from(now),
     )
     .await?;
     // A parked turn may free its execution's fleet slot.

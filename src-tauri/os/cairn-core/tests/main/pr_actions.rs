@@ -2544,6 +2544,10 @@ async fn composed_public_merge(disable_cancel: bool) {
         .await
         .unwrap();
     }
+    // A raw insert is not a writer: give each requester the count it carries.
+    cairn_db::stored_status::jobs::seed_from_sources_for_test(&db)
+        .await
+        .unwrap();
     if disable_cancel {
         db.execute_script(
             "CREATE TRIGGER disable_merge_check_cancel BEFORE UPDATE ON check_requests

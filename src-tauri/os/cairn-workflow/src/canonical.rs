@@ -558,14 +558,30 @@ async fn freeze_execution_conn(
         params![now, execution_id],
     )
     .await?;
-    conn.execute(
-        "UPDATE turns
-            SET state = 'cancelled', end_reason = ?1, ended_at = ?2, updated_at = ?2
-          WHERE job_id IN (SELECT id FROM jobs WHERE execution_id = ?3)
-            AND state IN ('pending', 'running', 'yielded')",
-        params![TURN_END_REASON_SUPERSEDED, now, execution_id],
-    )
-    .await?;
+    let mut rows = conn
+        .query(
+            "UPDATE turns
+                SET state = 'cancelled', end_reason = ?1, ended_at = ?2, updated_at = ?2
+              WHERE job_id IN (SELECT id FROM jobs WHERE execution_id = ?3)
+                AND state IN ('pending', 'running', 'yielded')
+             RETURNING id",
+            params![TURN_END_REASON_SUPERSEDED, now, execution_id],
+        )
+        .await?;
+    let mut cancelled_turns = Vec::new();
+    while let Some(row) = rows.next().await? {
+        cancelled_turns.push(row.text(0)?);
+    }
+    drop(rows);
+    for turn_id in &cancelled_turns {
+        let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+            conn,
+            turn_id,
+            cairn_db::stored_status::jobs::HeadTurn::Idle,
+            now,
+        )
+        .await?;
+    }
     conn.on_commit(cairn_db::admission_hint::evidence_changed);
 
     Ok(job_ids)

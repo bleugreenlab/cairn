@@ -1479,6 +1479,10 @@ async fn fixers_chain_as_requests_and_each_verdict_is_its_own_request_recorded_a
     db.execute("UPDATE check_requests SET state='running',outcome_json=NULL,observation_id=NULL,
         context_json=json_set(context_json,'$.recorded',json('false'),'$.final_recording',NULL,'$.terminal',NULL,'$.fold',NULL)
         WHERE id=?1",(first_request.clone(),)).await.unwrap();
+    // The raw reopen bypasses the job's stored open-request count.
+    cairn_db::stored_status::jobs::seed_from_sources_for_test(&db)
+        .await
+        .unwrap();
     requests::forget_driver_for_test(&first_request);
     let ticket = orch.late_write_checks.open(JOB, "tool-use");
     let (progress, _) = tokio::sync::watch::channel(WaveProgress::default());

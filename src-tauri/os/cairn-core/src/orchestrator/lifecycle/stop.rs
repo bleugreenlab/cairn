@@ -1242,6 +1242,9 @@ pub fn stop_job_for_resolution_preserving_run(
                             "UPDATE runs SET exit_reason = ?2 WHERE job_id = ?1 AND status IN ('starting', 'live')",
                             (job.as_str(), reason),
                         ).await?;
+                        // Every pending, running and yielded turn ended above.
+                        let _ = cairn_db::stored_status::jobs::set_no_turn_running(conn, job, now)
+                            .await?;
                     }
                     conn.on_commit(cairn_db::admission_hint::evidence_changed);
                     Ok((jobs, turns, runs))
@@ -1431,14 +1434,32 @@ fn cancel_open_input_and_live_turns_for_job(
                     now,
                 )
                 .await?;
-                conn.execute(
-                    "UPDATE turns
-                     SET state = 'cancelled', ended_at = ?1, updated_at = ?1
-                     WHERE job_id = ?2 AND state IN ('pending', 'running', 'yielded')
-                       AND id NOT IN (SELECT value FROM json_each(?3))",
-                    (now, job_id.as_str(), claimed_turns.as_str()),
-                )
-                .await?;
+                // A claimed terminal-completion turn is left running, so only
+                // the turns this cancels can stop heading the job as running.
+                let mut rows = conn
+                    .query(
+                        "UPDATE turns
+                         SET state = 'cancelled', ended_at = ?1, updated_at = ?1
+                         WHERE job_id = ?2 AND state IN ('pending', 'running', 'yielded')
+                           AND id NOT IN (SELECT value FROM json_each(?3))
+                         RETURNING id",
+                        (now, job_id.as_str(), claimed_turns.as_str()),
+                    )
+                    .await?;
+                let mut cancelled = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    cancelled.push(row.text(0)?);
+                }
+                drop(rows);
+                for turn_id in &cancelled {
+                    let _ = cairn_db::stored_status::jobs::set_head_turn_at(
+                        conn,
+                        turn_id,
+                        cairn_db::stored_status::jobs::HeadTurn::Idle,
+                        now,
+                    )
+                    .await?;
+                }
                 conn.on_commit(cairn_db::admission_hint::evidence_changed);
                 Ok(())
             })

@@ -321,6 +321,9 @@ async fn seed(db: &LocalDb, head: ParentHead, tasks: &[Task]) {
             .unwrap();
         }
     }
+    cairn_db::stored_status::jobs::seed_from_sources_for_test(db)
+        .await
+        .unwrap();
 }
 
 async fn text(orch: &Orchestrator, sql: &str, id: &str) -> Option<String> {
@@ -422,6 +425,9 @@ async fn parked_parent_is_admitted_past_a_full_queue_when_its_task_completes() {
     )
     .await
     .unwrap();
+    cairn_db::stored_status::jobs::seed_from_sources_for_test(&db)
+        .await
+        .unwrap();
     let orch = test_orchestrator(db);
     orch.update_settings(crate::models::UpdateSettings {
         max_concurrent_executions: Some(1),
@@ -477,6 +483,12 @@ async fn parked_parent_is_admitted_past_a_full_queue_when_its_task_completes() {
         None,
         "never reads as queued"
     );
+    crate::execution::queue::tests::assert_job_facts(
+        &orch.db.local,
+        EXECUTION,
+        "after the refused resume released its marker",
+    )
+    .await;
 }
 
 /// The session itself is a standing conversation: whatever its turns and
