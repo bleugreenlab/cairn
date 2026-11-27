@@ -21,8 +21,8 @@
 //!   inspecting the fleet costs nothing that running work would notice.
 
 use cairn_common::executor_protocol::{
-    BindingEvent, DeclineReason, ExecutorHealthStatus, ExecutorInspection, MachineRole,
-    PlacementDecision, PlacementOutcome, PlacementPrediction, PlacementReason,
+    BindingEvent, DeclineReason, ExecutorHealthStatus, ExecutorInspection, FleetPublisher,
+    MachineRole, PlacementDecision, PlacementOutcome, PlacementPrediction, PlacementReason,
     PlacementRejectionReason, PlacementSyncCost, ReachCandidateOutcome, ReachCandidateReport,
     ReachHistory, ReachReportSource, ReservationRationale, MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
@@ -428,6 +428,7 @@ fn connection_phase_label(phase: RemoteConnectionPhase) -> &'static str {
 /// machines disappear from this resource for hours while their enrollments sat
 /// intact: an empty fleet and a fleet whose machines are all unreachable are
 /// opposite facts, and this rendering has to be able to tell them apart.
+#[cfg(test)]
 pub(crate) fn render_executors(
     executors: &[ExecutorInspection],
     enrolled: &[EnrolledRemote],
@@ -437,6 +438,73 @@ pub(crate) fn render_executors(
     warming_up: bool,
     incidents: &std::collections::HashMap<String, String>,
 ) -> String {
+    render_fleet(
+        executors,
+        enrolled,
+        enrolling,
+        replaced_abnormal_exit,
+        captured_at_unix_ms,
+        warming_up,
+        incidents,
+        &[],
+    )
+}
+
+/// The fleet listing, with every `publishOnly` executor among `publishers`
+/// taken out of the machines. A publisher is a role its host has, not a
+/// machine (docs/executor.md, "Publishes only"): it is not listed, counted,
+/// put in the role census or in a model pool, and its host's row carries one
+/// `Publisher:` line instead. One alone on its host, with no row to fold
+/// into, is named in a short section of its own below the machines.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_fleet(
+    executors: &[ExecutorInspection],
+    enrolled: &[EnrolledRemote],
+    enrolling: &[EnrollmentOperation],
+    replaced_abnormal_exit: Option<&AbnormalExit>,
+    captured_at_unix_ms: u64,
+    warming_up: bool,
+    incidents: &std::collections::HashMap<String, String>,
+    publishers: &[FleetPublisher],
+) -> String {
+    let is_publisher = |executor_id: &str| {
+        publishers
+            .iter()
+            .any(|publisher| publisher.executor_id == executor_id)
+    };
+    let executors: Vec<&ExecutorInspection> = executors
+        .iter()
+        .filter(|executor| !is_publisher(&executor.health.identity.executor_id))
+        .collect();
+    let enrolled: Vec<&EnrolledRemote> = enrolled
+        .iter()
+        .filter(|remote| !is_publisher(&remote.executor_id))
+        .collect();
+    let publisher_line = |host_executor_id: &str| {
+        publishers
+            .iter()
+            .filter(|publisher| publisher.host_executor_id.as_deref() == Some(host_executor_id))
+            .map(|publisher| {
+                format!(
+                    "- Publisher: {} ({}, under its own account on this machine; read cairn://executors/{})\n",
+                    publisher.readiness(),
+                    publisher.name,
+                    publisher.name
+                )
+            })
+            .collect::<String>()
+    };
+    let lone_publishers: Vec<&FleetPublisher> = publishers
+        .iter()
+        .filter(|publisher| {
+            publisher.host_executor_id.as_deref().is_none_or(|host| {
+                !executors
+                    .iter()
+                    .any(|executor| executor.health.identity.executor_id == host)
+                    && !enrolled.iter().any(|remote| remote.executor_id == host)
+            })
+        })
+        .collect();
     if executors.is_empty() && enrolled.is_empty() && enrolling.is_empty() {
         let mut empty = if warming_up {
             String::from("# Executors\n\nStatus: warming\n\nWaiting quietly for the first executor heartbeat in this runner session.\n")
@@ -450,6 +518,7 @@ pub(crate) fn render_executors(
             replaced_abnormal_exit,
             captured_at_unix_ms,
         ));
+        empty.push_str(&lone_publishers_section(&lone_publishers));
         return empty;
     }
     let mut out = String::from("# Executors\n\n");
@@ -469,9 +538,9 @@ pub(crate) fn render_executors(
             plural(executors.len(), "executor", "executors")
         ));
     }
-    out.push_str(&role_census(executors, enrolled));
-    out.push_str(&stranded_summary(enrolled));
-    for executor in executors {
+    out.push_str(&role_census(&executors, &enrolled));
+    out.push_str(&stranded_summary(&enrolled));
+    for executor in executors.iter().copied() {
         out.push_str(&format!("## {}\n", executor.name));
         out.push_str(&advertised_name_line(executor));
         let capabilities = &executor.health.advertisement.capabilities;
@@ -519,6 +588,7 @@ pub(crate) fn render_executors(
         if executor.health.role != MachineRole::General {
             out.push_str(&machine_role_line(executor.health.role));
         }
+        out.push_str(&publisher_line(&executor.health.identity.executor_id));
         if executor.drain_state.effective_refusal {
             out.push_str(&format!(
                 "- Draining: yes ({})\n",
@@ -546,13 +616,13 @@ pub(crate) fn render_executors(
         ));
         out.push_str(&format!("- Read: cairn://executors/{}\n\n", executor.name));
     }
-    out.push_str(&render_model_pools(executors));
+    out.push_str(&render_model_pools(&executors));
     if !enrolled.is_empty() {
         out.push_str(&format!(
             "## Enrolled, not attached ({})\n\nThese machines are enrolled with this runner and are not reporting. They cannot be targeted until they attach.\n\n",
             enrolled.len()
         ));
-        for remote in enrolled {
+        for remote in enrolled.iter().copied() {
             out.push_str(&format!("### {}\n", remote.name));
             out.push_str(&render_reach(
                 remote.reach_history.as_ref(),
@@ -571,6 +641,7 @@ pub(crate) fn render_executors(
             if remote.role != MachineRole::General {
                 out.push_str(&machine_role_line(remote.role));
             }
+            out.push_str(&publisher_line(&remote.executor_id));
             out.push_str(&owned_drain_lines(&remote.drain_state));
             if !incidents.contains_key(&remote.executor_id) {
                 out.push_str(&format!(
@@ -611,8 +682,84 @@ pub(crate) fn render_executors(
             out.push_str(&format!("- Read: {}\n\n", operation.uri));
         }
     }
+    out.push_str(&lone_publishers_section(&lone_publishers));
     out.push_str("Target one with `run({executor:{name:\"<name>\"}})`, or any machine on a platform with `run({executor:{os:\"linux\"}})`.\n");
     out
+}
+
+/// Publishers with no host row to fold into: alone on their host, or beside
+/// an ordinary executor this listing does not show. Still not machines: they
+/// take publication legs only, so nothing else can be placed on them.
+fn lone_publishers_section(publishers: &[&FleetPublisher]) -> String {
+    if publishers.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "## Publishers without a machine row\n\nA release publisher on a host with no ordinary executor listed here. It takes publication legs only, so it is not a machine work can be placed on and is not counted above.\n\n",
+    );
+    for publisher in publishers {
+        out.push_str(&format!(
+            "- {}: publisher {}; read cairn://executors/{}\n",
+            publisher.name,
+            publisher.readiness(),
+            publisher.name
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// The `## Publisher` section of a host machine's page: the publisher that
+/// shares it, whether it can publish now, and where its full detail is.
+/// Nothing when no publisher shares the machine.
+pub(crate) fn render_host_publisher(
+    host_executor_id: &str,
+    publishers: &[FleetPublisher],
+) -> String {
+    publishers
+        .iter()
+        .filter(|publisher| publisher.host_executor_id.as_deref() == Some(host_executor_id))
+        .map(|publisher| {
+            format!(
+                "\n## Publisher\n\n- Publisher: {}\n- {} is the release publisher on this machine: a second executor under its own account that takes publication legs only. It is a role this machine has, not a machine of its own. Its isolation verdict, toolchain probes, build prerequisites and release-secret custody: cairn://executors/{}\n",
+                publisher.readiness(),
+                publisher.name,
+                publisher.name
+            )
+        })
+        .collect()
+}
+
+/// A publisher's own page, retitled so it reads as the publisher on its host
+/// rather than as a machine: its `# Executor <name>` heading gives way to one
+/// that names the host, and the executor facts follow unchanged. Any other
+/// executor's page is returned as it is.
+pub(crate) fn frame_as_publisher(
+    page: String,
+    executor_id: &str,
+    publishers: &[FleetPublisher],
+) -> String {
+    let Some(publisher) = publishers
+        .iter()
+        .find(|publisher| publisher.executor_id == executor_id)
+    else {
+        return page;
+    };
+    let heading = format!("# Executor {}\n\n", publisher.name);
+    let body = page.strip_prefix(&heading).unwrap_or(&page);
+    let opening = match (&publisher.host_name, &publisher.host_executor_id) {
+        (Some(host), Some(_)) => format!(
+            "# The publisher on {host}\n\n{} is the release publisher on {host}'s machine, not a machine of its own: a second executor under its own account that takes publication legs only. Publisher: {}. {host}'s row and page (cairn://executors/{host}) carry this line; the executor facts below are its own.\n\n",
+            publisher.name,
+            publisher.readiness(),
+        ),
+        _ => format!(
+            "# A publisher alone on its host\n\n{} is a release publisher on a host with no ordinary executor. It takes publication legs only, so it is not a machine work can be placed on. Publisher: {}.\n\n",
+            publisher.name,
+            publisher.readiness(),
+        ),
+    };
+    format!("{opening}{body}")
 }
 
 /// The review lanes the lane breaker holds, or nothing when there are none.
@@ -693,7 +840,7 @@ pub(crate) fn render_room_line(
 /// It sits beside the attached count because it is the same kind of fact: how
 /// much of the fleet can take work. Leaving it to each machine's own line is how
 /// five machines read as merely absent after a protocol bump.
-fn stranded_summary(enrolled: &[EnrolledRemote]) -> String {
+fn stranded_summary(enrolled: &[&EnrolledRemote]) -> String {
     let stranded: Vec<_> = enrolled
         .iter()
         .filter_map(|remote| remote.stranded.as_ref())
@@ -873,7 +1020,7 @@ fn drain_line(executor: &ExecutorInspection) -> String {
 /// Every machine by role, in one line, once any machine is not general: the
 /// service tier, the build tier and the inference tier at a glance. Nothing
 /// when every machine is general, which is what a fleet without roles is.
-fn role_census(executors: &[ExecutorInspection], enrolled: &[EnrolledRemote]) -> String {
+fn role_census(executors: &[&ExecutorInspection], enrolled: &[&EnrolledRemote]) -> String {
     let mut by_name = std::collections::BTreeMap::<&str, MachineRole>::new();
     for remote in enrolled {
         by_name.insert(remote.name.as_str(), remote.role);
@@ -6935,7 +7082,7 @@ fn render_interconnects(
 
 /// The model pools the attached machines' own reports derive, or nothing when
 /// no attached machine reports a GPU.
-fn render_model_pools(executors: &[ExecutorInspection]) -> String {
+fn render_model_pools(executors: &[&ExecutorInspection]) -> String {
     let pools = derive_pools(
         executors
             .iter()
@@ -12999,6 +13146,89 @@ mod tests {
                 "Roles: inference only: sp1 · services only: bgsrv-ub2 · general: local\n"
             ),
             "{listed}"
+        );
+    }
+
+    /// A publisher beside its host's ordinary executor is a role that machine
+    /// has, not a machine: it is not counted, listed, put in the role census
+    /// or given a row, and the host's row carries its state in one line,
+    /// attached or not.
+    #[test]
+    fn a_co_hosted_publisher_is_a_line_on_its_hosts_row_not_a_machine() {
+        use cairn_common::executor_protocol::{PublishIsolationEvidence, PublishIsolationVerdict};
+        let mut fedora = inspection("fedora", false);
+        fedora.health.identity.executor_id = "fedora".into();
+        let mut publisher = inspection("cairn-publish", false);
+        publisher.health.identity.executor_id = "cairn-publish".into();
+        publisher.health.role = MachineRole::PublishOnly;
+        let hosts =
+            std::collections::HashMap::from([("cairn-publish".to_string(), "fedora".to_string())]);
+        let listing = |attached: &[ExecutorInspection], enrolled: &[EnrolledRemote]| {
+            let publishers = crate::fleet::publishers::fleet_publishers(
+                attached.iter().map(|executor| &executor.health),
+                enrolled,
+                &hosts,
+                CAPTURED_AT,
+            );
+            render_fleet(
+                attached,
+                enrolled,
+                &[],
+                None,
+                CAPTURED_AT,
+                false,
+                &Default::default(),
+                &publishers,
+            )
+        };
+        let not_a_machine = |listed: &str| {
+            assert!(
+                listed.contains("1 executor attached to this runner."),
+                "{listed}"
+            );
+            assert!(!listed.contains("## cairn-publish"), "{listed}");
+            assert!(!listed.contains("### cairn-publish"), "{listed}");
+            assert!(!listed.contains("Roles:"), "{listed}");
+            assert!(!listed.contains("Enrolled, not attached"), "{listed}");
+        };
+
+        let unmeasured = listing(&[fedora.clone(), publisher.clone()], &[]);
+        not_a_machine(&unmeasured);
+        assert!(
+            unmeasured.contains("## fedora\n")
+                && unmeasured.contains("- Publisher: not ready — isolation unmeasured: executor not started as a publisher (cairn-publish, under its own account on this machine; read cairn://executors/cairn-publish)\n"),
+            "{unmeasured}"
+        );
+
+        publisher
+            .health
+            .advertisement
+            .capabilities
+            .publish_isolation = Some(PublishIsolationEvidence {
+            verdict: PublishIsolationVerdict::Pass,
+            measured_at_unix_ms: CAPTURED_AT,
+            lines: Vec::new(),
+        });
+        let ready = listing(&[fedora.clone(), publisher], &[]);
+        not_a_machine(&ready);
+        assert!(
+            ready.contains("- Publisher: ready (cairn-publish, under its own account"),
+            "{ready}"
+        );
+
+        let mut detached = enrolled(
+            "cairn-publish",
+            RemoteLinkState::Absent {
+                last_beat_unix_ms: None,
+                last_reason: String::new(),
+            },
+        );
+        detached.role = MachineRole::PublishOnly;
+        let absent = listing(&[fedora], &[detached]);
+        not_a_machine(&absent);
+        assert!(
+            absent.contains("- Publisher: not ready — not attached (cairn-publish"),
+            "{absent}"
         );
     }
 

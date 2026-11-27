@@ -9573,6 +9573,12 @@ pub struct LearnedResourceEstimate {
 /// older rows, without `deny_unknown_fields`. No executor wire meaning changes.
 /// Member-level admission and its protocol are not introduced here.
 ///
+/// cairn/7647 does not move the number. [`SubstrateHealthSnapshot`] gains a
+/// defaulted `publishers` list of [`FleetPublisher`], so the app can fold a
+/// release publisher into its host machine's row instead of listing it as a
+/// machine. The snapshot is the runner's answer to the app, never an executor
+/// frame; no executor sends, receives or decodes it.
+///
 /// cairn/7110 does not move the number. The runner's macOS adopted-tree
 /// metadata now names `buildJobProcesses` as absent, the field cairn/5685
 /// added and that constructor missed; nothing crosses the boundary that did
@@ -26250,6 +26256,39 @@ impl CompileCacheHealth {
     }
 }
 
+/// A `publishOnly` executor as the fleet surfaces present it: a role its host
+/// machine has, not a machine of its own. The release publisher is a second
+/// `cairn-exec` under its own account on a host that already runs an ordinary
+/// executor (docs/executor.md, "Publishes only"), so listing it beside that
+/// executor would count one machine twice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetPublisher {
+    pub executor_id: String,
+    /// The name `cairn://executors/<name>` resolves, which carries its full
+    /// detail.
+    pub name: String,
+    /// The ordinary executor that shares its host, whose row carries it.
+    /// Absent for a publisher alone on its host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_executor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
+    /// The one reason it cannot publish now; absent when it is ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_ready: Option<String>,
+}
+
+impl FleetPublisher {
+    /// `ready` or `not ready — <reason>`.
+    pub fn readiness(&self) -> String {
+        match &self.not_ready {
+            None => "ready".to_string(),
+            Some(why) => format!("not ready — {why}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubstrateHealthSnapshot {
@@ -26272,6 +26311,11 @@ pub struct SubstrateHealthSnapshot {
     /// a runner with no enrolled remotes, which is the common case.
     #[serde(default)]
     pub enrolled_remotes: Vec<EnrolledRemote>,
+    /// Every `publishOnly` executor, attached or not. Each is also present in
+    /// `executors` or `enrolled_remotes` as the facts it reports; this list
+    /// says which host row carries it, so no surface lists it as a machine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publishers: Vec<FleetPublisher>,
     /// This machine's supervised compile cache, absent when no build service is
     /// configured at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -32471,6 +32515,7 @@ mod tests {
             drain_initialization_error: None,
             schema_version: SUBSTRATE_HEALTH_SCHEMA_VERSION,
             captured_at_unix_ms: 42,
+            publishers: Vec::new(),
             // The CAIRN-3356 specimen: three enrolled machines, none attached,
             // for three different reasons. The panel fixture carries all three
             // so the rendering is exercised against the serializer's own output
@@ -33413,6 +33458,7 @@ mod tests {
             schema_version: SUBSTRATE_HEALTH_SCHEMA_VERSION,
             captured_at_unix_ms: 42,
             compile_cache: None,
+            publishers: Vec::new(),
             // A machine with no attempt and no sighting yet: both nulls are the
             // honest answer and both have to survive the wire, because a client
             // that read them as zero would render a machine last seen in 1970.

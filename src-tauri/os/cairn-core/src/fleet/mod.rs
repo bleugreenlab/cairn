@@ -31,6 +31,7 @@ pub(crate) mod placement_default;
 pub mod pools;
 pub(crate) mod preparation;
 mod profile_reads;
+pub mod publishers;
 pub(crate) mod purpose;
 pub(crate) mod queue;
 mod reliability;
@@ -1251,6 +1252,11 @@ pub struct Fleet {
     /// settings file does not. Attach stamps from it; the machine is never
     /// told.
     machine_roles: Arc<Mutex<HashMap<String, MachineRole>>>,
+    /// Each publisher that shares its machine with an ordinary executor,
+    /// publisher executor ID to host executor ID: a cache of
+    /// [`FleetConfig::publisher_hosts`], replaced whole beside the roles. Read
+    /// only by the surfaces that list machines, never by placement.
+    publisher_hosts: Arc<Mutex<HashMap<String, String>>>,
     /// Placement's local models: the residents on each machine, the room
     /// refusals that may evict them, and the pass that decides them.
     models: Arc<models::ModelPlacement>,

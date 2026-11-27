@@ -281,8 +281,12 @@ impl super::Fleet {
     /// machine's public name. Cached state only: nothing is probed.
     pub fn detected_pools(&self) -> Vec<Pool> {
         let connections = self.lock_connections();
+        // A publisher is a second executor on a machine already here, so it
+        // reports that machine's GPUs and ports again; and it never runs a
+        // deployment. Counting it would make a pool of one machine twice.
         let named: Vec<(String, &HostHealth)> = connections
             .values()
+            .filter(|entry| entry.machine_role != super::MachineRole::PublishOnly)
             .map(|entry| (super::executor_public_name(entry), &entry.health.host))
             .collect();
         derive_pools(named.iter().map(|(name, host)| (name.as_str(), *host)))

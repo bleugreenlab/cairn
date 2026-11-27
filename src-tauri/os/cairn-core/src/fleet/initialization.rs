@@ -30,6 +30,7 @@ fn load(
         },
         |config| {
             fleet.hydrate_machine_roles(config.role_executor_ids());
+            fleet.hydrate_publisher_hosts(config.publisher_hosts());
             fleet.publish_drain_projection(config);
         },
     );

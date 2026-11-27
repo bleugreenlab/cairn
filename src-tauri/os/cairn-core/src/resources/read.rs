@@ -2508,9 +2508,16 @@ async fn render_resource_body(
                     let executors = orch.fleet.inspect_executors(captured_at);
                     let warming_up = orch.fleet_warming_up(executors.len(), captured_at);
                     let incidents = crate::fleet::absence::incident_lines(orch).await;
-                    let mut rendered = crate::resources::executors::render_executors(
+                    let enrolled = orch.fleet.unattached_enrolled_remotes();
+                    let publishers = crate::fleet::publishers::fleet_publishers(
+                        executors.iter().map(|executor| &executor.health),
+                        &enrolled,
+                        &orch.fleet.publisher_hosts(),
+                        captured_at,
+                    );
+                    let mut rendered = crate::resources::executors::render_fleet(
                         &executors,
-                        &orch.fleet.unattached_enrolled_remotes(),
+                        &enrolled,
                         &orch.fleet.management().operations().in_flight(),
                         // A process-wide fact established once at boot, read here
                         // rather than threaded through the fleet: the runner's own
@@ -2519,6 +2526,7 @@ async fn render_resource_body(
                         captured_at,
                         warming_up,
                         incidents.as_ref().unwrap_or(&Default::default()),
+                        &publishers,
                     );
                     if let Err(error) = incidents {
                         rendered.push_str(&format!(
@@ -2533,7 +2541,7 @@ async fn render_resource_body(
                         &orch.fleet.learned_project_requirements(),
                         captured_at,
                     ));
-                    rendered.push_str(&render_machine_services_overview(orch));
+                    rendered.push_str(&render_machine_services_overview(orch, &publishers));
                     rendered.push_str(&crate::resources::executors::render_blocked_questions(
                         &orch.fleet.blocked_questions(None, captured_at),
                         orch.fleet.purpose_debt_journal_error().as_deref(),
@@ -2663,6 +2671,12 @@ async fn render_resource_body(
                 let captured_at = crate::fleet::unix_time_ms();
                 let executors = orch.fleet.inspect_executors(captured_at);
                 let enrolled = orch.fleet.unattached_enrolled_remotes();
+                let publishers = crate::fleet::publishers::fleet_publishers(
+                    executors.iter().map(|executor| &executor.health),
+                    &enrolled,
+                    &orch.fleet.publisher_hosts(),
+                    captured_at,
+                );
                 let notices = if view.is_none() {
                     crate::resource_notices::render_for(orch, &format!("cairn://executors/{name}"))
                         .await
@@ -2680,13 +2694,21 @@ async fn render_resource_body(
                             .await;
                             let attributions = crate::resources::executors::running_attributions(orch, executor).await;
                             let (rust_pins, rust_pin_gaps) = executor_rust_pins(orch, executor).await;
-                            let mut rendered = crate::resources::executors::render_executor_with_kills(
-                                executor,
-                                Some(&recorded_kills),
-                                &orch.fleet,
-                                &rust_pins,
-                                &attributions,
+                            let mut rendered = crate::resources::executors::frame_as_publisher(
+                                crate::resources::executors::render_executor_with_kills(
+                                    executor,
+                                    Some(&recorded_kills),
+                                    &orch.fleet,
+                                    &rust_pins,
+                                    &attributions,
+                                ),
+                                &executor.health.identity.executor_id,
+                                &publishers,
                             );
+                            rendered.push_str(&crate::resources::executors::render_host_publisher(
+                                &executor.health.identity.executor_id,
+                                &publishers,
+                            ));
                             if !rust_pin_gaps.is_empty() {
                                 rendered.push_str("\n## Repository Rust pins unavailable\n\n");
                                 for gap in rust_pin_gaps {
@@ -2841,7 +2863,15 @@ async fn render_resource_body(
                         Some(remote) => {
                             let incidents = crate::fleet::absence::incident_lines(orch).await;
                             let incident = incidents.as_ref().ok().and_then(|rows| rows.get(&remote.executor_id));
-                            let mut rendered = crate::resources::executors::render_enrolled_remote(remote, captured_at, incident.map(String::as_str));
+                            let mut rendered = crate::resources::executors::frame_as_publisher(
+                                crate::resources::executors::render_enrolled_remote(remote, captured_at, incident.map(String::as_str)),
+                                &remote.executor_id,
+                                &publishers,
+                            );
+                            rendered.push_str(&crate::resources::executors::render_host_publisher(
+                                &remote.executor_id,
+                                &publishers,
+                            ));
                             if let Err(error) = incidents {
                                 rendered.push_str(&format!("\nAbsence incident history unavailable: {error}\n"));
                             }
@@ -4397,7 +4427,12 @@ fn machine_services_section(
 
 /// One line per selected machine service, naming each machine it is selected
 /// on and that instance's state.
-fn render_machine_services_overview(orch: &Orchestrator) -> String {
+/// Publishers are left out: one is a role its host has, not a machine, and it
+/// takes no service resident.
+fn render_machine_services_overview(
+    orch: &Orchestrator,
+    publishers: &[cairn_common::executor_protocol::FleetPublisher],
+) -> String {
     let keys = crate::project_services::supervisor::machine::selected_keys(orch);
     let lines: Vec<(
         String,
@@ -4405,7 +4440,14 @@ fn render_machine_services_overview(orch: &Orchestrator) -> String {
     )> = keys
         .into_iter()
         .map(|key| {
-            let instances = crate::project_services::supervisor::machine::instances(orch, &key);
+            let instances = crate::project_services::supervisor::machine::instances(orch, &key)
+                .into_iter()
+                .filter(|instance| {
+                    !publishers
+                        .iter()
+                        .any(|publisher| publisher.name == instance.machine)
+                })
+                .collect();
             (key.to_string(), instances)
         })
         .collect();

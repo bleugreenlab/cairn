@@ -2525,6 +2525,13 @@ impl Orchestrator {
             reasons.extend(executor_health_reasons(executor));
         }
         let status = substrate_health_status(&reasons);
+        let enrolled_remotes = self.fleet.unattached_enrolled_remotes();
+        let publishers = crate::fleet::publishers::fleet_publishers(
+            &executors,
+            &enrolled_remotes,
+            &self.fleet.publisher_hosts(),
+            captured_at_unix_ms,
+        );
         SubstrateHealthSnapshot {
             schema_version: SUBSTRATE_HEALTH_SCHEMA_VERSION,
             captured_at_unix_ms,
@@ -2546,7 +2553,8 @@ impl Orchestrator {
             // about whether the machines that ARE attached hold an authoritative
             // inventory, and folding it in would have marked the fleet degraded
             // every time this runner's laptop left the network.
-            enrolled_remotes: self.fleet.unattached_enrolled_remotes(),
+            enrolled_remotes,
+            publishers,
             drain_initialization_error: self.fleet.drain_initialization_error(),
         }
     }

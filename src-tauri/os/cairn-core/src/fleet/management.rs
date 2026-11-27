@@ -2171,6 +2171,7 @@ pub fn mutate_fleet<T>(
 ) -> Result<T, String> {
     crate::config::settings::mutate_fleet(&orch.config_dir, mutate, |config| {
         orch.fleet.hydrate_machine_roles(config.role_executor_ids());
+        orch.fleet.hydrate_publisher_hosts(config.publisher_hosts());
         orch.fleet.publish_drain_projection(config);
     })
 }

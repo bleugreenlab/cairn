@@ -1070,6 +1070,30 @@ impl FleetConfig {
             .collect()
     }
 
+    /// Each publisher that shares its machine with an ordinary enrolment, as
+    /// `(publisher executor ID, host executor ID)`. This is the pairing
+    /// enrolment admits (a publisher beside a machine's ordinary executor),
+    /// read from the same recorded host identities. A publisher alone on its
+    /// machine has no entry.
+    pub fn publisher_hosts(&self) -> Vec<(String, String)> {
+        let identities = &self.remote_host_identities;
+        identities
+            .iter()
+            .filter(|(id, _)| self.machine_role(id) == MachineRole::PublishOnly)
+            .filter_map(|(publisher, identity)| {
+                identities
+                    .iter()
+                    .find(|(host, host_identity)| {
+                        *host != publisher
+                            && *host_identity == identity
+                            && self.remote_executors.contains_key(*host)
+                            && self.machine_role(host) != MachineRole::PublishOnly
+                    })
+                    .map(|(host, _)| (publisher.clone(), host.clone()))
+            })
+            .collect()
+    }
+
     /// The executor identity a durable key names: the inverse of
     /// [`Self::drain_key`].
     fn executor_id_for_key(key: &str) -> String {
