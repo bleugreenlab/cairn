@@ -512,6 +512,93 @@ async fn a_bulk_append_inserts_every_row_in_one_transaction_and_names_each() {
 }
 
 #[tokio::test]
+async fn a_refused_journal_write_names_the_column_and_the_shape_that_would_work() {
+    let fixture = fixture().await;
+    let journal = format!("{}/journal", root());
+    // The refusal text, unescaped from the change report.
+    let refusal = |rendered: String| -> String {
+        report(&rendered)["failures"][0]["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("not refused: {rendered}"))
+            .to_string()
+    };
+
+    let plain = refusal(
+        write(
+            &fixture,
+            &journal,
+            "append",
+            Some(json!({ "kind": "event", "note": "x", "refs": "cairn://p/a/1 cairn://p/a/2" })),
+        )
+        .await,
+    );
+    assert!(
+        plain.contains(
+            "`journal.refs` holds a JSON array; got the plain string \"cairn://p/a/1 cairn://p/a/2\", which is not JSON; send `refs: ["
+        ),
+        "{plain}"
+    );
+
+    let unknown = refusal(
+        sql(
+            &fixture,
+            "INSERT INTO journal(kind, body, refs) VALUES ('event', 'x', '[]')",
+        )
+        .await,
+    );
+    assert!(
+        unknown.contains(
+            "statement 1 failed: `journal` has no column `body`; its columns are: id, ts, kind, note, refs, resolution, resolved_at"
+        ),
+        "{unknown}"
+    );
+    assert!(!unknown.contains("row conversion failed"), "{unknown}");
+
+    // The engine names no column for malformed JSON, so the reply names the
+    // table's JSON columns as the likely cause, not as the fact.
+    let malformed = refusal(
+        sql(
+            &fixture,
+            "INSERT INTO journal(kind, note, refs) VALUES ('event', 'x', 'a b')",
+        )
+        .await,
+    );
+    assert!(
+        malformed.contains("statement 1 failed: `journal` reads `refs` (a JSON array) as JSON, so a value written there is likely not JSON"),
+        "{malformed}"
+    );
+
+    let missing = refusal(sql(&fixture, "INSERT INTO jornal(kind) VALUES ('event')").await);
+    assert!(missing.contains("No table `jornal` in "), "{missing}");
+    assert!(
+        missing.contains("its tables are: headlines, intent, journal"),
+        "{missing}"
+    );
+
+    // Any thread table's JSON CHECK is read the same way.
+    sql(
+        &fixture,
+        "CREATE TABLE notes(id INTEGER PRIMARY KEY, meta TEXT CHECK (json_valid(meta) AND json_type(meta) = 'object'))",
+    )
+    .await;
+    let notes = format!("{}/notes", root());
+    let scalar = refusal(write(&fixture, &notes, "append", Some(json!({ "meta": "x" }))).await);
+    assert!(
+        scalar.contains("`notes.meta` holds a JSON object; got the plain string \"x\""),
+        "{scalar}"
+    );
+
+    let written = write(
+        &fixture,
+        &journal,
+        "append",
+        Some(json!({ "kind": "event", "note": "x", "refs": ["cairn://p/a/1", "cairn://p/a/2"] })),
+    )
+    .await;
+    assert!(written.contains("Inserted "), "{written}");
+}
+
+#[tokio::test]
 async fn an_upsert_updates_only_the_columns_it_names_and_inserts_a_new_key() {
     let fixture = fixture().await;
     let commits = commits_table(&fixture).await;

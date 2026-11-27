@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use crate::{
     resources::{
         sql_policy,
-        sql_schema::{quote_identifier, USER_TABLE_PREDICATE},
+        sql_schema::{quote_identifier, CATALOG_TABLE_PREDICATE, USER_TABLE_PREDICATE},
     },
     storage::{db_set_paths, LocalDb, MigrationRunner, RowExt},
 };
@@ -178,16 +178,45 @@ pub async fn apply_write(
     // Turso requires schema changes to run outside its concurrent transaction
     // mode. The resource still owns transaction control: callers cannot submit
     // BEGIN/COMMIT, and a mixed DDL/DML batch remains one atomic transaction.
+    let failure: FailureSlot = Arc::default();
     let executed = if changes_schema {
         let statements = statements.clone();
-        db.exclusive(move |conn| Box::pin(execute_statements(conn, statements.clone())))
-            .await
+        let failure = failure.clone();
+        db.exclusive(move |conn| {
+            Box::pin(execute_statements(
+                conn,
+                statements.clone(),
+                failure.clone(),
+            ))
+        })
+        .await
     } else {
         let statements = statements.clone();
-        db.write(move |conn| Box::pin(execute_statements(conn, statements.clone())))
-            .await
-    }
-    .map_err(sanitize_error)?;
+        let failure = failure.clone();
+        db.write(move |conn| {
+            Box::pin(execute_statements(
+                conn,
+                statements.clone(),
+                failure.clone(),
+            ))
+        })
+        .await
+    };
+    let executed = match executed {
+        Ok(executed) => executed,
+        Err(error) => {
+            let failed = failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            return Err(match failed {
+                Some(failed) => {
+                    explain_failure(&db, scope, &statements[failed.index], &failed).await
+                }
+                None => sanitize_error(error),
+            });
+        }
+    };
 
     let root = scope.db_root();
     // Rows of one (table, action) written by several structured statements (a
@@ -385,10 +414,40 @@ struct Executed {
     per_statement: Vec<StatementResult>,
 }
 
+/// The statement an attempt failed at, and the engine's words, kept apart from
+/// the `DbError` the transaction rolls back on so the reply can be written
+/// once the schema can be read again.
+struct StatementFailure {
+    index: usize,
+    position: Option<usize>,
+    error: String,
+}
+
+impl StatementFailure {
+    /// `rows[N] failed` for a bulk append's row, `statement N failed` otherwise.
+    fn label(&self) -> String {
+        match self.position {
+            Some(position) => format!("rows[{position}] failed"),
+            None => format!("statement {} failed", self.index + 1),
+        }
+    }
+}
+
+type FailureSlot = Arc<std::sync::Mutex<Option<StatementFailure>>>;
+
 async fn execute_statements(
     conn: &cairn_db::storage::TrackedConnection,
     statements: Vec<WriteStatement>,
+    failure: FailureSlot,
 ) -> crate::storage::DbResult<Executed> {
+    let record = |failed: Option<StatementFailure>| {
+        *failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = failed;
+    };
+    // A retried attempt starts clean, so only the last attempt's failure is
+    // reported.
+    record(None);
     let mut executed = Executed {
         changed: 0,
         per_statement: Vec::with_capacity(statements.len()),
@@ -396,10 +455,14 @@ async fn execute_statements(
     for (index, statement) in statements.into_iter().enumerate() {
         let position = statement.row.as_ref().and_then(|target| target.position);
         let failed = |error: cairn_db::turso::Error| {
-            crate::storage::DbError::Row(match position {
-                Some(position) => format!("rows[{position}] failed: {error}"),
-                None => format!("statement {} failed: {error}", index + 1),
-            })
+            let failed = StatementFailure {
+                index,
+                position,
+                error: error.to_string(),
+            };
+            let message = format!("{}: {}", failed.label(), failed.error);
+            record(Some(failed));
+            crate::storage::DbError::Row(message)
         };
         let returning = statement
             .row
@@ -436,6 +499,110 @@ async fn execute_statements(
         executed.per_statement.push(result);
     }
     Ok(executed)
+}
+
+/// The refusal for a statement the engine failed: where it failed, what to
+/// fix when the schema can say, and the engine's own words. The fix is
+/// derived from the live schema after the failure, never predicted from the
+/// statement's text.
+async fn explain_failure(
+    db: &LocalDb,
+    scope: &WriteScope,
+    statement: &WriteStatement,
+    failure: &StatementFailure,
+) -> String {
+    let engine = sanitize_error(&failure.error);
+    match failure_fix(db, scope, statement, &engine).await {
+        Some(fix) => format!("{}: {fix} (the database said: {engine})", failure.label()),
+        None => format!("{}: {engine}", failure.label()),
+    }
+}
+
+async fn failure_fix(
+    db: &LocalDb,
+    scope: &WriteScope,
+    statement: &WriteStatement,
+    engine: &str,
+) -> Option<String> {
+    use crate::resources::db_rows;
+    let target = || {
+        statement
+            .row
+            .as_ref()
+            .map(|target| target.table.clone())
+            .or_else(|| sql_policy::statement_target(&statement.sql).map(|(table, _)| table))
+    };
+    if let Some((table, column)) = missing_column(engine) {
+        let shape = db_rows::load_shape(db, &table.or_else(target)?)
+            .await
+            .ok()??;
+        // `no such column` may name another table's column in an expression;
+        // the hint is given only when this table really lacks it.
+        return shape
+            .column(&column)
+            .is_none()
+            .then(|| db_rows::no_column(&shape, &column));
+    }
+    if let Some(table) = missing_table(engine) {
+        let tables = db
+            .query_all(
+                format!(
+                    "SELECT name FROM sqlite_schema WHERE {CATALOG_TABLE_PREDICATE} ORDER BY name"
+                ),
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .ok()?;
+        return Some(db_rows::no_table_among(&scope.db_root(), &table, &tables));
+    }
+    if engine.contains("malformed JSON") {
+        let shape = db_rows::load_shape(db, &target()?).await.ok()??;
+        return db_rows::malformed_json_hint(&shape);
+    }
+    None
+}
+
+/// The identifier that starts `text`, unquoted.
+fn leading_identifier(text: &str) -> Option<String> {
+    let word: String = text
+        .trim_start()
+        .chars()
+        .take_while(|ch| !ch.is_whitespace() && !matches!(ch, ',' | ';' | '(' | ')'))
+        .collect();
+    let word = word.trim_matches(|ch| matches!(ch, '"' | '`' | '\'' | '[' | ']'));
+    (!word.is_empty()).then(|| word.to_string())
+}
+
+/// `(table, column)` from the engine's `table T has no column named C` or
+/// `no such column: [T.]C`; the table is `None` when the message names none.
+fn missing_column(engine: &str) -> Option<(Option<String>, String)> {
+    const NAMED: &str = " has no column named ";
+    if let Some(at) = engine.find(NAMED) {
+        let column = leading_identifier(&engine[at + NAMED.len()..])?;
+        let table = engine[..at]
+            .rfind("table ")
+            .and_then(|start| leading_identifier(&engine[start + "table ".len()..at]));
+        return Some((table, column));
+    }
+    const NO_SUCH: &str = "no such column: ";
+    let at = engine.find(NO_SUCH)?;
+    let named = leading_identifier(&engine[at + NO_SUCH.len()..])?;
+    Some(match named.rsplit_once('.') {
+        Some((table, column)) => (Some(table.to_string()), column.to_string()),
+        None => (None, named),
+    })
+}
+
+/// The table the engine's `no such table: T` names, without a `main.` schema.
+fn missing_table(engine: &str) -> Option<String> {
+    const NO_SUCH: &str = "no such table: ";
+    let at = engine.find(NO_SUCH)?;
+    let named = leading_identifier(&engine[at + NO_SUCH.len()..])?;
+    Some(match named.split_once('.') {
+        Some((schema, table)) if schema.eq_ignore_ascii_case("main") => table.to_string(),
+        _ => named,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

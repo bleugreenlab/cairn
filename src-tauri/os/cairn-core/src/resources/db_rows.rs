@@ -43,6 +43,187 @@ pub(crate) struct Column {
     pub default: Option<String>,
     /// 1-based position in the primary key, 0 when not part of it.
     pub pk: i64,
+    /// Set when the table's schema validates or reads this column as JSON;
+    /// see [`json_columns`].
+    pub json: Option<JsonShape>,
+}
+
+/// What a JSON column must hold, as far as its schema says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JsonShape {
+    /// `json_type(col) = 'array'`, or `json_array_length(col)`.
+    Array,
+    /// `json_type(col) = 'object'`.
+    Object,
+    /// Any JSON text.
+    Any,
+}
+
+impl JsonShape {
+    pub(crate) fn described(self) -> &'static str {
+        match self {
+            Self::Array => "a JSON array",
+            Self::Object => "a JSON object",
+            Self::Any => "JSON text",
+        }
+    }
+
+    fn example(self) -> &'static str {
+        match self {
+            Self::Array => "[\"…\", \"…\"]",
+            Self::Object => "{\"key\": \"…\"}",
+            Self::Any => "[\"…\"] or {\"key\": \"…\"}",
+        }
+    }
+
+    fn admits(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::Array => value.is_array(),
+            Self::Object => value.is_object(),
+            Self::Any => true,
+        }
+    }
+}
+
+/// One lexeme of schema SQL, for [`json_columns`]: a word (bare or quoted
+/// identifier), a string literal, or a punctuation character.
+#[derive(Debug, PartialEq)]
+enum SchemaToken {
+    Word(String),
+    Text(String),
+    Punct(char),
+}
+
+fn schema_tokens(sql: &str) -> Vec<SchemaToken> {
+    let mut chars = sql.chars().peekable();
+    let mut out = Vec::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' | '"' | '`' | '[' => {
+                let close = if ch == '[' { ']' } else { ch };
+                let mut text = String::new();
+                while let Some(next) = chars.next() {
+                    if next == close {
+                        // A doubled quote is one literal quote.
+                        if close != ']' && chars.peek() == Some(&close) {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    text.push(next);
+                }
+                out.push(if ch == '\'' {
+                    SchemaToken::Text(text)
+                } else {
+                    SchemaToken::Word(text)
+                });
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut previous = ' ';
+                for next in chars.by_ref() {
+                    if previous == '*' && next == '/' {
+                        break;
+                    }
+                    previous = next;
+                }
+            }
+            c if c.is_alphanumeric() || c == '_' => {
+                let mut word = String::from(c);
+                while let Some(&next) = chars.peek() {
+                    if next.is_alphanumeric() || next == '_' || next == '$' {
+                        word.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push(SchemaToken::Word(word));
+            }
+            c if c.is_whitespace() => {}
+            c => out.push(SchemaToken::Punct(c)),
+        }
+    }
+    out
+}
+
+/// The columns a table's own SQL (its `CREATE TABLE`, indexes and triggers)
+/// hands to a `json_*` function as the first argument, keyed by lowercased
+/// name, with the shape a `json_type(col) = '…'` comparison or
+/// `json_array_length(col)` pins. The engine refuses non-JSON for such a
+/// column, or its readers fail on it, whichever table declares it.
+fn json_columns(
+    table: &str,
+    schema_sql: &[String],
+) -> std::collections::HashMap<String, JsonShape> {
+    use SchemaToken::{Punct, Text, Word};
+    let mut found = std::collections::HashMap::new();
+    for sql in schema_sql {
+        let tokens = schema_tokens(sql);
+        for (index, token) in tokens.iter().enumerate() {
+            let Word(function) = token else {
+                continue;
+            };
+            let function = function.to_ascii_lowercase();
+            if !function.starts_with("json") || tokens.get(index + 1) != Some(&Punct('(')) {
+                continue;
+            }
+            // The first argument: `col`, or `NEW.col`, `OLD.col` or
+            // `<table>.col`. A trigger may read another table's column of the
+            // same name, which says nothing about this one.
+            let mut at = index + 2;
+            if tokens.get(at + 1) == Some(&Punct('.')) {
+                let ours = matches!(tokens.get(at), Some(Word(qualifier))
+                    if ["new", "old", table].iter().any(|name| qualifier.eq_ignore_ascii_case(name)));
+                if !ours {
+                    continue;
+                }
+                at += 2;
+            }
+            let Some(Word(column)) = tokens.get(at) else {
+                continue;
+            };
+            let closes = tokens.get(at + 1) == Some(&Punct(')'));
+            if !closes && tokens.get(at + 1) != Some(&Punct(',')) {
+                continue;
+            }
+            let mut pinned = None;
+            if function == "json_array_length" {
+                pinned = Some(JsonShape::Array);
+            } else if function == "json_type" && closes {
+                let mut next = at + 2;
+                while tokens.get(next) == Some(&Punct('=')) {
+                    next += 1;
+                }
+                if next > at + 2 {
+                    pinned = match tokens.get(next) {
+                        Some(Text(kind)) if kind.eq_ignore_ascii_case("array") => {
+                            Some(JsonShape::Array)
+                        }
+                        Some(Text(kind)) if kind.eq_ignore_ascii_case("object") => {
+                            Some(JsonShape::Object)
+                        }
+                        _ => None,
+                    };
+                }
+            }
+            let entry = found
+                .entry(column.to_ascii_lowercase())
+                .or_insert(JsonShape::Any);
+            if let Some(pinned) = pinned {
+                *entry = pinned;
+            }
+        }
+    }
+    found
 }
 
 /// The live shape of one table or view.
@@ -72,7 +253,27 @@ impl TableShape {
                 not_null: row.get::<i64>(3)? != 0,
                 default: row.get::<Option<String>>(4)?,
                 pk: row.get::<i64>(5)?,
+                json: None,
             });
+        }
+        drop(rows);
+        if !columns.is_empty() {
+            let mut rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_schema
+                     WHERE lower(tbl_name) = lower(?1) AND type IN ('table', 'index', 'trigger')
+                       AND sql IS NOT NULL",
+                    [table],
+                )
+                .await?;
+            let mut schema_sql = Vec::new();
+            while let Some(row) = rows.next().await? {
+                schema_sql.push(row.get::<String>(0)?);
+            }
+            let json = json_columns(table, &schema_sql);
+            for column in &mut columns {
+                column.json = json.get(&column.name.to_ascii_lowercase()).copied();
+            }
         }
         Ok((!columns.is_empty()).then(|| Self {
             table: table.to_string(),
@@ -255,12 +456,81 @@ pub(crate) const NULL_WORD: &str = "null";
 pub(crate) const WHERE_FORMS: &str =
     "COL=VALUE, COL!=VALUE, COL=null or COL!=null (repeatable, ANDed; LIKE and ranges stay in ?sql=)";
 
-fn no_column(shape: &TableShape, name: &str) -> String {
+pub(crate) fn no_column(shape: &TableShape, name: &str) -> String {
     format!(
         "`{}` has no column `{name}`; its columns are: {}",
         shape.table,
         shape.column_names()
     )
+}
+
+/// A quoted value for a refusal, cut so a long one cannot bury the fix.
+fn quoted_excerpt(text: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    if text.chars().count() <= MAX_CHARS {
+        format!("{text:?}")
+    } else {
+        let cut: String = text.chars().take(MAX_CHARS).collect();
+        format!("{cut:?}…")
+    }
+}
+
+/// Refuse a value a JSON column cannot hold. A plain string is never split or
+/// wrapped into JSON: `"a b"` could be one element or two, so the writer says
+/// which.
+fn check_json_value(
+    shape: &TableShape,
+    column: &Column,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(json) = column.json else {
+        return Ok(());
+    };
+    let got = match value {
+        serde_json::Value::Null => return Ok(()),
+        serde_json::Value::String(text) => match serde_json::from_str::<serde_json::Value>(text) {
+            Err(_) => format!(
+                "the plain string {}, which is not JSON",
+                quoted_excerpt(text)
+            ),
+            Ok(parsed) if json.admits(&parsed) => return Ok(()),
+            Ok(_) => format!("the string {}", quoted_excerpt(text)),
+        },
+        other if json.admits(other) => return Ok(()),
+        other => other.to_string(),
+    };
+    Err(format!(
+        "`{table}.{name}` holds {described}; got {got}; send `{name}: {example}`",
+        table = shape.table,
+        name = column.name,
+        described = json.described(),
+        example = json.example(),
+    ))
+}
+
+/// Why an engine `malformed JSON` failure on `shape` most likely happened. The
+/// engine does not name the column, and a SQL statement's values cannot be
+/// tied to columns without parsing it, so this names the table's JSON columns
+/// as the likely cause rather than as the fact. `None` when the schema reads
+/// no column as JSON.
+pub(crate) fn malformed_json_hint(shape: &TableShape) -> Option<String> {
+    let columns: Vec<String> = shape
+        .columns
+        .iter()
+        .filter_map(|column| {
+            column
+                .json
+                .map(|json| format!("`{}` ({})", column.name, json.described()))
+        })
+        .collect();
+    if columns.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "`{}` reads {} as JSON, so a value written there is likely not JSON; write it as JSON text such as '[\"…\"]', not a plain string",
+        shape.table,
+        columns.join(", ")
+    ))
 }
 
 /// One `where=` term, its column in declared spelling. The same terms scope a
@@ -625,6 +895,7 @@ pub(crate) fn payload_columns(
                 column.name
             ));
         }
+        check_json_value(shape, column, value)?;
         let value = sql_param(value).map_err(|error| format!("payload.{key}: {error}"))?;
         columns.push((column.name.clone(), value));
     }
@@ -986,6 +1257,14 @@ impl Store<'_> {
 /// The refusal for a table the store does not hold.
 pub(crate) fn no_table(db_root: &str, table: &str) -> String {
     format!("No table `{table}` in {db_root}; read {db_root} for the catalog of tables")
+}
+
+/// [`no_table`] when the store's catalog is in hand, so the reply lists it.
+pub(crate) fn no_table_among(db_root: &str, table: &str, tables: &[String]) -> String {
+    format!(
+        "No table `{table}` in {db_root}; its tables are: {}",
+        tables.join(", ")
+    )
 }
 
 /// The row-form refusal for a table without a single-column primary key.
@@ -1598,6 +1877,7 @@ mod tests {
             not_null,
             default: default.map(str::to_string),
             pk,
+            json: None,
         }
     }
 
