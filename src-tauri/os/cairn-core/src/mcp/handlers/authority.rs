@@ -327,6 +327,109 @@ mod tests {
         );
     }
 
+    /// Two items of one `write` that each cross an authority boundary raise a
+    /// card each under the one tool call, in turn, and both are reported once
+    /// the operator has answered both. The second card used to collide with the
+    /// first on `(run_id, tool_use_id)` and fail to store.
+    #[tokio::test]
+    async fn two_items_needing_approval_in_one_write_each_raise_a_card() {
+        use crate::mcp::handlers::permission::{
+            resolve_permission_request,
+            tests::{desktop_approval, seed_allow_all_permission, test_orchestrator},
+            PermissionAnswer, PermissionDecision,
+        };
+        use crate::storage::RowExt;
+
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        orch.db
+            .local
+            .execute("DELETE FROM permission_requests", ())
+            .await
+            .unwrap();
+        let server = |name: &str| {
+            serde_json::json!({
+                "target": "cairn://mcp",
+                "mode": "create",
+                "payload": { "name": name, "command": "npx", "args": [format!("{name}-mcp")] }
+            })
+        };
+        let request = McpCallbackRequest {
+            run_id: Some("run-1".to_string()),
+            tool_use_id: Some("toolu-two-cards".to_string()),
+            tool: "write".to_string(),
+            cwd: "/wt".to_string(),
+            payload: serde_json::json!({ "changes": [server("axon"), server("linear")] }),
+            ..McpCallbackRequest::default()
+        };
+
+        let write = {
+            let (orch, request) = (orch.clone(), request.clone());
+            cairn_common::task::spawn(async move {
+                crate::mcp::handlers::write::handle_write(&orch, &request).await
+            })
+        };
+        for card in 1..=2 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let pending = loop {
+                let pending = orch
+                    .db
+                    .local
+                    .query_opt(
+                        "SELECT id FROM permission_requests WHERE status = 'pending'",
+                        (),
+                        |row| row.text(0),
+                    )
+                    .await
+                    .unwrap();
+                if let Some(id) = pending {
+                    break id;
+                }
+                if write.is_finished() {
+                    panic!(
+                        "the write ended before card {card}: {}",
+                        write.await.unwrap()
+                    );
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the write never raised card {card}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            let raised: i64 = orch
+                .db
+                .local
+                .query_one(
+                    "SELECT COUNT(*) FROM permission_requests WHERE tool_use_id = 'toolu-two-cards'",
+                    (),
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap();
+            assert_eq!(raised, card, "one card per item, raised in turn");
+            resolve_permission_request(
+                &orch,
+                &pending,
+                PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
+            )
+            .await
+            .unwrap();
+        }
+
+        let result = write.await.unwrap();
+        let report: serde_json::Value = serde_json::from_str(&result)
+            .unwrap_or_else(|error| panic!("not a change report ({error}): {result}"));
+        assert!(report.get("failures").is_none(), "{result}");
+        let applied: Vec<u64> = report["applied"]
+            .as_array()
+            .unwrap_or_else(|| panic!("nothing applied: {result}"))
+            .iter()
+            .filter_map(|change| change["index"].as_u64())
+            .collect();
+        assert_eq!(applied, [0, 1], "{result}");
+    }
+
     #[test]
     fn a_legacy_tool_prompt_is_neither() {
         let legacy = serde_json::json!({"command": "ls -la"}).to_string();

@@ -128,17 +128,67 @@ fn row_origin_refusal(
     })
 }
 
-/// A single-failure change report for an item refused before anything applied.
+/// List every item of `changes` that is in neither `applied` nor `failures` as
+/// a failure carrying `reason`. A write reports each of its items as applied or
+/// failed, so a caller that stops early names what happened to the rest; it is
+/// called only where those items are known not to have applied.
+fn report_unreported_items(
+    changes: &[crate::mcp::types::ChangeItem],
+    applied: &[AppliedChange],
+    failures: &mut Vec<ChangeFailure>,
+    reason: &str,
+) {
+    for (index, item) in changes.iter().enumerate() {
+        let reported = applied.iter().any(|change| change.index == index)
+            || failures.iter().any(|failure| failure.index == index);
+        if !reported {
+            let IndexedFailure { failure, .. } = *build_failure(index, item, reason);
+            failures.push(failure);
+        }
+    }
+    failures.sort_by_key(|failure| failure.index);
+}
+
+/// The report of a batch refused at item `index` before anything applied: that
+/// item carries `message`, and every other item says it was not applied.
 fn deny_change(changes: &[crate::mcp::types::ChangeItem], index: usize, message: String) -> String {
     let IndexedFailure { failure, .. } = *build_failure(index, &changes[index], message);
+    let mut failures = vec![failure];
+    report_unreported_items(
+        changes,
+        &[],
+        &mut failures,
+        &format!("Not applied: item {index} was refused, so nothing in this batch was applied."),
+    );
     serde_json::to_string(&empty_change_report(
         Vec::new(),
-        vec![failure],
+        failures,
         None,
         false,
         false,
     ))
     .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"))
+}
+
+/// The report of an atomic write that stopped at its first failure: what
+/// applied before it, the failure, and every item it did not reach.
+fn atomic_stop_report(
+    changes: &[crate::mcp::types::ChangeItem],
+    applied: Vec<AppliedChange>,
+    failure: ChangeFailure,
+    commit: Option<CommitReport>,
+) -> String {
+    let stopped_at = failure.index;
+    let mut failures = vec![failure];
+    report_unreported_items(
+        changes,
+        &applied,
+        &mut failures,
+        &format!(
+            "Not attempted: item {stopped_at} failed and this write is atomic, so it stopped there."
+        ),
+    );
+    change_report_json(applied, failures, commit, true)
 }
 
 /// Build a single-failure change report carrying the rendered multi-error
@@ -150,39 +200,45 @@ fn validation_failure_report(
     errors: &[cairn_common::change_validation::ChangeValidationError],
 ) -> String {
     let message = cairn_common::change_validation::render_validation_errors(errors);
-    let first_index = errors.iter().find_map(|e| e.index);
-    let (target, mode) = first_index
-        .and_then(|i| {
-            request
-                .payload
-                .get("changes")
-                .and_then(|c| c.as_array())
-                .and_then(|a| a.get(i))
-        })
-        .map(|item| {
-            (
-                item.get("target")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                item.get("mode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            )
-        })
+    let first_index = errors.iter().find_map(|e| e.index).unwrap_or(0);
+    let items = request
+        .payload
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .map(Vec::as_slice)
         .unwrap_or_default();
-
-    let failure = ChangeFailure {
-        index: first_index.unwrap_or(0),
-        target,
-        mode,
-        kind: "validation".to_string(),
-        error: message,
+    let field = |index: usize, key: &str| {
+        items
+            .get(index)
+            .and_then(|item| item.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     };
+    let failure_at = |index: usize, error: String| ChangeFailure {
+        index,
+        target: field(index, "target"),
+        mode: field(index, "mode"),
+        kind: "validation".to_string(),
+        error,
+    };
+
+    // The rendered message covers every problem; each other item is reported
+    // too, so none is missing from the report.
+    let mut failures = vec![failure_at(first_index, message)];
+    failures.extend((0..items.len()).filter(|i| *i != first_index).map(|index| {
+        failure_at(
+            index,
+            format!(
+                "Not applied: this batch failed validation (see item {first_index}), so nothing \
+                 in it was applied."
+            ),
+        )
+    }));
+    failures.sort_by_key(|failure| failure.index);
     serde_json::to_string(&empty_change_report(
         Vec::new(),
-        vec![failure],
+        failures,
         None,
         false,
         false,
@@ -976,33 +1032,9 @@ async fn handle_write_attempt(
                         .await
                         {
                             fence::FenceDecision::Allow => {}
-                            fence::FenceDecision::Deny(msg) => {
-                                let IndexedFailure { failure, .. } =
-                                    *build_failure(index, item, msg);
-                                return serde_json::to_string(&empty_change_report(
-                                    Vec::new(),
-                                    vec![failure],
-                                    None,
-                                    false,
-                                    false,
-                                ))
-                                .unwrap_or_else(|e| {
-                                    format!("Failed to serialize change report: {e}")
-                                });
-                            }
-                            fence::FenceDecision::Unavailable(msg) => {
-                                let IndexedFailure { failure, .. } =
-                                    *build_failure(index, item, msg);
-                                return serde_json::to_string(&empty_change_report(
-                                    Vec::new(),
-                                    vec![failure],
-                                    None,
-                                    false,
-                                    false,
-                                ))
-                                .unwrap_or_else(|e| {
-                                    format!("Failed to serialize change report: {e}")
-                                });
+                            fence::FenceDecision::Deny(msg)
+                            | fence::FenceDecision::Unavailable(msg) => {
+                                return deny_change(&payload.changes, index, msg);
                             }
                             fence::FenceDecision::Suspended => {
                                 return "Change suspended pending logical fence approval; resume \
@@ -1134,18 +1166,7 @@ async fn handle_write_attempt(
         let repo_path = crossing.path;
         use crate::mcp::handlers::fence;
         use crate::models::Fence;
-        let item = &payload.changes[index];
-        let deny = |msg: String| -> String {
-            let IndexedFailure { failure, .. } = *build_failure(index, item, msg);
-            serde_json::to_string(&empty_change_report(
-                Vec::new(),
-                vec![failure],
-                None,
-                false,
-                false,
-            ))
-            .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"))
-        };
+        let deny = |msg: String| -> String { deny_change(&payload.changes, index, msg) };
         match fence::resolve_run_fence(orch, request).await {
             fence::RunFenceResolution::Resolved(_, Fence::Allow) => {}
             fence::RunFenceResolution::Resolved(run_id, fence_mode @ (Fence::Ask | Fence::Deny)) => {
@@ -1500,21 +1521,14 @@ async fn handle_write_attempt(
             match super::branch::capture_publication_base(orch, request, resolution).await {
                 Ok(base) => Some(base),
                 Err(error) => {
-                    let (index, item) = payload
+                    let index = payload
                         .changes
                         .iter()
-                        .enumerate()
-                        .find(|(_, item)| {
+                        .position(|item| {
                             matches!(target_family(&item.target), Ok(TargetFamily::File))
                         })
                         .expect("a logical resolution belongs to a file write");
-                    let failure = build_failure(index, item, error).failure;
-                    return change_report_json(
-                        Vec::new(),
-                        vec![failure],
-                        None,
-                        payload.atomic.unwrap_or(false),
-                    );
+                    return deny_change(&payload.changes, index, error.to_string());
                 }
             }
         }
@@ -1773,7 +1787,7 @@ async fn handle_write_attempt(
             if atomic {
                 return settle_claim(
                     &mut resource_progress,
-                    change_report_json(applied, vec![failure], commit, atomic),
+                    atomic_stop_report(&payload.changes, applied, failure, commit),
                 )
                 .await;
             }
@@ -1858,11 +1872,11 @@ async fn handle_write_attempt(
                             if atomic {
                                 return settle_claim(
                                     &mut resource_progress,
-                                    change_report_json(
+                                    atomic_stop_report(
+                                        &payload.changes,
                                         applied,
-                                        vec![failure],
+                                        failure,
                                         failure_commit.or(commit),
-                                        atomic,
                                     ),
                                 )
                                 .await;
@@ -1882,11 +1896,11 @@ async fn handle_write_attempt(
                     if atomic {
                         return settle_claim(
                             &mut resource_progress,
-                            change_report_json(
+                            atomic_stop_report(
+                                &payload.changes,
                                 applied,
-                                vec![failure],
+                                failure,
                                 failure_commit.or(commit),
-                                atomic,
                             ),
                         )
                         .await;
@@ -1911,11 +1925,11 @@ async fn handle_write_attempt(
                 if atomic {
                     return settle_claim(
                         &mut resource_progress,
-                        change_report_json(
+                        atomic_stop_report(
+                            &payload.changes,
                             applied,
-                            vec![failure],
+                            failure,
                             failure_commit.or(commit),
-                            atomic,
                         ),
                     )
                     .await;
@@ -2023,11 +2037,11 @@ async fn handle_write_attempt(
                     if atomic {
                         return settle_claim(
                             &mut resource_progress,
-                            change_report_json(
+                            atomic_stop_report(
+                                &payload.changes,
                                 applied,
-                                vec![failure],
+                                failure,
                                 failure_commit.or(commit),
-                                atomic,
                             ),
                         )
                         .await;
@@ -2092,11 +2106,11 @@ async fn handle_write_attempt(
                     if atomic {
                         return settle_claim(
                             &mut resource_progress,
-                            change_report_json(
+                            atomic_stop_report(
+                                &payload.changes,
                                 applied,
-                                vec![failure],
+                                failure,
                                 failure_commit.or(commit),
-                                atomic,
                             ),
                         )
                         .await;
@@ -2339,7 +2353,7 @@ async fn handle_write_attempt(
                     rollback_promoted_memory_decisions(orch, &promoted_memories).await;
                     return settle_claim(
                         &mut resource_progress,
-                        change_report_json(applied, vec![failure], failure_commit, atomic),
+                        atomic_stop_report(&payload.changes, applied, failure, failure_commit),
                     )
                     .await;
                 }
@@ -3291,6 +3305,63 @@ mod change_preview_tests {
             mode,
             payload: Some(serde_json::json!({ "content": content })),
         }
+    }
+
+    /// Every index of a write that is refused or stops early is in its report,
+    /// as applied or as a failure.
+    #[test]
+    fn a_refused_or_stopped_write_reports_every_item() {
+        let changes = vec![
+            create_item("cairn://mcp", serde_json::json!({ "name": "a" })),
+            create_item("cairn://mcp", serde_json::json!({ "name": "b" })),
+            content_item("file:c.txt", ChangeMode::Create, "c"),
+        ];
+        let parse = |json: &str| serde_json::from_str::<types::ChangeReport>(json).unwrap();
+        let indices = |report: &types::ChangeReport| {
+            let mut indices: Vec<usize> = report
+                .applied
+                .iter()
+                .map(|change| change.index)
+                .chain(report.failures.iter().map(|failure| failure.index))
+                .collect();
+            indices.sort_unstable();
+            indices
+        };
+
+        let denied = parse(&deny_change(&changes, 1, "Denied: no".to_string()));
+        assert_eq!(indices(&denied), [0, 1, 2]);
+        assert!(denied.applied.is_empty());
+        assert_eq!(denied.failures[1].error, "Denied: no");
+        assert!(denied.failures[0].error.starts_with("Not applied: item 1"));
+        assert!(denied.failures[2].error.starts_with("Not applied: item 1"));
+
+        let applied = vec![AppliedChange {
+            index: 0,
+            target: changes[0].target.clone(),
+            mode: "create".to_string(),
+            kind: "resource".to_string(),
+            summary: "created".to_string(),
+            data: None,
+        }];
+        let IndexedFailure { failure, .. } = *build_failure(1, &changes[1], "boom");
+        let stopped = parse(&atomic_stop_report(&changes, applied, failure, None));
+        assert_eq!(indices(&stopped), [0, 1, 2]);
+        assert_eq!(stopped.failures[0].error, "boom");
+        assert!(stopped.failures[1]
+            .error
+            .starts_with("Not attempted: item 1"));
+
+        let request = McpCallbackRequest {
+            payload: serde_json::json!({ "changes": [
+                { "target": "cairn:~/todos", "mode": "append", "payload": {} },
+                { "target": "cairn:~/todos", "mode": "bogus" },
+            ] }),
+            ..McpCallbackRequest::default()
+        };
+        let errors = cairn_common::change_validation::validate_change_value(&request.payload);
+        assert!(!errors.is_empty());
+        let invalid = parse(&validation_failure_report(&request, &errors));
+        assert_eq!(indices(&invalid), [0, 1]);
     }
 
     #[test]
