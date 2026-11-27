@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-analytics"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-db",
  "cairn-models-types",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-attention"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "async-trait",
  "cairn-common",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-build-id"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-checkenv",
  "serde_json",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-cell"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "globset",
  "serde",
@@ -934,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-channels"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "async-trait",
  "cairn-common",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-checkenv"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-common",
  "sha2 0.10.9",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-cmd"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -988,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-codec"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "gix-features",
  "gix-hash",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-common"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "base64 0.22.1",
  "cairn-cell",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-config"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-common",
  "cairn-domain",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-core"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "async-trait",
  "axum",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-credentials"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "base64 0.22.1",
  "cairn-domain",
@@ -1171,7 +1171,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-db"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-domain"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-cell",
  "cairn-common",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-image-wire"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "base64 0.22.1",
  "cairn-tls",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-inference"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-models-types",
  "serde",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-llm-wire"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "base64 0.22.1",
  "cairn-tls",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-mcp-server"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "async-trait",
  "axum",
@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-models"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "base64 0.22.1",
  "cairn-common",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-models-types"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-packs"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-platform"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-common",
  "cairn-sandbox",
@@ -1357,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-procmem"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "libc",
  "tracing",
@@ -1366,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-sandbox"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-common",
  "chrono",
@@ -1382,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-session"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-analytics",
  "cairn-attention",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-speech-wire"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "base64 0.22.1",
  "cairn-tls",
@@ -1428,7 +1428,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-symbols"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "ast-grep-core",
  "ast-grep-language",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-tls"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "log",
  "reqwest 0.12.28",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-tokenize"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-toks"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-models",
  "serde",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-uri"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "regex",
  "schemars 1.2.0",
@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-uri-wasm"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-uri",
  "schemars 1.2.0",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-vcs"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "cairn-common",
  "cairn-platform",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-workflow"
-version = "0.13.7"
+version = "0.13.8"
 dependencies = [
  "async-trait",
  "cairn-attention",
