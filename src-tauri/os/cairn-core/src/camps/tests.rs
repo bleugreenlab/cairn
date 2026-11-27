@@ -388,6 +388,7 @@ async fn a_coalesced_camp_wake_shows_each_fact_s_camp_line() {
         content: told[0].1.clone(),
         created_at: 1,
         urgency: None,
+        number: 1,
     };
     assert_eq!(
         cairn_attention::message_render::render_direct_message(&message, "n0"),

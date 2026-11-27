@@ -152,13 +152,13 @@ const HINT_MARKERS: &[&str] = &[
     "\nTo reply, use the message tool",
 ];
 
-/// The canonical URI of a stored direct message: `cairn://p/<project>/messages/<id>`,
+/// The canonical URI of a stored direct message: `cairn://p/<project>/messages/<n>`,
 /// in the project of its first recipient, whose database holds the row. `None`
 /// when the first recipient has no canonical address.
 pub fn message_uri(msg: &Message) -> Option<String> {
     let address = msg.recipients.first()?.address.as_deref()?;
     let project = cairn_uri::parse_uri(address)?.project()?.to_string();
-    Some(cairn_uri::build_message_uri(&project, &msg.id))
+    Some(cairn_uri::build_message_uri(&project, msg.number))
 }
 
 /// Render a direct message for the recipient whose job is `reader_job_id`: the
@@ -281,6 +281,7 @@ mod tests {
             content: content.to_string(),
             created_at: 1,
             urgency: None,
+            number: 1,
         }
     }
 
@@ -317,7 +318,7 @@ mod tests {
         assert_eq!(
             rendered,
             "[Direct message from cairn://p/cairn/1361/1/builder] ship it\n\
-             (Cite as cairn://p/cairn/messages/m1. Reply with write \
+             (Cite as cairn://p/cairn/messages/1. Reply with write \
              {target:\"cairn://p/cairn/1361/1/builder/messages\", mode:\"append\", payload:{content}}.)"
         );
         assert!(!rendered.contains("message tool"), "{rendered}");
@@ -348,7 +349,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("Cite as cairn://p/rs/messages/m1."),
+            rendered.contains("Cite as cairn://p/rs/messages/1."),
             "{rendered}"
         );
         assert!(
@@ -467,8 +468,7 @@ mod tests {
         msg.recipients = vec![recipient(READER, "cairn://p/cairn/9/1/builder")];
         let rendered = render_direct_message(&msg, READER);
         assert!(
-            rendered
-                .contains("(Cite as cairn://p/cairn/messages/m1.) (Sent by an external session"),
+            rendered.contains("(Cite as cairn://p/cairn/messages/1.) (Sent by an external session"),
             "the external arm gains the cite clause: {rendered}"
         );
         assert!(rendered.contains("[Direct message from external] please summarize"));

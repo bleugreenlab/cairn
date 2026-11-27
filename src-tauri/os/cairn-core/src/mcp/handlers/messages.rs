@@ -870,13 +870,10 @@ pub fn requested_urgency(
     }
 }
 
-/// The canonical URI of a stored message, in the project whose database
-/// holds it.
-pub fn message_uri(project: &str, message_id: &str) -> String {
-    format!(
-        "cairn://p/{}/messages/{message_id}",
-        cairn_uri::canonical_project(project)
-    )
+/// The canonical URI of a stored message, by its number, in the project whose
+/// database holds it.
+pub fn message_uri(project: &str, number: u64) -> String {
+    cairn_uri::build_message_uri(project, number)
 }
 
 /// Send one direct message to its target and every cc recipient.
@@ -1015,6 +1012,14 @@ pub async fn send_direct_message(
         serde_json::json!({"table": "messages", "action": "insert"}),
     );
     orch.notifier.emit_change("attention_pushes");
+    let message_number = cairn_db::storage::address_numbers::number_of(
+        &owning_db,
+        cairn_db::storage::address_numbers::Numbered::Message,
+        None,
+        &message_id,
+    )
+    .await?
+    .ok_or_else(|| format!("message {message_id} was stored without a number"))?;
 
     // Sender resolution routes to the database that owns the sender's run (a team
     // agent's run lives in its replica, not the private DB).
@@ -1114,7 +1119,7 @@ pub async fn send_direct_message(
         .join(", ");
     let mut reply = format!(
         "Sent direct message {} to {names}.",
-        message_uri(project_key, &message_id)
+        message_uri(project_key, message_number)
     );
     for (addressed_uri, wake) in outcomes {
         reply.push_str(&format!("\n- {addressed_uri}: {}", recipient_outcome(wake)));

@@ -320,7 +320,7 @@ async fn cancel(
     let request_db = requests::request_db(orch, &project_id)
         .await
         .map_err(fail)?;
-    let row = requests::load_request(&request_db, &project_id, id)
+    let (row, legacy) = requests::load_request_by_segment(&request_db, &project_id, id)
         .await
         .map_err(fail)?
         .ok_or_else(|| {
@@ -328,18 +328,38 @@ async fn cancel(
                 "Nothing was cancelled: no check request `{id}` in {project}."
             ))
         })?;
+    let adjustments: Vec<_> = legacy
+        .then(|| {
+            let received = CairnResource::ProjectCheckRequest {
+                project: project.to_string(),
+                id: id.to_string(),
+            }
+            .to_uri();
+            cairn_db::storage::address_numbers::legacy_adjustment(&received, &row.uri(project))
+        })
+        .into_iter()
+        .collect();
     let writer = super::writer(orch, request).await.map_err(fail)?;
     authorize(&request_db, &writer, &row).await.map_err(fail)?;
     if dry_run {
-        return Ok(Some(format!(
-            "Would cancel check request `{id}` ({}) on behalf of {}",
-            row.suite,
-            writer.principal()
+        return Ok(Some(cairn_common::adjustment::with_summary(
+            format!(
+                "Would cancel check request {} ({}) on behalf of {}",
+                row.number,
+                row.suite,
+                writer.principal()
+            ),
+            &adjustments,
         )));
     }
     requests::cancel_check_request(orch, &request_db, &row, writer.principal())
         .await
-        .map(Some)
+        .map(|summary| {
+            Some(cairn_common::adjustment::with_summary(
+                summary,
+                &adjustments,
+            ))
+        })
         .map_err(fail)
 }
 

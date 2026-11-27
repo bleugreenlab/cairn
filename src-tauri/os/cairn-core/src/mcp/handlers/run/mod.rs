@@ -284,15 +284,12 @@ impl BatchWithoutResult {
 /// attempt of it was ever granted to a machine, and the dispatched account when
 /// one was.
 fn unexecuted_failure(
-    request_id: &str,
+    handle: &str,
     detail: String,
     grant_without_result: Option<crate::fleet::GrantWithoutResult>,
     commits: bool,
 ) -> RunFailure {
-    let detail = format!(
-        "{detail}\n\nLifecycle: `{}`.",
-        crate::resources::request_lifecycle::relative_lifecycle_uri(request_id),
-    );
+    let detail = format!("{detail}\n\nLifecycle: `{handle}`.");
     match grant_without_result {
         Some(grant) => {
             log::warn!(
@@ -316,7 +313,7 @@ fn unexecuted_failure(
 /// that ends without a result goes through [`unexecuted_failure`] and with it
 /// the account of any attempt that was granted.
 fn failure_without_result(
-    request_id: &str,
+    handle: &str,
     outcome: &CellOutcome,
     grant_without_result: Option<crate::fleet::GrantWithoutResult>,
     commits: bool,
@@ -330,7 +327,7 @@ fn failure_without_result(
         CellOutcome::Unavailable { reason, diagnostic } => {
             log::warn!("run batch ended without a result ({reason:?}): {diagnostic}");
             Some(unexecuted_failure(
-                request_id,
+                handle,
                 format!("{diagnostic}."),
                 grant_without_result,
                 commits,
@@ -348,7 +345,7 @@ fn failure_without_result(
             log::warn!("run batch failed on executor storage ({stage:?}/{kind:?}): {diagnostic}");
             let detail = format!("{diagnostic}.");
             Some(match grant_without_result {
-                Some(grant) => unexecuted_failure(request_id, detail, Some(grant), commits),
+                Some(grant) => unexecuted_failure(handle, detail, Some(grant), commits),
                 None => RunFailure::Unaccounted(detail),
             })
         }
@@ -603,13 +600,19 @@ mod failure_contract_tests {
     /// of the batch was granted to a machine that never answered for it.
     #[test]
     fn a_refusal_says_nothing_ran_only_when_no_machine_was_left_holding_the_batch() {
-        let refused = unexecuted_failure("r", "no executor matches.".into(), None, false).text();
+        let refused = unexecuted_failure(
+            "cairn:~/batches/3",
+            "no executor matches.".into(),
+            None,
+            false,
+        )
+        .text();
         assert!(refused.starts_with(RUN_NOT_EXECUTED), "{refused}");
         assert!(refused.contains("No commands ran"), "{refused}");
-        assert!(refused.contains("`cairn:@/requests/r`"), "{refused}");
+        assert!(refused.contains("`cairn:~/batches/3`"), "{refused}");
 
         let lost = unexecuted_failure(
-            "r",
+            "cairn:~/batches/3",
             "executor did not return request r attempt a.".into(),
             Some(specimen_grant(None)),
             false,
@@ -617,7 +620,7 @@ mod failure_contract_tests {
         .text();
         assert!(lost.starts_with(RUN_OUTCOME_UNKNOWN), "{lost}");
         assert!(lost.contains("**bgsrv-ub**"), "{lost}");
-        assert!(lost.contains("`cairn:@/requests/r`"), "{lost}");
+        assert!(lost.contains("`cairn:~/batches/3`"), "{lost}");
         assert!(!lost.contains("No commands ran"), "{lost}");
         assert!(envelope_reports_run_failure(&lost), "{lost}");
     }
@@ -3901,6 +3904,7 @@ pub(crate) mod slot_publication_tests {
                 settlement: None,
                 waiting_on: None,
                 late_report: None,
+                number: None,
             },
         )
         .await
@@ -6641,13 +6645,16 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // network, so it runs on the batch's own task, through publication. The
     // call's future only waits for it, and always answers by its deadline.
     let control = BatchControl::new(commit_present);
-    control.ledger.open(
-        orch,
-        request,
-        &control.request_id,
-        commit_present,
-        control.arrived_ms,
-    );
+    control
+        .ledger
+        .open(
+            orch,
+            request,
+            &control.request_id,
+            commit_present,
+            control.arrived_ms,
+        )
+        .await;
     // A service call's batches end with the call: its supervisor stops what
     // is still in flight when the call ends (`project_services::end_run`).
     let held_run = request.run_id.clone().filter(|_| service_branch.is_some());
@@ -8882,7 +8889,7 @@ impl BatchPlacement {
     /// returned sentence is what its result says about where it ran.
     fn go_hermetic(
         &mut self,
-        occupant: &str,
+        occupant: &occupancy::Occupant,
         home_machine: Option<String>,
         home_name: Option<&str>,
     ) -> String {
@@ -8902,27 +8909,31 @@ impl BatchPlacement {
 
 /// Why a commitless batch ran on a cell of its own rather than in its job's
 /// home.
-fn hermetic_note(occupant: &str, home_machine: Option<&str>) -> String {
-    if occupant.starts_with("terminal-refresh:") {
+fn hermetic_note(occupant: &occupancy::Occupant, home_machine: Option<&str>) -> String {
+    if occupant.request_id.starts_with("terminal-refresh:") {
         return "It ran on a cell of its own: the job's working tree was reconciling its terminal checkout, and a batch without `commit_msg` does not wait for it. It read the branch at its committed tip, and its edits were discarded.".into();
     }
     let on = home_machine
         .map(|machine| format!(" on {machine}"))
         .unwrap_or_default();
     format!(
-        "It ran on a cell of its own: the job's working tree{on} was running batch `{occupant}`, and a batch without `commit_msg` does not wait for it. It read the branch at its committed tip, and its edits were discarded."
+        "It ran on a cell of its own: the job's working tree{on} was running batch `{}`, and a batch without `commit_msg` does not wait for it. It read the branch at its committed tip, and its edits were discarded.",
+        occupant.handle
     )
 }
 
 /// What a committing batch waiting for its job's home is waiting for.
-fn home_wait_sentence(occupant: &str, home_machine: Option<&str>) -> String {
-    if occupant.starts_with("terminal-refresh:") {
+fn home_wait_sentence(occupant: &occupancy::Occupant, home_machine: Option<&str>) -> String {
+    if occupant.request_id.starts_with("terminal-refresh:") {
         return "waiting for the job's residency: reconciling its terminal checkout".into();
     }
     let on = home_machine
         .map(|machine| format!(" on {machine}"))
         .unwrap_or_default();
-    format!("waiting for the job's residency{on}: running `{occupant}`")
+    format!(
+        "waiting for the job's residency{on}: running `{}`",
+        occupant.handle
+    )
 }
 
 /// How often a batch waiting for its job's home looks again when no vacancy
@@ -9074,7 +9085,7 @@ impl PlacementNotes {
 /// above-ceiling note after any claim. The failure itself, and whether it may
 /// say nothing ran, is [`failure_without_result`]'s to decide.
 fn settled_failure_text(
-    request_id: &str,
+    handle: &str,
     outcome: &CellOutcome,
     grant_without_result: Option<crate::fleet::GrantWithoutResult>,
     commits: bool,
@@ -9082,7 +9093,7 @@ fn settled_failure_text(
     notes: &PlacementNotes,
 ) -> Option<String> {
     let text =
-        failure_without_result(request_id, outcome, grant_without_result, commits, ceiling)?.text();
+        failure_without_result(handle, outcome, grant_without_result, commits, ceiling)?.text();
     let note = match outcome {
         CellOutcome::FailedAfterExecution { .. } | CellOutcome::Completed { .. } => {
             [notes.ran_on.clone(), notes.executed()]
@@ -9176,16 +9187,9 @@ async fn run_routed_batch(
     {
         control.ledger.note_refusal(detail);
     }
-    let mut settled = off_frame(|| {
-        settle_joined_batch(
-            orch,
-            &control.request_id,
-            &settlement,
-            joined,
-            ceiling_detail,
-        )
-    })
-    .await;
+    let handle = control.handle();
+    let mut settled =
+        off_frame(|| settle_joined_batch(orch, &handle, &settlement, joined, ceiling_detail)).await;
     if let Some(note) = control.late_cancel_note() {
         settled.text.push_str(&format!("\n\nNote: {note}."));
     }
@@ -9259,19 +9263,18 @@ impl CapacityWait {
     /// not the sum of these pauses: nearly all of a congested batch's wait is
     /// spent queued inside an attempt, so counting only the pauses would make a
     /// declared bound mean almost nothing.
-    async fn hold(&mut self, request_id: &str, diagnostic: &str) -> Result<(), String> {
+    async fn hold(&mut self, handle: &str, diagnostic: &str) -> Result<(), String> {
         if let Some(budget) = self.budget {
             let elapsed = self.started.elapsed();
             if elapsed >= budget {
                 return Err(format!(
-                    "the machine had no room to run it, and the {}s this batch's own item timeouts allow for waiting elapsed while it queued ({diagnostic}). Lifecycle: `{}`.",
+                    "the machine had no room to run it, and the {}s this batch's own item timeouts allow for waiting elapsed while it queued ({diagnostic}). Lifecycle: `{handle}`.",
                     budget.as_secs(),
-                    crate::resources::request_lifecycle::relative_lifecycle_uri(request_id)
                 ));
             }
         }
         log::info!(
-            "run batch {request_id} has no room yet, waiting rather than refusing: {diagnostic}"
+            "run batch {handle} has no room yet, waiting rather than refusing: {diagnostic}"
         );
         // Jittered, because everything that reaches this path was refused by the
         // same full waiting room at the same instant. Unjittered backoff makes
@@ -9360,7 +9363,12 @@ async fn place_and_run_attempts(
     let tenancy = match placement.environment.as_ref().map(|env| env.job_id.clone()) {
         None => None,
         Some(job_id) => loop {
-            match occupancy::claim(&job_id, &request_id, placement.commit_present) {
+            match occupancy::claim(
+                &job_id,
+                &request_id,
+                &control.handle(),
+                placement.commit_present,
+            ) {
                 occupancy::HomeClaim::Tenant(tenancy) => {
                     let refresh_orch = orch.clone();
                     let refresh_job = job_id.clone();
@@ -9388,11 +9396,8 @@ async fn place_and_run_attempts(
                     let home_name = home_machine
                         .as_deref()
                         .map(|id| orch.fleet.executor_name_for_text(id));
-                    hermetic = Some(placement.go_hermetic(
-                        &occupant.request_id,
-                        home_machine,
-                        home_name.as_deref(),
-                    ));
+                    hermetic =
+                        Some(placement.go_hermetic(&occupant, home_machine, home_name.as_deref()));
                     control.leave_home();
                     break None;
                 }
@@ -9401,7 +9406,7 @@ async fn place_and_run_attempts(
                         .executor_id
                         .as_deref()
                         .map(|id| orch.fleet.executor_name_for_text(id));
-                    let waiting = home_wait_sentence(&occupant.request_id, machine.as_deref());
+                    let waiting = home_wait_sentence(&occupant, machine.as_deref());
                     if control.unplaced().as_deref() != Some(waiting.as_str()) {
                         log::info!("run batch {request_id} carries a commit_msg and is {waiting}");
                     }
@@ -9460,7 +9465,7 @@ async fn place_and_run_attempts(
                         .await;
                     let wait = waiting_for_room.as_mut().unwrap_or(&mut provisioning);
                     match cancelled
-                        .until(wait.hold(&request_id, &refusal.diagnostic))
+                        .until(wait.hold(&control.handle(), &refusal.diagnostic))
                         .await
                     {
                         Some(Ok(())) => continue,
@@ -9592,7 +9597,10 @@ async fn place_and_run_attempts(
         let wait = waiting_for_room
             .as_mut()
             .expect("the batch began waiting for room before its first presentation");
-        match cancelled.until(wait.hold(&request_id, &diagnostic)).await {
+        match cancelled
+            .until(wait.hold(&control.handle(), &diagnostic))
+            .await
+        {
             Some(Ok(())) => {}
             Some(Err(spent)) => return PlacedBatch::NoRoom(spent),
             None => return cancelled_batch(residence),
@@ -9889,6 +9897,15 @@ struct ItemProgress {
 }
 
 impl BatchControl {
+    /// The batch's caller-home-relative handle, `cairn:~/batches/{n}`, which
+    /// reads its whole lifecycle.
+    fn handle(&self) -> String {
+        detached::handle_uri(&detached::batch_segment(
+            self.ledger.number(),
+            &self.request_id,
+        ))
+    }
+
     fn new(commits: bool) -> std::sync::Arc<Self> {
         Self::with_request_id(&Uuid::new_v4().to_string(), commits)
     }
@@ -10614,14 +10631,13 @@ async fn reissue_refusal(orch: &Orchestrator, request: &McpCallbackRequest) -> O
         );
         if twin.reason == detached::INLINE_CAPTURE {
             return Some(format!(
-                "This batch is already in flight as request `{}`; its call still owns delivery of the result. Nothing new was started. Do not re-run it: `{}` shows where it stands, and `{}` its whole lifecycle.",
-                twin.request_id,
-                detached::handle_uri(&twin.request_id),
-                crate::resources::request_lifecycle::relative_lifecycle_uri(&twin.request_id),
+                "This batch is already in flight as `{}`; its call still owns delivery of the result. Nothing new was started. Do not re-run it: `{}` shows where it stands and its whole lifecycle.",
+                twin.handle(),
+                twin.handle(),
             ));
         }
         return Some(detached::reissue_refusal_text(
-            &twin.request_id,
+            &twin.handle(),
             &detached::live_state(orch, &twin),
         ));
     }
@@ -11013,6 +11029,7 @@ async fn record_detached(
         notified_ms: None,
         settlement: control.persisted_for_record(&orch.fleet),
         late_report: None,
+        number: control.ledger.number(),
     };
     detached::insert(&db, &batch).await?;
     let admitted = control.row_written(db.clone());
@@ -11593,14 +11610,14 @@ impl CallAnswer {
                     "run batch {} cannot be parked ({reason}); it is detached unplaced, {waiting}",
                     self.control.request_id
                 );
-                detached::detach_answer_parked_text(&self.control.request_id, reason, &waiting)
+                detached::detach_answer_parked_text(&self.control.handle(), reason, &waiting)
             }
             None => {
                 log::info!(
                     "run batch {} cannot be parked ({reason}); it keeps running detached",
                     self.control.request_id
                 );
-                detached::detach_answer_text(&self.control.request_id, reason)
+                detached::detach_answer_text(&self.control.handle(), reason)
             }
         };
         let rx = self
@@ -11637,7 +11654,7 @@ impl CallAnswer {
         if self.control.abandon(&self.orch) {
             let text = RunFailure::Cancelled(Some(format!(
                 "Cairn could not park this call ({reason}) or record it to finish on its own, so it cancelled the batch; nothing from it was committed. Lifecycle: `{}`.",
-                crate::resources::request_lifecycle::relative_lifecycle_uri(&self.control.request_id),
+                self.control.handle(),
             )))
             .text();
             return self.finish(AnswerOutcome::Cancelled, run_envelope(text, Vec::new()));
@@ -11654,7 +11671,7 @@ impl CallAnswer {
         };
         let text = RunFailure::Cancelled(Some(format!(
             "Cairn could not park this call ({reason}), and the batch was already publishing its result when the call had to answer, {left}. Lifecycle: `{}`.",
-            crate::resources::request_lifecycle::relative_lifecycle_uri(&self.control.request_id),
+            self.control.handle(),
         )))
         .text();
         self.finish(AnswerOutcome::Cancelled, run_envelope(text, Vec::new()))
@@ -11816,7 +11833,7 @@ async fn answer_call(
 
 async fn settle_joined_batch(
     orch: &Orchestrator,
-    request_id: &str,
+    handle: &str,
     settlement: &RunBatchSettlement,
     joined: Result<BatchAttempts, tokio::task::JoinError>,
     ceiling: Option<String>,
@@ -11836,7 +11853,7 @@ async fn settle_joined_batch(
         };
         let detail = selector::with_default_suffix(settlement.node_default.as_ref(), detail);
         SettledRunBatch::failure(
-            unexecuted_failure(request_id, detail, grant_without_result.clone(), commits).text(),
+            unexecuted_failure(handle, detail, grant_without_result.clone(), commits).text(),
         )
     };
     let mut settled = match placed {
@@ -11848,7 +11865,7 @@ async fn settle_joined_batch(
             off_frame(|| {
                 settle_routed_run_batch(
                     orch,
-                    request_id,
+                    handle,
                     settlement,
                     residence,
                     *outcome,
@@ -11922,7 +11939,7 @@ mod no_environment_detail_tests {
 #[allow(clippy::too_many_arguments)]
 async fn settle_routed_run_batch(
     orch: &Orchestrator,
-    request_id: &str,
+    handle: &str,
     settlement: &RunBatchSettlement,
     residence: BatchResidence,
     outcome: CellOutcome,
@@ -11942,7 +11959,7 @@ async fn settle_routed_run_batch(
         );
     }
     if let Some(text) = settled_failure_text(
-        request_id,
+        handle,
         &outcome,
         grant_without_result,
         settlement.commit_msg.is_some(),
@@ -12063,9 +12080,10 @@ pub(crate) async fn settle_adopted_result(
         .cancelled
         .as_ref()
         .map(|cancel| cancel.detail(persisted.commits(), false));
+    let handle = detached::handle_for(orch, request_id).await;
     let settled = settle_routed_run_batch(
         orch,
-        request_id,
+        &handle,
         &settlement,
         residence,
         outcome,
@@ -12085,7 +12103,7 @@ pub(crate) async fn settle_adopted_result(
 /// under its machine's line, opened by `unpublished` when the batch carried a
 /// commit that cannot be published, saying why. The batch is never dropped.
 pub(crate) fn compose_adopted_result(
-    request_id: &str,
+    handle: &str,
     outcome: &CellOutcome,
     machine: &str,
     unpublished: Option<&str>,
@@ -12094,14 +12112,9 @@ pub(crate) fn compose_adopted_result(
         ran_on: Some(adopted_ran_on(machine)),
         ..PlacementNotes::default()
     };
-    if let Some(text) = settled_failure_text(
-        request_id,
-        outcome,
-        None,
-        unpublished.is_some(),
-        None,
-        &notes,
-    ) {
+    if let Some(text) =
+        settled_failure_text(handle, outcome, None, unpublished.is_some(), None, &notes)
+    {
         let verdict = detached::verdict_from_text(&text);
         return (text, verdict);
     }
@@ -12999,6 +13012,15 @@ mod tests {
     use super::*;
     use cairn_common::executor_protocol::CellCommandClass;
 
+    /// A job home held by batch 1, whose request id no reply may name.
+    fn busy_home() -> occupancy::Occupant {
+        occupancy::Occupant {
+            request_id: "batch-uuid-1".into(),
+            handle: "cairn:~/batches/1".into(),
+            executor_id: Some("bgsrv-mac".into()),
+        }
+    }
+
     #[test]
     fn snapshot_attribution_preserves_input_across_branch_moves() {
         let captured = "a".repeat(40);
@@ -13531,16 +13553,17 @@ mod tests {
     fn a_commitless_batch_beside_a_busy_home_runs_on_a_cell_of_its_own() {
         let mut placement = test_placement(false);
         placement.template.executor = None;
-        let note = placement.go_hermetic("batch-1", Some("bgsrv-mac".into()), Some("bgsrv-mac"));
+        let note = placement.go_hermetic(&busy_home(), Some("bgsrv-mac".into()), Some("bgsrv-mac"));
         assert!(placement.environment.is_none(), "nothing waits on the home");
         assert_eq!(placement.residence, BatchResidence::Detached);
         let request = placement.attempt(None, false, placement.residence);
         assert_eq!(request.pinned_executor_id.as_deref(), Some("bgsrv-mac"));
         assert_eq!(request.mutation_policy, MutationPolicy::PureVerdict);
         assert!(
-            note.contains("working tree on bgsrv-mac was running batch `batch-1`"),
+            note.contains("working tree on bgsrv-mac was running batch `cairn:~/batches/1`"),
             "{note}"
         );
+        assert!(!note.contains("batch-uuid-1"), "{note}");
         let notes = PlacementNotes {
             hermetic: Some(note.clone()),
             ..PlacementNotes::default()
@@ -13550,7 +13573,7 @@ mod tests {
 
         // One that named a machine keeps its own selector and gets no pin.
         let mut named = test_placement(false);
-        named.go_hermetic("batch-1", Some("bgsrv-mac".into()), None);
+        named.go_hermetic(&busy_home(), Some("bgsrv-mac".into()), None);
         let request = named.attempt(None, false, named.residence);
         assert_eq!(request.pinned_executor_id, None);
         assert_eq!(request.executor.as_ref(), Some(&named_selector("local")));
@@ -13913,8 +13936,8 @@ mod tests {
     #[tokio::test]
     async fn an_exhausted_capacity_budget_links_its_request_lifecycle() {
         let mut wait = CapacityWait::new(Some(std::time::Duration::ZERO));
-        let text = wait.hold("budget-link", "full").await.unwrap_err();
-        assert!(text.contains("`cairn:@/requests/budget-link`"), "{text}");
+        let text = wait.hold("cairn:~/batches/5", "full").await.unwrap_err();
+        assert!(text.contains("`cairn:~/batches/5`"), "{text}");
     }
 
     #[test]
@@ -15914,7 +15937,7 @@ pub(crate) mod host_batch_tests {
         assert_eq!(
             envelope_text(&text),
             detached::detach_answer_text(
-                &control.request_id,
+                &control.handle(),
                 "the project store was busy past its answer deadline"
             )
         );
@@ -15961,7 +15984,7 @@ pub(crate) mod host_batch_tests {
         let text = envelope_text(&call.await.unwrap());
         assert_eq!(
             text,
-            detached::detach_answer_text(&control.request_id, NO_RESUMABLE_CALL)
+            detached::detach_answer_text(&control.handle(), NO_RESUMABLE_CALL)
         );
         assert_eq!(count(&orch, "SELECT COUNT(*) FROM agent_waits").await, 0);
         let turn_state = orch
@@ -16009,10 +16032,10 @@ pub(crate) mod host_batch_tests {
             Some(ms(600_000)),
         );
         let control = BatchControl::new(true);
-        let waiting = home_wait_sentence("batch-1", Some("bgsrv-mac"));
+        let waiting = home_wait_sentence(&busy_home(), Some("bgsrv-mac"));
         assert_eq!(
             waiting,
-            "waiting for the job's residency on bgsrv-mac: running `batch-1`"
+            "waiting for the job's residency on bgsrv-mac: running `cairn:~/batches/1`"
         );
         control.begin_placement(waiting.clone());
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -16020,7 +16043,7 @@ pub(crate) mod host_batch_tests {
             envelope_text(&answer_call(&orch, &request, deadlines, control.clone(), rx).await);
         assert_eq!(
             text,
-            detached::detach_answer_parked_text(&control.request_id, NO_RESUMABLE_CALL, &waiting)
+            detached::detach_answer_parked_text(&control.handle(), NO_RESUMABLE_CALL, &waiting)
         );
         assert!(!text.contains("still running"), "{text}");
         let (state, holds, waiting_on) = detached_row(&orch, &control.request_id).await;
@@ -16067,7 +16090,12 @@ pub(crate) mod host_batch_tests {
         );
         let control = BatchControl::new(true);
         control.begin_placement("waiting to be placed".into());
-        let tenancy = match occupancy::claim("job-vacant-control", &control.request_id, true) {
+        let tenancy = match occupancy::claim(
+            "job-vacant-control",
+            &control.request_id,
+            &control.handle(),
+            true,
+        ) {
             occupancy::HomeClaim::Tenant(tenancy) => tenancy,
             other => panic!("a vacant home is taken at once: {other:?}"),
         };
@@ -16077,7 +16105,7 @@ pub(crate) mod host_batch_tests {
             envelope_text(&answer_call(&orch, &request, deadlines, control.clone(), rx).await);
         assert_eq!(
             text,
-            detached::detach_answer_text(&control.request_id, NO_RESUMABLE_CALL)
+            detached::detach_answer_text(&control.handle(), NO_RESUMABLE_CALL)
         );
         let (state, holds, _) = detached_row(&orch, &control.request_id).await;
         assert_eq!((state.as_str(), holds), ("running", 1));
@@ -16181,20 +16209,15 @@ pub(crate) mod host_batch_tests {
             .await
             .unwrap();
         let refusal = reissue_refusal(&orch, &call_request(payload.clone())).await;
+        let row = detached::load(&orch.db.local, "req-d")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             refusal.as_deref(),
             Some(
-                detached::reissue_refusal_text(
-                    "req-d",
-                    &detached::live_state(
-                        &orch,
-                        &detached::load(&orch.db.local, "req-d")
-                            .await
-                            .unwrap()
-                            .unwrap()
-                    )
-                )
-                .as_str()
+                detached::reissue_refusal_text(&row.handle(), &detached::live_state(&orch, &row))
+                    .as_str()
             )
         );
         assert!(refusal.unwrap().contains("cairn:~/batches/req-d"));
@@ -16306,7 +16329,7 @@ pub(crate) mod host_batch_tests {
             .await
             .expect("an identical batch is still in flight");
         assert!(
-            refusal.contains(&format!("request `{}`", control.request_id)),
+            refusal.contains(&format!("already in flight as `{}`", row.handle())),
             "{refusal}"
         );
         assert!(
@@ -16877,6 +16900,7 @@ pub(crate) mod host_batch_tests {
                 notified_ms: None,
                 settlement: None,
                 late_report: None,
+                number: None,
             },
         )
         .await
@@ -17559,17 +17583,15 @@ pub(crate) mod host_batch_tests {
             );
             let mut reissue = call_request(payload);
             reissue.tool_use_id = Some("tool-2".into());
+            let row = detached::load(&orch.db.local, "req-abandoned")
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 reissue_refusal(&orch, &reissue).await,
                 Some(detached::reissue_refusal_text(
-                    "req-abandoned",
-                    &detached::live_state(
-                        &orch,
-                        &detached::load(&orch.db.local, "req-abandoned")
-                            .await
-                            .unwrap()
-                            .unwrap(),
-                    ),
+                    &row.handle(),
+                    &detached::live_state(&orch, &row),
                 )),
                 "compact: {compact}"
             );
@@ -17630,7 +17652,7 @@ pub(crate) mod host_batch_tests {
             "{text}"
         );
         assert!(
-            text.contains(&format!("`cairn:@/requests/{}`", control.request_id)),
+            text.contains(&format!("Lifecycle: `{}`.", control.handle())),
             "{text}"
         );
         assert!(
@@ -17672,7 +17694,7 @@ pub(crate) mod host_batch_tests {
             let text = call.cancel_in_time("cannot park").await;
             assert!(text.contains("already publishing its result"), "{text}");
             assert!(
-                text.contains(&format!("`cairn:@/requests/{}`", control.request_id)),
+                text.contains(&format!("Lifecycle: `{}`.", control.handle())),
                 "{text}"
             );
             assert!(

@@ -29,6 +29,9 @@ use std::time::Duration;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Occupant {
     pub(crate) request_id: String,
+    /// The batch's caller-home-relative handle, `cairn:~/batches/{n}`: how a
+    /// reply names it. A checkout reconciliation's reservation is never named.
+    pub(crate) handle: String,
     /// The machine holding the home, once the occupant has acquired it.
     pub(crate) executor_id: Option<String>,
 }
@@ -53,8 +56,9 @@ fn homes() -> std::sync::MutexGuard<'static, HashMap<String, Occupant>> {
     HOMES.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Claim job `job_id`'s home for `request_id`, or learn who has it.
-pub(crate) fn claim(job_id: &str, request_id: &str, commits: bool) -> HomeClaim {
+/// Claim job `job_id`'s home for `request_id` (whose handle is `handle`), or
+/// learn who has it.
+pub(crate) fn claim(job_id: &str, request_id: &str, handle: &str, commits: bool) -> HomeClaim {
     let mut homes = homes();
     match homes.get(job_id) {
         Some(occupant) if occupant.request_id != request_id => match commits {
@@ -66,6 +70,7 @@ pub(crate) fn claim(job_id: &str, request_id: &str, commits: bool) -> HomeClaim 
                 job_id.to_string(),
                 Occupant {
                     request_id: request_id.to_string(),
+                    handle: handle.to_string(),
                     executor_id: None,
                 },
             );
@@ -113,6 +118,7 @@ pub(crate) fn reserve_terminal_refresh(job_id: &str) -> Result<Tenancy, Occupant
         job_id.to_string(),
         Occupant {
             request_id: request_id.clone(),
+            handle: String::new(),
             executor_id: None,
         },
     );
@@ -144,8 +150,8 @@ pub(crate) fn terminal_refusal(slug: &str, occupant: &Occupant) -> String {
         return format!("Could not start terminal `{slug}`: this job's working tree is reconciling its terminal checkout. Nothing was started. Create the terminal once reconciliation finishes.");
     }
     format!(
-        "Could not start terminal `{slug}`: this job's working tree is running batch `{id}` (`cairn:~/batches/{id}`), and the tree runs one thing at a time. Nothing was started. Create the terminal once that batch settles.",
-        id = occupant.request_id
+        "Could not start terminal `{slug}`: this job's working tree is running batch `{handle}`, and the tree runs one thing at a time. Nothing was started. Create the terminal once that batch settles.",
+        handle = occupant.handle
     )
 }
 
@@ -228,26 +234,27 @@ mod tests {
     /// both naming the occupant; and a vacated home is taken by the waiter.
     #[tokio::test]
     async fn an_occupied_home_sends_a_commitless_batch_elsewhere_and_holds_a_committing_one() {
-        let first = tenant(claim("job-rule", "batch-1", true));
+        let first = tenant(claim("job-rule", "batch-1", "cairn:~/batches/1", true));
         first.located("bgsrv-mac");
         let expected = Occupant {
             request_id: "batch-1".into(),
+            handle: "cairn:~/batches/1".into(),
             executor_id: Some("bgsrv-mac".into()),
         };
-        match claim("job-rule", "batch-2", false) {
+        match claim("job-rule", "batch-2", "cairn:~/batches/2", false) {
             HomeClaim::Elsewhere(occupant) => assert_eq!(occupant, expected),
             other => panic!("a commitless batch never waits: {other:?}"),
         }
-        match claim("job-rule", "batch-3", true) {
+        match claim("job-rule", "batch-3", "cairn:~/batches/3", true) {
             HomeClaim::Wait(occupant) => assert_eq!(occupant, expected),
             other => panic!("a committing batch waits for the tree: {other:?}"),
         }
         // Another job's home is its own.
-        let other_job = tenant(claim("job-other", "batch-x", true));
+        let other_job = tenant(claim("job-other", "batch-x", "cairn:~/batches/x", true));
 
         let waiter = cairn_common::task::spawn(async {
             loop {
-                match claim("job-rule", "batch-3", true) {
+                match claim("job-rule", "batch-3", "cairn:~/batches/3", true) {
                     HomeClaim::Tenant(tenancy) => return tenancy,
                     _ => vacancy("job-rule", "batch-3", Duration::from_secs(30)).await,
                 }
@@ -272,8 +279,8 @@ mod tests {
         use std::sync::Arc;
         let calls = Arc::new(AtomicUsize::new(0));
         let mark = calls.clone();
-        let tenancy =
-            tenant(claim("job-refresh", "batch-1", false)).refresh_on_release(move || {
+        let tenancy = tenant(claim("job-refresh", "batch-1", "cairn:~/batches/1", false))
+            .refresh_on_release(move || {
                 mark.fetch_add(1, Ordering::SeqCst);
             });
         assert_eq!(
@@ -286,8 +293,8 @@ mod tests {
         assert!(defer_terminal_refresh("job-refresh").is_none());
 
         let mark = calls.clone();
-        let tenancy =
-            tenant(claim("job-refresh", "batch-2", false)).refresh_on_release(move || {
+        let tenancy = tenant(claim("job-refresh", "batch-2", "cairn:~/batches/2", false))
+            .refresh_on_release(move || {
                 mark.fetch_add(1, Ordering::SeqCst);
             });
         drop(tenancy);
@@ -301,13 +308,14 @@ mod tests {
     /// A tenancy that outlives a re-claim by someone else never evicts them.
     #[test]
     fn a_stale_tenancy_does_not_vacate_another_batchs_home() {
-        let first = tenant(claim("job-stale", "batch-1", false))
+        let first = tenant(claim("job-stale", "batch-1", "cairn:~/batches/1", false))
             .refresh_on_release(|| panic!("a stale tenancy must not refresh"));
         defer_terminal_refresh("job-stale");
         homes().insert(
             "job-stale".into(),
             Occupant {
                 request_id: "batch-2".into(),
+                handle: "cairn:~/batches/2".into(),
                 executor_id: None,
             },
         );
@@ -315,5 +323,19 @@ mod tests {
         assert_eq!(occupant("job-stale").unwrap().request_id, "batch-2");
         homes().remove("job-stale");
         DEFERRED.lock().unwrap().remove("job-stale");
+    }
+
+    /// A terminal refused for a busy tree names the batch by its numbered
+    /// handle, never by its request id.
+    #[test]
+    fn a_terminal_refusal_names_the_busy_batch_by_its_number() {
+        let occupant = Occupant {
+            request_id: "5f0c2a8e-9d1b-4c3e-8a7f-1b2c3d4e5f60".into(),
+            handle: "cairn:~/batches/2".into(),
+            executor_id: None,
+        };
+        let text = terminal_refusal("dev", &occupant);
+        assert!(text.contains("running batch `cairn:~/batches/2`"), "{text}");
+        assert!(!text.contains(&occupant.request_id), "{text}");
     }
 }

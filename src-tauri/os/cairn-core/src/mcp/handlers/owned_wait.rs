@@ -485,13 +485,13 @@ pub(crate) async fn check_requests_condition(
         let db = orch.db.for_project(&project).await;
         let project_id = super::run_context::project_id_by_key(&db, &project).await?;
         let request_db = requests::request_db(orch, &project_id).await?;
-        requests::load_request(&request_db, &project_id, &id)
+        let (row, _) = requests::load_request_by_segment(&request_db, &project_id, &id)
             .await?
             .ok_or_else(|| format!("no check request {id} in {project}; nothing to wait for"))?;
         return Ok(Some(Condition::CheckRequests {
-            uri: requests::request_uri(&project, &id),
+            uri: row.uri(&project),
             project_id,
-            ids: vec![id],
+            ids: vec![row.id],
         }));
     }
     // `<job>/checks/requests` as the grammar reads it, a thread's through its
@@ -788,7 +788,7 @@ async fn check_requests(
                     _ => verdict,
                 };
                 answers.push(serde_json::json!({
-                    "uri": requests::request_uri(&project_key, &row.id),
+                    "uri": row.uri(&project_key),
                     "suite": row.suite,
                     "state": row.state,
                     "answer": requests::verdict_words(&answer),

@@ -175,7 +175,7 @@ pub(super) async fn sightings(
         let rows = db
             .query_all(
                 format!(
-                    "SELECT r.test_id, COALESCE(o.public_handle, o.id), o.executor_id, o.commit_sha,
+                    "SELECT r.test_id, CAST(o.number AS TEXT), o.executor_id, o.commit_sha,
                             o.ran_at, r.status
                        FROM check_result_observations o
                        JOIN check_test_results r ON r.observation_id = o.id

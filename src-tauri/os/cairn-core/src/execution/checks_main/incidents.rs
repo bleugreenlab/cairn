@@ -1321,7 +1321,7 @@ mod tests {
         assert_eq!(count(&db, "issues").await, 0);
         assert_eq!(count(&db, "main_incident_evidence").await, 0);
         assert!(
-            recorded.note.contains(&format!("- `{test}` — released: passed on `sp2` at the same commit (cairn://p/proj/check-observations/sp2-row), a difference between hosts, not the tree")),
+            recorded.note.contains(&format!("- `{test}` — released: passed on `sp2` at the same commit (cairn://p/proj/check-observations/2), a difference between hosts, not the tree")),
             "{}",
             recorded.note
         );
@@ -1403,7 +1403,7 @@ mod tests {
             )]
         );
         assert!(
-            filed.note.contains("filed as single-host, uncorroborated: `fedora`'s next row (cairn://p/proj/check-observations/next, at `c2`) failed it again"),
+            filed.note.contains("filed as single-host, uncorroborated: `fedora`'s next row (cairn://p/proj/check-observations/2, at `c2`) failed it again"),
             "{}",
             filed.note
         );

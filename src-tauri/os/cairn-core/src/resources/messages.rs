@@ -149,7 +149,7 @@ fn project_board_purpose(project_key: &str) -> String {
 /// its first recipient's project when that recipient has an address.
 fn cite_uri(msg: &crate::models::Message, project_key: &str) -> String {
     cairn_attention::message_render::message_uri(msg)
-        .unwrap_or_else(|| cairn_uri::build_message_uri(project_key, &msg.id))
+        .unwrap_or_else(|| cairn_uri::build_message_uri(project_key, msg.number))
 }
 
 /// A direct message's line carries its citable address, its delivery urgency
@@ -259,12 +259,23 @@ pub(super) async fn read_project_message(
     id: &str,
     params: &[QueryParam],
 ) -> String {
-    let uri = cairn_uri::build_message_uri(project_key, id);
-    if let Some(param) = params.first() {
-        return format!("Unsupported query parameter '{}' for {uri}", param.key);
+    use cairn_db::storage::address_numbers::{resolve, with_legacy_line, Numbered};
+    let received = cairn_uri::CairnResource::ProjectMessage {
+        project: project_key.to_string(),
+        id: id.to_string(),
     }
-    let not_found = || format!("Message {uri} not found.");
-    let msg = match crate::messages::db::get_message_by_id_async(db, id).await {
+    .to_uri();
+    if let Some(param) = params.first() {
+        return format!("Unsupported query parameter '{}' for {received}", param.key);
+    }
+    let not_found = || format!("Message {received} not found.");
+    let resolved = match resolve(db, Numbered::Message, None, id).await {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return not_found(),
+        Err(error) => return format!("Failed to read {received}: {error}"),
+    };
+    let uri = cairn_uri::build_message_uri(project_key, resolved.number);
+    let msg = match crate::messages::db::get_message_by_id_async(db, &resolved.id).await {
         Ok(Some(msg)) => msg,
         Ok(None) => return not_found(),
         Err(error) => return format!("Failed to read {uri}: {error}"),
@@ -300,7 +311,7 @@ pub(super) async fn read_project_message(
     }
     out.push_str(&format!("\n{}\n", msg.content));
     out.push_str(&references_after(orch, std::slice::from_ref(&msg)).await);
-    out
+    with_legacy_line(&resolved, &received, &uri, out)
 }
 
 /// Read the direct-message stream for a node, thread, or sub-agent task.

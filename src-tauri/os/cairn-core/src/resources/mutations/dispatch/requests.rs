@@ -74,11 +74,30 @@ pub(super) async fn dispatch(
             summary
         }
         CairnResource::Request { id } => {
+            use cairn_db::storage::address_numbers::{legacy_adjustment, resolve, Numbered};
             check_withdraw(payload).map_err(|error| build_failure(index, item, error))?;
-            let updated = crate::operator_requests::withdraw(orch, request, id)
+            let resolved = resolve(&orch.db.local, Numbered::OperatorRequest, None, id)
+                .await
+                .map_err(|error| build_failure(index, item, error))?
+                .ok_or_else(|| {
+                    build_failure(
+                        index,
+                        item,
+                        format!("Operator request '{id}' does not exist"),
+                    )
+                })?;
+            let updated = crate::operator_requests::withdraw(orch, request, &resolved.id)
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-            let summary = format!("Withdrew your open contribution to {}", updated.uri);
+            let adjusted: Vec<_> = resolved
+                .legacy
+                .then(|| legacy_adjustment(&resource.to_uri(), &updated.uri))
+                .into_iter()
+                .collect();
+            let summary = cairn_common::adjustment::with_summary(
+                format!("Withdrew your open contribution to {}", updated.uri),
+                &adjusted,
+            );
             *applied_data = Some(
                 serde_json::to_value(updated)
                     .map_err(|error| build_failure(index, item, error.to_string()))?,

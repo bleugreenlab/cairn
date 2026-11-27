@@ -9393,6 +9393,16 @@ mod tests {
         crate::operator::messages::state(&message, row.as_ref())
     }
 
+    /// The address operator message `id` is cited by: its number, which the
+    /// store stamps on insert.
+    async fn operator_message_uri(db: &LocalDb, id: &str) -> String {
+        crate::operator::messages::get(db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .uri()
+    }
+
     /// The operator's purpose line is the grant: his message goes out on the
     /// hand-off while he is at the desktop, never parked for presence, and his
     /// reply to it reaches the sending thread and answers it.
@@ -9445,6 +9455,10 @@ mod tests {
             .resolve_bound("stream-guid", "operator", "operator", "yes, ship it")
             .await
             .unwrap();
+        let expected = format!(
+            "[Reply to {}] yes, ship it",
+            operator_message_uri(&db, "m-op").await
+        );
         assert_eq!(
             db.query_opt_text(
                 "SELECT content FROM messages WHERE channel_type = 'thread' ORDER BY created_at DESC LIMIT 1",
@@ -9453,7 +9467,7 @@ mod tests {
             .await
             .unwrap()
             .as_deref(),
-            Some("[Reply to cairn://operator/messages/m-op] yes, ship it"),
+            Some(expected.as_str()),
             "the reply lands in the sending thread through its own append, which steers it"
         );
         let answered = crate::operator::messages::get(&db, "m-op")
@@ -9513,14 +9527,13 @@ mod tests {
                 })
                 .await
                 .unwrap();
+            let expected = format!(
+                "[Reply to {}] go ahead",
+                operator_message_uri(&db, id).await
+            );
             let to_sender = queued
                 .iter()
-                .filter(|(job_id, content)| {
-                    job_id == job
-                        && content.contains(&format!(
-                            "[Reply to cairn://operator/messages/{id}] go ahead"
-                        ))
-                })
+                .filter(|(job_id, content)| job_id == job && content.contains(&expected))
                 .count();
             assert_eq!(to_sender, 1, "{id}: {queued:?}");
             assert!(
@@ -9791,7 +9804,10 @@ mod tests {
         ));
         assert_eq!(
             thread_messages(&db, "t-general").await,
-            vec!["[Reply to cairn://operator/messages/m-op] yes"]
+            vec![format!(
+                "[Reply to {}] yes",
+                operator_message_uri(&db, "m-op").await
+            )]
         );
 
         let telegram = agent_message_router(orch, Arc::new(RecordingProvider::new()), "telegram");
@@ -9917,12 +9933,12 @@ mod tests {
         .await
         .unwrap();
         let router = agent_message_router(orch, Arc::new(RecordingProvider::new()), "imessage");
-        let inferred = |id: &str| {
+        let inferred = |uri: &str| {
             format!(
-                "[Unaddressed text from the operator, delivered to you because cairn://operator/messages/{id} is the latest message any thread sent him on imessage in 24 h] bare"
+                "[Unaddressed text from the operator, delivered to you because {uri} is the latest message any thread sent him on imessage in 24 h] bare"
             )
         };
-        let native = |id: &str| format!("[Reply to cairn://operator/messages/{id}] replied");
+        let native = |uri: &str| format!("[Reply to {uri}] replied");
         for (home, job, first, second) in [
             ("cairn://p/cairn/general", session.as_str(), "m-t1", "m-t2"),
             (
@@ -9946,7 +9962,10 @@ mod tests {
 
         assert_eq!(
             thread_messages(&db, "t-general").await,
-            vec![inferred("m-t1"), native("m-t2")]
+            vec![
+                inferred(&operator_message_uri(&db, "m-t1").await),
+                native(&operator_message_uri(&db, "m-t2").await)
+            ]
         );
         let queued = db
             .query_all(
@@ -9957,8 +9976,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queued.len(), 2, "{queued:?}");
-        assert!(queued[0].contains(&inferred("m-n1")), "{queued:?}");
-        assert!(queued[1].contains(&native("m-n2")), "{queued:?}");
+        assert!(
+            queued[0].contains(&inferred(&operator_message_uri(&db, "m-n1").await)),
+            "{queued:?}"
+        );
+        assert!(
+            queued[1].contains(&native(&operator_message_uri(&db, "m-n2").await)),
+            "{queued:?}"
+        );
     }
 
     /// Rule 3: an operator message older than 24 hours no longer keeps the

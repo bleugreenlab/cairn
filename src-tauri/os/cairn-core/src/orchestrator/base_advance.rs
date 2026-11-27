@@ -1304,11 +1304,14 @@ pub(crate) struct InflightRunBatch {
     /// about it: child tasks share their parent's branch, so a child's batch
     /// holds the parent's branch too.
     pub(crate) job_id: String,
-    /// That job's home URI, when it resolves: the batch's cancel address
-    /// (`<holder>/batches/<request_id>`) sits under it.
+    /// That job's home URI, when it resolves: the batch's own address
+    /// (`<holder>/batches/<n>`) sits under it.
     pub(crate) holder: Option<String>,
-    /// The batch's placement request, which is what cancellation addresses.
+    /// The batch's placement request, the internal key every lookup uses.
     pub(crate) request_id: String,
+    /// The number its ledger row took within its job: its `batches/{n}`
+    /// handle, resolved with the holder.
+    pub(crate) number: Option<u64>,
     pub(crate) label: Option<String>,
     /// When the batch parked its turn (Unix milliseconds). The batch itself
     /// started up to one synchronous window before that.
@@ -1339,9 +1342,12 @@ impl InflightRunBatch {
             .as_deref()
             .map(|label| format!(" (\"{label}\")"))
             .unwrap_or_default();
-        let owner = match self.holder.as_deref() {
-            Some(uri) => format!(" on {uri}"),
-            None => format!(" on job `{}`", self.job_id),
+        let (batch, owner) = match self.cancel_uri() {
+            Some(uri) => (uri, String::new()),
+            None => (
+                format!("batches/{}", self.segment()),
+                format!(" on job `{}`", self.job_id),
+            ),
         };
         let parked = crate::clock::stamp_millis(self.parked_at_ms)
             .map(|stamp| match self.detached_because.as_deref() {
@@ -1359,18 +1365,13 @@ impl InflightRunBatch {
             .as_ref()
             .map(|progress| format!("; {}", progress.describe(now_ms)))
             .unwrap_or_default();
-        let lifecycle = self
-            .holder
-            .as_deref()
-            .and_then(|home| {
-                crate::resources::request_lifecycle::lifecycle_uri_for_home(home, &self.request_id)
-            })
-            .map(|uri| format!(" (lifecycle: {uri})"))
-            .unwrap_or_default();
-        format!(
-            "run batch `{}`{label}{owner}{parked}{progress}{lifecycle}",
-            self.request_id
-        )
+        format!("run batch `{batch}`{label}{owner}{parked}{progress}")
+    }
+
+    /// Its handle segment: its number, or its request id for a batch received
+    /// before the ledger numbered batches.
+    fn segment(&self) -> String {
+        crate::mcp::handlers::run::detached::batch_segment(self.number, &self.request_id)
     }
 
     /// The capability behind every branch refusal, with its direct release.
@@ -1382,12 +1383,16 @@ impl InflightRunBatch {
         )
     }
 
-    /// The batch's own resource, whose `action:"cancel"` patch ends it. A
-    /// task's holder already ends in `/task/<name>`.
+    /// The batch's own resource, which reads its lifecycle and whose
+    /// `action:"cancel"` patch ends it.
     pub(crate) fn cancel_uri(&self) -> Option<String> {
-        self.holder
-            .as_deref()
-            .map(|holder| format!("{holder}/batches/{}", self.request_id))
+        self.holder.as_deref().map(|holder| {
+            crate::mcp::handlers::run::detached::batch_uri_under(
+                holder,
+                self.number,
+                &self.request_id,
+            )
+        })
     }
 
     /// Fill in where the batch stands now, when this runner holds its task.
@@ -1399,7 +1404,12 @@ impl InflightRunBatch {
     /// Fill in the holder's home URI. Best effort: an unresolved URI falls
     /// back to the job id, which still identifies it.
     async fn resolve_holder(mut self, db: &LocalDb) -> Self {
+        use cairn_db::storage::address_numbers::{number_of, Numbered};
         self.holder = crate::jobs::queries::home_uri_for_job(db, &self.job_id)
+            .await
+            .ok()
+            .flatten();
+        self.number = number_of(db, Numbered::RunBatch, None, &self.request_id)
             .await
             .ok()
             .flatten();
@@ -1431,6 +1441,7 @@ fn run_batch_from_wait(
             job_id,
             holder: None,
             request_id,
+            number: None,
             label,
             parked_at_ms: created_at,
             detached_because: None,
@@ -1451,6 +1462,7 @@ fn run_batch_from_detached(
         job_id: row.text(0)?,
         holder: None,
         request_id: row.text(1)?,
+        number: None,
         label: row.opt_text(2)?,
         parked_at_ms: row.get::<i64>(3)?,
         detached_because: row.opt_text(4)?,
@@ -1679,7 +1691,8 @@ pub(crate) fn cancel_action(batch: &InflightRunBatch) -> String {
         ),
         None => format!(
             "an `action:\"cancel\"` patch on `batches/{}` under job `{}`'s home",
-            batch.request_id, batch.job_id
+            batch.segment(),
+            batch.job_id
         ),
     }
 }
@@ -4707,6 +4720,7 @@ mod tests {
             job_id: "job-builder".into(),
             holder: Some("cairn://p/cairn/5069/1/builder".into()),
             request_id: "ba0e0085".into(),
+            number: Some(3),
             label: Some("rust-tests on main".into()),
             parked_at_ms: 1_760_788_078_000,
             detached_because: None,
@@ -4742,7 +4756,7 @@ mod tests {
         assert!(said.contains("now running item 3 of 5"), "{said}");
         assert!(
             said.contains(
-                "target:\"cairn://p/cairn/5069/1/builder/batches/ba0e0085\",mode:\"patch\",payload:{action:\"cancel\"}"
+                "target:\"cairn://p/cairn/5069/1/builder/batches/3\",mode:\"patch\",payload:{action:\"cancel\"}"
             ),
             "offers the batch's own cancel: {said}"
         );
@@ -4766,15 +4780,16 @@ mod tests {
         task.holder = Some("cairn://p/cairn/5069/1/builder/task/verify".into());
         assert_eq!(
             task.cancel_uri().as_deref(),
-            Some("cairn://p/cairn/5069/1/builder/task/verify/batches/ba0e0085")
+            Some("cairn://p/cairn/5069/1/builder/task/verify/batches/3")
         );
         let mut unresolved = held().unwrap().unwrap();
         unresolved.holder = None;
         let said = mutation_boundary_hold(&Ok(Some(unresolved)));
         assert!(
-            said.contains("`batches/ba0e0085` under job `job-builder`"),
+            said.contains("`batches/3` under job `job-builder`"),
             "{said}"
         );
+        assert!(!said.contains("ba0e0085"), "{said}");
     }
 
     /// A host batch parks on a run-batch row too, but it holds no tree and
@@ -5004,6 +5019,7 @@ mod tests {
                 job_id: "job-overlap".into(),
                 holder: hold.clone().unwrap().unwrap().holder,
                 request_id: "req-detached".into(),
+                number: hold.clone().unwrap().unwrap().number,
                 label: Some("cargo test".into()),
                 parked_at_ms: 7,
                 detached_because: Some("its wait was abandoned while the batch ran".into()),

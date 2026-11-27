@@ -12,11 +12,9 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 /// by name, never truncated.
 pub const MAX_CHARS: usize = 400;
 
-const URI_PREFIX: &str = "cairn://operator/messages/";
-
-/// `cairn://operator/messages/{id}`.
-pub fn message_uri(id: &str) -> String {
-    format!("{URI_PREFIX}{id}")
+/// `cairn://operator/messages/{n}`, by the number the message took.
+pub fn message_uri(number: u64) -> String {
+    cairn_uri::build_operator_message_uri(number)
 }
 
 /// The channel a message was sent through: the provider word of a
@@ -148,11 +146,14 @@ pub struct Message {
     /// The `channel_inbound` id of a transport reply, or the thread message id
     /// of an app reply.
     pub answer_ref: Option<String>,
+    /// The number it took on this install: its address. The `id` stays the
+    /// key its delivery and receipts correlate on.
+    pub number: u64,
 }
 
 impl Message {
     pub fn uri(&self) -> String {
-        message_uri(&self.id)
+        message_uri(self.number)
     }
 
     /// Whether it waits on him: a message that states a default is in his
@@ -163,6 +164,9 @@ impl Message {
 }
 
 const COLUMNS: &str = "id, project_id, sender_home, sender_job_id, via, content, default_text, headline, headline_thread_id, headline_row_id, created_at, seen_at, seen_via, answered_at, answered_via, answer_ref";
+
+/// [`COLUMNS`] and the number the insert stamped, for every read.
+const READ_COLUMNS: &str = "id, project_id, sender_home, sender_job_id, via, content, default_text, headline, headline_thread_id, headline_row_id, created_at, seen_at, seen_via, answered_at, answered_via, answer_ref, number";
 
 fn from_row(row: &cairn_db::turso::Row) -> DbResult<Message> {
     Ok(Message {
@@ -183,6 +187,10 @@ fn from_row(row: &cairn_db::turso::Row) -> DbResult<Message> {
         answered_at: row.opt_i64(13)?,
         answered_via: row.opt_text(14)?.as_deref().and_then(AnsweredVia::parse),
         answer_ref: row.opt_text(15)?,
+        number: row
+            .opt_i64(16)?
+            .and_then(|number| u64::try_from(number).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -294,9 +302,31 @@ pub async fn insert(
     Ok(())
 }
 
+/// The message an address segment names: its number, or a legacy storage id,
+/// which the second field reports so the reply can name the mapping.
+pub async fn resolve(db: &LocalDb, segment: &str) -> Result<Option<(Message, bool)>, String> {
+    use cairn_db::storage::address_numbers::{resolve, Numbered};
+    let Some(resolved) = resolve(db, Numbered::OperatorMessage, None, segment).await? else {
+        return Ok(None);
+    };
+    Ok(get(db, &resolved.id)
+        .await?
+        .map(|message| (message, resolved.legacy)))
+}
+
+/// The `Adjusted:` line a reply carries when `segment` named `message` by its
+/// legacy storage id.
+pub fn legacy_line(segment: &str, message: &Message) -> cairn_common::adjustment::Adjustment {
+    let received = cairn_uri::CairnResource::OperatorMessage {
+        id: segment.to_string(),
+    }
+    .to_uri();
+    cairn_db::storage::address_numbers::legacy_adjustment(&received, &message.uri())
+}
+
 pub async fn get(db: &LocalDb, id: &str) -> Result<Option<Message>, String> {
     db.query_opt(
-        format!("SELECT {COLUMNS} FROM operator_messages WHERE id = ?1"),
+        format!("SELECT {READ_COLUMNS} FROM operator_messages WHERE id = ?1"),
         params![id.to_string()],
         from_row,
     )
@@ -308,7 +338,7 @@ pub async fn get(db: &LocalDb, id: &str) -> Result<Option<Message>, String> {
 pub async fn for_sender(db: &LocalDb, home: &str, limit: i64) -> Result<Vec<Message>, String> {
     db.query_all(
         format!(
-            "SELECT {COLUMNS} FROM operator_messages WHERE sender_home = ?1
+            "SELECT {READ_COLUMNS} FROM operator_messages WHERE sender_home = ?1
               ORDER BY created_at DESC, id DESC LIMIT ?2"
         ),
         params![home.to_string(), limit],
@@ -322,7 +352,7 @@ pub async fn for_sender(db: &LocalDb, home: &str, limit: i64) -> Result<Vec<Mess
 pub async fn all(db: &LocalDb, limit: i64) -> Result<Vec<Message>, String> {
     db.query_all(
         format!(
-            "SELECT {COLUMNS} FROM operator_messages ORDER BY created_at DESC, id DESC LIMIT ?1"
+            "SELECT {READ_COLUMNS} FROM operator_messages ORDER BY created_at DESC, id DESC LIMIT ?1"
         ),
         params![limit],
         from_row,
@@ -336,7 +366,7 @@ pub async fn all(db: &LocalDb, limit: i64) -> Result<Vec<Message>, String> {
 pub async fn waiting(db: &LocalDb, project_id: &str, since: i64) -> Result<Vec<Message>, String> {
     db.query_all(
         format!(
-            "SELECT {COLUMNS} FROM operator_messages
+            "SELECT {READ_COLUMNS} FROM operator_messages
               WHERE project_id = ?1 AND default_text IS NOT NULL
                 AND (answered_at IS NULL OR answered_at >= ?2)"
         ),

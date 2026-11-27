@@ -167,6 +167,11 @@ async fn a_parked_then_placed_batch_renders_every_stage_with_its_time() {
         tempfile::tempdir().unwrap().keep(),
     )
     .build();
+    // The batch page names the batch by its number, so reading it by its
+    // request id leads with the line that maps one onto the other.
+    let adjusted = format!(
+        "Adjusted: `address` `cairn://p/prj/builder/batches/{REQUEST}` → `cairn://p/prj/builder/batches/1` (addressed by its number; the storage-id link still resolves to the same row).\n\n"
+    );
     for state in ["parked", "running", "settled", "lost"] {
         db.execute(
             "UPDATE run_batch_requests SET \"end\"=NULL, ended_ms=NULL WHERE request_id=?1",
@@ -192,11 +197,11 @@ async fn a_parked_then_placed_batch_renders_every_stage_with_its_time() {
         .await;
         let expected = if matches!(state, "parked" | "running") {
             format!(
-                "{request_page}{}",
-                super::super::node::cancel_line("cairn://p/prj/builder", REQUEST)
+                "{adjusted}{request_page}{}",
+                super::super::node::cancel_line("cairn://p/prj/builder", "1")
             )
         } else {
-            request_page.clone()
+            format!("{adjusted}{request_page}")
         };
         assert_eq!(batch_page, expected, "{state}");
         for stage in [
@@ -245,7 +250,7 @@ async fn a_parked_then_placed_batch_renders_every_stage_with_its_time() {
         "{redirect}"
     );
     assert!(
-        redirect.contains(&format!("cairn://p/prj/builder/batches/{REQUEST}")),
+        redirect.contains("cairn://p/prj/builder/batches/1"),
         "{redirect}"
     );
     assert!(!redirect.contains("batch output"), "{redirect}");
@@ -279,7 +284,10 @@ async fn a_parked_then_placed_batch_renders_every_stage_with_its_time() {
             Some(REQUEST),
         )
         .await;
-        assert!(batch_page.starts_with(&request_page), "{batch_page}");
+        assert!(
+            batch_page.starts_with(&format!("{adjusted}{request_page}")),
+            "{batch_page}"
+        );
         assert!(batch_page.contains("publishing"), "{batch_page}");
         assert!(
             batch_page.contains("branch releases when the result settles"),
@@ -302,7 +310,7 @@ async fn a_parked_then_placed_batch_renders_every_stage_with_its_time() {
         Some(REQUEST),
     )
     .await;
-    assert_eq!(batch_page, project_page);
+    assert_eq!(batch_page, format!("{adjusted}{project_page}"));
     assert!(
         batch_page.contains("result is being delivered"),
         "{batch_page}"
@@ -339,8 +347,8 @@ async fn a_parked_then_placed_batch_renders_every_stage_with_its_time() {
         assert_eq!(
             batch_page,
             format!(
-                "{project_page}{}",
-                super::super::node::cancel_line("cairn://p/prj/builder", REQUEST)
+                "{adjusted}{project_page}{}",
+                super::super::node::cancel_line("cairn://p/prj/builder", "1")
             )
         );
         assert!(
@@ -639,10 +647,37 @@ async fn a_check_lane_reads_its_adoption_by_request_attempt_and_observation() {
             text.contains("## Check lane (`check_lane_adoptions`)"),
             "{text}"
         );
-        assert!(text.contains("Observation: UUID `obs-uuid`"), "{text}");
+        // The observation row is not in this database, so there is no
+        // number to cite it by.
+        assert!(
+            text.contains("  - Observation: `obs-uuid` (no number)"),
+            "{text}"
+        );
         assert!(
             text.contains("Waiter: rust-tests for turn_end `job`: delivered"),
             "{text}"
         );
     }
+
+    // Once the ledger row is present the lane cites it by its number.
+    db.execute_script(
+        "INSERT INTO check_result_observations
+           (id,project_id,commit_sha,tree_hash,check_name,input_hash,environment_fingerprint,
+            exit_code,verdict,complete,reusable,parser_version,result_schema_version,ran_at,
+            duration_ms,cadence,output_tail)
+         VALUES('obs-uuid','p','abc','tree','rust-tests','input','env',0,'passed',1,1,1,1,
+            61000,1,'turn_end','ok');",
+    )
+    .await
+    .unwrap();
+    let lifecycle = lifecycle(&db, "lane-request", &context()).await;
+    assert_eq!(
+        lifecycle.end.sentence,
+        "check lane on bginf-sp1 recorded observation `1` at 1970-01-01 00:01:01Z"
+    );
+    let text = render(&lifecycle);
+    assert!(
+        text.contains("  - Observation 1: cairn://p/prj/check-observations/1"),
+        "{text}"
+    );
 }

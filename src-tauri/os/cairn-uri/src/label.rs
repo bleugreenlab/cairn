@@ -23,7 +23,10 @@
 use std::fmt::Display;
 
 use crate::percent::decode_component;
-use crate::{build_thread_uri, AttachmentRef, AttachmentScopeRef, CairnResource, NodeAddress};
+use crate::{
+    build_thread_uri, is_storage_id_segment, AttachmentRef, AttachmentScopeRef, CairnResource,
+    NodeAddress,
+};
 
 /// Display names a caller already knows for the job an address names, used in
 /// place of the raw URI segments. The fields mirror `ResourceLabelOptions` in
@@ -152,6 +155,17 @@ fn channel_provider_name(provider: &str) -> &str {
     }
 }
 
+/// A handle segment as a label reads it: a number (`12`) or other short handle
+/// as written, and a legacy storage id, which old transcripts keep linking to,
+/// shortened to its first eight characters.
+fn handle_label(segment: &str) -> String {
+    if is_storage_id_segment(segment) {
+        segment.chars().take(8).collect()
+    } else {
+        segment.to_string()
+    }
+}
+
 fn workspace(word: &str, id: Option<&str>) -> String {
     match id {
         Some(id) => format!("{word} {id}"),
@@ -240,15 +254,12 @@ impl CairnResource {
             Self::ProjectEventFeedback { project } => in_project(project, "event feedback"),
             Self::Operator => "Operator".to_string(),
             Self::OperatorMessage { id } => {
-                format!(
-                    "Message to operator · {}",
-                    id.chars().take(8).collect::<String>()
-                )
+                format!("Message to operator {}", handle_label(id))
             }
             Self::Executors => "Executors".to_string(),
             Self::Executor { name } => workspace("Executor", Some(name)),
             Self::Requests => "Requests".to_string(),
-            Self::Request { id } => workspace("Request", Some(id)),
+            Self::Request { id } => workspace("Request", Some(handle_label(id).as_str())),
             Self::Grants => "Grants".to_string(),
             Self::Grant { id } => workspace("Grant", Some(id)),
             Self::Models => "Models".to_string(),
@@ -304,7 +315,9 @@ impl CairnResource {
             // ---- Project ----
             // The bare project and its message stream are the project itself.
             Self::Project { project } | Self::ProjectMessages { project } => key(project),
-            Self::ProjectMessage { project, id } => in_project(project, format!("message {id}")),
+            Self::ProjectMessage { project, id } => {
+                in_project(project, format!("message {}", handle_label(id)))
+            }
             Self::ProjectSettings { project } => in_project(project, "settings"),
             Self::ProjectIssues { project } => in_project(project, "issues"),
             Self::ProjectThreads { project } => in_project(project, "threads"),
@@ -344,15 +357,13 @@ impl CairnResource {
                 in_project(project, format!("checks {revision}"))
             }
             Self::ProjectCheckObservation { project, handle } => {
-                in_project(project, format!("check {handle}"))
+                in_project(project, format!("check {}", handle_label(handle)))
             }
             Self::ProjectCheckRequest { project, id } => {
-                let short = id.get(..8).unwrap_or(id);
-                in_project(project, format!("check request {short}"))
+                in_project(project, format!("check request {}", handle_label(id)))
             }
             Self::ProjectRequest { project, id } => {
-                let short = id.get(..8).unwrap_or(id);
-                in_project(project, format!("request {short}"))
+                in_project(project, format!("request {}", handle_label(id)))
             }
             Self::ProjectVcsDiff { project } => in_project(project, "vcs diff"),
             Self::ProjectVcsAncestry { project } => in_project(project, "vcs ancestry"),
@@ -663,7 +674,7 @@ impl CairnResource {
             } => self.job(
                 ctx,
                 Job::node(project, *number, *exec_seq, node_id),
-                Some(format!("batch {request_id}")),
+                Some(format!("batch {}", handle_label(request_id))),
             ),
             Self::NodeQuestions {
                 project,
@@ -878,7 +889,7 @@ impl CairnResource {
             } => self.job(
                 ctx,
                 Job::task(project, *number, *exec_seq, node_id, task_name),
-                Some(format!("batch {request_id}")),
+                Some(format!("batch {}", handle_label(request_id))),
             ),
             Self::TaskChecks {
                 project,

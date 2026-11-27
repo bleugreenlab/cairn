@@ -2980,6 +2980,7 @@ mod tests {
             job_id: "job-builder".to_string(),
             holder: Some("cairn://p/cairn/5069/1/builder".to_string()),
             request_id: "ba0e0085".to_string(),
+            number: Some(3),
             label: Some("rust-tests on main".to_string()),
             parked_at_ms: 130_000,
             detached_because: None,

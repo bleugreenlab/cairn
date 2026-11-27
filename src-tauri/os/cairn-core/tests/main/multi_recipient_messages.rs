@@ -136,14 +136,17 @@ async fn counts(db: &LocalDb) -> (i64, i64, i64) {
     )
 }
 
-async fn only_message_id(db: &LocalDb) -> String {
-    db.query_one(
-        "SELECT id FROM messages WHERE channel_type = 'direct'".to_string(),
-        (),
-        |row| cairn_core::internal::storage::RowExt::text(row, 0),
-    )
-    .await
-    .unwrap()
+/// The address of the one direct message stored: its number.
+async fn only_message_uri(db: &LocalDb) -> String {
+    let number = db
+        .query_one(
+            "SELECT number FROM messages WHERE channel_type = 'direct'".to_string(),
+            (),
+            |row| cairn_core::internal::storage::RowExt::i64(row, 0),
+        )
+        .await
+        .unwrap();
+    format!("cairn://p/proj/messages/{number}")
 }
 
 /// `(recipient job, wake)` of each `direct:` push.
@@ -215,8 +218,7 @@ async fn one_append_to_three_addresses_stores_one_message_and_wakes_each_once() 
     )
     .await;
 
-    let id = only_message_id(&db).await;
-    let uri = format!("cairn://p/proj/messages/{id}");
+    let uri = only_message_uri(&db).await;
     assert!(
         reply.contains(&format!(
             "Sent direct message {uri} to {ALPHA}, {BETA}, {GAMMA}."
@@ -534,8 +536,7 @@ async fn every_recipient_s_history_and_the_message_uri_show_the_recipient_list()
         serde_json::json!({"content": "release slot 3", "cc": [BETA, GAMMA]}),
     )
     .await;
-    let id = only_message_id(&orch.db.local).await;
-    let uri = format!("cairn://p/proj/messages/{id}");
+    let uri = only_message_uri(&orch.db.local).await;
 
     let read = |uri: String| {
         let orch = &orch;

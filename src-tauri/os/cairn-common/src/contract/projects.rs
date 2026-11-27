@@ -69,10 +69,10 @@ pub(crate) const PROJECT_ATTACHMENT_CONTRACT: ResourceContract = ResourceContrac
 
 pub(crate) const PROJECT_CHECK_OBSERVATION_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectCheckObservation,
-    uri_template: "cairn://p/{project}/check-observations/{handle}",
+    uri_template: "cairn://p/{project}/check-observations/{n}",
     name: "Check observation",
     description:
-        "One immutable check ledger row, by its 24-hex handle (read-only). A check request reads at check-requests/<id>",
+        "One immutable check ledger row, by the number it took within its project (read-only). A legacy 24-hex handle or row UUID still opens the same row. A check request reads at check-requests/<n>",
     read_projections: &[],
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -81,10 +81,10 @@ pub(crate) const PROJECT_CHECK_OBSERVATION_CONTRACT: ResourceContract = Resource
 
 pub(crate) const PROJECT_CHECK_REQUEST_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectCheckRequest,
-    uri_template: "cairn://p/{project}/check-requests/{id}",
+    uri_template: "cairn://p/{project}/check-requests/{n}",
     name: "Check request",
     description:
-        "One durable check request: one suite on one revision, filed with a write to a node's checks. Reads where it stands (queued since when, pinned to which machine, that machine's latest refusal in its own words; or running on which machine since when) and, once settled, its verdict with the ledger observation it recorded, or why it has none. Wait for it with run waitFor kind:\"checks\" ref:<this URI>; a patch with action:cancel withdraws it",
+        "One durable check request: one suite on one revision, filed with a write to a node's checks, addressed by the number it took within its project. Reads where it stands (queued since when, pinned to which machine, that machine's latest refusal in its own words; or running on which machine since when) and, once settled, its verdict with the ledger observation it recorded, or why it has none. Wait for it with run waitFor kind:\"checks\" ref:<this URI>; a patch with action:cancel withdraws it",
     read_projections: &[ProjectionSpec {
         key: "format",
         values: "json: the request's facts and answer as one JSON object",
@@ -96,7 +96,7 @@ pub(crate) const PROJECT_CHECK_REQUEST_CONTRACT: ResourceContract = ResourceCont
         required: &[KeySpec::new("action", KeyType::Str, "cancel")],
         optional: &[],
         label: "cancel this check request",
-        example: "write({changes:[{target:\"cairn://p/PROJECT/check-requests/ID\",mode:\"patch\",payload:{action:\"cancel\"}}]})",
+        example: "write({changes:[{target:\"cairn://p/PROJECT/check-requests/12\",mode:\"patch\",payload:{action:\"cancel\"}}]})",
     }],
 };
 
@@ -105,7 +105,7 @@ pub(crate) const PROJECT_REQUEST_CONTRACT: ResourceContract = ResourceContract {
     uri_template: "cairn://p/{project}/requests/{id}",
     name: "Request lifecycle",
     description:
-        "One run batch's whole lifecycle, by any id it was called by: its request id, the tool call id that made it, its run id (which lists every batch the run made), its wait id, or a placement entry or attempt id; a check request id links its check request. Reads, each with its time and the table it came from: the call (job, node, turn), the batch it became (label, items, declared timeout, commits, branch), each placement decision (parked and why, claimed where), where it ran (machine, cell, pid, peak CPU and memory), and its end: delivered to whom, refused and why, cancelled by whom, still running, or lost with the fact that lost it. Not cairn://requests/{id}, which is an operator request",
+        "One run batch's whole lifecycle, by any id it was called by: its request id, the tool call id that made it, its run id (which lists every batch the run made), its wait id, or a placement entry or attempt id; a check request id links its check request. An input address for looking a batch up; a batch is cited at its numbered `batches/<n>` handle under its node. Reads, each with its time and the table it came from: the call (job, node, turn), the batch it became (label, items, declared timeout, commits, branch), each placement decision (parked and why, claimed where), where it ran (machine, cell, pid, peak CPU and memory), and its end: delivered to whom, refused and why, cancelled by whom, still running, or lost with the fact that lost it. Not cairn://requests/<n>, which is an operator request",
     read_projections: &[ProjectionSpec {
         key: "format",
         values: "json: the lifecycle as one JSON object",
@@ -453,9 +453,9 @@ pub(crate) const PROJECT_ISSUES_CONTRACT: ResourceContract =
 
 pub(crate) const PROJECT_MESSAGE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectMessage,
-    uri_template: "cairn://p/{project}/messages/{id}",
+    uri_template: "cairn://p/{project}/messages/{n}",
     name: "Message",
-    description: "One stored message: its sender, time and urgency, every recipient in the order the sender named them with the wake each one's own mutes left it, and its content with the references it cites. A direct message sent to several addresses is this one message; every recipient's envelope cites this address",
+    description: "One stored message, by the number it took in the database that holds the project's messages: its sender, time and urgency, every recipient in the order the sender named them with the wake each one's own mutes left it, and its content with the references it cites. A direct message sent to several addresses is this one message; every recipient's envelope cites this address",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,

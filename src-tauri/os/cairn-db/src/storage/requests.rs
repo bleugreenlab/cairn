@@ -133,14 +133,32 @@ async fn attempt_conn(conn: &TrackedConnection, event: &str) -> DbResult<Option<
     let mut rows=conn.query(format!("SELECT {ATTEMPT_COLUMNS} FROM request_attempts a WHERE a.authorization_event_id=?1"),params![event]).await?;
     rows.next().await?.as_ref().map(attempt_row).transpose()
 }
+/// A request's canonical address, `cairn://requests/{n}`, read inside the
+/// transaction that may have just inserted it (its insert stamps the number).
+async fn request_uri_conn(conn: &TrackedConnection, request: &str) -> DbResult<String> {
+    let number = text(
+        conn,
+        "SELECT CAST(number AS TEXT) FROM requests WHERE id=?1",
+        params![request],
+    )
+    .await?
+    .and_then(|number| number.parse().ok())
+    .ok_or_else(|| error("request has no number"))?;
+    Ok(cairn_uri::build_request_uri(number))
+}
+
 async fn get_conn(conn: &TrackedConnection, request: &str) -> DbResult<Option<OperatorRequest>> {
-    let mut rows=conn.query("SELECT r.id,r.workspace_id,r.cohort_id,r.kind,r.target,r.target_identity,r.coalescing_key,c.revision,r.state,r.created_at,r.updated_at,r.current_attempt,r.fulfilled_by_attempt,r.report_json FROM requests r JOIN request_cohorts c ON c.id=r.cohort_id WHERE r.id=?1",params![request]).await?;
+    let mut rows=conn.query("SELECT r.id,r.workspace_id,r.cohort_id,r.kind,r.target,r.target_identity,r.coalescing_key,c.revision,r.state,r.created_at,r.updated_at,r.current_attempt,r.fulfilled_by_attempt,r.report_json,r.number FROM requests r JOIN request_cohorts c ON c.id=r.cohort_id WHERE r.id=?1",params![request]).await?;
     let Some(r) = rows.next().await? else {
         return Ok(None);
     };
     let mut out = OperatorRequest {
         id: r.text(0)?,
-        uri: format!("cairn://requests/{}", r.text(0)?),
+        uri: cairn_uri::build_request_uri(
+            r.opt_i64(14)?
+                .and_then(|number| u64::try_from(number).ok())
+                .unwrap_or_default(),
+        ),
         workspace_id: r.text(1)?,
         cohort_id: r.text(2)?,
         member_request_ids: vec![],
@@ -466,7 +484,7 @@ pub async fn file_request(
         if duplicate.is_none() {
             conn.execute("INSERT INTO request_requesters(id,request_id,origin_uri,run_id,principal_json,wake_destination,rationale,requirements_json,minimum_target,normalized_target_json,filing_key,active,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1,?12)",
                 params![contribution.clone(),request.clone(),c.origin_uri.clone(),c.run_id.clone(),encode(&c.principal)?,c.wake_destination.clone(),c.rationale.clone(),requirements,c.minimum_target.clone(),normalized,filing_key,now]).await?;
-            enqueue(conn,&request,"reference",Some(&c.wake_destination),json!({"request_id":request,"request_uri":format!("cairn://requests/{request}"),"run_id":c.run_id,"origin_uri":c.origin_uri}),now).await?;
+            enqueue(conn,&request,"reference",Some(&c.wake_destination),json!({"request_id":request,"request_uri":request_uri_conn(conn,&request).await?,"run_id":c.run_id,"origin_uri":c.origin_uri}),now).await?;
         } else {
             let active=text(conn,"SELECT CAST(active AS TEXT) FROM request_requesters WHERE id=?1",params![contribution.clone()]).await?;
             if active.as_deref()==Some("0") {
@@ -2440,7 +2458,16 @@ mod tests {
         members: &[String],
         origins: &[&str],
     ) {
+        use crate::storage::address_numbers::{number_of, Numbered};
         use std::collections::BTreeSet;
+        let mut member_uris = BTreeSet::new();
+        for id in members {
+            let number = number_of(db, Numbered::OperatorRequest, None, id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("request {id} has no number"));
+            member_uris.insert(format!("cairn://requests/{number}"));
+        }
         let wakes: Vec<_> = pending_outbox(db, 200)
             .await
             .unwrap()
@@ -2466,13 +2493,7 @@ mod tests {
                 .iter()
                 .map(|v| v.as_str().unwrap().to_string())
                 .collect();
-            assert_eq!(
-                uris,
-                members
-                    .iter()
-                    .map(|id| format!("cairn://requests/{id}"))
-                    .collect()
-            );
+            assert_eq!(uris, member_uris);
             let actual_origins: BTreeSet<_> = wake.payload["origin_uris"]
                 .as_array()
                 .unwrap()

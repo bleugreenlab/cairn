@@ -15550,7 +15550,7 @@ async fn dropped_publication_guard_transfers_ownership() {
     };
     let recorded = crate::execution::cache::RecordedCheckObservation {
         id: "obs-published".to_string(),
-        public_handle: "111111111111111111111111".into(),
+        number: 1,
         ran_at: 1,
         environment_fingerprint: "env".to_string(),
         executor_id: None,

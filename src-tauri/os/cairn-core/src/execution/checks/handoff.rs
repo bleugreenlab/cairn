@@ -528,7 +528,7 @@ pub(crate) async fn handoff_lanes(
             .or_insert_with(|| HandoffStanding {
                 commit: row.commit_sha.clone(),
                 open: row.is_open(),
-                uri: requests::request_uri(&coords.project_key, &row.id),
+                uri: row.uri(&coords.project_key),
                 words: match CheckRequestAnswer::of_settled(&row) {
                     Some(answer) if !row.is_open() => requests::verdict_words(&answer),
                     _ => requests::standing(&row),

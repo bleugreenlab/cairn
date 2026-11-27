@@ -372,7 +372,10 @@ async fn deliver_reference(orch: &Orchestrator, intent: &RequestOutbox) -> Resul
         }
         Some(CairnResource::Issue { project, .. }) => {
             let issue_db = orch.db.for_project(&project).await;
-            let content=format!("Operator request cairn://requests/{}. Read the request for its decision and report.",intent.request_id);
+            let content = format!(
+                "Operator request {}. Read the request for its decision and report.",
+                request_uri(orch, intent).await?
+            );
             let issue_id = deliver_issue_attention(
                 &issue_db,
                 destination,
@@ -399,9 +402,12 @@ async fn deliver_reference(orch: &Orchestrator, intent: &RequestOutbox) -> Resul
             return Err("request reference destination must be a canonical thread or issue".into())
         }
     };
-    persist_reference(&db, reference_event(intent, &run_id))
-        .await
-        .map_err(|e| e.to_string())?;
+    persist_reference(
+        &db,
+        reference_event(intent, &run_id, &request_uri(orch, intent).await?),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let scope = tokio::task::spawn_blocking({
         let db = db.clone();
         let run_id = run_id.clone();
@@ -416,8 +422,21 @@ async fn deliver_reference(orch: &Orchestrator, intent: &RequestOutbox) -> Resul
     Ok(())
 }
 
-fn reference_event(intent: &RequestOutbox, run_id: &str) -> EventInsert {
-    let request_uri = format!("cairn://requests/{}", intent.request_id);
+/// The request's canonical address, `cairn://requests/{n}`.
+async fn request_uri(orch: &Orchestrator, intent: &RequestOutbox) -> Result<String, String> {
+    use cairn_db::storage::address_numbers::{number_of, Numbered};
+    number_of(
+        &orch.db.local,
+        Numbered::OperatorRequest,
+        None,
+        &intent.request_id,
+    )
+    .await?
+    .map(cairn_uri::build_request_uri)
+    .ok_or_else(|| format!("operator request {} has no number", intent.request_id))
+}
+
+fn reference_event(intent: &RequestOutbox, run_id: &str, request_uri: &str) -> EventInsert {
     let data = TranscriptEvent {
         event_type: "request_reference".into(),
         session_id: None,
@@ -588,12 +607,12 @@ mod tests {
         use crate::agent_process::stream::TranscriptEvent;
         let (_temp, db) = test_db().await;
         insert_run(&db, "run-1").await;
-        let event = reference_event(&intent("reference"), "run-1");
+        let event = reference_event(&intent("reference"), "run-1", "cairn://requests/1");
         let parsed: TranscriptEvent = serde_json::from_str(&event.data).unwrap();
         assert_eq!(parsed.event_type, "request_reference");
         let content: serde_json::Value =
             serde_json::from_str(parsed.content.as_deref().unwrap()).unwrap();
-        assert_eq!(content["requestUri"], "cairn://requests/request-1");
+        assert_eq!(content["requestUri"], "cairn://requests/1");
         persist_reference(&db, event.clone()).await.unwrap();
         // The outbox ack is deliberately absent. A new connection, as on boot,
         // retries the exact same stable sink receipt.
@@ -604,7 +623,9 @@ mod tests {
             1
         );
         let mut conflicting = event;
-        conflicting.data = conflicting.data.replace("request-1", "request-2");
+        conflicting.data = conflicting
+            .data
+            .replace("cairn://requests/1", "cairn://requests/2");
         assert!(persist_reference(&reopened, conflicting).await.is_err());
     }
 
@@ -635,9 +656,12 @@ mod tests {
             .unwrap()
             .expect("the open chat holds a position in its session");
 
-        persist_reference(&db, reference_event(&intent("reference"), "run-1"))
-            .await
-            .unwrap();
+        persist_reference(
+            &db,
+            reference_event(&intent("reference"), "run-1", "cairn://requests/1"),
+        )
+        .await
+        .unwrap();
         notice("An account can serve this node again, so it resumes now.");
 
         let delta = reader
@@ -719,7 +743,11 @@ mod tests {
             "INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES('owner','project-1','owner',1,1);
              INSERT INTO jobs(id,project_id,thread_id,node_name,uri_segment,status,created_at,updated_at)
              VALUES('owner-job','project-1','owner','Thread','thread','running',1,1);
-             UPDATE runs SET job_id='owner-job',project_id='project-1' WHERE id='owner-run';"
+             UPDATE runs SET job_id='owner-job',project_id='project-1' WHERE id='owner-run';
+             INSERT INTO request_cohorts(id,workspace_id,kind,state,created_at,updated_at)
+             VALUES('owner-card','default','rebuild','open',1,1);
+             INSERT INTO requests(id,workspace_id,kind,target_identity,cohort_id,state,created_at,updated_at)
+             VALUES('request-1','default','rebuild','install','owner-card','open',1,1);"
         ).await.unwrap();
         let mut reference = intent("reference");
         reference.destination = Some("cairn://p/proj/owner".into());

@@ -2552,8 +2552,10 @@ async fn composed_public_merge(disable_cancel: bool) {
         .await
         .unwrap();
     }
-    let request_uri = "cairn://p/gh/check-requests/merge-open-check";
-    let control_uri = "cairn://p/gh/check-requests/other-issue-check";
+    // Each request is addressed by the number it took within the project, in
+    // the order inserted above.
+    let request_uri = "cairn://p/gh/check-requests/1";
+    let control_uri = "cairn://p/gh/check-requests/2";
 
     let http = MockHttpClient::new()
         .respond_to("access_tokens", token_response())

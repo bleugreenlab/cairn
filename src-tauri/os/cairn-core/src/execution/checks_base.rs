@@ -1171,7 +1171,7 @@ async fn red_at_base_elsewhere(
     let rows = db
         .query_all(
             format!(
-                "SELECT id, COALESCE(public_handle, id), LOWER(TRIM(verdict_platform))
+                "SELECT id, CAST(number AS TEXT), LOWER(TRIM(verdict_platform))
                    FROM check_result_observations
                   WHERE project_id = ?1 AND commit_sha = ?2 AND check_name = ?3
                     AND complete = 1 AND failure_kind IS NULL AND {PER_TEST_WHOLE_SUITE}
@@ -1232,7 +1232,7 @@ async fn failures_on_other_jobs(
     let rows = db
         .query_all(
             format!(
-                "SELECT id, COALESCE(public_handle, id), commit_sha,
+                "SELECT id, CAST(number AS TEXT), commit_sha,
                         LOWER(TRIM(COALESCE(verdict_platform, ''))), cadence, COALESCE(job_id, '')
                    FROM check_result_observations
                   WHERE project_id = ?1 AND check_name = ?2 AND verdict = 'failed'
@@ -2125,15 +2125,12 @@ pub(crate) mod tests {
         let row = attribution.main_row.as_ref().unwrap();
         assert_eq!((row.commit.as_str(), row.at_base), ("c256", false));
         assert_eq!(row.commits_before_base, Some(256));
-        assert_eq!(
-            row.observation,
-            "cairn://p/cairn/check-observations/h-mac-old"
-        );
+        assert_eq!(row.observation, "cairn://p/cairn/check-observations/1");
         assert_eq!(
             attribution.red_at_base_elsewhere,
             vec![ElsewhereAtBase {
                 platform: "linux".to_string(),
-                observation: "cairn://p/cairn/check-observations/h-linux-base".to_string(),
+                observation: "cairn://p/cairn/check-observations/2".to_string(),
                 red: names(&["a"]),
             }]
         );
@@ -2146,7 +2143,7 @@ pub(crate) mod tests {
         assert_eq!(
             lines[1],
             "1 red at exact base `base` on linux \
-             (cairn://p/cairn/check-observations/h-linux-base), another platform's row and not a \
+             (cairn://p/cairn/check-observations/2), another platform's row and not a \
              macos verdict: a"
         );
         assert!(attribution.elsewhere_unread.is_none());
@@ -2355,8 +2352,8 @@ pub(crate) mod tests {
         assert_eq!(
             cited,
             vec![
-                ("cairn://p/cairn/check-observations/h-same", Some(true)),
-                ("cairn://p/cairn/check-observations/h-differ", Some(false)),
+                ("cairn://p/cairn/check-observations/2", Some(true)),
+                ("cairn://p/cairn/check-observations/3", Some(false)),
             ]
         );
         let line = &texts(&attribution)[0];

@@ -765,8 +765,10 @@ pub(super) async fn read_node_wakes(
     .await
 }
 
-/// A node or task job's batches that outlived their calls, or one by request
-/// id: the handle a detached call answered with.
+/// A node or task job's batches that outlived their calls, or one by its
+/// number within the job (`batches/{n}`, the handle every reply names), which
+/// reads that batch's whole lifecycle. A legacy request-id address still
+/// opens it, with the mapping on the first line.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn read_node_batches(
     orch: &crate::orchestrator::Orchestrator,
@@ -803,77 +805,128 @@ pub(super) async fn read_node_batches(
         Ok(waits) => waits,
         Err(error) => return format!("Could not read this job's in-flight batches: {error}"),
     };
-    match request_id {
-        Some(request_id) => match detached::load(db, request_id).await {
-            Ok(Some(batch)) if batch.job_id == job_id => {
-                let cancellable = matches!(
-                    batch.state,
-                    detached::DetachedState::Parked | detached::DetachedState::Running
-                ) && !in_flight.iter().any(|wait| {
-                    wait.request_id == request_id && wait.state == "resolving"
-                });
-                render_batch(orch, project_key, &home, request_id, cancellable).await
-            }
-            Ok(None) if in_flight.iter().any(|wait| wait.request_id == request_id) => {
-                let cancellable = in_flight.iter().any(|wait| {
-                    wait.request_id == request_id && wait.state == "pending"
-                });
-                render_batch(orch, project_key, &home, request_id, cancellable).await
-            }
-            Ok(None)
-                if detached::live_owner(request_id)
-                    .is_some_and(|owner| owner.job_id == job_id) =>
-            {
-                render_batch(orch, project_key, &home, request_id, true).await
-            }
-            Ok(Some(batch)) => {
-                match crate::jobs::queries::home_uri_for_job(db, &batch.job_id).await {
-                    Ok(Some(owner)) => format!(
-                        "Run batch `{request_id}` belongs to a different job. Read `{owner}/batches/{request_id}`. This collection lists only batches owned by `{home}`, not its tasks."
-                    ),
-                    _ => format!("Run batch `{request_id}` exists but belongs to a different job, not `{home}`."),
-                }
-            }
-            Ok(None) => format!(
-                "No detached run batch `{request_id}` was found. This collection lists only batches owned by `{home}`, not its tasks. A batch whose call answered with its own result has no handle here."
+    if let Some(segment) = request_id {
+        use cairn_db::storage::address_numbers::{legacy_adjustment, resolve, Numbered};
+        let resolved = match resolve(db, Numbered::RunBatch, Some(&job_id), segment).await {
+            Ok(resolved) => resolved,
+            Err(error) => return format!("Could not read run batch {segment}: {error}"),
+        };
+        // A batch received before the ledger numbered batches is still
+        // addressed by its request id.
+        let (request_id, shown) = match &resolved {
+            Some(resolved) => (resolved.id.clone(), resolved.number.to_string()),
+            None => (segment.to_string(), segment.to_string()),
+        };
+        let page = batch_page(
+            orch,
+            db,
+            project_key,
+            &home,
+            &job_id,
+            (&request_id, &shown),
+            resolved.is_some(),
+            &in_flight,
+        )
+        .await;
+        return match resolved.filter(|resolved| resolved.legacy) {
+            Some(resolved) => format!(
+                "{}\n\n{page}",
+                legacy_adjustment(
+                    &format!("{home}/batches/{segment}"),
+                    &format!("{home}/batches/{}", resolved.number),
+                )
             ),
-            Err(error) => format!("Could not read run batch `{request_id}`: {error}"),
-        },
-        None => match detached::for_job(db, &job_id).await {
-            Ok(batches) if batches.is_empty() && in_flight.is_empty() => format!(
-                "# Batches ({label})\n\nNo run batch owned by this job is in flight or has kept running past its call. Tasks' batches live under each task's own `batches` collection.\n"
-            ),
-            Ok(batches) => {
-                let mut out = format!("# Batches ({label})\n\nOnly this job's batches; tasks have their own `batches` collections.\n\n");
-                if !in_flight.is_empty() {
-                    out.push_str("## In flight, their calls suspended\n\n");
-                    for wait in &in_flight {
-                        let progress = detached::live_progress(orch, &wait.request_id)
-                            .map(|progress| format!("; {}", progress.describe(now_ms)))
-                            .unwrap_or_default();
-                        out.push_str(&format!(
-                            "- `{home}/batches/{}` '{}'{progress}\n",
-                            wait.request_id,
-                            wait.label.as_deref().unwrap_or("unnamed")
-                        ));
-                    }
-                    out.push('\n');
-                }
-                if !batches.is_empty() {
-                    out.push_str("## Outlived their calls\n\n");
-                }
-                for batch in batches {
-                    let live = detached::live_state(orch, &batch);
+            None => page,
+        };
+    }
+    match detached::for_job(db, &job_id).await {
+        Ok(batches) if batches.is_empty() && in_flight.is_empty() => format!(
+            "# Batches ({label})\n\nNo run batch owned by this job is in flight or has kept running past its call. Tasks' batches live under each task's own `batches` collection.\n"
+        ),
+        Ok(batches) => {
+            let mut out = format!("# Batches ({label})\n\nOnly this job's batches; tasks have their own `batches` collections.\n\n");
+            if !in_flight.is_empty() {
+                out.push_str("## In flight, their calls suspended\n\n");
+                for wait in &in_flight {
+                    let progress = detached::live_progress(orch, &wait.request_id)
+                        .map(|progress| format!("; {}", progress.describe(now_ms)))
+                        .unwrap_or_default();
                     out.push_str(&format!(
-                        "- {}\n",
-                        detached::summary_line(&batch, &home, &live)
+                        "- `{home}/batches/{}` '{}'{progress}\n",
+                        detached::batch_segment(wait.number, &wait.request_id),
+                        wait.label.as_deref().unwrap_or("unnamed")
                     ));
                 }
-                out.push_str("\nCancel one in flight with an `action:\"cancel\"` patch on its own `batches/<request_id>`.\n");
-                out
+                out.push('\n');
             }
-            Err(error) => format!("Could not read this job's batches: {error}"),
+            if !batches.is_empty() {
+                out.push_str("## Outlived their calls\n\n");
+            }
+            for batch in batches {
+                let live = detached::live_state(orch, &batch);
+                out.push_str(&format!(
+                    "- {}\n",
+                    detached::summary_line(&batch, &home, &live)
+                ));
+            }
+            out.push_str("\nCancel one in flight with an `action:\"cancel\"` patch on its own `batches/<n>`.\n");
+            out
+        }
+        Err(error) => format!("Could not read this job's batches: {error}"),
+    }
+}
+
+/// One batch's page under its owning job: its lifecycle, and its cancel while
+/// it can still be cancelled. `shown` is the segment the page names it by.
+#[allow(clippy::too_many_arguments)]
+async fn batch_page(
+    orch: &crate::orchestrator::Orchestrator,
+    db: &LocalDb,
+    project_key: &str,
+    home: &str,
+    job_id: &str,
+    (request_id, shown): (&str, &str),
+    in_ledger: bool,
+    in_flight: &[OpenBatchWait],
+) -> String {
+    use crate::mcp::handlers::run::detached;
+    match detached::load(db, request_id).await {
+        Ok(Some(batch)) if batch.job_id == job_id => {
+            let cancellable = matches!(
+                batch.state,
+                detached::DetachedState::Parked | detached::DetachedState::Running
+            ) && !in_flight
+                .iter()
+                .any(|wait| wait.request_id == request_id && wait.state == "resolving");
+            render_batch(orch, project_key, home, (request_id, shown), cancellable).await
+        }
+        Ok(None) if in_flight.iter().any(|wait| wait.request_id == request_id) => {
+            let cancellable = in_flight
+                .iter()
+                .any(|wait| wait.request_id == request_id && wait.state == "pending");
+            render_batch(orch, project_key, home, (request_id, shown), cancellable).await
+        }
+        Ok(None)
+            if detached::live_owner(request_id).is_some_and(|owner| owner.job_id == job_id) =>
+        {
+            render_batch(orch, project_key, home, (request_id, shown), true).await
+        }
+        // A batch whose call answered with its own result still reads its
+        // lifecycle at its handle; it has ended, so it has no cancel.
+        Ok(None) if in_ledger => {
+            render_batch(orch, project_key, home, (request_id, shown), false).await
+        }
+        Ok(Some(batch)) => match crate::jobs::queries::home_uri_for_job(db, &batch.job_id).await {
+            Ok(Some(owner)) => format!(
+                "Run batch {shown} belongs to a different job. Read `{owner}/batches/{}`. This collection lists only batches owned by `{home}`, not its tasks.",
+                detached::batch_segment(batch.number, &batch.request_id)
+            ),
+            _ => format!("Run batch {shown} exists but belongs to a different job, not `{home}`."),
         },
+        Ok(None) => format!(
+            "No run batch {shown} was found. This collection lists only batches owned by `{home}`, not its tasks."
+        ),
+        Err(error) => format!("Could not read run batch {shown}: {error}"),
     }
 }
 
@@ -882,22 +935,27 @@ struct OpenBatchWait {
     request_id: String,
     label: Option<String>,
     state: String,
+    /// Its number within the job, from its ledger row.
+    number: Option<u64>,
 }
 
 /// The job's run batches whose calls are suspended on them, newest first.
 async fn open_batch_waits(db: &LocalDb, job_id: &str) -> Result<Vec<OpenBatchWait>, String> {
     db.query_all(
-        "SELECT json_extract(condition_json, '$.request_id'), json_extract(condition_json, '$.label'), state
-           FROM agent_waits
-          WHERE job_id = ?1 AND state IN ('pending', 'resolving')
-            AND json_extract(condition_json, '$.kind') = 'run_batch'
-          ORDER BY created_at DESC",
+        "SELECT json_extract(w.condition_json, '$.request_id'), json_extract(w.condition_json, '$.label'), w.state,
+                (SELECT r.number FROM run_batch_requests r
+                  WHERE r.request_id = json_extract(w.condition_json, '$.request_id'))
+           FROM agent_waits w
+          WHERE w.job_id = ?1 AND w.state IN ('pending', 'resolving')
+            AND json_extract(w.condition_json, '$.kind') = 'run_batch'
+          ORDER BY w.created_at DESC",
         (job_id.to_string(),),
         |row| {
             Ok(OpenBatchWait {
                 request_id: row.text(0)?,
                 label: row.opt_text(1)?,
                 state: row.text(2)?,
+                number: row.opt_i64(3)?.and_then(|n| u64::try_from(n).ok()),
             })
         },
     )
@@ -905,9 +963,10 @@ async fn open_batch_waits(db: &LocalDb, job_id: &str) -> Result<Vec<OpenBatchWai
     .map_err(|error| error.to_string())
 }
 
-pub(super) fn cancel_line(home: &str, request_id: &str) -> String {
+/// The cancel a batch page ends with, on its numbered handle.
+pub(super) fn cancel_line(home: &str, segment: &str) -> String {
     format!(
-        "\nCancel this batch only: `write({{changes:[{{target:\"{home}/batches/{request_id}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`. A call waiting on it resumes with a cancelled result, and it releases its branch; a commit it is already writing stands. One that no runner task or machine holds (an earlier runner placed it) is settled as lost, with its outcome unknown.\n"
+        "\nCancel this batch only: `write({{changes:[{{target:\"{home}/batches/{segment}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`. A call waiting on it resumes with a cancelled result, and it releases its branch; a commit it is already writing stands. One that no runner task or machine holds (an earlier runner placed it) is settled as lost, with its outcome unknown.\n"
     )
 }
 
@@ -917,12 +976,12 @@ async fn render_batch(
     orch: &crate::orchestrator::Orchestrator,
     project: &str,
     home: &str,
-    request_id: &str,
+    (request_id, shown): (&str, &str),
     cancellable: bool,
 ) -> String {
     let mut out = super::request_lifecycle::read_request(orch, project, request_id, false).await;
     if cancellable {
-        out.push_str(&cancel_line(home, request_id));
+        out.push_str(&cancel_line(home, shown));
     }
     out
 }

@@ -36,9 +36,9 @@ pub(crate) const REQUESTS_CONTRACT: ResourceContract = ResourceContract {
 
 pub(crate) const REQUEST_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Request,
-    uri_template: "cairn://requests/{id}",
+    uri_template: "cairn://requests/{n}",
     name: "Operator request",
-    description: "One durable request identity with requester contributions, actor facts and attempt history. Withdrawing removes only this authenticated origin's open contribution; it cannot cancel an accepted act. No resource mutation can accept, decline, set status, or write actor facts.",
+    description: "One durable request identity, addressed by its number, with requester contributions, actor facts and attempt history. Withdrawing removes only this authenticated origin's open contribution; it cannot cancel an accepted act. No resource mutation can accept, decline, set status, or write actor facts.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -47,6 +47,6 @@ pub(crate) const REQUEST_CONTRACT: ResourceContract = ResourceContract {
         required: &[KeySpec::new("withdraw", KeyType::Bool, "must be true")],
         optional: &[],
         label: "withdraw your open request contribution",
-        example: r#"write({changes:[{target:"cairn://requests/REQUEST_ID",mode:"patch",payload:{withdraw:true}}]})"#,
+        example: r#"write({changes:[{target:"cairn://requests/12",mode:"patch",payload:{withdraw:true}}]})"#,
     }],
 };

@@ -184,7 +184,7 @@ struct ObservationFacts {
 
 async fn observation_facts(db: &LocalDb, id: &str) -> Option<ObservationFacts> {
     db.query_opt(
-        "SELECT p.key, o.public_handle, o.verdict, o.failure_kind
+        "SELECT p.key, CAST(o.number AS TEXT), o.verdict, o.failure_kind
            FROM check_result_observations o
            JOIN projects p ON p.id = o.project_id
           WHERE o.id = ?1",
@@ -4148,10 +4148,35 @@ mod tests {
             lanes[5].failure, None,
             "a lane with no verdict shows no failure"
         );
+        let addresses: Vec<Option<&str>> = lanes
+            .iter()
+            .map(|lane| match &lane.observation {
+                Some(LaneObservation::Cited { uri, .. }) => uri.as_deref(),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            serde_json::to_string(&snapshot).unwrap(),
+            addresses,
+            [
+                Some("cairn://p/proj/check-observations/1"),
+                Some("cairn://p/proj/check-observations/2"),
+                Some("cairn://p/proj/check-observations/3"),
+                None,
+                None,
+                Some("cairn://p/proj/check-observations/1"),
+            ],
+            "each cited lane gains its observation's numbered address"
+        );
+        let mut unaddressed = snapshot.clone();
+        for lane in &mut unaddressed.systematic_checks {
+            if let Some(LaneObservation::Cited { uri, .. }) = &mut lane.observation {
+                *uri = None;
+            }
+        }
+        assert_eq!(
+            serde_json::to_string(&unaddressed).unwrap(),
             stored,
-            "hydrated detail is never written back"
+            "hydrated failure detail is never written back"
         );
 
         let rendered =
@@ -4160,7 +4185,10 @@ mod tests {
             rendered.contains("| rust-tests | failed (test) (20 failed) |"),
             "{rendered}"
         );
-        assert!(rendered.contains("observation `obs-red`"), "{rendered}");
+        assert!(
+            rendered.contains("cairn://p/proj/check-observations/1"),
+            "{rendered}"
+        );
         assert!(rendered.contains("none: explicit reason"), "{rendered}");
         assert_eq!(
             rendered.matches("Failing test (rust-tests): ").count(),
@@ -4228,9 +4256,9 @@ mod tests {
         );
     }
 
-    /// A lane cites the observation its verdict came from: by address when the
-    /// observation has a public handle, by id when it predates handles. A lane
-    /// with no observation says why instead of leaving the pointer empty.
+    /// A lane cites the observation its verdict came from by its numbered
+    /// address, whether or not the row ever had a public handle. A lane with no
+    /// observation says why instead of leaving the pointer empty.
     #[tokio::test(flavor = "current_thread")]
     async fn each_lane_cites_its_observation_or_says_why_it_has_none() {
         let db = migrated_db().await;
@@ -4253,14 +4281,14 @@ mod tests {
             lane_observation(&db, Some("obs-red"), "failed").await,
             LaneObservation::Cited {
                 id: "obs-red".to_string(),
-                uri: Some("cairn://p/proj/check-observations/e884003b".to_string()),
+                uri: Some("cairn://p/proj/check-observations/1".to_string()),
             }
         );
         assert_eq!(
             lane_observation(&db, Some("obs-old"), "passed").await,
             LaneObservation::Cited {
                 id: "obs-old".to_string(),
-                uri: None,
+                uri: Some("cairn://p/proj/check-observations/2".to_string()),
             }
         );
         assert_eq!(
@@ -4303,7 +4331,7 @@ mod tests {
             render_resolution_provenance(&attribution_with(snapshot), &ProvenanceLinks::default());
         assert!(
             rendered.contains(
-                "| rust-tests | failed (120 passed, 3 failed) | `feedfacecafe` | cairn://p/proj/check-observations/e884003b |"
+                "| rust-tests | failed (120 passed, 3 failed) | `feedfacecafe` | cairn://p/proj/check-observations/1 |"
             ),
             "{rendered}"
         );

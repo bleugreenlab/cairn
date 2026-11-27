@@ -57,14 +57,79 @@ pub fn build_db_row_uri(db_root: &str, table: &str, pk: &str) -> String {
     )
 }
 
-pub fn build_project_check_observation_uri(project: &str, handle: &str) -> String {
-    format!("{}/check-observations/{handle}", build_project_uri(project))
+/// Whether a path segment is a storage id: a UUID (8-4-4-4-12 hex) or a run of
+/// sixteen or more hex characters. No canonical address renders one (cairn/3143,
+/// `docs/agent-facing-identifiers.md`): a resource whose segment would
+/// otherwise be a storage id declares a short handle instead. Legacy links
+/// still carry them, so parsing accepts them and labels shorten them.
+pub fn is_storage_id_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let uuid = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        });
+    let mut run = 0usize;
+    let long_hex = bytes.iter().any(|byte| {
+        run = if byte.is_ascii_hexdigit() { run + 1 } else { 0 };
+        run >= 16
+    });
+    uuid || long_hex
 }
 
-pub fn build_project_check_request_uri(project: &str, id: &str) -> String {
-    format!("{}/check-requests/{id}", build_project_uri(project))
+/// One check ledger row: `cairn://p/{project}/check-observations/{n}`, by the
+/// number it took within its project when it was recorded.
+pub fn build_project_check_observation_uri(project: &str, number: u64) -> String {
+    check_observation_path(project, number)
 }
 
+// One path function per numbered shape, shared by its typed builder (which
+// takes the number) and `to_uri` (which renders whatever segment it parsed).
+fn check_observation_path(project: &str, segment: impl std::fmt::Display) -> String {
+    format!(
+        "{}/check-observations/{segment}",
+        build_project_uri(project)
+    )
+}
+
+fn check_request_path(project: &str, segment: impl std::fmt::Display) -> String {
+    format!("{}/check-requests/{segment}", build_project_uri(project))
+}
+
+fn message_path(project: &str, segment: impl std::fmt::Display) -> String {
+    format!("{}/{segment}", build_project_messages_uri(project))
+}
+
+fn operator_message_path(segment: impl std::fmt::Display) -> String {
+    format!("cairn://operator/messages/{segment}")
+}
+
+fn request_path(segment: impl std::fmt::Display) -> String {
+    format!("cairn://requests/{segment}")
+}
+
+fn task_batch_path(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+    segment: impl std::fmt::Display,
+) -> String {
+    format!(
+        "{}/{segment}",
+        build_task_batches_uri(project, number, exec_seq, node_id, task_name)
+    )
+}
+
+/// One check request: `cairn://p/{project}/check-requests/{n}`, by the number
+/// it took within its project when it was filed.
+pub fn build_project_check_request_uri(project: &str, number: u64) -> String {
+    check_request_path(project, number)
+}
+
+/// One run batch's lifecycle, looked up by any id it was called by. An input
+/// address: a batch is cited at its numbered `batches/{n}` handle.
 pub fn build_project_request_uri(project: &str, id: &str) -> String {
     format!("{}/requests/{id}", build_project_uri(project))
 }
@@ -264,9 +329,20 @@ pub fn build_project_messages_uri(project: &str) -> String {
     format!("{}/messages", build_project_uri(project))
 }
 
-/// One stored message: `cairn://p/{project}/messages/{id}`.
-pub fn build_message_uri(project: &str, id: &str) -> String {
-    format!("{}/{id}", build_project_messages_uri(project))
+/// One stored message: `cairn://p/{project}/messages/{n}`, by the number it
+/// took in the database that holds the project's messages.
+pub fn build_message_uri(project: &str, number: u64) -> String {
+    message_path(project, number)
+}
+
+/// One message to the operator: `cairn://operator/messages/{n}`.
+pub fn build_operator_message_uri(number: u64) -> String {
+    operator_message_path(number)
+}
+
+/// One operator request: `cairn://requests/{n}`.
+pub fn build_request_uri(number: u64) -> String {
+    request_path(number)
 }
 
 pub fn build_issue_messages_uri(project: &str, number: i32) -> String {
@@ -651,14 +727,23 @@ pub fn build_node_batches_uri(project: &str, number: i32, exec_seq: i32, node_id
     build_node_subresource_uri(project, number, exec_seq, node_id, "batches")
 }
 
+/// One run batch: `.../batches/{n}`, by the number it took within the node's
+/// job when it was called.
 pub fn build_node_batch_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
     node_id: &str,
-    request_id: &str,
+    batch: u64,
 ) -> String {
-    build_node_segmented_resource_uri(project, number, exec_seq, node_id, "batches", request_id)
+    build_node_segmented_resource_uri(
+        project,
+        number,
+        exec_seq,
+        node_id,
+        "batches",
+        &batch.to_string(),
+    )
 }
 
 pub fn build_task_batches_uri(
@@ -671,19 +756,17 @@ pub fn build_task_batches_uri(
     build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "batches")
 }
 
+/// One run batch: `.../task/{task}/batches/{n}`, by the number it took within
+/// the task's job when it was called.
 pub fn build_task_batch_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
     node_id: &str,
     task_name: &str,
-    request_id: &str,
+    batch: u64,
 ) -> String {
-    format!(
-        "{}/{}",
-        build_task_batches_uri(project, number, exec_seq, node_id, task_name),
-        request_id
-    )
+    task_batch_path(project, number, exec_seq, node_id, task_name, batch)
 }
 
 pub fn build_task_checks_uri(
@@ -1293,12 +1376,12 @@ impl CairnResource {
             Self::ProjectVcsAncestry { project } => build_project_vcs_uri(project, "ancestry"),
             Self::ProjectVcsLog { project } => build_project_vcs_uri(project, "log"),
             Self::ProjectVcsBlame { project } => build_project_vcs_uri(project, "blame"),
+            // A parsed address renders the segment it was given; a minted one
+            // goes through the typed builders, which take the number.
             Self::ProjectCheckObservation { project, handle } => {
-                build_project_check_observation_uri(project, handle)
+                check_observation_path(project, handle)
             }
-            Self::ProjectCheckRequest { project, id } => {
-                build_project_check_request_uri(project, id)
-            }
+            Self::ProjectCheckRequest { project, id } => check_request_path(project, id),
             Self::ProjectRequest { project, id } => build_project_request_uri(project, id),
             Self::ProjectImages { project, scope } => build_project_images_uri(project, scope),
             Self::ProjectImage { project, reference } => {
@@ -1589,7 +1672,9 @@ impl CairnResource {
                 exec_seq,
                 node_id,
                 request_id,
-            } => build_node_batch_uri(project, *number, *exec_seq, node_id, request_id),
+            } => build_node_segmented_resource_uri(
+                project, *number, *exec_seq, node_id, "batches", request_id,
+            ),
             Self::TaskBatches {
                 project,
                 number,
@@ -1604,7 +1689,7 @@ impl CairnResource {
                 node_id,
                 task_name,
                 request_id,
-            } => build_task_batch_uri(project, *number, *exec_seq, node_id, task_name, request_id),
+            } => task_batch_path(project, *number, *exec_seq, node_id, task_name, request_id),
             Self::TaskChecks {
                 project,
                 number,
@@ -1697,7 +1782,7 @@ impl CairnResource {
                 task_name,
             } => build_task_messages_uri(project, *number, *exec_seq, node_id, task_name),
             Self::ProjectMessages { project } => build_project_messages_uri(project),
-            Self::ProjectMessage { project, id } => build_message_uri(project, id),
+            Self::ProjectMessage { project, id } => message_path(project, id),
             Self::IssueMessages { project, number } => build_issue_messages_uri(project, *number),
             Self::Changed { project, number } => build_issue_changed_uri(project, *number),
             Self::IssueExecutions { project, number } => {
@@ -1763,10 +1848,10 @@ impl CairnResource {
             }
             Self::ProjectEventFeedback { project } => build_project_event_feedback_uri(project),
             Self::Operator => "cairn://operator".to_string(),
-            Self::OperatorMessage { id } => format!("cairn://operator/messages/{id}"),
+            Self::OperatorMessage { id } => operator_message_path(id),
             Self::Executors => "cairn://executors".to_string(),
             Self::Requests => "cairn://requests".to_string(),
-            Self::Request { id } => format!("cairn://requests/{id}"),
+            Self::Request { id } => request_path(id),
             Self::Grants => "cairn://grants".to_string(),
             Self::Grant { id } => format!("cairn://grants/{id}"),
             Self::Models => "cairn://models".to_string(),

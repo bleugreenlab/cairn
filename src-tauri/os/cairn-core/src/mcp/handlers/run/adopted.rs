@@ -437,8 +437,12 @@ pub(crate) async fn adopt(orch: &Orchestrator, result: UnboundResult) -> Adoptio
 /// What a result that arrives for a lost batch reports: its verdict as the
 /// batch's own settlement would state it, and the commit it sealed.
 fn late_report_of(result: &UnboundResult) -> detached::LateReport {
-    let (_, verdict) =
-        super::compose_adopted_result(&result.request_id, &result.outcome, &result.machine, None);
+    let (_, verdict) = super::compose_adopted_result(
+        &detached::handle_uri(&result.request_id),
+        &result.outcome,
+        &result.machine,
+        None,
+    );
     let commit = match &result.outcome {
         CellOutcome::Completed {
             mutation_delta: Some(delta),
@@ -671,11 +675,12 @@ async fn settle(
     let claim = read_claim(db, &row.request_id)
         .await
         .map_err(Interrupted::Retry)?;
+    let handle = detached::handle_for(orch, &row.request_id).await;
     let Some(claim) = claim else {
         // Settled by another path while this was adopted (an operator stop, a
         // compaction): compose it for the record, deliver it to nothing.
         return Ok(super::compose_adopted_result(
-            &row.request_id,
+            &handle,
             &outcome,
             &row.machine,
             None,
@@ -686,7 +691,7 @@ async fn settle(
             "its durable record predates what Cairn needs to publish it after a restart",
         );
         return Ok(super::compose_adopted_result(
-            &row.request_id,
+            &handle,
             &outcome,
             &row.machine,
             unpublished,
@@ -695,7 +700,7 @@ async fn settle(
     if settlement.commits() {
         if let Err(reason) = recover_delta(orch, settlement, row, &mut outcome).await? {
             return Ok(super::compose_adopted_result(
-                &row.request_id,
+                &handle,
                 &outcome,
                 &row.machine,
                 Some(&reason),
@@ -847,19 +852,18 @@ pub(crate) async fn deliver_batch_result(
 }
 
 /// What a host batch's call is told after a restart: it ran inside Cairn.
-pub(crate) fn host_restart_text(request_id: &str) -> String {
-    let lifecycle = crate::resources::request_lifecycle::relative_lifecycle_uri(request_id);
+/// Each restart text takes the batch's `batches/{n}` handle.
+pub(crate) fn host_restart_text(handle: &str) -> String {
     format!(
-        "Cairn restarted while this batch was running inside Cairn itself, and the batch ended with it (request {request_id}). Nothing of it survives; re-run it if the work still matters. Lifecycle: `{lifecycle}`."
+        "Cairn restarted while this batch was running inside Cairn itself, and the batch ended with it. Nothing of it survives; re-run it if the work still matters. Lifecycle: `{handle}`."
     )
 }
 
 /// What a batch on the colocated executor is told after a restart: that
 /// executor stops with Cairn (tenet 316).
-pub(crate) fn local_restart_text(request_id: &str, commits: bool) -> String {
-    let lifecycle = crate::resources::request_lifecycle::relative_lifecycle_uri(request_id);
+pub(crate) fn local_restart_text(handle: &str, commits: bool) -> String {
     format!(
-        "Cairn restarted while this batch was running on `local`, this machine's own executor, which stops with Cairn (request {request_id}). Its result did not survive.{} Lifecycle: `{lifecycle}`.",
+        "Cairn restarted while this batch was running on `local`, this machine's own executor, which stops with Cairn. Its result did not survive.{} Lifecycle: `{handle}`.",
         if commits {
             " It carried a commit_msg; read `cairn:@/vcs/log?limit=5` before re-running it."
         } else {
@@ -870,8 +874,7 @@ pub(crate) fn local_restart_text(request_id: &str, commits: bool) -> String {
 
 /// What a batch no reporting machine holds is told. `placed_on` is the
 /// machine that claimed it, when one is known: its report alone decided.
-pub(crate) fn lost_text(request_id: &str, placed_on: Option<&PlacedOn>, commits: bool) -> String {
-    let lifecycle = crate::resources::request_lifecycle::relative_lifecycle_uri(request_id);
+pub(crate) fn lost_text(handle: &str, placed_on: Option<&PlacedOn>, commits: bool) -> String {
     let (who, placed) = match placed_on {
         Some(placed) => (
             "the machine it was placed on has",
@@ -880,7 +883,7 @@ pub(crate) fn lost_text(request_id: &str, placed_on: Option<&PlacedOn>, commits:
         None => ("every machine has", String::new()),
     };
     format!(
-        "Cairn restarted while this batch was running, and {who} reported since without holding or having finished it (request {request_id}).{placed} Its outcome is unknown.{} Lifecycle: `{lifecycle}`.",
+        "Cairn restarted while this batch was running, and {who} reported since without holding or having finished it.{placed} Its outcome is unknown.{} Lifecycle: `{handle}`.",
         if commits {
             " It carried a commit_msg; read `cairn:@/vcs/log?limit=5` before re-running it."
         } else {
@@ -892,17 +895,15 @@ pub(crate) fn lost_text(request_id: &str, placed_on: Option<&PlacedOn>, commits:
 /// What a parked call is told when it is released because a machine that
 /// could hold its batch has not reported within [`RELEASE_AFTER`] of this
 /// process's start.
-pub(crate) fn release_text(request_id: &str, machines: &[String], commits: bool) -> String {
-    let lifecycle = crate::resources::request_lifecycle::relative_lifecycle_uri(request_id);
+pub(crate) fn release_text(handle: &str, machines: &[String], commits: bool) -> String {
     let away = match machines {
         [] => "a machine has not reported".to_string(),
         [one] => format!("{one} has not reported"),
         many => format!("{} have not reported", many.join(", ")),
     };
     format!(
-        "Cairn restarted while this batch was running, and {away} in the {} minutes since. Nothing was cancelled: when it does, the batch's result settles `{}`{}, and reaches this job as a notice. Do not re-run it. Lifecycle: `{lifecycle}`.",
+        "Cairn restarted while this batch was running, and {away} in the {} minutes since. Nothing was cancelled: when it does, the batch's result settles `{handle}`{}, and reaches this job as a notice. Do not re-run it. That handle reads its whole lifecycle.",
         RELEASE_AFTER.as_secs() / 60,
-        detached::handle_uri(request_id),
         if commits {
             " and its commit is published there"
         } else {
@@ -1084,15 +1085,9 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
                 }
             }
             claimed.insert(request_id.clone());
+            let handle = detached::handle_for(orch, request_id).await;
             if *host {
-                resolve_wait(
-                    orch,
-                    &db,
-                    &record,
-                    request_id,
-                    &host_restart_text(request_id),
-                )
-                .await;
+                resolve_wait(orch, &db, &record, request_id, &host_restart_text(&handle)).await;
                 continue;
             }
             match has_open_adoption(&db, request_id).await {
@@ -1112,7 +1107,7 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
                     &db,
                     &record,
                     request_id,
-                    &local_restart_text(request_id, *commits),
+                    &local_restart_text(&handle, *commits),
                 )
                 .await;
                 continue;
@@ -1152,7 +1147,7 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
                         &db,
                         &record,
                         request_id,
-                        &lost_text(request_id, placed_on.as_ref(), *commits),
+                        &lost_text(&handle, placed_on.as_ref(), *commits),
                     )
                     .await;
                 }
@@ -1161,7 +1156,7 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
                         orch,
                         &db,
                         &record,
-                        &release_text(request_id, &awaiting, *commits),
+                        &release_text(&handle, &awaiting, *commits),
                     )
                     .await;
                 }
@@ -1374,6 +1369,7 @@ mod parked_cancel_tests {
                 settlement: Some(PersistedSettlement::for_test(None, None, None)),
                 waiting_on: None,
                 late_report: None,
+                number: None,
             },
         )
         .await
@@ -1599,15 +1595,17 @@ mod lifecycle_link_tests {
         };
         for commits in [false, true] {
             for machines in [vec![], vec!["one".into()], vec!["one".into(), "two".into()]] {
+                let handle = "cairn:~/batches/4";
                 let answers = [
-                    host_restart_text("restart-link"),
-                    local_restart_text("restart-link", commits),
-                    lost_text("restart-link", None, commits),
-                    lost_text("restart-link", Some(&placed), commits),
-                    release_text("restart-link", &machines, commits),
+                    host_restart_text(handle),
+                    local_restart_text(handle, commits),
+                    lost_text(handle, None, commits),
+                    lost_text(handle, Some(&placed), commits),
+                    release_text(handle, &machines, commits),
                 ];
                 for text in answers {
-                    assert!(text.contains("`cairn:@/requests/restart-link`"), "{text}");
+                    assert!(text.contains("`cairn:~/batches/4`"), "{text}");
+                    assert!(!text.contains("request"), "{text}");
                 }
             }
         }

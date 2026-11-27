@@ -2158,10 +2158,9 @@ where
         let entry = reused.entry;
         let source_observation = reused.source_observation_id;
         let source_environment_fingerprint = reused.environment_fingerprint;
-        let public_handle = reused.public_handle;
         let recorded = crate::execution::cache::RecordedCheckObservation {
             id: source_observation.clone(),
-            public_handle,
+            number: reused.number,
             ran_at: entry.ran_at,
             environment_fingerprint: source_environment_fingerprint.clone(),
             executor_id: entry.executor_id.clone(),
@@ -2788,10 +2787,10 @@ where
                         let recording = loop {
                             let existing = match &request_identity {
                             Some(_) => db.query_opt(
-                                "SELECT id, public_handle, ran_at, environment_fingerprint, executor_id, reusable FROM check_result_observations WHERE id=?1 AND project_id=?2 AND commit_sha=?3 AND check_name=?4 AND input_hash=?5",
+                                "SELECT id, number, ran_at, environment_fingerprint, executor_id, reusable FROM check_result_observations WHERE id=?1 AND project_id=?2 AND commit_sha=?3 AND check_name=?4 AND input_hash=?5",
                                 cairn_db::turso::params![observation.id.clone(), project_id, observation.commit_sha.as_str(), plan.name.as_str(), input_hash.as_str()],
                                 |row| Ok(crate::execution::cache::RecordedCheckObservation {
-                                    id: row.text(0)?, public_handle: row.text(1)?, ran_at: row.i64(2)?,
+                                    id: row.text(0)?, number: u64::try_from(row.i64(1)?).unwrap_or_default(), ran_at: row.i64(2)?,
                                     environment_fingerprint: row.text(3)?, executor_id: row.opt_text(4)?,
                                     reusable: row.i64(5)? != 0,
                                 }),
@@ -2800,7 +2799,8 @@ where
                         };
                             let identity = crate::execution::cache::RecordedCheckObservation {
                                 id: observation.id.clone(),
-                                public_handle: observation.public_handle.clone(),
+                                // Stamped by the insert; read back once it lands.
+                                number: 0,
                                 ran_at: observation.ran_at,
                                 environment_fingerprint: observation
                                     .environment_fingerprint
@@ -2810,8 +2810,20 @@ where
                             };
                             let attempt = match existing {
                                 Ok(Some(existing)) => Ok(existing),
-                                Ok(None) => record_observation(db.clone(), observation.clone())
-                                    .map(|()| identity),
+                                Ok(None) => match record_observation(db.clone(), observation.clone()) {
+                                    Ok(()) => cairn_db::storage::address_numbers::number_of(
+                                        &db,
+                                        cairn_db::storage::address_numbers::Numbered::CheckObservation,
+                                        None,
+                                        &observation.id,
+                                    )
+                                    .await
+                                    .map(|number| crate::execution::cache::RecordedCheckObservation {
+                                        number: number.unwrap_or_default(),
+                                        ..identity
+                                    }),
+                                    Err(error) => Err(error),
+                                },
                                 Err(error) => Err(error),
                             };
                             if let Err(error) = &attempt {

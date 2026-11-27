@@ -17,7 +17,8 @@ pub(crate) struct RunningAttribution {
     pub project: Option<String>,
     pub commit: Option<String>,
     pub suites: Vec<String>,
-    pub handles: Vec<String>,
+    /// The open check requests waiting on the lane, by number.
+    pub handles: Vec<u64>,
 }
 
 impl RunningAttribution {
@@ -36,7 +37,7 @@ impl RunningAttribution {
             parts.extend(self.handles.iter().map(|handle| {
                 format!(
                     "check [{handle}]({})",
-                    requests::request_uri(project, handle)
+                    requests::request_uri(project, *handle)
                 )
             }));
         }
@@ -156,7 +157,7 @@ pub(crate) async fn running_attributions(
                                 if attribution.owner.is_none() {
                                     attribution.owner = Some(row.requester_ref);
                                 }
-                                attribution.handles.push(row.id);
+                                attribution.handles.push(row.number);
                             }
                             Ok(_) => {}
                             Err(error) => log::warn!("executor attribution: {error}"),
@@ -258,7 +259,8 @@ mod tests {
             let row = &map[&("request".into(), "attempt".into())];
             assert_eq!(row.owner.as_deref(), Some("cairn://p/proj/7/1/builder"));
             assert_eq!(row.commit.as_deref(), Some("aaaaaaaaaaaa1111"));
-            assert_eq!(row.handles, ["handle-a", "handle-b"]);
+            // Numbered in the order they were filed.
+            assert_eq!(row.handles, [1, 2]);
             let diagnostic =
                 "running on [fedora](cairn://executors/fedora), slot-43 since 09:01:00Z";
             orch.db
@@ -277,10 +279,7 @@ mod tests {
                 .await
                 .unwrap();
             let map = running_attributions(&orch, &executor).await;
-            assert_eq!(
-                map[&("request".into(), "attempt".into())].handles,
-                ["handle-b"]
-            );
+            assert_eq!(map[&("request".into(), "attempt".into())].handles, [2]);
             orch.db
                 .local
                 .execute(

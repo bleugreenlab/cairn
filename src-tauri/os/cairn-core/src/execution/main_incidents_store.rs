@@ -1499,7 +1499,7 @@ pub(crate) async fn source_health(
     let examples = if stuck > 0 {
         db.query_all(
             "SELECT s.event_key,s.observation_id,s.attempts,s.created_at,s.error,
-                    o.public_handle,p.key
+                    o.number,p.key
                FROM main_incident_sources s
                LEFT JOIN check_result_observations o ON o.id=s.observation_id
                LEFT JOIN projects p ON p.id=s.project_id
@@ -1516,16 +1516,14 @@ pub(crate) async fn source_health(
             move |r| {
                 let error = r.opt_text(4)?.unwrap_or_else(|| "pending delivery".into());
                 let error: String = error.chars().take(200).collect();
-                // The observation is cited by an address that opens: its
-                // permalink handle, or for a row recorded before handles its
-                // row id, which the check-observations read also resolves.
-                let observation = match (r.opt_text(1)?, r.opt_text(5)?, r.opt_text(6)?) {
+                // The observation is cited by its number.
+                let observation = match (r.opt_text(1)?, r.opt_i64(5)?, r.opt_text(6)?) {
                     (None, ..) => "none (row-less attempt)".to_string(),
-                    (Some(id), handle, Some(key)) => format!(
-                        "cairn://p/{key}/check-observations/{}",
-                        handle.unwrap_or(id)
-                    ),
-                    (Some(id), _, None) => format!("`{id}`"),
+                    (Some(_), Some(number), Some(key)) => {
+                        cairn_uri::build_project_check_observation_uri(&key, number as u64)
+                    }
+                    (Some(_), Some(number), None) => format!("number {number}"),
+                    (Some(_), None, _) => "none (unnumbered)".to_string(),
                 };
                 Ok(format!(
                     "source `{}`; held observation {observation}; attempts {}; age {}s; reason: {}",

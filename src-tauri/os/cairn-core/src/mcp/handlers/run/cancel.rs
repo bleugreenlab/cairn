@@ -75,9 +75,10 @@ pub(crate) enum CancelReport {
 }
 
 impl CancelReport {
-    /// The cancel's answer, for the principal that asked.
+    /// The cancel's answer, for the principal that asked. `request_id` is the
+    /// batch as the reply names it: its number within its job.
     pub(crate) fn sentence(&self, request_id: &str) -> String {
-        let lifecycle = crate::resources::request_lifecycle::relative_lifecycle_uri(request_id);
+        let lifecycle = detached::handle_uri(request_id);
         let sentence = match self {
             Self::Stopped { settled: true } => format!(
                 "Cancelled run batch `{request_id}`: it settled as cancelled and committed nothing, and its machine work has ended, so it no longer holds its branch. A call waiting on it resumes once with that result; a detached batch's result reaches its job as a notice."
@@ -333,7 +334,7 @@ async fn cancel_unheld(
             db,
             &record,
             request_id,
-            &unheld_cancel_text(request_id, by, commits),
+            &unheld_cancel_text(&detached::handle_for(orch, request_id).await, by, commits),
         )
         .await;
     }
@@ -382,12 +383,8 @@ async fn convert_wait(
 
 /// What a parked call waiting on a batch nothing held is told when the batch
 /// is cancelled.
-pub(crate) fn unheld_cancel_text(request_id: &str, by: &str, commits: bool) -> String {
-    format!(
-        "{}\n\nLifecycle: `{}`.",
-        detached::lost_text_for_wait(request_id, &detached::cancel_evidence(by), commits),
-        crate::resources::request_lifecycle::relative_lifecycle_uri(request_id),
-    )
+pub(crate) fn unheld_cancel_text(handle: &str, by: &str, commits: bool) -> String {
+    detached::lost_text_for_wait(handle, &detached::cancel_evidence(by), commits)
 }
 
 /// Whether a settled verdict is a cancellation's (or a stop before any
@@ -485,11 +482,23 @@ pub(crate) async fn settle_owned_batches(
             }
             _ => SettlementOutcome::CleanupPending,
         };
+        let segment = detached::batch_segment(
+            cairn_db::storage::address_numbers::number_of(
+                db,
+                cairn_db::storage::address_numbers::Numbered::RunBatch,
+                None,
+                &id,
+            )
+            .await
+            .ok()
+            .flatten(),
+            &id,
+        );
         let diagnostic =
-            (outcome == SettlementOutcome::CleanupPending).then(|| report.sentence(&id));
+            (outcome == SettlementOutcome::CleanupPending).then(|| report.sentence(&segment));
         reports.push(SettlementResource {
             uri: home
-                .map(|home| format!("{home}/batches/{id}"))
+                .map(|home| format!("{home}/batches/{segment}"))
                 .unwrap_or_else(|| fallback_uri.into()),
             outcome,
             diagnostic,
@@ -521,13 +530,13 @@ mod lifecycle_link_tests {
         for report in reports {
             let text = report.sentence("cancel-link");
             assert!(
-                text.contains("`cairn:@/requests/cancel-link`"),
+                text.ends_with("Lifecycle: `cairn:~/batches/cancel-link`."),
                 "{report:?}: {text}"
             );
         }
         for commits in [false, true] {
-            let text = unheld_cancel_text("unheld-link", "operator", commits);
-            assert!(text.contains("`cairn:@/requests/unheld-link`"), "{text}");
+            let text = unheld_cancel_text("cairn:~/batches/7", "operator", commits);
+            assert!(text.ends_with("Lifecycle: `cairn:~/batches/7`."), "{text}");
         }
     }
 }

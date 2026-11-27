@@ -362,7 +362,9 @@ impl CheckResultIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RecordedCheckObservation {
     pub id: String,
-    pub public_handle: String,
+    /// The number the row took within its project: its citation,
+    /// `check-observations/{number}`.
+    pub number: u64,
     /// When the source observation actually ran (Unix milliseconds). Cached aliases
     /// carry the source instant so every citation describes the same evidence.
     pub ran_at: i64,
@@ -2308,9 +2310,9 @@ pub(crate) struct CheckResultObservationProjection {
     /// accounting the page reconciles against `persisted_counts`. Carries no
     /// per-test rows. `None` for a run that produced no parse.
     pub verdict_result: Option<crate::execution::check_parsers::ParsedCheckResult>,
-    /// The source observation's permalink handle, so a reused verdict cites the
-    /// execution it came from. `None` on rows recorded before handles existed.
-    pub public_handle: Option<String>,
+    /// The source observation's number, so a reused verdict cites the execution
+    /// it came from at `check-observations/{number}`.
+    pub number: Option<u64>,
     /// The source observation's plan audit; `None` for a lane that carries none.
     pub plan_audit_state: Option<String>,
     pub plan_audit_note: Option<String>,
@@ -3375,7 +3377,7 @@ pub(crate) fn get_check_result_observation(
                             o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                             o.output_tail,a.defined_by_commit_sha,o.defined_by_commit_sha,
                             o.verdict_platform,o.verdict_arch,o.selection,o.deferred_count,
-                            {OBSERVATION_PHASE_COLUMNS},o.verdict_result_json,o.public_handle,
+                            {OBSERVATION_PHASE_COLUMNS},o.verdict_result_json,o.number,
                             o.plan_audit_state,o.plan_audit_note,o.nested_sandbox_lane
                        FROM check_result_commit_aliases a
                        JOIN check_result_observations o ON o.id=a.source_observation_id
@@ -3417,7 +3419,7 @@ pub(crate) fn get_check_result_observation(
                     nested_sandbox_lane: row.opt_text(57)?, tests: Vec::new(),
                     persisted_counts: observation_test_totals(conn, &observation_id).await?,
                     verdict_result: compact_result(row.opt_text(53)?),
-                    public_handle: row.opt_text(54)?,
+                    number: row.opt_i64(54)?.and_then(|n| u64::try_from(n).ok()),
                     plan_audit_state: row.opt_text(55)?, plan_audit_note: row.opt_text(56)?,
                     audit_findings, audit_reported,
                     test_total: 0, test_offset: offset,
@@ -3466,7 +3468,7 @@ fn observation_row_sql(source: &str) -> String {
                 o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                 o.output_tail,o.defined_by_commit_sha,o.verdict_platform,o.verdict_arch,
                 o.selection,o.deferred_count,{OBSERVATION_PHASE_COLUMNS},o.verdict_result_json,
-                o.plan_audit_state,o.plan_audit_note,o.nested_sandbox_lane,o.public_handle
+                o.plan_audit_state,o.plan_audit_note,o.nested_sandbox_lane,o.number
            FROM {source}"
     )
 }
@@ -3563,7 +3565,7 @@ fn load_observation_row(
                     tests: Vec::new(),
                     persisted_counts: observation_test_totals(conn, &id).await?,
                     verdict_result: compact_result(row.opt_text(48)?),
-                    public_handle: row.opt_text(52)?,
+                    number: row.opt_i64(52)?.and_then(|n| u64::try_from(n).ok()),
                     plan_audit_state: row.opt_text(49)?,
                     plan_audit_note: row.opt_text(50)?,
                     audit_findings,
@@ -3586,21 +3588,21 @@ fn load_observation_row(
     })
 }
 
-/// The public handle a verdict citation names, read on a connection the caller
+/// The number a verdict citation names, read on a connection the caller
 /// already holds.
-pub(crate) async fn get_check_observation_public_handle_conn(
+pub(crate) async fn get_check_observation_number_conn(
     conn: &crate::storage::TrackedConnection,
     project_id: &str,
     observation_id: &str,
-) -> DbResult<Option<String>> {
+) -> DbResult<Option<u64>> {
     let mut rows = conn
         .query(
-            "SELECT public_handle FROM check_result_observations WHERE project_id=?1 AND id=?2",
+            "SELECT number FROM check_result_observations WHERE project_id=?1 AND id=?2",
             params![project_id, observation_id],
         )
         .await?;
     match rows.next().await? {
-        Some(row) => Ok(row.opt_text(0)?),
+        Some(row) => Ok(row.opt_i64(0)?.and_then(|n| u64::try_from(n).ok())),
         None => Ok(None),
     }
 }

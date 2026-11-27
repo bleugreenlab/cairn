@@ -889,7 +889,12 @@ impl GateFact for RequestFact {
         clause: &TriggerClause,
     ) -> DbResult<GateOutcome> {
         self.validate(clause).map_err(DbError::Row)?;
-        let id = request_id(clause).map_err(DbError::Row)?;
+        let Some(id) = gated_request(ctx, clause).await? else {
+            return Ok(request_evidence_outcome(
+                None,
+                clause_str(clause, "outcome") == Some("accepted"),
+            ));
+        };
         let evidence =
             cairn_db::storage::requests::request_gate_state(&ctx.orch().db.local, &id).await?;
         Ok(request_evidence_outcome(
@@ -905,11 +910,17 @@ impl GateFact for RequestFact {
     ) -> DbResult<Option<String>> {
         use cairn_common::requests::RequestState;
         self.validate(clause).map_err(DbError::Row)?;
-        let id = request_id(clause).map_err(DbError::Row)?;
+        let named = request_id(clause).map_err(DbError::Row)?;
+        let uri = cairn_uri::CairnResource::Request { id: named }.to_uri();
         // Propagate unreadable storage: an unavailable database is not a missing
         // request and must never permanently foreclose a live gate.
-        let evidence =
-            cairn_db::storage::requests::request_gate_state(&ctx.orch().db.local, &id).await?;
+        let id = gated_request(ctx, clause).await?;
+        let evidence = match &id {
+            Some(id) => {
+                cairn_db::storage::requests::request_gate_state(&ctx.orch().db.local, id).await?
+            }
+            None => None,
+        };
         let accepted = clause_str(clause, "outcome") == Some("accepted");
         if request_evidence_outcome(
             evidence.as_ref().map(|value| (value.state, value.accepted)),
@@ -919,13 +930,14 @@ impl GateFact for RequestFact {
             return Ok(None);
         }
         Ok(match evidence {
-            None => Some(format!("request cairn://requests/{id} no longer exists")),
+            None => Some(format!("request {uri} no longer exists")),
             Some(value)
                 if matches!(
                     value.state,
                     RequestState::Declined | RequestState::Withdrawn
                 ) =>
             {
+                let id = id.unwrap_or_default();
                 let report = cairn_db::storage::requests::get_request(&ctx.orch().db.local, &id)
                     .await?
                     .and_then(|request| request.report);
@@ -935,10 +947,10 @@ impl GateFact for RequestFact {
                     .and_then(Value::as_str);
                 Some(match reason {
                     Some(reason) => format!(
-                        "request cairn://requests/{id} was {}; recorded reason: {reason:?}",
+                        "request {uri} was {}; recorded reason: {reason:?}",
                         value.state.as_str()
                     ),
-                    None => format!("request cairn://requests/{id} was {}", value.state.as_str()),
+                    None => format!("request {uri} was {}", value.state.as_str()),
                 })
             }
             _ => None,
@@ -954,9 +966,27 @@ impl GateFact for RequestFact {
     }
 }
 
+/// The stored id of the request a gate names, by its number or, for a gate
+/// armed before requests were numbered, its storage id. `None` when it names
+/// no request.
+async fn gated_request(ctx: &GateContext<'_>, clause: &TriggerClause) -> DbResult<Option<String>> {
+    use cairn_db::storage::address_numbers::{resolve, Numbered};
+    let named = request_id(clause).map_err(DbError::Row)?;
+    Ok(resolve(
+        &ctx.orch().db.local,
+        Numbered::OperatorRequest,
+        None,
+        &named,
+    )
+    .await
+    .map_err(DbError::Row)?
+    .map(|resolved| resolved.id))
+}
+
 fn request_id(clause: &TriggerClause) -> Result<String, String> {
     let raw = clause_str(clause, "request")
         .ok_or_else(|| "request gate needs a canonical 'request' URI".to_string())?;
+    // `cairn://requests/<n>`; a gate armed before numbering names the storage id.
     match cairn_uri::parse_uri(raw) {
         Some(cairn_uri::CairnResource::Request { id })
             if raw == format!("cairn://requests/{id}") =>
@@ -964,7 +994,7 @@ fn request_id(clause: &TriggerClause) -> Result<String, String> {
             Ok(id)
         }
         _ => Err(
-            "request gate needs exactly cairn://requests/<id>, without a query, alias or selector"
+            "request gate needs exactly cairn://requests/<n>, without a query, alias or selector"
                 .into(),
         ),
     }

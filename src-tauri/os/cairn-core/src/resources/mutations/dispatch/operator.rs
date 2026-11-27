@@ -501,15 +501,26 @@ async fn answer(
         .map(str::trim)
         .filter(|content| !content.is_empty())
         .ok_or("payload.content is required and must be a non-empty string")?;
-    let uri = messages::message_uri(id);
-    let message = messages::get(&orch.db.local, id)
-        .await?
-        .ok_or_else(|| format!("{uri} names no message to the operator"))?;
+    let Some((message, legacy)) = messages::resolve(&orch.db.local, id).await? else {
+        return Err(format!(
+            "{} names no message to the operator",
+            CairnResource::OperatorMessage { id: id.to_string() }.to_uri()
+        ));
+    };
+    let adjusted: Vec<_> = legacy
+        .then(|| messages::legacy_line(id, &message))
+        .into_iter()
+        .collect();
+    let uri = message.uri();
+    let id = message.id.as_str();
     if message.answered_at.is_some() {
         return Err(format!("{uri} is already answered"));
     }
     if dry_run {
-        return Ok(format!("Would answer {uri} to {}.", message.sender_home));
+        return Ok(cairn_common::adjustment::with_summary(
+            format!("Would answer {uri} to {}.", message.sender_home),
+            &adjusted,
+        ));
     }
     if crate::operator::record_answered(
         orch,
@@ -542,9 +553,9 @@ async fn answer(
             log::warn!("answer to {uri} was delivered as {answer_ref}, but {error}");
         }
     }
-    Ok(format!(
-        "Answered {uri}; delivered to {}.",
-        message.sender_home
+    Ok(cairn_common::adjustment::with_summary(
+        format!("Answered {uri}; delivered to {}.", message.sender_home),
+        &adjusted,
     ))
 }
 
@@ -567,25 +578,38 @@ async fn mark_seen(
             "payload.seen must be true: a message is marked seen, never unseen".to_string(),
         );
     }
-    let uri = messages::message_uri(id);
-    if messages::get(&orch.db.local, id).await?.is_none() {
-        return Err(format!("{uri} names no message to the operator"));
-    }
+    let Some((message, legacy)) = messages::resolve(&orch.db.local, id).await? else {
+        return Err(format!(
+            "{} names no message to the operator",
+            CairnResource::OperatorMessage { id: id.to_string() }.to_uri()
+        ));
+    };
+    let adjusted: Vec<_> = legacy
+        .then(|| messages::legacy_line(id, &message))
+        .into_iter()
+        .collect();
+    let uri = message.uri();
     if dry_run {
-        return Ok(format!("Would mark {uri} seen in the app."));
+        return Ok(cairn_common::adjustment::with_summary(
+            format!("Would mark {uri} seen in the app."),
+            &adjusted,
+        ));
     }
     let moved = crate::operator::record_seen(
         orch,
-        MessageFilter::Ids(vec![id.to_string()]),
+        MessageFilter::Ids(vec![message.id.clone()]),
         SeenVia::App,
         chrono::Utc::now().timestamp(),
     )
     .await?;
-    Ok(if moved.is_empty() {
-        format!("{uri} was already seen; nothing changed.")
-    } else {
-        format!("Marked {uri} seen in the app.")
-    })
+    Ok(cairn_common::adjustment::with_summary(
+        if moved.is_empty() {
+            format!("{uri} was already seen; nothing changed.")
+        } else {
+            format!("Marked {uri} seen in the app.")
+        },
+        &adjusted,
+    ))
 }
 
 #[cfg(test)]
@@ -705,7 +729,28 @@ mod tests {
             .map_err(|failure| failure.error)
     }
 
-    /// The id a successful send reports.
+    /// The storage id of the message a send's numbered address names.
+    async fn stored_id(orch: &Orchestrator, number: &str) -> String {
+        cairn_db::storage::address_numbers::id_for_number(
+            &orch.db.local,
+            cairn_db::storage::address_numbers::Numbered::OperatorMessage,
+            None,
+            number.parse().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn stored_uri(orch: &Orchestrator, id: &str) -> String {
+        messages::get(&orch.db.local, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .uri()
+    }
+
+    /// The number a successful send reports in its address.
     fn sent_id(summary: &str) -> String {
         summary
             .split("cairn://operator/messages/")
@@ -788,15 +833,19 @@ mod tests {
     #[tokio::test]
     async fn an_app_message_is_in_the_app_only_and_waits_only_with_a_default() {
         let orch = orchestrator("app").await;
-        let plain = sent_id(
-            &send(
-                &orch,
-                Some("r-live"),
-                serde_json::json!({"content": "FYI", "via": "cairn://channels/app"}),
-            )
-            .await
-            .unwrap(),
-        );
+        let plain = stored_id(
+            &orch,
+            &sent_id(
+                &send(
+                    &orch,
+                    Some("r-live"),
+                    serde_json::json!({"content": "FYI", "via": "cairn://channels/app"}),
+                )
+                .await
+                .unwrap(),
+            ),
+        )
+        .await;
         let body =
             crate::resources::operator::render_message(&orch, &request(Some("r-live")), &plain)
                 .await;
@@ -804,19 +853,23 @@ mod tests {
         assert!(entries(&orch).await.is_empty());
         assert_eq!(outbound_rows(&orch).await, 0);
 
-        let waiting = sent_id(
-            &send(
-                &orch,
-                Some("r-live"),
-                serde_json::json!({
-                    "content": "Rename the crate?",
-                    "via": "cairn://channels/app",
-                    "default": "Assuming yes, I rename it Friday"
-                }),
-            )
-            .await
-            .unwrap(),
-        );
+        let waiting = stored_id(
+            &orch,
+            &sent_id(
+                &send(
+                    &orch,
+                    Some("r-live"),
+                    serde_json::json!({
+                        "content": "Rename the crate?",
+                        "via": "cairn://channels/app",
+                        "default": "Assuming yes, I rename it Friday"
+                    }),
+                )
+                .await
+                .unwrap(),
+            ),
+        )
+        .await;
         let open = entries(&orch).await;
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].key, format!("operator_message:{waiting}"));
@@ -824,7 +877,7 @@ mod tests {
         assert_eq!(
             open[0].action,
             Some(crate::notifications::NotificationAction::Reply {
-                message: messages::message_uri(&waiting),
+                message: stored_uri(&orch, &waiting).await,
                 default_text: "Assuming yes, I rename it Friday".to_string(),
             })
         );
@@ -907,7 +960,9 @@ mod tests {
     #[tokio::test]
     async fn a_new_headline_is_linked_and_the_cursor_passing_it_sees_the_message() {
         let orch = orchestrator("cursor").await;
-        let id = sent_id(
+        let id = stored_id(
+        &orch,
+        &sent_id(
             &send(
                 &orch,
                 Some("r-live"),
@@ -920,7 +975,9 @@ mod tests {
             )
             .await
             .unwrap(),
-        );
+        ),
+    )
+    .await;
         let message = messages::get(&orch.db.local, &id).await.unwrap().unwrap();
         assert_eq!(
             message.headline.as_deref(),
@@ -977,7 +1034,7 @@ mod tests {
             .unwrap()
             .expect("one passive notice to the sender");
         assert!(
-            content.contains(&messages::message_uri(&id)) && content.contains("I merge at 5pm"),
+            content.contains(&stored_uri(&orch, &id).await) && content.contains("I merge at 5pm"),
             "{content}"
         );
         assert!(crate::operator::messages::cursor_moved(
@@ -996,7 +1053,9 @@ mod tests {
     #[tokio::test]
     async fn a_read_receipt_sees_the_message() {
         let orch = orchestrator("receipt").await;
-        let id = sent_id(
+        let id = stored_id(
+        &orch,
+        &sent_id(
             &send(
                 &orch,
                 Some("r-live"),
@@ -1004,7 +1063,9 @@ mod tests {
             )
             .await
             .unwrap(),
-        );
+        ),
+    )
+    .await;
         const GUID: &str = "8F0D3C55-2E3B-4E7B-9C61-0F6A1B2C3D4E";
         orch.db
             .local
@@ -1053,7 +1114,9 @@ mod tests {
     #[tokio::test]
     async fn the_operator_opens_and_answers_through_the_door() {
         let orch = orchestrator("door").await;
-        let id = sent_id(
+        let id = stored_id(
+        &orch,
+        &sent_id(
             &send(
                 &orch,
                 Some("r-live"),
@@ -1061,8 +1124,10 @@ mod tests {
             )
             .await
             .unwrap(),
-        );
-        let uri = messages::message_uri(&id);
+        ),
+    )
+    .await;
+        let uri = stored_uri(&orch, &id).await;
         crate::resources::operator::render_message(&orch, &request(Some("r-live")), &id).await;
         assert_eq!(
             state_of(&orch, &id).await,
@@ -1129,7 +1194,9 @@ mod tests {
     #[tokio::test]
     async fn the_operator_read_writes_nothing_and_the_seen_write_records_it_once() {
         let (orch, emitter) = orchestrator_capturing("pure-read").await;
-        let id = sent_id(
+        let id = stored_id(
+        &orch,
+        &sent_id(
             &send(
                 &orch,
                 Some("r-live"),
@@ -1137,8 +1204,10 @@ mod tests {
             )
             .await
             .unwrap(),
-        );
-        let uri = messages::message_uri(&id);
+        ),
+    )
+    .await;
+        let uri = stored_uri(&orch, &id).await;
         let notices = || async {
             orch.db
                 .local
@@ -1316,7 +1385,9 @@ mod tests {
     #[tokio::test]
     async fn an_answer_is_recorded_before_it_is_delivered() {
         let orch = orchestrator("answer-order").await;
-        let id = sent_id(
+        let id = stored_id(
+        &orch,
+        &sent_id(
             &send(
                 &orch,
                 Some("r-live"),
@@ -1324,8 +1395,10 @@ mod tests {
             )
             .await
             .unwrap(),
-        );
-        let uri = messages::message_uri(&id);
+        ),
+    )
+    .await;
+        let uri = stored_uri(&orch, &id).await;
         let answer = || {
             crate::channels::write_as_operator(
                 &orch,

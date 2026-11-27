@@ -60,7 +60,7 @@ pub(crate) const OPEN_STATES: &str = "('accepted','queued','granted','running')"
 const ROW_COLUMNS: &str = "id,project_id,suite,revision_spec,subject_job_id,selector_json,retry,consumer,
     requester_ref,requester_job_id,state,commit_sha,request_id,executor,diagnostic,held_by,held_at_ms,
     held_count,pinned_executor,waiting_to_learn,observation_id,outcome_json,evidence,cancel_requested_by,
-    accepted_at_ms,queued_at_ms,state_since_ms,updated_ms,publication_id,cadence";
+    accepted_at_ms,queued_at_ms,state_since_ms,updated_ms,publication_id,cadence,number";
 
 /// This runner's identity on the rows it drives, the one the team admission
 /// authority leases ordinary work to.
@@ -102,6 +102,8 @@ pub(crate) struct CheckRequestRow {
     pub publication_id: Option<String>,
     /// The explicit cadence that filed this request.
     pub cadence: Option<String>,
+    /// The number it took within its project when it was filed: its address.
+    pub number: u64,
 }
 
 impl CheckRequestRow {
@@ -137,7 +139,13 @@ impl CheckRequestRow {
             updated_ms: row.i64(27)?,
             publication_id: row.opt_text(28)?,
             cadence: row.opt_text(29)?,
+            number: u64::try_from(row.i64(30)?).unwrap_or_default(),
         })
+    }
+
+    /// The request's canonical address.
+    pub(crate) fn uri(&self, project_key: &str) -> String {
+        request_uri(project_key, self.number)
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -336,9 +344,9 @@ pub(crate) struct FiledRequest {
     pub joined: bool,
 }
 
-/// The canonical address of a check request.
-pub(crate) fn request_uri(project_key: &str, id: &str) -> String {
-    format!("cairn://p/{project_key}/check-requests/{id}")
+/// The canonical address of a check request, by its number.
+pub(crate) fn request_uri(project_key: &str, number: u64) -> String {
+    cairn_uri::build_project_check_request_uri(project_key, number)
 }
 
 /// The exact `run` item that waits for a request to settle with its verdict.
@@ -372,6 +380,24 @@ pub(crate) async fn load_request(
     )
     .await
     .map_err(|error| format!("read check request {id}: {error}"))
+}
+
+/// The request an address segment names: its number within the project, or a
+/// legacy storage id, which `legacy` reports so the reply can name the
+/// mapping.
+pub(crate) async fn load_request_by_segment(
+    db: &LocalDb,
+    project_id: &str,
+    segment: &str,
+) -> Result<Option<(CheckRequestRow, bool)>, String> {
+    use cairn_db::storage::address_numbers::{resolve, Numbered};
+    let Some(resolved) = resolve(db, Numbered::CheckRequest, Some(project_id), segment).await?
+    else {
+        return Ok(None);
+    };
+    Ok(load_request(db, project_id, &resolved.id)
+        .await?
+        .map(|row| (row, resolved.legacy)))
 }
 
 async fn load_request_by_id(db: &LocalDb, id: &str) -> Result<Option<CheckRequestRow>, String> {
@@ -561,7 +587,7 @@ pub(crate) async fn file_check_request(
         spawn_driver(orch, db, accepted.id.clone(), Some(revision));
     }
     Ok(FiledRequest {
-        uri: request_uri(&spec.project_key, &accepted.id),
+        uri: request_uri(&spec.project_key, accepted.number),
         id: accepted.id,
         suite,
         joined: accepted.joined,
@@ -617,7 +643,18 @@ pub(crate) enum Coordinate {
 
 pub(crate) struct Accepted {
     pub id: String,
+    /// The number the row took when it was inserted: its address.
+    pub number: u64,
     pub joined: bool,
+}
+
+/// The accepted (or joined) row, with the number its insert stamped on it.
+async fn accepted(db: &LocalDb, id: String, joined: bool) -> Result<Accepted, String> {
+    use cairn_db::storage::address_numbers::{number_of, Numbered};
+    let number = number_of(db, Numbered::CheckRequest, None, &id)
+        .await?
+        .ok_or_else(|| format!("check request {id} has no number"))?;
+    Ok(Accepted { id, number, joined })
 }
 
 /// The identity an open request is joined by. Two filings that differ in any
@@ -665,10 +702,7 @@ async fn accept_with_context(
 ) -> Result<Accepted, String> {
     if let Some(id) = stable_id {
         if load_request_by_id(db, id).await?.is_some() {
-            return Ok(Accepted {
-                id: id.to_string(),
-                joined: true,
-            });
+            return accepted(db, id.to_string(), true).await;
         }
     }
     let key = stable_id
@@ -725,10 +759,10 @@ async fn accept_with_context(
             .await
             .map_err(|error| format!("persist check request: {error}"))?;
         if inserted > 0 {
-            return Ok(Accepted { id, joined: false });
+            return accepted(db, id, false).await;
         }
         if stable_id.is_some() && load_request_by_id(db, &id).await?.is_some() {
-            return Ok(Accepted { id, joined: true });
+            return accepted(db, id, true).await;
         }
         let open = db
             .query_opt_text(
@@ -738,7 +772,7 @@ async fn accept_with_context(
             .await
             .map_err(|error| format!("look for the open check request: {error}"))?;
         if let Some(id) = open {
-            return Ok(Accepted { id, joined: true });
+            return accepted(db, id, true).await;
         }
     }
     Err(format!(
@@ -1474,7 +1508,7 @@ pub(crate) async fn settle_requests_for_resolution(
                 ),
             };
             resources.push(SettlementResource {
-                uri: request_uri(&key, &row.id),
+                uri: row.uri(&key),
                 outcome,
                 diagnostic,
             });
@@ -1866,10 +1900,10 @@ pub(crate) async fn request_value(
     row: &CheckRequestRow,
 ) -> Result<serde_json::Value, String> {
     let answer = request_answer(orch, db, row).await?;
-    let uri = request_uri(project_key, &row.id);
+    let uri = row.uri(project_key);
     Ok(serde_json::json!({
         "ok": true,
-        "id": row.id,
+        "id": row.number,
         "uri": uri,
         "suite": row.suite,
         "state": row.state,

@@ -2349,6 +2349,8 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("agent_waits", TableScope::ProjectScoped),
     // The lifecycle ledger is read with its project's waits and detached batches.
     ("run_batch_requests", TableScope::ProjectScoped),
+    // Each database counts the address numbers of the rows it holds.
+    ("address_counters", TableScope::ProjectScoped),
     // A run batch that outlived its call; read beside `agent_waits` by the
     // replay mutation boundary, so it lives where they do.
     ("run_batch_detached", TableScope::ProjectScoped),
@@ -3832,6 +3834,12 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "camps",
         id_columns: &["id", "project_id"],
+    },
+    // `scope` is the project or job a count belongs to ('' for a
+    // database-wide count).
+    RekeyTableManifest {
+        table: "address_counters",
+        id_columns: &["scope"],
     },
     // workflow_progress.id is the composite `{job_id}:{seq}` (a non-uuid, so
     // rekey_to_team leaves it as-is); job_id is the routable column that gets
@@ -6069,6 +6077,156 @@ mod tests {
             4,
             "every message survives"
         );
+    }
+
+    /// cairn/7650: existing rows are numbered in creation order within their
+    /// scope, a row inserted afterwards takes the next number in its own
+    /// insert, a deleted row's number is never handed out again, and the
+    /// immutability guards still hold once a row is numbered.
+    #[tokio::test]
+    async fn address_numbers_backfill_in_creation_order_and_are_never_reused() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("address-numbers.turso.db"))
+            .await
+            .unwrap();
+        let named = |name: &str| {
+            TURSO_MIGRATIONS
+                .iter()
+                .find(|migration| migration.name() == name)
+                .copied()
+                .expect("the migration is in the private lineage")
+        };
+        let (shared, private) = (named("address_numbers"), named("operator_address_numbers"));
+        assert!(TEAM_MIGRATIONS
+            .iter()
+            .any(|migration| migration.name() == "address_numbers"));
+        assert!(!TEAM_MIGRATIONS
+            .iter()
+            .any(|migration| migration.name() == "operator_address_numbers"));
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != "address_numbers")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p','default','P','p','/tmp/p',1,1), ('q','default','Q','q','/tmp/q',1,1);
+            INSERT INTO check_requests(id, project_id, suite, consumer, requester_ref, priority, state,
+                                       accepted_at_ms, state_since_ms, updated_ms)
+              VALUES('c','p','s','requested','operator','review_check','recorded',30,30,30),
+                    ('a','p','s','requested','operator','review_check','recorded',10,10,10),
+                    ('z','q','s','requested','operator','review_check','recorded',5,5,5),
+                    ('b','p','s','requested','operator','review_check','recorded',20,20,20);
+            INSERT INTO check_result_observations(id,project_id,commit_sha,tree_hash,check_name,input_hash,
+                   environment_fingerprint,exit_code,verdict,complete,reusable,parser_version,
+                   result_schema_version,ran_at,duration_ms,cadence,output_tail)
+              VALUES('o2','p','c','t','rust','i2','env',0,'passed',1,1,1,1,2,1,'manual','ok'),
+                    ('o1','p','c','t','rust','i1','env',0,'passed',1,1,1,1,1,1,'manual','ok');
+            INSERT INTO messages(id, channel_type, sender_name, content, created_at)
+              VALUES('m2','project','a','second',2), ('m1','project','a','first',1);
+            INSERT INTO run_batch_requests(request_id, job_id, run_id, project_id, received_ms)
+              VALUES('r2','j','run','p',2), ('r3','k','run','p',0), ('r1','j','run','p',1);
+            INSERT INTO operator_messages(id, project_id, sender_home, sender_job_id, via, content, created_at)
+              VALUES('om2','p','h','j','app','second',2), ('om1','p','h','j','app','first',1);
+            INSERT INTO request_cohorts(id, workspace_id, kind, state, created_at, updated_at)
+              VALUES('cohort','default','rebuild','open',1,1);
+            INSERT INTO requests(id, workspace_id, kind, target_identity, cohort_id, state, created_at, updated_at)
+              VALUES('q2','default','rebuild','t','cohort','declined',2,2),
+                    ('q1','default','rebuild','t','cohort','open',1,1);
+            ",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(vec![shared, private])
+            .run(&db)
+            .await
+            .unwrap();
+
+        for (sql, expected) in [
+            (
+                "SELECT group_concat(id || ':' || number, ' ') FROM (SELECT * FROM check_requests ORDER BY id)",
+                "a:1 b:2 c:3 z:1",
+            ),
+            (
+                "SELECT group_concat(id || ':' || number, ' ') FROM (SELECT * FROM check_result_observations ORDER BY id)",
+                "o1:1 o2:2",
+            ),
+            (
+                "SELECT group_concat(id || ':' || number, ' ') FROM (SELECT * FROM messages ORDER BY id)",
+                "m1:1 m2:2",
+            ),
+            (
+                "SELECT group_concat(request_id || ':' || number, ' ') FROM (SELECT * FROM run_batch_requests ORDER BY request_id)",
+                "r1:1 r2:2 r3:1",
+            ),
+            (
+                "SELECT group_concat(id || ':' || number, ' ') FROM (SELECT * FROM operator_messages ORDER BY id)",
+                "om1:1 om2:2",
+            ),
+            (
+                "SELECT group_concat(id || ':' || number, ' ') FROM (SELECT * FROM requests ORDER BY id)",
+                "q1:1 q2:2",
+            ),
+        ] {
+            assert_eq!(query_text(&db, sql).await.unwrap(), expected, "{sql}");
+        }
+
+        db.execute_script(
+            "
+            INSERT INTO check_requests(id, project_id, suite, consumer, requester_ref, priority, state,
+                                       accepted_at_ms, state_since_ms, updated_ms)
+              VALUES('d','p','s','requested','operator','review_check','recorded',40,40,40);
+            DELETE FROM check_requests WHERE id = 'd';
+            INSERT INTO check_requests(id, project_id, suite, consumer, requester_ref, priority, state,
+                                       accepted_at_ms, state_since_ms, updated_ms)
+              VALUES('e','p','s','requested','operator','review_check','recorded',50,50,50);
+            INSERT INTO check_result_observations(id,project_id,commit_sha,tree_hash,check_name,input_hash,
+                   environment_fingerprint,exit_code,verdict,complete,reusable,parser_version,
+                   result_schema_version,ran_at,duration_ms,cadence,output_tail)
+              VALUES('oq','q','c','t','rust','iq','env',0,'passed',1,1,1,1,3,1,'manual','ok');
+            INSERT INTO messages(id, channel_type, sender_name, content, created_at)
+              VALUES('m3','project','a','third',3);
+            INSERT INTO run_batch_requests(request_id, job_id, run_id, project_id, received_ms)
+              VALUES('rn','n','run','p',3);
+            INSERT INTO operator_messages(id, project_id, sender_home, sender_job_id, via, content, created_at)
+              VALUES('om3','p','h','j','app','third',3);
+            INSERT INTO requests(id, workspace_id, kind, target_identity, cohort_id, state, created_at, updated_at)
+              VALUES('q3','default','rebuild','t','cohort','open',3,3);
+            ",
+        )
+        .await
+        .unwrap();
+        for (sql, expected) in [
+            ("SELECT number FROM check_requests WHERE id = 'e'", 5),
+            (
+                "SELECT number FROM check_result_observations WHERE id = 'oq'",
+                1,
+            ),
+            ("SELECT number FROM messages WHERE id = 'm3'", 3),
+            (
+                "SELECT number FROM run_batch_requests WHERE request_id = 'rn'",
+                1,
+            ),
+            ("SELECT number FROM operator_messages WHERE id = 'om3'", 3),
+            ("SELECT number FROM requests WHERE id = 'q3'", 3),
+        ] {
+            assert_eq!(query_i64(&db, sql).await.unwrap(), expected, "{sql}");
+        }
+
+        assert!(db
+            .execute(
+                "UPDATE check_result_observations SET output_tail = 'x' WHERE id = 'o1'",
+                ()
+            )
+            .await
+            .is_err());
+        assert!(db
+            .execute("UPDATE requests SET updated_at = 9 WHERE id = 'q2'", ())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

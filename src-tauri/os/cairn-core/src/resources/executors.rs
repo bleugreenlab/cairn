@@ -4701,11 +4701,10 @@ fn placement_not_found(
 fn run_batch_line(request_id: &str) -> String {
     match crate::mcp::handlers::run::detached::live_owner(request_id).and_then(|owner| owner.home) {
         Some(home) => {
-            let lifecycle = super::request_lifecycle::lifecycle_uri_for_home(&home, request_id)
-                .map(|uri| format!("; its lifecycle: `{uri}`"))
-                .unwrap_or_default();
+            let batch = crate::mcp::handlers::run::detached::live_segment(request_id)
+                .unwrap_or_else(|| request_id.to_string());
             format!(
-                "  - Run batch: `{home}/batches/{request_id}`; cancel it with `write({{changes:[{{target:\"{home}/batches/{request_id}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`{lifecycle}\n"
+                "  - Run batch: `{home}/batches/{batch}`, which reads its whole lifecycle; cancel it with `write({{changes:[{{target:\"{home}/batches/{batch}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`\n"
             )
         }
         None => String::new(),
@@ -7457,17 +7456,16 @@ fn render_running_now_with_attribution(
                 ),
                 format!("attempt {}", request.attempt_id),
             ),
-            None => (
-                request.cell_id.clone(),
-                match crate::mcp::handlers::run::detached::live_owner(&request.request_id)
+            None => (request.cell_id.clone(), {
+                use crate::mcp::handlers::run::detached;
+                match detached::live_owner(&request.request_id)
                     .and_then(|owner| owner.home)
-                    .and_then(|home| {
-                        super::request_lifecycle::lifecycle_uri_for_home(&home, &request.request_id)
-                    }) {
-                    Some(uri) => format!("request [{}]({uri})", request.request_id),
+                    .zip(detached::live_segment(&request.request_id))
+                {
+                    Some((home, segment)) => format!("batch [{segment}]({home}/batches/{segment})"),
                     None => format!("request {}", request.request_id),
-                },
-            ),
+                }
+            }),
         };
         // A phased test lane names the charge it holds and the phase it is
         // in, so a retained compile reserve reads apart from a measured test
@@ -16676,13 +16674,13 @@ mod running_now_tests {
         snapshot.executing_requests.push(other);
         let mut attributions = RunningAttributions::new();
         for (request, attempt, issue, commit, handle) in [
-            ("request", "attempt", 6151, "aaaaaaaaaaaa1111", "check-a"),
+            ("request", "attempt", 6151, "aaaaaaaaaaaa1111", 11_u64),
             (
                 "other-request",
                 "other-attempt",
                 6411,
                 "bbbbbbbbbbbb2222",
-                "check-b",
+                12,
             ),
         ] {
             attributions.insert(
@@ -16692,7 +16690,7 @@ mod running_now_tests {
                     project: Some("cairn".into()),
                     commit: Some(commit.into()),
                     suites: vec!["rust-tests".into()],
-                    handles: vec![handle.into()],
+                    handles: vec![handle],
                 },
             );
         }
@@ -16706,22 +16704,8 @@ mod running_now_tests {
             &attributions,
         );
         for (slot, issue, commit, short, handle, other_handle) in [
-            (
-                "slot-103",
-                6151,
-                "aaaaaaaaaaaa1111",
-                "aaaaaaaaaaaa",
-                "check-a",
-                "check-b",
-            ),
-            (
-                "slot-104",
-                6411,
-                "bbbbbbbbbbbb2222",
-                "bbbbbbbbbbbb",
-                "check-b",
-                "check-a",
-            ),
+            ("slot-103", 6151, "aaaaaaaaaaaa1111", "aaaaaaaaaaaa", 11, 12),
+            ("slot-104", 6411, "bbbbbbbbbbbb2222", "bbbbbbbbbbbb", 12, 11),
         ] {
             let row = rendered
                 .lines()
@@ -16736,7 +16720,10 @@ mod running_now_tests {
                 )),
                 "{row}"
             );
-            assert!(!row.contains(other_handle), "{row}");
+            assert!(
+                !row.contains(&format!("check-requests/{other_handle}")),
+                "{row}"
+            );
         }
         // An old attempt's metadata cannot identify a new attempt of the same request.
         snapshot.executing_requests[0].attempt_id = "new-attempt".into();

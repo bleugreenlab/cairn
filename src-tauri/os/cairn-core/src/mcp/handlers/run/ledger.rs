@@ -2,12 +2,14 @@
 //! call's arrival to its one end.
 //!
 //! The row is what `cairn://p/<project>/requests/<id>` reads first
-//! ([`crate::resources::requests`]). It is written by one task per request,
-//! never on the call's path or under the fleet lock: the call hands writes to
-//! the task through a channel, and the task applies them in order. The task
-//! inserts the identity row when the call arrives, records what the batch
-//! became once its items resolve, samples where it runs from the machine's
-//! reports (the first look soon after receipt, then every
+//! ([`crate::resources::requests`]). The identity row is inserted on the
+//! call's path when it arrives, because its insert stamps the batch's number
+//! (its `batches/{n}` handle) and every reply that names the batch needs it.
+//! Every later write belongs to one task per request, never on the call's path
+//! or under the fleet lock: the call hands writes to the task through a
+//! channel, and the task applies them in order. The task records what the
+//! batch became once its items resolve, samples where it runs from the
+//! machine's reports (the first look soon after receipt, then every
 //! [`SAMPLE_EVERY`]), and writes the end once.
 //!
 //! A process that ends with the call still open writes no end. That absence
@@ -163,12 +165,14 @@ pub(crate) struct Ledger {
     ended: AtomicBool,
     /// Why placement refused the batch, when it did; its end names it.
     refusal: Mutex<Option<String>>,
+    /// The number its identity row took within its job: its handle.
+    number: OnceLock<u64>,
 }
 
 impl Ledger {
     /// Start recording a request. A call that belongs to no agent run has no
     /// project store to record into, and is not recorded.
-    pub(crate) fn open(
+    pub(crate) async fn open(
         &self,
         orch: &Orchestrator,
         request: &McpCallbackRequest,
@@ -179,8 +183,7 @@ impl Ledger {
         let Some(run_id) = request.run_id.as_deref().filter(|id| !id.is_empty()) else {
             return;
         };
-        let (tx, rx) = mpsc::unbounded_channel();
-        if self.tx.set(tx).is_err() {
+        if self.tx.get().is_some() {
             return;
         }
         let receipt = Receipt {
@@ -191,7 +194,51 @@ impl Ledger {
             received_ms,
             incarnation: orch.fleet.runner_incarnation().map(str::to_owned),
         };
-        cairn_common::task::spawn(write_ledger(orch.clone(), request.clone(), receipt, rx));
+        let db = match super::super::run_context::lookup_run_routed(&orch.db, request).await {
+            Ok((ctx, db)) => {
+                if let Err(error) =
+                    insert(&db, &receipt, &ctx.job_id, &ctx.run_id, &ctx.project_id).await
+                {
+                    log::warn!(
+                        "run batch {} has no ledger row: {error}",
+                        receipt.request_id
+                    );
+                    return;
+                }
+                db
+            }
+            Err(error) => {
+                log::debug!(
+                    "run batch {} is not recorded in the request ledger: {error}",
+                    receipt.request_id
+                );
+                return;
+            }
+        };
+        match cairn_db::storage::address_numbers::number_of(
+            &db,
+            cairn_db::storage::address_numbers::Numbered::RunBatch,
+            None,
+            &receipt.request_id,
+        )
+        .await
+        {
+            Ok(Some(number)) => {
+                let _ = self.number.set(number);
+            }
+            Ok(None) => log::warn!("run batch {} has no number", receipt.request_id),
+            Err(error) => log::warn!("run batch {}: {error}", receipt.request_id),
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        if self.tx.set(tx).is_err() {
+            return;
+        }
+        cairn_common::task::spawn(write_ledger(orch.clone(), db, receipt.request_id, rx));
+    }
+
+    /// The number the batch took within its job, once its row is written.
+    pub(crate) fn number(&self) -> Option<u64> {
+        self.number.get().copied()
     }
 
     fn send(&self, write: Write) {
@@ -241,32 +288,10 @@ impl Ledger {
 
 async fn write_ledger(
     orch: Orchestrator,
-    request: McpCallbackRequest,
-    receipt: Receipt,
+    db: std::sync::Arc<LocalDb>,
+    id: String,
     mut rx: mpsc::UnboundedReceiver<Write>,
 ) {
-    let db = match super::super::run_context::lookup_run_routed(&orch.db, &request).await {
-        Ok((ctx, db)) => {
-            if let Err(error) =
-                insert(&db, &receipt, &ctx.job_id, &ctx.run_id, &ctx.project_id).await
-            {
-                log::warn!(
-                    "run batch {} has no ledger row: {error}",
-                    receipt.request_id
-                );
-                return;
-            }
-            db
-        }
-        Err(error) => {
-            log::debug!(
-                "run batch {} is not recorded in the request ledger: {error}",
-                receipt.request_id
-            );
-            return;
-        }
-    };
-    let id = receipt.request_id;
     let mut sampler = Sampler::default();
     let mut ticker =
         tokio::time::interval_at(tokio::time::Instant::now() + FIRST_SAMPLE, LOOK_EVERY);

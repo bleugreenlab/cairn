@@ -989,9 +989,15 @@ async fn copy_project_graph(
         let Some(copy_where_sql) = spec.copy_where_sql else {
             continue;
         };
-        let Some(columns) = target_columns.get(spec.table).cloned() else {
+        let Some(mut columns) = target_columns.get(spec.table).cloned() else {
             continue;
         };
+        if spec.table == "messages" {
+            // A message's address number counts within its database, so the
+            // private one would collide with the team's own messages; left out
+            // of the copy, the team's insert trigger mints the next team number.
+            columns.retain(|column| column != "number");
+        }
         let rows = load_rows(source, spec.table, copy_where_sql, project_id, &columns).await?;
         if rows.is_empty() {
             continue;

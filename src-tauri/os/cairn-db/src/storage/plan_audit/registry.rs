@@ -141,6 +141,7 @@ const fn trigger(
 
 const SEARCH_OUTBOX: &str = "queues one search_outbox row for the written row; reads no table";
 const IMMUTABLE: &str = "refuses the write with RAISE; reads no table";
+const ADDRESS_NUMBER: &str = "upserts its (kind, scope) address_counters row by primary key, then stamps the inserted row by its primary key (cairn/7650)";
 const ROW_CHECK: &str = "checks the written row's own columns with RAISE; reads no table";
 const DISJOINT: &str =
     "probes the sibling table by its (observation_id, test_id) key, which a unique index serves";
@@ -148,6 +149,12 @@ const TOOL_ANALYTICS: &str = "upserts the invocation's hour bucket by its id and
 
 /// Every trigger in either lineage, private and team alike.
 pub const AUDITED_TRIGGERS: &[AuditedTrigger] = &[
+    trigger("check_requests_number", "check_requests", ADDRESS_NUMBER),
+    trigger("check_result_observations_number", "check_result_observations", ADDRESS_NUMBER),
+    trigger("messages_number", "messages", ADDRESS_NUMBER),
+    trigger("run_batch_requests_number", "run_batch_requests", ADDRESS_NUMBER),
+    trigger("operator_messages_number", "operator_messages", ADDRESS_NUMBER),
+    trigger("requests_number", "requests", ADDRESS_NUMBER),
     trigger("main_incident_sources_immutable", "main_incident_sources", IMMUTABLE),
     trigger("main_incident_source_retention_guard", "check_result_observations",
         "probes pending sources by idx_main_incident_sources_observation_pending; ignores deletion until ack"),

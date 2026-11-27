@@ -18,9 +18,7 @@ pub(super) async fn read_check_request(
     id: &str,
     json: bool,
 ) -> String {
-    let Some(id) = super::check_results::request_handle(id) else {
-        return format!("Invalid check request id `{id}`: expected the UUID a filing returned");
-    };
+    let segment = id;
     let db = orch.db.for_project(project).await;
     let project_id = match project_id_by_key(&db, project).await {
         Ok(project_id) => project_id,
@@ -30,19 +28,33 @@ pub(super) async fn read_check_request(
         Ok(db) => db,
         Err(error) => return error,
     };
-    let row = match requests::load_request(&request_db, &project_id, &id).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return format!("Check request {id} is unknown in this project"),
-        Err(error) => return error,
-    };
+    let (row, legacy) =
+        match requests::load_request_by_segment(&request_db, &project_id, segment).await {
+            Ok(Some(found)) => found,
+            Ok(None) => return format!("Check request {segment} is unknown in this project"),
+            Err(error) => return error,
+        };
     let value = match requests::request_value(orch, request_db, project, &row).await {
         Ok(value) => value,
-        Err(error) => return format!("Unable to read check request {id}: {error}"),
+        Err(error) => return format!("Unable to read check request {}: {error}", row.number),
     };
     if json {
         return value.to_string();
     }
-    render(project, &row, &value)
+    let body = render(project, &row, &value);
+    if legacy {
+        let received = cairn_uri::CairnResource::ProjectCheckRequest {
+            project: project.to_string(),
+            id: segment.to_string(),
+        }
+        .to_uri();
+        format!(
+            "{}\n\n{body}",
+            cairn_db::storage::address_numbers::legacy_adjustment(&received, &row.uri(project))
+        )
+    } else {
+        body
+    }
 }
 
 fn executor_link(name: &str) -> String {
@@ -66,9 +78,9 @@ fn consumer_label(consumer: &str) -> &str {
 }
 
 fn render(project: &str, row: &CheckRequestRow, value: &serde_json::Value) -> String {
-    let uri = requests::request_uri(project, &row.id);
+    let uri = row.uri(project);
     let mut lines = vec![
-        format!("# Check request {}", row.id),
+        format!("# Check request {}", row.number),
         String::new(),
         format!("- Suite: {}", row.suite),
         format!("- Consumer: {}", consumer_label(&row.consumer)),
@@ -153,7 +165,7 @@ pub(super) async fn requested_section(
         out.push_str(&format!(
             "- [{}]({}) ({}) on {revision}: {}\n",
             row.suite,
-            requests::request_uri(project_key, &row.id),
+            row.uri(project_key),
             consumer_label(&row.consumer),
             requests::standing(row)
         ));
@@ -244,10 +256,10 @@ fn render_open(
     }
     out.push_str("| Request | Suite | Revision | State | Age |\n|---|---|---|---|---|\n");
     for row in rows {
-        let link = requests::request_uri(project, &row.id);
+        let link = row.uri(project);
         out.push_str(&format!(
             "| [{}]({link}) | {} | {} | {} | {} |\n",
-            row.id,
+            row.number,
             row.suite,
             row.revision_spec.as_deref().unwrap_or("own head"),
             requests::standing(row),
@@ -285,7 +297,7 @@ pub(crate) async fn pinned_section(orch: &Orchestrator, executor_name: &str) -> 
             .unwrap_or_else(|| row.project_id.clone());
         out.push_str(&format!(
             "- {} {} ({}) on {} for {}: {}\n",
-            requests::request_uri(&project_key, &row.id),
+            row.uri(&project_key),
             row.suite,
             consumer_label(&row.consumer),
             row.revision_spec

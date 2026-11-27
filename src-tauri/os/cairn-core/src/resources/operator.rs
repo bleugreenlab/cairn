@@ -157,10 +157,13 @@ async fn message_view(
     id: &str,
 ) -> Result<String, String> {
     let reader = reader(orch, request).await?;
-    let uri = messages::message_uri(id);
-    let Some(message) = messages::get(&orch.db.local, id).await? else {
-        return Err(format!("{uri} names no message to the operator."));
+    let Some((message, legacy)) = messages::resolve(&orch.db.local, id).await? else {
+        return Err(format!(
+            "{} names no message to the operator.",
+            cairn_uri::CairnResource::OperatorMessage { id: id.to_string() }.to_uri()
+        ));
     };
+    let uri = message.uri();
     if let Reader::Agent { home } = &reader {
         if *home != message.sender_home {
             return Err(format!(
@@ -171,7 +174,12 @@ async fn message_view(
     let now = chrono::Utc::now().timestamp();
     let delivery = messages::delivery(&orch.db.local, &message).await?;
     let state = messages::state(&message, delivery.as_ref());
-    let mut out = format!(
+    let mut out = if legacy {
+        format!("{}\n\n", messages::legacy_line(id, &message))
+    } else {
+        String::new()
+    };
+    out.push_str(&format!(
         "# Message to the operator\n\n- uri: {uri}\n- from: {}\n- via: {} ({})\n- sent: {}\n- state: {}\n- content: {}\n",
         message.sender_home,
         message.via.display_name(),
@@ -179,7 +187,7 @@ async fn message_view(
         at_ms(message.created_at * 1000),
         state.describe(now),
         message.content,
-    );
+    ));
     if let Some(default) = &message.default_text {
         out.push_str(&format!("- default: {default}\n"));
     }

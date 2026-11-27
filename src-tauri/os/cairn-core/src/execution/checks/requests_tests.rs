@@ -293,8 +293,9 @@ async fn an_exact_revision_is_resolved_at_acceptance() {
     assert_eq!(row.requester_job_id.as_deref(), Some(SUBJECT_JOB));
     assert_eq!(
         filed.uri,
-        format!("cairn://p/proj/check-requests/{}", filed.id)
+        format!("cairn://p/proj/check-requests/{}", row.number)
     );
+    assert_eq!(filed.uri, "cairn://p/proj/check-requests/1");
     let _ = &fixture.repo;
 }
 
@@ -687,7 +688,7 @@ async fn an_attached_ledger_source_recovers_without_a_written_answer() {
         assert_eq!(result["disposition"], disposition);
         assert_eq!(
             result["observationRef"],
-            "cairn://p/proj/check-observations/source-public"
+            "cairn://p/proj/check-observations/1"
         );
         assert_eq!(result["tier"], "fast tier: 9 ran, 3 deferred");
     }
@@ -1396,7 +1397,7 @@ async fn resolution_cancels_completed_producers_queued_requests_idempotently() {
         .await
         .unwrap();
     assert_eq!(report.len(), 1);
-    assert_eq!(report[0].uri, request_uri("proj", &queued));
+    assert_eq!(report[0].uri, row(&orch, &queued).await.uri("proj"));
     assert_eq!(report[0].outcome, SettlementOutcome::Cancelled);
     let cancelled = row(&orch, &queued).await;
     assert_eq!(cancelled.state, "cancelled");
@@ -1546,11 +1547,17 @@ async fn the_open_requests_read_and_the_settled_wait_agree() {
             Err(error) => panic!("{uri} refused: {error}"),
         }
     }
+    let mut numbered = Vec::new();
+    for id in [&queued, &running, &foreign] {
+        numbered.push((id.clone(), row(&orch, id).await.number));
+    }
     let listed = |body: &str| {
-        let mut ids: Vec<String> = [&queued, &running, &foreign]
-            .into_iter()
-            .filter(|id| body.contains(&format!("(cairn://p/proj/check-requests/{id})")))
-            .cloned()
+        let mut ids: Vec<String> = numbered
+            .iter()
+            .filter(|(_, number)| {
+                body.contains(&format!("(cairn://p/proj/check-requests/{number})"))
+            })
+            .map(|(id, _)| id.clone())
             .collect();
         ids.sort();
         ids

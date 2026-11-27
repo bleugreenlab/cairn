@@ -23,6 +23,7 @@ mod test_template;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod checkpoint_probe;
 
+pub mod address_numbers;
 pub mod authority;
 pub mod content_store;
 pub mod events;

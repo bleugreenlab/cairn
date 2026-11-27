@@ -201,7 +201,7 @@ pub(crate) async fn trigger(orch: &Orchestrator, request_id: &str, baseline: &[S
     match outcome_of(&orch.db.local, request_id, baseline).await {
         Ok(settled) => scrubbed_outcome(&settled),
         Err(error) => super::scrub_text(format!(
-            "Operator request cairn://requests/{request_id} could not be read for its outcome: {error}. Read the request for its decision and report."
+            "The operator request could not be read for its outcome: {error}. Read the request for its decision and report."
         )),
     }
 }

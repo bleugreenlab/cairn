@@ -62,6 +62,7 @@ fn open_row(id: &str, suite: &str, commit: Option<&str>, state: &str) -> CheckRe
         updated_ms: 1,
         publication_id: None,
         cadence: Some(HANDOFF.into()),
+        number: 1,
     }
 }
 

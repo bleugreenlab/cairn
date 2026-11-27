@@ -94,16 +94,24 @@ fn parses_and_roundtrips_the_operator() {
     assert_eq!(operator.kind(), ResourceKind::Operator);
     assert_eq!(operator.project(), None);
 
-    let message = CairnResource::OperatorMessage {
-        id: "0193a5e2-7c1d-7b1e-9f3a-5d2c8e4b6a10".into(),
-    };
-    let uri = "cairn://operator/messages/0193a5e2-7c1d-7b1e-9f3a-5d2c8e4b6a10";
-    assert_eq!(parse_uri(uri), Some(message.clone()));
+    let message = CairnResource::OperatorMessage { id: "12".into() };
+    let uri = build_operator_message_uri(12);
+    assert_eq!(uri, "cairn://operator/messages/12");
+    assert_eq!(parse_uri(&uri), Some(message.clone()));
     assert_eq!(message.to_uri(), uri);
     assert_eq!(message.kind(), ResourceKind::OperatorMessage);
     assert_eq!(
         message.label(&LabelContext::default()),
-        "Message to operator · 0193a5e2"
+        "Message to operator 12"
+    );
+    // A legacy link still parses, to reach the read that maps it, and its
+    // label shortens the storage id.
+    let legacy = "cairn://operator/messages/0193a5e2-7c1d-7b1e-9f3a-5d2c8e4b6a10";
+    let parsed = parse_uri(legacy).unwrap();
+    assert_eq!(parsed.to_uri(), legacy);
+    assert_eq!(
+        parsed.label(&LabelContext::default()),
+        "Message to operator 0193a5e2"
     );
     assert_eq!(parse_uri("cairn://operator/messages"), None);
 
@@ -1268,6 +1276,68 @@ fn project_check_results_uri_parses_and_round_trips() {
     assert_eq!(parse_uri("cairn://p/cairn/check-results/"), None);
 }
 
+/// Kinds whose canonical address still renders a storage id, each a known
+/// debt rather than a choice: model sessions and clients and inference
+/// verifications and generations are keyed by their UUID or hex id, and an
+/// image's content-hash permalink is its content-store key. cairn/7650 moved
+/// check requests, observations, messages, operator requests and run batches
+/// to numbers; cairn/7693 owns these. This list only shrinks: a new kind
+/// declares a short handle (docs/agent-facing-identifiers.md).
+const STORAGE_ID_SEGMENT_DEBT: &[ResourceKind] = &[
+    ResourceKind::ModelsSession,
+    ResourceKind::ModelsClient,
+    ResourceKind::InferenceVerification,
+    ResourceKind::InferenceGeneration,
+    ResourceKind::ProjectImage,
+];
+
+/// No canonical address renders a storage id (cairn/3143): every sampled
+/// address is free of a UUID-shaped segment and of a run of sixteen or more hex
+/// characters, outside the named debt above. The typed builders taking a
+/// number are what hold the line at mint sites; this catches a sample, and so
+/// a kind, that regressed.
+#[test]
+fn no_canonical_address_renders_a_storage_id() {
+    // Positive control: the predicate flags both storage-id shapes and passes
+    // the short handles canonical addresses use.
+    assert!(is_storage_id_segment(
+        "2ceba732-1436-45ad-aca2-7ecac587b852"
+    ));
+    assert!(is_storage_id_segment("06cf896c5e1c4eccb855f24e"));
+    assert!(is_storage_id_segment("cli_0011223344556677"));
+    for handle in [
+        "12",
+        "rust-tests@main",
+        "builder",
+        "perm-3",
+        "e884003b",
+        "req-1",
+    ] {
+        assert!(!is_storage_id_segment(handle), "{handle}");
+    }
+    let offenders: Vec<String> = samples::every_resource_variant()
+        .into_iter()
+        .filter(|sample| !STORAGE_ID_SEGMENT_DEBT.contains(&sample.resource.kind()))
+        .map(|sample| sample.resource.to_uri())
+        .filter(|uri| {
+            let path = uri.split(['?', '#']).next().unwrap_or(uri);
+            path.split('/').any(is_storage_id_segment)
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "these canonical addresses render a storage id; give the kind a short handle \
+         (a number allocated in filing order) and a typed builder: {offenders:#?}"
+    );
+    // And the check itself bites: a UUID-shaped sample would have been caught.
+    let uuid = CairnResource::ProjectCheckRequest {
+        project: "cairn".into(),
+        id: "2ceba732-1436-45ad-aca2-7ecac587b852".into(),
+    }
+    .to_uri();
+    assert!(uuid.split('/').any(is_storage_id_segment));
+}
+
 /// Every `CairnResource` variant survives its own canonical URI.
 ///
 /// Driven by [`samples::every_resource_variant`], which is exhaustive over the
@@ -2300,7 +2370,7 @@ fn project_map_uri_parses_builds_and_reports_its_kind() {
 #[test]
 fn task_batch_uris_roundtrip_with_owner_coordinates() {
     let list = build_task_batches_uri("CAIRN", 42, 2, "builder", "atomic-incident");
-    let item = build_task_batch_uri("CAIRN", 42, 2, "builder", "atomic-incident", "req-1");
+    let item = build_task_batch_uri("CAIRN", 42, 2, "builder", "atomic-incident", 3);
     for (uri, kind) in [
         (&list, ResourceKind::TaskBatches),
         (&item, ResourceKind::TaskBatch),
@@ -2313,11 +2383,11 @@ fn task_batch_uris_roundtrip_with_owner_coordinates() {
     }
     assert!(
         matches!(parse_uri(&item), Some(CairnResource::TaskBatch { task_name, request_id, .. })
-        if task_name == "atomic-incident" && request_id == "req-1")
+        if task_name == "atomic-incident" && request_id == "3")
     );
     assert_eq!(
         item,
-        "cairn://p/cairn/42/2/builder/task/atomic-incident/batches/req-1"
+        "cairn://p/cairn/42/2/builder/task/atomic-incident/batches/3"
     );
 }
 

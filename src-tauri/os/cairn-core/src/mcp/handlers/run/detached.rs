@@ -99,6 +99,16 @@ pub(crate) struct DetachedBatch {
     pub(crate) waiting_on: Option<String>,
     /// What a lost batch's machine reported after it was settled lost.
     pub(crate) late_report: Option<LateReport>,
+    /// The number its ledger row took within its job: its `batches/{n}`
+    /// handle. `None` for a batch received before the ledger existed.
+    pub(crate) number: Option<u64>,
+}
+
+impl DetachedBatch {
+    /// Its caller-home-relative handle.
+    pub(crate) fn handle(&self) -> String {
+        handle_uri(&batch_segment(self.number, &self.request_id))
+    }
 }
 
 /// A result that arrived for a batch already settled lost: recorded and
@@ -115,6 +125,9 @@ pub(crate) struct LateReport {
 }
 
 const COLUMNS: &str = "request_id,job_id,run_id,label,identity,commits,holds_branch,state,verdict,output,commit_id,reason,lost_evidence,created_ms,settled_ms,notified_ms,settlement_json,waiting_on,late_report";
+
+/// [`COLUMNS`] and the batch's number from its ledger row, for every read.
+const SELECT_COLUMNS: &str = "request_id,job_id,run_id,label,identity,commits,holds_branch,state,verdict,output,commit_id,reason,lost_evidence,created_ms,settled_ms,notified_ms,settlement_json,waiting_on,late_report,(SELECT r.number FROM run_batch_requests r WHERE r.request_id=run_batch_detached.request_id)";
 
 fn from_row(row: &cairn_db::turso::Row) -> DbResult<DetachedBatch> {
     Ok(DetachedBatch {
@@ -148,6 +161,7 @@ fn from_row(row: &cairn_db::turso::Row) -> DbResult<DetachedBatch> {
         late_report: row
             .opt_text(18)?
             .and_then(|json| serde_json::from_str(&json).ok()),
+        number: row.opt_i64(19)?.and_then(|n| u64::try_from(n).ok()),
     })
 }
 
@@ -257,6 +271,13 @@ pub(crate) fn live_environment_owners() -> Vec<(String, BatchOwner)> {
 pub(crate) struct BatchOwner {
     pub(crate) job_id: String,
     pub(crate) home: Option<String>,
+}
+
+/// The handle segment of a batch whose task is running in this process: its
+/// number, or its request id before its ledger row exists.
+pub(crate) fn live_segment(request_id: &str) -> Option<String> {
+    live_control(request_id)
+        .map(|control| batch_segment(control.ledger.number(), &control.request_id))
 }
 
 /// The owner of a batch whose task is running in this process, once its run
@@ -972,46 +993,80 @@ fn holder_gone_evidence(orch: &Orchestrator, holder: &Holder) -> String {
     evidence
 }
 
-/// The caller-home-relative handle, resolved beneath the owning node or task.
-pub(crate) fn handle_uri(request_id: &str) -> String {
-    format!("cairn:~/batches/{request_id}")
+/// The caller-home-relative handle, resolved beneath the owning node or task:
+/// `cairn:~/batches/{n}`. It reads the batch's whole lifecycle.
+pub(crate) fn handle_uri(segment: &str) -> String {
+    format!("cairn:~/batches/{segment}")
 }
 
-/// The sentence every answer that leaves a batch running ends with: where
-/// its whole lifecycle reads, by any of its ids.
-fn lifecycle_sentence(request_id: &str) -> String {
-    format!(
-        " Its whole lifecycle reads at `{}`.",
-        crate::resources::request_lifecycle::relative_lifecycle_uri(request_id)
-    )
+/// A batch's handle segment: its number, or for a batch received before the
+/// ledger numbered batches, the request id it was addressed by then.
+pub(crate) fn batch_segment(number: Option<u64>, request_id: &str) -> String {
+    number.map_or_else(|| request_id.to_string(), |number| number.to_string())
+}
+
+/// A batch's canonical address under its owner's home URI: the typed
+/// node or task batch builder when the home parses as one and the batch has
+/// its number, and its handle segment beneath the home otherwise.
+pub(crate) fn batch_uri_under(home: &str, number: Option<u64>, request_id: &str) -> String {
+    match (number, cairn_uri::parse_uri(home)) {
+        (
+            Some(batch),
+            Some(cairn_uri::CairnResource::Node {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            }),
+        ) => cairn_uri::build_node_batch_uri(&project, number, exec_seq, &node_id, batch),
+        (
+            Some(batch),
+            Some(cairn_uri::CairnResource::Task {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            }),
+        ) => {
+            cairn_uri::build_task_batch_uri(&project, number, exec_seq, &node_id, &task_name, batch)
+        }
+        _ => format!("{home}/batches/{}", batch_segment(number, request_id)),
+    }
+}
+
+/// The handle of the batch `request_id` names, read from its ledger row in
+/// whichever database holds it.
+pub(crate) async fn handle_for(orch: &Orchestrator, request_id: &str) -> String {
+    use cairn_db::storage::address_numbers::{number_of, Numbered};
+    for db in orch.db.all_dbs().await {
+        if let Ok(Some(number)) = number_of(&db, Numbered::RunBatch, None, request_id).await {
+            return handle_uri(&number.to_string());
+        }
+    }
+    handle_uri(request_id)
 }
 
 /// What a call that detached answers with.
-pub(crate) fn detach_answer_text(request_id: &str, reason: &str) -> String {
+pub(crate) fn detach_answer_text(handle: &str, reason: &str) -> String {
     format!(
-        "This batch is still running. Cairn could not suspend this call ({reason}), so the call answers now instead. Nothing was cancelled. When it settles, Cairn delivers its result to this job as a notice, and you can read it any time at `{}`. Do not re-run it.{}",
-        handle_uri(request_id),
-        lifecycle_sentence(request_id)
+        "This batch is still running. Cairn could not suspend this call ({reason}), so the call answers now instead. Nothing was cancelled. When it settles, Cairn delivers its result to this job as a notice, and you can read it and its whole lifecycle any time at `{handle}`. Do not re-run it."
     )
 }
 
 /// What a call that detached a batch no machine has yet answers with.
-pub(crate) fn detach_answer_parked_text(request_id: &str, reason: &str, waiting: &str) -> String {
+pub(crate) fn detach_answer_parked_text(handle: &str, reason: &str, waiting: &str) -> String {
     format!(
-        "This batch has not started yet: it is {waiting}. Cairn could not suspend this call ({reason}), so the call answers now instead. Nothing was cancelled, and it holds no branch until it starts. When it settles, Cairn delivers its result to this job as a notice, and `{}` shows where it stands. Do not re-run it.{}",
-        handle_uri(request_id),
-        lifecycle_sentence(request_id)
+        "This batch has not started yet: it is {waiting}. Cairn could not suspend this call ({reason}), so the call answers now instead. Nothing was cancelled, and it holds no branch until it starts. When it settles, Cairn delivers its result to this job as a notice, and `{handle}` shows where it stands and its whole lifecycle. Do not re-run it."
     )
 }
 
-/// What a reissue of a batch still unsettled detached is told: which request
-/// it is, where that request stands now, and how to wait on it.
-pub(crate) fn reissue_refusal_text(request_id: &str, live: &LiveState) -> String {
+/// What a reissue of a batch still unsettled detached is told: which batch
+/// it is, where it stands now, and how to wait on it.
+pub(crate) fn reissue_refusal_text(handle: &str, live: &LiveState) -> String {
     format!(
-        "This batch is already in flight as request `{request_id}`, detached from the call that issued it: {}. Nothing new was started. Wait on that request instead of re-running it: its result reaches this job as a notice when it settles, and `{}` shows where it stands now.{}",
+        "This batch is already in flight as `{handle}`, detached from the call that issued it: {}. Nothing new was started. Wait on it instead of re-running it: its result reaches this job as a notice when it settles, and `{handle}` shows where it stands now.",
         live.sentence(),
-        handle_uri(request_id),
-        lifecycle_sentence(request_id)
     )
 }
 
@@ -1058,7 +1113,7 @@ pub(crate) fn commit_phrase(batch: &DetachedBatch) -> String {
 /// Cairn's sentence about a detached batch, as its job receives it. It is the
 /// whole notice: the full output stays behind the handle.
 pub(crate) fn notice_sentence(batch: &DetachedBatch) -> String {
-    let handle = handle_uri(&batch.request_id);
+    let handle = batch.handle();
     match batch.state {
         DetachedState::Lost => format!(
             "Your run batch '{}' ({handle}) can no longer report ({}); its outcome is unknown, and the handle shows what was recorded.",
@@ -1114,7 +1169,7 @@ pub(crate) fn late_notice_sentence(batch: &DetachedBatch, late: &LateReport) -> 
     format!(
         "Your run batch '{}' ({}), settled lost at {} ({}), reported afterwards from {}: {}. {}",
         label_of(batch),
-        handle_uri(&batch.request_id),
+        batch.handle(),
         batch
             .settled_ms
             .map(at)
@@ -1149,7 +1204,7 @@ pub(crate) fn summary_line(batch: &DetachedBatch, home: &str, live: &LiveState) 
     };
     format!(
         "`{home}/batches/{}` '{}': {state}",
-        batch.request_id,
+        batch_segment(batch.number, &batch.request_id),
         label_of(batch)
     )
 }
@@ -1466,7 +1521,7 @@ pub(crate) async fn insert(db: &LocalDb, batch: &DetachedBatch) -> Result<(), St
 
 pub(crate) async fn load(db: &LocalDb, request_id: &str) -> Result<Option<DetachedBatch>, String> {
     db.query_opt(
-        format!("SELECT {COLUMNS} FROM run_batch_detached WHERE request_id=?1"),
+        format!("SELECT {SELECT_COLUMNS} FROM run_batch_detached WHERE request_id=?1"),
         params![request_id.to_string()],
         from_row,
     )
@@ -1478,7 +1533,7 @@ pub(crate) async fn load(db: &LocalDb, request_id: &str) -> Result<Option<Detach
 pub(crate) async fn for_job(db: &LocalDb, job_id: &str) -> Result<Vec<DetachedBatch>, String> {
     db.query_all(
         format!(
-            "SELECT {COLUMNS} FROM run_batch_detached WHERE job_id=?1 ORDER BY created_ms DESC"
+            "SELECT {SELECT_COLUMNS} FROM run_batch_detached WHERE job_id=?1 ORDER BY created_ms DESC"
         ),
         params![job_id.to_string()],
         from_row,
@@ -1538,7 +1593,7 @@ pub(crate) async fn running_for_job(
     job_id: &str,
 ) -> Result<Vec<DetachedBatch>, String> {
     db.query_all(
-        format!("SELECT {COLUMNS} FROM run_batch_detached WHERE job_id=?1 AND state IN ('parked','running')"),
+        format!("SELECT {SELECT_COLUMNS} FROM run_batch_detached WHERE job_id=?1 AND state IN ('parked','running')"),
         params![job_id.to_string()],
         from_row,
     )
@@ -1549,7 +1604,9 @@ pub(crate) async fn running_for_job(
 /// Every batch still unsettled detached in this database: parked or running.
 pub(crate) async fn all_running(db: &LocalDb) -> Result<Vec<DetachedBatch>, String> {
     db.query_all(
-        format!("SELECT {COLUMNS} FROM run_batch_detached WHERE state IN ('parked','running')"),
+        format!(
+            "SELECT {SELECT_COLUMNS} FROM run_batch_detached WHERE state IN ('parked','running')"
+        ),
         (),
         from_row,
     )
@@ -1690,7 +1747,7 @@ async fn finish(
             }
             let mut rows = c
                 .query(
-                    &format!("SELECT {COLUMNS} FROM run_batch_detached WHERE request_id=?1"),
+                    &format!("SELECT {SELECT_COLUMNS} FROM run_batch_detached WHERE request_id=?1"),
                     params![id.clone()],
                 )
                 .await?;
@@ -1751,9 +1808,10 @@ pub(crate) async fn mark_lost(
 
 /// What a parked call is told when its batch was settled lost: the outcome is
 /// unknown, the branch is released, and a later result is only reported.
-pub(crate) fn lost_text_for_wait(request_id: &str, evidence: &str, commits: bool) -> String {
+/// `handle` is the batch's `batches/{n}` handle, which reads its lifecycle.
+pub(crate) fn lost_text_for_wait(handle: &str, evidence: &str, commits: bool) -> String {
     format!(
-        "{}: run batch `{request_id}` was settled lost ({evidence}). It no longer holds its branch, and a result that arrives later is reported to this job and not published.{}",
+        "{}: this run batch was settled lost ({evidence}). It no longer holds its branch, and a result that arrives later is reported to this job and not published.{}\n\nLifecycle: `{handle}`.",
         super::RUN_OUTCOME_UNKNOWN,
         if commits {
             " It carried a commit_msg; read `cairn:@/vcs/log?limit=5` before re-running it."
@@ -1766,7 +1824,7 @@ pub(crate) fn lost_text_for_wait(request_id: &str, evidence: &str, commits: bool
 /// [`lost_text_for_wait`] from a lost row's own record.
 pub(crate) fn lost_wait_text(batch: &DetachedBatch) -> String {
     lost_text_for_wait(
-        &batch.request_id,
+        &batch.handle(),
         batch
             .lost_evidence
             .as_deref()
@@ -1844,7 +1902,7 @@ pub(crate) async fn report_late(
                 }
                 let mut rows = c
                     .query(
-                        &format!("SELECT {COLUMNS} FROM run_batch_detached WHERE request_id=?1"),
+                        &format!("SELECT {SELECT_COLUMNS} FROM run_batch_detached WHERE request_id=?1"),
                         params![id.clone()],
                     )
                     .await?;
@@ -2082,6 +2140,7 @@ mod tests {
             settlement: None,
             waiting_on: None,
             late_report: None,
+            number: None,
         }
     }
 
@@ -2718,10 +2777,16 @@ mod tests {
         let row = running("req-1");
         assert!(summary_line(&row, "cairn://p/x/1/1/builder", &queued)
             .ends_with("queued, not yet placed on any machine"));
-        let refusal = reissue_refusal_text("req-1", &queued);
-        assert!(refusal.contains("request `req-1`"), "{refusal}");
+        let refusal = reissue_refusal_text(&handle_uri("1"), &queued);
+        assert!(
+            refusal.contains("already in flight as `cairn:~/batches/1`"),
+            "{refusal}"
+        );
         assert!(refusal.contains("ProjectProvisioning"), "{refusal}");
-        assert!(refusal.contains("cairn:~/batches/req-1"), "{refusal}");
+        assert!(
+            refusal.contains("`cairn:~/batches/1` shows where it stands now"),
+            "{refusal}"
+        );
         assert!(summary_line(
             &row,
             "cairn://p/x/1/1/builder",
@@ -2733,8 +2798,11 @@ mod tests {
         let parked = LiveState::Parked {
             waiting: "waiting for the job's residency on bgsrv-mac: running `batch-1`".into(),
         };
-        let refusal = reissue_refusal_text("req-2", &parked);
-        assert!(refusal.contains("request `req-2`"), "{refusal}");
+        let refusal = reissue_refusal_text(&handle_uri("2"), &parked);
+        assert!(
+            refusal.contains("already in flight as `cairn:~/batches/2`"),
+            "{refusal}"
+        );
         assert!(refusal.contains("running `batch-1`"), "{refusal}");
         assert!(refusal.contains("holds no branch"), "{refusal}");
     }
@@ -2742,11 +2810,14 @@ mod tests {
     #[test]
     fn the_detach_answer_says_nothing_was_cancelled_and_names_the_handle() {
         assert_eq!(
-            detach_answer_text("req-1", "the project store was busy past its answer deadline"),
-            "This batch is still running. Cairn could not suspend this call (the project store was busy past its answer deadline), so the call answers now instead. Nothing was cancelled. When it settles, Cairn delivers its result to this job as a notice, and you can read it any time at `cairn:~/batches/req-1`. Do not re-run it. Its whole lifecycle reads at `cairn:@/requests/req-1`."
+            detach_answer_text(
+                &handle_uri("1"),
+                "the project store was busy past its answer deadline"
+            ),
+            "This batch is still running. Cairn could not suspend this call (the project store was busy past its answer deadline), so the call answers now instead. Nothing was cancelled. When it settles, Cairn delivers its result to this job as a notice, and you can read it and its whole lifecycle any time at `cairn:~/batches/1`. Do not re-run it."
         );
         assert!(!crate::mcp::handlers::run::envelope_reports_run_failure(
-            &detach_answer_text("req-1", "x")
+            &detach_answer_text(&handle_uri("1"), "x")
         ));
     }
 

@@ -204,6 +204,9 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("runs", SKELETON),
     // Inline and refused batches have no other durable lifecycle record.
     keep("run_batch_requests", SKELETON),
+    // The last number each scope handed out; dropping one would reuse numbers
+    // that old addresses still name.
+    keep("address_counters", SKELETON),
     keep("sessions", SKELETON),
     keep("turns", SKELETON),
     keep("threads", SKELETON),

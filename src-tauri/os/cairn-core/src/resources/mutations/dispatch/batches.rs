@@ -1,8 +1,8 @@
-//! `patch {action:"cancel"}` on a node's or task's `batches/<request_id>`:
-//! cancel that one run batch ([`crate::mcp::handlers::run::cancel`]).
+//! `patch {action:"cancel"}` on a node's or task's `batches/<n>`: cancel that
+//! one run batch ([`crate::mcp::handlers::run::cancel`]).
 //!
-//! The address is the batch's own: the request id the rebase hold, the
-//! executor's placement page, and the batch's handle all show. A cancel
+//! The address is the batch's own handle, by the number it took within its
+//! job; a legacy address naming its request id still reaches it. A cancel
 //! addressed under the wrong node is refused naming the right one, so a
 //! principal never cancels a batch it did not mean.
 //!
@@ -81,24 +81,71 @@ pub(super) async fn dispatch(
     )
     .await
     .map_err(fail)?;
+    use cairn_db::storage::address_numbers::{number_of, resolve, Numbered};
+    let segment = request_id;
+    let resolved = resolve(&db, Numbered::RunBatch, Some(&addressed), segment)
+        .await
+        .map_err(fail)?;
+    // A batch received before the ledger numbered batches is still addressed
+    // by its request id, which then names it directly.
+    let (request_id, legacy) = match &resolved {
+        Some(resolved) => (resolved.id.clone(), resolved.legacy),
+        None => (segment.clone(), false),
+    };
+    let request_id = &request_id;
+    let shown = resolved
+        .as_ref()
+        .map_or_else(|| segment.clone(), |resolved| resolved.number.to_string());
+    let adjusted: Vec<_> = legacy
+        .then(|| {
+            let canonical = match resource {
+                CairnResource::NodeBatch { .. } => cairn_uri::build_node_batch_uri(
+                    project,
+                    number,
+                    exec_seq,
+                    node_id,
+                    resolved.as_ref().map_or(0, |r| r.number),
+                ),
+                _ => cairn_uri::build_task_batch_uri(
+                    project,
+                    number,
+                    exec_seq,
+                    node_id,
+                    task_name.unwrap_or_default(),
+                    resolved.as_ref().map_or(0, |r| r.number),
+                ),
+            };
+            cairn_db::storage::address_numbers::legacy_adjustment(&resource.to_uri(), &canonical)
+        })
+        .into_iter()
+        .collect();
     let owner = batch_owner(&db, request_id).await.map_err(fail)?;
     let Some(owner) = owner else {
-        return Err(fail(not_in_flight(&db, request_id).await));
+        return Err(fail(not_in_flight(&db, request_id, &shown).await));
     };
     if owner != addressed {
+        let theirs = number_of(&db, Numbered::RunBatch, None, request_id)
+            .await
+            .ok()
+            .flatten();
         let right = crate::jobs::queries::home_uri_for_job(&db, &owner)
             .await
             .ok()
             .flatten()
-            .map(|home| format!(" Address it at `{home}/batches/{request_id}`."))
+            .map(|home| {
+                format!(
+                    " Address it at `{home}/batches/{}`.",
+                    detached::batch_segment(theirs, request_id)
+                )
+            })
             .unwrap_or_default();
         return Err(fail(format!(
-            "Refused: run batch `{request_id}` belongs to a different job than this address names.{right} Nothing was cancelled."
+            "Refused: run batch {shown} belongs to a different job than this address names.{right} Nothing was cancelled."
         )));
     }
     let writer = super::writer(orch, request).await.map_err(fail)?;
     let thread = super::threads::run_thread_home(orch, request).await;
-    authorize(&db, &writer, thread.as_deref(), &owner, request_id)
+    authorize(&db, &writer, thread.as_deref(), &owner, &shown)
         .await
         .map_err(fail)?;
     let principal = thread.as_deref().unwrap_or_else(|| writer.principal());
@@ -113,16 +160,19 @@ pub(super) async fn dispatch(
         Some(_) => return Err(fail("payload.reason must be a string".to_string())),
     };
     if dry_run {
-        return Ok(Some(format!(
-            "Would cancel run batch `{request_id}` on behalf of {}",
-            by
+        return Ok(Some(cairn_common::adjustment::with_summary(
+            format!("Would cancel run batch {shown} on behalf of {by}"),
+            &adjusted,
         )));
     }
     let report = cancel::cancel_batch(orch, &db, request_id, &by, cancel::CANCEL_SETTLE_WAIT).await;
     if !report.reached() {
-        return Err(fail(report.sentence(request_id)));
+        return Err(fail(report.sentence(&shown)));
     }
-    Ok(Some(report.sentence(request_id)))
+    Ok(Some(cairn_common::adjustment::with_summary(
+        report.sentence(&shown),
+        &adjusted,
+    )))
 }
 
 /// The job a batch runs for: its live control's, its detached row's, or its
@@ -154,10 +204,10 @@ pub(super) async fn batch_owner(db: &LocalDb, request_id: &str) -> Result<Option
 }
 
 /// Why a batch with no in-flight record cannot be cancelled.
-async fn not_in_flight(db: &LocalDb, request_id: &str) -> String {
+async fn not_in_flight(db: &LocalDb, request_id: &str, shown: &str) -> String {
     match detached::load(db, request_id).await {
         Ok(Some(batch)) => format!(
-            "Nothing was cancelled: run batch `{request_id}` already ended ({}).",
+            "Nothing was cancelled: run batch {shown} already ended ({}).",
             batch
                 .verdict
                 .as_deref()
@@ -165,7 +215,7 @@ async fn not_in_flight(db: &LocalDb, request_id: &str) -> String {
                 .unwrap_or("settled")
         ),
         _ => format!(
-            "Nothing was cancelled: no run batch `{request_id}` is in flight. A batch whose call already answered has ended; one an earlier runner placed and nothing records settles from its machine's own report."
+            "Nothing was cancelled: no run batch {shown} is in flight. A batch whose call already answered has ended; one an earlier runner placed and nothing records settles from its machine's own report."
         ),
     }
 }
@@ -176,7 +226,7 @@ async fn authorize(
     writer: &Writer,
     thread: Option<&str>,
     owner: &str,
-    request_id: &str,
+    shown: &str,
 ) -> Result<(), String> {
     let Writer::Run { job_id, .. } = writer else {
         return Ok(());
@@ -193,7 +243,7 @@ async fn authorize(
         .flatten()
         .unwrap_or_else(|| format!("job `{owner}`"));
     Err(format!(
-        "Refused: run batch `{request_id}` belongs to {holder}. Any thread (its sessions and their tasks), that node, a node sharing its branch, or the operator may cancel it; caller {} acts for no thread and owns neither this batch nor its branch. Nothing was cancelled.",
+        "Refused: run batch {shown} belongs to {holder}. Any thread (its sessions and their tasks), that node, a node sharing its branch, or the operator may cancel it; caller {} acts for no thread and owns neither this batch nor its branch. Nothing was cancelled.",
         writer.principal()
     ))
 }

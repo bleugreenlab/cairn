@@ -129,11 +129,6 @@ pub(crate) async fn parked_section(orch: &Orchestrator, executor_id: &str) -> Op
     Some(out)
 }
 
-/// The lifecycle address a node reads its own batches at.
-pub(crate) fn relative_lifecycle_uri(request_id: &str) -> String {
-    format!("cairn:@/requests/{request_id}")
-}
-
 /// Read one request's lifecycle as Markdown or (`json`) as one JSON object.
 pub(crate) async fn read_request(
     orch: &Orchestrator,
@@ -198,7 +193,10 @@ pub(crate) async fn read_request(
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct CheckRequestRef {
+    #[serde(skip)]
     id: String,
+    /// Its address within the project: `check-requests/{number}`.
+    number: u64,
     suite: String,
     state: String,
     fleet_request_id: Option<String>,
@@ -396,7 +394,7 @@ async fn resolve(
     if let Some(checks_db) = checks_db {
         let row = checks_db
             .query_opt(
-                "SELECT id, suite, state, request_id FROM check_requests WHERE id=?1",
+                "SELECT id, suite, state, request_id, number FROM check_requests WHERE id=?1",
                 params![id.to_owned()],
                 |row| {
                     Ok(CheckRequestRef {
@@ -404,6 +402,8 @@ async fn resolve(
                         suite: row.text(1)?,
                         state: row.text(2)?,
                         fleet_request_id: row.opt_text(3)?,
+                        number: u64::try_from(row.opt_i64(4)?.unwrap_or_default())
+                            .unwrap_or_default(),
                     })
                 },
             )
@@ -454,6 +454,8 @@ struct LedgerRow {
     ended_ms: Option<i64>,
     end: Option<String>,
     end_detail: Option<String>,
+    /// Its number within its job: the `batches/{n}` handle.
+    number: Option<u64>,
 }
 
 const LEDGER_COLUMNS: &str =
@@ -461,7 +463,7 @@ const LEDGER_COLUMNS: &str =
      incarnation, label, item_count, sequential, declared_timeout_ms, verdict_branch, cwd, \
      selector_json, attempt_id, executor_id, machine, generation, cell_id, pid, started_ms, \
      peak_cpu_milli, peak_resident_bytes, last_progress_ms, output_bytes, ended_ms, \"end\", \
-     end_detail";
+     end_detail, number";
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -633,6 +635,7 @@ async fn ledger_row(db: &LocalDb, request_id: &str) -> Result<Option<LedgerRow>,
                 ended_ms: row.opt_i64(26)?,
                 end: row.opt_text(27)?,
                 end_detail: row.opt_text(28)?,
+                number: row.opt_i64(29)?.and_then(|n| u64::try_from(n).ok()),
             })
         },
     )
@@ -884,7 +887,7 @@ async fn lanes(db: &LocalDb, local: &LocalDb, request_id: &str) -> Result<Vec<La
         if let Some(observation) = &lane.observation_id {
             lane.observation_handle = db
                 .query_opt_text(
-                    "SELECT public_handle FROM check_result_observations WHERE id=?1",
+                    "SELECT CAST(number AS TEXT) FROM check_result_observations WHERE id=?1",
                     (observation.clone(),),
                 )
                 .await
@@ -1554,14 +1557,15 @@ fn build(
     if end.kind == "still_running" {
         if let Some(node) = &context.node {
             actions.push(format!(
-                "Where it is held, and its cancel: `{node}/batches/{request_id}`"
+                "Where it is held, and its cancel: `{node}/batches/{}`",
+                detached::batch_segment(ledger.as_ref().and_then(|row| row.number), request_id)
             ));
         }
     }
     if let Some(check) = &ids.check_request {
         actions.push(format!(
             "Its check request: `{}`",
-            crate::execution::checks::requests::request_uri(project, &check.id)
+            crate::execution::checks::requests::request_uri(project, check.number)
         ));
     }
     RequestLifecycle {
@@ -1681,8 +1685,8 @@ fn render(lifecycle: &RequestLifecycle) -> String {
     }
     if let Some(check) = &ids.check_request {
         lines.push(format!(
-            "- Check request: `{}` ({}, {})",
-            check.id, check.suite, check.state
+            "- Check request: {} ({}, {})",
+            check.number, check.suite, check.state
         ));
     }
 
@@ -1798,12 +1802,10 @@ fn render(lifecycle: &RequestLifecycle) -> String {
                 &lane.observation_handle,
                 &lane.observation_uri,
             ) {
-                (Some(id), Some(handle), Some(uri)) => lines.push(format!(
-                    "  - Observation: UUID `{id}`, handle `{handle}`: {uri}"
-                )),
-                (Some(id), _, _) => {
-                    lines.push(format!("  - Observation: UUID `{id}` (no public handle)"))
+                (Some(_), Some(number), Some(uri)) => {
+                    lines.push(format!("  - Observation {number}: {uri}"))
                 }
+                (Some(id), _, _) => lines.push(format!("  - Observation: `{id}` (no number)")),
                 _ => {}
             }
             for waiter in &lane.waiters {
@@ -1968,13 +1970,13 @@ fn unknown(id: &str, json: bool) -> String {
 }
 
 fn check_request_only(project: &str, check: &CheckRequestRef, json: bool) -> String {
-    let uri = crate::execution::checks::requests::request_uri(project, &check.id);
+    let uri = crate::execution::checks::requests::request_uri(project, check.number);
     if json {
         return serde_json::json!({ "checkRequest": check, "uri": uri }).to_string();
     }
     format!(
-        "`{}` is check request {} ({}), which no fleet request carries yet. Its own page says where it stands: `{uri}`",
-        check.id, check.suite, check.state
+        "This is check request {} ({}, {}), which no fleet request carries yet. Its own page says where it stands: `{uri}`",
+        check.number, check.suite, check.state
     )
 }
 

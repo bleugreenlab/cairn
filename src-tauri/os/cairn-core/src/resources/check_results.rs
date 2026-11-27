@@ -40,20 +40,51 @@ pub(super) async fn read_project_check_observation(
     project: &str,
     handle: &str,
 ) -> String {
+    use cairn_db::storage::address_numbers::{id_for_number, parse_number, Numbered};
     let uuid = request_handle(handle);
+    let number = parse_number(handle);
     if uuid.is_none()
+        && number.is_none()
         && (handle.len() != 24 || !handle.bytes().all(|byte| byte.is_ascii_hexdigit()))
     {
-        return "Invalid check observation handle: expected a 24-hex ledger handle".to_string();
+        return "Invalid check observation address: expected its number".to_string();
     }
     let db = orch.db.for_project(project).await;
     let project_id = match project_id_by_key(&db, project).await {
         Ok(project_id) => project_id,
         Err(error) => return error,
     };
+    // The number first; a legacy 24-hex handle or row UUID still opens the
+    // same row, and the page names the mapping on its first line.
+    if let Some(number) = number {
+        let id =
+            match id_for_number(&db, Numbered::CheckObservation, Some(&project_id), number).await {
+                Ok(Some(id)) => id,
+                Ok(None) => return "Check observation not found".to_string(),
+                Err(error) => return format!("Unable to read check observation: {error}"),
+            };
+        return match get_check_result_observation_by_id(db, &project_id, &id) {
+            Ok(Some(observation)) => render_ledger_row(orch, project, &observation),
+            Ok(None) => "Check observation not found".to_string(),
+            Err(error) => format!("Unable to read check observation: {error}"),
+        };
+    }
+    let legacy = |observation: &CheckResultObservationProjection| {
+        let page = render_ledger_row(orch, project, observation);
+        match observation.number {
+            Some(number) => format!(
+                "{}\n\n{page}",
+                cairn_db::storage::address_numbers::legacy_adjustment(
+                    &format!("cairn://p/{project}/check-observations/{handle}"),
+                    &cairn_uri::build_project_check_observation_uri(project, number),
+                )
+            ),
+            None => page,
+        }
+    };
     let Some(uuid) = uuid else {
         return match get_check_result_observation_by_handle(db, &project_id, handle) {
-            Ok(Some(observation)) => render_ledger_row(orch, project, &observation),
+            Ok(Some(observation)) => legacy(&observation),
             Ok(None) => "Check observation not found".to_string(),
             Err(error) => format!("Unable to read check observation: {error}"),
         };
@@ -61,7 +92,7 @@ pub(super) async fn read_project_check_observation(
     // A UUID is either a raw observation row id or a check request id; only a
     // lookup tells which, and an address naming neither is simply not found.
     match get_check_result_observation_by_id(db, &project_id, &uuid) {
-        Ok(Some(observation)) => return render_ledger_row(orch, project, &observation),
+        Ok(Some(observation)) => return legacy(&observation),
         Ok(None) => {}
         Err(error) => return format!("Unable to read check observation: {error}"),
     }
@@ -70,8 +101,10 @@ pub(super) async fn read_project_check_observation(
         Err(error) => return error,
     };
     match requests::load_request(&request_db, &project_id, &uuid).await {
-        Ok(Some(_)) => format!(
-            "`{uuid}` is a check request, not a ledger row. Read it at cairn://p/{project}/check-requests/{uuid}"
+        Ok(Some(row)) => format!(
+            "This is check request {}, not a ledger row. Read it at {}",
+            row.number,
+            row.uri(project)
         ),
         Ok(None) => "Check observation not found".to_string(),
         Err(error) => error,
@@ -100,9 +133,8 @@ fn render_ledger_row(
         offset: 0,
     };
     let citation = observation
-        .public_handle
-        .as_deref()
-        .map(|handle| format!("cairn://p/{project}/check-observations/{handle}"));
+        .number
+        .map(|number| cairn_uri::build_project_check_observation_uri(project, number));
     render_observation(
         project,
         &observation.source_commit_sha,
@@ -662,9 +694,9 @@ fn render_observation_page(
     // A cached alias answers this commit with an execution at another one; the
     // populations below are that execution's, never this request's.
     let reused_from = (observation.disposition == "cached").then(|| {
-        let source = observation.public_handle.as_deref().map_or_else(
-            || "its source observation has no permalink handle".to_string(),
-            |handle| format!("cairn://p/{project}/check-observations/{handle}"),
+        let source = observation.number.map_or_else(
+            || "its source observation has no number".to_string(),
+            |number| cairn_uri::build_project_check_observation_uri(project, number),
         );
         format!(
             "the execution at {} ({source})",
@@ -1291,21 +1323,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ledger_handles_keep_their_shape_and_other_handles_are_refused() {
+    async fn an_observation_opens_by_its_number_and_other_shapes_are_refused() {
         let (_root, orch) = request_fixture().await;
+        let page = read_project_check_observation(&orch, "proj", "1").await;
+        assert_eq!(page, "Check observation not found");
+        seed_held_observation(&orch).await;
+        let page = read_project_check_observation(&orch, "proj", "1").await;
+        assert!(page.starts_with("# Check results: rust-tests"), "{page}");
+        // A legacy 24-hex handle keeps its shape, and one naming no row is
+        // not found.
         let page = read_project_check_observation(&orch, "proj", "0123456789abcdef01234567").await;
         assert_eq!(page, "Check observation not found");
         let page = read_project_check_observation(&orch, "proj", "not-a-handle").await;
-        assert!(
-            page.starts_with("Invalid check observation handle"),
-            "{page}"
+        assert_eq!(
+            page,
+            "Invalid check observation address: expected its number"
         );
         // A 32-hex UUID spelling is neither shape: request ids are hyphenated.
         let simple = uuid::Uuid::new_v4().simple().to_string();
         let page = read_project_check_observation(&orch, "proj", &simple).await;
-        assert!(
-            page.starts_with("Invalid check observation handle"),
-            "{page}"
+        assert_eq!(
+            page,
+            "Invalid check observation address: expected its number"
         );
     }
 
@@ -1344,18 +1383,35 @@ mod tests {
             .await
             .unwrap();
 
-        // A raw ledger row id renders the row, cited by its handle.
-        let page = read_project_check_observation(&orch, "proj", HELD_OBSERVATION).await;
-        assert!(page.starts_with("# Check results: rust-tests"), "{page}");
+        // A raw ledger row id renders the row, cited by its number, after the
+        // line that maps the legacy address onto it.
+        let adjusted = |legacy: &str| {
+            format!(
+                "Adjusted: `address` `cairn://p/proj/check-observations/{legacy}` → `cairn://p/proj/check-observations/1` (addressed by its number; the storage-id link still resolves to the same row).\n\n"
+            )
+        };
+        let numbered = read_project_check_observation(&orch, "proj", "1").await;
         assert!(
-            page.contains(&format!("cairn://p/proj/check-observations/{HELD_HANDLE}")),
+            numbered.starts_with("# Check results: rust-tests"),
+            "{numbered}"
+        );
+        assert!(
+            numbered.contains("(cairn://p/proj/check-observations/1)"),
+            "{numbered}"
+        );
+        let page = read_project_check_observation(&orch, "proj", HELD_OBSERVATION).await;
+        assert_eq!(
+            page.strip_prefix(&adjusted(HELD_OBSERVATION)),
+            Some(numbered.as_str()),
             "{page}"
         );
         assert!(!page.contains("check-requests"), "{page}");
-        // The row is the same one its handle names.
+        // The row is the same one its legacy handle names.
+        let by_handle = read_project_check_observation(&orch, "proj", HELD_HANDLE).await;
         assert_eq!(
-            page,
-            read_project_check_observation(&orch, "proj", HELD_HANDLE).await
+            by_handle.strip_prefix(&adjusted(HELD_HANDLE)),
+            Some(numbered.as_str()),
+            "{by_handle}"
         );
         // Another project's row is not this project's.
         assert_eq!(
@@ -1365,10 +1421,7 @@ mod tests {
 
         // A check request id points at the request, which opens.
         let page = read_project_check_observation(&orch, "proj", &request).await;
-        assert!(
-            page.contains(&format!("cairn://p/proj/check-requests/{request}")),
-            "{page}"
-        );
+        assert!(page.contains("cairn://p/proj/check-requests/1"), "{page}");
         let opened =
             super::super::check_requests::read_check_request(&orch, "proj", &request, false).await;
         assert!(!opened.contains("is unknown"), "{opened}");
@@ -1394,12 +1447,12 @@ mod tests {
         let text = health.to_string();
         let prefix = "held observation cairn://p/proj/check-observations/";
         let start = text.find(prefix).unwrap_or_else(|| panic!("{text}")) + prefix.len();
-        let handle: String = text[start..]
+        let number: String = text[start..]
             .chars()
-            .take_while(|c| c.is_ascii_hexdigit())
+            .take_while(|c| c.is_ascii_digit())
             .collect();
-        assert_eq!(handle.len(), 24, "{text}");
-        let page = read_project_check_observation(&orch, "proj", &handle).await;
+        assert_eq!(number, "1", "{text}");
+        let page = read_project_check_observation(&orch, "proj", &number).await;
         assert!(page.starts_with("# Check results: rust-tests"), "{page}");
         assert!(
             !text.contains(&format!("held observation `{HELD_OBSERVATION}`")),
@@ -1615,7 +1668,7 @@ mod tests {
                 ..Default::default()
             },
             verdict_result: None,
-            public_handle: Some("0123456789abcdef01234567".into()),
+            number: Some(7),
             plan_audit_state: None,
             plan_audit_note: None,
             audit_findings: Vec::new(),
@@ -1750,7 +1803,7 @@ mod tests {
         );
         // A cached alias says whose execution these populations are.
         assert!(
-            page.contains("- Execution: reused from the execution at source-commi (cairn://p/cairn/check-observations/0123456789abcdef01234567) (not counted as a fresh execution)"),
+            page.contains("- Execution: reused from the execution at source-commi (cairn://p/cairn/check-observations/7) (not counted as a fresh execution)"),
             "{page}"
         );
 

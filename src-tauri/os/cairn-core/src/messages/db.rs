@@ -41,7 +41,7 @@ pub async fn query_for_thread(
 /// only needs one edit here and a matching row-index update in
 /// [`message_from_row`].
 const MESSAGE_COLUMNS: &str = "id, channel_type, channel_id, sender_run_id, sender_name,
-        content, created_at, urgency";
+        content, created_at, urgency, number";
 
 /// Convert a database row to a domain Message. Its recipients are filled by
 /// [`with_recipients`].
@@ -62,6 +62,10 @@ fn message_from_row(row: &cairn_db::turso::Row) -> DbResult<Message> {
             .map(DeliveryUrgency::parse)
             .transpose()
             .map_err(DbError::Row)?,
+        number: row
+            .opt_i64(8)?
+            .and_then(|number| u64::try_from(number).ok())
+            .unwrap_or_default(),
     })
 }
 

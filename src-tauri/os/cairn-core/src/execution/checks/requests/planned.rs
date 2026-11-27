@@ -481,7 +481,7 @@ pub(super) async fn file(
         spawn(orch, db, id.clone(), Drive::Planned(Some(Box::new(live))));
     }
     Ok(FiledRequest {
-        uri: request_uri(&spec.project_key, &id),
+        uri: request_uri(&spec.project_key, accepted.number),
         id,
         suite: spec.suite,
         joined: accepted.joined,

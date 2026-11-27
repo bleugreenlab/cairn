@@ -817,9 +817,9 @@ impl Condition {
                 label: Some(label), ..
             } => format!("run: {label}"),
             Condition::RunBatch { label: None, .. } => "run batch".to_string(),
-            Condition::OperatorRequest { request_id, .. } => {
-                format!("write: operator request cairn://requests/{request_id}")
-            }
+            // The stored id is internal; the resumed result names the request
+            // by its numbered address.
+            Condition::OperatorRequest { .. } => "write: operator request".to_string(),
         }
     }
 }
@@ -1915,7 +1915,7 @@ async fn deliver_abandonment(
             "outcome": ABANDONED_OUTCOME,
             "error": format!(
                 "This call's wait ended before its batch finished, but the batch keeps running. Cairn delivers its result to this job as a notice, and `{}` shows it now. Do not re-run it.",
-                super::run::detached::handle_uri(request_id)
+                super::run::detached::handle_for(orch, request_id).await
             ),
         })
         .to_string(),
@@ -3720,9 +3720,9 @@ async fn resolution_after_restart(
         }
         // Only a host batch reaches here (see `reconcile`): it ran inside the
         // process that died, so nothing of it is left to wait for.
-        Condition::RunBatch { request_id, .. } => {
-            super::run::adopted::host_restart_text(request_id)
-        }
+        Condition::RunBatch { request_id, .. } => super::run::adopted::host_restart_text(
+            &super::run::detached::handle_for(orch, request_id).await,
+        ),
         // Level-triggered conditions re-arm from their own durable state, so a
         // restart simply asks them again.
         Condition::Duration
@@ -4735,7 +4735,11 @@ mod tests {
             assert!(report.reached());
             assert_eq!(
                 resolution(&orch).await,
-                cancel::unheld_cancel_text("request-1", "operator", false)
+                cancel::unheld_cancel_text(
+                    &crate::mcp::handlers::run::detached::handle_for(&orch, "request-1").await,
+                    "operator",
+                    false
+                )
             );
             assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
             let lost = detached::load(&orch.db.local, "request-1")
@@ -4816,6 +4820,7 @@ mod tests {
                         settlement: None,
                         waiting_on: None,
                         late_report: None,
+                        number: None,
                     },
                 )
                 .await
@@ -4839,7 +4844,11 @@ mod tests {
                 }
                 assert_eq!(
                     resolution(&orch).await,
-                    cancel::unheld_cancel_text("request-1", "operator", false),
+                    cancel::unheld_cancel_text(
+                        &crate::mcp::handlers::run::detached::handle_for(&orch, "request-1").await,
+                        "operator",
+                        false
+                    ),
                     "retry by cancel: {retry_by_cancel}"
                 );
                 assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
@@ -4911,6 +4920,7 @@ mod tests {
                     settlement: None,
                     waiting_on: None,
                     late_report: None,
+                    number: None,
                 },
             )
             .await
@@ -5020,7 +5030,11 @@ mod tests {
             let resolution = resolution(&orch).await;
             assert_eq!(
                 resolution,
-                adopted::lost_text("request-1", Some(&placed), false)
+                adopted::lost_text(
+                    &crate::mcp::handlers::run::detached::handle_for(&orch, "request-1").await,
+                    Some(&placed),
+                    false
+                )
             );
             assert!(resolution.contains("placed on exec-a"), "{resolution}");
         }
@@ -5436,7 +5450,14 @@ mod tests {
             orch.adoption.backdate_for_test(adopted::RELEASE_AFTER);
             adopted::judge_unheard(&orch).await;
             let resolution = resolution(&orch).await;
-            assert_eq!(resolution, adopted::release_text("request-1", &[], false));
+            assert_eq!(
+                resolution,
+                adopted::release_text(
+                    &crate::mcp::handlers::run::detached::handle_for(&orch, "request-1").await,
+                    &[],
+                    false
+                )
+            );
             let (state, holds): (String, i64) = orch
                 .db
                 .local
@@ -5527,7 +5548,13 @@ mod tests {
 
             adopted::judge_unheard(&orch).await;
             let resolution = resolution(&orch).await;
-            assert_eq!(resolution, adopted::local_restart_text("request-1", true));
+            assert_eq!(
+                resolution,
+                adopted::local_restart_text(
+                    &crate::mcp::handlers::run::detached::handle_for(&orch, "request-1").await,
+                    true
+                )
+            );
             assert!(resolution.contains("request-1") && resolution.contains("`local`"));
         }
     }
@@ -5566,9 +5593,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             resolution,
-            super::super::run::adopted::host_restart_text("request-1")
+            super::super::run::adopted::host_restart_text(
+                &crate::mcp::handlers::run::detached::handle_for(&orch, "request-1").await
+            )
         );
-        assert!(resolution.contains("request-1"));
+        assert!(resolution.contains("cairn:~/batches/"));
         let detached: i64 = orch
             .db
             .local

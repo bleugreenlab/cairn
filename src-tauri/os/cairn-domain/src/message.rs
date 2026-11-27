@@ -166,4 +166,8 @@ pub struct Message {
     pub content: String,
     pub created_at: i64,
     pub urgency: Option<DeliveryUrgency>,
+    /// The number the row took in the database that holds it: its address,
+    /// `cairn://p/{project}/messages/{number}`. The `id` stays internal.
+    #[serde(default)]
+    pub number: u64,
 }

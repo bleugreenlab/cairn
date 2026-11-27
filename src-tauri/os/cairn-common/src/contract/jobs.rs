@@ -121,9 +121,9 @@ pub(crate) const NODE_BATCHES_CONTRACT: ResourceContract = ResourceContract {
 
 pub(crate) const NODE_BATCH_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::NodeBatch,
-    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/batches/{request_id}",
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/batches/{n}",
     name: "Node batch",
-    description: "One run batch of this node, in flight (suspended with its call or detached from it) or settled: where it stands now and the item it is running, its verdict and output once settled, and whether it committed. Any thread on the install (its sessions and their tasks), the owner, a node sharing its branch, or the operator may patch action:cancel to stop this batch only, with an optional reason. The owner's resumed result and batch page name the cancelling principal and reason; a commit already being written stands",
+    description: "One run batch of this node, by the number it took within the node's job, which reads its whole lifecycle: in flight (suspended with its call or detached from it) or settled: where it stands now and the item it is running, its verdict and output once settled, and whether it committed. Any thread on the install (its sessions and their tasks), the owner, a node sharing its branch, or the operator may patch action:cancel to stop this batch only, with an optional reason. The owner's resumed result and batch page name the cancelling principal and reason; a commit already being written stands",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -132,7 +132,7 @@ pub(crate) const NODE_BATCH_CONTRACT: ResourceContract = ResourceContract {
         required: &[BATCH_ACTION],
         optional: &[BATCH_CANCEL_REASON],
         label: "cancel this run batch",
-        example: "write({changes:[{target:\"cairn:~/batches/REQUEST_ID\",mode:\"patch\",payload:{action:\"cancel\"}}]})",
+        example: "write({changes:[{target:\"cairn:~/batches/3\",mode:\"patch\",payload:{action:\"cancel\"}}]})",
     }],
 };
 
@@ -449,9 +449,9 @@ pub(crate) const TASK_BATCHES_CONTRACT: ResourceContract = ResourceContract {
 
 pub(crate) const TASK_BATCH_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::TaskBatch,
-    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/batches/{request_id}",
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/batches/{n}",
     name: "Task batch",
-    description: "One run batch of this task, in flight or settled: where it stands and the item it is running, its verdict, output and commit. Any thread on the install (its sessions and their tasks), the owner, a node sharing its branch, or the operator may patch action:cancel to stop this batch only, with an optional reason. The owner's resumed result and batch page name the cancelling principal and reason; a commit already being written stands",
+    description: "One run batch of this task, by the number it took within the task's job: in flight or settled: where it stands and the item it is running, its verdict, output and commit. Any thread on the install (its sessions and their tasks), the owner, a node sharing its branch, or the operator may patch action:cancel to stop this batch only, with an optional reason. The owner's resumed result and batch page name the cancelling principal and reason; a commit already being written stands",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -460,6 +460,6 @@ pub(crate) const TASK_BATCH_CONTRACT: ResourceContract = ResourceContract {
         required: &[BATCH_ACTION],
         optional: &[BATCH_CANCEL_REASON],
         label: "cancel this run batch",
-        example: "write({changes:[{target:\"cairn://p/PROJ/1/1/builder/task/review/batches/REQUEST_ID\",mode:\"patch\",payload:{action:\"cancel\"}}]})",
+        example: "write({changes:[{target:\"cairn://p/PROJ/1/1/builder/task/review/batches/3\",mode:\"patch\",payload:{action:\"cancel\"}}]})",
     }],
 };

@@ -1079,9 +1079,9 @@ pub(super) fn manual_configured_check_result(
         match outcome.recorded {
             Some(recorded) => (
                 Some(recorded.id),
-                Some(format!(
-                    "cairn://p/{project_key}/check-observations/{}",
-                    recorded.public_handle
+                Some(cairn_uri::build_project_check_observation_uri(
+                    project_key,
+                    recorded.number,
                 )),
                 crate::clock::stamp_millis(recorded.ran_at),
                 recorded.environment_fingerprint,
@@ -1834,7 +1834,7 @@ pub(crate) async fn recover_manual_check_result(
     let (mut result, machine, context) = db.read(move |conn| Box::pin(async move {
         let mut rows = conn.query(
             "SELECT h.commit_sha,h.tree_hash,h.input_hash,h.disposition,h.context_json,
-                    o.id,o.public_handle,o.check_name,o.environment_fingerprint,o.reusable,o.ran_at,
+                    o.id,o.number,o.check_name,o.environment_fingerprint,o.reusable,o.ran_at,
                     o.exit_code,o.verdict,o.failure_kind,o.verdict_result_json,o.output_tail,o.duration_ms,
                     o.executor_id,o.verdict_platform,o.toolchain_fingerprint
                FROM check_requests h
@@ -1875,7 +1875,7 @@ pub(crate) async fn recover_manual_check_result(
             duration_ms: row.i64(16)?,
             suppressed_after: None,
             recorded: Some(crate::execution::cache::RecordedCheckObservation {
-                id: row.text(5)?, public_handle: row.text(6)?,
+                id: row.text(5)?, number: u64::try_from(row.i64(6)?).unwrap_or_default(),
                 ran_at: row.i64(10)?, environment_fingerprint,
                 executor_id: executor_id.clone(), reusable: row.i64(9)? != 0,
             }),

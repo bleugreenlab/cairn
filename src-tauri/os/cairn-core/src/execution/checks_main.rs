@@ -3875,7 +3875,7 @@ async fn load_row(
 ) -> Result<CadenceRow, String> {
     let head = db
         .query_opt(
-            "SELECT id, COALESCE(public_handle, id), commit_sha, COALESCE(verdict_platform, ''),
+            "SELECT id, CAST(number AS TEXT), commit_sha, COALESCE(verdict_platform, ''),
                     executor_id, ran_at, verdict, exit_code, complete, output_tail, cadence,
                     selection,
                     CASE WHEN phase_origin = 'executor' THEN executor_started_at_unix_ms END,
@@ -10194,7 +10194,9 @@ mod tests {
         );
         let text = report(&death, &covered, &Bracket::default());
         assert!(
-            text.contains("Last complete row: cairn://p/cairn/check-observations/h-man-b, the manual row on `bbs`"),
+            text.contains(
+                "Last complete row: cairn://p/cairn/check-observations/2, the manual row on `bbs`"
+            ),
             "{text}"
         );
 
@@ -10244,7 +10246,7 @@ mod tests {
             &Bracket::default(),
         );
         assert!(
-            text.contains("Compared with: cairn://p/cairn/check-observations/h-man-f, the previous manual row on `fedora`"),
+            text.contains("Compared with: cairn://p/cairn/check-observations/8, the previous manual row on `fedora`"),
             "{text}"
         );
     }
@@ -11610,7 +11612,7 @@ mod tests {
             &Bracket::default(),
         );
         assert!(
-            text.contains("Compared with: cairn://p/cairn/check-observations/h-sp2-old"),
+            text.contains("Compared with: cairn://p/cairn/check-observations/1"),
             "{text}"
         );
         assert!(!text.contains("No earlier complete"), "{text}");

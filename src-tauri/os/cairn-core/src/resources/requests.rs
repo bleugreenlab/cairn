@@ -145,8 +145,17 @@ pub(super) async fn read_requests(orch: &Orchestrator, params: &[QueryParam]) ->
 }
 
 pub(super) async fn read_request(orch: &Orchestrator, id: &str) -> String {
-    match operator_requests::get(orch, id).await {
-        Ok(Some(request)) => render_request(&request),
+    use cairn_db::storage::address_numbers::{resolve, with_legacy_line, Numbered};
+    let resolved = match resolve(&orch.db.local, Numbered::OperatorRequest, None, id).await {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return format!("Operator request '{id}' does not exist"),
+        Err(error) => return format!("Unable to read operator request '{id}': {error}"),
+    };
+    match operator_requests::get(orch, &resolved.id).await {
+        Ok(Some(request)) => {
+            let received = cairn_uri::CairnResource::Request { id: id.to_string() }.to_uri();
+            with_legacy_line(&resolved, &received, &request.uri, render_request(&request))
+        }
         Ok(None) => format!("Operator request '{id}' does not exist"),
         Err(error) => format!("Unable to read operator request '{id}': {error}"),
     }

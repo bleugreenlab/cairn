@@ -2721,7 +2721,8 @@ pub(crate) struct ReusedCheckVerdict {
     pub(crate) entry: crate::execution::cache::CheckResultCacheEntry,
     pub(crate) source_observation_id: String,
     pub(crate) environment_fingerprint: String,
-    pub(crate) public_handle: String,
+    /// The source observation's number, its citation.
+    pub(crate) number: u64,
 }
 
 /// Whether a planned lane already holds a verdict this run may report without
@@ -2855,7 +2856,7 @@ async fn reusable_verdict_conn(
     .await
     .ok()
     .flatten()?;
-    let public_handle = crate::execution::cache::get_check_observation_public_handle_conn(
+    let number = crate::execution::cache::get_check_observation_number_conn(
         conn,
         project_id,
         &reused.source_observation_id,
@@ -2867,7 +2868,7 @@ async fn reusable_verdict_conn(
         entry: reused.entry,
         source_observation_id: reused.source_observation_id,
         environment_fingerprint: reused.environment_fingerprint,
-        public_handle,
+        number,
     })
 }
 

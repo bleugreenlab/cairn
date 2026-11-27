@@ -9623,13 +9623,13 @@ async fn an_exit_code_only_manual_pass_cites_a_readable_public_observation() {
         outcome,
     );
     let reference = reply.observation_ref.as_deref().expect("a public citation");
-    let handle = reference.rsplit('/').next().unwrap();
-    assert_eq!(handle.len(), 24, "{reference}");
-    assert!(handle.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    let stored =
-        crate::execution::cache::get_check_result_observation_by_handle(db, "project-a", handle)
-            .unwrap()
-            .expect("the printed citation reads back from the ledger");
+    assert!(
+        reference.starts_with("cairn://p/project-a/check-observations/"),
+        "{reference}"
+    );
+    let stored = observation_cited_by(&db, "project-a", reference)
+        .await
+        .expect("the printed citation reads back from the ledger");
     assert_eq!(stored.verdict, "passed");
     assert_eq!(stored.exit_code, 0);
     assert!(reply.passed && reply.verified, "{reply:?}");
@@ -9678,15 +9678,30 @@ async fn a_vite_build_without_test_counts_is_a_verified_manual_pass() {
         .observation_ref
         .as_deref()
         .expect("the build has a public citation");
-    let handle = reference.rsplit('/').next().unwrap();
-    let stored =
-        crate::execution::cache::get_check_result_observation_by_handle(db, "project-a", handle)
-            .unwrap()
-            .expect("the citation reads back");
+    let stored = observation_cited_by(&db, "project-a", reference)
+        .await
+        .expect("the citation reads back");
     assert_eq!(stored.check_name, "frontend-build");
     assert_eq!(stored.verdict, "passed");
     assert_eq!(stored.exit_code, 0);
     assert!(stored.complete && stored.reusable);
+}
+
+/// The observation a printed citation names: the number its last segment
+/// carries, within `project_id`.
+async fn observation_cited_by(
+    db: &Arc<LocalDb>,
+    project_id: &str,
+    reference: &str,
+) -> Option<crate::execution::cache::CheckResultObservationProjection> {
+    use cairn_db::storage::address_numbers::{id_for_number, parse_number, Numbered};
+    let number = parse_number(reference.rsplit('/').next().unwrap())
+        .unwrap_or_else(|| panic!("{reference} cites no number"));
+    let id = id_for_number(db, Numbered::CheckObservation, Some(project_id), number)
+        .await
+        .unwrap()?;
+    crate::execution::cache::get_check_result_observation_by_id(db.clone(), project_id, &id)
+        .unwrap()
 }
 
 /// One exit-zero manual run of `command` whose output no parser reads.
@@ -9766,13 +9781,9 @@ async fn a_parse_less_test_runner_exit_zero_stays_an_unverified_manual_pass() {
         );
         assert!(!reply.reusable, "{command}: {reply:?}");
         let reference = reply.observation_ref.as_deref().expect("a public citation");
-        let stored = crate::execution::cache::get_check_result_observation_by_handle(
-            db.clone(),
-            "project-a",
-            reference.rsplit('/').next().unwrap(),
-        )
-        .unwrap()
-        .expect("the citation reads back");
+        let stored = observation_cited_by(&db, "project-a", reference)
+            .await
+            .expect("the citation reads back");
         assert_eq!(stored.verdict, "passed", "{command}");
         assert_eq!(stored.exit_code, 0, "{command}");
         assert!(!stored.reusable, "{command}");
@@ -10098,7 +10109,7 @@ fn a_suppressed_check_reports_that_cairn_declined_to_run_it() {
         suppressed_after: None,
         recorded: Some(crate::execution::cache::RecordedCheckObservation {
             id: "obs-red".to_string(),
-            public_handle: "111111111111111111111111".into(),
+            number: 1,
             ran_at: 1_754_246_320_000,
             environment_fingerprint: "env-local".to_string(),
             executor_id: None,
@@ -10124,7 +10135,7 @@ fn a_suppressed_check_reports_that_cairn_declined_to_run_it() {
 
 #[test]
 fn repeated_observations_at_one_coordinate_get_distinct_public_permalinks() {
-    let make = |id: uuid::Uuid, public_handle: &str, ran_at| CheckOutcome {
+    let make = |id: uuid::Uuid, number: u64, ran_at| CheckOutcome {
         left_running: None,
         consumer_guard: None,
         name: "rust-tests".into(),
@@ -10138,7 +10149,7 @@ fn repeated_observations_at_one_coordinate_get_distinct_public_permalinks() {
         suppressed_after: None,
         recorded: Some(crate::execution::cache::RecordedCheckObservation {
             id: id.to_string(),
-            public_handle: public_handle.into(),
+            number,
             ran_at,
             environment_fingerprint: "env".into(),
             executor_id: None,
@@ -10155,7 +10166,7 @@ fn repeated_observations_at_one_coordinate_get_distinct_public_permalinks() {
         "tree".into(),
         "input".into(),
         Some("bun run test:rust"),
-        make(first_id, "111111111111111111111111", 1_754_246_320_000),
+        make(first_id, 1, 1_754_246_320_000),
     );
     let second = manual_configured_check_result(
         "rust-tests",
@@ -10164,7 +10175,7 @@ fn repeated_observations_at_one_coordinate_get_distinct_public_permalinks() {
         "tree".into(),
         "input".into(),
         Some("bun run test:rust"),
-        make(second_id, "222222222222222222222222", 1_754_246_321_000),
+        make(second_id, 2, 1_754_246_321_000),
     );
     assert_ne!(first.observation_ref, second.observation_ref);
     assert!(
