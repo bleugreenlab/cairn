@@ -201,8 +201,20 @@ async fn change_create_refuses_existing_logical_target_atomically() {
         }))
         .await;
 
-    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert_eq!(failure_count(&report), 2, "{report:?}");
     assert!(report["applied"].as_array().is_some_and(Vec::is_empty));
+    assert!(
+        report["failures"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("target already exists")),
+        "{report:?}"
+    );
+    assert!(
+        report["failures"][1]["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("Not attempted: item 0 failed")),
+        "{report:?}"
+    );
     assert_eq!(repo.read("logical.txt"), "original logical bytes\n");
     assert!(!repo.logical_exists("must-not-exist.txt"));
     assert_eq!(repo.branch_head(), head_before);
@@ -1489,9 +1501,16 @@ async fn a_file_batch_with_a_rebase_item_is_refused_before_taking_the_store_lock
             Some(0),
             "{action}: {report:?}"
         );
-        assert_eq!(failure_count(&report), 1, "{action}: {report:?}");
-        assert_eq!(report["failures"][0]["index"], 1, "{action}: {report:?}");
-        let error = report["failures"][0]["error"].as_str().unwrap();
+        assert_eq!(failure_count(&report), 2, "{action}: {report:?}");
+        assert_eq!(report["failures"][0]["index"], 0, "{action}: {report:?}");
+        assert!(
+            report["failures"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("Not applied: item 1 was refused")),
+            "{action}: {report:?}"
+        );
+        assert_eq!(report["failures"][1]["index"], 1, "{action}: {report:?}");
+        let error = report["failures"][1]["error"].as_str().unwrap();
         assert!(
             error.contains("Refusing cairn:~/rebase in a batch with file edits")
                 && error.contains("as its own write"),
@@ -1554,14 +1573,24 @@ async fn a_file_batch_with_a_pull_request_action_is_refused_before_anything_appl
             );
             assert_eq!(
                 failure_count(&report),
-                1,
+                2,
                 "{action} atomic={atomic}: {report:?}"
             );
             assert_eq!(
-                report["failures"][0]["index"], 1,
+                report["failures"][0]["index"], 0,
                 "{action} atomic={atomic}"
             );
-            let error = report["failures"][0]["error"].as_str().unwrap();
+            assert!(
+                report["failures"][0]["error"]
+                    .as_str()
+                    .is_some_and(|error| error.starts_with("Not applied: item 1 was refused")),
+                "{action} atomic={atomic}: {report:?}"
+            );
+            assert_eq!(
+                report["failures"][1]["index"], 1,
+                "{action} atomic={atomic}"
+            );
+            let error = report["failures"][1]["error"].as_str().unwrap();
             assert!(
                 error.contains("Refusing a pull-request action")
                     && error.contains("as its own write"),
@@ -2402,7 +2431,24 @@ async fn change_atomic_true_preserves_file_group_fail_fast() {
         .await;
 
     assert_eq!(report["applied"].as_array().unwrap().len(), 0);
-    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert_eq!(failure_count(&report), 2, "{report:?}");
+    assert_eq!(report["failures"][0]["target"], "file:bad.rs", "{report:?}");
+    assert!(
+        report["failures"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("old_string not found")),
+        "{report:?}"
+    );
+    assert_eq!(
+        report["failures"][1]["target"], "file:good.rs",
+        "{report:?}"
+    );
+    assert!(
+        report["failures"][1]["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("Not attempted: item 0 failed")),
+        "{report:?}"
+    );
     assert_eq!(report["transactional"], true);
     assert_eq!(repo.read("bad.rs"), "old bad\n");
     assert_eq!(repo.read("good.rs"), "old good\n");
