@@ -337,6 +337,8 @@ struct TaskToolResultDelivery {
 struct TaskResumeDelivery {
     parent_job_id: String,
     parent_turn_id: String,
+    /// The claimed `dependency_unblock` marker heading the parent's job.
+    marker_turn_id: String,
     message: String,
     tool_results: Vec<TaskToolResultDelivery>,
 }
@@ -538,14 +540,20 @@ fn delegated_sibling_ids(
 }
 
 /// Atomically mint and claim the dependency-unblock marker after the final
-/// blocking child is terminal. The yielded anchor remaining the job head is the
-/// durable ownership predicate, so provider admission never sees an unowned
-/// pending successor.
+/// blocking child is terminal, returning the marker's id when this call won
+/// the claim. The yielded anchor remaining the job head is the durable
+/// ownership predicate, so provider admission never sees an unowned pending
+/// successor.
+///
+/// The marker heading the job, with no run and no `end_reason`, is also the
+/// run queue's record that the parent's resume is owed: it keeps the
+/// execution active between the last task settling and the resume minting its
+/// own turn (see `activity_sql!` in `execution/queue.rs`).
 async fn claim_dependency_unblock(
     db: &LocalDb,
     parent_job_id: &str,
     predecessor_id: &str,
-) -> Result<bool, String> {
+) -> Result<Option<String>, String> {
     let parent_job_id = parent_job_id.to_string();
     let predecessor_id = predecessor_id.to_string();
     db.write(|conn| {
@@ -567,7 +575,7 @@ async fn claim_dependency_unblock(
                     )
                     .await?;
                 conn.on_commit(cairn_db::admission_hint::evidence_changed);
-                return Ok(affected == 1);
+                return Ok((affected == 1).then_some(successor_id));
             }
             let mut rows = conn
                 .query(
@@ -579,13 +587,13 @@ async fn claim_dependency_unblock(
                 )
                 .await?;
             let Some(row) = rows.next().await? else {
-                return Ok(false);
+                return Ok(None);
             };
             let session_id = row.text(0)?;
             let state = row.text(1)?;
             let yield_reason = row.opt_text(2)?;
             if state != "yielded" || yield_reason.as_deref() != Some("dependency_wait") {
-                return Ok(false);
+                return Ok(None);
             }
 
             let sequence = next_turn_sequence(conn, &session_id).await?;
@@ -623,11 +631,36 @@ async fn claim_dependency_unblock(
                     "dependency-unblock ownership changed during atomic claim".to_string(),
                 ));
             }
-            Ok(true)
+            Ok(Some(successor_id))
         })
     })
     .await
     .map_err(|e| format!("Failed to claim resume successor: {}", e))
+}
+
+/// Record that the resume a claimed `dependency_unblock` marker owes did not
+/// launch, so the marker stops reading as a turn due. Only while the marker is
+/// still the job's head with no hold resting on it: a launch that got as far
+/// as minting its turn has moved the head, and a hold (the run queue's, or a
+/// provider limit's) still owes the resume and keeps it. Returns whether the
+/// marker was released.
+async fn release_unlaunched_dependency_unblock(
+    db: &LocalDb,
+    parent_job_id: &str,
+    marker_turn_id: &str,
+) -> Result<bool, String> {
+    let now = chrono::Utc::now().timestamp();
+    db.execute(
+        "UPDATE turns SET end_reason = 'launch_refused', updated_at = ?3
+          WHERE id = ?1 AND start_reason = 'dependency_unblock' AND end_reason IS NULL
+            AND id = (SELECT current_turn_id FROM jobs WHERE id = ?2)
+            AND NOT EXISTS (SELECT 1 FROM provider_limit_holds h
+                             WHERE h.job_id = ?2 AND h.state = 'active' AND h.turn_id = ?1)",
+        cairn_db::turso::params![marker_turn_id, parent_job_id, now],
+    )
+    .await
+    .map(|released| released == 1)
+    .map_err(|e| format!("Failed to release unlaunched dependency unblock: {e}"))
 }
 
 /// Whether `job_id` belongs to a one-shot ephemeral `CallTool` packet.
@@ -793,11 +826,12 @@ fn resume_parent_after_task_settled(
             };
             // Publish an already-claimed marker only after every sibling is
             // terminal. Exactly one concurrent completion can replace the anchor.
-            if !claim_dependency_unblock(&db, &refreshed_packet.parent_job_id, parent_turn_id)
-                .await?
-            {
+            let Some(marker_turn_id) =
+                claim_dependency_unblock(&db, &refreshed_packet.parent_job_id, parent_turn_id)
+                    .await?
+            else {
                 return Ok(None);
-            }
+            };
 
             grouped_packets.sort_by_key(|packet| (packet.task_index, packet.created_at));
             let rendered_packets = render_delegated_results(&db, grouped_packets, mode).await?;
@@ -842,6 +876,7 @@ fn resume_parent_after_task_settled(
             Ok(Some(TaskCompletionOutcome::Resume(TaskResumeDelivery {
                 parent_job_id: refreshed_packet.parent_job_id,
                 parent_turn_id: parent_turn_id.to_string(),
+                marker_turn_id,
                 message: full_combined,
                 tool_results,
             })))
@@ -904,15 +939,42 @@ fn resume_parent_after_task_settled(
         )),
         ..Default::default()
     });
-    crate::execution::jobs::continue_job_impl(
+    let launched = crate::execution::jobs::continue_job_impl(
         crate::execution::jobs::WakeCause::System,
         orch,
         &resume.parent_job_id,
         Some(&resume.message),
         None,
         resume_context,
-    )
-    .map(|_| ())
+    );
+    if let Err(error) = &launched {
+        let released = block_on({
+            let (db, job, marker) = (
+                db.clone(),
+                resume.parent_job_id.clone(),
+                resume.marker_turn_id.clone(),
+            );
+            async move { release_unlaunched_dependency_unblock(&db, &job, &marker).await }
+        });
+        match released {
+            Ok(true) => {
+                log::warn!(
+                    "Resume of parent job {} after its tasks settled did not launch ({error}); \
+                     its execution no longer holds a run-queue seat for it",
+                    resume.parent_job_id
+                );
+                let orch = orch.clone();
+                if let Err(e) =
+                    block_on(async move { crate::execution::queue::settle(&orch).await })
+                {
+                    log::warn!("run queue could not settle after a refused resume: {e}");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => log::warn!("{e}"),
+        }
+    }
+    launched.map(|_| ())
 }
 
 #[cfg(test)]
@@ -1166,7 +1228,8 @@ mod tests {
         let db = migrated_db_with_dependency_anchor().await;
         assert!(claim_dependency_unblock(&db, "job", "anchor")
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
         let successor_id = db
             .query_opt_text(
                 "SELECT id FROM turns WHERE predecessor_id = ?1",
@@ -1176,9 +1239,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(turn_state(&db, &successor_id).await, "complete");
-        assert!(!claim_dependency_unblock(&db, "job", "anchor")
+        assert!(claim_dependency_unblock(&db, "job", "anchor")
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
     }
 
     /// Operator cancellation removes the yielded-anchor ownership predicate.
@@ -1197,9 +1261,10 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(!claim_dependency_unblock(&db, "job", "anchor")
+        assert!(claim_dependency_unblock(&db, "job", "anchor")
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
         assert!(db
             .query_opt_text(
                 "SELECT id FROM turns WHERE predecessor_id = ?1",

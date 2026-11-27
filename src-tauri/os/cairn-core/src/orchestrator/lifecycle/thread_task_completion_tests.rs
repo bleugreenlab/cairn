@@ -388,6 +388,97 @@ async fn thread_task_completion_resumes_parked_thread_once() {
     );
 }
 
+/// A parent parked on blocking tasks keeps its execution's run-queue seat from
+/// parking through its resume: with the one seat taken by other running work
+/// and another execution wanting it, the last task's completion is admitted
+/// rather than held behind the queue, so no queue hold is armed. The parent
+/// has no current session, so its resume then fails for a reason that is not
+/// the queue; its marker records the refused launch and stops holding a seat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parked_parent_is_admitted_past_a_full_queue_when_its_task_completes() {
+    let db = test_db().await;
+    let task = Task {
+        last_turn: LastTurn::Running,
+        ..Task::delivered("j-task", "pkt-task", 1_757_000_000)
+    };
+    seed(&db, ParentHead::Parked, &[task]).await;
+    db.execute_script(
+        "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+           VALUES('i-host','p',1,'I','active',1,1),('i-busy','p',2,'I','active',1,1),
+                 ('i-due','p',3,'I','active',1,1);
+         UPDATE executions SET issue_id = 'i-host' WHERE id = 'e-host';
+         INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+           VALUES('e-busy','recipe-default','i-busy','p','running',0,1),
+                 ('e-due','recipe-default','i-due','p','running',0,2);
+         INSERT INTO jobs(id,execution_id,project_id,status,created_at,updated_at)
+           VALUES('j-busy','e-busy','p','running',1,1),('j-due','e-due','p','pending',1,1);
+         INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+           VALUES('t-busy','s-busy','j-busy',1,'running','initial',1,1),
+                 ('t-due','s-due','j-due',1,'complete','initial',1,1);
+         UPDATE jobs SET current_turn_id = 't-busy' WHERE id = 'j-busy';
+         UPDATE jobs SET current_turn_id = 't-due' WHERE id = 'j-due';
+         INSERT INTO provider_limit_holds(id,job_id,turn_id,backend,boundary_source,kind,created_at,updated_at)
+           VALUES('h-due','j-due','t-due','claude','queue','launch',1,1);",
+    )
+    .await
+    .unwrap();
+    let orch = test_orchestrator(db);
+    orch.update_settings(crate::models::UpdateSettings {
+        max_concurrent_executions: Some(1),
+        ..Default::default()
+    })
+    .unwrap();
+    register_warm_process(&orch, "run-j-task", Some("j-task"));
+    orch.process_state
+        .set_current_turn_id("run-j-task", Some("turn-j-task"));
+
+    assert!(transition_to_warm_state(
+        &orch,
+        "run-j-task",
+        Some(TurnEndReason::ArtifactHandoff),
+    ));
+
+    assert_eq!(unblock_turns(&orch).await, 1);
+    assert_eq!(
+        count(
+            &orch,
+            "SELECT COUNT(*) FROM provider_limit_holds WHERE job_id = 'j-session'"
+        )
+        .await,
+        0,
+        "the resume was admitted, not held behind the queue"
+    );
+    assert_eq!(
+        text(
+            &orch,
+            "SELECT end_reason FROM turns
+              WHERE predecessor_id = ?1 AND start_reason = 'dependency_unblock'",
+            "anchor",
+        )
+        .await
+        .as_deref(),
+        Some("launch_refused"),
+        "a resume that did not launch releases its marker"
+    );
+    let state = crate::execution::queue::read(&orch).await.unwrap();
+    let host = state.item(EXECUTION).unwrap();
+    assert_eq!(
+        host.activity,
+        crate::execution::queue::Activity::Dormant,
+        "a stalled marker pins no seat"
+    );
+    assert_eq!(
+        text(
+            &orch,
+            "SELECT queue_state FROM executions WHERE id = ?1",
+            EXECUTION
+        )
+        .await,
+        None,
+        "never reads as queued"
+    );
+}
+
 /// The session itself is a standing conversation: whatever its turns and
 /// artifacts say, it rests Idle or runs, through both recompute entry points.
 #[tokio::test]

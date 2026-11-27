@@ -15,7 +15,11 @@
 //!   execution waits on something Cairn is doing now (its own check lanes or
 //!   check requests, a run batch, a terminal, a tool call, a timer, a provider
 //!   limit with a known reset). It holds a seat, through the wait, wherever it
-//!   is in the list, so it never has to win one back and is never cut.
+//!   is in the list, so it never has to win one back and is never cut. A
+//!   parent parked on blocking tasks is due from the moment its last task
+//!   settles: the claimed `dependency_unblock` marker heading its job, with no
+//!   run and no `end_reason`, is its resume owed. A resume that cannot launch
+//!   stamps the marker's `end_reason`, so a stalled marker pins no seat.
 //! - **Wanting**: work is due and the queue holds it (a queue hold). It takes
 //!   a free seat by its place in the list.
 //! - **Dormant**: nothing it waits on is moving: a person (a review, a
@@ -351,6 +355,8 @@ macro_rules! activity_sql {
         SELECT 1 FROM jobs aj LEFT JOIN turns ht ON ht.id = aj.current_turn_id
          WHERE aj.execution_id = e.id AND aj.status IN ('running', 'pending') AND (
                ht.state IN ('pending', 'running')
+            OR (ht.state = 'complete' AND ht.start_reason = 'dependency_unblock'
+                AND ht.run_id IS NULL AND ht.end_reason IS NULL)
             OR (aj.status = 'running' AND aj.current_turn_id IS NULL)
             OR EXISTS (SELECT 1 FROM agent_waits aw WHERE aw.job_id = aj.id
                          AND (aw.state = 'resolving'

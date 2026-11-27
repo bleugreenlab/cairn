@@ -342,7 +342,37 @@ async fn activity_is_read_from_stored_facts() {
             .unwrap();
         }
     }
-    for (id, .., expected) in cases {
+    // A parent parked on blocking tasks whose last task settled: its job's head
+    // is the claimed `dependency_unblock` marker. Its resume is a turn due
+    // until it launches; once a launch is refused the marker says so and pins
+    // no seat.
+    let markers = [
+        ("unblock-owed", "NULL", "active"),
+        ("unblock-refused", "'launch_refused'", "dormant"),
+    ];
+    for (n, (id, end_reason, _)) in markers.iter().enumerate() {
+        db.execute_script(format!(
+            "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+               VALUES('i-{id}','p',{},'I','active',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+               VALUES('{id}','recipe-default','i-{id}','p','running',1,1);
+             INSERT INTO jobs(id,execution_id,project_id,status,created_at,updated_at)
+               VALUES('j-{id}','{id}','p','running',1,1);
+             INSERT INTO turns(id,session_id,job_id,sequence,state,yield_reason,start_reason,created_at,updated_at)
+               VALUES('a-{id}','s-{id}','j-{id}',1,'yielded','dependency_wait','initial',1,1);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,predecessor_id,state,start_reason,end_reason,created_at,updated_at)
+               VALUES('t-{id}','s-{id}',NULL,'j-{id}',2,'a-{id}','complete','dependency_unblock',{end_reason},1,1);
+             UPDATE jobs SET current_turn_id='t-{id}' WHERE id='j-{id}';",
+            100 + n
+        ))
+        .await
+        .unwrap();
+    }
+    let expectations = cases
+        .iter()
+        .map(|(id, .., expected)| (*id, *expected))
+        .chain(markers.iter().map(|(id, _, expected)| (*id, *expected)));
+    for (id, expected) in expectations {
         let sql = format!(
             "SELECT {} FROM executions e WHERE e.id = '{id}'",
             activity_sql!()
@@ -350,6 +380,73 @@ async fn activity_is_read_from_stored_facts() {
         let activity = db.query_opt_text(&sql, ()).await.unwrap();
         assert_eq!(activity.as_deref(), Some(expected), "{id}");
     }
+}
+
+/// A parent that an earlier build held behind the queue the moment its last
+/// task settled (a queue resume hold resting on its `dependency_unblock`
+/// marker) is seated by the next settle, ahead of wanting work and past a full
+/// cap, and so has its held resume released; it never reads as queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settle_seats_a_parent_held_behind_the_queue_on_its_unblock_marker() {
+    let orch = crate::resources::references::test_orchestrator(
+        crate::storage::migrated_test_db("run-queue-unblock-held.db").await,
+    );
+    orch.update_settings(crate::models::UpdateSettings {
+        max_concurrent_executions: Some(1),
+        ..Default::default()
+    })
+    .unwrap();
+    let db = orch.db.local.clone();
+    db.execute_script(
+        "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+         INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+           VALUES('p','w','P','p','/tmp/p',1,1);",
+    )
+    .await
+    .unwrap();
+    // `busy` fills the one seat; `due` wants one and is ahead of `parent`.
+    for (n, id, job_status, turn_state) in [
+        (1, "busy", "running", "running"),
+        (2, "due", "pending", "complete"),
+        (3, "parent", "running", "yielded"),
+    ] {
+        db.execute_script(format!(
+            "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+               VALUES('i-{id}','p',{n},'I','active',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+               VALUES('{id}','recipe-default','i-{id}','p','running',{n},1);
+             INSERT INTO jobs(id,execution_id,project_id,status,created_at,updated_at)
+               VALUES('j-{id}','{id}','p','{job_status}',1,1);
+             INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+               VALUES('t-{id}','s-{id}','j-{id}',1,'{turn_state}','initial',1,1);
+             UPDATE jobs SET current_turn_id='t-{id}' WHERE id='j-{id}';"
+        ))
+        .await
+        .unwrap();
+    }
+    db.execute_script(
+        "INSERT INTO turns(id,session_id,run_id,job_id,sequence,predecessor_id,state,start_reason,created_at,updated_at)
+           VALUES('marker','s-parent',NULL,'j-parent',2,'t-parent','complete','dependency_unblock',2,2);
+         UPDATE jobs SET current_turn_id='marker' WHERE id='j-parent';
+         INSERT INTO provider_limit_holds(id,job_id,turn_id,backend,boundary_source,kind,created_at,updated_at)
+           VALUES('h-due','j-due','t-due','claude','queue','launch',1,1),
+                 ('h-parent','j-parent','marker','claude','queue','resume',2,2);",
+    )
+    .await
+    .unwrap();
+
+    let state = settle(&orch).await.unwrap();
+    let parent = state.item("parent").unwrap();
+    assert_eq!(parent.activity, Activity::Active);
+    assert!(parent.runs, "the owed resume holds its seat");
+    assert_eq!(recorded_state(parent), None, "never reads as queued");
+    assert!(!state.runs("due"), "nothing else takes the full cap");
+    assert_eq!(
+        db.query_opt_text("SELECT queue_state FROM executions WHERE id = 'parent'", ())
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 /// The launch seam every wake goes through: with the one seat taken by running
