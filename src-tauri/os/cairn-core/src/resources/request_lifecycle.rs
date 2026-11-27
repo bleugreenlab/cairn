@@ -65,14 +65,6 @@ pub(crate) fn lifecycle_uri(project: &str, request_id: &str) -> String {
     )
 }
 
-/// The lifecycle address of a request whose owner is known by its node home.
-/// `None` when the home names no project, which leaves the link out rather
-/// than guessing it.
-pub(crate) fn lifecycle_uri_for_home(home: &str, request_id: &str) -> Option<String> {
-    let resource = cairn_uri::parse_uri(home)?;
-    Some(lifecycle_uri(resource.project_key()?, request_id))
-}
-
 /// What waits for room on one machine, with what closes its room: the
 /// "Parked against this machine" section of its page. `None` when nothing
 /// waits there.

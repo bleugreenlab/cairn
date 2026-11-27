@@ -4899,7 +4899,7 @@ mod tests {
         );
         let said = mutation_boundary_hold(&hold);
         assert!(
-            said.contains("`request-child`") && !said.contains("nothing holds"),
+            said.contains("`batches/request-child`") && !said.contains("nothing holds"),
             "{said}"
         );
 
@@ -5027,7 +5027,7 @@ mod tests {
             })
         );
         let said = mutation_boundary_hold(&hold);
-        assert!(said.contains("`req-detached`"), "{said}");
+        assert!(said.contains("`batches/req-detached`"), "{said}");
         assert!(
             said.contains(
                 "because its wait was abandoned while the batch ran, so no call is waiting for it"
@@ -5651,7 +5651,9 @@ mod tests {
         .await
         .unwrap();
         let orch = h.orch.clone();
-        let HomeClaim::Tenant(tenancy) = claim(job, "current-head-refresh", false) else {
+        let HomeClaim::Tenant(tenancy) =
+            claim(job, "current-head-refresh", "cairn:~/batches/1", false)
+        else {
             panic!("fixture home is vacant");
         };
         let tenancy = tenancy.refresh_on_release(move || {
@@ -5720,11 +5722,14 @@ mod tests {
                 "neither refresh may restore the captured A head"
             );
             assert!(
-                matches!(claim(job, "competing-commit", true), HomeClaim::Wait(_)),
+                matches!(
+                    claim(job, "competing-commit", "cairn:~/batches/2", true),
+                    HomeClaim::Wait(_)
+                ),
                 "the refresh owns the home until its executor reply"
             );
             assert!(matches!(
-                claim(job, "competing-read", false),
+                claim(job, "competing-read", "cairn:~/batches/3", false),
                 HomeClaim::Elsewhere(_)
             ));
             assert_eq!(fence.holder, residency.holder);
@@ -5737,11 +5742,11 @@ mod tests {
                 observer.abort();
                 assert!(observer.await.err().unwrap().is_cancelled());
                 assert!(matches!(
-                    claim(job, "cancelled-observer-commit", true),
+                    claim(job, "cancelled-observer-commit", "cairn:~/batches/4", true),
                     HomeClaim::Wait(_)
                 ));
                 assert!(matches!(
-                    claim(job, "cancelled-observer-read", false),
+                    claim(job, "cancelled-observer-read", "cairn:~/batches/5", false),
                     HomeClaim::Elsewhere(_)
                 ));
                 assert!(terminal_refresh_order(&residency.holder.storage_key())
@@ -5783,7 +5788,9 @@ mod tests {
         }
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                if let HomeClaim::Tenant(tenancy) = claim(job, "after-refresh-completion", true) {
+                if let HomeClaim::Tenant(tenancy) =
+                    claim(job, "after-refresh-completion", "cairn:~/batches/6", true)
+                {
                     drop(tenancy);
                     break;
                 }
@@ -5810,8 +5817,12 @@ mod tests {
         .unwrap();
         let orch = test_orchestrator(db, MockGitClient::new());
         let db = owning_db_for_job(&orch.db, "job-overlap").await.unwrap();
-        let HomeClaim::Tenant(tenancy) = claim("job-overlap", "occupied-refresh-batch", false)
-        else {
+        let HomeClaim::Tenant(tenancy) = claim(
+            "job-overlap",
+            "occupied-refresh-batch",
+            "cairn:~/batches/1",
+            false,
+        ) else {
             panic!("fixture home is vacant");
         };
         let refresh =

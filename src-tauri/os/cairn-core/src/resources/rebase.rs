@@ -2996,10 +2996,9 @@ mod tests {
         let deferred = advance_state("279ddbcf", &Ok(Some(deferred_pass())), &held());
         assert!(deferred.contains("**Deferred.**"), "{deferred}");
         assert!(
-            deferred.contains("run batch `ba0e0085` (\"rust-tests on main\")")
-                && deferred.contains("on cairn://p/cairn/5069/1/builder")
-                && deferred.contains("The hold ends when that batch finishes")
-                && deferred.contains("cairn://p/cairn/5069/1/builder/batches/ba0e0085")
+            deferred.contains(
+                "run batch `cairn://p/cairn/5069/1/builder/batches/3` (\"rust-tests on main\")"
+            ) && deferred.contains("The hold ends when that batch finishes")
                 && deferred.contains("action:\"cancel\"")
                 && deferred.contains("next commit, requested check or run, or merge"),
             "names the holding batch and what ends the hold: {deferred}"
@@ -3025,7 +3024,7 @@ mod tests {
             "{unread}"
         );
         assert!(
-            unread.contains("`ba0e0085`"),
+            unread.contains("`cairn://p/cairn/5069/1/builder/batches/3`"),
             "the live hold is still reported: {unread}"
         );
 
@@ -3061,11 +3060,11 @@ mod tests {
             held_now.contains("`req-1`")
                 && held_now.contains("accepted at `c9bcf33c` onto `main` at `a337fa4d`")
                 && held_now.contains("**pending**")
-                && held_now.contains("run batch `ba0e0085`")
+                && held_now.contains("run batch `cairn://p/cairn/5069/1/builder/batches/3`")
                 && held_now.contains("when that batch completes")
                 && held_now.contains("do not need to request it again")
                 && held_now.contains(
-                    "target:\"cairn://p/cairn/5069/1/builder/batches/ba0e0085\",mode:\"patch\",payload:{action:\"cancel\"}"
+                    "target:\"cairn://p/cairn/5069/1/builder/batches/3\",mode:\"patch\",payload:{action:\"cancel\"}"
                 ),
             "names the batch's own cancel: {held_now}"
         );

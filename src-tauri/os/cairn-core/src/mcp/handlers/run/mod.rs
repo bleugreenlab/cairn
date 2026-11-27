@@ -13013,7 +13013,7 @@ mod tests {
     use cairn_common::executor_protocol::CellCommandClass;
 
     /// A job home held by batch 1, whose request id no reply may name.
-    fn busy_home() -> occupancy::Occupant {
+    pub(super) fn busy_home() -> occupancy::Occupant {
         occupancy::Occupant {
             request_id: "batch-uuid-1".into(),
             handle: "cairn:~/batches/1".into(),
@@ -14738,7 +14738,7 @@ mod decide_door_tests {
 /// provider, against a seeded run whose turn can park.
 #[cfg(test)]
 pub(crate) mod host_batch_tests {
-    use super::tests::{named, shell, test_placement};
+    use super::tests::{busy_home, named, shell, test_placement};
     use super::types::RunSpec;
     use super::*;
 
@@ -16064,7 +16064,10 @@ pub(crate) mod host_batch_tests {
             rendered.contains("detached and not yet started"),
             "{rendered}"
         );
-        assert!(rendered.contains("running `batch-1`"), "{rendered}");
+        assert!(
+            rendered.contains("running `cairn:~/batches/1`"),
+            "{rendered}"
+        );
 
         control.admit().await;
         let (state, holds, waiting_on) = detached_row(&orch, &control.request_id).await;

@@ -2812,7 +2812,7 @@ where
                                 Ok(Some(existing)) => Ok(existing),
                                 Ok(None) => match record_observation(db.clone(), observation.clone()) {
                                     Ok(()) => cairn_db::storage::address_numbers::number_of(
-                                        &db,
+                                        db,
                                         cairn_db::storage::address_numbers::Numbered::CheckObservation,
                                         None,
                                         &observation.id,
