@@ -928,8 +928,9 @@ pub(crate) const UNSTAMPED_WAIT_WALK: &str = "SELECT rowid, created_at FROM agen
      WHERE state IN ('resolved', 'cancelled') AND resolved_at IS NULL \
      AND created_at > ?1 AND created_at < ?2 ORDER BY created_at LIMIT ?3";
 /// Transferred waits whose permission is still pending, driven from the few
-/// pending permissions. A permission owns exactly one call, the
-/// `(run_id, tool_use_id)` it shares with the wait it took over.
+/// pending permissions, read from the pending-only unique index. A call holds
+/// at most one pending permission, keyed by the `(run_id, tool_use_id)` it
+/// shares with the wait it took over.
 pub(crate) const HELD_TRANSFERRED_WAITS: &str = "SELECT w.rowid FROM permission_requests p \
      JOIN agent_waits w ON w.run_id = p.run_id AND w.tool_use_id = p.tool_use_id \
      WHERE p.status = 'pending' AND w.state = 'resolved' AND w.resolution_json = ?1";

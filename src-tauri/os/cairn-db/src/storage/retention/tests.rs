@@ -203,13 +203,25 @@ async fn every_selection_and_delete_seeks() {
             "{walk} sorts: {plan:#?}"
         );
     }
-    assert_seeks(
-        &db,
-        HELD_TRANSFERRED_WAITS,
+    // The pending-only unique index holds exactly the rows the walk starts
+    // from and covers the join key, so the planner reads it whole: a SCAN
+    // bounded by the pending set, not by the table. Every other step seeks.
+    let plan = query_plan(&db, HELD_TRANSFERRED_WAITS, 1).await;
+    assert!(
+        plan.iter().any(|line| line
+            == "SCAN permission_requests AS p USING COVERING INDEX \
+                idx_permission_requests_pending_tool_use"),
+        "{plan:#?}"
+    );
+    assert!(
+        plan.iter().any(|line| line.starts_with("SEARCH w USING ")),
+        "{plan:#?}"
+    );
+    assert_eq!(
+        plan.iter().filter(|line| line.starts_with("SCAN")).count(),
         1,
-        "idx_permission_requests_status",
-    )
-    .await;
+        "{plan:#?}"
+    );
     for (walk, binds) in [
         (QUEUE_NEXT_INCARNATION, 1),
         (QUEUE_SETTLED_ENTRIES, 4),
