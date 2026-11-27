@@ -115,6 +115,10 @@ pub(crate) async fn settle_issue_resources(
     resolution: crate::transitions::Resolution,
 ) -> Vec<crate::issues::status::SettlementResource> {
     use crate::issues::status::{SettlementOutcome, SettlementResource};
+    // Read before anything settles: an acquisition, re-resolution or
+    // reopen-then-resolve that enrols the issue while this pass runs writes a
+    // new token, and that enrolment must survive our clear.
+    let enrolment = crate::execution::resolution_cleanups::issue_enrolment(db, issue_id).await;
     let issue_uri = db
         .query_opt_text(
             "SELECT 'cairn://p/' || p.key || '/' || i.number FROM issues i
@@ -254,7 +258,55 @@ pub(crate) async fn settle_issue_resources(
         }),
     }
     resources.extend(release_settled_job_environments(orch, db, &job_ids, &issue_uri).await);
+    let settled = !resources
+        .iter()
+        .any(|resource| resource.outcome == SettlementOutcome::CleanupPending);
+    if let (true, Ok(Some(enrolment))) = (settled, enrolment) {
+        // An agent process whose job has no environment is not reported
+        // above, but is still owed its stop until it exits.
+        match live_processes(orch, db, &job_ids).await {
+            Ok(live) if live.is_empty() => {
+                if let Err(error) =
+                    crate::execution::resolution_cleanups::clear_issue(db, issue_id, &enrolment)
+                        .await
+                {
+                    log::warn!(
+                        "Could not retire settled resolution cleanup for {issue_id}: {error}"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => log::warn!("Resolution process census pending for {issue_id}: {error}"),
+        }
+    }
     resources
+}
+
+/// The jobs among `job_ids` with an agent process starting, live, or retained
+/// by this runner.
+async fn live_processes(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_ids: &[String],
+) -> Result<Vec<String>, String> {
+    let retained = orch.process_state.run_ids();
+    let mut live = Vec::new();
+    for job_id in job_ids {
+        let runs = db
+            .query_all(
+                "SELECT id, status FROM runs WHERE job_id=?1",
+                (job_id.clone(),),
+                |row| Ok((row.text(0)?, row.opt_text(1)?)),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if runs.iter().any(|(id, status)| {
+            matches!(status.as_deref(), Some("starting" | "live")) || retained.contains(id)
+        }) {
+            live.push(job_id.clone());
+        }
+    }
+    Ok(live)
 }
 
 /// Stopping branch-dependent work does not resolve its owning issue or start
@@ -351,7 +403,7 @@ async fn job_environment_pending(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Option<String>, String> {
-    if !resolution_calls_pending(db, Some(job_id)).await?.is_empty() {
+    if !resolution_calls_pending(db, job_id).await?.is_empty() {
         return Ok(Some(
             "cancelled turn tool-call settlement is not confirmed".into(),
         ));
@@ -431,14 +483,14 @@ async fn job_environment_pending(
 /// acquired a new session after reopening.
 async fn resolution_calls_pending(
     db: &LocalDb,
-    job_id: Option<&str>,
+    job_id: &str,
 ) -> Result<Vec<(String, String, String)>, String> {
     let turns = db
         .query_all(
             "SELECT id,run_id,end_reason FROM turns
-         WHERE state='cancelled' AND end_reason IN ('issue_merged','issue_closed')
-           AND run_id IS NOT NULL AND (?1 IS NULL OR job_id=?1)",
-            (job_id.map(str::to_string),),
+         WHERE job_id=?1 AND state='cancelled' AND end_reason IN ('issue_merged','issue_closed')
+           AND run_id IS NOT NULL",
+            (job_id.to_string(),),
             |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
         )
         .await
@@ -456,149 +508,191 @@ async fn resolution_calls_pending(
     Ok(pending)
 }
 
-/// Reuse the terminal lifecycle sweep to retry resolved owners. The rows and
-/// admitted controls are the retry evidence; there is no separate cleanup queue.
+/// Retry the resolution cleanups still owed, as `resolution_cleanups` records
+/// them. Calls are settled before resources, and live processes are stopped
+/// before resources are settled. An idle pass is one read per database.
 pub(crate) async fn reconcile_resolved_resources(orch: &Orchestrator) {
-    use crate::mcp::handlers::run::detached;
-    let mut owners: std::collections::BTreeSet<String> = detached::live_mutating_owners()
-        .into_iter()
-        .map(|(_, owner)| owner.job_id)
-        .collect();
-    owners.extend(
-        detached::live_environment_owners()
-            .into_iter()
-            .map(|(_, owner)| owner.job_id),
-    );
-    // An idle environment can outlive both its final terminal and response
-    // guard. Its holder must keep resolution discoverable after those disappear.
-    for executor in orch
-        .fleet
-        .inspect_executors(chrono::Utc::now().timestamp_millis().max(0) as u64)
-    {
-        for cell in executor.occupancy.cells {
-            if let Some(residency) = cell.residency {
-                if let cairn_common::executor_protocol::ResidencyHolder::Job { job_id } =
-                    residency.holder
-                {
-                    owners.insert(job_id);
-                }
-            }
-        }
-    }
-    if let Ok(jobs) = orch.db.local.query_all(
-        "SELECT DISTINCT job_id FROM job_terminals WHERE status != 'exited' AND job_id IS NOT NULL",
-        (), |row| row.text(0),
-    ).await { owners.extend(jobs); }
-    if let Ok(jobs) = orch
-        .db
-        .local
-        .query_all(
-            "SELECT DISTINCT job_id FROM terminal_outputs
-         WHERE expiry_basis='resolution' AND (resolved_at IS NULL OR capture='capturing') AND job_id IS NOT NULL",
-            (),
-            |row| row.text(0),
-        )
-        .await
-    {
-        owners.extend(jobs);
-    }
-    let retained_runs =
-        serde_json::to_string(&orch.process_state.run_ids()).unwrap_or_else(|_| "[]".into());
+    use crate::execution::resolution_cleanups::{self, Cleanup};
+    use std::time::Instant;
     for db in orch.db.all_dbs().await {
-        match resolution_calls_pending(&db, None).await {
-            Ok(turns) => {
-                for (turn, run, reason) in turns {
-                    if orch.resolution_responses.lock().unwrap().contains_key(&run) {
-                        continue;
-                    }
-                    if let Err(error) = crate::orchestrator::lifecycle::settle_unanswered_calls(
-                        orch,
-                        &run,
-                        &turn,
-                        crate::orchestrator::lifecycle::InterruptCause::Resolution {
-                            exit_reason: reason,
-                        },
-                    ) {
-                        log::warn!("Resolution call cleanup pending for turn {turn}: {error}");
-                    }
-                }
+        let started = Instant::now();
+        let owed = match resolution_cleanups::pending(&db).await {
+            Ok(owed) => owed,
+            Err(error) => {
+                log::warn!("Could not read owed resolution cleanups: {error}");
+                continue;
             }
-            Err(error) => log::warn!("Could not census cancelled resolution calls: {error}"),
+        };
+        let read_ms = started.elapsed().as_millis() as u64;
+        let db_name = db.path().display().to_string();
+        if owed.is_empty() {
+            tracing::debug!(target: "execution::teardown", db = %db_name, read_ms,
+                trigger = "terminal_lifecycle", "resolved resource reconcile pass");
+            continue;
         }
-        let process_owners = db
-            .query_all(
-                "SELECT DISTINCT job_id FROM runs WHERE job_id IS NOT NULL
-             AND (status IN ('starting','live') OR id IN (SELECT value FROM json_each(?1)))",
-                (retained_runs.clone(),),
-                |row| row.text(0),
-            )
-            .await
-            .unwrap_or_default();
-        owners.extend(process_owners.iter().cloned());
-        if let Ok(batches) = detached::all_running(&db).await {
-            owners.extend(
-                batches
-                    .into_iter()
-                    .filter(|b| b.commits || b.holds_branch)
-                    .map(|b| b.job_id),
-            );
-        }
-        if let Ok(requesters) = db
-            .query_all(
-                format!(
-                    "SELECT DISTINCT requester_job_id FROM check_requests
-                     WHERE requester_job_id IS NOT NULL AND state IN {}",
-                    crate::execution::checks::requests::OPEN_STATES
-                ),
-                (),
-                |row| row.text(0),
-            )
-            .await
-        {
-            owners.extend(requesters);
-        }
-        let mut issues = BTreeMap::new();
-        for job in &owners {
-            match resolved_resource_issues(&db, job).await {
-                Ok(found) => {
-                    if !found.is_empty() && process_owners.contains(job) {
-                        let resolution = if found.iter().any(|(_, status)| status == "merged") {
-                            crate::transitions::Resolution::Merged
-                        } else {
-                            crate::transitions::Resolution::Closed
-                        };
-                        if let Err(error) = crate::orchestrator::lifecycle::stop_job_for_resolution(
-                            orch, job, resolution,
-                        ) {
-                            log::warn!("Resolution process cleanup pending for {job}: {error}");
-                        }
-                    }
-                    issues.extend(found);
-                }
-                Err(error) => {
-                    log::warn!("Could not identify resolved resource owner {job}: {error}")
-                }
-            }
-        }
-        for (issue, status) in issues {
-            let resolution = if status == "merged" {
-                crate::transitions::Resolution::Merged
-            } else {
-                crate::transitions::Resolution::Closed
+        let (mut calls, mut issues) = (0usize, 0usize);
+        let calls_started = Instant::now();
+        for cleanup in &owed {
+            let Cleanup::Calls {
+                turn_id,
+                run_id,
+                resolution,
+            } = cleanup
+            else {
+                continue;
             };
-            let _ = settle_issue_resources(orch, &db, &issue, resolution).await;
+            calls += 1;
+            if orch
+                .resolution_responses
+                .lock()
+                .unwrap()
+                .contains_key(run_id)
+            {
+                continue;
+            }
+            settle_resolution_calls(orch, &db, turn_id, run_id, *resolution).await;
+        }
+        let calls_ms = calls_started.elapsed().as_millis() as u64;
+        let settle_started = Instant::now();
+        for cleanup in &owed {
+            let Cleanup::Issue {
+                issue_id,
+                resolution,
+                generation,
+                token,
+            } = cleanup
+            else {
+                continue;
+            };
+            issues += 1;
+            retry_issue_cleanup(orch, &db, issue_id, *resolution, *generation, token).await;
+        }
+        let settle_ms = settle_started.elapsed().as_millis() as u64;
+        tracing::info!(target: "execution::teardown", db = %db_name, issues, calls, read_ms,
+            calls_ms, settle_ms, total_ms = started.elapsed().as_millis() as u64,
+            trigger = "terminal_lifecycle", "resolved resource reconcile pass");
+    }
+}
+
+/// Answer a resolution-cancelled turn's open calls, and retire its entry once
+/// none is open.
+async fn settle_resolution_calls(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    turn_id: &str,
+    run_id: &str,
+    resolution: crate::transitions::Resolution,
+) {
+    use crate::orchestrator::lifecycle::{open_call_names, settle_unanswered_calls};
+    let answered = || async {
+        open_call_names(db, run_id, turn_id)
+            .await
+            .map(|names| names.is_empty())
+    };
+    match answered().await {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Err(error) = settle_unanswered_calls(
+                orch,
+                run_id,
+                turn_id,
+                crate::orchestrator::lifecycle::InterruptCause::Resolution {
+                    exit_reason: crate::orchestrator::lifecycle::resolution_exit_reason(resolution)
+                        .to_string(),
+                },
+            ) {
+                log::warn!("Resolution call cleanup pending for turn {turn_id}: {error}");
+                return;
+            }
+            if !matches!(answered().await, Ok(true)) {
+                return;
+            }
+        }
+        Err(error) => {
+            log::warn!("Could not read open calls of turn {turn_id}: {error}");
+            return;
         }
     }
+    if let Err(error) = crate::execution::resolution_cleanups::clear_calls(db, turn_id).await {
+        log::warn!("Could not retire answered resolution calls of turn {turn_id}: {error}");
+    }
+}
+
+/// Retry one resolved issue's settlement, if it still reads resolved at the
+/// generation its entry names; otherwise the entry is stale and goes.
+async fn retry_issue_cleanup(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    issue_id: &str,
+    resolution: crate::transitions::Resolution,
+    generation: i64,
+    token: &str,
+) {
+    let current = db
+        .query_opt(
+            "SELECT status, resolution_generation FROM issues WHERE id=?1",
+            (issue_id.to_string(),),
+            |row| Ok((row.text(0)?, row.i64(1)?)),
+        )
+        .await;
+    let current = match current {
+        Ok(current) => current,
+        Err(error) => {
+            log::warn!("Could not read resolved issue {issue_id}: {error}");
+            return;
+        }
+    };
+    let still_owed = current
+        .as_ref()
+        .is_some_and(|(status, current_generation)| {
+            crate::execution::resolution_cleanups::parse_resolution(status) == Some(resolution)
+                && *current_generation == generation
+        });
+    if !still_owed {
+        if let Err(error) =
+            crate::execution::resolution_cleanups::clear_issue(db, issue_id, token).await
+        {
+            log::warn!("Could not retire stale resolution cleanup for {issue_id}: {error}");
+        }
+        return;
+    }
+    match issue_resource_jobs(db, issue_id).await {
+        Ok(job_ids) => match live_processes(orch, db, &job_ids).await {
+            Ok(live) => {
+                for job in live {
+                    if let Err(error) = crate::orchestrator::lifecycle::stop_job_for_resolution(
+                        orch, &job, resolution,
+                    ) {
+                        log::warn!("Resolution process cleanup pending for {job}: {error}");
+                    }
+                }
+            }
+            Err(error) => log::warn!("Resolution process census pending for {issue_id}: {error}"),
+        },
+        Err(error) => log::warn!("Could not list resolved issue {issue_id}'s jobs: {error}"),
+    }
+    let _ = settle_issue_resources(orch, db, issue_id, resolution).await;
 }
 
 /// A delegated child may have no issue, and branch-dependent work may belong
 /// to a different, still-open issue. Both retain their source resolution.
-async fn resolved_resource_issues(
+///
+/// The issue lookup is a seek per source (`i.id IN (...)`), not a join that
+/// re-walks the sources for every issue.
+pub(crate) async fn resolved_resource_issues(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<(String, String)>, String> {
-    db.query_all(
-        "WITH RECURSIVE ancestors(id,issue_id,parent_job_id,project_id,base_branch) AS (
+    db.query_all(RESOLVED_RESOURCE_ISSUES_SQL, (job_id.to_string(),), |row| {
+        Ok((row.text(0)?, row.text(1)?))
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// [`resolved_resource_issues`]' statement, binding the job id as `?1`.
+pub(crate) const RESOLVED_RESOURCE_ISSUES_SQL: &str =
+    "WITH RECURSIVE ancestors(id,issue_id,parent_job_id,project_id,base_branch) AS (
              SELECT id,issue_id,parent_job_id,project_id,base_branch FROM jobs WHERE id=?1
              UNION SELECT j.id,j.issue_id,j.parent_job_id,j.project_id,j.base_branch
                  FROM jobs j JOIN ancestors a ON j.id=a.parent_job_id
@@ -606,14 +700,8 @@ async fn resolved_resource_issues(
              SELECT issue_id FROM ancestors
              UNION SELECT j.issue_id FROM jobs j JOIN ancestors a
                  ON j.project_id=a.project_id AND j.branch=a.base_branch
-         ) SELECT DISTINCT i.id,i.status FROM issues i JOIN sources s ON s.issue_id=i.id
-             WHERE i.status IN ('merged','closed')",
-        (job_id.to_string(),),
-        |row| Ok((row.text(0)?, row.text(1)?)),
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
+         ) SELECT i.id,i.status FROM issues i
+             WHERE i.id IN (SELECT issue_id FROM sources) AND i.status IN ('merged','closed')";
 
 pub(crate) async fn cleanup_issue_jobs(
     orch: &Orchestrator,
@@ -1706,6 +1794,22 @@ mod tests {
             root.path().to_path_buf(),
         )
         .build();
+        // The fixture resolved the issue by raw SQL, so it records the owed
+        // cleanup the resolve write would have.
+        orch.db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    crate::execution::resolution_cleanups::record_issue(
+                        conn,
+                        "i",
+                        Resolution::Merged,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
         let first = settle_issue_resources(&orch, &orch.db.local, "i", Resolution::Merged).await;
         assert!(first.iter().any(|r| r
             .diagnostic

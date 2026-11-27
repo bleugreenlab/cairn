@@ -1053,6 +1053,53 @@ impl Drop for ResidentProcessSubscription {
     }
 }
 
+type JobResidencyObserver = Arc<dyn Fn(String) + Send + Sync>;
+
+/// Who hears a job's residency first appear in an executor's reports, and the
+/// job holders each executor's latest report carried, which is what makes an
+/// appearance an edge rather than every heartbeat.
+#[derive(Default)]
+struct JobResidencyObservers {
+    observers: Vec<JobResidencyObserver>,
+    reported: HashMap<String, HashSet<String>>,
+}
+
+impl Fleet {
+    /// Call `observer` with the job id each time an executor's report carries
+    /// a job's residency its previous report did not: a new placement, or an
+    /// executor re-advertising what it held across this runner's restart.
+    /// The observer runs on the ingest path and must not block.
+    pub(crate) fn subscribe_job_residency_observed(
+        &self,
+        observer: impl Fn(String) + Send + Sync + 'static,
+    ) {
+        self.job_residency_observers
+            .lock()
+            .unwrap()
+            .observers
+            .push(Arc::new(observer));
+    }
+
+    /// Record the job holders `executor_id` reports now and tell the observers
+    /// about the ones its previous report lacked.
+    pub(super) fn note_reported_job_residencies(&self, executor_id: &str, jobs: HashSet<String>) {
+        let (appeared, observers) = {
+            let mut state = self.job_residency_observers.lock().unwrap();
+            let previous = state
+                .reported
+                .insert(executor_id.to_string(), jobs.clone())
+                .unwrap_or_default();
+            let appeared = jobs.difference(&previous).cloned().collect::<Vec<_>>();
+            (appeared, state.observers.clone())
+        };
+        for job in appeared {
+            for observer in &observers {
+                observer(job.clone());
+            }
+        }
+    }
+}
+
 pub(crate) mod node_scratch;
 pub use inference::DeploymentReportReceived;
 pub(crate) use node_scratch::NodeScratchEvent;
@@ -1344,6 +1391,7 @@ pub struct Fleet {
     /// another machine's recovery would only extend the outage.
     last_telemetry_bounce_unix_ms: Arc<Mutex<u64>>,
     resident_process_subscribers: Arc<Mutex<ResidentProcessSubscribers>>,
+    job_residency_observers: Arc<Mutex<JobResidencyObservers>>,
     node_scratch_subscribers: Arc<Mutex<Vec<node_scratch::NodeScratchSubscriber>>>,
     /// At most one live work item per question. The single chokepoint fact that
     /// makes duplicate answers unrepresentable rather than merely suppressed;

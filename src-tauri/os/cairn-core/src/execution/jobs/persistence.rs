@@ -620,68 +620,74 @@ pub(super) struct RunInsert {
 }
 
 pub(super) async fn insert_run(db: Arc<LocalDb>, input: RunInsert) -> Result<i64, String> {
-    db.write(|conn| {
-        let input = RunInsert {
-            run_id: input.run_id.clone(),
-            issue_id: input.issue_id.clone(),
-            project_id: input.project_id.clone(),
-            job_id: input.job_id.clone(),
-            status: input.status.clone(),
-            session_id: input.session_id.clone(),
-            started_at: input.started_at,
-            created_at: input.created_at,
-            updated_at: input.updated_at,
-            start_mode: input.start_mode.clone(),
-            warn_existing_active: input.warn_existing_active,
-        };
-        Box::pin(async move {
-            let existing_active = if input.warn_existing_active {
-                if let Some(job_id) = input.job_id.as_deref() {
-                    let mut rows = conn
-                        .query(
-                            "SELECT COUNT(*) FROM runs
+    let job_id = input.job_id.clone();
+    let existing_active = db
+        .write(|conn| {
+            let input = RunInsert {
+                run_id: input.run_id.clone(),
+                issue_id: input.issue_id.clone(),
+                project_id: input.project_id.clone(),
+                job_id: input.job_id.clone(),
+                status: input.status.clone(),
+                session_id: input.session_id.clone(),
+                started_at: input.started_at,
+                created_at: input.created_at,
+                updated_at: input.updated_at,
+                start_mode: input.start_mode.clone(),
+                warn_existing_active: input.warn_existing_active,
+            };
+            Box::pin(async move {
+                let existing_active = if input.warn_existing_active {
+                    if let Some(job_id) = input.job_id.as_deref() {
+                        let mut rows = conn
+                            .query(
+                                "SELECT COUNT(*) FROM runs
                              WHERE job_id = ?1 AND status IN ('starting', 'live')",
-                            (job_id,),
-                        )
-                        .await?;
-                    rows.next()
-                        .await?
-                        .map(|row| row.i64(0))
-                        .transpose()?
-                        .unwrap_or(0)
+                                (job_id,),
+                            )
+                            .await?;
+                        rows.next()
+                            .await?
+                            .map(|row| row.i64(0))
+                            .transpose()?
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    }
                 } else {
                     0
-                }
-            } else {
-                0
-            };
+                };
 
-            conn.execute(
-                "INSERT INTO runs(
+                conn.execute(
+                    "INSERT INTO runs(
                     id, issue_id, project_id, job_id, chat_id, status, session_id,
                     error_message, started_at, exited_at, created_at, updated_at,
                     exit_reason, start_mode
                 )
                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, ?7, NULL, ?8, ?9, NULL, ?10)",
-                params![
-                    input.run_id.as_str(),
-                    input.issue_id.as_deref(),
-                    input.project_id.as_deref(),
-                    input.job_id.as_deref(),
-                    input.status.as_str(),
-                    input.session_id.as_deref(),
-                    input.started_at,
-                    input.created_at,
-                    input.updated_at,
-                    input.start_mode.as_deref(),
-                ],
-            )
-            .await?;
-            Ok(existing_active)
+                    params![
+                        input.run_id.as_str(),
+                        input.issue_id.as_deref(),
+                        input.project_id.as_deref(),
+                        input.job_id.as_deref(),
+                        input.status.as_str(),
+                        input.session_id.as_deref(),
+                        input.started_at,
+                        input.created_at,
+                        input.updated_at,
+                        input.start_mode.as_deref(),
+                    ],
+                )
+                .await?;
+                Ok(existing_active)
+            })
         })
-    })
-    .await
-    .map_err(|e| db_error("Failed to create run", e))
+        .await
+        .map_err(|e| db_error("Failed to create run", e))?;
+    if let Some(job_id) = job_id.as_deref() {
+        crate::execution::resolution_cleanups::note_acquisition_logged(&db, job_id).await;
+    }
+    Ok(existing_active)
 }
 
 pub(super) async fn load_run(
@@ -902,6 +908,7 @@ pub(crate) async fn insert_child_job_session_run(
     })
     .await
     .map_err(|e| e.to_string())?;
+    crate::execution::resolution_cleanups::note_acquisition_logged(&seed_db, &seed_job_id).await;
     crate::orchestrator::wakes::seed_default_job_subscriptions(&seed_db, &seed_job_id).await?;
     Ok(())
 }

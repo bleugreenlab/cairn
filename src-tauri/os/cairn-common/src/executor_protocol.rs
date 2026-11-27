@@ -7279,6 +7279,13 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/7685 does not move the number. The runner remembers which job
+/// residencies each executor's latest snapshot carried and notes the ones that
+/// newly appear, so a resource held for an already-resolved issue is recorded
+/// as owed its settlement. It reads the snapshot's existing residency holders
+/// only; no frame or field changes, and an older executor is read exactly as
+/// before.
+///
 /// cairn/7111 does not move the number. The runner refuses a launch whose
 /// complete serialized JSON exceeds the existing link frame limit, before
 /// issuing launch authority or enqueueing it. Admitted frames, runtime asset

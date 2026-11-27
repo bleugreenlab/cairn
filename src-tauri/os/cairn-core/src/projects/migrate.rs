@@ -420,6 +420,9 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     owned("codex_watchdog_leases", &[owner(OwnerSet::Runs, "run_id IN {ids}"), owner(OwnerSet::Runs, "successor_run_id IN {ids}")]),
     owned("codex_watchdog_lifecycle", &[owner(OwnerSet::Runs, "run_id IN {ids}"), owner(OwnerSet::Runs, "successor_run_id IN {ids}")]),
     spec("turns", concat!("run_id IN (", project_runs!(), ") OR job_id IN (SELECT id FROM jobs WHERE ", project_jobs_where!(), ")")),
+    // Owed resolution cleanups travel with what they are owed for: an issue
+    // entry with its issue, a calls entry with its turn.
+    spec("resolution_cleanups", concat!("(kind = 'issue' AND subject_id IN (SELECT id FROM issues WHERE project_id = ?1)) OR (kind = 'calls' AND subject_id IN (SELECT id FROM turns WHERE run_id IN (", project_runs!(), ") OR job_id IN (SELECT id FROM jobs WHERE ", project_jobs_where!(), ")))")),
     spec("provider_limit_holds", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))) OR run_id IN (SELECT id FROM runs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     // Swept through the counted seams in `sweep_shared_half`, which keep the
     // skyline watermarks exact in the transaction that removes the rows.
@@ -2029,6 +2032,87 @@ pub(super) mod tests {
             copy_insert_sql("t", &columns[..1], &[], "?1"),
             "INSERT INTO t (a) VALUES (?1)"
         );
+    }
+
+    /// A project moved to a team takes the resolution cleanups it is owed (an
+    /// issue's settlement, a cancelled turn's unanswered calls) with it,
+    /// re-keyed like the issue and turn they name, and leaves none behind.
+    #[tokio::test]
+    async fn owed_resolution_cleanups_move_and_sweep_with_their_project() {
+        let issue = "11111111-1111-4111-8111-111111111111";
+        let turn = "22222222-2222-4222-8222-222222222222";
+        let run = "33333333-3333-4333-8333-333333333333";
+        let local = migrated_db("move-cleanups-local.db", TURSO_MIGRATIONS.to_vec()).await;
+        let team = migrated_db(
+            "move-cleanups-team.db",
+            crate::storage::TEAM_MIGRATIONS.to_vec(),
+        )
+        .await;
+        team.execute(
+            "INSERT INTO teams(id, name, created_at, updated_at) VALUES ('team1', 'T', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        local
+            .execute_batch(&format!(
+                "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+                 INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+                   VALUES('p','w','P','MOVE','',1,1);
+                 INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+                   VALUES('{issue}','p',1,'I','merged',1,1);
+                 INSERT INTO jobs(id,project_id,issue_id,status,created_at,updated_at)
+                   VALUES('j','p','{issue}','complete',1,1);
+                 INSERT INTO sessions(id,job_id,backend,status,created_at,updated_at)
+                   VALUES('s','j','claude','closed',1,1);
+                 INSERT INTO runs(id,project_id,job_id,session_id,status,created_at,updated_at)
+                   VALUES('{run}','p','j','s','exited',1,1);
+                 INSERT INTO turns(id,session_id,job_id,run_id,sequence,state,start_reason,created_at,updated_at)
+                   VALUES('{turn}','s','j','{run}',1,'running','initial',1,1);
+                 UPDATE turns SET state='cancelled', end_reason='issue_merged' WHERE id='{turn}';"
+            ))
+            .await
+            .unwrap();
+        let issue_id = issue.to_string();
+        local
+            .write(|conn| {
+                let issue_id = issue_id.clone();
+                Box::pin(async move {
+                    crate::execution::resolution_cleanups::record_issue(
+                        conn,
+                        &issue_id,
+                        crate::transitions::Resolution::Merged,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        async fn owed(
+            db: &LocalDb,
+        ) -> crate::storage::DbResult<Vec<(String, String, Option<String>)>> {
+            db.query_all(
+                "SELECT kind, subject_id, run_id FROM resolution_cleanups ORDER BY kind",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.opt_text(2)?)),
+            )
+            .await
+        }
+        assert_eq!(owed(&local).await.unwrap().len(), 2);
+
+        copy_project_graph(&local, &team, "p", "team1")
+            .await
+            .unwrap();
+        let moved = |id: &str| rekey_to_team(id, "team1").unwrap();
+        assert_eq!(
+            owed(&team).await.unwrap(),
+            vec![
+                ("calls".to_string(), moved(turn), Some(moved(run))),
+                ("issue".to_string(), moved(issue), None),
+            ]
+        );
+        sweep_project(&local, "p").await.unwrap();
+        assert!(owed(&local).await.unwrap().is_empty());
     }
 
     #[test]

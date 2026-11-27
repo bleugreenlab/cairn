@@ -4442,6 +4442,9 @@ async fn spawn_terminal_session(
             return Err(format!("Database error: {error}"));
         }
     };
+    if let Some(job_id) = target.job_id.as_deref() {
+        crate::execution::resolution_cleanups::note_job_acquisition(&orch.db, job_id).await;
+    }
     // A recovery restart of a terminal from before retained capture takes its
     // scratch log along, since it is the same terminal continuing.
     if let (Some(_), Some(job_id)) = (target.replaces.as_ref(), target.job_id.as_deref()) {

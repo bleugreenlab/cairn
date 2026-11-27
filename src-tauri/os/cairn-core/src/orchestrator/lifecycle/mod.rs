@@ -91,7 +91,7 @@ pub use stop::{
 #[cfg(test)]
 pub(crate) use unanswered_calls::{
     lost_call_answer, pending_tool_result_ids, process_end_opening, CallEffect, LedgerRow, Loss,
-    LostCallAnswer, USER_STOP_TOOL_RESULT,
+    LostCallAnswer, RECORDED_CALLS_SQL, USER_STOP_TOOL_RESULT,
 };
 pub(crate) use unanswered_calls::{
     lost_calls_note, open_call_names, settle_calls_cut_off_by_process_end, settle_unanswered_calls,

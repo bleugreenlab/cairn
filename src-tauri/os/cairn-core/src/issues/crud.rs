@@ -868,6 +868,9 @@ pub async fn resolve(
                     .await?;
                 }
             }
+            // Settlement of what the issue's jobs hold is owed from this
+            // commit on, until a pass leaves nothing pending.
+            crate::execution::resolution_cleanups::record_issue(conn, &id, resolution).await?;
             let reason = SessionCloseReason::from(resolution);
 
             // Live work was stopped before this write, while the issue was
@@ -1001,6 +1004,9 @@ pub async fn unresolve(db: &LocalDb, clock: &dyn Clock, id: &str) -> Result<(), 
             .await?;
             crate::transitions::outcome::recompute_issue_status_after_unresolve_conn(conn, &id)
                 .await?;
+            // A reopened issue's work is never a settlement retry's to stop.
+            // Its cancelled turns' unanswered calls stay owed.
+            crate::execution::resolution_cleanups::clear_issue_any(conn, &id).await?;
             // In the same write, once the issue no longer reads resolved: lift
             // the jobs the resolution cancelled back onto their own facts.
             // Archived and superseded jobs stay Cancelled.

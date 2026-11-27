@@ -473,6 +473,15 @@ impl Fleet {
             .iter()
             .map(|(route, _)| route.holder.storage_key())
             .collect::<HashSet<_>>();
+        let reported_jobs = routes
+            .iter()
+            .filter_map(|(route, _)| match &route.holder {
+                cairn_common::executor_protocol::ResidencyHolder::Job { job_id } => {
+                    Some(job_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
         let now = unix_time_ms();
         let mut superseded = Vec::new();
         if let Err(error) = self.update_residency_routes(|known| {
@@ -524,6 +533,7 @@ impl Fleet {
             self.end_relay_of_exited_process(executor_id, &event);
             self.publish_resident_process_event(event);
         }
+        self.note_reported_job_residencies(executor_id, reported_jobs);
         self.machine_facts_posted(executor_id);
         snapshot_changed
     }

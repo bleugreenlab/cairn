@@ -470,6 +470,19 @@ struct RecordedCall {
     parent_tool_use_id: Option<String>,
 }
 
+/// A turn's assistant and tool-result events, in transcript order.
+///
+/// The unary `+` keeps the planner off `idx_events_type_run`: led by
+/// `event_type`, it walks every assistant and tool_result event in the table
+/// and filters run and turn afterwards (about 850 ms on a 4.4M-event database).
+/// A turn's own events are a seek on `idx_events_turn_id`.
+pub(crate) const RECORDED_CALLS_SQL: &str = "SELECT data
+     FROM events
+     WHERE +run_id = ?1
+       AND turn_id = ?2
+       AND +event_type IN ('assistant', 'tool_result')
+     ORDER BY sequence ASC, rowid ASC";
+
 /// A turn's calls in transcript order, and the ids its own events answered.
 async fn recorded_calls(
     db: &LocalDb,
@@ -483,15 +496,7 @@ async fn recorded_calls(
         let turn_id = turn_id.clone();
         Box::pin(async move {
             let mut rows = conn
-                .query(
-                    "SELECT data
-                     FROM events
-                     WHERE run_id = ?1
-                       AND turn_id = ?2
-                       AND event_type IN ('assistant', 'tool_result')
-                     ORDER BY sequence ASC, rowid ASC",
-                    (run_id.as_str(), turn_id.as_str()),
-                )
+                .query(RECORDED_CALLS_SQL, (run_id.as_str(), turn_id.as_str()))
                 .await?;
             let mut calls = Vec::new();
             let mut completed = HashSet::new();

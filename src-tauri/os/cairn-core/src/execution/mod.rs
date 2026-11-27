@@ -56,6 +56,7 @@ pub mod queries;
 pub mod queue;
 pub mod recipe;
 pub mod recipe_resolution;
+pub(crate) mod resolution_cleanups;
 pub mod routing;
 pub mod scheduler;
 pub mod selection;

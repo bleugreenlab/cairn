@@ -778,6 +778,9 @@ async fn accept_with_context(
             .await
             .map_err(|error| format!("persist check request: {error}"))?;
         if inserted > 0 {
+            if let Some(job_id) = spec.requester_job_id.as_deref() {
+                crate::execution::resolution_cleanups::note_acquisition_logged(db, job_id).await;
+            }
             return accepted(db, id, false).await;
         }
         if stable_id.is_some() && load_request_by_id(db, &id).await?.is_some() {

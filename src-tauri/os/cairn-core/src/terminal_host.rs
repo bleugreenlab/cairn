@@ -392,6 +392,7 @@ async fn superseded_fence_loss(
 
 pub fn schedule_terminal_lifecycle_recovery(orch: Orchestrator) {
     start_owner_recovery_clock();
+    crate::execution::resolution_cleanups::observe_job_residencies(&orch);
     cairn_common::task::spawn(async move {
         let mut liveness = ProcessLossWatch::default();
         loop {

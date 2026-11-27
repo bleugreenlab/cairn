@@ -1571,6 +1571,7 @@ async fn insert_restart_run_rows(
     phase: Option<String>,
     now: i32,
 ) -> Result<(), String> {
+    let noted_job = job_id.clone();
     db.write(move |conn| {
         let job_id = job_id.clone();
         let run_id = run_id.clone();
@@ -1610,7 +1611,9 @@ async fn insert_restart_run_rows(
         })
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    crate::execution::resolution_cleanups::note_acquisition_logged(&db, &noted_job).await;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -89,6 +89,7 @@ pub(crate) async fn mint_run(
     job_id: &str,
 ) -> Result<String, String> {
     let run_id = ids::mint_child(job_id);
+    let noted_job = job_id;
     let (project_id, job_id, id) = (project_id.to_string(), job_id.to_string(), run_id.clone());
     db.write(move |conn| {
         let (project_id, job_id, id) = (project_id.clone(), job_id.clone(), id.clone());
@@ -112,6 +113,7 @@ pub(crate) async fn mint_run(
     })
     .await
     .map_err(|error| format!("Failed to mint a service run: {error}"))?;
+    crate::execution::resolution_cleanups::note_acquisition_logged(db, noted_job).await;
     Ok(run_id)
 }
 

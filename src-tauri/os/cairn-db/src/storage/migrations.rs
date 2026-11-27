@@ -2354,6 +2354,9 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // A run batch that outlived its call; read beside `agent_waits` by the
     // replay mutation boundary, so it lives where they do.
     ("run_batch_detached", TableScope::ProjectScoped),
+    // Resolution cleanups still owed: an issue's settlement or a cancelled
+    // turn's unanswered calls, kept beside the issue or turn they name.
+    ("resolution_cleanups", TableScope::ProjectScoped),
     // A result a restarted runner adopted for a batch it did not start; read
     // beside `run_batch_detached` and `agent_waits`, so it lives where they do.
     ("run_batch_adopted_outcomes", TableScope::ProjectScoped),
@@ -3328,6 +3331,11 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "run_batch_detached",
         id_columns: &["job_id", "run_id"],
+    },
+    // `subject_id` is an issue id or a turn id by kind; both re-key alike.
+    RekeyTableManifest {
+        table: "resolution_cleanups",
+        id_columns: &["subject_id", "run_id"],
     },
     RekeyTableManifest {
         table: "run_batch_adopted_outcomes",

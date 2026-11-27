@@ -1277,6 +1277,7 @@ pub(crate) async fn insert_converted(
         ],
     )
     .await?;
+    crate::execution::resolution_cleanups::note_acquisition_conn(c, job_id).await?;
     // An inline capture already owns this request's row. Transfer delivery
     // with the wait's abandonment, in this same transaction.
     c.execute(
@@ -1516,7 +1517,9 @@ pub(crate) async fn insert(db: &LocalDb, batch: &DetachedBatch) -> Result<(), St
         })
     })
     .await
-    .map_err(|error| format!("record detached run batch: {error}"))
+    .map_err(|error| format!("record detached run batch: {error}"))?;
+    crate::execution::resolution_cleanups::note_acquisition_logged(db, &batch.job_id).await;
+    Ok(())
 }
 
 pub(crate) async fn load(db: &LocalDb, request_id: &str) -> Result<Option<DetachedBatch>, String> {

@@ -20656,6 +20656,12 @@ async fn resolved_environment_retries_after_response_guard_and_resident_exit() {
              INSERT INTO runs(id,project_id,job_id,status,created_at,updated_at)
                VALUES('response','p','job','exited',1,1);"
         ).await.unwrap();
+        // Resolved by raw SQL: record the owed cleanup the resolve write would have.
+        orch.db.local.write(|conn| Box::pin(async move {
+            crate::execution::resolution_cleanups::record_issue(
+                conn, "i", crate::transitions::Resolution::Merged,
+            ).await
+        })).await.unwrap();
         let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
         let mut cell = residency_grant_on_remote(&orch, &mut remote, generation, "job").await;
         let holder = cell.residency.as_ref().unwrap().holder.clone();
@@ -20714,4 +20720,24 @@ async fn resolved_environment_retries_after_response_guard_and_resident_exit() {
         );
         assert!(orch.fleet.residency_fence(&holder).is_none());
     }).await;
+}
+
+#[test]
+fn a_job_residency_is_observed_when_it_appears_not_on_every_report() {
+    let fleet = Fleet::default();
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let record = seen.clone();
+    fleet.subscribe_job_residency_observed(move |job| record.lock().unwrap().push(job));
+    let jobs = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<HashSet<_>>();
+    fleet.note_reported_job_residencies("a", jobs(&["j1"]));
+    fleet.note_reported_job_residencies("a", jobs(&["j1"]));
+    fleet.note_reported_job_residencies("a", jobs(&["j1", "j2"]));
+    fleet.note_reported_job_residencies("b", jobs(&["j1"]));
+    fleet.note_reported_job_residencies("a", jobs(&[]));
+    fleet.note_reported_job_residencies("a", jobs(&["j2"]));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["j1", "j2", "j1", "j2"],
+        "once per appearance on an executor: not per heartbeat, again after it went away"
+    );
 }
