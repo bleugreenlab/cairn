@@ -7279,6 +7279,12 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/7759 does not move the number. The executor's node scratch snapshot
+/// also retries `git add` when a resident deletes a file between Git's stat
+/// and its open, not only between listing and stat. That is local to the
+/// executor's staging; no frame or field changes, and an older executor only
+/// fails that race as it always has.
+///
 /// cairn/7685 does not move the number. The runner remembers which job
 /// residencies each executor's latest snapshot carried and notes the ones that
 /// newly appear, so a resource held for an already-resolved issue is recorded
