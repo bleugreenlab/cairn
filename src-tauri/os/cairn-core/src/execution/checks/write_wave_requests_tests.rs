@@ -1463,6 +1463,17 @@ async fn fixers_chain_as_requests_and_each_verdict_is_its_own_request_recorded_a
         .unwrap();
     assert_eq!(Some(stored), replay);
     drop(ticket);
+    // Taken while the wave is still undelivered: the deliveries below retire
+    // the job's settled requests to what a delivered wave's readers need, and
+    // the retirement case at the end reopens this one as a crash left it.
+    let first_context = db
+        .query_text(
+            "SELECT context_json FROM check_requests WHERE id=?1",
+            (first_request.clone(),),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     assert_superseded_summary_restart(&orch, &config_dir, &bin).await;
     let fold_b =
         assert_active_legacy_successor(&orch, &repo, &replay_run, &first_request, &fold_b).await;
@@ -1477,8 +1488,8 @@ async fn fixers_chain_as_requests_and_each_verdict_is_its_own_request_recorded_a
     db.execute("UPDATE write_check_waves SET completed=0,delivered=0,summary=NULL WHERE id='write:job:tool-use'",())
         .await.unwrap();
     db.execute("UPDATE check_requests SET state='running',outcome_json=NULL,observation_id=NULL,
-        context_json=json_set(context_json,'$.recorded',json('false'),'$.final_recording',NULL,'$.terminal',NULL,'$.fold',NULL)
-        WHERE id=?1",(first_request.clone(),)).await.unwrap();
+        context_json=json_set(?2,'$.recorded',json('false'),'$.final_recording',NULL,'$.terminal',NULL,'$.fold',NULL)
+        WHERE id=?1",(first_request.clone(),first_context)).await.unwrap();
     // The raw reopen bypasses the job's stored open-request count.
     cairn_db::stored_status::jobs::seed_from_sources_for_test(&db)
         .await

@@ -4,6 +4,10 @@ pub(super) async fn rearm_at_boot(orch: &Orchestrator) {
     durable::rearm(orch).await;
 }
 
+pub(super) async fn compact_delivered_backlog(orch: &Orchestrator, db: &Arc<LocalDb>) {
+    durable::compact_delivered_backlog(orch, db).await;
+}
+
 use super::*;
 
 #[cfg(test)]
@@ -250,6 +254,9 @@ pub(super) struct PlannedWriteWave {
     pub(super) tree_hash: String,
     /// The commit the slot materializes and the observations are recorded under.
     pub(super) sealed_commit: String,
+    /// Absent from a delivered wave's stored snapshot, which never launches a
+    /// lane again (`durable::DELIVERED_SNAPSHOT`).
+    #[serde(default)]
     pub(super) transport: Vec<(String, String)>,
 }
 

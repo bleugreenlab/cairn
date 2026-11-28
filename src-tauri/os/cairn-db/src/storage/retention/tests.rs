@@ -253,6 +253,11 @@ async fn every_selection_and_delete_seeks() {
     for walk in [RUN_QUEUE_WALK, RESOLUTION_CLEANUP_WALK, PIN_MOVE_WALK] {
         assert_seeks(&db, walk, 3, ROWID).await;
     }
+    for walk in [CHECK_REQUEST_WALK, WRITE_WAVE_WALK] {
+        assert_seeks(&db, walk, 2, ROWID).await;
+    }
+    assert_seeks(&db, WRITE_JOB_PENDING_WAVE, 1, "(job_id=?)").await;
+    assert_seeks(&db, WRITE_WAVE_PENDING_BEFORE, 2, "(job_id=?)").await;
     for table in [
         "codex_watchdog_lifecycle",
         "effect_outbox",
@@ -270,6 +275,8 @@ async fn every_selection_and_delete_seeks() {
         "run_queue",
         "resolution_cleanups",
         "inference_pin_moves",
+        "check_requests",
+        "write_check_waves",
     ] {
         let delete = format!("DELETE FROM {table} WHERE rowid IN ({})", placeholders(3));
         assert_seeks(&db, &delete, 3, ROWID).await;
@@ -1101,6 +1108,174 @@ async fn settled_regenerations_go_once_shadowed_or_retired_and_live_ones_never_d
         .await
         .unwrap();
     assert_eq!(kept, vec![2, 3, 4, 6, 7]);
+}
+
+async fn insert_check_request(
+    db: &LocalDb,
+    id: &str,
+    consumer: &str,
+    state: &str,
+    accepted_s: i64,
+    settled_s: i64,
+    job: &str,
+    context_bytes: usize,
+) {
+    db.execute(
+        "INSERT INTO check_requests (id, project_id, suite, subject_job_id, consumer, requester_ref,
+            priority, state, context_json, accepted_at_ms, state_since_ms, updated_ms)
+         VALUES (?1, 'p', 'suite', ?2, ?3, 'node', 'write_check', ?4, ?5, ?6, ?7, ?7)",
+        (
+            id.to_string(),
+            job.to_string(),
+            consumer.to_string(),
+            state.to_string(),
+            format!(r#"{{"pad":"{}"}}"#, "x".repeat(context_bytes)),
+            accepted_s * 1_000,
+            settled_s * 1_000,
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+async fn insert_wave(db: &LocalDb, id: &str, job: &str, delivered: bool, created_s: i64) {
+    db.execute(
+        "INSERT INTO write_check_waves (id, project_id, job_id, run_id, tool_use_id, driven_by,
+            snapshot_json, delivered, completed, created_at_ms)
+         VALUES (?1, 'p', ?2, 'r', ?1, 'runner', '{}', ?3, ?3, ?4)",
+        (
+            id.to_string(),
+            job.to_string(),
+            i64::from(delivered),
+            created_s * 1_000,
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// A settled write request goes a day after it settles, unless its job still
+/// has an undelivered wave that could replay it; any other settled request
+/// goes after a week; an open request never goes. A delivered wave goes a day
+/// after it was created, unless an older wave of its job is still pending.
+#[tokio::test]
+async fn settled_check_requests_and_delivered_waves_go_and_live_ones_never_do() {
+    let (_temp, db) = private_db().await;
+    seed_owners(&db).await;
+    let days = |n: i64| NOW - n * DAY_S;
+    // Job `j` has a pending wave; job `consumer` has none.
+    insert_wave(&db, "wave-pending", "j", false, days(3)).await;
+    insert_wave(&db, "wave-after-pending", "j", true, days(2)).await;
+    insert_wave(&db, "wave-delivered-old", "consumer", true, days(2)).await;
+    insert_wave(&db, "wave-delivered-new", "consumer", true, NOW - HOUR).await;
+    let request = |id, consumer, state, accepted, settled, job| {
+        insert_check_request(&db, id, consumer, state, accepted, settled, job, 16)
+    };
+    request(
+        "write-old",
+        "write",
+        "recorded",
+        days(3),
+        days(2),
+        "consumer",
+    )
+    .await;
+    request("write-lost", "write", "lost", days(3), days(2), "consumer").await;
+    request(
+        "write-young",
+        "write",
+        "recorded",
+        days(2),
+        NOW - 12 * HOUR,
+        "consumer",
+    )
+    .await;
+    request("write-held", "write", "cancelled", days(3), days(2), "j").await;
+    request(
+        "write-open",
+        "write",
+        "running",
+        days(3),
+        days(3),
+        "consumer",
+    )
+    .await;
+    request(
+        "requested-old",
+        "requested",
+        "recorded",
+        days(9),
+        days(8),
+        "consumer",
+    )
+    .await;
+    request(
+        "requested-recent",
+        "requested",
+        "failed",
+        days(4),
+        days(3),
+        "consumer",
+    )
+    .await;
+    request(
+        "requested-open",
+        "requested",
+        "queued",
+        days(9),
+        days(9),
+        "consumer",
+    )
+    .await;
+    request(
+        "write-new",
+        "write",
+        "recorded",
+        NOW - HOUR,
+        NOW - HOUR,
+        "consumer",
+    )
+    .await;
+
+    let report = run(&db, UNBOUNDED, &[Eviction::SettledCheckRequests]).await;
+
+    assert_eq!(report.end, PassEnd::Complete, "{report}");
+    assert!(report.rules[0].finished, "{report}");
+    assert_eq!(
+        ids(&db, "SELECT id FROM check_requests ORDER BY id").await,
+        vec![
+            "requested-open",
+            "requested-recent",
+            "write-held",
+            "write-new",
+            "write-open",
+            "write-young"
+        ]
+    );
+    assert_eq!(
+        ids(&db, "SELECT id FROM write_check_waves ORDER BY id").await,
+        vec!["wave-after-pending", "wave-delivered-new", "wave-pending"]
+    );
+}
+
+/// Rows written before settling compacted them are megabytes each: the rule
+/// deletes them a page of at most four megabytes at a time.
+#[tokio::test]
+async fn oversized_settled_check_requests_go_in_pages_of_a_few_megabytes() {
+    let (_temp, db) = private_db().await;
+    seed_owners(&db).await;
+    let old = NOW - 3 * DAY_S;
+    for id in ["a", "b", "c"] {
+        insert_check_request(&db, id, "write", "recorded", old, old, "consumer", 3 << 20).await;
+    }
+
+    let report = run(&db, UNBOUNDED, &[Eviction::SettledCheckRequests]).await;
+
+    assert_eq!(report.end, PassEnd::Complete, "{report}");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM check_requests").await, 0);
+    let rule = &report.rules[0];
+    assert_eq!((rule.rows, rule.pages), (3, 3), "{report}");
+    assert!(rule.bytes >= 9 << 20, "{report}");
 }
 
 #[tokio::test]

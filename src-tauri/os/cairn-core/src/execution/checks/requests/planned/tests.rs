@@ -96,7 +96,49 @@ fn returned() -> Returned {
 }
 
 async fn accepted(orch: &Orchestrator, key: &str, phase: WriteLanePhase) -> String {
-    let request = request();
+    accepted_with(orch, key, phase, request()).await
+}
+
+/// The executor's base-content bundle a wave that plans the executor-protocol
+/// suite ships every suite's request: 1.7-2.8 MB on the 11-27 database.
+fn base_content() -> (String, String) {
+    (
+        "CAIRN_CHECK_BASE_CONTENT_CONTENT".into(),
+        "b".repeat(2 << 20),
+    )
+}
+
+fn terminal() -> crate::execution::checks::ManualConfiguredCheckResult {
+    serde_json::from_value(serde_json::json!({
+        "checkName":"fix","commitSha":"commit","treeHash":"tree","inputHash":"input","environmentFingerprint":"",
+        "observationRef":null,"ranAt":null,"reusable":false,"notRecorded":"no verdict","disposition":"fresh",
+        "passed":false,"verified":false,"unverifiedReason":null,"tier":null,"exitCode":null,"noVerdict":null,
+        "outputTail":"","executor":null,"verdictPlatform":null,"runtime":null,"placementNote":null,"placementUnmet":null,"capture":null
+    }))
+    .unwrap()
+}
+
+async fn context_bytes(orch: &Orchestrator, id: &str) -> i64 {
+    orch.db
+        .local
+        .query_one(
+            "SELECT length(context_json) FROM check_requests WHERE id=?1",
+            (id.to_string(),),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap()
+}
+
+/// A stored settled write request, whatever its launch transport was.
+const SETTLED_ROW_BYTES: i64 = 4 * 1024;
+
+async fn accepted_with(
+    orch: &Orchestrator,
+    key: &str,
+    phase: WriteLanePhase,
+    request: PlannedCheckRequest,
+) -> String {
     let snapshot = Snapshot::capture(&request, phase).unwrap();
     let c = Context {
         write_lane: snapshot,
@@ -263,13 +305,7 @@ async fn a_recorded_checkpoint_finishes_settlement_without_executing_or_recordin
     checkpoint(&orch.db.local, &id, "returned", &returned())
         .await
         .unwrap();
-    let terminal:crate::execution::checks::ManualConfiguredCheckResult=serde_json::from_value(serde_json::json!({
-        "checkName":"fix","commitSha":"commit","treeHash":"tree","inputHash":"input","environmentFingerprint":"",
-        "observationRef":null,"ranAt":null,"reusable":false,"notRecorded":"no verdict","disposition":"fresh",
-        "passed":false,"verified":false,"unverifiedReason":null,"tier":null,"exitCode":null,"noVerdict":null,
-        "outputTail":"","executor":null,"verdictPlatform":null,"runtime":null,"placementNote":null,"placementUnmet":null,"capture":null
-    })).unwrap();
-    checkpoint(&orch.db.local, &id, "terminal", &terminal)
+    checkpoint(&orch.db.local, &id, "terminal", &terminal())
         .await
         .unwrap();
     checkpoint(&orch.db.local, &id, "recorded", &true)
@@ -300,6 +336,137 @@ async fn a_recorded_checkpoint_finishes_settlement_without_executing_or_recordin
             .unwrap()
             .unwrap(),
         1
+    );
+}
+
+/// While a request is open its launch transport is what a restart relaunches
+/// it with. The write that settles it drops the transport, and the delivery
+/// of its job's last wave drops what only a wave replay reads.
+#[tokio::test]
+async fn a_recorded_write_request_stores_kilobytes_not_its_launch_transport() {
+    let (_root, orch) = super::super::tests::row_fixture().await;
+    let mut request = request();
+    request.item.env.push(base_content());
+    let id = accepted_with(&orch, "wave:verdict", WriteLanePhase::Fixer, request).await;
+    assert!(context_bytes(&orch, &id).await > 2 << 20);
+    let open = context(&orch.db.local, &id).await.unwrap().unwrap();
+    let relaunch = open.write_lane.restore(&orch, &id);
+    assert!(
+        relaunch
+            .item
+            .env
+            .iter()
+            .any(|(name, value)| name == "CAIRN_CHECK_BASE_CONTENT_CONTENT"
+                && value.len() == 2 << 20),
+        "an open request relaunches with its whole transport"
+    );
+    checkpoint(&orch.db.local, &id, "returned", &returned())
+        .await
+        .unwrap();
+    checkpoint(&orch.db.local, &id, "terminal", &terminal())
+        .await
+        .unwrap();
+    checkpoint(&orch.db.local, &id, "recorded", &true)
+        .await
+        .unwrap();
+    drive_inner(&orch, orch.db.local.clone(), &id, None)
+        .await
+        .unwrap();
+
+    let row = load_request_by_id(&orch.db.local, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "recorded");
+    let settled = context_bytes(&orch, &id).await;
+    assert!(settled < SETTLED_ROW_BYTES, "{settled} bytes");
+    // What a wave replay of the settled phase reads is still there.
+    let c = context(&orch.db.local, &id).await.unwrap().unwrap();
+    assert!(c.recorded && c.write_lane.transport.is_empty());
+    let replay = c.returned.unwrap().outcome(&orch, &id, &c.write_lane);
+    assert_eq!(replay.delta.unwrap().delta_commit, "rewrite");
+    assert_eq!(replay.request.unwrap().request_id, "physical");
+
+    // The job's last wave is delivered: nothing replays the phase again.
+    let retired = orch
+        .db
+        .local
+        .write(|conn| Box::pin(async move { retire_settled_requests(conn, "j").await }))
+        .await
+        .unwrap();
+    assert_eq!(retired, 1);
+    let retired_bytes = context_bytes(&orch, &id).await;
+    assert!(retired_bytes < settled, "{retired_bytes} of {settled}");
+    let c = context(&orch.db.local, &id).await.unwrap().unwrap();
+    let returned = c.returned.unwrap();
+    assert!(returned.results.is_empty() && returned.delta.is_none() && c.terminal.is_none());
+    assert_eq!(
+        returned.identity,
+        Some(("physical".into(), "attempt".into())),
+        "consumer delivery still names the physical lane"
+    );
+    // A second settled-row visit (boot delivery, a late finalize) still reads it.
+    drive_inner(&orch, orch.db.local.clone(), &id, None)
+        .await
+        .unwrap();
+}
+
+/// Rows that settled before settling compacted them are stripped by the boot
+/// sweep; an open request keeps its transport, and a settled one whose job
+/// still has a pending wave keeps what that wave's replay reads.
+#[tokio::test]
+async fn the_boot_sweep_strips_settled_rows_and_leaves_open_ones_whole() {
+    let (_root, orch) = super::super::tests::row_fixture().await;
+    let db = &orch.db.local;
+    db.execute(
+        "INSERT INTO runs(id, job_id, status, created_at, updated_at) VALUES('r','j','exited',1,1)",
+        (),
+    )
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for key in ["old-retired", "old-held", "open"] {
+        let mut request = request();
+        request.item.env.push(base_content());
+        let id = accepted_with(&orch, key, WriteLanePhase::Fixer, request).await;
+        checkpoint(db, &id, "returned", &returned()).await.unwrap();
+        ids.push(id);
+    }
+    // Settled by a build that kept the transport: raw state writes.
+    db.execute(
+        "UPDATE check_requests SET state='recorded',subject_job_id='x' WHERE id=?1",
+        (ids[0].clone(),),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE check_requests SET state='cancelled' WHERE id=?1",
+        (ids[1].clone(),),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO write_check_waves(id,project_id,job_id,run_id,tool_use_id,driven_by,snapshot_json,created_at_ms)
+         VALUES('pending','p','j','r','pending','runner','{}',1)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    compact_settled_backlog(orch.clone()).await;
+
+    let retired = context_bytes(&orch, &ids[0]).await;
+    assert!(retired < SETTLED_ROW_BYTES, "{retired} bytes");
+    let held = context(db, &ids[1]).await.unwrap().unwrap();
+    assert!(held.write_lane.transport.is_empty());
+    assert!(
+        held.returned.unwrap().delta.is_some(),
+        "a pending wave of the job may still replay it"
+    );
+    assert!(context_bytes(&orch, &ids[1]).await < SETTLED_ROW_BYTES);
+    assert!(
+        context_bytes(&orch, &ids[2]).await > 2 << 20,
+        "an open request keeps what its relaunch needs"
     );
 }
 

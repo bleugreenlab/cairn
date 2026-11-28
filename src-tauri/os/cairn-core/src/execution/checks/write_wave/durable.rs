@@ -121,28 +121,131 @@ pub(super) async fn complete(
 }
 
 pub(super) async fn delivered(db: &Arc<LocalDb>, id: &str) -> Result<(), String> {
-    db.execute(
+    settle_delivery(
+        db,
+        id,
         "UPDATE write_check_waves SET delivered=1 WHERE id=?1 OR (superseded=1
             AND job_id=(SELECT job_id FROM write_check_waves WHERE id=?1)
             AND created_at_ms <= (SELECT created_at_ms FROM write_check_waves WHERE id=?1))",
-        (id.to_string(),),
     )
     .await
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 pub(super) async fn superseded(db: &Arc<LocalDb>, id: &str) -> Result<(), String> {
-    db.execute(
+    settle_delivery(
+        db,
+        id,
         "UPDATE write_check_waves SET superseded=1,delivered=EXISTS(
         SELECT 1 FROM write_check_waves newer WHERE newer.job_id=write_check_waves.job_id
         AND newer.created_at_ms>write_check_waves.created_at_ms AND newer.delivered=1)
         WHERE id=?1",
-        (id.to_string(),),
     )
     .await
-    .map_err(|e| e.to_string())?;
-    Ok(())
+}
+
+/// A delivered wave as it is kept: its launch transport and fold rekeys go.
+///
+/// A delivered wave is never driven again. Boot recovery reads it only as
+/// ordering evidence for an older pending wave of its job (its job, sealed
+/// commit and verdicts), and its transport, the bulk of the snapshot (the
+/// executor's base-content bundle when the wave planned the executor-protocol
+/// suite), is read only to launch lanes.
+const DELIVERED_SNAPSHOT: &str = "snapshot_json=json_remove(snapshot_json,'$.planned.transport'),\
+     rekeys_json='{}'";
+
+/// Whether a delivered wave still holds what [`DELIVERED_SNAPSHOT`] drops.
+const DELIVERED_COMPACTABLE: &str = "delivered=1 \
+     AND (json_type(snapshot_json,'$.planned.transport') IS NOT NULL OR rekeys_json<>'{}')";
+
+/// Apply `update` to wave `id`, and in the same transaction compact every
+/// wave of its job that is now delivered and, once none of the job's waves is
+/// pending, the job's settled write requests
+/// ([`requests::retire_settled_requests`]).
+async fn settle_delivery(db: &Arc<LocalDb>, id: &str, update: &'static str) -> Result<(), String> {
+    let id = id.to_string();
+    db.write(move |conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            conn.execute(update, (id.clone(),)).await?;
+            let mut rows = conn
+                .query(
+                    "SELECT job_id FROM write_check_waves WHERE id=?1",
+                    (id.clone(),),
+                )
+                .await?;
+            let job = match rows.next().await? {
+                Some(row) => row.text(0)?,
+                None => return Ok(()),
+            };
+            drop(rows);
+            conn.execute(
+                &format!(
+                    "UPDATE write_check_waves SET {DELIVERED_SNAPSHOT}
+                      WHERE job_id=?1 AND {DELIVERED_COMPACTABLE}"
+                ),
+                (job.clone(),),
+            )
+            .await?;
+            requests::retire_settled_requests(conn, &job).await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Waves delivered before their delivery compacted them, two per transaction:
+/// a pre-compaction snapshot is about 1.8 MB.
+pub(super) async fn compact_delivered_backlog(orch: &Orchestrator, db: &Arc<LocalDb>) {
+    let mut rewritten = 0u64;
+    let mut after = 0i64;
+    loop {
+        if orch.fleet.runner_stopping_since().is_some() {
+            return;
+        }
+        let page = match db
+            .query_all(
+                "SELECT rowid FROM write_check_waves WHERE rowid > ?1 ORDER BY rowid LIMIT 64",
+                (after,),
+                |row| row.i64(0),
+            )
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                log::warn!("delivered write-wave compaction stopped: {error}");
+                return;
+            }
+        };
+        let Some(last) = page.last().copied() else {
+            break;
+        };
+        for rowids in page.chunks(2) {
+            let list = rowids
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            match db
+                .execute(
+                    format!(
+                        "UPDATE write_check_waves SET {DELIVERED_SNAPSHOT}
+                          WHERE rowid IN ({list}) AND {DELIVERED_COMPACTABLE}"
+                    ),
+                    (),
+                )
+                .await
+            {
+                Ok(count) => rewritten += count,
+                Err(error) => log::warn!("delivered write-wave compaction: {error}"),
+            }
+            tokio::task::yield_now().await;
+        }
+        after = last;
+    }
+    if rewritten > 0 {
+        log::info!("compacted {rewritten} delivered write-check waves");
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -387,5 +490,131 @@ pub(super) async fn rearm(orch: &Orchestrator) {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stored delivered wave, whatever its launch transport was.
+    const DELIVERED_WAVE_BYTES: i64 = 4 * 1024;
+
+    async fn wave(db: &LocalDb, id: &str, created_at_ms: i64) {
+        // The shape that matters: `planned.transport` carries the executor's
+        // base-content bundle (1.8 MB a wave on the 11-27 database).
+        db.execute(
+            "INSERT INTO write_check_waves(id,project_id,job_id,run_id,tool_use_id,driven_by,
+                snapshot_json,rekeys_json,completed,created_at_ms)
+             VALUES(?1,'p','j','r',?1,'runner',
+                json_object('planned',json_object('sealed_commit','c','transport',
+                    json_array(json_array('CAIRN_CHECK_BASE_CONTENT_CONTENT',?2)))),
+                json_object('0',json_object('transport',json_array(json_array('X',?2)))),1,?3)",
+            cairn_db::turso::params![id, "b".repeat(2 << 20), created_at_ms],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn bytes(db: &LocalDb, sql: &str, id: &str) -> i64 {
+        db.query_one(sql, (id.to_string(),), |row| row.i64(0))
+            .await
+            .unwrap()
+    }
+
+    async fn wave_bytes(db: &LocalDb, id: &str) -> i64 {
+        bytes(
+            db,
+            "SELECT length(snapshot_json)+length(rekeys_json) FROM write_check_waves WHERE id=?1",
+            id,
+        )
+        .await
+    }
+
+    async fn request_bytes(db: &LocalDb) -> i64 {
+        bytes(
+            db,
+            "SELECT length(context_json) FROM check_requests WHERE id=?1",
+            "settled",
+        )
+        .await
+    }
+
+    /// Delivering a wave compacts it in the same transaction; its job's
+    /// settled write requests are retired once no wave of the job is pending,
+    /// and not before.
+    #[tokio::test]
+    async fn a_delivered_wave_stores_kilobytes_and_retires_its_jobs_settled_requests() {
+        let db = Arc::new(crate::storage::migrated_test_db("delivered-waves.db").await);
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','proj','/unused',1,1);
+             INSERT INTO jobs(id,project_id,status,created_at,updated_at) VALUES('j','p','running',1,1);
+             INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES('r','j','exited',1,1);",
+        )
+        .await
+        .unwrap();
+        wave(&db, "older", 1).await;
+        wave(&db, "newer", 2).await;
+        db.execute(
+            "INSERT INTO check_requests(id,project_id,suite,subject_job_id,consumer,requester_ref,
+                priority,state,context_json,accepted_at_ms,state_since_ms,updated_ms)
+             VALUES('settled','p','fix','j','write','w','write_check','recorded',
+                json_object('write_lane',json_object('phase','fixer','transport',json_array()),
+                    'returned',json_object('results',json_object('0',json_object('Ok',?1)),
+                        'identity',json_array('physical','attempt'),'delta',NULL),
+                    'recorded',json('true'),'terminal',json_object('outputTail',?1)),1,1,1)",
+            ("o".repeat(40 << 10),),
+        )
+        .await
+        .unwrap();
+        let settled = request_bytes(&db).await;
+
+        delivered(&db, "newer").await.unwrap();
+
+        let newer = wave_bytes(&db, "newer").await;
+        assert!(newer < DELIVERED_WAVE_BYTES, "{newer} bytes");
+        assert!(
+            wave_bytes(&db, "older").await > 2 << 20,
+            "a pending wave keeps what its relaunch needs"
+        );
+        assert_eq!(
+            request_bytes(&db).await,
+            settled,
+            "the pending wave may still replay the job's settled requests"
+        );
+        // Boot recovery reads a delivered wave's sealed commit as ordering
+        // evidence; the rest of its snapshot is untouched.
+        assert_eq!(
+            db.query_text(
+                "SELECT json_extract(snapshot_json,'$.planned.sealed_commit')||'/'||
+                    coalesce(json_type(snapshot_json,'$.planned.transport'),'absent')||'/'||rekeys_json
+                 FROM write_check_waves WHERE id='newer'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            "c/absent/{}"
+        );
+
+        delivered(&db, "older").await.unwrap();
+
+        assert!(wave_bytes(&db, "older").await < DELIVERED_WAVE_BYTES);
+        let retired = request_bytes(&db).await;
+        assert!(retired < 1024, "{retired} of {settled} bytes");
+        let kept: serde_json::Value = serde_json::from_str(
+            &db.query_text(
+                "SELECT context_json FROM check_requests WHERE id='settled'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kept["returned"]["identity"][0], "physical");
+        assert_eq!(kept["recorded"], true);
     }
 }

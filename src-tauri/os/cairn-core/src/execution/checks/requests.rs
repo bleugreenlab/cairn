@@ -37,7 +37,7 @@ mod planned;
 pub(crate) use planned::install_granted_write_for_test;
 pub(crate) use planned::{
     file_planned_check_request, finalize_planned_check_request, load_planned_fold, planned_filing,
-    record_planned_fold, supersede_planned_check_request, WriteLanePhase,
+    record_planned_fold, retire_settled_requests, supersede_planned_check_request, WriteLanePhase,
 };
 
 pub(crate) enum CheckRequestInput {
@@ -1350,10 +1350,12 @@ async fn settle(
                     let settled = conn.execute(
                         format!(
                             "UPDATE check_requests SET state=?2,outcome_json=?3,evidence=?4,open_key=NULL,
+                                context_json={},
                                 observation_id=COALESCE(observation_id,
                                     (SELECT id FROM check_result_observations WHERE project_id=?6 AND id=?5)),
                                 waiting_to_learn=NULL,state_since_ms=?7,updated_ms=?7
-                              WHERE id=?1 AND state IN {OPEN_STATES}"
+                              WHERE id=?1 AND state IN {OPEN_STATES}",
+                            planned::SETTLED_CONTEXT,
                         ),
                         cairn_db::turso::params![
                             id.as_str(),
@@ -1624,6 +1626,7 @@ pub(crate) async fn rearm_at_boot(orch: &Orchestrator) {
         planned::rearm_deliveries(orch, &db).await;
     }
     super::write_wave::rearm_at_boot(orch).await;
+    cairn_common::task::spawn(planned::compact_settled_backlog(orch.clone()));
 }
 
 async fn rearm(orch: &Orchestrator, db: &Arc<LocalDb>, row: CheckRequestRow) {

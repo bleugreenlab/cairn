@@ -41,7 +41,11 @@ struct Snapshot {
     #[serde(skip)]
     run_context: Option<crate::mcp::handlers::RunContext>,
     // Only the three content transports are data. Launch credentials are
-    // reacquired from the runner's environment, never journaled.
+    // reacquired from the runner's environment, never journaled. Absent once
+    // the request settles ([`SETTLED_CONTEXT`]): a settled request never
+    // launches again, and the cell request it still rebuilds for its fold
+    // publication reads ids, repository and project, never an item's env.
+    #[serde(default)]
     transport: Vec<(String, String)>,
     phase: WriteLanePhase,
 }
@@ -167,6 +171,9 @@ impl Snapshot {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Returned {
+    /// Empty once every wave of the request's job is delivered
+    /// ([`RETIRED_CONTEXT`]): only a wave replay reads the raw results.
+    #[serde(default)]
     results: CheckGroupResults,
     identity: Option<(String, String)>,
     delta: Option<crate::fleet::MutationDelta>,
@@ -240,6 +247,132 @@ struct Fold {
     patch: String,
     paths: Vec<String>,
     landed_on_tested_base: bool,
+}
+
+/// A write request's `context_json` as its settling write leaves it.
+///
+/// The launch transport is the request's bulk: the wave's changed-file list
+/// plus, whenever the wave plans the executor-protocol suite, the executor's
+/// base-content bundle (1.7-2.8 MB on the 11-27 database), copied into every
+/// suite's request. Nothing reads it once the request has settled. Everything
+/// else stays, because a wave still in flight replays its settled phases after
+/// a restart and reads their raw results, delta and fold.
+pub(crate) const SETTLED_CONTEXT: &str = "CASE WHEN consumer='write' \
+     THEN json_remove(context_json,'$.write_lane.transport') ELSE context_json END";
+
+/// What a settled write request keeps once no wave of its job is undelivered:
+/// its phase, item and final recording (what `rearm_deliveries` and a legacy
+/// finish deserialize), `recorded`, and the returned identity its consumer
+/// delivery names. The raw results, delta, fold and terminal answer are read
+/// only by a wave replay, and a delivered wave never replays; the request's
+/// answer itself is `outcome_json`.
+const RETIRED_CONTEXT: &str = "json_remove(context_json,'$.write_lane.transport',\
+     '$.returned.results','$.returned.delta','$.fold','$.terminal')";
+
+/// Whether a write request's context still holds something [`RETIRED_CONTEXT`]
+/// drops, so a retirement pass rewrites only rows it shrinks.
+const RETIRABLE: &str = "(json_type(context_json,'$.write_lane.transport') IS NOT NULL \
+     OR json_type(context_json,'$.returned.results') IS NOT NULL \
+     OR json_type(context_json,'$.returned.delta') IS NOT NULL \
+     OR json_type(context_json,'$.fold') IS NOT NULL \
+     OR json_type(context_json,'$.terminal') IS NOT NULL)";
+
+const SETTLED_STATES: &str = "('recorded','failed','cancelled','lost')";
+
+/// Retire the settled write requests of `job` once it has no undelivered wave,
+/// inside the transaction that delivered its last one.
+pub(crate) async fn retire_settled_requests(
+    conn: &crate::storage::TrackedConnection,
+    job: &str,
+) -> crate::storage::DbResult<u64> {
+    Ok(conn
+        .execute(
+            &format!(
+                "UPDATE check_requests SET context_json={RETIRED_CONTEXT}
+                  WHERE subject_job_id=?1 AND state IN {SETTLED_STATES} AND consumer='write'
+                    AND NOT EXISTS(SELECT 1 FROM write_check_waves WHERE job_id=?1 AND delivered=0)
+                    AND {RETIRABLE}"
+            ),
+            (job.to_string(),),
+        )
+        .await?)
+}
+
+/// Rows one backlog write rewrites. A pre-compaction row is up to 3 MB, and
+/// Turso reads a whole record to touch any column of it, so a write stays
+/// near the evictor's 4 MB page.
+const BACKLOG_WRITE_ROWS: usize = 2;
+
+/// Strip the launch context from write requests that settled before their
+/// settling write did it, a few rows per transaction, and from delivered
+/// waves the same way ([`super::super::write_wave::compact_delivered_backlog`]).
+///
+/// Runs once per boot over every open database. Rows already compact are
+/// rewritten by no write: the predicate reads them and matches nothing.
+pub(crate) async fn compact_settled_backlog(orch: Orchestrator) {
+    for db in orch.db.all_dbs().await {
+        let mut rewritten = 0u64;
+        let mut after = 0i64;
+        loop {
+            if orch.fleet.runner_stopping_since().is_some() {
+                return;
+            }
+            let page = match db
+                .query_all(
+                    "SELECT rowid FROM check_requests WHERE rowid > ?1 ORDER BY rowid LIMIT 64",
+                    (after,),
+                    |row| row.i64(0),
+                )
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    log::warn!("settled write-request compaction stopped: {error}");
+                    break;
+                }
+            };
+            let Some(last) = page.last().copied() else {
+                break;
+            };
+            for rowids in page.chunks(BACKLOG_WRITE_ROWS) {
+                match compact_settled_rows(&db, rowids).await {
+                    Ok(count) => rewritten += count,
+                    Err(error) => log::warn!("settled write-request compaction: {error}"),
+                }
+                tokio::task::yield_now().await;
+            }
+            after = last;
+        }
+        if rewritten > 0 {
+            log::info!("compacted {rewritten} settled write-check requests");
+        }
+        super::super::write_wave::compact_delivered_backlog(&orch, &db).await;
+    }
+}
+
+/// One backlog write: each settled write request among `rowids` keeps what
+/// [`RETIRED_CONTEXT`] keeps when its job has no undelivered wave, and what
+/// [`SETTLED_CONTEXT`] keeps while one could still replay it.
+async fn compact_settled_rows(db: &LocalDb, rowids: &[i64]) -> Result<u64, String> {
+    let list = rowids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    db.execute(
+        format!(
+            "UPDATE check_requests SET context_json=CASE
+                 WHEN EXISTS(SELECT 1 FROM write_check_waves w
+                              WHERE w.job_id=check_requests.subject_job_id AND w.delivered=0)
+                 THEN json_remove(context_json,'$.write_lane.transport')
+                 ELSE {RETIRED_CONTEXT} END
+              WHERE rowid IN ({list}) AND consumer='write' AND state IN {SETTLED_STATES}
+                AND {RETIRABLE}"
+        ),
+        (),
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 fn filing_id(_project_id: &str, key: &str) -> String {

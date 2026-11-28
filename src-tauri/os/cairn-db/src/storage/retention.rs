@@ -428,8 +428,11 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "window observations (newest per check and input plus 90 days); children cascade",
     )
     .budget(256),
-    owned("check_requests", "projects"),
-    owned("write_check_waves", "jobs"),
+    // About 3 KB a settled write request once its waves deliver, and a few
+    // thousand a day; before cairn/7747 each carried 1.7-2.8 MB of launch
+    // transport and the table reached 10.7 GB in 42 hours.
+    evict("check_requests", Eviction::SettledCheckRequests).budget(64),
+    evict("write_check_waves", Eviction::SettledCheckRequests).budget(32),
     owned("check_test_results", "check_result_observations").budget(1_100),
     owned("check_deferred_tests", "check_result_observations"),
     owned("check_audit_findings", "check_result_observations"),
@@ -904,6 +907,23 @@ const QUEUE_PAGE_ROWS: usize = 32;
 /// delete per page. The backlog's first passes run unmeasured (no clone was
 /// taken for cairn/7261), so the bound is by construction, not by a timing.
 const QUEUE_PAGE_BYTES: i64 = 4 * 1024 * 1024;
+/// A settled write-cadence check request is read afterwards by two things: a
+/// replay of its wave, which only an undelivered wave runs and this rule
+/// waits out, and its consumer delivery, retried at the next boot. A day is
+/// past both.
+const SETTLED_WRITE_REQUEST_AGE_S: i64 = DAY_S;
+/// Every other settled check request is the address an agent filed and waits
+/// on (`check-requests/<n>`); the wait is bounded by the batch ceiling (6 h)
+/// or the next boot, as a settled wait is ([`SETTLED_WAIT_AGE_S`]).
+const SETTLED_CHECK_REQUEST_AGE_S: i64 = 7 * DAY_S;
+/// A delivered write wave is read only as ordering evidence for an older wave
+/// of its job that is still pending; with none, nothing reads it.
+const DELIVERED_WAVE_AGE_S: i64 = DAY_S;
+/// Rows read per check-request or wave walk. Rows written before cairn/7747
+/// are 1.8-3 MB, and Turso reads a whole record to read any column of it.
+const CHECK_REQUEST_WALK_ROWS: usize = 16;
+/// The states a check request settles in.
+const CHECK_REQUEST_SETTLED_STATES: [&str; 4] = ["recorded", "failed", "cancelled", "lost"];
 /// The states an entry ends in. An entry whose newest row is in one of them
 /// is settled; any other newest row (`queued`, `offered`, `claimed`) is live.
 const QUEUE_TERMINAL_STATES: [&str; 3] = ["completed", "cancelled", "expired"];
@@ -1048,6 +1068,25 @@ pub(crate) const QUEUE_ENTRY_ROWS: &str = "SELECT rowid, sequence, \
      length(CAST(scoring_json AS BLOB)) + length(CAST(constraints_json AS BLOB)) \
      + coalesce(length(CAST(detail AS BLOB)), 0) \
      FROM execution_queue WHERE entry_id = ?1 ORDER BY sequence LIMIT ?2";
+/// Check requests in rowid order, which is acceptance order: `accepted_at_ms`
+/// is stamped at insert, so the walk stops at the first row accepted after
+/// the shortest window.
+pub(crate) const CHECK_REQUEST_WALK: &str = "SELECT rowid, consumer, state, state_since_ms, \
+     accepted_at_ms, subject_job_id, coalesce(length(CAST(context_json AS BLOB)), 0) \
+     + coalesce(length(CAST(outcome_json AS BLOB)), 0) \
+     FROM check_requests WHERE rowid > ?1 ORDER BY rowid LIMIT ?2";
+/// Whether a job has a write wave not yet delivered, which may still replay
+/// its settled requests. A seek on the `(job_id, tool_use_id)` key.
+pub(crate) const WRITE_JOB_PENDING_WAVE: &str =
+    "SELECT 1 FROM write_check_waves WHERE job_id = ?1 AND delivered = 0 LIMIT 1";
+/// Write waves in rowid order, which is creation order.
+pub(crate) const WRITE_WAVE_WALK: &str = "SELECT rowid, job_id, delivered, created_at_ms, \
+     length(CAST(snapshot_json AS BLOB)) + length(CAST(rekeys_json AS BLOB)) \
+     FROM write_check_waves WHERE rowid > ?1 ORDER BY rowid LIMIT ?2";
+/// Whether a pending wave of the job is older than (or as old as) a delivered
+/// one, which boot recovery then reads as ordering evidence.
+pub(crate) const WRITE_WAVE_PENDING_BEFORE: &str = "SELECT 1 FROM write_check_waves \
+     WHERE job_id = ?1 AND delivered = 0 AND created_at_ms <= ?2 LIMIT 1";
 pub(crate) const QUEUE_MARKER_WALK: &str = "SELECT rowid, runner_incarnation \
      FROM execution_queue_closed_incarnations WHERE rowid > ?1 ORDER BY rowid LIMIT ?2";
 /// Whether any journal row of an incarnation remains.
@@ -1117,12 +1156,19 @@ pub enum Eviction {
     /// `inference_pin_moves` re-verifies that ended more than a week ago and
     /// whose candidate profile is gone. One still verifying is never deleted.
     EndedPinMoves,
+    /// Settled `check_requests` (`recorded`, `failed`, `cancelled`, `lost`):
+    /// a write-cadence request a day after it settles once no wave of its job
+    /// is undelivered, any other a week after it settles. Delivered
+    /// `write_check_waves` a day after they were created, unless an older wave
+    /// of the job is still pending. An open request and a pending wave are
+    /// never deleted.
+    SettledCheckRequests,
 }
 
 impl Eviction {
     /// The initial order before budget-driven rotation. Watchdog evidence gets
     /// the first runtime turn rather than waiting behind payload-heavy journals.
-    pub const ALL: [Eviction; 13] = [
+    pub const ALL: [Eviction; 14] = [
         Eviction::WatchdogLifecycle,
         Eviction::DoneOutbox,
         Eviction::TerminalStreams,
@@ -1136,6 +1182,7 @@ impl Eviction {
         Eviction::FinishedRunQueueEntries,
         Eviction::GoneResolutionCleanups,
         Eviction::EndedPinMoves,
+        Eviction::SettledCheckRequests,
     ];
 
     pub fn name(self) -> &'static str {
@@ -1153,6 +1200,7 @@ impl Eviction {
             Eviction::FinishedRunQueueEntries => "finished_run_queue_entries",
             Eviction::GoneResolutionCleanups => "gone_resolution_cleanups",
             Eviction::EndedPinMoves => "ended_pin_moves",
+            Eviction::SettledCheckRequests => "settled_check_requests",
         }
     }
 
@@ -1176,12 +1224,16 @@ impl Eviction {
             Eviction::FinishedRunQueueEntries => &["run_queue"],
             Eviction::GoneResolutionCleanups => &["resolution_cleanups"],
             Eviction::EndedPinMoves => &["inference_pin_moves"],
+            Eviction::SettledCheckRequests => &["check_requests", "write_check_waves"],
         }
     }
 
     /// Whether [`RuleReport::bytes`] is measured for this rule.
     pub fn measures_bytes(self) -> bool {
-        matches!(self, Eviction::SettledQueueEntries)
+        matches!(
+            self,
+            Eviction::SettledQueueEntries | Eviction::SettledCheckRequests
+        )
     }
 
     async fn page(self, db: &LocalDb, now: i64, cursor: &mut Cursor) -> DbResult<Page> {
@@ -1215,6 +1267,9 @@ impl Eviction {
             Eviction::EndedPinMoves => {
                 let cutoff = (now - ENDED_PIN_MOVE_AGE_S) * 1_000;
                 select_flagged(db, "inference_pin_moves", PIN_MOVE_WALK, cutoff, cursor).await?
+            }
+            Eviction::SettledCheckRequests => {
+                select_settled_check_requests(db, now, cursor).await?
             }
         };
         let select = started.elapsed();
@@ -1259,6 +1314,9 @@ struct Cursor {
     waits_stamped: bool,
     after_at: Option<i64>,
     queue: QueueWalk,
+    /// Settled check requests: the request walk is finished and the wave walk
+    /// is under way.
+    check_waves: bool,
 }
 
 /// Where the settled-queue walk stands: the incarnation and terminal state
@@ -1998,6 +2056,189 @@ async fn select_settled_regenerations(
         },
         unlink_parents: Vec::new(),
         bytes: 0,
+    })
+}
+
+/// One walked row of [`Eviction::SettledCheckRequests`]: its rowid, the time
+/// its walk stops at, whether the rule deletes it, and its stored bytes.
+struct CheckRow {
+    rowid: i64,
+    born_ms: i64,
+    delete: bool,
+    bytes: i64,
+}
+
+/// Choose a page of `rows` to delete: up to [`QUEUE_PAGE_BYTES`] (at least one
+/// row), stopping at the first row born at or after `cutoff_ms`. Returns the
+/// rowids, their bytes, the last rowid consumed and whether the walk is over.
+fn check_page(rows: Vec<CheckRow>, cutoff_ms: i64, after: i64) -> (Vec<i64>, i64, i64, bool) {
+    let walked_all = rows.len() < CHECK_REQUEST_WALK_ROWS;
+    let (mut rowids, mut bytes, mut last) = (Vec::new(), 0i64, after);
+    let mut reached_new = false;
+    for row in rows {
+        if row.born_ms >= cutoff_ms {
+            reached_new = true;
+            break;
+        }
+        if row.delete {
+            if !rowids.is_empty() && bytes + row.bytes > QUEUE_PAGE_BYTES {
+                break;
+            }
+            rowids.push(row.rowid);
+            bytes += row.bytes;
+        }
+        last = row.rowid;
+    }
+    let over = rowids.is_empty() && (reached_new || walked_all);
+    (rowids, bytes, last, over)
+}
+
+/// Settled check requests, then delivered write waves
+/// ([`Eviction::SettledCheckRequests`]), at most [`QUEUE_PAGE_BYTES`] a page.
+async fn select_settled_check_requests(
+    db: &LocalDb,
+    now: i64,
+    cursor: &mut Cursor,
+) -> DbResult<Selection> {
+    if cursor.check_waves {
+        return select_delivered_waves(db, now, cursor).await;
+    }
+    let write_cutoff = (now - SETTLED_WRITE_REQUEST_AGE_S) * 1_000;
+    let other_cutoff = (now - SETTLED_CHECK_REQUEST_AGE_S) * 1_000;
+    let after = cursor.rowid;
+    let rows = db
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut walked = Vec::new();
+                let mut rows = conn
+                    .query(CHECK_REQUEST_WALK, (after, CHECK_REQUEST_WALK_ROWS as i64))
+                    .await?;
+                while let Some(row) = rows.next().await? {
+                    walked.push((
+                        row.i64(0)?,
+                        row.text(1)?,
+                        row.text(2)?,
+                        row.i64(3)?,
+                        row.i64(4)?,
+                        row.opt_text(5)?,
+                        row.i64(6)?,
+                    ));
+                }
+                drop(rows);
+                let mut pending: HashMap<String, bool> = HashMap::new();
+                let mut checked = Vec::with_capacity(walked.len());
+                for (rowid, consumer, state, settled_ms, accepted_ms, job, bytes) in walked {
+                    let settled = CHECK_REQUEST_SETTLED_STATES.contains(&state.as_str());
+                    let delete = settled
+                        && if consumer == "write" {
+                            settled_ms < write_cutoff
+                                && match job {
+                                    None => true,
+                                    Some(job) => {
+                                        let held = match pending.get(&job) {
+                                            Some(held) => *held,
+                                            None => {
+                                                let mut rows = conn
+                                                    .query(WRITE_JOB_PENDING_WAVE, (job.clone(),))
+                                                    .await?;
+                                                let held = rows.next().await?.is_some();
+                                                drop(rows);
+                                                pending.insert(job, held);
+                                                held
+                                            }
+                                        };
+                                        !held
+                                    }
+                                }
+                        } else {
+                            settled_ms < other_cutoff
+                        };
+                    checked.push(CheckRow {
+                        rowid,
+                        born_ms: accepted_ms,
+                        delete,
+                        bytes,
+                    });
+                }
+                Ok(checked)
+            })
+        })
+        .await?;
+    let (rowids, bytes, last, over) = check_page(rows, write_cutoff, after);
+    if over {
+        cursor.check_waves = true;
+        cursor.rowid = 0;
+    } else {
+        cursor.rowid = last;
+    }
+    Ok(Selection {
+        deletes: if rowids.is_empty() {
+            Vec::new()
+        } else {
+            vec![("check_requests", rowids)]
+        },
+        unlink_parents: Vec::new(),
+        done: false,
+        bytes: bytes as u64,
+    })
+}
+
+async fn select_delivered_waves(
+    db: &LocalDb,
+    now: i64,
+    cursor: &mut Cursor,
+) -> DbResult<Selection> {
+    let cutoff = (now - DELIVERED_WAVE_AGE_S) * 1_000;
+    let after = cursor.rowid;
+    let rows = db
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut walked = Vec::new();
+                let mut rows = conn
+                    .query(WRITE_WAVE_WALK, (after, CHECK_REQUEST_WALK_ROWS as i64))
+                    .await?;
+                while let Some(row) = rows.next().await? {
+                    walked.push((
+                        row.i64(0)?,
+                        row.text(1)?,
+                        row.i64(2)?,
+                        row.i64(3)?,
+                        row.i64(4)?,
+                    ));
+                }
+                drop(rows);
+                let mut checked = Vec::with_capacity(walked.len());
+                for (rowid, job, delivered, created_ms, bytes) in walked {
+                    let delete = delivered != 0 && created_ms < cutoff && {
+                        let mut rows = conn
+                            .query(WRITE_WAVE_PENDING_BEFORE, (job, created_ms))
+                            .await?;
+                        let held = rows.next().await?.is_some();
+                        drop(rows);
+                        !held
+                    };
+                    checked.push(CheckRow {
+                        rowid,
+                        born_ms: created_ms,
+                        delete,
+                        bytes,
+                    });
+                }
+                Ok(checked)
+            })
+        })
+        .await?;
+    let (rowids, bytes, last, over) = check_page(rows, cutoff, after);
+    cursor.rowid = last;
+    Ok(Selection {
+        deletes: if rowids.is_empty() {
+            Vec::new()
+        } else {
+            vec![("write_check_waves", rowids)]
+        },
+        unlink_parents: Vec::new(),
+        done: over,
+        bytes: bytes as u64,
     })
 }
 
