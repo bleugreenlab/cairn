@@ -1458,6 +1458,7 @@ pub(crate) mod tests {
             verdict_passed: false,
             exit_code: 100,
             complete: true,
+            failure_kind: None,
             selection: Some("full".to_string()),
             tests: tests
                 .iter()

@@ -83,8 +83,9 @@ use crate::execution::check_placement::CheckPlacementOverride;
 use crate::execution::checks::{
     execute_adopted_check_item, execute_check_contract, host_ended_compile,
     load_checks_contract_at_commit_detailed, resolve_check_contract_at_commit,
-    CheckContractSnapshot, CheckRunProducer, CheckRunTarget, CommitChecksContract,
-    CommitChecksContractError, HostEnding, MAIN_CADENCE_STREAM_PREFIX, NO_VERDICT_SUPPRESSED,
+    CheckContractSnapshot, CheckFailureKind, CheckRunProducer, CheckRunTarget,
+    CommitChecksContract, CommitChecksContractError, HostEnding, MAIN_CADENCE_STREAM_PREFIX,
+    NO_VERDICT_SUPPRESSED,
 };
 use crate::fleet::PURPOSE_OWES_DEATH;
 use crate::orchestrator::Orchestrator;
@@ -3463,6 +3464,8 @@ pub(crate) struct CadenceRow {
     pub(crate) selection: Option<String>,
     pub(crate) tests: BTreeMap<String, TestOutcome>,
     pub(crate) output_tail: String,
+    /// How the store classified the run's failure, when it ended with one.
+    pub(crate) failure_kind: Option<CheckFailureKind>,
     /// The wall-clock instant a [`Span`] counts from: the executor's spawn
     /// stamp, when the lane's timeline started there (`phase_origin =
     /// 'executor'`). `None` when the timeline started anywhere else.
@@ -3587,7 +3590,7 @@ impl CadenceVerdict {
 /// zero tests is never one, whatever its exit code (rulings 695/706): an empty
 /// or unknown selection is the absence of a verdict, not a green.
 fn classify_row(row: CadenceRow) -> CadenceVerdict {
-    if let Some(cause) = host_ended_compile_cause(&row).or_else(|| credential_fetch_cause(&row)) {
+    if let Some(cause) = death_cause(&row) {
         return CadenceVerdict::Death {
             row: Some(row),
             cause,
@@ -3627,7 +3630,7 @@ fn classify_row(row: CadenceRow) -> CadenceVerdict {
 /// before it finished measuring, is stored as incomplete, and a green beside it
 /// is not one.
 fn classify_exit_row(row: CadenceRow) -> CadenceVerdict {
-    if let Some(cause) = host_ended_compile_cause(&row).or_else(|| credential_fetch_cause(&row)) {
+    if let Some(cause) = death_cause(&row) {
         return CadenceVerdict::Death {
             row: Some(row),
             cause,
@@ -3658,6 +3661,44 @@ fn classify_exit_row(row: CadenceRow) -> CadenceVerdict {
         },
         None => CadenceVerdict::Complete(row),
     }
+}
+
+/// Why a stored row of either lane kind is the lane's death rather than an
+/// answer about the tree, when it is one.
+fn death_cause(row: &CadenceRow) -> Option<String> {
+    host_ended_compile_cause(row)
+        .or_else(|| credential_fetch_cause(row))
+        .or_else(|| stored_infrastructure_cause(row))
+}
+
+/// A stored row the store's own classifier recorded as an infrastructure
+/// failure, such as a lane whose spawn could not publish its process event
+/// because the runner link went down. The command never answered for the
+/// tree, whatever its exit code says. The cause quotes the tail's last line,
+/// where the store names the failing step. A row with a failing test keeps
+/// its per-test verdict, as the two tail matchers above also leave it.
+fn stored_infrastructure_cause(row: &CadenceRow) -> Option<String> {
+    const EVIDENCE_CHARS: usize = 240;
+    if row.failure_kind != Some(CheckFailureKind::Infrastructure)
+        || row.verdict_passed
+        || row.failed() > 0
+        || row.exit_is_plan_audits()
+    {
+        return None;
+    }
+    let evidence: String = row
+        .output_tail
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or("no diagnostic recorded")
+        .chars()
+        .take(EVIDENCE_CHARS)
+        .collect();
+    Some(format!(
+        "infrastructure: the store recorded this run as an infrastructure failure ({evidence}), so the run exited {} without a verdict on the tree. The failure is Cairn's own, not the code's, so the tree is not implicated and there is no error to match against a break on main",
+        row.exit_code
+    ))
 }
 
 /// The cause a row reports when its compile was ended by the host (see
@@ -3879,7 +3920,7 @@ async fn load_row(
                     executor_id, ran_at, verdict, exit_code, complete, output_tail, cadence,
                     selection,
                     CASE WHEN phase_origin = 'executor' THEN executor_started_at_unix_ms END,
-                    plan_audit_state, plan_audit_note
+                    plan_audit_state, plan_audit_note, failure_kind
                FROM check_result_observations WHERE id = ?1",
             (observation_id.to_string(),),
             |row| {
@@ -3899,6 +3940,7 @@ async fn load_row(
                     row.opt_i64(12)?,
                     row.opt_text(13)?,
                     row.opt_text(14)?,
+                    row.opt_text(15)?,
                 ))
             },
         )
@@ -3921,6 +3963,7 @@ async fn load_row(
         lane_started_at_ms,
         plan_audit_state,
         plan_audit_note,
+        failure_kind,
     ) = head;
     let plan_audit = match plan_audit_state {
         None => None,
@@ -3992,6 +4035,9 @@ async fn load_row(
         selection,
         tests,
         output_tail: tail,
+        failure_kind: failure_kind
+            .as_deref()
+            .and_then(CheckFailureKind::from_stored),
         lane_started_at_ms,
         plan_audit,
     })
@@ -6741,6 +6787,7 @@ mod tests {
                 .map(|(test, outcome)| (test.to_string(), outcome.clone()))
                 .collect(),
             output_tail: String::new(),
+            failure_kind: None,
             lane_started_at_ms: None,
             plan_audit: None,
         }
@@ -10542,6 +10589,42 @@ mod tests {
             LaneVerdict::PerTest.classify(tsc_row("g", "c", 0, 0)),
             CadenceVerdict::NoVerdict { .. }
         ));
+
+        // cairn/7725: a lane that died at spawn when the runner restarted is
+        // stored complete and failed at exit -1, classified `infrastructure`.
+        // On either lane kind it is a death, never a red or a no-verdict.
+        let spawn_death = || {
+            let mut row = tsc_row("spawn", "c", 0, -1);
+            row.failure_kind = Some(CheckFailureKind::Infrastructure);
+            row.output_tail = "Cairn could not start this check. This is a failure inside Cairn, not a result about your change: no verdict was recorded, and the check runs again the next time checks run.\nFailing step:\nSpawn: publish process event: the runner link is down; this callback cannot be answered".to_string();
+            row
+        };
+        for lane in [LaneVerdict::Exit, LaneVerdict::PerTest] {
+            let verdict = lane.classify(spawn_death());
+            let CadenceVerdict::Death {
+                row: Some(_),
+                cause,
+            } = &verdict
+            else {
+                panic!("{lane:?}: a stored infrastructure failure is a death: {verdict:?}");
+            };
+            assert!(
+                cause.starts_with("infrastructure: ")
+                    && cause.contains("Spawn: publish process event: the runner link is down"),
+                "{lane:?}: {cause}"
+            );
+        }
+        let text = exit_report(
+            &LaneVerdict::Exit.classify(spawn_death()),
+            &same(&tsc_row("green", "aaaaaaaaaaaaaaaaaaaa", 0, 0)),
+            &Bracket::default(),
+        );
+        assert!(
+            text.starts_with("🚨 **MAIN CADENCE DID NOT COMPLETE"),
+            "{text}"
+        );
+        assert!(text.contains("Cause class: **death**"), "{text}");
+        assert!(!text.contains("newly red"), "{text}");
     }
 
     /// The specimen: a merge that breaks `tsc --noEmit` after a green row

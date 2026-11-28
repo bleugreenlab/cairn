@@ -1921,6 +1921,67 @@ mod tests {
             (parent.as_str(), class.as_str(), number),
             ("execution-thread", "infrastructure", 2)
         );
+
+        // cairn/7725: an exit lane that died at spawn, as the store records
+        // it, files as execution's infrastructure incident, not a lane failure.
+        db.execute(
+            "INSERT INTO check_result_observations
+             (id,project_id,commit_sha,tree_hash,check_name,input_hash,environment_fingerprint,
+              exit_code,verdict,complete,reusable,parser_version,result_schema_version,ran_at,duration_ms,
+              cadence,output_tail,executor_id,verdict_platform,verdict_arch,toolchain_fingerprint,
+              runner_build_id,failure_kind)
+             VALUES('spawn','p','commit-spawn','tree-spawn','external-host','input','env',-1,'failed',
+                    1,0,1,1,9000,0,'main',?1,'host','linux','x86_64','rust-runtime','runner',
+                    'infrastructure')",
+            (
+                "Failing step:\nSpawn: publish process event: runner callback abandoned: link_lost"
+                    .to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        let spawn =
+            LaneVerdict::Exit.classify(load_row(&db, "proj", "spawn", &names).await.unwrap());
+        let report = CadenceReport {
+            check: "external-host",
+            platform: "linux",
+            kind: LaneVerdict::Exit,
+            commit: Some("requested-tip"),
+            verdict: &spawn,
+            comparison: &Comparison::Baseline,
+            bracket: &Bracket::default(),
+            now_ms: 10_000,
+            rearmed: None,
+        };
+        record(
+            &db,
+            "p",
+            "proj",
+            "testing",
+            &report,
+            crate::issues::crud::installation_machine_authorship("fixture-device", 1).unwrap(),
+            None,
+            &names,
+        )
+        .await
+        .unwrap();
+        let filed = db
+            .query_all(
+                "SELECT i.parent_thread_id,m.class,i.title FROM main_incidents m
+             JOIN issues i ON i.id=m.issue_id WHERE m.identity='external-host:linux'",
+                (),
+                |r| Ok((r.text(0)?, r.text(1)?, r.text(2)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filed,
+            vec![(
+                "execution-thread".to_string(),
+                "infrastructure".to_string(),
+                "Main infrastructure: external-host:linux".to_string()
+            )]
+        );
     }
 
     #[test]

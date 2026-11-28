@@ -410,6 +410,7 @@ mod tests {
             selection: Some("full".into()),
             tests: BTreeMap::new(),
             output_tail: String::new(),
+            failure_kind: None,
             lane_started_at_ms: None,
             plan_audit: None,
         }
