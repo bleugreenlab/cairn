@@ -706,6 +706,70 @@ pub fn list_events_for_session_after_count(
     run_query_db(async move { load_events_for_session_after_count(&db, session_id, offset).await })
 }
 
+/// Where a skyline's processed prefix ends: the last event's run, named by the
+/// creation time and rowid that order a lineage's runs, and its sequence, which
+/// is unique within the run. The events after it are the rest of that run past
+/// `sequence` followed by every later run, so they can be read by seeking
+/// rather than by counting past everything before them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkylineEdge {
+    pub run_created_at: i64,
+    pub run_rowid: i64,
+    pub sequence: i64,
+}
+
+/// Skyline events read past a position, and the edge after the last of them.
+///
+/// `edge` is `None` when no event was read, or when the last one belongs to a
+/// run outside the lineage: such events sort after every lineage run, by keys
+/// no index orders, so no seek can start from them.
+#[derive(Debug, Clone)]
+pub struct SkylineEvents {
+    pub events: Vec<Event>,
+    pub edge: Option<SkylineEdge>,
+}
+
+/// [`list_events_for_session_after_count`], with the edge after its last event.
+pub fn list_skyline_events_after_count(
+    db: Arc<LocalDb>,
+    session_id: &str,
+    cached_event_count: i32,
+) -> Result<SkylineEvents, CairnError> {
+    let session_id = session_id.to_string();
+    let offset = i64::from(cached_event_count.max(0));
+    run_query_db(async move {
+        let lineage = load_session_lineage_ids(&db, &session_id).await?;
+        let events = load_lineage_events_after_count(&db, &lineage, offset).await?;
+        let edge = match events.last() {
+            Some(last) => edge_after(&db, &lineage, last).await?,
+            None => None,
+        };
+        Ok(SkylineEvents { events, edge })
+    })
+}
+
+/// The session lineage's events ordered after `edge`, in the order
+/// [`list_events_for_session_after_count`] returns them.
+///
+/// It reads the lineage runs from the edge's run on, then each run's events
+/// past the edge's sequence, so its cost is the events after the edge and never
+/// the history before it. Events of runs outside the lineage are not read; the
+/// caller holds the count of events that arrived and treats a shortfall, which
+/// is also what any insert ordered before the edge produces, as a prefix that
+/// moved.
+pub fn list_skyline_events_after_edge(
+    db: Arc<LocalDb>,
+    session_id: &str,
+    edge: SkylineEdge,
+) -> Result<SkylineEvents, CairnError> {
+    let session_id = session_id.to_string();
+    run_query_db(async move {
+        let lineage = load_session_lineage_ids(&db, &session_id).await?;
+        load_lineage_events_after_edge(&db, &lineage, edge).await
+    })
+}
+
 pub fn list_events_for_turn(db: Arc<LocalDb>, turn_id: &str) -> Result<Vec<Event>, CairnError> {
     let turn_id = turn_id.to_string();
     let query_db = db.clone();
@@ -1159,13 +1223,22 @@ async fn load_events_for_session_after_count(
     session_id: String,
     offset: i64,
 ) -> Result<Vec<Event>, CairnError> {
+    let lineage = load_session_lineage_ids(db, &session_id).await?;
+    load_lineage_events_after_count(db, &lineage, offset).await
+}
+
+async fn load_lineage_events_after_count(
+    db: &LocalDb,
+    lineage: &[String],
+    offset: i64,
+) -> Result<Vec<Event>, CairnError> {
     // Reuse the lineage-ordered stream the transcript renders so skyline bars stay
     // 1:1 with transcript rows across a cold-resume reseed rotation; `offset` skips
     // the prefix the skyline cache has already processed. New events only ever
     // append to the current (last) session in the lineage, so this prefix is
     // stable and the incremental append stays sound.
     let skip = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
-    let lineage = load_session_lineage_ids(db, &session_id).await?;
+    let lineage = lineage.to_vec();
     let mut reader = HistoryReader::new(db);
     if let Some(page) = reader
         .hot_sessions_after_count(&lineage, offset.max(0))
@@ -1215,6 +1288,98 @@ async fn load_events_for_session_after_count(
     }
     rows.sort_by_key(|row| order[&row.event.id]);
     Ok(rows.into_iter().map(|row| row.event).collect())
+}
+
+/// The edge after `last`, or `None` when its run is not one of the lineage's.
+async fn edge_after(
+    db: &LocalDb,
+    lineage: &[String],
+    last: &Event,
+) -> Result<Option<SkylineEdge>, CairnError> {
+    let (placeholders, mut binds) = text_in_list(lineage);
+    binds.insert(0, Value::Text(last.run_id.clone()));
+    let run = db
+        .query_opt(
+            format!("SELECT created_at, rowid FROM runs WHERE id = ? AND session_id IN ({placeholders})"),
+            binds,
+            |row| Ok((row.i64(0)?, row.i64(1)?)),
+        )
+        .await
+        .map_err(CairnError::from)?;
+    Ok(run.map(|(run_created_at, run_rowid)| SkylineEdge {
+        run_created_at,
+        run_rowid,
+        sequence: i64::from(last.sequence),
+    }))
+}
+
+/// The lineage runs ordered at or after the edge's run, as `(id, created_at,
+/// rowid)` in lineage order. `created_at >= ?` is the range the session/created
+/// index seeks; the rest only drops the edge's earlier same-second siblings.
+fn lineage_runs_from_edge_sql(placeholders: &str) -> String {
+    format!(
+        "SELECT id, created_at, rowid FROM runs
+         WHERE session_id IN ({placeholders}) AND created_at >= ? AND (created_at > ? OR rowid >= ?)
+         ORDER BY created_at ASC, rowid ASC"
+    )
+}
+
+async fn load_lineage_events_after_edge(
+    db: &LocalDb,
+    lineage: &[String],
+    edge: SkylineEdge,
+) -> Result<SkylineEvents, CairnError> {
+    let (placeholders, mut binds) = text_in_list(lineage);
+    binds.extend([
+        Value::Integer(edge.run_created_at),
+        Value::Integer(edge.run_created_at),
+        Value::Integer(edge.run_rowid),
+    ]);
+    let runs: Vec<(String, i64, i64)> = db
+        .query_all(lineage_runs_from_edge_sql(&placeholders), binds, |row| {
+            Ok((row.text(0)?, row.i64(1)?, row.i64(2)?))
+        })
+        .await
+        .map_err(CairnError::from)?;
+    let mut reader = HistoryReader::new(db);
+    let run_ids: Vec<String> = runs.iter().map(|(id, _, _)| id.clone()).collect();
+    reader
+        .prime_sessions_and_runs(lineage, &run_ids)
+        .await
+        .map_err(history_error)?;
+    let sessions: HashSet<&str> = lineage.iter().map(String::as_str).collect();
+    let mut events = Vec::new();
+    let mut last_edge = Some(edge);
+    for (run_id, run_created_at, run_rowid) in runs {
+        let after = if run_rowid == edge.run_rowid {
+            edge.sequence
+        } else {
+            i64::MIN
+        };
+        let rows = reader
+            .run_events_after_sequence(&run_id, after)
+            .await
+            .map_err(history_error)?;
+        for row in rows {
+            if row
+                .event
+                .session_id
+                .as_deref()
+                .is_some_and(|session| sessions.contains(session))
+            {
+                last_edge = Some(SkylineEdge {
+                    run_created_at,
+                    run_rowid,
+                    sequence: i64::from(row.event.sequence),
+                });
+                events.push(row.event);
+            }
+        }
+    }
+    Ok(SkylineEvents {
+        events,
+        edge: last_edge,
+    })
 }
 
 async fn load_events_for_turn(db: &LocalDb, turn_id: String) -> Result<Vec<Event>, CairnError> {
@@ -3327,6 +3492,107 @@ mod tests {
                 assert!(hot[0].contains(&events.plain));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn skyline_tail_after_an_edge_reads_only_what_follows_it() {
+        use cairn_db::storage::events::history::statements;
+        let db = cairn_db::storage::migrated_test_db("skyline-edge").await;
+        // A rotation lineage of six runs, three per session, 500 events each.
+        // Runs 5 and 6 start in the same second, so their rowid orders them.
+        db.execute_script(
+            "INSERT INTO sessions (id, chat_id, backend, status, sequence, created_at, updated_at)
+              VALUES ('sky-1', 'sky-chat', 'claude', 'closed', 1, 1, 1);
+             INSERT INTO sessions (id, chat_id, backend, status, sequence, created_at, updated_at, parent_session_id)
+              VALUES ('sky-2', 'sky-chat', 'claude', 'open', 2, 2, 2, 'sky-1');
+             UPDATE sessions SET replaced_by_id = 'sky-2' WHERE id = 'sky-1';
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 6)
+             INSERT INTO runs (id, session_id, status, created_at, updated_at)
+             SELECT 'sky-run-' || i, CASE WHEN i <= 3 THEN 'sky-1' ELSE 'sky-2' END, 'exited',
+                    CASE WHEN i = 6 THEN 50 ELSE 10 * i END, 1
+             FROM n;
+             WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < 3000)
+             INSERT INTO events (id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+             SELECT 'sky-e-' || i, 'sky-run-' || (i / 500 + 1),
+                    CASE WHEN i < 1500 THEN 'sky-1' ELSE 'sky-2' END, i % 500, i, 'assistant',
+                    '{\"eventType\":\"assistant\",\"content\":\"' || hex(randomblob(512)) || '\",\"isError\":false}', i
+             FROM n;",
+        )
+        .await
+        .unwrap();
+        let lineage = load_session_lineage_ids(&db, "sky-2").await.unwrap();
+        assert_eq!(lineage, ["sky-1", "sky-2"]);
+        let full = load_events_for_session_after_count(&db, "sky-2".to_string(), 0)
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 3000);
+        let ids = |events: &[Event]| events.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        let last_edge = edge_after(&db, &lineage, full.last().unwrap())
+            .await
+            .unwrap();
+
+        for cut in [1usize, 499, 500, 1499, 1500, 2500, 2999, 3000] {
+            let edge = edge_after(&db, &lineage, &full[cut - 1])
+                .await
+                .unwrap()
+                .expect("a lineage run's event has an edge");
+            let before = db.read_statement_count();
+            let tail = load_lineage_events_after_edge(&db, &lineage, edge)
+                .await
+                .unwrap();
+            let statements_read = db.read_statement_count() - before;
+            let counted = load_events_for_session_after_count(&db, "sky-2".to_string(), cut as i64)
+                .await
+                .unwrap();
+            assert_eq!(
+                ids(&tail.events),
+                ids(&counted),
+                "cut {cut}: the tail past the edge is the tail past the count"
+            );
+            assert_eq!(
+                tail.edge,
+                if cut < full.len() {
+                    last_edge
+                } else {
+                    Some(edge)
+                },
+                "cut {cut}"
+            );
+            // One statement names the runs from the edge's on and one reads
+            // each of them past the edge. Nothing before the edge is named.
+            let runs_from_edge = 6 - (cut - 1) / 500;
+            assert_eq!(statements_read, 1 + runs_from_edge, "cut {cut}");
+        }
+
+        let text = |value: &str| Value::Text(value.to_string());
+        let runs_plan = cairn_db::storage::query_plan(
+            &db,
+            &lineage_runs_from_edge_sql("?, ?"),
+            vec![
+                text("sky-1"),
+                text("sky-2"),
+                Value::Integer(10),
+                Value::Integer(10),
+                Value::Integer(1),
+            ],
+        )
+        .await;
+        assert!(
+            runs_plan.contains("idx_runs_session_id_created_at") && !runs_plan.contains("SCAN"),
+            "the runs after an edge are a seek: {runs_plan}"
+        );
+        let events_plan = cairn_db::storage::query_plan(
+            &db,
+            &statements::run_after_sequence(),
+            vec![text("sky-run-1"), Value::Integer(5)],
+        )
+        .await;
+        assert!(
+            events_plan.contains("idx_events_run_sequence")
+                && !events_plan.contains("SCAN")
+                && !events_plan.contains("SORTER"),
+            "a run's events past a sequence are a range seek: {events_plan}"
+        );
     }
 
     async fn parity_db(

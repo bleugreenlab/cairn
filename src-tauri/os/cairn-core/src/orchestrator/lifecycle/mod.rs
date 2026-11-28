@@ -31,6 +31,8 @@ mod process_lifetime_tests;
 mod review_push;
 mod stop;
 mod unanswered_calls;
+#[cfg(test)]
+mod unanswered_calls_tests;
 mod unowned_running;
 #[cfg(test)]
 mod unowned_running_tests;

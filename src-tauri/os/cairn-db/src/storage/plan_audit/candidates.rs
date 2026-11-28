@@ -44,6 +44,21 @@ impl IndexCatalog {
             names.push((row.text(0)?, row.text(1)?));
         }
         drop(rows);
+        // A partial index serves only a statement whose terms imply its
+        // predicate, so it never leads a better index for an arbitrary one.
+        let mut partial = std::collections::HashSet::new();
+        let tables: std::collections::BTreeSet<&String> =
+            names.iter().map(|(_, table)| table).collect();
+        for table in tables {
+            let mut list = conn
+                .query(format!("PRAGMA index_list(\"{table}\")"), ())
+                .await?;
+            while let Some(row) = list.next().await? {
+                if row.i64(4)? != 0 {
+                    partial.insert(row.text(1)?);
+                }
+            }
+        }
         let mut catalog = Self::default();
         for (index, table) in names {
             let mut info = conn
@@ -55,11 +70,13 @@ impl IndexCatalog {
                 columns.push(row.opt_text(2)?);
             }
             if let Some(Some(column)) = columns.first() {
-                catalog
-                    .leads
-                    .entry((table, column.clone()))
-                    .or_default()
-                    .push(index.clone());
+                if !partial.contains(&index) {
+                    catalog
+                        .leads
+                        .entry((table, column.clone()))
+                        .or_default()
+                        .push(index.clone());
+                }
                 catalog.leading.insert(index.clone(), column.clone());
             }
             catalog

@@ -945,63 +945,110 @@ fn call_subject(input: &serde_json::Value) -> Option<String> {
     })
 }
 
+/// A turn's tool results that carry a `raw.reason`, in transcript order. Only a
+/// settlement's answers carry one, so on almost every turn this is empty.
+///
+/// The reason test is spelled exactly as `idx_events_turn_call_answers` spells
+/// its predicate, which is what lets Turso substitute that partial index: the
+/// statement reads these rows and no other row of the turn or the table. The
+/// `json_valid` guard keeps `json_extract` off a body that is not JSON.
+pub(crate) const CALL_ANSWERS_SQL: &str = "SELECT data
+     FROM events
+     WHERE turn_id = ?2
+       AND event_type = 'tool_result'
+       AND CASE WHEN json_valid(data) THEN json_extract(data, '$.raw.reason') END IS NOT NULL
+       AND +run_id = ?1
+     ORDER BY sequence ASC, rowid ASC";
+
+/// A turn's assistant events, in transcript order: where the calls the answers
+/// name recorded their input. A seek on `idx_events_turn_id`; the unary `+`s
+/// keep the planner off `idx_events_type_run`, which leads with the type and
+/// walks every assistant event in the table.
+pub(crate) const TURN_ASSISTANT_EVENTS_SQL: &str = "SELECT data
+     FROM events
+     WHERE turn_id = ?2
+       AND +run_id = ?1
+       AND +event_type = 'assistant'
+     ORDER BY sequence ASC, rowid ASC";
+
+async fn turn_transcript_events(
+    db: &LocalDb,
+    sql: &'static str,
+    run_id: &str,
+    turn_id: &str,
+) -> DbResult<Vec<TranscriptEvent>> {
+    let run_id = run_id.to_string();
+    let turn_id = turn_id.to_string();
+    db.read(|conn| {
+        let run_id = run_id.clone();
+        let turn_id = turn_id.clone();
+        Box::pin(async move {
+            let mut rows = conn.query(sql, (run_id.as_str(), turn_id.as_str())).await?;
+            let mut events = Vec::new();
+            while let Some(row) = rows.next().await? {
+                if let Ok(event) = serde_json::from_str::<TranscriptEvent>(&row.text(0)?) {
+                    events.push(event);
+                }
+            }
+            Ok(events)
+        })
+    })
+    .await
+}
+
+/// Whether `event` is an answer a settlement wrote for one of `reasons`.
+fn answers_for(event: &TranscriptEvent, reasons: &[&str]) -> bool {
+    event
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|reason| reasons.contains(&reason))
+}
+
 /// The list a resume prompt carries: each call a settlement with one of
 /// `reasons` (`raw.reason`) answered on this turn, named, with the settlement's
 /// own text. `None` when it answered none.
 ///
 /// This prompt is what reaches the model: a native resume reads the provider's
 /// own session file, not the transcript event the settlement wrote.
+///
+/// It is composed on every resume, after nearly every turn, so it reads only
+/// the turn's settlement answers, and the turn's calls only when one of them
+/// is for `reasons`.
 pub(crate) async fn lost_calls_note(
     db: &LocalDb,
     run_id: &str,
     turn_id: &str,
     reasons: &[&str],
 ) -> DbResult<Option<String>> {
-    let run_id = run_id.to_string();
-    let turn_id = turn_id.to_string();
-    let events: Vec<TranscriptEvent> = db
-        .read(|conn| {
-            let run_id = run_id.clone();
-            let turn_id = turn_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT data
-                         FROM events
-                         WHERE run_id = ?1
-                           AND turn_id = ?2
-                           AND event_type IN ('assistant', 'tool_result')
-                         ORDER BY sequence ASC, rowid ASC",
-                        (run_id.as_str(), turn_id.as_str()),
-                    )
-                    .await?;
-                let mut events = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    if let Ok(event) = serde_json::from_str::<TranscriptEvent>(&row.text(0)?) {
-                        events.push(event);
-                    }
-                }
-                Ok(events)
-            })
-        })
-        .await?;
+    let answers = turn_transcript_events(db, CALL_ANSWERS_SQL, run_id, turn_id).await?;
+    if !answers.iter().any(|event| {
+        answers_for(event, reasons) && event.tool_use_id.is_some() && event.tool_result.is_some()
+    }) {
+        return Ok(None);
+    }
+    let calls = turn_transcript_events(db, TURN_ASSISTANT_EVENTS_SQL, run_id, turn_id).await?;
+    Ok(render_lost_calls(&answers, &calls, reasons))
+}
+
+/// The note for the `answers` among `events` that are for `reasons`, naming
+/// each by the input its call recorded in `calls`.
+pub(crate) fn render_lost_calls(
+    answers: &[TranscriptEvent],
+    calls: &[TranscriptEvent],
+    reasons: &[&str],
+) -> Option<String> {
     let input_of = |id: &str| {
-        events
+        calls
             .iter()
             .flat_map(|event| event.tool_uses.iter().flatten())
             .find(|tool| tool.id == id)
             .map(|tool| &tool.input)
     };
-    let lines: Vec<String> = events
+    let lines: Vec<String> = answers
         .iter()
-        .filter(|event| {
-            event
-                .raw
-                .as_ref()
-                .and_then(|raw| raw.get("reason"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|reason| reasons.contains(&reason))
-        })
+        .filter(|event| answers_for(event, reasons))
         .filter_map(|event| {
             let id = event.tool_use_id.as_deref()?;
             let text = event.tool_result.as_deref()?;
@@ -1017,10 +1064,10 @@ pub(crate) async fn lost_calls_note(
             Some(format!("- {named}: {quoted}"))
         })
         .collect();
-    Ok((!lines.is_empty()).then(|| {
+    (!lines.is_empty()).then(|| {
         format!(
             "The calls that were in flight, and what is known about each:\n{}",
             lines.join("\n")
         )
-    }))
+    })
 }

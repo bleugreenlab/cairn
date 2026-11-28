@@ -419,6 +419,15 @@ pub mod statements {
         )
     }
 
+    /// A run's events past a sequence, in sequence order. The range seeks
+    /// `idx_events_run_sequence`, so the rows before the bound are never read.
+    pub fn run_after_sequence() -> String {
+        format!(
+            "SELECT {} FROM events INDEXED BY idx_events_run_sequence WHERE run_id = ?1 AND sequence > ?2 ORDER BY sequence ASC",
+            EventFilter::default().columns()
+        )
+    }
+
     /// A signed sequence-ordered slice on the run/sequence index. Without
     /// the explicit index Turso chooses the run-id index and sorts full bodies.
     pub fn run_slice() -> String {
@@ -1126,6 +1135,32 @@ impl<'db> HistoryReader<'db> {
             }
         };
         Ok(page.rows.into_iter().next())
+    }
+
+    /// A run's events with `sequence > after_seq`, in sequence order: the rest
+    /// of a run past a position its reader already holds.
+    pub async fn run_events_after_sequence(
+        &mut self,
+        run_id: &str,
+        after_seq: i64,
+    ) -> Result<Vec<HistoryRow>, HistoryError> {
+        let filter = EventFilter::default();
+        let mut rows = match self.source_of_run(run_id).await? {
+            Source::Hot => {
+                let binds = vec![Value::Text(run_id.to_string()), Value::Integer(after_seq)];
+                self.hot_page(statements::run_after_sequence(), binds, filter)
+                    .await?
+                    .rows
+            }
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
+                let mut rows = pack.run_events(run_id)?;
+                rows.retain(|row| i64::from(row.event.sequence) > after_seq);
+                pack_page(rows, filter, source).rows
+            }
+        };
+        rows.sort_by_key(|row| (row.event.sequence, row.rowid));
+        Ok(rows)
     }
 
     /// A run's sequence-ordered slice, with SQL's signed LIMIT/OFFSET semantics:
