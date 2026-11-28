@@ -24,11 +24,13 @@
 //!   sample-days <db> <as_of> <days>      that many daily censuses replayed on the clone,
 //!                                        to score the pooled estimates
 //!   sql <db> <statement>                 one ad-hoc statement, rows as JSON
-//!   reclaim <db> <dest> [--cap-gb N] [--fold-mib N] [--stop-after-mib N]
+//!   reclaim <db> <dest> [--rehearse] [--cap-gb N] [--fold-mib N] [--stop-after-mib N]
 //!                                        the bounded reclaim copy (`storage::reclaim`)
 //!                                        into <dest>, then its verification; with
 //!                                        --stop-after-mib, a partial copy and no
-//!                                        verification (the fold-size probe)
+//!                                        verification (the fold-size probe); with
+//!                                        --rehearse, every step but the row copy,
+//!                                        leaving no <dest> (minutes, not hours)
 //!   delete-probe <db> <pages> [rows]     delete the oldest events a page per write,
 //!                                        on a sibling clone of <db>
 //!
@@ -49,7 +51,9 @@ use std::time::{Duration, Instant};
 use cairn_db::storage::census::{
     payload_expr, quote_identifier as quote, refuse_live_directory, Column,
 };
-use cairn_db::storage::reclaim::{copy_compacted, verify, CopyProgress, ReclaimLimits};
+use cairn_db::storage::reclaim::{
+    copy_compacted, rehearse, verify, CopyProgress, CopyReport, ReclaimLimits, Verification,
+};
 use cairn_db::storage::retention::retention_for;
 use cairn_db::storage::{census, db_set_paths, DrainBudget, LocalDb, TrackedConnection};
 use cairn_db::turso::Value;
@@ -964,11 +968,17 @@ async fn adhoc(path: &str, sql: &str) -> Res<Json> {
 /// The bounded reclaim copy of the clone into `dest`, then its verification.
 /// The copy's own memory guard enforces `--cap-gb`; a failed copy removes
 /// `dest` itself. A passing verification still leaves `dest` for the caller
-/// to measure and delete.
+/// to measure and delete. With `--rehearse`, every step but the row copy,
+/// and `dest` is removed afterwards.
 async fn reclaim(path: &str, dest: &str, options: &[&str]) -> Res<Json> {
     let mut limits = ReclaimLimits::with_cap(8_000_000_000);
+    let mut rehearsal = false;
     let mut options = options.iter();
     while let Some(flag) = options.next() {
+        if *flag == "--rehearse" {
+            rehearsal = true;
+            continue;
+        }
         let value = options
             .next()
             .ok_or_else(|| format!("{flag} needs a value"))?;
@@ -984,6 +994,29 @@ async fn reclaim(path: &str, dest: &str, options: &[&str]) -> Res<Json> {
     }
     let started = Instant::now();
     let source_db_bytes = file_bytes(path);
+    if rehearsal {
+        let rehearsal = rehearse(Path::new(path), Path::new(dest), limits)
+            .await
+            .map_err(|e| e.to_string())?;
+        let failures = rehearsal.verification.failures();
+        eprintln!(
+            "rehearsal: {:.0}s, {}",
+            started.elapsed().as_secs_f64(),
+            if failures.is_empty() {
+                "passed"
+            } else {
+                "failed"
+            }
+        );
+        return Ok(reclaim_report(
+            started,
+            0.0,
+            source_db_bytes,
+            0,
+            &rehearsal.copy,
+            Some(&rehearsal.verification),
+        ));
+    }
     let copy = copy_compacted(
         Path::new(path),
         Path::new(dest),
@@ -1020,8 +1053,31 @@ async fn reclaim(path: &str, dest: &str, options: &[&str]) -> Res<Json> {
                 .map_err(|e| e.to_string())?,
         )
     };
-    let failures = verification.as_ref().map(|v| v.failures());
-    Ok(json!({
+    Ok(reclaim_report(
+        started,
+        copy_s,
+        source_db_bytes,
+        dest_db_bytes,
+        &copy,
+        verification.as_ref(),
+    ))
+}
+
+/// The `reclaim` document. `passed` is the verdict a swap may act on; the
+/// duplicates the copy dropped and the tables without a retention rule are
+/// raised to the top beside it because an operator should see them, though
+/// neither fails the copy.
+fn reclaim_report(
+    started: Instant,
+    copy_s: f64,
+    source_db_bytes: u64,
+    dest_db_bytes: u64,
+    copy: &CopyReport,
+    verification: Option<&Verification>,
+) -> Json {
+    let failures = verification.map(Verification::failures);
+    json!({
+        "rehearsal": copy.rehearsal,
         "copy_s": copy_s,
         "wall_s": started.elapsed().as_secs_f64(),
         "source_db_bytes": source_db_bytes,
@@ -1031,9 +1087,11 @@ async fn reclaim(path: &str, dest: &str, options: &[&str]) -> Res<Json> {
         "reclaimed_bytes": copy.source_set_bytes as i64 - copy.dest_set_bytes as i64,
         "passed": failures.as_ref().map(Vec::is_empty),
         "failures": failures,
+        "schema_duplicates": copy.schema_duplicates,
+        "unruled_tables": verification.map(|v| v.unruled_tables.clone()),
         "copy": copy,
         "verification": verification,
-    }))
+    })
 }
 
 /// Clone `path`'s three-file set to a `<stem>.probe.db` sibling, run the

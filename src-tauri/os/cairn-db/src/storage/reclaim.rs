@@ -28,6 +28,15 @@
 //!   validators). Views go before triggers because an `INSTEAD OF` trigger
 //!   names its view.
 //!
+//! Before any of that, the whole schema is replayed into an empty scratch
+//! database and compared with the source, so a schema the copy cannot carry
+//! fails in seconds rather than after hours of rows.
+//!
+//! The schema is read from `sqlite_master` deduplicated by `(type, name)`,
+//! keeping the last row. The pinned engine has let a database list one trigger
+//! twice (cairn/7751), and replaying both rows fails on the second `CREATE`.
+//! The copy and its verification both name every duplicate they dropped.
+//!
 //! Rowids are preserved on every table: retention, the archival progress
 //! cursor and the census all page by rowid. AUTOINCREMENT counters are carried
 //! over too, including a counter above the table's largest rowid.
@@ -35,7 +44,13 @@
 //! [`verify`] reads both files whole and compares them: schema, AUTOINCREMENT
 //! counters, and per table the row count, largest rowid and a digest of every
 //! row's content in rowid order. It then checks the copy on its own:
-//! `integrity_check`, the migration chain, and the retention registry.
+//! `integrity_check` and the migration chain. It reports the tables the
+//! retention registry has no rule for, but a missing rule is not a failure of
+//! the copy; `every_table_has_a_retention_rule` is where that fails.
+//!
+//! [`rehearse`] runs every step but the row copy, against a snapshot of the
+//! real database, so the tool can be checked against the production schema in
+//! minutes before an operator window.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -79,6 +94,12 @@ const SEQUENCE_BACKING_PREFIX: &str = "__turso_internal_seq_";
 const MVCC_META_TABLE: &str = "__turso_internal_mvcc_meta";
 /// The engine's name for the implicit sequence behind an AUTOINCREMENT table.
 const AUTOINCREMENT_SEQUENCE_PREFIX: &str = "__turso_internal_autoincrement_";
+/// The migration runner's ledger (`storage/migration.rs`): the one table whose
+/// rows a rehearsal copies, so the migration check means on the empty copy
+/// what it means on a full one.
+const MIGRATION_LEDGER: &str = "cairn_schema_migrations";
+/// The order the schema is replayed in; see the module docs.
+const REPLAY_ORDER: [&str; 4] = ["table", "index", "view", "trigger"];
 
 /// How large the copy's pages and folds are, and the memory it may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -123,6 +144,12 @@ pub enum ReclaimError {
     MemoryUnreadable(u32),
     #[error("folding the logical log of {path} failed: {error}")]
     Fold { path: String, error: String },
+    #[error(
+        "the source's schema cannot be replayed into an empty database, so no row was \
+         copied: {}",
+        .0.join("; ")
+    )]
+    Schema(Vec<String>),
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -158,6 +185,8 @@ pub struct FoldRecord {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CopyPhases {
     pub source_fold_ms: u64,
+    /// The whole schema replayed into an empty scratch database and compared.
+    pub schema_check_ms: u64,
     pub schema_ms: u64,
     pub rows_ms: u64,
     /// AUTOINCREMENT counters, views and triggers.
@@ -186,6 +215,13 @@ pub struct CopyReport {
     /// The copy stopped at [`ReclaimLimits::stop_after_bytes`]: rows are
     /// missing and no counters, views or triggers were created.
     pub partial: bool,
+    /// A [`rehearse`] copy: the whole schema and the counters, but only the
+    /// migration ledger's rows.
+    pub rehearsal: bool,
+    /// `(type, name)`s the source's `sqlite_master` lists more than once, and
+    /// how many rows were dropped for them in all.
+    pub schema_duplicates: Vec<SchemaDuplicate>,
+    pub schema_rows_dropped: usize,
     pub source_set_bytes: u64,
     pub dest_set_bytes: u64,
     pub phases: CopyPhases,
@@ -202,8 +238,10 @@ pub enum CopyProgress<'a> {
 ///
 /// `dest` must be a `.db` path none of whose file set exists. Nothing else may
 /// have either database open: the copy folds both, and a fold needs a moment
-/// with no transaction open. On any failure the destination set is removed
-/// and the source is untouched.
+/// with no transaction open. Folding the source is a write to it: its pending
+/// logical log moves into its main file, as at every boot, so its files change
+/// while its rows do not. Beyond that the source is only read. On any failure
+/// the destination set is removed.
 pub async fn copy_compacted(
     source: &Path,
     dest: &Path,
@@ -220,12 +258,81 @@ pub async fn copy_compacted(
     .await
 }
 
+/// Which rows a copy carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Every table's.
+    Copy,
+    /// Only the migration ledger's: [`rehearse`].
+    Rehearse,
+}
+
+/// What [`rehearse`] found.
+#[derive(Debug, Clone, Serialize)]
+pub struct Rehearsal {
+    pub copy: CopyReport,
+    pub verification: Verification,
+}
+
+/// Every step of [`copy_compacted`] and [`verify`] but the row copy, against
+/// `source`, which should be a snapshot: the source fold and its log bound,
+/// the schema check, the destination's schema, counters, views and triggers,
+/// then the schema, counter, `integrity_check`, migration and retention
+/// checks. Only the migration ledger's rows are copied, and the row digests
+/// and `foreign_key_check`, which read every row, are not run. The empty copy
+/// at `dest` is removed afterwards, whatever the outcome.
+pub async fn rehearse(
+    source: &Path,
+    dest: &Path,
+    limits: ReclaimLimits,
+) -> Result<Rehearsal, ReclaimError> {
+    rehearse_with_reader(
+        source,
+        dest,
+        limits,
+        &cairn_common::memory::own_resident_bytes,
+    )
+    .await
+}
+
+async fn rehearse_with_reader(
+    source: &Path,
+    dest: &Path,
+    limits: ReclaimLimits,
+    read_memory: &(dyn Fn() -> Option<u64> + Send + Sync),
+) -> Result<Rehearsal, ReclaimError> {
+    let limits = ReclaimLimits {
+        stop_after_bytes: None,
+        ..limits
+    };
+    let copy = run_copy(source, dest, limits, Mode::Rehearse, read_memory, |_| {}).await?;
+    let verification = verify_in(source, dest, Mode::Rehearse).await;
+    for member in db_set_paths(dest) {
+        let _ = std::fs::remove_file(member);
+    }
+    Ok(Rehearsal {
+        copy,
+        verification: verification?,
+    })
+}
+
 /// [`copy_compacted`] with the memory reading supplied, so a test can stand
 /// in a reader that fails.
 async fn copy_with_reader(
     source: &Path,
     dest: &Path,
     limits: ReclaimLimits,
+    read_memory: &(dyn Fn() -> Option<u64> + Send + Sync),
+    observe: impl FnMut(CopyProgress<'_>),
+) -> Result<CopyReport, ReclaimError> {
+    run_copy(source, dest, limits, Mode::Copy, read_memory, observe).await
+}
+
+async fn run_copy(
+    source: &Path,
+    dest: &Path,
+    limits: ReclaimLimits,
+    mode: Mode,
     read_memory: &(dyn Fn() -> Option<u64> + Send + Sync),
     mut observe: impl FnMut(CopyProgress<'_>),
 ) -> Result<CopyReport, ReclaimError> {
@@ -245,7 +352,7 @@ async fn copy_with_reader(
     // Fail closed before anything is written: a cap that cannot be read now
     // could not be enforced later either.
     guard.check(0)?;
-    let result = copy_into(source, dest, limits, &mut guard, &mut observe).await;
+    let result = copy_into(source, dest, limits, mode, &mut guard, &mut observe).await;
     match result {
         Ok(mut report) => {
             report.peak_resident_bytes = guard.peak;
@@ -268,6 +375,7 @@ async fn copy_into(
     source_path: &Path,
     dest_path: &Path,
     limits: ReclaimLimits,
+    mode: Mode,
     guard: &mut MemoryGuard<'_>,
     observe: &mut impl FnMut(CopyProgress<'_>),
 ) -> Result<CopyReport, ReclaimError> {
@@ -285,8 +393,9 @@ async fn copy_into(
     }
     phases.source_fold_ms = source_fold.ms;
     let source_page_size = scalar(&source, "PRAGMA page_size").await?.unwrap_or(0);
-    let entries = schema(&source).await?;
+    let (entries, schema_duplicates) = read_schema(&source).await?;
     refuse_unknown_schema(&source).await?;
+    phases.schema_check_ms = check_replay(&entries, dest_path).await?;
 
     let schema_started = Instant::now();
     let dest = LocalDb::open(dest_path).await?;
@@ -311,7 +420,10 @@ async fn copy_into(
     let mut folds = Vec::new();
     let (mut rows, mut bytes) = (0u64, 0u64);
     let mut partial = false;
-    'tables: for entry in entries.iter().filter(|entry| entry.kind == "table") {
+    let copied = |entry: &&SchemaEntry| {
+        entry.kind == "table" && (mode == Mode::Copy || entry.name == MIGRATION_LEDGER)
+    };
+    'tables: for entry in entries.iter().filter(copied) {
         let table_started = Instant::now();
         let shape = TableShape::read(&source, &entry.name).await?;
         let insert = shape.insert_sql();
@@ -399,6 +511,12 @@ async fn copy_into(
         peak_resident_bytes: 0,
         readings: 0,
         partial,
+        rehearsal: mode == Mode::Rehearse,
+        schema_rows_dropped: schema_duplicates
+            .iter()
+            .map(|duplicate| duplicate.dropped_rowids.len())
+            .sum(),
+        schema_duplicates,
         source_set_bytes: db_set_size(source_path),
         dest_set_bytes: 0,
         phases,
@@ -521,26 +639,140 @@ fn engine_owned(name: &str) -> bool {
     name.starts_with("sqlite_") || name.starts_with("__turso")
 }
 
-/// The schema's entries in creation order, less the engine's own.
-async fn schema(db: &LocalDb) -> DbResult<Vec<SchemaEntry>> {
+/// A `(type, name)` that `sqlite_master` lists more than once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SchemaDuplicate {
+    pub kind: String,
+    pub name: String,
+    /// The row kept: the last one.
+    pub kept_rowid: i64,
+    /// The earlier rows, dropped.
+    pub dropped_rowids: Vec<i64>,
+    /// A dropped row's table or SQL differs from the kept row's, beyond the
+    /// whitespace [`normalized_sql`] ignores.
+    pub texts_differ: bool,
+}
+
+/// The schema's entries in creation order, less the engine's own and with
+/// one entry per `(type, name)`, the last listed; and the duplicates dropped.
+async fn read_schema(db: &LocalDb) -> DbResult<(Vec<SchemaEntry>, Vec<SchemaDuplicate>)> {
     let rows = db
         .query_all(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid",
+            "SELECT rowid, type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid",
             (),
             |row| {
-                Ok(SchemaEntry {
-                    kind: row.text(0)?,
-                    name: row.text(1)?,
-                    table: row.text(2)?,
-                    sql: row.opt_text(3)?,
-                })
+                Ok((
+                    row.i64(0)?,
+                    SchemaEntry {
+                        kind: row.text(1)?,
+                        name: row.text(2)?,
+                        table: row.text(3)?,
+                        sql: row.opt_text(4)?,
+                    },
+                ))
             },
         )
         .await?;
-    Ok(rows
+    Ok(dedupe(
+        rows.into_iter()
+            .filter(|(_, entry)| !engine_owned(&entry.name))
+            .collect(),
+    ))
+}
+
+fn schema_key(entry: &SchemaEntry) -> (String, String) {
+    (entry.kind.clone(), entry.name.clone())
+}
+
+/// `rows` (rowid, entry) in rowid order, one entry kept per `(type, name)`:
+/// the last, at its own place in the order.
+fn dedupe(rows: Vec<(i64, SchemaEntry)>) -> (Vec<SchemaEntry>, Vec<SchemaDuplicate>) {
+    let last: BTreeMap<(String, String), usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, entry))| (schema_key(entry), idx))
+        .collect();
+    let mut duplicates: BTreeMap<(String, String), SchemaDuplicate> = BTreeMap::new();
+    for (idx, (rowid, entry)) in rows.iter().enumerate() {
+        let key = schema_key(entry);
+        let kept = last[&key];
+        if idx == kept {
+            continue;
+        }
+        let (kept_rowid, kept_entry) = &rows[kept];
+        let duplicate = duplicates.entry(key).or_insert_with(|| SchemaDuplicate {
+            kind: entry.kind.clone(),
+            name: entry.name.clone(),
+            kept_rowid: *kept_rowid,
+            dropped_rowids: Vec::new(),
+            texts_differ: false,
+        });
+        duplicate.dropped_rowids.push(*rowid);
+        duplicate.texts_differ |= !same_definition(entry, kept_entry);
+    }
+    let entries = rows
         .into_iter()
-        .filter(|entry| !engine_owned(&entry.name))
-        .collect())
+        .enumerate()
+        .filter(|(idx, (_, entry))| last[&schema_key(entry)] == *idx)
+        .map(|(_, (_, entry))| entry)
+        .collect();
+    (entries, duplicates.into_values().collect())
+}
+
+/// Replay `entries` into an empty scratch database beside `dest`, in the
+/// copy's order, and compare what it holds with them: the copy will execute
+/// the same statements, so a statement that fails or stores something else
+/// here would fail or differ there, after the rows. Returns the check's wall
+/// time; the scratch database is removed either way.
+async fn check_replay(entries: &[SchemaEntry], dest: &Path) -> Result<u64, ReclaimError> {
+    let started = Instant::now();
+    let dir = dest
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let scratch = tempfile::Builder::new()
+        .prefix(".reclaim-schema-check-")
+        .tempdir_in(dir)
+        .map_err(|error| {
+            ReclaimError::Refused(format!(
+                "could not create the schema check's scratch directory in {}: {error}",
+                dir.display()
+            ))
+        })?;
+    let db = LocalDb::open(scratch.path().join("schema-check.db")).await?;
+    let mut writer = Writer::default();
+    let mut problems = Vec::new();
+    for kind in REPLAY_ORDER {
+        for entry in entries.iter().filter(|entry| entry.kind == kind) {
+            if let Some(sql) = &entry.sql {
+                if let Err(error) = writer.get(&db).await?.execute(sql, ()).await {
+                    problems.push(format!("{} {}: {error}", entry.kind, entry.name));
+                }
+            }
+        }
+    }
+    writer.release();
+    if problems.is_empty() {
+        let (replayed, duplicates) = read_schema(&db).await?;
+        problems = schema_differences(entries, &replayed);
+        problems.extend(duplicates.iter().map(listed_twice));
+    }
+    drop(db);
+    drop(scratch);
+    if problems.is_empty() {
+        Ok(millis(started))
+    } else {
+        Err(ReclaimError::Schema(problems))
+    }
+}
+
+fn listed_twice(duplicate: &SchemaDuplicate) -> String {
+    format!(
+        "the copy lists {} {} {} times",
+        duplicate.kind,
+        duplicate.name,
+        duplicate.dropped_rowids.len() + 1
+    )
 }
 
 /// Refuse a schema holding something this copy would not carry: engine
@@ -838,6 +1070,8 @@ pub enum ForeignKeyCheck {
     Unsupported {
         error: String,
     },
+    /// A rehearsal, which copies no rows to check.
+    NotRun,
 }
 
 /// Wall time of each phase of the verification, in milliseconds.
@@ -856,7 +1090,12 @@ pub struct VerifyPhases {
 /// What [`verify`] found.
 #[derive(Debug, Clone, Serialize)]
 pub struct Verification {
-    /// Schema entries present on one side only, or different between them.
+    /// A [`rehearse`] verification: no row digests or `foreign_key_check`.
+    pub rehearsal: bool,
+    /// Duplicates in the source's `sqlite_master`, compared as their last row.
+    pub source_schema_duplicates: Vec<SchemaDuplicate>,
+    /// Schema entries present on one side only, or different between them,
+    /// and any entry the copy lists twice.
     pub schema_differences: Vec<String>,
     /// AUTOINCREMENT counters that differ.
     pub sequence_differences: Vec<String>,
@@ -871,7 +1110,9 @@ pub struct Verification {
     pub migrations_applied: Vec<String>,
     /// The migration runner failed on the copy.
     pub migration_error: Option<String>,
-    /// Tables in the copy with no retention rule.
+    /// Tables in the copy with no retention rule. Reported, not a failure: a
+    /// missing rule says nothing about whether the copy is faithful, and
+    /// `every_table_has_a_retention_rule` is where it fails.
     pub unruled_tables: Vec<String>,
     pub phases: VerifyPhases,
 }
@@ -927,12 +1168,6 @@ impl Verification {
                 self.migrations_applied, self.source_pending_migrations
             ));
         }
-        if !self.unruled_tables.is_empty() {
-            failures.push(format!(
-                "tables without a retention rule: {}",
-                self.unruled_tables.join(", ")
-            ));
-        }
         failures
     }
 
@@ -949,15 +1184,24 @@ impl Verification {
 /// leaves verification at this binary's schema, as the runner would have left
 /// it at the next boot.
 pub async fn verify(source_path: &Path, dest_path: &Path) -> Result<Verification, ReclaimError> {
+    verify_in(source_path, dest_path, Mode::Copy).await
+}
+
+async fn verify_in(
+    source_path: &Path,
+    dest_path: &Path,
+    mode: Mode,
+) -> Result<Verification, ReclaimError> {
     let started = Instant::now();
     let mut phases = VerifyPhases::default();
     let source = LocalDb::open(source_path).await?;
     let dest = LocalDb::open(dest_path).await?;
 
     let phase = Instant::now();
-    let source_schema = schema(&source).await?;
-    let dest_schema = schema(&dest).await?;
-    let schema_differences = schema_differences(&source_schema, &dest_schema);
+    let (source_schema, source_schema_duplicates) = read_schema(&source).await?;
+    let (dest_schema, dest_duplicates) = read_schema(&dest).await?;
+    let mut schema_differences = schema_differences(&source_schema, &dest_schema);
+    schema_differences.extend(dest_duplicates.iter().map(listed_twice));
     let sequence_differences = differences(
         &sequences(&source).await?.into_iter().collect::<Vec<_>>(),
         &sequences(&dest).await?.into_iter().collect::<Vec<_>>(),
@@ -967,7 +1211,8 @@ pub async fn verify(source_path: &Path, dest_path: &Path) -> Result<Verification
 
     let phase = Instant::now();
     let mut tables = Vec::new();
-    for entry in source_schema.iter().filter(|entry| entry.kind == "table") {
+    let digested = |entry: &&SchemaEntry| entry.kind == "table" && mode == Mode::Copy;
+    for entry in source_schema.iter().filter(digested) {
         let shape = TableShape::read(&source, &entry.name).await?;
         let limits = ReclaimLimits::with_cap(u64::MAX);
         let ((source_rows, source_max_rowid, source_sha256), dest_digest) = tokio::try_join!(
@@ -992,27 +1237,9 @@ pub async fn verify(source_path: &Path, dest_path: &Path) -> Result<Verification
     phases.integrity_check_ms = millis(phase);
 
     let phase = Instant::now();
-    let foreign_key_check = match (
-        pragma_rows(&source, "PRAGMA foreign_key_check").await,
-        pragma_rows(&dest, "PRAGMA foreign_key_check").await,
-    ) {
-        (Ok(mut source), Ok(mut dest)) => {
-            source.sort();
-            dest.sort();
-            if source == dest {
-                ForeignKeyCheck::Same {
-                    violations: source.len(),
-                }
-            } else {
-                ForeignKeyCheck::Different {
-                    source: source.len(),
-                    dest: dest.len(),
-                }
-            }
-        }
-        (Err(error), _) | (_, Err(error)) => ForeignKeyCheck::Unsupported {
-            error: error.to_string(),
-        },
+    let foreign_key_check = match mode {
+        Mode::Rehearse => ForeignKeyCheck::NotRun,
+        Mode::Copy => foreign_key_check(&source, &dest).await,
     };
     phases.foreign_key_check_ms = millis(phase);
 
@@ -1031,6 +1258,8 @@ pub async fn verify(source_path: &Path, dest_path: &Path) -> Result<Verification
     phases.total_ms = millis(started);
 
     Ok(Verification {
+        rehearsal: mode == Mode::Rehearse,
+        source_schema_duplicates,
         schema_differences,
         sequence_differences,
         tables,
@@ -1042,6 +1271,31 @@ pub async fn verify(source_path: &Path, dest_path: &Path) -> Result<Verification
         unruled_tables,
         phases,
     })
+}
+
+async fn foreign_key_check(source: &LocalDb, dest: &LocalDb) -> ForeignKeyCheck {
+    match (
+        pragma_rows(source, "PRAGMA foreign_key_check").await,
+        pragma_rows(dest, "PRAGMA foreign_key_check").await,
+    ) {
+        (Ok(mut source), Ok(mut dest)) => {
+            source.sort();
+            dest.sort();
+            if source == dest {
+                ForeignKeyCheck::Same {
+                    violations: source.len(),
+                }
+            } else {
+                ForeignKeyCheck::Different {
+                    source: source.len(),
+                    dest: dest.len(),
+                }
+            }
+        }
+        (Err(error), _) | (_, Err(error)) => ForeignKeyCheck::Unsupported {
+            error: error.to_string(),
+        },
+    }
 }
 
 /// `sql` with the whitespace outside quotes removed.
@@ -1076,23 +1330,29 @@ pub(crate) fn normalized_sql(sql: &str) -> String {
     out
 }
 
+/// Both entries name one table and have the same SQL modulo whitespace.
+fn same_definition(a: &SchemaEntry, b: &SchemaEntry) -> bool {
+    a.table == b.table
+        && a.sql.as_deref().map(normalized_sql) == b.sql.as_deref().map(normalized_sql)
+}
+
 /// Schema entries on one side only, and entries whose table or SQL differ
-/// beyond the engine's whitespace (see [`normalized_sql`]).
+/// beyond the engine's whitespace (see [`normalized_sql`]). Both sides are
+/// deduplicated already ([`read_schema`]).
 fn schema_differences(source: &[SchemaEntry], dest: &[SchemaEntry]) -> Vec<String> {
-    let same = |a: &SchemaEntry, b: &SchemaEntry| {
-        a.table == b.table
-            && a.sql.as_deref().map(normalized_sql) == b.sql.as_deref().map(normalized_sql)
-    };
-    let key = |entry: &SchemaEntry| (entry.kind.clone(), entry.name.clone());
-    let source: BTreeMap<(String, String), &SchemaEntry> =
-        source.iter().map(|entry| (key(entry), entry)).collect();
-    let dest: BTreeMap<(String, String), &SchemaEntry> =
-        dest.iter().map(|entry| (key(entry), entry)).collect();
+    let source: BTreeMap<(String, String), &SchemaEntry> = source
+        .iter()
+        .map(|entry| (schema_key(entry), entry))
+        .collect();
+    let dest: BTreeMap<(String, String), &SchemaEntry> = dest
+        .iter()
+        .map(|entry| (schema_key(entry), entry))
+        .collect();
     let mut out = Vec::new();
     for ((kind, name), entry) in &source {
         match dest.get(&(kind.clone(), name.clone())) {
             None => out.push(format!("only in the source: {kind} {name}")),
-            Some(copy) if !same(entry, copy) => out.push(format!(
+            Some(copy) if !same_definition(entry, copy) => out.push(format!(
                 "{kind} {name} differs: the source has {:?} on {}, the copy {:?} on {}",
                 entry.sql, entry.table, copy.sql, copy.table
             )),
