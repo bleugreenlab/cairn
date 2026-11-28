@@ -161,6 +161,8 @@ pub const AUDITED_TRIGGERS: &[AuditedTrigger] = &[
     trigger("main_incident_source_enqueue", "check_result_observations",
         "enqueues one prospective main source by its (project_id,event_key) primary key; reads no table"),
     trigger("main_incidents_immutable", "main_incidents", IMMUTABLE),
+    trigger("resolution_cleanups_cancelled_turn", "turns",
+        "records one calls entry by resolution_cleanups' (kind,subject_id) primary key; reads no table"),
     trigger("publications_settled_immutable", "publications", IMMUTABLE),
     trigger("publications_identity_immutable", "publications", IMMUTABLE),
     trigger("publication_legs_terminal_immutable", "publication_legs", IMMUTABLE),
