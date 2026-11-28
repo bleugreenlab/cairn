@@ -15,6 +15,8 @@ mod route_firings;
 mod row;
 mod run_failures;
 pub use run_failures::record_run_failure_conn;
+#[cfg(test)]
+mod cursor_open_bench;
 mod runtime_admission;
 mod search_index;
 #[cfg(any(test, feature = "test-utils"))]

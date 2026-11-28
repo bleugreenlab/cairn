@@ -31,11 +31,18 @@ tantivy = "0.26.1"
 # this line, so tursodb and the sync-supervisor image build the same source
 # (CAIRN-2147 ABI invariant); keep it on one line.
 #
+# This is a fork pin carrying one patch: upstream 7b7f1595 plus a commit that
+# indexes MVCC root bindings by root page, so opening a cursor no longer scans
+# every table and index binding (branch cairn/7b7f1595-rootpage-index). The
+# first move to an upstream revision that fixes tursodatabase/turso#12620
+# points this line back at tursodatabase/turso; see "The Turso pin carries one
+# patch" in docs/database.md.
+#
 # The revision must contain upstream's MVCC checkpoint rollback repair (stage
 # root-map mutations until pager commit, clear pending reads on teardown;
 # CAIRN-3838) and the Rust binding's `Connection::set_query_timeout` and
 # `Connection::interrupt`, which LocalDb's pooled-read bound needs.
-turso = { git = "https://github.com/tursodatabase/turso", rev = "7b7f159537bec57ce461cb814d8c1ab07f5d5a7f", default-features = false, features = ["sync"] }
+turso = { git = "https://github.com/bleugreen/turso", rev = "7f6b07736b51cf566729e9a79584922c5f53c67f", default-features = false, features = ["sync"] }
 # Direct rustls handle so `LocalDb::ensure_crypto_provider` can install a
 # process-wide default `CryptoProvider` before turso's sync TLS client is built.
 # See the doc comment on `ensure_crypto_provider` in storage/local_db.rs.
