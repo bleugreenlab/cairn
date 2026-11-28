@@ -397,6 +397,11 @@ async fn thread_task_completion_resumes_parked_thread_once() {
 /// rather than held behind the queue, so no queue hold is armed. The parent
 /// has no current session, so its resume then fails for a reason that is not
 /// the queue; its marker records the refused launch and stops holding a seat.
+///
+/// The resume is not necessarily this thread's: the task's recompute also
+/// dispatches it on a detached thread, and whichever claims the anchor first
+/// launches and releases. Under load the detached one wins and the warm
+/// transition returns before the marker is released, so the release is awaited.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parked_parent_is_admitted_past_a_full_queue_when_its_task_completes() {
     let db = test_db().await;
@@ -445,6 +450,18 @@ async fn parked_parent_is_admitted_past_a_full_queue_when_its_task_completes() {
     ));
 
     assert_eq!(unblock_turns(&orch).await, 1);
+    let marker_end_reason = || {
+        text(
+            &orch,
+            "SELECT end_reason FROM turns
+              WHERE predecessor_id = ?1 AND start_reason = 'dependency_unblock'",
+            "anchor",
+        )
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while marker_end_reason().await.is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert_eq!(
         count(
             &orch,
@@ -455,14 +472,7 @@ async fn parked_parent_is_admitted_past_a_full_queue_when_its_task_completes() {
         "the resume was admitted, not held behind the queue"
     );
     assert_eq!(
-        text(
-            &orch,
-            "SELECT end_reason FROM turns
-              WHERE predecessor_id = ?1 AND start_reason = 'dependency_unblock'",
-            "anchor",
-        )
-        .await
-        .as_deref(),
+        marker_end_reason().await.as_deref(),
         Some("launch_refused"),
         "a resume that did not launch releases its marker"
     );
